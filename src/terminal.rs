@@ -364,9 +364,10 @@ impl Render for TerminalView {
             }))
             .on_scroll_wheel(cx.listener(move |this, ev: &ScrollWheelEvent, _window, cx| {
                 let line_h = this.cell_size.map_or(px(19.6), |c| c.height);
+                let multiplier = this.font_config.scroll_sensitivity;
                 let delta_px = ev.delta.pixel_delta(line_h);
                 let old_offset = (this.scroll_acc.get() / f32::from(line_h)) as i32;
-                let acc = this.scroll_acc.get() + f32::from(delta_px.y);
+                let acc = this.scroll_acc.get() + f32::from(delta_px.y) * multiplier;
                 let new_offset = (acc / f32::from(line_h)) as i32;
                 let total_h = f32::from(line_h) * 100.0;
                 this.scroll_acc.set(acc % total_h);

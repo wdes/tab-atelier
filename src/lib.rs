@@ -44,6 +44,7 @@ pub struct FontConfig {
     pub family: String,
     pub weight: u16,
     pub size: f32,
+    pub scroll_sensitivity: f32,
 }
 
 impl Default for FontConfig {
@@ -52,6 +53,7 @@ impl Default for FontConfig {
             family: "monospace".into(),
             weight: 400,
             size: 16.0,
+            scroll_sensitivity: 1.0,
         }
     }
 }
@@ -94,6 +96,9 @@ pub fn load_font_config_from(path: &std::path::Path) -> FontConfig {
         config.size = size as f32;
     } else if let Some(size) = parsed.get("buffer_font_size").and_then(|v| v.as_f64()) {
         config.size = size as f32;
+    }
+    if let Some(sens) = parsed.get("scroll_sensitivity").and_then(|v| v.as_f64()) {
+        config.scroll_sensitivity = (sens as f32).max(0.01);
     }
 
     config
