@@ -23,6 +23,7 @@ use crate::terminal_utils::{
     color_to_hsla, hsla_eq, is_default_bg, is_default_fg, keystroke_to_bytes, DEFAULT_BG,
     DEFAULT_FG,
 };
+use swoop::FontConfig;
 
 const INITIAL_COLS: usize = 80;
 const INITIAL_LINES: usize = 24;
@@ -55,11 +56,14 @@ pub struct TerminalView {
     last_size: Rc<Cell<Option<(usize, usize)>>>,
     content_origin: Rc<Cell<gpui::Point<Pixels>>>,
     pid: u32,
+    exited: Rc<Cell<bool>>,
+    font_config: FontConfig,
 }
 
 impl TerminalView {
     pub fn new(
         cwd: Option<&Path>,
+        font_config: FontConfig,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -73,8 +77,12 @@ impl TerminalView {
         opts.working_directory = cwd.map(|p| p.to_path_buf());
         let pty = tty::new(&opts, ws, 0).expect("failed to create pty");
         let pid = pty.child().id();
+        let config = Config {
+            scrolling_history: 10_000,
+            ..Config::default()
+        };
         let term = Term::new(
-            Config::default(),
+            config,
             &TermDims { columns: INITIAL_COLS, screen_lines: INITIAL_LINES },
             EventProxy,
         );
@@ -98,11 +106,30 @@ impl TerminalView {
         })
         .detach();
 
+        let exited = Rc::new(Cell::new(false));
+        let exited_clone = exited.clone();
+        let pid_for_check = pid;
+        cx.spawn(async move |this: WeakEntity<TerminalView>, cx: &mut AsyncApp| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(500))
+                    .await;
+                if !Path::new(&format!("/proc/{pid_for_check}")).exists() {
+                    exited_clone.set(true);
+                    let _ = this.update(cx, |_, cx: &mut Context<TerminalView>| cx.notify());
+                    break;
+                }
+            }
+        })
+        .detach();
+
         Self {
             term, notifier, focus, cell_size: None,
             last_size: Rc::new(Cell::new(None)),
             content_origin: Rc::new(Cell::new(point(px(0.0), px(0.0)))),
             pid,
+            exited,
+            font_config,
         }
     }
 
@@ -110,15 +137,66 @@ impl TerminalView {
         self.pid
     }
 
+    pub fn has_exited(&self) -> bool {
+        self.exited.get()
+    }
+
+    pub fn respawn(&mut self, cwd: Option<&Path>, cx: &mut Context<Self>) {
+        let _ = self.notifier.send(Msg::Shutdown);
+
+        let (cols, lines) = self.last_size.get().unwrap_or((INITIAL_COLS, INITIAL_LINES));
+        let cell = self.cell_size.unwrap_or(Size { width: px(8.4), height: px(19.6) });
+
+        let ws = WindowSize {
+            num_lines: lines as u16,
+            num_cols: cols as u16,
+            cell_width: f32::from(cell.width) as u16,
+            cell_height: f32::from(cell.height) as u16,
+        };
+
+        let mut opts = tty::Options::default();
+        opts.working_directory = cwd.map(|p| p.to_path_buf());
+        let pty = tty::new(&opts, ws, 0).expect("failed to create pty");
+        let pid = pty.child().id();
+
+        self.term.lock().grid_mut().scroll_display(Scroll::Bottom);
+
+        let el = EventLoop::new(self.term.clone(), EventProxy, pty, false, false)
+            .expect("failed to create event loop");
+        self.notifier = el.channel();
+        el.spawn();
+
+        self.pid = pid;
+        self.exited.set(false);
+
+        let exited = self.exited.clone();
+        let pid_for_check = pid;
+        cx.spawn(async move |this: WeakEntity<TerminalView>, cx: &mut AsyncApp| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(500))
+                    .await;
+                if !Path::new(&format!("/proc/{pid_for_check}")).exists() {
+                    exited.set(true);
+                    let _ = this.update(cx, |_, cx: &mut Context<TerminalView>| cx.notify());
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
     pub fn shutdown(&self) {
         let _ = self.notifier.send(Msg::Shutdown);
     }
 
     fn send_input(&self, bytes: Vec<u8>) {
+        self.term.lock().grid_mut().scroll_display(Scroll::Bottom);
         let _ = self.notifier.send(Msg::Input(bytes.into()));
     }
 
     pub fn send_clipboard(&self, text: String) {
+        self.term.lock().grid_mut().scroll_display(Scroll::Bottom);
         let bracketed = format!("\x1b[200~{text}\x1b[201~");
         let _ = self.notifier.send(Msg::Input(bracketed.into_bytes().into()));
     }
@@ -150,6 +228,37 @@ impl TerminalView {
         t.selection_to_string()
     }
 
+    pub fn copy_all_history(&self) -> String {
+        let t = self.term.lock();
+        let grid = t.grid();
+        let cols = grid.columns();
+        let history = grid.history_size();
+        let screen = grid.screen_lines();
+        let mut lines = Vec::new();
+
+        for row in (-(history as i32))..screen as i32 {
+            let mut line = String::with_capacity(cols);
+            for col in 0..cols {
+                let cell = &grid[GridPoint::new(Line(row), Column(col))];
+                if cell.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
+                    continue;
+                }
+                let ch = if cell.c == '\0' { ' ' } else { cell.c };
+                line.push(ch);
+            }
+            lines.push(line.trim_end().to_string());
+        }
+
+        // Trim leading and trailing empty lines
+        while lines.first().is_some_and(|l| l.is_empty()) {
+            lines.remove(0);
+        }
+        while lines.last().is_some_and(|l| l.is_empty()) {
+            lines.pop();
+        }
+        lines.join("\n")
+    }
+
     fn pixel_to_grid(&self, pos: gpui::Point<Pixels>, bounds_origin: gpui::Point<Pixels>) -> (GridPoint, Side) {
         let cell = self.cell_size.unwrap_or(Size { width: px(8.4), height: px(19.6) });
         let x = f32::from(pos.x - bounds_origin.x);
@@ -171,18 +280,35 @@ impl Render for TerminalView {
         let term = self.term.clone();
 
         // Measure cell size once we have a text system.
+        // Cell width measurement based on Zed's terminal_element.rs
+        // Copyright (c) Zed Industries — Apache-2.0 / GPL-3.0
         if self.cell_size.is_none() {
-            let f = font("monospace");
-            let font_size = px(14.0);
+            let mut f = font(self.font_config.family.clone());
+            f.weight = FontWeight(self.font_config.weight as f32);
+            let font_size = px(self.font_config.size);
             let text_sys = window.text_system();
             let font_id = text_sys.resolve_font(&f);
-            if let Ok(advance) = text_sys.advance(font_id, font_size, 'M') {
-                let line_height = font_size * 1.4;
-                self.cell_size = Some(Size {
-                    width: advance.width,
-                    height: line_height,
-                });
-            }
+            // Measure cell width through the shaping pipeline to match shape_line
+            let layout = text_sys.layout_line(
+                "m",
+                font_size,
+                &[TextRun {
+                    len: 1,
+                    font: f.clone(),
+                    color: gpui::black(),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                }],
+                None,
+            );
+            let cell_width = layout.width;
+            let _ = font_id;
+            let line_height = font_size * 1.4;
+            self.cell_size = Some(Size {
+                width: cell_width,
+                height: line_height,
+            });
         }
 
         let cell_size = self.cell_size.unwrap_or(Size {
@@ -230,6 +356,7 @@ impl Render for TerminalView {
                 cell_size,
                 last_size: self.last_size.clone(),
                 content_origin: self.content_origin.clone(),
+                font_config: self.font_config.clone(),
             })
     }
 }
@@ -246,6 +373,7 @@ struct TerminalElement {
     cell_size: Size<Pixels>,
     last_size: Rc<Cell<Option<(usize, usize)>>>,
     content_origin: Rc<Cell<gpui::Point<Pixels>>>,
+    font_config: FontConfig,
 }
 
 impl IntoElement for TerminalElement {
@@ -334,13 +462,15 @@ impl Element for TerminalElement {
         self.content_origin.set(bounds.origin);
 
         let text_sys = window.text_system();
-        let mono_font = font("monospace");
-        let font_size = px(14.0);
+        let mut mono_font = font(self.font_config.family.clone());
+        mono_font.weight = FontWeight(self.font_config.weight as f32);
+        let font_size = px(self.font_config.size);
         let fg_default: Hsla = rgb(DEFAULT_FG).into();
 
         let term = self.term.lock();
         let grid = term.grid();
         let cursor_point = grid.cursor.point;
+        let display_offset = grid.display_offset() as i32;
         let visible_lines = grid.screen_lines().min(lines);
         let visible_cols = grid.columns().min(cols);
 
@@ -352,7 +482,32 @@ impl Element for TerminalElement {
             let mut bg_runs: Vec<BgRun> = Vec::new();
 
             for c in 0..visible_cols {
-                let cell_data = &grid[GridPoint::new(Line(l as i32), Column(c))];
+                let cell_data = &grid[GridPoint::new(Line(l as i32 - display_offset), Column(c))];
+                if cell_data.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
+                    text.push(' ');
+                    let char_len = 1;
+                    let can_merge = !runs.is_empty();
+                    if can_merge {
+                        runs.last_mut().unwrap().len += char_len;
+                    } else {
+                        let fg = if is_default_fg(cell_data.fg) {
+                            fg_default
+                        } else {
+                            color_to_hsla(cell_data.fg)
+                        };
+                        let mut spacer_font = font(mono_font.family.clone());
+                        spacer_font.weight = mono_font.weight;
+                        runs.push(TextRun {
+                            len: char_len,
+                            font: spacer_font,
+                            color: fg,
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        });
+                    }
+                    continue;
+                }
                 let ch = if cell_data.c == '\0' { ' ' } else { cell_data.c };
                 text.push(ch);
 
@@ -362,7 +517,7 @@ impl Element for TerminalElement {
                     color_to_hsla(cell_data.fg)
                 };
 
-                let mut font_weight = FontWeight::NORMAL;
+                let mut font_weight = FontWeight(self.font_config.weight as f32);
                 let mut font_style = FontStyle::Normal;
                 let mut underline = None;
                 let mut strikethrough = None;
@@ -449,12 +604,13 @@ impl Element for TerminalElement {
                 text.into(),
                 font_size,
                 &runs,
-                Some(cell.width * visible_cols as f32),
+                Some(cell.width),
             );
             result_lines.push(TermLine { shaped, bg_runs });
         }
 
-        let cursor = if (cursor_point.line.0 as usize) < visible_lines
+        let cursor = if display_offset == 0
+            && (cursor_point.line.0 as usize) < visible_lines
             && cursor_point.column.0 < visible_cols
         {
             Some((cursor_point.line.0 as usize, cursor_point.column.0))
