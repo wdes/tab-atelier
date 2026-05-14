@@ -39,6 +39,133 @@ pub fn load_state() -> Option<SavedState> {
     serde_json::from_str(&data).ok()
 }
 
+#[derive(Debug, Clone)]
+pub struct FontConfig {
+    pub family: String,
+    pub weight: u16,
+    pub size: f32,
+}
+
+impl Default for FontConfig {
+    fn default() -> Self {
+        Self {
+            family: "monospace".into(),
+            weight: 400,
+            size: 16.0,
+        }
+    }
+}
+
+pub fn load_font_config() -> FontConfig {
+    let config_path = std::env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+            PathBuf::from(home).join(".config")
+        })
+        .join("zed/settings.json");
+
+    load_font_config_from(&config_path)
+}
+
+pub fn load_font_config_from(path: &std::path::Path) -> FontConfig {
+    let mut config = FontConfig::default();
+
+    let data = match std::fs::read_to_string(path) {
+        Ok(d) => d,
+        Err(_) => return config,
+    };
+
+    // Zed settings.json has comments — strip them before parsing
+    let stripped: String = strip_json_comments(&data);
+
+    let parsed: serde_json::Value = match serde_json::from_str(&stripped) {
+        Ok(v) => v,
+        Err(_) => return config,
+    };
+
+    if let Some(family) = parsed.get("ui_font_family").and_then(|v| v.as_str()) {
+        config.family = family.to_string();
+    }
+    if let Some(weight) = parsed.get("ui_font_weight").and_then(|v| v.as_u64()) {
+        config.weight = weight as u16;
+    }
+    if let Some(size) = parsed.get("ui_font_size").and_then(|v| v.as_f64()) {
+        config.size = size as f32;
+    } else if let Some(size) = parsed.get("buffer_font_size").and_then(|v| v.as_f64()) {
+        config.size = size as f32;
+    }
+
+    config
+}
+
+fn strip_json_comments(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    let mut in_string = false;
+
+    while let Some(ch) = chars.next() {
+        if in_string {
+            out.push(ch);
+            if ch == '\\' {
+                if let Some(&next) = chars.peek() {
+                    out.push(next);
+                    chars.next();
+                }
+            } else if ch == '"' {
+                in_string = false;
+            }
+        } else if ch == '"' {
+            in_string = true;
+            out.push(ch);
+        } else if ch == '/' {
+            match chars.peek() {
+                Some(&'/') => {
+                    chars.next();
+                    for c in chars.by_ref() {
+                        if c == '\n' {
+                            out.push('\n');
+                            break;
+                        }
+                    }
+                }
+                Some(&'*') => {
+                    chars.next();
+                    while let Some(c) = chars.next() {
+                        if c == '*' && chars.peek() == Some(&'/') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                _ => out.push(ch),
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+pub fn load_wakatime_key() -> Option<String> {
+    let config_path = std::env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+            PathBuf::from(home).join(".config")
+        })
+        .join("zed/settings.json");
+
+    let data = std::fs::read_to_string(config_path).ok()?;
+    let stripped = strip_json_comments(&data);
+    let parsed: serde_json::Value = serde_json::from_str(&stripped).ok()?;
+    parsed.get("wakatime")
+        .and_then(|w| w.get("settings"))
+        .and_then(|s| s.get("api-key"))
+        .and_then(|k| k.as_str())
+        .map(|s| s.to_string())
+}
+
 pub fn save_state(state: &SavedState) {
     let dir = dirs_or_default();
     let _ = std::fs::create_dir_all(&dir);
@@ -51,6 +178,14 @@ pub fn save_state(state: &SavedState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    unsafe fn set_env(key: &str, val: &str) {
+        unsafe { std::env::set_var(key, val) }
+    }
+
+    unsafe fn remove_env(key: &str) {
+        unsafe { std::env::remove_var(key) }
+    }
 
     #[test]
     fn test_tab_state_serialization() {
@@ -90,13 +225,66 @@ mod tests {
 
     #[test]
     fn test_load_state_missing_file() {
+        let prev = std::env::var("XDG_STATE_HOME").ok();
+        unsafe { set_env("XDG_STATE_HOME", "/tmp/swoop-test-nonexistent") };
         let result = load_state();
-        let _ = result;
+        assert!(result.is_none());
+        match prev {
+            Some(v) => unsafe { set_env("XDG_STATE_HOME", &v) },
+            None => unsafe { remove_env("XDG_STATE_HOME") },
+        }
+    }
+
+    #[test]
+    fn test_save_then_load_round_trip() {
+        let dir = std::env::temp_dir().join("swoop-test-round-trip");
+        let _ = std::fs::create_dir_all(&dir);
+        unsafe { set_env("XDG_STATE_HOME", dir.to_str().unwrap()) };
+
+        let state = SavedState {
+            tabs: vec![
+                TabState { name: "One".into(), cwd: Some("/tmp".into()) },
+                TabState { name: "Two".into(), cwd: None },
+            ],
+            active: 1,
+        };
+        save_state(&state);
+        let loaded = load_state().expect("should load saved state");
+        assert_eq!(loaded.tabs.len(), 2);
+        assert_eq!(loaded.tabs[0].name, "One");
+        assert_eq!(loaded.tabs[0].cwd, Some("/tmp".into()));
+        assert_eq!(loaded.tabs[1].name, "Two");
+        assert_eq!(loaded.tabs[1].cwd, None);
+        assert_eq!(loaded.active, 1);
+
+        let _ = std::fs::remove_dir_all(dir.join("swoop"));
+    }
+
+    #[test]
+    fn test_load_state_malformed_json() {
+        let dir = std::env::temp_dir().join("swoop-test-malformed");
+        let swoop_dir = dir.join("swoop");
+        let _ = std::fs::create_dir_all(&swoop_dir);
+        std::fs::write(swoop_dir.join("tabs.json"), "not json").unwrap();
+        unsafe { set_env("XDG_STATE_HOME", dir.to_str().unwrap()) };
+
+        let result = load_state();
+        assert!(result.is_none());
+
+        let _ = std::fs::remove_dir_all(&swoop_dir);
     }
 
     #[test]
     fn test_dirs_or_default_has_swoop() {
         let dir = dirs_or_default();
         assert_eq!(dir.file_name().unwrap(), "swoop");
+    }
+
+    #[test]
+    fn test_dirs_respects_xdg_state_home() {
+        unsafe { set_env("XDG_STATE_HOME", "/tmp/custom-state") };
+        let dir = dirs_or_default();
+        assert_eq!(dir, PathBuf::from("/tmp/custom-state/swoop"));
+        unsafe { remove_env("XDG_STATE_HOME") };
     }
 }
