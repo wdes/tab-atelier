@@ -19,6 +19,7 @@ use tracking::WakatimeTracker;
 struct Tab {
     view: Entity<TerminalView>,
     name: String,
+    created_at: std::time::Instant,
 }
 
 enum MenuKind {
@@ -69,19 +70,19 @@ impl Swoop {
                 if let Some(ref output) = ts.output {
                     view.read(cx).restore_output(output);
                 }
-                tabs.push(Tab { view, name: ts.name.clone() });
+                tabs.push(Tab { view, name: ts.name.clone(), created_at: std::time::Instant::now() });
             }
             if tabs.is_empty() {
                 let fc = font_config.clone();
                 let view = cx.new(|cx| TerminalView::new(None, fc, window, cx));
-                tabs.push(Tab { view, name: "Terminal".into() });
+                tabs.push(Tab { view, name: "Terminal".into(), created_at: std::time::Instant::now() });
             }
             let active = saved.active.min(tabs.len() - 1);
             (tabs, active)
         } else {
             let fc = font_config.clone();
             let view = cx.new(|cx| TerminalView::new(None, fc, window, cx));
-            (vec![Tab { view, name: "Terminal".into() }], 0)
+            (vec![Tab { view, name: "Terminal".into(), created_at: std::time::Instant::now() }], 0)
         };
 
         cx.spawn(async |this: WeakEntity<Swoop>, cx: &mut AsyncApp| {
@@ -166,7 +167,7 @@ impl Swoop {
         let fc = self.font_config.clone();
         let view = cx.new(|cx| TerminalView::new(cwd.as_deref(), fc, window, cx));
         let idx = self.tabs.len();
-        self.tabs.push(Tab { view, name: format!("Terminal {}", idx + 1) });
+        self.tabs.push(Tab { view, name: format!("Terminal {}", idx + 1), created_at: std::time::Instant::now() });
         self.active = idx;
         cx.notify();
     }
@@ -253,6 +254,7 @@ impl Swoop {
         let fc = self.font_config.clone();
         let view = cx.new(|cx| TerminalView::new(cwd.as_deref(), fc, window, cx));
         self.tabs[idx].view = view;
+        self.tabs[idx].created_at = std::time::Instant::now();
         self.exit_confirm = None;
         self.tabs[self.active].view.read(cx).focus_handle(cx).focus(window);
         cx.notify();
@@ -269,6 +271,7 @@ impl Swoop {
         self.tabs[idx].view.update(cx, |view, cx| {
             view.respawn(cwd.as_deref(), cx);
         });
+        self.tabs[idx].created_at = std::time::Instant::now();
         self.exit_confirm = None;
         self.tabs[self.active].view.read(cx).focus_handle(cx).focus(window);
         cx.notify();
@@ -400,11 +403,6 @@ impl Swoop {
         let menu_border: Hsla = rgb(0x3c3c3c).into();
 
         let pos = menu.position;
-        let item_count = match menu.kind {
-            MenuKind::Tab(_) => if self.tabs.len() > 1 { 9 } else { 8 },
-            MenuKind::Background => 7,
-        };
-        let menu_height = px(item_count as f32 * 27.0 + 8.0);
 
         let mut container = div()
             .id("context-menu")
@@ -412,7 +410,7 @@ impl Swoop {
             .left(pos.x);
 
         container = if menu.open_upward {
-            container.top(pos.y - menu_height)
+            container.bottom(px(0.0))
         } else {
             container.top(pos.y)
         };
@@ -459,6 +457,46 @@ impl Swoop {
                             cx.notify();
                         }))
                         .child("Close"),
+                );
+            }
+
+            let stat_fg: Hsla = rgb(0x888888).into();
+            let elapsed = self.tabs[idx].created_at.elapsed();
+            let power = self.power_watts.lock().unwrap();
+            let power_info = power.get(idx);
+
+            let mut stats_lines: Vec<String> = Vec::new();
+
+            if let Some(p) = power_info {
+                stats_lines.push(format!("CPU: {}", p.cpu_label()));
+                if let Some(w) = p.watts {
+                    stats_lines.push(format!("Power: {}", p.label()));
+                    let wh = w * elapsed.as_secs_f64() / 3600.0;
+                    if wh >= 1.0 {
+                        stats_lines.push(format!("Energy: {wh:.1} Wh"));
+                    } else {
+                        stats_lines.push(format!("Energy: {:.0} mWh", wh * 1000.0));
+                    }
+                }
+            }
+            stats_lines.push(format!("Uptime: {}", format_duration(elapsed)));
+
+            container = container.child(
+                div()
+                    .mx(px(8.0))
+                    .my(px(4.0))
+                    .h(px(1.0))
+                    .bg(menu_border),
+            );
+            for (si, line) in stats_lines.iter().enumerate() {
+                container = container.child(
+                    div()
+                        .id(SharedString::from(format!("menu-stat-{si}")))
+                        .px(px(12.0))
+                        .py(px(2.0))
+                        .text_size(px(11.0))
+                        .text_color(stat_fg)
+                        .child(line.clone()),
                 );
             }
         }
@@ -1050,6 +1088,19 @@ impl Render for Swoop {
         }
 
         root
+    }
+}
+
+fn format_duration(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        let h = secs / 3600;
+        let m = (secs % 3600) / 60;
+        format!("{h}h {m}m")
     }
 }
 

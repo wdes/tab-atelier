@@ -29,7 +29,7 @@ impl TabPower {
         }
     }
 
-    fn cpu_label(&self) -> String {
+    pub fn cpu_label(&self) -> String {
         if self.cpu_percent >= 100.0 {
             format!("{:.0}%", self.cpu_percent)
         } else {
