@@ -2,12 +2,16 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+mod api;
+mod power;
 mod terminal;
 mod terminal_utils;
 mod tracking;
 
-use gpui::*;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use gpui::*;
+use gpui::prelude::FluentBuilder;
 use swoop::{FontConfig, SavedState, TabState, load_font_config, load_state, load_wakatime_key, save_state};
 use terminal::TerminalView;
 use tracking::WakatimeTracker;
@@ -39,9 +43,14 @@ struct Swoop {
     renaming: Option<(usize, String)>,
     rename_focus: FocusHandle,
     visible: bool,
+    windowed: bool,
     exit_confirm: Option<ExitConfirm>,
+    close_confirm: Option<usize>,
     font_config: FontConfig,
     tracker: Option<WakatimeTracker>,
+    api_state: Arc<Mutex<api::TabSnapshot>>,
+    power_pids: Arc<Mutex<Vec<u32>>>,
+    power_watts: Arc<Mutex<Vec<power::TabPower>>>,
 }
 
 impl Swoop {
@@ -52,7 +61,7 @@ impl Swoop {
         let (tabs, active) = if let Some(saved) = load_state() {
             let mut tabs = Vec::new();
             for ts in &saved.tabs {
-                let cwd = ts.cwd.as_ref().map(|p| PathBuf::from(p));
+                let cwd = ts.cwd.as_ref().map(PathBuf::from);
                 let fc = font_config.clone();
                 let view = cx.new(|cx| TerminalView::new(cwd.as_deref(), fc, window, cx));
                 tabs.push(Tab { view, name: ts.name.clone() });
@@ -111,6 +120,17 @@ impl Swoop {
 
         let tracker = load_wakatime_key().map(WakatimeTracker::new);
 
+        let api_state = Arc::new(Mutex::new(api::TabSnapshot {
+            tabs: Vec::new(),
+            active: 0,
+            power: Vec::new(),
+        }));
+        api::start_api_server(api_state.clone());
+
+        let power_pids: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+        let power_watts: Arc<Mutex<Vec<power::TabPower>>> = Arc::new(Mutex::new(Vec::new()));
+        power::start_power_monitor(power_pids.clone(), power_watts.clone());
+
         Self {
             tabs,
             active,
@@ -118,9 +138,14 @@ impl Swoop {
             renaming: None,
             rename_focus,
             visible: true,
+            windowed: false,
             exit_confirm: None,
+            close_confirm: None,
             font_config,
             tracker,
+            api_state,
+            power_pids,
+            power_watts,
         }
     }
 
@@ -164,7 +189,28 @@ impl Swoop {
                 TabState { name: tab.name.clone(), cwd }
             })
             .collect();
+        let api_tabs: Vec<(String, Option<String>)> = tabs
+            .iter()
+            .map(|t| (t.name.clone(), t.cwd.clone()))
+            .collect();
+
         save_state(&SavedState { tabs, active: self.active });
+
+        {
+            let mut snapshot = self.api_state.lock().unwrap();
+            snapshot.tabs = api_tabs;
+            snapshot.active = self.active;
+            snapshot.power = self.power_watts.lock().unwrap().clone();
+        }
+
+        {
+            let pids: Vec<u32> = self
+                .tabs
+                .iter()
+                .map(|tab| tab.view.read(cx).pid())
+                .collect();
+            *self.power_pids.lock().unwrap() = pids;
+        }
 
         if let Some(ref tracker) = self.tracker {
             let pid = self.tabs[self.active].view.read(cx).pid();
@@ -222,6 +268,9 @@ impl Swoop {
         let tab_active_bg: Hsla = rgb(0x2d2d2d).into();
         let tab_fg: Hsla = rgb(0xcccccc).into();
         let tab_border: Hsla = rgb(0x3c3c3c).into();
+        let watts_fg: Hsla = rgb(0x888888).into();
+
+        let watts = self.power_watts.lock().unwrap().clone();
 
         let mut bar = div()
             .flex()
@@ -239,6 +288,8 @@ impl Swoop {
             } else {
                 tab.name.clone()
             };
+
+            let power_label = watts.get(i).map(|tp| tp.label()).unwrap_or_default();
 
             let tab_el = div()
                 .id(ElementId::Name(format!("tab-{i}").into()))
@@ -268,7 +319,17 @@ impl Swoop {
                         cx.notify();
                     }),
                 )
-                .child(name);
+                .child(name)
+                .when(!power_label.is_empty(), |el: Stateful<Div>| {
+                    el.child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(watts_fg)
+                            .min_w(px(36.0))
+                            .text_align(gpui::TextAlign::Right)
+                            .child(power_label),
+                    )
+                });
 
             bar = bar.child(tab_el);
         }
@@ -301,8 +362,8 @@ impl Swoop {
 
         let pos = menu.position;
         let item_count = match menu.kind {
-            MenuKind::Tab(_) => if self.tabs.len() > 1 { 6 } else { 5 },
-            MenuKind::Background => 4,
+            MenuKind::Tab(_) => if self.tabs.len() > 1 { 7 } else { 6 },
+            MenuKind::Background => 5,
         };
         let menu_height = px(item_count as f32 * 27.0 + 8.0);
 
@@ -354,7 +415,9 @@ impl Swoop {
                         .cursor_pointer()
                         .hover(|s| s.bg(menu_hover))
                         .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
-                            this.close_tab(idx, cx);
+                            this.close_confirm = Some(idx);
+                            this.context_menu = None;
+                            cx.notify();
                         }))
                         .child("Close"),
                 );
@@ -403,16 +466,31 @@ impl Swoop {
                     .cursor_pointer()
                     .hover(|s| s.bg(menu_hover))
                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
-                        if let Some(item) = cx.read_from_clipboard() {
-                            if let Some(text) = item.text() {
-                                let view = &this.tabs[this.active].view;
-                                view.read(cx).send_clipboard(text.to_string());
-                            }
+                        if let Some(item) = cx.read_from_clipboard()
+                            && let Some(text) = item.text()
+                        {
+                            let view = &this.tabs[this.active].view;
+                            view.read(cx).send_clipboard(text.to_string());
                         }
                         this.context_menu = None;
                         cx.notify();
                     }))
                     .child("Paste"),
+            )
+            .child(
+                div()
+                    .id("menu-windowed")
+                    .px(px(12.0))
+                    .py(px(4.0))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(menu_hover))
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev: &MouseDownEvent, window, cx| {
+                        this.windowed = !this.windowed;
+                        window.toggle_fullscreen();
+                        this.context_menu = None;
+                        cx.notify();
+                    }))
+                    .child(if self.windowed { "Fullscreen mode" } else { "Windowed mode" }),
             )
             .child(
                 div()
@@ -468,10 +546,10 @@ impl Swoop {
                             let key = ev.keystroke.key.as_str();
                             match key {
                                 "enter" => {
-                                    if let Some((i, ref text)) = this.renaming {
-                                        if i < this.tabs.len() {
-                                            this.tabs[i].name = text.clone();
-                                        }
+                                    if let Some((i, ref text)) = this.renaming
+                                        && i < this.tabs.len()
+                                    {
+                                        this.tabs[i].name = text.clone();
                                     }
                                     this.renaming = None;
                                     this.tabs[this.active].view.read(cx).focus_handle(cx).focus(window);
@@ -634,19 +712,107 @@ impl Swoop {
                 ),
         )
     }
+
+    fn render_close_confirm(&self, cx: &Context<Self>) -> Option<Stateful<Div>> {
+        let idx = self.close_confirm?;
+        if idx >= self.tabs.len() {
+            return None;
+        }
+        let tab_name = self.tabs[idx].name.clone();
+
+        let dialog_bg: Hsla = rgb(0x252526).into();
+        let dialog_fg: Hsla = rgb(0xcccccc).into();
+        let dialog_border: Hsla = rgb(0x3c3c3c).into();
+        let btn_bg: Hsla = rgb(0x0e639c).into();
+        let btn_hover: Hsla = rgb(0x1177bb).into();
+        let btn_secondary_bg: Hsla = rgb(0x3c3c3c).into();
+        let btn_secondary_hover: Hsla = rgb(0x505050).into();
+
+        Some(
+            div()
+                .id("close-confirm-overlay")
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(Hsla::from(Rgba { r: 0.0, g: 0.0, b: 0.0, a: 0.5 }))
+                .on_mouse_down(MouseButton::Left, |_ev: &MouseDownEvent, _window, _cx| {})
+                .on_mouse_down(MouseButton::Right, |_ev: &MouseDownEvent, _window, _cx| {})
+                .child(
+                    div()
+                        .id("close-confirm-box")
+                        .bg(dialog_bg)
+                        .border_1()
+                        .border_color(dialog_border)
+                        .rounded(px(6.0))
+                        .p(px(20.0))
+                        .min_w(px(320.0))
+                        .text_color(dialog_fg)
+                        .text_size(px(14.0))
+                        .child(
+                            div()
+                                .text_size(px(15.0))
+                                .child(format!("Close \"{}\"?", tab_name)),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .gap(px(8.0))
+                                .mt(px(16.0))
+                                .justify_end()
+                                .child(
+                                    div()
+                                        .id("close-cancel")
+                                        .px(px(14.0))
+                                        .py(px(6.0))
+                                        .bg(btn_secondary_bg)
+                                        .rounded(px(3.0))
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(btn_secondary_hover))
+                                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                                            this.close_confirm = None;
+                                            cx.notify();
+                                        }))
+                                        .child("Cancel"),
+                                )
+                                .child(
+                                    div()
+                                        .id("close-confirm-btn")
+                                        .px(px(14.0))
+                                        .py(px(6.0))
+                                        .bg(btn_bg)
+                                        .rounded(px(3.0))
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(btn_hover))
+                                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                                            this.close_confirm = None;
+                                            this.close_tab(idx, cx);
+                                        }))
+                                        .child("Close"),
+                                ),
+                        ),
+                ),
+        )
+    }
     }
 
 impl Render for Swoop {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        window.set_window_title(&format!("{} — swoop", self.tabs[self.active].name));
         let active_terminal = self.tabs[self.active].view.clone();
         let tab_bar = self.render_tab_bar(window, cx);
-        let context_menu = if self.renaming.is_none() && self.exit_confirm.is_none() {
+        let context_menu = if self.renaming.is_none() && self.exit_confirm.is_none() && self.close_confirm.is_none() {
             self.render_context_menu(cx)
         } else {
             None
         };
         let rename_input = self.render_rename_input(cx);
         let exit_confirm = self.render_exit_confirm(cx);
+        let close_confirm = self.render_close_confirm(cx);
         if self.renaming.is_some() {
             self.rename_focus.focus(window);
         }
@@ -703,6 +869,10 @@ impl Render for Swoop {
         }
 
         if let Some(confirm) = exit_confirm {
+            root = root.child(confirm);
+        }
+
+        if let Some(confirm) = close_confirm {
             root = root.child(confirm);
         }
 
@@ -763,14 +933,9 @@ fn spawn_hotkey_listener(window_handle: WindowHandle<Swoop>, cx: &mut App) {
     let (tx, rx) = std::sync::mpsc::channel::<()>();
 
     std::thread::spawn(move || {
-        loop {
-            match conn.wait_for_event() {
-                Ok(event) => {
-                    if let x11rb::protocol::Event::KeyPress(_) = event {
-                        let _ = tx.send(());
-                    }
-                }
-                Err(_) => break,
+        while let Ok(event) = conn.wait_for_event() {
+            if let x11rb::protocol::Event::KeyPress(_) = event {
+                let _ = tx.send(());
             }
         }
     });

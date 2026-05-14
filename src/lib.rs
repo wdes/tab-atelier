@@ -292,4 +292,162 @@ mod tests {
         assert_eq!(dir, PathBuf::from("/tmp/custom-state/swoop"));
         unsafe { remove_env("XDG_STATE_HOME") };
     }
+
+    #[test]
+    fn test_font_config_default() {
+        let fc = FontConfig::default();
+        assert_eq!(fc.family, "monospace");
+        assert_eq!(fc.weight, 400);
+        assert!((fc.size - 16.0).abs() < f32::EPSILON);
+        assert!((fc.scroll_sensitivity - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_load_font_config_missing_file() {
+        let fc = load_font_config_from(std::path::Path::new("/tmp/nonexistent-swoop.json"));
+        assert_eq!(fc.family, "monospace");
+        assert_eq!(fc.weight, 400);
+    }
+
+    #[test]
+    fn test_load_font_config_partial() {
+        let dir = std::env::temp_dir().join("swoop-test-font");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("settings.json");
+        std::fs::write(&path, r#"{ "ui_font_family": "JetBrains Mono", "ui_font_size": 14 }"#).unwrap();
+        let fc = load_font_config_from(&path);
+        assert_eq!(fc.family, "JetBrains Mono");
+        assert!((fc.size - 14.0).abs() < f32::EPSILON);
+        assert_eq!(fc.weight, 400);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_font_config_buffer_font_fallback() {
+        let dir = std::env::temp_dir().join("swoop-test-font-fallback");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("settings.json");
+        std::fs::write(&path, r#"{ "buffer_font_size": 20 }"#).unwrap();
+        let fc = load_font_config_from(&path);
+        assert!((fc.size - 20.0).abs() < f32::EPSILON);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_font_config_scroll_sensitivity() {
+        let dir = std::env::temp_dir().join("swoop-test-scroll-sens");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("settings.json");
+        std::fs::write(&path, r#"{ "scroll_sensitivity": 2.5 }"#).unwrap();
+        let fc = load_font_config_from(&path);
+        assert!((fc.scroll_sensitivity - 2.5).abs() < f32::EPSILON);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_font_config_scroll_sensitivity_clamped() {
+        let dir = std::env::temp_dir().join("swoop-test-scroll-clamp");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("settings.json");
+        std::fs::write(&path, r#"{ "scroll_sensitivity": 0.001 }"#).unwrap();
+        let fc = load_font_config_from(&path);
+        assert!((fc.scroll_sensitivity - 0.01).abs() < f32::EPSILON);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_strip_json_comments_line() {
+        let input = r#"{
+  // this is a comment
+  "key": "value"
+}"#;
+        let out = strip_json_comments(input);
+        assert!(!out.contains("comment"));
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["key"], "value");
+    }
+
+    #[test]
+    fn test_strip_json_comments_block() {
+        let input = r#"{ /* block comment */ "a": 1 }"#;
+        let out = strip_json_comments(input);
+        assert!(!out.contains("block"));
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["a"], 1);
+    }
+
+    #[test]
+    fn test_strip_json_comments_preserves_strings() {
+        let input = r#"{ "url": "https://example.com" }"#;
+        let out = strip_json_comments(input);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["url"], "https://example.com");
+    }
+
+    #[test]
+    fn test_strip_json_comments_slash_in_string() {
+        let input = r#"{ "path": "a//b", "x": 1 }"#;
+        let out = strip_json_comments(input);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["path"], "a//b");
+        assert_eq!(v["x"], 1);
+    }
+
+    #[test]
+    fn test_strip_json_comments_escaped_quote() {
+        let input = r#"{ "s": "he said \"hi\"", "n": 1 }"#;
+        let out = strip_json_comments(input);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["s"], r#"he said "hi""#);
+    }
+
+    #[test]
+    fn test_load_font_config_with_comments() {
+        let dir = std::env::temp_dir().join("swoop-test-comments");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("settings.json");
+        std::fs::write(&path, r#"{
+  // font settings
+  "ui_font_family": "Fira Code",
+  "ui_font_weight": 700,
+  "ui_font_size": 18
+}"#).unwrap();
+        let fc = load_font_config_from(&path);
+        assert_eq!(fc.family, "Fira Code");
+        assert_eq!(fc.weight, 700);
+        assert!((fc.size - 18.0).abs() < f32::EPSILON);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_save_state_creates_directory() {
+        let dir = std::env::temp_dir().join("swoop-test-create-dir");
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe { set_env("XDG_STATE_HOME", dir.to_str().unwrap()) };
+        let state = SavedState {
+            tabs: vec![TabState { name: "T".into(), cwd: None }],
+            active: 0,
+        };
+        save_state(&state);
+        assert!(dir.join("swoop/tabs.json").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_active_clamped_on_load() {
+        let dir = std::env::temp_dir().join("swoop-test-clamp-active");
+        let swoop_dir = dir.join("swoop");
+        let _ = std::fs::create_dir_all(&swoop_dir);
+        let state = SavedState {
+            tabs: vec![TabState { name: "Only".into(), cwd: None }],
+            active: 999,
+        };
+        let json = serde_json::to_string_pretty(&state).unwrap();
+        std::fs::write(swoop_dir.join("tabs.json"), json).unwrap();
+        unsafe { set_env("XDG_STATE_HOME", dir.to_str().unwrap()) };
+
+        let loaded = load_state().unwrap();
+        assert_eq!(loaded.active, 999);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
