@@ -2,7 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -49,6 +50,11 @@ impl Dimensions for TermDims {
     }
 }
 
+struct CachedLine {
+    text: String,
+    shaped: ShapedLine,
+}
+
 pub struct TerminalView {
     term: Arc<FairMutex<Term<EventProxy>>>,
     notifier: EventLoopSender,
@@ -57,9 +63,11 @@ pub struct TerminalView {
     last_size: Rc<Cell<Option<(usize, usize)>>>,
     content_origin: Rc<Cell<gpui::Point<Pixels>>>,
     bounds_size: Rc<Cell<Size<Pixels>>>,
+    line_cache: Rc<RefCell<HashMap<i32, CachedLine>>>,
     pid: u32,
     exited: Rc<Cell<bool>>,
     scrollbar_dragging: Rc<Cell<bool>>,
+    scroll_acc: Rc<Cell<f32>>,
     font_config: FontConfig,
 }
 
@@ -97,12 +105,21 @@ impl TerminalView {
 
         let focus = cx.focus_handle();
 
-        cx.spawn(async |this: WeakEntity<TerminalView>, cx: &mut AsyncApp| {
+        let tick = Rc::new(Cell::new(0u32));
+        let tick_clone = tick.clone();
+        cx.spawn(async move |this: WeakEntity<TerminalView>, cx: &mut AsyncApp| {
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(33))
                     .await;
-                let Ok(()) = this.update(cx, |_, cx: &mut Context<TerminalView>| cx.notify()) else {
+                let Ok(()) = this.update(cx, |view, cx: &mut Context<TerminalView>| {
+                    let n = tick_clone.get().wrapping_add(1);
+                    tick_clone.set(n);
+                    let scrolled = view.term.lock().grid().display_offset() > 0;
+                    if !scrolled || n % 6 == 0 {
+                        cx.notify();
+                    }
+                }) else {
                     break;
                 };
             }
@@ -131,9 +148,11 @@ impl TerminalView {
             last_size: Rc::new(Cell::new(None)),
             content_origin: Rc::new(Cell::new(point(px(0.0), px(0.0)))),
             bounds_size: Rc::new(Cell::new(size(px(0.0), px(0.0)))),
+            line_cache: Rc::new(RefCell::new(HashMap::new())),
             pid,
             exited,
             scrollbar_dragging: Rc::new(Cell::new(false)),
+            scroll_acc: Rc::new(Cell::new(0.0)),
             font_config,
         }
     }
@@ -344,13 +363,16 @@ impl Render for TerminalView {
                 }
             }))
             .on_scroll_wheel(cx.listener(move |this, ev: &ScrollWheelEvent, _window, cx| {
-                let cell_h = f32::from(this.cell_size.map_or(px(19.6), |c| c.height));
-                let lines = match ev.delta {
-                    ScrollDelta::Lines(pt) => -pt.y as i32,
-                    ScrollDelta::Pixels(pt) => -(f32::from(pt.y) / cell_h) as i32,
-                };
+                let line_h = this.cell_size.map_or(px(19.6), |c| c.height);
+                let delta_px = ev.delta.pixel_delta(line_h);
+                let old_offset = (this.scroll_acc.get() / f32::from(line_h)) as i32;
+                let acc = this.scroll_acc.get() + f32::from(delta_px.y);
+                let new_offset = (acc / f32::from(line_h)) as i32;
+                let total_h = f32::from(line_h) * 100.0;
+                this.scroll_acc.set(acc % total_h);
+                let lines = new_offset - old_offset;
                 if lines != 0 {
-                    this.scroll(lines);
+                    this.scroll(-lines);
                     cx.notify();
                 }
             }))
@@ -390,6 +412,7 @@ impl Render for TerminalView {
                 last_size: self.last_size.clone(),
                 content_origin: self.content_origin.clone(),
                 bounds_size: self.bounds_size.clone(),
+                line_cache: self.line_cache.clone(),
                 font_config: self.font_config.clone(),
             })
     }
@@ -408,6 +431,7 @@ struct TerminalElement {
     last_size: Rc<Cell<Option<(usize, usize)>>>,
     content_origin: Rc<Cell<gpui::Point<Pixels>>>,
     bounds_size: Rc<Cell<Size<Pixels>>>,
+    line_cache: Rc<RefCell<HashMap<i32, CachedLine>>>,
     font_config: FontConfig,
 }
 
@@ -506,6 +530,7 @@ impl Element for TerminalElement {
 
         // Phase 1: read cell data under the lock — no shaping here.
         struct RawLine {
+            grid_line: i32,
             text: String,
             runs: Vec<TextRun>,
             bg_runs: Vec<BgRun>,
@@ -522,12 +547,13 @@ impl Element for TerminalElement {
             let mut raw_lines = Vec::with_capacity(visible_lines);
 
             for l in 0..visible_lines {
+                let grid_line = l as i32 - display_offset;
                 let mut text = String::with_capacity(visible_cols);
                 let mut runs: Vec<TextRun> = Vec::new();
                 let mut bg_runs: Vec<BgRun> = Vec::new();
 
                 for c in 0..visible_cols {
-                    let cell_data = &grid[GridPoint::new(Line(l as i32 - display_offset), Column(c))];
+                    let cell_data = &grid[GridPoint::new(Line(grid_line), Column(c))];
                     if cell_data.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
                         text.push(' ');
                         let char_len = 1;
@@ -641,7 +667,7 @@ impl Element for TerminalElement {
                     }
                 }
 
-                raw_lines.push(RawLine { text, runs, bg_runs });
+                raw_lines.push(RawLine { grid_line, text, runs, bg_runs });
             }
 
             let cursor = if display_offset == 0
@@ -660,18 +686,37 @@ impl Element for TerminalElement {
         };
         // Lock released — event loop can proceed while we shape text.
 
-        // Phase 2: shape lines without holding the lock.
+        // Phase 2: shape lines (with cache) without holding the lock.
         let text_sys = window.text_system();
+        let mut cache = self.line_cache.borrow_mut();
+        let mut new_cache = HashMap::with_capacity(raw_lines.len());
         let mut result_lines = Vec::with_capacity(raw_lines.len());
         for raw in raw_lines {
+            if let Some(cached) = cache.remove(&raw.grid_line) {
+                if cached.text == raw.text {
+                    result_lines.push(TermLine { shaped: cached.shaped, bg_runs: raw.bg_runs });
+                    new_cache.insert(raw.grid_line, CachedLine {
+                        text: cached.text,
+                        shaped: result_lines.last().unwrap().shaped.clone(),
+                    });
+                    continue;
+                }
+            }
+            let text_clone = raw.text.clone();
             let shaped = text_sys.shape_line(
                 raw.text.into(),
                 font_size,
                 &raw.runs,
                 Some(cell.width),
             );
+            new_cache.insert(raw.grid_line, CachedLine {
+                text: text_clone,
+                shaped: shaped.clone(),
+            });
             result_lines.push(TermLine { shaped, bg_runs: raw.bg_runs });
         }
+
+        *cache = new_cache;
 
         Some(TermPrepaint {
             lines: result_lines,
