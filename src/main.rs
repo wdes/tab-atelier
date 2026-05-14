@@ -64,6 +64,9 @@ impl Swoop {
                 let cwd = ts.cwd.as_ref().map(PathBuf::from);
                 let fc = font_config.clone();
                 let view = cx.new(|cx| TerminalView::new(cwd.as_deref(), fc, window, cx));
+                if let Some(ref output) = ts.output {
+                    view.read(cx).restore_output(output);
+                }
                 tabs.push(Tab { view, name: ts.name.clone() });
             }
             if tabs.is_empty() {
@@ -186,7 +189,7 @@ impl Swoop {
                 let cwd = std::fs::read_link(format!("/proc/{pid}/cwd"))
                     .ok()
                     .map(|p| p.to_string_lossy().into_owned());
-                TabState { name: tab.name.clone(), cwd }
+                TabState { name: tab.name.clone(), cwd, output: None }
             })
             .collect();
         let api_tabs: Vec<(String, Option<String>)> = tabs
@@ -253,7 +256,23 @@ impl Swoop {
     }
 
     fn close_all_tabs(&mut self, cx: &mut Context<Self>) {
-        self.persist(cx);
+        let tabs: Vec<TabState> = self
+            .tabs
+            .iter()
+            .map(|tab| {
+                let pid = tab.view.read(cx).pid();
+                let cwd = std::fs::read_link(format!("/proc/{pid}/cwd"))
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned());
+                let output = {
+                    let text = tab.view.read(cx).copy_all_history();
+                    if text.is_empty() { None } else { Some(text) }
+                };
+                TabState { name: tab.name.clone(), cwd, output }
+            })
+            .collect();
+        save_state(&SavedState { tabs, active: self.active });
+
         if let Some(ref tracker) = self.tracker {
             tracker.shutdown();
         }
@@ -325,7 +344,7 @@ impl Swoop {
                         div()
                             .text_size(px(11.0))
                             .text_color(watts_fg)
-                            .min_w(px(36.0))
+                            .min_w(px(55.0))
                             .text_align(gpui::TextAlign::Right)
                             .child(power_label),
                     )
@@ -911,22 +930,24 @@ fn spawn_hotkey_listener(window_handle: WindowHandle<Swoop>, cx: &mut App) {
 
     let screen = &conn.setup().roots[_screen_num];
     let root = screen.root;
-    let f12_keycode = 96u8;
+    let hotkeys: &[u8] = &[148, 49]; // XF86Calculator, œ
 
-    for mask in [
-        ModMask::default(),
-        ModMask::LOCK,
-        ModMask::from(u16::from(ModMask::M2)),
-        ModMask::LOCK | ModMask::from(u16::from(ModMask::M2)),
-    ] {
-        let _ = conn.grab_key(
-            false,
-            root,
-            mask,
-            f12_keycode,
-            GrabMode::ASYNC,
-            GrabMode::ASYNC,
-        );
+    for &keycode in hotkeys {
+        for mask in [
+            ModMask::default(),
+            ModMask::LOCK,
+            ModMask::from(u16::from(ModMask::M2)),
+            ModMask::LOCK | ModMask::from(u16::from(ModMask::M2)),
+        ] {
+            let _ = conn.grab_key(
+                false,
+                root,
+                mask,
+                keycode,
+                GrabMode::ASYNC,
+                GrabMode::ASYNC,
+            );
+        }
     }
     let _ = conn.flush();
 
