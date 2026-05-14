@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use gpui::*;
 use gpui::prelude::FluentBuilder;
-use swoop::{FontConfig, SavedState, TabState, load_font_config, load_state, load_wakatime_key, save_state};
+use tab_atelier::{FontConfig, SavedState, TabState, load_font_config, load_state, load_wakatime_key, save_state};
 use terminal::TerminalView;
 use tracking::WakatimeTracker;
 
@@ -46,8 +46,10 @@ struct Swoop {
     windowed: bool,
     exit_confirm: Option<ExitConfirm>,
     close_confirm: Option<usize>,
+    show_qr: bool,
     font_config: FontConfig,
     tracker: Option<WakatimeTracker>,
+    api_token: String,
     api_state: Arc<Mutex<api::TabSnapshot>>,
     power_pids: Arc<Mutex<Vec<u32>>>,
     power_watts: Arc<Mutex<Vec<power::TabPower>>>,
@@ -87,8 +89,8 @@ impl Swoop {
                 cx.background_executor()
                     .timer(std::time::Duration::from_secs(2))
                     .await;
-                let Ok(()) = this.update(cx, |swoop, cx| {
-                    swoop.persist(cx);
+                let Ok(()) = this.update(cx, |app, cx| {
+                    app.persist(cx);
                 }) else {
                     break;
                 };
@@ -101,13 +103,13 @@ impl Swoop {
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(500))
                     .await;
-                let Ok(()) = this.update(cx, |swoop, cx| {
-                    if swoop.exit_confirm.is_some() {
+                let Ok(()) = this.update(cx, |app, cx| {
+                    if app.exit_confirm.is_some() {
                         return;
                     }
-                    for (i, tab) in swoop.tabs.iter().enumerate() {
+                    for (i, tab) in app.tabs.iter().enumerate() {
                         if tab.view.read(cx).has_exited() {
-                            swoop.exit_confirm = Some(ExitConfirm { tab_idx: i });
+                            app.exit_confirm = Some(ExitConfirm { tab_idx: i });
                             cx.notify();
                             break;
                         }
@@ -123,12 +125,14 @@ impl Swoop {
 
         let tracker = load_wakatime_key().map(WakatimeTracker::new);
 
+        let api_token = api::generate_token();
         let api_state = Arc::new(Mutex::new(api::TabSnapshot {
             tabs: Vec::new(),
             active: 0,
             power: Vec::new(),
+            pending_closes: Vec::new(),
         }));
-        api::start_api_server(api_state.clone());
+        api::start_api_server(api_state.clone(), api_token.clone());
 
         let power_pids: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
         let power_watts: Arc<Mutex<Vec<power::TabPower>>> = Arc::new(Mutex::new(Vec::new()));
@@ -144,8 +148,10 @@ impl Swoop {
             windowed: false,
             exit_confirm: None,
             close_confirm: None,
+            show_qr: false,
             font_config,
             tracker,
+            api_token,
             api_state,
             power_pids,
             power_watts,
@@ -180,7 +186,7 @@ impl Swoop {
         cx.notify();
     }
 
-    fn persist(&self, cx: &Context<Self>) {
+    fn persist(&mut self, cx: &mut Context<Self>) {
         let tabs: Vec<TabState> = self
             .tabs
             .iter()
@@ -213,6 +219,19 @@ impl Swoop {
                 .map(|tab| tab.view.read(cx).pid())
                 .collect();
             *self.power_pids.lock().unwrap() = pids;
+        }
+
+        {
+            let mut snapshot = self.api_state.lock().unwrap();
+            let mut closes: Vec<usize> = snapshot.pending_closes.drain(..).collect();
+            drop(snapshot);
+            closes.sort_unstable();
+            closes.dedup();
+            for idx in closes.into_iter().rev() {
+                if idx < self.tabs.len() && self.tabs.len() > 1 {
+                    self.close_tab(idx, cx);
+                }
+            }
         }
 
         if let Some(ref tracker) = self.tracker {
@@ -382,8 +401,8 @@ impl Swoop {
 
         let pos = menu.position;
         let item_count = match menu.kind {
-            MenuKind::Tab(_) => if self.tabs.len() > 1 { 8 } else { 7 },
-            MenuKind::Background => 6,
+            MenuKind::Tab(_) => if self.tabs.len() > 1 { 9 } else { 8 },
+            MenuKind::Background => 7,
         };
         let menu_height = px(item_count as f32 * 27.0 + 8.0);
 
@@ -537,6 +556,20 @@ impl Swoop {
                         this.close_all_tabs(cx);
                     }))
                     .child("Close All"),
+            )
+            .child(
+                div()
+                    .id("menu-remote")
+                    .px(px(12.0))
+                    .py(px(4.0))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(menu_hover))
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                        this.show_qr = true;
+                        this.context_menu = None;
+                        cx.notify();
+                    }))
+                    .child("Remote control"),
             );
 
         Some(container)
@@ -833,14 +866,115 @@ impl Swoop {
                 ),
         )
     }
+
+    fn render_qr_modal(&self, cx: &Context<Self>) -> Option<Stateful<Div>> {
+        if !self.show_qr {
+            return None;
+        }
+
+        let ip = api::local_ip();
+        let url = format!("http://{}:7890?token={}", ip, self.api_token);
+
+        let qr = match qrcode::QrCode::new(url.as_bytes()) {
+            Ok(q) => q,
+            Err(_) => return None,
+        };
+        let matrix = qr.render::<char>()
+            .quiet_zone(true)
+            .module_dimensions(2, 1)
+            .build();
+
+        let dialog_bg: Hsla = rgb(0x252526).into();
+        let dialog_fg: Hsla = rgb(0xcccccc).into();
+        let dialog_border: Hsla = rgb(0x3c3c3c).into();
+        let btn_bg: Hsla = rgb(0x0e639c).into();
+        let btn_hover: Hsla = rgb(0x1177bb).into();
+
+        Some(
+            div()
+                .id("qr-overlay")
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(Hsla::from(Rgba { r: 0.0, g: 0.0, b: 0.0, a: 0.5 }))
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                    this.show_qr = false;
+                    cx.notify();
+                }))
+                .on_mouse_down(MouseButton::Right, |_ev: &MouseDownEvent, _window, _cx| {})
+                .child(
+                    div()
+                        .id("qr-box")
+                        .bg(dialog_bg)
+                        .border_1()
+                        .border_color(dialog_border)
+                        .rounded(px(6.0))
+                        .p(px(20.0))
+                        .text_color(dialog_fg)
+                        .text_size(px(14.0))
+                        .on_mouse_down(MouseButton::Left, |_ev: &MouseDownEvent, _window, _cx| {})
+                        .child(
+                            div()
+                                .text_size(px(15.0))
+                                .child("Scan to connect from your phone"),
+                        )
+                        .child(
+                            div()
+                                .mt(px(12.0))
+                                .bg(gpui::white())
+                                .rounded(px(4.0))
+                                .p(px(8.0))
+                                .child(
+                                    div()
+                                        .text_color(gpui::black())
+                                        .text_size(px(6.0))
+                                        .font_family("monospace")
+                                        .child(matrix),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .mt(px(8.0))
+                                .text_size(px(11.0))
+                                .text_color(rgb(0x999999))
+                                .child(url),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .mt(px(12.0))
+                                .child(
+                                    div()
+                                        .id("qr-close")
+                                        .px(px(14.0))
+                                        .py(px(6.0))
+                                        .bg(btn_bg)
+                                        .rounded(px(3.0))
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(btn_hover))
+                                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                                            this.show_qr = false;
+                                            cx.notify();
+                                        }))
+                                        .child("Close"),
+                                ),
+                        ),
+                ),
+        )
     }
+}
 
 impl Render for Swoop {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        window.set_window_title(&format!("{} — swoop", self.tabs[self.active].name));
+        window.set_window_title(&format!("{} — Tab Atelier", self.tabs[self.active].name));
         let active_terminal = self.tabs[self.active].view.clone();
         let tab_bar = self.render_tab_bar(window, cx);
-        let context_menu = if self.renaming.is_none() && self.exit_confirm.is_none() && self.close_confirm.is_none() {
+        let context_menu = if self.renaming.is_none() && self.exit_confirm.is_none() && self.close_confirm.is_none() && !self.show_qr {
             self.render_context_menu(cx)
         } else {
             None
@@ -853,7 +987,7 @@ impl Render for Swoop {
         }
 
         let mut root = div()
-            .id("swoop-root")
+            .id("app-root")
             .size_full()
             .bg(rgba(0x141414b8))
             .flex()
@@ -909,6 +1043,10 @@ impl Render for Swoop {
 
         if let Some(confirm) = close_confirm {
             root = root.child(confirm);
+        }
+
+        if let Some(qr) = self.render_qr_modal(cx) {
+            root = root.child(qr);
         }
 
         root
@@ -984,9 +1122,9 @@ fn spawn_hotkey_listener(window_handle: WindowHandle<Swoop>, cx: &mut App) {
                 .await;
             if rx.try_recv().is_ok() {
                 let _ = cx.update(|cx| {
-                    let _ = window_handle.update(cx, |swoop, window, _cx| {
-                        swoop.visible = !swoop.visible;
-                        if swoop.visible {
+                    let _ = window_handle.update(cx, |state, window, _cx| {
+                        state.visible = !state.visible;
+                        if state.visible {
                             window.activate_window();
                         } else {
                             window.minimize_window();

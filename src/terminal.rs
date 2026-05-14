@@ -25,7 +25,7 @@ use crate::terminal_utils::{
     color_to_hsla, hsla_eq, is_default_bg, is_default_fg, keystroke_to_bytes, DEFAULT_BG,
     DEFAULT_FG,
 };
-use swoop::FontConfig;
+use tab_atelier::FontConfig;
 
 const INITIAL_COLS: usize = 80;
 const INITIAL_LINES: usize = 24;
