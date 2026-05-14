@@ -159,6 +159,18 @@ impl TerminalView {
         }
     }
 
+    pub fn restore_output(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let mut parser: vte::ansi::Processor = vte::ansi::Processor::new();
+        let mut term = self.term.lock();
+        for line in text.lines() {
+            parser.advance(&mut *term, line.as_bytes());
+            parser.advance(&mut *term, b"\r\n");
+        }
+    }
+
     pub fn pid(&self) -> u32 {
         self.pid
     }

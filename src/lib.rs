@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 pub struct TabState {
     pub name: String,
     pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -196,8 +198,8 @@ mod tests {
     fn test_tab_state_serialization() {
         let state = SavedState {
             tabs: vec![
-                TabState { name: "Terminal".into(), cwd: Some("/home/user".into()) },
-                TabState { name: "Build".into(), cwd: None },
+                TabState { name: "Terminal".into(), cwd: Some("/home/user".into()), output: None },
+                TabState { name: "Build".into(), cwd: None, output: None },
             ],
             active: 1,
         };
@@ -248,8 +250,8 @@ mod tests {
 
         let state = SavedState {
             tabs: vec![
-                TabState { name: "One".into(), cwd: Some("/tmp".into()) },
-                TabState { name: "Two".into(), cwd: None },
+                TabState { name: "One".into(), cwd: Some("/tmp".into()), output: None },
+                TabState { name: "Two".into(), cwd: None, output: None },
             ],
             active: 1,
         };
@@ -425,7 +427,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         unsafe { set_env("XDG_STATE_HOME", dir.to_str().unwrap()) };
         let state = SavedState {
-            tabs: vec![TabState { name: "T".into(), cwd: None }],
+            tabs: vec![TabState { name: "T".into(), cwd: None, output: None }],
             active: 0,
         };
         save_state(&state);
@@ -439,7 +441,7 @@ mod tests {
         let swoop_dir = dir.join("swoop");
         let _ = std::fs::create_dir_all(&swoop_dir);
         let state = SavedState {
-            tabs: vec![TabState { name: "Only".into(), cwd: None }],
+            tabs: vec![TabState { name: "Only".into(), cwd: None, output: None }],
             active: 999,
         };
         let json = serde_json::to_string_pretty(&state).unwrap();

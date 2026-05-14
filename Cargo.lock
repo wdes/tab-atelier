@@ -5121,6 +5121,7 @@ dependencies = [
  "serde",
  "serde_json",
  "ureq",
+ "vte",
  "wattaouille",
  "x11rb",
 ]
