@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEBOUNCE_SECS: u64 = 2;
 
-pub const USER_AGENT: &str = concat!("swoop/", env!("CARGO_PKG_VERSION"), " (terminal; +https://github.com/wdes/swoop)");
+pub const USER_AGENT: &str = concat!("tab-atelier/", env!("CARGO_PKG_VERSION"), " (terminal; +https://github.com/wdes/tab-atelier)");
 
 pub enum HeartbeatEvent {
     Activity { cwd: Option<PathBuf> },
@@ -76,7 +76,7 @@ fn detect_project(cwd: &Path) -> Option<String> {
 
 fn send_heartbeat(api_key: &str, time: u64, project: Option<&str>) -> Result<(), String> {
     let mut body = serde_json::json!({
-        "entity": "swoop-terminal",
+        "entity": "tab-atelier-terminal",
         "type": "app",
         "time": time as f64,
         "category": "coding",
@@ -104,7 +104,7 @@ mod tests {
 
     #[test]
     fn detect_project_finds_git() {
-        let dir = std::env::temp_dir().join("swoop-test-detect-project");
+        let dir = std::env::temp_dir().join("ta-test-detect-project");
         let sub = dir.join("myproject");
         let _ = std::fs::create_dir_all(sub.join(".git"));
         let deep = sub.join("src/nested");
@@ -118,7 +118,7 @@ mod tests {
 
     #[test]
     fn detect_project_no_git_uses_dirname() {
-        let dir = std::env::temp_dir().join("swoop-test-no-git");
+        let dir = std::env::temp_dir().join("ta-test-no-git");
         let leaf = dir.join("somefolder");
         let _ = std::fs::create_dir_all(&leaf);
 
@@ -129,9 +129,9 @@ mod tests {
 
     #[test]
     fn user_agent_contains_version() {
-        assert!(USER_AGENT.starts_with("swoop/"));
+        assert!(USER_AGENT.starts_with("tab-atelier/"));
         assert!(USER_AGENT.contains("terminal"));
-        assert!(USER_AGENT.contains("github.com/wdes/swoop"));
+        assert!(USER_AGENT.contains("github.com/wdes/tab-atelier"));
     }
 
     #[test]

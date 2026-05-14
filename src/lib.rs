@@ -6,6 +6,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+pub const APP_DIR: &str = "tab-atelier";
+
 #[derive(Serialize, Deserialize)]
 pub struct TabState {
     pub name: String,
@@ -32,7 +34,7 @@ pub fn dirs_or_default() -> PathBuf {
             let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
             PathBuf::from(home).join(".local/state")
         });
-    base.join("swoop")
+    base.join(APP_DIR)
 }
 
 pub fn load_state() -> Option<SavedState> {
@@ -227,13 +229,13 @@ mod tests {
     #[test]
     fn test_state_path_uses_xdg() {
         let path = state_path();
-        assert!(path.ends_with("swoop/tabs.json"));
+        assert!(path.ends_with(&format!("{APP_DIR}/tabs.json")));
     }
 
     #[test]
     fn test_load_state_missing_file() {
         let prev = std::env::var("XDG_STATE_HOME").ok();
-        unsafe { set_env("XDG_STATE_HOME", "/tmp/swoop-test-nonexistent") };
+        unsafe { set_env("XDG_STATE_HOME", "/tmp/tab-atelier-test-nonexistent") };
         let result = load_state();
         assert!(result.is_none());
         match prev {
@@ -244,7 +246,7 @@ mod tests {
 
     #[test]
     fn test_save_then_load_round_trip() {
-        let dir = std::env::temp_dir().join("swoop-test-round-trip");
+        let dir = std::env::temp_dir().join("ta-test-round-trip");
         let _ = std::fs::create_dir_all(&dir);
         unsafe { set_env("XDG_STATE_HOME", dir.to_str().unwrap()) };
 
@@ -264,34 +266,34 @@ mod tests {
         assert_eq!(loaded.tabs[1].cwd, None);
         assert_eq!(loaded.active, 1);
 
-        let _ = std::fs::remove_dir_all(dir.join("swoop"));
+        let _ = std::fs::remove_dir_all(dir.join("tab-atelier"));
     }
 
     #[test]
     fn test_load_state_malformed_json() {
-        let dir = std::env::temp_dir().join("swoop-test-malformed");
-        let swoop_dir = dir.join("swoop");
-        let _ = std::fs::create_dir_all(&swoop_dir);
-        std::fs::write(swoop_dir.join("tabs.json"), "not json").unwrap();
+        let dir = std::env::temp_dir().join("ta-test-malformed");
+        let state_dir = dir.join("tab-atelier");
+        let _ = std::fs::create_dir_all(&state_dir);
+        std::fs::write(state_dir.join("tabs.json"), "not json").unwrap();
         unsafe { set_env("XDG_STATE_HOME", dir.to_str().unwrap()) };
 
         let result = load_state();
         assert!(result.is_none());
 
-        let _ = std::fs::remove_dir_all(&swoop_dir);
+        let _ = std::fs::remove_dir_all(&state_dir);
     }
 
     #[test]
-    fn test_dirs_or_default_has_swoop() {
+    fn test_dirs_or_default_has_app_dir() {
         let dir = dirs_or_default();
-        assert_eq!(dir.file_name().unwrap(), "swoop");
+        assert_eq!(dir.file_name().unwrap(), APP_DIR);
     }
 
     #[test]
     fn test_dirs_respects_xdg_state_home() {
         unsafe { set_env("XDG_STATE_HOME", "/tmp/custom-state") };
         let dir = dirs_or_default();
-        assert_eq!(dir, PathBuf::from("/tmp/custom-state/swoop"));
+        assert_eq!(dir, PathBuf::from(format!("/tmp/custom-state/{APP_DIR}")));
         unsafe { remove_env("XDG_STATE_HOME") };
     }
 
@@ -306,14 +308,14 @@ mod tests {
 
     #[test]
     fn test_load_font_config_missing_file() {
-        let fc = load_font_config_from(std::path::Path::new("/tmp/nonexistent-swoop.json"));
+        let fc = load_font_config_from(std::path::Path::new("/tmp/nonexistent-config.json"));
         assert_eq!(fc.family, "monospace");
         assert_eq!(fc.weight, 400);
     }
 
     #[test]
     fn test_load_font_config_partial() {
-        let dir = std::env::temp_dir().join("swoop-test-font");
+        let dir = std::env::temp_dir().join("ta-test-font");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("settings.json");
         std::fs::write(&path, r#"{ "ui_font_family": "JetBrains Mono", "ui_font_size": 14 }"#).unwrap();
@@ -326,7 +328,7 @@ mod tests {
 
     #[test]
     fn test_load_font_config_buffer_font_fallback() {
-        let dir = std::env::temp_dir().join("swoop-test-font-fallback");
+        let dir = std::env::temp_dir().join("ta-test-font-fallback");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("settings.json");
         std::fs::write(&path, r#"{ "buffer_font_size": 20 }"#).unwrap();
@@ -337,7 +339,7 @@ mod tests {
 
     #[test]
     fn test_load_font_config_scroll_sensitivity() {
-        let dir = std::env::temp_dir().join("swoop-test-scroll-sens");
+        let dir = std::env::temp_dir().join("ta-test-scroll-sens");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("settings.json");
         std::fs::write(&path, r#"{ "scroll_sensitivity": 2.5 }"#).unwrap();
@@ -348,7 +350,7 @@ mod tests {
 
     #[test]
     fn test_load_font_config_scroll_sensitivity_clamped() {
-        let dir = std::env::temp_dir().join("swoop-test-scroll-clamp");
+        let dir = std::env::temp_dir().join("ta-test-scroll-clamp");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("settings.json");
         std::fs::write(&path, r#"{ "scroll_sensitivity": 0.001 }"#).unwrap();
@@ -405,7 +407,7 @@ mod tests {
 
     #[test]
     fn test_load_font_config_with_comments() {
-        let dir = std::env::temp_dir().join("swoop-test-comments");
+        let dir = std::env::temp_dir().join("ta-test-comments");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("settings.json");
         std::fs::write(&path, r#"{
@@ -423,7 +425,7 @@ mod tests {
 
     #[test]
     fn test_save_state_creates_directory() {
-        let dir = std::env::temp_dir().join("swoop-test-create-dir");
+        let dir = std::env::temp_dir().join("ta-test-create-dir");
         let _ = std::fs::remove_dir_all(&dir);
         unsafe { set_env("XDG_STATE_HOME", dir.to_str().unwrap()) };
         let state = SavedState {
@@ -431,21 +433,21 @@ mod tests {
             active: 0,
         };
         save_state(&state);
-        assert!(dir.join("swoop/tabs.json").exists());
+        assert!(dir.join(format!("{APP_DIR}/tabs.json")).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn test_active_clamped_on_load() {
-        let dir = std::env::temp_dir().join("swoop-test-clamp-active");
-        let swoop_dir = dir.join("swoop");
-        let _ = std::fs::create_dir_all(&swoop_dir);
+        let dir = std::env::temp_dir().join("ta-test-clamp-active");
+        let state_dir = dir.join("tab-atelier");
+        let _ = std::fs::create_dir_all(&state_dir);
         let state = SavedState {
             tabs: vec![TabState { name: "Only".into(), cwd: None, output: None }],
             active: 999,
         };
         let json = serde_json::to_string_pretty(&state).unwrap();
-        std::fs::write(swoop_dir.join("tabs.json"), json).unwrap();
+        std::fs::write(state_dir.join("tabs.json"), json).unwrap();
         unsafe { set_env("XDG_STATE_HOME", dir.to_str().unwrap()) };
 
         let loaded = load_state().unwrap();

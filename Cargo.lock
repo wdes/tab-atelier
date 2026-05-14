@@ -3945,6 +3945,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
+
+[[package]]
 name = "quick-error"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5113,20 +5119,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "swoop"
-version = "0.1.0"
-dependencies = [
- "alacritty_terminal",
- "gpui",
- "serde",
- "serde_json",
- "ureq",
- "vte",
- "wattaouille",
- "x11rb",
-]
-
-[[package]]
 name = "syn"
 version = "1.0.109"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5210,6 +5202,21 @@ checksum = "8e1d1b10ced5ca923a1fcb8d03e96b8d3268065d724548c0211415ff6ac6bac4"
 dependencies = [
  "core-foundation-sys",
  "libc",
+]
+
+[[package]]
+name = "tab-atelier"
+version = "0.1.0"
+dependencies = [
+ "alacritty_terminal",
+ "gpui",
+ "qrcode",
+ "serde",
+ "serde_json",
+ "ureq",
+ "vte",
+ "wattaouille",
+ "x11rb",
 ]
 
 [[package]]
