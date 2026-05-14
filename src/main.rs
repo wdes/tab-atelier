@@ -322,9 +322,10 @@ impl Swoop {
                 .text_color(tab_fg)
                 .text_size(px(13.0))
                 .cursor_pointer()
-                .on_click(cx.listener(move |this, _ev: &ClickEvent, _window, cx| {
+                .on_click(cx.listener(move |this, _ev: &ClickEvent, window, cx| {
                     this.active = i;
                     this.context_menu = None;
+                    this.tabs[i].view.read(cx).focus_handle(cx).focus(window);
                     cx.notify();
                 }))
                 .on_mouse_down(
@@ -381,8 +382,8 @@ impl Swoop {
 
         let pos = menu.position;
         let item_count = match menu.kind {
-            MenuKind::Tab(_) => if self.tabs.len() > 1 { 7 } else { 6 },
-            MenuKind::Background => 5,
+            MenuKind::Tab(_) => if self.tabs.len() > 1 { 8 } else { 7 },
+            MenuKind::Background => 6,
         };
         let menu_height = px(item_count as f32 * 27.0 + 8.0);
 
@@ -498,6 +499,20 @@ impl Swoop {
             )
             .child(
                 div()
+                    .id("menu-reset")
+                    .px(px(12.0))
+                    .py(px(4.0))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(menu_hover))
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                        this.tabs[this.active].view.read(cx).reset_terminal();
+                        this.context_menu = None;
+                        cx.notify();
+                    }))
+                    .child("Reset input & color"),
+            )
+            .child(
+                div()
                     .id("menu-windowed")
                     .px(px(12.0))
                     .py(px(4.0))
@@ -609,6 +624,7 @@ impl Swoop {
                                 .px(px(8.0))
                                 .py(px(4.0))
                                 .min_h(px(28.0))
+                                .cursor_text()
                                 .child(text)
                                 .child(
                                     div()

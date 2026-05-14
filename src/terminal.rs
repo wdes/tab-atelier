@@ -236,6 +236,22 @@ impl TerminalView {
         let _ = self.notifier.send(Msg::Input(bytes.into()));
     }
 
+    pub fn reset_terminal(&self) {
+        let reset = concat!(
+            "\x1b[?1049l",  // exit alternate screen
+            "\x1b[0m",      // reset all SGR attributes (colors/styles)
+            "\x1b[?25h",    // show cursor
+            "\x1b[?1l",     // reset cursor keys to normal mode
+            "\x1b[?7h",     // enable auto-wrap
+            "\x1b[?2004h",  // enable bracketed paste
+            "\x1b(B",       // reset charset to ASCII
+        );
+        let mut parser: vte::ansi::Processor = vte::ansi::Processor::new();
+        let mut term = self.term.lock();
+        parser.advance(&mut *term, reset.as_bytes());
+        term.grid_mut().scroll_display(Scroll::Bottom);
+    }
+
     pub fn send_clipboard(&self, text: String) {
         self.term.lock().grid_mut().scroll_display(Scroll::Bottom);
         let bracketed = format!("\x1b[200~{text}\x1b[201~");
