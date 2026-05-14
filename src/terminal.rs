@@ -18,6 +18,7 @@ use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags as CellFlags;
 use alacritty_terminal::term::{Config, Term};
+use vte::ansi::{Color, NamedColor};
 use alacritty_terminal::tty;
 use gpui::*;
 use crate::terminal_utils::{
@@ -286,22 +287,93 @@ impl TerminalView {
         let cols = grid.columns();
         let history = grid.history_size();
         let screen = grid.screen_lines();
+
+        let default_fg = Color::Named(NamedColor::Foreground);
+        let default_bg = Color::Named(NamedColor::Background);
+        let mut cur_fg = default_fg;
+        let mut cur_bg = default_bg;
+        let mut cur_flags = CellFlags::empty();
         let mut lines = Vec::new();
 
         for row in (-(history as i32))..screen as i32 {
-            let mut line = String::with_capacity(cols);
+            let mut line = String::with_capacity(cols * 2);
             for col in 0..cols {
                 let cell = &grid[GridPoint::new(Line(row), Column(col))];
                 if cell.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
                     continue;
                 }
                 let ch = if cell.c == '\0' { ' ' } else { cell.c };
+
+                let is_default = cell.fg == default_fg
+                    && cell.bg == default_bg
+                    && cell.flags.is_empty();
+                if is_default && ch == ' ' && cur_fg == default_fg && cur_bg == default_bg && cur_flags.is_empty() {
+                    line.push(' ');
+                    continue;
+                }
+
+                if cell.fg != cur_fg || cell.bg != cur_bg || cell.flags != cur_flags {
+                    let mut sgr = Vec::new();
+
+                    let removed = cur_flags & !cell.flags;
+                    if removed.intersects(CellFlags::BOLD | CellFlags::DIM | CellFlags::ITALIC
+                        | CellFlags::UNDERLINE | CellFlags::INVERSE | CellFlags::HIDDEN | CellFlags::STRIKEOUT)
+                    {
+                        sgr.push("0".to_string());
+                        cur_fg = default_fg;
+                        cur_bg = default_bg;
+                        cur_flags = CellFlags::empty();
+                    }
+
+                    if cell.flags.contains(CellFlags::BOLD) && !cur_flags.contains(CellFlags::BOLD) {
+                        sgr.push("1".into());
+                    }
+                    if cell.flags.contains(CellFlags::DIM) && !cur_flags.contains(CellFlags::DIM) {
+                        sgr.push("2".into());
+                    }
+                    if cell.flags.contains(CellFlags::ITALIC) && !cur_flags.contains(CellFlags::ITALIC) {
+                        sgr.push("3".into());
+                    }
+                    if cell.flags.contains(CellFlags::UNDERLINE) && !cur_flags.contains(CellFlags::UNDERLINE) {
+                        sgr.push("4".into());
+                    }
+                    if cell.flags.contains(CellFlags::INVERSE) && !cur_flags.contains(CellFlags::INVERSE) {
+                        sgr.push("7".into());
+                    }
+                    if cell.flags.contains(CellFlags::HIDDEN) && !cur_flags.contains(CellFlags::HIDDEN) {
+                        sgr.push("8".into());
+                    }
+                    if cell.flags.contains(CellFlags::STRIKEOUT) && !cur_flags.contains(CellFlags::STRIKEOUT) {
+                        sgr.push("9".into());
+                    }
+
+                    if cell.fg != cur_fg {
+                        sgr_color(&mut sgr, cell.fg, true);
+                    }
+                    if cell.bg != cur_bg {
+                        sgr_color(&mut sgr, cell.bg, false);
+                    }
+
+                    cur_fg = cell.fg;
+                    cur_bg = cell.bg;
+                    cur_flags = cell.flags;
+
+                    if !sgr.is_empty() {
+                        line.push_str(&format!("\x1b[{}m", sgr.join(";")));
+                    }
+                }
                 line.push(ch);
+            }
+
+            if cur_fg != default_fg || cur_bg != default_bg || !cur_flags.is_empty() {
+                line.push_str("\x1b[0m");
+                cur_fg = default_fg;
+                cur_bg = default_bg;
+                cur_flags = CellFlags::empty();
             }
             lines.push(line.trim_end().to_string());
         }
 
-        // Trim leading and trailing empty lines
         while lines.first().is_some_and(|l| l.is_empty()) {
             lines.remove(0);
         }
@@ -323,6 +395,66 @@ impl TerminalView {
             Side::Right
         };
         (GridPoint::new(Line(line), Column(col)), side)
+    }
+}
+
+fn sgr_color(sgr: &mut Vec<String>, color: Color, foreground: bool) {
+    match color {
+        Color::Named(n) => {
+            let code = match n {
+                NamedColor::Black => 0,
+                NamedColor::Red => 1,
+                NamedColor::Green => 2,
+                NamedColor::Yellow => 3,
+                NamedColor::Blue => 4,
+                NamedColor::Magenta => 5,
+                NamedColor::Cyan => 6,
+                NamedColor::White => 7,
+                NamedColor::BrightBlack => 8,
+                NamedColor::BrightRed => 9,
+                NamedColor::BrightGreen => 10,
+                NamedColor::BrightYellow => 11,
+                NamedColor::BrightBlue => 12,
+                NamedColor::BrightMagenta => 13,
+                NamedColor::BrightCyan => 14,
+                NamedColor::BrightWhite => 15,
+                NamedColor::Foreground | NamedColor::BrightForeground | NamedColor::DimForeground => {
+                    if foreground {
+                        sgr.push("39".into());
+                    } else {
+                        sgr.push("49".into());
+                    }
+                    return;
+                }
+                NamedColor::Background | NamedColor::Cursor => {
+                    if foreground {
+                        sgr.push("39".into());
+                    } else {
+                        sgr.push("49".into());
+                    }
+                    return;
+                }
+                NamedColor::DimBlack => 0,
+                NamedColor::DimRed => 1,
+                NamedColor::DimGreen => 2,
+                NamedColor::DimYellow => 3,
+                NamedColor::DimBlue => 4,
+                NamedColor::DimMagenta => 5,
+                NamedColor::DimCyan => 6,
+                NamedColor::DimWhite => 7,
+            };
+            if code < 8 {
+                sgr.push(format!("{}", if foreground { 30 + code } else { 40 + code }));
+            } else {
+                sgr.push(format!("{}", if foreground { 90 + code - 8 } else { 100 + code - 8 }));
+            }
+        }
+        Color::Indexed(idx) => {
+            sgr.push(format!("{};5;{}", if foreground { 38 } else { 48 }, idx));
+        }
+        Color::Spec(rgb) => {
+            sgr.push(format!("{};2;{};{};{}", if foreground { 38 } else { 48 }, rgb.r, rgb.g, rgb.b));
+        }
     }
 }
 
