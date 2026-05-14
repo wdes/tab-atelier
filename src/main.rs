@@ -4,11 +4,13 @@
 
 mod terminal;
 mod terminal_utils;
+mod tracking;
 
 use gpui::*;
 use std::path::PathBuf;
-use swoop::{FontConfig, SavedState, TabState, load_font_config, load_state, save_state};
+use swoop::{FontConfig, SavedState, TabState, load_font_config, load_state, load_wakatime_key, save_state};
 use terminal::TerminalView;
+use tracking::WakatimeTracker;
 
 struct Tab {
     view: Entity<TerminalView>,
@@ -39,6 +41,7 @@ struct Swoop {
     visible: bool,
     exit_confirm: Option<ExitConfirm>,
     font_config: FontConfig,
+    tracker: Option<WakatimeTracker>,
 }
 
 impl Swoop {
@@ -106,6 +109,8 @@ impl Swoop {
 
         tabs[active].view.read(cx).focus_handle(cx).focus(window);
 
+        let tracker = load_wakatime_key().map(WakatimeTracker::new);
+
         Self {
             tabs,
             active,
@@ -115,6 +120,7 @@ impl Swoop {
             visible: true,
             exit_confirm: None,
             font_config,
+            tracker,
         }
     }
 
@@ -159,6 +165,12 @@ impl Swoop {
             })
             .collect();
         save_state(&SavedState { tabs, active: self.active });
+
+        if let Some(ref tracker) = self.tracker {
+            let pid = self.tabs[self.active].view.read(cx).pid();
+            let cwd = std::fs::read_link(format!("/proc/{pid}/cwd")).ok();
+            tracker.record_activity(cwd);
+        }
     }
 
     fn respawn_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -196,6 +208,9 @@ impl Swoop {
 
     fn close_all_tabs(&mut self, cx: &mut Context<Self>) {
         self.persist(cx);
+        if let Some(ref tracker) = self.tracker {
+            tracker.shutdown();
+        }
         for tab in &self.tabs {
             tab.view.read(cx).shutdown();
         }
