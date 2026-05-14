@@ -84,8 +84,10 @@ impl TerminalView {
             cell_width: 9,
             cell_height: 18,
         };
-        let mut opts = tty::Options::default();
-        opts.working_directory = cwd.map(|p| p.to_path_buf());
+        let opts = tty::Options {
+            working_directory: cwd.map(|p| p.to_path_buf()),
+            ..Default::default()
+        };
         let pty = tty::new(&opts, ws, 0).expect("failed to create pty");
         let pid = pty.child().id();
         let config = Config {
@@ -116,7 +118,7 @@ impl TerminalView {
                     let n = tick_clone.get().wrapping_add(1);
                     tick_clone.set(n);
                     let scrolled = view.term.lock().grid().display_offset() > 0;
-                    if !scrolled || n % 6 == 0 {
+                    if !scrolled || n.is_multiple_of(6) {
                         cx.notify();
                     }
                 }) else {
@@ -178,8 +180,10 @@ impl TerminalView {
             cell_height: f32::from(cell.height) as u16,
         };
 
-        let mut opts = tty::Options::default();
-        opts.working_directory = cwd.map(|p| p.to_path_buf());
+        let opts = tty::Options {
+            working_directory: cwd.map(|p| p.to_path_buf()),
+            ..Default::default()
+        };
         let pty = tty::new(&opts, ws, 0).expect("failed to create pty");
         let pid = pty.child().id();
 
@@ -648,7 +652,7 @@ impl Element for TerminalElement {
                     cell_font.style = font_style;
 
                     let char_len = ch.len_utf8();
-                    let can_merge = runs.last().map_or(false, |last: &TextRun| {
+                    let can_merge = runs.last().is_some_and(|last: &TextRun| {
                         last.color == fg
                             && last.font == cell_font
                             && last.underline == underline
@@ -693,15 +697,15 @@ impl Element for TerminalElement {
         let mut new_cache = HashMap::with_capacity(raw_lines.len());
         let mut result_lines = Vec::with_capacity(raw_lines.len());
         for raw in raw_lines {
-            if let Some(cached) = cache.remove(&raw.grid_line) {
-                if cached.text == raw.text {
-                    result_lines.push(TermLine { shaped: cached.shaped, bg_runs: raw.bg_runs });
-                    new_cache.insert(raw.grid_line, CachedLine {
-                        text: cached.text,
-                        shaped: result_lines.last().unwrap().shaped.clone(),
-                    });
-                    continue;
-                }
+            if let Some(cached) = cache.remove(&raw.grid_line)
+                && cached.text == raw.text
+            {
+                result_lines.push(TermLine { shaped: cached.shaped, bg_runs: raw.bg_runs });
+                new_cache.insert(raw.grid_line, CachedLine {
+                    text: cached.text,
+                    shaped: result_lines.last().unwrap().shaped.clone(),
+                });
+                continue;
             }
             let text_clone = raw.text.clone();
             let shaped = text_sys.shape_line(
