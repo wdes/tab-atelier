@@ -14,6 +14,10 @@ pub struct TabState {
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uptime_secs: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub energy_wh: Option<f64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -158,6 +162,8 @@ pub fn load_wakatime_key(config_base: &std::path::Path) -> Option<String> {
 pub struct Preferences {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lang: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser: Option<String>,
 }
 
 pub fn load_preferences(base: &std::path::Path) -> Preferences {
@@ -186,6 +192,103 @@ pub fn save_state(base: &std::path::Path, state: &SavedState) {
     }
 }
 
+pub fn detect_urls(text: &str) -> Vec<(usize, usize, String, bool)> {
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let mut urls = Vec::new();
+    let mut i = 0;
+
+    while i < len {
+        if chars[i] == 'h' && i + 7 < len {
+            let prefix_len = if i + 8 <= len
+                && chars[i+1] == 't' && chars[i+2] == 't' && chars[i+3] == 'p'
+                && chars[i+4] == 's' && chars[i+5] == ':' && chars[i+6] == '/' && chars[i+7] == '/'
+            {
+                8
+            } else if i + 7 <= len
+                && chars[i+1] == 't' && chars[i+2] == 't' && chars[i+3] == 'p'
+                && chars[i+4] == ':' && chars[i+5] == '/' && chars[i+6] == '/'
+            {
+                7
+            } else {
+                0
+            };
+            if prefix_len > 0 {
+                let start = i;
+                while i < len && !chars[i].is_whitespace()
+                    && !matches!(chars[i], '"' | '\'' | '<' | '>' | ')' | ']' | '}')
+                {
+                    i += 1;
+                }
+                while i > start + prefix_len && matches!(chars[i-1], '.' | ',' | ';') {
+                    i -= 1;
+                }
+                let url: String = chars[start..i].iter().collect();
+                urls.push((start, i, url, false));
+                continue;
+            }
+        }
+
+        if chars[i] == '/' && i + 1 < len && (chars[i+1].is_alphanumeric() || chars[i+1] == '.') {
+            let start = i;
+            let mut j = i;
+            while j < len && !chars[j].is_whitespace()
+                && !matches!(chars[j], '"' | '\'' | '<' | '>' | ')' | ']' | '}')
+            {
+                j += 1;
+            }
+            let path: String = chars[start..j].iter().collect();
+            if path.matches('/').count() >= 2 {
+                urls.push((start, j, path, true));
+                i = j;
+                continue;
+            }
+        }
+
+        if i + 4 < len && chars[i].is_alphanumeric() {
+            let start = i;
+            let mut j = i;
+            while j < len && !chars[j].is_whitespace()
+                && !matches!(chars[j], '"' | '\'' | '<' | '>' | ')' | ']' | '}')
+            {
+                j += 1;
+            }
+            let candidate: String = chars[start..j].iter().collect();
+            if candidate.contains('/') && candidate.contains(':') {
+                let has_slash = candidate.matches('/').count() >= 1;
+                let colon_part = candidate.rsplit(':').next().unwrap_or("");
+                let looks_like_path = has_slash && !colon_part.is_empty() && colon_part.chars().all(|c| c.is_ascii_digit());
+                if looks_like_path && !candidate.starts_with("http") {
+                    urls.push((start, j, candidate, true));
+                    i = j;
+                    continue;
+                }
+            }
+        }
+
+        i += 1;
+    }
+
+    urls
+}
+
+pub fn file_path_for_open(path: &str) -> &str {
+    if let Some(colon_pos) = path.rfind(':') {
+        let after = &path[colon_pos+1..];
+        if !after.is_empty() && after.chars().all(|c| c.is_ascii_digit()) {
+            let base = &path[..colon_pos];
+            if let Some(colon_pos2) = base.rfind(':') {
+                let after2 = &base[colon_pos2+1..];
+                if !after2.is_empty() && after2.chars().all(|c| c.is_ascii_digit()) {
+                    return &path[..colon_pos2];
+                }
+            }
+            return base;
+        }
+    }
+    path
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,8 +297,8 @@ mod tests {
     fn test_tab_state_serialization() {
         let state = SavedState {
             tabs: vec![
-                TabState { name: "Terminal".into(), cwd: Some("/home/user".into()), output: None },
-                TabState { name: "Build".into(), cwd: None, output: None },
+                TabState { name: "Terminal".into(), cwd: Some("/home/user".into()), output: None, uptime_secs: None, energy_wh: None },
+                TabState { name: "Build".into(), cwd: None, output: None, uptime_secs: None, energy_wh: None },
             ],
             active: 1,
         };
@@ -207,6 +310,28 @@ mod tests {
         assert_eq!(restored.tabs[1].name, "Build");
         assert_eq!(restored.tabs[1].cwd, None);
         assert_eq!(restored.active, 1);
+    }
+
+    #[test]
+    fn test_tab_state_uptime_energy_round_trip() {
+        let state = SavedState {
+            tabs: vec![
+                TabState { name: "T".into(), cwd: None, output: None, uptime_secs: Some(123.5), energy_wh: Some(0.042) },
+            ],
+            active: 0,
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let restored: SavedState = serde_json::from_str(&json).unwrap();
+        assert!((restored.tabs[0].uptime_secs.unwrap() - 123.5).abs() < f64::EPSILON);
+        assert!((restored.tabs[0].energy_wh.unwrap() - 0.042).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_tab_state_uptime_energy_defaults() {
+        let json = r#"{"tabs":[{"name":"X","cwd":null}],"active":0}"#;
+        let restored: SavedState = serde_json::from_str(json).unwrap();
+        assert!(restored.tabs[0].uptime_secs.is_none());
+        assert!(restored.tabs[0].energy_wh.is_none());
     }
 
     #[test]
@@ -239,8 +364,8 @@ mod tests {
 
         let state = SavedState {
             tabs: vec![
-                TabState { name: "One".into(), cwd: Some("/tmp".into()), output: None },
-                TabState { name: "Two".into(), cwd: None, output: None },
+                TabState { name: "One".into(), cwd: Some("/tmp".into()), output: None, uptime_secs: None, energy_wh: None },
+                TabState { name: "Two".into(), cwd: None, output: None, uptime_secs: None, energy_wh: None },
             ],
             active: 1,
         };
@@ -412,7 +537,7 @@ mod tests {
         let dir = std::env::temp_dir().join("ta-test-create-dir");
         let _ = std::fs::remove_dir_all(&dir);
         let state = SavedState {
-            tabs: vec![TabState { name: "T".into(), cwd: None, output: None }],
+            tabs: vec![TabState { name: "T".into(), cwd: None, output: None, uptime_secs: None, energy_wh: None }],
             active: 0,
         };
         save_state(&dir, &state);
@@ -421,12 +546,89 @@ mod tests {
     }
 
     #[test]
+    fn detect_http_url() {
+        let urls = detect_urls("visit https://example.com/page today");
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0].2, "https://example.com/page");
+        assert!(!urls[0].3);
+    }
+
+    #[test]
+    fn detect_http_url_with_query() {
+        let urls = detect_urls("go to http://localhost:3000/api?key=val&x=1");
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0].2, "http://localhost:3000/api?key=val&x=1");
+    }
+
+    #[test]
+    fn detect_url_trims_trailing_punctuation() {
+        let urls = detect_urls("see https://example.com.");
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0].2, "https://example.com");
+    }
+
+    #[test]
+    fn detect_file_path() {
+        let urls = detect_urls("error at /home/user/src/main.rs:42:5");
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0].2, "/home/user/src/main.rs:42:5");
+        assert!(urls[0].3);
+    }
+
+    #[test]
+    fn detect_file_path_needs_two_components() {
+        let urls = detect_urls("see /tmp or /dev");
+        assert!(urls.is_empty());
+    }
+
+    #[test]
+    fn detect_multiple_urls() {
+        let urls = detect_urls("https://a.com and /home/user/file.rs");
+        assert_eq!(urls.len(), 2);
+    }
+
+    #[test]
+    fn file_path_strip_line_col() {
+        assert_eq!(file_path_for_open("/src/main.rs:42:5"), "/src/main.rs");
+        assert_eq!(file_path_for_open("/src/main.rs:42"), "/src/main.rs");
+        assert_eq!(file_path_for_open("/src/main.rs"), "/src/main.rs");
+    }
+
+    #[test]
+    fn no_urls_in_plain_text() {
+        let urls = detect_urls("hello world nothing here");
+        assert!(urls.is_empty());
+    }
+
+    #[test]
+    fn detect_partial_path_with_line() {
+        let urls = detect_urls("error at src/main.php:42");
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0].2, "src/main.php:42");
+        assert!(urls[0].3);
+    }
+
+    #[test]
+    fn detect_partial_path_with_line_col() {
+        let urls = detect_urls("see src/lib/utils.rs:10:5 for details");
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0].2, "src/lib/utils.rs:10:5");
+        assert!(urls[0].3);
+    }
+
+    #[test]
+    fn file_path_for_open_partial() {
+        assert_eq!(file_path_for_open("src/main.php:42"), "src/main.php");
+        assert_eq!(file_path_for_open("src/lib/utils.rs:10:5"), "src/lib/utils.rs");
+    }
+
+    #[test]
     fn test_active_clamped_on_load() {
         let dir = std::env::temp_dir().join("ta-test-clamp-active");
         let sd = dir.join(APP_DIR);
         let _ = std::fs::create_dir_all(&sd);
         let state = SavedState {
-            tabs: vec![TabState { name: "Only".into(), cwd: None, output: None }],
+            tabs: vec![TabState { name: "Only".into(), cwd: None, output: None, uptime_secs: None, energy_wh: None }],
             active: 999,
         };
         let json = serde_json::to_string_pretty(&state).unwrap();

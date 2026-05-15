@@ -2,6 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+
 mod api;
 mod locale;
 mod platform;
@@ -12,6 +13,8 @@ mod terminal_utils;
 mod tracking;
 
 use std::path::PathBuf;
+use std::rc::Rc;
+use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
 use gpui::*;
 use gpui::prelude::FluentBuilder;
@@ -24,7 +27,29 @@ use tracking::WakatimeTracker;
 struct Tab {
     view: Entity<TerminalView>,
     name: String,
-    created_at: std::time::Instant,
+    active_duration: std::time::Duration,
+    last_activated: Option<std::time::Instant>,
+    energy_wh: f64,
+}
+
+impl Tab {
+    fn uptime(&self) -> std::time::Duration {
+        self.active_duration
+            + self.last_activated
+                .map_or(std::time::Duration::ZERO, |t| t.elapsed())
+    }
+
+    fn activate(&mut self) {
+        if self.last_activated.is_none() {
+            self.last_activated = Some(std::time::Instant::now());
+        }
+    }
+
+    fn deactivate(&mut self) {
+        if let Some(t) = self.last_activated.take() {
+            self.active_duration += t.elapsed();
+        }
+    }
 }
 
 enum MenuKind {
@@ -36,6 +61,12 @@ struct ContextMenu {
     kind: MenuKind,
     position: Point<Pixels>,
     open_upward: bool,
+}
+
+struct Toast {
+    message: String,
+    time: std::time::Instant,
+    path: Option<PathBuf>,
 }
 
 struct ExitConfirm {
@@ -59,9 +90,12 @@ struct Swoop {
     api_state: Arc<Mutex<api::TabSnapshot>>,
     power_pids: Arc<Mutex<Vec<u32>>>,
     power_watts: Arc<Mutex<Vec<power::TabPower>>>,
-    toasts: Vec<(String, std::time::Instant)>,
+    toasts: Vec<Toast>,
     lang: Lang,
     show_preferences: bool,
+    browser: Rc<RefCell<Option<String>>>,
+    pref_browser_text: String,
+    pref_browser_focus: FocusHandle,
 }
 
 impl Swoop {
@@ -71,8 +105,10 @@ impl Swoop {
 
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let rename_focus = cx.focus_handle();
+        let pref_browser_focus = cx.focus_handle();
         let font_config = load_font_config(&platform::config_dir());
         let prefs = load_preferences(&platform::state_base_dir());
+        let browser: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(prefs.browser.clone()));
         let lang = match prefs.lang.as_deref() {
             Some("fr") => Lang::Fr,
             Some("en") => Lang::En,
@@ -85,24 +121,33 @@ impl Swoop {
             for ts in &saved.tabs {
                 let cwd = ts.cwd.as_ref().map(PathBuf::from);
                 let fc = font_config.clone();
-                let view = cx.new(|cx| TerminalView::new(cwd.as_deref(), fc, window, cx));
+                let br = browser.clone();
+                let view = cx.new(|cx| TerminalView::new(cwd.as_deref(), fc, br, window, cx));
                 if let Some(ref output) = ts.output {
                     debug!("restoring {} chars of output for '{}'", output.len(), ts.name);
                     view.read(cx).restore_output(output);
                 }
-                tabs.push(Tab { view, name: ts.name.clone(), created_at: std::time::Instant::now() });
+                tabs.push(Tab {
+                    view, name: ts.name.clone(),
+                    active_duration: std::time::Duration::from_secs_f64(ts.uptime_secs.unwrap_or(0.0)),
+                    last_activated: None,
+                    energy_wh: ts.energy_wh.unwrap_or(0.0),
+                });
             }
             if tabs.is_empty() {
                 let fc = font_config.clone();
-                let view = cx.new(|cx| TerminalView::new(None, fc, window, cx));
-                tabs.push(Tab { view, name: locale::strings(lang).terminal.into(), created_at: std::time::Instant::now() });
+                let br = browser.clone();
+                let view = cx.new(|cx| TerminalView::new(None, fc, br, window, cx));
+                tabs.push(Tab { view, name: locale::strings(lang).terminal.into(), active_duration: std::time::Duration::ZERO, last_activated: None, energy_wh: 0.0 });
             }
             let active = saved.active.min(tabs.len() - 1);
+            tabs[active].activate();
             (tabs, active)
         } else {
             let fc = font_config.clone();
-            let view = cx.new(|cx| TerminalView::new(None, fc, window, cx));
-            (vec![Tab { view, name: locale::strings(lang).terminal.into(), created_at: std::time::Instant::now() }], 0)
+            let br = browser.clone();
+            let view = cx.new(|cx| TerminalView::new(None, fc, br, window, cx));
+            (vec![Tab { view, name: locale::strings(lang).terminal.into(), active_duration: std::time::Duration::ZERO, last_activated: Some(std::time::Instant::now()), energy_wh: 0.0 }], 0)
         };
 
         cx.spawn(async |this: WeakEntity<Swoop>, cx: &mut AsyncApp| {
@@ -183,6 +228,9 @@ impl Swoop {
             toasts: Vec::new(),
             lang,
             show_preferences: false,
+            browser,
+            pref_browser_text: String::new(),
+            pref_browser_focus,
         }
     }
 
@@ -191,10 +239,12 @@ impl Swoop {
             let pid = self.tabs[self.active].view.read(cx).pid();
             platform::process_cwd(pid)
         };
+        self.tabs[self.active].deactivate();
         let fc = self.font_config.clone();
-        let view = cx.new(|cx| TerminalView::new(cwd.as_deref(), fc, window, cx));
+        let br = self.browser.clone();
+        let view = cx.new(|cx| TerminalView::new(cwd.as_deref(), fc, br, window, cx));
         let idx = self.tabs.len();
-        self.tabs.push(Tab { view, name: format!("{} {}", self.t().terminal_n, idx + 1), created_at: std::time::Instant::now() });
+        self.tabs.push(Tab { view, name: format!("{} {}", self.t().terminal_n, idx + 1), active_duration: std::time::Duration::ZERO, last_activated: Some(std::time::Instant::now()), energy_wh: 0.0 });
         self.active = idx;
         cx.notify();
     }
@@ -203,6 +253,8 @@ impl Swoop {
         if self.tabs.len() <= 1 {
             return;
         }
+        let was_active = self.active == idx;
+        self.tabs[idx].deactivate();
         self.tabs[idx].view.read(cx).shutdown();
         self.tabs.remove(idx);
         if self.active >= self.tabs.len() {
@@ -210,11 +262,22 @@ impl Swoop {
         } else if self.active > idx {
             self.active -= 1;
         }
+        if was_active {
+            self.tabs[self.active].activate();
+        }
         self.context_menu = None;
         cx.notify();
     }
 
     fn persist(&mut self, cx: &mut Context<Self>) {
+        {
+            let watts = self.power_watts.lock().unwrap();
+            for (i, tab) in self.tabs.iter_mut().enumerate() {
+                if let Some(w) = watts.get(i).and_then(|p| p.watts) {
+                    tab.energy_wh += w * 2.0 / 3600.0;
+                }
+            }
+        }
         let tabs: Vec<TabState> = self
             .tabs
             .iter()
@@ -222,7 +285,11 @@ impl Swoop {
                 let pid = tab.view.read(cx).pid();
                 let cwd = platform::process_cwd(pid)
                     .map(|p| p.to_string_lossy().into_owned());
-                TabState { name: tab.name.clone(), cwd, output: None }
+                TabState {
+                    name: tab.name.clone(), cwd, output: None,
+                    uptime_secs: Some(tab.uptime().as_secs_f64()),
+                    energy_wh: if tab.energy_wh > 0.0 { Some(tab.energy_wh) } else { None },
+                }
             })
             .collect();
         let api_tabs: Vec<(String, Option<String>)> = tabs
@@ -277,9 +344,12 @@ impl Swoop {
             .or_else(|| Some(std::env::current_dir().unwrap_or_default()));
         self.tabs[idx].view.read(cx).shutdown();
         let fc = self.font_config.clone();
-        let view = cx.new(|cx| TerminalView::new(cwd.as_deref(), fc, window, cx));
+        let br = self.browser.clone();
+        let view = cx.new(|cx| TerminalView::new(cwd.as_deref(), fc, br, window, cx));
         self.tabs[idx].view = view;
-        self.tabs[idx].created_at = std::time::Instant::now();
+        self.tabs[idx].active_duration = std::time::Duration::ZERO;
+        self.tabs[idx].last_activated = if idx == self.active { Some(std::time::Instant::now()) } else { None };
+        self.tabs[idx].energy_wh = 0.0;
         self.exit_confirm = None;
         self.tabs[self.active].view.read(cx).focus_handle(cx).focus(window);
         cx.notify();
@@ -295,7 +365,9 @@ impl Swoop {
         self.tabs[idx].view.update(cx, |view, cx| {
             view.respawn(cwd.as_deref(), cx);
         });
-        self.tabs[idx].created_at = std::time::Instant::now();
+        self.tabs[idx].active_duration = std::time::Duration::ZERO;
+        self.tabs[idx].last_activated = if idx == self.active { Some(std::time::Instant::now()) } else { None };
+        self.tabs[idx].energy_wh = 0.0;
         self.exit_confirm = None;
         self.tabs[self.active].view.read(cx).focus_handle(cx).focus(window);
         cx.notify();
@@ -313,7 +385,11 @@ impl Swoop {
                     let text = tab.view.read(cx).copy_all_history();
                     if text.is_empty() { None } else { Some(text) }
                 };
-                TabState { name: tab.name.clone(), cwd, output }
+                TabState {
+                    name: tab.name.clone(), cwd, output,
+                    uptime_secs: Some(tab.uptime().as_secs_f64()),
+                    energy_wh: if tab.energy_wh > 0.0 { Some(tab.energy_wh) } else { None },
+                }
             })
             .collect();
         save_state(&platform::state_base_dir(), &SavedState { tabs, active: self.active });
@@ -330,7 +406,7 @@ impl Swoop {
     fn do_screenshot(&mut self, full: bool, cx: &mut Context<Self>) {
         let tab_name = self.tabs[self.active].name.clone();
         let progress_time = std::time::Instant::now();
-        self.toasts.push((self.t().taking_screenshot.into(), progress_time));
+        self.toasts.push(Toast { message: self.t().taking_screenshot.into(), time: progress_time, path: None });
         cx.notify();
         cx.spawn(async move |this: WeakEntity<Swoop>, cx: &mut AsyncApp| {
             cx.background_executor()
@@ -338,8 +414,8 @@ impl Swoop {
                 .await;
             let render_time = std::time::Instant::now();
             let _ = this.update(cx, |state, cx| {
-                state.toasts.retain(|(_, t)| *t != progress_time);
-                state.toasts.push((state.t().rendering_screenshot.into(), render_time));
+                state.toasts.retain(|t| t.time != progress_time);
+                state.toasts.push(Toast { message: state.t().rendering_screenshot.into(), time: render_time, path: None });
                 cx.notify();
             });
             cx.background_executor()
@@ -354,20 +430,20 @@ impl Swoop {
             }).await;
             let toast_time = std::time::Instant::now();
             let _ = this.update(cx, |state, cx| {
-                state.toasts.retain(|(_, t)| *t != render_time);
+                state.toasts.retain(|t| t.time != render_time);
                 let t = state.t();
-                let msg = match result {
-                    Ok(path) => format!("{}: {}", t.saved, path.display()),
-                    Err(e) => format!("{}: {e}", t.screenshot_failed),
+                let (msg, path) = match result {
+                    Ok(path) => (t.saved.to_string(), Some(path)),
+                    Err(e) => (format!("{}: {e}", t.screenshot_failed), None),
                 };
-                state.toasts.push((msg, toast_time));
+                state.toasts.push(Toast { message: msg, time: toast_time, path });
                 cx.notify();
             });
             cx.background_executor()
                 .timer(std::time::Duration::from_secs(3))
                 .await;
             let _ = this.update(cx, |state, cx| {
-                state.toasts.retain(|(_, t)| *t != toast_time);
+                state.toasts.retain(|t| t.time != toast_time);
                 cx.notify();
             });
         })
@@ -415,7 +491,9 @@ impl Swoop {
                 .text_size(px(13.0))
                 .cursor_pointer()
                 .on_click(cx.listener(move |this, _ev: &ClickEvent, window, cx| {
+                    this.tabs[this.active].deactivate();
                     this.active = i;
+                    this.tabs[i].activate();
                     this.context_menu = None;
                     this.tabs[i].view.read(cx).focus_handle(cx).focus(window);
                     cx.notify();
@@ -534,31 +612,41 @@ impl Swoop {
                         .child(self.t().close),
                 );
             }
+        }
 
+        {
+            let stats_idx = match menu.kind {
+                MenuKind::Tab(idx) => idx,
+                MenuKind::Background => self.active,
+            };
             let stat_fg: Hsla = rgb(0x888888).into();
-            let elapsed = self.tabs[idx].created_at.elapsed();
+            let elapsed = self.tabs[stats_idx].uptime();
             let power = self.power_watts.lock().unwrap();
-            let power_info = power.get(idx);
+            let power_info = power.get(stats_idx);
             let t = self.t();
 
             let mut stats_lines: Vec<String> = Vec::new();
 
             if let Some(p) = power_info {
                 stats_lines.push(format!("{}: {}", t.cpu, p.cpu_label()));
-                if let Some(w) = p.watts {
+                if p.watts.is_some() {
                     stats_lines.push(format!("{}: {}", t.power, p.label()));
-                    let wh = w * elapsed.as_secs_f64() / 3600.0;
-                    if wh >= 1.0 {
-                        stats_lines.push(format!("{}: {wh:.1} Wh", t.energy));
-                    } else {
-                        stats_lines.push(format!("{}: {:.0} mWh", t.energy, wh * 1000.0));
-                    }
+                }
+            }
+            let wh = self.tabs[stats_idx].energy_wh;
+            if wh > 0.0 {
+                if wh >= 1.0 {
+                    stats_lines.push(format!("{}: {wh:.1} Wh", t.energy));
+                } else {
+                    stats_lines.push(format!("{}: {:.0} mWh", t.energy, wh * 1000.0));
                 }
             }
             stats_lines.push(format!("{}: {}", t.uptime, format_duration(elapsed)));
 
             if !stats_lines.is_empty() {
-                container = container.child(sep());
+                if has_tab_section {
+                    container = container.child(sep());
+                }
                 for (si, line) in stats_lines.iter().enumerate() {
                     container = container.child(
                         div()
@@ -575,7 +663,7 @@ impl Swoop {
 
         // Clipboard section
         container = container
-            .when(has_tab_section, |el| el.child(sep()))
+            .child(sep())
             .child(
                 div()
                     .id("menu-copy")
@@ -725,6 +813,7 @@ impl Swoop {
                     .cursor_pointer()
                     .hover(|s| s.bg(menu_hover))
                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                        this.pref_browser_text = this.browser.borrow().clone().unwrap_or_default();
                         this.show_preferences = true;
                         this.context_menu = None;
                         cx.notify();
@@ -1034,21 +1123,43 @@ impl Swoop {
 
         let ip = api::local_ip();
         let url = format!("http://{}:7890?token={}", ip, self.api_token);
+        let url_for_click = url.clone();
 
         let qr = match qrcode::QrCode::new(url.as_bytes()) {
             Ok(q) => q,
             Err(_) => return None,
         };
-        let matrix = qr.render::<char>()
-            .quiet_zone(true)
-            .module_dimensions(2, 1)
-            .build();
 
         let dialog_bg: Hsla = rgb(0x252526).into();
         let dialog_fg: Hsla = rgb(0xcccccc).into();
         let dialog_border: Hsla = rgb(0x3c3c3c).into();
         let btn_bg: Hsla = rgb(0x0e639c).into();
         let btn_hover: Hsla = rgb(0x1177bb).into();
+        let link_fg: Hsla = rgb(0x3794ff).into();
+
+        let colors = qr.to_colors();
+        let w = qr.width() as usize;
+        let module_size = px(4.0);
+        let mut qr_grid = div()
+            .mt(px(12.0))
+            .bg(gpui::white())
+            .rounded(px(4.0))
+            .p(px(16.0))
+            .flex()
+            .flex_col();
+        for row in 0..w {
+            let mut row_div = div().flex().flex_row();
+            for col in 0..w {
+                let is_dark = colors[row * w + col] == qrcode::Color::Dark;
+                row_div = row_div.child(
+                    div()
+                        .w(module_size)
+                        .h(module_size)
+                        .when(is_dark, |el| el.bg(gpui::black())),
+                );
+            }
+            qr_grid = qr_grid.child(row_div);
+        }
 
         Some(
             div()
@@ -1082,25 +1193,18 @@ impl Swoop {
                                 .text_size(px(15.0))
                                 .child(self.t().scan_to_connect),
                         )
+                        .child(qr_grid)
                         .child(
                             div()
-                                .mt(px(12.0))
-                                .bg(gpui::white())
-                                .rounded(px(4.0))
-                                .p(px(8.0))
-                                .child(
-                                    div()
-                                        .text_color(gpui::black())
-                                        .text_size(px(6.0))
-                                        .font_family("monospace")
-                                        .child(matrix),
-                                ),
-                        )
-                        .child(
-                            div()
+                                .id("qr-url")
                                 .mt(px(8.0))
                                 .text_size(px(11.0))
-                                .text_color(rgb(0x999999))
+                                .text_color(link_fg)
+                                .cursor_pointer()
+                                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev: &MouseDownEvent, _window, _cx| {
+                                    let browser = this.browser.borrow().clone();
+                                    platform::open_url(&url_for_click, browser.as_deref());
+                                }))
                                 .child(url),
                         )
                         .child(
@@ -1137,10 +1241,13 @@ impl Swoop {
         let modal_bg: Hsla = rgb(0x1e1e1e).into();
         let modal_fg: Hsla = rgb(0xcccccc).into();
         let modal_border: Hsla = rgb(0x3c3c3c).into();
+        let input_border: Hsla = rgb(0x007acc).into();
         let btn_bg: Hsla = rgb(0x007acc).into();
         let btn_hover: Hsla = rgb(0x1c8cd9).into();
         let option_bg: Hsla = rgb(0x2d2d2d).into();
         let option_active: Hsla = rgb(0x007acc).into();
+        let placeholder_fg: Hsla = rgb(0x666666).into();
+        let cursor_color: Hsla = rgb(0xcccccc).into();
         let t = self.t();
 
         let mut lang_options = div()
@@ -1167,6 +1274,46 @@ impl Swoop {
                     .child(lang.label()),
             );
         }
+
+        let browser_text = self.pref_browser_text.clone();
+        let browser_input = div()
+            .id("pref-browser-input")
+            .key_context("pref-browser")
+            .track_focus(&self.pref_browser_focus)
+            .mt(px(8.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .bg(rgb(0x141414))
+            .border_1()
+            .border_color(input_border)
+            .rounded(px(3.0))
+            .px(px(8.0))
+            .py(px(4.0))
+            .min_h(px(28.0))
+            .cursor_text()
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev: &MouseDownEvent, window, cx| {
+                this.pref_browser_focus.focus(window);
+                cx.notify();
+            }))
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _window, cx| {
+                match ev.keystroke.key.as_str() {
+                    "backspace" => { this.pref_browser_text.pop(); cx.notify(); }
+                    _ => {
+                        if let Some(ref ch) = ev.keystroke.key_char {
+                            this.pref_browser_text.push_str(ch);
+                            cx.notify();
+                        }
+                    }
+                }
+            }))
+            .when(browser_text.is_empty(), |el| {
+                el.child(div().text_color(placeholder_fg).child(t.browser_placeholder))
+            })
+            .when(!browser_text.is_empty(), |el| {
+                el.child(browser_text)
+                    .child(div().w(px(1.0)).h(px(16.0)).bg(cursor_color))
+            });
 
         Some(
             div()
@@ -1206,6 +1353,12 @@ impl Swoop {
                         )
                         .child(
                             div()
+                                .mt(px(16.0))
+                                .child(t.browser)
+                                .child(browser_input),
+                        )
+                        .child(
+                            div()
                                 .mt(px(20.0))
                                 .flex()
                                 .flex_row()
@@ -1240,7 +1393,16 @@ impl Swoop {
                                                 Lang::En => "en",
                                                 Lang::Fr => "fr",
                                             };
-                                            save_preferences(&platform::state_base_dir(), &Preferences { lang: Some(lang_str.into()) });
+                                            let browser = if this.pref_browser_text.is_empty() {
+                                                None
+                                            } else {
+                                                Some(this.pref_browser_text.clone())
+                                            };
+                                            *this.browser.borrow_mut() = browser.clone();
+                                            save_preferences(&platform::state_base_dir(), &Preferences {
+                                                lang: Some(lang_str.into()),
+                                                browser,
+                                            });
                                             this.show_preferences = false;
                                             cx.notify();
                                         }))
@@ -1340,6 +1502,7 @@ impl Render for Swoop {
             let toast_bg: Hsla = rgb(0x2d2d2d).into();
             let toast_fg: Hsla = rgb(0xcccccc).into();
             let toast_border: Hsla = rgb(0x007acc).into();
+            let link_fg: Hsla = rgb(0x3794ff).into();
             let mut stack = div()
                 .id("toast-stack")
                 .absolute()
@@ -1348,20 +1511,40 @@ impl Render for Swoop {
                 .flex()
                 .flex_col()
                 .gap(px(6.0));
-            for (i, (msg, _)) in self.toasts.iter().enumerate() {
-                stack = stack.child(
-                    div()
-                        .id(SharedString::from(format!("toast-{i}")))
-                        .bg(toast_bg)
-                        .text_color(toast_fg)
-                        .border_1()
-                        .border_color(toast_border)
-                        .rounded(px(6.0))
-                        .px(px(16.0))
-                        .py(px(10.0))
-                        .text_size(px(13.0))
-                        .child(msg.clone()),
-                );
+            for (i, toast) in self.toasts.iter().enumerate() {
+                let path_clone = toast.path.clone();
+                let mut el = div()
+                    .id(SharedString::from(format!("toast-{i}")))
+                    .bg(toast_bg)
+                    .text_color(toast_fg)
+                    .border_1()
+                    .border_color(toast_border)
+                    .rounded(px(6.0))
+                    .px(px(16.0))
+                    .py(px(10.0))
+                    .text_size(px(13.0));
+                if let Some(ref path) = toast.path {
+                    el = el
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(4.0))
+                        .child(format!("{}:", toast.message))
+                        .child(
+                            div()
+                                .text_color(link_fg)
+                                .child(path.display().to_string()),
+                        )
+                        .cursor_pointer()
+                        .on_mouse_down(MouseButton::Left, cx.listener(move |_this, _ev: &MouseDownEvent, _window, _cx| {
+                            if let Some(ref path) = path_clone {
+                                platform::open_path(path);
+                            }
+                        }));
+                } else {
+                    el = el.child(toast.message.clone());
+                }
+                stack = stack.child(el);
             }
             root = root.child(stack);
         }
