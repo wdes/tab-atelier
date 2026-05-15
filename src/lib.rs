@@ -175,6 +175,29 @@ pub fn load_wakatime_key() -> Option<String> {
         .map(|s| s.to_string())
 }
 
+#[derive(Serialize, Deserialize, Default)]
+pub struct Preferences {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lang: Option<String>,
+}
+
+pub fn load_preferences() -> Preferences {
+    let path = dirs_or_default().join("preferences.json");
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|data| serde_json::from_str(&data).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_preferences(prefs: &Preferences) {
+    let dir = dirs_or_default();
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("preferences.json");
+    if let Ok(data) = serde_json::to_string_pretty(prefs) {
+        let _ = std::fs::write(path, data);
+    }
+}
+
 pub fn save_state(state: &SavedState) {
     let dir = dirs_or_default();
     let _ = std::fs::create_dir_all(&dir);
