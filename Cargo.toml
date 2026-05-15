@@ -4,6 +4,29 @@ version = "0.2.0"
 edition = "2024"
 license = "MPL-2.0"
 
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+
+# Pixel math requires constant casting between f32/i32/usize
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+cast_lossless = "allow"
+cast_possible_wrap = "allow"
+# gpui render functions are inherently long
+too_many_lines = "allow"
+# Common in terminal code with grid coordinates
+similar_names = "allow"
+# Swoop state struct
+struct_excessive_bools = "allow"
+# gpui Window/Context are always &mut even when not mutated by our code
+needless_pass_by_ref_mut = "allow"
+
 [dependencies]
 alacritty_terminal = "0.26"
 env_logger = "0.11"
