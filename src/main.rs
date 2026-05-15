@@ -797,13 +797,20 @@ impl AppState {
 
         let pos = menu.position;
         let menu_width = px(150.0);
+        let menu_height_estimate = if matches!(menu.kind, MenuKind::Tab(_)) {
+            px(400.0)
+        } else {
+            px(350.0)
+        };
         let vp = window.viewport_size();
         let x = pos.x.min(vp.width - menu_width);
+        let open_upward = menu.open_upward || pos.y + menu_height_estimate > vp.height;
 
         let mut container = div().id("context-menu").absolute().left(x);
 
-        container = if menu.open_upward {
-            container.bottom(px(0.0))
+        container = if open_upward {
+            let bottom_offset = vp.height - pos.y;
+            container.bottom(bottom_offset)
         } else {
             container.top(pos.y)
         };
@@ -1617,37 +1624,30 @@ impl AppState {
             );
         }
 
-        let opacity_presets: &[(u8, &str)] = &[
-            (255, "100%"),
-            (230, "90%"),
-            (204, "80%"),
-            (184, "72%"),
-            (178, "70%"),
-            (153, "60%"),
-            (128, "50%"),
-        ];
-        let mut opacity_options = div().flex().flex_row().flex_wrap().gap(px(4.0)).mt(px(8.0));
-        for &(val, label) in opacity_presets {
-            let is_active = val == self.opacity;
-            opacity_options = opacity_options.child(
+        let opacity_pct = (self.opacity as f32 / 255.0 * 100.0).round() as u8;
+        let mut opacity_slider = div().flex().flex_row().items_center().gap(px(8.0)).mt(px(8.0));
+        let mut track = div().flex().flex_row().h(px(20.0)).rounded(px(3.0)).overflow_hidden();
+        for i in 0..100u8 {
+            let val = ((i as f32 + 1.0) / 100.0 * 255.0).round() as u8;
+            let filled = val <= self.opacity;
+            track = track.child(
                 div()
-                    .id(SharedString::from(format!("pref-opacity-{val}")))
-                    .px(px(12.0))
-                    .py(px(6.0))
-                    .rounded(px(3.0))
+                    .id(SharedString::from(format!("pref-opacity-{i}")))
+                    .w(px(2.72))
+                    .h_full()
                     .cursor_pointer()
-                    .bg(if is_active { option_active } else { option_bg })
-                    .hover(|s| s.bg(if is_active { option_active } else { btn_hover }))
+                    .bg(if filled { option_active } else { option_bg })
+                    .hover(|s| s.bg(btn_hover))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
                             this.opacity = val;
                             cx.notify();
                         }),
-                    )
-                    .child(label),
+                    ),
             );
         }
+        opacity_slider = opacity_slider.child(track).child(format!("{opacity_pct}%"));
 
         let mut lang_options = div().flex().flex_col().gap(px(4.0)).mt(px(8.0));
 
@@ -1792,7 +1792,7 @@ impl AppState {
                         .on_mouse_down(MouseButton::Left, |_ev: &MouseDownEvent, _window, _cx| {})
                         .child(div().text_size(px(16.0)).mb(px(16.0)).child(t.preferences))
                         .child(div().child(t.theme).child(theme_options))
-                        .child(div().mt(px(16.0)).child(t.opacity).child(opacity_options))
+                        .child(div().mt(px(16.0)).child(t.opacity).child(opacity_slider))
                         .child(div().mt(px(16.0)).child(t.language).child(lang_options))
                         .child(div().mt(px(16.0)).child(t.browser).child(browser_input))
                         .child(div().mt(px(16.0)).child(t.code_editor).child(editor_input))
