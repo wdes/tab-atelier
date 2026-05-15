@@ -605,6 +605,7 @@ impl Render for TerminalView {
                             }
                             return;
                         }
+                        "t" => return,
                         _ => {}
                     }
                 }
