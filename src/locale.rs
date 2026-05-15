@@ -67,6 +67,7 @@ pub struct Strings {
 
     // Screenshots
     pub taking_screenshot: &'static str,
+    pub rendering_screenshot: &'static str,
     pub saved: &'static str,
     pub screenshot_failed: &'static str,
 
@@ -114,6 +115,7 @@ pub static EN: Strings = Strings {
     scan_to_connect: "Scan to connect from your phone",
 
     taking_screenshot: "Taking screenshot...",
+    rendering_screenshot: "Rendering screenshot...",
     saved: "Saved",
     screenshot_failed: "Screenshot failed",
 
@@ -160,6 +162,7 @@ pub static FR: Strings = Strings {
     scan_to_connect: "Scannez pour vous connecter depuis votre téléphone",
 
     taking_screenshot: "Capture en cours...",
+    rendering_screenshot: "Rendu de la capture...",
     saved: "Enregistré",
     screenshot_failed: "Échec de la capture",
 
