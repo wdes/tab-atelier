@@ -3,6 +3,9 @@ name = "tab-atelier"
 version = "0.2.0"
 edition = "2024"
 license = "MPL-2.0"
+description = "Guake-style drop-down terminal emulator for Linux (X11)"
+repository = "https://github.com/wdes/tab-atelier"
+authors = ["William Desportes <williamdes@wdes.fr>"]
 
 [lints.rust]
 unsafe_code = "deny"
@@ -39,3 +42,10 @@ qrcode = { version = "0.14", default-features = false }
 ureq = { version = "3", features = ["json"] }
 vte = { version = "0.15", default-features = false, features = ["std", "ansi"] }
 wattaouille = { git = "https://github.com/wdes/wattaouille.git", rev = "07fcac6" }
+
+[package.metadata.deb]
+section = "x11"
+priority = "optional"
+depends = "libfreetype6, libxkbcommon0, libxkbcommon-x11-0, libxcb1, libxcb-xkb1"
+maintainer = "William Desportes <williamdes@wdes.fr>"
+extended-description = "A Guake-style drop-down terminal emulator built with alacritty_terminal and gpui. Features tabbed terminals, i18n (English/French), power monitoring, screenshots, remote control via QR code, and Wakatime integration."

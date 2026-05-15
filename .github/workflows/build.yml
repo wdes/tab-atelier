@@ -38,13 +38,13 @@ jobs:
               run: cargo fmt -- --check
             - name: Clippy
               run: cargo clippy --all-targets --locked -- -D warnings
-            - name: Build release binary
-              run: cargo build --release --locked
-            - name: Upload release binary
+            - name: Build .deb package
+              run: cargo install cargo-deb && cargo deb --locked
+            - name: Upload .deb package
               uses: actions/upload-artifact@v4
               with:
-                  name: tab-atelier-linux-amd64
-                  path: target/release/tab-atelier
+                  name: tab-atelier-deb
+                  path: target/debian/*.deb
                   retention-days: 5
 
     integration:
@@ -54,20 +54,12 @@ jobs:
         steps:
             - uses: actions/download-artifact@v4
               with:
-                  name: tab-atelier-linux-amd64
-            - name: Run --check before installing deps (expect failure)
-              continue-on-error: true
-              run: |
-                  chmod +x tab-atelier
-                  docker run --rm \
-                      -v "$PWD/tab-atelier:/usr/local/bin/tab-atelier:ro" \
-                      debian:trixie-slim \
-                      tab-atelier --check
-            - name: Run --check after installing deps
+                  name: tab-atelier-deb
+            - name: Install .deb and run --check
               run: |
                   docker run --rm \
-                      -v "$PWD/tab-atelier:/usr/local/bin/tab-atelier:ro" \
+                      -v "$PWD:/debs:ro" \
                       debian:trixie-slim \
-                      sh -c "apt-get update && apt-get install -y --no-install-recommends \
-                          libfreetype6 libxkbcommon0 libxkbcommon-x11-0 libxcb1 libxcb-xkb1 \
+                      sh -c "apt-get update \
+                          && apt-get install -y --no-install-recommends /debs/*.deb \
                           && tab-atelier --check"
