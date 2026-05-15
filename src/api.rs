@@ -40,11 +40,10 @@ pub struct TabSnapshot {
 }
 
 pub fn generate_token() -> String {
+    use std::io::Read;
     let mut buf = [0u8; 16];
-    if let Ok(bytes) = std::fs::read("/dev/urandom") {
-        for (i, b) in bytes.iter().take(16).enumerate() {
-            buf[i] = *b;
-        }
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        let _ = f.read_exact(&mut buf);
     } else {
         let seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
