@@ -74,6 +74,26 @@ struct Toast {
     path: Option<PathBuf>,
 }
 
+#[derive(Clone)]
+struct DraggedTab {
+    idx: usize,
+    name: String,
+}
+
+impl Render for DraggedTab {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px(px(12.0))
+            .py(px(4.0))
+            .bg(rgb(0x2d_2d2d))
+            .text_color(rgb(0xcc_cccc))
+            .text_size(px(13.0))
+            .rounded(px(4.0))
+            .opacity(0.8)
+            .child(self.name.clone())
+    }
+}
+
 struct ExitConfirm {
     tab_idx: usize,
 }
@@ -83,6 +103,7 @@ struct Swoop {
     active: usize,
     context_menu: Option<ContextMenu>,
     renaming: Option<(usize, String)>,
+    rename_select_all: bool,
     rename_focus: FocusHandle,
     visible: bool,
     windowed: bool,
@@ -260,6 +281,7 @@ impl Swoop {
             active,
             context_menu: None,
             renaming: None,
+            rename_select_all: false,
             rename_focus,
             visible: true,
             windowed: false,
@@ -308,6 +330,29 @@ impl Swoop {
         cx.notify();
     }
 
+    fn move_tab(&mut self, from: usize, to: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if from == to || from >= self.tabs.len() || to >= self.tabs.len() {
+            return;
+        }
+        let tab = self.tabs.remove(from);
+        let new_to = if from < to { to - 1 } else { to };
+        self.tabs.insert(new_to, tab);
+        self.active = if self.active == from {
+            new_to
+        } else {
+            let mut a = self.active;
+            if from < a {
+                a -= 1;
+            }
+            if new_to <= a {
+                a += 1;
+            }
+            a
+        };
+        self.tabs[self.active].view.read(cx).focus_handle(cx).focus(window);
+        cx.notify();
+    }
+
     fn close_tab(&mut self, idx: usize, cx: &mut Context<Self>) {
         if self.tabs.len() <= 1 {
             return;
@@ -329,6 +374,19 @@ impl Swoop {
     }
 
     fn persist(&mut self, cx: &mut Context<Self>) {
+        if self.visible {
+            let tab = &mut self.tabs[self.active];
+            let idle = tab
+                .view
+                .read(cx)
+                .last_input_time()
+                .is_none_or(|t| t.elapsed().as_secs() >= 30);
+            if idle && tab.last_activated.is_some() {
+                tab.deactivate();
+            } else if !idle && tab.last_activated.is_none() {
+                tab.activate();
+            }
+        }
         {
             let watts = self.power_watts.lock().unwrap();
             for (i, tab) in self.tabs.iter_mut().enumerate() {
@@ -566,6 +624,7 @@ impl Swoop {
 
             let power_label = watts.get(i).map(power::TabPower::label).unwrap_or_default();
 
+            let drag_name = tab.name.clone();
             let tab_el = div()
                 .id(ElementId::Name(format!("tab-{i}").into()))
                 .flex()
@@ -584,12 +643,19 @@ impl Swoop {
                 .text_color(tab_fg)
                 .text_size(px(13.0))
                 .cursor_pointer()
-                .on_click(cx.listener(move |this, _ev: &ClickEvent, window, cx| {
-                    this.tabs[this.active].deactivate();
-                    this.active = i;
-                    this.tabs[i].activate();
-                    this.context_menu = None;
-                    this.tabs[i].view.read(cx).focus_handle(cx).focus(window);
+                .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
+                    if ev.click_count() == 2 {
+                        let name = this.tabs[i].name.clone();
+                        this.renaming = Some((i, name));
+                        this.rename_select_all = true;
+                        this.rename_focus.focus(window);
+                    } else {
+                        this.tabs[this.active].deactivate();
+                        this.active = i;
+                        this.tabs[i].activate();
+                        this.context_menu = None;
+                        this.tabs[i].view.read(cx).focus_handle(cx).focus(window);
+                    }
                     cx.notify();
                 }))
                 .on_mouse_down(
@@ -603,6 +669,27 @@ impl Swoop {
                         cx.notify();
                     }),
                 )
+                .on_drag(
+                    DraggedTab {
+                        idx: i,
+                        name: drag_name,
+                    },
+                    |tab, _offset, _window, cx| cx.new(|_| tab.clone()),
+                )
+                .drag_over::<DraggedTab>(move |style, dragged, _window, _cx| {
+                    if dragged.idx == i {
+                        return style;
+                    }
+                    let s = style.bg(rgb(0x09_4771));
+                    if i < dragged.idx {
+                        s.border_l_2()
+                    } else {
+                        s.border_r_2()
+                    }
+                })
+                .on_drop(cx.listener(move |this, dragged: &DraggedTab, window, cx| {
+                    this.move_tab(dragged.idx, i, window, cx);
+                }))
                 .child(name)
                 .when(!power_label.is_empty(), |el: Stateful<Div>| {
                     el.child(
@@ -682,6 +769,7 @@ impl Swoop {
                         cx.listener(move |this, _ev: &MouseDownEvent, window, cx| {
                             let name = this.tabs[idx].name.clone();
                             this.renaming = Some((idx, name));
+                            this.rename_select_all = true;
                             this.context_menu = None;
                             this.rename_focus.focus(window);
                             cx.notify();
@@ -1007,23 +1095,34 @@ impl Swoop {
                                         this.tabs[i].name = text.clone();
                                     }
                                     this.renaming = None;
+                                    this.rename_select_all = false;
                                     this.tabs[this.active].view.read(cx).focus_handle(cx).focus(window);
                                     cx.notify();
                                 }
                                 "escape" => {
                                     this.renaming = None;
+                                    this.rename_select_all = false;
                                     this.tabs[this.active].view.read(cx).focus_handle(cx).focus(window);
                                     cx.notify();
                                 }
                                 "backspace" => {
                                     if let Some((_, ref mut text)) = this.renaming {
-                                        text.pop();
+                                        if this.rename_select_all {
+                                            text.clear();
+                                            this.rename_select_all = false;
+                                        } else {
+                                            text.pop();
+                                        }
                                     }
                                     cx.notify();
                                 }
                                 _ => {
                                     if let Some(ref ch) = ev.keystroke.key_char {
                                         if let Some((_, ref mut text)) = this.renaming {
+                                            if this.rename_select_all {
+                                                text.clear();
+                                                this.rename_select_all = false;
+                                            }
                                             text.push_str(ch);
                                         }
                                         cx.notify();
@@ -1046,8 +1145,12 @@ impl Swoop {
                                 .py(px(4.0))
                                 .min_h(px(28.0))
                                 .cursor_text()
-                                .child(text)
-                                .child(div().w(px(1.0)).h(px(16.0)).bg(cursor_color)),
+                                .when(self.rename_select_all, |el| {
+                                    el.child(div().bg(rgb(0x26_4f78)).px(px(2.0)).child(text.clone()))
+                                })
+                                .when(!self.rename_select_all, |el| {
+                                    el.child(text).child(div().w(px(1.0)).h(px(16.0)).bg(cursor_color))
+                                }),
                         ),
                 ),
         )
@@ -1670,6 +1773,16 @@ impl Render for Swoop {
             .bg(bg_color)
             .flex()
             .flex_col()
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                let ks = &ev.keystroke;
+                if ks.modifiers.alt && ks.key.as_str() == "tab" {
+                    this.tabs[this.active].deactivate();
+                    this.active = (this.active + 1) % this.tabs.len();
+                    this.tabs[this.active].activate();
+                    this.tabs[this.active].view.read(cx).focus_handle(cx).focus(window);
+                    cx.notify();
+                }
+            }))
             .child(
                 div()
                     .id("terminal-area")
@@ -1904,8 +2017,10 @@ fn spawn_hotkey_listener(window_handle: WindowHandle<Swoop>, cx: &mut App) {
                     let _ = window_handle.update(cx, |state, window, _cx| {
                         state.visible = !state.visible;
                         if state.visible {
+                            state.tabs[state.active].activate();
                             window.activate_window();
                         } else {
+                            state.tabs[state.active].deactivate();
                             window.minimize_window();
                         }
                     });
