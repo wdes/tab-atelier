@@ -87,6 +87,8 @@ Tab Atelier persists session state (tab names, working directories, terminal out
 
 On Intel systems with readable RAPL counters, each tab shows its estimated power usage in the right-click context menu. The estimate uses the same technique as [wattaouille](https://github.com/wdes/wattaouille): `per-tab watts = package watts * (tab CPU jiffies / total system jiffies)`. See wattaouille's README for how to make RAPL readable (`chmod` or udev rule). When RAPL is not available, only CPU percentage is shown.
 
+**What are jiffies?** Jiffies are the Linux kernel's internal time-keeping unit — a counter that increments at a fixed rate (typically 100, 250, or 1000 Hz depending on `CONFIG_HZ`). Each tick, the kernel records CPU time consumed by every process. Per-process jiffies are read from `/proc/[pid]/stat` and total system jiffies from `/proc/stat`. The ratio between them gives the fraction of CPU a tab's shell used, which is multiplied by package power (from Intel RAPL) to estimate per-tab wattage.
+
 ## HTTP API
 
 Tab Atelier exposes tab state on `http://<local-ip>:7890` as JSON. Access requires a bearer token, shown via a QR code in the right-click menu ("Remote control"). The response includes tab names, working directories, active tab index, and per-tab power stats. Tabs can be closed remotely via `DELETE /tabs/{index}`.
