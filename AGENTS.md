@@ -9,7 +9,7 @@ Tab Atelier is a Guake-style drop-down terminal emulator for Linux (X11), built 
 ## Architecture
 
 - `src/lib.rs` — shared types (TabState, Preferences, FontConfig), state persistence, URL detection
-- `src/main.rs` — application entry, tab management (Swoop struct), UI rendering via gpui
+- `src/main.rs` — application entry, tab management (AppState struct), UI rendering via gpui
 - `src/terminal.rs` — terminal emulator view (TerminalView), PTY management, grid rendering
 - `src/terminal_utils.rs` — color conversion, keystroke mapping, ANSI color tables
 - `src/locale.rs` — i18n with English/French translations

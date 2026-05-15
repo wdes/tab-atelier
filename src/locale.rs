@@ -73,6 +73,7 @@ pub struct Strings {
 
     // Preferences
     pub theme: &'static str,
+    pub opacity: &'static str,
     pub language: &'static str,
     pub browser: &'static str,
     pub browser_placeholder: &'static str,
@@ -125,6 +126,7 @@ pub static EN: Strings = Strings {
     screenshot_failed: "Screenshot failed",
 
     theme: "Theme",
+    opacity: "Opacity",
     language: "Language",
     browser: "Browser",
     browser_placeholder: "xdg-open (system default)",
@@ -177,6 +179,7 @@ pub static FR: Strings = Strings {
     screenshot_failed: "Échec de la capture",
 
     theme: "Thème",
+    opacity: "Opacité",
     language: "Langue",
     browser: "Navigateur",
     browser_placeholder: "xdg-open (par défaut)",
