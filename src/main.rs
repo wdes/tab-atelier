@@ -679,9 +679,12 @@ impl Swoop {
             let mut stats_lines: Vec<String> = Vec::new();
 
             if let Some(ref p) = power_info {
-                stats_lines.push(format!("{}: {}", t.cpu, p.cpu_label()));
-                if p.watts.is_some() {
-                    stats_lines.push(format!("{}: {}", t.power, p.label()));
+                if p.cpu_percent >= 0.1 {
+                    stats_lines.push(format!("{}: {}", t.cpu, p.cpu_label()));
+                }
+                let wl = p.watts_label();
+                if !wl.is_empty() {
+                    stats_lines.push(format!("{}: {wl}", t.power));
                 }
             }
             let wh = self.tabs[stats_idx].energy_wh;
