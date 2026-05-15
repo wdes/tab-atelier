@@ -6247,8 +6247,9 @@ dependencies = [
 
 [[package]]
 name = "wattaouille"
-version = "1.3.5"
-source = "git+https://github.com/wdes/wattaouille.git?rev=07fcac6#07fcac635bfe92fcd974147fd4c52c4a2d2f0b15"
+version = "1.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d8798d0effceace2bb1cf512ab5a11378d36e2dc691e90c922cbb3d46521ed74"
 dependencies = [
  "ctrlc",
  "libc",

@@ -23,11 +23,12 @@ impl TabPower {
             } else if w >= 0.01 {
                 return format!("{:.0}mW", w * 1000.0);
             }
+            return "0W".into();
         }
         if self.cpu_percent >= 0.1 {
             return self.cpu_label();
         }
-        String::new()
+        "0%".into()
     }
 
     pub fn cpu_label(&self) -> String {
@@ -210,21 +211,21 @@ mod tests {
     }
 
     #[test]
-    fn label_shows_percent_when_watts_tiny() {
+    fn label_shows_zero_watts_when_tiny() {
         let tp = TabPower {
             cpu_percent: 0.5,
             watts: Some(0.001),
         };
-        assert_eq!(tp.label(), "0.5%");
+        assert_eq!(tp.label(), "0W");
     }
 
     #[test]
-    fn label_empty_when_idle() {
+    fn label_shows_zero_when_idle() {
         let tp = TabPower {
             cpu_percent: 0.0,
             watts: None,
         };
-        assert_eq!(tp.label(), "");
+        assert_eq!(tp.label(), "0%");
     }
 
     #[test]
