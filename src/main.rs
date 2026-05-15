@@ -56,6 +56,7 @@ struct Swoop {
     api_state: Arc<Mutex<api::TabSnapshot>>,
     power_pids: Arc<Mutex<Vec<u32>>>,
     power_watts: Arc<Mutex<Vec<power::TabPower>>>,
+    toast: Option<(String, std::time::Instant)>,
 }
 
 impl Swoop {
@@ -164,6 +165,7 @@ impl Swoop {
             api_state,
             power_pids,
             power_watts,
+            toast: None,
         }
     }
 
@@ -310,6 +312,30 @@ impl Swoop {
             tab.view.read(cx).shutdown();
         }
         cx.quit();
+    }
+
+    fn do_screenshot(&mut self, full: bool, cx: &mut Context<Self>) {
+        let result = if full {
+            screenshot::take_screenshot_full()
+        } else {
+            screenshot::take_screenshot_tab(32)
+        };
+        let msg = match result {
+            Ok(path) => format!("Saved: {}", path.display()),
+            Err(e) => format!("Screenshot failed: {e}"),
+        };
+        self.toast = Some((msg, std::time::Instant::now()));
+        cx.notify();
+        cx.spawn(async |this: WeakEntity<Swoop>, cx: &mut AsyncApp| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(3))
+                .await;
+            let _ = this.update(cx, |state, cx| {
+                state.toast = None;
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn render_tab_bar(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Div {
@@ -585,8 +611,7 @@ impl Swoop {
                     .hover(|s| s.bg(menu_hover))
                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
                         this.context_menu = None;
-                        cx.notify();
-                        screenshot::take_screenshot(false);
+                        this.do_screenshot(false, cx);
                     }))
                     .child("Screenshot tab"),
             )
@@ -599,8 +624,7 @@ impl Swoop {
                     .hover(|s| s.bg(menu_hover))
                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
                         this.context_menu = None;
-                        cx.notify();
-                        screenshot::take_screenshot(true);
+                        this.do_screenshot(true, cx);
                     }))
                     .child("Screenshot app"),
             )
@@ -1121,6 +1145,28 @@ impl Render for Swoop {
 
         if let Some(qr) = self.render_qr_modal(cx) {
             root = root.child(qr);
+        }
+
+        if let Some((ref msg, _)) = self.toast {
+            let toast_bg: Hsla = rgb(0x2d2d2d).into();
+            let toast_fg: Hsla = rgb(0xcccccc).into();
+            let toast_border: Hsla = rgb(0x007acc).into();
+            root = root.child(
+                div()
+                    .id("toast")
+                    .absolute()
+                    .bottom(px(48.0))
+                    .right(px(16.0))
+                    .bg(toast_bg)
+                    .text_color(toast_fg)
+                    .border_1()
+                    .border_color(toast_border)
+                    .rounded(px(6.0))
+                    .px(px(16.0))
+                    .py(px(10.0))
+                    .text_size(px(13.0))
+                    .child(msg.clone()),
+            );
         }
 
         root
