@@ -27,8 +27,8 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use tab_atelier::{
-    FontConfig, Preferences, SavedState, TabState, load_font_config, load_preferences, load_state_from,
-    load_wakatime_key, save_preferences, save_state,
+    DEFAULT_HOTKEYS, FontConfig, HOTKEY_OPTIONS, Preferences, SavedState, TabState, hotkey_keycodes, load_font_config,
+    load_preferences, load_state_from, load_wakatime_key, save_preferences, save_state,
 };
 use terminal::TerminalView;
 use theme::ThemeName;
@@ -131,6 +131,7 @@ struct AppState {
     lang: Lang,
     theme_name: ThemeName,
     opacity: u8,
+    hotkeys: Vec<String>,
     show_preferences: bool,
     browser: Rc<RefCell<Option<String>>>,
     code_editor: Rc<RefCell<Option<String>>>,
@@ -164,6 +165,11 @@ impl AppState {
         };
         let theme_name = prefs.theme.as_deref().and_then(ThemeName::from_id).unwrap_or_default();
         let opacity = prefs.opacity.unwrap_or(0xb8);
+        let hotkeys = if prefs.hotkeys.is_empty() {
+            DEFAULT_HOTKEYS.iter().map(|s| (*s).to_string()).collect()
+        } else {
+            prefs.hotkeys
+        };
 
         let (tabs, active) = if let Some(saved) = load_state_from(&platform::state_base_dir()) {
             info!("restoring {} tab(s) from saved state", saved.tabs.len());
@@ -341,6 +347,7 @@ impl AppState {
             lang,
             theme_name,
             opacity,
+            hotkeys,
             show_preferences: false,
             browser,
             code_editor,
@@ -1701,6 +1708,36 @@ impl AppState {
         }
         opacity_slider = opacity_slider.child(track).child(format!("{opacity_pct}%"));
 
+        let mut hotkey_options = div().flex().flex_row().flex_wrap().gap(px(4.0)).mt(px(8.0));
+        for hk in HOTKEY_OPTIONS {
+            let is_active = self.hotkeys.iter().any(|id| id == hk.id);
+            let hk_id = hk.id;
+            hotkey_options = hotkey_options.child(
+                div()
+                    .id(SharedString::from(format!("pref-hk-{}", hk.id)))
+                    .px(px(12.0))
+                    .py(px(6.0))
+                    .rounded(px(3.0))
+                    .cursor_pointer()
+                    .bg(if is_active { option_active } else { option_bg })
+                    .hover(|s| s.bg(if is_active { option_active } else { btn_hover }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                            if let Some(pos) = this.hotkeys.iter().position(|id| id == hk_id) {
+                                if this.hotkeys.len() > 1 {
+                                    this.hotkeys.remove(pos);
+                                }
+                            } else {
+                                this.hotkeys.push(hk_id.to_string());
+                            }
+                            cx.notify();
+                        }),
+                    )
+                    .child(hk.label),
+            );
+        }
+
         let mut lang_options = div().flex().flex_col().gap(px(4.0)).mt(px(8.0));
 
         for &lang in Lang::ALL {
@@ -1845,6 +1882,7 @@ impl AppState {
                         .child(div().text_size(px(16.0)).mb(px(16.0)).child(t.preferences))
                         .child(div().child(t.theme).child(theme_options))
                         .child(div().mt(px(16.0)).child(t.opacity).child(opacity_slider))
+                        .child(div().mt(px(16.0)).child(t.toggle_hotkeys).child(hotkey_options))
                         .child(div().mt(px(16.0)).child(t.language).child(lang_options))
                         .child(div().mt(px(16.0)).child(t.browser).child(browser_input))
                         .child(div().mt(px(16.0)).child(t.code_editor).child(editor_input))
@@ -1907,6 +1945,7 @@ impl AppState {
                                                         lang: Some(lang_str.into()),
                                                         theme: Some(this.theme_name.id().into()),
                                                         opacity: Some(this.opacity),
+                                                        hotkeys: this.hotkeys.clone(),
                                                         browser,
                                                         code_editor: editor,
                                                     },
@@ -2178,6 +2217,14 @@ fn main() {
 
     info!("starting Tab Atelier v{}", env!("CARGO_PKG_VERSION"));
     Application::new().run(|cx: &mut App| {
+        let prefs = load_preferences(&platform::state_base_dir());
+        let hotkey_ids: Vec<String> = if prefs.hotkeys.is_empty() {
+            DEFAULT_HOTKEYS.iter().map(|s| (*s).to_string()).collect()
+        } else {
+            prefs.hotkeys
+        };
+        let keycodes = hotkey_keycodes(&hotkey_ids);
+
         let window_handle = cx
             .open_window(
                 WindowOptions {
@@ -2192,14 +2239,14 @@ fn main() {
             )
             .unwrap();
 
-        spawn_hotkey_listener(window_handle, cx);
+        spawn_hotkey_listener(&keycodes, window_handle, cx);
     });
 }
 
-fn spawn_hotkey_listener(window_handle: WindowHandle<AppState>, cx: &mut App) {
+fn spawn_hotkey_listener(keycodes: &[u8], window_handle: WindowHandle<AppState>, cx: &mut App) {
     let (tx, rx) = std::sync::mpsc::channel::<()>();
 
-    platform::grab_hotkeys(move || {
+    platform::grab_hotkeys(keycodes, move || {
         let _ = tx.send(());
     });
 

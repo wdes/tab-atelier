@@ -170,10 +170,56 @@ pub struct Preferences {
     pub theme: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opacity: Option<u8>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hotkeys: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_editor: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Hotkey {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub keycode: u8,
+}
+
+pub static HOTKEY_OPTIONS: &[Hotkey] = &[
+    Hotkey {
+        id: "grave",
+        label: "` (Grave)",
+        keycode: 49,
+    },
+    Hotkey {
+        id: "f12",
+        label: "F12",
+        keycode: 96,
+    },
+    Hotkey {
+        id: "f11",
+        label: "F11",
+        keycode: 95,
+    },
+    Hotkey {
+        id: "f1",
+        label: "F1",
+        keycode: 67,
+    },
+    Hotkey {
+        id: "xf86calculator",
+        label: "XF86Calculator",
+        keycode: 148,
+    },
+];
+
+pub static DEFAULT_HOTKEYS: &[&str] = &["grave", "xf86calculator"];
+
+#[must_use]
+pub fn hotkey_keycodes(ids: &[String]) -> Vec<u8> {
+    ids.iter()
+        .filter_map(|id| HOTKEY_OPTIONS.iter().find(|h| h.id == id).map(|h| h.keycode))
+        .collect()
 }
 
 #[must_use]

@@ -162,7 +162,7 @@ pub fn open_path(path: &std::path::Path, editor: Option<&str>) {
 
 // --- Hotkeys (X11) ---
 
-pub fn grab_hotkeys<F>(on_press: F)
+pub fn grab_hotkeys<F>(keycodes: &[u8], on_press: F)
 where
     F: Fn() + Send + 'static,
 {
@@ -174,9 +174,8 @@ where
 
     let screen = &conn.setup().roots[screen_num];
     let root = screen.root;
-    let hotkeys: &[u8] = &[148, 49]; // XF86Calculator, œ
 
-    for &keycode in hotkeys {
+    for &keycode in keycodes {
         for mask in [
             ModMask::default(),
             ModMask::LOCK,
