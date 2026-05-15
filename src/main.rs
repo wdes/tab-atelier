@@ -440,10 +440,14 @@ impl Swoop {
             .map(|tab| {
                 let pid = tab.view.read(cx).pid();
                 let cwd = platform::process_cwd(pid).map(|p| p.to_string_lossy().into_owned());
+                let output = {
+                    let text = tab.view.read(cx).copy_all_history();
+                    if text.is_empty() { None } else { Some(text) }
+                };
                 TabState {
                     name: tab.name.clone(),
                     cwd,
-                    output: None,
+                    output,
                     uptime_secs: Some(tab.uptime().as_secs_f64()),
                     energy_wh: if tab.energy_wh > 0.0 { Some(tab.energy_wh) } else { None },
                 }
