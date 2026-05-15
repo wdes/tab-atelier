@@ -105,7 +105,7 @@ pub static EN: Strings = Strings {
     cpu: "CPU",
     power: "Power",
     energy: "Energy",
-    uptime: "Uptime",
+    uptime: "Active time",
 
     rename_tab: "Rename tab:",
 
@@ -156,7 +156,7 @@ pub static FR: Strings = Strings {
     cpu: "CPU",
     power: "Puissance",
     energy: "Énergie",
-    uptime: "Durée",
+    uptime: "Temps actif",
 
     rename_tab: "Renommer l'onglet :",
 
