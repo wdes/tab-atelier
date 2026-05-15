@@ -17,9 +17,8 @@ use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point as GridPoint, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 
-use crate::terminal_utils::{
-    DEFAULT_BG, DEFAULT_FG, color_to_hsla, hsla_eq, is_default_bg, is_default_fg, keystroke_to_bytes,
-};
+use crate::terminal_utils::{hsla_eq, is_default_bg, is_default_fg, keystroke_to_bytes};
+use crate::theme::{self, ThemeName};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags as CellFlags;
 use alacritty_terminal::term::{Config, Term, TermMode};
@@ -29,7 +28,7 @@ use gpui::{
     Focusable, FontStyle, FontWeight, GlobalElementId, Hsla, InspectorElementId, InteractiveElement, IntoElement,
     KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement,
     Pixels, Render, Rgba, ScrollWheelEvent, ShapedLine, Size, StrikethroughStyle, Style, Styled, TextRun,
-    UnderlineStyle, WeakEntity, Window, div, fill, font, point, px, relative, rgb, size,
+    UnderlineStyle, WeakEntity, Window, div, fill, font, point, px, relative, size,
 };
 use tab_atelier::{FontConfig, detect_urls, file_path_for_open};
 use vte::ansi::{Color, NamedColor};
@@ -85,6 +84,7 @@ pub struct TerminalView {
     exited: Rc<Cell<bool>>,
     scrollbar_dragging: Rc<Cell<bool>>,
     scroll_acc: Rc<Cell<f32>>,
+    pub theme: ThemeName,
     font_config: FontConfig,
     browser: Rc<RefCell<Option<String>>>,
     code_editor: Rc<RefCell<Option<String>>>,
@@ -181,6 +181,7 @@ impl TerminalView {
             exited,
             scrollbar_dragging: Rc::new(Cell::new(false)),
             scroll_acc: Rc::new(Cell::new(0.0)),
+            theme: ThemeName::default(),
             font_config,
             browser,
             code_editor,
@@ -781,6 +782,7 @@ impl Render for TerminalView {
                 content_origin: self.content_origin.clone(),
                 bounds_size: self.bounds_size.clone(),
                 line_cache: self.line_cache.clone(),
+                theme: self.theme,
                 font_config: self.font_config.clone(),
                 detected_urls: self.detected_urls.clone(),
                 hover_grid: self.hover_grid.clone(),
@@ -802,6 +804,7 @@ struct TerminalElement {
     content_origin: Rc<Cell<gpui::Point<Pixels>>>,
     bounds_size: Rc<Cell<Size<Pixels>>>,
     line_cache: Rc<RefCell<HashMap<i32, CachedLine>>>,
+    theme: ThemeName,
     font_config: FontConfig,
     detected_urls: Rc<RefCell<Vec<DetectedUrl>>>,
     hover_grid: Rc<Cell<Option<(usize, usize)>>>,
@@ -932,7 +935,8 @@ impl Element for TerminalElement {
         let mut mono_font = font(self.font_config.family.clone());
         mono_font.weight = FontWeight(self.font_config.weight as f32);
         let font_size = px(self.font_config.size);
-        let fg_default: Hsla = rgb(DEFAULT_FG).into();
+        let t = theme::theme(self.theme);
+        let fg_default = t.term_fg_hsla();
 
         // Phase 1: read cell data under the lock — no shaping here.
 
@@ -965,7 +969,7 @@ impl Element for TerminalElement {
                     let mut fg = if is_default_fg(cell_data.fg) {
                         fg_default
                     } else {
-                        color_to_hsla(cell_data.fg)
+                        t.color_to_hsla(cell_data.fg)
                     };
 
                     let mut font_weight = FontWeight(self.font_config.weight as f32);
@@ -994,9 +998,9 @@ impl Element for TerminalElement {
                     }
                     if cell_data.flags.contains(CellFlags::INVERSE) {
                         let bg_c = if is_default_bg(cell_data.bg) {
-                            rgb(DEFAULT_BG).into()
+                            t.term_bg_hsla()
                         } else {
-                            color_to_hsla(cell_data.bg)
+                            t.color_to_hsla(cell_data.bg)
                         };
                         let old_fg = fg;
                         fg = bg_c;
@@ -1018,7 +1022,7 @@ impl Element for TerminalElement {
                             });
                         }
                     } else if !is_default_bg(cell_data.bg) {
-                        let bg_c = color_to_hsla(cell_data.bg);
+                        let bg_c = t.color_to_hsla(cell_data.bg);
                         if let Some(last) = bg_runs.last_mut() {
                             if last.col + last.len == c && hsla_eq(last.color, bg_c) {
                                 last.len += 1;

@@ -72,6 +72,7 @@ pub struct Strings {
     pub screenshot_failed: &'static str,
 
     // Preferences
+    pub theme: &'static str,
     pub language: &'static str,
     pub browser: &'static str,
     pub browser_placeholder: &'static str,
@@ -123,6 +124,7 @@ pub static EN: Strings = Strings {
     saved: "Saved",
     screenshot_failed: "Screenshot failed",
 
+    theme: "Theme",
     language: "Language",
     browser: "Browser",
     browser_placeholder: "xdg-open (system default)",
@@ -174,6 +176,7 @@ pub static FR: Strings = Strings {
     saved: "Enregistré",
     screenshot_failed: "Échec de la capture",
 
+    theme: "Thème",
     language: "Langue",
     browser: "Navigateur",
     browser_placeholder: "xdg-open (par défaut)",

@@ -167,6 +167,8 @@ pub struct Preferences {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lang: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_editor: Option<String>,
