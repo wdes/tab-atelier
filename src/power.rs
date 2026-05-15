@@ -15,19 +15,20 @@ pub struct TabPower {
 
 impl TabPower {
     pub fn label(&self) -> String {
-        if let Some(w) = self.watts {
-            if w >= 100.0 {
-                format!("{:.0}W", w)
-            } else if w >= 1.0 {
-                format!("{:.1}W", w)
-            } else if w >= 0.01 {
-                format!("{:.0}mW", w * 1000.0)
-            } else {
-                self.cpu_label()
-            }
-        } else {
-            self.cpu_label()
-        }
+        self.watts.map_or_else(
+            || self.cpu_label(),
+            |w| {
+                if w >= 100.0 {
+                    format!("{w:.0}W")
+                } else if w >= 1.0 {
+                    format!("{w:.1}W")
+                } else if w >= 0.01 {
+                    format!("{:.0}mW", w * 1000.0)
+                } else {
+                    self.cpu_label()
+                }
+            },
+        )
     }
 
     pub fn cpu_label(&self) -> String {
@@ -55,16 +56,21 @@ impl PowerMonitor {
     pub fn new() -> Self {
         let sensor = PowerSensor::detect(false);
         let cpus = num_cpus().max(1);
-        info!("power monitor: {} CPUs, RAPL {}", cpus, if sensor.enabled { "available" } else { "unavailable" });
-        Self { sensor, cpus, prev: None }
+        info!(
+            "power monitor: {} CPUs, RAPL {}",
+            cpus,
+            if sensor.enabled { "available" } else { "unavailable" }
+        );
+        Self {
+            sensor,
+            cpus,
+            prev: None,
+        }
     }
 
     pub fn sample(&mut self, tab_pids: &[u32], interval_secs: f64) -> Vec<TabPower> {
         let cur_total = total_cpu_jiffies();
-        let per_tab_jiffies: Vec<u64> = tab_pids
-            .iter()
-            .map(|&pid| sum_tree_jiffies(pid))
-            .collect();
+        let per_tab_jiffies: Vec<u64> = tab_pids.iter().map(|&pid| sum_tree_jiffies(pid)).collect();
         let energy_uj = self.sensor.read_uj();
 
         let result = if let Some(ref prev) = self.prev {
@@ -108,10 +114,7 @@ impl PowerMonitor {
     }
 }
 
-pub fn start_power_monitor(
-    tab_pids: Arc<Mutex<Vec<u32>>>,
-    results: Arc<Mutex<Vec<TabPower>>>,
-) {
+pub fn start_power_monitor(tab_pids: Arc<Mutex<Vec<u32>>>, results: Arc<Mutex<Vec<TabPower>>>) {
     std::thread::spawn(move || {
         let mut monitor = PowerMonitor::new();
         let interval = std::time::Duration::from_secs(2);
@@ -146,25 +149,37 @@ mod tests {
 
     #[test]
     fn label_shows_percent_without_rapl() {
-        let tp = TabPower { cpu_percent: 12.3, watts: None };
+        let tp = TabPower {
+            cpu_percent: 12.3,
+            watts: None,
+        };
         assert_eq!(tp.label(), "12.3%");
     }
 
     #[test]
     fn label_shows_watts_when_high() {
-        let tp = TabPower { cpu_percent: 50.0, watts: Some(3.5) };
+        let tp = TabPower {
+            cpu_percent: 50.0,
+            watts: Some(3.5),
+        };
         assert_eq!(tp.label(), "3.5W");
     }
 
     #[test]
     fn label_shows_milliwatts() {
-        let tp = TabPower { cpu_percent: 1.0, watts: Some(0.05) };
+        let tp = TabPower {
+            cpu_percent: 1.0,
+            watts: Some(0.05),
+        };
         assert_eq!(tp.label(), "50mW");
     }
 
     #[test]
     fn label_shows_percent_when_watts_tiny() {
-        let tp = TabPower { cpu_percent: 0.5, watts: Some(0.001) };
+        let tp = TabPower {
+            cpu_percent: 0.5,
+            watts: Some(0.001),
+        };
         assert_eq!(tp.label(), "0.5%");
     }
 }

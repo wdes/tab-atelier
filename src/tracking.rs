@@ -10,7 +10,11 @@ use log::{debug, warn};
 
 const DEBOUNCE_SECS: u64 = 2;
 
-pub const USER_AGENT: &str = concat!("tab-atelier/", env!("CARGO_PKG_VERSION"), " (terminal; +https://github.com/wdes/tab-atelier)");
+pub const USER_AGENT: &str = concat!(
+    "tab-atelier/",
+    env!("CARGO_PKG_VERSION"),
+    " (terminal; +https://github.com/wdes/tab-atelier)"
+);
 
 pub enum HeartbeatEvent {
     Activity { cwd: Option<PathBuf> },
@@ -39,8 +43,8 @@ impl WakatimeTracker {
                 }
 
                 last_sent = now;
-                last_project = project.clone();
-                debug!("wakatime: heartbeat project={:?}", project);
+                last_project.clone_from(&project);
+                debug!("wakatime: heartbeat project={project:?}");
                 if let Err(e) = send_heartbeat(&api_key, now, project.as_deref()) {
                     warn!("{e}");
                 }

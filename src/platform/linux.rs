@@ -13,21 +13,23 @@ use crate::platform::CapturedImage;
 // --- Directories ---
 
 pub fn state_base_dir() -> PathBuf {
-    std::env::var("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
+    std::env::var("XDG_STATE_HOME").map_or_else(
+        |_| {
             let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
             PathBuf::from(home).join(".local/state")
-        })
+        },
+        PathBuf::from,
+    )
 }
 
 pub fn config_dir() -> PathBuf {
-    std::env::var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
+    std::env::var("XDG_CONFIG_HOME").map_or_else(
+        |_| {
             let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
             PathBuf::from(home).join(".config")
-        })
+        },
+        PathBuf::from,
+    )
 }
 
 pub fn pictures_dir() -> PathBuf {
@@ -79,39 +81,55 @@ pub fn capture_focused_window() -> Result<CapturedImage, String> {
     let screen = &conn.setup().roots[screen_num];
     let root = screen.root;
 
-    let focus = conn.get_input_focus().map_err(|e| format!("get_input_focus: {e}"))?
-        .reply().map_err(|e| format!("get_input_focus reply: {e}"))?;
+    let focus = conn
+        .get_input_focus()
+        .map_err(|e| format!("get_input_focus: {e}"))?
+        .reply()
+        .map_err(|e| format!("get_input_focus reply: {e}"))?;
 
     let mut window = focus.focus;
     loop {
-        let tree = conn.query_tree(window).map_err(|e| format!("query_tree: {e}"))?
-            .reply().map_err(|e| format!("query_tree reply: {e}"))?;
+        let tree = conn
+            .query_tree(window)
+            .map_err(|e| format!("query_tree: {e}"))?
+            .reply()
+            .map_err(|e| format!("query_tree reply: {e}"))?;
         if tree.parent == root || tree.parent == 0 {
             break;
         }
         window = tree.parent;
     }
 
-    let geom = conn.get_geometry(window).map_err(|e| format!("get_geometry: {e}"))?
-        .reply().map_err(|e| format!("get_geometry reply: {e}"))?;
+    let geom = conn
+        .get_geometry(window)
+        .map_err(|e| format!("get_geometry: {e}"))?
+        .reply()
+        .map_err(|e| format!("get_geometry reply: {e}"))?;
 
-    let coords = conn.translate_coordinates(window, root, 0, 0)
+    let coords = conn
+        .translate_coordinates(window, root, 0, 0)
         .map_err(|e| format!("translate_coordinates: {e}"))?
-        .reply().map_err(|e| format!("translate_coordinates reply: {e}"))?;
+        .reply()
+        .map_err(|e| format!("translate_coordinates reply: {e}"))?;
 
     debug!(
         "screenshot: capturing from root at ({},{}) size {}x{}",
         coords.dst_x, coords.dst_y, geom.width, geom.height
     );
 
-    let reply = conn.get_image(
-        ImageFormat::Z_PIXMAP,
-        root,
-        coords.dst_x, coords.dst_y,
-        geom.width, geom.height,
-        u32::MAX,
-    ).map_err(|e| format!("get_image: {e}"))?
-     .reply().map_err(|e| format!("get_image reply: {e}"))?;
+    let reply = conn
+        .get_image(
+            ImageFormat::Z_PIXMAP,
+            root,
+            coords.dst_x,
+            coords.dst_y,
+            geom.width,
+            geom.height,
+            u32::MAX,
+        )
+        .map_err(|e| format!("get_image: {e}"))?
+        .reply()
+        .map_err(|e| format!("get_image reply: {e}"))?;
 
     Ok(CapturedImage {
         width: geom.width,
@@ -149,9 +167,8 @@ where
 {
     use x11rb::protocol::xproto::{GrabMode, ModMask};
 
-    let (conn, screen_num) = match x11rb::connect(None) {
-        Ok(c) => c,
-        Err(_) => return,
+    let Ok((conn, screen_num)) = x11rb::connect(None) else {
+        return;
     };
 
     let screen = &conn.setup().roots[screen_num];
@@ -165,14 +182,7 @@ where
             ModMask::from(u16::from(ModMask::M2)),
             ModMask::LOCK | ModMask::from(u16::from(ModMask::M2)),
         ] {
-            let _ = conn.grab_key(
-                false,
-                root,
-                mask,
-                keycode,
-                GrabMode::ASYNC,
-                GrabMode::ASYNC,
-            );
+            let _ = conn.grab_key(false, root, mask, keycode, GrabMode::ASYNC, GrabMode::ASYNC);
         }
     }
     let _ = conn.flush();

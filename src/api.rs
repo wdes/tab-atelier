@@ -42,9 +42,14 @@ pub struct TabSnapshot {
 }
 
 pub fn generate_token() -> String {
+    use std::fmt::Write;
     let mut buf = [0u8; 16];
     crate::platform::random_bytes(&mut buf);
-    buf.iter().map(|b| format!("{b:02x}")).collect()
+    let mut s = String::with_capacity(buf.len() * 2);
+    for b in buf {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 pub fn local_ip() -> String {
@@ -53,8 +58,7 @@ pub fn local_ip() -> String {
             s.connect("8.8.8.8:80")?;
             s.local_addr()
         })
-        .map(|a| a.ip().to_string())
-        .unwrap_or_else(|_| "127.0.0.1".into())
+        .map_or_else(|_| "127.0.0.1".into(), |a| a.ip().to_string())
 }
 
 fn respond_json(stream: &mut std::net::TcpStream, status: u16, body: &str) {
@@ -121,9 +125,10 @@ pub fn start_api_server(state: Arc<Mutex<TabSnapshot>>, token: String) {
             let raw_path = parts[1].to_string();
 
             let (path, query_token) = if let Some((p, q)) = raw_path.split_once('?') {
-                let qt = q.split('&')
+                let qt = q
+                    .split('&')
                     .find_map(|pair| pair.strip_prefix("token="))
-                    .map(|v| v.to_string());
+                    .map(std::string::ToString::to_string);
                 (p.to_string(), qt)
             } else {
                 (raw_path.clone(), None)
@@ -138,7 +143,7 @@ pub fn start_api_server(state: Arc<Mutex<TabSnapshot>>, token: String) {
 
             debug!("API: {method} {path}");
             match (method.as_str(), path.as_str()) {
-                ("GET", "/") | ("GET", "/tabs") => {
+                ("GET", "/" | "/tabs") => {
                     let state = state.lock().unwrap();
                     let tabs: Vec<TabInfo> = state
                         .tabs
@@ -149,10 +154,11 @@ pub fn start_api_server(state: Arc<Mutex<TabSnapshot>>, token: String) {
                             name: name.clone(),
                             cwd: cwd.clone(),
                             active: i == state.active,
-                            cpu_percent: state.power.get(i).map(|p| p.cpu_percent).unwrap_or(0.0),
+                            cpu_percent: state.power.get(i).map_or(0.0, |p| p.cpu_percent),
                             watts: state.power.get(i).and_then(|p| p.watts),
                         })
                         .collect();
+                    drop(state);
                     let resp = ApiResponse { app: USER_AGENT, tabs };
                     let body = serde_json::to_string_pretty(&resp).unwrap_or_default();
                     respond_json(&mut stream, 200, &body);
@@ -164,6 +170,7 @@ pub fn start_api_server(state: Arc<Mutex<TabSnapshot>>, token: String) {
                         if idx < state.tabs.len() {
                             info!("API: closing tab {idx}");
                             state.pending_closes.push(idx);
+                            drop(state);
                             let body = serde_json::to_string(&serde_json::json!({"closed": idx})).unwrap_or_default();
                             respond_json(&mut stream, 200, &body);
                         } else {
@@ -173,7 +180,7 @@ pub fn start_api_server(state: Arc<Mutex<TabSnapshot>>, token: String) {
                         error_json(&mut stream, 404, "invalid tab index");
                     }
                 }
-                (_, "/") | (_, "/tabs") => {
+                (_, "/" | "/tabs") => {
                     error_json(&mut stream, 405, "method not allowed");
                 }
                 (_, p) if p.starts_with("/tabs/") => {

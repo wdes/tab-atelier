@@ -67,7 +67,13 @@ fn write_bmp(path: &std::path::Path, width: u16, height: u16, bgra: &[u8]) -> Re
 
 fn sanitize_filename(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect::<String>()
         .to_lowercase()
 }
@@ -90,7 +96,11 @@ pub fn take_screenshot_tab(tab_name: &str, tab_bar_height: u16) -> Result<PathBu
     }
 
     let crop_h = img.height - tab_bar_height;
-    let bpp = if img.data.len() >= (img.width as usize * img.height as usize * 4) { 4 } else { 3 };
+    let bpp = if img.data.len() >= (img.width as usize * img.height as usize * 4) {
+        4
+    } else {
+        3
+    };
     let src_stride = img.width as usize * bpp;
     let start = tab_bar_height as usize * src_stride;
     let cropped = if start < img.data.len() {
@@ -132,10 +142,7 @@ mod tests {
         let path = dir.join("test.bmp");
 
         let data = vec![
-            0xFF, 0x00, 0x00, 0xFF,
-            0x00, 0xFF, 0x00, 0xFF,
-            0x00, 0x00, 0xFF, 0xFF,
-            0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
         ];
         write_bmp(&path, 2, 2, &data).unwrap();
 

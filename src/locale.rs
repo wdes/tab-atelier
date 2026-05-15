@@ -9,14 +9,14 @@ pub enum Lang {
 }
 
 impl Lang {
-    pub fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
-            Lang::En => "English",
-            Lang::Fr => "Français",
+            Self::En => "English",
+            Self::Fr => "Français",
         }
     }
 
-    pub const ALL: &[Lang] = &[Lang::En, Lang::Fr];
+    pub const ALL: &[Self] = &[Self::En, Self::Fr];
 }
 
 #[allow(dead_code)]
