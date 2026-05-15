@@ -334,11 +334,12 @@ impl Swoop {
         cx.notify();
         cx.spawn(async move |this: WeakEntity<Swoop>, cx: &mut AsyncApp| {
             cx.background_executor()
-                .timer(std::time::Duration::from_millis(100))
+                .timer(std::time::Duration::from_secs(1))
                 .await;
-            // Hide progress toast before capture so it doesn't appear in the screenshot
+            let render_time = std::time::Instant::now();
             let _ = this.update(cx, |state, cx| {
                 state.toasts.retain(|(_, t)| *t != progress_time);
+                state.toasts.push((state.t().rendering_screenshot.into(), render_time));
                 cx.notify();
             });
             cx.background_executor()
@@ -353,6 +354,7 @@ impl Swoop {
             }).await;
             let toast_time = std::time::Instant::now();
             let _ = this.update(cx, |state, cx| {
+                state.toasts.retain(|(_, t)| *t != render_time);
                 let t = state.t();
                 let msg = match result {
                     Ok(path) => format!("{}: {}", t.saved, path.display()),
@@ -493,7 +495,12 @@ impl Swoop {
             .text_color(menu_fg)
             .text_size(px(13.0));
 
+        let sep = || div().mx(px(8.0)).my(px(4.0)).h(px(1.0)).bg(menu_border);
+
+        let mut has_tab_section = false;
+
         if let MenuKind::Tab(idx) = menu.kind {
+            has_tab_section = true;
             container = container.child(
                 div()
                     .id("menu-rename")
@@ -550,27 +557,25 @@ impl Swoop {
             }
             stats_lines.push(format!("{}: {}", t.uptime, format_duration(elapsed)));
 
-            container = container.child(
-                div()
-                    .mx(px(8.0))
-                    .my(px(4.0))
-                    .h(px(1.0))
-                    .bg(menu_border),
-            );
-            for (si, line) in stats_lines.iter().enumerate() {
-                container = container.child(
-                    div()
-                        .id(SharedString::from(format!("menu-stat-{si}")))
-                        .px(px(12.0))
-                        .py(px(2.0))
-                        .text_size(px(11.0))
-                        .text_color(stat_fg)
-                        .child(line.clone()),
-                );
+            if !stats_lines.is_empty() {
+                container = container.child(sep());
+                for (si, line) in stats_lines.iter().enumerate() {
+                    container = container.child(
+                        div()
+                            .id(SharedString::from(format!("menu-stat-{si}")))
+                            .px(px(12.0))
+                            .py(px(2.0))
+                            .text_size(px(11.0))
+                            .text_color(stat_fg)
+                            .child(line.clone()),
+                    );
+                }
             }
         }
 
+        // Clipboard section
         container = container
+            .when(has_tab_section, |el| el.child(sep()))
             .child(
                 div()
                     .id("menu-copy")
@@ -623,6 +628,8 @@ impl Swoop {
                     }))
                     .child(self.t().paste),
             )
+            // Terminal section
+            .child(sep())
             .child(
                 div()
                     .id("menu-reset")
@@ -637,6 +644,8 @@ impl Swoop {
                     }))
                     .child(self.t().reset_input_color),
             )
+            // Screenshot section
+            .child(sep())
             .child(
                 div()
                     .id("menu-screenshot-tab")
@@ -663,6 +672,8 @@ impl Swoop {
                     }))
                     .child(self.t().screenshot_app),
             )
+            // Window section
+            .child(sep())
             .child(
                 div()
                     .id("menu-windowed")
@@ -690,6 +701,8 @@ impl Swoop {
                     }))
                     .child(self.t().close_all),
             )
+            // App section
+            .child(sep())
             .child(
                 div()
                     .id("menu-remote")
