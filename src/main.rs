@@ -3,6 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 mod api;
+mod locale;
 mod power;
 mod screenshot;
 mod terminal;
@@ -14,7 +15,8 @@ use std::sync::{Arc, Mutex};
 use gpui::*;
 use gpui::prelude::FluentBuilder;
 use log::{debug, info};
-use tab_atelier::{FontConfig, SavedState, TabState, load_font_config, load_state, load_wakatime_key, save_state};
+use tab_atelier::{FontConfig, Preferences, SavedState, TabState, load_font_config, load_preferences, load_state, load_wakatime_key, save_preferences, save_state};
+use locale::{Lang, Strings};
 use terminal::TerminalView;
 use tracking::WakatimeTracker;
 
@@ -57,12 +59,24 @@ struct Swoop {
     power_pids: Arc<Mutex<Vec<u32>>>,
     power_watts: Arc<Mutex<Vec<power::TabPower>>>,
     toasts: Vec<(String, std::time::Instant)>,
+    lang: Lang,
+    show_preferences: bool,
 }
 
 impl Swoop {
+    fn t(&self) -> &'static Strings {
+        locale::strings(self.lang)
+    }
+
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let rename_focus = cx.focus_handle();
         let font_config = load_font_config();
+        let prefs = load_preferences();
+        let lang = match prefs.lang.as_deref() {
+            Some("fr") => Lang::Fr,
+            Some("en") => Lang::En,
+            _ => locale::detect_lang(),
+        };
 
         let (tabs, active) = if let Some(saved) = load_state() {
             info!("restoring {} tab(s) from saved state", saved.tabs.len());
@@ -80,14 +94,14 @@ impl Swoop {
             if tabs.is_empty() {
                 let fc = font_config.clone();
                 let view = cx.new(|cx| TerminalView::new(None, fc, window, cx));
-                tabs.push(Tab { view, name: "Terminal".into(), created_at: std::time::Instant::now() });
+                tabs.push(Tab { view, name: locale::strings(lang).terminal.into(), created_at: std::time::Instant::now() });
             }
             let active = saved.active.min(tabs.len() - 1);
             (tabs, active)
         } else {
             let fc = font_config.clone();
             let view = cx.new(|cx| TerminalView::new(None, fc, window, cx));
-            (vec![Tab { view, name: "Terminal".into(), created_at: std::time::Instant::now() }], 0)
+            (vec![Tab { view, name: locale::strings(lang).terminal.into(), created_at: std::time::Instant::now() }], 0)
         };
 
         cx.spawn(async |this: WeakEntity<Swoop>, cx: &mut AsyncApp| {
@@ -166,6 +180,8 @@ impl Swoop {
             power_pids,
             power_watts,
             toasts: Vec::new(),
+            lang,
+            show_preferences: false,
         }
     }
 
@@ -177,7 +193,7 @@ impl Swoop {
         let fc = self.font_config.clone();
         let view = cx.new(|cx| TerminalView::new(cwd.as_deref(), fc, window, cx));
         let idx = self.tabs.len();
-        self.tabs.push(Tab { view, name: format!("Terminal {}", idx + 1), created_at: std::time::Instant::now() });
+        self.tabs.push(Tab { view, name: format!("{} {}", self.t().terminal_n, idx + 1), created_at: std::time::Instant::now() });
         self.active = idx;
         cx.notify();
     }
@@ -317,7 +333,7 @@ impl Swoop {
     fn do_screenshot(&mut self, full: bool, cx: &mut Context<Self>) {
         let tab_name = self.tabs[self.active].name.clone();
         let progress_time = std::time::Instant::now();
-        self.toasts.push(("Taking screenshot...".into(), progress_time));
+        self.toasts.push((self.t().taking_screenshot.into(), progress_time));
         cx.notify();
         cx.spawn(async move |this: WeakEntity<Swoop>, cx: &mut AsyncApp| {
             cx.background_executor()
@@ -340,9 +356,10 @@ impl Swoop {
             }).await;
             let toast_time = std::time::Instant::now();
             let _ = this.update(cx, |state, cx| {
+                let t = state.t();
                 let msg = match result {
-                    Ok(path) => format!("Saved: {}", path.display()),
-                    Err(e) => format!("Screenshot failed: {e}"),
+                    Ok(path) => format!("{}: {}", t.saved, path.display()),
+                    Err(e) => format!("{}: {e}", t.screenshot_failed),
                 };
                 state.toasts.push((msg, toast_time));
                 cx.notify();
@@ -494,7 +511,7 @@ impl Swoop {
                         this.rename_focus.focus(window);
                         cx.notify();
                     }))
-                    .child("Rename"),
+                    .child(self.t().rename),
             );
 
             if self.tabs.len() > 1 {
@@ -510,7 +527,7 @@ impl Swoop {
                             this.context_menu = None;
                             cx.notify();
                         }))
-                        .child("Close"),
+                        .child(self.t().close),
                 );
             }
 
@@ -518,22 +535,23 @@ impl Swoop {
             let elapsed = self.tabs[idx].created_at.elapsed();
             let power = self.power_watts.lock().unwrap();
             let power_info = power.get(idx);
+            let t = self.t();
 
             let mut stats_lines: Vec<String> = Vec::new();
 
             if let Some(p) = power_info {
-                stats_lines.push(format!("CPU: {}", p.cpu_label()));
+                stats_lines.push(format!("{}: {}", t.cpu, p.cpu_label()));
                 if let Some(w) = p.watts {
-                    stats_lines.push(format!("Power: {}", p.label()));
+                    stats_lines.push(format!("{}: {}", t.power, p.label()));
                     let wh = w * elapsed.as_secs_f64() / 3600.0;
                     if wh >= 1.0 {
-                        stats_lines.push(format!("Energy: {wh:.1} Wh"));
+                        stats_lines.push(format!("{}: {wh:.1} Wh", t.energy));
                     } else {
-                        stats_lines.push(format!("Energy: {:.0} mWh", wh * 1000.0));
+                        stats_lines.push(format!("{}: {:.0} mWh", t.energy, wh * 1000.0));
                     }
                 }
             }
-            stats_lines.push(format!("Uptime: {}", format_duration(elapsed)));
+            stats_lines.push(format!("{}: {}", t.uptime, format_duration(elapsed)));
 
             container = container.child(
                 div()
@@ -570,7 +588,7 @@ impl Swoop {
                         this.context_menu = None;
                         cx.notify();
                     }))
-                    .child("Copy"),
+                    .child(self.t().copy),
             )
             .child(
                 div()
@@ -587,7 +605,7 @@ impl Swoop {
                         this.context_menu = None;
                         cx.notify();
                     }))
-                    .child("Copy All"),
+                    .child(self.t().copy_all),
             )
             .child(
                 div()
@@ -606,7 +624,7 @@ impl Swoop {
                         this.context_menu = None;
                         cx.notify();
                     }))
-                    .child("Paste"),
+                    .child(self.t().paste),
             )
             .child(
                 div()
@@ -620,7 +638,7 @@ impl Swoop {
                         this.context_menu = None;
                         cx.notify();
                     }))
-                    .child("Reset input & color"),
+                    .child(self.t().reset_input_color),
             )
             .child(
                 div()
@@ -633,7 +651,7 @@ impl Swoop {
                         this.context_menu = None;
                         this.do_screenshot(false, cx);
                     }))
-                    .child("Screenshot tab"),
+                    .child(self.t().screenshot_tab),
             )
             .child(
                 div()
@@ -646,7 +664,7 @@ impl Swoop {
                         this.context_menu = None;
                         this.do_screenshot(true, cx);
                     }))
-                    .child("Screenshot app"),
+                    .child(self.t().screenshot_app),
             )
             .child(
                 div()
@@ -661,7 +679,7 @@ impl Swoop {
                         this.context_menu = None;
                         cx.notify();
                     }))
-                    .child(if self.windowed { "Fullscreen mode" } else { "Windowed mode" }),
+                    .child(if self.windowed { self.t().fullscreen_mode } else { self.t().windowed_mode }),
             )
             .child(
                 div()
@@ -673,7 +691,7 @@ impl Swoop {
                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
                         this.close_all_tabs(cx);
                     }))
-                    .child("Close All"),
+                    .child(self.t().close_all),
             )
             .child(
                 div()
@@ -687,7 +705,21 @@ impl Swoop {
                         this.context_menu = None;
                         cx.notify();
                     }))
-                    .child("Remote control"),
+                    .child(self.t().remote_control),
+            )
+            .child(
+                div()
+                    .id("menu-preferences")
+                    .px(px(12.0))
+                    .py(px(4.0))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(menu_hover))
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                        this.show_preferences = true;
+                        this.context_menu = None;
+                        cx.notify();
+                    }))
+                    .child(self.t().preferences),
             );
 
         Some(container)
@@ -761,7 +793,7 @@ impl Swoop {
                                 }
                             }
                         }))
-                        .child("Rename tab:")
+                        .child(self.t().rename_tab)
                         .child(
                             div()
                                 .flex()
@@ -838,7 +870,7 @@ impl Swoop {
                                 .mt(px(8.0))
                                 .text_size(px(13.0))
                                 .text_color(rgb(0x999999))
-                                .child("Close this tab or reopen a new shell?"),
+                                .child(self.t().exit_close_or_reopen),
                         )
                         .child(
                             div()
@@ -859,7 +891,7 @@ impl Swoop {
                                         .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev: &MouseDownEvent, window, cx| {
                                             this.respawn_tab(idx, window, cx);
                                         }))
-                                        .child("Reopen (clean)"),
+                                        .child(self.t().reopen_clean),
                                 )
                                 .child(
                                     div()
@@ -873,7 +905,7 @@ impl Swoop {
                                         .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev: &MouseDownEvent, window, cx| {
                                             this.respawn_tab_with_history(idx, window, cx);
                                         }))
-                                        .child("Reopen (with history)"),
+                                        .child(self.t().reopen_with_history),
                                 )
                                 .child(
                                     div()
@@ -892,7 +924,7 @@ impl Swoop {
                                                 this.close_tab(idx, cx);
                                             }
                                         }))
-                                        .child("Close Tab"),
+                                        .child(self.t().close_tab),
                                 ),
                         ),
                 ),
@@ -963,7 +995,7 @@ impl Swoop {
                                             this.close_confirm = None;
                                             cx.notify();
                                         }))
-                                        .child("Cancel"),
+                                        .child(self.t().cancel),
                                 )
                                 .child(
                                     div()
@@ -978,7 +1010,7 @@ impl Swoop {
                                             this.close_confirm = None;
                                             this.close_tab(idx, cx);
                                         }))
-                                        .child("Close"),
+                                        .child(self.t().close),
                                 ),
                         ),
                 ),
@@ -1038,7 +1070,7 @@ impl Swoop {
                         .child(
                             div()
                                 .text_size(px(15.0))
-                                .child("Scan to connect from your phone"),
+                                .child(self.t().scan_to_connect),
                         )
                         .child(
                             div()
@@ -1079,7 +1111,130 @@ impl Swoop {
                                             this.show_qr = false;
                                             cx.notify();
                                         }))
-                                        .child("Close"),
+                                        .child(self.t().close),
+                                ),
+                        ),
+                ),
+        )
+    }
+
+    fn render_preferences(&self, cx: &Context<Self>) -> Option<Stateful<Div>> {
+        if !self.show_preferences {
+            return None;
+        }
+
+        let overlay_bg = Hsla::from(Rgba { r: 0.0, g: 0.0, b: 0.0, a: 0.5 });
+        let modal_bg: Hsla = rgb(0x1e1e1e).into();
+        let modal_fg: Hsla = rgb(0xcccccc).into();
+        let modal_border: Hsla = rgb(0x3c3c3c).into();
+        let btn_bg: Hsla = rgb(0x007acc).into();
+        let btn_hover: Hsla = rgb(0x1c8cd9).into();
+        let option_bg: Hsla = rgb(0x2d2d2d).into();
+        let option_active: Hsla = rgb(0x007acc).into();
+        let t = self.t();
+
+        let mut lang_options = div()
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .mt(px(8.0));
+
+        for &lang in Lang::ALL {
+            let is_active = lang == self.lang;
+            lang_options = lang_options.child(
+                div()
+                    .id(SharedString::from(format!("pref-lang-{}", lang.label())))
+                    .px(px(12.0))
+                    .py(px(6.0))
+                    .rounded(px(3.0))
+                    .cursor_pointer()
+                    .bg(if is_active { option_active } else { option_bg })
+                    .hover(|s| s.bg(if is_active { option_active } else { btn_hover }))
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                        this.lang = lang;
+                        cx.notify();
+                    }))
+                    .child(lang.label()),
+            );
+        }
+
+        Some(
+            div()
+                .id("preferences-overlay")
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(overlay_bg)
+                .on_mouse_down(MouseButton::Left, |_ev: &MouseDownEvent, _window, _cx| {})
+                .on_mouse_down(MouseButton::Right, |_ev: &MouseDownEvent, _window, _cx| {})
+                .child(
+                    div()
+                        .id("preferences-box")
+                        .bg(modal_bg)
+                        .text_color(modal_fg)
+                        .border_1()
+                        .border_color(modal_border)
+                        .rounded(px(6.0))
+                        .p(px(24.0))
+                        .min_w(px(320.0))
+                        .text_size(px(14.0))
+                        .on_mouse_down(MouseButton::Left, |_ev: &MouseDownEvent, _window, _cx| {})
+                        .child(
+                            div()
+                                .text_size(px(16.0))
+                                .mb(px(16.0))
+                                .child(t.preferences),
+                        )
+                        .child(
+                            div()
+                                .child(t.language)
+                                .child(lang_options),
+                        )
+                        .child(
+                            div()
+                                .mt(px(20.0))
+                                .flex()
+                                .flex_row()
+                                .justify_end()
+                                .gap(px(8.0))
+                                .child(
+                                    div()
+                                        .id("pref-cancel")
+                                        .px(px(14.0))
+                                        .py(px(6.0))
+                                        .bg(option_bg)
+                                        .rounded(px(3.0))
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(btn_hover))
+                                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                                            this.show_preferences = false;
+                                            cx.notify();
+                                        }))
+                                        .child(t.cancel),
+                                )
+                                .child(
+                                    div()
+                                        .id("pref-save")
+                                        .px(px(14.0))
+                                        .py(px(6.0))
+                                        .bg(btn_bg)
+                                        .rounded(px(3.0))
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(btn_hover))
+                                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                                            let lang_str = match this.lang {
+                                                Lang::En => "en",
+                                                Lang::Fr => "fr",
+                                            };
+                                            save_preferences(&Preferences { lang: Some(lang_str.into()) });
+                                            this.show_preferences = false;
+                                            cx.notify();
+                                        }))
+                                        .child(t.save),
                                 ),
                         ),
                 ),
@@ -1089,10 +1244,10 @@ impl Swoop {
 
 impl Render for Swoop {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        window.set_window_title(&format!("{} — Tab Atelier", self.tabs[self.active].name));
+        window.set_window_title(&format!("{}{}", self.tabs[self.active].name, self.t().title_suffix));
         let active_terminal = self.tabs[self.active].view.clone();
         let tab_bar = self.render_tab_bar(window, cx);
-        let context_menu = if self.renaming.is_none() && self.exit_confirm.is_none() && self.close_confirm.is_none() && !self.show_qr {
+        let context_menu = if self.renaming.is_none() && self.exit_confirm.is_none() && self.close_confirm.is_none() && !self.show_qr && !self.show_preferences {
             self.render_context_menu(cx)
         } else {
             None
@@ -1165,6 +1320,10 @@ impl Render for Swoop {
 
         if let Some(qr) = self.render_qr_modal(cx) {
             root = root.child(qr);
+        }
+
+        if let Some(prefs) = self.render_preferences(cx) {
+            root = root.child(prefs);
         }
 
         if !self.toasts.is_empty() {
