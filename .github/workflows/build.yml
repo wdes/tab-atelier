@@ -46,6 +46,7 @@ jobs:
                   name: tab-atelier-deb
                   path: target/debian/*.deb
                   retention-days: 5
+                  archive: false
 
     integration:
         name: Integration test (debian:trixie-slim)

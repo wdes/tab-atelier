@@ -46,6 +46,7 @@ jobs:
               with:
                   name: tab-atelier-deb
                   path: target/debian/*.deb
+                  archive: false
 
     release:
         name: Create draft release
