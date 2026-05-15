@@ -4,6 +4,7 @@
 
 mod api;
 mod power;
+mod screenshot;
 mod terminal;
 mod terminal_utils;
 mod tracking;
@@ -574,6 +575,34 @@ impl Swoop {
                         cx.notify();
                     }))
                     .child("Reset input & color"),
+            )
+            .child(
+                div()
+                    .id("menu-screenshot-tab")
+                    .px(px(12.0))
+                    .py(px(4.0))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(menu_hover))
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                        this.context_menu = None;
+                        cx.notify();
+                        screenshot::take_screenshot(false);
+                    }))
+                    .child("Screenshot tab"),
+            )
+            .child(
+                div()
+                    .id("menu-screenshot-app")
+                    .px(px(12.0))
+                    .py(px(4.0))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(menu_hover))
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                        this.context_menu = None;
+                        cx.notify();
+                        screenshot::take_screenshot(true);
+                    }))
+                    .child("Screenshot app"),
             )
             .child(
                 div()
