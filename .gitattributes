@@ -1,2 +1,11 @@
 * text=auto
 *.lock linguist-generated
+
+.gitignore export-ignore
+.gitattributes export-ignore
+.github/ export-ignore
+.claude/ export-ignore
+AGENTS.md export-ignore
+CLAUDE.md export-ignore
+CHANGELOG.md export-ignore
+rustfmt.toml export-ignore
