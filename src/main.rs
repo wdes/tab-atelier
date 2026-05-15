@@ -27,8 +27,8 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use tab_atelier::{
-    DEFAULT_HOTKEYS, FontConfig, HOTKEY_OPTIONS, Preferences, SavedState, TabState, hotkey_keycodes, load_font_config,
-    load_preferences, load_state_from, load_wakatime_key, save_preferences, save_state,
+    DEFAULT_HOTKEYS, FontConfig, Preferences, SavedState, TabState, gpui_key_to_keycode, keycode_label,
+    load_font_config, load_preferences, load_state_from, load_wakatime_key, save_preferences, save_state,
 };
 use terminal::TerminalView;
 use theme::ThemeName;
@@ -131,14 +131,18 @@ struct AppState {
     lang: Lang,
     theme_name: ThemeName,
     opacity: u8,
-    hotkeys: Vec<String>,
+    hotkeys: Vec<u8>,
     show_preferences: bool,
+    show_hotkey_picker: bool,
+    hotkey_picker_focus: FocusHandle,
+    hotkey_picker_error: Option<String>,
     browser: Rc<RefCell<Option<String>>>,
     code_editor: Rc<RefCell<Option<String>>>,
     pref_browser_text: String,
     pref_browser_focus: FocusHandle,
     pref_editor_text: String,
     pref_editor_focus: FocusHandle,
+    hotkey_handle: Option<platform::HotkeyHandle>,
 }
 
 impl AppState {
@@ -152,6 +156,7 @@ impl AppState {
 
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let rename_focus = cx.focus_handle();
+        let hotkey_picker_focus = cx.focus_handle();
         let pref_browser_focus = cx.focus_handle();
         let pref_editor_focus = cx.focus_handle();
         let font_config = load_font_config(&platform::config_dir());
@@ -166,7 +171,7 @@ impl AppState {
         let theme_name = prefs.theme.as_deref().and_then(ThemeName::from_id).unwrap_or_default();
         let opacity = prefs.opacity.unwrap_or(0xb8);
         let hotkeys = if prefs.hotkeys.is_empty() {
-            DEFAULT_HOTKEYS.iter().map(|s| (*s).to_string()).collect()
+            DEFAULT_HOTKEYS.to_vec()
         } else {
             prefs.hotkeys
         };
@@ -349,12 +354,16 @@ impl AppState {
             opacity,
             hotkeys,
             show_preferences: false,
+            show_hotkey_picker: false,
+            hotkey_picker_focus,
+            hotkey_picker_error: None,
             browser,
             code_editor,
             pref_browser_text: String::new(),
             pref_browser_focus,
             pref_editor_text: String::new(),
             pref_editor_focus,
+            hotkey_handle: None,
         }
     }
 
@@ -1708,35 +1717,65 @@ impl AppState {
         }
         opacity_slider = opacity_slider.child(track).child(format!("{opacity_pct}%"));
 
-        let mut hotkey_options = div().flex().flex_row().flex_wrap().gap(px(4.0)).mt(px(8.0));
-        for hk in HOTKEY_OPTIONS {
-            let is_active = self.hotkeys.iter().any(|id| id == hk.id);
-            let hk_id = hk.id;
-            hotkey_options = hotkey_options.child(
+        let mut hotkey_list = div().flex().flex_col().gap(px(4.0)).mt(px(8.0));
+        for &kc in &self.hotkeys {
+            let label = keycode_label(kc);
+            let can_remove = self.hotkeys.len() > 1;
+            hotkey_list = hotkey_list.child(
                 div()
-                    .id(SharedString::from(format!("pref-hk-{}", hk.id)))
+                    .id(SharedString::from(format!("pref-hk-{kc}")))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
                     .px(px(12.0))
                     .py(px(6.0))
                     .rounded(px(3.0))
-                    .cursor_pointer()
-                    .bg(if is_active { option_active } else { option_bg })
-                    .hover(|s| s.bg(if is_active { option_active } else { btn_hover }))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
-                            if let Some(pos) = this.hotkeys.iter().position(|id| id == hk_id) {
-                                if this.hotkeys.len() > 1 {
-                                    this.hotkeys.remove(pos);
-                                }
-                            } else {
-                                this.hotkeys.push(hk_id.to_string());
-                            }
-                            cx.notify();
-                        }),
-                    )
-                    .child(hk.label),
+                    .bg(option_bg)
+                    .child(label)
+                    .when(can_remove, |el| {
+                        el.child(
+                            div()
+                                .id(SharedString::from(format!("pref-hk-rm-{kc}")))
+                                .cursor_pointer()
+                                .px(px(6.0))
+                                .rounded(px(3.0))
+                                .hover(|s| s.bg(btn_hover))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                                        this.hotkeys.retain(|&k| k != kc);
+                                        cx.notify();
+                                    }),
+                                )
+                                .child("\u{00d7}"),
+                        )
+                    }),
             );
         }
+        hotkey_list = hotkey_list.child(
+            div()
+                .id("pref-hk-add")
+                .px(px(12.0))
+                .py(px(6.0))
+                .rounded(px(3.0))
+                .cursor_pointer()
+                .bg(btn_bg)
+                .hover(|s| s.bg(btn_hover))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _ev: &MouseDownEvent, window, cx| {
+                        this.show_hotkey_picker = true;
+                        this.hotkey_picker_error = None;
+                        if let Some(ref handle) = this.hotkey_handle {
+                            handle.suspend();
+                        }
+                        this.hotkey_picker_focus.focus(window);
+                        cx.notify();
+                    }),
+                )
+                .child(format!("+ {}", t.add_key)),
+        );
 
         let mut lang_options = div().flex().flex_col().gap(px(4.0)).mt(px(8.0));
 
@@ -1882,7 +1921,7 @@ impl AppState {
                         .child(div().text_size(px(16.0)).mb(px(16.0)).child(t.preferences))
                         .child(div().child(t.theme).child(theme_options))
                         .child(div().mt(px(16.0)).child(t.opacity).child(opacity_slider))
-                        .child(div().mt(px(16.0)).child(t.toggle_hotkeys).child(hotkey_options))
+                        .child(div().mt(px(16.0)).child(t.toggle_hotkeys).child(hotkey_list))
                         .child(div().mt(px(16.0)).child(t.language).child(lang_options))
                         .child(div().mt(px(16.0)).child(t.browser).child(browser_input))
                         .child(div().mt(px(16.0)).child(t.code_editor).child(editor_input))
@@ -1905,7 +1944,13 @@ impl AppState {
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                                                if this.show_hotkey_picker
+                                                    && let Some(ref handle) = this.hotkey_handle
+                                                {
+                                                    handle.resume();
+                                                }
                                                 this.show_preferences = false;
+                                                this.show_hotkey_picker = false;
                                                 cx.notify();
                                             }),
                                         )
@@ -1950,13 +1995,126 @@ impl AppState {
                                                         code_editor: editor,
                                                     },
                                                 );
+                                                if let Some(ref handle) = this.hotkey_handle {
+                                                    handle.update_keys(&this.hotkeys);
+                                                }
                                                 this.show_preferences = false;
+                                                this.show_hotkey_picker = false;
                                                 cx.notify();
                                             }),
                                         )
                                         .child(t.save),
                                 ),
                         ),
+                ),
+        )
+    }
+
+    fn render_hotkey_picker(&self, cx: &Context<Self>) -> Option<Stateful<Div>> {
+        if !self.show_hotkey_picker {
+            return None;
+        }
+
+        let overlay_bg = Hsla::from(Rgba {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 0.6,
+        });
+        let th = self.th();
+        let modal_bg = th.surface_hsla();
+        let modal_fg = th.fg_hsla();
+        let modal_border = th.border_hsla();
+        let muted_fg = th.fg_muted_hsla();
+        let error_fg = Hsla {
+            h: 0.0,
+            s: 0.8,
+            l: 0.65,
+            a: 1.0,
+        };
+        let t = self.t();
+
+        Some(
+            div()
+                .id("hotkey-picker-overlay")
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .size_full()
+                .bg(overlay_bg)
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                        this.show_hotkey_picker = false;
+                        if let Some(ref handle) = this.hotkey_handle {
+                            handle.resume();
+                        }
+                        cx.notify();
+                    }),
+                )
+                .child(
+                    div()
+                        .id("hotkey-picker-box")
+                        .key_context("hotkey-picker")
+                        .track_focus(&self.hotkey_picker_focus)
+                        .bg(modal_bg)
+                        .text_color(modal_fg)
+                        .border_1()
+                        .border_color(modal_border)
+                        .rounded(px(6.0))
+                        .p(px(24.0))
+                        .min_w(px(260.0))
+                        .text_size(px(14.0))
+                        .on_mouse_down(MouseButton::Left, |_ev: &MouseDownEvent, _window, _cx| {})
+                        .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _window, cx| {
+                            let key = ev.keystroke.key.as_str();
+                            if key == "escape" {
+                                this.show_hotkey_picker = false;
+                                if let Some(ref handle) = this.hotkey_handle {
+                                    handle.resume();
+                                }
+                                cx.notify();
+                                return;
+                            }
+                            if let Some(kc) = gpui_key_to_keycode(key) {
+                                if this.hotkeys.contains(&kc) {
+                                    this.hotkey_picker_error =
+                                        Some(format!("{} — {}", keycode_label(kc), t.key_already_registered));
+                                } else {
+                                    this.hotkeys.push(kc);
+                                    this.show_hotkey_picker = false;
+                                    if let Some(ref handle) = this.hotkey_handle {
+                                        handle.resume();
+                                    }
+                                }
+                                cx.notify();
+                            }
+                        }))
+                        .child(div().text_size(px(16.0)).mb(px(8.0)).child(t.choose_a_key))
+                        .child(
+                            div()
+                                .text_size(px(20.0))
+                                .text_color(muted_fg)
+                                .py(px(16.0))
+                                .flex()
+                                .justify_center()
+                                .child(t.press_a_key),
+                        )
+                        .when(self.hotkey_picker_error.is_some(), |el| {
+                            let err = self.hotkey_picker_error.as_deref().unwrap_or_default();
+                            el.child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .text_color(error_fg)
+                                    .mt(px(8.0))
+                                    .flex()
+                                    .justify_center()
+                                    .child(err.to_string()),
+                            )
+                        }),
                 ),
         )
     }
@@ -1986,6 +2144,9 @@ impl Render for AppState {
         let close_confirm = self.render_close_confirm(cx);
         if self.renaming.is_some() {
             self.rename_focus.focus(window);
+        }
+        if self.show_hotkey_picker {
+            self.hotkey_picker_focus.focus(window);
         }
 
         let alpha = self.opacity as u32;
@@ -2082,6 +2243,10 @@ impl Render for AppState {
 
         if let Some(prefs) = self.render_preferences(cx) {
             root = root.child(prefs);
+        }
+
+        if let Some(picker) = self.render_hotkey_picker(cx) {
+            root = root.child(picker);
         }
 
         if !self.toasts.is_empty() {
@@ -2218,12 +2383,11 @@ fn main() {
     info!("starting Tab Atelier v{}", env!("CARGO_PKG_VERSION"));
     Application::new().run(|cx: &mut App| {
         let prefs = load_preferences(&platform::state_base_dir());
-        let hotkey_ids: Vec<String> = if prefs.hotkeys.is_empty() {
-            DEFAULT_HOTKEYS.iter().map(|s| (*s).to_string()).collect()
+        let keycodes: Vec<u8> = if prefs.hotkeys.is_empty() {
+            DEFAULT_HOTKEYS.to_vec()
         } else {
             prefs.hotkeys
         };
-        let keycodes = hotkey_keycodes(&hotkey_ids);
 
         let window_handle = cx
             .open_window(
@@ -2246,8 +2410,12 @@ fn main() {
 fn spawn_hotkey_listener(keycodes: &[u8], window_handle: WindowHandle<AppState>, cx: &mut App) {
     let (tx, rx) = std::sync::mpsc::channel::<()>();
 
-    platform::grab_hotkeys(keycodes, move || {
+    let handle = platform::grab_hotkeys(keycodes, move || {
         let _ = tx.send(());
+    });
+
+    let _ = window_handle.update(cx, |state, _window, _cx| {
+        state.hotkey_handle = Some(handle);
     });
 
     cx.spawn(async move |cx: &mut AsyncApp| {

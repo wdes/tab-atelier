@@ -170,56 +170,448 @@ pub struct Preferences {
     pub theme: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opacity: Option<u8>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub hotkeys: Vec<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_hotkeys",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub hotkeys: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_editor: Option<String>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct Hotkey {
-    pub id: &'static str,
-    pub label: &'static str,
-    pub keycode: u8,
+fn deserialize_hotkeys<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+    let raw: Vec<serde_json::Value> = serde::Deserialize::deserialize(deserializer)?;
+    Ok(raw
+        .into_iter()
+        .filter_map(|v| match v {
+            serde_json::Value::Number(n) => n.as_u64().and_then(|n| u8::try_from(n).ok()),
+            serde_json::Value::String(s) => legacy_hotkey_id_to_keycode(&s),
+            _ => None,
+        })
+        .collect())
 }
 
-pub static HOTKEY_OPTIONS: &[Hotkey] = &[
-    Hotkey {
-        id: "grave",
-        label: "` (Grave)",
+fn legacy_hotkey_id_to_keycode(id: &str) -> Option<u8> {
+    match id {
+        "grave" => Some(49),
+        "f1" => Some(67),
+        "f11" => Some(95),
+        "f12" => Some(96),
+        "xf86calculator" => Some(148),
+        _ => None,
+    }
+}
+
+pub static DEFAULT_HOTKEYS: &[u8] = &[49, 148];
+
+struct KeycodeInfo {
+    keycode: u8,
+    label: &'static str,
+    gpui_key: &'static str,
+}
+
+static KEYCODE_TABLE: &[KeycodeInfo] = &[
+    KeycodeInfo {
+        keycode: 9,
+        label: "Escape",
+        gpui_key: "escape",
+    },
+    KeycodeInfo {
+        keycode: 10,
+        label: "1",
+        gpui_key: "1",
+    },
+    KeycodeInfo {
+        keycode: 11,
+        label: "2",
+        gpui_key: "2",
+    },
+    KeycodeInfo {
+        keycode: 12,
+        label: "3",
+        gpui_key: "3",
+    },
+    KeycodeInfo {
+        keycode: 13,
+        label: "4",
+        gpui_key: "4",
+    },
+    KeycodeInfo {
+        keycode: 14,
+        label: "5",
+        gpui_key: "5",
+    },
+    KeycodeInfo {
+        keycode: 15,
+        label: "6",
+        gpui_key: "6",
+    },
+    KeycodeInfo {
+        keycode: 16,
+        label: "7",
+        gpui_key: "7",
+    },
+    KeycodeInfo {
+        keycode: 17,
+        label: "8",
+        gpui_key: "8",
+    },
+    KeycodeInfo {
+        keycode: 18,
+        label: "9",
+        gpui_key: "9",
+    },
+    KeycodeInfo {
+        keycode: 19,
+        label: "0",
+        gpui_key: "0",
+    },
+    KeycodeInfo {
+        keycode: 20,
+        label: "-",
+        gpui_key: "-",
+    },
+    KeycodeInfo {
+        keycode: 21,
+        label: "=",
+        gpui_key: "=",
+    },
+    KeycodeInfo {
+        keycode: 22,
+        label: "Backspace",
+        gpui_key: "backspace",
+    },
+    KeycodeInfo {
+        keycode: 23,
+        label: "Tab",
+        gpui_key: "tab",
+    },
+    KeycodeInfo {
+        keycode: 24,
+        label: "Q",
+        gpui_key: "q",
+    },
+    KeycodeInfo {
+        keycode: 25,
+        label: "W",
+        gpui_key: "w",
+    },
+    KeycodeInfo {
+        keycode: 26,
+        label: "E",
+        gpui_key: "e",
+    },
+    KeycodeInfo {
+        keycode: 27,
+        label: "R",
+        gpui_key: "r",
+    },
+    KeycodeInfo {
+        keycode: 28,
+        label: "T",
+        gpui_key: "t",
+    },
+    KeycodeInfo {
+        keycode: 29,
+        label: "Y",
+        gpui_key: "y",
+    },
+    KeycodeInfo {
+        keycode: 30,
+        label: "U",
+        gpui_key: "u",
+    },
+    KeycodeInfo {
+        keycode: 31,
+        label: "I",
+        gpui_key: "i",
+    },
+    KeycodeInfo {
+        keycode: 32,
+        label: "O",
+        gpui_key: "o",
+    },
+    KeycodeInfo {
+        keycode: 33,
+        label: "P",
+        gpui_key: "p",
+    },
+    KeycodeInfo {
+        keycode: 34,
+        label: "[",
+        gpui_key: "[",
+    },
+    KeycodeInfo {
+        keycode: 35,
+        label: "]",
+        gpui_key: "]",
+    },
+    KeycodeInfo {
+        keycode: 36,
+        label: "Enter",
+        gpui_key: "enter",
+    },
+    KeycodeInfo {
+        keycode: 38,
+        label: "A",
+        gpui_key: "a",
+    },
+    KeycodeInfo {
+        keycode: 39,
+        label: "S",
+        gpui_key: "s",
+    },
+    KeycodeInfo {
+        keycode: 40,
+        label: "D",
+        gpui_key: "d",
+    },
+    KeycodeInfo {
+        keycode: 41,
+        label: "F",
+        gpui_key: "f",
+    },
+    KeycodeInfo {
+        keycode: 42,
+        label: "G",
+        gpui_key: "g",
+    },
+    KeycodeInfo {
+        keycode: 43,
+        label: "H",
+        gpui_key: "h",
+    },
+    KeycodeInfo {
+        keycode: 44,
+        label: "J",
+        gpui_key: "j",
+    },
+    KeycodeInfo {
+        keycode: 45,
+        label: "K",
+        gpui_key: "k",
+    },
+    KeycodeInfo {
+        keycode: 46,
+        label: "L",
+        gpui_key: "l",
+    },
+    KeycodeInfo {
+        keycode: 47,
+        label: ";",
+        gpui_key: ";",
+    },
+    KeycodeInfo {
+        keycode: 48,
+        label: "'",
+        gpui_key: "'",
+    },
+    KeycodeInfo {
         keycode: 49,
+        label: "` (Grave)",
+        gpui_key: "`",
     },
-    Hotkey {
-        id: "f12",
-        label: "F12",
-        keycode: 96,
+    KeycodeInfo {
+        keycode: 51,
+        label: "\\",
+        gpui_key: "\\",
     },
-    Hotkey {
-        id: "f11",
-        label: "F11",
-        keycode: 95,
+    KeycodeInfo {
+        keycode: 52,
+        label: "Z",
+        gpui_key: "z",
     },
-    Hotkey {
-        id: "f1",
-        label: "F1",
+    KeycodeInfo {
+        keycode: 53,
+        label: "X",
+        gpui_key: "x",
+    },
+    KeycodeInfo {
+        keycode: 54,
+        label: "C",
+        gpui_key: "c",
+    },
+    KeycodeInfo {
+        keycode: 55,
+        label: "V",
+        gpui_key: "v",
+    },
+    KeycodeInfo {
+        keycode: 56,
+        label: "B",
+        gpui_key: "b",
+    },
+    KeycodeInfo {
+        keycode: 57,
+        label: "N",
+        gpui_key: "n",
+    },
+    KeycodeInfo {
+        keycode: 58,
+        label: "M",
+        gpui_key: "m",
+    },
+    KeycodeInfo {
+        keycode: 59,
+        label: ",",
+        gpui_key: ",",
+    },
+    KeycodeInfo {
+        keycode: 60,
+        label: ".",
+        gpui_key: ".",
+    },
+    KeycodeInfo {
+        keycode: 61,
+        label: "/",
+        gpui_key: "/",
+    },
+    KeycodeInfo {
+        keycode: 65,
+        label: "Space",
+        gpui_key: "space",
+    },
+    KeycodeInfo {
         keycode: 67,
+        label: "F1",
+        gpui_key: "f1",
     },
-    Hotkey {
-        id: "xf86calculator",
-        label: "XF86Calculator",
+    KeycodeInfo {
+        keycode: 68,
+        label: "F2",
+        gpui_key: "f2",
+    },
+    KeycodeInfo {
+        keycode: 69,
+        label: "F3",
+        gpui_key: "f3",
+    },
+    KeycodeInfo {
+        keycode: 70,
+        label: "F4",
+        gpui_key: "f4",
+    },
+    KeycodeInfo {
+        keycode: 71,
+        label: "F5",
+        gpui_key: "f5",
+    },
+    KeycodeInfo {
+        keycode: 72,
+        label: "F6",
+        gpui_key: "f6",
+    },
+    KeycodeInfo {
+        keycode: 73,
+        label: "F7",
+        gpui_key: "f7",
+    },
+    KeycodeInfo {
+        keycode: 74,
+        label: "F8",
+        gpui_key: "f8",
+    },
+    KeycodeInfo {
+        keycode: 75,
+        label: "F9",
+        gpui_key: "f9",
+    },
+    KeycodeInfo {
+        keycode: 76,
+        label: "F10",
+        gpui_key: "f10",
+    },
+    KeycodeInfo {
+        keycode: 95,
+        label: "F11",
+        gpui_key: "f11",
+    },
+    KeycodeInfo {
+        keycode: 96,
+        label: "F12",
+        gpui_key: "f12",
+    },
+    KeycodeInfo {
+        keycode: 107,
+        label: "Print Screen",
+        gpui_key: "print",
+    },
+    KeycodeInfo {
+        keycode: 110,
+        label: "Home",
+        gpui_key: "home",
+    },
+    KeycodeInfo {
+        keycode: 111,
+        label: "Up",
+        gpui_key: "up",
+    },
+    KeycodeInfo {
+        keycode: 112,
+        label: "Page Up",
+        gpui_key: "pageup",
+    },
+    KeycodeInfo {
+        keycode: 113,
+        label: "Left",
+        gpui_key: "left",
+    },
+    KeycodeInfo {
+        keycode: 114,
+        label: "Right",
+        gpui_key: "right",
+    },
+    KeycodeInfo {
+        keycode: 115,
+        label: "End",
+        gpui_key: "end",
+    },
+    KeycodeInfo {
+        keycode: 116,
+        label: "Down",
+        gpui_key: "down",
+    },
+    KeycodeInfo {
+        keycode: 117,
+        label: "Page Down",
+        gpui_key: "pagedown",
+    },
+    KeycodeInfo {
+        keycode: 118,
+        label: "Insert",
+        gpui_key: "insert",
+    },
+    KeycodeInfo {
+        keycode: 119,
+        label: "Delete",
+        gpui_key: "delete",
+    },
+    KeycodeInfo {
+        keycode: 127,
+        label: "Pause",
+        gpui_key: "pause",
+    },
+    KeycodeInfo {
         keycode: 148,
+        label: "XF86Calculator",
+        gpui_key: "xf86calculator",
     },
 ];
 
-pub static DEFAULT_HOTKEYS: &[&str] = &["grave", "xf86calculator"];
+#[must_use]
+pub fn gpui_key_to_keycode(key: &str) -> Option<u8> {
+    KEYCODE_TABLE.iter().find(|e| e.gpui_key == key).map(|e| e.keycode)
+}
 
 #[must_use]
-pub fn hotkey_keycodes(ids: &[String]) -> Vec<u8> {
-    ids.iter()
-        .filter_map(|id| HOTKEY_OPTIONS.iter().find(|h| h.id == id).map(|h| h.keycode))
-        .collect()
+pub fn keycode_label(keycode: u8) -> String {
+    KEYCODE_TABLE
+        .iter()
+        .find(|e| e.keycode == keycode)
+        .map_or_else(|| format!("Key {keycode}"), |e| e.label.to_string())
 }
 
 #[must_use]
