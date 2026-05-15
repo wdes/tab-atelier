@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use log::{debug, warn};
+
 const DEBOUNCE_SECS: u64 = 2;
 
 pub const USER_AGENT: &str = concat!("tab-atelier/", env!("CARGO_PKG_VERSION"), " (terminal; +https://github.com/wdes/tab-atelier)");
@@ -38,7 +40,10 @@ impl WakatimeTracker {
 
                 last_sent = now;
                 last_project = project.clone();
-                let _ = send_heartbeat(&api_key, now, project.as_deref());
+                debug!("wakatime: heartbeat project={:?}", project);
+                if let Err(e) = send_heartbeat(&api_key, now, project.as_deref()) {
+                    warn!("{e}");
+                }
             }
         });
 
@@ -93,7 +98,10 @@ fn send_heartbeat(api_key: &str, time: u64, project: Option<&str>) -> Result<(),
         .send(body.to_string().as_bytes());
 
     match resp {
-        Ok(_) => Ok(()),
+        Ok(_) => {
+            debug!("wakatime: heartbeat sent");
+            Ok(())
+        }
         Err(e) => Err(format!("wakatime: {e}")),
     }
 }
