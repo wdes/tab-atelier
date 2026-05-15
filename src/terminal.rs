@@ -22,7 +22,7 @@ use crate::terminal_utils::{
 };
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags as CellFlags;
-use alacritty_terminal::term::{Config, Term};
+use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::tty;
 use gpui::{
     App, AsyncApp, Bounds, ClipboardItem, ContentMask, Context, Corners, Edges, Element, ElementId, FocusHandle,
@@ -298,9 +298,16 @@ impl TerminalView {
 
     pub fn send_clipboard(&self, text: &str) {
         self.last_input.set(Some(std::time::Instant::now()));
-        self.term.lock().grid_mut().scroll_display(Scroll::Bottom);
-        let bracketed = format!("\x1b[200~{text}\x1b[201~");
-        let _ = self.notifier.send(Msg::Input(bracketed.into_bytes().into()));
+        let mut term = self.term.lock();
+        let bracketed = term.mode().contains(TermMode::BRACKETED_PASTE);
+        term.grid_mut().scroll_display(Scroll::Bottom);
+        drop(term);
+        let payload = if bracketed {
+            format!("\x1b[200~{}\x1b[201~", text.replace('\x1b', ""))
+        } else {
+            text.replace("\r\n", "\r").replace('\n', "\r")
+        };
+        let _ = self.notifier.send(Msg::Input(payload.into_bytes().into()));
     }
 
     fn scroll(&self, delta: i32) {
