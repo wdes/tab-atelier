@@ -18,7 +18,9 @@ struct TabInfo {
     name: String,
     cwd: Option<String>,
     active: bool,
+    #[cfg(feature = "energy")]
     cpu_percent: f64,
+    #[cfg(feature = "energy")]
     #[serde(skip_serializing_if = "Option::is_none")]
     watts: Option<f64>,
 }
@@ -37,6 +39,7 @@ struct ErrorResponse {
 pub struct TabSnapshot {
     pub tabs: Vec<(String, Option<String>)>,
     pub active: usize,
+    #[cfg(feature = "energy")]
     pub power: Vec<crate::power::TabPower>,
     pub pending_closes: Vec<usize>,
 }
@@ -154,7 +157,9 @@ pub fn start_api_server(state: Arc<Mutex<TabSnapshot>>, token: String) {
                             name: name.clone(),
                             cwd: cwd.clone(),
                             active: i == state.active,
+                            #[cfg(feature = "energy")]
                             cpu_percent: state.power.get(i).map_or(0.0, |p| p.cpu_percent),
+                            #[cfg(feature = "energy")]
                             watts: state.power.get(i).and_then(|p| p.watts),
                         })
                         .collect();

@@ -5,6 +5,7 @@
 mod api;
 mod locale;
 mod platform;
+#[cfg(feature = "energy")]
 mod power;
 mod screenshot;
 mod terminal;
@@ -38,6 +39,7 @@ struct Tab {
     name: String,
     active_duration: std::time::Duration,
     last_activated: Option<std::time::Instant>,
+    #[cfg(feature = "energy")]
     energy_wh: f64,
 }
 
@@ -118,8 +120,11 @@ struct AppState {
     tracker: Option<WakatimeTracker>,
     api_token: String,
     api_state: Arc<Mutex<api::TabSnapshot>>,
+    #[cfg(feature = "energy")]
     power_pids: Arc<Mutex<Vec<u32>>>,
+    #[cfg(feature = "energy")]
     power_watts: Arc<Mutex<Vec<power::TabPower>>>,
+    #[cfg(feature = "energy")]
     battery_percent: Arc<Mutex<Option<u8>>>,
     blink_on: bool,
     toasts: Vec<Toast>,
@@ -182,6 +187,7 @@ impl AppState {
                     name: ts.name.clone(),
                     active_duration: std::time::Duration::from_secs_f64(ts.uptime_secs.unwrap_or(0.0)),
                     last_activated: None,
+                    #[cfg(feature = "energy")]
                     energy_wh: ts.energy_wh.unwrap_or(0.0),
                 });
             }
@@ -199,6 +205,7 @@ impl AppState {
                     name: locale::strings(lang).terminal.into(),
                     active_duration: std::time::Duration::ZERO,
                     last_activated: None,
+                    #[cfg(feature = "energy")]
                     energy_wh: 0.0,
                 });
             }
@@ -220,6 +227,7 @@ impl AppState {
                     name: locale::strings(lang).terminal.into(),
                     active_duration: std::time::Duration::ZERO,
                     last_activated: Some(std::time::Instant::now()),
+                    #[cfg(feature = "energy")]
                     energy_wh: 0.0,
                 }],
                 0,
@@ -261,6 +269,7 @@ impl AppState {
         })
         .detach();
 
+        #[cfg(feature = "energy")]
         cx.spawn(async |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             loop {
                 cx.background_executor()
@@ -290,14 +299,19 @@ impl AppState {
         let api_state = Arc::new(Mutex::new(api::TabSnapshot {
             tabs: Vec::new(),
             active: 0,
+            #[cfg(feature = "energy")]
             power: Vec::new(),
             pending_closes: Vec::new(),
         }));
         api::start_api_server(api_state.clone(), api_token.clone());
 
+        #[cfg(feature = "energy")]
         let power_pids: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+        #[cfg(feature = "energy")]
         let power_watts: Arc<Mutex<Vec<power::TabPower>>> = Arc::new(Mutex::new(Vec::new()));
+        #[cfg(feature = "energy")]
         let battery_percent: Arc<Mutex<Option<u8>>> = Arc::new(Mutex::new(None));
+        #[cfg(feature = "energy")]
         power::start_power_monitor(power_pids.clone(), power_watts.clone(), battery_percent.clone());
 
         Self {
@@ -316,8 +330,11 @@ impl AppState {
             tracker,
             api_token,
             api_state,
+            #[cfg(feature = "energy")]
             power_pids,
+            #[cfg(feature = "energy")]
             power_watts,
+            #[cfg(feature = "energy")]
             battery_percent,
             blink_on: false,
             toasts: Vec::new(),
@@ -365,6 +382,7 @@ impl AppState {
                 name: format!("{} {}", self.t().terminal_n, self.tabs.len()),
                 active_duration: std::time::Duration::ZERO,
                 last_activated: Some(std::time::Instant::now()),
+                #[cfg(feature = "energy")]
                 energy_wh: 0.0,
             },
         );
@@ -429,6 +447,7 @@ impl AppState {
                 tab.activate();
             }
         }
+        #[cfg(feature = "energy")]
         {
             let watts = self.power_watts.lock().unwrap();
             for (i, tab) in self.tabs.iter_mut().enumerate() {
@@ -452,7 +471,10 @@ impl AppState {
                     cwd,
                     output,
                     uptime_secs: Some(tab.uptime().as_secs_f64()),
+                    #[cfg(feature = "energy")]
                     energy_wh: if tab.energy_wh > 0.0 { Some(tab.energy_wh) } else { None },
+                    #[cfg(not(feature = "energy"))]
+                    energy_wh: None,
                 }
             })
             .collect();
@@ -470,9 +492,11 @@ impl AppState {
             let mut snapshot = self.api_state.lock().unwrap();
             snapshot.tabs = api_tabs;
             snapshot.active = self.active;
+            #[cfg(feature = "energy")]
             snapshot.power.clone_from(&self.power_watts.lock().unwrap());
         }
 
+        #[cfg(feature = "energy")]
         {
             let pids: Vec<u32> = self.tabs.iter().map(|tab| tab.view.read(cx).pid()).collect();
             *self.power_pids.lock().unwrap() = pids;
@@ -521,7 +545,10 @@ impl AppState {
         } else {
             None
         };
-        self.tabs[idx].energy_wh = 0.0;
+        #[cfg(feature = "energy")]
+        {
+            self.tabs[idx].energy_wh = 0.0;
+        }
         self.exit_confirm = None;
         self.tabs[self.active].view.read(cx).focus_handle(cx).focus(window);
         cx.notify();
@@ -542,7 +569,10 @@ impl AppState {
         } else {
             None
         };
-        self.tabs[idx].energy_wh = 0.0;
+        #[cfg(feature = "energy")]
+        {
+            self.tabs[idx].energy_wh = 0.0;
+        }
         self.exit_confirm = None;
         self.tabs[self.active].view.read(cx).focus_handle(cx).focus(window);
         cx.notify();
@@ -564,7 +594,10 @@ impl AppState {
                     cwd,
                     output,
                     uptime_secs: Some(tab.uptime().as_secs_f64()),
+                    #[cfg(feature = "energy")]
                     energy_wh: if tab.energy_wh > 0.0 { Some(tab.energy_wh) } else { None },
+                    #[cfg(not(feature = "energy"))]
+                    energy_wh: None,
                 }
             })
             .collect();
@@ -595,9 +628,7 @@ impl AppState {
         });
         cx.notify();
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            cx.background_executor()
-                .timer(std::time::Duration::from_secs(1))
-                .await;
+            cx.background_executor().timer(std::time::Duration::from_secs(1)).await;
             let _ = this.update(cx, |state, cx| {
                 state.toasts.retain(|t| t.time != progress_time);
                 cx.notify();
@@ -648,8 +679,10 @@ impl AppState {
         let tab_blink_bg = th.danger_hsla();
         let tab_fg = th.fg_hsla();
         let tab_border = th.border_hsla();
+        #[cfg(feature = "energy")]
         let watts_fg = th.fg_muted_hsla();
 
+        #[cfg(feature = "energy")]
         let watts = self.power_watts.lock().unwrap().clone();
 
         let mut bar = div()
@@ -664,7 +697,11 @@ impl AppState {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(|this, ev: &MouseDownEvent, _window, cx| {
-                    if this.context_menu.as_ref().is_some_and(|m| matches!(m.kind, MenuKind::Tab(_))) {
+                    if this
+                        .context_menu
+                        .as_ref()
+                        .is_some_and(|m| matches!(m.kind, MenuKind::Tab(_)))
+                    {
                         return;
                     }
                     this.context_menu = Some(ContextMenu {
@@ -684,6 +721,7 @@ impl AppState {
                 tab.name.clone()
             };
 
+            #[cfg(feature = "energy")]
             let power_label = watts.get(i).map(power::TabPower::label).unwrap_or_default();
 
             let drag_name = tab.name.clone();
@@ -764,15 +802,17 @@ impl AppState {
                 .on_drop(cx.listener(move |this, dragged: &DraggedTab, window, cx| {
                     this.move_tab(dragged.idx, i, window, cx);
                 }))
-                .child(name)
-                .child(
-                    div()
-                        .text_size(px(11.0))
-                        .text_color(watts_fg)
-                        .min_w(px(55.0))
-                        .text_align(gpui::TextAlign::Right)
-                        .child(power_label),
-                );
+                .child(name);
+
+            #[cfg(feature = "energy")]
+            let tab_el = tab_el.child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(watts_fg)
+                    .min_w(px(55.0))
+                    .text_align(gpui::TextAlign::Right)
+                    .child(power_label),
+            );
 
             bar = bar.child(tab_el);
         }
@@ -889,26 +929,29 @@ impl AppState {
             };
             let stat_fg = th.fg_muted_hsla();
             let elapsed = self.tabs[stats_idx].uptime();
-            let power_info = self.power_watts.lock().unwrap().get(stats_idx).cloned();
             let t = self.t();
 
             let mut stats_lines: Vec<String> = Vec::new();
 
-            if let Some(ref p) = power_info {
-                if p.cpu_percent >= 0.1 {
-                    stats_lines.push(format!("{}: {}", t.cpu, p.cpu_label()));
+            #[cfg(feature = "energy")]
+            {
+                let power_info = self.power_watts.lock().unwrap().get(stats_idx).cloned();
+                if let Some(ref p) = power_info {
+                    if p.cpu_percent >= 0.1 {
+                        stats_lines.push(format!("{}: {}", t.cpu, p.cpu_label()));
+                    }
+                    let wl = p.watts_label();
+                    if !wl.is_empty() {
+                        stats_lines.push(format!("{}: {wl}", t.power));
+                    }
                 }
-                let wl = p.watts_label();
-                if !wl.is_empty() {
-                    stats_lines.push(format!("{}: {wl}", t.power));
-                }
-            }
-            let wh = self.tabs[stats_idx].energy_wh;
-            if wh > 0.0 {
-                if wh >= 1.0 {
-                    stats_lines.push(format!("{}: {wh:.1} Wh", t.energy));
-                } else {
-                    stats_lines.push(format!("{}: {:.0} mWh", t.energy, wh * 1000.0));
+                let wh = self.tabs[stats_idx].energy_wh;
+                if wh > 0.0 {
+                    if wh >= 1.0 {
+                        stats_lines.push(format!("{}: {wh:.1} Wh", t.energy));
+                    } else {
+                        stats_lines.push(format!("{}: {:.0} mWh", t.energy, wh * 1000.0));
+                    }
                 }
             }
             stats_lines.push(format!("{}: {}", t.uptime, format_duration(elapsed)));
@@ -1884,7 +1927,10 @@ impl Render for AppState {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         window.set_window_title(&format!("{}{}", self.tabs[self.active].name, self.t().title_suffix));
         let active_terminal = self.tabs[self.active].view.clone();
+        #[cfg(feature = "energy")]
         let battery = *self.battery_percent.lock().unwrap();
+        #[cfg(not(feature = "energy"))]
+        let battery: Option<u8> = None;
         let tab_bar = self.render_tab_bar(battery, window, cx);
         let context_menu = if self.renaming.is_none()
             && self.exit_confirm.is_none()
