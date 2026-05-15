@@ -55,9 +55,16 @@ jobs:
             - uses: actions/download-artifact@v4
               with:
                   name: tab-atelier-linux-amd64
-            - name: Run --check inside debian:trixie-slim
+            - name: Run --check before installing deps (expect failure)
+              continue-on-error: true
               run: |
                   chmod +x tab-atelier
+                  docker run --rm \
+                      -v "$PWD/tab-atelier:/usr/local/bin/tab-atelier:ro" \
+                      debian:trixie-slim \
+                      tab-atelier --check
+            - name: Run --check after installing deps
+              run: |
                   docker run --rm \
                       -v "$PWD/tab-atelier:/usr/local/bin/tab-atelier:ro" \
                       debian:trixie-slim \
