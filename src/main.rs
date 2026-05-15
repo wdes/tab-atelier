@@ -316,9 +316,20 @@ impl Swoop {
 
     fn do_screenshot(&mut self, full: bool, cx: &mut Context<Self>) {
         let tab_name = self.tabs[self.active].name.clone();
+        let progress_time = std::time::Instant::now();
+        self.toasts.push(("Taking screenshot...".into(), progress_time));
+        cx.notify();
         cx.spawn(async move |this: WeakEntity<Swoop>, cx: &mut AsyncApp| {
             cx.background_executor()
-                .timer(std::time::Duration::from_millis(150))
+                .timer(std::time::Duration::from_millis(100))
+                .await;
+            // Hide progress toast before capture so it doesn't appear in the screenshot
+            let _ = this.update(cx, |state, cx| {
+                state.toasts.retain(|(_, t)| *t != progress_time);
+                cx.notify();
+            });
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(50))
                 .await;
             let result = cx.background_executor().spawn(async move {
                 if full {
