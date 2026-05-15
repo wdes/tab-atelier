@@ -691,16 +691,14 @@ impl Swoop {
                     this.move_tab(dragged.idx, i, window, cx);
                 }))
                 .child(name)
-                .when(!power_label.is_empty(), |el: Stateful<Div>| {
-                    el.child(
-                        div()
-                            .text_size(px(11.0))
-                            .text_color(watts_fg)
-                            .min_w(px(55.0))
-                            .text_align(gpui::TextAlign::Right)
-                            .child(power_label),
-                    )
-                });
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(watts_fg)
+                        .min_w(px(55.0))
+                        .text_align(gpui::TextAlign::Right)
+                        .child(power_label),
+                );
 
             bar = bar.child(tab_el);
         }
