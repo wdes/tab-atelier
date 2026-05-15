@@ -15,20 +15,19 @@ pub struct TabPower {
 
 impl TabPower {
     pub fn label(&self) -> String {
-        self.watts.map_or_else(
-            || self.cpu_label(),
-            |w| {
-                if w >= 100.0 {
-                    format!("{w:.0}W")
-                } else if w >= 1.0 {
-                    format!("{w:.1}W")
-                } else if w >= 0.01 {
-                    format!("{:.0}mW", w * 1000.0)
-                } else {
-                    self.cpu_label()
-                }
-            },
-        )
+        if let Some(w) = self.watts {
+            if w >= 100.0 {
+                return format!("{w:.0}W");
+            } else if w >= 1.0 {
+                return format!("{w:.1}W");
+            } else if w >= 0.01 {
+                return format!("{:.0}mW", w * 1000.0);
+            }
+        }
+        if self.cpu_percent >= 0.1 {
+            return self.cpu_label();
+        }
+        String::new()
     }
 
     pub fn cpu_label(&self) -> String {
@@ -37,6 +36,20 @@ impl TabPower {
         } else {
             format!("{:.1}%", self.cpu_percent)
         }
+    }
+
+    pub fn watts_label(&self) -> String {
+        self.watts.map_or_else(String::new, |w| {
+            if w >= 100.0 {
+                format!("{w:.0} W")
+            } else if w >= 1.0 {
+                format!("{w:.1} W")
+            } else if w >= 0.01 {
+                format!("{:.0} mW", w * 1000.0)
+            } else {
+                String::new()
+            }
+        })
     }
 }
 
@@ -181,5 +194,42 @@ mod tests {
             watts: Some(0.001),
         };
         assert_eq!(tp.label(), "0.5%");
+    }
+
+    #[test]
+    fn label_empty_when_idle() {
+        let tp = TabPower {
+            cpu_percent: 0.0,
+            watts: None,
+        };
+        assert_eq!(tp.label(), "");
+    }
+
+    #[test]
+    fn watts_label_formats_correctly() {
+        assert_eq!(
+            TabPower {
+                cpu_percent: 50.0,
+                watts: Some(3.5)
+            }
+            .watts_label(),
+            "3.5 W"
+        );
+        assert_eq!(
+            TabPower {
+                cpu_percent: 1.0,
+                watts: Some(0.05)
+            }
+            .watts_label(),
+            "50 mW"
+        );
+        assert_eq!(
+            TabPower {
+                cpu_percent: 0.0,
+                watts: None
+            }
+            .watts_label(),
+            ""
+        );
     }
 }
