@@ -26,14 +26,17 @@ pub struct SavedState {
     pub active: usize,
 }
 
+#[must_use]
 pub fn state_dir(base: &std::path::Path) -> PathBuf {
     base.join(APP_DIR)
 }
 
+#[must_use]
 pub fn state_path(base: &std::path::Path) -> PathBuf {
     state_dir(base).join("tabs.json")
 }
 
+#[must_use]
 pub fn load_state_from(base: &std::path::Path) -> Option<SavedState> {
     let path = state_path(base);
     let data = std::fs::read_to_string(path).ok()?;
@@ -59,39 +62,38 @@ impl Default for FontConfig {
     }
 }
 
+#[must_use]
 pub fn load_font_config(config_base: &std::path::Path) -> FontConfig {
     let config_path = config_base.join("zed/settings.json");
     load_font_config_from(&config_path)
 }
 
+#[must_use]
 pub fn load_font_config_from(path: &std::path::Path) -> FontConfig {
     let mut config = FontConfig::default();
 
-    let data = match std::fs::read_to_string(path) {
-        Ok(d) => d,
-        Err(_) => return config,
+    let Ok(data) = std::fs::read_to_string(path) else {
+        return config;
     };
 
-    // Zed settings.json has comments — strip them before parsing
     let stripped: String = strip_json_comments(&data);
 
-    let parsed: serde_json::Value = match serde_json::from_str(&stripped) {
-        Ok(v) => v,
-        Err(_) => return config,
+    let Ok(parsed): Result<serde_json::Value, _> = serde_json::from_str(&stripped) else {
+        return config;
     };
 
     if let Some(family) = parsed.get("ui_font_family").and_then(|v| v.as_str()) {
         config.family = family.to_string();
     }
-    if let Some(weight) = parsed.get("ui_font_weight").and_then(|v| v.as_u64()) {
+    if let Some(weight) = parsed.get("ui_font_weight").and_then(serde_json::Value::as_u64) {
         config.weight = weight as u16;
     }
-    if let Some(size) = parsed.get("ui_font_size").and_then(|v| v.as_f64()) {
+    if let Some(size) = parsed.get("ui_font_size").and_then(serde_json::Value::as_f64) {
         config.size = size as f32;
-    } else if let Some(size) = parsed.get("buffer_font_size").and_then(|v| v.as_f64()) {
+    } else if let Some(size) = parsed.get("buffer_font_size").and_then(serde_json::Value::as_f64) {
         config.size = size as f32;
     }
-    if let Some(sens) = parsed.get("scroll_sensitivity").and_then(|v| v.as_f64()) {
+    if let Some(sens) = parsed.get("scroll_sensitivity").and_then(serde_json::Value::as_f64) {
         config.scroll_sensitivity = (sens as f32).max(0.01);
     }
 
@@ -146,16 +148,18 @@ fn strip_json_comments(input: &str) -> String {
     out
 }
 
+#[must_use]
 pub fn load_wakatime_key(config_base: &std::path::Path) -> Option<String> {
     let config_path = config_base.join("zed/settings.json");
     let data = std::fs::read_to_string(config_path).ok()?;
     let stripped = strip_json_comments(&data);
     let parsed: serde_json::Value = serde_json::from_str(&stripped).ok()?;
-    parsed.get("wakatime")
+    parsed
+        .get("wakatime")
         .and_then(|w| w.get("settings"))
         .and_then(|s| s.get("api-key"))
         .and_then(|k| k.as_str())
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -166,6 +170,7 @@ pub struct Preferences {
     pub browser: Option<String>,
 }
 
+#[must_use]
 pub fn load_preferences(base: &std::path::Path) -> Preferences {
     let path = state_dir(base).join("preferences.json");
     std::fs::read_to_string(path)
@@ -192,6 +197,7 @@ pub fn save_state(base: &std::path::Path, state: &SavedState) {
     }
 }
 
+#[must_use]
 pub fn detect_urls(text: &str) -> Vec<(usize, usize, String, bool)> {
     let chars: Vec<char> = text.chars().collect();
     let len = chars.len();
@@ -201,13 +207,22 @@ pub fn detect_urls(text: &str) -> Vec<(usize, usize, String, bool)> {
     while i < len {
         if chars[i] == 'h' && i + 7 < len {
             let prefix_len = if i + 8 <= len
-                && chars[i+1] == 't' && chars[i+2] == 't' && chars[i+3] == 'p'
-                && chars[i+4] == 's' && chars[i+5] == ':' && chars[i+6] == '/' && chars[i+7] == '/'
+                && chars[i + 1] == 't'
+                && chars[i + 2] == 't'
+                && chars[i + 3] == 'p'
+                && chars[i + 4] == 's'
+                && chars[i + 5] == ':'
+                && chars[i + 6] == '/'
+                && chars[i + 7] == '/'
             {
                 8
             } else if i + 7 <= len
-                && chars[i+1] == 't' && chars[i+2] == 't' && chars[i+3] == 'p'
-                && chars[i+4] == ':' && chars[i+5] == '/' && chars[i+6] == '/'
+                && chars[i + 1] == 't'
+                && chars[i + 2] == 't'
+                && chars[i + 3] == 'p'
+                && chars[i + 4] == ':'
+                && chars[i + 5] == '/'
+                && chars[i + 6] == '/'
             {
                 7
             } else {
@@ -215,12 +230,13 @@ pub fn detect_urls(text: &str) -> Vec<(usize, usize, String, bool)> {
             };
             if prefix_len > 0 {
                 let start = i;
-                while i < len && !chars[i].is_whitespace()
+                while i < len
+                    && !chars[i].is_whitespace()
                     && !matches!(chars[i], '"' | '\'' | '<' | '>' | ')' | ']' | '}')
                 {
                     i += 1;
                 }
-                while i > start + prefix_len && matches!(chars[i-1], '.' | ',' | ';') {
+                while i > start + prefix_len && matches!(chars[i - 1], '.' | ',' | ';') {
                     i -= 1;
                 }
                 let url: String = chars[start..i].iter().collect();
@@ -229,11 +245,10 @@ pub fn detect_urls(text: &str) -> Vec<(usize, usize, String, bool)> {
             }
         }
 
-        if chars[i] == '/' && i + 1 < len && (chars[i+1].is_alphanumeric() || chars[i+1] == '.') {
+        if chars[i] == '/' && i + 1 < len && (chars[i + 1].is_alphanumeric() || chars[i + 1] == '.') {
             let start = i;
             let mut j = i;
-            while j < len && !chars[j].is_whitespace()
-                && !matches!(chars[j], '"' | '\'' | '<' | '>' | ')' | ']' | '}')
+            while j < len && !chars[j].is_whitespace() && !matches!(chars[j], '"' | '\'' | '<' | '>' | ')' | ']' | '}')
             {
                 j += 1;
             }
@@ -248,8 +263,7 @@ pub fn detect_urls(text: &str) -> Vec<(usize, usize, String, bool)> {
         if i + 4 < len && chars[i].is_alphanumeric() {
             let start = i;
             let mut j = i;
-            while j < len && !chars[j].is_whitespace()
-                && !matches!(chars[j], '"' | '\'' | '<' | '>' | ')' | ']' | '}')
+            while j < len && !chars[j].is_whitespace() && !matches!(chars[j], '"' | '\'' | '<' | '>' | ')' | ']' | '}')
             {
                 j += 1;
             }
@@ -257,7 +271,8 @@ pub fn detect_urls(text: &str) -> Vec<(usize, usize, String, bool)> {
             if candidate.contains('/') && candidate.contains(':') {
                 let has_slash = candidate.matches('/').count() >= 1;
                 let colon_part = candidate.rsplit(':').next().unwrap_or("");
-                let looks_like_path = has_slash && !colon_part.is_empty() && colon_part.chars().all(|c| c.is_ascii_digit());
+                let looks_like_path =
+                    has_slash && !colon_part.is_empty() && colon_part.chars().all(|c| c.is_ascii_digit());
                 if looks_like_path && !candidate.starts_with("http") {
                     urls.push((start, j, candidate, true));
                     i = j;
@@ -272,13 +287,14 @@ pub fn detect_urls(text: &str) -> Vec<(usize, usize, String, bool)> {
     urls
 }
 
+#[must_use]
 pub fn file_path_for_open(path: &str) -> &str {
     if let Some(colon_pos) = path.rfind(':') {
-        let after = &path[colon_pos+1..];
+        let after = &path[colon_pos + 1..];
         if !after.is_empty() && after.chars().all(|c| c.is_ascii_digit()) {
             let base = &path[..colon_pos];
             if let Some(colon_pos2) = base.rfind(':') {
-                let after2 = &base[colon_pos2+1..];
+                let after2 = &base[colon_pos2 + 1..];
                 if !after2.is_empty() && after2.chars().all(|c| c.is_ascii_digit()) {
                     return &path[..colon_pos2];
                 }
@@ -297,8 +313,20 @@ mod tests {
     fn test_tab_state_serialization() {
         let state = SavedState {
             tabs: vec![
-                TabState { name: "Terminal".into(), cwd: Some("/home/user".into()), output: None, uptime_secs: None, energy_wh: None },
-                TabState { name: "Build".into(), cwd: None, output: None, uptime_secs: None, energy_wh: None },
+                TabState {
+                    name: "Terminal".into(),
+                    cwd: Some("/home/user".into()),
+                    output: None,
+                    uptime_secs: None,
+                    energy_wh: None,
+                },
+                TabState {
+                    name: "Build".into(),
+                    cwd: None,
+                    output: None,
+                    uptime_secs: None,
+                    energy_wh: None,
+                },
             ],
             active: 1,
         };
@@ -315,9 +343,13 @@ mod tests {
     #[test]
     fn test_tab_state_uptime_energy_round_trip() {
         let state = SavedState {
-            tabs: vec![
-                TabState { name: "T".into(), cwd: None, output: None, uptime_secs: Some(123.5), energy_wh: Some(0.042) },
-            ],
+            tabs: vec![TabState {
+                name: "T".into(),
+                cwd: None,
+                output: None,
+                uptime_secs: Some(123.5),
+                energy_wh: Some(0.042),
+            }],
             active: 0,
         };
         let json = serde_json::to_string(&state).unwrap();
@@ -348,7 +380,7 @@ mod tests {
     #[test]
     fn test_state_path_uses_base() {
         let path = state_path(std::path::Path::new("/tmp/test-base"));
-        assert!(path.ends_with(&format!("{APP_DIR}/tabs.json")));
+        assert!(path.ends_with(format!("{APP_DIR}/tabs.json")));
     }
 
     #[test]
@@ -364,8 +396,20 @@ mod tests {
 
         let state = SavedState {
             tabs: vec![
-                TabState { name: "One".into(), cwd: Some("/tmp".into()), output: None, uptime_secs: None, energy_wh: None },
-                TabState { name: "Two".into(), cwd: None, output: None, uptime_secs: None, energy_wh: None },
+                TabState {
+                    name: "One".into(),
+                    cwd: Some("/tmp".into()),
+                    output: None,
+                    uptime_secs: None,
+                    energy_wh: None,
+                },
+                TabState {
+                    name: "Two".into(),
+                    cwd: None,
+                    output: None,
+                    uptime_secs: None,
+                    energy_wh: None,
+                },
             ],
             active: 1,
         };
@@ -519,12 +563,16 @@ mod tests {
         let dir = std::env::temp_dir().join("ta-test-comments");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("settings.json");
-        std::fs::write(&path, r#"{
+        std::fs::write(
+            &path,
+            r#"{
   // font settings
   "ui_font_family": "Fira Code",
   "ui_font_weight": 700,
   "ui_font_size": 18
-}"#).unwrap();
+}"#,
+        )
+        .unwrap();
         let fc = load_font_config_from(&path);
         assert_eq!(fc.family, "Fira Code");
         assert_eq!(fc.weight, 700);
@@ -537,7 +585,13 @@ mod tests {
         let dir = std::env::temp_dir().join("ta-test-create-dir");
         let _ = std::fs::remove_dir_all(&dir);
         let state = SavedState {
-            tabs: vec![TabState { name: "T".into(), cwd: None, output: None, uptime_secs: None, energy_wh: None }],
+            tabs: vec![TabState {
+                name: "T".into(),
+                cwd: None,
+                output: None,
+                uptime_secs: None,
+                energy_wh: None,
+            }],
             active: 0,
         };
         save_state(&dir, &state);
@@ -628,7 +682,13 @@ mod tests {
         let sd = dir.join(APP_DIR);
         let _ = std::fs::create_dir_all(&sd);
         let state = SavedState {
-            tabs: vec![TabState { name: "Only".into(), cwd: None, output: None, uptime_secs: None, energy_wh: None }],
+            tabs: vec![TabState {
+                name: "Only".into(),
+                cwd: None,
+                output: None,
+                uptime_secs: None,
+                energy_wh: None,
+            }],
             active: 999,
         };
         let json = serde_json::to_string_pretty(&state).unwrap();
