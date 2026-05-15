@@ -13,6 +13,10 @@ keywords = ["terminal", "guake", "dropdown", "x11", "emulator"]
 categories = ["command-line-utilities"]
 include = ["/src/**/*.rs", "/Cargo.toml", "/LICENSE", "/README.md"]
 
+[features]
+default = ["energy"]
+energy = ["dep:wattaouille"]
+
 [lints.rust]
 unsafe_code = "deny"
 
@@ -47,7 +51,7 @@ x11rb = { version = "0.13", features = ["allow-unsafe-code"] }
 qrcode = { version = "0.14", default-features = false }
 ureq = { version = "3", features = ["json"] }
 vte = { version = "0.15", default-features = false, features = ["std", "ansi"] }
-wattaouille = "1.4.0"
+wattaouille = { version = "1.4.0", optional = true }
 
 [package.metadata.deb]
 section = "x11"
