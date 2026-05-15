@@ -127,12 +127,34 @@ impl PowerMonitor {
     }
 }
 
-pub fn start_power_monitor(tab_pids: Arc<Mutex<Vec<u32>>>, results: Arc<Mutex<Vec<TabPower>>>) {
+pub fn read_battery_percent() -> Option<u8> {
+    let dir = std::fs::read_dir("/sys/class/power_supply").ok()?;
+    for entry in dir.flatten() {
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with("BAT") {
+            continue;
+        }
+        let status = std::fs::read_to_string(entry.path().join("status")).unwrap_or_default();
+        if status.trim() != "Discharging" {
+            continue;
+        }
+        let capacity = std::fs::read_to_string(entry.path().join("capacity")).ok()?;
+        return capacity.trim().parse().ok();
+    }
+    None
+}
+
+pub fn start_power_monitor(
+    tab_pids: Arc<Mutex<Vec<u32>>>,
+    results: Arc<Mutex<Vec<TabPower>>>,
+    battery: Arc<Mutex<Option<u8>>>,
+) {
     std::thread::spawn(move || {
         let mut monitor = PowerMonitor::new();
         let interval = std::time::Duration::from_secs(2);
         loop {
             std::thread::sleep(interval);
+            *battery.lock().unwrap() = read_battery_percent();
             let pids = tab_pids.lock().unwrap().clone();
             if pids.is_empty() {
                 continue;
