@@ -38,3 +38,29 @@ jobs:
               run: cargo fmt -- --check
             - name: Clippy
               run: cargo clippy --all-targets --locked -- -D warnings
+            - name: Build release binary
+              run: cargo build --release --locked
+            - name: Upload release binary
+              uses: actions/upload-artifact@v4
+              with:
+                  name: tab-atelier-linux-amd64
+                  path: target/release/tab-atelier
+                  retention-days: 5
+
+    integration:
+        name: Integration test (debian:trixie-slim)
+        runs-on: ubuntu-latest
+        needs: build
+        steps:
+            - uses: actions/download-artifact@v4
+              with:
+                  name: tab-atelier-linux-amd64
+            - name: Run --check inside debian:trixie-slim
+              run: |
+                  chmod +x tab-atelier
+                  docker run --rm \
+                      -v "$PWD/tab-atelier:/usr/local/bin/tab-atelier:ro" \
+                      debian:trixie-slim \
+                      sh -c "apt-get update && apt-get install -y --no-install-recommends \
+                          libfreetype6 libxkbcommon0 libxkbcommon-x11-0 libxcb1 libxcb-xkb1 \
+                          && tab-atelier --check"
