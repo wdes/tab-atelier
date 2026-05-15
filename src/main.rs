@@ -56,7 +56,7 @@ struct Swoop {
     api_state: Arc<Mutex<api::TabSnapshot>>,
     power_pids: Arc<Mutex<Vec<u32>>>,
     power_watts: Arc<Mutex<Vec<power::TabPower>>>,
-    toast: Option<(String, std::time::Instant)>,
+    toasts: Vec<(String, std::time::Instant)>,
 }
 
 impl Swoop {
@@ -165,7 +165,7 @@ impl Swoop {
             api_state,
             power_pids,
             power_watts,
-            toast: None,
+            toasts: Vec::new(),
         }
     }
 
@@ -315,32 +315,32 @@ impl Swoop {
     }
 
     fn do_screenshot(&mut self, full: bool, cx: &mut Context<Self>) {
-        self.toast = Some(("Taking screenshot...".into(), std::time::Instant::now()));
-        cx.notify();
+        let tab_name = self.tabs[self.active].name.clone();
         cx.spawn(async move |this: WeakEntity<Swoop>, cx: &mut AsyncApp| {
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(150))
                 .await;
             let result = cx.background_executor().spawn(async move {
                 if full {
-                    screenshot::take_screenshot_full()
+                    screenshot::take_screenshot_full(&tab_name)
                 } else {
-                    screenshot::take_screenshot_tab(32)
+                    screenshot::take_screenshot_tab(&tab_name, 32)
                 }
             }).await;
+            let toast_time = std::time::Instant::now();
             let _ = this.update(cx, |state, cx| {
                 let msg = match result {
                     Ok(path) => format!("Saved: {}", path.display()),
                     Err(e) => format!("Screenshot failed: {e}"),
                 };
-                state.toast = Some((msg, std::time::Instant::now()));
+                state.toasts.push((msg, toast_time));
                 cx.notify();
             });
             cx.background_executor()
                 .timer(std::time::Duration::from_secs(3))
                 .await;
             let _ = this.update(cx, |state, cx| {
-                state.toast = None;
+                state.toasts.retain(|(_, t)| *t != toast_time);
                 cx.notify();
             });
         })
@@ -1156,26 +1156,34 @@ impl Render for Swoop {
             root = root.child(qr);
         }
 
-        if let Some((ref msg, _)) = self.toast {
+        if !self.toasts.is_empty() {
             let toast_bg: Hsla = rgb(0x2d2d2d).into();
             let toast_fg: Hsla = rgb(0xcccccc).into();
             let toast_border: Hsla = rgb(0x007acc).into();
-            root = root.child(
-                div()
-                    .id("toast")
-                    .absolute()
-                    .bottom(px(48.0))
-                    .right(px(16.0))
-                    .bg(toast_bg)
-                    .text_color(toast_fg)
-                    .border_1()
-                    .border_color(toast_border)
-                    .rounded(px(6.0))
-                    .px(px(16.0))
-                    .py(px(10.0))
-                    .text_size(px(13.0))
-                    .child(msg.clone()),
-            );
+            let mut stack = div()
+                .id("toast-stack")
+                .absolute()
+                .bottom(px(48.0))
+                .right(px(16.0))
+                .flex()
+                .flex_col()
+                .gap(px(6.0));
+            for (i, (msg, _)) in self.toasts.iter().enumerate() {
+                stack = stack.child(
+                    div()
+                        .id(SharedString::from(format!("toast-{i}")))
+                        .bg(toast_bg)
+                        .text_color(toast_fg)
+                        .border_1()
+                        .border_color(toast_border)
+                        .rounded(px(6.0))
+                        .px(px(16.0))
+                        .py(px(10.0))
+                        .text_size(px(13.0))
+                        .child(msg.clone()),
+                );
+            }
+            root = root.child(stack);
         }
 
         root
