@@ -315,15 +315,19 @@ impl Swoop {
     }
 
     fn do_screenshot(&mut self, full: bool, cx: &mut Context<Self>) {
+        self.toast = Some(("Taking screenshot...".into(), std::time::Instant::now()));
+        cx.notify();
         cx.spawn(async move |this: WeakEntity<Swoop>, cx: &mut AsyncApp| {
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(150))
                 .await;
-            let result = if full {
-                screenshot::take_screenshot_full()
-            } else {
-                screenshot::take_screenshot_tab(32)
-            };
+            let result = cx.background_executor().spawn(async move {
+                if full {
+                    screenshot::take_screenshot_full()
+                } else {
+                    screenshot::take_screenshot_tab(32)
+                }
+            }).await;
             let _ = this.update(cx, |state, cx| {
                 let msg = match result {
                     Ok(path) => format!("Saved: {}", path.display()),
