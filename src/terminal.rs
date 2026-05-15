@@ -25,11 +25,11 @@ use alacritty_terminal::term::cell::Flags as CellFlags;
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::tty;
 use gpui::{
-    App, AsyncApp, Bounds, ContentMask, Context, Corners, Edges, Element, ElementId, FocusHandle, Focusable, FontStyle,
-    FontWeight, GlobalElementId, Hsla, InspectorElementId, InteractiveElement, IntoElement, KeyDownEvent, LayoutId,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, Pixels, Render, Rgba,
-    ScrollWheelEvent, ShapedLine, Size, StrikethroughStyle, Style, Styled, TextRun, UnderlineStyle, WeakEntity, Window,
-    div, fill, font, point, px, relative, rgb, size,
+    App, AsyncApp, Bounds, ClipboardItem, ContentMask, Context, Corners, Edges, Element, ElementId, FocusHandle,
+    Focusable, FontStyle, FontWeight, GlobalElementId, Hsla, InspectorElementId, InteractiveElement, IntoElement,
+    KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement,
+    Pixels, Render, Rgba, ScrollWheelEvent, ShapedLine, Size, StrikethroughStyle, Style, Styled, TextRun,
+    UnderlineStyle, WeakEntity, Window, div, fill, font, point, px, relative, rgb, size,
 };
 use tab_atelier::{FontConfig, detect_urls, file_path_for_open};
 use vte::ansi::{Color, NamedColor};
@@ -69,7 +69,7 @@ impl Dimensions for TermDims {
 
 struct CachedLine {
     text: String,
-    shaped: ShapedLine,
+    segments: Vec<TermSegment>,
 }
 
 pub struct TerminalView {
@@ -91,6 +91,7 @@ pub struct TerminalView {
     detected_urls: Rc<RefCell<Vec<DetectedUrl>>>,
     hover_grid: Rc<Cell<Option<(usize, usize)>>>,
     click_origin: Rc<Cell<Option<GridPoint>>>,
+    last_input: Rc<Cell<Option<std::time::Instant>>>,
 }
 
 impl TerminalView {
@@ -186,6 +187,7 @@ impl TerminalView {
             detected_urls: Rc::new(RefCell::new(Vec::new())),
             hover_grid: Rc::new(Cell::new(None)),
             click_origin: Rc::new(Cell::new(None)),
+            last_input: Rc::new(Cell::new(None)),
         }
     }
 
@@ -207,6 +209,18 @@ impl TerminalView {
 
     pub fn has_exited(&self) -> bool {
         self.exited.get()
+    }
+
+    pub fn last_input_time(&self) -> Option<std::time::Instant> {
+        self.last_input.get()
+    }
+
+    fn visible_lines(&self) -> usize {
+        self.cell_size
+            .map_or(25, |c| {
+                (f32::from(self.bounds_size.get().height) / f32::from(c.height)) as usize
+            })
+            .max(1)
     }
 
     pub fn respawn(&mut self, cwd: Option<&Path>, cx: &mut Context<Self>) {
@@ -261,6 +275,7 @@ impl TerminalView {
     }
 
     fn send_input(&self, bytes: Vec<u8>) {
+        self.last_input.set(Some(std::time::Instant::now()));
         self.term.lock().grid_mut().scroll_display(Scroll::Bottom);
         let _ = self.notifier.send(Msg::Input(bytes.into()));
     }
@@ -282,6 +297,7 @@ impl TerminalView {
     }
 
     pub fn send_clipboard(&self, text: &str) {
+        self.last_input.set(Some(std::time::Instant::now()));
         self.term.lock().grid_mut().scroll_display(Scroll::Bottom);
         let bracketed = format!("\x1b[200~{text}\x1b[201~");
         let _ = self.notifier.send(Msg::Input(bracketed.into_bytes().into()));
@@ -564,7 +580,69 @@ impl Render for TerminalView {
             .id("terminal")
             .key_context("terminal")
             .track_focus(&focus)
-            .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, _window, _cx| {
+            .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, _window, cx| {
+                let ks = &ev.keystroke;
+                if ks.modifiers.control && ks.modifiers.shift {
+                    match ks.key.as_str() {
+                        "c" => {
+                            if let Some(text) = this.copy_selection() {
+                                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                            }
+                            return;
+                        }
+                        "v" => {
+                            if let Some(item) = cx.read_from_clipboard()
+                                && let Some(text) = item.text()
+                            {
+                                this.send_clipboard(&text);
+                            }
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+                if ks.modifiers.alt && ks.key.as_str() == "tab" {
+                    return;
+                }
+                if ks.modifiers.shift && !ks.modifiers.control {
+                    match ks.key.as_str() {
+                        "pageup" => {
+                            this.scroll(-(this.visible_lines() as i32));
+                            return;
+                        }
+                        "pagedown" => {
+                            this.scroll(this.visible_lines() as i32);
+                            return;
+                        }
+                        "home" => {
+                            this.scroll_to_fraction(0.0);
+                            return;
+                        }
+                        "end" => {
+                            this.scroll_to_fraction(1.0);
+                            return;
+                        }
+                        "insert" => {
+                            if let Some(item) = cx.read_from_clipboard()
+                                && let Some(text) = item.text()
+                            {
+                                this.send_clipboard(&text);
+                            }
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+                if ks.modifiers.control && !ks.modifiers.shift && ks.key.as_str() == "insert" {
+                    if let Some(text) = this.copy_selection() {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    }
+                    return;
+                }
+                if ks.modifiers.control && ks.modifiers.shift && ks.key.as_str() == "l" {
+                    this.send_input(b"\x1b[2J\x1b[H".to_vec());
+                    return;
+                }
                 if let Some(bytes) = keystroke_to_bytes(&ev.keystroke) {
                     this.clear_selection();
                     this.send_input(bytes);
@@ -646,9 +724,36 @@ impl Render for TerminalView {
                                     } else {
                                         path.to_path_buf()
                                     };
-                                    let editor = this.code_editor.borrow().clone();
-                                    info!("opening file: {}", resolved.display());
-                                    crate::platform::open_path(&resolved, editor.as_deref());
+                                    let ext = resolved
+                                        .extension()
+                                        .and_then(|e| e.to_str())
+                                        .unwrap_or("")
+                                        .to_ascii_lowercase();
+                                    let open_in_viewer = matches!(
+                                        ext.as_str(),
+                                        "html"
+                                            | "htm"
+                                            | "pdf"
+                                            | "png"
+                                            | "jpg"
+                                            | "jpeg"
+                                            | "gif"
+                                            | "svg"
+                                            | "webp"
+                                            | "mp4"
+                                            | "mp3"
+                                            | "webm"
+                                            | "avi"
+                                            | "mkv"
+                                    );
+                                    if open_in_viewer {
+                                        info!("opening in viewer: {}", resolved.display());
+                                        crate::platform::open_url(&resolved.to_string_lossy(), browser.as_deref());
+                                    } else {
+                                        let editor = this.code_editor.borrow().clone();
+                                        info!("opening file: {}", resolved.display());
+                                        crate::platform::open_path(&resolved, editor.as_deref());
+                                    }
                                 } else {
                                     info!("opening URL: {}", url.url);
                                     crate::platform::open_url(&url.url, browser.as_deref());
@@ -712,8 +817,22 @@ struct TermPrepaint {
 
 use alacritty_terminal::selection::SelectionRange;
 
-struct TermLine {
+struct TermSegment {
+    col_start: usize,
     shaped: ShapedLine,
+}
+
+impl Clone for TermSegment {
+    fn clone(&self) -> Self {
+        Self {
+            col_start: self.col_start,
+            shaped: self.shaped.clone(),
+        }
+    }
+}
+
+struct TermLine {
+    segments: Vec<TermSegment>,
     bg_runs: Vec<BgRun>,
 }
 
@@ -765,10 +884,16 @@ impl Element for TerminalElement {
         window: &mut Window,
         _cx: &mut App,
     ) -> Self::PrepaintState {
+        struct RawSegment {
+            col_start: usize,
+            text: String,
+            runs: Vec<TextRun>,
+        }
+
         struct RawLine {
             grid_line: i32,
             text: String,
-            runs: Vec<TextRun>,
+            segments: Vec<RawSegment>,
             bg_runs: Vec<BgRun>,
         }
 
@@ -815,39 +940,19 @@ impl Element for TerminalElement {
 
             for l in 0..visible_lines {
                 let grid_line = l as i32 - display_offset;
-                let mut text = String::with_capacity(visible_cols);
-                let mut runs: Vec<TextRun> = Vec::new();
+                let mut full_text = String::with_capacity(visible_cols);
+                let mut segments: Vec<RawSegment> = Vec::new();
+                let mut cur_seg: Option<RawSegment> = None;
                 let mut bg_runs: Vec<BgRun> = Vec::new();
 
                 for c in 0..visible_cols {
                     let cell_data = &grid[GridPoint::new(Line(grid_line), Column(c))];
                     if cell_data.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
-                        text.push(' ');
-                        let char_len = 1;
-                        let can_merge = !runs.is_empty();
-                        if can_merge {
-                            runs.last_mut().unwrap().len += char_len;
-                        } else {
-                            let fg = if is_default_fg(cell_data.fg) {
-                                fg_default
-                            } else {
-                                color_to_hsla(cell_data.fg)
-                            };
-                            let mut spacer_font = font(mono_font.family.clone());
-                            spacer_font.weight = mono_font.weight;
-                            runs.push(TextRun {
-                                len: char_len,
-                                font: spacer_font,
-                                color: fg,
-                                background_color: None,
-                                underline: None,
-                                strikethrough: None,
-                            });
-                        }
+                        full_text.push(' ');
                         continue;
                     }
                     let ch = if cell_data.c == '\0' { ' ' } else { cell_data.c };
-                    text.push(ch);
+                    full_text.push(ch);
 
                     let mut fg = if is_default_fg(cell_data.fg) {
                         fg_default
@@ -929,17 +1034,45 @@ impl Element for TerminalElement {
                     cell_font.weight = font_weight;
                     cell_font.style = font_style;
 
+                    let is_ascii_printable = ch.is_ascii_graphic() || ch == ' ';
+
+                    if !is_ascii_printable {
+                        if let Some(seg) = cur_seg.take() {
+                            segments.push(seg);
+                        }
+                        let char_len = ch.len_utf8();
+                        segments.push(RawSegment {
+                            col_start: c,
+                            text: ch.to_string(),
+                            runs: vec![TextRun {
+                                len: char_len,
+                                font: cell_font,
+                                color: fg,
+                                background_color: None,
+                                underline,
+                                strikethrough,
+                            }],
+                        });
+                        continue;
+                    }
+
+                    let seg = cur_seg.get_or_insert_with(|| RawSegment {
+                        col_start: c,
+                        text: String::new(),
+                        runs: Vec::new(),
+                    });
+                    seg.text.push(ch);
                     let char_len = ch.len_utf8();
-                    let can_merge = runs.last().is_some_and(|last: &TextRun| {
+                    let can_merge = seg.runs.last().is_some_and(|last: &TextRun| {
                         last.color == fg
                             && last.font == cell_font
                             && last.underline == underline
                             && last.strikethrough == strikethrough
                     });
                     if can_merge {
-                        runs.last_mut().unwrap().len += char_len;
+                        seg.runs.last_mut().unwrap().len += char_len;
                     } else {
-                        runs.push(TextRun {
+                        seg.runs.push(TextRun {
                             len: char_len,
                             font: cell_font,
                             color: fg,
@@ -949,11 +1082,14 @@ impl Element for TerminalElement {
                         });
                     }
                 }
+                if let Some(seg) = cur_seg {
+                    segments.push(seg);
+                }
 
                 raw_lines.push(RawLine {
                     grid_line,
-                    text,
-                    runs,
+                    text: full_text,
+                    segments,
                     bg_runs,
                 });
             }
@@ -982,7 +1118,7 @@ impl Element for TerminalElement {
         };
         // Lock released — event loop can proceed while we shape text.
 
-        // Phase 2: shape lines (with cache) without holding the lock.
+        // Phase 2: shape line segments (with cache) without holding the lock.
         let text_sys = window.text_system();
         let mut cache = self.line_cache.borrow_mut();
         let mut new_cache = HashMap::with_capacity(raw_lines.len());
@@ -994,29 +1130,33 @@ impl Element for TerminalElement {
                 && cached.text == raw.text
             {
                 result_lines.push(TermLine {
-                    shaped: cached.shaped,
+                    segments: cached.segments.clone(),
                     bg_runs: raw.bg_runs,
                 });
-                new_cache.insert(
-                    raw.grid_line,
-                    CachedLine {
-                        text: cached.text,
-                        shaped: result_lines.last().unwrap().shaped.clone(),
-                    },
-                );
+                new_cache.insert(raw.grid_line, cached);
                 continue;
             }
             let text_clone = raw.text.clone();
-            let shaped = text_sys.shape_line(raw.text.into(), font_size, &raw.runs, Some(cell.width));
+            let shaped_segments: Vec<TermSegment> = raw
+                .segments
+                .into_iter()
+                .map(|seg| {
+                    let shaped = text_sys.shape_line(seg.text.into(), font_size, &seg.runs, None);
+                    TermSegment {
+                        col_start: seg.col_start,
+                        shaped,
+                    }
+                })
+                .collect();
             new_cache.insert(
                 raw.grid_line,
                 CachedLine {
                     text: text_clone,
-                    shaped: shaped.clone(),
+                    segments: shaped_segments.clone(),
                 },
             );
             result_lines.push(TermLine {
-                shaped,
+                segments: shaped_segments,
                 bg_runs: raw.bg_runs,
             });
         }
@@ -1108,10 +1248,15 @@ impl Element for TerminalElement {
                 }
             }
 
-            // Paint text.
+            // Paint text segments at grid-aligned positions.
             for (line_idx, line) in state.lines.iter().enumerate() {
-                let pos = point(origin.x, origin.y + cell.height * line_idx as f32);
-                let _ = line.shaped.paint(pos, cell.height, window, cx);
+                for seg in &line.segments {
+                    let pos = point(
+                        origin.x + cell.width * seg.col_start as f32,
+                        origin.y + cell.height * line_idx as f32,
+                    );
+                    let _ = seg.shaped.paint(pos, cell.height, window, cx);
+                }
             }
 
             // Paint URL underlines on hover.

@@ -16,6 +16,7 @@ pub fn keystroke_to_bytes(ks: &Keystroke) -> Option<Vec<u8>> {
     let bytes = match key {
         "enter" => b"\r".to_vec(),
         "backspace" => b"\x7f".to_vec(),
+        "tab" if ks.modifiers.shift => b"\x1b[Z".to_vec(),
         "tab" => b"\t".to_vec(),
         "escape" => b"\x1b".to_vec(),
         "up" => b"\x1b[A".to_vec(),
