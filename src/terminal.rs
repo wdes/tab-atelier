@@ -9,6 +9,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
+use log::info;
+
 use alacritty_terminal::event::{EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
 use alacritty_terminal::grid::{Dimensions, Scroll};
@@ -25,11 +27,20 @@ use crate::terminal_utils::{
     color_to_hsla, hsla_eq, is_default_bg, is_default_fg, keystroke_to_bytes, DEFAULT_BG,
     DEFAULT_FG,
 };
-use tab_atelier::FontConfig;
+use tab_atelier::{FontConfig, detect_urls, file_path_for_open};
 
 const INITIAL_COLS: usize = 80;
 const INITIAL_LINES: usize = 24;
 const SCROLLBAR_WIDTH: f32 = 8.0;
+
+#[derive(Clone)]
+pub struct DetectedUrl {
+    pub line: usize,
+    pub start_col: usize,
+    pub end_col: usize,
+    pub url: String,
+    pub is_file: bool,
+}
 
 #[derive(Clone)]
 struct EventProxy;
@@ -70,12 +81,17 @@ pub struct TerminalView {
     scrollbar_dragging: Rc<Cell<bool>>,
     scroll_acc: Rc<Cell<f32>>,
     font_config: FontConfig,
+    browser: Rc<RefCell<Option<String>>>,
+    detected_urls: Rc<RefCell<Vec<DetectedUrl>>>,
+    hover_grid: Rc<Cell<Option<(usize, usize)>>>,
+    click_origin: Rc<Cell<Option<GridPoint>>>,
 }
 
 impl TerminalView {
     pub fn new(
         cwd: Option<&Path>,
         font_config: FontConfig,
+        browser: Rc<RefCell<Option<String>>>,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -157,6 +173,10 @@ impl TerminalView {
             scrollbar_dragging: Rc::new(Cell::new(false)),
             scroll_acc: Rc::new(Cell::new(0.0)),
             font_config,
+            browser,
+            detected_urls: Rc::new(RefCell::new(Vec::new())),
+            hover_grid: Rc::new(Cell::new(None)),
+            click_origin: Rc::new(Cell::new(None)),
         }
     }
 
@@ -399,6 +419,11 @@ impl TerminalView {
         lines.join("\n")
     }
 
+    fn url_at_grid(&self, line: usize, col: usize) -> Option<DetectedUrl> {
+        let urls = self.detected_urls.borrow();
+        urls.iter().find(|u| u.line == line && col >= u.start_col && col < u.end_col).cloned()
+    }
+
     fn pixel_to_grid(&self, pos: gpui::Point<Pixels>, bounds_origin: gpui::Point<Pixels>) -> (GridPoint, Side) {
         let cell = self.cell_size.unwrap_or(Size { width: px(8.4), height: px(19.6) });
         let x = f32::from(pos.x - bounds_origin.x);
@@ -547,14 +572,16 @@ impl Render for TerminalView {
                 let scrollbar_left = origin.x + bounds.width - px(SCROLLBAR_WIDTH);
                 if ev.position.x >= scrollbar_left {
                     this.scrollbar_dragging.set(true);
+                    this.click_origin.set(None);
                     let y_frac = f32::from(ev.position.y - origin.y) / f32::from(bounds.height);
                     this.scroll_to_fraction(y_frac.clamp(0.0, 1.0));
                 } else {
                     let (gp, side) = this.pixel_to_grid(ev.position, origin);
+                    this.click_origin.set(Some(gp));
                     this.start_selection(gp, side);
                 }
             }))
-            .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _window, _cx| {
+            .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _window, cx| {
                 if this.scrollbar_dragging.get() {
                     let origin = this.content_origin.get();
                     let bounds = this.bounds_size.get();
@@ -564,10 +591,49 @@ impl Render for TerminalView {
                     let origin = this.content_origin.get();
                     let (gp, side) = this.pixel_to_grid(ev.position, origin);
                     this.update_selection(gp, side);
+                } else {
+                    let origin = this.content_origin.get();
+                    let (gp, _) = this.pixel_to_grid(ev.position, origin);
+                    let line = gp.line.0.max(0) as usize;
+                    let col = gp.column.0;
+                    let prev = this.hover_grid.get();
+                    let new = Some((line, col));
+                    if prev != new {
+                        this.hover_grid.set(new);
+                        cx.notify();
+                    }
                 }
             }))
-            .on_mouse_up(MouseButton::Left, cx.listener(move |this, _ev: &MouseUpEvent, _window, _cx| {
+            .on_mouse_up(MouseButton::Left, cx.listener(move |this, ev: &MouseUpEvent, _window, _cx| {
                 this.scrollbar_dragging.set(false);
+                if let Some(origin_gp) = this.click_origin.take() {
+                    let origin = this.content_origin.get();
+                    let (gp, _) = this.pixel_to_grid(ev.position, origin);
+                    if origin_gp == gp {
+                        let line = gp.line.0.max(0) as usize;
+                        let col = gp.column.0;
+                        if let Some(url) = this.url_at_grid(line, col) {
+                            let browser = this.browser.borrow().clone();
+                            if url.is_file {
+                                let raw = file_path_for_open(&url.url);
+                                let path = std::path::Path::new(raw);
+                                let resolved = if path.is_absolute() {
+                                    path.to_path_buf()
+                                } else if let Some(cwd) = crate::platform::process_cwd(this.pid) {
+                                    cwd.join(path)
+                                } else {
+                                    path.to_path_buf()
+                                };
+                                info!("opening file: {}", resolved.display());
+                                crate::platform::open_path(&resolved);
+                            } else {
+                                info!("opening URL: {}", url.url);
+                                crate::platform::open_url(&url.url, browser.as_deref());
+                            }
+                            this.clear_selection();
+                        }
+                    }
+                }
             }))
             .size_full()
             .child(TerminalElement {
@@ -579,6 +645,8 @@ impl Render for TerminalView {
                 bounds_size: self.bounds_size.clone(),
                 line_cache: self.line_cache.clone(),
                 font_config: self.font_config.clone(),
+                detected_urls: self.detected_urls.clone(),
+                hover_grid: self.hover_grid.clone(),
             })
     }
 }
@@ -598,6 +666,8 @@ struct TerminalElement {
     bounds_size: Rc<Cell<Size<Pixels>>>,
     line_cache: Rc<RefCell<HashMap<i32, CachedLine>>>,
     font_config: FontConfig,
+    detected_urls: Rc<RefCell<Vec<DetectedUrl>>>,
+    hover_grid: Rc<Cell<Option<(usize, usize)>>>,
 }
 
 impl IntoElement for TerminalElement {
@@ -856,7 +926,9 @@ impl Element for TerminalElement {
         let mut cache = self.line_cache.borrow_mut();
         let mut new_cache = HashMap::with_capacity(raw_lines.len());
         let mut result_lines = Vec::with_capacity(raw_lines.len());
+        let mut line_texts: Vec<String> = Vec::with_capacity(raw_lines.len());
         for raw in raw_lines {
+            line_texts.push(raw.text.clone());
             if let Some(cached) = cache.remove(&raw.grid_line)
                 && cached.text == raw.text
             {
@@ -882,6 +954,14 @@ impl Element for TerminalElement {
         }
 
         *cache = new_cache;
+
+        let mut detected = Vec::new();
+        for (line_idx, text) in line_texts.iter().enumerate() {
+            for (start, end, url, is_file) in detect_urls(text) {
+                detected.push(DetectedUrl { line: line_idx, start_col: start, end_col: end, url, is_file });
+            }
+        }
+        *self.detected_urls.borrow_mut() = detected;
 
         Some(TermPrepaint {
             lines: result_lines,
@@ -958,6 +1038,23 @@ impl Element for TerminalElement {
                 let _ = line.shaped.paint(pos, cell.height, window, cx);
             }
 
+            // Paint URL underlines on hover.
+            let urls = self.detected_urls.borrow();
+            if let Some((h_line, h_col)) = self.hover_grid.get() {
+                let hovered_url = urls.iter().find(|u| u.line == h_line && h_col >= u.start_col && h_col < u.end_col);
+                if let Some(url) = hovered_url {
+                    let underline_color = Hsla::from(Rgba { r: 0.22, g: 0.58, b: 1.0, a: 0.9 });
+                    let y = origin.y + cell.height * (url.line as f32 + 1.0) - px(2.0);
+                    let x = origin.x + cell.width * url.start_col as f32;
+                    let w = cell.width * (url.end_col - url.start_col) as f32;
+                    window.paint_quad(fill(
+                        Bounds::new(point(x, y), size(w, px(1.0))),
+                        underline_color,
+                    ));
+                }
+            }
+            drop(urls);
+
             // Paint cursor.
             if let Some((row, col)) = state.cursor {
                 let pos = point(
@@ -1013,4 +1110,5 @@ impl Element for TerminalElement {
         });
     }
 }
+
 

@@ -120,6 +120,27 @@ pub fn capture_focused_window() -> Result<CapturedImage, String> {
     })
 }
 
+// --- Openers ---
+
+pub fn open_url(url: &str, browser: Option<&str>) {
+    let cmd = browser.unwrap_or("xdg-open");
+    let _ = std::process::Command::new(cmd)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+pub fn open_path(path: &std::path::Path) {
+    let _ = std::process::Command::new("xdg-open")
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
 // --- Hotkeys (X11) ---
 
 pub fn grab_hotkeys<F>(on_press: F)
