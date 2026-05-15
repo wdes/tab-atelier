@@ -2,10 +2,15 @@
 name = "tab-atelier"
 version = "0.2.0"
 edition = "2024"
-license = "MPL-2.0"
-description = "Guake-style drop-down terminal emulator for Linux (X11)"
-repository = "https://github.com/wdes/tab-atelier"
+rust-version = "1.92"
 authors = ["William Desportes <williamdes@wdes.fr>"]
+description = "Guake-style drop-down terminal emulator for Linux (X11)"
+license = "MPL-2.0"
+homepage = "https://github.com/wdes/tab-atelier#readme"
+repository = "https://github.com/wdes/tab-atelier"
+readme = "README.md"
+keywords = ["terminal", "guake", "dropdown", "x11", "emulator"]
+categories = ["command-line-utilities"]
 
 [lints.rust]
 unsafe_code = "deny"
