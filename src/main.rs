@@ -669,6 +669,9 @@ impl AppState {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(|this, ev: &MouseDownEvent, _window, cx| {
+                    if this.context_menu.as_ref().is_some_and(|m| matches!(m.kind, MenuKind::Tab(_))) {
+                        return;
+                    }
                     this.context_menu = Some(ContextMenu {
                         kind: MenuKind::Background,
                         position: ev.position,
@@ -708,19 +711,30 @@ impl AppState {
                 .text_size(px(13.0))
                 .cursor_pointer()
                 .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
-                    if ev.click_count() == 2 {
+                    if ev.click_count() >= 2 {
                         let name = this.tabs[i].name.clone();
                         this.renaming = Some((i, name));
                         this.rename_select_all = true;
                         this.rename_focus.focus(window);
-                    } else {
-                        this.tabs[this.active].deactivate();
-                        this.active = i;
-                        this.tabs[i].activate();
-                        this.context_menu = None;
-                        this.tabs[i].view.read(cx).focus_handle(cx).focus(window);
+                        cx.notify();
+                    } else if this.active != i {
+                        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                            cx.background_executor()
+                                .timer(std::time::Duration::from_millis(200))
+                                .await;
+                            let _ = this.update(cx, |app, cx| {
+                                if app.renaming.is_some() || app.active == i {
+                                    return;
+                                }
+                                app.tabs[app.active].deactivate();
+                                app.active = i;
+                                app.tabs[i].activate();
+                                app.context_menu = None;
+                                cx.notify();
+                            });
+                        })
+                        .detach();
                     }
-                    cx.notify();
                 }))
                 .on_mouse_down(
                     MouseButton::Right,
