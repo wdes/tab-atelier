@@ -595,19 +595,15 @@ impl AppState {
         });
         cx.notify();
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            cx.background_executor().timer(std::time::Duration::from_secs(1)).await;
-            let render_time = std::time::Instant::now();
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(1))
+                .await;
             let _ = this.update(cx, |state, cx| {
                 state.toasts.retain(|t| t.time != progress_time);
-                state.toasts.push(Toast {
-                    message: state.t().rendering_screenshot.into(),
-                    time: render_time,
-                    path: None,
-                });
                 cx.notify();
             });
             cx.background_executor()
-                .timer(std::time::Duration::from_millis(50))
+                .timer(std::time::Duration::from_millis(100))
                 .await;
             let result = cx
                 .background_executor()
@@ -621,7 +617,6 @@ impl AppState {
                 .await;
             let toast_time = std::time::Instant::now();
             let _ = this.update(cx, |state, cx| {
-                state.toasts.retain(|t| t.time != render_time);
                 let t = state.t();
                 let (msg, path) = match result {
                     Ok(path) => (t.saved.to_string(), Some(path)),

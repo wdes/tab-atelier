@@ -102,9 +102,9 @@ pub fn take_screenshot_tab(tab_name: &str, tab_bar_height: u16) -> Result<PathBu
         3
     };
     let src_stride = img.width as usize * bpp;
-    let start = tab_bar_height as usize * src_stride;
-    let cropped = if start < img.data.len() {
-        img.data[start..].to_vec()
+    let end = crop_h as usize * src_stride;
+    let cropped = if end <= img.data.len() {
+        img.data[..end].to_vec()
     } else {
         return Err("crop offset exceeds image data".into());
     };
