@@ -12,7 +12,7 @@ A Guake-style drop-down terminal emulator for Linux (X11), built with Rust using
 ## Features
 
 **Terminal**
-- Drop-down terminal toggled with global **F12** hotkey
+- Drop-down terminal toggled with global hotkeys (**`** / **XF86Calculator**)
 - Full terminal emulation via alacritty_terminal (colors, scrollback, bracketed paste, ...)
 - GPU-accelerated rendering via gpui
 - Text selection with mouse, copy/paste from context menu

@@ -74,6 +74,7 @@ pub struct Strings {
     // Preferences
     pub theme: &'static str,
     pub opacity: &'static str,
+    pub toggle_hotkeys: &'static str,
     pub language: &'static str,
     pub browser: &'static str,
     pub browser_placeholder: &'static str,
@@ -127,6 +128,7 @@ pub static EN: Strings = Strings {
 
     theme: "Theme",
     opacity: "Opacity",
+    toggle_hotkeys: "Toggle hotkeys",
     language: "Language",
     browser: "Browser",
     browser_placeholder: "xdg-open (system default)",
@@ -180,6 +182,7 @@ pub static FR: Strings = Strings {
 
     theme: "Thème",
     opacity: "Opacité",
+    toggle_hotkeys: "Raccourcis d'affichage",
     language: "Langue",
     browser: "Navigateur",
     browser_placeholder: "xdg-open (par défaut)",
