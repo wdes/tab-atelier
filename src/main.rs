@@ -102,7 +102,7 @@ struct ExitConfirm {
     tab_idx: usize,
 }
 
-struct Swoop {
+struct AppState {
     tabs: Vec<Tab>,
     active: usize,
     context_menu: Option<ContextMenu>,
@@ -125,6 +125,7 @@ struct Swoop {
     toasts: Vec<Toast>,
     lang: Lang,
     theme_name: ThemeName,
+    opacity: u8,
     show_preferences: bool,
     browser: Rc<RefCell<Option<String>>>,
     code_editor: Rc<RefCell<Option<String>>>,
@@ -134,7 +135,7 @@ struct Swoop {
     pref_editor_focus: FocusHandle,
 }
 
-impl Swoop {
+impl AppState {
     fn t(&self) -> &'static Strings {
         locale::strings(self.lang)
     }
@@ -157,6 +158,7 @@ impl Swoop {
             _ => locale::detect_lang(),
         };
         let theme_name = prefs.theme.as_deref().and_then(ThemeName::from_id).unwrap_or_default();
+        let opacity = prefs.opacity.unwrap_or(0xb8);
 
         let (tabs, active) = if let Some(saved) = load_state_from(&platform::state_base_dir()) {
             info!("restoring {} tab(s) from saved state", saved.tabs.len());
@@ -321,6 +323,7 @@ impl Swoop {
             toasts: Vec::new(),
             lang,
             theme_name,
+            opacity,
             show_preferences: false,
             browser,
             code_editor,
@@ -1614,6 +1617,38 @@ impl Swoop {
             );
         }
 
+        let opacity_presets: &[(u8, &str)] = &[
+            (255, "100%"),
+            (230, "90%"),
+            (204, "80%"),
+            (184, "72%"),
+            (178, "70%"),
+            (153, "60%"),
+            (128, "50%"),
+        ];
+        let mut opacity_options = div().flex().flex_row().flex_wrap().gap(px(4.0)).mt(px(8.0));
+        for &(val, label) in opacity_presets {
+            let is_active = val == self.opacity;
+            opacity_options = opacity_options.child(
+                div()
+                    .id(SharedString::from(format!("pref-opacity-{val}")))
+                    .px(px(12.0))
+                    .py(px(6.0))
+                    .rounded(px(3.0))
+                    .cursor_pointer()
+                    .bg(if is_active { option_active } else { option_bg })
+                    .hover(|s| s.bg(if is_active { option_active } else { btn_hover }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                            this.opacity = val;
+                            cx.notify();
+                        }),
+                    )
+                    .child(label),
+            );
+        }
+
         let mut lang_options = div().flex().flex_col().gap(px(4.0)).mt(px(8.0));
 
         for &lang in Lang::ALL {
@@ -1757,6 +1792,7 @@ impl Swoop {
                         .on_mouse_down(MouseButton::Left, |_ev: &MouseDownEvent, _window, _cx| {})
                         .child(div().text_size(px(16.0)).mb(px(16.0)).child(t.preferences))
                         .child(div().child(t.theme).child(theme_options))
+                        .child(div().mt(px(16.0)).child(t.opacity).child(opacity_options))
                         .child(div().mt(px(16.0)).child(t.language).child(lang_options))
                         .child(div().mt(px(16.0)).child(t.browser).child(browser_input))
                         .child(div().mt(px(16.0)).child(t.code_editor).child(editor_input))
@@ -1818,6 +1854,7 @@ impl Swoop {
                                                     &Preferences {
                                                         lang: Some(lang_str.into()),
                                                         theme: Some(this.theme_name.id().into()),
+                                                        opacity: Some(this.opacity),
                                                         browser,
                                                         code_editor: editor,
                                                     },
@@ -1834,7 +1871,7 @@ impl Swoop {
     }
 }
 
-impl Render for Swoop {
+impl Render for AppState {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         window.set_window_title(&format!("{}{}", self.tabs[self.active].name, self.t().title_suffix));
         let active_terminal = self.tabs[self.active].view.clone();
@@ -1857,12 +1894,13 @@ impl Render for Swoop {
             self.rename_focus.focus(window);
         }
 
+        let alpha = self.opacity as u32;
         let bg_color = if battery.is_some_and(|b| b < 10) {
-            rgba(0x3a05_05b8)
+            rgba((0x3a05_0500) | alpha)
         } else if battery.is_some_and(|b| b < 20) {
-            rgba(0x2d08_08b8)
+            rgba((0x2d08_0800) | alpha)
         } else {
-            rgba(0x1414_14b8)
+            rgba((self.th().bg << 8) | alpha)
         };
 
         let mut root = div()
@@ -2094,7 +2132,7 @@ fn main() {
                 },
                 |window, cx| {
                     window.toggle_fullscreen();
-                    cx.new(|cx| Swoop::new(window, cx))
+                    cx.new(|cx| AppState::new(window, cx))
                 },
             )
             .unwrap();
@@ -2103,7 +2141,7 @@ fn main() {
     });
 }
 
-fn spawn_hotkey_listener(window_handle: WindowHandle<Swoop>, cx: &mut App) {
+fn spawn_hotkey_listener(window_handle: WindowHandle<AppState>, cx: &mut App) {
     let (tx, rx) = std::sync::mpsc::channel::<()>();
 
     platform::grab_hotkeys(move || {
