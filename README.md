@@ -2,6 +2,8 @@
 
 A Guake-style drop-down terminal emulator for Linux (X11), built with Rust using [alacritty_terminal](https://crates.io/crates/alacritty_terminal) and [gpui](https://crates.io/crates/gpui) (Zed's GPU-accelerated UI framework).
 
+![Tab Atelier screenshot](.github/docs/screenshot.webp)
+
 ## Features
 
 **Terminal**
