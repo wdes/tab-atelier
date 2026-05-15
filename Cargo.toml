@@ -47,7 +47,7 @@ x11rb = { version = "0.13", features = ["allow-unsafe-code"] }
 qrcode = { version = "0.14", default-features = false }
 ureq = { version = "3", features = ["json"] }
 vte = { version = "0.15", default-features = false, features = ["std", "ansi"] }
-wattaouille = { git = "https://github.com/wdes/wattaouille.git", rev = "07fcac6" }
+wattaouille = "1.4.0"
 
 [package.metadata.deb]
 section = "x11"
