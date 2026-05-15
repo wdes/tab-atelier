@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use log::{debug, info, warn};
+use log::{debug, info};
 use x11rb::protocol::xproto::{ConnectionExt, ImageFormat};
 
 pub fn screenshot_dir() -> PathBuf {
@@ -152,20 +152,6 @@ pub fn take_screenshot_tab(tab_bar_height: u16) -> Result<PathBuf, String> {
     write_bmp(&path, img.width, crop_h, &cropped)?;
     info!("tab screenshot saved: {}", path.display());
     Ok(path)
-}
-
-pub fn take_screenshot(full: bool) {
-    std::thread::spawn(move || {
-        let result = if full {
-            take_screenshot_full()
-        } else {
-            take_screenshot_tab(32)
-        };
-        match result {
-            Ok(path) => info!("screenshot: {}", path.display()),
-            Err(e) => warn!("screenshot failed: {e}"),
-        }
-    });
 }
 
 #[cfg(test)]
