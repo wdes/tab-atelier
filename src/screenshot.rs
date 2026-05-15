@@ -8,10 +8,8 @@ use log::{debug, info, warn};
 use x11rb::protocol::xproto::{ConnectionExt, ImageFormat};
 
 pub fn screenshot_dir() -> PathBuf {
-    let pictures = std::env::var("XDG_PICTURES_DIR")
-        .or_else(|_| std::env::var("HOME").map(|h| format!("{h}/Pictures")))
-        .unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(pictures)
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    PathBuf::from(home).join("Pictures/screenshots")
 }
 
 fn timestamp() -> String {
