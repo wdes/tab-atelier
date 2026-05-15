@@ -309,6 +309,14 @@ impl Swoop {
     }
 
     fn add_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.insert_tab(self.tabs.len(), window, cx);
+    }
+
+    fn add_tab_after_current(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.insert_tab(self.active + 1, window, cx);
+    }
+
+    fn insert_tab(&mut self, at: usize, window: &mut Window, cx: &mut Context<Self>) {
         let cwd = {
             let pid = self.tabs[self.active].view.read(cx).pid();
             platform::process_cwd(pid)
@@ -318,10 +326,10 @@ impl Swoop {
         let br = self.browser.clone();
         let ce = self.code_editor.clone();
         let view = cx.new(|cx| TerminalView::new(cwd.as_deref(), fc, br, ce, window, cx));
-        let idx = self.tabs.len();
-        self.tabs.push(Tab {
+        let idx = at.min(self.tabs.len());
+        self.tabs.insert(idx, Tab {
             view,
-            name: format!("{} {}", self.t().terminal_n, idx + 1),
+            name: format!("{} {}", self.t().terminal_n, self.tabs.len()),
             active_duration: std::time::Duration::ZERO,
             last_activated: Some(std::time::Instant::now()),
             energy_wh: 0.0,
@@ -1773,6 +1781,10 @@ impl Render for Swoop {
             .flex_col()
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 let ks = &ev.keystroke;
+                if ks.modifiers.control && ks.modifiers.shift && ks.key.as_str() == "t" {
+                    this.add_tab_after_current(window, cx);
+                    return;
+                }
                 if ks.modifiers.alt && ks.key.as_str() == "tab" {
                     this.tabs[this.active].deactivate();
                     this.active = (this.active + 1) % this.tabs.len();
