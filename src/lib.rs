@@ -22,23 +22,16 @@ pub struct SavedState {
     pub active: usize,
 }
 
-pub fn state_path() -> PathBuf {
-    let dir = dirs_or_default();
-    dir.join("tabs.json")
-}
-
-pub fn dirs_or_default() -> PathBuf {
-    let base = std::env::var("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-            PathBuf::from(home).join(".local/state")
-        });
+pub fn state_dir(base: &std::path::Path) -> PathBuf {
     base.join(APP_DIR)
 }
 
-pub fn load_state() -> Option<SavedState> {
-    let path = state_path();
+pub fn state_path(base: &std::path::Path) -> PathBuf {
+    state_dir(base).join("tabs.json")
+}
+
+pub fn load_state_from(base: &std::path::Path) -> Option<SavedState> {
+    let path = state_path(base);
     let data = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&data).ok()
 }
@@ -62,15 +55,8 @@ impl Default for FontConfig {
     }
 }
 
-pub fn load_font_config() -> FontConfig {
-    let config_path = std::env::var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-            PathBuf::from(home).join(".config")
-        })
-        .join("zed/settings.json");
-
+pub fn load_font_config(config_base: &std::path::Path) -> FontConfig {
+    let config_path = config_base.join("zed/settings.json");
     load_font_config_from(&config_path)
 }
 
@@ -156,15 +142,8 @@ fn strip_json_comments(input: &str) -> String {
     out
 }
 
-pub fn load_wakatime_key() -> Option<String> {
-    let config_path = std::env::var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-            PathBuf::from(home).join(".config")
-        })
-        .join("zed/settings.json");
-
+pub fn load_wakatime_key(config_base: &std::path::Path) -> Option<String> {
+    let config_path = config_base.join("zed/settings.json");
     let data = std::fs::read_to_string(config_path).ok()?;
     let stripped = strip_json_comments(&data);
     let parsed: serde_json::Value = serde_json::from_str(&stripped).ok()?;
@@ -181,16 +160,16 @@ pub struct Preferences {
     pub lang: Option<String>,
 }
 
-pub fn load_preferences() -> Preferences {
-    let path = dirs_or_default().join("preferences.json");
+pub fn load_preferences(base: &std::path::Path) -> Preferences {
+    let path = state_dir(base).join("preferences.json");
     std::fs::read_to_string(path)
         .ok()
         .and_then(|data| serde_json::from_str(&data).ok())
         .unwrap_or_default()
 }
 
-pub fn save_preferences(prefs: &Preferences) {
-    let dir = dirs_or_default();
+pub fn save_preferences(base: &std::path::Path, prefs: &Preferences) {
+    let dir = state_dir(base);
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("preferences.json");
     if let Ok(data) = serde_json::to_string_pretty(prefs) {
@@ -198,8 +177,8 @@ pub fn save_preferences(prefs: &Preferences) {
     }
 }
 
-pub fn save_state(state: &SavedState) {
-    let dir = dirs_or_default();
+pub fn save_state(base: &std::path::Path, state: &SavedState) {
+    let dir = state_dir(base);
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("tabs.json");
     if let Ok(data) = serde_json::to_string_pretty(state) {
@@ -210,14 +189,6 @@ pub fn save_state(state: &SavedState) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    unsafe fn set_env(key: &str, val: &str) {
-        unsafe { std::env::set_var(key, val) }
-    }
-
-    unsafe fn remove_env(key: &str) {
-        unsafe { std::env::remove_var(key) }
-    }
 
     #[test]
     fn test_tab_state_serialization() {
@@ -250,28 +221,21 @@ mod tests {
     }
 
     #[test]
-    fn test_state_path_uses_xdg() {
-        let path = state_path();
+    fn test_state_path_uses_base() {
+        let path = state_path(std::path::Path::new("/tmp/test-base"));
         assert!(path.ends_with(&format!("{APP_DIR}/tabs.json")));
     }
 
     #[test]
     fn test_load_state_missing_file() {
-        let prev = std::env::var("XDG_STATE_HOME").ok();
-        unsafe { set_env("XDG_STATE_HOME", "/tmp/tab-atelier-test-nonexistent") };
-        let result = load_state();
+        let result = load_state_from(std::path::Path::new("/tmp/ta-test-nonexistent"));
         assert!(result.is_none());
-        match prev {
-            Some(v) => unsafe { set_env("XDG_STATE_HOME", &v) },
-            None => unsafe { remove_env("XDG_STATE_HOME") },
-        }
     }
 
     #[test]
     fn test_save_then_load_round_trip() {
         let dir = std::env::temp_dir().join("ta-test-round-trip");
         let _ = std::fs::create_dir_all(&dir);
-        unsafe { set_env("XDG_STATE_HOME", dir.to_str().unwrap()) };
 
         let state = SavedState {
             tabs: vec![
@@ -280,8 +244,8 @@ mod tests {
             ],
             active: 1,
         };
-        save_state(&state);
-        let loaded = load_state().expect("should load saved state");
+        save_state(&dir, &state);
+        let loaded = load_state_from(&dir).expect("should load saved state");
         assert_eq!(loaded.tabs.len(), 2);
         assert_eq!(loaded.tabs[0].name, "One");
         assert_eq!(loaded.tabs[0].cwd, Some("/tmp".into()));
@@ -289,35 +253,32 @@ mod tests {
         assert_eq!(loaded.tabs[1].cwd, None);
         assert_eq!(loaded.active, 1);
 
-        let _ = std::fs::remove_dir_all(dir.join("tab-atelier"));
+        let _ = std::fs::remove_dir_all(dir.join(APP_DIR));
     }
 
     #[test]
     fn test_load_state_malformed_json() {
         let dir = std::env::temp_dir().join("ta-test-malformed");
-        let state_dir = dir.join("tab-atelier");
-        let _ = std::fs::create_dir_all(&state_dir);
-        std::fs::write(state_dir.join("tabs.json"), "not json").unwrap();
-        unsafe { set_env("XDG_STATE_HOME", dir.to_str().unwrap()) };
+        let sd = dir.join(APP_DIR);
+        let _ = std::fs::create_dir_all(&sd);
+        std::fs::write(sd.join("tabs.json"), "not json").unwrap();
 
-        let result = load_state();
+        let result = load_state_from(&dir);
         assert!(result.is_none());
 
-        let _ = std::fs::remove_dir_all(&state_dir);
+        let _ = std::fs::remove_dir_all(&sd);
     }
 
     #[test]
-    fn test_dirs_or_default_has_app_dir() {
-        let dir = dirs_or_default();
+    fn test_state_dir_has_app_dir() {
+        let dir = state_dir(std::path::Path::new("/tmp/test"));
         assert_eq!(dir.file_name().unwrap(), APP_DIR);
     }
 
     #[test]
-    fn test_dirs_respects_xdg_state_home() {
-        unsafe { set_env("XDG_STATE_HOME", "/tmp/custom-state") };
-        let dir = dirs_or_default();
+    fn test_state_dir_with_base() {
+        let dir = state_dir(std::path::Path::new("/tmp/custom-state"));
         assert_eq!(dir, PathBuf::from(format!("/tmp/custom-state/{APP_DIR}")));
-        unsafe { remove_env("XDG_STATE_HOME") };
     }
 
     #[test]
@@ -450,12 +411,11 @@ mod tests {
     fn test_save_state_creates_directory() {
         let dir = std::env::temp_dir().join("ta-test-create-dir");
         let _ = std::fs::remove_dir_all(&dir);
-        unsafe { set_env("XDG_STATE_HOME", dir.to_str().unwrap()) };
         let state = SavedState {
             tabs: vec![TabState { name: "T".into(), cwd: None, output: None }],
             active: 0,
         };
-        save_state(&state);
+        save_state(&dir, &state);
         assert!(dir.join(format!("{APP_DIR}/tabs.json")).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -463,17 +423,16 @@ mod tests {
     #[test]
     fn test_active_clamped_on_load() {
         let dir = std::env::temp_dir().join("ta-test-clamp-active");
-        let state_dir = dir.join("tab-atelier");
-        let _ = std::fs::create_dir_all(&state_dir);
+        let sd = dir.join(APP_DIR);
+        let _ = std::fs::create_dir_all(&sd);
         let state = SavedState {
             tabs: vec![TabState { name: "Only".into(), cwd: None, output: None }],
             active: 999,
         };
         let json = serde_json::to_string_pretty(&state).unwrap();
-        std::fs::write(state_dir.join("tabs.json"), json).unwrap();
-        unsafe { set_env("XDG_STATE_HOME", dir.to_str().unwrap()) };
+        std::fs::write(sd.join("tabs.json"), json).unwrap();
 
-        let loaded = load_state().unwrap();
+        let loaded = load_state_from(&dir).unwrap();
         assert_eq!(loaded.active, 999);
         let _ = std::fs::remove_dir_all(&dir);
     }

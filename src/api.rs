@@ -42,19 +42,8 @@ pub struct TabSnapshot {
 }
 
 pub fn generate_token() -> String {
-    use std::io::Read;
     let mut buf = [0u8; 16];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        let _ = f.read_exact(&mut buf);
-    } else {
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        for (i, b) in seed.to_le_bytes().iter().cycle().take(16).enumerate() {
-            buf[i] = *b;
-        }
-    }
+    crate::platform::random_bytes(&mut buf);
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 

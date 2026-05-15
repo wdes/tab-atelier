@@ -137,7 +137,7 @@ impl TerminalView {
                 cx.background_executor()
                     .timer(Duration::from_millis(500))
                     .await;
-                if !Path::new(&format!("/proc/{pid_for_check}")).exists() {
+                if !crate::platform::process_alive(pid_for_check) {
                     exited_clone.set(true);
                     let _ = this.update(cx, |_, cx: &mut Context<TerminalView>| cx.notify());
                     break;
@@ -217,7 +217,7 @@ impl TerminalView {
                 cx.background_executor()
                     .timer(Duration::from_millis(500))
                     .await;
-                if !Path::new(&format!("/proc/{pid_for_check}")).exists() {
+                if !crate::platform::process_alive(pid_for_check) {
                     exited.set(true);
                     let _ = this.update(cx, |_, cx: &mut Context<TerminalView>| cx.notify());
                     break;

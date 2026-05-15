@@ -4,6 +4,7 @@
 
 mod api;
 mod locale;
+mod platform;
 mod power;
 mod screenshot;
 mod terminal;
@@ -15,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use gpui::*;
 use gpui::prelude::FluentBuilder;
 use log::{debug, info};
-use tab_atelier::{FontConfig, Preferences, SavedState, TabState, load_font_config, load_preferences, load_state, load_wakatime_key, save_preferences, save_state};
+use tab_atelier::{FontConfig, Preferences, SavedState, TabState, load_font_config, load_preferences, load_state_from, load_wakatime_key, save_preferences, save_state};
 use locale::{Lang, Strings};
 use terminal::TerminalView;
 use tracking::WakatimeTracker;
@@ -70,15 +71,15 @@ impl Swoop {
 
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let rename_focus = cx.focus_handle();
-        let font_config = load_font_config();
-        let prefs = load_preferences();
+        let font_config = load_font_config(&platform::config_dir());
+        let prefs = load_preferences(&platform::state_base_dir());
         let lang = match prefs.lang.as_deref() {
             Some("fr") => Lang::Fr,
             Some("en") => Lang::En,
             _ => locale::detect_lang(),
         };
 
-        let (tabs, active) = if let Some(saved) = load_state() {
+        let (tabs, active) = if let Some(saved) = load_state_from(&platform::state_base_dir()) {
             info!("restoring {} tab(s) from saved state", saved.tabs.len());
             let mut tabs = Vec::new();
             for ts in &saved.tabs {
@@ -143,7 +144,7 @@ impl Swoop {
 
         tabs[active].view.read(cx).focus_handle(cx).focus(window);
 
-        let tracker = load_wakatime_key().map(|key| {
+        let tracker = load_wakatime_key(&platform::config_dir()).map(|key| {
             info!("wakatime tracking enabled");
             WakatimeTracker::new(key)
         });
@@ -188,7 +189,7 @@ impl Swoop {
     fn add_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let cwd = {
             let pid = self.tabs[self.active].view.read(cx).pid();
-            std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+            platform::process_cwd(pid)
         };
         let fc = self.font_config.clone();
         let view = cx.new(|cx| TerminalView::new(cwd.as_deref(), fc, window, cx));
@@ -219,8 +220,7 @@ impl Swoop {
             .iter()
             .map(|tab| {
                 let pid = tab.view.read(cx).pid();
-                let cwd = std::fs::read_link(format!("/proc/{pid}/cwd"))
-                    .ok()
+                let cwd = platform::process_cwd(pid)
                     .map(|p| p.to_string_lossy().into_owned());
                 TabState { name: tab.name.clone(), cwd, output: None }
             })
@@ -230,7 +230,7 @@ impl Swoop {
             .map(|t| (t.name.clone(), t.cwd.clone()))
             .collect();
 
-        save_state(&SavedState { tabs, active: self.active });
+        save_state(&platform::state_base_dir(), &SavedState { tabs, active: self.active });
 
         {
             let mut snapshot = self.api_state.lock().unwrap();
@@ -263,7 +263,7 @@ impl Swoop {
 
         if let Some(ref tracker) = self.tracker {
             let pid = self.tabs[self.active].view.read(cx).pid();
-            let cwd = std::fs::read_link(format!("/proc/{pid}/cwd")).ok();
+            let cwd = platform::process_cwd(pid);
             tracker.record_activity(cwd);
         }
     }
@@ -273,8 +273,7 @@ impl Swoop {
             return;
         }
         let old_pid = self.tabs[idx].view.read(cx).pid();
-        let cwd = std::fs::read_link(format!("/proc/{old_pid}/cwd"))
-            .ok()
+        let cwd = platform::process_cwd(old_pid)
             .or_else(|| Some(std::env::current_dir().unwrap_or_default()));
         self.tabs[idx].view.read(cx).shutdown();
         let fc = self.font_config.clone();
@@ -291,8 +290,7 @@ impl Swoop {
             return;
         }
         let old_pid = self.tabs[idx].view.read(cx).pid();
-        let cwd = std::fs::read_link(format!("/proc/{old_pid}/cwd"))
-            .ok()
+        let cwd = platform::process_cwd(old_pid)
             .or_else(|| Some(std::env::current_dir().unwrap_or_default()));
         self.tabs[idx].view.update(cx, |view, cx| {
             view.respawn(cwd.as_deref(), cx);
@@ -309,8 +307,7 @@ impl Swoop {
             .iter()
             .map(|tab| {
                 let pid = tab.view.read(cx).pid();
-                let cwd = std::fs::read_link(format!("/proc/{pid}/cwd"))
-                    .ok()
+                let cwd = platform::process_cwd(pid)
                     .map(|p| p.to_string_lossy().into_owned());
                 let output = {
                     let text = tab.view.read(cx).copy_all_history();
@@ -319,7 +316,7 @@ impl Swoop {
                 TabState { name: tab.name.clone(), cwd, output }
             })
             .collect();
-        save_state(&SavedState { tabs, active: self.active });
+        save_state(&platform::state_base_dir(), &SavedState { tabs, active: self.active });
 
         if let Some(ref tracker) = self.tracker {
             tracker.shutdown();
@@ -1230,7 +1227,7 @@ impl Swoop {
                                                 Lang::En => "en",
                                                 Lang::Fr => "fr",
                                             };
-                                            save_preferences(&Preferences { lang: Some(lang_str.into()) });
+                                            save_preferences(&platform::state_base_dir(), &Preferences { lang: Some(lang_str.into()) });
                                             this.show_preferences = false;
                                             cx.notify();
                                         }))
@@ -1396,45 +1393,10 @@ fn main() {
 
 
 fn spawn_hotkey_listener(window_handle: WindowHandle<Swoop>, cx: &mut App) {
-    use x11rb::connection::Connection;
-    use x11rb::protocol::xproto::{ConnectionExt as _, GrabMode, ModMask};
-
-    let (conn, _screen_num) = match x11rb::connect(None) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-
-    let screen = &conn.setup().roots[_screen_num];
-    let root = screen.root;
-    let hotkeys: &[u8] = &[148, 49]; // XF86Calculator, œ
-
-    for &keycode in hotkeys {
-        for mask in [
-            ModMask::default(),
-            ModMask::LOCK,
-            ModMask::from(u16::from(ModMask::M2)),
-            ModMask::LOCK | ModMask::from(u16::from(ModMask::M2)),
-        ] {
-            let _ = conn.grab_key(
-                false,
-                root,
-                mask,
-                keycode,
-                GrabMode::ASYNC,
-                GrabMode::ASYNC,
-            );
-        }
-    }
-    let _ = conn.flush();
-
     let (tx, rx) = std::sync::mpsc::channel::<()>();
 
-    std::thread::spawn(move || {
-        while let Ok(event) = conn.wait_for_event() {
-            if let x11rb::protocol::Event::KeyPress(_) = event {
-                let _ = tx.send(());
-            }
-        }
+    platform::grab_hotkeys(move || {
+        let _ = tx.send(());
     });
 
     cx.spawn(async move |cx: &mut AsyncApp| {
