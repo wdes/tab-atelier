@@ -9,6 +9,7 @@ mod power;
 mod screenshot;
 mod terminal;
 mod terminal_utils;
+mod theme;
 mod tracking;
 
 use gpui::prelude::FluentBuilder;
@@ -16,7 +17,7 @@ use gpui::{
     App, AppContext, Application, AsyncApp, ClickEvent, ClipboardItem, Context, Div, ElementId, Entity, FocusHandle,
     Focusable, Hsla, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Pixels,
     Point, Render, Rgba, SharedString, Stateful, StatefulInteractiveElement, Styled, WeakEntity, Window,
-    WindowBackgroundAppearance, WindowHandle, WindowOptions, div, px, rgb, rgba,
+    WindowBackgroundAppearance, WindowHandle, WindowOptions, div, px, rgba,
 };
 use locale::{Lang, Strings};
 use log::{debug, info};
@@ -29,6 +30,7 @@ use tab_atelier::{
     load_wakatime_key, save_preferences, save_state,
 };
 use terminal::TerminalView;
+use theme::ThemeName;
 use tracking::WakatimeTracker;
 
 struct Tab {
@@ -78,15 +80,17 @@ struct Toast {
 struct DraggedTab {
     idx: usize,
     name: String,
+    theme: ThemeName,
 }
 
 impl Render for DraggedTab {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let th = theme::theme(self.theme);
         div()
             .px(px(12.0))
             .py(px(4.0))
-            .bg(rgb(0x2d_2d2d))
-            .text_color(rgb(0xcc_cccc))
+            .bg(th.elevated_hsla())
+            .text_color(th.fg_hsla())
             .text_size(px(13.0))
             .rounded(px(4.0))
             .opacity(0.8)
@@ -120,6 +124,7 @@ struct Swoop {
     blink_on: bool,
     toasts: Vec<Toast>,
     lang: Lang,
+    theme_name: ThemeName,
     show_preferences: bool,
     browser: Rc<RefCell<Option<String>>>,
     code_editor: Rc<RefCell<Option<String>>>,
@@ -132,6 +137,10 @@ struct Swoop {
 impl Swoop {
     fn t(&self) -> &'static Strings {
         locale::strings(self.lang)
+    }
+
+    fn th(&self) -> &'static theme::Theme {
+        theme::theme(self.theme_name)
     }
 
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -147,6 +156,7 @@ impl Swoop {
             Some("en") => Lang::En,
             _ => locale::detect_lang(),
         };
+        let theme_name = prefs.theme.as_deref().and_then(ThemeName::from_id).unwrap_or_default();
 
         let (tabs, active) = if let Some(saved) = load_state_from(&platform::state_base_dir()) {
             info!("restoring {} tab(s) from saved state", saved.tabs.len());
@@ -156,7 +166,11 @@ impl Swoop {
                 let fc = font_config.clone();
                 let br = browser.clone();
                 let ce = code_editor.clone();
-                let view = cx.new(|cx| TerminalView::new(cwd.as_deref(), fc, br, ce, window, cx));
+                let view = cx.new(|cx| {
+                    let mut tv = TerminalView::new(cwd.as_deref(), fc, br, ce, window, cx);
+                    tv.theme = theme_name;
+                    tv
+                });
                 if let Some(ref output) = ts.output {
                     debug!("restoring {} chars of output for '{}'", output.len(), ts.name);
                     view.read(cx).restore_output(output);
@@ -173,7 +187,11 @@ impl Swoop {
                 let fc = font_config.clone();
                 let br = browser.clone();
                 let ce = code_editor.clone();
-                let view = cx.new(|cx| TerminalView::new(None, fc, br, ce, window, cx));
+                let view = cx.new(|cx| {
+                    let mut tv = TerminalView::new(None, fc, br, ce, window, cx);
+                    tv.theme = theme_name;
+                    tv
+                });
                 tabs.push(Tab {
                     view,
                     name: locale::strings(lang).terminal.into(),
@@ -189,7 +207,11 @@ impl Swoop {
             let fc = font_config.clone();
             let br = browser.clone();
             let ce = code_editor.clone();
-            let view = cx.new(|cx| TerminalView::new(None, fc, br, ce, window, cx));
+            let view = cx.new(|cx| {
+                let mut tv = TerminalView::new(None, fc, br, ce, window, cx);
+                tv.theme = theme_name;
+                tv
+            });
             (
                 vec![Tab {
                     view,
@@ -298,6 +320,7 @@ impl Swoop {
             blink_on: false,
             toasts: Vec::new(),
             lang,
+            theme_name,
             show_preferences: false,
             browser,
             code_editor,
@@ -325,15 +348,23 @@ impl Swoop {
         let fc = self.font_config.clone();
         let br = self.browser.clone();
         let ce = self.code_editor.clone();
-        let view = cx.new(|cx| TerminalView::new(cwd.as_deref(), fc, br, ce, window, cx));
-        let idx = at.min(self.tabs.len());
-        self.tabs.insert(idx, Tab {
-            view,
-            name: format!("{} {}", self.t().terminal_n, self.tabs.len()),
-            active_duration: std::time::Duration::ZERO,
-            last_activated: Some(std::time::Instant::now()),
-            energy_wh: 0.0,
+        let tn = self.theme_name;
+        let view = cx.new(|cx| {
+            let mut tv = TerminalView::new(cwd.as_deref(), fc, br, ce, window, cx);
+            tv.theme = tn;
+            tv
         });
+        let idx = at.min(self.tabs.len());
+        self.tabs.insert(
+            idx,
+            Tab {
+                view,
+                name: format!("{} {}", self.t().terminal_n, self.tabs.len()),
+                active_duration: std::time::Duration::ZERO,
+                last_activated: Some(std::time::Instant::now()),
+                energy_wh: 0.0,
+            },
+        );
         self.active = idx;
         cx.notify();
     }
@@ -470,7 +501,12 @@ impl Swoop {
         let fc = self.font_config.clone();
         let br = self.browser.clone();
         let ce = self.code_editor.clone();
-        let view = cx.new(|cx| TerminalView::new(cwd.as_deref(), fc, br, ce, window, cx));
+        let tn = self.theme_name;
+        let view = cx.new(|cx| {
+            let mut tv = TerminalView::new(cwd.as_deref(), fc, br, ce, window, cx);
+            tv.theme = tn;
+            tv
+        });
         self.tabs[idx].view = view;
         self.tabs[idx].active_duration = std::time::Duration::ZERO;
         self.tabs[idx].last_activated = if idx == self.active {
@@ -604,12 +640,13 @@ impl Swoop {
         let battery_critical = battery.is_some_and(|b| b < 10);
         let blink_red = battery_critical && self.blink_on;
 
-        let tab_bg: Hsla = rgb(0x1e_1e1e).into();
-        let tab_active_bg: Hsla = rgb(0x2d_2d2d).into();
-        let tab_blink_bg: Hsla = rgb(0x5c_1010).into();
-        let tab_fg: Hsla = rgb(0xcc_cccc).into();
-        let tab_border: Hsla = rgb(0x3c_3c3c).into();
-        let watts_fg: Hsla = rgb(0x88_8888).into();
+        let th = self.th();
+        let tab_bg = th.surface_hsla();
+        let tab_active_bg = th.elevated_hsla();
+        let tab_blink_bg = th.danger_hsla();
+        let tab_fg = th.fg_hsla();
+        let tab_border = th.border_hsla();
+        let watts_fg = th.fg_muted_hsla();
 
         let watts = self.power_watts.lock().unwrap().clone();
 
@@ -693,6 +730,7 @@ impl Swoop {
                     DraggedTab {
                         idx: i,
                         name: drag_name,
+                        theme: self.theme_name,
                     },
                     |tab, _offset, _window, cx| cx.new(|_| tab.clone()),
                 )
@@ -700,7 +738,7 @@ impl Swoop {
                     if dragged.idx == i {
                         return style;
                     }
-                    let s = style.bg(rgb(0x09_4771));
+                    let s = style.bg(theme::theme(dragged.theme).selection_hsla());
                     if i < dragged.idx {
                         s.border_l_2()
                     } else {
@@ -744,10 +782,11 @@ impl Swoop {
 
     fn render_context_menu(&self, window: &Window, cx: &Context<Self>) -> Option<Stateful<Div>> {
         let menu = self.context_menu.as_ref()?;
-        let menu_bg: Hsla = rgb(0x25_2526).into();
-        let menu_fg: Hsla = rgb(0xcc_cccc).into();
-        let menu_hover: Hsla = rgb(0x09_4771).into();
-        let menu_border: Hsla = rgb(0x3c_3c3c).into();
+        let th = self.th();
+        let menu_bg = th.surface_hsla();
+        let menu_fg = th.fg_hsla();
+        let menu_hover = th.selection_hsla();
+        let menu_border = th.border_hsla();
 
         let pos = menu.position;
         let menu_width = px(150.0);
@@ -825,7 +864,7 @@ impl Swoop {
                 MenuKind::Tab(idx) => idx,
                 MenuKind::Background => self.active,
             };
-            let stat_fg: Hsla = rgb(0x88_8888).into();
+            let stat_fg = th.fg_muted_hsla();
             let elapsed = self.tabs[stats_idx].uptime();
             let power_info = self.power_watts.lock().unwrap().get(stats_idx).cloned();
             let t = self.t();
@@ -1070,10 +1109,11 @@ impl Swoop {
     fn render_rename_input(&self, cx: &Context<Self>) -> Option<Stateful<Div>> {
         let (_idx, text) = self.renaming.as_ref()?;
         let text = text.clone();
-        let input_bg: Hsla = rgb(0x1e_1e1e).into();
-        let input_fg: Hsla = rgb(0xcc_cccc).into();
-        let input_border: Hsla = rgb(0x00_7acc).into();
-        let cursor_color: Hsla = rgb(0xcc_cccc).into();
+        let th = self.th();
+        let input_bg = th.surface_hsla();
+        let input_fg = th.fg_hsla();
+        let input_border = th.accent_hsla();
+        let cursor_color = th.fg_hsla();
 
         Some(
             div()
@@ -1158,7 +1198,7 @@ impl Swoop {
                                 .flex_row()
                                 .items_center()
                                 .mt(px(8.0))
-                                .bg(rgb(0x14_1414))
+                                .bg(th.bg_hsla())
                                 .border_1()
                                 .border_color(input_border)
                                 .rounded(px(3.0))
@@ -1167,7 +1207,7 @@ impl Swoop {
                                 .min_h(px(28.0))
                                 .cursor_text()
                                 .when(self.rename_select_all, |el| {
-                                    el.child(div().bg(rgb(0x26_4f78)).px(px(2.0)).child(text.clone()))
+                                    el.child(div().bg(th.selection_hsla()).px(px(2.0)).child(text.clone()))
                                 })
                                 .when(!self.rename_select_all, |el| {
                                     el.child(text).child(div().w(px(1.0)).h(px(16.0)).bg(cursor_color))
@@ -1185,13 +1225,14 @@ impl Swoop {
         }
         let tab_name = self.tabs[idx].name.clone();
 
-        let dialog_bg: Hsla = rgb(0x25_2526).into();
-        let dialog_fg: Hsla = rgb(0xcc_cccc).into();
-        let dialog_border: Hsla = rgb(0x3c_3c3c).into();
-        let btn_bg: Hsla = rgb(0x0e_639c).into();
-        let btn_hover: Hsla = rgb(0x11_77bb).into();
-        let btn_secondary_bg: Hsla = rgb(0x3c_3c3c).into();
-        let btn_secondary_hover: Hsla = rgb(0x50_5050).into();
+        let th = self.th();
+        let dialog_bg = th.surface_hsla();
+        let dialog_fg = th.fg_hsla();
+        let dialog_border = th.border_hsla();
+        let btn_bg = th.accent_hsla();
+        let btn_hover = th.accent_hover_hsla();
+        let btn_secondary_bg = th.border_hsla();
+        let btn_secondary_hover = th.selection_hsla();
 
         Some(
             div()
@@ -1231,7 +1272,7 @@ impl Swoop {
                             div()
                                 .mt(px(8.0))
                                 .text_size(px(13.0))
-                                .text_color(rgb(0x99_9999))
+                                .text_color(th.fg_muted_hsla())
                                 .child(self.t().exit_close_or_reopen),
                         )
                         .child(
@@ -1309,13 +1350,14 @@ impl Swoop {
         }
         let tab_name = self.tabs[idx].name.clone();
 
-        let dialog_bg: Hsla = rgb(0x25_2526).into();
-        let dialog_fg: Hsla = rgb(0xcc_cccc).into();
-        let dialog_border: Hsla = rgb(0x3c_3c3c).into();
-        let btn_bg: Hsla = rgb(0x0e_639c).into();
-        let btn_hover: Hsla = rgb(0x11_77bb).into();
-        let btn_secondary_bg: Hsla = rgb(0x3c_3c3c).into();
-        let btn_secondary_hover: Hsla = rgb(0x50_5050).into();
+        let th = self.th();
+        let dialog_bg = th.surface_hsla();
+        let dialog_fg = th.fg_hsla();
+        let dialog_border = th.border_hsla();
+        let btn_bg = th.accent_hsla();
+        let btn_hover = th.accent_hover_hsla();
+        let btn_secondary_bg = th.border_hsla();
+        let btn_secondary_hover = th.selection_hsla();
 
         Some(
             div()
@@ -1408,12 +1450,13 @@ impl Swoop {
             return None;
         };
 
-        let dialog_bg: Hsla = rgb(0x25_2526).into();
-        let dialog_fg: Hsla = rgb(0xcc_cccc).into();
-        let dialog_border: Hsla = rgb(0x3c_3c3c).into();
-        let btn_bg: Hsla = rgb(0x0e_639c).into();
-        let btn_hover: Hsla = rgb(0x11_77bb).into();
-        let link_fg: Hsla = rgb(0x37_94ff).into();
+        let th = self.th();
+        let dialog_bg = th.surface_hsla();
+        let dialog_fg = th.fg_hsla();
+        let dialog_border = th.border_hsla();
+        let btn_bg = th.accent_hsla();
+        let btn_hover = th.accent_hover_hsla();
+        let link_fg = th.accent_hsla();
 
         let colors = qr.to_colors();
         let w = qr.width();
@@ -1527,17 +1570,45 @@ impl Swoop {
             b: 0.0,
             a: 0.5,
         });
-        let modal_bg: Hsla = rgb(0x1e_1e1e).into();
-        let modal_fg: Hsla = rgb(0xcc_cccc).into();
-        let modal_border: Hsla = rgb(0x3c_3c3c).into();
-        let input_border: Hsla = rgb(0x00_7acc).into();
-        let btn_bg: Hsla = rgb(0x00_7acc).into();
-        let btn_hover: Hsla = rgb(0x1c_8cd9).into();
-        let option_bg: Hsla = rgb(0x2d_2d2d).into();
-        let option_active: Hsla = rgb(0x00_7acc).into();
-        let placeholder_fg: Hsla = rgb(0x66_6666).into();
-        let cursor_color: Hsla = rgb(0xcc_cccc).into();
+        let th = self.th();
+        let modal_bg = th.surface_hsla();
+        let modal_fg = th.fg_hsla();
+        let modal_border = th.border_hsla();
+        let input_border = th.accent_hsla();
+        let btn_bg = th.accent_hsla();
+        let btn_hover = th.accent_hover_hsla();
+        let option_bg = th.elevated_hsla();
+        let option_active = th.accent_hsla();
+        let placeholder_fg = th.fg_muted_hsla();
+        let cursor_color = th.fg_hsla();
         let t = self.t();
+
+        let mut theme_options = div().flex().flex_col().gap(px(4.0)).mt(px(8.0));
+
+        for &tn in ThemeName::ALL {
+            let is_active = tn == self.theme_name;
+            theme_options = theme_options.child(
+                div()
+                    .id(SharedString::from(format!("pref-theme-{}", tn.id())))
+                    .px(px(12.0))
+                    .py(px(6.0))
+                    .rounded(px(3.0))
+                    .cursor_pointer()
+                    .bg(if is_active { option_active } else { option_bg })
+                    .hover(|s| s.bg(if is_active { option_active } else { btn_hover }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                            this.theme_name = tn;
+                            for tab in &this.tabs {
+                                tab.view.update(cx, |tv, _cx| tv.theme = tn);
+                            }
+                            cx.notify();
+                        }),
+                    )
+                    .child(tn.label()),
+            );
+        }
 
         let mut lang_options = div().flex().flex_col().gap(px(4.0)).mt(px(8.0));
 
@@ -1572,7 +1643,7 @@ impl Swoop {
             .flex()
             .flex_row()
             .items_center()
-            .bg(rgb(0x14_1414))
+            .bg(th.bg_hsla())
             .border_1()
             .border_color(input_border)
             .rounded(px(3.0))
@@ -1618,7 +1689,7 @@ impl Swoop {
             .flex()
             .flex_row()
             .items_center()
-            .bg(rgb(0x14_1414))
+            .bg(th.bg_hsla())
             .border_1()
             .border_color(input_border)
             .rounded(px(3.0))
@@ -1681,7 +1752,8 @@ impl Swoop {
                         .text_size(px(14.0))
                         .on_mouse_down(MouseButton::Left, |_ev: &MouseDownEvent, _window, _cx| {})
                         .child(div().text_size(px(16.0)).mb(px(16.0)).child(t.preferences))
-                        .child(div().child(t.language).child(lang_options))
+                        .child(div().child(t.theme).child(theme_options))
+                        .child(div().mt(px(16.0)).child(t.language).child(lang_options))
                         .child(div().mt(px(16.0)).child(t.browser).child(browser_input))
                         .child(div().mt(px(16.0)).child(t.code_editor).child(editor_input))
                         .child(
@@ -1741,6 +1813,7 @@ impl Swoop {
                                                     &platform::state_base_dir(),
                                                     &Preferences {
                                                         lang: Some(lang_str.into()),
+                                                        theme: Some(this.theme_name.id().into()),
                                                         browser,
                                                         code_editor: editor,
                                                     },
@@ -1876,10 +1949,11 @@ impl Render for Swoop {
         }
 
         if !self.toasts.is_empty() {
-            let toast_bg: Hsla = rgb(0x2d_2d2d).into();
-            let toast_fg: Hsla = rgb(0xcc_cccc).into();
-            let toast_border: Hsla = rgb(0x00_7acc).into();
-            let link_fg: Hsla = rgb(0x37_94ff).into();
+            let th = self.th();
+            let toast_bg = th.elevated_hsla();
+            let toast_fg = th.fg_hsla();
+            let toast_border = th.accent_hsla();
+            let link_fg = th.accent_hsla();
             let mut stack = div()
                 .id("toast-stack")
                 .absolute()
