@@ -95,6 +95,8 @@ struct Swoop {
     api_state: Arc<Mutex<api::TabSnapshot>>,
     power_pids: Arc<Mutex<Vec<u32>>>,
     power_watts: Arc<Mutex<Vec<power::TabPower>>>,
+    battery_percent: Arc<Mutex<Option<u8>>>,
+    blink_on: bool,
     toasts: Vec<Toast>,
     lang: Lang,
     show_preferences: bool,
@@ -214,6 +216,23 @@ impl Swoop {
         })
         .detach();
 
+        cx.spawn(async |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(500))
+                    .await;
+                let Ok(()) = this.update(cx, |app, cx| {
+                    app.blink_on = !app.blink_on;
+                    if app.battery_percent.lock().unwrap().is_some_and(|b| b < 10) {
+                        cx.notify();
+                    }
+                }) else {
+                    break;
+                };
+            }
+        })
+        .detach();
+
         tabs[active].view.read(cx).focus_handle(cx).focus(window);
 
         let tracker = load_wakatime_key(&platform::config_dir()).map(|key| {
@@ -233,7 +252,8 @@ impl Swoop {
 
         let power_pids: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
         let power_watts: Arc<Mutex<Vec<power::TabPower>>> = Arc::new(Mutex::new(Vec::new()));
-        power::start_power_monitor(power_pids.clone(), power_watts.clone());
+        let battery_percent: Arc<Mutex<Option<u8>>> = Arc::new(Mutex::new(None));
+        power::start_power_monitor(power_pids.clone(), power_watts.clone(), battery_percent.clone());
 
         Self {
             tabs,
@@ -252,6 +272,8 @@ impl Swoop {
             api_state,
             power_pids,
             power_watts,
+            battery_percent,
+            blink_on: false,
             toasts: Vec::new(),
             lang,
             show_preferences: false,
@@ -512,9 +534,13 @@ impl Swoop {
         .detach();
     }
 
-    fn render_tab_bar(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Div {
+    fn render_tab_bar(&mut self, battery: Option<u8>, _window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let battery_critical = battery.is_some_and(|b| b < 10);
+        let blink_red = battery_critical && self.blink_on;
+
         let tab_bg: Hsla = rgb(0x1e_1e1e).into();
         let tab_active_bg: Hsla = rgb(0x2d_2d2d).into();
+        let tab_blink_bg: Hsla = rgb(0x5c_1010).into();
         let tab_fg: Hsla = rgb(0xcc_cccc).into();
         let tab_border: Hsla = rgb(0x3c_3c3c).into();
         let watts_fg: Hsla = rgb(0x88_8888).into();
@@ -546,7 +572,13 @@ impl Swoop {
                 .items_center()
                 .px(px(12.0))
                 .h_full()
-                .bg(if is_active { tab_active_bg } else { tab_bg })
+                .bg(if blink_red {
+                    tab_blink_bg
+                } else if is_active {
+                    tab_active_bg
+                } else {
+                    tab_bg
+                })
                 .border_r_1()
                 .border_color(tab_border)
                 .text_color(tab_fg)
@@ -1605,7 +1637,8 @@ impl Render for Swoop {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         window.set_window_title(&format!("{}{}", self.tabs[self.active].name, self.t().title_suffix));
         let active_terminal = self.tabs[self.active].view.clone();
-        let tab_bar = self.render_tab_bar(window, cx);
+        let battery = *self.battery_percent.lock().unwrap();
+        let tab_bar = self.render_tab_bar(battery, window, cx);
         let context_menu = if self.renaming.is_none()
             && self.exit_confirm.is_none()
             && self.close_confirm.is_none()
@@ -1623,10 +1656,18 @@ impl Render for Swoop {
             self.rename_focus.focus(window);
         }
 
+        let bg_color = if battery.is_some_and(|b| b < 10) {
+            rgba(0x3a05_05b8)
+        } else if battery.is_some_and(|b| b < 20) {
+            rgba(0x2d08_08b8)
+        } else {
+            rgba(0x1414_14b8)
+        };
+
         let mut root = div()
             .id("app-root")
             .size_full()
-            .bg(rgba(0x1414_14b8))
+            .bg(bg_color)
             .flex()
             .flex_col()
             .child(
