@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 
 use log::{debug, info};
+use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{ConnectionExt, ImageFormat};
 
 pub fn screenshot_dir() -> PathBuf {
@@ -37,40 +38,39 @@ struct CapturedImage {
 }
 
 fn capture_focused_window() -> Result<CapturedImage, String> {
-    let (conn, _screen_num) = x11rb::connect(None).map_err(|e| format!("x11 connect: {e}"))?;
+    let (conn, screen_num) = x11rb::connect(None).map_err(|e| format!("x11 connect: {e}"))?;
+    let screen = &conn.setup().roots[screen_num];
+    let root = screen.root;
+
     let focus = conn.get_input_focus().map_err(|e| format!("get_input_focus: {e}"))?
         .reply().map_err(|e| format!("get_input_focus reply: {e}"))?;
 
     let mut window = focus.focus;
     loop {
-        let geom = conn.get_geometry(window).map_err(|e| format!("get_geometry: {e}"))?
-            .reply().map_err(|e| format!("get_geometry reply: {e}"))?;
-        if geom.width > 1 && geom.height > 1 {
-            break;
-        }
         let tree = conn.query_tree(window).map_err(|e| format!("query_tree: {e}"))?
             .reply().map_err(|e| format!("query_tree reply: {e}"))?;
-        if tree.parent == 0 || tree.parent == tree.root {
+        if tree.parent == root || tree.parent == 0 {
             break;
         }
         window = tree.parent;
     }
 
-    let attrs = conn.get_window_attributes(window).map_err(|e| format!("get_attrs: {e}"))?
-        .reply().map_err(|e| format!("get_attrs reply: {e}"))?;
-    if attrs.map_state != x11rb::protocol::xproto::MapState::VIEWABLE {
-        return Err("window not viewable".into());
-    }
-
     let geom = conn.get_geometry(window).map_err(|e| format!("get_geometry: {e}"))?
         .reply().map_err(|e| format!("get_geometry reply: {e}"))?;
 
-    debug!("screenshot: capturing window 0x{:x} ({}x{})", window, geom.width, geom.height);
+    let coords = conn.translate_coordinates(window, root, 0, 0)
+        .map_err(|e| format!("translate_coordinates: {e}"))?
+        .reply().map_err(|e| format!("translate_coordinates reply: {e}"))?;
+
+    debug!(
+        "screenshot: capturing from root at ({},{}) size {}x{}",
+        coords.dst_x, coords.dst_y, geom.width, geom.height
+    );
 
     let reply = conn.get_image(
         ImageFormat::Z_PIXMAP,
-        window,
-        0, 0,
+        root,
+        coords.dst_x, coords.dst_y,
         geom.width, geom.height,
         u32::MAX,
     ).map_err(|e| format!("get_image: {e}"))?
@@ -130,17 +130,25 @@ fn write_bmp(path: &std::path::Path, width: u16, height: u16, bgra: &[u8]) -> Re
     Ok(())
 }
 
-pub fn take_screenshot_full() -> Result<PathBuf, String> {
+fn sanitize_filename(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect::<String>()
+        .to_lowercase()
+}
+
+pub fn take_screenshot_full(tab_name: &str) -> Result<PathBuf, String> {
     let img = capture_focused_window()?;
     let dir = screenshot_dir();
     let _ = std::fs::create_dir_all(&dir);
-    let path = dir.join(format!("tab-atelier-{}.bmp", timestamp()));
+    let safe = sanitize_filename(tab_name);
+    let path = dir.join(format!("tab-atelier-{safe}-{}.bmp", timestamp()));
     write_bmp(&path, img.width, img.height, &img.data)?;
     info!("screenshot saved: {}", path.display());
     Ok(path)
 }
 
-pub fn take_screenshot_tab(tab_bar_height: u16) -> Result<PathBuf, String> {
+pub fn take_screenshot_tab(tab_name: &str, tab_bar_height: u16) -> Result<PathBuf, String> {
     let img = capture_focused_window()?;
     if img.height <= tab_bar_height {
         return Err("window too small to crop tab bar".into());
@@ -158,7 +166,8 @@ pub fn take_screenshot_tab(tab_bar_height: u16) -> Result<PathBuf, String> {
 
     let dir = screenshot_dir();
     let _ = std::fs::create_dir_all(&dir);
-    let path = dir.join(format!("tab-atelier-tab-{}.bmp", timestamp()));
+    let safe = sanitize_filename(tab_name);
+    let path = dir.join(format!("tab-atelier-tab-{safe}-{}.bmp", timestamp()));
     write_bmp(&path, img.width, crop_h, &cropped)?;
     info!("tab screenshot saved: {}", path.display());
     Ok(path)
@@ -201,5 +210,13 @@ mod tests {
         assert!(contents.len() > 54);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sanitize_removes_special_chars() {
+        assert_eq!(sanitize_filename("Terminal"), "terminal");
+        assert_eq!(sanitize_filename("my tab/name"), "my_tab_name");
+        assert_eq!(sanitize_filename("hello world!"), "hello_world_");
+        assert_eq!(sanitize_filename("a-b_c"), "a-b_c");
     }
 }
