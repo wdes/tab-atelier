@@ -150,8 +150,9 @@ pub fn open_url(url: &str, browser: Option<&str>) {
         .spawn();
 }
 
-pub fn open_path(path: &std::path::Path) {
-    let _ = std::process::Command::new("xdg-open")
+pub fn open_path(path: &std::path::Path, editor: Option<&str>) {
+    let cmd = editor.unwrap_or("xdg-open");
+    let _ = std::process::Command::new(cmd)
         .arg(path)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())

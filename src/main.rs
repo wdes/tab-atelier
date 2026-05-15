@@ -99,8 +99,11 @@ struct Swoop {
     lang: Lang,
     show_preferences: bool,
     browser: Rc<RefCell<Option<String>>>,
+    code_editor: Rc<RefCell<Option<String>>>,
     pref_browser_text: String,
     pref_browser_focus: FocusHandle,
+    pref_editor_text: String,
+    pref_editor_focus: FocusHandle,
 }
 
 impl Swoop {
@@ -111,9 +114,11 @@ impl Swoop {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let rename_focus = cx.focus_handle();
         let pref_browser_focus = cx.focus_handle();
+        let pref_editor_focus = cx.focus_handle();
         let font_config = load_font_config(&platform::config_dir());
         let prefs = load_preferences(&platform::state_base_dir());
         let browser: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(prefs.browser.clone()));
+        let code_editor: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(prefs.code_editor.clone()));
         let lang = match prefs.lang.as_deref() {
             Some("fr") => Lang::Fr,
             Some("en") => Lang::En,
@@ -127,7 +132,8 @@ impl Swoop {
                 let cwd = ts.cwd.as_ref().map(PathBuf::from);
                 let fc = font_config.clone();
                 let br = browser.clone();
-                let view = cx.new(|cx| TerminalView::new(cwd.as_deref(), fc, br, window, cx));
+                let ce = code_editor.clone();
+                let view = cx.new(|cx| TerminalView::new(cwd.as_deref(), fc, br, ce, window, cx));
                 if let Some(ref output) = ts.output {
                     debug!("restoring {} chars of output for '{}'", output.len(), ts.name);
                     view.read(cx).restore_output(output);
@@ -143,7 +149,8 @@ impl Swoop {
             if tabs.is_empty() {
                 let fc = font_config.clone();
                 let br = browser.clone();
-                let view = cx.new(|cx| TerminalView::new(None, fc, br, window, cx));
+                let ce = code_editor.clone();
+                let view = cx.new(|cx| TerminalView::new(None, fc, br, ce, window, cx));
                 tabs.push(Tab {
                     view,
                     name: locale::strings(lang).terminal.into(),
@@ -158,7 +165,8 @@ impl Swoop {
         } else {
             let fc = font_config.clone();
             let br = browser.clone();
-            let view = cx.new(|cx| TerminalView::new(None, fc, br, window, cx));
+            let ce = code_editor.clone();
+            let view = cx.new(|cx| TerminalView::new(None, fc, br, ce, window, cx));
             (
                 vec![Tab {
                     view,
@@ -248,8 +256,11 @@ impl Swoop {
             lang,
             show_preferences: false,
             browser,
+            code_editor,
             pref_browser_text: String::new(),
             pref_browser_focus,
+            pref_editor_text: String::new(),
+            pref_editor_focus,
         }
     }
 
@@ -261,7 +272,8 @@ impl Swoop {
         self.tabs[self.active].deactivate();
         let fc = self.font_config.clone();
         let br = self.browser.clone();
-        let view = cx.new(|cx| TerminalView::new(cwd.as_deref(), fc, br, window, cx));
+        let ce = self.code_editor.clone();
+        let view = cx.new(|cx| TerminalView::new(cwd.as_deref(), fc, br, ce, window, cx));
         let idx = self.tabs.len();
         self.tabs.push(Tab {
             view,
@@ -369,7 +381,8 @@ impl Swoop {
         self.tabs[idx].view.read(cx).shutdown();
         let fc = self.font_config.clone();
         let br = self.browser.clone();
-        let view = cx.new(|cx| TerminalView::new(cwd.as_deref(), fc, br, window, cx));
+        let ce = self.code_editor.clone();
+        let view = cx.new(|cx| TerminalView::new(cwd.as_deref(), fc, br, ce, window, cx));
         self.tabs[idx].view = view;
         self.tabs[idx].active_duration = std::time::Duration::ZERO;
         self.tabs[idx].last_activated = if idx == self.active {
@@ -901,6 +914,7 @@ impl Swoop {
                         MouseButton::Left,
                         cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
                             this.pref_browser_text = this.browser.borrow().clone().unwrap_or_default();
+                            this.pref_editor_text = this.code_editor.borrow().clone().unwrap_or_default();
                             this.show_preferences = true;
                             this.context_menu = None;
                             cx.notify();
@@ -1439,6 +1453,52 @@ impl Swoop {
                     .child(div().w(px(1.0)).h(px(16.0)).bg(cursor_color))
             });
 
+        let editor_text = self.pref_editor_text.clone();
+        let editor_input = div()
+            .id("pref-editor-input")
+            .key_context("pref-editor")
+            .track_focus(&self.pref_editor_focus)
+            .mt(px(8.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .bg(rgb(0x14_1414))
+            .border_1()
+            .border_color(input_border)
+            .rounded(px(3.0))
+            .px(px(8.0))
+            .py(px(4.0))
+            .min_h(px(28.0))
+            .cursor_text()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _ev: &MouseDownEvent, window, cx| {
+                    this.pref_editor_focus.focus(window);
+                    cx.notify();
+                }),
+            )
+            .on_key_down(
+                cx.listener(|this, ev: &KeyDownEvent, _window, cx| match ev.keystroke.key.as_str() {
+                    "backspace" => {
+                        this.pref_editor_text.pop();
+                        cx.notify();
+                    }
+                    _ => {
+                        if let Some(ref ch) = ev.keystroke.key_char {
+                            this.pref_editor_text.push_str(ch);
+                            cx.notify();
+                        }
+                    }
+                }),
+            )
+            .when(editor_text.is_empty(), |el| {
+                el.child(div().text_color(placeholder_fg).child(t.code_editor_placeholder))
+            })
+            .when(!editor_text.is_empty(), |el| {
+                el.child(editor_text)
+                    .child(div().w(px(1.0)).h(px(16.0)).bg(cursor_color))
+            });
+
         Some(
             div()
                 .id("preferences-overlay")
@@ -1467,6 +1527,7 @@ impl Swoop {
                         .child(div().text_size(px(16.0)).mb(px(16.0)).child(t.preferences))
                         .child(div().child(t.language).child(lang_options))
                         .child(div().mt(px(16.0)).child(t.browser).child(browser_input))
+                        .child(div().mt(px(16.0)).child(t.code_editor).child(editor_input))
                         .child(
                             div()
                                 .mt(px(20.0))
@@ -1513,12 +1574,19 @@ impl Swoop {
                                                 } else {
                                                     Some(this.pref_browser_text.clone())
                                                 };
+                                                let editor = if this.pref_editor_text.is_empty() {
+                                                    None
+                                                } else {
+                                                    Some(this.pref_editor_text.clone())
+                                                };
                                                 (*this.browser.borrow_mut()).clone_from(&browser);
+                                                (*this.code_editor.borrow_mut()).clone_from(&editor);
                                                 save_preferences(
                                                     &platform::state_base_dir(),
                                                     &Preferences {
                                                         lang: Some(lang_str.into()),
                                                         browser,
+                                                        code_editor: editor,
                                                     },
                                                 );
                                                 this.show_preferences = false;
@@ -1666,7 +1734,7 @@ impl Render for Swoop {
                             MouseButton::Left,
                             cx.listener(move |_this, _ev: &MouseDownEvent, _window, _cx| {
                                 if let Some(ref path) = path_clone {
-                                    platform::open_path(path);
+                                    platform::open_path(path, None);
                                 }
                             }),
                         );
