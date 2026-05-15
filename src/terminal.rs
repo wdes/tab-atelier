@@ -17,17 +17,22 @@ use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point as GridPoint, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 
+use crate::terminal_utils::{
+    DEFAULT_BG, DEFAULT_FG, color_to_hsla, hsla_eq, is_default_bg, is_default_fg, keystroke_to_bytes,
+};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags as CellFlags;
 use alacritty_terminal::term::{Config, Term};
-use vte::ansi::{Color, NamedColor};
 use alacritty_terminal::tty;
-use gpui::*;
-use crate::terminal_utils::{
-    color_to_hsla, hsla_eq, is_default_bg, is_default_fg, keystroke_to_bytes, DEFAULT_BG,
-    DEFAULT_FG,
+use gpui::{
+    App, AsyncApp, Bounds, ContentMask, Context, Corners, Edges, Element, ElementId, FocusHandle, Focusable, FontStyle,
+    FontWeight, GlobalElementId, Hsla, InspectorElementId, InteractiveElement, IntoElement, KeyDownEvent, LayoutId,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, Pixels, Render, Rgba,
+    ScrollWheelEvent, ShapedLine, Size, StrikethroughStyle, Style, Styled, TextRun, UnderlineStyle, WeakEntity, Window,
+    div, fill, font, point, px, relative, rgb, size,
 };
 use tab_atelier::{FontConfig, detect_urls, file_path_for_open};
+use vte::ansi::{Color, NamedColor};
 
 const INITIAL_COLS: usize = 80;
 const INITIAL_LINES: usize = 24;
@@ -102,7 +107,7 @@ impl TerminalView {
             cell_height: 18,
         };
         let opts = tty::Options {
-            working_directory: cwd.map(|p| p.to_path_buf()),
+            working_directory: cwd.map(std::path::Path::to_path_buf),
             ..Default::default()
         };
         let pty = tty::new(&opts, ws, 0).expect("failed to create pty");
@@ -113,25 +118,25 @@ impl TerminalView {
         };
         let term = Term::new(
             config,
-            &TermDims { columns: INITIAL_COLS, screen_lines: INITIAL_LINES },
+            &TermDims {
+                columns: INITIAL_COLS,
+                screen_lines: INITIAL_LINES,
+            },
             EventProxy,
         );
         let term = Arc::new(FairMutex::new(term));
-        let el = EventLoop::new(term.clone(), EventProxy, pty, false, false)
-            .expect("failed to create event loop");
+        let el = EventLoop::new(term.clone(), EventProxy, pty, false, false).expect("failed to create event loop");
         let notifier = el.channel();
         el.spawn();
 
         let focus = cx.focus_handle();
 
         let tick = Rc::new(Cell::new(0u32));
-        let tick_clone = tick.clone();
-        cx.spawn(async move |this: WeakEntity<TerminalView>, cx: &mut AsyncApp| {
+        let tick_clone = tick;
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(33))
-                    .await;
-                let Ok(()) = this.update(cx, |view, cx: &mut Context<TerminalView>| {
+                cx.background_executor().timer(Duration::from_millis(33)).await;
+                let Ok(()) = this.update(cx, |view, cx: &mut Context<Self>| {
                     let n = tick_clone.get().wrapping_add(1);
                     tick_clone.set(n);
                     let scrolled = view.term.lock().grid().display_offset() > 0;
@@ -148,14 +153,12 @@ impl TerminalView {
         let exited = Rc::new(Cell::new(false));
         let exited_clone = exited.clone();
         let pid_for_check = pid;
-        cx.spawn(async move |this: WeakEntity<TerminalView>, cx: &mut AsyncApp| {
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(500))
-                    .await;
+                cx.background_executor().timer(Duration::from_millis(500)).await;
                 if !crate::platform::process_alive(pid_for_check) {
                     exited_clone.set(true);
-                    let _ = this.update(cx, |_, cx: &mut Context<TerminalView>| cx.notify());
+                    let _ = this.update(cx, |_, cx: &mut Context<Self>| cx.notify());
                     break;
                 }
             }
@@ -163,7 +166,10 @@ impl TerminalView {
         .detach();
 
         Self {
-            term, notifier, focus, cell_size: None,
+            term,
+            notifier,
+            focus,
+            cell_size: None,
             last_size: Rc::new(Cell::new(None)),
             content_origin: Rc::new(Cell::new(point(px(0.0), px(0.0)))),
             bounds_size: Rc::new(Cell::new(size(px(0.0), px(0.0)))),
@@ -192,7 +198,7 @@ impl TerminalView {
         }
     }
 
-    pub fn pid(&self) -> u32 {
+    pub const fn pid(&self) -> u32 {
         self.pid
     }
 
@@ -204,7 +210,10 @@ impl TerminalView {
         let _ = self.notifier.send(Msg::Shutdown);
 
         let (cols, lines) = self.last_size.get().unwrap_or((INITIAL_COLS, INITIAL_LINES));
-        let cell = self.cell_size.unwrap_or(Size { width: px(8.4), height: px(19.6) });
+        let cell = self.cell_size.unwrap_or(Size {
+            width: px(8.4),
+            height: px(19.6),
+        });
 
         let ws = WindowSize {
             num_lines: lines as u16,
@@ -214,7 +223,7 @@ impl TerminalView {
         };
 
         let opts = tty::Options {
-            working_directory: cwd.map(|p| p.to_path_buf()),
+            working_directory: cwd.map(std::path::Path::to_path_buf),
             ..Default::default()
         };
         let pty = tty::new(&opts, ws, 0).expect("failed to create pty");
@@ -222,8 +231,7 @@ impl TerminalView {
 
         self.term.lock().grid_mut().scroll_display(Scroll::Bottom);
 
-        let el = EventLoop::new(self.term.clone(), EventProxy, pty, false, false)
-            .expect("failed to create event loop");
+        let el = EventLoop::new(self.term.clone(), EventProxy, pty, false, false).expect("failed to create event loop");
         self.notifier = el.channel();
         el.spawn();
 
@@ -232,14 +240,12 @@ impl TerminalView {
 
         let exited = self.exited.clone();
         let pid_for_check = pid;
-        cx.spawn(async move |this: WeakEntity<TerminalView>, cx: &mut AsyncApp| {
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(500))
-                    .await;
+                cx.background_executor().timer(Duration::from_millis(500)).await;
                 if !crate::platform::process_alive(pid_for_check) {
                     exited.set(true);
-                    let _ = this.update(cx, |_, cx: &mut Context<TerminalView>| cx.notify());
+                    let _ = this.update(cx, |_, cx: &mut Context<Self>| cx.notify());
                     break;
                 }
             }
@@ -258,13 +264,13 @@ impl TerminalView {
 
     pub fn reset_terminal(&self) {
         let reset = concat!(
-            "\x1b[?1049l",  // exit alternate screen
-            "\x1b[0m",      // reset all SGR attributes (colors/styles)
-            "\x1b[?25h",    // show cursor
-            "\x1b[?1l",     // reset cursor keys to normal mode
-            "\x1b[?7h",     // enable auto-wrap
-            "\x1b[?2004h",  // enable bracketed paste
-            "\x1b(B",       // reset charset to ASCII
+            "\x1b[?1049l", // exit alternate screen
+            "\x1b[0m",     // reset all SGR attributes (colors/styles)
+            "\x1b[?25h",   // show cursor
+            "\x1b[?1l",    // reset cursor keys to normal mode
+            "\x1b[?7h",    // enable auto-wrap
+            "\x1b[?2004h", // enable bracketed paste
+            "\x1b(B",      // reset charset to ASCII
         );
         let mut parser: vte::ansi::Processor = vte::ansi::Processor::new();
         let mut term = self.term.lock();
@@ -272,7 +278,7 @@ impl TerminalView {
         term.grid_mut().scroll_display(Scroll::Bottom);
     }
 
-    pub fn send_clipboard(&self, text: String) {
+    pub fn send_clipboard(&self, text: &str) {
         self.term.lock().grid_mut().scroll_display(Scroll::Bottom);
         let bracketed = format!("\x1b[200~{text}\x1b[201~");
         let _ = self.notifier.send(Msg::Input(bracketed.into_bytes().into()));
@@ -317,103 +323,114 @@ impl TerminalView {
         t.selection_to_string()
     }
 
+    #[allow(clippy::significant_drop_tightening)]
     pub fn copy_all_history(&self) -> String {
-        let t = self.term.lock();
-        let grid = t.grid();
-        let cols = grid.columns();
-        let history = grid.history_size();
-        let screen = grid.screen_lines();
+        use std::fmt::Write;
+        let lines = {
+            let t = self.term.lock();
+            let grid = t.grid();
+            let cols = grid.columns();
+            let history = grid.history_size();
+            let screen = grid.screen_lines();
 
-        let default_fg = Color::Named(NamedColor::Foreground);
-        let default_bg = Color::Named(NamedColor::Background);
-        let mut cur_fg = default_fg;
-        let mut cur_bg = default_bg;
-        let mut cur_flags = CellFlags::empty();
-        let mut lines = Vec::new();
+            let default_fg = Color::Named(NamedColor::Foreground);
+            let default_bg = Color::Named(NamedColor::Background);
+            let mut cur_fg = default_fg;
+            let mut cur_bg = default_bg;
+            let mut cur_flags = CellFlags::empty();
+            let mut lines = Vec::new();
 
-        for row in (-(history as i32))..screen as i32 {
-            let mut line = String::with_capacity(cols * 2);
-            for col in 0..cols {
-                let cell = &grid[GridPoint::new(Line(row), Column(col))];
-                if cell.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
-                    continue;
+            for row in (-(history as i32))..screen as i32 {
+                let mut line = String::with_capacity(cols * 2);
+                for col in 0..cols {
+                    let cell = &grid[GridPoint::new(Line(row), Column(col))];
+                    if cell.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
+                        continue;
+                    }
+                    let ch = if cell.c == '\0' { ' ' } else { cell.c };
+
+                    let is_default = cell.fg == default_fg && cell.bg == default_bg && cell.flags.is_empty();
+                    if is_default && ch == ' ' && cur_fg == default_fg && cur_bg == default_bg && cur_flags.is_empty() {
+                        line.push(' ');
+                        continue;
+                    }
+
+                    if cell.fg != cur_fg || cell.bg != cur_bg || cell.flags != cur_flags {
+                        let mut sgr = Vec::new();
+
+                        let removed = cur_flags & !cell.flags;
+                        if removed.intersects(
+                            CellFlags::BOLD
+                                | CellFlags::DIM
+                                | CellFlags::ITALIC
+                                | CellFlags::UNDERLINE
+                                | CellFlags::INVERSE
+                                | CellFlags::HIDDEN
+                                | CellFlags::STRIKEOUT,
+                        ) {
+                            sgr.push("0".to_string());
+                            cur_fg = default_fg;
+                            cur_bg = default_bg;
+                            cur_flags = CellFlags::empty();
+                        }
+
+                        if cell.flags.contains(CellFlags::BOLD) && !cur_flags.contains(CellFlags::BOLD) {
+                            sgr.push("1".into());
+                        }
+                        if cell.flags.contains(CellFlags::DIM) && !cur_flags.contains(CellFlags::DIM) {
+                            sgr.push("2".into());
+                        }
+                        if cell.flags.contains(CellFlags::ITALIC) && !cur_flags.contains(CellFlags::ITALIC) {
+                            sgr.push("3".into());
+                        }
+                        if cell.flags.contains(CellFlags::UNDERLINE) && !cur_flags.contains(CellFlags::UNDERLINE) {
+                            sgr.push("4".into());
+                        }
+                        if cell.flags.contains(CellFlags::INVERSE) && !cur_flags.contains(CellFlags::INVERSE) {
+                            sgr.push("7".into());
+                        }
+                        if cell.flags.contains(CellFlags::HIDDEN) && !cur_flags.contains(CellFlags::HIDDEN) {
+                            sgr.push("8".into());
+                        }
+                        if cell.flags.contains(CellFlags::STRIKEOUT) && !cur_flags.contains(CellFlags::STRIKEOUT) {
+                            sgr.push("9".into());
+                        }
+
+                        if cell.fg != cur_fg {
+                            sgr_color(&mut sgr, cell.fg, true);
+                        }
+                        if cell.bg != cur_bg {
+                            sgr_color(&mut sgr, cell.bg, false);
+                        }
+
+                        cur_fg = cell.fg;
+                        cur_bg = cell.bg;
+                        cur_flags = cell.flags;
+
+                        if !sgr.is_empty() {
+                            let _ = write!(line, "\x1b[{}m", sgr.join(";"));
+                        }
+                    }
+                    line.push(ch);
                 }
-                let ch = if cell.c == '\0' { ' ' } else { cell.c };
 
-                let is_default = cell.fg == default_fg
-                    && cell.bg == default_bg
-                    && cell.flags.is_empty();
-                if is_default && ch == ' ' && cur_fg == default_fg && cur_bg == default_bg && cur_flags.is_empty() {
-                    line.push(' ');
-                    continue;
+                if cur_fg != default_fg || cur_bg != default_bg || !cur_flags.is_empty() {
+                    line.push_str("\x1b[0m");
+                    cur_fg = default_fg;
+                    cur_bg = default_bg;
+                    cur_flags = CellFlags::empty();
                 }
-
-                if cell.fg != cur_fg || cell.bg != cur_bg || cell.flags != cur_flags {
-                    let mut sgr = Vec::new();
-
-                    let removed = cur_flags & !cell.flags;
-                    if removed.intersects(CellFlags::BOLD | CellFlags::DIM | CellFlags::ITALIC
-                        | CellFlags::UNDERLINE | CellFlags::INVERSE | CellFlags::HIDDEN | CellFlags::STRIKEOUT)
-                    {
-                        sgr.push("0".to_string());
-                        cur_fg = default_fg;
-                        cur_bg = default_bg;
-                        cur_flags = CellFlags::empty();
-                    }
-
-                    if cell.flags.contains(CellFlags::BOLD) && !cur_flags.contains(CellFlags::BOLD) {
-                        sgr.push("1".into());
-                    }
-                    if cell.flags.contains(CellFlags::DIM) && !cur_flags.contains(CellFlags::DIM) {
-                        sgr.push("2".into());
-                    }
-                    if cell.flags.contains(CellFlags::ITALIC) && !cur_flags.contains(CellFlags::ITALIC) {
-                        sgr.push("3".into());
-                    }
-                    if cell.flags.contains(CellFlags::UNDERLINE) && !cur_flags.contains(CellFlags::UNDERLINE) {
-                        sgr.push("4".into());
-                    }
-                    if cell.flags.contains(CellFlags::INVERSE) && !cur_flags.contains(CellFlags::INVERSE) {
-                        sgr.push("7".into());
-                    }
-                    if cell.flags.contains(CellFlags::HIDDEN) && !cur_flags.contains(CellFlags::HIDDEN) {
-                        sgr.push("8".into());
-                    }
-                    if cell.flags.contains(CellFlags::STRIKEOUT) && !cur_flags.contains(CellFlags::STRIKEOUT) {
-                        sgr.push("9".into());
-                    }
-
-                    if cell.fg != cur_fg {
-                        sgr_color(&mut sgr, cell.fg, true);
-                    }
-                    if cell.bg != cur_bg {
-                        sgr_color(&mut sgr, cell.bg, false);
-                    }
-
-                    cur_fg = cell.fg;
-                    cur_bg = cell.bg;
-                    cur_flags = cell.flags;
-
-                    if !sgr.is_empty() {
-                        line.push_str(&format!("\x1b[{}m", sgr.join(";")));
-                    }
-                }
-                line.push(ch);
+                lines.push(line.trim_end().to_string());
             }
+            lines
+        };
+        // Lock released.
 
-            if cur_fg != default_fg || cur_bg != default_bg || !cur_flags.is_empty() {
-                line.push_str("\x1b[0m");
-                cur_fg = default_fg;
-                cur_bg = default_bg;
-                cur_flags = CellFlags::empty();
-            }
-            lines.push(line.trim_end().to_string());
-        }
-
-        while lines.first().is_some_and(|l| l.is_empty()) {
+        let mut lines = lines;
+        while lines.first().is_some_and(std::string::String::is_empty) {
             lines.remove(0);
         }
-        while lines.last().is_some_and(|l| l.is_empty()) {
+        while lines.last().is_some_and(std::string::String::is_empty) {
             lines.pop();
         }
         lines.join("\n")
@@ -421,11 +438,16 @@ impl TerminalView {
 
     fn url_at_grid(&self, line: usize, col: usize) -> Option<DetectedUrl> {
         let urls = self.detected_urls.borrow();
-        urls.iter().find(|u| u.line == line && col >= u.start_col && col < u.end_col).cloned()
+        urls.iter()
+            .find(|u| u.line == line && col >= u.start_col && col < u.end_col)
+            .cloned()
     }
 
     fn pixel_to_grid(&self, pos: gpui::Point<Pixels>, bounds_origin: gpui::Point<Pixels>) -> (GridPoint, Side) {
-        let cell = self.cell_size.unwrap_or(Size { width: px(8.4), height: px(19.6) });
+        let cell = self.cell_size.unwrap_or(Size {
+            width: px(8.4),
+            height: px(19.6),
+        });
         let x = f32::from(pos.x - bounds_origin.x);
         let y = f32::from(pos.y - bounds_origin.y);
         let col = (x / f32::from(cell.width)).max(0.0) as usize;
@@ -443,14 +465,14 @@ fn sgr_color(sgr: &mut Vec<String>, color: Color, foreground: bool) {
     match color {
         Color::Named(n) => {
             let code = match n {
-                NamedColor::Black => 0,
-                NamedColor::Red => 1,
-                NamedColor::Green => 2,
-                NamedColor::Yellow => 3,
-                NamedColor::Blue => 4,
-                NamedColor::Magenta => 5,
-                NamedColor::Cyan => 6,
-                NamedColor::White => 7,
+                NamedColor::Black | NamedColor::DimBlack => 0,
+                NamedColor::Red | NamedColor::DimRed => 1,
+                NamedColor::Green | NamedColor::DimGreen => 2,
+                NamedColor::Yellow | NamedColor::DimYellow => 3,
+                NamedColor::Blue | NamedColor::DimBlue => 4,
+                NamedColor::Magenta | NamedColor::DimMagenta => 5,
+                NamedColor::Cyan | NamedColor::DimCyan => 6,
+                NamedColor::White | NamedColor::DimWhite => 7,
                 NamedColor::BrightBlack => 8,
                 NamedColor::BrightRed => 9,
                 NamedColor::BrightGreen => 10,
@@ -459,7 +481,11 @@ fn sgr_color(sgr: &mut Vec<String>, color: Color, foreground: bool) {
                 NamedColor::BrightMagenta => 13,
                 NamedColor::BrightCyan => 14,
                 NamedColor::BrightWhite => 15,
-                NamedColor::Foreground | NamedColor::BrightForeground | NamedColor::DimForeground => {
+                NamedColor::Foreground
+                | NamedColor::BrightForeground
+                | NamedColor::DimForeground
+                | NamedColor::Background
+                | NamedColor::Cursor => {
                     if foreground {
                         sgr.push("39".into());
                     } else {
@@ -467,22 +493,6 @@ fn sgr_color(sgr: &mut Vec<String>, color: Color, foreground: bool) {
                     }
                     return;
                 }
-                NamedColor::Background | NamedColor::Cursor => {
-                    if foreground {
-                        sgr.push("39".into());
-                    } else {
-                        sgr.push("49".into());
-                    }
-                    return;
-                }
-                NamedColor::DimBlack => 0,
-                NamedColor::DimRed => 1,
-                NamedColor::DimGreen => 2,
-                NamedColor::DimYellow => 3,
-                NamedColor::DimBlue => 4,
-                NamedColor::DimMagenta => 5,
-                NamedColor::DimCyan => 6,
-                NamedColor::DimWhite => 7,
             };
             if code < 8 {
                 sgr.push(format!("{}", if foreground { 30 + code } else { 40 + code }));
@@ -494,7 +504,13 @@ fn sgr_color(sgr: &mut Vec<String>, color: Color, foreground: bool) {
             sgr.push(format!("{};5;{}", if foreground { 38 } else { 48 }, idx));
         }
         Color::Spec(rgb) => {
-            sgr.push(format!("{};2;{};{};{}", if foreground { 38 } else { 48 }, rgb.r, rgb.g, rgb.b));
+            sgr.push(format!(
+                "{};2;{};{};{}",
+                if foreground { 38 } else { 48 },
+                rgb.r,
+                rgb.g,
+                rgb.b
+            ));
         }
     }
 }
@@ -519,7 +535,7 @@ impl Render for TerminalView {
                 font_size,
                 &[TextRun {
                     len: 1,
-                    font: f.clone(),
+                    font: f,
                     color: gpui::black(),
                     background_color: None,
                     underline: None,
@@ -566,33 +582,34 @@ impl Render for TerminalView {
                     cx.notify();
                 }
             }))
-            .on_mouse_down(MouseButton::Left, cx.listener(move |this, ev: &MouseDownEvent, _window, _cx| {
-                let origin = this.content_origin.get();
-                let bounds = this.bounds_size.get();
-                let scrollbar_left = origin.x + bounds.width - px(SCROLLBAR_WIDTH);
-                if ev.position.x >= scrollbar_left {
-                    this.scrollbar_dragging.set(true);
-                    this.click_origin.set(None);
-                    let y_frac = f32::from(ev.position.y - origin.y) / f32::from(bounds.height);
-                    this.scroll_to_fraction(y_frac.clamp(0.0, 1.0));
-                } else {
-                    let (gp, side) = this.pixel_to_grid(ev.position, origin);
-                    this.click_origin.set(Some(gp));
-                    this.start_selection(gp, side);
-                }
-            }))
-            .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _window, cx| {
-                if this.scrollbar_dragging.get() {
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, ev: &MouseDownEvent, _window, _cx| {
                     let origin = this.content_origin.get();
+                    let bounds = this.bounds_size.get();
+                    let scrollbar_left = origin.x + bounds.width - px(SCROLLBAR_WIDTH);
+                    if ev.position.x >= scrollbar_left {
+                        this.scrollbar_dragging.set(true);
+                        this.click_origin.set(None);
+                        let y_frac = f32::from(ev.position.y - origin.y) / f32::from(bounds.height);
+                        this.scroll_to_fraction(y_frac.clamp(0.0, 1.0));
+                    } else {
+                        let (gp, side) = this.pixel_to_grid(ev.position, origin);
+                        this.click_origin.set(Some(gp));
+                        this.start_selection(gp, side);
+                    }
+                }),
+            )
+            .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _window, cx| {
+                let origin = this.content_origin.get();
+                if this.scrollbar_dragging.get() {
                     let bounds = this.bounds_size.get();
                     let y_frac = f32::from(ev.position.y - origin.y) / f32::from(bounds.height);
                     this.scroll_to_fraction(y_frac.clamp(0.0, 1.0));
                 } else if ev.pressed_button == Some(MouseButton::Left) {
-                    let origin = this.content_origin.get();
                     let (gp, side) = this.pixel_to_grid(ev.position, origin);
                     this.update_selection(gp, side);
                 } else {
-                    let origin = this.content_origin.get();
                     let (gp, _) = this.pixel_to_grid(ev.position, origin);
                     let line = gp.line.0.max(0) as usize;
                     let col = gp.column.0;
@@ -604,37 +621,40 @@ impl Render for TerminalView {
                     }
                 }
             }))
-            .on_mouse_up(MouseButton::Left, cx.listener(move |this, ev: &MouseUpEvent, _window, _cx| {
-                this.scrollbar_dragging.set(false);
-                if let Some(origin_gp) = this.click_origin.take() {
-                    let origin = this.content_origin.get();
-                    let (gp, _) = this.pixel_to_grid(ev.position, origin);
-                    if origin_gp == gp {
-                        let line = gp.line.0.max(0) as usize;
-                        let col = gp.column.0;
-                        if let Some(url) = this.url_at_grid(line, col) {
-                            let browser = this.browser.borrow().clone();
-                            if url.is_file {
-                                let raw = file_path_for_open(&url.url);
-                                let path = std::path::Path::new(raw);
-                                let resolved = if path.is_absolute() {
-                                    path.to_path_buf()
-                                } else if let Some(cwd) = crate::platform::process_cwd(this.pid) {
-                                    cwd.join(path)
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, ev: &MouseUpEvent, _window, _cx| {
+                    this.scrollbar_dragging.set(false);
+                    if let Some(origin_gp) = this.click_origin.take() {
+                        let origin = this.content_origin.get();
+                        let (gp, _) = this.pixel_to_grid(ev.position, origin);
+                        if origin_gp == gp {
+                            let line = gp.line.0.max(0) as usize;
+                            let col = gp.column.0;
+                            if let Some(url) = this.url_at_grid(line, col) {
+                                let browser = this.browser.borrow().clone();
+                                if url.is_file {
+                                    let raw = file_path_for_open(&url.url);
+                                    let path = std::path::Path::new(raw);
+                                    let resolved = if path.is_absolute() {
+                                        path.to_path_buf()
+                                    } else if let Some(cwd) = crate::platform::process_cwd(this.pid) {
+                                        cwd.join(path)
+                                    } else {
+                                        path.to_path_buf()
+                                    };
+                                    info!("opening file: {}", resolved.display());
+                                    crate::platform::open_path(&resolved);
                                 } else {
-                                    path.to_path_buf()
-                                };
-                                info!("opening file: {}", resolved.display());
-                                crate::platform::open_path(&resolved);
-                            } else {
-                                info!("opening URL: {}", url.url);
-                                crate::platform::open_url(&url.url, browser.as_deref());
+                                    info!("opening URL: {}", url.url);
+                                    crate::platform::open_url(&url.url, browser.as_deref());
+                                }
+                                this.clear_selection();
                             }
-                            this.clear_selection();
                         }
                     }
-                }
-            }))
+                }),
+            )
             .size_full()
             .child(TerminalElement {
                 term,
@@ -715,16 +735,20 @@ impl Element for TerminalElement {
         &mut self,
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        _window: &mut Window,
-        _cx: &mut App,
+        window: &mut Window,
+        cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        let layout_id = _window.request_layout(Style {
-            size: Size {
-                width: relative(1.0).into(),
-                height: relative(1.0).into(),
+        let layout_id = window.request_layout(
+            Style {
+                size: Size {
+                    width: relative(1.0).into(),
+                    height: relative(1.0).into(),
+                },
+                ..Default::default()
             },
-            ..Default::default()
-        }, [], _cx);
+            [],
+            cx,
+        );
         (layout_id, ())
     }
 
@@ -733,10 +757,17 @@ impl Element for TerminalElement {
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
-        _: &mut Self::RequestLayoutState,
+        (): &mut Self::RequestLayoutState,
         window: &mut Window,
         _cx: &mut App,
     ) -> Self::PrepaintState {
+        struct RawLine {
+            grid_line: i32,
+            text: String,
+            runs: Vec<TextRun>,
+            bg_runs: Vec<BgRun>,
+        }
+
         let cell = self.cell_size;
         let cols = ((bounds.size.width / cell.width) as usize).max(2);
         let lines = ((bounds.size.height / cell.height) as usize).max(1);
@@ -745,7 +776,10 @@ impl Element for TerminalElement {
             self.last_size.set(Some((cols, lines)));
             {
                 let mut t = self.term.lock();
-                t.resize(TermDims { columns: cols, screen_lines: lines });
+                t.resize(TermDims {
+                    columns: cols,
+                    screen_lines: lines,
+                });
             }
             let _ = self.notifier.send(Msg::Resize(WindowSize {
                 num_lines: lines as u16,
@@ -764,12 +798,6 @@ impl Element for TerminalElement {
         let fg_default: Hsla = rgb(DEFAULT_FG).into();
 
         // Phase 1: read cell data under the lock — no shaping here.
-        struct RawLine {
-            grid_line: i32,
-            text: String,
-            runs: Vec<TextRun>,
-            bg_runs: Vec<BgRun>,
-        }
 
         let (raw_lines, cursor, selection, visible_cols, display_offset_val, history_size) = {
             let term = self.term.lock();
@@ -859,10 +887,18 @@ impl Element for TerminalElement {
                             if last.col + last.len == c && hsla_eq(last.color, old_fg) {
                                 last.len += 1;
                             } else {
-                                bg_runs.push(BgRun { col: c, len: 1, color: old_fg });
+                                bg_runs.push(BgRun {
+                                    col: c,
+                                    len: 1,
+                                    color: old_fg,
+                                });
                             }
                         } else {
-                            bg_runs.push(BgRun { col: c, len: 1, color: old_fg });
+                            bg_runs.push(BgRun {
+                                col: c,
+                                len: 1,
+                                color: old_fg,
+                            });
                         }
                     } else if !is_default_bg(cell_data.bg) {
                         let bg_c = color_to_hsla(cell_data.bg);
@@ -870,10 +906,18 @@ impl Element for TerminalElement {
                             if last.col + last.len == c && hsla_eq(last.color, bg_c) {
                                 last.len += 1;
                             } else {
-                                bg_runs.push(BgRun { col: c, len: 1, color: bg_c });
+                                bg_runs.push(BgRun {
+                                    col: c,
+                                    len: 1,
+                                    color: bg_c,
+                                });
                             }
                         } else {
-                            bg_runs.push(BgRun { col: c, len: 1, color: bg_c });
+                            bg_runs.push(BgRun {
+                                col: c,
+                                len: 1,
+                                color: bg_c,
+                            });
                         }
                     }
 
@@ -902,7 +946,12 @@ impl Element for TerminalElement {
                     }
                 }
 
-                raw_lines.push(RawLine { grid_line, text, runs, bg_runs });
+                raw_lines.push(RawLine {
+                    grid_line,
+                    text,
+                    runs,
+                    bg_runs,
+                });
             }
 
             let cursor = if display_offset == 0
@@ -916,8 +965,16 @@ impl Element for TerminalElement {
 
             let selection = term.selection.as_ref().and_then(|s| s.to_range(&*term));
             let history_size = grid.history_size();
+            drop(term);
 
-            (raw_lines, cursor, selection, visible_cols, display_offset as usize, history_size)
+            (
+                raw_lines,
+                cursor,
+                selection,
+                visible_cols,
+                display_offset as usize,
+                history_size,
+            )
         };
         // Lock released — event loop can proceed while we shape text.
 
@@ -932,25 +989,32 @@ impl Element for TerminalElement {
             if let Some(cached) = cache.remove(&raw.grid_line)
                 && cached.text == raw.text
             {
-                result_lines.push(TermLine { shaped: cached.shaped, bg_runs: raw.bg_runs });
-                new_cache.insert(raw.grid_line, CachedLine {
-                    text: cached.text,
-                    shaped: result_lines.last().unwrap().shaped.clone(),
+                result_lines.push(TermLine {
+                    shaped: cached.shaped,
+                    bg_runs: raw.bg_runs,
                 });
+                new_cache.insert(
+                    raw.grid_line,
+                    CachedLine {
+                        text: cached.text,
+                        shaped: result_lines.last().unwrap().shaped.clone(),
+                    },
+                );
                 continue;
             }
             let text_clone = raw.text.clone();
-            let shaped = text_sys.shape_line(
-                raw.text.into(),
-                font_size,
-                &raw.runs,
-                Some(cell.width),
+            let shaped = text_sys.shape_line(raw.text.into(), font_size, &raw.runs, Some(cell.width));
+            new_cache.insert(
+                raw.grid_line,
+                CachedLine {
+                    text: text_clone,
+                    shaped: shaped.clone(),
+                },
             );
-            new_cache.insert(raw.grid_line, CachedLine {
-                text: text_clone,
-                shaped: shaped.clone(),
+            result_lines.push(TermLine {
+                shaped,
+                bg_runs: raw.bg_runs,
             });
-            result_lines.push(TermLine { shaped, bg_runs: raw.bg_runs });
         }
 
         *cache = new_cache;
@@ -958,7 +1022,13 @@ impl Element for TerminalElement {
         let mut detected = Vec::new();
         for (line_idx, text) in line_texts.iter().enumerate() {
             for (start, end, url, is_file) in detect_urls(text) {
-                detected.push(DetectedUrl { line: line_idx, start_col: start, end_col: end, url, is_file });
+                detected.push(DetectedUrl {
+                    line: line_idx,
+                    start_col: start,
+                    end_col: end,
+                    url,
+                    is_file,
+                });
             }
         }
         *self.detected_urls.borrow_mut() = detected;
@@ -978,7 +1048,7 @@ impl Element for TerminalElement {
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
-        _: &mut Self::RequestLayoutState,
+        (): &mut Self::RequestLayoutState,
         prepaint: &mut Self::PrepaintState,
         window: &mut Window,
         cx: &mut App,
@@ -1004,7 +1074,12 @@ impl Element for TerminalElement {
 
             // Paint selection.
             if let Some(ref sel) = state.selection {
-                let sel_color = Hsla::from(Rgba { r: 0.2, g: 0.4, b: 0.7, a: 0.5 });
+                let sel_color = Hsla::from(Rgba {
+                    r: 0.2,
+                    g: 0.4,
+                    b: 0.7,
+                    a: 0.5,
+                });
                 let start = sel.start;
                 let end = sel.end;
                 for row in start.line.0..=end.line.0 {
@@ -1031,40 +1106,43 @@ impl Element for TerminalElement {
 
             // Paint text.
             for (line_idx, line) in state.lines.iter().enumerate() {
-                let pos = point(
-                    origin.x,
-                    origin.y + cell.height * line_idx as f32,
-                );
+                let pos = point(origin.x, origin.y + cell.height * line_idx as f32);
                 let _ = line.shaped.paint(pos, cell.height, window, cx);
             }
 
             // Paint URL underlines on hover.
             let urls = self.detected_urls.borrow();
             if let Some((h_line, h_col)) = self.hover_grid.get() {
-                let hovered_url = urls.iter().find(|u| u.line == h_line && h_col >= u.start_col && h_col < u.end_col);
+                let hovered_url = urls
+                    .iter()
+                    .find(|u| u.line == h_line && h_col >= u.start_col && h_col < u.end_col);
                 if let Some(url) = hovered_url {
-                    let underline_color = Hsla::from(Rgba { r: 0.22, g: 0.58, b: 1.0, a: 0.9 });
+                    let underline_color = Hsla::from(Rgba {
+                        r: 0.22,
+                        g: 0.58,
+                        b: 1.0,
+                        a: 0.9,
+                    });
                     let y = origin.y + cell.height * (url.line as f32 + 1.0) - px(2.0);
                     let x = origin.x + cell.width * url.start_col as f32;
                     let w = cell.width * (url.end_col - url.start_col) as f32;
-                    window.paint_quad(fill(
-                        Bounds::new(point(x, y), size(w, px(1.0))),
-                        underline_color,
-                    ));
+                    window.paint_quad(fill(Bounds::new(point(x, y), size(w, px(1.0))), underline_color));
                 }
             }
             drop(urls);
 
             // Paint cursor.
             if let Some((row, col)) = state.cursor {
-                let pos = point(
-                    origin.x + cell.width * col as f32,
-                    origin.y + cell.height * row as f32,
-                );
+                let pos = point(origin.x + cell.width * col as f32, origin.y + cell.height * row as f32);
                 let cursor_size = size(cell.width, cell.height);
                 window.paint_quad(fill(
                     Bounds::new(pos, cursor_size),
-                    Hsla::from(Rgba { r: 0.86, g: 0.86, b: 0.86, a: 0.7 }),
+                    Hsla::from(Rgba {
+                        r: 0.86,
+                        g: 0.86,
+                        b: 0.86,
+                        a: 0.7,
+                    }),
                 ));
             }
 
@@ -1074,11 +1152,16 @@ impl Element for TerminalElement {
                 let track_left = origin.x + bounds.size.width - sb_width;
                 let track_height = bounds.size.height;
 
-                let track_bounds = Bounds::new(
-                    point(track_left, origin.y),
-                    size(sb_width, track_height),
-                );
-                window.paint_quad(fill(track_bounds, Hsla::from(Rgba { r: 1.0, g: 1.0, b: 1.0, a: 0.05 })));
+                let track_bounds = Bounds::new(point(track_left, origin.y), size(sb_width, track_height));
+                window.paint_quad(fill(
+                    track_bounds,
+                    Hsla::from(Rgba {
+                        r: 1.0,
+                        g: 1.0,
+                        b: 1.0,
+                        a: 0.05,
+                    }),
+                ));
 
                 let total = (state.history_size + state.lines.len()) as f32;
                 let visible_frac = state.lines.len() as f32 / total;
@@ -1089,14 +1172,21 @@ impl Element for TerminalElement {
                 let available = track_height - thumb_h;
                 let thumb_top = origin.y + available * scroll_frac;
 
-                let thumb_bounds = Bounds::new(
-                    point(track_left, thumb_top),
-                    size(sb_width, thumb_h),
-                );
+                let thumb_bounds = Bounds::new(point(track_left, thumb_top), size(sb_width, thumb_h));
                 let thumb_color = if state.display_offset > 0 {
-                    Hsla::from(Rgba { r: 1.0, g: 1.0, b: 1.0, a: 0.4 })
+                    Hsla::from(Rgba {
+                        r: 1.0,
+                        g: 1.0,
+                        b: 1.0,
+                        a: 0.4,
+                    })
                 } else {
-                    Hsla::from(Rgba { r: 1.0, g: 1.0, b: 1.0, a: 0.2 })
+                    Hsla::from(Rgba {
+                        r: 1.0,
+                        g: 1.0,
+                        b: 1.0,
+                        a: 0.2,
+                    })
                 };
                 window.paint_quad(PaintQuad {
                     bounds: thumb_bounds,
@@ -1110,5 +1200,3 @@ impl Element for TerminalElement {
         });
     }
 }
-
-

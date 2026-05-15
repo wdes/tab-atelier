@@ -3,10 +3,10 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
-use gpui::*;
+use gpui::{Hsla, Keystroke, Rgba, rgb};
 
-pub const DEFAULT_FG: u32 = 0xdcdcdc;
-pub const DEFAULT_BG: u32 = 0x141414;
+pub const DEFAULT_FG: u32 = 0xdc_dcdc;
+pub const DEFAULT_BG: u32 = 0x14_1414;
 
 pub fn keystroke_to_bytes(ks: &Keystroke) -> Option<Vec<u8>> {
     let key = ks.key.as_str();
@@ -69,27 +69,26 @@ pub fn keystroke_to_bytes(ks: &Keystroke) -> Option<Vec<u8>> {
 
 pub fn named_to_hsla(c: NamedColor) -> Hsla {
     match c {
-        NamedColor::Black | NamedColor::DimBlack => rgb(0x1c1c1c).into(),
-        NamedColor::Red | NamedColor::DimRed => rgb(0xcc0000).into(),
-        NamedColor::Green | NamedColor::DimGreen => rgb(0x4e9a06).into(),
-        NamedColor::Yellow | NamedColor::DimYellow => rgb(0xc4a000).into(),
-        NamedColor::Blue | NamedColor::DimBlue => rgb(0x3465a4).into(),
-        NamedColor::Magenta | NamedColor::DimMagenta => rgb(0x75507b).into(),
-        NamedColor::Cyan | NamedColor::DimCyan => rgb(0x06989a).into(),
-        NamedColor::White | NamedColor::DimWhite => rgb(0xd3d7cf).into(),
-        NamedColor::BrightBlack => rgb(0x555753).into(),
-        NamedColor::BrightRed => rgb(0xef2929).into(),
-        NamedColor::BrightGreen => rgb(0x8ae234).into(),
-        NamedColor::BrightYellow => rgb(0xfce94f).into(),
-        NamedColor::BrightBlue => rgb(0x729fcf).into(),
-        NamedColor::BrightMagenta => rgb(0xad7fa8).into(),
-        NamedColor::BrightCyan => rgb(0x34e2e2).into(),
-        NamedColor::BrightWhite => rgb(0xeeeeec).into(),
-        NamedColor::Foreground | NamedColor::BrightForeground | NamedColor::DimForeground => {
-            rgb(0xdcdcdc).into()
+        NamedColor::Black | NamedColor::DimBlack => rgb(0x1c_1c1c).into(),
+        NamedColor::Red | NamedColor::DimRed => rgb(0xcc_0000).into(),
+        NamedColor::Green | NamedColor::DimGreen => rgb(0x4e_9a06).into(),
+        NamedColor::Yellow | NamedColor::DimYellow => rgb(0xc4_a000).into(),
+        NamedColor::Blue | NamedColor::DimBlue => rgb(0x34_65a4).into(),
+        NamedColor::Magenta | NamedColor::DimMagenta => rgb(0x75_507b).into(),
+        NamedColor::Cyan | NamedColor::DimCyan => rgb(0x06_989a).into(),
+        NamedColor::White | NamedColor::DimWhite => rgb(0xd3_d7cf).into(),
+        NamedColor::BrightBlack => rgb(0x55_5753).into(),
+        NamedColor::BrightRed => rgb(0xef_2929).into(),
+        NamedColor::BrightGreen => rgb(0x8a_e234).into(),
+        NamedColor::BrightYellow => rgb(0xfc_e94f).into(),
+        NamedColor::BrightBlue => rgb(0x72_9fcf).into(),
+        NamedColor::BrightMagenta => rgb(0xad_7fa8).into(),
+        NamedColor::BrightCyan => rgb(0x34_e2e2).into(),
+        NamedColor::BrightWhite => rgb(0xee_eeec).into(),
+        NamedColor::Foreground | NamedColor::BrightForeground | NamedColor::DimForeground | NamedColor::Cursor => {
+            rgb(0xdc_dcdc).into()
         }
-        NamedColor::Background => rgb(0x141414).into(),
-        NamedColor::Cursor => rgb(0xdcdcdc).into(),
+        NamedColor::Background => rgb(0x14_1414).into(),
     }
 }
 
@@ -130,7 +129,12 @@ pub fn xterm_256_to_hsla(idx: u8) -> Hsla {
     } else {
         let s = 8 + 10 * (idx as u32 - 232);
         let v = s as f32 / 255.0;
-        Hsla::from(Rgba { r: v, g: v, b: v, a: 1.0 })
+        Hsla::from(Rgba {
+            r: v,
+            g: v,
+            b: v,
+            a: 1.0,
+        })
     }
 }
 
@@ -147,17 +151,14 @@ pub fn color_to_hsla(c: Color) -> Hsla {
     }
 }
 
-pub fn is_default_fg(c: Color) -> bool {
+pub const fn is_default_fg(c: Color) -> bool {
     matches!(c, Color::Named(NamedColor::Foreground))
 }
 
-pub fn is_default_bg(c: Color) -> bool {
+pub const fn is_default_bg(c: Color) -> bool {
     matches!(c, Color::Named(NamedColor::Background))
 }
 
 pub fn hsla_eq(a: Hsla, b: Hsla) -> bool {
-    (a.h - b.h).abs() < 0.001
-        && (a.s - b.s).abs() < 0.001
-        && (a.l - b.l).abs() < 0.001
-        && (a.a - b.a).abs() < 0.001
+    (a.h - b.h).abs() < 0.001 && (a.s - b.s).abs() < 0.001 && (a.l - b.l).abs() < 0.001 && (a.a - b.a).abs() < 0.001
 }
