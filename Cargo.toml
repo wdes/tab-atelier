@@ -11,6 +11,7 @@ repository = "https://github.com/wdes/tab-atelier"
 readme = "README.md"
 keywords = ["terminal", "guake", "dropdown", "x11", "emulator"]
 categories = ["command-line-utilities"]
+include = ["/src/**/*.rs", "/Cargo.toml", "/LICENSE", "/README.md"]
 
 [lints.rust]
 unsafe_code = "deny"
