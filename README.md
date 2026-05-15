@@ -4,21 +4,54 @@ A Guake-style drop-down terminal emulator for Linux (X11), built with Rust using
 
 ## Features
 
-- Drop-down terminal toggled with global F12 hotkey
-- Multiple tabs with right-click context menu
-- Tab rename, copy/paste, close, close all
-- Session persistence (tabs, working directories, and terminal output saved across restarts)
-- Text selection with mouse
-- Scrollback history with ANSI color preservation
+**Terminal**
+- Drop-down terminal toggled with global **F12** hotkey
+- Full terminal emulation via alacritty_terminal (colors, scrollback, bracketed paste, ...)
+- GPU-accelerated rendering via gpui
+- Text selection with mouse, copy/paste from context menu
+- Clickable URLs and file paths detected in terminal output
+- Reset input & color for misbehaving programs
+
+**Tabs**
+- Multiple tabs with drag-and-drop reordering
+- Double-click to rename, right-click context menu
+- **Ctrl+Shift+T** to open a new tab (inherits working directory)
+- **Alt+Tab** to cycle between tabs
 - Shell exit detection with close/respawn confirmation
-- Per-tab power usage and uptime display (Intel RAPL, same technique as [wattaouille](https://github.com/wdes/wattaouille))
-- HTTP API with token auth and QR code for remote tab management
+
+**Session**
+- Tabs, working directories, and full terminal output persisted across restarts
+- Active tab selection restored on startup
+
+**Preferences**
+- Theme selection (Dark, Tomorrow Night Blue)
+- Window opacity (1%-100% slider)
+- Language (English, French)
+- Configurable browser and code editor for opening links
+
+**Monitoring**
+- Per-tab CPU usage, power draw (watts), energy consumption (Wh), and uptime
+- Low battery warning with visual indicator
+
+**Integration**
+- HTTP API with token auth and QR code for remote tab management from a phone
 - Wakatime time tracking (reads API key from Zed settings)
-- Reset input & color mode for misbehaving programs
+- Screenshots (per-tab or full app) saved as BMP
 
-## Settings
+## Installation
 
-Tab Atelier reads font configuration from your Zed editor settings file:
+```sh
+cargo build --release
+# Binary at target/release/tab-atelier
+```
+
+Requires Rust 2024 edition (rustc 1.92+).
+
+## Configuration
+
+### Font settings
+
+Tab Atelier reads font configuration from your Zed editor settings:
 
 **File:** `$XDG_CONFIG_HOME/zed/settings.json` (defaults to `~/.config/zed/settings.json`)
 
@@ -30,52 +63,38 @@ Tab Atelier reads font configuration from your Zed editor settings file:
 | `buffer_font_size`   | Fallback if no ui_font_size  | `16`         |
 | `scroll_sensitivity` | Scroll speed multiplier      | `1.0`        |
 
-### Logging
+### Preferences
 
-Tab Atelier uses `env_logger`. Control log output with the `RUST_LOG` environment variable:
+In-app preferences (theme, opacity, language, browser, code editor) are stored in:
 
-```sh
-# Show all logs
-RUST_LOG=tab_atelier=debug cargo run
-
-# Show only warnings and errors
-RUST_LOG=tab_atelier=warn cargo run
-
-# Show info-level logs (startup, restore, API)
-RUST_LOG=tab_atelier=info cargo run
-
-# Show logs from all crates (verbose)
-RUST_LOG=debug cargo run
-
-# Filter specific modules
-RUST_LOG=tab_atelier::api=debug,tab_atelier::tracking=debug cargo run
-```
-
-### Power monitoring
-
-On Intel systems with readable RAPL counters, each tab shows its estimated power usage (watts) in the right-click context menu. The estimate uses the same technique as [wattaouille](https://github.com/wdes/wattaouille): `per-tab watts = package watts × (tab CPU jiffies / total system jiffies)`. See wattaouille's README for how to make RAPL readable (`chmod` or udev rule). When RAPL is not available, only CPU percentage is shown.
-
-### HTTP API
-
-Tab Atelier exposes tab state on `http://<local-ip>:7890` as JSON. Access requires a bearer token, shown via a QR code in the right-click menu ("Remote control"). The response includes tab names, working directories, active tab index, and per-tab power stats. Tabs can be closed remotely via `DELETE /tabs/{index}`.
-
-### Wakatime
-
-Wakatime integration is automatic if your Zed settings contain `wakatime.settings.api-key`. Heartbeats are sent with project detection (walks up to find `.git`).
+**File:** `$XDG_STATE_HOME/tab-atelier/preferences.json` (defaults to `~/.local/state/tab-atelier/preferences.json`)
 
 ### State
 
-Tab Atelier stores its state (tab names, working directories, terminal output) in:
+Tab Atelier persists session state (tab names, working directories, terminal output, active tab) in:
 
 **File:** `$XDG_STATE_HOME/tab-atelier/tabs.json` (defaults to `~/.local/state/tab-atelier/tabs.json`)
 
-## Building
+## Power monitoring
+
+On Intel systems with readable RAPL counters, each tab shows its estimated power usage in the right-click context menu. The estimate uses the same technique as [wattaouille](https://github.com/wdes/wattaouille): `per-tab watts = package watts * (tab CPU jiffies / total system jiffies)`. See wattaouille's README for how to make RAPL readable (`chmod` or udev rule). When RAPL is not available, only CPU percentage is shown.
+
+## HTTP API
+
+Tab Atelier exposes tab state on `http://<local-ip>:7890` as JSON. Access requires a bearer token, shown via a QR code in the right-click menu ("Remote control"). The response includes tab names, working directories, active tab index, and per-tab power stats. Tabs can be closed remotely via `DELETE /tabs/{index}`.
+
+## Wakatime
+
+Wakatime integration is automatic if your Zed settings contain `wakatime.settings.api-key`. Heartbeats are sent with project detection (walks up to find `.git`).
+
+## Logging
+
+Control log output with the `RUST_LOG` environment variable:
 
 ```sh
-cargo build --release
+RUST_LOG=tab_atelier=info cargo run    # Startup, restore, API
+RUST_LOG=tab_atelier=debug cargo run   # Verbose
 ```
-
-Requires Rust 2024 edition (rustc 1.92+).
 
 ## Testing
 
