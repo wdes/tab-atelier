@@ -8,6 +8,8 @@ use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 
+use log::{debug, error, info};
+
 use crate::tracking::USER_AGENT;
 
 #[derive(Serialize)]
@@ -90,9 +92,12 @@ fn error_json(stream: &mut std::net::TcpStream, status: u16, msg: &str) {
 pub fn start_api_server(state: Arc<Mutex<TabSnapshot>>, token: String) {
     std::thread::spawn(move || {
         let listener = match TcpListener::bind("0.0.0.0:7890") {
-            Ok(l) => l,
+            Ok(l) => {
+                info!("API: listening on 0.0.0.0:7890");
+                l
+            }
             Err(e) => {
-                eprintln!("tab-atelier api: failed to bind :7890: {e}");
+                error!("API: failed to bind :7890: {e}");
                 return;
             }
         };
@@ -137,10 +142,12 @@ pub fn start_api_server(state: Arc<Mutex<TabSnapshot>>, token: String) {
 
             let provided_token = auth_token.or(query_token);
             if provided_token.as_deref() != Some(&token) {
+                debug!("API: 401 unauthorized request to {path}");
                 error_json(&mut stream, 401, "invalid or missing token");
                 continue;
             }
 
+            debug!("API: {method} {path}");
             match (method.as_str(), path.as_str()) {
                 ("GET", "/") | ("GET", "/tabs") => {
                     let state = state.lock().unwrap();
@@ -166,6 +173,7 @@ pub fn start_api_server(state: Arc<Mutex<TabSnapshot>>, token: String) {
                     if let Ok(idx) = idx_str.parse::<usize>() {
                         let mut state = state.lock().unwrap();
                         if idx < state.tabs.len() {
+                            info!("API: closing tab {idx}");
                             state.pending_closes.push(idx);
                             let body = serde_json::to_string(&serde_json::json!({"closed": idx})).unwrap_or_default();
                             respond_json(&mut stream, 200, &body);

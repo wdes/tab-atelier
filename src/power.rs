@@ -4,6 +4,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use log::info;
 use wattaouille::{PowerSensor, num_cpus, sum_tree_jiffies, total_cpu_jiffies};
 
 #[derive(Clone, Default)]
@@ -52,11 +53,10 @@ pub struct PowerMonitor {
 
 impl PowerMonitor {
     pub fn new() -> Self {
-        Self {
-            sensor: PowerSensor::detect(false),
-            cpus: num_cpus().max(1),
-            prev: None,
-        }
+        let sensor = PowerSensor::detect(false);
+        let cpus = num_cpus().max(1);
+        info!("power monitor: {} CPUs, RAPL {}", cpus, if sensor.enabled { "available" } else { "unavailable" });
+        Self { sensor, cpus, prev: None }
     }
 
     pub fn sample(&mut self, tab_pids: &[u32], interval_secs: f64) -> Vec<TabPower> {

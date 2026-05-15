@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use gpui::*;
 use gpui::prelude::FluentBuilder;
+use log::{debug, info};
 use tab_atelier::{FontConfig, SavedState, TabState, load_font_config, load_state, load_wakatime_key, save_state};
 use terminal::TerminalView;
 use tracking::WakatimeTracker;
@@ -62,12 +63,14 @@ impl Swoop {
         let font_config = load_font_config();
 
         let (tabs, active) = if let Some(saved) = load_state() {
+            info!("restoring {} tab(s) from saved state", saved.tabs.len());
             let mut tabs = Vec::new();
             for ts in &saved.tabs {
                 let cwd = ts.cwd.as_ref().map(PathBuf::from);
                 let fc = font_config.clone();
                 let view = cx.new(|cx| TerminalView::new(cwd.as_deref(), fc, window, cx));
                 if let Some(ref output) = ts.output {
+                    debug!("restoring {} chars of output for '{}'", output.len(), ts.name);
                     view.read(cx).restore_output(output);
                 }
                 tabs.push(Tab { view, name: ts.name.clone(), created_at: std::time::Instant::now() });
@@ -124,9 +127,13 @@ impl Swoop {
 
         tabs[active].view.read(cx).focus_handle(cx).focus(window);
 
-        let tracker = load_wakatime_key().map(WakatimeTracker::new);
+        let tracker = load_wakatime_key().map(|key| {
+            info!("wakatime tracking enabled");
+            WakatimeTracker::new(key)
+        });
 
         let api_token = api::generate_token();
+        info!("API server starting on 0.0.0.0:7890");
         let api_state = Arc::new(Mutex::new(api::TabSnapshot {
             tabs: Vec::new(),
             active: 0,
@@ -1105,6 +1112,8 @@ fn format_duration(d: std::time::Duration) -> String {
 }
 
 fn main() {
+    env_logger::init();
+    info!("starting Tab Atelier v{}", env!("CARGO_PKG_VERSION"));
     Application::new().run(|cx: &mut App| {
         let window_handle = cx.open_window(
             WindowOptions {
