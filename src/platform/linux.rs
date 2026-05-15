@@ -162,38 +162,123 @@ pub fn open_path(path: &std::path::Path, editor: Option<&str>) {
 
 // --- Hotkeys (X11) ---
 
-pub fn grab_hotkeys<F>(keycodes: &[u8], on_press: F)
+enum HotkeyCommand {
+    UpdateKeys(Vec<u8>),
+    Suspend,
+    Resume,
+}
+
+pub fn grab_hotkeys<F>(keycodes: &[u8], on_press: F) -> HotkeyHandle
 where
     F: Fn() + Send + 'static,
 {
+    use std::sync::mpsc;
     use x11rb::protocol::xproto::{GrabMode, ModMask};
 
+    let (cmd_tx, cmd_rx) = mpsc::channel::<HotkeyCommand>();
+
     let Ok((conn, screen_num)) = x11rb::connect(None) else {
-        return;
+        return HotkeyHandle { cmd_tx };
     };
 
     let screen = &conn.setup().roots[screen_num];
     let root = screen.root;
 
+    let masks = [
+        ModMask::default(),
+        ModMask::LOCK,
+        ModMask::from(u16::from(ModMask::M2)),
+        ModMask::LOCK | ModMask::from(u16::from(ModMask::M2)),
+    ];
+
     for &keycode in keycodes {
-        for mask in [
-            ModMask::default(),
-            ModMask::LOCK,
-            ModMask::from(u16::from(ModMask::M2)),
-            ModMask::LOCK | ModMask::from(u16::from(ModMask::M2)),
-        ] {
+        for mask in masks {
             let _ = conn.grab_key(false, root, mask, keycode, GrabMode::ASYNC, GrabMode::ASYNC);
         }
     }
     let _ = conn.flush();
 
+    let initial_keys = keycodes.to_vec();
+
     std::thread::spawn(move || {
-        while let Ok(event) = conn.wait_for_event() {
-            if let x11rb::protocol::Event::KeyPress(_) = event {
-                on_press();
+        let mut active_keys = initial_keys;
+        let mut suspended = false;
+
+        loop {
+            while let Ok(cmd) = cmd_rx.try_recv() {
+                match cmd {
+                    HotkeyCommand::UpdateKeys(new_keys) => {
+                        for &keycode in &active_keys {
+                            for mask in masks {
+                                let _ = conn.ungrab_key(keycode, root, mask);
+                            }
+                        }
+                        for &keycode in &new_keys {
+                            for mask in masks {
+                                let _ = conn.grab_key(false, root, mask, keycode, GrabMode::ASYNC, GrabMode::ASYNC);
+                            }
+                        }
+                        let _ = conn.flush();
+                        active_keys = new_keys;
+                        suspended = false;
+                    }
+                    HotkeyCommand::Suspend => {
+                        for &keycode in &active_keys {
+                            for mask in masks {
+                                let _ = conn.ungrab_key(keycode, root, mask);
+                            }
+                        }
+                        let _ = conn.flush();
+                        suspended = true;
+                    }
+                    HotkeyCommand::Resume => {
+                        for &keycode in &active_keys {
+                            for mask in masks {
+                                let _ = conn.grab_key(false, root, mask, keycode, GrabMode::ASYNC, GrabMode::ASYNC);
+                            }
+                        }
+                        let _ = conn.flush();
+                        suspended = false;
+                    }
+                }
+            }
+
+            match conn.poll_for_event() {
+                Ok(Some(event)) => {
+                    if let x11rb::protocol::Event::KeyPress(kp) = event
+                        && !suspended
+                        && active_keys.contains(&kp.detail)
+                    {
+                        on_press();
+                    }
+                }
+                Ok(None) => {
+                    std::thread::sleep(std::time::Duration::from_millis(16));
+                }
+                Err(_) => break,
             }
         }
     });
+
+    HotkeyHandle { cmd_tx }
+}
+
+pub struct HotkeyHandle {
+    cmd_tx: std::sync::mpsc::Sender<HotkeyCommand>,
+}
+
+impl HotkeyHandle {
+    pub fn update_keys(&self, new_keycodes: &[u8]) {
+        let _ = self.cmd_tx.send(HotkeyCommand::UpdateKeys(new_keycodes.to_vec()));
+    }
+
+    pub fn suspend(&self) {
+        let _ = self.cmd_tx.send(HotkeyCommand::Suspend);
+    }
+
+    pub fn resume(&self) {
+        let _ = self.cmd_tx.send(HotkeyCommand::Resume);
+    }
 }
 
 #[cfg(test)]

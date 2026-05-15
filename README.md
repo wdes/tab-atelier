@@ -12,7 +12,7 @@ A Guake-style drop-down terminal emulator for Linux (X11), built with Rust using
 ## Features
 
 **Terminal**
-- Drop-down terminal toggled with global hotkeys (**`** / **XF86Calculator**)
+- Drop-down terminal toggled with global hotkeys (default: **`** and **XF86Calculator**, customizable in preferences)
 - Full terminal emulation via alacritty_terminal (colors, scrollback, bracketed paste, ...)
 - GPU-accelerated rendering via gpui
 - Text selection with mouse, copy/paste from context menu
@@ -34,6 +34,7 @@ A Guake-style drop-down terminal emulator for Linux (X11), built with Rust using
 - Theme selection (Dark, Tomorrow Night Blue)
 - Window opacity (1%-100% slider)
 - Language (English, French)
+- Configurable toggle hotkeys (press any key to register, applied immediately)
 - Configurable browser and code editor for opening links
 
 **Monitoring**
