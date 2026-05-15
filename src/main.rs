@@ -600,7 +600,7 @@ impl Swoop {
         .detach();
     }
 
-    fn render_tab_bar(&mut self, battery: Option<u8>, _window: &mut Window, cx: &mut Context<Self>) -> Div {
+    fn render_tab_bar(&mut self, battery: Option<u8>, _window: &mut Window, cx: &mut Context<Self>) -> Stateful<Div> {
         let battery_critical = battery.is_some_and(|b| b < 10);
         let blink_red = battery_critical && self.blink_on;
 
@@ -614,13 +614,25 @@ impl Swoop {
         let watts = self.power_watts.lock().unwrap().clone();
 
         let mut bar = div()
+            .id("tab-bar")
             .flex()
             .flex_row()
             .w_full()
             .h(px(32.0))
             .bg(tab_bg)
             .border_t_1()
-            .border_color(tab_border);
+            .border_color(tab_border)
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, ev: &MouseDownEvent, _window, cx| {
+                    this.context_menu = Some(ContextMenu {
+                        kind: MenuKind::Background,
+                        position: ev.position,
+                        open_upward: true,
+                    });
+                    cx.notify();
+                }),
+            );
 
         for (i, tab) in self.tabs.iter().enumerate() {
             let is_active = i == self.active;
@@ -730,7 +742,7 @@ impl Swoop {
         bar.child(plus_btn)
     }
 
-    fn render_context_menu(&self, cx: &Context<Self>) -> Option<Stateful<Div>> {
+    fn render_context_menu(&self, window: &Window, cx: &Context<Self>) -> Option<Stateful<Div>> {
         let menu = self.context_menu.as_ref()?;
         let menu_bg: Hsla = rgb(0x25_2526).into();
         let menu_fg: Hsla = rgb(0xcc_cccc).into();
@@ -738,8 +750,11 @@ impl Swoop {
         let menu_border: Hsla = rgb(0x3c_3c3c).into();
 
         let pos = menu.position;
+        let menu_width = px(150.0);
+        let vp = window.viewport_size();
+        let x = pos.x.min(vp.width - menu_width);
 
-        let mut container = div().id("context-menu").absolute().left(pos.x);
+        let mut container = div().id("context-menu").absolute().left(x);
 
         container = if menu.open_upward {
             container.bottom(px(0.0))
@@ -1754,7 +1769,7 @@ impl Render for Swoop {
             && !self.show_qr
             && !self.show_preferences
         {
-            self.render_context_menu(cx)
+            self.render_context_menu(window, cx)
         } else {
             None
         };
