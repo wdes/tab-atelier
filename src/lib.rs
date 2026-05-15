@@ -250,9 +250,14 @@ pub fn detect_urls(text: &str) -> Vec<(usize, usize, String, bool)> {
         }
 
         if chars[i] == '/' && i + 1 < len && (chars[i + 1].is_alphanumeric() || chars[i + 1] == '.') {
-            let start = i;
+            let mut start = i;
+            while start > 0 && (chars[start - 1].is_alphanumeric() || matches!(chars[start - 1], '_' | '-' | '.')) {
+                start -= 1;
+            }
             let mut j = i;
-            while j < len && !chars[j].is_whitespace() && !matches!(chars[j], '"' | '\'' | '<' | '>' | ')' | ']' | '}')
+            while j < len
+                && !chars[j].is_whitespace()
+                && !matches!(chars[j], '"' | '\'' | '<' | '>' | ')' | ']' | '}' | '|' | '│')
             {
                 j += 1;
             }
@@ -671,6 +676,14 @@ mod tests {
         let urls = detect_urls("see src/lib/utils.rs:10:5 for details");
         assert_eq!(urls.len(), 1);
         assert_eq!(urls[0].2, "src/lib/utils.rs:10:5");
+        assert!(urls[0].3);
+    }
+
+    #[test]
+    fn detect_relative_path_with_prefix() {
+        let urls = detect_urls("│ phpMyAdmin/2026/02/detailed-report.md |");
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0].2, "phpMyAdmin/2026/02/detailed-report.md");
         assert!(urls[0].3);
     }
 
