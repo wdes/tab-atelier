@@ -2,7 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-
 mod api;
 mod locale;
 mod platform;
@@ -12,15 +11,23 @@ mod terminal;
 mod terminal_utils;
 mod tracking;
 
+use gpui::prelude::FluentBuilder;
+use gpui::{
+    App, AppContext, Application, AsyncApp, ClickEvent, ClipboardItem, Context, Div, ElementId, Entity, FocusHandle,
+    Focusable, Hsla, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Pixels,
+    Point, Render, Rgba, SharedString, Stateful, StatefulInteractiveElement, Styled, WeakEntity, Window,
+    WindowBackgroundAppearance, WindowHandle, WindowOptions, div, px, rgb, rgba,
+};
+use locale::{Lang, Strings};
+use log::{debug, info};
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
-use gpui::*;
-use gpui::prelude::FluentBuilder;
-use log::{debug, info};
-use tab_atelier::{FontConfig, Preferences, SavedState, TabState, load_font_config, load_preferences, load_state_from, load_wakatime_key, save_preferences, save_state};
-use locale::{Lang, Strings};
+use tab_atelier::{
+    FontConfig, Preferences, SavedState, TabState, load_font_config, load_preferences, load_state_from,
+    load_wakatime_key, save_preferences, save_state,
+};
 use terminal::TerminalView;
 use tracking::WakatimeTracker;
 
@@ -34,9 +41,7 @@ struct Tab {
 
 impl Tab {
     fn uptime(&self) -> std::time::Duration {
-        self.active_duration
-            + self.last_activated
-                .map_or(std::time::Duration::ZERO, |t| t.elapsed())
+        self.active_duration + self.last_activated.map_or(std::time::Duration::ZERO, |t| t.elapsed())
     }
 
     fn activate(&mut self) {
@@ -128,7 +133,8 @@ impl Swoop {
                     view.read(cx).restore_output(output);
                 }
                 tabs.push(Tab {
-                    view, name: ts.name.clone(),
+                    view,
+                    name: ts.name.clone(),
                     active_duration: std::time::Duration::from_secs_f64(ts.uptime_secs.unwrap_or(0.0)),
                     last_activated: None,
                     energy_wh: ts.energy_wh.unwrap_or(0.0),
@@ -138,7 +144,13 @@ impl Swoop {
                 let fc = font_config.clone();
                 let br = browser.clone();
                 let view = cx.new(|cx| TerminalView::new(None, fc, br, window, cx));
-                tabs.push(Tab { view, name: locale::strings(lang).terminal.into(), active_duration: std::time::Duration::ZERO, last_activated: None, energy_wh: 0.0 });
+                tabs.push(Tab {
+                    view,
+                    name: locale::strings(lang).terminal.into(),
+                    active_duration: std::time::Duration::ZERO,
+                    last_activated: None,
+                    energy_wh: 0.0,
+                });
             }
             let active = saved.active.min(tabs.len() - 1);
             tabs[active].activate();
@@ -147,14 +159,21 @@ impl Swoop {
             let fc = font_config.clone();
             let br = browser.clone();
             let view = cx.new(|cx| TerminalView::new(None, fc, br, window, cx));
-            (vec![Tab { view, name: locale::strings(lang).terminal.into(), active_duration: std::time::Duration::ZERO, last_activated: Some(std::time::Instant::now()), energy_wh: 0.0 }], 0)
+            (
+                vec![Tab {
+                    view,
+                    name: locale::strings(lang).terminal.into(),
+                    active_duration: std::time::Duration::ZERO,
+                    last_activated: Some(std::time::Instant::now()),
+                    energy_wh: 0.0,
+                }],
+                0,
+            )
         };
 
-        cx.spawn(async |this: WeakEntity<Swoop>, cx: &mut AsyncApp| {
+        cx.spawn(async |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             loop {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_secs(2))
-                    .await;
+                cx.background_executor().timer(std::time::Duration::from_secs(2)).await;
                 let Ok(()) = this.update(cx, |app, cx| {
                     app.persist(cx);
                 }) else {
@@ -164,7 +183,7 @@ impl Swoop {
         })
         .detach();
 
-        cx.spawn(async |this: WeakEntity<Swoop>, cx: &mut AsyncApp| {
+        cx.spawn(async |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             loop {
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(500))
@@ -244,7 +263,13 @@ impl Swoop {
         let br = self.browser.clone();
         let view = cx.new(|cx| TerminalView::new(cwd.as_deref(), fc, br, window, cx));
         let idx = self.tabs.len();
-        self.tabs.push(Tab { view, name: format!("{} {}", self.t().terminal_n, idx + 1), active_duration: std::time::Duration::ZERO, last_activated: Some(std::time::Instant::now()), energy_wh: 0.0 });
+        self.tabs.push(Tab {
+            view,
+            name: format!("{} {}", self.t().terminal_n, idx + 1),
+            active_duration: std::time::Duration::ZERO,
+            last_activated: Some(std::time::Instant::now()),
+            energy_wh: 0.0,
+        });
         self.active = idx;
         cx.notify();
     }
@@ -283,35 +308,35 @@ impl Swoop {
             .iter()
             .map(|tab| {
                 let pid = tab.view.read(cx).pid();
-                let cwd = platform::process_cwd(pid)
-                    .map(|p| p.to_string_lossy().into_owned());
+                let cwd = platform::process_cwd(pid).map(|p| p.to_string_lossy().into_owned());
                 TabState {
-                    name: tab.name.clone(), cwd, output: None,
+                    name: tab.name.clone(),
+                    cwd,
+                    output: None,
                     uptime_secs: Some(tab.uptime().as_secs_f64()),
                     energy_wh: if tab.energy_wh > 0.0 { Some(tab.energy_wh) } else { None },
                 }
             })
             .collect();
-        let api_tabs: Vec<(String, Option<String>)> = tabs
-            .iter()
-            .map(|t| (t.name.clone(), t.cwd.clone()))
-            .collect();
+        let api_tabs: Vec<(String, Option<String>)> = tabs.iter().map(|t| (t.name.clone(), t.cwd.clone())).collect();
 
-        save_state(&platform::state_base_dir(), &SavedState { tabs, active: self.active });
+        save_state(
+            &platform::state_base_dir(),
+            &SavedState {
+                tabs,
+                active: self.active,
+            },
+        );
 
         {
             let mut snapshot = self.api_state.lock().unwrap();
             snapshot.tabs = api_tabs;
             snapshot.active = self.active;
-            snapshot.power = self.power_watts.lock().unwrap().clone();
+            snapshot.power.clone_from(&self.power_watts.lock().unwrap());
         }
 
         {
-            let pids: Vec<u32> = self
-                .tabs
-                .iter()
-                .map(|tab| tab.view.read(cx).pid())
-                .collect();
+            let pids: Vec<u32> = self.tabs.iter().map(|tab| tab.view.read(cx).pid()).collect();
             *self.power_pids.lock().unwrap() = pids;
         }
 
@@ -340,15 +365,18 @@ impl Swoop {
             return;
         }
         let old_pid = self.tabs[idx].view.read(cx).pid();
-        let cwd = platform::process_cwd(old_pid)
-            .or_else(|| Some(std::env::current_dir().unwrap_or_default()));
+        let cwd = platform::process_cwd(old_pid).or_else(|| Some(std::env::current_dir().unwrap_or_default()));
         self.tabs[idx].view.read(cx).shutdown();
         let fc = self.font_config.clone();
         let br = self.browser.clone();
         let view = cx.new(|cx| TerminalView::new(cwd.as_deref(), fc, br, window, cx));
         self.tabs[idx].view = view;
         self.tabs[idx].active_duration = std::time::Duration::ZERO;
-        self.tabs[idx].last_activated = if idx == self.active { Some(std::time::Instant::now()) } else { None };
+        self.tabs[idx].last_activated = if idx == self.active {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         self.tabs[idx].energy_wh = 0.0;
         self.exit_confirm = None;
         self.tabs[self.active].view.read(cx).focus_handle(cx).focus(window);
@@ -360,13 +388,16 @@ impl Swoop {
             return;
         }
         let old_pid = self.tabs[idx].view.read(cx).pid();
-        let cwd = platform::process_cwd(old_pid)
-            .or_else(|| Some(std::env::current_dir().unwrap_or_default()));
+        let cwd = platform::process_cwd(old_pid).or_else(|| Some(std::env::current_dir().unwrap_or_default()));
         self.tabs[idx].view.update(cx, |view, cx| {
             view.respawn(cwd.as_deref(), cx);
         });
         self.tabs[idx].active_duration = std::time::Duration::ZERO;
-        self.tabs[idx].last_activated = if idx == self.active { Some(std::time::Instant::now()) } else { None };
+        self.tabs[idx].last_activated = if idx == self.active {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         self.tabs[idx].energy_wh = 0.0;
         self.exit_confirm = None;
         self.tabs[self.active].view.read(cx).focus_handle(cx).focus(window);
@@ -379,20 +410,27 @@ impl Swoop {
             .iter()
             .map(|tab| {
                 let pid = tab.view.read(cx).pid();
-                let cwd = platform::process_cwd(pid)
-                    .map(|p| p.to_string_lossy().into_owned());
+                let cwd = platform::process_cwd(pid).map(|p| p.to_string_lossy().into_owned());
                 let output = {
                     let text = tab.view.read(cx).copy_all_history();
                     if text.is_empty() { None } else { Some(text) }
                 };
                 TabState {
-                    name: tab.name.clone(), cwd, output,
+                    name: tab.name.clone(),
+                    cwd,
+                    output,
                     uptime_secs: Some(tab.uptime().as_secs_f64()),
                     energy_wh: if tab.energy_wh > 0.0 { Some(tab.energy_wh) } else { None },
                 }
             })
             .collect();
-        save_state(&platform::state_base_dir(), &SavedState { tabs, active: self.active });
+        save_state(
+            &platform::state_base_dir(),
+            &SavedState {
+                tabs,
+                active: self.active,
+            },
+        );
 
         if let Some(ref tracker) = self.tracker {
             tracker.shutdown();
@@ -406,28 +444,37 @@ impl Swoop {
     fn do_screenshot(&mut self, full: bool, cx: &mut Context<Self>) {
         let tab_name = self.tabs[self.active].name.clone();
         let progress_time = std::time::Instant::now();
-        self.toasts.push(Toast { message: self.t().taking_screenshot.into(), time: progress_time, path: None });
+        self.toasts.push(Toast {
+            message: self.t().taking_screenshot.into(),
+            time: progress_time,
+            path: None,
+        });
         cx.notify();
-        cx.spawn(async move |this: WeakEntity<Swoop>, cx: &mut AsyncApp| {
-            cx.background_executor()
-                .timer(std::time::Duration::from_secs(1))
-                .await;
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            cx.background_executor().timer(std::time::Duration::from_secs(1)).await;
             let render_time = std::time::Instant::now();
             let _ = this.update(cx, |state, cx| {
                 state.toasts.retain(|t| t.time != progress_time);
-                state.toasts.push(Toast { message: state.t().rendering_screenshot.into(), time: render_time, path: None });
+                state.toasts.push(Toast {
+                    message: state.t().rendering_screenshot.into(),
+                    time: render_time,
+                    path: None,
+                });
                 cx.notify();
             });
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(50))
                 .await;
-            let result = cx.background_executor().spawn(async move {
-                if full {
-                    screenshot::take_screenshot_full(&tab_name)
-                } else {
-                    screenshot::take_screenshot_tab(&tab_name, 32)
-                }
-            }).await;
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    if full {
+                        screenshot::take_screenshot_full(&tab_name)
+                    } else {
+                        screenshot::take_screenshot_tab(&tab_name, 32)
+                    }
+                })
+                .await;
             let toast_time = std::time::Instant::now();
             let _ = this.update(cx, |state, cx| {
                 state.toasts.retain(|t| t.time != render_time);
@@ -436,12 +483,14 @@ impl Swoop {
                     Ok(path) => (t.saved.to_string(), Some(path)),
                     Err(e) => (format!("{}: {e}", t.screenshot_failed), None),
                 };
-                state.toasts.push(Toast { message: msg, time: toast_time, path });
+                state.toasts.push(Toast {
+                    message: msg,
+                    time: toast_time,
+                    path,
+                });
                 cx.notify();
             });
-            cx.background_executor()
-                .timer(std::time::Duration::from_secs(3))
-                .await;
+            cx.background_executor().timer(std::time::Duration::from_secs(3)).await;
             let _ = this.update(cx, |state, cx| {
                 state.toasts.retain(|t| t.time != toast_time);
                 cx.notify();
@@ -451,11 +500,11 @@ impl Swoop {
     }
 
     fn render_tab_bar(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Div {
-        let tab_bg: Hsla = rgb(0x1e1e1e).into();
-        let tab_active_bg: Hsla = rgb(0x2d2d2d).into();
-        let tab_fg: Hsla = rgb(0xcccccc).into();
-        let tab_border: Hsla = rgb(0x3c3c3c).into();
-        let watts_fg: Hsla = rgb(0x888888).into();
+        let tab_bg: Hsla = rgb(0x1e_1e1e).into();
+        let tab_active_bg: Hsla = rgb(0x2d_2d2d).into();
+        let tab_fg: Hsla = rgb(0xcc_cccc).into();
+        let tab_border: Hsla = rgb(0x3c_3c3c).into();
+        let watts_fg: Hsla = rgb(0x88_8888).into();
 
         let watts = self.power_watts.lock().unwrap().clone();
 
@@ -476,7 +525,7 @@ impl Swoop {
                 tab.name.clone()
             };
 
-            let power_label = watts.get(i).map(|tp| tp.label()).unwrap_or_default();
+            let power_label = watts.get(i).map(power::TabPower::label).unwrap_or_default();
 
             let tab_el = div()
                 .id(ElementId::Name(format!("tab-{i}").into()))
@@ -545,17 +594,14 @@ impl Swoop {
 
     fn render_context_menu(&self, cx: &Context<Self>) -> Option<Stateful<Div>> {
         let menu = self.context_menu.as_ref()?;
-        let menu_bg: Hsla = rgb(0x252526).into();
-        let menu_fg: Hsla = rgb(0xcccccc).into();
-        let menu_hover: Hsla = rgb(0x094771).into();
-        let menu_border: Hsla = rgb(0x3c3c3c).into();
+        let menu_bg: Hsla = rgb(0x25_2526).into();
+        let menu_fg: Hsla = rgb(0xcc_cccc).into();
+        let menu_hover: Hsla = rgb(0x09_4771).into();
+        let menu_border: Hsla = rgb(0x3c_3c3c).into();
 
         let pos = menu.position;
 
-        let mut container = div()
-            .id("context-menu")
-            .absolute()
-            .left(pos.x);
+        let mut container = div().id("context-menu").absolute().left(pos.x);
 
         container = if menu.open_upward {
             container.bottom(px(0.0))
@@ -586,13 +632,16 @@ impl Swoop {
                     .py(px(4.0))
                     .cursor_pointer()
                     .hover(|s| s.bg(menu_hover))
-                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev: &MouseDownEvent, window, cx| {
-                        let name = this.tabs[idx].name.clone();
-                        this.renaming = Some((idx, name));
-                        this.context_menu = None;
-                        this.rename_focus.focus(window);
-                        cx.notify();
-                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev: &MouseDownEvent, window, cx| {
+                            let name = this.tabs[idx].name.clone();
+                            this.renaming = Some((idx, name));
+                            this.context_menu = None;
+                            this.rename_focus.focus(window);
+                            cx.notify();
+                        }),
+                    )
                     .child(self.t().rename),
             );
 
@@ -604,11 +653,14 @@ impl Swoop {
                         .py(px(4.0))
                         .cursor_pointer()
                         .hover(|s| s.bg(menu_hover))
-                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
-                            this.close_confirm = Some(idx);
-                            this.context_menu = None;
-                            cx.notify();
-                        }))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                                this.close_confirm = Some(idx);
+                                this.context_menu = None;
+                                cx.notify();
+                            }),
+                        )
                         .child(self.t().close),
                 );
             }
@@ -619,15 +671,14 @@ impl Swoop {
                 MenuKind::Tab(idx) => idx,
                 MenuKind::Background => self.active,
             };
-            let stat_fg: Hsla = rgb(0x888888).into();
+            let stat_fg: Hsla = rgb(0x88_8888).into();
             let elapsed = self.tabs[stats_idx].uptime();
-            let power = self.power_watts.lock().unwrap();
-            let power_info = power.get(stats_idx);
+            let power_info = self.power_watts.lock().unwrap().get(stats_idx).cloned();
             let t = self.t();
 
             let mut stats_lines: Vec<String> = Vec::new();
 
-            if let Some(p) = power_info {
+            if let Some(ref p) = power_info {
                 stats_lines.push(format!("{}: {}", t.cpu, p.cpu_label()));
                 if p.watts.is_some() {
                     stats_lines.push(format!("{}: {}", t.power, p.label()));
@@ -671,13 +722,16 @@ impl Swoop {
                     .py(px(4.0))
                     .cursor_pointer()
                     .hover(|s| s.bg(menu_hover))
-                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
-                        if let Some(text) = this.tabs[this.active].view.read(cx).copy_selection() {
-                            cx.write_to_clipboard(ClipboardItem::new_string(text));
-                        }
-                        this.context_menu = None;
-                        cx.notify();
-                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                            if let Some(text) = this.tabs[this.active].view.read(cx).copy_selection() {
+                                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                            }
+                            this.context_menu = None;
+                            cx.notify();
+                        }),
+                    )
                     .child(self.t().copy),
             )
             .child(
@@ -687,14 +741,17 @@ impl Swoop {
                     .py(px(4.0))
                     .cursor_pointer()
                     .hover(|s| s.bg(menu_hover))
-                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
-                        let text = this.tabs[this.active].view.read(cx).copy_all_history();
-                        if !text.is_empty() {
-                            cx.write_to_clipboard(ClipboardItem::new_string(text));
-                        }
-                        this.context_menu = None;
-                        cx.notify();
-                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                            let text = this.tabs[this.active].view.read(cx).copy_all_history();
+                            if !text.is_empty() {
+                                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                            }
+                            this.context_menu = None;
+                            cx.notify();
+                        }),
+                    )
                     .child(self.t().copy_all),
             )
             .child(
@@ -704,16 +761,19 @@ impl Swoop {
                     .py(px(4.0))
                     .cursor_pointer()
                     .hover(|s| s.bg(menu_hover))
-                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
-                        if let Some(item) = cx.read_from_clipboard()
-                            && let Some(text) = item.text()
-                        {
-                            let view = &this.tabs[this.active].view;
-                            view.read(cx).send_clipboard(text.to_string());
-                        }
-                        this.context_menu = None;
-                        cx.notify();
-                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                            if let Some(item) = cx.read_from_clipboard()
+                                && let Some(text) = item.text()
+                            {
+                                let view = &this.tabs[this.active].view;
+                                view.read(cx).send_clipboard(&text);
+                            }
+                            this.context_menu = None;
+                            cx.notify();
+                        }),
+                    )
                     .child(self.t().paste),
             )
             // Terminal section
@@ -725,11 +785,14 @@ impl Swoop {
                     .py(px(4.0))
                     .cursor_pointer()
                     .hover(|s| s.bg(menu_hover))
-                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
-                        this.tabs[this.active].view.read(cx).reset_terminal();
-                        this.context_menu = None;
-                        cx.notify();
-                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                            this.tabs[this.active].view.read(cx).reset_terminal();
+                            this.context_menu = None;
+                            cx.notify();
+                        }),
+                    )
                     .child(self.t().reset_input_color),
             )
             // Screenshot section
@@ -741,10 +804,13 @@ impl Swoop {
                     .py(px(4.0))
                     .cursor_pointer()
                     .hover(|s| s.bg(menu_hover))
-                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
-                        this.context_menu = None;
-                        this.do_screenshot(false, cx);
-                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                            this.context_menu = None;
+                            this.do_screenshot(false, cx);
+                        }),
+                    )
                     .child(self.t().screenshot_tab),
             )
             .child(
@@ -754,10 +820,13 @@ impl Swoop {
                     .py(px(4.0))
                     .cursor_pointer()
                     .hover(|s| s.bg(menu_hover))
-                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
-                        this.context_menu = None;
-                        this.do_screenshot(true, cx);
-                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                            this.context_menu = None;
+                            this.do_screenshot(true, cx);
+                        }),
+                    )
                     .child(self.t().screenshot_app),
             )
             // Window section
@@ -769,13 +838,20 @@ impl Swoop {
                     .py(px(4.0))
                     .cursor_pointer()
                     .hover(|s| s.bg(menu_hover))
-                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev: &MouseDownEvent, window, cx| {
-                        this.windowed = !this.windowed;
-                        window.toggle_fullscreen();
-                        this.context_menu = None;
-                        cx.notify();
-                    }))
-                    .child(if self.windowed { self.t().fullscreen_mode } else { self.t().windowed_mode }),
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _ev: &MouseDownEvent, window, cx| {
+                            this.windowed = !this.windowed;
+                            window.toggle_fullscreen();
+                            this.context_menu = None;
+                            cx.notify();
+                        }),
+                    )
+                    .child(if self.windowed {
+                        self.t().fullscreen_mode
+                    } else {
+                        self.t().windowed_mode
+                    }),
             )
             .child(
                 div()
@@ -784,9 +860,12 @@ impl Swoop {
                     .py(px(4.0))
                     .cursor_pointer()
                     .hover(|s| s.bg(menu_hover))
-                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
-                        this.close_all_tabs(cx);
-                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                            this.close_all_tabs(cx);
+                        }),
+                    )
                     .child(self.t().close_all),
             )
             // App section
@@ -798,11 +877,14 @@ impl Swoop {
                     .py(px(4.0))
                     .cursor_pointer()
                     .hover(|s| s.bg(menu_hover))
-                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
-                        this.show_qr = true;
-                        this.context_menu = None;
-                        cx.notify();
-                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                            this.show_qr = true;
+                            this.context_menu = None;
+                            cx.notify();
+                        }),
+                    )
                     .child(self.t().remote_control),
             )
             .child(
@@ -812,12 +894,15 @@ impl Swoop {
                     .py(px(4.0))
                     .cursor_pointer()
                     .hover(|s| s.bg(menu_hover))
-                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
-                        this.pref_browser_text = this.browser.borrow().clone().unwrap_or_default();
-                        this.show_preferences = true;
-                        this.context_menu = None;
-                        cx.notify();
-                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                            this.pref_browser_text = this.browser.borrow().clone().unwrap_or_default();
+                            this.show_preferences = true;
+                            this.context_menu = None;
+                            cx.notify();
+                        }),
+                    )
                     .child(self.t().preferences),
             );
 
@@ -827,10 +912,10 @@ impl Swoop {
     fn render_rename_input(&self, cx: &Context<Self>) -> Option<Stateful<Div>> {
         let (_idx, text) = self.renaming.as_ref()?;
         let text = text.clone();
-        let input_bg: Hsla = rgb(0x1e1e1e).into();
-        let input_fg: Hsla = rgb(0xcccccc).into();
-        let input_border: Hsla = rgb(0x007acc).into();
-        let cursor_color: Hsla = rgb(0xcccccc).into();
+        let input_bg: Hsla = rgb(0x1e_1e1e).into();
+        let input_fg: Hsla = rgb(0xcc_cccc).into();
+        let input_border: Hsla = rgb(0x00_7acc).into();
+        let cursor_color: Hsla = rgb(0xcc_cccc).into();
 
         Some(
             div()
@@ -842,7 +927,12 @@ impl Swoop {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(Hsla::from(Rgba { r: 0.0, g: 0.0, b: 0.0, a: 0.5 }))
+                .bg(Hsla::from(Rgba {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 0.5,
+                }))
                 .on_mouse_down(MouseButton::Left, |_ev: &MouseDownEvent, _window, _cx| {})
                 .on_mouse_down(MouseButton::Right, |_ev: &MouseDownEvent, _window, _cx| {})
                 .child(
@@ -899,7 +989,7 @@ impl Swoop {
                                 .flex_row()
                                 .items_center()
                                 .mt(px(8.0))
-                                .bg(rgb(0x141414))
+                                .bg(rgb(0x14_1414))
                                 .border_1()
                                 .border_color(input_border)
                                 .rounded(px(3.0))
@@ -908,12 +998,7 @@ impl Swoop {
                                 .min_h(px(28.0))
                                 .cursor_text()
                                 .child(text)
-                                .child(
-                                    div()
-                                        .w(px(1.0))
-                                        .h(px(16.0))
-                                        .bg(cursor_color),
-                                ),
+                                .child(div().w(px(1.0)).h(px(16.0)).bg(cursor_color)),
                         ),
                 ),
         )
@@ -927,13 +1012,13 @@ impl Swoop {
         }
         let tab_name = self.tabs[idx].name.clone();
 
-        let dialog_bg: Hsla = rgb(0x252526).into();
-        let dialog_fg: Hsla = rgb(0xcccccc).into();
-        let dialog_border: Hsla = rgb(0x3c3c3c).into();
-        let btn_bg: Hsla = rgb(0x0e639c).into();
-        let btn_hover: Hsla = rgb(0x1177bb).into();
-        let btn_secondary_bg: Hsla = rgb(0x3c3c3c).into();
-        let btn_secondary_hover: Hsla = rgb(0x505050).into();
+        let dialog_bg: Hsla = rgb(0x25_2526).into();
+        let dialog_fg: Hsla = rgb(0xcc_cccc).into();
+        let dialog_border: Hsla = rgb(0x3c_3c3c).into();
+        let btn_bg: Hsla = rgb(0x0e_639c).into();
+        let btn_hover: Hsla = rgb(0x11_77bb).into();
+        let btn_secondary_bg: Hsla = rgb(0x3c_3c3c).into();
+        let btn_secondary_hover: Hsla = rgb(0x50_5050).into();
 
         Some(
             div()
@@ -945,7 +1030,12 @@ impl Swoop {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(Hsla::from(Rgba { r: 0.0, g: 0.0, b: 0.0, a: 0.5 }))
+                .bg(Hsla::from(Rgba {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 0.5,
+                }))
                 .on_mouse_down(MouseButton::Left, |_ev: &MouseDownEvent, _window, _cx| {})
                 .on_mouse_down(MouseButton::Right, |_ev: &MouseDownEvent, _window, _cx| {})
                 .child(
@@ -962,13 +1052,13 @@ impl Swoop {
                         .child(
                             div()
                                 .text_size(px(15.0))
-                                .child(format!("Shell exited in \"{}\"", tab_name)),
+                                .child(format!("Shell exited in \"{tab_name}\"")),
                         )
                         .child(
                             div()
                                 .mt(px(8.0))
                                 .text_size(px(13.0))
-                                .text_color(rgb(0x999999))
+                                .text_color(rgb(0x99_9999))
                                 .child(self.t().exit_close_or_reopen),
                         )
                         .child(
@@ -987,9 +1077,12 @@ impl Swoop {
                                         .rounded(px(3.0))
                                         .cursor_pointer()
                                         .hover(|s| s.bg(btn_secondary_hover))
-                                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev: &MouseDownEvent, window, cx| {
-                                            this.respawn_tab(idx, window, cx);
-                                        }))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _ev: &MouseDownEvent, window, cx| {
+                                                this.respawn_tab(idx, window, cx);
+                                            }),
+                                        )
                                         .child(self.t().reopen_clean),
                                 )
                                 .child(
@@ -1001,9 +1094,12 @@ impl Swoop {
                                         .rounded(px(3.0))
                                         .cursor_pointer()
                                         .hover(|s| s.bg(btn_secondary_hover))
-                                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev: &MouseDownEvent, window, cx| {
-                                            this.respawn_tab_with_history(idx, window, cx);
-                                        }))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _ev: &MouseDownEvent, window, cx| {
+                                                this.respawn_tab_with_history(idx, window, cx);
+                                            }),
+                                        )
                                         .child(self.t().reopen_with_history),
                                 )
                                 .child(
@@ -1015,14 +1111,17 @@ impl Swoop {
                                         .rounded(px(3.0))
                                         .cursor_pointer()
                                         .hover(|s| s.bg(btn_hover))
-                                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
-                                            this.exit_confirm = None;
-                                            if this.tabs.len() <= 1 {
-                                                this.close_all_tabs(cx);
-                                            } else {
-                                                this.close_tab(idx, cx);
-                                            }
-                                        }))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                                                this.exit_confirm = None;
+                                                if this.tabs.len() <= 1 {
+                                                    this.close_all_tabs(cx);
+                                                } else {
+                                                    this.close_tab(idx, cx);
+                                                }
+                                            }),
+                                        )
                                         .child(self.t().close_tab),
                                 ),
                         ),
@@ -1037,13 +1136,13 @@ impl Swoop {
         }
         let tab_name = self.tabs[idx].name.clone();
 
-        let dialog_bg: Hsla = rgb(0x252526).into();
-        let dialog_fg: Hsla = rgb(0xcccccc).into();
-        let dialog_border: Hsla = rgb(0x3c3c3c).into();
-        let btn_bg: Hsla = rgb(0x0e639c).into();
-        let btn_hover: Hsla = rgb(0x1177bb).into();
-        let btn_secondary_bg: Hsla = rgb(0x3c3c3c).into();
-        let btn_secondary_hover: Hsla = rgb(0x505050).into();
+        let dialog_bg: Hsla = rgb(0x25_2526).into();
+        let dialog_fg: Hsla = rgb(0xcc_cccc).into();
+        let dialog_border: Hsla = rgb(0x3c_3c3c).into();
+        let btn_bg: Hsla = rgb(0x0e_639c).into();
+        let btn_hover: Hsla = rgb(0x11_77bb).into();
+        let btn_secondary_bg: Hsla = rgb(0x3c_3c3c).into();
+        let btn_secondary_hover: Hsla = rgb(0x50_5050).into();
 
         Some(
             div()
@@ -1055,7 +1154,12 @@ impl Swoop {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(Hsla::from(Rgba { r: 0.0, g: 0.0, b: 0.0, a: 0.5 }))
+                .bg(Hsla::from(Rgba {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 0.5,
+                }))
                 .on_mouse_down(MouseButton::Left, |_ev: &MouseDownEvent, _window, _cx| {})
                 .on_mouse_down(MouseButton::Right, |_ev: &MouseDownEvent, _window, _cx| {})
                 .child(
@@ -1069,11 +1173,7 @@ impl Swoop {
                         .min_w(px(320.0))
                         .text_color(dialog_fg)
                         .text_size(px(14.0))
-                        .child(
-                            div()
-                                .text_size(px(15.0))
-                                .child(format!("Close \"{}\"?", tab_name)),
-                        )
+                        .child(div().text_size(px(15.0)).child(format!("Close \"{tab_name}\"?")))
                         .child(
                             div()
                                 .flex()
@@ -1090,10 +1190,13 @@ impl Swoop {
                                         .rounded(px(3.0))
                                         .cursor_pointer()
                                         .hover(|s| s.bg(btn_secondary_hover))
-                                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
-                                            this.close_confirm = None;
-                                            cx.notify();
-                                        }))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                                                this.close_confirm = None;
+                                                cx.notify();
+                                            }),
+                                        )
                                         .child(self.t().cancel),
                                 )
                                 .child(
@@ -1105,10 +1208,13 @@ impl Swoop {
                                         .rounded(px(3.0))
                                         .cursor_pointer()
                                         .hover(|s| s.bg(btn_hover))
-                                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
-                                            this.close_confirm = None;
-                                            this.close_tab(idx, cx);
-                                        }))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                                                this.close_confirm = None;
+                                                this.close_tab(idx, cx);
+                                            }),
+                                        )
                                         .child(self.t().close),
                                 ),
                         ),
@@ -1125,20 +1231,19 @@ impl Swoop {
         let url = format!("http://{}:7890?token={}", ip, self.api_token);
         let url_for_click = url.clone();
 
-        let qr = match qrcode::QrCode::new(url.as_bytes()) {
-            Ok(q) => q,
-            Err(_) => return None,
+        let Ok(qr) = qrcode::QrCode::new(url.as_bytes()) else {
+            return None;
         };
 
-        let dialog_bg: Hsla = rgb(0x252526).into();
-        let dialog_fg: Hsla = rgb(0xcccccc).into();
-        let dialog_border: Hsla = rgb(0x3c3c3c).into();
-        let btn_bg: Hsla = rgb(0x0e639c).into();
-        let btn_hover: Hsla = rgb(0x1177bb).into();
-        let link_fg: Hsla = rgb(0x3794ff).into();
+        let dialog_bg: Hsla = rgb(0x25_2526).into();
+        let dialog_fg: Hsla = rgb(0xcc_cccc).into();
+        let dialog_border: Hsla = rgb(0x3c_3c3c).into();
+        let btn_bg: Hsla = rgb(0x0e_639c).into();
+        let btn_hover: Hsla = rgb(0x11_77bb).into();
+        let link_fg: Hsla = rgb(0x37_94ff).into();
 
         let colors = qr.to_colors();
-        let w = qr.width() as usize;
+        let w = qr.width();
         let module_size = px(4.0);
         let mut qr_grid = div()
             .mt(px(12.0))
@@ -1171,11 +1276,19 @@ impl Swoop {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(Hsla::from(Rgba { r: 0.0, g: 0.0, b: 0.0, a: 0.5 }))
-                .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
-                    this.show_qr = false;
-                    cx.notify();
+                .bg(Hsla::from(Rgba {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 0.5,
                 }))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                        this.show_qr = false;
+                        cx.notify();
+                    }),
+                )
                 .on_mouse_down(MouseButton::Right, |_ev: &MouseDownEvent, _window, _cx| {})
                 .child(
                     div()
@@ -1188,11 +1301,7 @@ impl Swoop {
                         .text_color(dialog_fg)
                         .text_size(px(14.0))
                         .on_mouse_down(MouseButton::Left, |_ev: &MouseDownEvent, _window, _cx| {})
-                        .child(
-                            div()
-                                .text_size(px(15.0))
-                                .child(self.t().scan_to_connect),
-                        )
+                        .child(div().text_size(px(15.0)).child(self.t().scan_to_connect))
                         .child(qr_grid)
                         .child(
                             div()
@@ -1201,32 +1310,34 @@ impl Swoop {
                                 .text_size(px(11.0))
                                 .text_color(link_fg)
                                 .cursor_pointer()
-                                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev: &MouseDownEvent, _window, _cx| {
-                                    let browser = this.browser.borrow().clone();
-                                    platform::open_url(&url_for_click, browser.as_deref());
-                                }))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _ev: &MouseDownEvent, _window, _cx| {
+                                        let browser = this.browser.borrow().clone();
+                                        platform::open_url(&url_for_click, browser.as_deref());
+                                    }),
+                                )
                                 .child(url),
                         )
                         .child(
-                            div()
-                                .flex()
-                                .justify_end()
-                                .mt(px(12.0))
-                                .child(
-                                    div()
-                                        .id("qr-close")
-                                        .px(px(14.0))
-                                        .py(px(6.0))
-                                        .bg(btn_bg)
-                                        .rounded(px(3.0))
-                                        .cursor_pointer()
-                                        .hover(|s| s.bg(btn_hover))
-                                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                            div().flex().justify_end().mt(px(12.0)).child(
+                                div()
+                                    .id("qr-close")
+                                    .px(px(14.0))
+                                    .py(px(6.0))
+                                    .bg(btn_bg)
+                                    .rounded(px(3.0))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(btn_hover))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
                                             this.show_qr = false;
                                             cx.notify();
-                                        }))
-                                        .child(self.t().close),
-                                ),
+                                        }),
+                                    )
+                                    .child(self.t().close),
+                            ),
                         ),
                 ),
         )
@@ -1237,24 +1348,25 @@ impl Swoop {
             return None;
         }
 
-        let overlay_bg = Hsla::from(Rgba { r: 0.0, g: 0.0, b: 0.0, a: 0.5 });
-        let modal_bg: Hsla = rgb(0x1e1e1e).into();
-        let modal_fg: Hsla = rgb(0xcccccc).into();
-        let modal_border: Hsla = rgb(0x3c3c3c).into();
-        let input_border: Hsla = rgb(0x007acc).into();
-        let btn_bg: Hsla = rgb(0x007acc).into();
-        let btn_hover: Hsla = rgb(0x1c8cd9).into();
-        let option_bg: Hsla = rgb(0x2d2d2d).into();
-        let option_active: Hsla = rgb(0x007acc).into();
-        let placeholder_fg: Hsla = rgb(0x666666).into();
-        let cursor_color: Hsla = rgb(0xcccccc).into();
+        let overlay_bg = Hsla::from(Rgba {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 0.5,
+        });
+        let modal_bg: Hsla = rgb(0x1e_1e1e).into();
+        let modal_fg: Hsla = rgb(0xcc_cccc).into();
+        let modal_border: Hsla = rgb(0x3c_3c3c).into();
+        let input_border: Hsla = rgb(0x00_7acc).into();
+        let btn_bg: Hsla = rgb(0x00_7acc).into();
+        let btn_hover: Hsla = rgb(0x1c_8cd9).into();
+        let option_bg: Hsla = rgb(0x2d_2d2d).into();
+        let option_active: Hsla = rgb(0x00_7acc).into();
+        let placeholder_fg: Hsla = rgb(0x66_6666).into();
+        let cursor_color: Hsla = rgb(0xcc_cccc).into();
         let t = self.t();
 
-        let mut lang_options = div()
-            .flex()
-            .flex_col()
-            .gap(px(4.0))
-            .mt(px(8.0));
+        let mut lang_options = div().flex().flex_col().gap(px(4.0)).mt(px(8.0));
 
         for &lang in Lang::ALL {
             let is_active = lang == self.lang;
@@ -1267,10 +1379,13 @@ impl Swoop {
                     .cursor_pointer()
                     .bg(if is_active { option_active } else { option_bg })
                     .hover(|s| s.bg(if is_active { option_active } else { btn_hover }))
-                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
-                        this.lang = lang;
-                        cx.notify();
-                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                            this.lang = lang;
+                            cx.notify();
+                        }),
+                    )
                     .child(lang.label()),
             );
         }
@@ -1284,7 +1399,7 @@ impl Swoop {
             .flex()
             .flex_row()
             .items_center()
-            .bg(rgb(0x141414))
+            .bg(rgb(0x14_1414))
             .border_1()
             .border_color(input_border)
             .rounded(px(3.0))
@@ -1292,21 +1407,27 @@ impl Swoop {
             .py(px(4.0))
             .min_h(px(28.0))
             .cursor_text()
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev: &MouseDownEvent, window, cx| {
-                this.pref_browser_focus.focus(window);
-                cx.notify();
-            }))
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _window, cx| {
-                match ev.keystroke.key.as_str() {
-                    "backspace" => { this.pref_browser_text.pop(); cx.notify(); }
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _ev: &MouseDownEvent, window, cx| {
+                    this.pref_browser_focus.focus(window);
+                    cx.notify();
+                }),
+            )
+            .on_key_down(
+                cx.listener(|this, ev: &KeyDownEvent, _window, cx| match ev.keystroke.key.as_str() {
+                    "backspace" => {
+                        this.pref_browser_text.pop();
+                        cx.notify();
+                    }
                     _ => {
                         if let Some(ref ch) = ev.keystroke.key_char {
                             this.pref_browser_text.push_str(ch);
                             cx.notify();
                         }
                     }
-                }
-            }))
+                }),
+            )
             .when(browser_text.is_empty(), |el| {
                 el.child(div().text_color(placeholder_fg).child(t.browser_placeholder))
             })
@@ -1340,23 +1461,9 @@ impl Swoop {
                         .min_w(px(320.0))
                         .text_size(px(14.0))
                         .on_mouse_down(MouseButton::Left, |_ev: &MouseDownEvent, _window, _cx| {})
-                        .child(
-                            div()
-                                .text_size(px(16.0))
-                                .mb(px(16.0))
-                                .child(t.preferences),
-                        )
-                        .child(
-                            div()
-                                .child(t.language)
-                                .child(lang_options),
-                        )
-                        .child(
-                            div()
-                                .mt(px(16.0))
-                                .child(t.browser)
-                                .child(browser_input),
-                        )
+                        .child(div().text_size(px(16.0)).mb(px(16.0)).child(t.preferences))
+                        .child(div().child(t.language).child(lang_options))
+                        .child(div().mt(px(16.0)).child(t.browser).child(browser_input))
                         .child(
                             div()
                                 .mt(px(20.0))
@@ -1373,10 +1480,13 @@ impl Swoop {
                                         .rounded(px(3.0))
                                         .cursor_pointer()
                                         .hover(|s| s.bg(btn_hover))
-                                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
-                                            this.show_preferences = false;
-                                            cx.notify();
-                                        }))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                                                this.show_preferences = false;
+                                                cx.notify();
+                                            }),
+                                        )
                                         .child(t.cancel),
                                 )
                                 .child(
@@ -1388,24 +1498,30 @@ impl Swoop {
                                         .rounded(px(3.0))
                                         .cursor_pointer()
                                         .hover(|s| s.bg(btn_hover))
-                                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
-                                            let lang_str = match this.lang {
-                                                Lang::En => "en",
-                                                Lang::Fr => "fr",
-                                            };
-                                            let browser = if this.pref_browser_text.is_empty() {
-                                                None
-                                            } else {
-                                                Some(this.pref_browser_text.clone())
-                                            };
-                                            *this.browser.borrow_mut() = browser.clone();
-                                            save_preferences(&platform::state_base_dir(), &Preferences {
-                                                lang: Some(lang_str.into()),
-                                                browser,
-                                            });
-                                            this.show_preferences = false;
-                                            cx.notify();
-                                        }))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                                                let lang_str = match this.lang {
+                                                    Lang::En => "en",
+                                                    Lang::Fr => "fr",
+                                                };
+                                                let browser = if this.pref_browser_text.is_empty() {
+                                                    None
+                                                } else {
+                                                    Some(this.pref_browser_text.clone())
+                                                };
+                                                (*this.browser.borrow_mut()).clone_from(&browser);
+                                                save_preferences(
+                                                    &platform::state_base_dir(),
+                                                    &Preferences {
+                                                        lang: Some(lang_str.into()),
+                                                        browser,
+                                                    },
+                                                );
+                                                this.show_preferences = false;
+                                                cx.notify();
+                                            }),
+                                        )
                                         .child(t.save),
                                 ),
                         ),
@@ -1419,7 +1535,12 @@ impl Render for Swoop {
         window.set_window_title(&format!("{}{}", self.tabs[self.active].name, self.t().title_suffix));
         let active_terminal = self.tabs[self.active].view.clone();
         let tab_bar = self.render_tab_bar(window, cx);
-        let context_menu = if self.renaming.is_none() && self.exit_confirm.is_none() && self.close_confirm.is_none() && !self.show_qr && !self.show_preferences {
+        let context_menu = if self.renaming.is_none()
+            && self.exit_confirm.is_none()
+            && self.close_confirm.is_none()
+            && !self.show_qr
+            && !self.show_preferences
+        {
             self.render_context_menu(cx)
         } else {
             None
@@ -1434,7 +1555,7 @@ impl Render for Swoop {
         let mut root = div()
             .id("app-root")
             .size_full()
-            .bg(rgba(0x141414b8))
+            .bg(rgba(0x1414_14b8))
             .flex()
             .flex_col()
             .child(
@@ -1466,14 +1587,20 @@ impl Render for Swoop {
                         .top(px(0.0))
                         .left(px(0.0))
                         .size_full()
-                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
-                            this.context_menu = None;
-                            cx.notify();
-                        }))
-                        .on_mouse_down(MouseButton::Right, cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
-                            this.context_menu = None;
-                            cx.notify();
-                        })),
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                                this.context_menu = None;
+                                cx.notify();
+                            }),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                                this.context_menu = None;
+                                cx.notify();
+                            }),
+                        ),
                 )
                 .child(menu);
         }
@@ -1499,10 +1626,10 @@ impl Render for Swoop {
         }
 
         if !self.toasts.is_empty() {
-            let toast_bg: Hsla = rgb(0x2d2d2d).into();
-            let toast_fg: Hsla = rgb(0xcccccc).into();
-            let toast_border: Hsla = rgb(0x007acc).into();
-            let link_fg: Hsla = rgb(0x3794ff).into();
+            let toast_bg: Hsla = rgb(0x2d_2d2d).into();
+            let toast_fg: Hsla = rgb(0xcc_cccc).into();
+            let toast_border: Hsla = rgb(0x00_7acc).into();
+            let link_fg: Hsla = rgb(0x37_94ff).into();
             let mut stack = div()
                 .id("toast-stack")
                 .absolute()
@@ -1530,17 +1657,16 @@ impl Render for Swoop {
                         .items_center()
                         .gap(px(4.0))
                         .child(format!("{}:", toast.message))
-                        .child(
-                            div()
-                                .text_color(link_fg)
-                                .child(path.display().to_string()),
-                        )
+                        .child(div().text_color(link_fg).child(path.display().to_string()))
                         .cursor_pointer()
-                        .on_mouse_down(MouseButton::Left, cx.listener(move |_this, _ev: &MouseDownEvent, _window, _cx| {
-                            if let Some(ref path) = path_clone {
-                                platform::open_path(path);
-                            }
-                        }));
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |_this, _ev: &MouseDownEvent, _window, _cx| {
+                                if let Some(ref path) = path_clone {
+                                    platform::open_path(path);
+                                }
+                            }),
+                        );
                 } else {
                     el = el.child(toast.message.clone());
                 }
@@ -1570,23 +1696,23 @@ fn main() {
     env_logger::init();
     info!("starting Tab Atelier v{}", env!("CARGO_PKG_VERSION"));
     Application::new().run(|cx: &mut App| {
-        let window_handle = cx.open_window(
-            WindowOptions {
-                titlebar: None,
-                window_background: WindowBackgroundAppearance::Transparent,
-                ..Default::default()
-            },
-            |window, cx| {
-                window.toggle_fullscreen();
-                cx.new(|cx| Swoop::new(window, cx))
-            },
-        )
-        .unwrap();
+        let window_handle = cx
+            .open_window(
+                WindowOptions {
+                    titlebar: None,
+                    window_background: WindowBackgroundAppearance::Transparent,
+                    ..Default::default()
+                },
+                |window, cx| {
+                    window.toggle_fullscreen();
+                    cx.new(|cx| Swoop::new(window, cx))
+                },
+            )
+            .unwrap();
 
         spawn_hotkey_listener(window_handle, cx);
     });
 }
-
 
 fn spawn_hotkey_listener(window_handle: WindowHandle<Swoop>, cx: &mut App) {
     let (tx, rx) = std::sync::mpsc::channel::<()>();
