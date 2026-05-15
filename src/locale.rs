@@ -75,6 +75,8 @@ pub struct Strings {
     pub language: &'static str,
     pub browser: &'static str,
     pub browser_placeholder: &'static str,
+    pub code_editor: &'static str,
+    pub code_editor_placeholder: &'static str,
     pub save: &'static str,
 }
 
@@ -124,6 +126,8 @@ pub static EN: Strings = Strings {
     language: "Language",
     browser: "Browser",
     browser_placeholder: "xdg-open (system default)",
+    code_editor: "Code editor",
+    code_editor_placeholder: "xdg-open (system default)",
     save: "Save",
 };
 
@@ -173,6 +177,8 @@ pub static FR: Strings = Strings {
     language: "Langue",
     browser: "Navigateur",
     browser_placeholder: "xdg-open (par défaut)",
+    code_editor: "Éditeur de code",
+    code_editor_placeholder: "xdg-open (par défaut)",
     save: "Enregistrer",
 };
 

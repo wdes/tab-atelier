@@ -87,6 +87,7 @@ pub struct TerminalView {
     scroll_acc: Rc<Cell<f32>>,
     font_config: FontConfig,
     browser: Rc<RefCell<Option<String>>>,
+    code_editor: Rc<RefCell<Option<String>>>,
     detected_urls: Rc<RefCell<Vec<DetectedUrl>>>,
     hover_grid: Rc<Cell<Option<(usize, usize)>>>,
     click_origin: Rc<Cell<Option<GridPoint>>>,
@@ -97,6 +98,7 @@ impl TerminalView {
         cwd: Option<&Path>,
         font_config: FontConfig,
         browser: Rc<RefCell<Option<String>>>,
+        code_editor: Rc<RefCell<Option<String>>>,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -180,6 +182,7 @@ impl TerminalView {
             scroll_acc: Rc::new(Cell::new(0.0)),
             font_config,
             browser,
+            code_editor,
             detected_urls: Rc::new(RefCell::new(Vec::new())),
             hover_grid: Rc::new(Cell::new(None)),
             click_origin: Rc::new(Cell::new(None)),
@@ -643,8 +646,9 @@ impl Render for TerminalView {
                                     } else {
                                         path.to_path_buf()
                                     };
+                                    let editor = this.code_editor.borrow().clone();
                                     info!("opening file: {}", resolved.display());
-                                    crate::platform::open_path(&resolved);
+                                    crate::platform::open_path(&resolved, editor.as_deref());
                                 } else {
                                     info!("opening URL: {}", url.url);
                                     crate::platform::open_url(&url.url, browser.as_deref());
