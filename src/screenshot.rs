@@ -4,23 +4,12 @@
 
 use std::path::PathBuf;
 
-use log::{debug, info};
-use x11rb::connection::Connection;
-use x11rb::protocol::xproto::{ConnectionExt, ImageFormat};
+use log::info;
+
+use crate::platform;
 
 pub fn screenshot_dir() -> PathBuf {
-    let pictures = std::process::Command::new("xdg-user-dir")
-        .arg("PICTURES")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-            format!("{home}/Pictures")
-        });
-    PathBuf::from(pictures).join("screenshots")
+    platform::pictures_dir().join("screenshots")
 }
 
 fn timestamp() -> String {
@@ -29,58 +18,6 @@ fn timestamp() -> String {
         .unwrap_or_default()
         .as_secs();
     format!("{secs}")
-}
-
-struct CapturedImage {
-    width: u16,
-    height: u16,
-    data: Vec<u8>,
-}
-
-fn capture_focused_window() -> Result<CapturedImage, String> {
-    let (conn, screen_num) = x11rb::connect(None).map_err(|e| format!("x11 connect: {e}"))?;
-    let screen = &conn.setup().roots[screen_num];
-    let root = screen.root;
-
-    let focus = conn.get_input_focus().map_err(|e| format!("get_input_focus: {e}"))?
-        .reply().map_err(|e| format!("get_input_focus reply: {e}"))?;
-
-    let mut window = focus.focus;
-    loop {
-        let tree = conn.query_tree(window).map_err(|e| format!("query_tree: {e}"))?
-            .reply().map_err(|e| format!("query_tree reply: {e}"))?;
-        if tree.parent == root || tree.parent == 0 {
-            break;
-        }
-        window = tree.parent;
-    }
-
-    let geom = conn.get_geometry(window).map_err(|e| format!("get_geometry: {e}"))?
-        .reply().map_err(|e| format!("get_geometry reply: {e}"))?;
-
-    let coords = conn.translate_coordinates(window, root, 0, 0)
-        .map_err(|e| format!("translate_coordinates: {e}"))?
-        .reply().map_err(|e| format!("translate_coordinates reply: {e}"))?;
-
-    debug!(
-        "screenshot: capturing from root at ({},{}) size {}x{}",
-        coords.dst_x, coords.dst_y, geom.width, geom.height
-    );
-
-    let reply = conn.get_image(
-        ImageFormat::Z_PIXMAP,
-        root,
-        coords.dst_x, coords.dst_y,
-        geom.width, geom.height,
-        u32::MAX,
-    ).map_err(|e| format!("get_image: {e}"))?
-     .reply().map_err(|e| format!("get_image reply: {e}"))?;
-
-    Ok(CapturedImage {
-        width: geom.width,
-        height: geom.height,
-        data: reply.data,
-    })
 }
 
 fn write_bmp(path: &std::path::Path, width: u16, height: u16, bgra: &[u8]) -> Result<(), String> {
@@ -97,26 +34,24 @@ fn write_bmp(path: &std::path::Path, width: u16, height: u16, bgra: &[u8]) -> Re
     // BMP header
     f.write_all(b"BM").map_err(|e| e.to_string())?;
     f.write_all(&file_size.to_le_bytes()).map_err(|e| e.to_string())?;
-    f.write_all(&[0u8; 4]).map_err(|e| e.to_string())?; // reserved
-    f.write_all(&54u32.to_le_bytes()).map_err(|e| e.to_string())?; // data offset
+    f.write_all(&[0u8; 4]).map_err(|e| e.to_string())?;
+    f.write_all(&54u32.to_le_bytes()).map_err(|e| e.to_string())?;
 
     // DIB header (BITMAPINFOHEADER)
-    f.write_all(&40u32.to_le_bytes()).map_err(|e| e.to_string())?; // header size
+    f.write_all(&40u32.to_le_bytes()).map_err(|e| e.to_string())?;
     f.write_all(&w.to_le_bytes()).map_err(|e| e.to_string())?;
     f.write_all(&h.to_le_bytes()).map_err(|e| e.to_string())?;
-    f.write_all(&1u16.to_le_bytes()).map_err(|e| e.to_string())?; // planes
-    f.write_all(&24u16.to_le_bytes()).map_err(|e| e.to_string())?; // bits per pixel
-    f.write_all(&[0u8; 24]).map_err(|e| e.to_string())?; // compression, sizes, resolution, colors
+    f.write_all(&1u16.to_le_bytes()).map_err(|e| e.to_string())?;
+    f.write_all(&24u16.to_le_bytes()).map_err(|e| e.to_string())?;
+    f.write_all(&[0u8; 24]).map_err(|e| e.to_string())?;
 
     let padding = vec![0u8; (row_padded - row_size) as usize];
     let bpp = if bgra.len() >= (w * h * 4) as usize { 4 } else { 3 };
 
-    // BMP stores rows bottom-to-top
     for y in (0..h).rev() {
         for x in 0..w {
             let src = (y * w + x) as usize * bpp;
             if src + 2 < bgra.len() {
-                // BGRA → BGR (BMP native order)
                 f.write_all(&bgra[src..src + 3]).map_err(|e| e.to_string())?;
             } else {
                 f.write_all(&[0, 0, 0]).map_err(|e| e.to_string())?;
@@ -138,7 +73,7 @@ fn sanitize_filename(name: &str) -> String {
 }
 
 pub fn take_screenshot_full(tab_name: &str) -> Result<PathBuf, String> {
-    let img = capture_focused_window()?;
+    let img = platform::capture_focused_window()?;
     let dir = screenshot_dir();
     let _ = std::fs::create_dir_all(&dir);
     let safe = sanitize_filename(tab_name);
@@ -149,7 +84,7 @@ pub fn take_screenshot_full(tab_name: &str) -> Result<PathBuf, String> {
 }
 
 pub fn take_screenshot_tab(tab_name: &str, tab_bar_height: u16) -> Result<PathBuf, String> {
-    let img = capture_focused_window()?;
+    let img = platform::capture_focused_window()?;
     if img.height <= tab_bar_height {
         return Err("window too small to crop tab bar".into());
     }
@@ -196,12 +131,11 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("test.bmp");
 
-        // 2x2 blue image (BGRA)
         let data = vec![
-            0xFF, 0x00, 0x00, 0xFF, // blue
-            0x00, 0xFF, 0x00, 0xFF, // green
-            0x00, 0x00, 0xFF, 0xFF, // red
-            0xFF, 0xFF, 0xFF, 0xFF, // white
+            0xFF, 0x00, 0x00, 0xFF,
+            0x00, 0xFF, 0x00, 0xFF,
+            0x00, 0x00, 0xFF, 0xFF,
+            0xFF, 0xFF, 0xFF, 0xFF,
         ];
         write_bmp(&path, 2, 2, &data).unwrap();
 
