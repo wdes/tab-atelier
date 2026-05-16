@@ -796,7 +796,29 @@ export component AppWindow inherits Window {
             background: #2a2a2a;
         }
 
-        Flickable {
+        if root.hosts.length == 0 : Rectangle {
+            VerticalLayout {
+                padding: 24px;
+                spacing: 16px;
+                alignment: center;
+                Text {
+                    text: "Welcome to Tab Atelier Remote";
+                    color: #e0e0e0;
+                    font-size: 18px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                }
+                Text {
+                    text: "To connect to a Tab Atelier instance, open the QR code on the desktop app and scan it with your phone — or tap the + button above and enter the URL and token manually.";
+                    color: #aaa;
+                    font-size: 13px;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+            }
+        }
+
+        if root.hosts.length > 0 : Flickable {
             VerticalLayout {
                 padding: 12px;
                 spacing: 8px;
