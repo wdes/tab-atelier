@@ -258,31 +258,46 @@ mod tests {
 
     #[test]
     fn watts_label_high_wattage() {
-        let tp = TabPower { cpu_percent: 90.0, watts: Some(150.0) };
+        let tp = TabPower {
+            cpu_percent: 90.0,
+            watts: Some(150.0),
+        };
         assert_eq!(tp.watts_label(), "150 W");
     }
 
     #[test]
     fn watts_label_tiny_returns_empty() {
-        let tp = TabPower { cpu_percent: 0.0, watts: Some(0.005) };
+        let tp = TabPower {
+            cpu_percent: 0.0,
+            watts: Some(0.005),
+        };
         assert_eq!(tp.watts_label(), "");
     }
 
     #[test]
     fn cpu_label_under_100() {
-        let tp = TabPower { cpu_percent: 45.7, watts: None };
+        let tp = TabPower {
+            cpu_percent: 45.7,
+            watts: None,
+        };
         assert_eq!(tp.cpu_label(), "45.7%");
     }
 
     #[test]
     fn cpu_label_over_100() {
-        let tp = TabPower { cpu_percent: 312.0, watts: None };
+        let tp = TabPower {
+            cpu_percent: 312.0,
+            watts: None,
+        };
         assert_eq!(tp.cpu_label(), "312%");
     }
 
     #[test]
     fn label_high_watts() {
-        let tp = TabPower { cpu_percent: 80.0, watts: Some(200.0) };
+        let tp = TabPower {
+            cpu_percent: 80.0,
+            watts: Some(200.0),
+        };
         assert_eq!(tp.label(), "200W");
     }
 
