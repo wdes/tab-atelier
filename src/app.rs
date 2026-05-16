@@ -397,6 +397,7 @@ impl AppState {
             },
         );
         self.active = idx;
+        self.tabs[self.active].view.read(cx).focus_handle(cx).focus(window);
         cx.notify();
     }
 
@@ -761,20 +762,26 @@ impl AppState {
                         this.rename_focus.focus(window);
                         cx.notify();
                     } else if this.active != i {
-                        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                        let window_handle = window.window_handle().downcast::<Self>();
+                        cx.spawn(async move |_this: WeakEntity<Self>, cx: &mut AsyncApp| {
                             cx.background_executor()
                                 .timer(std::time::Duration::from_millis(200))
                                 .await;
-                            let _ = this.update(cx, |app, cx| {
-                                if app.renaming.is_some() || app.active == i {
-                                    return;
-                                }
-                                app.tabs[app.active].deactivate();
-                                app.active = i;
-                                app.tabs[i].activate();
-                                app.context_menu = None;
-                                cx.notify();
-                            });
+                            if let Some(wh) = window_handle {
+                                let _ = cx.update(|cx| {
+                                    let _ = wh.update(cx, |app, window, cx| {
+                                        if app.renaming.is_some() || app.active == i {
+                                            return;
+                                        }
+                                        app.tabs[app.active].deactivate();
+                                        app.active = i;
+                                        app.tabs[i].activate();
+                                        app.context_menu = None;
+                                        app.tabs[app.active].view.read(cx).focus_handle(cx).focus(window);
+                                        cx.notify();
+                                    });
+                                });
+                            }
                         })
                         .detach();
                     }
