@@ -513,6 +513,9 @@ mod tests {
         assert_eq!(keystroke_to_bytes(&ks("c", Some("c"), ctrl()), NORMAL), Some(vec![3]));
         assert_eq!(keystroke_to_bytes(&ks("a", Some("a"), ctrl()), NORMAL), Some(vec![1]));
         assert_eq!(keystroke_to_bytes(&ks("z", Some("z"), ctrl()), NORMAL), Some(vec![26]));
+        // ctrl+l = 12 (form feed, triggers clear-screen in readline shells)
+        assert_eq!(keystroke_to_bytes(&ks("l", Some("l"), ctrl()), NORMAL), Some(vec![0x0c]));
+        assert_eq!(keystroke_to_bytes(&ks("l", None, ctrl()), NORMAL), Some(vec![0x0c]));
     }
 
     #[test]
