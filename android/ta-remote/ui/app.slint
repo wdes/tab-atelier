@@ -176,56 +176,81 @@ component HostRow inherits Rectangle {
     in property <Host> host;
     in property <bool> selected;
     callback tapped();
+    callback removed();
 
     height: 64px;
     background: ta.has-hover ? #2a2a2a : transparent;
 
-    ta := TouchArea {
-        clicked => { root.tapped() }
+    HorizontalLayout {
+        padding-left: 16px;
+        padding-right: 4px;
+        spacing: 12px;
 
-        HorizontalLayout {
-            padding-left: 16px;
-            padding-right: 16px;
-            spacing: 12px;
+        ta := TouchArea {
+            horizontal-stretch: 1;
+            clicked => { root.tapped() }
 
-            Rectangle {
-                width: 10px;
-                background: host.reachability == "lan" ? #66bb6a
-                    : host.reachability == "remote" ? #ffa726
-                    : #ef5350;
-                border-radius: 5px;
-                y: parent.height / 2 - self.height / 2;
-                height: 10px;
-            }
+            HorizontalLayout {
+                spacing: 12px;
 
-            VerticalLayout {
-                horizontal-stretch: 1;
-                alignment: center;
-                spacing: 2px;
-                Text {
-                    text: host.name;
-                    color: #f0f0f0;
-                    font-size: 15px;
-                    font-weight: 600;
+                Rectangle {
+                    width: 10px;
+                    background: host.reachability == "lan" ? #66bb6a
+                        : host.reachability == "remote" ? #ffa726
+                        : #ef5350;
+                    border-radius: 5px;
+                    y: parent.height / 2 - self.height / 2;
+                    height: 10px;
                 }
-                Text {
-                    text: host.detail;
-                    color: #888;
-                    font-size: 12px;
-                }
-            }
 
-            Rectangle {
-                width: 24px;
-                if root.selected : Path {
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    alignment: center;
+                    spacing: 2px;
+                    Text {
+                        text: host.name;
+                        color: #f0f0f0;
+                        font-size: 15px;
+                        font-weight: 600;
+                    }
+                    Text {
+                        text: host.detail;
+                        color: #888;
+                        font-size: 12px;
+                    }
+                }
+
+                Rectangle {
                     width: 24px;
-                    height: 24px;
-                    x: parent.width / 2 - 12px;
-                    y: parent.height / 2 - 12px;
+                    if root.selected : Path {
+                        width: 24px;
+                        height: 24px;
+                        x: parent.width / 2 - 12px;
+                        y: parent.height / 2 - 12px;
+                        viewbox-width: 24;
+                        viewbox-height: 24;
+                        fill: #4a8cff;
+                        commands: "M 9 16.17 L 4.83 12 L 3.41 13.41 L 9 19 L 21 7 L 19.59 5.59 Z";
+                    }
+                }
+            }
+        }
+
+        TouchArea {
+            width: 40px;
+            clicked => { root.removed() }
+            Rectangle {
+                background: parent.has-hover ? #3a1f1f : transparent;
+                border-radius: 6px;
+                Path {
+                    width: 20px;
+                    height: 20px;
+                    x: parent.width / 2 - 10px;
+                    y: parent.height / 2 - 10px;
                     viewbox-width: 24;
                     viewbox-height: 24;
-                    fill: #4a8cff;
-                    commands: "M 9 16.17 L 4.83 12 L 3.41 13.41 L 9 19 L 21 7 L 19.59 5.59 Z";
+                    fill: #ef5350;
+                    commands: "M 19 6.41 L 17.59 5 L 12 10.59 L 6.41 5 L 5 6.41 L 10.59 12 L 5 17.59 L 6.41 19 L 12 13.41 L 17.59 19 L 19 17.59 L 13.41 12 Z";
                 }
             }
         }
@@ -403,6 +428,7 @@ component HostPicker inherits Rectangle {
     in property <length> safe-top;
     in property <length> safe-bottom;
     callback pick(int);
+    callback remove(int);
     callback dismiss();
 
     background: #000000aa;
@@ -445,6 +471,7 @@ component HostPicker inherits Rectangle {
                         host: h;
                         selected: i == root.selected-host;
                         tapped => { root.pick(i) }
+                        removed => { root.remove(i) }
                     }
                 }
             }
@@ -874,6 +901,12 @@ export component AppWindow inherits Window {
             root.active-host = i;
             root.picker-open = false;
             root.request-set-active-host(i);
+        }
+        remove(i) => {
+            root.request-remove-host(i);
+            if (root.hosts.length <= 1) {
+                root.picker-open = false;
+            }
         }
         dismiss => { root.picker-open = false; }
     }
