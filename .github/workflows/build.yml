@@ -13,6 +13,8 @@ jobs:
     build:
         name: Build & test & lint
         runs-on: ubuntu-latest
+        outputs:
+            deb-artifact-id: ${{ steps.upload-deb.outputs.artifact-id }}
         steps:
             - uses: actions/checkout@v6
             - name: Install system dependencies
@@ -71,6 +73,7 @@ jobs:
             - name: Build .deb package
               run: cargo install cargo-deb && cargo deb --locked
             - name: Upload .deb package
+              id: upload-deb
               uses: actions/upload-artifact@v7
               with:
                   name: tab-atelier-deb
@@ -85,7 +88,8 @@ jobs:
         steps:
             - uses: actions/download-artifact@v7
               with:
-                  name: tab-atelier-deb
+                  artifact-ids: ${{ needs.build.outputs.deb-artifact-id }}
+                  merge-multiple: true
             - name: Install .deb and run --check
               run: |
                   docker run --rm \
