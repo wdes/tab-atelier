@@ -4,10 +4,81 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use jni::JavaVM;
+use jni::objects::{JObject, JString};
 use serde::{Deserialize, Serialize};
 use slint::{ComponentHandle, Model, SharedString, VecModel, Weak};
 
 slint::include_modules!();
+
+/// Read the URI the activity was launched with, if any (e.g. via the
+/// `taremote://onboard?url=...&token=...` deep link).
+fn launch_intent_uri(app: &slint::android::AndroidApp) -> Option<String> {
+    let vm_ptr = app.vm_as_ptr();
+    let activity_ptr = app.activity_as_ptr();
+    if vm_ptr.is_null() || activity_ptr.is_null() {
+        return None;
+    }
+    let vm = unsafe { JavaVM::from_raw(vm_ptr.cast()) }.ok()?;
+    let mut env = vm.attach_current_thread().ok()?;
+    let activity = unsafe { JObject::from_raw(activity_ptr.cast()) };
+    let intent = env
+        .call_method(&activity, "getIntent", "()Landroid/content/Intent;", &[])
+        .ok()?
+        .l()
+        .ok()?;
+    let uri = env
+        .call_method(&intent, "getData", "()Landroid/net/Uri;", &[])
+        .ok()?
+        .l()
+        .ok()?;
+    if uri.is_null() {
+        return None;
+    }
+    let s = env
+        .call_method(&uri, "toString", "()Ljava/lang/String;", &[])
+        .ok()?
+        .l()
+        .ok()?;
+    let jstr: JString = s.into();
+    env.get_string(&jstr).ok().map(|j| j.into())
+}
+
+fn parse_onboard_url(url: &str) -> Option<(String, String)> {
+    let q = url.strip_prefix("taremote://onboard?")?;
+    let mut host_url = None;
+    let mut token = None;
+    for pair in q.split('&') {
+        let (k, v) = pair.split_once('=')?;
+        match k {
+            "url" => host_url = Some(percent_decode(v)),
+            "token" => token = Some(percent_decode(v)),
+            _ => {}
+        }
+    }
+    Some((host_url?, token?))
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            ) {
+                out.push(((hi << 4) | lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HostConfig {
@@ -186,12 +257,22 @@ fn android_main(app: slint::android::AndroidApp) {
     let config_path = data_dir.join("hosts.json");
     log::info!("ta-remote config path: {}", config_path.display());
 
+    let launch_onboard = launch_intent_uri(&app).and_then(|u| parse_onboard_url(&u));
+
     slint::android::init(app).unwrap();
     let ui = AppWindow::new().unwrap();
     let ui_weak = ui.as_weak();
 
     let data = Arc::new(Mutex::new(AppData::load(config_path)));
     push_hosts(&ui_weak, &data.lock().unwrap());
+
+    // Pre-fill the host editor from a launch deep link, if any.
+    if let Some((host_url, token)) = launch_onboard {
+        log::info!("launched with onboard deep link for {host_url}");
+        ui.set_editor_url(SharedString::from(host_url));
+        ui.set_editor_token(SharedString::from(token));
+        ui.set_editor_open(true);
+    }
 
     let agent: Arc<ureq::Agent> = Arc::new(
         ureq::AgentBuilder::new()
