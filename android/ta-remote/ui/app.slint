@@ -7,9 +7,10 @@ struct TabRow {
 
 struct Host {
     name: string,
-    reachability: string,  // "lan" | "remote" | "offline"
-    detail: string,        // e.g. "192.168.1.42" or "home.wdes.fr"
-    url: string,
+    reachability: string,    // "lan" | "remote" | "offline"
+    detail: string,          // shown next to the badge
+    url: string,             // LAN URL
+    remote-url: string,      // optional remote URL
     token: string,
 }
 
@@ -235,8 +236,9 @@ component HostEditor inherits Rectangle {
     in property <length> safe-top;
     in-out property <string> name-text;
     in-out property <string> url-text;
+    in-out property <string> remote-url-text;
     in-out property <string> token-text;
-    callback save(string, string, string);
+    callback save(string, string, string, string);
     callback dismiss();
 
     background: #000000aa;
@@ -247,7 +249,7 @@ component HostEditor inherits Rectangle {
 
     Rectangle {
         width: min(parent.width * 88%, 480px);
-        height: 360px;
+        height: 440px;
         background: #1c1c1c;
         border-radius: 14px;
         border-width: 1px;
@@ -295,7 +297,7 @@ component HostEditor inherits Rectangle {
                     }
                 }
 
-                Text { text: "URL (e.g. http://192.168.1.42:7890)"; color: #888; font-size: 11px; }
+                Text { text: "LAN URL (http://192.168.x.x:7890)"; color: #888; font-size: 11px; }
                 Rectangle {
                     height: 40px;
                     background: #232323;
@@ -305,6 +307,24 @@ component HostEditor inherits Rectangle {
                         padding-right: 10px;
                         TextInput {
                             text <=> root.url-text;
+                            color: #e0e0e0;
+                            font-size: 14px;
+                            single-line: true;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+
+                Text { text: "Remote URL (optional)"; color: #888; font-size: 11px; }
+                Rectangle {
+                    height: 40px;
+                    background: #232323;
+                    border-radius: 6px;
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        TextInput {
+                            text <=> root.remote-url-text;
                             color: #e0e0e0;
                             font-size: 14px;
                             single-line: true;
@@ -357,7 +377,7 @@ component HostEditor inherits Rectangle {
 
                 TouchArea {
                     horizontal-stretch: 1;
-                    clicked => { root.save(root.name-text, root.url-text, root.token-text) }
+                    clicked => { root.save(root.name-text, root.url-text, root.remote-url-text, root.token-text) }
                     Rectangle {
                         height: 40px;
                         background: parent.has-hover ? #5599ff : #4a8cff;
@@ -719,11 +739,12 @@ export component AppWindow inherits Window {
     in-out property <string> input-text: "";
     in-out property <string> editor-name: "";
     in-out property <string> editor-url: "";
+    in-out property <string> editor-remote-url: "";
     in-out property <string> editor-token: "";
 
     callback request-activate(int);
     callback request-send-input(int, string);
-    callback request-add-host(string, string, string);
+    callback request-add-host(string, string, string, string);
     callback request-set-active-host(int);
     callback request-remove-host(int);
 
@@ -764,6 +785,7 @@ export component AppWindow inherits Window {
             add-host-tap => {
                 root.editor-name = "";
                 root.editor-url = "";
+                root.editor-remote-url = "";
                 root.editor-token = "";
                 root.editor-open = true;
             }
@@ -840,10 +862,11 @@ export component AppWindow inherits Window {
         safe-top: root.safe-area-insets.top;
         name-text <=> root.editor-name;
         url-text <=> root.editor-url;
+        remote-url-text <=> root.editor-remote-url;
         token-text <=> root.editor-token;
-        save(n, u, t) => {
+        save(n, u, r, t) => {
             root.editor-open = false;
-            root.request-add-host(n, u, t);
+            root.request-add-host(n, u, r, t);
         }
         dismiss => { root.editor-open = false; }
     }
