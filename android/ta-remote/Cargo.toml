@@ -19,7 +19,7 @@ slint = { version = "1", default-features = false, features = [
 slint-build = "1"
 
 [package.metadata.android]
-package = "fr.wdes.taremote"
+package = "fr.wdes.tab_atelier"
 build_targets = ["aarch64-linux-android"]
 apk_name = "ta-remote"
 
@@ -40,6 +40,7 @@ label = "Tab Atelier Remote"
 [[package.metadata.android.application.activity]]
 name = "android.app.NativeActivity"
 config_changes = "orientation|keyboardHidden|screenSize"
+theme = "@android:style/Theme.DeviceDefault.NoActionBar"
 
 [[package.metadata.android.application.activity.meta_data]]
 name = "android.app.lib_name"

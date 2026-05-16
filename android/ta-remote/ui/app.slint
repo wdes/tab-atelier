@@ -1,23 +1,624 @@
-export component AppWindow inherits Window {
-    title: "Tab Atelier Remote";
-    background: #1e1e1e;
+struct TabRow {
+    name: string,
+    cwd: string,
+    active: bool,
+    cpu: string,
+}
+
+struct Host {
+    name: string,
+    reachability: string,  // "lan" | "remote" | "offline"
+    detail: string,        // e.g. "192.168.1.42" or "home.wdes.fr"
+}
+
+component HeaderBar inherits Rectangle {
+    in property <string> host-name;
+    in property <string> reachability;
+    in property <string> detail;
+    in property <bool> multi-host;
+    callback host-tap();
+    callback add-host-tap();
+
+    height: 64px;
+    background: #181818;
+
+    HorizontalLayout {
+        padding-left: 16px;
+        padding-right: 12px;
+        spacing: 12px;
+        alignment: stretch;
+
+        TouchArea {
+            enabled: root.multi-host;
+            clicked => { root.host-tap() }
+            HorizontalLayout {
+                spacing: 8px;
+                alignment: start;
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 2px;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        alignment: start;
+                        Text {
+                            text: root.host-name;
+                            color: #e0e0e0;
+                            font-size: 18px;
+                            font-weight: 600;
+                            vertical-alignment: center;
+                        }
+                        if root.multi-host : Rectangle {
+                            width: 18px;
+                            height: 18px;
+                            y: parent.height / 2 - 9px;
+                            Path {
+                                viewbox-width: 24;
+                                viewbox-height: 24;
+                                fill: #888;
+                                commands: "M 7 10 L 12 15 L 17 10 Z";
+                            }
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 6px;
+                        alignment: start;
+                        Rectangle {
+                            width: 8px;
+                            height: 8px;
+                            border-radius: 4px;
+                            background: root.reachability == "lan" ? #66bb6a
+                                : root.reachability == "remote" ? #ffa726
+                                : #ef5350;
+                            y: parent.height / 2 - 4px;
+                        }
+                        Text {
+                            text: (root.reachability == "lan" ? "LAN · "
+                                : root.reachability == "remote" ? "Remote · "
+                                : "Offline · ") + root.detail;
+                            color: root.reachability == "lan" ? #66bb6a
+                                : root.reachability == "remote" ? #ffa726
+                                : #ef5350;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+        }
+
+        Rectangle { horizontal-stretch: 1; }
+
+        TouchArea {
+            width: 44px;
+            clicked => { root.add-host-tap() }
+            Rectangle {
+                background: parent.has-hover ? #2a2a2a : transparent;
+                border-radius: 6px;
+                Text {
+                    text: "+";
+                    color: #e0e0e0;
+                    font-size: 26px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+}
+
+component TabCard inherits Rectangle {
+    in property <TabRow> tab;
+    callback tapped();
+
+    height: 76px;
+    background: ta.has-hover ? #232323 : #1e1e1e;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: tab.active ? #4a8cff : #2a2a2a;
+
+    ta := TouchArea {
+        clicked => { root.tapped() }
+
+        HorizontalLayout {
+            padding: 12px;
+            spacing: 12px;
+
+            Rectangle {
+                width: 8px;
+                background: tab.active ? #4a8cff : #555;
+                border-radius: 4px;
+            }
+
+            VerticalLayout {
+                horizontal-stretch: 1;
+                alignment: center;
+                spacing: 4px;
+
+                Text {
+                    text: tab.name;
+                    color: #f0f0f0;
+                    font-size: 16px;
+                    font-weight: 600;
+                    overflow: elide;
+                }
+                Text {
+                    text: tab.cwd;
+                    color: #888;
+                    font-size: 12px;
+                    overflow: elide;
+                }
+            }
+
+            VerticalLayout {
+                alignment: center;
+                spacing: 2px;
+                Text {
+                    text: tab.cpu;
+                    color: #aaa;
+                    font-size: 12px;
+                    horizontal-alignment: right;
+                }
+                Text {
+                    text: tab.active ? "active" : "";
+                    color: #4a8cff;
+                    font-size: 11px;
+                    horizontal-alignment: right;
+                }
+            }
+        }
+    }
+}
+
+component HostRow inherits Rectangle {
+    in property <Host> host;
+    in property <bool> selected;
+    callback tapped();
+
+    height: 64px;
+    background: ta.has-hover ? #2a2a2a : transparent;
+
+    ta := TouchArea {
+        clicked => { root.tapped() }
+
+        HorizontalLayout {
+            padding-left: 16px;
+            padding-right: 16px;
+            spacing: 12px;
+
+            Rectangle {
+                width: 10px;
+                background: host.reachability == "lan" ? #66bb6a
+                    : host.reachability == "remote" ? #ffa726
+                    : #ef5350;
+                border-radius: 5px;
+                y: parent.height / 2 - self.height / 2;
+                height: 10px;
+            }
+
+            VerticalLayout {
+                horizontal-stretch: 1;
+                alignment: center;
+                spacing: 2px;
+                Text {
+                    text: host.name;
+                    color: #f0f0f0;
+                    font-size: 15px;
+                    font-weight: 600;
+                }
+                Text {
+                    text: host.detail;
+                    color: #888;
+                    font-size: 12px;
+                }
+            }
+
+            Rectangle {
+                width: 24px;
+                if root.selected : Path {
+                    width: 24px;
+                    height: 24px;
+                    x: parent.width / 2 - 12px;
+                    y: parent.height / 2 - 12px;
+                    viewbox-width: 24;
+                    viewbox-height: 24;
+                    fill: #4a8cff;
+                    commands: "M 9 16.17 L 4.83 12 L 3.41 13.41 L 9 19 L 21 7 L 19.59 5.59 Z";
+                }
+            }
+        }
+    }
+}
+
+component HostPicker inherits Rectangle {
+    in property <[Host]> hosts;
+    in property <int> selected-host;
+    in property <length> safe-top;
+    in property <length> safe-bottom;
+    callback pick(int);
+    callback dismiss();
+
+    background: #000000aa;
+
+    TouchArea {
+        clicked => { root.dismiss() }
+    }
+
+    Rectangle {
+        width: min(parent.width * 88%, 420px);
+        height: min(parent.height * 0.7, 80px + hosts.length * 64px);
+        background: #1c1c1c;
+        border-radius: 14px;
+        border-width: 1px;
+        border-color: #2a2a2a;
+        y: root.safe-top + 24px;
+
+        VerticalLayout {
+            padding: 0;
+            spacing: 0;
+
+            Rectangle {
+                height: 48px;
+                background: #232323;
+                border-top-left-radius: 14px;
+                border-top-right-radius: 14px;
+                Text {
+                    text: "Workstations";
+                    color: #e0e0e0;
+                    font-size: 16px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+
+            Flickable {
+                VerticalLayout {
+                    for h[i] in root.hosts : HostRow {
+                        host: h;
+                        selected: i == root.selected-host;
+                        tapped => { root.pick(i) }
+                    }
+                }
+            }
+
+            Rectangle {
+                height: 1px;
+                background: #2a2a2a;
+            }
+            TouchArea {
+                height: 48px;
+                clicked => { root.dismiss() }
+                Rectangle {
+                    background: parent.has-hover ? #2a2a2a : transparent;
+                    border-bottom-left-radius: 14px;
+                    border-bottom-right-radius: 14px;
+                    Text {
+                        text: "+ Add workstation";
+                        color: #4a8cff;
+                        font-size: 14px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+    }
+}
+
+component KeyButton inherits Rectangle {
+    in property <string> label;
+    in property <string> icon-commands;  // SVG path data, optional
+    callback tapped();
+    horizontal-stretch: 1;
+    height: 36px;
+    background: ta.has-hover ? #1f3f6c : #16365d;
+    border-radius: 4px;
+    ta := TouchArea {
+        clicked => { root.tapped() }
+        if root.icon-commands == "" : Text {
+            text: root.label;
+            color: #e0eaff;
+            font-size: 12px;
+            font-weight: 600;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+        if root.icon-commands != "" : Path {
+            width: 20px;
+            height: 20px;
+            x: parent.width / 2 - 10px;
+            y: parent.height / 2 - 10px;
+            viewbox-width: 24;
+            viewbox-height: 24;
+            fill: #e0eaff;
+            commands: root.icon-commands;
+        }
+    }
+}
+
+component KeyboardHeader inherits Rectangle {
+    callback key-tapped(string);
+    height: 84px;
+    background: #122b48;
+    VerticalLayout {
+        padding: 4px;
+        spacing: 4px;
+        HorizontalLayout {
+            spacing: 4px;
+            KeyButton { label: "ESC";   tapped => { root.key-tapped("esc") } }
+            KeyButton { label: "/";     tapped => { root.key-tapped("/") } }
+            KeyButton { label: "|";     tapped => { root.key-tapped("|") } }
+            KeyButton { label: "-";     tapped => { root.key-tapped("-") } }
+            KeyButton { label: "HOME";  tapped => { root.key-tapped("home") } }
+            KeyButton {
+                icon-commands: "M 12 4 L 6 10 L 7.41 11.41 L 11 7.83 L 11 20 L 13 20 L 13 7.83 L 16.59 11.41 L 18 10 Z";
+                tapped => { root.key-tapped("up") }
+            }
+            KeyButton { label: "END";   tapped => { root.key-tapped("end") } }
+            KeyButton { label: "PGUP";  tapped => { root.key-tapped("pgup") } }
+            KeyButton { label: "FN";    tapped => { root.key-tapped("fn") } }
+        }
+        HorizontalLayout {
+            spacing: 4px;
+            KeyButton { label: "TAB";   tapped => { root.key-tapped("tab") } }
+            KeyButton { label: "CTRL";  tapped => { root.key-tapped("ctrl") } }
+            KeyButton { label: "ALT";   tapped => { root.key-tapped("alt") } }
+            KeyButton {
+                icon-commands: "M 20 11 L 7.83 11 L 13.42 5.41 L 12 4 L 4 12 L 12 20 L 13.41 18.59 L 7.83 13 L 20 13 Z";
+                tapped => { root.key-tapped("left") }
+            }
+            KeyButton {
+                icon-commands: "M 12 20 L 18 14 L 16.59 12.59 L 13 16.17 L 13 4 L 11 4 L 11 16.17 L 7.41 12.59 L 6 14 Z";
+                tapped => { root.key-tapped("down") }
+            }
+            KeyButton {
+                icon-commands: "M 4 13 L 16.17 13 L 10.58 18.59 L 12 20 L 20 12 L 12 4 L 10.59 5.41 L 16.17 11 L 4 11 Z";
+                tapped => { root.key-tapped("right") }
+            }
+            KeyButton { label: "PGDN";  tapped => { root.key-tapped("pgdn") } }
+            KeyButton {
+                // keyboard icon
+                icon-commands: "M 20 5 L 4 5 C 2.89 5 2 5.89 2 7 L 2 17 C 2 18.11 2.89 19 4 19 L 20 19 C 21.11 19 22 18.11 22 17 L 22 7 C 22 5.89 21.11 5 20 5 Z M 11 8 L 13 8 L 13 10 L 11 10 Z M 11 11 L 13 11 L 13 13 L 11 13 Z M 8 8 L 10 8 L 10 10 L 8 10 Z M 8 11 L 10 11 L 10 13 L 8 13 Z M 7 13 L 5 13 L 5 11 L 7 11 Z M 7 10 L 5 10 L 5 8 L 7 8 Z M 16 17 L 8 17 L 8 15 L 16 15 Z M 16 13 L 14 13 L 14 11 L 16 11 Z M 16 10 L 14 10 L 14 8 L 16 8 Z M 19 13 L 17 13 L 17 11 L 19 11 Z M 19 10 L 17 10 L 17 8 L 19 8 Z";
+                tapped => { root.key-tapped("kbd") }
+            }
+        }
+    }
+}
+
+component TerminalView inherits Rectangle {
+    in property <TabRow> tab;
+    in property <length> safe-top;
+    in property <length> safe-bottom;
+    in property <length> safe-left;
+    in property <length> safe-right;
+    callback back();
+    callback send-input();
+
+    background: #0e0e0e;
 
     VerticalLayout {
-        alignment: center;
-        spacing: 16px;
+        spacing: 0;
+        padding-top: root.safe-top;
+        padding-bottom: root.safe-bottom;
+        padding-left: root.safe-left;
+        padding-right: root.safe-right;
 
-        Text {
-            text: "Tab Atelier Remote";
-            color: #e0e0e0;
-            font-size: 22px;
-            horizontal-alignment: center;
+        // Top bar
+        Rectangle {
+            height: 52px;
+            background: #181818;
+            HorizontalLayout {
+                padding-left: 8px;
+                padding-right: 12px;
+                spacing: 8px;
+                alignment: stretch;
+                TouchArea {
+                    width: 44px;
+                    clicked => { root.back() }
+                    Rectangle {
+                        background: parent.has-hover ? #2a2a2a : transparent;
+                        border-radius: 6px;
+                        Path {
+                            width: 24px;
+                            height: 24px;
+                            x: parent.width / 2 - 12px;
+                            y: parent.height / 2 - 12px;
+                            viewbox-width: 24;
+                            viewbox-height: 24;
+                            fill: #e0e0e0;
+                            commands: "M 20 11 L 7.83 11 L 13.42 5.41 L 12 4 L 4 12 L 12 20 L 13.41 18.59 L 7.83 13 L 20 13 Z";
+                        }
+                    }
+                }
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    alignment: center;
+                    spacing: 2px;
+                    Text {
+                        text: tab.name;
+                        color: #f0f0f0;
+                        font-size: 16px;
+                        font-weight: 600;
+                        overflow: elide;
+                    }
+                    Text {
+                        text: tab.cwd;
+                        color: #888;
+                        font-size: 11px;
+                        overflow: elide;
+                    }
+                }
+                Text {
+                    text: tab.cpu;
+                    color: #aaa;
+                    font-size: 12px;
+                    vertical-alignment: center;
+                }
+            }
         }
 
-        Text {
-            text: "v0.1.0 — connection coming soon";
-            color: #888;
-            font-size: 14px;
-            horizontal-alignment: center;
+        Rectangle {
+            height: 1px;
+            background: #2a2a2a;
         }
+
+        // Mocked terminal output
+        Flickable {
+            VerticalLayout {
+                padding: 10px;
+                spacing: 0;
+                Text { text: "$ git status";                           color: #d0d0d0; font-family: "monospace"; font-size: 13px; }
+                Text { text: "On branch main";                         color: #aaaaaa; font-family: "monospace"; font-size: 13px; }
+                Text { text: "Your branch is ahead of 'origin/main'";  color: #aaaaaa; font-family: "monospace"; font-size: 13px; }
+                Text { text: "by 8 commits.";                          color: #aaaaaa; font-family: "monospace"; font-size: 13px; }
+                Text { text: "";                                       color: #aaaaaa; font-family: "monospace"; font-size: 13px; }
+                Text { text: "nothing to commit, working tree clean";  color: #66bb6a; font-family: "monospace"; font-size: 13px; }
+                Text { text: "";                                       color: #aaaaaa; font-family: "monospace"; font-size: 13px; }
+                Text { text: "$ cargo build --release";                color: #d0d0d0; font-family: "monospace"; font-size: 13px; }
+                Text { text: "   Compiling tab-atelier v0.3.1-dev";    color: #aaaaaa; font-family: "monospace"; font-size: 13px; }
+                Text { text: "    Finished `release` profile";         color: #aaaaaa; font-family: "monospace"; font-size: 13px; }
+                Text { text: "    [optimized] target(s) in 8.23s";     color: #aaaaaa; font-family: "monospace"; font-size: 13px; }
+                Text { text: "";                                       color: #aaaaaa; font-family: "monospace"; font-size: 13px; }
+                HorizontalLayout {
+                    spacing: 0;
+                    alignment: start;
+                    Text { text: "$ "; color: #4a8cff; font-family: "monospace"; font-size: 13px; }
+                    Rectangle { width: 8px; height: 14px; background: #4a8cff; }
+                }
+            }
+        }
+
+        KeyboardHeader {
+            key-tapped(k) => { /* mock */ }
+        }
+
+        Rectangle {
+            height: 1px;
+            background: #2a2a2a;
+        }
+
+        // Input bar
+        Rectangle {
+            height: 56px;
+            background: #181818;
+            HorizontalLayout {
+                padding: 8px;
+                spacing: 8px;
+                Rectangle {
+                    horizontal-stretch: 1;
+                    background: #232323;
+                    border-radius: 8px;
+                    Text {
+                        text: "  Type a command...";
+                        color: #666;
+                        font-family: "monospace";
+                        font-size: 13px;
+                        vertical-alignment: center;
+                        horizontal-alignment: left;
+                    }
+                }
+                TouchArea {
+                    width: 48px;
+                    clicked => { root.send-input() }
+                    Rectangle {
+                        background: parent.has-hover ? #5599ff : #4a8cff;
+                        border-radius: 8px;
+                        Path {
+                            width: 22px;
+                            height: 22px;
+                            x: parent.width / 2 - 11px;
+                            y: parent.height / 2 - 11px;
+                            viewbox-width: 24;
+                            viewbox-height: 24;
+                            fill: white;
+                            commands: "M 2.01 21 L 23 12 L 2.01 3 L 2 10 L 17 12 L 2 14 Z";
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+export component AppWindow inherits Window {
+    title: "Tab Atelier Remote";
+    background: #121212;
+
+    in-out property <[TabRow]> tabs: [
+        { name: "tab2",        cwd: "/mnt/Dev/@wdes/tab-atelier",     active: true,  cpu: "3.1%" },
+        { name: "m-invoice",   cwd: "/mnt/Dev/@wdes/mounch",          active: false, cpu: "0.0%" },
+        { name: "Blog",        cwd: "/home/williamdes/blog",          active: false, cpu: "0.4%" },
+        { name: "OSS",         cwd: "/mnt/Dev/oss",                   active: false, cpu: "0.0%" },
+        { name: "6.0",         cwd: "/mnt/Dev/phpmyadmin/6.0",        active: false, cpu: "1.2%" },
+        { name: "deb",         cwd: "/mnt/Dev/@wdes/debian-build",    active: false, cpu: "0.0%" },
+        { name: "prj",         cwd: "/home/williamdes/projects",      active: false, cpu: "0.0%" },
+        { name: "Terminal 16", cwd: "~",                              active: false, cpu: "0.0%" },
+    ];
+
+    in-out property <[Host]> hosts: [
+        { name: "workstation", reachability: "lan",     detail: "192.168.1.42" },
+        { name: "homelab",     reachability: "remote",  detail: "home.wdes.fr" },
+        { name: "laptop",      reachability: "offline", detail: "unreachable" },
+    ];
+
+    in-out property <int> active-host: 0;
+    in-out property <int> open-tab: -1;
+    in-out property <bool> picker-open: false;
+
+    VerticalLayout {
+        spacing: 0;
+        padding-top: root.safe-area-insets.top;
+        padding-bottom: root.safe-area-insets.bottom;
+        padding-left: root.safe-area-insets.left;
+        padding-right: root.safe-area-insets.right;
+
+        HeaderBar {
+            host-name: root.hosts[root.active-host].name;
+            reachability: root.hosts[root.active-host].reachability;
+            detail: root.hosts[root.active-host].detail;
+            multi-host: root.hosts.length > 1;
+            host-tap => { root.picker-open = true; }
+        }
+
+        Rectangle {
+            height: 1px;
+            background: #2a2a2a;
+        }
+
+        Flickable {
+            VerticalLayout {
+                padding: 12px;
+                spacing: 8px;
+                for tab[i] in root.tabs : TabCard {
+                    tab: tab;
+                    tapped => { root.open-tab = i; }
+                }
+            }
+        }
+    }
+
+    if root.open-tab >= 0 : TerminalView {
+        width: 100%;
+        height: 100%;
+        tab: root.tabs[root.open-tab];
+        safe-top: root.safe-area-insets.top;
+        safe-bottom: root.safe-area-insets.bottom;
+        safe-left: root.safe-area-insets.left;
+        safe-right: root.safe-area-insets.right;
+        back => { root.open-tab = -1; }
+    }
+
+    if root.picker-open : HostPicker {
+        width: 100%;
+        height: 100%;
+        hosts: root.hosts;
+        selected-host: root.active-host;
+        safe-top: root.safe-area-insets.top;
+        safe-bottom: root.safe-area-insets.bottom;
+        pick(i) => {
+            root.active-host = i;
+            root.picker-open = false;
+        }
+        dismiss => { root.picker-open = false; }
     }
 }
