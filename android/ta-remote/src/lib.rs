@@ -84,7 +84,22 @@ fn percent_decode(s: &str) -> String {
 struct HostConfig {
     name: String,
     url: String,
+    #[serde(default)]
+    remote_url: String,
     token: String,
+}
+
+/// Outcome of an HTTP request that may have been tried against the LAN URL
+/// and/or the remote URL of a host.
+#[derive(Debug, Clone, Copy)]
+enum Reach {
+    Lan,
+    Remote,
+    Offline,
+}
+
+fn clone_reach(r: &Reach) -> Reach {
+    *r
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -144,18 +159,46 @@ impl AppData {
     }
 }
 
-fn fetch_tabs(agent: &ureq::Agent, host: &HostConfig) -> Result<Vec<ApiTab>, ureq::Error> {
-    let resp: ApiResponse = agent
-        .get(&format!("{}/tabs", host.url))
-        .set("Authorization", &format!("Bearer {}", host.token))
-        .timeout(Duration::from_secs(2))
-        .call()?
-        .into_json()?;
-    Ok(resp.tabs)
+fn fetch_tabs(
+    agent: &ureq::Agent,
+    host: &HostConfig,
+) -> (Reach, Option<Vec<ApiTab>>) {
+    if !host.url.is_empty()
+        && let Ok(resp) = agent
+            .get(&format!("{}/tabs", host.url))
+            .set("Authorization", &format!("Bearer {}", host.token))
+            .timeout(Duration::from_millis(1500))
+            .call()
+        && let Ok(r) = resp.into_json::<ApiResponse>()
+    {
+        return (Reach::Lan, Some(r.tabs));
+    }
+    if !host.remote_url.is_empty()
+        && let Ok(resp) = agent
+            .get(&format!("{}/tabs", host.remote_url))
+            .set("Authorization", &format!("Bearer {}", host.token))
+            .timeout(Duration::from_secs(4))
+            .call()
+        && let Ok(r) = resp.into_json::<ApiResponse>()
+    {
+        return (Reach::Remote, Some(r.tabs));
+    }
+    (Reach::Offline, None)
 }
 
-fn post_input(agent: &ureq::Agent, host: &HostConfig, idx: i32, bytes: &[u8]) {
-    let url = format!("{}/tabs/{idx}/input", host.url);
+fn base_url(host: &HostConfig, reach: &Reach) -> String {
+    match reach {
+        Reach::Remote => host.remote_url.clone(),
+        _ => host.url.clone(),
+    }
+}
+
+fn post_input(agent: &ureq::Agent, host: &HostConfig, reach: &Reach, idx: i32, bytes: &[u8]) {
+    let base = base_url(host, reach);
+    if base.is_empty() {
+        return;
+    }
+    let url = format!("{base}/tabs/{idx}/input");
     if let Err(e) = agent
         .post(&url)
         .set("Authorization", &format!("Bearer {}", host.token))
@@ -167,8 +210,12 @@ fn post_input(agent: &ureq::Agent, host: &HostConfig, idx: i32, bytes: &[u8]) {
     }
 }
 
-fn post_activate(agent: &ureq::Agent, host: &HostConfig, idx: i32) {
-    let url = format!("{}/tabs/{idx}/activate", host.url);
+fn post_activate(agent: &ureq::Agent, host: &HostConfig, reach: &Reach, idx: i32) {
+    let base = base_url(host, reach);
+    if base.is_empty() {
+        return;
+    }
+    let url = format!("{base}/tabs/{idx}/activate");
     if let Err(e) = agent
         .post(&url)
         .set("Authorization", &format!("Bearer {}", host.token))
@@ -205,6 +252,7 @@ fn push_hosts(ui_weak: &Weak<AppWindow>, data: &AppData) {
             reachability: SharedString::from("offline"),
             detail: SharedString::from(host_detail(&h.url)),
             url: SharedString::from(h.url.as_str()),
+            remote_url: SharedString::from(h.remote_url.as_str()),
             token: SharedString::from(h.token.as_str()),
         })
         .collect();
@@ -224,7 +272,12 @@ fn host_detail(url: &str) -> String {
         .to_string()
 }
 
-fn push_reachability(ui_weak: &Weak<AppWindow>, active: usize, ok: bool) {
+fn push_reachability(ui_weak: &Weak<AppWindow>, active: usize, reach: Reach) {
+    let label = match reach {
+        Reach::Lan => "lan",
+        Reach::Remote => "remote",
+        Reach::Offline => "offline",
+    };
     let weak = ui_weak.clone();
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(ui) = weak.upgrade() {
@@ -233,12 +286,7 @@ fn push_reachability(ui_weak: &Weak<AppWindow>, active: usize, ok: bool) {
                 .filter_map(|i| model.row_data(i))
                 .collect();
             if let Some(h) = list.get_mut(active) {
-                let new_state = if ok {
-                    if h.url.starts_with("https://") { "remote" } else { "lan" }
-                } else {
-                    "offline"
-                };
-                h.reachability = SharedString::from(new_state);
+                h.reachability = SharedString::from(label);
             }
             ui.set_hosts(VecModel::from_slice(&list));
         }
@@ -280,43 +328,62 @@ fn android_main(app: slint::android::AndroidApp) {
             .build(),
     );
 
+    // Active-host reachability, shared between poller and request handlers.
+    let last_reach: Arc<Mutex<Reach>> = Arc::new(Mutex::new(Reach::Offline));
+
     // Background poller
     let poll_weak = ui_weak.clone();
     let poll_agent = agent.clone();
     let poll_data = data.clone();
+    let poll_reach = last_reach.clone();
     std::thread::spawn(move || loop {
-        let snapshot = poll_data.lock().unwrap().active_host();
-        if let Some(host) = snapshot {
-            let active_idx = poll_data.lock().unwrap().active;
-            match fetch_tabs(&poll_agent, &host) {
-                Ok(tabs) => {
-                    push_tabs(&poll_weak, tabs);
-                    push_reachability(&poll_weak, active_idx, true);
-                }
-                Err(e) => {
-                    log::warn!("fetch_tabs({}) failed: {e}", host.url);
-                    push_reachability(&poll_weak, active_idx, false);
-                }
+        let (host, active_idx) = {
+            let d = poll_data.lock().unwrap();
+            (d.active_host(), d.active)
+        };
+        if let Some(host) = host {
+            let (reach, tabs) = fetch_tabs(&poll_agent, &host);
+            if let Some(t) = tabs {
+                push_tabs(&poll_weak, t);
             }
+            log::debug!("poll {}: {reach:?}", host.name);
+            *poll_reach.lock().unwrap() = match reach {
+                Reach::Lan => Reach::Lan,
+                Reach::Remote => Reach::Remote,
+                Reach::Offline => Reach::Offline,
+            };
+            push_reachability(
+                &poll_weak,
+                active_idx,
+                match *poll_reach.lock().unwrap() {
+                    Reach::Lan => Reach::Lan,
+                    Reach::Remote => Reach::Remote,
+                    Reach::Offline => Reach::Offline,
+                },
+            );
         }
         std::thread::sleep(Duration::from_secs(2));
     });
 
     let act_agent = agent.clone();
     let act_data = data.clone();
+    let act_reach = last_reach.clone();
     ui.on_request_activate(move |idx| {
         let Some(host) = act_data.lock().unwrap().active_host() else { return };
+        let reach = clone_reach(&act_reach.lock().unwrap());
         let agent = act_agent.clone();
-        std::thread::spawn(move || post_activate(&agent, &host, idx));
+        std::thread::spawn(move || post_activate(&agent, &host, &reach, idx));
     });
 
     let send_agent = agent.clone();
     let send_data = data.clone();
+    let send_reach = last_reach.clone();
     ui.on_request_send_input(move |idx, text| {
         let Some(host) = send_data.lock().unwrap().active_host() else { return };
+        let reach = clone_reach(&send_reach.lock().unwrap());
         let agent = send_agent.clone();
         let bytes = text.as_bytes().to_vec();
-        std::thread::spawn(move || post_input(&agent, &host, idx, &bytes));
+        std::thread::spawn(move || post_input(&agent, &host, &reach, idx, &bytes));
     });
 
     let set_data = data.clone();
@@ -347,9 +414,10 @@ fn android_main(app: slint::android::AndroidApp) {
 
     let add_data = data.clone();
     let add_weak = ui_weak.clone();
-    ui.on_request_add_host(move |name, url, token| {
+    ui.on_request_add_host(move |name, url, remote_url, token| {
         let name = name.to_string();
         let url = url.trim_end_matches('/').to_string();
+        let remote_url = remote_url.trim_end_matches('/').to_string();
         let token = token.to_string();
         if url.is_empty() || token.is_empty() {
             return;
@@ -359,6 +427,7 @@ fn android_main(app: slint::android::AndroidApp) {
         data.hosts.push(HostConfig {
             name: if name.is_empty() { host_detail(&url) } else { name },
             url,
+            remote_url,
             token,
         });
         data.active = new_idx;
