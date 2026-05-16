@@ -1571,10 +1571,12 @@ impl AppState {
         }
 
         let ip = api::local_ip();
-        let url = format!("http://{}:7890?token={}", ip, self.api_token);
+        let lan_url = format!("http://{ip}:7890");
+        let qr_payload = format!("taremote://onboard?url={lan_url}&token={}", self.api_token);
+        let url = format!("{lan_url}?token={}", self.api_token);
         let url_for_click = url.clone();
 
-        let Ok(qr) = qrcode::QrCode::new(url.as_bytes()) else {
+        let Ok(qr) = qrcode::QrCode::new(qr_payload.as_bytes()) else {
             return None;
         };
 
