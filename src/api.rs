@@ -198,3 +198,44 @@ pub fn start_api_server(state: Arc<Mutex<TabSnapshot>>, token: String) {
         }
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generate_token_length() {
+        let t = generate_token();
+        assert_eq!(t.len(), 32);
+    }
+
+    #[test]
+    fn generate_token_is_hex() {
+        let t = generate_token();
+        assert!(t.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn generate_token_unique() {
+        let a = generate_token();
+        let b = generate_token();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn local_ip_not_empty() {
+        let ip = local_ip();
+        assert!(!ip.is_empty());
+    }
+
+    #[test]
+    fn local_ip_valid_format() {
+        let ip = local_ip();
+        assert!(ip.contains('.'), "should be IPv4: {ip}");
+        let parts: Vec<&str> = ip.split('.').collect();
+        assert_eq!(parts.len(), 4);
+        for p in parts {
+            assert!(p.parse::<u32>().unwrap() <= 255);
+        }
+    }
+}

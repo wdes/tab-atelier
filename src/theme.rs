@@ -282,4 +282,101 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn from_id_roundtrip() {
+        for t in ThemeName::ALL {
+            assert_eq!(ThemeName::from_id(t.id()), Some(*t));
+        }
+        assert_eq!(ThemeName::from_id("nonexistent"), None);
+    }
+
+    #[test]
+    fn xterm_256_first_16_match_ansi() {
+        let t = theme(ThemeName::Dark);
+        for i in 0u8..16 {
+            let from_xterm = t.xterm_256_to_hsla(i);
+            let from_ansi: Hsla = rgb(t.ansi[i as usize]).into();
+            assert!((from_xterm.h - from_ansi.h).abs() < 0.001, "mismatch at index {i}");
+        }
+    }
+
+    #[test]
+    fn xterm_256_cube_range() {
+        let t = theme(ThemeName::Dark);
+        for i in 16u8..232 {
+            let c = t.xterm_256_to_hsla(i);
+            assert!(c.a > 0.99, "alpha should be 1.0 for index {i}");
+        }
+    }
+
+    #[test]
+    fn xterm_256_grayscale_range() {
+        let t = theme(ThemeName::Dark);
+        let first = t.xterm_256_to_hsla(232);
+        let last = t.xterm_256_to_hsla(255);
+        assert!(first.l < last.l, "grayscale should get lighter");
+        assert!(first.s < 0.01, "grayscale should have no saturation");
+    }
+
+    #[test]
+    fn color_to_hsla_spec() {
+        let t = theme(ThemeName::Dark);
+        let c = t.color_to_hsla(Color::Spec(Rgb { r: 255, g: 0, b: 0 }));
+        assert!(c.s > 0.9, "pure red should be saturated");
+    }
+
+    #[test]
+    fn color_to_hsla_indexed() {
+        let t = theme(ThemeName::Dark);
+        let from_method = t.color_to_hsla(Color::Indexed(100));
+        let direct = t.xterm_256_to_hsla(100);
+        assert!((from_method.h - direct.h).abs() < 0.001);
+    }
+
+    #[test]
+    fn color_to_hsla_named() {
+        let t = theme(ThemeName::TomorrowNightBlue);
+        let bg = t.color_to_hsla(Color::Named(NamedColor::Background));
+        let expected: Hsla = rgb(t.term_bg).into();
+        assert!((bg.h - expected.h).abs() < 0.001);
+    }
+
+    #[test]
+    fn named_colors_all_resolve() {
+        let t = theme(ThemeName::Dark);
+        let names = [
+            NamedColor::Black, NamedColor::Red, NamedColor::Green, NamedColor::Yellow,
+            NamedColor::Blue, NamedColor::Magenta, NamedColor::Cyan, NamedColor::White,
+            NamedColor::BrightBlack, NamedColor::BrightRed, NamedColor::BrightGreen,
+            NamedColor::BrightYellow, NamedColor::BrightBlue, NamedColor::BrightMagenta,
+            NamedColor::BrightCyan, NamedColor::BrightWhite,
+            NamedColor::DimBlack, NamedColor::DimRed, NamedColor::DimGreen,
+            NamedColor::DimYellow, NamedColor::DimBlue, NamedColor::DimMagenta,
+            NamedColor::DimCyan, NamedColor::DimWhite,
+            NamedColor::Foreground, NamedColor::BrightForeground, NamedColor::DimForeground,
+            NamedColor::Background, NamedColor::Cursor,
+        ];
+        for n in names {
+            let c = t.named_to_hsla(n);
+            assert!(c.a > 0.99, "alpha should be 1.0 for {n:?}");
+        }
+    }
+
+    #[test]
+    fn helper_hsla_methods() {
+        let t = theme(ThemeName::Dark);
+        let _ = t.term_fg_hsla();
+        let _ = t.term_bg_hsla();
+        let _ = t.bg_hsla();
+        let _ = t.surface_hsla();
+        let _ = t.elevated_hsla();
+        let _ = t.fg_hsla();
+        let _ = t.fg_muted_hsla();
+        let _ = t.border_hsla();
+        let _ = t.selection_hsla();
+        let _ = t.accent_hsla();
+        let _ = t.accent_hover_hsla();
+        let _ = t.danger_hsla();
+    }
 }
