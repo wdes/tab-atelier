@@ -47,7 +47,9 @@ fn test_detect_urls_in_gpui_context(cx: &mut TestAppContext) {
 
     let window = cx.add_window(|_window: &mut Window, _cx: &mut Context<UrlModel>| {
         let text = "Visit https://example.com or open /home/user/file.rs:10";
-        UrlModel { urls: detect_urls(text) }
+        UrlModel {
+            urls: detect_urls(text),
+        }
     });
 
     window
@@ -102,8 +104,8 @@ impl Render for PrefsModel {
 
 #[gpui::test]
 fn test_load_preferences_missing_dir(cx: &mut TestAppContext) {
-    use tab_atelier::load_preferences;
     use std::path::Path;
+    use tab_atelier::load_preferences;
 
     let window = cx.add_window(|_window: &mut Window, _cx: &mut Context<PrefsModel>| PrefsModel {
         prefs: load_preferences(Path::new("/nonexistent/path")),
