@@ -1155,4 +1155,90 @@ mod tests {
         assert_eq!(loaded.active, 999);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn gpui_key_to_keycode_known_keys() {
+        assert_eq!(gpui_key_to_keycode("`"), Some(49));
+        assert_eq!(gpui_key_to_keycode("f12"), Some(96));
+        assert_eq!(gpui_key_to_keycode("f1"), Some(67));
+        assert_eq!(gpui_key_to_keycode("escape"), Some(9));
+        assert_eq!(gpui_key_to_keycode("space"), Some(65));
+        assert_eq!(gpui_key_to_keycode("a"), Some(38));
+        assert_eq!(gpui_key_to_keycode("xf86calculator"), Some(148));
+    }
+
+    #[test]
+    fn gpui_key_to_keycode_unknown() {
+        assert_eq!(gpui_key_to_keycode("nonexistent"), None);
+        assert_eq!(gpui_key_to_keycode(""), None);
+        assert_eq!(gpui_key_to_keycode("F12"), None);
+    }
+
+    #[test]
+    fn keycode_label_known() {
+        assert_eq!(keycode_label(49), "` (Grave)");
+        assert_eq!(keycode_label(96), "F12");
+        assert_eq!(keycode_label(148), "XF86Calculator");
+        assert_eq!(keycode_label(65), "Space");
+    }
+
+    #[test]
+    fn keycode_label_unknown_fallback() {
+        assert_eq!(keycode_label(200), "Key 200");
+        assert_eq!(keycode_label(0), "Key 0");
+        assert_eq!(keycode_label(255), "Key 255");
+    }
+
+    #[test]
+    fn legacy_hotkey_ids() {
+        assert_eq!(legacy_hotkey_id_to_keycode("grave"), Some(49));
+        assert_eq!(legacy_hotkey_id_to_keycode("f1"), Some(67));
+        assert_eq!(legacy_hotkey_id_to_keycode("f11"), Some(95));
+        assert_eq!(legacy_hotkey_id_to_keycode("f12"), Some(96));
+        assert_eq!(legacy_hotkey_id_to_keycode("xf86calculator"), Some(148));
+        assert_eq!(legacy_hotkey_id_to_keycode("unknown"), None);
+        assert_eq!(legacy_hotkey_id_to_keycode(""), None);
+    }
+
+    #[test]
+    fn deserialize_hotkeys_numbers() {
+        let json = r#"{"hotkeys": [49, 96, 148]}"#;
+        let prefs: Preferences = serde_json::from_str(json).unwrap();
+        assert_eq!(prefs.hotkeys, vec![49, 96, 148]);
+    }
+
+    #[test]
+    fn deserialize_hotkeys_legacy_strings() {
+        let json = r#"{"hotkeys": ["grave", "f12", "xf86calculator"]}"#;
+        let prefs: Preferences = serde_json::from_str(json).unwrap();
+        assert_eq!(prefs.hotkeys, vec![49, 96, 148]);
+    }
+
+    #[test]
+    fn deserialize_hotkeys_mixed() {
+        let json = r#"{"hotkeys": ["grave", 96]}"#;
+        let prefs: Preferences = serde_json::from_str(json).unwrap();
+        assert_eq!(prefs.hotkeys, vec![49, 96]);
+    }
+
+    #[test]
+    fn deserialize_hotkeys_empty() {
+        let json = r#"{"hotkeys": []}"#;
+        let prefs: Preferences = serde_json::from_str(json).unwrap();
+        assert!(prefs.hotkeys.is_empty());
+    }
+
+    #[test]
+    fn deserialize_hotkeys_missing_field() {
+        let json = r"{}";
+        let prefs: Preferences = serde_json::from_str(json).unwrap();
+        assert!(prefs.hotkeys.is_empty());
+    }
+
+    #[test]
+    fn deserialize_hotkeys_invalid_entries_skipped() {
+        let json = r#"{"hotkeys": ["grave", "bogus", null, 300, 49]}"#;
+        let prefs: Preferences = serde_json::from_str(json).unwrap();
+        assert_eq!(prefs.hotkeys, vec![49, 49]);
+    }
 }
