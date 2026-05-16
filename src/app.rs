@@ -2,17 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-mod api;
-mod locale;
-mod platform;
-#[cfg(feature = "energy")]
-mod power;
-mod screenshot;
-mod terminal;
-mod terminal_utils;
-mod theme;
-mod tracking;
-
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Application, AsyncApp, ClickEvent, ClipboardItem, Context, Div, ElementId, Entity, FocusHandle,
@@ -20,7 +9,15 @@ use gpui::{
     Point, Render, Rgba, SharedString, Stateful, StatefulInteractiveElement, Styled, WeakEntity, Window,
     WindowBackgroundAppearance, WindowHandle, WindowOptions, div, px, rgba,
 };
-use locale::{Lang, Strings};
+use crate::api;
+use crate::locale::{self, Lang, Strings};
+use crate::platform;
+#[cfg(feature = "energy")]
+use crate::power;
+use crate::screenshot;
+use crate::terminal::TerminalView;
+use crate::theme::{self, ThemeName};
+use crate::tracking::WakatimeTracker;
 use log::{debug, info};
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -30,9 +27,6 @@ use tab_atelier::{
     DEFAULT_HOTKEYS, FontConfig, Preferences, SavedState, TabState, gpui_key_to_keycode, keycode_label,
     load_font_config, load_preferences, load_state_from, load_wakatime_key, save_preferences, save_state,
 };
-use terminal::TerminalView;
-use theme::ThemeName;
-use tracking::WakatimeTracker;
 
 struct Tab {
     view: Entity<TerminalView>,
@@ -2367,7 +2361,7 @@ fn run_check() {
     }
 }
 
-fn main() {
+pub fn run() {
     env_logger::init();
 
     let args: Vec<String> = std::env::args().collect();
