@@ -1380,7 +1380,14 @@ mod tests {
     #[gpui::test]
     fn test_terminal_view_creation(cx: &mut TestAppContext) {
         let window = cx.add_window(|window, cx| {
-            TerminalView::new(None, FontConfig::default(), default_browser(), default_editor(), window, cx)
+            TerminalView::new(
+                None,
+                FontConfig::default(),
+                default_browser(),
+                default_editor(),
+                window,
+                cx,
+            )
         });
 
         window
@@ -1396,7 +1403,14 @@ mod tests {
     #[gpui::test]
     fn test_restore_output(cx: &mut TestAppContext) {
         let window = cx.add_window(|window, cx| {
-            TerminalView::new(None, FontConfig::default(), default_browser(), default_editor(), window, cx)
+            TerminalView::new(
+                None,
+                FontConfig::default(),
+                default_browser(),
+                default_editor(),
+                window,
+                cx,
+            )
         });
 
         window
@@ -1426,7 +1440,14 @@ mod tests {
     #[gpui::test]
     fn test_restore_output_empty(cx: &mut TestAppContext) {
         let window = cx.add_window(|window, cx| {
-            TerminalView::new(None, FontConfig::default(), default_browser(), default_editor(), window, cx)
+            TerminalView::new(
+                None,
+                FontConfig::default(),
+                default_browser(),
+                default_editor(),
+                window,
+                cx,
+            )
         });
 
         window
@@ -1440,7 +1461,14 @@ mod tests {
     #[gpui::test]
     fn test_send_input_updates_last_input(cx: &mut TestAppContext) {
         let window = cx.add_window(|window, cx| {
-            TerminalView::new(None, FontConfig::default(), default_browser(), default_editor(), window, cx)
+            TerminalView::new(
+                None,
+                FontConfig::default(),
+                default_browser(),
+                default_editor(),
+                window,
+                cx,
+            )
         });
 
         window
@@ -1456,7 +1484,14 @@ mod tests {
     #[gpui::test]
     fn test_send_clipboard_plain(cx: &mut TestAppContext) {
         let window = cx.add_window(|window, cx| {
-            TerminalView::new(None, FontConfig::default(), default_browser(), default_editor(), window, cx)
+            TerminalView::new(
+                None,
+                FontConfig::default(),
+                default_browser(),
+                default_editor(),
+                window,
+                cx,
+            )
         });
 
         window
@@ -1471,7 +1506,14 @@ mod tests {
     #[gpui::test]
     fn test_scroll(cx: &mut TestAppContext) {
         let window = cx.add_window(|window, cx| {
-            TerminalView::new(None, FontConfig::default(), default_browser(), default_editor(), window, cx)
+            TerminalView::new(
+                None,
+                FontConfig::default(),
+                default_browser(),
+                default_editor(),
+                window,
+                cx,
+            )
         });
 
         window
@@ -1501,7 +1543,14 @@ mod tests {
     #[gpui::test]
     fn test_scroll_to_fraction(cx: &mut TestAppContext) {
         let window = cx.add_window(|window, cx| {
-            TerminalView::new(None, FontConfig::default(), default_browser(), default_editor(), window, cx)
+            TerminalView::new(
+                None,
+                FontConfig::default(),
+                default_browser(),
+                default_editor(),
+                window,
+                cx,
+            )
         });
 
         window
@@ -1520,7 +1569,14 @@ mod tests {
     #[gpui::test]
     fn test_selection(cx: &mut TestAppContext) {
         let window = cx.add_window(|window, cx| {
-            TerminalView::new(None, FontConfig::default(), default_browser(), default_editor(), window, cx)
+            TerminalView::new(
+                None,
+                FontConfig::default(),
+                default_browser(),
+                default_editor(),
+                window,
+                cx,
+            )
         });
 
         window
@@ -1543,7 +1599,14 @@ mod tests {
     #[gpui::test]
     fn test_reset_terminal(cx: &mut TestAppContext) {
         let window = cx.add_window(|window, cx| {
-            TerminalView::new(None, FontConfig::default(), default_browser(), default_editor(), window, cx)
+            TerminalView::new(
+                None,
+                FontConfig::default(),
+                default_browser(),
+                default_editor(),
+                window,
+                cx,
+            )
         });
 
         window
@@ -1557,7 +1620,14 @@ mod tests {
     #[gpui::test]
     fn test_copy_all_history(cx: &mut TestAppContext) {
         let window = cx.add_window(|window, cx| {
-            TerminalView::new(None, FontConfig::default(), default_browser(), default_editor(), window, cx)
+            TerminalView::new(
+                None,
+                FontConfig::default(),
+                default_browser(),
+                default_editor(),
+                window,
+                cx,
+            )
         });
 
         window

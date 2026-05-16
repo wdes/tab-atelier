@@ -2449,15 +2449,15 @@ mod tests {
 
     #[test]
     fn format_duration_minutes() {
-        assert_eq!(format_duration(std::time::Duration::from_secs(60)), "1m 0s");
+        assert_eq!(format_duration(std::time::Duration::from_mins(1)), "1m 0s");
         assert_eq!(format_duration(std::time::Duration::from_secs(125)), "2m 5s");
         assert_eq!(format_duration(std::time::Duration::from_secs(3599)), "59m 59s");
     }
 
     #[test]
     fn format_duration_hours() {
-        assert_eq!(format_duration(std::time::Duration::from_secs(3600)), "1h 0m");
-        assert_eq!(format_duration(std::time::Duration::from_secs(7260)), "2h 1m");
-        assert_eq!(format_duration(std::time::Duration::from_secs(86400)), "24h 0m");
+        assert_eq!(format_duration(std::time::Duration::from_hours(1)), "1h 0m");
+        assert_eq!(format_duration(std::time::Duration::from_mins(121)), "2h 1m");
+        assert_eq!(format_duration(std::time::Duration::from_hours(24)), "24h 0m");
     }
 }

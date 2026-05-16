@@ -161,8 +161,7 @@ fn handle_connection(stream: &mut std::net::TcpStream, state: &Arc<Mutex<TabSnap
                     info!("API: closing tab {idx}");
                     state.pending_closes.push(idx);
                     drop(state);
-                    let body =
-                        serde_json::to_string(&serde_json::json!({"closed": idx})).unwrap_or_default();
+                    let body = serde_json::to_string(&serde_json::json!({"closed": idx})).unwrap_or_default();
                     respond_json(stream, 200, &body);
                 } else {
                     error_json(stream, 404, "tab index out of range");
@@ -214,10 +213,7 @@ mod tests {
 
     fn test_state() -> Arc<Mutex<TabSnapshot>> {
         Arc::new(Mutex::new(TabSnapshot {
-            tabs: vec![
-                ("shell".into(), Some("/home/user".into())),
-                ("build".into(), None),
-            ],
+            tabs: vec![("shell".into(), Some("/home/user".into())), ("build".into(), None)],
             active: 0,
             #[cfg(feature = "energy")]
             power: vec![],
@@ -335,10 +331,7 @@ mod tests {
     #[test]
     fn unauthorized_wrong_token() {
         let (port, _, _) = spawn_server();
-        let resp = request(
-            port,
-            "GET /tabs HTTP/1.1\r\nAuthorization: Bearer wrong\r\n\r\n",
-        );
+        let resp = request(port, "GET /tabs HTTP/1.1\r\nAuthorization: Bearer wrong\r\n\r\n");
         assert_eq!(status_code(&resp), 401);
     }
 
@@ -411,10 +404,7 @@ mod tests {
     #[test]
     fn query_token_with_extra_params() {
         let (port, _, token) = spawn_server();
-        let resp = request(
-            port,
-            &format!("GET /tabs?foo=bar&token={token}&baz=1 HTTP/1.1\r\n\r\n"),
-        );
+        let resp = request(port, &format!("GET /tabs?foo=bar&token={token}&baz=1 HTTP/1.1\r\n\r\n"));
         assert_eq!(status_code(&resp), 200);
     }
 }
