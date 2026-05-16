@@ -719,7 +719,7 @@ impl Render for TerminalView {
                     if let Some(origin_gp) = this.click_origin.take() {
                         let origin = this.content_origin.get();
                         let (gp, _) = this.pixel_to_grid(ev.position, origin);
-                        if origin_gp == gp {
+                        if origin_gp == gp && ev.click_count >= 2 {
                             let line = gp.line.0.max(0) as usize;
                             let col = gp.column.0;
                             if let Some(url) = this.url_at_grid(line, col) {
@@ -756,9 +756,29 @@ impl Render for TerminalView {
                                             | "avi"
                                             | "mkv"
                                     );
+                                    let open_with_system = matches!(
+                                        ext.as_str(),
+                                        "deb"
+                                            | "rpm"
+                                            | "appimage"
+                                            | "flatpakref"
+                                            | "iso"
+                                            | "dmg"
+                                            | "pkg"
+                                            | "zip"
+                                            | "tar"
+                                            | "gz"
+                                            | "bz2"
+                                            | "xz"
+                                            | "7z"
+                                            | "rar"
+                                    );
                                     if open_in_viewer {
                                         info!("opening in viewer: {}", resolved.display());
                                         crate::platform::open_url(&resolved.to_string_lossy(), browser.as_deref());
+                                    } else if open_with_system {
+                                        info!("opening with system handler: {}", resolved.display());
+                                        crate::platform::open_path(&resolved, None);
                                     } else {
                                         let editor = this.code_editor.borrow().clone();
                                         info!("opening file: {}", resolved.display());
