@@ -1434,12 +1434,15 @@ impl AppState {
                                         .hover(|s| s.bg(btn_hover))
                                         .on_mouse_down(
                                             MouseButton::Left,
-                                            cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                                            cx.listener(move |this, _ev: &MouseDownEvent, window, cx| {
                                                 this.exit_confirm = None;
                                                 if this.tabs.len() <= 1 {
                                                     this.close_all_tabs(cx);
                                                 } else {
                                                     this.close_tab(idx, cx);
+                                                }
+                                                if !this.tabs.is_empty() {
+                                                    this.tabs[this.active].view.read(cx).focus_handle(cx).focus(window);
                                                 }
                                             }),
                                         )

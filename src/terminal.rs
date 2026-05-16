@@ -173,8 +173,13 @@ impl TerminalView {
             loop {
                 cx.background_executor().timer(Duration::from_millis(500)).await;
                 if !crate::platform::process_alive(pid_for_check) {
-                    exited_clone.set(true);
-                    let _ = this.update(cx, |_, cx: &mut Context<Self>| cx.notify());
+                    let still_current = this
+                        .update(cx, |view: &mut Self, _| view.pid == pid_for_check)
+                        .unwrap_or(false);
+                    if still_current {
+                        exited_clone.set(true);
+                        let _ = this.update(cx, |_, cx: &mut Context<Self>| cx.notify());
+                    }
                     break;
                 }
             }
@@ -286,8 +291,13 @@ impl TerminalView {
             loop {
                 cx.background_executor().timer(Duration::from_millis(500)).await;
                 if !crate::platform::process_alive(pid_for_check) {
-                    exited.set(true);
-                    let _ = this.update(cx, |_, cx: &mut Context<Self>| cx.notify());
+                    let still_current = this
+                        .update(cx, |view: &mut Self, _| view.pid == pid_for_check)
+                        .unwrap_or(false);
+                    if still_current {
+                        exited.set(true);
+                        let _ = this.update(cx, |_, cx: &mut Context<Self>| cx.notify());
+                    }
                     break;
                 }
             }
