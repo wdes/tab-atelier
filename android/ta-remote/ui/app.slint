@@ -582,6 +582,7 @@ component KeyboardHeader inherits Rectangle {
 
 component TerminalView inherits Rectangle {
     in property <TabRow> tab;
+    in property <string> output-text;
     in property <length> safe-top;
     in property <length> safe-bottom;
     in property <length> safe-left;
@@ -659,28 +660,22 @@ component TerminalView inherits Rectangle {
             background: #2a2a2a;
         }
 
-        // Mocked terminal output
         Flickable {
             VerticalLayout {
                 padding: 10px;
                 spacing: 0;
-                Text { text: "$ git status";                           color: #d0d0d0; font-family: "monospace"; font-size: 13px; }
-                Text { text: "On branch main";                         color: #aaaaaa; font-family: "monospace"; font-size: 13px; }
-                Text { text: "Your branch is ahead of 'origin/main'";  color: #aaaaaa; font-family: "monospace"; font-size: 13px; }
-                Text { text: "by 8 commits.";                          color: #aaaaaa; font-family: "monospace"; font-size: 13px; }
-                Text { text: "";                                       color: #aaaaaa; font-family: "monospace"; font-size: 13px; }
-                Text { text: "nothing to commit, working tree clean";  color: #66bb6a; font-family: "monospace"; font-size: 13px; }
-                Text { text: "";                                       color: #aaaaaa; font-family: "monospace"; font-size: 13px; }
-                Text { text: "$ cargo build --release";                color: #d0d0d0; font-family: "monospace"; font-size: 13px; }
-                Text { text: "   Compiling tab-atelier v0.3.1-dev";    color: #aaaaaa; font-family: "monospace"; font-size: 13px; }
-                Text { text: "    Finished `release` profile";         color: #aaaaaa; font-family: "monospace"; font-size: 13px; }
-                Text { text: "    [optimized] target(s) in 8.23s";     color: #aaaaaa; font-family: "monospace"; font-size: 13px; }
-                Text { text: "";                                       color: #aaaaaa; font-family: "monospace"; font-size: 13px; }
-                HorizontalLayout {
-                    spacing: 0;
-                    alignment: start;
-                    Text { text: "$ "; color: #4a8cff; font-family: "monospace"; font-size: 13px; }
-                    Rectangle { width: 8px; height: 14px; background: #4a8cff; }
+                if root.output-text != "" : Text {
+                    text: root.output-text;
+                    color: #d0d0d0;
+                    font-family: "monospace";
+                    font-size: 13px;
+                    wrap: no-wrap;
+                }
+                if root.output-text == "" : Text {
+                    text: "Waiting for output…";
+                    color: #666;
+                    font-family: "monospace";
+                    font-size: 13px;
                 }
             }
         }
@@ -768,12 +763,16 @@ export component AppWindow inherits Window {
     in-out property <string> editor-url: "";
     in-out property <string> editor-remote-url: "";
     in-out property <string> editor-token: "";
+    in-out property <string> open-tab-output: "";
 
     callback request-activate(int);
     callback request-send-input(int, string);
     callback request-add-host(string, string, string, string);
     callback request-set-active-host(int);
     callback request-remove-host(int);
+    callback open-tab-changed(int);
+
+    changed open-tab => { root.open-tab-changed(root.open-tab) }
 
     fs := FocusScope {
         init => { fs.focus() }
@@ -864,6 +863,7 @@ export component AppWindow inherits Window {
         width: 100%;
         height: 100%;
         tab: root.tabs[root.open-tab];
+        output-text: root.open-tab-output;
         safe-top: root.safe-area-insets.top;
         safe-bottom: root.safe-area-insets.bottom;
         safe-left: root.safe-area-insets.left;
