@@ -2435,3 +2435,29 @@ fn spawn_hotkey_listener(keycodes: &[u8], window_handle: WindowHandle<AppState>,
     })
     .detach();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_duration_seconds() {
+        assert_eq!(format_duration(std::time::Duration::from_secs(0)), "0s");
+        assert_eq!(format_duration(std::time::Duration::from_secs(45)), "45s");
+        assert_eq!(format_duration(std::time::Duration::from_secs(59)), "59s");
+    }
+
+    #[test]
+    fn format_duration_minutes() {
+        assert_eq!(format_duration(std::time::Duration::from_secs(60)), "1m 0s");
+        assert_eq!(format_duration(std::time::Duration::from_secs(125)), "2m 5s");
+        assert_eq!(format_duration(std::time::Duration::from_secs(3599)), "59m 59s");
+    }
+
+    #[test]
+    fn format_duration_hours() {
+        assert_eq!(format_duration(std::time::Duration::from_secs(3600)), "1h 0m");
+        assert_eq!(format_duration(std::time::Duration::from_secs(7260)), "2h 1m");
+        assert_eq!(format_duration(std::time::Duration::from_secs(86400)), "24h 0m");
+    }
+}
