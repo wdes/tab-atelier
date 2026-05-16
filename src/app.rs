@@ -937,6 +937,30 @@ impl AppState {
                         .child(self.t().close),
                 );
             }
+
+            let colors_enabled = self.tabs[idx].view.read(cx).colors_enabled();
+            let toggle_label = if colors_enabled {
+                self.t().disable_colors
+            } else {
+                self.t().enable_colors
+            };
+            container = container.child(
+                div()
+                    .id("menu-toggle-colors")
+                    .px(px(12.0))
+                    .py(px(4.0))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(menu_hover))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev: &MouseDownEvent, window, cx| {
+                            this.tabs[idx].view.read(cx).set_colors_enabled(!colors_enabled);
+                            this.context_menu = None;
+                            this.respawn_tab_with_history(idx, window, cx);
+                        }),
+                    )
+                    .child(toggle_label),
+            );
         }
 
         {
