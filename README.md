@@ -1,6 +1,7 @@
 # Tab Atelier
 
 [![Build](https://github.com/wdes/tab-atelier/actions/workflows/build.yml/badge.svg)](https://github.com/wdes/tab-atelier/actions/workflows/build.yml)
+[![codecov](https://codecov.io/gh/wdes/tab-atelier/branch/main/graph/badge.svg)](https://codecov.io/gh/wdes/tab-atelier)
 ![Unsafe forbidden](https://img.shields.io/badge/unsafe-forbidden-brightgreen.svg)
 
 A Guake-style drop-down terminal emulator for Linux (X11), built with Rust using [alacritty_terminal](https://crates.io/crates/alacritty_terminal), [gpui](https://crates.io/crates/gpui) (Zed's GPU-accelerated UI framework), and [wattaouille](https://crates.io/crates/wattaouille) for power monitoring.
