@@ -37,13 +37,13 @@ name = "android.permission.INTERNET"
 [package.metadata.android.application]
 label = "Tab Atelier Remote"
 
-[[package.metadata.android.application.meta_data]]
-name = "android.app.lib_name"
-value = "ta_remote"
-
 [[package.metadata.android.application.activity]]
 name = "android.app.NativeActivity"
 config_changes = "orientation|keyboardHidden|screenSize"
+
+[[package.metadata.android.application.activity.meta_data]]
+name = "android.app.lib_name"
+value = "ta_remote"
 
 [[package.metadata.android.application.activity.intent_filter]]
 actions = ["android.intent.action.MAIN"]
