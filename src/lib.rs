@@ -701,6 +701,9 @@ pub fn detect_urls(text: &str) -> Vec<(usize, usize, String, bool)> {
             {
                 j += 1;
             }
+            while j > start + 1 && matches!(chars[j - 1], '.' | ',' | ';') {
+                j -= 1;
+            }
             let path: String = chars[start..j].iter().collect();
             if path.matches('/').count() >= 2 {
                 urls.push((start, j, path, true));
@@ -715,6 +718,9 @@ pub fn detect_urls(text: &str) -> Vec<(usize, usize, String, bool)> {
             while j < len && !chars[j].is_whitespace() && !matches!(chars[j], '"' | '\'' | '<' | '>' | ')' | ']' | '}')
             {
                 j += 1;
+            }
+            while j > start + 1 && matches!(chars[j - 1], '.' | ',' | ';') {
+                j -= 1;
             }
             let candidate: String = chars[start..j].iter().collect();
             if candidate.contains('/') && candidate.contains(':') {
@@ -1082,6 +1088,13 @@ mod tests {
     fn detect_file_path_needs_two_components() {
         let urls = detect_urls("see /tmp or /dev");
         assert!(urls.is_empty());
+    }
+
+    #[test]
+    fn detect_file_path_trims_trailing_period() {
+        let urls = detect_urls("deb at /tmp/pkg/app_0.1-1_amd64.deb.");
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0].2, "/tmp/pkg/app_0.1-1_amd64.deb");
     }
 
     #[test]
