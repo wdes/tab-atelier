@@ -86,10 +86,11 @@ jobs:
         runs-on: ubuntu-latest
         needs: build
         steps:
-            - uses: actions/download-artifact@v7
+            - uses: actions/download-artifact@v8
               with:
                   artifact-ids: ${{ needs.build.outputs.deb-artifact-id }}
                   merge-multiple: true
+                  skip-decompress: true
             - name: Install .deb and run --check
               run: |
                   docker run --rm \
