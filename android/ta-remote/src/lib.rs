@@ -319,6 +319,32 @@ fn android_main(app: slint::android::AndroidApp) {
         std::thread::spawn(move || post_input(&agent, &host, idx, &bytes));
     });
 
+    let set_data = data.clone();
+    ui.on_request_set_active_host(move |idx| {
+        let mut data = set_data.lock().unwrap();
+        if (idx as usize) < data.hosts.len() {
+            data.active = idx as usize;
+            data.save();
+        }
+    });
+
+    let rm_data = data.clone();
+    let rm_weak = ui_weak.clone();
+    ui.on_request_remove_host(move |idx| {
+        let mut data = rm_data.lock().unwrap();
+        let idx = idx as usize;
+        if idx < data.hosts.len() {
+            data.hosts.remove(idx);
+            if data.active >= data.hosts.len() && !data.hosts.is_empty() {
+                data.active = data.hosts.len() - 1;
+            } else if data.hosts.is_empty() {
+                data.active = 0;
+            }
+            data.save();
+            push_hosts(&rm_weak, &data);
+        }
+    });
+
     let add_data = data.clone();
     let add_weak = ui_weak.clone();
     ui.on_request_add_host(move |name, url, token| {

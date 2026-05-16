@@ -724,6 +724,8 @@ export component AppWindow inherits Window {
     callback request-activate(int);
     callback request-send-input(int, string);
     callback request-add-host(string, string, string);
+    callback request-set-active-host(int);
+    callback request-remove-host(int);
 
     fs := FocusScope {
         init => { fs.focus() }
@@ -827,6 +829,7 @@ export component AppWindow inherits Window {
         pick(i) => {
             root.active-host = i;
             root.picker-open = false;
+            root.request-set-active-host(i);
         }
         dismiss => { root.picker-open = false; }
     }
