@@ -652,7 +652,8 @@ impl Render for TerminalView {
                     this.send_input(b"\x1b[2J\x1b[H".to_vec());
                     return;
                 }
-                if let Some(bytes) = keystroke_to_bytes(&ev.keystroke) {
+                let mode = this.term.lock().mode().to_owned();
+                if let Some(bytes) = keystroke_to_bytes(&ev.keystroke, mode) {
                     this.clear_selection();
                     this.send_input(bytes);
                 }
