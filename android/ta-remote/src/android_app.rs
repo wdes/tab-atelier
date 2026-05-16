@@ -1,5 +1,7 @@
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use jni::JavaVM;
@@ -117,6 +119,34 @@ impl AppData {
     fn active_host(&self) -> Option<HostConfig> {
         self.hosts.get(self.active).cloned()
     }
+}
+
+fn fetch_output(
+    agent: &ureq::Agent,
+    host: &HostConfig,
+    reach: &Reach,
+    idx: i32,
+) -> Option<String> {
+    let base = base_url(host, reach);
+    if base.is_empty() {
+        return None;
+    }
+    let resp = agent
+        .get(&format!("{base}/tabs/{idx}/output"))
+        .set("Authorization", &format!("Bearer {}", host.token))
+        .timeout(Duration::from_millis(1500))
+        .call()
+        .ok()?;
+    resp.into_string().ok()
+}
+
+fn push_output(ui_weak: &Weak<AppWindow>, text: String) {
+    let weak = ui_weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(ui) = weak.upgrade() {
+            ui.set_open_tab_output(SharedString::from(text));
+        }
+    });
 }
 
 fn fetch_tabs(
@@ -289,12 +319,14 @@ pub fn android_main(app: slint::android::AndroidApp) {
     );
 
     let last_reach: Arc<Mutex<Reach>> = Arc::new(Mutex::new(Reach::Offline));
+    let open_tab: Arc<AtomicI32> = Arc::new(AtomicI32::new(-1));
 
     // Background poller
     let poll_weak = ui_weak.clone();
     let poll_agent = agent.clone();
     let poll_data = data.clone();
     let poll_reach = last_reach.clone();
+    let poll_open = open_tab.clone();
     std::thread::spawn(move || loop {
         let (host, active_idx) = {
             let d = poll_data.lock().unwrap();
@@ -308,6 +340,13 @@ pub fn android_main(app: slint::android::AndroidApp) {
             log::debug!("poll {}: {reach:?}", host.name);
             *poll_reach.lock().unwrap() = reach;
             push_reachability(&poll_weak, active_idx, reach);
+
+            let idx = poll_open.load(Ordering::Relaxed);
+            if idx >= 0
+                && let Some(text) = fetch_output(&poll_agent, &host, &reach, idx)
+            {
+                push_output(&poll_weak, text);
+            }
         }
         std::thread::sleep(Duration::from_secs(2));
     });
@@ -331,6 +370,16 @@ pub fn android_main(app: slint::android::AndroidApp) {
         let agent = send_agent.clone();
         let bytes = text.as_bytes().to_vec();
         std::thread::spawn(move || post_input(&agent, &host, &reach, idx, &bytes));
+    });
+
+    let open_tab_for_cb = open_tab.clone();
+    let open_weak = ui_weak.clone();
+    ui.on_open_tab_changed(move |idx| {
+        open_tab_for_cb.store(idx, Ordering::Relaxed);
+        // Clear stale output immediately when closing the view.
+        if idx < 0 {
+            push_output(&open_weak, String::new());
+        }
     });
 
     let set_data = data.clone();
