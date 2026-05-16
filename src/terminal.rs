@@ -389,6 +389,37 @@ impl TerminalView {
     }
 
     #[allow(clippy::significant_drop_tightening)]
+    /// Return the visible screen as plain text (no ANSI escapes), one line per row.
+    /// Used by the API to expose terminal content to remote clients.
+    pub fn visible_plain_text(&self) -> String {
+        let t = self.term.lock();
+        let grid = t.grid();
+        let cols = grid.columns();
+        let screen = grid.screen_lines();
+        let mut out = String::with_capacity(cols * screen + screen);
+        for row in 0..screen as i32 {
+            let mut line = String::with_capacity(cols);
+            for col in 0..cols {
+                let cell = &grid[GridPoint::new(Line(row), Column(col))];
+                if cell.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
+                    continue;
+                }
+                let ch = if cell.c == '\0' { ' ' } else { cell.c };
+                line.push(ch);
+            }
+            while line.ends_with(' ') {
+                line.pop();
+            }
+            out.push_str(&line);
+            out.push('\n');
+        }
+        while out.ends_with('\n') {
+            out.pop();
+        }
+        out
+    }
+
+    #[allow(clippy::significant_drop_tightening)]
     pub fn copy_all_history(&self) -> String {
         use std::fmt::Write;
         let lines = {

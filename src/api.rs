@@ -36,8 +36,15 @@ struct ErrorResponse {
     error: String,
 }
 
+#[derive(Clone)]
+pub struct SnapshotTab {
+    pub name: String,
+    pub cwd: Option<String>,
+    pub output: String,
+}
+
 pub struct TabSnapshot {
-    pub tabs: Vec<(String, Option<String>)>,
+    pub tabs: Vec<SnapshotTab>,
     pub active: usize,
     #[cfg(feature = "energy")]
     pub power: Vec<crate::power::TabPower>,
@@ -143,10 +150,10 @@ fn handle_connection(stream: &mut std::net::TcpStream, state: &Arc<Mutex<TabSnap
                 .tabs
                 .iter()
                 .enumerate()
-                .map(|(i, (name, cwd))| TabInfo {
+                .map(|(i, t)| TabInfo {
                     index: i,
-                    name: name.clone(),
-                    cwd: cwd.clone(),
+                    name: t.name.clone(),
+                    cwd: t.cwd.clone(),
                     active: i == state.active,
                     #[cfg(feature = "energy")]
                     cpu_percent: state.power.get(i).map_or(0.0, |p| p.cpu_percent),
@@ -158,6 +165,26 @@ fn handle_connection(stream: &mut std::net::TcpStream, state: &Arc<Mutex<TabSnap
             let resp = ApiResponse { app: USER_AGENT, tabs };
             let body = serde_json::to_string_pretty(&resp).unwrap_or_default();
             respond_json(stream, 200, &body);
+        }
+        ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/output") => {
+            let idx_str = &p["/tabs/".len()..p.len() - "/output".len()];
+            if let Ok(idx) = idx_str.parse::<usize>() {
+                let state = state.lock().unwrap();
+                if let Some(t) = state.tabs.get(idx) {
+                    let body = t.output.clone();
+                    drop(state);
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                } else {
+                    error_json(stream, 404, "tab index out of range");
+                }
+            } else {
+                error_json(stream, 404, "invalid tab index");
+            }
         }
         ("DELETE", p) if p.starts_with("/tabs/") && !p[6..].contains('/') => {
             let idx_str = &p[6..];
@@ -259,7 +286,18 @@ mod tests {
 
     fn test_state() -> Arc<Mutex<TabSnapshot>> {
         Arc::new(Mutex::new(TabSnapshot {
-            tabs: vec![("shell".into(), Some("/home/user".into())), ("build".into(), None)],
+            tabs: vec![
+                SnapshotTab {
+                    name: "shell".into(),
+                    cwd: Some("/home/user".into()),
+                    output: "$ ls\nfoo bar baz".into(),
+                },
+                SnapshotTab {
+                    name: "build".into(),
+                    cwd: None,
+                    output: String::new(),
+                },
+            ],
             active: 0,
             #[cfg(feature = "energy")]
             power: vec![],
@@ -543,6 +581,46 @@ mod tests {
             ),
         );
         assert_eq!(status_code(&resp), 404);
+    }
+
+    #[test]
+    fn get_tab_output_success() {
+        let (port, _, token) = spawn_server();
+        let resp = request(
+            port,
+            &format!("GET /tabs/0/output HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        assert_eq!(status_code(&resp), 200);
+        let b = body(&resp);
+        assert_eq!(b, "$ ls\nfoo bar baz");
+    }
+
+    #[test]
+    fn get_tab_output_empty() {
+        let (port, _, token) = spawn_server();
+        let resp = request(
+            port,
+            &format!("GET /tabs/1/output HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        assert_eq!(status_code(&resp), 200);
+        assert_eq!(body(&resp), "");
+    }
+
+    #[test]
+    fn get_tab_output_out_of_range() {
+        let (port, _, token) = spawn_server();
+        let resp = request(
+            port,
+            &format!("GET /tabs/99/output HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        assert_eq!(status_code(&resp), 404);
+    }
+
+    #[test]
+    fn get_tab_output_requires_auth() {
+        let (port, _, _) = spawn_server();
+        let resp = request(port, "GET /tabs/0/output HTTP/1.1\r\n\r\n");
+        assert_eq!(status_code(&resp), 401);
     }
 
     #[test]

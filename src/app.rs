@@ -302,7 +302,7 @@ impl AppState {
         let api_token = api::generate_token();
         info!("API server starting on 0.0.0.0:7890");
         let api_state = Arc::new(Mutex::new(api::TabSnapshot {
-            tabs: Vec::new(),
+            tabs: Vec::<api::SnapshotTab>::new(),
             active: 0,
             #[cfg(feature = "energy")]
             power: Vec::new(),
@@ -491,7 +491,16 @@ impl AppState {
                 }
             })
             .collect();
-        let api_tabs: Vec<(String, Option<String>)> = tabs.iter().map(|t| (t.name.clone(), t.cwd.clone())).collect();
+        let api_tabs: Vec<api::SnapshotTab> = self
+            .tabs
+            .iter()
+            .zip(tabs.iter())
+            .map(|(tab, ts)| api::SnapshotTab {
+                name: ts.name.clone(),
+                cwd: ts.cwd.clone(),
+                output: tab.view.read(cx).visible_plain_text(),
+            })
+            .collect();
 
         save_state(
             &platform::state_base_dir(),
