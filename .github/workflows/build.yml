@@ -5,6 +5,9 @@ on: [push, pull_request]
 permissions:
     contents: read
 
+env:
+    GRCOV_VERSION: "0.10.5"
+
 jobs:
     build:
         name: Build & test & lint
@@ -29,17 +32,40 @@ jobs:
             - name: Install Rust toolchain
               uses: dtolnay/rust-toolchain@stable
               with:
-                  components: clippy, rustfmt
+                  components: clippy, rustfmt, llvm-tools
             - name: Cache cargo artifacts
               uses: Swatinem/rust-cache@v2
             - name: Build without energy feature
               run: cargo check --locked --no-default-features
+            - name: Build
+              run: cargo build --locked --all-targets
+              env:
+                  CARGO_INCREMENTAL: "0"
+                  RUSTFLAGS: "-Cinstrument-coverage"
+                  RUSTDOCFLAGS: "-Cinstrument-coverage"
             - name: Run tests
-              run: cargo test --locked --all-targets
+              run: cargo test --locked --all-targets --no-fail-fast
+              env:
+                  CARGO_INCREMENTAL: "0"
+                  RUSTFLAGS: "-Cinstrument-coverage"
+                  RUSTDOCFLAGS: "-Cinstrument-coverage"
             - name: Check formatting
               run: cargo fmt -- --check
             - name: Clippy
               run: cargo clippy --all-targets --locked -- -D warnings
+            - name: Install grcov
+              run: |
+                  mkdir -p "${HOME}/.local/bin"
+                  curl -sL https://github.com/mozilla/grcov/releases/download/v${GRCOV_VERSION}/grcov-x86_64-unknown-linux-gnu.tar.bz2 | tar jxf - -C "${HOME}/.local/bin"
+                  echo "$HOME/.local/bin" >> $GITHUB_PATH
+            - name: Run grcov
+              run: grcov . --binary-path target/debug/deps/ -s . -t lcov --branch --ignore-not-existing --ignore '../**' --ignore '/*' -o coverage.lcov
+            - uses: codecov/codecov-action@v5
+              with:
+                  files: ./coverage.lcov
+                  flags: rust
+                  fail_ci_if_error: true
+                  token: ${{ secrets.CODECOV_TOKEN }}
             - name: Build .deb package
               run: cargo install cargo-deb && cargo deb --locked
             - name: Upload .deb package
