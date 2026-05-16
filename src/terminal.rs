@@ -315,6 +315,10 @@ impl TerminalView {
         let _ = self.notifier.send(Msg::Input(bytes.into()));
     }
 
+    pub fn send_input_bytes(&self, bytes: Vec<u8>) {
+        self.send_input(bytes);
+    }
+
     pub fn reset_terminal(&self) {
         let reset = concat!(
             "\x1b[?1049l", // exit alternate screen

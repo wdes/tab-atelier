@@ -307,6 +307,8 @@ impl AppState {
             #[cfg(feature = "energy")]
             power: Vec::new(),
             pending_closes: Vec::new(),
+            pending_activate: None,
+            pending_input: Vec::new(),
         }));
         api::start_api_server(api_state.clone(), api_token.clone());
 
@@ -516,12 +518,28 @@ impl AppState {
         {
             let mut snapshot = self.api_state.lock().unwrap();
             let mut closes: Vec<usize> = snapshot.pending_closes.drain(..).collect();
+            let activate = snapshot.pending_activate.take();
+            let inputs: Vec<(usize, Vec<u8>)> = snapshot.pending_input.drain(..).collect();
             drop(snapshot);
             closes.sort_unstable();
             closes.dedup();
             for idx in closes.into_iter().rev() {
                 if idx < self.tabs.len() && self.tabs.len() > 1 {
                     self.close_tab(idx, cx);
+                }
+            }
+            if let Some(idx) = activate
+                && idx < self.tabs.len()
+                && self.active != idx
+            {
+                self.tabs[self.active].deactivate();
+                self.active = idx;
+                self.tabs[idx].activate();
+                cx.notify();
+            }
+            for (idx, bytes) in inputs {
+                if idx < self.tabs.len() {
+                    self.tabs[idx].view.read(cx).send_input_bytes(bytes);
                 }
             }
         }
