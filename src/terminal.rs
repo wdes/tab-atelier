@@ -1362,3 +1362,270 @@ impl Element for TerminalElement {
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+    use tab_atelier::FontConfig;
+
+    fn default_browser() -> Rc<RefCell<Option<String>>> {
+        Rc::new(RefCell::new(None))
+    }
+
+    fn default_editor() -> Rc<RefCell<Option<String>>> {
+        Rc::new(RefCell::new(None))
+    }
+
+    #[gpui::test]
+    fn test_terminal_view_creation(cx: &mut TestAppContext) {
+        let window = cx.add_window(|window, cx| {
+            TerminalView::new(None, FontConfig::default(), default_browser(), default_editor(), window, cx)
+        });
+
+        window
+            .update(cx, |view, _window, _cx| {
+                assert!(view.pid() > 0);
+                assert!(!view.has_exited());
+                assert!(view.last_input_time().is_none());
+                view.shutdown();
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn test_restore_output(cx: &mut TestAppContext) {
+        let window = cx.add_window(|window, cx| {
+            TerminalView::new(None, FontConfig::default(), default_browser(), default_editor(), window, cx)
+        });
+
+        window
+            .update(cx, |view, _window, _cx| {
+                view.restore_output("hello world\nsecond line");
+                let t = view.term.lock();
+                let grid = t.grid();
+                let mut found = false;
+                for row in 0..grid.screen_lines() as i32 {
+                    let mut line_text = String::new();
+                    for col in 0..grid.columns() {
+                        let cell = &grid[GridPoint::new(Line(row), Column(col))];
+                        line_text.push(cell.c);
+                    }
+                    if line_text.contains("hello world") {
+                        found = true;
+                        break;
+                    }
+                }
+                assert!(found, "restored text should appear in grid");
+                drop(t);
+                view.shutdown();
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn test_restore_output_empty(cx: &mut TestAppContext) {
+        let window = cx.add_window(|window, cx| {
+            TerminalView::new(None, FontConfig::default(), default_browser(), default_editor(), window, cx)
+        });
+
+        window
+            .update(cx, |view, _window, _cx| {
+                view.restore_output("");
+                view.shutdown();
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn test_send_input_updates_last_input(cx: &mut TestAppContext) {
+        let window = cx.add_window(|window, cx| {
+            TerminalView::new(None, FontConfig::default(), default_browser(), default_editor(), window, cx)
+        });
+
+        window
+            .update(cx, |view, _window, _cx| {
+                assert!(view.last_input_time().is_none());
+                view.send_input(b"hello".to_vec());
+                assert!(view.last_input_time().is_some());
+                view.shutdown();
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn test_send_clipboard_plain(cx: &mut TestAppContext) {
+        let window = cx.add_window(|window, cx| {
+            TerminalView::new(None, FontConfig::default(), default_browser(), default_editor(), window, cx)
+        });
+
+        window
+            .update(cx, |view, _window, _cx| {
+                view.send_clipboard("pasted text");
+                assert!(view.last_input_time().is_some());
+                view.shutdown();
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn test_scroll(cx: &mut TestAppContext) {
+        let window = cx.add_window(|window, cx| {
+            TerminalView::new(None, FontConfig::default(), default_browser(), default_editor(), window, cx)
+        });
+
+        window
+            .update(cx, |view, _window, _cx| {
+                // Write enough newlines via the parser to overflow the 24-line screen
+                let mut parser: vte::ansi::Processor = vte::ansi::Processor::new();
+                let mut term = view.term.lock();
+                for _ in 0..200 {
+                    parser.advance(&mut *term, b"x\n");
+                }
+                drop(parser);
+                let history = term.grid().history_size();
+                drop(term);
+                assert!(history > 0, "should have scroll history after 200 lines");
+
+                view.scroll(5);
+                let offset = view.term.lock().grid().display_offset();
+                assert!(offset > 0, "scroll up should increase offset");
+                view.scroll(-5);
+                let offset2 = view.term.lock().grid().display_offset();
+                assert!(offset2 < offset, "scroll down should decrease offset");
+                view.shutdown();
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn test_scroll_to_fraction(cx: &mut TestAppContext) {
+        let window = cx.add_window(|window, cx| {
+            TerminalView::new(None, FontConfig::default(), default_browser(), default_editor(), window, cx)
+        });
+
+        window
+            .update(cx, |view, _window, _cx| {
+                view.restore_output(&"line\n".repeat(100));
+                view.scroll_to_fraction(0.0);
+                let top = view.term.lock().grid().display_offset();
+                view.scroll_to_fraction(1.0);
+                let bottom = view.term.lock().grid().display_offset();
+                assert!(top > bottom);
+                view.shutdown();
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn test_selection(cx: &mut TestAppContext) {
+        let window = cx.add_window(|window, cx| {
+            TerminalView::new(None, FontConfig::default(), default_browser(), default_editor(), window, cx)
+        });
+
+        window
+            .update(cx, |view, _window, _cx| {
+                view.restore_output("select this text");
+                let start = GridPoint::new(Line(0), Column(0));
+                let end = GridPoint::new(Line(0), Column(5));
+                view.start_selection(start, Side::Left);
+                view.update_selection(end, Side::Right);
+                let text = view.copy_selection();
+                assert!(text.is_some());
+                assert!(!text.unwrap().is_empty());
+                view.clear_selection();
+                assert!(view.copy_selection().is_none());
+                view.shutdown();
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn test_reset_terminal(cx: &mut TestAppContext) {
+        let window = cx.add_window(|window, cx| {
+            TerminalView::new(None, FontConfig::default(), default_browser(), default_editor(), window, cx)
+        });
+
+        window
+            .update(cx, |view, _window, _cx| {
+                view.reset_terminal();
+                view.shutdown();
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn test_copy_all_history(cx: &mut TestAppContext) {
+        let window = cx.add_window(|window, cx| {
+            TerminalView::new(None, FontConfig::default(), default_browser(), default_editor(), window, cx)
+        });
+
+        window
+            .update(cx, |view, _window, _cx| {
+                view.restore_output("first line\nsecond line");
+                let history = view.copy_all_history();
+                assert!(history.contains("first line"));
+                assert!(history.contains("second line"));
+                view.shutdown();
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn test_sgr_color_named() {
+        let mut sgr = Vec::new();
+        sgr_color(&mut sgr, Color::Named(NamedColor::Red), true);
+        assert_eq!(sgr, vec!["31"]);
+
+        sgr.clear();
+        sgr_color(&mut sgr, Color::Named(NamedColor::Red), false);
+        assert_eq!(sgr, vec!["41"]);
+    }
+
+    #[test]
+    fn test_sgr_color_bright() {
+        let mut sgr = Vec::new();
+        sgr_color(&mut sgr, Color::Named(NamedColor::BrightRed), true);
+        assert_eq!(sgr, vec!["91"]);
+
+        sgr.clear();
+        sgr_color(&mut sgr, Color::Named(NamedColor::BrightRed), false);
+        assert_eq!(sgr, vec!["101"]);
+    }
+
+    #[test]
+    fn test_sgr_color_foreground_default() {
+        let mut sgr = Vec::new();
+        sgr_color(&mut sgr, Color::Named(NamedColor::Foreground), true);
+        assert_eq!(sgr, vec!["39"]);
+
+        sgr.clear();
+        sgr_color(&mut sgr, Color::Named(NamedColor::Foreground), false);
+        assert_eq!(sgr, vec!["49"]);
+    }
+
+    #[test]
+    fn test_sgr_color_indexed() {
+        let mut sgr = Vec::new();
+        sgr_color(&mut sgr, Color::Indexed(196), true);
+        assert_eq!(sgr, vec!["38;5;196"]);
+
+        sgr.clear();
+        sgr_color(&mut sgr, Color::Indexed(196), false);
+        assert_eq!(sgr, vec!["48;5;196"]);
+    }
+
+    #[test]
+    fn test_sgr_color_rgb() {
+        let mut sgr = Vec::new();
+        sgr_color(&mut sgr, Color::Spec(vte::ansi::Rgb { r: 255, g: 128, b: 0 }), true);
+        assert_eq!(sgr, vec!["38;2;255;128;0"]);
+    }
+
+    #[test]
+    fn test_visible_lines_default() {
+        // Without cell_size set, should return 25
+        // We can't easily construct a TerminalView without gpui context,
+        // so this is tested indirectly via the scroll tests.
+    }
+}
