@@ -565,6 +565,23 @@ export component AppWindow inherits Window {
     in-out property <int> open-tab: -1;
     in-out property <bool> picker-open: false;
 
+    fs := FocusScope {
+        init => { fs.focus() }
+        key-pressed(event) => {
+            if event.text == Key.Escape || event.text == Key.Back {
+                if root.picker-open {
+                    root.picker-open = false;
+                    return accept;
+                }
+                if root.open-tab >= 0 {
+                    root.open-tab = -1;
+                    return accept;
+                }
+            }
+            return reject;
+        }
+    }
+
     VerticalLayout {
         spacing: 0;
         padding-top: root.safe-area-insets.top;
