@@ -71,7 +71,7 @@ jobs:
             - name: Build .deb package
               run: cargo install cargo-deb && cargo deb --locked
             - name: Upload .deb package
-              uses: actions/upload-artifact@v6
+              uses: actions/upload-artifact@v7
               with:
                   name: tab-atelier-deb
                   path: target/debian/*.deb
