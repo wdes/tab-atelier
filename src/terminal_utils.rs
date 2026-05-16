@@ -209,14 +209,26 @@ mod tests {
     fn enter_variants() {
         assert_eq!(keystroke_to_bytes(&ks("enter", None, no_mod()), NORMAL), Some(b"\r".to_vec()));
         assert_eq!(keystroke_to_bytes(&ks("enter", None, shift()), NORMAL), Some(b"\x0a".to_vec()));
-        assert_eq!(keystroke_to_bytes(&ks("enter", None, alt()), NORMAL), Some(b"\x1b\x0d".to_vec()));
+        assert_eq!(
+            keystroke_to_bytes(&ks("enter", None, alt()), NORMAL),
+            Some(b"\x1b\x0d".to_vec())
+        );
     }
 
     #[test]
     fn backspace_variants() {
-        assert_eq!(keystroke_to_bytes(&ks("backspace", None, no_mod()), NORMAL), Some(b"\x7f".to_vec()));
-        assert_eq!(keystroke_to_bytes(&ks("backspace", None, ctrl()), NORMAL), Some(b"\x08".to_vec()));
-        assert_eq!(keystroke_to_bytes(&ks("backspace", None, alt()), NORMAL), Some(b"\x1b\x7f".to_vec()));
+        assert_eq!(
+            keystroke_to_bytes(&ks("backspace", None, no_mod()), NORMAL),
+            Some(b"\x7f".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("backspace", None, ctrl()), NORMAL),
+            Some(b"\x08".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("backspace", None, alt()), NORMAL),
+            Some(b"\x1b\x7f".to_vec())
+        );
     }
 
     #[test]
@@ -227,78 +239,165 @@ mod tests {
 
     #[test]
     fn escape() {
-        assert_eq!(keystroke_to_bytes(&ks("escape", None, no_mod()), NORMAL), Some(b"\x1b".to_vec()));
+        assert_eq!(
+            keystroke_to_bytes(&ks("escape", None, no_mod()), NORMAL),
+            Some(b"\x1b".to_vec())
+        );
     }
 
     #[test]
     fn arrows_normal() {
-        assert_eq!(keystroke_to_bytes(&ks("up", None, no_mod()), NORMAL), Some(b"\x1b[A".to_vec()));
-        assert_eq!(keystroke_to_bytes(&ks("down", None, no_mod()), NORMAL), Some(b"\x1b[B".to_vec()));
-        assert_eq!(keystroke_to_bytes(&ks("right", None, no_mod()), NORMAL), Some(b"\x1b[C".to_vec()));
-        assert_eq!(keystroke_to_bytes(&ks("left", None, no_mod()), NORMAL), Some(b"\x1b[D".to_vec()));
+        assert_eq!(
+            keystroke_to_bytes(&ks("up", None, no_mod()), NORMAL),
+            Some(b"\x1b[A".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("down", None, no_mod()), NORMAL),
+            Some(b"\x1b[B".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("right", None, no_mod()), NORMAL),
+            Some(b"\x1b[C".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("left", None, no_mod()), NORMAL),
+            Some(b"\x1b[D".to_vec())
+        );
     }
 
     #[test]
     fn arrows_app_cursor() {
-        assert_eq!(keystroke_to_bytes(&ks("up", None, no_mod()), APP_CUR), Some(b"\x1bOA".to_vec()));
-        assert_eq!(keystroke_to_bytes(&ks("down", None, no_mod()), APP_CUR), Some(b"\x1bOB".to_vec()));
-        assert_eq!(keystroke_to_bytes(&ks("right", None, no_mod()), APP_CUR), Some(b"\x1bOC".to_vec()));
-        assert_eq!(keystroke_to_bytes(&ks("left", None, no_mod()), APP_CUR), Some(b"\x1bOD".to_vec()));
+        assert_eq!(
+            keystroke_to_bytes(&ks("up", None, no_mod()), APP_CUR),
+            Some(b"\x1bOA".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("down", None, no_mod()), APP_CUR),
+            Some(b"\x1bOB".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("right", None, no_mod()), APP_CUR),
+            Some(b"\x1bOC".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("left", None, no_mod()), APP_CUR),
+            Some(b"\x1bOD".to_vec())
+        );
     }
 
     #[test]
     fn arrows_with_ctrl() {
         // ctrl modifier = 1 + 4 = 5
-        assert_eq!(keystroke_to_bytes(&ks("up", None, ctrl()), NORMAL), Some(b"\x1b[1;5A".to_vec()));
-        assert_eq!(keystroke_to_bytes(&ks("down", None, ctrl()), NORMAL), Some(b"\x1b[1;5B".to_vec()));
-        assert_eq!(keystroke_to_bytes(&ks("right", None, ctrl()), NORMAL), Some(b"\x1b[1;5C".to_vec()));
-        assert_eq!(keystroke_to_bytes(&ks("left", None, ctrl()), NORMAL), Some(b"\x1b[1;5D".to_vec()));
+        assert_eq!(
+            keystroke_to_bytes(&ks("up", None, ctrl()), NORMAL),
+            Some(b"\x1b[1;5A".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("down", None, ctrl()), NORMAL),
+            Some(b"\x1b[1;5B".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("right", None, ctrl()), NORMAL),
+            Some(b"\x1b[1;5C".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("left", None, ctrl()), NORMAL),
+            Some(b"\x1b[1;5D".to_vec())
+        );
     }
 
     #[test]
     fn arrows_with_shift() {
         // shift modifier = 1 + 1 = 2
-        assert_eq!(keystroke_to_bytes(&ks("up", None, shift()), NORMAL), Some(b"\x1b[1;2A".to_vec()));
-        assert_eq!(keystroke_to_bytes(&ks("left", None, shift()), NORMAL), Some(b"\x1b[1;2D".to_vec()));
+        assert_eq!(
+            keystroke_to_bytes(&ks("up", None, shift()), NORMAL),
+            Some(b"\x1b[1;2A".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("left", None, shift()), NORMAL),
+            Some(b"\x1b[1;2D".to_vec())
+        );
     }
 
     #[test]
     fn arrows_with_ctrl_alt() {
         // ctrl+alt modifier = 1 + 2 + 4 = 7
-        assert_eq!(keystroke_to_bytes(&ks("right", None, ctrl_alt()), NORMAL), Some(b"\x1b[1;7C".to_vec()));
+        assert_eq!(
+            keystroke_to_bytes(&ks("right", None, ctrl_alt()), NORMAL),
+            Some(b"\x1b[1;7C".to_vec())
+        );
     }
 
     #[test]
     fn home_end_normal() {
-        assert_eq!(keystroke_to_bytes(&ks("home", None, no_mod()), NORMAL), Some(b"\x1b[H".to_vec()));
-        assert_eq!(keystroke_to_bytes(&ks("end", None, no_mod()), NORMAL), Some(b"\x1b[F".to_vec()));
+        assert_eq!(
+            keystroke_to_bytes(&ks("home", None, no_mod()), NORMAL),
+            Some(b"\x1b[H".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("end", None, no_mod()), NORMAL),
+            Some(b"\x1b[F".to_vec())
+        );
     }
 
     #[test]
     fn home_end_app_cursor() {
-        assert_eq!(keystroke_to_bytes(&ks("home", None, no_mod()), APP_CUR), Some(b"\x1bOH".to_vec()));
-        assert_eq!(keystroke_to_bytes(&ks("end", None, no_mod()), APP_CUR), Some(b"\x1bOF".to_vec()));
+        assert_eq!(
+            keystroke_to_bytes(&ks("home", None, no_mod()), APP_CUR),
+            Some(b"\x1bOH".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("end", None, no_mod()), APP_CUR),
+            Some(b"\x1bOF".to_vec())
+        );
     }
 
     #[test]
     fn home_end_with_ctrl() {
-        assert_eq!(keystroke_to_bytes(&ks("home", None, ctrl()), NORMAL), Some(b"\x1b[1;5H".to_vec()));
-        assert_eq!(keystroke_to_bytes(&ks("end", None, ctrl()), NORMAL), Some(b"\x1b[1;5F".to_vec()));
+        assert_eq!(
+            keystroke_to_bytes(&ks("home", None, ctrl()), NORMAL),
+            Some(b"\x1b[1;5H".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("end", None, ctrl()), NORMAL),
+            Some(b"\x1b[1;5F".to_vec())
+        );
     }
 
     #[test]
     fn insert_delete() {
-        assert_eq!(keystroke_to_bytes(&ks("insert", None, no_mod()), NORMAL), Some(b"\x1b[2~".to_vec()));
-        assert_eq!(keystroke_to_bytes(&ks("delete", None, no_mod()), NORMAL), Some(b"\x1b[3~".to_vec()));
-        assert_eq!(keystroke_to_bytes(&ks("insert", None, ctrl()), NORMAL), Some(b"\x1b[2;5~".to_vec()));
-        assert_eq!(keystroke_to_bytes(&ks("delete", None, shift()), NORMAL), Some(b"\x1b[3;2~".to_vec()));
+        assert_eq!(
+            keystroke_to_bytes(&ks("insert", None, no_mod()), NORMAL),
+            Some(b"\x1b[2~".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("delete", None, no_mod()), NORMAL),
+            Some(b"\x1b[3~".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("insert", None, ctrl()), NORMAL),
+            Some(b"\x1b[2;5~".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("delete", None, shift()), NORMAL),
+            Some(b"\x1b[3;2~".to_vec())
+        );
     }
 
     #[test]
     fn page_up_down() {
-        assert_eq!(keystroke_to_bytes(&ks("pageup", None, no_mod()), NORMAL), Some(b"\x1b[5~".to_vec()));
-        assert_eq!(keystroke_to_bytes(&ks("pagedown", None, no_mod()), NORMAL), Some(b"\x1b[6~".to_vec()));
-        assert_eq!(keystroke_to_bytes(&ks("pageup", None, ctrl()), NORMAL), Some(b"\x1b[5;5~".to_vec()));
+        assert_eq!(
+            keystroke_to_bytes(&ks("pageup", None, no_mod()), NORMAL),
+            Some(b"\x1b[5~".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("pagedown", None, no_mod()), NORMAL),
+            Some(b"\x1b[6~".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("pageup", None, ctrl()), NORMAL),
+            Some(b"\x1b[5;5~".to_vec())
+        );
     }
 
     #[test]
@@ -307,27 +406,63 @@ mod tests {
         assert_eq!(keystroke_to_bytes(&ks("f2", None, no_mod()), NORMAL), Some(b"\x1bOQ".to_vec()));
         assert_eq!(keystroke_to_bytes(&ks("f3", None, no_mod()), NORMAL), Some(b"\x1bOR".to_vec()));
         assert_eq!(keystroke_to_bytes(&ks("f4", None, no_mod()), NORMAL), Some(b"\x1bOS".to_vec()));
-        assert_eq!(keystroke_to_bytes(&ks("f5", None, no_mod()), NORMAL), Some(b"\x1b[15~".to_vec()));
-        assert_eq!(keystroke_to_bytes(&ks("f6", None, no_mod()), NORMAL), Some(b"\x1b[17~".to_vec()));
-        assert_eq!(keystroke_to_bytes(&ks("f7", None, no_mod()), NORMAL), Some(b"\x1b[18~".to_vec()));
-        assert_eq!(keystroke_to_bytes(&ks("f8", None, no_mod()), NORMAL), Some(b"\x1b[19~".to_vec()));
-        assert_eq!(keystroke_to_bytes(&ks("f9", None, no_mod()), NORMAL), Some(b"\x1b[20~".to_vec()));
-        assert_eq!(keystroke_to_bytes(&ks("f10", None, no_mod()), NORMAL), Some(b"\x1b[21~".to_vec()));
-        assert_eq!(keystroke_to_bytes(&ks("f11", None, no_mod()), NORMAL), Some(b"\x1b[23~".to_vec()));
-        assert_eq!(keystroke_to_bytes(&ks("f12", None, no_mod()), NORMAL), Some(b"\x1b[24~".to_vec()));
+        assert_eq!(
+            keystroke_to_bytes(&ks("f5", None, no_mod()), NORMAL),
+            Some(b"\x1b[15~".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("f6", None, no_mod()), NORMAL),
+            Some(b"\x1b[17~".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("f7", None, no_mod()), NORMAL),
+            Some(b"\x1b[18~".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("f8", None, no_mod()), NORMAL),
+            Some(b"\x1b[19~".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("f9", None, no_mod()), NORMAL),
+            Some(b"\x1b[20~".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("f10", None, no_mod()), NORMAL),
+            Some(b"\x1b[21~".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("f11", None, no_mod()), NORMAL),
+            Some(b"\x1b[23~".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("f12", None, no_mod()), NORMAL),
+            Some(b"\x1b[24~".to_vec())
+        );
     }
 
     #[test]
     fn function_keys_with_shift() {
         // shift = 1 + 1 = 2
-        assert_eq!(keystroke_to_bytes(&ks("f1", None, shift()), NORMAL), Some(b"\x1b[1;2P".to_vec()));
-        assert_eq!(keystroke_to_bytes(&ks("f5", None, shift()), NORMAL), Some(b"\x1b[15;2~".to_vec()));
-        assert_eq!(keystroke_to_bytes(&ks("f12", None, shift()), NORMAL), Some(b"\x1b[24;2~".to_vec()));
+        assert_eq!(
+            keystroke_to_bytes(&ks("f1", None, shift()), NORMAL),
+            Some(b"\x1b[1;2P".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("f5", None, shift()), NORMAL),
+            Some(b"\x1b[15;2~".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("f12", None, shift()), NORMAL),
+            Some(b"\x1b[24;2~".to_vec())
+        );
     }
 
     #[test]
     fn space_variants() {
-        assert_eq!(keystroke_to_bytes(&ks("space", None, no_mod()), NORMAL), Some(b" ".to_vec()));
+        assert_eq!(
+            keystroke_to_bytes(&ks("space", None, no_mod()), NORMAL),
+            Some(b" ".to_vec())
+        );
         assert_eq!(keystroke_to_bytes(&ks("space", None, ctrl()), NORMAL), Some(vec![0x00]));
     }
 
@@ -342,8 +477,14 @@ mod tests {
     #[test]
     fn ctrl_shift_letters() {
         // ctrl+shift+c should also produce ctrl code
-        assert_eq!(keystroke_to_bytes(&ks("c", Some("C"), ctrl_shift()), NORMAL), Some(vec![3]));
-        assert_eq!(keystroke_to_bytes(&ks("a", Some("A"), ctrl_shift()), NORMAL), Some(vec![1]));
+        assert_eq!(
+            keystroke_to_bytes(&ks("c", Some("C"), ctrl_shift()), NORMAL),
+            Some(vec![3])
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("a", Some("A"), ctrl_shift()), NORMAL),
+            Some(vec![1])
+        );
     }
 
     #[test]
@@ -359,24 +500,42 @@ mod tests {
 
     #[test]
     fn alt_character() {
-        assert_eq!(keystroke_to_bytes(&ks("a", Some("a"), alt()), NORMAL), Some(vec![0x1b, b'a']));
-        assert_eq!(keystroke_to_bytes(&ks("z", Some("z"), alt()), NORMAL), Some(vec![0x1b, b'z']));
+        assert_eq!(
+            keystroke_to_bytes(&ks("a", Some("a"), alt()), NORMAL),
+            Some(vec![0x1b, b'a'])
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("z", Some("z"), alt()), NORMAL),
+            Some(vec![0x1b, b'z'])
+        );
     }
 
     #[test]
     fn plain_character_with_key_char() {
-        assert_eq!(keystroke_to_bytes(&ks("a", Some("a"), no_mod()), NORMAL), Some(b"a".to_vec()));
-        assert_eq!(keystroke_to_bytes(&ks("1", Some("1"), no_mod()), NORMAL), Some(b"1".to_vec()));
+        assert_eq!(
+            keystroke_to_bytes(&ks("a", Some("a"), no_mod()), NORMAL),
+            Some(b"a".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("1", Some("1"), no_mod()), NORMAL),
+            Some(b"1".to_vec())
+        );
     }
 
     #[test]
     fn plain_character_without_key_char() {
-        assert_eq!(keystroke_to_bytes(&ks("x", None, no_mod()), NORMAL), Some(b"x".to_vec()));
+        assert_eq!(
+            keystroke_to_bytes(&ks("x", None, no_mod()), NORMAL),
+            Some(b"x".to_vec())
+        );
     }
 
     #[test]
     fn alt_without_key_char() {
-        assert_eq!(keystroke_to_bytes(&ks("x", None, alt()), NORMAL), Some(vec![0x1b, b'x']));
+        assert_eq!(
+            keystroke_to_bytes(&ks("x", None, alt()), NORMAL),
+            Some(vec![0x1b, b'x'])
+        );
     }
 
     #[test]
@@ -400,19 +559,38 @@ mod tests {
         assert!(!is_default_fg(Color::Named(NamedColor::Background)));
         assert!(is_default_bg(Color::Named(NamedColor::Background)));
         assert!(!is_default_bg(Color::Named(NamedColor::Foreground)));
-        assert!(!is_default_fg(Color::Spec(alacritty_terminal::vte::ansi::Rgb { r: 0, g: 0, b: 0 })));
+        assert!(!is_default_fg(Color::Spec(alacritty_terminal::vte::ansi::Rgb {
+            r: 0,
+            g: 0,
+            b: 0
+        })));
     }
 
     #[test]
     fn hsla_eq_identical() {
-        let a = Hsla { h: 0.5, s: 0.5, l: 0.5, a: 1.0 };
+        let a = Hsla {
+            h: 0.5,
+            s: 0.5,
+            l: 0.5,
+            a: 1.0,
+        };
         assert!(hsla_eq(a, a));
     }
 
     #[test]
     fn hsla_eq_different() {
-        let a = Hsla { h: 0.5, s: 0.5, l: 0.5, a: 1.0 };
-        let b = Hsla { h: 0.6, s: 0.5, l: 0.5, a: 1.0 };
+        let a = Hsla {
+            h: 0.5,
+            s: 0.5,
+            l: 0.5,
+            a: 1.0,
+        };
+        let b = Hsla {
+            h: 0.6,
+            s: 0.5,
+            l: 0.5,
+            a: 1.0,
+        };
         assert!(!hsla_eq(a, b));
     }
 }
