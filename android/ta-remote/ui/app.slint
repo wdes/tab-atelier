@@ -391,8 +391,10 @@ component TerminalView inherits Rectangle {
     in property <length> safe-bottom;
     in property <length> safe-left;
     in property <length> safe-right;
+    in-out property <string> input-text;
     callback back();
     callback send-input();
+    callback key-tapped(string);
 
     background: #0e0e0e;
 
@@ -489,7 +491,7 @@ component TerminalView inherits Rectangle {
         }
 
         KeyboardHeader {
-            key-tapped(k) => { /* mock */ }
+            key-tapped(k) => { root.key-tapped(k) }
         }
 
         Rectangle {
@@ -508,13 +510,18 @@ component TerminalView inherits Rectangle {
                     horizontal-stretch: 1;
                     background: #232323;
                     border-radius: 8px;
-                    Text {
-                        text: "  Type a command...";
-                        color: #666;
-                        font-family: "monospace";
-                        font-size: 13px;
-                        vertical-alignment: center;
-                        horizontal-alignment: left;
+                    HorizontalLayout {
+                        padding-left: 8px;
+                        padding-right: 8px;
+                        TextInput {
+                            text <=> root.input-text;
+                            color: #e0e0e0;
+                            font-family: "monospace";
+                            font-size: 14px;
+                            single-line: true;
+                            vertical-alignment: center;
+                            accepted => { root.send-input(); }
+                        }
                     }
                 }
                 TouchArea {
@@ -564,6 +571,10 @@ export component AppWindow inherits Window {
     in-out property <int> active-host: 0;
     in-out property <int> open-tab: -1;
     in-out property <bool> picker-open: false;
+    in-out property <string> input-text: "";
+
+    callback request-activate(int);
+    callback request-send-input(int, string);
 
     fs := FocusScope {
         init => { fs.focus() }
@@ -608,7 +619,10 @@ export component AppWindow inherits Window {
                 spacing: 8px;
                 for tab[i] in root.tabs : TabCard {
                     tab: tab;
-                    tapped => { root.open-tab = i; }
+                    tapped => {
+                        root.open-tab = i;
+                        root.request-activate(i);
+                    }
                 }
             }
         }
@@ -622,7 +636,26 @@ export component AppWindow inherits Window {
         safe-bottom: root.safe-area-insets.bottom;
         safe-left: root.safe-area-insets.left;
         safe-right: root.safe-area-insets.right;
+        input-text <=> root.input-text;
         back => { root.open-tab = -1; }
+        send-input => {
+            if (root.input-text != "") {
+                root.request-send-input(root.open-tab, root.input-text + "\n");
+                root.input-text = "";
+            }
+        }
+        key-tapped(k) => {
+            if (k == "tab")   { root.request-send-input(root.open-tab, "\u{0009}"); }
+            if (k == "esc")   { root.request-send-input(root.open-tab, "\u{001b}"); }
+            if (k == "up")    { root.request-send-input(root.open-tab, "\u{001b}[A"); }
+            if (k == "down")  { root.request-send-input(root.open-tab, "\u{001b}[B"); }
+            if (k == "right") { root.request-send-input(root.open-tab, "\u{001b}[C"); }
+            if (k == "left")  { root.request-send-input(root.open-tab, "\u{001b}[D"); }
+            if (k == "home")  { root.request-send-input(root.open-tab, "\u{001b}[H"); }
+            if (k == "end")   { root.request-send-input(root.open-tab, "\u{001b}[F"); }
+            if (k == "pgup")  { root.request-send-input(root.open-tab, "\u{001b}[5~"); }
+            if (k == "pgdn")  { root.request-send-input(root.open-tab, "\u{001b}[6~"); }
+        }
     }
 
     if root.picker-open : HostPicker {
