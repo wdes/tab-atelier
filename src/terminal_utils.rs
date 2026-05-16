@@ -183,23 +183,40 @@ mod tests {
     }
 
     fn ctrl() -> Modifiers {
-        Modifiers { control: true, ..Default::default() }
+        Modifiers {
+            control: true,
+            ..Default::default()
+        }
     }
 
     fn alt() -> Modifiers {
-        Modifiers { alt: true, ..Default::default() }
+        Modifiers {
+            alt: true,
+            ..Default::default()
+        }
     }
 
     fn shift() -> Modifiers {
-        Modifiers { shift: true, ..Default::default() }
+        Modifiers {
+            shift: true,
+            ..Default::default()
+        }
     }
 
     fn ctrl_shift() -> Modifiers {
-        Modifiers { control: true, shift: true, ..Default::default() }
+        Modifiers {
+            control: true,
+            shift: true,
+            ..Default::default()
+        }
     }
 
     fn ctrl_alt() -> Modifiers {
-        Modifiers { control: true, alt: true, ..Default::default() }
+        Modifiers {
+            control: true,
+            alt: true,
+            ..Default::default()
+        }
     }
 
     const NORMAL: TermMode = TermMode::empty();
@@ -207,8 +224,14 @@ mod tests {
 
     #[test]
     fn enter_variants() {
-        assert_eq!(keystroke_to_bytes(&ks("enter", None, no_mod()), NORMAL), Some(b"\r".to_vec()));
-        assert_eq!(keystroke_to_bytes(&ks("enter", None, shift()), NORMAL), Some(b"\x0a".to_vec()));
+        assert_eq!(
+            keystroke_to_bytes(&ks("enter", None, no_mod()), NORMAL),
+            Some(b"\r".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("enter", None, shift()), NORMAL),
+            Some(b"\x0a".to_vec())
+        );
         assert_eq!(
             keystroke_to_bytes(&ks("enter", None, alt()), NORMAL),
             Some(b"\x1b\x0d".to_vec())
@@ -233,8 +256,14 @@ mod tests {
 
     #[test]
     fn tab_variants() {
-        assert_eq!(keystroke_to_bytes(&ks("tab", None, no_mod()), NORMAL), Some(b"\t".to_vec()));
-        assert_eq!(keystroke_to_bytes(&ks("tab", None, shift()), NORMAL), Some(b"\x1b[Z".to_vec()));
+        assert_eq!(
+            keystroke_to_bytes(&ks("tab", None, no_mod()), NORMAL),
+            Some(b"\t".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("tab", None, shift()), NORMAL),
+            Some(b"\x1b[Z".to_vec())
+        );
     }
 
     #[test]
@@ -402,10 +431,22 @@ mod tests {
 
     #[test]
     fn function_keys_plain() {
-        assert_eq!(keystroke_to_bytes(&ks("f1", None, no_mod()), NORMAL), Some(b"\x1bOP".to_vec()));
-        assert_eq!(keystroke_to_bytes(&ks("f2", None, no_mod()), NORMAL), Some(b"\x1bOQ".to_vec()));
-        assert_eq!(keystroke_to_bytes(&ks("f3", None, no_mod()), NORMAL), Some(b"\x1bOR".to_vec()));
-        assert_eq!(keystroke_to_bytes(&ks("f4", None, no_mod()), NORMAL), Some(b"\x1bOS".to_vec()));
+        assert_eq!(
+            keystroke_to_bytes(&ks("f1", None, no_mod()), NORMAL),
+            Some(b"\x1bOP".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("f2", None, no_mod()), NORMAL),
+            Some(b"\x1bOQ".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("f3", None, no_mod()), NORMAL),
+            Some(b"\x1bOR".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("f4", None, no_mod()), NORMAL),
+            Some(b"\x1bOS".to_vec())
+        );
         assert_eq!(
             keystroke_to_bytes(&ks("f5", None, no_mod()), NORMAL),
             Some(b"\x1b[15~".to_vec())

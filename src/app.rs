@@ -2,13 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use gpui::prelude::FluentBuilder;
-use gpui::{
-    App, AppContext, Application, AsyncApp, ClickEvent, ClipboardItem, Context, Div, ElementId, Entity, FocusHandle,
-    Focusable, Hsla, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Pixels,
-    Point, Render, Rgba, SharedString, Stateful, StatefulInteractiveElement, Styled, WeakEntity, Window,
-    WindowBackgroundAppearance, WindowHandle, WindowOptions, div, px, rgba,
-};
 use crate::api;
 use crate::locale::{self, Lang, Strings};
 use crate::platform;
@@ -18,6 +11,13 @@ use crate::screenshot;
 use crate::terminal::TerminalView;
 use crate::theme::{self, ThemeName};
 use crate::tracking::WakatimeTracker;
+use gpui::prelude::FluentBuilder;
+use gpui::{
+    App, AppContext, Application, AsyncApp, ClickEvent, ClipboardItem, Context, Div, ElementId, Entity, FocusHandle,
+    Focusable, Hsla, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Pixels,
+    Point, Render, Rgba, SharedString, Stateful, StatefulInteractiveElement, Styled, WeakEntity, Window,
+    WindowBackgroundAppearance, WindowHandle, WindowOptions, div, px, rgba,
+};
 use log::{debug, info};
 use std::cell::RefCell;
 use std::path::PathBuf;
