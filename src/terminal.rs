@@ -92,6 +92,18 @@ pub struct TerminalView {
     hover_grid: Rc<Cell<Option<(usize, usize)>>>,
     click_origin: Rc<Cell<Option<GridPoint>>>,
     last_input: Rc<Cell<Option<std::time::Instant>>>,
+    colors_enabled: Cell<bool>,
+}
+
+fn pty_env(colors_enabled: bool) -> HashMap<String, String> {
+    let mut env = HashMap::new();
+    if colors_enabled {
+        env.insert("TERM".into(), "xterm-256color".into());
+        env.insert("COLORTERM".into(), "truecolor".into());
+    } else {
+        env.insert("TERM".into(), "dumb".into());
+    }
+    env
 }
 
 impl TerminalView {
@@ -111,6 +123,7 @@ impl TerminalView {
         };
         let opts = tty::Options {
             working_directory: cwd.map(std::path::Path::to_path_buf),
+            env: pty_env(true),
             ..Default::default()
         };
         let pty = tty::new(&opts, ws, 0).expect("failed to create pty");
@@ -189,7 +202,17 @@ impl TerminalView {
             hover_grid: Rc::new(Cell::new(None)),
             click_origin: Rc::new(Cell::new(None)),
             last_input: Rc::new(Cell::new(None)),
+            colors_enabled: Cell::new(true),
         }
+    }
+
+    pub const fn colors_enabled(&self) -> bool {
+        self.colors_enabled.get()
+    }
+
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn set_colors_enabled(&self, enabled: bool) {
+        self.colors_enabled.set(enabled);
     }
 
     pub fn restore_output(&self, text: &str) {
@@ -242,6 +265,7 @@ impl TerminalView {
 
         let opts = tty::Options {
             working_directory: cwd.map(std::path::Path::to_path_buf),
+            env: pty_env(self.colors_enabled.get()),
             ..Default::default()
         };
         let pty = tty::new(&opts, ws, 0).expect("failed to create pty");
