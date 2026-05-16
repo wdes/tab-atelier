@@ -352,4 +352,14 @@ mod tests {
         open_path(std::path::Path::new("/dev/null"), None);
         open_path(std::path::Path::new("/dev/null"), Some("false"));
     }
+
+    #[test]
+    fn hotkey_handle_methods_without_display() {
+        use std::sync::mpsc;
+        let (cmd_tx, _rx) = mpsc::channel::<HotkeyCommand>();
+        let handle = HotkeyHandle { cmd_tx };
+        handle.update_keys(&[49, 96]);
+        handle.suspend();
+        handle.resume();
+    }
 }
