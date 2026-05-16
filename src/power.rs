@@ -255,4 +255,48 @@ mod tests {
             ""
         );
     }
+
+    #[test]
+    fn watts_label_high_wattage() {
+        let tp = TabPower { cpu_percent: 90.0, watts: Some(150.0) };
+        assert_eq!(tp.watts_label(), "150 W");
+    }
+
+    #[test]
+    fn watts_label_tiny_returns_empty() {
+        let tp = TabPower { cpu_percent: 0.0, watts: Some(0.005) };
+        assert_eq!(tp.watts_label(), "");
+    }
+
+    #[test]
+    fn cpu_label_under_100() {
+        let tp = TabPower { cpu_percent: 45.7, watts: None };
+        assert_eq!(tp.cpu_label(), "45.7%");
+    }
+
+    #[test]
+    fn cpu_label_over_100() {
+        let tp = TabPower { cpu_percent: 312.0, watts: None };
+        assert_eq!(tp.cpu_label(), "312%");
+    }
+
+    #[test]
+    fn label_high_watts() {
+        let tp = TabPower { cpu_percent: 80.0, watts: Some(200.0) };
+        assert_eq!(tp.label(), "200W");
+    }
+
+    #[test]
+    fn second_sample_has_values() {
+        let mut m = PowerMonitor {
+            sensor: PowerSensor::detect(true),
+            cpus: 4,
+            prev: None,
+        };
+        let pid = std::process::id();
+        m.sample(&[pid], 1.0);
+        let snap = m.sample(&[pid], 1.0);
+        assert_eq!(snap.len(), 1);
+        assert!(snap[0].cpu_percent >= 0.0);
+    }
 }

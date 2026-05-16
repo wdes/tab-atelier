@@ -160,4 +160,59 @@ mod tests {
         assert_eq!(sanitize_filename("hello world!"), "hello_world_");
         assert_eq!(sanitize_filename("a-b_c"), "a-b_c");
     }
+
+    #[test]
+    fn sanitize_empty_string() {
+        assert_eq!(sanitize_filename(""), "");
+    }
+
+    #[test]
+    fn sanitize_unicode() {
+        assert_eq!(sanitize_filename("café"), "café");
+        assert_eq!(sanitize_filename("tab 日本"), "tab_日本");
+    }
+
+    #[test]
+    fn write_bmp_3byte_pixels() {
+        let dir = std::env::temp_dir().join("ta-test-bmp-3byte");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test3.bmp");
+
+        // 2x2 image with 3 bytes per pixel (no alpha)
+        let data = vec![
+            0xFF, 0x00, 0x00, 0x00, 0xFF, 0x00,
+            0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF,
+        ];
+        write_bmp(&path, 2, 2, &data).unwrap();
+
+        let contents = std::fs::read(&path).unwrap();
+        assert_eq!(&contents[0..2], b"BM");
+        // 54 header + 2 rows * 8 bytes (6 pixel bytes + 2 padding each)
+        assert_eq!(contents.len(), 54 + 16);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_bmp_1x1() {
+        let dir = std::env::temp_dir().join("ta-test-bmp-1x1");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("tiny.bmp");
+
+        let data = vec![0xAA, 0xBB, 0xCC, 0xFF];
+        write_bmp(&path, 1, 1, &data).unwrap();
+
+        let contents = std::fs::read(&path).unwrap();
+        assert_eq!(&contents[0..2], b"BM");
+        // 1 pixel = 3 bytes, padded to 4 bytes per row
+        assert_eq!(contents.len(), 54 + 4);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_bmp_invalid_path() {
+        let result = write_bmp(std::path::Path::new("/nonexistent/dir/file.bmp"), 1, 1, &[0; 4]);
+        assert!(result.is_err());
+    }
 }

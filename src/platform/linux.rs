@@ -326,4 +326,30 @@ mod tests {
     fn process_alive_bogus() {
         assert!(!process_alive(u32::MAX));
     }
+
+    #[test]
+    fn process_cwd_bogus_returns_none() {
+        assert_eq!(process_cwd(u32::MAX), None);
+    }
+
+    #[test]
+    fn random_bytes_different_calls() {
+        let mut a = [0u8; 16];
+        let mut b = [0u8; 16];
+        random_bytes(&mut a);
+        random_bytes(&mut b);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn open_url_does_not_panic() {
+        open_url("http://localhost:1", None);
+        open_url("http://localhost:1", Some("false"));
+    }
+
+    #[test]
+    fn open_path_does_not_panic() {
+        open_path(std::path::Path::new("/dev/null"), None);
+        open_path(std::path::Path::new("/dev/null"), Some("false"));
+    }
 }
