@@ -80,7 +80,7 @@ pub fn local_ip() -> String {
         .map_or_else(|_| "127.0.0.1".into(), |a| a.ip().to_string())
 }
 
-fn respond_json(stream: &mut std::net::TcpStream, status: u16, body: &str) {
+fn respond_json<W: Write>(stream: &mut W, status: u16, body: &str) {
     let reason = match status {
         200 => "OK",
         401 => "Unauthorized",
@@ -96,13 +96,21 @@ fn respond_json(stream: &mut std::net::TcpStream, status: u16, body: &str) {
     );
 }
 
-fn error_json(stream: &mut std::net::TcpStream, status: u16, msg: &str) {
+fn error_json<W: Write>(stream: &mut W, status: u16, msg: &str) {
     let body = serde_json::to_string(&ErrorResponse { error: msg.to_string() }).unwrap_or_default();
     respond_json(stream, status, &body);
 }
 
-fn handle_connection(stream: &mut std::net::TcpStream, state: &Arc<Mutex<TabSnapshot>>, token: &str) {
-    let mut reader = BufReader::new(stream.try_clone().unwrap());
+fn handle_connection<S: Read + Write>(
+    stream: &mut S,
+    state: &Arc<Mutex<TabSnapshot>>,
+    token: &str,
+) {
+    // Owned BufReader around the stream itself — `try_clone` was only used
+    // to dodge the read/write borrow on TcpStream, but it doesn't exist on
+    // rustls::Stream. Buffering on `&mut S` works for both, and the read
+    // side is dropped before any write below.
+    let mut reader = BufReader::new(&mut *stream);
     let mut request_line = String::new();
     if reader.read_line(&mut request_line).is_err() {
         return;
@@ -145,6 +153,21 @@ fn handle_connection(stream: &mut std::net::TcpStream, state: &Arc<Mutex<TabSnap
     } else {
         (raw_path, None, None)
     };
+
+    // Read the body (if any) before dropping the reader so we can write the
+    // response back through `stream` without a borrow conflict.
+    let body_bytes: Vec<u8> = if content_length > 0 {
+        let mut buf = vec![0u8; content_length];
+        if reader.read_exact(&mut buf).is_err() {
+            drop(reader);
+            error_json(stream, 400, "could not read body");
+            return;
+        }
+        buf
+    } else {
+        Vec::new()
+    };
+    drop(reader);
 
     let provided_token = auth_token.or(query_token);
     if provided_token.as_deref() != Some(token) {
@@ -239,13 +262,9 @@ fn handle_connection(stream: &mut std::net::TcpStream, state: &Arc<Mutex<TabSnap
         ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/rename") => {
             let idx_str = &p["/tabs/".len()..p.len() - "/rename".len()];
             if let Ok(idx) = idx_str.parse::<usize>() {
-                let mut body = vec![0u8; content_length];
-                if reader.read_exact(&mut body).is_err() {
-                    error_json(stream, 400, "could not read body");
-                    return;
-                }
-                let new_name = serde_json::from_slice::<serde_json::Value>(&body).map_or_else(
-                    |_| String::from_utf8_lossy(&body).trim().to_string(),
+                let body = &body_bytes;
+                let new_name = serde_json::from_slice::<serde_json::Value>(body).map_or_else(
+                    |_| String::from_utf8_lossy(body).trim().to_string(),
                     |v| v.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string(),
                 );
                 if new_name.is_empty() {
@@ -286,16 +305,11 @@ fn handle_connection(stream: &mut std::net::TcpStream, state: &Arc<Mutex<TabSnap
         ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/input") => {
             let idx_str = &p["/tabs/".len()..p.len() - "/input".len()];
             if let Ok(idx) = idx_str.parse::<usize>() {
-                let mut body = vec![0u8; content_length];
-                if reader.read_exact(&mut body).is_err() {
-                    error_json(stream, 400, "could not read body");
-                    return;
-                }
                 let mut state = state.lock().unwrap();
                 if idx < state.tabs.len() {
-                    info!("API: sending {} bytes of input to tab {idx}", body.len());
-                    let n = body.len();
-                    state.pending_input.push((idx, body));
+                    info!("API: sending {} bytes of input to tab {idx}", body_bytes.len());
+                    let n = body_bytes.len();
+                    state.pending_input.push((idx, body_bytes));
                     drop(state);
                     let resp = serde_json::to_string(&serde_json::json!({"sent": n})).unwrap_or_default();
                     respond_json(stream, 200, &resp);
@@ -339,6 +353,110 @@ pub fn start_api_server(state: Arc<Mutex<TabSnapshot>>, token: String) {
         };
         serve(&listener, &state, &token);
     });
+}
+
+/// Start a second listener on `:7891` that serves the same API over TLS.
+///
+/// Uses a self-signed certificate generated on first launch and cached at
+/// `{state_base}/tab-atelier/{tls.crt,tls.key}`. The cert is created with
+/// the host's local IP and `localhost` as SANs so clients on the LAN can
+/// validate via either. Pin-on-first-use clients (the Android remote) can
+/// trust the cert directly; browsers will warn until added to their
+/// trust store — fine for personal use.
+pub fn start_api_server_tls(state: Arc<Mutex<TabSnapshot>>, token: String) {
+    use rustls::ServerConfig;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+    let (cert_der, key_der) = match load_or_generate_cert() {
+        Ok(pair) => pair,
+        Err(e) => {
+            error!("API/TLS: cert provisioning failed: {e}");
+            return;
+        }
+    };
+
+    let cfg = match ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from(cert_der)],
+            PrivateKeyDer::try_from(key_der).map_err(std::string::ToString::to_string).unwrap(),
+        ) {
+        Ok(c) => Arc::new(c),
+        Err(e) => {
+            error!("API/TLS: rustls config build failed: {e}");
+            return;
+        }
+    };
+
+    std::thread::spawn(move || {
+        let listener = match TcpListener::bind("0.0.0.0:7891") {
+            Ok(l) => {
+                info!("API: TLS listening on 0.0.0.0:7891");
+                l
+            }
+            Err(e) => {
+                error!("API: failed to bind :7891: {e}");
+                return;
+            }
+        };
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut conn = match rustls::ServerConnection::new(cfg.clone()) {
+                Ok(c) => c,
+                Err(e) => {
+                    debug!("API/TLS: handshake init failed: {e}");
+                    continue;
+                }
+            };
+            let mut tls = rustls::Stream::new(&mut conn, &mut stream);
+            handle_connection(&mut tls, &state, &token);
+        }
+    });
+}
+
+fn load_or_generate_cert() -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+    let dir = crate::platform::state_base_dir().join(tab_atelier::APP_DIR);
+    std::fs::create_dir_all(&dir)?;
+    let crt_path = dir.join("tls.crt");
+    let key_path = dir.join("tls.key");
+
+    if crt_path.exists() && key_path.exists() {
+        let crt_pem = std::fs::read(&crt_path)?;
+        let key_pem = std::fs::read(&key_path)?;
+        let cert_der = rustls_pemfile::certs(&mut crt_pem.as_slice())
+            .next()
+            .and_then(Result::ok)
+            .ok_or_else(|| std::io::Error::other("no cert in tls.crt"))?
+            .to_vec();
+        let key_der = rustls_pemfile::private_key(&mut key_pem.as_slice())?
+            .ok_or_else(|| std::io::Error::other("no key in tls.key"))?
+            .secret_der()
+            .to_vec();
+        return Ok((cert_der, key_der));
+    }
+
+    info!("API/TLS: generating self-signed certificate at {}", dir.display());
+    let mut params = rcgen::CertificateParams::new(vec![
+        "localhost".to_string(),
+        local_ip(),
+    ])
+    .map_err(|e| std::io::Error::other(e.to_string()))?;
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "tab-atelier");
+    let key_pair = rcgen::KeyPair::generate()
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let cert = params
+        .self_signed(&key_pair)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let crt_pem = cert.pem();
+    let key_pem = key_pair.serialize_pem();
+    std::fs::write(&crt_path, &crt_pem)?;
+    std::fs::write(&key_path, &key_pem)?;
+    let cert_der = cert.der().to_vec();
+    let key_der = key_pair.serialize_der();
+    Ok((cert_der, key_der))
 }
 
 #[cfg(test)]

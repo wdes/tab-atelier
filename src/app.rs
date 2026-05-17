@@ -388,6 +388,7 @@ impl AppState {
             pending_renames: Vec::new(),
         }));
         api::start_api_server(api_state.clone(), api_token.clone());
+        api::start_api_server_tls(api_state.clone(), api_token.clone());
 
         #[cfg(feature = "energy")]
         let power_pids: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1794,7 +1795,13 @@ impl AppState {
 
         let ip = api::local_ip();
         let lan_url = format!("http://{ip}:7890");
-        let qr_payload = format!("taremote://onboard?url={lan_url}&token={}", self.api_token);
+        let lan_url_tls = format!("https://{ip}:7891");
+        // Pass both the plain-HTTP and TLS URLs into the deep link; the
+        // mobile client picks whichever its current build supports.
+        let qr_payload = format!(
+            "taremote://onboard?url={lan_url}&tls_url={lan_url_tls}&token={}",
+            self.api_token
+        );
         let url = format!("{lan_url}?token={}", self.api_token);
         let url_for_click = url.clone();
 
