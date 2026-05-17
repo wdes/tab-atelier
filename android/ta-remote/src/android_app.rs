@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -291,22 +292,62 @@ fn post_activate(agent: &ureq::Agent, host: &HostConfig, reach: &Reach, idx: i32
     }
 }
 
-fn push_tabs(ui_weak: &Weak<AppWindow>, tabs: Vec<ApiTab>) {
+/// Per-tab CRC32 of the last preview we showed the user. A row gets a
+/// "new output" dot whenever the current preview hashes differently from
+/// the stored value, *unless* this is the first poll for that tab (in
+/// which case we just record the baseline silently).
+type SeenPreviews = Arc<Mutex<HashMap<String, u32>>>;
+
+/// Small inline CRC32 (IEEE) — same polynomial as the desktop side's
+/// helper. Used to fingerprint tab previews for the "new output" dot.
+fn crc32(data: &[u8]) -> u32 {
+    const POLY: u32 = 0xEDB8_8320;
+    let mut crc: u32 = !0;
+    for &b in data {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (POLY & mask);
+        }
+    }
+    !crc
+}
+
+fn push_tabs(ui_weak: &Weak<AppWindow>, tabs: Vec<ApiTab>, seen: &SeenPreviews) {
+    let rows: Vec<TabRow> = {
+        let mut seen_guard = seen.lock().unwrap();
+        tabs.into_iter()
+            .map(|t| {
+                let preview_hash = crc32(t.preview.as_bytes());
+                let has_new = match seen_guard.get(&t.name) {
+                    None => false, // first sighting, seed silently
+                    Some(&prev) => prev != preview_hash,
+                };
+                seen_guard.entry(t.name.clone()).or_insert(preview_hash);
+                TabRow {
+                    name: SharedString::from(t.name.clone()),
+                    cwd: SharedString::from(t.cwd.unwrap_or_default()),
+                    active: t.active,
+                    cpu: SharedString::from(format!("{:.1}%", t.cpu_percent)),
+                    preview: SharedString::from(t.preview),
+                    has_new,
+                }
+            })
+            .collect()
+    };
     let weak = ui_weak.clone();
     let _ = slint::invoke_from_event_loop(move || {
-        let Some(ui) = weak.upgrade() else { return };
-        let rows: Vec<TabRow> = tabs
-            .into_iter()
-            .map(|t| TabRow {
-                name: SharedString::from(t.name),
-                cwd: SharedString::from(t.cwd.unwrap_or_default()),
-                active: t.active,
-                cpu: SharedString::from(format!("{:.1}%", t.cpu_percent)),
-                preview: SharedString::from(t.preview),
-            })
-            .collect();
-        ui.set_tabs(VecModel::from_slice(&rows));
+        if let Some(ui) = weak.upgrade() {
+            ui.set_tabs(VecModel::from_slice(&rows));
+        }
     });
+}
+
+/// Mark the given tab's current preview as "seen", clearing the dot the
+/// next time push_tabs runs.
+fn mark_seen(seen: &SeenPreviews, name: &str, preview: &str) {
+    let hash = crc32(preview.as_bytes());
+    seen.lock().unwrap().insert(name.to_string(), hash);
 }
 
 fn push_hosts(ui_weak: &Weak<AppWindow>, data: &AppData) {
@@ -398,6 +439,7 @@ pub fn android_main(app: slint::android::AndroidApp) {
     );
 
     let last_reach: Arc<Mutex<Reach>> = Arc::new(Mutex::new(Reach::Offline));
+    let seen_previews: SeenPreviews = Arc::new(Mutex::new(HashMap::new()));
     let open_tab: Arc<AtomicI32> = Arc::new(AtomicI32::new(-1));
 
     // Background poller
@@ -406,6 +448,7 @@ pub fn android_main(app: slint::android::AndroidApp) {
     let poll_data = data.clone();
     let poll_reach = last_reach.clone();
     let poll_open = open_tab.clone();
+    let poll_seen = seen_previews.clone();
     std::thread::spawn(move || loop {
         let (host, active_idx) = {
             let d = poll_data.lock().unwrap();
@@ -414,7 +457,7 @@ pub fn android_main(app: slint::android::AndroidApp) {
         if let Some(host) = host {
             let (reach, tabs) = fetch_tabs(&poll_agent, &host);
             if let Some(t) = tabs {
-                push_tabs(&poll_weak, t);
+                push_tabs(&poll_weak, t, &poll_seen);
             }
             log::debug!("poll {}: {reach:?}", host.name);
             *poll_reach.lock().unwrap() = reach;
@@ -487,11 +530,19 @@ pub fn android_main(app: slint::android::AndroidApp) {
     let open_data = data.clone();
     let open_reach = last_reach.clone();
     let open_agent = agent.clone();
+    let open_seen = seen_previews.clone();
     ui.on_open_tab_changed(move |idx| {
         open_tab_for_cb.store(idx, Ordering::Relaxed);
         if idx < 0 {
             push_output(&open_weak, String::new());
             return;
+        }
+        // Mark this tab's current preview as seen so the green "new
+        // output" dot clears on the next poll's tabs refresh.
+        if let Some(ui) = open_weak.upgrade()
+            && let Some(row) = ui.get_tabs().row_data(idx as usize)
+        {
+            mark_seen(&open_seen, &row.name, &row.preview);
         }
         // Fire an immediate fetch so the view isn't blank for up to 2s.
         let host = open_data.lock().unwrap().active_host();

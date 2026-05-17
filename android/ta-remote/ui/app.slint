@@ -4,6 +4,9 @@ struct TabRow {
     active: bool,
     cpu: string,
     preview: string,
+    /// Set when the preview text has changed since the user last opened
+    /// this tab — used to surface "this tab moved" without having to open it.
+    has-new: bool,
 }
 
 struct Host {
@@ -148,12 +151,23 @@ component TabCard inherits Rectangle {
                     alignment: center;
                     spacing: 3px;
 
-                    Text {
-                        text: tab.name;
-                        color: #f0f0f0;
-                        font-size: 16px;
-                        font-weight: 600;
-                        overflow: elide;
+                    HorizontalLayout {
+                        spacing: 6px;
+                        alignment: start;
+                        Text {
+                            text: tab.name;
+                            color: #f0f0f0;
+                            font-size: 16px;
+                            font-weight: 600;
+                            overflow: elide;
+                        }
+                        if tab.has-new : Rectangle {
+                            width: 8px;
+                            height: 8px;
+                            y: parent.height / 2 - 4px;
+                            border-radius: 4px;
+                            background: #66bb6a;
+                        }
                     }
                     Text {
                         text: tab.cwd;
