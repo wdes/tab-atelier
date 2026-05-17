@@ -14,6 +14,16 @@ mod terminal_utils;
 mod theme;
 mod tracking;
 
+use std::sync::atomic::AtomicBool;
+
+/// Set by the SIGINT/SIGTERM handler. The persist tick checks it and runs
+/// `close_all_tabs` (which does an unconditional flush of every tab's
+/// output / uptime / energy file) before letting gpui shut down.
+pub static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
 fn main() {
+    let _ = ctrlc::set_handler(|| {
+        SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
     app::run();
 }

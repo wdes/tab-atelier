@@ -572,6 +572,13 @@ impl AppState {
             }
         }
 
+        // A SIGINT/SIGTERM came in; do the unconditional flush and quit.
+        if crate::SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
+            log::info!("graceful shutdown requested by signal, flushing state");
+            self.close_all_tabs(cx);
+            return;
+        }
+
         {
             let mut snapshot = self.api_state.lock().unwrap();
             snapshot.tabs = api_tabs;
