@@ -389,15 +389,23 @@ impl TerminalView {
     }
 
     #[allow(clippy::significant_drop_tightening)]
-    /// Return the visible screen as plain text (no ANSI escapes), one line per row.
-    /// Used by the API to expose terminal content to remote clients.
-    pub fn visible_plain_text(&self) -> String {
+    /// Return up to `max_lines` (or the visible screen if `None`) of the terminal
+    /// as plain text (no ANSI escapes), one line per row, ending without a
+    /// trailing newline. When `max_lines` exceeds the visible screen the result
+    /// also includes scrollback rows.
+    #[allow(clippy::significant_drop_tightening)]
+    pub fn plain_text(&self, max_lines: Option<usize>) -> String {
         let t = self.term.lock();
         let grid = t.grid();
         let cols = grid.columns();
         let screen = grid.screen_lines();
-        let mut out = String::with_capacity(cols * screen + screen);
-        for row in 0..screen as i32 {
+        let history = grid.history_size();
+        let want = max_lines.unwrap_or(screen).min(screen + history);
+        let extra = want.saturating_sub(screen);
+        let start_row = -(extra as i32);
+        let end_row = screen as i32;
+        let mut out = String::with_capacity(cols * want + want);
+        for row in start_row..end_row {
             let mut line = String::with_capacity(cols);
             for col in 0..cols {
                 let cell = &grid[GridPoint::new(Line(row), Column(col))];
@@ -417,6 +425,11 @@ impl TerminalView {
             out.pop();
         }
         out
+    }
+
+    /// Visible screen only — convenience wrapper, used by the snapshot tick.
+    pub fn visible_plain_text(&self) -> String {
+        self.plain_text(None)
     }
 
     #[allow(clippy::significant_drop_tightening)]

@@ -39,8 +39,22 @@ pub fn state_path(base: &std::path::Path) -> PathBuf {
 #[must_use]
 pub fn load_state_from(base: &std::path::Path) -> Option<SavedState> {
     let path = state_path(base);
-    let data = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&data).ok()
+    if let Ok(data) = std::fs::read_to_string(&path)
+        && let Ok(state) = serde_json::from_str::<SavedState>(&data)
+    {
+        return Some(state);
+    }
+    // Primary file missing or corrupt — try rotated backups, newest first.
+    for ext in ["bak", "bak.1", "bak.2"] {
+        let alt = path.with_extension(format!("json.{ext}"));
+        if let Ok(data) = std::fs::read_to_string(&alt)
+            && let Ok(state) = serde_json::from_str::<SavedState>(&data)
+        {
+            log::warn!("loaded state from backup {}", alt.display());
+            return Some(state);
+        }
+    }
+    None
 }
 
 #[derive(Debug, Clone)]
@@ -632,13 +646,38 @@ pub fn save_preferences(base: &std::path::Path, prefs: &Preferences) {
     }
 }
 
+/// Atomically persist tab state, rotating the previous file to `.bak`,
+/// `.bak.1`, `.bak.2`. The write is staged to a `.tmp` file, fsynced, and
+/// renamed; if the rename fails the existing file is untouched.
+///
+/// This is intentionally conservative because a bad save losing a 17-tab
+/// workspace once was enough.
 pub fn save_state(base: &std::path::Path, state: &SavedState) {
+    use std::io::Write;
+
     let dir = state_dir(base);
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("tabs.json");
-    if let Ok(data) = serde_json::to_string_pretty(state) {
-        let _ = std::fs::write(path, data);
+
+    let Ok(data) = serde_json::to_string_pretty(state) else { return };
+
+    let tmp = dir.join("tabs.json.tmp");
+    let Ok(mut f) = std::fs::File::create(&tmp) else { return };
+    if f.write_all(data.as_bytes()).is_err() || f.sync_all().is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return;
     }
+    drop(f);
+
+    if path.exists() {
+        let bak = dir.join("tabs.json.bak");
+        let bak1 = dir.join("tabs.json.bak.1");
+        let bak2 = dir.join("tabs.json.bak.2");
+        let _ = std::fs::rename(&bak1, &bak2);
+        let _ = std::fs::rename(&bak, &bak1);
+        let _ = std::fs::rename(&path, &bak);
+    }
+    let _ = std::fs::rename(&tmp, &path);
 }
 
 #[must_use]
@@ -842,6 +881,75 @@ mod tests {
     fn test_load_state_missing_file() {
         let result = load_state_from(std::path::Path::new("/tmp/ta-test-nonexistent"));
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_save_rotates_backups() {
+        let dir = std::env::temp_dir().join("ta-test-rotation");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        let mk = |name: &str| SavedState {
+            tabs: vec![TabState {
+                name: name.into(),
+                cwd: None,
+                output: None,
+                uptime_secs: None,
+                energy_wh: None,
+            }],
+            active: 0,
+        };
+
+        save_state(&dir, &mk("v1"));
+        save_state(&dir, &mk("v2"));
+        save_state(&dir, &mk("v3"));
+        save_state(&dir, &mk("v4"));
+
+        let sd = state_dir(&dir);
+        let read = |name: &str| {
+            std::fs::read_to_string(sd.join(name))
+                .ok()
+                .and_then(|s| serde_json::from_str::<SavedState>(&s).ok())
+                .and_then(|s| s.tabs.into_iter().next().map(|t| t.name))
+        };
+
+        assert_eq!(read("tabs.json").as_deref(), Some("v4"));
+        assert_eq!(read("tabs.json.bak").as_deref(), Some("v3"));
+        assert_eq!(read("tabs.json.bak.1").as_deref(), Some("v2"));
+        assert_eq!(read("tabs.json.bak.2").as_deref(), Some("v1"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_falls_back_to_bak_when_primary_corrupt() {
+        let dir = std::env::temp_dir().join("ta-test-fallback");
+        let _ = std::fs::remove_dir_all(&dir);
+        let sd = state_dir(&dir);
+        let _ = std::fs::create_dir_all(&sd);
+
+        let good = SavedState {
+            tabs: vec![TabState {
+                name: "rescued".into(),
+                cwd: None,
+                output: None,
+                uptime_secs: None,
+                energy_wh: None,
+            }],
+            active: 0,
+        };
+        std::fs::write(sd.join("tabs.json"), "broken json").unwrap();
+        std::fs::write(
+            sd.join("tabs.json.bak"),
+            serde_json::to_string(&good).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load_state_from(&dir).expect("should fall back to .bak");
+        assert_eq!(loaded.tabs.len(), 1);
+        assert_eq!(loaded.tabs[0].name, "rescued");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
