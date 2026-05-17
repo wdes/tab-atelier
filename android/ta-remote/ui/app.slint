@@ -187,6 +187,7 @@ component HostRow inherits Rectangle {
     in property <Host> host;
     in property <bool> selected;
     callback tapped();
+    callback edited();
     callback removed();
 
     height: 64px;
@@ -249,7 +250,27 @@ component HostRow inherits Rectangle {
         }
 
         TouchArea {
-            width: 40px;
+            width: 36px;
+            clicked => { root.edited() }
+            Rectangle {
+                background: parent.has-hover ? #2a2a2a : transparent;
+                border-radius: 6px;
+                // Material `edit` (pencil)
+                Path {
+                    width: 20px;
+                    height: 20px;
+                    x: parent.width / 2 - 10px;
+                    y: parent.height / 2 - 10px;
+                    viewbox-width: 24;
+                    viewbox-height: 24;
+                    fill: #aaaaaa;
+                    commands: "M 3 17.25 L 3 21 L 6.75 21 L 17.81 9.94 L 14.06 6.19 L 3 17.25 Z M 20.71 7.04 C 21.1 6.65 21.1 6.02 20.71 5.63 L 18.37 3.29 C 17.98 2.9 17.35 2.9 16.96 3.29 L 15.13 5.12 L 18.88 8.87 L 20.71 7.04 Z";
+                }
+            }
+        }
+
+        TouchArea {
+            width: 36px;
             clicked => { root.removed() }
             Rectangle {
                 background: parent.has-hover ? #3a1f1f : transparent;
@@ -271,6 +292,7 @@ component HostRow inherits Rectangle {
 
 component HostEditor inherits Rectangle {
     in property <length> safe-top;
+    in property <bool> editing;
     in-out property <string> name-text;
     in-out property <string> url-text;
     in-out property <string> remote-url-text;
@@ -303,7 +325,7 @@ component HostEditor inherits Rectangle {
                 border-top-left-radius: 14px;
                 border-top-right-radius: 14px;
                 Text {
-                    text: "Add workstation";
+                    text: root.editing ? "Edit workstation" : "Add workstation";
                     color: #e0e0e0;
                     font-size: 16px;
                     font-weight: 600;
@@ -440,6 +462,7 @@ component HostPicker inherits Rectangle {
     in property <length> safe-top;
     in property <length> safe-bottom;
     callback pick(int);
+    callback edit(int);
     callback remove(int);
     callback dismiss();
 
@@ -483,6 +506,7 @@ component HostPicker inherits Rectangle {
                         host: h;
                         selected: i == root.selected-host;
                         tapped => { root.pick(i) }
+                        edited => { root.edit(i) }
                         removed => { root.remove(i) }
                     }
                 }
@@ -763,6 +787,8 @@ export component AppWindow inherits Window {
     in-out property <int> open-tab: -1;
     in-out property <bool> picker-open: false;
     in-out property <bool> editor-open: false;
+    /// -1 means "add new host"; >= 0 means "edit host at that index".
+    in-out property <int> editor-edit-index: -1;
     in-out property <string> input-text: "";
     in-out property <string> editor-name: "";
     in-out property <string> editor-url: "";
@@ -773,6 +799,7 @@ export component AppWindow inherits Window {
     callback request-activate(int);
     callback request-send-input(int, string);
     callback request-add-host(string, string, string, string);
+    callback request-update-host(int, string, string, string, string);
     callback request-set-active-host(int);
     callback request-remove-host(int);
     callback open-tab-changed(int);
@@ -814,6 +841,7 @@ export component AppWindow inherits Window {
             multi-host: root.hosts.length > 1;
             host-tap => { root.picker-open = true; }
             add-host-tap => {
+                root.editor-edit-index = -1;
                 root.editor-name = "";
                 root.editor-url = "";
                 root.editor-remote-url = "";
@@ -907,6 +935,15 @@ export component AppWindow inherits Window {
             root.picker-open = false;
             root.request-set-active-host(i);
         }
+        edit(i) => {
+            root.editor-edit-index = i;
+            root.editor-name = root.hosts[i].name;
+            root.editor-url = root.hosts[i].url;
+            root.editor-remote-url = root.hosts[i].remote-url;
+            root.editor-token = root.hosts[i].token;
+            root.picker-open = false;
+            root.editor-open = true;
+        }
         remove(i) => {
             root.request-remove-host(i);
             if (root.hosts.length <= 1) {
@@ -920,13 +957,18 @@ export component AppWindow inherits Window {
         width: 100%;
         height: 100%;
         safe-top: root.safe-area-insets.top;
+        editing: root.editor-edit-index >= 0;
         name-text <=> root.editor-name;
         url-text <=> root.editor-url;
         remote-url-text <=> root.editor-remote-url;
         token-text <=> root.editor-token;
         save(n, u, r, t) => {
             root.editor-open = false;
-            root.request-add-host(n, u, r, t);
+            if (root.editor-edit-index >= 0) {
+                root.request-update-host(root.editor-edit-index, n, u, r, t);
+            } else {
+                root.request-add-host(n, u, r, t);
+            }
         }
         dismiss => { root.editor-open = false; }
     }
