@@ -85,6 +85,44 @@ pub fn local_ip() -> String {
         .map_or_else(|_| "127.0.0.1".into(), |a| a.ip().to_string())
 }
 
+/// Enumerate every non-loopback IPv4 address bound to a local
+/// interface. Used by the QR modal so the user can see all the
+/// possible LAN IPs the phone might reach the desktop on — handy on
+/// machines with VPN, Docker bridges, or multi-homed Wi-Fi/Ethernet
+/// where `local_ip()` only returns the default-route source.
+///
+/// Implementation note: shelling out to `ip -4 -o addr show scope
+/// global` keeps us inside Rust's safe code — `getifaddrs` would
+/// require an `unsafe` FFI block and the crate denies that globally.
+pub fn local_ips_all() -> Vec<String> {
+    let output = std::process::Command::new("ip")
+        .args(["-4", "-o", "addr", "show", "scope", "global"])
+        .output();
+    let Ok(out) = output else { return vec![local_ip()] };
+    if !out.status.success() {
+        return vec![local_ip()];
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut ips: Vec<String> = text
+        .lines()
+        .filter_map(|line| {
+            // `ip` output format: `<idx>: <iface> inet <addr>/<mask> ...`
+            let inet_pos = line.find(" inet ")?;
+            let rest = &line[inet_pos + 6..];
+            let addr = rest.split('/').next()?.trim();
+            if addr.is_empty() || addr == "127.0.0.1" {
+                None
+            } else {
+                Some(addr.to_string())
+            }
+        })
+        .collect();
+    if ips.is_empty() {
+        ips.push(local_ip());
+    }
+    ips
+}
+
 fn respond_json<W: Write>(stream: &mut W, status: u16, body: &str) {
     let reason = match status {
         200 => "OK",

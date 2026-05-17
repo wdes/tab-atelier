@@ -1822,9 +1822,13 @@ impl AppState {
             return None;
         }
 
-        let ip = api::local_ip();
-        let lan_url = format!("http://{ip}:7890");
-        let lan_url_tls = format!("https://{ip}:7891");
+        // Refresh on every render so a freshly-opened modal reflects the
+        // current routing table (Wi-Fi switch, VPN up/down, …) rather
+        // than whatever IPs were live when the process started.
+        let ips = api::local_ips_all();
+        let primary_ip = ips.first().cloned().unwrap_or_else(|| "127.0.0.1".into());
+        let lan_url = format!("http://{primary_ip}:7890");
+        let lan_url_tls = format!("https://{primary_ip}:7891");
         // Pass both the plain-HTTP and TLS URLs into the deep link; the
         // mobile client picks whichever its current build supports.
         let qr_payload = format!(
@@ -1923,6 +1927,27 @@ impl AppState {
                                 )
                                 .child(url),
                         )
+                        .when(ips.len() > 1, |el| {
+                            // Surface every interface IP so the user can
+                            // see which network they're reachable on
+                            // (Wi-Fi vs Ethernet vs Docker bridge, etc.).
+                            let mut list = div()
+                                .mt(px(8.0))
+                                .text_size(px(10.0))
+                                .text_color(dialog_fg)
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.0))
+                                .child(div().text_color(dialog_fg).child("Also reachable at:"));
+                            for ip in ips.iter().skip(1) {
+                                list = list.child(
+                                    div()
+                                        .text_color(link_fg)
+                                        .child(format!("http://{ip}:7890")),
+                                );
+                            }
+                            el.child(list)
+                        })
                         .child(
                             div().flex().justify_end().mt(px(12.0)).child(
                                 div()
