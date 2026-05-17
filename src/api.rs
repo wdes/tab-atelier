@@ -22,6 +22,10 @@ struct TabInfo {
     /// to preview what's happening without fetching the full output.
     #[serde(skip_serializing_if = "String::is_empty")]
     preview: String,
+    /// Cumulative time the tab has spent in the "active" state on the
+    /// desktop. Lets the mobile remote show the same per-tab counter
+    /// without needing its own activity tracker.
+    uptime_secs: f64,
     #[cfg(feature = "energy")]
     cpu_percent: f64,
     #[cfg(feature = "energy")]
@@ -45,6 +49,7 @@ pub struct SnapshotTab {
     pub name: String,
     pub cwd: Option<String>,
     pub output: String,
+    pub uptime_secs: f64,
 }
 
 pub struct TabSnapshot {
@@ -96,6 +101,29 @@ fn respond_json<W: Write>(stream: &mut W, status: u16, body: &str) {
         body.len(),
         body
     );
+}
+
+/// Strip ANSI CSI/SGR escapes (`ESC [ … final`) from `s`. Used to flatten
+/// the tab-list preview line; the full /output endpoint keeps its escapes
+/// so mobile clients can render colour.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            for nc in chars.by_ref() {
+                // CSI parameters are `0x30..=0x3F`, intermediates `0x20..=0x2F`,
+                // and the sequence ends at the first byte in `0x40..=0x7E`.
+                if ('\x40'..='\x7e').contains(&nc) {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn error_json<W: Write>(stream: &mut W, status: u16, msg: &str) {
@@ -203,12 +231,18 @@ fn handle_connection<S: Read + Write>(
                     name: t.name.clone(),
                     cwd: t.cwd.clone(),
                     active: i == state.active,
-                    preview: t.output
-                        .lines()
-                        .rev()
-                        .find(|l| !l.trim().is_empty())
-                        .unwrap_or("")
-                        .to_string(),
+                    // The cached output now ships ANSI SGR escapes for
+                    // remote-side colouring, but the tab-list preview is
+                    // rendered as plain Text — strip them first so the
+                    // ESC byte and `[…m` payload don't show up as junk.
+                    preview: strip_ansi(
+                        t.output
+                            .lines()
+                            .rev()
+                            .find(|l| !l.trim().is_empty())
+                            .unwrap_or(""),
+                    ),
+                    uptime_secs: t.uptime_secs,
                     #[cfg(feature = "energy")]
                     cpu_percent: state.power.get(i).map_or(0.0, |p| p.cpu_percent),
                     #[cfg(feature = "energy")]
@@ -491,11 +525,13 @@ mod tests {
                     name: "shell".into(),
                     cwd: Some("/home/user".into()),
                     output: "$ ls\nfoo bar baz".into(),
+                    uptime_secs: 0.0,
                 },
                 SnapshotTab {
                     name: "build".into(),
                     cwd: None,
                     output: String::new(),
+                    uptime_secs: 0.0,
                 },
             ],
             active: 0,

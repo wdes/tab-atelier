@@ -400,48 +400,22 @@ impl TerminalView {
         t.selection_to_string()
     }
 
-    #[allow(clippy::significant_drop_tightening)]
-    /// Return up to `max_lines` (or the visible screen if `None`) of the terminal
-    /// as plain text (no ANSI escapes), one line per row, ending without a
-    /// trailing newline. When `max_lines` exceeds the visible screen the result
-    /// also includes scrollback rows.
-    #[allow(clippy::significant_drop_tightening)]
-    pub fn plain_text(&self, max_lines: Option<usize>) -> String {
-        let t = self.term.lock();
-        let grid = t.grid();
-        let cols = grid.columns();
-        let screen = grid.screen_lines();
-        let history = grid.history_size();
-        let want = max_lines.unwrap_or(screen).min(screen + history);
-        let extra = want.saturating_sub(screen);
-        let start_row = -(extra as i32);
-        let end_row = screen as i32;
-        let mut out = String::with_capacity(cols * want + want);
-        for row in start_row..end_row {
-            let mut line = String::with_capacity(cols);
-            for col in 0..cols {
-                let cell = &grid[GridPoint::new(Line(row), Column(col))];
-                if cell.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
-                    continue;
-                }
-                let ch = if cell.c == '\0' { ' ' } else { cell.c };
-                line.push(ch);
-            }
-            while line.ends_with(' ') {
-                line.pop();
-            }
-            out.push_str(&line);
-            out.push('\n');
-        }
-        while out.ends_with('\n') {
-            out.pop();
-        }
-        out
-    }
-
 
     #[allow(clippy::significant_drop_tightening)]
     pub fn copy_all_history(&self) -> String {
+        self.ansi_lines(None).join("\n")
+    }
+
+    /// Same view as `plain_text` but with SGR escape sequences preserved
+    /// per fg/bg/flags change, so a remote client can render colours.
+    /// `max_lines` caps the result to the last N lines (visible screen
+    /// plus scrollback) — pass `None` to dump the full history.
+    pub fn ansi_text(&self, max_lines: Option<usize>) -> String {
+        self.ansi_lines(max_lines).join("\n")
+    }
+
+    #[allow(clippy::significant_drop_tightening)]
+    fn ansi_lines(&self, max_lines: Option<usize>) -> Vec<String> {
         use std::fmt::Write;
         let lines = {
             let t = self.term.lock();
@@ -457,7 +431,13 @@ impl TerminalView {
             let mut cur_flags = CellFlags::empty();
             let mut lines = Vec::new();
 
-            for row in (-(history as i32))..screen as i32 {
+            // Visible screen + scrollback, optionally clipped to the last
+            // `max_lines` rows so the API doesn't have to ship the entire
+            // history on every poll.
+            let want = max_lines.unwrap_or(screen + history).min(screen + history);
+            let extra = want.saturating_sub(screen);
+            let start_row = -(extra as i32);
+            for row in start_row..screen as i32 {
                 let mut line = String::with_capacity(cols * 2);
                 for col in 0..cols {
                     let cell = &grid[GridPoint::new(Line(row), Column(col))];
@@ -550,7 +530,7 @@ impl TerminalView {
         while lines.last().is_some_and(std::string::String::is_empty) {
             lines.pop();
         }
-        lines.join("\n")
+        lines
     }
 
     fn url_at_grid(&self, line: usize, col: usize) -> Option<DetectedUrl> {

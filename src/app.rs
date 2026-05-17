@@ -595,7 +595,10 @@ impl AppState {
                 name: ts.name.clone(),
                 cwd: ts.cwd.clone(),
                 // Cache 200 lines so remote clients can request scrollback.
-                output: tab.view.read(cx).plain_text(Some(200)),
+                // ANSI escapes are kept so the mobile remote can render
+                // colours instead of the previous flat-grey text.
+                output: tab.view.read(cx).ansi_text(Some(200)),
+                uptime_secs: tab.uptime().as_secs_f64(),
             })
             .collect();
 

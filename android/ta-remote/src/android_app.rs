@@ -153,6 +153,8 @@ struct ApiTab {
     watts: Option<f64>,
     #[serde(default)]
     preview: String,
+    #[serde(default)]
+    uptime_secs: f64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -240,12 +242,181 @@ fn fetch_output(
 }
 
 fn push_output(ui_weak: &Weak<AppWindow>, text: String) {
+    // Parsing runs on whatever thread called us, but the Slint structs
+    // (`ColorLine` carries a `ModelRc` which is `!Send`) must be built
+    // on the UI thread.
+    let lines = parse_ansi(&text);
     let weak = ui_weak.clone();
     let _ = slint::invoke_from_event_loop(move || {
-        if let Some(ui) = weak.upgrade() {
-            ui.set_open_tab_output(SharedString::from(text));
-        }
+        let Some(ui) = weak.upgrade() else { return };
+        let model: Vec<ColorLine> = lines
+            .into_iter()
+            .map(|spans| {
+                let span_models: Vec<ColorSpan> = spans
+                    .into_iter()
+                    .map(|s| ColorSpan {
+                        text: SharedString::from(s.text),
+                        color: slint::Color::from_rgb_u8(s.rgb[0], s.rgb[1], s.rgb[2]),
+                        bold: s.bold,
+                    })
+                    .collect();
+                ColorLine {
+                    spans: std::rc::Rc::new(slint::VecModel::from(span_models)).into(),
+                }
+            })
+            .collect();
+        ui.set_open_tab_output_lines(VecModel::from_slice(&model));
     });
+}
+
+struct ParsedSpan {
+    text: String,
+    rgb: [u8; 3],
+    bold: bool,
+}
+
+/// Default foreground colour for the terminal view — keep in sync with
+/// the old `#d0d0d0` used by the plain-text Text element.
+const DEFAULT_FG: [u8; 3] = [0xd0, 0xd0, 0xd0];
+
+/// Parse `text` (lines separated by '\n') as a sequence of rows where each
+/// row is a vector of single-colour runs. Recognises CSI SGR sequences
+/// (reset, bold, 8 fg, bright fg, 256 fg, 24-bit fg); other CSI sequences
+/// are silently consumed so they don't appear as garbage in the output.
+fn parse_ansi(text: &str) -> Vec<Vec<ParsedSpan>> {
+    let mut lines = Vec::new();
+    let mut cur_color = DEFAULT_FG;
+    let mut cur_bold = false;
+
+    for raw_line in text.split('\n') {
+        let mut spans: Vec<ParsedSpan> = Vec::new();
+        let mut buf = String::new();
+        let mut chars = raw_line.chars().peekable();
+
+        while let Some(c) = chars.next() {
+            if c == '\x1b' && chars.peek() == Some(&'[') {
+                chars.next();
+                let mut params = String::new();
+                let mut final_byte = 0u8;
+                for nc in chars.by_ref() {
+                    if ('\x40'..='\x7e').contains(&nc) {
+                        final_byte = nc as u8;
+                        break;
+                    }
+                    params.push(nc);
+                }
+                if final_byte == b'm' {
+                    if !buf.is_empty() {
+                        spans.push(ParsedSpan {
+                            text: std::mem::take(&mut buf),
+                            rgb: cur_color,
+                            bold: cur_bold,
+                        });
+                    }
+                    apply_sgr(&params, &mut cur_color, &mut cur_bold);
+                }
+            } else {
+                buf.push(c);
+            }
+        }
+        if !buf.is_empty() {
+            spans.push(ParsedSpan {
+                text: buf,
+                rgb: cur_color,
+                bold: cur_bold,
+            });
+        }
+        // Empty rows still need a placeholder span so the VerticalLayout
+        // reserves a row of vertical space — otherwise blank shell lines
+        // would collapse the gap above/below them.
+        if spans.is_empty() {
+            spans.push(ParsedSpan {
+                text: " ".to_string(),
+                rgb: cur_color,
+                bold: cur_bold,
+            });
+        }
+        lines.push(spans);
+    }
+    lines
+}
+
+fn apply_sgr(params: &str, cur: &mut [u8; 3], bold: &mut bool) {
+    if params.is_empty() {
+        *cur = DEFAULT_FG;
+        *bold = false;
+        return;
+    }
+    let parts: Vec<u32> = params.split(';').filter_map(|s| s.parse().ok()).collect();
+    let mut i = 0;
+    while i < parts.len() {
+        let code = parts[i];
+        match code {
+            0 => {
+                *cur = DEFAULT_FG;
+                *bold = false;
+            }
+            1 => *bold = true,
+            22 => *bold = false,
+            30..=37 => *cur = ansi16((code - 30) as u8),
+            38 => {
+                if i + 1 < parts.len() && parts[i + 1] == 5 && i + 2 < parts.len() {
+                    *cur = ansi256(parts[i + 2] as u8);
+                    i += 2;
+                } else if i + 4 < parts.len() && parts[i + 1] == 2 {
+                    *cur = [
+                        parts[i + 2] as u8,
+                        parts[i + 3] as u8,
+                        parts[i + 4] as u8,
+                    ];
+                    i += 4;
+                }
+            }
+            39 => *cur = DEFAULT_FG,
+            90..=97 => *cur = ansi16((code - 90 + 8) as u8),
+            _ => {}
+        }
+        i += 1;
+    }
+}
+
+const ANSI_PALETTE: [[u8; 3]; 16] = [
+    [0x00, 0x00, 0x00],
+    [0xcd, 0x00, 0x00],
+    [0x00, 0xcd, 0x00],
+    [0xcd, 0xcd, 0x00],
+    [0x40, 0x80, 0xff], // blue — brightened from #0000ee for readability on dark bg
+    [0xcd, 0x00, 0xcd],
+    [0x00, 0xcd, 0xcd],
+    [0xe5, 0xe5, 0xe5],
+    [0x7f, 0x7f, 0x7f],
+    [0xff, 0x40, 0x40],
+    [0x40, 0xff, 0x40],
+    [0xff, 0xff, 0x40],
+    [0x80, 0xa0, 0xff],
+    [0xff, 0x40, 0xff],
+    [0x40, 0xff, 0xff],
+    [0xff, 0xff, 0xff],
+];
+
+fn ansi16(idx: u8) -> [u8; 3] {
+    ANSI_PALETTE[(idx as usize) % 16]
+}
+
+fn ansi256(idx: u8) -> [u8; 3] {
+    if idx < 16 {
+        ansi16(idx)
+    } else if idx < 232 {
+        let i = idx - 16;
+        let r = i / 36;
+        let g = (i % 36) / 6;
+        let b = i % 6;
+        let to_val = |v: u8| if v == 0 { 0u8 } else { 55 + v * 40 };
+        [to_val(r), to_val(g), to_val(b)]
+    } else {
+        let v = 8u8.saturating_add((idx - 232).saturating_mul(10));
+        [v, v, v]
+    }
 }
 
 fn fetch_tabs(
@@ -365,6 +536,20 @@ fn post_activate(agent: &ureq::Agent, host: &HostConfig, reach: &Reach, idx: i32
     }
 }
 
+/// Compact "Xh Ym" / "Xm Ys" / "Xs" uptime string — matches the visual
+/// vocabulary the desktop uses in its tab headers so the phone counter
+/// reads identically.
+fn format_uptime(secs: f64) -> String {
+    let total = secs.max(0.0) as u64;
+    if total >= 3600 {
+        format!("{}h {:02}m", total / 3600, (total % 3600) / 60)
+    } else if total >= 60 {
+        format!("{}m {:02}s", total / 60, total % 60)
+    } else {
+        format!("{total}s")
+    }
+}
+
 /// Per-tab CRC32 of the last preview we showed the user. A row gets a
 /// "new output" dot whenever the current preview hashes differently from
 /// the stored value, *unless* this is the first poll for that tab (in
@@ -409,6 +594,7 @@ fn push_tabs(ui_weak: &Weak<AppWindow>, tabs: Vec<ApiTab>, seen: &SeenPreviews) 
                         _ => format!("{:.1}%", t.cpu_percent),
                     }),
                     preview: SharedString::from(t.preview),
+                    uptime: SharedString::from(format_uptime(t.uptime_secs)),
                     has_new,
                 }
             })
