@@ -343,6 +343,32 @@ fn push_tabs(ui_weak: &Weak<AppWindow>, tabs: Vec<ApiTab>, seen: &SeenPreviews) 
     });
 }
 
+/// After a mutating API call (new tab / close / rename / activate),
+/// trigger a one-shot /tabs refresh ~250 ms later so the user sees the
+/// change reflected without waiting for the next 2 s poll tick.
+fn refresh_soon(
+    ui_weak: &Weak<AppWindow>,
+    agent: &Arc<ureq::Agent>,
+    data: &Arc<Mutex<AppData>>,
+    reach: &Arc<Mutex<Reach>>,
+    seen: &SeenPreviews,
+) {
+    let weak = ui_weak.clone();
+    let agent = agent.clone();
+    let data = data.clone();
+    let reach = reach.clone();
+    let seen = seen.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(250));
+        let Some(host) = data.lock().unwrap().active_host() else { return };
+        let (new_reach, tabs) = fetch_tabs(&agent, &host);
+        if let Some(t) = tabs {
+            push_tabs(&weak, t, &seen);
+        }
+        *reach.lock().unwrap() = new_reach;
+    });
+}
+
 /// Mark the given tab's current preview as "seen", clearing the dot the
 /// next time push_tabs runs.
 fn mark_seen(seen: &SeenPreviews, name: &str, preview: &str) {
@@ -497,32 +523,41 @@ pub fn android_main(app: slint::android::AndroidApp) {
     let close_agent = agent.clone();
     let close_data = data.clone();
     let close_reach = last_reach.clone();
+    let close_weak = ui_weak.clone();
+    let close_seen = seen_previews.clone();
     ui.on_request_close_tab(move |idx| {
         let Some(host) = close_data.lock().unwrap().active_host() else { return };
         let reach = *close_reach.lock().unwrap();
         let agent = close_agent.clone();
         std::thread::spawn(move || delete_tab(&agent, &host, &reach, idx));
+        refresh_soon(&close_weak, &close_agent, &close_data, &close_reach, &close_seen);
     });
 
     let new_agent = agent.clone();
     let new_data = data.clone();
     let new_reach = last_reach.clone();
+    let new_weak = ui_weak.clone();
+    let new_seen = seen_previews.clone();
     ui.on_request_new_tab(move || {
         let Some(host) = new_data.lock().unwrap().active_host() else { return };
         let reach = *new_reach.lock().unwrap();
         let agent = new_agent.clone();
         std::thread::spawn(move || post_new_tab(&agent, &host, &reach));
+        refresh_soon(&new_weak, &new_agent, &new_data, &new_reach, &new_seen);
     });
 
     let rename_agent = agent.clone();
     let rename_data = data.clone();
     let rename_reach = last_reach.clone();
+    let rename_weak = ui_weak.clone();
+    let rename_seen = seen_previews.clone();
     ui.on_request_rename_tab(move |idx, name| {
         let Some(host) = rename_data.lock().unwrap().active_host() else { return };
         let reach = *rename_reach.lock().unwrap();
         let agent = rename_agent.clone();
         let name = name.to_string();
         std::thread::spawn(move || post_rename_tab(&agent, &host, &reach, idx, &name));
+        refresh_soon(&rename_weak, &rename_agent, &rename_data, &rename_reach, &rename_seen);
     });
 
     let open_tab_for_cb = open_tab.clone();
