@@ -429,7 +429,7 @@ impl TerminalView {
             let mut cur_fg = default_fg;
             let mut cur_bg = default_bg;
             let mut cur_flags = CellFlags::empty();
-            let mut lines = Vec::new();
+            let mut lines: Vec<String> = Vec::new();
 
             // Visible screen + scrollback, optionally clipped to the last
             // `max_lines` rows so the API doesn't have to ship the entire
@@ -437,7 +437,16 @@ impl TerminalView {
             let want = max_lines.unwrap_or(screen + history).min(screen + history);
             let extra = want.saturating_sub(screen);
             let start_row = -(extra as i32);
+            // Track when the previous row's last cell carried WRAPLINE —
+            // alacritty sets that flag when a line was soft-wrapped to
+            // fit the grid width. Concatenating wrapped rows into one
+            // logical line lets long URLs survive the trip to the
+            // mobile remote without being chopped in half.
+            let mut continues_prev = false;
             for row in start_row..screen as i32 {
+                let last_cell_wraps = grid[GridPoint::new(Line(row), Column(cols - 1))]
+                    .flags
+                    .contains(CellFlags::WRAPLINE);
                 let mut line = String::with_capacity(cols * 2);
                 for col in 0..cols {
                     let cell = &grid[GridPoint::new(Line(row), Column(col))];
@@ -517,7 +526,26 @@ impl TerminalView {
                     cur_bg = default_bg;
                     cur_flags = CellFlags::empty();
                 }
-                lines.push(line.trim_end().to_string());
+                // Soft-wrapped rows in alacritty are full-width with no
+                // trailing whitespace — preserve every cell so the
+                // joined result reads back as the original logical
+                // line. Only trim the right edge when this row stands
+                // alone (the next row is *not* a continuation).
+                let row_text = if last_cell_wraps {
+                    line
+                } else {
+                    line.trim_end().to_string()
+                };
+                if continues_prev {
+                    if let Some(prev) = lines.last_mut() {
+                        prev.push_str(&row_text);
+                    } else {
+                        lines.push(row_text);
+                    }
+                } else {
+                    lines.push(row_text);
+                }
+                continues_prev = last_cell_wraps;
             }
             lines
         };
