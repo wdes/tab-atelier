@@ -1070,6 +1070,12 @@ export component AppWindow inherits Window {
     callback request-new-tab();
     callback request-rename-tab(int, string);
     callback request-scan-qr();
+    /// Open the host editor pre-filled from the clipboard if it
+    /// contains a `taremote://onboard?…` URL, otherwise open it empty
+    /// (no error banner). Used by every "Add workstation" entry point
+    /// so pasting the desktop link straight from the system clipboard
+    /// is a one-tap import.
+    callback request-add-host-prefill();
     callback request-set-active-host(int);
     callback request-remove-host(int);
     callback open-tab-changed(int);
@@ -1128,15 +1134,7 @@ export component AppWindow inherits Window {
             detail: root.hosts.length > 0 ? root.hosts[root.active-host].detail : "tap + to add a workstation";
             multi-host: root.hosts.length > 1;
             host-tap => { root.picker-open = true; }
-            add-host-tap => {
-                root.editor-edit-index = -1;
-                root.editor-name = "";
-                root.editor-url = "";
-                root.editor-remote-url = "";
-                root.editor-token = "";
-                root.editor-error = "";
-                root.editor-open = true;
-            }
+            add-host-tap => { root.request-add-host-prefill(); }
         }
 
         Rectangle {
@@ -1305,13 +1303,7 @@ export component AppWindow inherits Window {
         }
         add => {
             root.picker-open = false;
-            root.editor-edit-index = -1;
-            root.editor-name = "";
-            root.editor-url = "";
-            root.editor-remote-url = "";
-            root.editor-token = "";
-            root.editor-error = "";
-            root.editor-open = true;
+            root.request-add-host-prefill();
         }
         dismiss => { root.picker-open = false; }
     }

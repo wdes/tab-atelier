@@ -1080,6 +1080,41 @@ pub fn android_main(app: slint::android::AndroidApp) {
         }
     });
 
+    // Add-Workstation entry points all funnel through this callback so
+    // pasting the desktop's `taremote://onboard…` link from the system
+    // clipboard auto-fills the editor. When the clipboard has nothing
+    // usable, fall back to a blank editor without an error banner —
+    // the user explicitly chose "add", so a scolding "clipboard didn't
+    // contain X" message would be wrong.
+    let add_app = app_for_callbacks.clone();
+    let add_weak = ui_weak.clone();
+    ui.on_request_add_host_prefill(move || {
+        let pasted = read_clipboard(&add_app).unwrap_or_default();
+        let parsed = pasted
+            .lines()
+            .find(|l| l.trim_start().starts_with("taremote://onboard?"))
+            .and_then(|l| crate::onboard::parse_onboard_url(l.trim()));
+        let weak = add_weak.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            ui.set_editor_edit_index(-1);
+            ui.set_editor_name(SharedString::new());
+            ui.set_editor_remote_url(SharedString::new());
+            ui.set_editor_error(SharedString::new());
+            match parsed {
+                Some((url, token)) => {
+                    ui.set_editor_url(SharedString::from(url));
+                    ui.set_editor_token(SharedString::from(token));
+                }
+                None => {
+                    ui.set_editor_url(SharedString::new());
+                    ui.set_editor_token(SharedString::new());
+                }
+            }
+            ui.set_editor_open(true);
+        });
+    });
+
     let scan_weak = ui_weak.clone();
     ui.on_request_scan_qr(move || {
         // The Android intents for "open camera" only invoke the photo
