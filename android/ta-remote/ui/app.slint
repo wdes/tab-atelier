@@ -1,3 +1,12 @@
+// Bundle a monospace font with broad Unicode coverage plus a monochrome
+// emoji font, since Android's "monospace" alias (DroidSans/RobotoMono)
+// has neither extended Latin nor pictographs — emojis show as tofu and
+// accented chars in tab previews/output go missing. Slint registers both
+// at compile time; fontique then resolves codepoints by trying the
+// requested family first and falling back across the registered fonts.
+import "../fonts/DejaVuSansMono.ttf";
+import "../fonts/NotoEmoji.ttf";
+
 struct TabRow {
     name: string,
     cwd: string,
@@ -179,7 +188,7 @@ component TabCard inherits Rectangle {
                         text: tab.preview;
                         color: #6b8caf;
                         font-size: 11px;
-                        font-family: "monospace";
+                        font-family: "DejaVu Sans Mono";
                         overflow: elide;
                     }
                 }
@@ -353,6 +362,7 @@ component HostRow inherits Rectangle {
 
 component HostEditor inherits Rectangle {
     in property <length> safe-top;
+    in property <length> ime-height;
     in property <bool> editing;
     in-out property <string> name-text;
     in-out property <string> url-text;
@@ -375,7 +385,12 @@ component HostEditor inherits Rectangle {
         border-radius: 14px;
         border-width: 1px;
         border-color: #2a2a2a;
-        y: root.safe-top + 24px;
+        // Slide the dialog up when the IME is open so the Save/Cancel
+        // row stays above the keyboard. When closed, anchor to the top
+        // safe area as before.
+        y: root.ime-height > 0px
+            ? max(root.safe-top + 8px, parent.height - root.ime-height - self.height - 8px)
+            : root.safe-top + 24px;
 
         VerticalLayout {
             padding: 0;
@@ -693,6 +708,7 @@ component TerminalView inherits Rectangle {
     in property <length> safe-bottom;
     in property <length> safe-left;
     in property <length> safe-right;
+    in property <length> ime-height;
     in-out property <string> input-text;
     in-out property <length> font-size: 13px;
     callback back();
@@ -713,7 +729,10 @@ component TerminalView inherits Rectangle {
     VerticalLayout {
         spacing: 0;
         padding-top: root.safe-top;
-        padding-bottom: root.safe-bottom;
+        // Shrink the layout by the IME height when the keyboard is up so
+        // the input bar (last child of this layout) floats above it
+        // instead of being painted underneath.
+        padding-bottom: max(root.safe-bottom, root.ime-height);
         padding-left: root.safe-left;
         padding-right: root.safe-right;
 
@@ -822,14 +841,14 @@ component TerminalView inherits Rectangle {
                 if root.output-text != "" : Text {
                     text: root.output-text;
                     color: #d0d0d0;
-                    font-family: "monospace";
+                    font-family: "DejaVu Sans Mono";
                     font-size: root.font-size;
                     wrap: no-wrap;
                 }
                 if root.output-text == "" : Text {
                     text: "Waiting for output…";
                     color: #666;
-                    font-family: "monospace";
+                    font-family: "DejaVu Sans Mono";
                     font-size: root.font-size;
                 }
             }
@@ -861,7 +880,7 @@ component TerminalView inherits Rectangle {
                         TextInput {
                             text <=> root.input-text;
                             color: #e0e0e0;
-                            font-family: "monospace";
+                            font-family: "DejaVu Sans Mono";
                             font-size: root.font-size + 1px;
                             single-line: true;
                             vertical-alignment: center;
@@ -1125,6 +1144,7 @@ export component AppWindow inherits Window {
         safe-bottom: root.safe-area-insets.bottom;
         safe-left: root.safe-area-insets.left;
         safe-right: root.safe-area-insets.right;
+        ime-height: root.virtual-keyboard-size.height;
         input-text <=> root.input-text;
         back => { root.open-tab = -1; }
         send-input => {
@@ -1199,6 +1219,7 @@ export component AppWindow inherits Window {
         width: 100%;
         height: 100%;
         safe-top: root.safe-area-insets.top;
+        ime-height: root.virtual-keyboard-size.height;
         editing: root.editor-edit-index >= 0;
         name-text <=> root.editor-name;
         url-text <=> root.editor-url;
@@ -1230,7 +1251,11 @@ export component AppWindow inherits Window {
         Rectangle {
             width: min(parent.width * 88%, 420px);
             height: 220px;
-            y: root.safe-area-insets.top + 24px;
+            // Same IME-aware positioning as the host editor: float up
+            // when the keyboard is showing, otherwise anchor at top.
+            y: root.virtual-keyboard-size.height > 0px
+                ? max(root.safe-area-insets.top + 8px, parent.height - root.virtual-keyboard-size.height - self.height - 8px)
+                : root.safe-area-insets.top + 24px;
             background: #1c1c1c;
             border-radius: 14px;
             border-width: 1px;
@@ -1380,7 +1405,7 @@ export component AppWindow inherits Window {
                         color: #f0f0f0;
                         font-size: 15px;
                         font-weight: 600;
-                        font-family: "monospace";
+                        font-family: "DejaVu Sans Mono";
                         horizontal-alignment: center;
                         overflow: elide;
                     }
