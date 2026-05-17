@@ -31,15 +31,86 @@ pub fn state_dir(base: &std::path::Path) -> PathBuf {
     base.join(APP_DIR)
 }
 
+/// Sub-directory that holds the global tab list and preferences,
+/// underneath `config_base_dir()` (e.g. `~/.local/tab-atelier`).
+#[must_use]
+pub fn config_dir(base: &std::path::Path) -> PathBuf {
+    base.join(APP_DIR)
+}
+
 #[must_use]
 pub fn state_path(base: &std::path::Path) -> PathBuf {
     state_dir(base).join("tabs.json")
 }
 
 #[must_use]
+pub fn config_state_path(config_base: &std::path::Path) -> PathBuf {
+    config_dir(config_base).join("tabs.json")
+}
+
+/// CRC32 (IEEE) — small inline implementation; used to disambiguate tab
+/// names whose sanitized form would otherwise collide (e.g. `foo/bar` and
+/// `foo_bar` both sanitize to `foo_bar`).
+#[must_use]
+pub fn crc32(data: &[u8]) -> u32 {
+    const POLY: u32 = 0xEDB8_8320;
+    let mut crc: u32 = !0;
+    for &b in data {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (POLY & mask);
+        }
+    }
+    !crc
+}
+
+/// Sanitize a tab name into something safe to use as a filename component
+/// and append a CRC32 of the original name so two tabs whose sanitized
+/// forms collide still get distinct files.
+///
+/// Non-alphanumeric and non-`._-` characters become `_`. Result is bounded
+/// in length so very long names don't blow past OS path limits.
+#[must_use]
+pub fn sanitize_tab_filename(name: &str) -> String {
+    let mut out: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if out.is_empty() || out.starts_with('.') {
+        out.insert(0, '_');
+    }
+    if out.len() > 100 {
+        out.truncate(100);
+    }
+    let hash = crc32(name.as_bytes());
+    format!("{out}-{hash:08x}")
+}
+
+#[must_use]
+pub fn tab_output_path(state_base: &std::path::Path, tab_name: &str) -> PathBuf {
+    state_dir(state_base).join(format!("output_tab-{}.json", sanitize_tab_filename(tab_name)))
+}
+
+#[must_use]
+pub fn tab_power_path(state_base: &std::path::Path, tab_name: &str) -> PathBuf {
+    state_dir(state_base).join(format!("power_tab-{}.json", sanitize_tab_filename(tab_name)))
+}
+
+#[must_use]
 pub fn load_state_from(base: &std::path::Path) -> Option<SavedState> {
-    let path = state_path(base);
-    if let Ok(data) = std::fs::read_to_string(&path)
+    load_state_at(&state_path(base))
+}
+
+#[must_use]
+pub fn load_state_at(path: &std::path::Path) -> Option<SavedState> {
+    if let Ok(data) = std::fs::read_to_string(path)
         && let Ok(state) = serde_json::from_str::<SavedState>(&data)
     {
         return Some(state);
@@ -55,6 +126,58 @@ pub fn load_state_from(base: &std::path::Path) -> Option<SavedState> {
         }
     }
     None
+}
+
+/// Load tab list + preferences using the new layout.
+///
+/// Reads `~/.local/tab-atelier/tabs.json` for metadata and the per-tab
+/// `output_tab-<sanitized>-<crc>.json` files alongside it. Falls back to
+/// the legacy `~/.local/state/tab-atelier/tabs.json` (which embedded
+/// `output` inline) for a one-shot migration if the new file is absent.
+#[must_use]
+pub fn load_state_with_outputs(
+    config_base: &std::path::Path,
+    state_base: &std::path::Path,
+) -> Option<SavedState> {
+    let new_path = config_state_path(config_base);
+    let legacy_path = state_path(state_base);
+
+    // Migration: if the new layout is empty but legacy data exists, copy it
+    // forward (metadata to config_dir, output to per-tab files).
+    if !new_path.exists()
+        && let Some(legacy) = load_state_at(&legacy_path)
+    {
+        log::warn!("migrating tab state from {} to new layout", legacy_path.display());
+        let mut split = SavedState {
+            tabs: legacy.tabs.iter().map(|t| TabState {
+                name: t.name.clone(),
+                cwd: t.cwd.clone(),
+                output: None,
+                uptime_secs: t.uptime_secs,
+                energy_wh: t.energy_wh,
+            }).collect(),
+            active: legacy.active,
+        };
+        save_state(config_base, &split);
+        for t in &legacy.tabs {
+            if let Some(ref out) = t.output {
+                save_tab_output(state_base, &t.name, out);
+            }
+        }
+        // Reload after migration so this function returns the new canonical
+        // state (in case anything went wrong with the write we just did).
+        split.tabs = legacy.tabs;
+        return Some(split);
+    }
+
+    let mut state = load_state_at(&new_path)?;
+    // Hydrate output from the per-tab files.
+    for t in &mut state.tabs {
+        if t.output.is_none() {
+            t.output = load_tab_output(state_base, &t.name);
+        }
+    }
+    Some(state)
 }
 
 #[derive(Debug, Clone)]
@@ -629,16 +752,41 @@ pub fn keycode_label(keycode: u8) -> String {
 }
 
 #[must_use]
-pub fn load_preferences(base: &std::path::Path) -> Preferences {
-    let path = state_dir(base).join("preferences.json");
+pub fn load_preferences(config_base: &std::path::Path) -> Preferences {
+    let path = config_dir(config_base).join("preferences.json");
     std::fs::read_to_string(path)
         .ok()
         .and_then(|data| serde_json::from_str(&data).ok())
         .unwrap_or_default()
 }
 
-pub fn save_preferences(base: &std::path::Path, prefs: &Preferences) {
-    let dir = state_dir(base);
+/// Load preferences with one-shot migration from the legacy path.
+///
+/// When the new file (`{config_base}/tab-atelier/preferences.json`) is absent
+/// but the legacy `{state_base}/tab-atelier/preferences.json` exists, copy
+/// the contents forward so the user keeps their settings across upgrade.
+#[must_use]
+pub fn load_preferences_with_legacy(
+    config_base: &std::path::Path,
+    state_base: &std::path::Path,
+) -> Preferences {
+    let new_path = config_dir(config_base).join("preferences.json");
+    if new_path.exists() {
+        return load_preferences(config_base);
+    }
+    let legacy_path = state_dir(state_base).join("preferences.json");
+    if let Ok(data) = std::fs::read_to_string(&legacy_path)
+        && let Ok(prefs) = serde_json::from_str::<Preferences>(&data)
+    {
+        log::warn!("migrating preferences from {}", legacy_path.display());
+        save_preferences(config_base, &prefs);
+        return prefs;
+    }
+    Preferences::default()
+}
+
+pub fn save_preferences(config_base: &std::path::Path, prefs: &Preferences) {
+    let dir = config_dir(config_base);
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("preferences.json");
     if let Ok(data) = serde_json::to_string_pretty(prefs) {
@@ -646,22 +794,59 @@ pub fn save_preferences(base: &std::path::Path, prefs: &Preferences) {
     }
 }
 
-/// Atomically persist tab state, rotating the previous file to `.bak`,
-/// `.bak.1`, `.bak.2`. The write is staged to a `.tmp` file, fsynced, and
-/// renamed; if the rename fails the existing file is untouched.
+/// Atomically persist the tab list to `{config_base}/tab-atelier/tabs.json`.
 ///
-/// This is intentionally conservative because a bad save losing a 17-tab
-/// workspace once was enough.
-pub fn save_state(base: &std::path::Path, state: &SavedState) {
-    use std::io::Write;
-
-    let dir = state_dir(base);
-    let _ = std::fs::create_dir_all(&dir);
+/// Rotates `.bak`, `.bak.1`, `.bak.2`; staged via `.tmp` + fsync + rename.
+/// Per-tab output should be saved separately with `save_tab_output()` so a
+/// bad write to one tab's output cannot corrupt the global tab list.
+pub fn save_state(config_base: &std::path::Path, state: &SavedState) {
+    let dir = config_dir(config_base);
     let path = dir.join("tabs.json");
+    write_atomic_with_rotation(&dir, &path, state);
+}
 
-    let Ok(data) = serde_json::to_string_pretty(state) else { return };
+pub fn save_preferences_at(path: &std::path::Path, prefs: &Preferences) {
+    if let Some(parent) = path.parent() {
+        write_atomic_with_rotation(parent, path, prefs);
+    }
+}
 
-    let tmp = dir.join("tabs.json.tmp");
+/// Persist a single tab's output buffer to its own file
+/// (`{state_base}/tab-atelier/output_tab-<sanitized-name>.json`). Atomic,
+/// with one rotated backup.
+pub fn save_tab_output(state_base: &std::path::Path, tab_name: &str, output: &str) {
+    let dir = state_dir(state_base);
+    let path = tab_output_path(state_base, tab_name);
+    write_atomic_with_rotation(&dir, &path, &output);
+}
+
+#[must_use]
+pub fn load_tab_output(state_base: &std::path::Path, tab_name: &str) -> Option<String> {
+    let path = tab_output_path(state_base, tab_name);
+    if let Ok(data) = std::fs::read_to_string(&path)
+        && let Ok(s) = serde_json::from_str::<String>(&data)
+    {
+        return Some(s);
+    }
+    let bak = path.with_extension("json.bak");
+    if let Ok(data) = std::fs::read_to_string(&bak)
+        && let Ok(s) = serde_json::from_str::<String>(&data)
+    {
+        return Some(s);
+    }
+    None
+}
+
+fn write_atomic_with_rotation<T: serde::Serialize>(
+    dir: &std::path::Path,
+    path: &std::path::Path,
+    value: &T,
+) {
+    use std::io::Write;
+    let _ = std::fs::create_dir_all(dir);
+    let Ok(data) = serde_json::to_string_pretty(value) else { return };
+
+    let tmp = path.with_extension("json.tmp");
     let Ok(mut f) = std::fs::File::create(&tmp) else { return };
     if f.write_all(data.as_bytes()).is_err() || f.sync_all().is_err() {
         let _ = std::fs::remove_file(&tmp);
@@ -670,19 +855,17 @@ pub fn save_state(base: &std::path::Path, state: &SavedState) {
     drop(f);
 
     if path.exists() {
-        let bak = dir.join("tabs.json.bak");
-        let bak1 = dir.join("tabs.json.bak.1");
-        let bak2 = dir.join("tabs.json.bak.2");
+        let bak = path.with_extension("json.bak");
+        let bak1 = path.with_extension("json.bak.1");
+        let bak2 = path.with_extension("json.bak.2");
         let _ = std::fs::rename(&bak1, &bak2);
         let _ = std::fs::rename(&bak, &bak1);
-        let _ = std::fs::rename(&path, &bak);
+        let _ = std::fs::rename(path, &bak);
     }
-    let _ = std::fs::rename(&tmp, &path);
+    let _ = std::fs::rename(&tmp, path);
 
-    // fsync the directory so the rename hits disk before we return — on
-    // ext4 the journal would otherwise commit lazily.
     #[cfg(unix)]
-    if let Ok(d) = std::fs::File::open(&dir) {
+    if let Ok(d) = std::fs::File::open(dir) {
         let _ = d.sync_all();
     }
 }
@@ -894,6 +1077,51 @@ mod tests {
     fn test_load_state_missing_file() {
         let result = load_state_from(std::path::Path::new("/tmp/ta-test-nonexistent"));
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_crc32_matches_known_vector() {
+        // "123456789" → 0xCBF43926 (standard CRC-32/ISO-HDLC test vector).
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+    }
+
+    #[test]
+    fn test_sanitize_tab_filename_collision_resistant() {
+        // "foo/bar" and "foo_bar" sanitize to the same prefix but the CRC
+        // suffix keeps them distinct.
+        let a = sanitize_tab_filename("foo/bar");
+        let b = sanitize_tab_filename("foo_bar");
+        assert!(a.starts_with("foo_bar-"));
+        assert!(b.starts_with("foo_bar-"));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_sanitize_tab_filename_handles_unusual_names() {
+        assert!(sanitize_tab_filename("").starts_with("_-"));
+        assert!(sanitize_tab_filename(".hidden").starts_with("_.hidden-"));
+        let long = "a".repeat(200);
+        let san = sanitize_tab_filename(&long);
+        // Truncated to 100 + 1 ("-") + 8 (hex) = 109 chars max.
+        assert!(san.len() <= 109);
+    }
+
+    #[test]
+    fn test_save_tab_output_round_trip() {
+        let base = std::env::temp_dir().join("ta-test-output-roundtrip");
+        let _ = std::fs::remove_dir_all(&base);
+
+        save_tab_output(&base, "build/run", "lots of output\nhere\n");
+        let loaded = load_tab_output(&base, "build/run");
+        assert_eq!(loaded.as_deref(), Some("lots of output\nhere\n"));
+
+        // Same sanitized prefix, different CRC → independent file.
+        save_tab_output(&base, "build_run", "different tab");
+        assert_eq!(load_tab_output(&base, "build_run").as_deref(), Some("different tab"));
+        // Original is untouched.
+        assert_eq!(load_tab_output(&base, "build/run").as_deref(), Some("lots of output\nhere\n"));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

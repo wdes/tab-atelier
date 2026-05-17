@@ -25,7 +25,8 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use tab_atelier::{
     DEFAULT_HOTKEYS, FontConfig, Preferences, SavedState, TabState, gpui_key_to_keycode, keycode_label,
-    load_font_config, load_preferences, load_state_from, load_wakatime_key, save_preferences, save_state,
+    load_font_config, load_preferences_with_legacy, load_state_with_outputs, load_wakatime_key,
+    save_preferences, save_state, save_tab_output,
 };
 
 struct Tab {
@@ -154,7 +155,10 @@ impl AppState {
         let pref_browser_focus = cx.focus_handle();
         let pref_editor_focus = cx.focus_handle();
         let font_config = load_font_config(&platform::config_dir());
-        let prefs = load_preferences(&platform::state_base_dir());
+        let prefs = load_preferences_with_legacy(
+            &platform::config_base_dir(),
+            &platform::state_base_dir(),
+        );
         let browser: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(prefs.browser.clone()));
         let code_editor: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(prefs.code_editor.clone()));
         let lang = match prefs.lang.as_deref() {
@@ -170,7 +174,10 @@ impl AppState {
             prefs.hotkeys
         };
 
-        let (tabs, active) = if let Some(saved) = load_state_from(&platform::state_base_dir()) {
+        let (tabs, active) = if let Some(saved) = load_state_with_outputs(
+            &platform::config_base_dir(),
+            &platform::state_base_dir(),
+        ) {
             info!("restoring {} tab(s) from saved state", saved.tabs.len());
             let mut tabs = Vec::new();
             for ts in &saved.tabs {
@@ -469,20 +476,23 @@ impl AppState {
                 }
             }
         }
+        let state_base = platform::state_base_dir();
+        let outputs: Vec<(String, String)> = self
+            .tabs
+            .iter()
+            .map(|tab| (tab.name.clone(), tab.view.read(cx).copy_all_history()))
+            .collect();
         let tabs: Vec<TabState> = self
             .tabs
             .iter()
             .map(|tab| {
                 let pid = tab.view.read(cx).pid();
                 let cwd = platform::process_cwd(pid).map(|p| p.to_string_lossy().into_owned());
-                let output = {
-                    let text = tab.view.read(cx).copy_all_history();
-                    if text.is_empty() { None } else { Some(text) }
-                };
                 TabState {
                     name: tab.name.clone(),
                     cwd,
-                    output,
+                    // Output is now persisted in a per-tab file, not inline.
+                    output: None,
                     uptime_secs: Some(tab.uptime().as_secs_f64()),
                     #[cfg(feature = "energy")]
                     energy_wh: if tab.energy_wh > 0.0 { Some(tab.energy_wh) } else { None },
@@ -504,12 +514,17 @@ impl AppState {
             .collect();
 
         save_state(
-            &platform::state_base_dir(),
+            &platform::config_base_dir(),
             &SavedState {
                 tabs,
                 active: self.active,
             },
         );
+        for (name, output) in outputs {
+            if !output.is_empty() {
+                save_tab_output(&state_base, &name, &output);
+            }
+        }
 
         {
             let mut snapshot = self.api_state.lock().unwrap();
@@ -618,20 +633,22 @@ impl AppState {
     }
 
     fn close_all_tabs(&mut self, cx: &mut Context<Self>) {
+        let state_base = platform::state_base_dir();
+        let outputs: Vec<(String, String)> = self
+            .tabs
+            .iter()
+            .map(|tab| (tab.name.clone(), tab.view.read(cx).copy_all_history()))
+            .collect();
         let tabs: Vec<TabState> = self
             .tabs
             .iter()
             .map(|tab| {
                 let pid = tab.view.read(cx).pid();
                 let cwd = platform::process_cwd(pid).map(|p| p.to_string_lossy().into_owned());
-                let output = {
-                    let text = tab.view.read(cx).copy_all_history();
-                    if text.is_empty() { None } else { Some(text) }
-                };
                 TabState {
                     name: tab.name.clone(),
                     cwd,
-                    output,
+                    output: None,
                     uptime_secs: Some(tab.uptime().as_secs_f64()),
                     #[cfg(feature = "energy")]
                     energy_wh: if tab.energy_wh > 0.0 { Some(tab.energy_wh) } else { None },
@@ -641,12 +658,17 @@ impl AppState {
             })
             .collect();
         save_state(
-            &platform::state_base_dir(),
+            &platform::config_base_dir(),
             &SavedState {
                 tabs,
                 active: self.active,
             },
         );
+        for (name, output) in outputs {
+            if !output.is_empty() {
+                save_tab_output(&state_base, &name, &output);
+            }
+        }
 
         if let Some(ref tracker) = self.tracker {
             tracker.shutdown();
@@ -1288,7 +1310,23 @@ impl AppState {
                                     if let Some((i, ref text)) = this.renaming
                                         && i < this.tabs.len()
                                     {
-                                        this.tabs[i].name = text.clone();
+                                        let old_name = this.tabs[i].name.clone();
+                                        let new_name = text.clone();
+                                        if old_name != new_name {
+                                            // Move the per-tab output file across so we don't
+                                            // orphan history when the user renames a tab.
+                                            let base = platform::state_base_dir();
+                                            let old_path = tab_atelier::tab_output_path(&base, &old_name);
+                                            let new_path = tab_atelier::tab_output_path(&base, &new_name);
+                                            if old_path.exists() {
+                                                let _ = std::fs::rename(&old_path, &new_path);
+                                                let _ = std::fs::rename(
+                                                    old_path.with_extension("json.bak"),
+                                                    new_path.with_extension("json.bak"),
+                                                );
+                                            }
+                                        }
+                                        this.tabs[i].name = new_name;
                                     }
                                     this.renaming = None;
                                     this.rename_select_all = false;
@@ -2043,7 +2081,7 @@ impl AppState {
                                                 (*this.browser.borrow_mut()).clone_from(&browser);
                                                 (*this.code_editor.borrow_mut()).clone_from(&editor);
                                                 save_preferences(
-                                                    &platform::state_base_dir(),
+                                                    &platform::config_base_dir(),
                                                     &Preferences {
                                                         lang: Some(lang_str.into()),
                                                         theme: Some(this.theme_name.id().into()),
@@ -2440,7 +2478,10 @@ pub fn run() {
 
     info!("starting Tab Atelier v{}", env!("CARGO_PKG_VERSION"));
     Application::new().run(|cx: &mut App| {
-        let prefs = load_preferences(&platform::state_base_dir());
+        let prefs = load_preferences_with_legacy(
+            &platform::config_base_dir(),
+            &platform::state_base_dir(),
+        );
         let keycodes: Vec<u8> = if prefs.hotkeys.is_empty() {
             DEFAULT_HOTKEYS.to_vec()
         } else {
