@@ -805,6 +805,7 @@ component TerminalView inherits Rectangle {
         flick := Flickable {
             vertical-stretch: 1;
             interactive: true;
+            viewport-width: output-content.preferred-width;
             viewport-height: output-content.preferred-height;
             output-content := VerticalLayout {
                 padding: 10px;
