@@ -49,6 +49,10 @@ component HeaderBar inherits Rectangle {
     in property <string> reachability;
     in property <string> detail;
     in property <bool> multi-host;
+    /// Phone battery percentage (0–100), or -1 when not yet polled.
+    /// Drives the small badge tucked in after the IP/host detail.
+    in property <int> battery-level: -1;
+    in property <bool> battery-blink: false;
     callback host-tap();
     callback add-host-tap();
 
@@ -115,6 +119,18 @@ component HeaderBar inherits Rectangle {
                                 : root.reachability == "connecting" ? #aaaaaa
                                 : #ef5350;
                             font-size: 12px;
+                            vertical-alignment: center;
+                        }
+                        if root.battery-level >= 0 : Text {
+                            // Battery badge sits to the right of the IP
+                            // detail. Goes red ≤20 %; pulses with the
+                            // existing blink driver ≤10 %.
+                            text: " · " + root.battery-level + "%";
+                            color: root.battery-level <= 10 && root.battery-blink
+                                ? transparent
+                                : (root.battery-level <= 20 ? #ef5350 : #888888);
+                            font-size: 12px;
+                            font-weight: root.battery-level <= 20 ? 700 : 400;
                             vertical-alignment: center;
                         }
                     }
@@ -795,9 +811,11 @@ component TerminalView inherits Rectangle {
         spacing: 0;
         padding-top: root.safe-top;
         // Shrink the layout by the IME height when the keyboard is up so
-        // the input bar (last child of this layout) floats above it
-        // instead of being painted underneath.
-        padding-bottom: max(root.safe-bottom, root.ime-height);
+        // the shortcut row (last child of this layout) floats above it
+        // instead of being painted underneath. Add 12 px of breathing
+        // room either way — without the old input bar below, the
+        // shortcut row was sitting too close to the screen edge / IME.
+        padding-bottom: max(root.safe-bottom, root.ime-height) + 12px;
         padding-left: root.safe-left;
         padding-right: root.safe-right;
 
@@ -1090,6 +1108,8 @@ export component AppWindow inherits Window {
         padding-right: root.safe-area-insets.right;
 
         HeaderBar {
+            battery-level: root.battery-level;
+            battery-blink: root._battery_blink;
             host-name: root.hosts.length > 0 ? root.hosts[root.active-host].name : "No host";
             reachability: root.hosts.length > 0 ? root.hosts[root.active-host].reachability : "offline";
             detail: root.hosts.length > 0 ? root.hosts[root.active-host].detail : "tap + to add a workstation";
