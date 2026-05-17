@@ -548,6 +548,10 @@ impl TerminalView {
             .cloned()
     }
 
+    /// Returns viewport-relative grid point and side (Line(0) = top of
+    /// visible region, regardless of scrollback offset). Use
+    /// `pixel_to_absolute_grid` when the result feeds alacritty's selection,
+    /// which stores absolute grid coordinates.
     fn pixel_to_grid(&self, pos: gpui::Point<Pixels>, bounds_origin: gpui::Point<Pixels>) -> (GridPoint, Side) {
         let cell = self.cell_size.unwrap_or(Size {
             width: px(8.4),
@@ -563,6 +567,21 @@ impl TerminalView {
             Side::Right
         };
         (GridPoint::new(Line(line), Column(col)), side)
+    }
+
+    /// Same as `pixel_to_grid` but with the scrollback offset folded in so
+    /// the Line value addresses absolute grid content, not screen position.
+    /// This is what alacritty's selection model expects — it rotates the
+    /// stored absolute lines as new output pushes content around.
+    fn pixel_to_absolute_grid(
+        &self,
+        pos: gpui::Point<Pixels>,
+        bounds_origin: gpui::Point<Pixels>,
+    ) -> (GridPoint, Side) {
+        let (mut gp, side) = self.pixel_to_grid(pos, bounds_origin);
+        let off = self.term.lock().grid().display_offset() as i32;
+        gp.line = Line(gp.line.0 - off);
+        (gp, side)
     }
 }
 
@@ -763,9 +782,13 @@ impl Render for TerminalView {
                         let y_frac = f32::from(ev.position.y - origin.y) / f32::from(bounds.height);
                         this.scroll_to_fraction(y_frac.clamp(0.0, 1.0));
                     } else {
-                        let (gp, side) = this.pixel_to_grid(ev.position, origin);
-                        this.click_origin.set(Some(gp));
-                        this.start_selection(gp, side);
+                        // Record click_origin in viewport coordinates (so
+                        // double-click-on-link detection compares like with
+                        // like) but feed selection the absolute coordinates.
+                        let (vp_gp, vp_side) = this.pixel_to_grid(ev.position, origin);
+                        this.click_origin.set(Some(vp_gp));
+                        let (abs_gp, _) = this.pixel_to_absolute_grid(ev.position, origin);
+                        this.start_selection(abs_gp, vp_side);
                     }
                 }),
             )
@@ -783,7 +806,7 @@ impl Render for TerminalView {
                     let y_frac = f32::from(ev.position.y - origin.y) / f32::from(bounds.height);
                     this.scroll_to_fraction(y_frac.clamp(0.0, 1.0));
                 } else if ev.pressed_button == Some(MouseButton::Left) {
-                    let (gp, side) = this.pixel_to_grid(ev.position, origin);
+                    let (gp, side) = this.pixel_to_absolute_grid(ev.position, origin);
                     this.update_selection(gp, side);
                 } else {
                     let (gp, _) = this.pixel_to_grid(ev.position, origin);
@@ -1347,7 +1370,12 @@ impl Element for TerminalElement {
                 }
             }
 
-            // Paint selection.
+            // Paint selection. Selection coordinates are in alacritty's
+            // grid Line space, where Line(0) is the top of the un-scrolled
+            // viewport. Convert to the on-screen row by adding the current
+            // display_offset (positive when the user has scrolled up into
+            // scrollback), so the highlight tracks the actual content as it
+            // moves under the user.
             if let Some(ref sel) = state.selection {
                 let sel_color = Hsla::from(Rgba {
                     r: 0.2,
@@ -1357,8 +1385,10 @@ impl Element for TerminalElement {
                 });
                 let start = sel.start;
                 let end = sel.end;
+                let off = state.display_offset as i32;
                 for row in start.line.0..=end.line.0 {
-                    if row < 0 || row as usize >= state.lines.len() {
+                    let screen_row = row + off;
+                    if screen_row < 0 || screen_row as usize >= state.lines.len() {
                         continue;
                     }
                     let col_start = if row == start.line.0 { start.column.0 } else { 0 };
@@ -1372,7 +1402,7 @@ impl Element for TerminalElement {
                     }
                     let pos = point(
                         origin.x + cell.width * col_start as f32,
-                        origin.y + cell.height * row as f32,
+                        origin.y + cell.height * screen_row as f32,
                     );
                     let sz = size(cell.width * (col_end - col_start) as f32, cell.height);
                     window.paint_quad(fill(Bounds::new(pos, sz), sel_color));
