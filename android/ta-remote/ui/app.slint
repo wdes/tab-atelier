@@ -910,6 +910,10 @@ export component AppWindow inherits Window {
     /// -1 = no rename dialog open; >= 0 = index of the tab being renamed.
     in-out property <int> rename-idx: -1;
     in-out property <string> rename-text: "";
+    /// Transient toast text + visibility. Rust sets `toast-text` on
+    /// connect/disconnect events; the timer below auto-dismisses 3 s later.
+    in-out property <string> toast-text: "";
+    in-out property <bool> toast-visible: false;
 
     callback request-activate(int);
     callback request-send-input(int, string);
@@ -1357,6 +1361,37 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+
+    // Transient connection-state toast — anchored top-center, fades itself
+    // after 3 s. Rust sets toast-text on lan/remote ↔ offline transitions.
+    Timer {
+        interval: 3s;
+        running: root.toast-visible;
+        triggered => { root.toast-visible = false; }
+    }
+    if root.toast-visible : Rectangle {
+        width: 100%;
+        y: root.safe-area-insets.top + 8px;
+        height: 40px;
+        HorizontalLayout {
+            alignment: center;
+            Rectangle {
+                width: min(parent.width * 88%, 360px);
+                height: 40px;
+                background: #2a2a2a;
+                border-radius: 8px;
+                border-width: 1px;
+                border-color: #4a4a4a;
+                Text {
+                    text: root.toast-text;
+                    color: #e0e0e0;
+                    font-size: 13px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
                 }
             }
         }

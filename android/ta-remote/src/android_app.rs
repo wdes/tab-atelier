@@ -416,6 +416,16 @@ fn host_detail(url: &str) -> String {
         .to_string()
 }
 
+fn show_toast(ui_weak: &Weak<AppWindow>, msg: String) {
+    let weak = ui_weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(ui) = weak.upgrade() {
+            ui.set_toast_text(SharedString::from(msg));
+            ui.set_toast_visible(true);
+        }
+    });
+}
+
 fn push_reachability(ui_weak: &Weak<AppWindow>, active: usize, reach: Reach) {
     let label = match reach {
         Reach::Lan => "lan",
@@ -494,7 +504,20 @@ pub fn android_main(app: slint::android::AndroidApp) {
                 push_tabs(&poll_weak, t, &poll_seen);
             }
             log::debug!("poll {}: {reach:?}", host.name);
-            *poll_reach.lock().unwrap() = reach;
+            // Show a toast when reachability transitions between online and
+            // offline so a connection drop doesn't go unnoticed.
+            {
+                let mut last = poll_reach.lock().unwrap();
+                let was_online = matches!(*last, Reach::Lan | Reach::Remote);
+                let is_online = matches!(reach, Reach::Lan | Reach::Remote);
+                if was_online && !is_online {
+                    show_toast(&poll_weak, format!("Disconnected from {}", host.name));
+                } else if !was_online && is_online {
+                    let via = if matches!(reach, Reach::Lan) { "LAN" } else { "remote" };
+                    show_toast(&poll_weak, format!("Connected to {} via {via}", host.name));
+                }
+                *last = reach;
+            }
             push_reachability(&poll_weak, active_idx, reach);
 
             let idx = poll_open.load(Ordering::Relaxed);
