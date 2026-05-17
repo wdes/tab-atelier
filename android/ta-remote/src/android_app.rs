@@ -536,6 +536,45 @@ fn post_activate(agent: &ureq::Agent, host: &HostConfig, reach: &Reach, idx: i32
     }
 }
 
+/// Fold sticky CTRL / ALT into a typed UTF-8 string.
+///
+/// CTRL maps the *first* ASCII letter (case-insensitive) to its Ctrl
+/// equivalent (Ctrl-A → 0x01, Ctrl-? → 0x7f for `?`/`/`), then the
+/// remaining bytes are appended verbatim. ALT prepends an ESC byte
+/// (the standard meta-encoding) to the *first* code point and leaves
+/// the rest untouched. If both are set, ALT wraps CTRL.
+fn apply_modifiers(text: &str, ctrl: bool, alt: bool) -> Vec<u8> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut iter = text.chars();
+    let Some(first) = iter.next() else { return Vec::new() };
+    let rest: String = iter.collect();
+
+    let first_bytes: Vec<u8> = if ctrl {
+        match first {
+            'a'..='z' => vec![(first as u8) - b'a' + 1],
+            'A'..='Z' => vec![(first as u8) - b'A' + 1],
+            // Ctrl-? / Ctrl-/ → DEL (0x7f), Ctrl-Space → NUL,
+            // anything else falls through as-is so the user still sees
+            // their key arrive at the terminal.
+            '?' | '/' => vec![0x7f],
+            ' ' => vec![0x00],
+            other => other.to_string().into_bytes(),
+        }
+    } else {
+        first.to_string().into_bytes()
+    };
+
+    let mut out = Vec::with_capacity(first_bytes.len() + rest.len() + 1);
+    if alt {
+        out.push(0x1b);
+    }
+    out.extend_from_slice(&first_bytes);
+    out.extend_from_slice(rest.as_bytes());
+    out
+}
+
 /// Compact "Xh Ym" / "Xm Ys" / "Xs" uptime string — matches the visual
 /// vocabulary the desktop uses in its tab headers so the phone counter
 /// reads identically.
@@ -809,6 +848,17 @@ pub fn android_main(app: slint::android::AndroidApp) {
         let reach = *send_reach.lock().unwrap();
         let agent = send_agent.clone();
         let bytes = text.as_bytes().to_vec();
+        std::thread::spawn(move || post_input(&agent, &host, &reach, idx, &bytes));
+    });
+
+    let typed_agent = agent.clone();
+    let typed_data = data.clone();
+    let typed_reach = last_reach.clone();
+    ui.on_request_typed_text(move |idx, text, ctrl, alt| {
+        let Some(host) = typed_data.lock().unwrap().active_host() else { return };
+        let reach = *typed_reach.lock().unwrap();
+        let agent = typed_agent.clone();
+        let bytes = apply_modifiers(text.as_str(), ctrl, alt);
         std::thread::spawn(move || post_input(&agent, &host, &reach, idx, &bytes));
     });
 

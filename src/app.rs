@@ -32,6 +32,14 @@ use tab_atelier::{
 struct Tab {
     view: Entity<TerminalView>,
     name: String,
+    /// Wall-clock instant we started this tab in *this* process run.
+    /// Persisted uptime is folded in via `prior_uptime` so a restart
+    /// doesn't reset the counter to zero.
+    created_at: std::time::Instant,
+    /// Uptime accumulated in previous process runs, loaded from
+    /// `tab-<name>.uptime.json`. Added to `created_at.elapsed()` in
+    /// `Tab::uptime()`.
+    prior_uptime: std::time::Duration,
     active_duration: std::time::Duration,
     last_activated: Option<std::time::Instant>,
     #[cfg(feature = "energy")]
@@ -52,8 +60,13 @@ struct Tab {
 }
 
 impl Tab {
+    /// Wall-clock time this tab has existed (live run + persisted prior
+    /// runs). The mobile remote's per-tab counter reads from this, so it
+    /// keeps ticking even when no input is happening — the "actively
+    /// typing" semantic of the old `active_duration` field surprised
+    /// users who only viewed tabs from the phone.
     fn uptime(&self) -> std::time::Duration {
-        self.active_duration + self.last_activated.map_or(std::time::Duration::ZERO, |t| t.elapsed())
+        self.prior_uptime + self.created_at.elapsed()
     }
 
     fn activate(&mut self) {
@@ -243,7 +256,9 @@ impl AppState {
                 tabs.push(Tab {
                     view,
                     name: ts.name.clone(),
-                    active_duration: std::time::Duration::from_secs_f64(ts.uptime_secs.unwrap_or(0.0)),
+                    created_at: std::time::Instant::now(),
+                    prior_uptime: std::time::Duration::from_secs_f64(ts.uptime_secs.unwrap_or(0.0)),
+                    active_duration: std::time::Duration::ZERO,
                     last_activated: None,
                     #[cfg(feature = "energy")]
                     energy_wh: ts.energy_wh.unwrap_or(0.0),
@@ -271,6 +286,8 @@ impl AppState {
                 tabs.push(Tab {
                     view,
                     name: locale::strings(lang).terminal.into(),
+                    created_at: std::time::Instant::now(),
+                    prior_uptime: std::time::Duration::ZERO,
                     active_duration: std::time::Duration::ZERO,
                     last_activated: None,
                     #[cfg(feature = "energy")]
@@ -297,6 +314,8 @@ impl AppState {
                 vec![Tab {
                     view,
                     name: locale::strings(lang).terminal.into(),
+                    created_at: std::time::Instant::now(),
+                    prior_uptime: std::time::Duration::ZERO,
                     active_duration: std::time::Duration::ZERO,
                     last_activated: Some(std::time::Instant::now()),
                     #[cfg(feature = "energy")]
@@ -473,6 +492,8 @@ impl AppState {
             Tab {
                 view,
                 name: format!("{} {}", self.t().terminal_n, self.tabs.len()),
+                created_at: std::time::Instant::now(),
+                prior_uptime: std::time::Duration::ZERO,
                 active_duration: std::time::Duration::ZERO,
                 last_activated: Some(std::time::Instant::now()),
                 #[cfg(feature = "energy")]
@@ -734,6 +755,8 @@ impl AppState {
             tv
         });
         self.tabs[idx].view = view;
+        self.tabs[idx].created_at = std::time::Instant::now();
+        self.tabs[idx].prior_uptime = std::time::Duration::ZERO;
         self.tabs[idx].active_duration = std::time::Duration::ZERO;
         self.tabs[idx].last_activated = if idx == self.active {
             Some(std::time::Instant::now())
@@ -758,6 +781,8 @@ impl AppState {
         self.tabs[idx].view.update(cx, |view, cx| {
             view.respawn(cwd.as_deref(), cx);
         });
+        self.tabs[idx].created_at = std::time::Instant::now();
+        self.tabs[idx].prior_uptime = std::time::Duration::ZERO;
         self.tabs[idx].active_duration = std::time::Duration::ZERO;
         self.tabs[idx].last_activated = if idx == self.active {
             Some(std::time::Instant::now())
