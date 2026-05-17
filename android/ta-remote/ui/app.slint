@@ -1010,7 +1010,7 @@ export component AppWindow inherits Window {
                     horizontal-alignment: center;
                 }
                 Text {
-                    text: "To connect to a Tab Atelier instance, open the QR code on the desktop app and scan it with your phone — or tap the + button above and enter the URL and token manually.";
+                    text: "On the desktop, open Tab Atelier's QR dialog and either scan the QR with your phone camera (which dispatches via the taremote:// deep link) or copy the URL and paste it here.";
                     color: #aaa;
                     font-size: 13px;
                     horizontal-alignment: center;
@@ -1019,7 +1019,7 @@ export component AppWindow inherits Window {
                 HorizontalLayout {
                     alignment: center;
                     TouchArea {
-                        width: 200px;
+                        width: 220px;
                         clicked => { root.request-scan-qr() }
                         Rectangle {
                             height: 44px;
@@ -1028,7 +1028,7 @@ export component AppWindow inherits Window {
                             HorizontalLayout {
                                 alignment: center;
                                 spacing: 8px;
-                                // Material qr_code_scanner icon
+                                // Material content_paste icon
                                 Path {
                                     width: 22px;
                                     height: 22px;
@@ -1036,10 +1036,10 @@ export component AppWindow inherits Window {
                                     viewbox-width: 24;
                                     viewbox-height: 24;
                                     fill: white;
-                                    commands: "M 9.5 6.5 L 9.5 9.5 L 6.5 9.5 L 6.5 6.5 L 9.5 6.5 Z M 11 5 L 5 5 L 5 11 L 11 11 L 11 5 Z M 9.5 14.5 L 9.5 17.5 L 6.5 17.5 L 6.5 14.5 L 9.5 14.5 Z M 11 13 L 5 13 L 5 19 L 11 19 L 11 13 Z M 17.5 6.5 L 17.5 9.5 L 14.5 9.5 L 14.5 6.5 L 17.5 6.5 Z M 19 5 L 13 5 L 13 11 L 19 11 L 19 5 Z M 13 13 L 15 13 L 15 15 L 13 15 L 13 13 Z M 15 15 L 17 15 L 17 17 L 15 17 L 15 15 Z M 17 13 L 19 13 L 19 15 L 17 15 L 17 13 Z M 13 17 L 15 17 L 15 19 L 13 19 L 13 17 Z M 15 19 L 17 19 L 17 21 L 15 21 L 15 19 Z M 17 17 L 19 17 L 19 19 L 17 19 L 17 17 Z";
+                                    commands: "M 19 2 L 14.82 2 C 14.4 0.84 13.3 0 12 0 C 10.7 0 9.6 0.84 9.18 2 L 5 2 C 3.9 2 3 2.9 3 4 L 3 20 C 3 21.1 3.9 22 5 22 L 19 22 C 20.1 22 21 21.1 21 20 L 21 4 C 21 2.9 20.1 2 19 2 Z M 12 2 C 12.55 2 13 2.45 13 3 C 13 3.55 12.55 4 12 4 C 11.45 4 11 3.55 11 3 C 11 2.45 11.45 2 12 2 Z M 19 20 L 5 20 L 5 4 L 7 4 L 7 7 L 17 7 L 17 4 L 19 4 L 19 20 Z";
                                 }
                                 Text {
-                                    text: "Scan QR";
+                                    text: "Paste URL";
                                     color: white;
                                     font-size: 15px;
                                     font-weight: 700;
