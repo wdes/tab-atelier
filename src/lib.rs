@@ -170,54 +170,14 @@ pub fn load_state_at(path: &std::path::Path) -> Option<SavedState> {
     None
 }
 
-/// Load tab list + preferences using the new layout.
-///
-/// Reads `~/.local/tab-atelier/tabs.json` for metadata and the per-tab
-/// `output_tab-<sanitized>-<crc>.json` files alongside it. Falls back to
-/// the legacy `~/.local/state/tab-atelier/tabs.json` (which embedded
-/// `output` inline) for a one-shot migration if the new file is absent.
+/// Load tab list and hydrate each tab's output / uptime / energy from its
+/// per-tab file under `state_base`.
 #[must_use]
 pub fn load_state_with_outputs(
     config_base: &std::path::Path,
     state_base: &std::path::Path,
 ) -> Option<SavedState> {
-    let new_path = config_state_path(config_base);
-    let legacy_path = state_path(state_base);
-
-    // Migration: if the new layout is empty but legacy data exists, copy it
-    // forward (metadata to config_dir, output + uptime to per-tab files).
-    if !new_path.exists()
-        && let Some(legacy) = load_state_at(&legacy_path)
-    {
-        log::warn!("migrating tab state from {} to new layout", legacy_path.display());
-        let split = SavedState {
-            tabs: legacy.tabs.iter().map(|t| TabState {
-                name: t.name.clone(),
-                cwd: t.cwd.clone(),
-                output: None,
-                // Uptime now lives in its own per-tab file.
-                uptime_secs: None,
-                energy_wh: t.energy_wh,
-            }).collect(),
-            active: legacy.active,
-        };
-        save_state(config_base, &split);
-        for t in &legacy.tabs {
-            if let Some(ref out) = t.output {
-                save_tab_output(state_base, &t.name, out);
-            }
-            if let Some(secs) = t.uptime_secs {
-                save_tab_uptime(state_base, &t.name, secs);
-            }
-            if let Some(wh) = t.energy_wh {
-                save_tab_energy(state_base, &t.name, wh);
-            }
-        }
-        return Some(legacy);
-    }
-
-    let mut state = load_state_at(&new_path)?;
-    // Hydrate per-tab files for output, uptime, energy.
+    let mut state = load_state_at(&config_state_path(config_base))?;
     for t in &mut state.tabs {
         if t.output.is_none() {
             t.output = load_tab_output(state_base, &t.name);
@@ -810,39 +770,6 @@ pub fn load_preferences(config_base: &std::path::Path) -> Preferences {
         .ok()
         .and_then(|data| serde_json::from_str(&data).ok())
         .unwrap_or_default()
-}
-
-/// Load preferences with one-shot migration from legacy paths.
-///
-/// Tries `{xdg_config_base}/tab-atelier/preferences.json` first
-/// (`~/.config/...`). If absent, walks two older locations in age order —
-/// `{tabs_config_base}/tab-atelier/preferences.json` (`~/.local/...`) and
-/// `{state_base}/tab-atelier/preferences.json` — and migrates whichever it
-/// finds forward to the canonical XDG path.
-#[must_use]
-pub fn load_preferences_with_legacy(
-    xdg_config_base: &std::path::Path,
-    tabs_config_base: &std::path::Path,
-    state_base: &std::path::Path,
-) -> Preferences {
-    let new_path = config_dir(xdg_config_base).join("preferences.json");
-    if new_path.exists() {
-        return load_preferences(xdg_config_base);
-    }
-    let legacy_paths = [
-        config_dir(tabs_config_base).join("preferences.json"),
-        state_dir(state_base).join("preferences.json"),
-    ];
-    for legacy in legacy_paths {
-        if let Ok(data) = std::fs::read_to_string(&legacy)
-            && let Ok(prefs) = serde_json::from_str::<Preferences>(&data)
-        {
-            log::warn!("migrating preferences from {}", legacy.display());
-            save_preferences(xdg_config_base, &prefs);
-            return prefs;
-        }
-    }
-    Preferences::default()
 }
 
 pub fn save_preferences(config_base: &std::path::Path, prefs: &Preferences) {
