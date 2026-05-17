@@ -18,6 +18,10 @@ struct TabInfo {
     name: String,
     cwd: Option<String>,
     active: bool,
+    /// Last non-empty line of the cached output buffer — used by remote clients
+    /// to preview what's happening without fetching the full output.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    preview: String,
     #[cfg(feature = "energy")]
     cpu_percent: f64,
     #[cfg(feature = "energy")]
@@ -159,6 +163,12 @@ fn handle_connection(stream: &mut std::net::TcpStream, state: &Arc<Mutex<TabSnap
                     name: t.name.clone(),
                     cwd: t.cwd.clone(),
                     active: i == state.active,
+                    preview: t.output
+                        .lines()
+                        .rev()
+                        .find(|l| !l.trim().is_empty())
+                        .unwrap_or("")
+                        .to_string(),
                     #[cfg(feature = "energy")]
                     cpu_percent: state.power.get(i).map_or(0.0, |p| p.cpu_percent),
                     #[cfg(feature = "energy")]
@@ -404,8 +414,12 @@ mod tests {
         assert_eq!(json["tabs"][0]["name"], "shell");
         assert_eq!(json["tabs"][0]["cwd"], "/home/user");
         assert_eq!(json["tabs"][0]["active"], true);
+        // Last non-empty line of the cached output is exposed as preview.
+        assert_eq!(json["tabs"][0]["preview"], "foo bar baz");
         assert_eq!(json["tabs"][1]["name"], "build");
         assert_eq!(json["tabs"][1]["active"], false);
+        // Empty output → preview field omitted entirely.
+        assert!(json["tabs"][1].get("preview").is_none());
     }
 
     #[test]

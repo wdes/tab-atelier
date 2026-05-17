@@ -77,6 +77,8 @@ struct ApiTab {
     active: bool,
     #[serde(default)]
     cpu_percent: f64,
+    #[serde(default)]
+    preview: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -250,6 +252,7 @@ fn push_tabs(ui_weak: &Weak<AppWindow>, tabs: Vec<ApiTab>) {
                 cwd: SharedString::from(t.cwd.unwrap_or_default()),
                 active: t.active,
                 cpu: SharedString::from(format!("{:.1}%", t.cpu_percent)),
+                preview: SharedString::from(t.preview),
             })
             .collect();
         ui.set_tabs(VecModel::from_slice(&rows));
