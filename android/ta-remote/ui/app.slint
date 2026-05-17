@@ -640,7 +640,7 @@ component KeyboardHeader inherits Rectangle {
             KeyButton { label: "ESC";   tapped => { root.key-tapped("esc") } }
             KeyButton { label: "/";     tapped => { root.key-tapped("/") } }
             KeyButton { label: "|";     tapped => { root.key-tapped("|") } }
-            KeyButton { label: "-";     tapped => { root.key-tapped("-") } }
+            KeyButton { label: "^L";    tapped => { root.key-tapped("ctrl-l") } }
             KeyButton { label: "HOME";  tapped => { root.key-tapped("home") } }
             KeyButton {
                 icon-commands: "M 12 4 L 6 10 L 7.41 11.41 L 11 7.83 L 11 20 L 13 20 L 13 7.83 L 16.59 11.41 L 18 10 Z";
@@ -1055,9 +1055,11 @@ export component AppWindow inherits Window {
             if (k == "pgup")   { root.request-send-input(root.open-tab, "\u{001b}[5~"); }
             if (k == "pgdn")   { root.request-send-input(root.open-tab, "\u{001b}[6~"); }
             // Common Ctrl chords for terminal control:
-            // ^C = SIGINT (0x03), ^D = EOF (0x04), ^Z = SIGTSTP (0x1a)
+            // ^C = SIGINT (0x03), ^D = EOF (0x04), ^L = readline clear-screen
+            // (0x0c), ^Z = SIGTSTP (0x1a).
             if (k == "ctrl-c") { root.request-send-input(root.open-tab, "\u{0003}"); }
             if (k == "ctrl-d") { root.request-send-input(root.open-tab, "\u{0004}"); }
+            if (k == "ctrl-l") { root.request-send-input(root.open-tab, "\u{000c}"); }
             if (k == "ctrl-z") { root.request-send-input(root.open-tab, "\u{001a}"); }
         }
     }
