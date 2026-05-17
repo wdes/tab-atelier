@@ -51,6 +51,11 @@ icon = "@mipmap/ic_launcher"
 name = "android.app.NativeActivity"
 config_changes = "orientation|keyboardHidden|screenSize"
 theme = "@android:style/Theme.DeviceDefault.NoActionBar"
+# Note: cargo-apk2's manifest schema doesn't currently expose
+# windowSoftInputMode, so the IME-overlap fix lives in Slint instead —
+# `root.virtual-keyboard-size.height` is read in ui/app.slint to lift
+# the editor/rename dialogs and the terminal input bar above the
+# keyboard when it shows.
 
 [[package.metadata.android.application.activity.meta_data]]
 name = "android.app.lib_name"
