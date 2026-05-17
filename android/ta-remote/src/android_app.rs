@@ -265,7 +265,10 @@ fn push_hosts(ui_weak: &Weak<AppWindow>, data: &AppData) {
         .iter()
         .map(|h| Host {
             name: SharedString::from(h.name.as_str()),
-            reachability: SharedString::from("offline"),
+            // Start as "connecting" — the poller flips this to lan/remote/offline
+            // after the first attempt completes, so newly-added hosts don't
+            // look broken for the first 2 seconds.
+            reachability: SharedString::from("connecting"),
             detail: SharedString::from(host_detail(&h.url)),
             url: SharedString::from(h.url.as_str()),
             remote_url: SharedString::from(h.remote_url.as_str()),

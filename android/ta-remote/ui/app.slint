@@ -72,15 +72,18 @@ component HeaderBar inherits Rectangle {
                             border-radius: 4px;
                             background: root.reachability == "lan" ? #66bb6a
                                 : root.reachability == "remote" ? #ffa726
+                                : root.reachability == "connecting" ? #aaaaaa
                                 : #ef5350;
                             y: parent.height / 2 - 4px;
                         }
                         Text {
                             text: (root.reachability == "lan" ? "LAN · "
                                 : root.reachability == "remote" ? "Remote · "
+                                : root.reachability == "connecting" ? "Connecting · "
                                 : "Offline · ") + root.detail;
                             color: root.reachability == "lan" ? #66bb6a
                                 : root.reachability == "remote" ? #ffa726
+                                : root.reachability == "connecting" ? #aaaaaa
                                 : #ef5350;
                             font-size: 12px;
                             vertical-alignment: center;
@@ -205,6 +208,7 @@ component HostRow inherits Rectangle {
                     width: 10px;
                     background: host.reachability == "lan" ? #66bb6a
                         : host.reachability == "remote" ? #ffa726
+                        : host.reachability == "connecting" ? #aaaaaa
                         : #ef5350;
                     border-radius: 5px;
                     y: parent.height / 2 - self.height / 2;
