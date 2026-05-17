@@ -225,6 +225,22 @@ fn post_input(agent: &ureq::Agent, host: &HostConfig, reach: &Reach, idx: i32, b
     }
 }
 
+fn post_new_tab(agent: &ureq::Agent, host: &HostConfig, reach: &Reach) {
+    let base = base_url(host, reach);
+    if base.is_empty() {
+        return;
+    }
+    let url = format!("{base}/tabs");
+    if let Err(e) = agent
+        .post(&url)
+        .set("Authorization", &format!("Bearer {}", host.token))
+        .timeout(Duration::from_secs(2))
+        .send_string("")
+    {
+        log::warn!("post_new_tab failed: {e}");
+    }
+}
+
 fn delete_tab(agent: &ureq::Agent, host: &HostConfig, reach: &Reach, idx: i32) {
     let base = base_url(host, reach);
     if base.is_empty() {
@@ -425,6 +441,16 @@ pub fn android_main(app: slint::android::AndroidApp) {
         let reach = *close_reach.lock().unwrap();
         let agent = close_agent.clone();
         std::thread::spawn(move || delete_tab(&agent, &host, &reach, idx));
+    });
+
+    let new_agent = agent.clone();
+    let new_data = data.clone();
+    let new_reach = last_reach.clone();
+    ui.on_request_new_tab(move || {
+        let Some(host) = new_data.lock().unwrap().active_host() else { return };
+        let reach = *new_reach.lock().unwrap();
+        let agent = new_agent.clone();
+        std::thread::spawn(move || post_new_tab(&agent, &host, &reach));
     });
 
     let open_tab_for_cb = open_tab.clone();

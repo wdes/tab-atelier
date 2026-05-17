@@ -831,6 +831,7 @@ export component AppWindow inherits Window {
     callback request-add-host(string, string, string, string);
     callback request-update-host(int, string, string, string, string);
     callback request-close-tab(int);
+    callback request-new-tab();
     callback request-set-active-host(int);
     callback request-remove-host(int);
     callback open-tab-changed(int);
@@ -925,6 +926,43 @@ export component AppWindow inherits Window {
                     close-requested => {
                         root.close-confirm-idx = i;
                         root.close-confirm-name = tab.name;
+                    }
+                }
+
+                // New-tab affordance — rendered as a dashed-border card to
+                // visually distinguish it from real tab rows.
+                if root.tabs.length > 0 : Rectangle {
+                    height: 56px;
+                    background: new_ta.has-hover ? #1f2a3a : #161e2a;
+                    border-radius: 8px;
+                    border-width: 1px;
+                    border-color: #2a4060;
+                    new_ta := TouchArea {
+                        clicked => { root.request-new-tab() }
+                        HorizontalLayout {
+                            alignment: center;
+                            spacing: 8px;
+                            Rectangle {
+                                width: 22px;
+                                height: 22px;
+                                y: parent.height / 2 - 11px;
+                                Path {
+                                    width: 22px;
+                                    height: 22px;
+                                    viewbox-width: 24;
+                                    viewbox-height: 24;
+                                    fill: #4a8cff;
+                                    commands: "M 19 13 L 13 13 L 13 19 L 11 19 L 11 13 L 5 13 L 5 11 L 11 11 L 11 5 L 13 5 L 13 11 L 19 11 Z";
+                                }
+                            }
+                            Text {
+                                text: "New tab";
+                                color: #4a8cff;
+                                font-size: 14px;
+                                font-weight: 600;
+                                vertical-alignment: center;
+                            }
+                        }
                     }
                 }
             }

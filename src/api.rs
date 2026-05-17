@@ -55,6 +55,7 @@ pub struct TabSnapshot {
     pub pending_closes: Vec<usize>,
     pub pending_activate: Option<usize>,
     pub pending_input: Vec<(usize, Vec<u8>)>,
+    pub pending_new_tabs: usize,
 }
 
 pub fn generate_token() -> String {
@@ -225,6 +226,14 @@ fn handle_connection(stream: &mut std::net::TcpStream, state: &Arc<Mutex<TabSnap
                 error_json(stream, 404, "invalid tab index");
             }
         }
+        ("POST", "/tabs") => {
+            let mut state = state.lock().unwrap();
+            info!("API: queueing new tab creation");
+            state.pending_new_tabs += 1;
+            drop(state);
+            let body = serde_json::to_string(&serde_json::json!({"queued": "new"})).unwrap_or_default();
+            respond_json(stream, 200, &body);
+        }
         ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/activate") => {
             let idx_str = &p["/tabs/".len()..p.len() - "/activate".len()];
             if let Ok(idx) = idx_str.parse::<usize>() {
@@ -326,6 +335,7 @@ mod tests {
             pending_closes: vec![],
             pending_activate: None,
             pending_input: vec![],
+            pending_new_tabs: 0,
         }))
     }
 
@@ -487,9 +497,27 @@ mod tests {
         let (port, _, token) = spawn_server();
         let resp = request(
             port,
-            &format!("POST /tabs HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+            &format!("PATCH /tabs HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
         );
         assert_eq!(status_code(&resp), 405);
+    }
+
+    #[test]
+    fn post_tabs_queues_new_tab() {
+        let (port, state, token) = spawn_server();
+        let resp = request(
+            port,
+            &format!("POST /tabs HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\n\r\n"),
+        );
+        assert_eq!(status_code(&resp), 200);
+        assert_eq!(state.lock().unwrap().pending_new_tabs, 1);
+    }
+
+    #[test]
+    fn post_tabs_requires_auth() {
+        let (port, _, _) = spawn_server();
+        let resp = request(port, "POST /tabs HTTP/1.1\r\n\r\n");
+        assert_eq!(status_code(&resp), 401);
     }
 
     #[test]
