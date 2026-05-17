@@ -733,15 +733,21 @@ component KeyboardHeader inherits Rectangle {
             KeyButton { label: "F4"; tapped => { root.send-bytes("\u{001b}OS");   root.fn-mode = false; } }
             KeyButton { label: "F5"; tapped => { root.send-bytes("\u{001b}[15~"); root.fn-mode = false; } }
             KeyButton { label: "F6"; tapped => { root.send-bytes("\u{001b}[17~"); root.fn-mode = false; } }
+            KeyButton { label: "F7"; tapped => { root.send-bytes("\u{001b}[18~"); root.fn-mode = false; } }
         }
         if root.fn-mode : HorizontalLayout {
             spacing: 4px;
-            KeyButton { label: "F7";  tapped => { root.send-bytes("\u{001b}[18~"); root.fn-mode = false; } }
             KeyButton { label: "F8";  tapped => { root.send-bytes("\u{001b}[19~"); root.fn-mode = false; } }
             KeyButton { label: "F9";  tapped => { root.send-bytes("\u{001b}[20~"); root.fn-mode = false; } }
             KeyButton { label: "F10"; tapped => { root.send-bytes("\u{001b}[21~"); root.fn-mode = false; } }
             KeyButton { label: "F11"; tapped => { root.send-bytes("\u{001b}[23~"); root.fn-mode = false; } }
             KeyButton { label: "F12"; tapped => { root.send-bytes("\u{001b}[24~"); root.fn-mode = false; } }
+            // Explicit back-out — without this the only way to leave
+            // FN-mode is to commit an F-key press.
+            KeyButton {
+                icon-commands: "M 20 11 L 7.83 11 L 13.42 5.41 L 12 4 L 4 12 L 12 20 L 13.41 18.59 L 7.83 13 L 20 13 Z";
+                tapped => { root.fn-mode = false; }
+            }
         }
     }
 }
@@ -754,11 +760,19 @@ component TerminalView inherits Rectangle {
     in property <length> safe-left;
     in property <length> safe-right;
     in property <length> ime-height;
-    in-out property <string> input-text;
     in-out property <length> font-size: 13px;
+    // Transient buffer fed by the hidden TextInput. Always empty
+    // outside of an in-flight `edited` flush.
+    in-out property <string> capture-buffer: "";
     callback back();
-    callback send-input();
+    /// Raw byte sequence to feed straight to the terminal — used by
+    /// shortcut keys (ESC, arrows, function keys, …).
     callback key-tapped(string);
+    /// User-typed characters that should be transformed by sticky
+    /// modifiers before reaching the host. The bool args are the
+    /// CTRL/ALT sticky states at flush time; they're cleared by the
+    /// caller after this fires.
+    callback typed(string, bool, bool);
 
     // Auto-scroll to bottom whenever new output arrives. Setting
     // viewport-y to a negative value scrolls the content upwards — the
@@ -918,68 +932,52 @@ component TerminalView inherits Rectangle {
         // which the Android backend wires to InputMethodManager.hide(...).
         hide-focus := FocusScope { width: 0; height: 0; }
 
-        KeyboardHeader {
+        // Hidden capture buffer — kept invisible so the user types
+        // straight "into the terminal". Each `edited` flush forwards
+        // the new characters (with sticky CTRL/ALT applied on the Rust
+        // side) and clears the buffer so it never grows. The IME only
+        // shows while this widget has focus, which is what KBD toggles.
+        Rectangle {
+            height: 0px;
+            width: 0px;
+            clip: true;
+            input-field := TextInput {
+                text <=> root.capture-buffer;
+                color: transparent;
+                font-size: 1px;
+                single-line: true;
+                edited => {
+                    if (root.capture-buffer != "") {
+                        root.typed(
+                            root.capture-buffer,
+                            kh.ctrl-sticky,
+                            kh.alt-sticky,
+                        );
+                        root.capture-buffer = "";
+                        kh.ctrl-sticky = false;
+                        kh.alt-sticky = false;
+                    }
+                }
+                accepted => {
+                    // Standard Enter is sent as part of the regular text
+                    // stream, but some IMEs swallow the trailing newline —
+                    // fire one explicitly here as a safety net.
+                    root.key-tapped("\n");
+                }
+            }
+        }
+
+        kh := KeyboardHeader {
             // Bytes route straight to the host's tab-input callback.
             send-bytes(b) => { root.key-tapped(b); }
-            // Printable shortcuts append to the input field so the user
-            // can refine or batch the input before pressing Enter.
-            type-text(t) => { root.input-text += t; }
+            // `/`, `|`, `-` no longer have an input field to land in;
+            // dispatch them directly to the terminal too.
+            type-text(t) => { root.key-tapped(t); }
             toggle-kbd => {
                 if (root.ime-height > 0px) {
                     hide-focus.focus();
                 } else {
                     input-field.focus();
-                }
-            }
-        }
-
-        Rectangle {
-            height: 1px;
-            background: #2a2a2a;
-        }
-
-        // Input bar
-        Rectangle {
-            height: 56px;
-            background: #181818;
-            HorizontalLayout {
-                padding: 8px;
-                spacing: 8px;
-                Rectangle {
-                    horizontal-stretch: 1;
-                    background: #232323;
-                    border-radius: 8px;
-                    HorizontalLayout {
-                        padding-left: 8px;
-                        padding-right: 8px;
-                        input-field := TextInput {
-                            text <=> root.input-text;
-                            color: #e0e0e0;
-                            font-family: "FreeMono";
-                            font-size: root.font-size + 1px;
-                            single-line: true;
-                            vertical-alignment: center;
-                            accepted => { root.send-input(); }
-                        }
-                    }
-                }
-                TouchArea {
-                    width: 48px;
-                    clicked => { root.send-input() }
-                    Rectangle {
-                        background: parent.has-hover ? #5599ff : #4a8cff;
-                        border-radius: 8px;
-                        Path {
-                            width: 22px;
-                            height: 22px;
-                            x: parent.width / 2 - 11px;
-                            y: parent.height / 2 - 11px;
-                            viewbox-width: 24;
-                            viewbox-height: 24;
-                            fill: white;
-                            commands: "M 2.01 21 L 23 12 L 2.01 3 L 2 10 L 17 12 L 2 14 Z";
-                        }
-                    }
                 }
             }
         }
@@ -1000,7 +998,6 @@ export component AppWindow inherits Window {
     in-out property <bool> editor-open: false;
     /// -1 means "add new host"; >= 0 means "edit host at that index".
     in-out property <int> editor-edit-index: -1;
-    in-out property <string> input-text: "";
     in-out property <string> editor-name: "";
     in-out property <string> editor-url: "";
     in-out property <string> editor-remote-url: "";
@@ -1025,6 +1022,11 @@ export component AppWindow inherits Window {
 
     callback request-activate(int);
     callback request-send-input(int, string);
+    /// Free-typed characters that should be transformed by sticky
+    /// CTRL/ALT before being sent to the active tab. Implemented on
+    /// the Rust side so the ASCII→Ctrl-byte mapping doesn't have to
+    /// live in Slint.
+    callback request-typed-text(int, string, bool, bool);
     callback request-add-host(string, string, string, string);
     callback request-update-host(int, string, string, string, string);
     callback request-close-tab(int);
@@ -1223,17 +1225,15 @@ export component AppWindow inherits Window {
         safe-left: root.safe-area-insets.left;
         safe-right: root.safe-area-insets.right;
         ime-height: root.virtual-keyboard-size.height;
-        input-text <=> root.input-text;
         back => { root.open-tab = -1; }
-        send-input => {
-            if (root.input-text != "") {
-                root.request-send-input(root.open-tab, root.input-text + "\n");
-                root.input-text = "";
-            }
-        }
-        // TerminalView already turns each shortcut button into the
-        // matching byte sequence, so this handler just forwards it.
+        // Shortcut keys produce ready-to-send byte sequences.
         key-tapped(bytes) => { root.request-send-input(root.open-tab, bytes); }
+        // Free-typed characters go through `request-typed-text` so the
+        // host-side handler can fold sticky CTRL / ALT into them
+        // (Ctrl-A → 0x01, Alt-X → "\x1bx", etc.).
+        typed(text, ctrl, alt) => {
+            root.request-typed-text(root.open-tab, text, ctrl, alt);
+        }
     }
 
     if root.picker-open : HostPicker {
