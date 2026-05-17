@@ -13,9 +13,26 @@ struct TabRow {
     active: bool,
     cpu: string,
     preview: string,
+    /// Pre-formatted active-time counter ("1h 02m", "37m 12s", …) sourced
+    /// from the desktop's per-tab uptime so the phone shows the same
+    /// clock without running its own timer.
+    uptime: string,
     /// Set when the preview text has changed since the user last opened
     /// this tab — used to surface "this tab moved" without having to open it.
     has-new: bool,
+}
+
+// One contiguous run of same-colour glyphs in a terminal row. Built on
+// the Rust side from the ANSI SGR sequences in /tabs/N/output so the
+// renderer can compose colourised lines without a Slint-side parser.
+struct ColorSpan {
+    text: string,
+    color: color,
+    bold: bool,
+}
+
+struct ColorLine {
+    spans: [ColorSpan],
 }
 
 struct Host {
@@ -200,6 +217,12 @@ component TabCard inherits Rectangle {
                         text: tab.cpu;
                         color: #aaa;
                         font-size: 12px;
+                        horizontal-alignment: right;
+                    }
+                    Text {
+                        text: tab.uptime;
+                        color: #888;
+                        font-size: 11px;
                         horizontal-alignment: right;
                     }
                     Text {
@@ -624,10 +647,11 @@ component HostPicker inherits Rectangle {
 component KeyButton inherits Rectangle {
     in property <string> label;
     in property <string> icon-commands;  // SVG path data, optional
+    in property <bool> active;           // highlight when a sticky modifier is on
     callback tapped();
     horizontal-stretch: 1;
     height: 36px;
-    background: ta.has-hover ? #1f3f6c : #16365d;
+    background: root.active ? #4a8cff : (ta.has-hover ? #1f3f6c : #16365d);
     border-radius: 4px;
     ta := TouchArea {
         clicked => { root.tapped() }
@@ -653,57 +677,95 @@ component KeyButton inherits Rectangle {
 }
 
 component KeyboardHeader inherits Rectangle {
-    callback key-tapped(string);
+    // Direct-send keys (ESC, arrows, function keys, TAB) emit byte
+    // sequences over `send-bytes`; printable shortcuts (/, |, -) emit
+    // `type-text` so the host integrates them into the input field
+    // rather than dispatching to the terminal. KBD toggles the IME via
+    // its own callback because that's a UI concern, not an input one.
+    callback send-bytes(string);
+    callback type-text(string);
+    callback toggle-kbd();
+    // FN flips the two-row layout to F1–F12, mirroring the Termux
+    // pattern the user requested.
+    in-out property <bool> fn-mode: false;
+    // Sticky CTRL/ALT for future modifier work — visible state only,
+    // dispatch isn't combined with the on-screen keyboard yet.
+    in-out property <bool> ctrl-sticky: false;
+    in-out property <bool> alt-sticky: false;
+
     height: 84px;
     background: #122b48;
     VerticalLayout {
         padding: 4px;
         spacing: 4px;
-        HorizontalLayout {
+
+        // ── normal mode ─────────────────────────────────────────────
+        if !root.fn-mode : HorizontalLayout {
             spacing: 4px;
-            KeyButton { label: "ESC";   tapped => { root.key-tapped("esc") } }
-            KeyButton { label: "/";     tapped => { root.key-tapped("/") } }
-            KeyButton { label: "|";     tapped => { root.key-tapped("|") } }
-            KeyButton { label: "^L";    tapped => { root.key-tapped("ctrl-l") } }
-            KeyButton { label: "HOME";  tapped => { root.key-tapped("home") } }
+            KeyButton { label: "ESC";     tapped => { root.send-bytes("\u{001b}") } }
+            KeyButton { label: "/";       tapped => { root.type-text("/") } }
+            KeyButton { label: "|";       tapped => { root.type-text("|") } }
+            KeyButton { label: "-";       tapped => { root.type-text("-") } }
+            KeyButton { label: "HOME";    tapped => { root.send-bytes("\u{001b}[H") } }
             KeyButton {
                 icon-commands: "M 12 4 L 6 10 L 7.41 11.41 L 11 7.83 L 11 20 L 13 20 L 13 7.83 L 16.59 11.41 L 18 10 Z";
-                tapped => { root.key-tapped("up") }
+                tapped => { root.send-bytes("\u{001b}[A") }
             }
-            KeyButton { label: "END";   tapped => { root.key-tapped("end") } }
-            KeyButton { label: "PGUP";  tapped => { root.key-tapped("pgup") } }
-            KeyButton { label: "^C";    tapped => { root.key-tapped("ctrl-c") } }
+            KeyButton { label: "END";     tapped => { root.send-bytes("\u{001b}[F") } }
+            KeyButton { label: "PGPRÉC";  tapped => { root.send-bytes("\u{001b}[5~") } }
+            KeyButton { label: "FN";      active: root.fn-mode; tapped => { root.fn-mode = true; } }
         }
-        HorizontalLayout {
+        if !root.fn-mode : HorizontalLayout {
             spacing: 4px;
-            KeyButton { label: "TAB";   tapped => { root.key-tapped("tab") } }
-            KeyButton { label: "^D";    tapped => { root.key-tapped("ctrl-d") } }
-            KeyButton { label: "^Z";    tapped => { root.key-tapped("ctrl-z") } }
+            KeyButton { label: "TAB";     tapped => { root.send-bytes("\u{0009}") } }
+            KeyButton { label: "CTRL";    active: root.ctrl-sticky; tapped => { root.ctrl-sticky = !root.ctrl-sticky; } }
+            KeyButton { label: "ALT";     active: root.alt-sticky;  tapped => { root.alt-sticky  = !root.alt-sticky;  } }
             KeyButton {
                 icon-commands: "M 20 11 L 7.83 11 L 13.42 5.41 L 12 4 L 4 12 L 12 20 L 13.41 18.59 L 7.83 13 L 20 13 Z";
-                tapped => { root.key-tapped("left") }
+                tapped => { root.send-bytes("\u{001b}[D") }
             }
             KeyButton {
                 icon-commands: "M 12 20 L 18 14 L 16.59 12.59 L 13 16.17 L 13 4 L 11 4 L 11 16.17 L 7.41 12.59 L 6 14 Z";
-                tapped => { root.key-tapped("down") }
+                tapped => { root.send-bytes("\u{001b}[B") }
             }
             KeyButton {
                 icon-commands: "M 4 13 L 16.17 13 L 10.58 18.59 L 12 20 L 20 12 L 12 4 L 10.59 5.41 L 16.17 11 L 4 11 Z";
-                tapped => { root.key-tapped("right") }
+                tapped => { root.send-bytes("\u{001b}[C") }
             }
-            KeyButton { label: "PGDN";  tapped => { root.key-tapped("pgdn") } }
+            KeyButton { label: "PGSUIV";  tapped => { root.send-bytes("\u{001b}[6~") } }
             KeyButton {
-                // keyboard icon
                 icon-commands: "M 20 5 L 4 5 C 2.89 5 2 5.89 2 7 L 2 17 C 2 18.11 2.89 19 4 19 L 20 19 C 21.11 19 22 18.11 22 17 L 22 7 C 22 5.89 21.11 5 20 5 Z M 11 8 L 13 8 L 13 10 L 11 10 Z M 11 11 L 13 11 L 13 13 L 11 13 Z M 8 8 L 10 8 L 10 10 L 8 10 Z M 8 11 L 10 11 L 10 13 L 8 13 Z M 7 13 L 5 13 L 5 11 L 7 11 Z M 7 10 L 5 10 L 5 8 L 7 8 Z M 16 17 L 8 17 L 8 15 L 16 15 Z M 16 13 L 14 13 L 14 11 L 16 11 Z M 16 10 L 14 10 L 14 8 L 16 8 Z M 19 13 L 17 13 L 17 11 L 19 11 Z M 19 10 L 17 10 L 17 8 L 19 8 Z";
-                tapped => { root.key-tapped("kbd") }
+                tapped => { root.toggle-kbd() }
             }
+        }
+
+        // ── FN mode (F1–F12) ─────────────────────────────────────────
+        // Sequences match the standard xterm/VT220 mapping used by
+        // most TUIs: F1–F4 as SS3 P/Q/R/S and F5+ as CSI ~ codes.
+        if root.fn-mode : HorizontalLayout {
+            spacing: 4px;
+            KeyButton { label: "F1"; tapped => { root.send-bytes("\u{001b}OP");   root.fn-mode = false; } }
+            KeyButton { label: "F2"; tapped => { root.send-bytes("\u{001b}OQ");   root.fn-mode = false; } }
+            KeyButton { label: "F3"; tapped => { root.send-bytes("\u{001b}OR");   root.fn-mode = false; } }
+            KeyButton { label: "F4"; tapped => { root.send-bytes("\u{001b}OS");   root.fn-mode = false; } }
+            KeyButton { label: "F5"; tapped => { root.send-bytes("\u{001b}[15~"); root.fn-mode = false; } }
+            KeyButton { label: "F6"; tapped => { root.send-bytes("\u{001b}[17~"); root.fn-mode = false; } }
+        }
+        if root.fn-mode : HorizontalLayout {
+            spacing: 4px;
+            KeyButton { label: "F7";  tapped => { root.send-bytes("\u{001b}[18~"); root.fn-mode = false; } }
+            KeyButton { label: "F8";  tapped => { root.send-bytes("\u{001b}[19~"); root.fn-mode = false; } }
+            KeyButton { label: "F9";  tapped => { root.send-bytes("\u{001b}[20~"); root.fn-mode = false; } }
+            KeyButton { label: "F10"; tapped => { root.send-bytes("\u{001b}[21~"); root.fn-mode = false; } }
+            KeyButton { label: "F11"; tapped => { root.send-bytes("\u{001b}[23~"); root.fn-mode = false; } }
+            KeyButton { label: "F12"; tapped => { root.send-bytes("\u{001b}[24~"); root.fn-mode = false; } }
         }
     }
 }
 
 component TerminalView inherits Rectangle {
     in property <TabRow> tab;
-    in property <string> output-text;
+    in property <[ColorLine]> output-lines;
     in property <length> safe-top;
     in property <length> safe-bottom;
     in property <length> safe-left;
@@ -715,12 +777,12 @@ component TerminalView inherits Rectangle {
     callback send-input();
     callback key-tapped(string);
 
-    // Auto-scroll to bottom whenever the output text grows. Setting
+    // Auto-scroll to bottom whenever new output arrives. Setting
     // viewport-y to a negative value scrolls the content upwards — the
     // bottom of output-content lines up with the bottom of the flickable.
     // A subsequent user scroll-up briefly moves away from the bottom; the
     // next 2 s poll re-anchors.
-    changed output-text => {
+    changed output-lines => {
         flick.viewport-y = min(0px, flick.height - flick.viewport-height);
     }
     // Same re-anchor whenever the IME shows or hides: the layout shrinks
@@ -844,18 +906,26 @@ component TerminalView inherits Rectangle {
             output-content := VerticalLayout {
                 padding: 10px;
                 spacing: 0;
-                if root.output-text != "" : Text {
-                    text: root.output-text;
-                    color: #d0d0d0;
-                    font-family: "FreeMono";
-                    font-size: root.font-size;
-                    wrap: no-wrap;
-                }
-                if root.output-text == "" : Text {
+                if root.output-lines.length == 0 : Text {
                     text: "Waiting for output…";
                     color: #666;
                     font-family: "FreeMono";
                     font-size: root.font-size;
+                }
+                // One HorizontalLayout per terminal row, one Text per
+                // contiguous same-colour run. FreeMono is monospace, so
+                // spans line up without explicit cell widths.
+                for line[i] in root.output-lines : HorizontalLayout {
+                    spacing: 0px;
+                    alignment: start;
+                    for span[j] in line.spans : Text {
+                        text: span.text;
+                        color: span.color;
+                        font-family: "FreeMono";
+                        font-size: root.font-size;
+                        font-weight: span.bold ? 700 : 400;
+                        wrap: no-wrap;
+                    }
                 }
             }
         }
@@ -866,33 +936,17 @@ component TerminalView inherits Rectangle {
         hide-focus := FocusScope { width: 0; height: 0; }
 
         KeyboardHeader {
-            key-tapped(k) => {
-                // KBD toggles the IME locally; every other key maps to a
-                // byte sequence sent to the active tab. Keep the mapping
-                // here (instead of bouncing through AppWindow) so each
-                // arm is one statement and Slint doesn't lose any of
-                // them to ambiguous block parsing.
-                if (k == "kbd" && root.ime-height > 0px) { hide-focus.focus(); }
-                if (k == "kbd" && root.ime-height <= 0px) { input-field.focus(); }
-                if (k == "tab")    { root.key-tapped("\u{0009}"); }
-                if (k == "esc")    { root.key-tapped("\u{001b}"); }
-                if (k == "up")     { root.key-tapped("\u{001b}[A"); }
-                if (k == "down")   { root.key-tapped("\u{001b}[B"); }
-                if (k == "right")  { root.key-tapped("\u{001b}[C"); }
-                if (k == "left")   { root.key-tapped("\u{001b}[D"); }
-                if (k == "home")   { root.key-tapped("\u{001b}[H"); }
-                if (k == "end")    { root.key-tapped("\u{001b}[F"); }
-                if (k == "pgup")   { root.key-tapped("\u{001b}[5~"); }
-                if (k == "pgdn")   { root.key-tapped("\u{001b}[6~"); }
-                // Common Ctrl chords for terminal control:
-                // ^C = SIGINT (0x03), ^D = EOF (0x04),
-                // ^L = readline clear-screen (0x0c), ^Z = SIGTSTP (0x1a).
-                if (k == "ctrl-c") { root.key-tapped("\u{0003}"); }
-                if (k == "ctrl-d") { root.key-tapped("\u{0004}"); }
-                if (k == "ctrl-l") { root.key-tapped("\u{000c}"); }
-                if (k == "ctrl-z") { root.key-tapped("\u{001a}"); }
-                if (k == "/")      { root.key-tapped("/"); }
-                if (k == "|")      { root.key-tapped("|"); }
+            // Bytes route straight to the host's tab-input callback.
+            send-bytes(b) => { root.key-tapped(b); }
+            // Printable shortcuts append to the input field so the user
+            // can refine or batch the input before pressing Enter.
+            type-text(t) => { root.input-text += t; }
+            toggle-kbd => {
+                if (root.ime-height > 0px) {
+                    hide-focus.focus();
+                } else {
+                    input-field.focus();
+                }
             }
         }
 
@@ -969,7 +1023,7 @@ export component AppWindow inherits Window {
     in-out property <string> editor-remote-url: "";
     in-out property <string> editor-token: "";
     in-out property <string> editor-error: "";
-    in-out property <string> open-tab-output: "";
+    in-out property <[ColorLine]> open-tab-output-lines: [];
     /// -1 = no close confirmation dialog open; >= 0 = index of the tab the
     /// user just hit the X on.
     in-out property <int> close-confirm-idx: -1;
@@ -1119,10 +1173,12 @@ export component AppWindow inherits Window {
                 spacing: 8px;
                 for tab[i] in root.tabs : TabCard {
                     tab: tab;
-                    tapped => {
-                        root.open-tab = i;
-                        root.request-activate(i);
-                    }
+                    // Tap = open the tab's output on the phone only.
+                    // Switching the *desktop's* active tab is a separate
+                    // explicit action (long-press / menu) so glancing
+                    // through tabs on the phone doesn't yank the user's
+                    // focus around on the workstation.
+                    tapped => { root.open-tab = i; }
                     rename-requested => {
                         root.rename-idx = i;
                         root.rename-text = tab.name;
@@ -1177,7 +1233,7 @@ export component AppWindow inherits Window {
         width: 100%;
         height: 100%;
         tab: root.tabs[root.open-tab];
-        output-text: root.open-tab-output;
+        output-lines: root.open-tab-output-lines;
         safe-top: root.safe-area-insets.top;
         safe-bottom: root.safe-area-insets.bottom;
         safe-left: root.safe-area-insets.left;
