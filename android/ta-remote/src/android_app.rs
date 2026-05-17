@@ -17,7 +17,7 @@ slint::include_modules!();
 /// Read the URI the activity was launched with, if any (e.g. via the
 /// `taremote://onboard?url=...&token=...` deep link).
 /// Read the system clipboard's primary text item via JNI. Returns `None` if
-/// the clipboard is empty or doesn't contain a CharSequence.
+/// the clipboard is empty or doesn't contain a `CharSequence`.
 fn read_clipboard(app: &slint::android::AndroidApp) -> Option<String> {
     let vm = unsafe { JavaVM::from_raw(app.vm_as_ptr().cast()) }.ok()?;
     let mut env = vm.attach_current_thread().ok()?;
@@ -84,7 +84,7 @@ fn read_clipboard(app: &slint::android::AndroidApp) -> Option<String> {
         .l()
         .ok()?;
     let jstr: JString = s.into();
-    env.get_string(&jstr).ok().map(|j| j.into())
+    env.get_string(&jstr).ok().map(Into::into)
 }
 
 /// Query the system battery level (0–100) via JNI.
@@ -185,7 +185,7 @@ fn launch_intent_uri(app: &slint::android::AndroidApp) -> Option<String> {
         .l()
         .ok()?;
     let jstr: JString = s.into();
-    env.get_string(&jstr).ok().map(|j| j.into())
+    env.get_string(&jstr).ok().map(Into::into)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -295,7 +295,7 @@ impl AppData {
 fn fetch_output(
     agent: &ureq::Agent,
     host: &HostConfig,
-    reach: &Reach,
+    reach: Reach,
     idx: i32,
 ) -> Option<String> {
     let base = base_url(host, reach);
@@ -469,7 +469,7 @@ const ANSI_PALETTE: [[u8; 3]; 16] = [
     [0xff, 0xff, 0xff],
 ];
 
-fn ansi16(idx: u8) -> [u8; 3] {
+const fn ansi16(idx: u8) -> [u8; 3] {
     ANSI_PALETTE[(idx as usize) % 16]
 }
 
@@ -516,14 +516,14 @@ fn fetch_tabs(
     (Reach::Offline, None)
 }
 
-fn base_url(host: &HostConfig, reach: &Reach) -> String {
+fn base_url(host: &HostConfig, reach: Reach) -> String {
     match reach {
         Reach::Remote => host.remote_url.clone(),
         _ => host.url.clone(),
     }
 }
 
-fn post_input(agent: &ureq::Agent, host: &HostConfig, reach: &Reach, idx: i32, bytes: &[u8]) {
+fn post_input(agent: &ureq::Agent, host: &HostConfig, reach: Reach, idx: i32, bytes: &[u8]) {
     let base = base_url(host, reach);
     if base.is_empty() {
         return;
@@ -540,7 +540,7 @@ fn post_input(agent: &ureq::Agent, host: &HostConfig, reach: &Reach, idx: i32, b
     }
 }
 
-fn post_rename_tab(agent: &ureq::Agent, host: &HostConfig, reach: &Reach, idx: i32, name: &str) {
+fn post_rename_tab(agent: &ureq::Agent, host: &HostConfig, reach: Reach, idx: i32, name: &str) {
     let base = base_url(host, reach);
     if base.is_empty() {
         return;
@@ -558,7 +558,7 @@ fn post_rename_tab(agent: &ureq::Agent, host: &HostConfig, reach: &Reach, idx: i
     }
 }
 
-fn post_new_tab(agent: &ureq::Agent, host: &HostConfig, reach: &Reach) {
+fn post_new_tab(agent: &ureq::Agent, host: &HostConfig, reach: Reach) {
     let base = base_url(host, reach);
     if base.is_empty() {
         return;
@@ -574,7 +574,7 @@ fn post_new_tab(agent: &ureq::Agent, host: &HostConfig, reach: &Reach) {
     }
 }
 
-fn delete_tab(agent: &ureq::Agent, host: &HostConfig, reach: &Reach, idx: i32) {
+fn delete_tab(agent: &ureq::Agent, host: &HostConfig, reach: Reach, idx: i32) {
     let base = base_url(host, reach);
     if base.is_empty() {
         return;
@@ -590,7 +590,7 @@ fn delete_tab(agent: &ureq::Agent, host: &HostConfig, reach: &Reach, idx: i32) {
     }
 }
 
-fn post_activate(agent: &ureq::Agent, host: &HostConfig, reach: &Reach, idx: i32) {
+fn post_activate(agent: &ureq::Agent, host: &HostConfig, reach: Reach, idx: i32) {
     let base = base_url(host, reach);
     if base.is_empty() {
         return;
@@ -744,7 +744,7 @@ fn refresh_soon(
 }
 
 /// Mark the given tab's current preview as "seen", clearing the dot the
-/// next time push_tabs runs.
+/// next time `push_tabs` runs.
 fn mark_seen(seen: &SeenPreviews, name: &str, preview: &str) {
     let hash = crc32(preview.as_bytes());
     seen.lock().unwrap().insert(name.to_string(), hash);
@@ -813,6 +813,11 @@ fn push_reachability(ui_weak: &Weak<AppWindow>, active: usize, reach: Reach) {
     });
 }
 
+// `android_main` is the entry point android-activity dispatches to; it
+// must keep its plain symbol name. `slint::android::AndroidApp` isn't
+// `#[repr(C)]` so we can't honour clippy's "no_mangle should be extern"
+// recommendation either — allow it explicitly.
+#[allow(clippy::no_mangle_with_rust_abi)]
 #[unsafe(no_mangle)]
 pub fn android_main(app: slint::android::AndroidApp) {
     android_logger::init_once(
@@ -893,7 +898,7 @@ pub fn android_main(app: slint::android::AndroidApp) {
 
             let idx = poll_open.load(Ordering::Relaxed);
             if idx >= 0
-                && let Some(text) = fetch_output(&poll_agent, &host, &reach, idx)
+                && let Some(text) = fetch_output(&poll_agent, &host, reach, idx)
             {
                 push_output(&poll_weak, text);
             }
@@ -908,7 +913,7 @@ pub fn android_main(app: slint::android::AndroidApp) {
         let Some(host) = act_data.lock().unwrap().active_host() else { return };
         let reach = *act_reach.lock().unwrap();
         let agent = act_agent.clone();
-        std::thread::spawn(move || post_activate(&agent, &host, &reach, idx));
+        std::thread::spawn(move || post_activate(&agent, &host, reach, idx));
     });
 
     let send_agent = agent.clone();
@@ -919,7 +924,7 @@ pub fn android_main(app: slint::android::AndroidApp) {
         let reach = *send_reach.lock().unwrap();
         let agent = send_agent.clone();
         let bytes = text.as_bytes().to_vec();
-        std::thread::spawn(move || post_input(&agent, &host, &reach, idx, &bytes));
+        std::thread::spawn(move || post_input(&agent, &host, reach, idx, &bytes));
     });
 
     let typed_agent = agent.clone();
@@ -930,7 +935,7 @@ pub fn android_main(app: slint::android::AndroidApp) {
         let reach = *typed_reach.lock().unwrap();
         let agent = typed_agent.clone();
         let bytes = apply_modifiers(text.as_str(), ctrl, alt);
-        std::thread::spawn(move || post_input(&agent, &host, &reach, idx, &bytes));
+        std::thread::spawn(move || post_input(&agent, &host, reach, idx, &bytes));
     });
 
     let close_agent = agent.clone();
@@ -942,7 +947,7 @@ pub fn android_main(app: slint::android::AndroidApp) {
         let Some(host) = close_data.lock().unwrap().active_host() else { return };
         let reach = *close_reach.lock().unwrap();
         let agent = close_agent.clone();
-        std::thread::spawn(move || delete_tab(&agent, &host, &reach, idx));
+        std::thread::spawn(move || delete_tab(&agent, &host, reach, idx));
         refresh_soon(&close_weak, &close_agent, &close_data, &close_reach, &close_seen);
     });
 
@@ -955,7 +960,7 @@ pub fn android_main(app: slint::android::AndroidApp) {
         let Some(host) = new_data.lock().unwrap().active_host() else { return };
         let reach = *new_reach.lock().unwrap();
         let agent = new_agent.clone();
-        std::thread::spawn(move || post_new_tab(&agent, &host, &reach));
+        std::thread::spawn(move || post_new_tab(&agent, &host, reach));
         refresh_soon(&new_weak, &new_agent, &new_data, &new_reach, &new_seen);
     });
 
@@ -969,16 +974,17 @@ pub fn android_main(app: slint::android::AndroidApp) {
         let reach = *rename_reach.lock().unwrap();
         let agent = rename_agent.clone();
         let name = name.to_string();
-        std::thread::spawn(move || post_rename_tab(&agent, &host, &reach, idx, &name));
+        std::thread::spawn(move || post_rename_tab(&agent, &host, reach, idx, &name));
         refresh_soon(&rename_weak, &rename_agent, &rename_data, &rename_reach, &rename_seen);
     });
 
-    let open_tab_for_cb = open_tab.clone();
+    // Last use of these process-wide handles — move instead of clone.
+    let open_tab_for_cb = open_tab;
     let open_weak = ui_weak.clone();
     let open_data = data.clone();
-    let open_reach = last_reach.clone();
-    let open_agent = agent.clone();
-    let open_seen = seen_previews.clone();
+    let open_reach = last_reach;
+    let open_agent = agent;
+    let open_seen = seen_previews;
     ui.on_open_tab_changed(move |idx| {
         open_tab_for_cb.store(idx, Ordering::Relaxed);
         if idx < 0 {
@@ -999,7 +1005,7 @@ pub fn android_main(app: slint::android::AndroidApp) {
             let agent = open_agent.clone();
             let weak = open_weak.clone();
             std::thread::spawn(move || {
-                if let Some(text) = fetch_output(&agent, &host, &reach, idx) {
+                if let Some(text) = fetch_output(&agent, &host, reach, idx) {
                     push_output(&weak, text);
                 }
             });
@@ -1055,7 +1061,7 @@ pub fn android_main(app: slint::android::AndroidApp) {
         push_hosts(&add_weak, &data);
     });
 
-    let upd_data = data.clone();
+    let upd_data = data;
     let upd_weak = ui_weak.clone();
     ui.on_request_update_host(move |idx, name, url, remote_url, token| {
         let idx = idx as usize;
@@ -1101,15 +1107,12 @@ pub fn android_main(app: slint::android::AndroidApp) {
             ui.set_editor_name(SharedString::new());
             ui.set_editor_remote_url(SharedString::new());
             ui.set_editor_error(SharedString::new());
-            match parsed {
-                Some((url, token)) => {
-                    ui.set_editor_url(SharedString::from(url));
-                    ui.set_editor_token(SharedString::from(token));
-                }
-                None => {
-                    ui.set_editor_url(SharedString::new());
-                    ui.set_editor_token(SharedString::new());
-                }
+            if let Some((url, token)) = parsed {
+                ui.set_editor_url(SharedString::from(url));
+                ui.set_editor_token(SharedString::from(token));
+            } else {
+                ui.set_editor_url(SharedString::new());
+                ui.set_editor_token(SharedString::new());
             }
             ui.set_editor_open(true);
         });
@@ -1135,19 +1138,16 @@ pub fn android_main(app: slint::android::AndroidApp) {
             ui.set_editor_edit_index(-1);
             ui.set_editor_name(SharedString::new());
             ui.set_editor_remote_url(SharedString::new());
-            match parsed {
-                Some((url, token)) => {
-                    ui.set_editor_url(SharedString::from(url));
-                    ui.set_editor_token(SharedString::from(token));
-                    ui.set_editor_error(SharedString::new());
-                }
-                None => {
-                    ui.set_editor_url(SharedString::new());
-                    ui.set_editor_token(SharedString::new());
-                    ui.set_editor_error(SharedString::from(
-                        "Clipboard didn't contain a taremote:// URL. Copy the URL under the QR code on the desktop and try again.",
-                    ));
-                }
+            if let Some((url, token)) = parsed {
+                ui.set_editor_url(SharedString::from(url));
+                ui.set_editor_token(SharedString::from(token));
+                ui.set_editor_error(SharedString::new());
+            } else {
+                ui.set_editor_url(SharedString::new());
+                ui.set_editor_token(SharedString::new());
+                ui.set_editor_error(SharedString::from(
+                    "Clipboard didn't contain a taremote:// URL. Copy the URL under the QR code on the desktop and try again.",
+                ));
             }
             ui.set_editor_open(true);
         });
@@ -1157,7 +1157,7 @@ pub fn android_main(app: slint::android::AndroidApp) {
     // `battery-level` (0–100, or -1 when unavailable) and turns the top
     // bar red/blinking when the phone is below 20 % / 10 %.
     {
-        let weak = ui_weak.clone();
+        let weak = ui_weak;
         std::thread::spawn(move || {
             loop {
                 let level = read_battery_level(&app_for_battery).unwrap_or(-1);

@@ -1,5 +1,6 @@
 //! Parsing of the `taremote://onboard?url=...&token=...` deep link.
 
+#[must_use]
 pub fn parse_onboard_url(url: &str) -> Option<(String, String)> {
     let q = url.strip_prefix("taremote://onboard?")?;
     let mut host_url = None;
@@ -15,6 +16,7 @@ pub fn parse_onboard_url(url: &str) -> Option<(String, String)> {
     Some((host_url?, token?))
 }
 
+#[must_use]
 pub fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());

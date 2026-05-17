@@ -7,6 +7,32 @@ publish = false
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+
+# Reuse the desktop crate's casting-policy exemptions — ANSI palette
+# indices, CRC32 byte mixing, and battery-percent math are all
+# narrowing casts we genuinely want.
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+cast_lossless = "allow"
+cast_possible_wrap = "allow"
+# `android_main` is one big wiring function; splitting it would obscure
+# the start-up ordering.
+too_many_lines = "allow"
+# Slint generates `Send`-ish callback handlers that take owned
+# SharedString arguments; the closures don't always consume them.
+needless_pass_by_value = "allow"
+# The remove/add/update-host handlers lock the AppData mutex, mutate
+# it, and call push_hosts(&data) before returning. Releasing the lock
+# before push_hosts would require cloning out the host vector, which
+# is more allocation churn than the lock contention it avoids on the
+# (almost-never-contended) UI thread.
+significant_drop_tightening = "allow"
+
 [dependencies]
 
 [target.'cfg(target_os = "android")'.dependencies]
