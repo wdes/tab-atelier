@@ -64,3 +64,16 @@ priority = "optional"
 depends = "libc6, libgcc-s1, libfreetype6, libxkbcommon0, libxkbcommon-x11-0, libxcb1, libxcb-xkb1"
 maintainer = "William Desportes <williamdes@wdes.fr>"
 extended-description = "A Guake-style drop-down terminal emulator built with alacritty_terminal and gpui. Features tabbed terminals, i18n (English/French), power monitoring, screenshots, remote control via QR code, and Wakatime integration."
+assets = [
+    ["target/release/tab-atelier", "/usr/bin/", "755"],
+    ["assets/tab-atelier.desktop", "/usr/share/applications/", "644"],
+    ["assets/tab-atelier.svg", "/usr/share/icons/hicolor/scalable/apps/tab-atelier.svg", "644"],
+    ["README.md", "/usr/share/doc/tab-atelier/", "644"],
+    ["LICENSE", "/usr/share/doc/tab-atelier/", "644"],
+]
+# Per debian-policy §10.7.2, conffiles are files in /etc that dpkg
+# treats as user-modifiable. tab-atelier ships none — every piece of
+# user state lives under $XDG_CONFIG_HOME / $XDG_STATE_HOME in the
+# user's home directory, so dpkg has no business managing it. Setting
+# this to [] makes that intentional rather than implicit.
+conf-files = []
