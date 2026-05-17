@@ -660,10 +660,12 @@ component TerminalView inherits Rectangle {
             background: #2a2a2a;
         }
 
-        Flickable {
+        Rectangle {
+            vertical-stretch: 1;
             VerticalLayout {
                 padding: 10px;
                 spacing: 0;
+                alignment: end;
                 if root.output-text != "" : Text {
                     text: root.output-text;
                     color: #d0d0d0;
