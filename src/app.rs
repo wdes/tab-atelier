@@ -509,6 +509,7 @@ impl AppState {
             }
         }
         let state_base = platform::state_base_dir();
+        #[allow(clippy::needless_collect)]
         let outputs: Vec<(String, String)> = self
             .tabs
             .iter()
@@ -550,6 +551,7 @@ impl AppState {
             })
             .collect();
 
+        let read_only = crate::read_only();
         let saved = SavedState {
             tabs,
             active: self.active,
@@ -558,41 +560,45 @@ impl AppState {
         // last tick — the common case once the user stops poking the UI.
         let serialized = serde_json::to_string_pretty(&saved).unwrap_or_default();
         let new_hash = tab_atelier::crc32(serialized.as_bytes());
-        if new_hash != self.last_state_hash.get() {
+        if !read_only && new_hash != self.last_state_hash.get() {
             save_state(&platform::config_base_dir(), &saved);
             self.last_state_hash.set(new_hash);
         }
-        for (i, (name, output)) in outputs.into_iter().enumerate() {
-            if output.is_empty() {
-                continue;
+        if !read_only {
+            for (i, (name, output)) in outputs.into_iter().enumerate() {
+                if output.is_empty() {
+                    continue;
+                }
+                let h = tab_atelier::crc32(output.as_bytes());
+                if h == self.tabs[i].output_hash_last_saved {
+                    continue;
+                }
+                save_tab_output(&state_base, &name, &output);
+                self.tabs[i].output_hash_last_saved = h;
             }
-            let h = tab_atelier::crc32(output.as_bytes());
-            if h == self.tabs[i].output_hash_last_saved {
-                continue;
-            }
-            save_tab_output(&state_base, &name, &output);
-            self.tabs[i].output_hash_last_saved = h;
         }
-        // Uptime grows ~2s per tick; only flush every 30s to spare writes.
-        let should_save_uptime = self
-            .last_uptime_save
-            .get()
-            .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(30));
-        if should_save_uptime {
-            for (name, secs) in &uptimes {
-                save_tab_uptime(&state_base, name, *secs);
+        // Uptime + energy are never written in read-only mode; in normal
+        // mode each has its own throttle (30s for uptime, ≥0.1 Wh delta for
+        // energy) plus an unconditional flush on shutdown.
+        if !read_only {
+            let should_save_uptime = self
+                .last_uptime_save
+                .get()
+                .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(30));
+            if should_save_uptime {
+                for (name, secs) in &uptimes {
+                    save_tab_uptime(&state_base, name, *secs);
+                }
+                self.last_uptime_save.set(Some(std::time::Instant::now()));
             }
-            self.last_uptime_save.set(Some(std::time::Instant::now()));
-        }
-        // Energy: only flush when at least 0.1 Wh has been consumed since the
-        // last save. Avoids writing tiny float increments on every tick.
-        #[cfg(feature = "energy")]
-        {
-            const ENERGY_DELTA_WH: f64 = 0.1;
-            for tab in &mut self.tabs {
-                if (tab.energy_wh - tab.energy_wh_last_saved).abs() >= ENERGY_DELTA_WH {
-                    save_tab_energy(&state_base, &tab.name, tab.energy_wh);
-                    tab.energy_wh_last_saved = tab.energy_wh;
+            #[cfg(feature = "energy")]
+            {
+                const ENERGY_DELTA_WH: f64 = 0.1;
+                for tab in &mut self.tabs {
+                    if (tab.energy_wh - tab.energy_wh_last_saved).abs() >= ENERGY_DELTA_WH {
+                        save_tab_energy(&state_base, &tab.name, tab.energy_wh);
+                        tab.energy_wh_last_saved = tab.energy_wh;
+                    }
                 }
             }
         }
@@ -712,6 +718,7 @@ impl AppState {
 
     fn close_all_tabs(&mut self, cx: &mut Context<Self>) {
         let state_base = platform::state_base_dir();
+        #[allow(clippy::needless_collect)]
         let outputs: Vec<(String, String)> = self
             .tabs
             .iter()
@@ -740,27 +747,29 @@ impl AppState {
                 }
             })
             .collect();
-        save_state(
-            &platform::config_base_dir(),
-            &SavedState {
-                tabs,
-                active: self.active,
-            },
-        );
-        for (name, output) in outputs {
-            if !output.is_empty() {
-                save_tab_output(&state_base, &name, &output);
+        if !crate::read_only() {
+            save_state(
+                &platform::config_base_dir(),
+                &SavedState {
+                    tabs,
+                    active: self.active,
+                },
+            );
+            for (name, output) in outputs {
+                if !output.is_empty() {
+                    save_tab_output(&state_base, &name, &output);
+                }
             }
-        }
-        // Always flush uptime + energy on shutdown — bypass throttles so the
-        // last tick isn't lost.
-        for (name, secs) in &uptimes {
-            save_tab_uptime(&state_base, name, *secs);
-        }
-        #[cfg(feature = "energy")]
-        for tab in &mut self.tabs {
-            save_tab_energy(&state_base, &tab.name, tab.energy_wh);
-            tab.energy_wh_last_saved = tab.energy_wh;
+            // Always flush uptime + energy on shutdown — bypass throttles so
+            // the last tick isn't lost.
+            for (name, secs) in &uptimes {
+                save_tab_uptime(&state_base, name, *secs);
+            }
+            #[cfg(feature = "energy")]
+            for tab in &mut self.tabs {
+                save_tab_energy(&state_base, &tab.name, tab.energy_wh);
+                tab.energy_wh_last_saved = tab.energy_wh;
+            }
         }
 
         if let Some(ref tracker) = self.tracker {
@@ -1405,7 +1414,7 @@ impl AppState {
                                     {
                                         let old_name = this.tabs[i].name.clone();
                                         let new_name = text.clone();
-                                        if old_name != new_name {
+                                        if old_name != new_name && !crate::read_only() {
                                             // Move per-tab files across so we don't orphan
                                             // history or uptime when the user renames a tab.
                                             let base = platform::state_base_dir();
@@ -2152,55 +2161,62 @@ impl AppState {
                                         )
                                         .child(t.cancel),
                                 )
-                                .child(
-                                    div()
+                                .child({
+                                    let ro = crate::read_only();
+                                    let mut btn = div()
                                         .id("pref-save")
                                         .px(px(14.0))
                                         .py(px(6.0))
                                         .bg(btn_bg)
                                         .rounded(px(3.0))
-                                        .cursor_pointer()
-                                        .hover(|s| s.bg(btn_hover))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
-                                                let lang_str = match this.lang {
-                                                    Lang::En => "en",
-                                                    Lang::Fr => "fr",
-                                                };
-                                                let browser = if this.pref_browser_text.is_empty() {
-                                                    None
-                                                } else {
-                                                    Some(this.pref_browser_text.clone())
-                                                };
-                                                let editor = if this.pref_editor_text.is_empty() {
-                                                    None
-                                                } else {
-                                                    Some(this.pref_editor_text.clone())
-                                                };
-                                                (*this.browser.borrow_mut()).clone_from(&browser);
-                                                (*this.code_editor.borrow_mut()).clone_from(&editor);
-                                                save_preferences(
-                                                    &platform::config_dir(),
-                                                    &Preferences {
-                                                        lang: Some(lang_str.into()),
-                                                        theme: Some(this.theme_name.id().into()),
-                                                        opacity: Some(this.opacity),
-                                                        hotkeys: this.hotkeys.clone(),
-                                                        browser,
-                                                        code_editor: editor,
-                                                    },
-                                                );
-                                                if let Some(ref handle) = this.hotkey_handle {
-                                                    handle.update_keys(&this.hotkeys);
-                                                }
-                                                this.show_preferences = false;
-                                                this.show_hotkey_picker = false;
-                                                cx.notify();
-                                            }),
-                                        )
-                                        .child(t.save),
-                                ),
+                                        .child(t.save);
+                                    if ro {
+                                        btn = btn.opacity(0.4);
+                                    } else {
+                                        btn = btn
+                                            .cursor_pointer()
+                                            .hover(|s| s.bg(btn_hover))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                                                    let lang_str = match this.lang {
+                                                        Lang::En => "en",
+                                                        Lang::Fr => "fr",
+                                                    };
+                                                    let browser = if this.pref_browser_text.is_empty() {
+                                                        None
+                                                    } else {
+                                                        Some(this.pref_browser_text.clone())
+                                                    };
+                                                    let editor = if this.pref_editor_text.is_empty() {
+                                                        None
+                                                    } else {
+                                                        Some(this.pref_editor_text.clone())
+                                                    };
+                                                    (*this.browser.borrow_mut()).clone_from(&browser);
+                                                    (*this.code_editor.borrow_mut()).clone_from(&editor);
+                                                    save_preferences(
+                                                        &platform::config_dir(),
+                                                        &Preferences {
+                                                            lang: Some(lang_str.into()),
+                                                            theme: Some(this.theme_name.id().into()),
+                                                            opacity: Some(this.opacity),
+                                                            hotkeys: this.hotkeys.clone(),
+                                                            browser,
+                                                            code_editor: editor,
+                                                        },
+                                                    );
+                                                    if let Some(ref handle) = this.hotkey_handle {
+                                                        handle.update_keys(&this.hotkeys);
+                                                    }
+                                                    this.show_preferences = false;
+                                                    this.show_hotkey_picker = false;
+                                                    cx.notify();
+                                                }),
+                                            );
+                                    }
+                                    btn
+                                }),
                         ),
                 ),
         )

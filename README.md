@@ -56,6 +56,17 @@ cargo build --release
 
 Requires Rust 2024 edition (rustc 1.92+).
 
+## Running
+
+```sh
+tab-atelier               # normal mode
+tab-atelier --read-only   # second instance, no writes
+```
+
+A normal launch acquires a single-instance lock on `~/.local/state/tab-atelier/tab-atelier.lock` and exits if another normal instance is already running — concurrent writers would race each other and produce inconsistent state files.
+
+`--read-only` skips the lock so any number of read-only instances can run alongside the primary one. In that mode tab-atelier never writes anything: no `tabs.json` rewrites, no per-tab output / uptime / energy files, no preference saves, no rename-time file moves. The preferences "Save" button is visually disabled. Useful for snapshotting the running workspace from a script or for poking around without disturbing live state.
+
 ## Configuration
 
 ### Font settings
