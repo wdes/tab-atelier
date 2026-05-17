@@ -83,7 +83,9 @@ pub fn local_ip() -> String {
 fn respond_json<W: Write>(stream: &mut W, status: u16, body: &str) {
     let reason = match status {
         200 => "OK",
+        400 => "Bad Request",
         401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         _ => "Error",
@@ -105,6 +107,7 @@ fn handle_connection<S: Read + Write>(
     stream: &mut S,
     state: &Arc<Mutex<TabSnapshot>>,
     token: &str,
+    read_only: bool,
 ) {
     // Owned BufReader around the stream itself — `try_clone` was only used
     // to dodge the read/write borrow on TcpStream, but it doesn't exist on
@@ -177,6 +180,17 @@ fn handle_connection<S: Read + Write>(
     }
 
     debug!("API: {method} {path}");
+
+    // Block every mutating verb when the process was launched with
+    // --read-only. The flag is meant to advertise "this instance never
+    // changes anything", so an open-ended HTTP API that closes tabs or
+    // sends keystrokes would violate that contract from the outside.
+    let is_mutating = matches!(method.as_str(), "DELETE" | "POST" | "PUT" | "PATCH");
+    if is_mutating && read_only {
+        error_json(stream, 403, "tab-atelier is running in --read-only mode");
+        return;
+    }
+
     match (method.as_str(), path.as_str()) {
         ("GET", "/" | "/tabs") => {
             let state = state.lock().unwrap();
@@ -332,14 +346,19 @@ fn handle_connection<S: Read + Write>(
     }
 }
 
-pub fn serve(listener: &TcpListener, state: &Arc<Mutex<TabSnapshot>>, token: &str) {
+pub fn serve(
+    listener: &TcpListener,
+    state: &Arc<Mutex<TabSnapshot>>,
+    token: &str,
+    read_only: bool,
+) {
     for stream in listener.incoming() {
         let Ok(mut stream) = stream else { continue };
-        handle_connection(&mut stream, state, token);
+        handle_connection(&mut stream, state, token, read_only);
     }
 }
 
-pub fn start_api_server(state: Arc<Mutex<TabSnapshot>>, token: String) {
+pub fn start_api_server(state: Arc<Mutex<TabSnapshot>>, token: String, read_only: bool) {
     std::thread::spawn(move || {
         let listener = match TcpListener::bind("0.0.0.0:7890") {
             Ok(l) => {
@@ -351,7 +370,7 @@ pub fn start_api_server(state: Arc<Mutex<TabSnapshot>>, token: String) {
                 return;
             }
         };
-        serve(&listener, &state, &token);
+        serve(&listener, &state, &token, read_only);
     });
 }
 
@@ -363,7 +382,7 @@ pub fn start_api_server(state: Arc<Mutex<TabSnapshot>>, token: String) {
 /// validate via either. Pin-on-first-use clients (the Android remote) can
 /// trust the cert directly; browsers will warn until added to their
 /// trust store — fine for personal use.
-pub fn start_api_server_tls(state: Arc<Mutex<TabSnapshot>>, token: String) {
+pub fn start_api_server_tls(state: Arc<Mutex<TabSnapshot>>, token: String, read_only: bool) {
     use rustls::ServerConfig;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
@@ -409,7 +428,7 @@ pub fn start_api_server_tls(state: Arc<Mutex<TabSnapshot>>, token: String) {
                 }
             };
             let mut tls = rustls::Stream::new(&mut conn, &mut stream);
-            handle_connection(&mut tls, &state, &token);
+            handle_connection(&mut tls, &state, &token, read_only);
         }
     });
 }
@@ -491,13 +510,17 @@ mod tests {
     }
 
     fn spawn_server() -> (u16, Arc<Mutex<TabSnapshot>>, String) {
+        spawn_server_with_read_only(false)
+    }
+
+    fn spawn_server_with_read_only(read_only: bool) -> (u16, Arc<Mutex<TabSnapshot>>, String) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let state = test_state();
         let token = "test-secret-token".to_string();
         let s = state.clone();
         let t = token.clone();
-        std::thread::spawn(move || serve(&listener, &s, &t));
+        std::thread::spawn(move || serve(&listener, &s, &t, read_only));
         (port, state, token)
     }
 
@@ -699,6 +722,52 @@ mod tests {
             ),
         );
         assert_eq!(status_code(&resp), 400);
+    }
+
+    #[test]
+    fn read_only_blocks_delete() {
+        let (port, _, token) = spawn_server_with_read_only(true);
+        let resp = request(
+            port,
+            &format!("DELETE /tabs/0 HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        assert_eq!(status_code(&resp), 403);
+        assert!(body(&resp).contains("read-only"));
+    }
+
+    #[test]
+    fn read_only_blocks_post_new_tab() {
+        let (port, _, token) = spawn_server_with_read_only(true);
+        let resp = request(
+            port,
+            &format!("POST /tabs HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\n\r\n"),
+        );
+        assert_eq!(status_code(&resp), 403);
+    }
+
+    #[test]
+    fn read_only_blocks_post_input() {
+        let (port, _, token) = spawn_server_with_read_only(true);
+        let payload = "ls\n";
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/0/input HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{}",
+                payload.len(),
+                payload,
+            ),
+        );
+        assert_eq!(status_code(&resp), 403);
+    }
+
+    #[test]
+    fn read_only_allows_get_tabs() {
+        let (port, _, token) = spawn_server_with_read_only(true);
+        let resp = request(
+            port,
+            &format!("GET /tabs HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        assert_eq!(status_code(&resp), 200);
     }
 
     #[test]

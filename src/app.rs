@@ -387,8 +387,9 @@ impl AppState {
             pending_new_tabs: 0,
             pending_renames: Vec::new(),
         }));
-        api::start_api_server(api_state.clone(), api_token.clone());
-        api::start_api_server_tls(api_state.clone(), api_token.clone());
+        let api_read_only = crate::read_only();
+        api::start_api_server(api_state.clone(), api_token.clone(), api_read_only);
+        api::start_api_server_tls(api_state.clone(), api_token.clone(), api_read_only);
 
         #[cfg(feature = "energy")]
         let power_pids: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
