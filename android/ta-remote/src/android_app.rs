@@ -87,6 +87,44 @@ fn read_clipboard(app: &slint::android::AndroidApp) -> Option<String> {
     env.get_string(&jstr).ok().map(|j| j.into())
 }
 
+/// Query the system battery level (0–100) via JNI. Returns `None` on any
+/// JNI plumbing failure so the caller can keep the previous reading and
+/// avoid spurious warning flashes.
+fn read_battery_level(app: &slint::android::AndroidApp) -> Option<i32> {
+    let vm = unsafe { JavaVM::from_raw(app.vm_as_ptr().cast()) }.ok()?;
+    let mut env = vm.attach_current_thread().ok()?;
+    let activity = unsafe { JObject::from_raw(app.activity_as_ptr().cast()) };
+
+    let ctx_class = env.find_class("android/content/Context").ok()?;
+    let svc_key = env
+        .get_static_field(&ctx_class, "BATTERY_SERVICE", "Ljava/lang/String;")
+        .ok()?
+        .l()
+        .ok()?;
+    let bm = env
+        .call_method(
+            &activity,
+            "getSystemService",
+            "(Ljava/lang/String;)Ljava/lang/Object;",
+            &[(&svc_key).into()],
+        )
+        .ok()?
+        .l()
+        .ok()?;
+    let bm_class = env.find_class("android/os/BatteryManager").ok()?;
+    let capacity_const = env
+        .get_static_field(&bm_class, "BATTERY_PROPERTY_CAPACITY", "I")
+        .ok()?
+        .i()
+        .ok()?;
+    let level = env
+        .call_method(&bm, "getIntProperty", "(I)I", &[capacity_const.into()])
+        .ok()?
+        .i()
+        .ok()?;
+    Some(level)
+}
+
 fn launch_intent_uri(app: &slint::android::AndroidApp) -> Option<String> {
     let vm_ptr = app.vm_as_ptr();
     let activity_ptr = app.activity_as_ptr();
@@ -758,6 +796,7 @@ pub fn android_main(app: slint::android::AndroidApp) {
     // Keep an AndroidApp clone for JNI callbacks (e.g. scan-QR) before
     // slint::android::init takes ownership of the original.
     let app_for_callbacks = app.clone();
+    let app_for_battery = app.clone();
 
     let launch_onboard = launch_intent_uri(&app).and_then(|u| parse_onboard_url(&u));
 
@@ -1046,6 +1085,25 @@ pub fn android_main(app: slint::android::AndroidApp) {
             ui.set_editor_open(true);
         });
     });
+
+    // Battery poller — refreshes every 30 s. Slint side reads
+    // `battery-level` (0–100, or -1 when unavailable) and turns the top
+    // bar red/blinking when the phone is below 20 % / 10 %.
+    {
+        let weak = ui_weak.clone();
+        std::thread::spawn(move || {
+            loop {
+                let level = read_battery_level(&app_for_battery).unwrap_or(-1);
+                let w = weak.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = w.upgrade() {
+                        ui.set_battery_level(level);
+                    }
+                });
+                std::thread::sleep(Duration::from_secs(30));
+            }
+        });
+    }
 
     ui.run().unwrap();
 }
