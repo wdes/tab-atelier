@@ -798,11 +798,21 @@ component TerminalView inherits Rectangle {
     changed output-lines => {
         flick.viewport-y = min(0px, flick.height - flick.viewport-height);
     }
-    // Same re-anchor whenever the IME shows or hides: the layout shrinks
-    // by `ime-height`, so the previous viewport-y leaves the bottom rows
-    // cut off behind the keyboard.
-    changed ime-height => {
-        flick.viewport-y = min(0px, flick.height - flick.viewport-height);
+    // Re-anchor when the IME opens or closes. Slint propagates
+    // `ime-height` synchronously but only re-lays out (and thus updates
+    // `flick.height`) on the next frame — sampling immediately reads
+    // stale geometry and the bottom row gets parked behind the
+    // keyboard. Defer via a one-shot Timer so the new flick.height is
+    // in place by the time we compute viewport-y.
+    in-out property <bool> _reanchor_pending: false;
+    changed ime-height => { root._reanchor_pending = true; }
+    Timer {
+        interval: 80ms;
+        running: root._reanchor_pending;
+        triggered => {
+            flick.viewport-y = min(0px, flick.height - flick.viewport-height);
+            root._reanchor_pending = false;
+        }
     }
 
     background: #0e0e0e;
