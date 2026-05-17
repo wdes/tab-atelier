@@ -411,6 +411,8 @@ impl AppState {
             active: 0,
             #[cfg(feature = "energy")]
             power: Vec::new(),
+            #[cfg(feature = "energy")]
+            battery_percent: None,
             pending_closes: Vec::new(),
             pending_activate: None,
             pending_input: Vec::new(),
@@ -703,6 +705,10 @@ impl AppState {
             snapshot.active = self.active;
             #[cfg(feature = "energy")]
             snapshot.power.clone_from(&self.power_watts.lock().unwrap());
+            #[cfg(feature = "energy")]
+            {
+                snapshot.battery_percent = *self.battery_percent.lock().unwrap();
+            }
         }
 
         #[cfg(feature = "energy")]

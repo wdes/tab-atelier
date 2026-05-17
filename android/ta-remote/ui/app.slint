@@ -49,10 +49,14 @@ component HeaderBar inherits Rectangle {
     in property <string> reachability;
     in property <string> detail;
     in property <bool> multi-host;
-    /// Phone battery percentage (0–100), or -1 when not yet polled.
-    /// Drives the small badge tucked in after the IP/host detail.
+    /// Workstation battery percentage (0–100), or -1 if the desktop
+    /// reports no battery (plugged-in tower) or the API hasn't been
+    /// polled yet. Sourced from the desktop's power monitor.
     in property <int> battery-level: -1;
     in property <bool> battery-blink: false;
+    /// Workstation total power draw in watts, summed across all
+    /// tracked tabs. 0 hides the badge.
+    in property <float> host-watts: 0;
     callback host-tap();
     callback add-host-tap();
 
@@ -125,15 +129,22 @@ component HeaderBar inherits Rectangle {
                             vertical-alignment: center;
                         }
                         if root.battery-level >= 0 : Text {
-                            // Battery badge sits to the right of the IP
-                            // detail. Goes red ≤20 %; pulses with the
-                            // existing blink driver ≤10 %.
-                            text: " · " + root.battery-level + "%";
+                            // Workstation battery: goes red ≤20 %, pulses
+                            // ≤10 % via the shared blink driver. Plain
+                            // grey when healthy so it doesn't compete
+                            // with the LAN/Remote/Offline label.
+                            text: " · 🔋" + root.battery-level + "%";
                             color: root.battery-level <= 10 && root.battery-blink
                                 ? transparent
                                 : (root.battery-level <= 20 ? #ef5350 : #888888);
                             font-size: 12px;
                             font-weight: root.battery-level <= 20 ? 700 : 400;
+                            vertical-alignment: center;
+                        }
+                        if root.host-watts > 0.1 : Text {
+                            text: " · " + round(root.host-watts * 10) / 10 + "W";
+                            color: #888888;
+                            font-size: 12px;
                             vertical-alignment: center;
                         }
                     }
@@ -1046,12 +1057,15 @@ export component AppWindow inherits Window {
     /// tapped. Used to surface Rename/Close from a bottom sheet so
     /// they're discoverable without crowding the row.
     in-out property <int> actions-idx: -1;
-    /// System battery level (0–100). -1 means "unknown / not queried
-    /// yet"; pushed from the Rust JNI poller every 30 s. Drives the
-    /// red warning bar at the top of the window: solid at <20 %,
-    /// blinking at <10 %.
+    /// Workstation battery level (0–100). -1 means "unknown / not yet
+    /// reported by the API" (e.g. the desktop has no battery). Pushed
+    /// from the `/tabs` host stats block every poll. Drives the red
+    /// warning bar at the top of the window: solid ≤20 %, blinking ≤10 %.
     in-out property <int> battery-level: -1;
     in-out property <bool> _battery_blink: false;
+    /// Workstation total power draw in watts, also from the host
+    /// stats block. Surfaced in the HeaderBar.
+    in-out property <float> host-watts: 0;
     /// -1 = no rename dialog open; >= 0 = index of the tab being renamed.
     in-out property <int> rename-idx: -1;
     in-out property <string> rename-text: "";
@@ -1132,6 +1146,7 @@ export component AppWindow inherits Window {
         HeaderBar {
             battery-level: root.battery-level;
             battery-blink: root._battery_blink;
+            host-watts: root.host-watts;
             host-name: root.hosts.length > 0 ? root.hosts[root.active-host].name : "No host";
             reachability: root.hosts.length > 0 ? root.hosts[root.active-host].reachability : "offline";
             detail: root.hosts.length > 0 ? root.hosts[root.active-host].detail : "tap + to add a workstation";
