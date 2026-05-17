@@ -400,11 +400,26 @@ pub fn android_main(app: slint::android::AndroidApp) {
 
     let open_tab_for_cb = open_tab.clone();
     let open_weak = ui_weak.clone();
+    let open_data = data.clone();
+    let open_reach = last_reach.clone();
+    let open_agent = agent.clone();
     ui.on_open_tab_changed(move |idx| {
         open_tab_for_cb.store(idx, Ordering::Relaxed);
-        // Clear stale output immediately when closing the view.
         if idx < 0 {
             push_output(&open_weak, String::new());
+            return;
+        }
+        // Fire an immediate fetch so the view isn't blank for up to 2s.
+        let host = open_data.lock().unwrap().active_host();
+        let reach = *open_reach.lock().unwrap();
+        if let Some(host) = host {
+            let agent = open_agent.clone();
+            let weak = open_weak.clone();
+            std::thread::spawn(move || {
+                if let Some(text) = fetch_output(&agent, &host, &reach, idx) {
+                    push_output(&weak, text);
+                }
+            });
         }
     });
 
