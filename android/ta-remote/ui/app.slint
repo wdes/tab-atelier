@@ -3,6 +3,7 @@ struct TabRow {
     cwd: string,
     active: bool,
     cpu: string,
+    preview: string,
 }
 
 struct Host {
@@ -113,7 +114,7 @@ component TabCard inherits Rectangle {
     in property <TabRow> tab;
     callback tapped();
 
-    height: 76px;
+    height: 96px;
     background: ta.has-hover ? #232323 : #1e1e1e;
     border-radius: 8px;
     border-width: 1px;
@@ -135,7 +136,7 @@ component TabCard inherits Rectangle {
             VerticalLayout {
                 horizontal-stretch: 1;
                 alignment: center;
-                spacing: 4px;
+                spacing: 3px;
 
                 Text {
                     text: tab.name;
@@ -148,6 +149,13 @@ component TabCard inherits Rectangle {
                     text: tab.cwd;
                     color: #888;
                     font-size: 12px;
+                    overflow: elide;
+                }
+                Text {
+                    text: tab.preview;
+                    color: #6b8caf;
+                    font-size: 11px;
+                    font-family: "monospace";
                     overflow: elide;
                 }
             }
@@ -743,16 +751,7 @@ export component AppWindow inherits Window {
     title: "Tab Atelier Remote";
     background: #121212;
 
-    in-out property <[TabRow]> tabs: [
-        { name: "tab2",        cwd: "/mnt/Dev/@wdes/tab-atelier",     active: true,  cpu: "3.1%" },
-        { name: "m-invoice",   cwd: "/mnt/Dev/@wdes/mounch",          active: false, cpu: "0.0%" },
-        { name: "Blog",        cwd: "/home/williamdes/blog",          active: false, cpu: "0.4%" },
-        { name: "OSS",         cwd: "/mnt/Dev/oss",                   active: false, cpu: "0.0%" },
-        { name: "6.0",         cwd: "/mnt/Dev/phpmyadmin/6.0",        active: false, cpu: "1.2%" },
-        { name: "deb",         cwd: "/mnt/Dev/@wdes/debian-build",    active: false, cpu: "0.0%" },
-        { name: "prj",         cwd: "/home/williamdes/projects",      active: false, cpu: "0.0%" },
-        { name: "Terminal 16", cwd: "~",                              active: false, cpu: "0.0%" },
-    ];
+    in-out property <[TabRow]> tabs: [];
 
     in-out property <[Host]> hosts: [];
 
