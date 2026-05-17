@@ -16,6 +16,37 @@ slint::include_modules!();
 
 /// Read the URI the activity was launched with, if any (e.g. via the
 /// `taremote://onboard?url=...&token=...` deep link).
+/// Open the system camera in viewfinder mode. Most modern Android camera
+/// apps detect QR codes natively and surface the deep link as a tap-to-
+/// open chip — when the user taps the `taremote://onboard?...` URL the
+/// existing intent-filter brings the user back into ta-remote with the
+/// onboard parameters filled in.
+fn launch_system_camera(app: &slint::android::AndroidApp) -> Option<()> {
+    let vm = unsafe { JavaVM::from_raw(app.vm_as_ptr().cast()) }.ok()?;
+    let mut env = vm.attach_current_thread().ok()?;
+    let activity = unsafe { JObject::from_raw(app.activity_as_ptr().cast()) };
+
+    let intent_class = env.find_class("android/content/Intent").ok()?;
+    let action = env
+        .new_string("android.media.action.STILL_IMAGE_CAMERA")
+        .ok()?;
+    let intent = env
+        .new_object(&intent_class, "(Ljava/lang/String;)V", &[(&action).into()])
+        .ok()?;
+    // FLAG_ACTIVITY_NEW_TASK = 0x10000000 — required when launching from a
+    // non-Activity JNI context.
+    env.call_method(&intent, "addFlags", "(I)Landroid/content/Intent;", &[0x1000_0000_i32.into()])
+        .ok()?;
+    env.call_method(
+        &activity,
+        "startActivity",
+        "(Landroid/content/Intent;)V",
+        &[(&intent).into()],
+    )
+    .ok()?;
+    Some(())
+}
+
 fn launch_intent_uri(app: &slint::android::AndroidApp) -> Option<String> {
     let vm_ptr = app.vm_as_ptr();
     let activity_ptr = app.activity_as_ptr();
@@ -459,6 +490,10 @@ pub fn android_main(app: slint::android::AndroidApp) {
     let config_path = data_dir.join("hosts.json");
     log::info!("ta-remote config path: {}", config_path.display());
 
+    // Keep an AndroidApp clone for JNI callbacks (e.g. scan-QR) before
+    // slint::android::init takes ownership of the original.
+    let app_for_callbacks = app.clone();
+
     let launch_onboard = launch_intent_uri(&app).and_then(|u| parse_onboard_url(&u));
 
     slint::android::init(app).unwrap();
@@ -695,6 +730,12 @@ pub fn android_main(app: slint::android::AndroidApp) {
             h.token = token;
             data.save();
             push_hosts(&upd_weak, &data);
+        }
+    });
+
+    ui.on_request_scan_qr(move || {
+        if launch_system_camera(&app_for_callbacks).is_none() {
+            log::warn!("scan-qr: failed to launch system camera");
         }
     });
 
