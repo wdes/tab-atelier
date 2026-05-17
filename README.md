@@ -78,11 +78,9 @@ In-app preferences (theme, opacity, language, browser, code editor) are stored i
 
 **File:** `$XDG_CONFIG_HOME/tab-atelier/preferences.json` (defaults to `~/.config/tab-atelier/preferences.json`)
 
-On upgrade, previous locations (`~/.local/tab-atelier/preferences.json`, then `~/.local/state/tab-atelier/preferences.json`) are migrated forward automatically the first time the app starts after the upgrade.
-
 ### State
 
-Tab Atelier splits persisted state across three files to keep a bad write to any one piece from corrupting the rest. Each file is written atomically (`.tmp` + `fsync` + rename) with rotated backups (`.bak`, `.bak.1`, `.bak.2`).
+Tab Atelier splits persisted state across four files to keep a bad write to any one piece from corrupting the rest. Each file is written atomically (`.tmp` + `fsync` + rename) with rotated backups (`.bak`, `.bak.1`, `.bak.2`).
 
 | Data | Path | Notes |
 |---|---|---|
@@ -92,8 +90,6 @@ Tab Atelier splits persisted state across three files to keep a bad write to any
 | Per-tab energy (Wh) | `~/.local/state/tab-atelier/power_tab-<sanitized>-<crc32>.json` | One file per tab. **Throttled by delta (≥ 0.1 Wh consumed)**; final value flushed on shutdown |
 
 Tab filename = sanitized tab name (non-`[A-Za-z0-9._-]` → `_`) plus an 8-hex-digit CRC32 of the original name, so two tabs whose sanitized forms collide (e.g. `foo/bar` and `foo_bar`) still land in distinct files. Renaming a tab in the UI moves all four files (output, uptime, power, plus their `.bak`s) to the new name's slot so history isn't orphaned.
-
-On upgrade, the previous monolithic `~/.local/state/tab-atelier/tabs.json` (which embedded `output` and `uptime_secs` inline) is split forward into the new layout the first time the app starts after the upgrade.
 
 ## Power monitoring
 
