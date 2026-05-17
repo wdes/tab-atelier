@@ -384,6 +384,7 @@ impl AppState {
             pending_closes: Vec::new(),
             pending_activate: None,
             pending_input: Vec::new(),
+            pending_new_tabs: 0,
         }));
         api::start_api_server(api_state.clone(), api_token.clone());
 
@@ -2383,6 +2384,17 @@ impl AppState {
 
 impl Render for AppState {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Drain any tabs the API thread asked us to create. We can't call
+        // insert_tab from persist() because that path doesn't have a
+        // Window handle; piggy-backing on render() is the simplest place
+        // to react to remote POST /tabs requests.
+        let new_tab_count = {
+            let mut snap = self.api_state.lock().unwrap();
+            std::mem::take(&mut snap.pending_new_tabs)
+        };
+        for _ in 0..new_tab_count {
+            self.add_tab(window, cx);
+        }
         window.set_window_title(&format!("{}{}", self.tabs[self.active].name, self.t().title_suffix));
         let active_terminal = self.tabs[self.active].view.clone();
         #[cfg(feature = "energy")]
