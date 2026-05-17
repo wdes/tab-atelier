@@ -116,6 +116,7 @@ component HeaderBar inherits Rectangle {
 component TabCard inherits Rectangle {
     in property <TabRow> tab;
     callback tapped();
+    callback rename-requested();
     callback close-requested();
 
     height: 96px;
@@ -189,7 +190,27 @@ component TabCard inherits Rectangle {
         }
 
         TouchArea {
-            width: 44px;
+            width: 40px;
+            clicked => { root.rename-requested() }
+            Rectangle {
+                background: parent.has-hover ? #2a2a2a : transparent;
+                border-radius: 6px;
+                // Material edit (pencil) icon, same shape as host row.
+                Path {
+                    width: 18px;
+                    height: 18px;
+                    x: parent.width / 2 - 9px;
+                    y: parent.height / 2 - 9px;
+                    viewbox-width: 24;
+                    viewbox-height: 24;
+                    fill: #888;
+                    commands: "M 3 17.25 L 3 21 L 6.75 21 L 17.81 9.94 L 14.06 6.19 L 3 17.25 Z M 20.71 7.04 C 21.1 6.65 21.1 6.02 20.71 5.63 L 18.37 3.29 C 17.98 2.9 17.35 2.9 16.96 3.29 L 15.13 5.12 L 18.88 8.87 L 20.71 7.04 Z";
+                }
+            }
+        }
+
+        TouchArea {
+            width: 40px;
             clicked => { root.close-requested() }
             Rectangle {
                 background: parent.has-hover ? #3a1f1f : transparent;
@@ -825,6 +846,9 @@ export component AppWindow inherits Window {
     /// user just hit the X on.
     in-out property <int> close-confirm-idx: -1;
     in-out property <string> close-confirm-name: "";
+    /// -1 = no rename dialog open; >= 0 = index of the tab being renamed.
+    in-out property <int> rename-idx: -1;
+    in-out property <string> rename-text: "";
 
     callback request-activate(int);
     callback request-send-input(int, string);
@@ -832,6 +856,7 @@ export component AppWindow inherits Window {
     callback request-update-host(int, string, string, string, string);
     callback request-close-tab(int);
     callback request-new-tab();
+    callback request-rename-tab(int, string);
     callback request-set-active-host(int);
     callback request-remove-host(int);
     callback open-tab-changed(int);
@@ -842,6 +867,10 @@ export component AppWindow inherits Window {
         init => { fs.focus() }
         key-pressed(event) => {
             if event.text == Key.Escape || event.text == Key.Back {
+                if root.rename-idx >= 0 {
+                    root.rename-idx = -1;
+                    return accept;
+                }
                 if root.close-confirm-idx >= 0 {
                     root.close-confirm-idx = -1;
                     return accept;
@@ -922,6 +951,10 @@ export component AppWindow inherits Window {
                     tapped => {
                         root.open-tab = i;
                         root.request-activate(i);
+                    }
+                    rename-requested => {
+                        root.rename-idx = i;
+                        root.rename-text = tab.name;
                     }
                     close-requested => {
                         root.close-confirm-idx = i;
@@ -1053,6 +1086,116 @@ export component AppWindow inherits Window {
             }
         }
         dismiss => { root.editor-open = false; }
+    }
+
+    if root.rename-idx >= 0 : Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #000000aa;
+        TouchArea { clicked => { root.rename-idx = -1 } }
+
+        Rectangle {
+            width: min(parent.width * 88%, 420px);
+            height: 220px;
+            y: root.safe-area-insets.top + 24px;
+            background: #1c1c1c;
+            border-radius: 14px;
+            border-width: 1px;
+            border-color: #2a2a2a;
+
+            VerticalLayout {
+                padding: 0;
+                spacing: 0;
+
+                Rectangle {
+                    height: 48px;
+                    background: #232323;
+                    border-top-left-radius: 14px;
+                    border-top-right-radius: 14px;
+                    Text {
+                        text: "Rename tab";
+                        color: #e0e0e0;
+                        font-size: 16px;
+                        font-weight: 600;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                VerticalLayout {
+                    padding: 16px;
+                    spacing: 8px;
+                    Text { text: "New name"; color: #888; font-size: 11px; }
+                    Rectangle {
+                        height: 40px;
+                        background: #232323;
+                        border-radius: 6px;
+                        HorizontalLayout {
+                            padding-left: 10px;
+                            padding-right: 10px;
+                            rename-input := TextInput {
+                                text <=> root.rename-text;
+                                color: #e0e0e0;
+                                font-size: 14px;
+                                single-line: true;
+                                vertical-alignment: center;
+                                accepted => {
+                                    if (root.rename-text != "") {
+                                        root.request-rename-tab(root.rename-idx, root.rename-text);
+                                    }
+                                    root.rename-idx = -1;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                HorizontalLayout {
+                    padding: 12px;
+                    spacing: 8px;
+                    TouchArea {
+                        horizontal-stretch: 1;
+                        clicked => { root.rename-idx = -1 }
+                        Rectangle {
+                            height: 40px;
+                            background: parent.has-hover ? #2a2a2a : transparent;
+                            border-radius: 6px;
+                            border-width: 1px;
+                            border-color: #3a3a3a;
+                            Text {
+                                text: "Cancel";
+                                color: #ccc;
+                                font-size: 14px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                    TouchArea {
+                        horizontal-stretch: 1;
+                        clicked => {
+                            if (root.rename-text != "") {
+                                root.request-rename-tab(root.rename-idx, root.rename-text);
+                            }
+                            root.rename-idx = -1;
+                        }
+                        Rectangle {
+                            height: 40px;
+                            background: parent.has-hover ? #5599ff : #4a8cff;
+                            border-radius: 6px;
+                            Text {
+                                text: "Rename";
+                                color: white;
+                                font-size: 14px;
+                                font-weight: 700;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     if root.close-confirm-idx >= 0 : Rectangle {

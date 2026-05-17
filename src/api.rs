@@ -56,6 +56,8 @@ pub struct TabSnapshot {
     pub pending_activate: Option<usize>,
     pub pending_input: Vec<(usize, Vec<u8>)>,
     pub pending_new_tabs: usize,
+    /// (tab index, new name) pairs queued by `POST /tabs/{idx}/rename`.
+    pub pending_renames: Vec<(usize, String)>,
 }
 
 pub fn generate_token() -> String {
@@ -234,6 +236,36 @@ fn handle_connection(stream: &mut std::net::TcpStream, state: &Arc<Mutex<TabSnap
             let body = serde_json::to_string(&serde_json::json!({"queued": "new"})).unwrap_or_default();
             respond_json(stream, 200, &body);
         }
+        ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/rename") => {
+            let idx_str = &p["/tabs/".len()..p.len() - "/rename".len()];
+            if let Ok(idx) = idx_str.parse::<usize>() {
+                let mut body = vec![0u8; content_length];
+                if reader.read_exact(&mut body).is_err() {
+                    error_json(stream, 400, "could not read body");
+                    return;
+                }
+                let new_name = serde_json::from_slice::<serde_json::Value>(&body).map_or_else(
+                    |_| String::from_utf8_lossy(&body).trim().to_string(),
+                    |v| v.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string(),
+                );
+                if new_name.is_empty() {
+                    error_json(stream, 400, "missing or empty name");
+                    return;
+                }
+                let mut state = state.lock().unwrap();
+                if idx < state.tabs.len() {
+                    info!("API: renaming tab {idx} to {new_name}");
+                    state.pending_renames.push((idx, new_name.clone()));
+                    drop(state);
+                    let body = serde_json::to_string(&serde_json::json!({"renamed": idx, "name": new_name})).unwrap_or_default();
+                    respond_json(stream, 200, &body);
+                } else {
+                    error_json(stream, 404, "tab index out of range");
+                }
+            } else {
+                error_json(stream, 404, "invalid tab index");
+            }
+        }
         ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/activate") => {
             let idx_str = &p["/tabs/".len()..p.len() - "/activate".len()];
             if let Ok(idx) = idx_str.parse::<usize>() {
@@ -336,6 +368,7 @@ mod tests {
             pending_activate: None,
             pending_input: vec![],
             pending_new_tabs: 0,
+            pending_renames: vec![],
         }))
     }
 
@@ -518,6 +551,50 @@ mod tests {
         let (port, _, _) = spawn_server();
         let resp = request(port, "POST /tabs HTTP/1.1\r\n\r\n");
         assert_eq!(status_code(&resp), 401);
+    }
+
+    #[test]
+    fn rename_tab_success_json_body() {
+        let (port, state, token) = spawn_server();
+        let body = r#"{"name":"renamed"}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/0/rename HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 200);
+        let pending = state.lock().unwrap().pending_renames.clone();
+        assert_eq!(pending, vec![(0_usize, "renamed".into())]);
+    }
+
+    #[test]
+    fn rename_tab_empty_name_400() {
+        let (port, _, token) = spawn_server();
+        let body = r#"{"name":""}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/0/rename HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 400);
+    }
+
+    #[test]
+    fn rename_tab_out_of_range() {
+        let (port, _, token) = spawn_server();
+        let body = r#"{"name":"x"}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/99/rename HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 404);
     }
 
     #[test]

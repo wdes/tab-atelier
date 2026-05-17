@@ -225,6 +225,24 @@ fn post_input(agent: &ureq::Agent, host: &HostConfig, reach: &Reach, idx: i32, b
     }
 }
 
+fn post_rename_tab(agent: &ureq::Agent, host: &HostConfig, reach: &Reach, idx: i32, name: &str) {
+    let base = base_url(host, reach);
+    if base.is_empty() {
+        return;
+    }
+    let body = serde_json::json!({ "name": name }).to_string();
+    let url = format!("{base}/tabs/{idx}/rename");
+    if let Err(e) = agent
+        .post(&url)
+        .set("Authorization", &format!("Bearer {}", host.token))
+        .set("Content-Type", "application/json")
+        .timeout(Duration::from_secs(2))
+        .send_string(&body)
+    {
+        log::warn!("post_rename_tab failed: {e}");
+    }
+}
+
 fn post_new_tab(agent: &ureq::Agent, host: &HostConfig, reach: &Reach) {
     let base = base_url(host, reach);
     if base.is_empty() {
@@ -451,6 +469,17 @@ pub fn android_main(app: slint::android::AndroidApp) {
         let reach = *new_reach.lock().unwrap();
         let agent = new_agent.clone();
         std::thread::spawn(move || post_new_tab(&agent, &host, &reach));
+    });
+
+    let rename_agent = agent.clone();
+    let rename_data = data.clone();
+    let rename_reach = last_reach.clone();
+    ui.on_request_rename_tab(move |idx, name| {
+        let Some(host) = rename_data.lock().unwrap().active_host() else { return };
+        let reach = *rename_reach.lock().unwrap();
+        let agent = rename_agent.clone();
+        let name = name.to_string();
+        std::thread::spawn(move || post_rename_tab(&agent, &host, &reach, idx, &name));
     });
 
     let open_tab_for_cb = open_tab.clone();
