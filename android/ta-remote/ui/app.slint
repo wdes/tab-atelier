@@ -613,13 +613,13 @@ component KeyboardHeader inherits Rectangle {
             }
             KeyButton { label: "END";   tapped => { root.key-tapped("end") } }
             KeyButton { label: "PGUP";  tapped => { root.key-tapped("pgup") } }
-            KeyButton { label: "FN";    tapped => { root.key-tapped("fn") } }
+            KeyButton { label: "^C";    tapped => { root.key-tapped("ctrl-c") } }
         }
         HorizontalLayout {
             spacing: 4px;
             KeyButton { label: "TAB";   tapped => { root.key-tapped("tab") } }
-            KeyButton { label: "CTRL";  tapped => { root.key-tapped("ctrl") } }
-            KeyButton { label: "ALT";   tapped => { root.key-tapped("alt") } }
+            KeyButton { label: "^D";    tapped => { root.key-tapped("ctrl-d") } }
+            KeyButton { label: "^Z";    tapped => { root.key-tapped("ctrl-z") } }
             KeyButton {
                 icon-commands: "M 20 11 L 7.83 11 L 13.42 5.41 L 12 4 L 4 12 L 12 20 L 13.41 18.59 L 7.83 13 L 20 13 Z";
                 tapped => { root.key-tapped("left") }
@@ -987,16 +987,21 @@ export component AppWindow inherits Window {
             }
         }
         key-tapped(k) => {
-            if (k == "tab")   { root.request-send-input(root.open-tab, "\u{0009}"); }
-            if (k == "esc")   { root.request-send-input(root.open-tab, "\u{001b}"); }
-            if (k == "up")    { root.request-send-input(root.open-tab, "\u{001b}[A"); }
-            if (k == "down")  { root.request-send-input(root.open-tab, "\u{001b}[B"); }
-            if (k == "right") { root.request-send-input(root.open-tab, "\u{001b}[C"); }
-            if (k == "left")  { root.request-send-input(root.open-tab, "\u{001b}[D"); }
-            if (k == "home")  { root.request-send-input(root.open-tab, "\u{001b}[H"); }
-            if (k == "end")   { root.request-send-input(root.open-tab, "\u{001b}[F"); }
-            if (k == "pgup")  { root.request-send-input(root.open-tab, "\u{001b}[5~"); }
-            if (k == "pgdn")  { root.request-send-input(root.open-tab, "\u{001b}[6~"); }
+            if (k == "tab")    { root.request-send-input(root.open-tab, "\u{0009}"); }
+            if (k == "esc")    { root.request-send-input(root.open-tab, "\u{001b}"); }
+            if (k == "up")     { root.request-send-input(root.open-tab, "\u{001b}[A"); }
+            if (k == "down")   { root.request-send-input(root.open-tab, "\u{001b}[B"); }
+            if (k == "right")  { root.request-send-input(root.open-tab, "\u{001b}[C"); }
+            if (k == "left")   { root.request-send-input(root.open-tab, "\u{001b}[D"); }
+            if (k == "home")   { root.request-send-input(root.open-tab, "\u{001b}[H"); }
+            if (k == "end")    { root.request-send-input(root.open-tab, "\u{001b}[F"); }
+            if (k == "pgup")   { root.request-send-input(root.open-tab, "\u{001b}[5~"); }
+            if (k == "pgdn")   { root.request-send-input(root.open-tab, "\u{001b}[6~"); }
+            // Common Ctrl chords for terminal control:
+            // ^C = SIGINT (0x03), ^D = EOF (0x04), ^Z = SIGTSTP (0x1a)
+            if (k == "ctrl-c") { root.request-send-input(root.open-tab, "\u{0003}"); }
+            if (k == "ctrl-d") { root.request-send-input(root.open-tab, "\u{0004}"); }
+            if (k == "ctrl-z") { root.request-send-input(root.open-tab, "\u{001a}"); }
         }
     }
 
