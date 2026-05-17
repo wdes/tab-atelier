@@ -678,6 +678,13 @@ pub fn save_state(base: &std::path::Path, state: &SavedState) {
         let _ = std::fs::rename(&path, &bak);
     }
     let _ = std::fs::rename(&tmp, &path);
+
+    // fsync the directory so the rename hits disk before we return — on
+    // ext4 the journal would otherwise commit lazily.
+    #[cfg(unix)]
+    if let Ok(d) = std::fs::File::open(&dir) {
+        let _ = d.sync_all();
+    }
 }
 
 #[must_use]
