@@ -186,7 +186,7 @@ impl AppState {
             prefs.hotkeys
         };
 
-        let (tabs, active) = if let Some(saved) = load_state_with_outputs(
+        let (tabs, active, restored_windowed) = if let Some(saved) = load_state_with_outputs(
             &platform::config_base_dir(),
             &platform::state_base_dir(),
         ) {
@@ -256,7 +256,7 @@ impl AppState {
             }
             let active = saved.active.min(tabs.len() - 1);
             tabs[active].activate();
-            (tabs, active)
+            (tabs, active, saved.windowed)
         } else {
             let fc = font_config.clone();
             let br = browser.clone();
@@ -279,8 +279,12 @@ impl AppState {
                     output_hash_last_saved: 0,
                 }],
                 0,
+                false,
             )
         };
+        if restored_windowed {
+            window.toggle_fullscreen();
+        }
 
         cx.spawn(async |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             loop {
@@ -372,7 +376,7 @@ impl AppState {
             rename_select_all: false,
             rename_focus,
             visible: true,
-            windowed: false,
+            windowed: restored_windowed,
             exit_confirm: None,
             close_confirm: None,
             show_qr: false,
@@ -565,6 +569,7 @@ impl AppState {
         let saved = SavedState {
             tabs,
             active: self.active,
+            windowed: self.windowed,
         };
         // Skip the write+rotate when the serialized content is identical to
         // last tick — the common case once the user stops poking the UI.
@@ -764,6 +769,7 @@ impl AppState {
                 &SavedState {
                     tabs,
                     active: self.active,
+                    windowed: self.windowed,
                 },
             );
             for (name, output) in outputs {

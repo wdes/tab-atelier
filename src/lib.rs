@@ -37,6 +37,16 @@ const fn is_true(b: &bool) -> bool {
 pub struct SavedState {
     pub tabs: Vec<TabState>,
     pub active: usize,
+    /// `true` when the user had toggled "Windowed mode" (Guake-style drop-down
+    /// is the default, hence the field's name in the negative). Skipped when
+    /// `false` so an unchanged session stays out of the serialized file.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub windowed: bool,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[must_use]
@@ -1021,6 +1031,7 @@ mod tests {
                 },
             ],
             active: 1,
+            windowed: false,
         };
         let json = serde_json::to_string(&state).unwrap();
         let restored: SavedState = serde_json::from_str(&json).unwrap();
@@ -1045,6 +1056,7 @@ mod tests {
                 colors_enabled: false,
             }],
             active: 0,
+            windowed: false,
         };
         let json = serde_json::to_string(&state).unwrap();
         assert!(
@@ -1072,6 +1084,7 @@ mod tests {
                 colors_enabled: true,
             }],
             active: 0,
+            windowed: false,
         };
         let json = serde_json::to_string(&state).unwrap();
         let restored: SavedState = serde_json::from_str(&json).unwrap();
@@ -1092,6 +1105,7 @@ mod tests {
         let state = SavedState {
             tabs: vec![],
             active: 0,
+            windowed: false,
         };
         let json = serde_json::to_string(&state).unwrap();
         let restored: SavedState = serde_json::from_str(&json).unwrap();
@@ -1171,6 +1185,7 @@ mod tests {
                 colors_enabled: true,
             }],
             active: 0,
+            windowed: false,
         };
 
         save_state(&dir, &mk("v1"));
@@ -1211,6 +1226,7 @@ mod tests {
                 colors_enabled: true,
             }],
             active: 0,
+            windowed: false,
         };
         std::fs::write(sd.join("tabs.json"), "broken json").unwrap();
         std::fs::write(
@@ -1251,6 +1267,7 @@ mod tests {
                 },
             ],
             active: 1,
+            windowed: false,
         };
         save_state(&dir, &state);
         let loaded = load_state_from(&dir).expect("should load saved state");
@@ -1433,6 +1450,7 @@ mod tests {
                 colors_enabled: true,
             }],
             active: 0,
+            windowed: false,
         };
         save_state(&dir, &state);
         assert!(dir.join(format!("{APP_DIR}/tabs.json")).exists());
@@ -1582,6 +1600,7 @@ mod tests {
                 colors_enabled: true,
             }],
             active: 999,
+            windowed: false,
         };
         let json = serde_json::to_string_pretty(&state).unwrap();
         std::fs::write(sd.join("tabs.json"), json).unwrap();
