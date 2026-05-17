@@ -810,12 +810,15 @@ component TerminalView inherits Rectangle {
     VerticalLayout {
         spacing: 0;
         padding-top: root.safe-top;
-        // Shrink the layout by the IME height when the keyboard is up so
-        // the shortcut row (last child of this layout) floats above it
-        // instead of being painted underneath. Add 12 px of breathing
-        // room either way — without the old input bar below, the
-        // shortcut row was sitting too close to the screen edge / IME.
-        padding-bottom: max(root.safe-bottom, root.ime-height) + 12px;
+        // When the IME is up, sit just above it with a small gap.
+        // When it isn't, reserve at least 48 px — `safe-area-insets`
+        // only reports the system-bars inset; phones running gesture
+        // nav report 0 there but still draw a handle the user
+        // shouldn't tap through, so a hard floor keeps the shortcut
+        // row from being borked into that area.
+        padding-bottom: root.ime-height > 0px
+            ? root.ime-height + 12px
+            : max(root.safe-bottom + 12px, 48px);
         padding-left: root.safe-left;
         padding-right: root.safe-right;
 
