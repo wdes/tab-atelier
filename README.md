@@ -125,7 +125,27 @@ Tab filename = sanitized tab name (non-`[A-Za-z0-9._-]` → `_`) plus an 8-hex-d
 
 ## Power monitoring
 
-On Intel systems with readable RAPL counters, each tab shows its estimated power usage in the right-click context menu. The estimate uses the same technique as [wattaouille](https://github.com/wdes/wattaouille): `per-tab watts = package watts * (tab CPU jiffies / total system jiffies)`. See wattaouille's README for how to make RAPL readable (`chmod` or udev rule). When RAPL is not available, only CPU percentage is shown.
+On Intel systems with readable RAPL counters, each tab shows its estimated power usage in the right-click context menu. The estimate uses the same technique as [wattaouille](https://github.com/wdes/wattaouille): `per-tab watts = package watts * (tab CPU jiffies / total system jiffies)`. When RAPL is not available, only CPU percentage is shown.
+
+### Making RAPL readable
+
+Since CVE-2020-8694 (PLATYPUS side-channel) the kernel ships `/sys/class/powercap/intel-rapl/intel-rapl:*/energy_uj` as `mode 400, owned by root`, so a regular user — including the one running tab-atelier — gets `Permission denied`. Symptom: the watts column on every tab card is empty, the stats popover shows CPU% only, and `~/.local/state/tab-atelier/power_tab-*.json` files never get created.
+
+**One-shot for the current boot:**
+
+```sh
+sudo chmod -R g+r,o+r /sys/devices/virtual/powercap/intel-rapl
+```
+
+**Persistent (every boot)** — drop a udev rule:
+
+```sh
+echo 'SUBSYSTEM=="powercap", ACTION=="add", RUN+="/bin/chmod -R g+r,o+r /sys/devices/virtual/powercap/intel-rapl"' | sudo tee /etc/udev/rules.d/99-rapl.rules
+sudo udevadm control --reload
+sudo udevadm trigger --subsystem-match=powercap
+```
+
+After either, **restart tab-atelier**. `PowerSensor::detect` runs once at startup, so a mid-session permission fix is only picked up by the next launch.
 
 **What are jiffies?** Jiffies are the Linux kernel's internal time-keeping unit — a counter that increments at a fixed rate (typically 100, 250, or 1000 Hz depending on `CONFIG_HZ`). Each tick, the kernel records CPU time consumed by every process. Per-process jiffies are read from `/proc/[pid]/stat` and total system jiffies from `/proc/stat`. The ratio between them gives the fraction of CPU a tab's shell used, which is multiplied by package power (from Intel RAPL) to estimate per-tab wattage.
 
