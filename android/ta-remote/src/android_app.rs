@@ -87,76 +87,6 @@ fn read_clipboard(app: &slint::android::AndroidApp) -> Option<String> {
     env.get_string(&jstr).ok().map(Into::into)
 }
 
-/// Query the system battery level (0–100) via JNI.
-///
-/// Uses the `ACTION_BATTERY_CHANGED` sticky broadcast rather than
-/// `BatteryManager.getIntProperty(BATTERY_PROPERTY_CAPACITY)` — the
-/// latter returned bogus values on the user's device. Sticky broadcast
-/// is the canonical Android battery API and exposes both `level` and
-/// `scale` extras so we can normalise to a percentage.
-fn read_battery_level(app: &slint::android::AndroidApp) -> Option<i32> {
-    let vm = unsafe { JavaVM::from_raw(app.vm_as_ptr().cast()) }.ok()?;
-    let mut env = vm.attach_current_thread().ok()?;
-    let activity = unsafe { JObject::from_raw(app.activity_as_ptr().cast()) };
-
-    let intent_class = env.find_class("android/content/Intent").ok()?;
-    let action = env
-        .get_static_field(&intent_class, "ACTION_BATTERY_CHANGED", "Ljava/lang/String;")
-        .ok()?
-        .l()
-        .ok()?;
-    let filter_class = env.find_class("android/content/IntentFilter").ok()?;
-    let filter = env
-        .new_object(&filter_class, "(Ljava/lang/String;)V", &[(&action).into()])
-        .ok()?;
-
-    // Passing a null receiver makes `registerReceiver` return the
-    // last broadcasted sticky Intent without subscribing to future
-    // updates — exactly the snapshot we need to read once per poll.
-    let null_receiver = JObject::null();
-    let battery_intent = env
-        .call_method(
-            &activity,
-            "registerReceiver",
-            "(Landroid/content/BroadcastReceiver;Landroid/content/IntentFilter;)Landroid/content/Intent;",
-            &[(&null_receiver).into(), (&filter).into()],
-        )
-        .ok()?
-        .l()
-        .ok()?;
-    if battery_intent.is_null() {
-        return None;
-    }
-
-    let level_key = env.new_string("level").ok()?;
-    let scale_key = env.new_string("scale").ok()?;
-    let level = env
-        .call_method(
-            &battery_intent,
-            "getIntExtra",
-            "(Ljava/lang/String;I)I",
-            &[(&level_key).into(), (-1_i32).into()],
-        )
-        .ok()?
-        .i()
-        .ok()?;
-    let scale = env
-        .call_method(
-            &battery_intent,
-            "getIntExtra",
-            "(Ljava/lang/String;I)I",
-            &[(&scale_key).into(), (-1_i32).into()],
-        )
-        .ok()?
-        .i()
-        .ok()?;
-    if level < 0 || scale <= 0 {
-        return None;
-    }
-    let pct = (level as f64 * 100.0 / scale as f64).round() as i32;
-    Some(pct.clamp(0, 100))
-}
-
 fn launch_intent_uri(app: &slint::android::AndroidApp) -> Option<String> {
     let vm_ptr = app.vm_as_ptr();
     let activity_ptr = app.activity_as_ptr();
@@ -234,8 +164,18 @@ struct ApiTab {
     uptime_secs: f64,
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct ApiHost {
+    #[serde(default)]
+    battery_percent: Option<u8>,
+    #[serde(default)]
+    watts: Option<f64>,
+}
+
 #[derive(Debug, Deserialize)]
 struct ApiResponse {
+    #[serde(default)]
+    host: ApiHost,
     tabs: Vec<ApiTab>,
 }
 
@@ -500,7 +440,7 @@ fn ansi256(idx: u8) -> [u8; 3] {
 /// distinguish "no answer at all" (try the next URL) from "answered
 /// with 401/403" (host is reachable but token is stale).
 enum FetchOutcome {
-    Ok(Vec<ApiTab>),
+    Ok(ApiResponse),
     Forbidden,
     NoResponse,
 }
@@ -513,7 +453,7 @@ fn try_fetch_tabs(agent: &ureq::Agent, base: &str, token: &str, timeout: Duratio
     match req.call() {
         Ok(resp) => resp
             .into_json::<ApiResponse>()
-            .map_or(FetchOutcome::NoResponse, |r| FetchOutcome::Ok(r.tabs)),
+            .map_or(FetchOutcome::NoResponse, FetchOutcome::Ok),
         Err(ureq::Error::Status(code, _)) if code == 401 || code == 403 => {
             FetchOutcome::Forbidden
         }
@@ -521,29 +461,47 @@ fn try_fetch_tabs(agent: &ureq::Agent, base: &str, token: &str, timeout: Duratio
     }
 }
 
-fn fetch_tabs(
-    agent: &ureq::Agent,
-    host: &HostConfig,
-) -> (Reach, Option<Vec<ApiTab>>) {
+/// Result of a host-wide tabs fetch — bundles the per-tab list with
+/// the host-wide stats block so callers don't have to issue a second
+/// request just to learn the workstation's battery / power draw.
+struct TabsFetch {
+    reach: Reach,
+    tabs: Option<Vec<ApiTab>>,
+    host: ApiHost,
+}
+
+fn fetch_tabs(agent: &ureq::Agent, host: &HostConfig) -> TabsFetch {
     let mut saw_forbidden = false;
     if !host.url.is_empty() {
         match try_fetch_tabs(agent, &host.url, &host.token, Duration::from_millis(1500)) {
-            FetchOutcome::Ok(tabs) => return (Reach::Lan, Some(tabs)),
+            FetchOutcome::Ok(r) => {
+                return TabsFetch {
+                    reach: Reach::Lan,
+                    tabs: Some(r.tabs),
+                    host: r.host,
+                };
+            }
             FetchOutcome::Forbidden => saw_forbidden = true,
             FetchOutcome::NoResponse => {}
         }
     }
     if !host.remote_url.is_empty() {
         match try_fetch_tabs(agent, &host.remote_url, &host.token, Duration::from_secs(4)) {
-            FetchOutcome::Ok(tabs) => return (Reach::Remote, Some(tabs)),
+            FetchOutcome::Ok(r) => {
+                return TabsFetch {
+                    reach: Reach::Remote,
+                    tabs: Some(r.tabs),
+                    host: r.host,
+                };
+            }
             FetchOutcome::Forbidden => saw_forbidden = true,
             FetchOutcome::NoResponse => {}
         }
     }
-    if saw_forbidden {
-        (Reach::Forbidden, None)
-    } else {
-        (Reach::Offline, None)
+    TabsFetch {
+        reach: if saw_forbidden { Reach::Forbidden } else { Reach::Offline },
+        tabs: None,
+        host: ApiHost::default(),
     }
 }
 
@@ -766,11 +724,27 @@ fn refresh_soon(
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(250));
         let Some(host) = data.lock().unwrap().active_host() else { return };
-        let (new_reach, tabs) = fetch_tabs(&agent, &host);
-        if let Some(t) = tabs {
+        let result = fetch_tabs(&agent, &host);
+        if let Some(t) = result.tabs {
             push_tabs(&weak, t, &seen);
         }
-        *reach.lock().unwrap() = new_reach;
+        push_host_stats(&weak, &result.host);
+        *reach.lock().unwrap() = result.reach;
+    });
+}
+
+/// Forward the API's `host` block to the Slint side. The UI shows the
+/// workstation's battery and total power draw in the header — these
+/// are the user's own machine's stats, not the phone's.
+fn push_host_stats(ui_weak: &Weak<AppWindow>, host: &ApiHost) {
+    let battery = host.battery_percent.map_or(-1_i32, i32::from);
+    let watts = host.watts.unwrap_or(0.0);
+    let weak = ui_weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(ui) = weak.upgrade() {
+            ui.set_battery_level(battery);
+            ui.set_host_watts(watts as f32);
+        }
     });
 }
 
@@ -865,7 +839,6 @@ pub fn android_main(app: slint::android::AndroidApp) {
     // Keep an AndroidApp clone for JNI callbacks (e.g. scan-QR) before
     // slint::android::init takes ownership of the original.
     let app_for_callbacks = app.clone();
-    let app_for_battery = app.clone();
 
     let launch_onboard = launch_intent_uri(&app).and_then(|u| parse_onboard_url(&u));
 
@@ -907,10 +880,12 @@ pub fn android_main(app: slint::android::AndroidApp) {
             (d.active_host(), d.active)
         };
         if let Some(host) = host {
-            let (reach, tabs) = fetch_tabs(&poll_agent, &host);
-            if let Some(t) = tabs {
+            let result = fetch_tabs(&poll_agent, &host);
+            let reach = result.reach;
+            if let Some(t) = result.tabs {
                 push_tabs(&poll_weak, t, &poll_seen);
             }
+            push_host_stats(&poll_weak, &result.host);
             log::debug!("poll {}: {reach:?}", host.name);
             // Show a toast when reachability transitions between online and
             // offline so a connection drop doesn't go unnoticed.
@@ -1160,7 +1135,9 @@ pub fn android_main(app: slint::android::AndroidApp) {
         });
     });
 
-    let scan_weak = ui_weak.clone();
+    // Last use of `ui_weak`; the local battery poller that used to
+    // hold a separate clone is gone.
+    let scan_weak = ui_weak;
     ui.on_request_scan_qr(move || {
         // The Android intents for "open camera" only invoke the photo
         // viewfinder on many devices — they don't run the QR detector. So
@@ -1195,24 +1172,9 @@ pub fn android_main(app: slint::android::AndroidApp) {
         });
     });
 
-    // Battery poller — refreshes every 30 s. Slint side reads
-    // `battery-level` (0–100, or -1 when unavailable) and turns the top
-    // bar red/blinking when the phone is below 20 % / 10 %.
-    {
-        let weak = ui_weak;
-        std::thread::spawn(move || {
-            loop {
-                let level = read_battery_level(&app_for_battery).unwrap_or(-1);
-                let w = weak.clone();
-                let _ = slint::invoke_from_event_loop(move || {
-                    if let Some(ui) = w.upgrade() {
-                        ui.set_battery_level(level);
-                    }
-                });
-                std::thread::sleep(Duration::from_secs(30));
-            }
-        });
-    }
+    // The workstation's battery + power draw arrive through the
+    // existing `/tabs` poll (host stats block) — no separate poller
+    // needed.
 
     ui.run().unwrap();
 }

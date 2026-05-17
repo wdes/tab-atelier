@@ -33,9 +33,24 @@ struct TabInfo {
     watts: Option<f64>,
 }
 
+/// Host-wide stats reported alongside the per-tab list. Keeps the
+/// mobile remote from having to guess these values (it used to read
+/// the *phone's* own battery, which made no sense — the user wants
+/// the workstation's stats).
+#[derive(Serialize, Default)]
+struct HostInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    battery_percent: Option<u8>,
+    /// Total instantaneous power draw across every tab's tracked
+    /// processes, in watts. Omitted when RAPL is unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    watts: Option<f64>,
+}
+
 #[derive(Serialize)]
 struct ApiResponse {
     app: &'static str,
+    host: HostInfo,
     tabs: Vec<TabInfo>,
 }
 
@@ -57,6 +72,11 @@ pub struct TabSnapshot {
     pub active: usize,
     #[cfg(feature = "energy")]
     pub power: Vec<crate::power::TabPower>,
+    /// Battery percentage of the workstation, sampled by the desktop's
+    /// power monitor. None when no discharging battery is present (e.g.
+    /// plugged-in desktop tower).
+    #[cfg(feature = "energy")]
+    pub battery_percent: Option<u8>,
     pub pending_closes: Vec<usize>,
     pub pending_activate: Option<usize>,
     pub pending_input: Vec<(usize, Vec<u8>)>,
@@ -319,8 +339,21 @@ fn handle_connection<S: Read + Write>(
                     watts: state.power.get(i).and_then(|p| p.watts),
                 })
                 .collect();
+            #[cfg(feature = "energy")]
+            let host = HostInfo {
+                battery_percent: state.battery_percent,
+                // Sum each tab's watts to give a host-wide draw figure;
+                // tabs without a reading contribute zero, which is the
+                // honest answer for any not-yet-sampled process.
+                watts: {
+                    let total: f64 = state.power.iter().filter_map(|p| p.watts).sum();
+                    if total > 0.0 { Some(total) } else { None }
+                },
+            };
+            #[cfg(not(feature = "energy"))]
+            let host = HostInfo::default();
             drop(state);
-            let resp = ApiResponse { app: USER_AGENT, tabs };
+            let resp = ApiResponse { app: USER_AGENT, host, tabs };
             let body = serde_json::to_string_pretty(&resp).unwrap_or_default();
             respond_json(stream, 200, &body);
         }
@@ -619,6 +652,8 @@ mod tests {
             active: 0,
             #[cfg(feature = "energy")]
             power: vec![],
+            #[cfg(feature = "energy")]
+            battery_percent: None,
             pending_closes: vec![],
             pending_activate: None,
             pending_input: vec![],
