@@ -939,6 +939,11 @@ export component AppWindow inherits Window {
 
     changed open-tab => { root.open-tab-changed(root.open-tab) }
 
+    // Wrap every visible child in a FocusScope so the Android Back key —
+    // dispatched by Slint as Key.Back — bubbles from any focused widget
+    // (TextInputs in dialogs, etc.) up to this handler. Used to be a
+    // sibling of the main layout, which meant focus on a TextInput
+    // swallowed Back and the OS closed the activity.
     fs := FocusScope {
         init => { fs.focus() }
         key-pressed(event) => {
@@ -966,7 +971,6 @@ export component AppWindow inherits Window {
             }
             return reject;
         }
-    }
 
     VerticalLayout {
         spacing: 0;
@@ -1426,6 +1430,7 @@ export component AppWindow inherits Window {
                 }
             }
         }
+    }
     }
 
     // Transient connection-state toast — anchored top-center, fades itself
