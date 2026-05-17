@@ -92,9 +92,9 @@ struct AppData {
 
 impl AppData {
     fn load(config_path: PathBuf) -> Self {
-        let stored: StoredConfig = std::fs::read_to_string(&config_path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
+        let stored = Self::read_stored(&config_path)
+            .or_else(|| Self::read_stored(&config_path.with_extension("json.bak")))
+            .or_else(|| Self::read_stored(&config_path.with_extension("json.bak.1")))
             .unwrap_or_default();
         Self {
             hosts: stored.hosts,
@@ -103,17 +103,40 @@ impl AppData {
         }
     }
 
+    fn read_stored(path: &std::path::Path) -> Option<StoredConfig> {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+    }
+
+    /// Atomically persist host config with a 2-generation rotation
+    /// (`hosts.json`, `hosts.json.bak`, `hosts.json.bak.1`) — same approach
+    /// as the desktop `save_state`, defensive against partial writes.
     fn save(&self) {
+        use std::io::Write;
         let stored = StoredConfig {
             hosts: self.hosts.clone(),
             active: self.active,
         };
-        if let Ok(text) = serde_json::to_string_pretty(&stored)
-            && let Some(parent) = self.config_path.parent()
-        {
-            let _ = std::fs::create_dir_all(parent);
-            let _ = std::fs::write(&self.config_path, text);
+        let Ok(text) = serde_json::to_string_pretty(&stored) else { return };
+        let Some(parent) = self.config_path.parent() else { return };
+        let _ = std::fs::create_dir_all(parent);
+
+        let tmp = self.config_path.with_extension("json.tmp");
+        let Ok(mut f) = std::fs::File::create(&tmp) else { return };
+        if f.write_all(text.as_bytes()).is_err() || f.sync_all().is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return;
         }
+        drop(f);
+
+        if self.config_path.exists() {
+            let bak = self.config_path.with_extension("json.bak");
+            let bak1 = self.config_path.with_extension("json.bak.1");
+            let _ = std::fs::rename(&bak, &bak1);
+            let _ = std::fs::rename(&self.config_path, &bak);
+        }
+        let _ = std::fs::rename(&tmp, &self.config_path);
     }
 
     fn active_host(&self) -> Option<HostConfig> {
