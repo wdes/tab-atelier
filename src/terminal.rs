@@ -771,6 +771,13 @@ impl Render for TerminalView {
             )
             .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _window, cx| {
                 let origin = this.content_origin.get();
+                // If the button was released while the cursor was outside our
+                // element bounds, on_mouse_up doesn't fire — so the drag flag
+                // would otherwise stick. Reconcile against the actual button
+                // state on every move.
+                if this.scrollbar_dragging.get() && ev.pressed_button != Some(MouseButton::Left) {
+                    this.scrollbar_dragging.set(false);
+                }
                 if this.scrollbar_dragging.get() {
                     let bounds = this.bounds_size.get();
                     let y_frac = f32::from(ev.position.y - origin.y) / f32::from(bounds.height);
