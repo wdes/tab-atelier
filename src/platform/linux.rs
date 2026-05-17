@@ -352,13 +352,14 @@ mod tests {
 
     #[test]
     fn open_url_does_not_panic() {
-        open_url("http://localhost:1", None);
+        // Only exercise the explicit-handler path: passing `None` would
+        // shell out to xdg-open and actually launch the user's default
+        // browser. `false` exits non-zero immediately.
         open_url("http://localhost:1", Some("false"));
     }
 
     #[test]
     fn open_path_does_not_panic() {
-        open_path(std::path::Path::new("/dev/null"), None);
         open_path(std::path::Path::new("/dev/null"), Some("false"));
     }
 
