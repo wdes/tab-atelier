@@ -99,6 +99,7 @@ Tab Atelier splits persisted state across four files to keep a bad write to any 
 | Per-tab terminal scrollback | `~/.local/state/tab-atelier/output_tab-<sanitized>-<crc32>.json` | One file per tab. Rewritten on every persist tick |
 | Per-tab uptime (active seconds) | `~/.local/state/tab-atelier/uptime_tab-<sanitized>-<crc32>.json` | One file per tab. **Throttled to once every 30 s**; final value flushed on shutdown |
 | Per-tab energy (Wh) | `~/.local/state/tab-atelier/power_tab-<sanitized>-<crc32>.json` | One file per tab. **Throttled by delta (≥ 0.1 Wh consumed)**; final value flushed on shutdown |
+| Single-instance lock | `~/.local/state/tab-atelier/tab-atelier.lock` | Empty file. Held via `flock(2)`; released automatically by the kernel on process exit (including crashes), so no manual cleanup needed |
 
 Tab filename = sanitized tab name (non-`[A-Za-z0-9._-]` → `_`) plus an 8-hex-digit CRC32 of the original name, so two tabs whose sanitized forms collide (e.g. `foo/bar` and `foo_bar`) still land in distinct files. Renaming a tab in the UI moves all four files (output, uptime, power, plus their `.bak`s) to the new name's slot so history isn't orphaned.
 
