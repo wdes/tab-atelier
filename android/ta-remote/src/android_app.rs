@@ -199,10 +199,17 @@ struct HostConfig {
 
 /// Outcome of an HTTP request that may have been tried against the LAN URL
 /// and/or the remote URL of a host.
+///
+/// `Forbidden` is reached when at least one of the two URLs answered
+/// with HTTP 401 / 403 — the host *is* online, the saved bearer token
+/// just no longer matches. Distinguishing it from `Offline` lets the
+/// UI surface "online but access forbidden" instead of "offline" so
+/// the user knows to re-pair the host instead of debugging Wi-Fi.
 #[derive(Debug, Clone, Copy)]
 enum Reach {
     Lan,
     Remote,
+    Forbidden,
     Offline,
 }
 
@@ -489,31 +496,55 @@ fn ansi256(idx: u8) -> [u8; 3] {
     }
 }
 
+/// Outcome of one `GET /tabs` attempt — needed because we want to
+/// distinguish "no answer at all" (try the next URL) from "answered
+/// with 401/403" (host is reachable but token is stale).
+enum FetchOutcome {
+    Ok(Vec<ApiTab>),
+    Forbidden,
+    NoResponse,
+}
+
+fn try_fetch_tabs(agent: &ureq::Agent, base: &str, token: &str, timeout: Duration) -> FetchOutcome {
+    let req = agent
+        .get(&format!("{base}/tabs"))
+        .set("Authorization", &format!("Bearer {token}"))
+        .timeout(timeout);
+    match req.call() {
+        Ok(resp) => resp
+            .into_json::<ApiResponse>()
+            .map_or(FetchOutcome::NoResponse, |r| FetchOutcome::Ok(r.tabs)),
+        Err(ureq::Error::Status(code, _)) if code == 401 || code == 403 => {
+            FetchOutcome::Forbidden
+        }
+        Err(_) => FetchOutcome::NoResponse,
+    }
+}
+
 fn fetch_tabs(
     agent: &ureq::Agent,
     host: &HostConfig,
 ) -> (Reach, Option<Vec<ApiTab>>) {
-    if !host.url.is_empty()
-        && let Ok(resp) = agent
-            .get(&format!("{}/tabs", host.url))
-            .set("Authorization", &format!("Bearer {}", host.token))
-            .timeout(Duration::from_millis(1500))
-            .call()
-        && let Ok(r) = resp.into_json::<ApiResponse>()
-    {
-        return (Reach::Lan, Some(r.tabs));
+    let mut saw_forbidden = false;
+    if !host.url.is_empty() {
+        match try_fetch_tabs(agent, &host.url, &host.token, Duration::from_millis(1500)) {
+            FetchOutcome::Ok(tabs) => return (Reach::Lan, Some(tabs)),
+            FetchOutcome::Forbidden => saw_forbidden = true,
+            FetchOutcome::NoResponse => {}
+        }
     }
-    if !host.remote_url.is_empty()
-        && let Ok(resp) = agent
-            .get(&format!("{}/tabs", host.remote_url))
-            .set("Authorization", &format!("Bearer {}", host.token))
-            .timeout(Duration::from_secs(4))
-            .call()
-        && let Ok(r) = resp.into_json::<ApiResponse>()
-    {
-        return (Reach::Remote, Some(r.tabs));
+    if !host.remote_url.is_empty() {
+        match try_fetch_tabs(agent, &host.remote_url, &host.token, Duration::from_secs(4)) {
+            FetchOutcome::Ok(tabs) => return (Reach::Remote, Some(tabs)),
+            FetchOutcome::Forbidden => saw_forbidden = true,
+            FetchOutcome::NoResponse => {}
+        }
     }
-    (Reach::Offline, None)
+    if saw_forbidden {
+        (Reach::Forbidden, None)
+    } else {
+        (Reach::Offline, None)
+    }
 }
 
 fn base_url(host: &HostConfig, reach: Reach) -> String {
@@ -796,6 +827,7 @@ fn push_reachability(ui_weak: &Weak<AppWindow>, active: usize, reach: Reach) {
     let label = match reach {
         Reach::Lan => "lan",
         Reach::Remote => "remote",
+        Reach::Forbidden => "forbidden",
         Reach::Offline => "offline",
     };
     let weak = ui_weak.clone();
@@ -882,12 +914,22 @@ pub fn android_main(app: slint::android::AndroidApp) {
             log::debug!("poll {}: {reach:?}", host.name);
             // Show a toast when reachability transitions between online and
             // offline so a connection drop doesn't go unnoticed.
+            // Forbidden gets its own message — the host answered, the
+            // saved token just doesn't match, so "Disconnected" would
+            // be misleading.
             {
                 let mut last = poll_reach.lock().unwrap();
                 let was_online = matches!(*last, Reach::Lan | Reach::Remote);
                 let is_online = matches!(reach, Reach::Lan | Reach::Remote);
-                if was_online && !is_online {
+                let was_forbidden = matches!(*last, Reach::Forbidden);
+                let is_forbidden = matches!(reach, Reach::Forbidden);
+                if (was_online || was_forbidden) && !is_online && !is_forbidden {
                     show_toast(&poll_weak, format!("Disconnected from {}", host.name));
+                } else if !was_forbidden && is_forbidden {
+                    show_toast(
+                        &poll_weak,
+                        format!("{} rejected the saved token — re-pair to reconnect", host.name),
+                    );
                 } else if !was_online && is_online {
                     let via = if matches!(reach, Reach::Lan) { "LAN" } else { "remote" };
                     show_toast(&poll_weak, format!("Connected to {} via {via}", host.name));

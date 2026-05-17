@@ -403,7 +403,7 @@ impl AppState {
             WakatimeTracker::new(key)
         });
 
-        let api_token = api::generate_token();
+        let api_token = api::load_or_generate_token();
         let api_port = prefs.api_port.unwrap_or(tab_atelier::DEFAULT_API_PORT);
         info!("API server starting on 0.0.0.0:{api_port}");
         let api_state = Arc::new(Mutex::new(api::TabSnapshot {
