@@ -87,42 +87,74 @@ fn read_clipboard(app: &slint::android::AndroidApp) -> Option<String> {
     env.get_string(&jstr).ok().map(|j| j.into())
 }
 
-/// Query the system battery level (0–100) via JNI. Returns `None` on any
-/// JNI plumbing failure so the caller can keep the previous reading and
-/// avoid spurious warning flashes.
+/// Query the system battery level (0–100) via JNI.
+///
+/// Uses the `ACTION_BATTERY_CHANGED` sticky broadcast rather than
+/// `BatteryManager.getIntProperty(BATTERY_PROPERTY_CAPACITY)` — the
+/// latter returned bogus values on the user's device. Sticky broadcast
+/// is the canonical Android battery API and exposes both `level` and
+/// `scale` extras so we can normalise to a percentage.
 fn read_battery_level(app: &slint::android::AndroidApp) -> Option<i32> {
     let vm = unsafe { JavaVM::from_raw(app.vm_as_ptr().cast()) }.ok()?;
     let mut env = vm.attach_current_thread().ok()?;
     let activity = unsafe { JObject::from_raw(app.activity_as_ptr().cast()) };
 
-    let ctx_class = env.find_class("android/content/Context").ok()?;
-    let svc_key = env
-        .get_static_field(&ctx_class, "BATTERY_SERVICE", "Ljava/lang/String;")
+    let intent_class = env.find_class("android/content/Intent").ok()?;
+    let action = env
+        .get_static_field(&intent_class, "ACTION_BATTERY_CHANGED", "Ljava/lang/String;")
         .ok()?
         .l()
         .ok()?;
-    let bm = env
+    let filter_class = env.find_class("android/content/IntentFilter").ok()?;
+    let filter = env
+        .new_object(&filter_class, "(Ljava/lang/String;)V", &[(&action).into()])
+        .ok()?;
+
+    // Passing a null receiver makes `registerReceiver` return the
+    // last broadcasted sticky Intent without subscribing to future
+    // updates — exactly the snapshot we need to read once per poll.
+    let null_receiver = JObject::null();
+    let battery_intent = env
         .call_method(
             &activity,
-            "getSystemService",
-            "(Ljava/lang/String;)Ljava/lang/Object;",
-            &[(&svc_key).into()],
+            "registerReceiver",
+            "(Landroid/content/BroadcastReceiver;Landroid/content/IntentFilter;)Landroid/content/Intent;",
+            &[(&null_receiver).into(), (&filter).into()],
         )
         .ok()?
         .l()
         .ok()?;
-    let bm_class = env.find_class("android/os/BatteryManager").ok()?;
-    let capacity_const = env
-        .get_static_field(&bm_class, "BATTERY_PROPERTY_CAPACITY", "I")
-        .ok()?
-        .i()
-        .ok()?;
+    if battery_intent.is_null() {
+        return None;
+    }
+
+    let level_key = env.new_string("level").ok()?;
+    let scale_key = env.new_string("scale").ok()?;
     let level = env
-        .call_method(&bm, "getIntProperty", "(I)I", &[capacity_const.into()])
+        .call_method(
+            &battery_intent,
+            "getIntExtra",
+            "(Ljava/lang/String;I)I",
+            &[(&level_key).into(), (-1_i32).into()],
+        )
         .ok()?
         .i()
         .ok()?;
-    Some(level)
+    let scale = env
+        .call_method(
+            &battery_intent,
+            "getIntExtra",
+            "(Ljava/lang/String;I)I",
+            &[(&scale_key).into(), (-1_i32).into()],
+        )
+        .ok()?
+        .i()
+        .ok()?;
+    if level < 0 || scale <= 0 {
+        return None;
+    }
+    let pct = (level as f64 * 100.0 / scale as f64).round() as i32;
+    Some(pct.clamp(0, 100))
 }
 
 fn launch_intent_uri(app: &slint::android::AndroidApp) -> Option<String> {
