@@ -1012,6 +1012,12 @@ export component AppWindow inherits Window {
     /// tapped. Used to surface Rename/Close from a bottom sheet so
     /// they're discoverable without crowding the row.
     in-out property <int> actions-idx: -1;
+    /// System battery level (0–100). -1 means "unknown / not queried
+    /// yet"; pushed from the Rust JNI poller every 30 s. Drives the
+    /// red warning bar at the top of the window: solid at <20 %,
+    /// blinking at <10 %.
+    in-out property <int> battery-level: -1;
+    in-out property <bool> _battery_blink: false;
     /// -1 = no rename dialog open; >= 0 = index of the tab being renamed.
     in-out property <int> rename-idx: -1;
     in-out property <string> rename-text: "";
@@ -1666,6 +1672,24 @@ export component AppWindow inherits Window {
         interval: 3s;
         running: root.toast-visible;
         triggered => { root.toast-visible = false; }
+    }
+
+    // Battery warning banner: visible whenever level is known and ≤20 %.
+    // Blink driver toggles a bool at 1 Hz when we drop to ≤10 % so the
+    // bar pulses instead of fading silently into the chrome.
+    Timer {
+        interval: 600ms;
+        running: root.battery-level >= 0 && root.battery-level <= 10;
+        triggered => { root._battery_blink = !root._battery_blink; }
+    }
+    if root.battery-level >= 0 && root.battery-level <= 20 : Rectangle {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: 4px;
+        background: root.battery-level <= 10 && root._battery_blink
+            ? transparent
+            : #ef5350;
     }
     if root.toast-visible : Rectangle {
         width: 100%;
