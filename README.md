@@ -56,6 +56,26 @@ cargo build --release
 
 Requires Rust 2024 edition (rustc 1.92+).
 
+### Debian package
+
+```sh
+cargo deb
+sudo apt install ./target/debian/tab-atelier_*.deb
+```
+
+The `.deb` lays out the following under FHS-standard paths:
+
+| Path | Permission | Contents |
+|---|---|---|
+| `/usr/bin/tab-atelier` | `0755` | The binary |
+| `/usr/share/applications/tab-atelier.desktop` | `0644` | Desktop entry (registers Tab Atelier in app launchers) |
+| `/usr/share/icons/hicolor/scalable/apps/tab-atelier.svg` | `0644` | App icon (scalable SVG, picked up by the desktop environment via the `Icon=tab-atelier` line in the .desktop) |
+| `/usr/share/doc/tab-atelier/` | `0644` | `README.md`, `LICENSE`, `copyright` |
+
+**`conffiles` (per [debian-policy §10.7.2](https://www.debian.org/doc/debian-policy/ch-files.html#behavior)):** none. tab-atelier ships no system-wide configuration in `/etc`, so dpkg has no files to track between upgrades. All user-modifiable state — preferences, tab list, scrollback, uptime, energy, single-instance lock — lives under the user's `$XDG_CONFIG_HOME` and `$XDG_STATE_HOME` (see [State](#state) below). The package's `conf-files = []` in `Cargo.toml` records this intentionally.
+
+**`dirs` (per [debian-policy §10.5](https://www.debian.org/doc/debian-policy/ch-files.html#permissions-and-owners)):** the package creates only what it installs (under `/usr/bin`, `/usr/share/applications`, `/usr/share/icons/hicolor/scalable/apps`, `/usr/share/doc/tab-atelier`). It does **not** pre-create any directory under `/etc` or `/var`. The per-user `~/.config/tab-atelier/` and `~/.local/{,state/}tab-atelier/` directories are created lazily by the running application on first save — dpkg never touches them, so a `dpkg --purge` leaves them in place for the user to remove manually if desired.
+
 ## Running
 
 ```sh
