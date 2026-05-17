@@ -125,14 +125,18 @@ fn handle_connection(stream: &mut std::net::TcpStream, state: &Arc<Mutex<TabSnap
     let method = parts[0].to_string();
     let raw_path = parts[1].to_string();
 
-    let (path, query_token) = if let Some((p, q)) = raw_path.split_once('?') {
+    let (path, query_token, query_lines) = if let Some((p, q)) = raw_path.split_once('?') {
         let qt = q
             .split('&')
             .find_map(|pair| pair.strip_prefix("token="))
             .map(std::string::ToString::to_string);
-        (p.to_string(), qt)
+        let ql = q
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("lines="))
+            .and_then(|s| s.parse::<usize>().ok());
+        (p.to_string(), qt, ql)
     } else {
-        (raw_path, None)
+        (raw_path, None, None)
     };
 
     let provided_token = auth_token.or(query_token);
@@ -171,8 +175,16 @@ fn handle_connection(stream: &mut std::net::TcpStream, state: &Arc<Mutex<TabSnap
             if let Ok(idx) = idx_str.parse::<usize>() {
                 let state = state.lock().unwrap();
                 if let Some(t) = state.tabs.get(idx) {
-                    let body = t.output.clone();
+                    let mut body = t.output.clone();
                     drop(state);
+                    if let Some(n) = query_lines
+                        && n > 0
+                    {
+                        let lines: Vec<&str> = body.lines().collect();
+                        if lines.len() > n {
+                            body = lines[lines.len() - n..].join("\n");
+                        }
+                    }
                     let _ = write!(
                         stream,
                         "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -621,6 +633,30 @@ mod tests {
         let (port, _, _) = spawn_server();
         let resp = request(port, "GET /tabs/0/output HTTP/1.1\r\n\r\n");
         assert_eq!(status_code(&resp), 401);
+    }
+
+    #[test]
+    fn get_tab_output_lines_param_tails() {
+        let (port, state, token) = spawn_server();
+        state.lock().unwrap().tabs[0].output =
+            (1..=10).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let resp = request(
+            port,
+            &format!("GET /tabs/0/output?lines=3&token={token} HTTP/1.1\r\n\r\n"),
+        );
+        assert_eq!(status_code(&resp), 200);
+        assert_eq!(body(&resp), "line 8\nline 9\nline 10");
+    }
+
+    #[test]
+    fn get_tab_output_lines_param_larger_than_buffer_returns_all() {
+        let (port, _, token) = spawn_server();
+        let resp = request(
+            port,
+            &format!("GET /tabs/0/output?lines=99&token={token} HTTP/1.1\r\n\r\n"),
+        );
+        assert_eq!(status_code(&resp), 200);
+        assert_eq!(body(&resp), "$ ls\nfoo bar baz");
     }
 
     #[test]

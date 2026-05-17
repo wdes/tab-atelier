@@ -498,7 +498,8 @@ impl AppState {
             .map(|(tab, ts)| api::SnapshotTab {
                 name: ts.name.clone(),
                 cwd: ts.cwd.clone(),
-                output: tab.view.read(cx).visible_plain_text(),
+                // Cache 200 lines so remote clients can request scrollback.
+                output: tab.view.read(cx).plain_text(Some(200)),
             })
             .collect();
 

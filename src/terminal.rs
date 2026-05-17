@@ -427,10 +427,6 @@ impl TerminalView {
         out
     }
 
-    /// Visible screen only — convenience wrapper, used by the snapshot tick.
-    pub fn visible_plain_text(&self) -> String {
-        self.plain_text(None)
-    }
 
     #[allow(clippy::significant_drop_tightening)]
     pub fn copy_all_history(&self) -> String {
