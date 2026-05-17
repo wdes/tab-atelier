@@ -812,7 +812,20 @@ impl Render for TerminalView {
                                 if url.is_file {
                                     let raw = file_path_for_open(&url.url);
                                     let path = std::path::Path::new(raw);
-                                    let resolved = if path.is_absolute() {
+                                    let resolved = if let Some(tail) = raw.strip_prefix("~/")
+                                        && let Some(home) = std::env::var_os("HOME")
+                                    {
+                                        std::path::PathBuf::from(home).join(tail)
+                                    } else if raw == "~"
+                                        && let Some(home) = std::env::var_os("HOME")
+                                    {
+                                        std::path::PathBuf::from(home)
+                                    } else if let Some(rest) = raw.strip_prefix('$')
+                                        && let Some(slash) = rest.find('/')
+                                        && let Some(val) = std::env::var_os(&rest[..slash])
+                                    {
+                                        std::path::PathBuf::from(val).join(&rest[slash + 1..])
+                                    } else if path.is_absolute() {
                                         path.to_path_buf()
                                     } else if let Some(cwd) = crate::platform::process_cwd(this.pid) {
                                         cwd.join(path)

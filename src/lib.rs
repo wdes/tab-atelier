@@ -740,6 +740,12 @@ pub fn detect_urls(text: &str) -> Vec<(usize, usize, String, bool)> {
             while start > 0 && (chars[start - 1].is_alphanumeric() || matches!(chars[start - 1], '_' | '-' | '.')) {
                 start -= 1;
             }
+            // Pick up a leading `~` so home-relative paths like
+            // `~/.local/state/tab-atelier/tabs.json` are detected as a whole.
+            // Same for `$VAR/...` style env-var prefixes.
+            if start > 0 && matches!(chars[start - 1], '~' | '$') {
+                start -= 1;
+            }
             let mut j = i;
             while j < len
                 && !chars[j].is_whitespace()
@@ -1210,6 +1216,42 @@ mod tests {
         let urls = detect_urls("deb at /tmp/pkg/app_0.1-1_amd64.deb.");
         assert_eq!(urls.len(), 1);
         assert_eq!(urls[0].2, "/tmp/pkg/app_0.1-1_amd64.deb");
+    }
+
+    #[test]
+    fn detect_file_path_with_tilde() {
+        let urls = detect_urls("see ~/.local/state/tab-atelier/tabs.json for state");
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0].2, "~/.local/state/tab-atelier/tabs.json");
+    }
+
+    #[test]
+    fn detect_file_path_with_tilde_at_start() {
+        let urls = detect_urls("~/.config/foo/bar.txt");
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0].2, "~/.config/foo/bar.txt");
+    }
+
+    #[test]
+    fn detect_file_path_with_env_var_prefix() {
+        let urls = detect_urls("see $XDG_STATE_HOME/tab-atelier/tabs.json after reboot");
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0].2, "$XDG_STATE_HOME/tab-atelier/tabs.json");
+    }
+
+    #[test]
+    fn detect_file_path_with_home_env_var() {
+        let urls = detect_urls("$HOME/dev/foo/bar.rs");
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0].2, "$HOME/dev/foo/bar.rs");
+    }
+
+    #[test]
+    fn detect_file_path_does_not_eat_arbitrary_prefix() {
+        // 'cat' before /tmp shouldn't be captured (only ~ is grafted on).
+        let urls = detect_urls("cat /home/user/foo/bar");
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0].2, "/home/user/foo/bar");
     }
 
     #[test]
