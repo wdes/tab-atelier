@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 use tab_atelier::{
     DEFAULT_HOTKEYS, FontConfig, Preferences, SavedState, TabState, gpui_key_to_keycode, keycode_label,
     load_font_config, load_preferences_with_legacy, load_state_with_outputs, load_wakatime_key,
-    save_preferences, save_state, save_tab_output,
+    save_preferences, save_state, save_tab_energy, save_tab_output, save_tab_uptime,
 };
 
 struct Tab {
@@ -36,6 +36,10 @@ struct Tab {
     last_activated: Option<std::time::Instant>,
     #[cfg(feature = "energy")]
     energy_wh: f64,
+    /// Last `energy_wh` value flushed to disk. Used to skip writes when no
+    /// meaningful additional energy has been consumed since last save.
+    #[cfg(feature = "energy")]
+    energy_wh_last_saved: f64,
 }
 
 impl Tab {
@@ -138,6 +142,10 @@ struct AppState {
     pref_editor_text: String,
     pref_editor_focus: FocusHandle,
     hotkey_handle: Option<platform::HotkeyHandle>,
+    /// When the per-tab uptime files were last written. Persisting uptime
+    /// every 2s would burn through disk writes for a value that only
+    /// advances by ~2s anyway; we batch writes to once every 30s.
+    last_uptime_save: std::cell::Cell<Option<std::time::Instant>>,
 }
 
 impl AppState {
@@ -156,6 +164,7 @@ impl AppState {
         let pref_editor_focus = cx.focus_handle();
         let font_config = load_font_config(&platform::config_dir());
         let prefs = load_preferences_with_legacy(
+            &platform::config_dir(),
             &platform::config_base_dir(),
             &platform::state_base_dir(),
         );
@@ -201,6 +210,8 @@ impl AppState {
                     last_activated: None,
                     #[cfg(feature = "energy")]
                     energy_wh: ts.energy_wh.unwrap_or(0.0),
+                    #[cfg(feature = "energy")]
+                    energy_wh_last_saved: ts.energy_wh.unwrap_or(0.0),
                 });
             }
             if tabs.is_empty() {
@@ -219,6 +230,8 @@ impl AppState {
                     last_activated: None,
                     #[cfg(feature = "energy")]
                     energy_wh: 0.0,
+                    #[cfg(feature = "energy")]
+                    energy_wh_last_saved: 0.0,
                 });
             }
             let active = saved.active.min(tabs.len() - 1);
@@ -241,6 +254,8 @@ impl AppState {
                     last_activated: Some(std::time::Instant::now()),
                     #[cfg(feature = "energy")]
                     energy_wh: 0.0,
+                    #[cfg(feature = "energy")]
+                    energy_wh_last_saved: 0.0,
                 }],
                 0,
             )
@@ -367,6 +382,7 @@ impl AppState {
             pref_editor_text: String::new(),
             pref_editor_focus,
             hotkey_handle: None,
+            last_uptime_save: std::cell::Cell::new(None),
         }
     }
 
@@ -403,6 +419,8 @@ impl AppState {
                 last_activated: Some(std::time::Instant::now()),
                 #[cfg(feature = "energy")]
                 energy_wh: 0.0,
+                #[cfg(feature = "energy")]
+                energy_wh_last_saved: 0.0,
             },
         );
         self.active = idx;
@@ -482,6 +500,11 @@ impl AppState {
             .iter()
             .map(|tab| (tab.name.clone(), tab.view.read(cx).copy_all_history()))
             .collect();
+        let uptimes: Vec<(String, f64)> = self
+            .tabs
+            .iter()
+            .map(|tab| (tab.name.clone(), tab.uptime().as_secs_f64()))
+            .collect();
         let tabs: Vec<TabState> = self
             .tabs
             .iter()
@@ -491,11 +514,11 @@ impl AppState {
                 TabState {
                     name: tab.name.clone(),
                     cwd,
-                    // Output is now persisted in a per-tab file, not inline.
+                    // Output and uptime are now persisted in per-tab files.
                     output: None,
-                    uptime_secs: Some(tab.uptime().as_secs_f64()),
+                    uptime_secs: None,
                     #[cfg(feature = "energy")]
-                    energy_wh: if tab.energy_wh > 0.0 { Some(tab.energy_wh) } else { None },
+                    energy_wh: None,
                     #[cfg(not(feature = "energy"))]
                     energy_wh: None,
                 }
@@ -523,6 +546,29 @@ impl AppState {
         for (name, output) in outputs {
             if !output.is_empty() {
                 save_tab_output(&state_base, &name, &output);
+            }
+        }
+        // Uptime grows ~2s per tick; only flush every 30s to spare writes.
+        let should_save_uptime = self
+            .last_uptime_save
+            .get()
+            .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(30));
+        if should_save_uptime {
+            for (name, secs) in &uptimes {
+                save_tab_uptime(&state_base, name, *secs);
+            }
+            self.last_uptime_save.set(Some(std::time::Instant::now()));
+        }
+        // Energy: only flush when at least 0.1 Wh has been consumed since the
+        // last save. Avoids writing tiny float increments on every tick.
+        #[cfg(feature = "energy")]
+        {
+            const ENERGY_DELTA_WH: f64 = 0.1;
+            for tab in &mut self.tabs {
+                if (tab.energy_wh - tab.energy_wh_last_saved).abs() >= ENERGY_DELTA_WH {
+                    save_tab_energy(&state_base, &tab.name, tab.energy_wh);
+                    tab.energy_wh_last_saved = tab.energy_wh;
+                }
             }
         }
 
@@ -639,6 +685,11 @@ impl AppState {
             .iter()
             .map(|tab| (tab.name.clone(), tab.view.read(cx).copy_all_history()))
             .collect();
+        let uptimes: Vec<(String, f64)> = self
+            .tabs
+            .iter()
+            .map(|tab| (tab.name.clone(), tab.uptime().as_secs_f64()))
+            .collect();
         let tabs: Vec<TabState> = self
             .tabs
             .iter()
@@ -649,9 +700,9 @@ impl AppState {
                     name: tab.name.clone(),
                     cwd,
                     output: None,
-                    uptime_secs: Some(tab.uptime().as_secs_f64()),
+                    uptime_secs: None,
                     #[cfg(feature = "energy")]
-                    energy_wh: if tab.energy_wh > 0.0 { Some(tab.energy_wh) } else { None },
+                    energy_wh: None,
                     #[cfg(not(feature = "energy"))]
                     energy_wh: None,
                 }
@@ -668,6 +719,16 @@ impl AppState {
             if !output.is_empty() {
                 save_tab_output(&state_base, &name, &output);
             }
+        }
+        // Always flush uptime + energy on shutdown — bypass throttles so the
+        // last tick isn't lost.
+        for (name, secs) in &uptimes {
+            save_tab_uptime(&state_base, name, *secs);
+        }
+        #[cfg(feature = "energy")]
+        for tab in &mut self.tabs {
+            save_tab_energy(&state_base, &tab.name, tab.energy_wh);
+            tab.energy_wh_last_saved = tab.energy_wh;
         }
 
         if let Some(ref tracker) = self.tracker {
@@ -1313,17 +1374,24 @@ impl AppState {
                                         let old_name = this.tabs[i].name.clone();
                                         let new_name = text.clone();
                                         if old_name != new_name {
-                                            // Move the per-tab output file across so we don't
-                                            // orphan history when the user renames a tab.
+                                            // Move per-tab files across so we don't orphan
+                                            // history or uptime when the user renames a tab.
                                             let base = platform::state_base_dir();
-                                            let old_path = tab_atelier::tab_output_path(&base, &old_name);
-                                            let new_path = tab_atelier::tab_output_path(&base, &new_name);
-                                            if old_path.exists() {
-                                                let _ = std::fs::rename(&old_path, &new_path);
-                                                let _ = std::fs::rename(
-                                                    old_path.with_extension("json.bak"),
-                                                    new_path.with_extension("json.bak"),
-                                                );
+                                            for resolver in [
+                                                tab_atelier::tab_output_path
+                                                    as fn(&std::path::Path, &str) -> std::path::PathBuf,
+                                                tab_atelier::tab_uptime_path,
+                                                tab_atelier::tab_power_path,
+                                            ] {
+                                                let old_path = resolver(&base, &old_name);
+                                                let new_path = resolver(&base, &new_name);
+                                                if old_path.exists() {
+                                                    let _ = std::fs::rename(&old_path, &new_path);
+                                                    let _ = std::fs::rename(
+                                                        old_path.with_extension("json.bak"),
+                                                        new_path.with_extension("json.bak"),
+                                                    );
+                                                }
                                             }
                                         }
                                         this.tabs[i].name = new_name;
@@ -2081,7 +2149,7 @@ impl AppState {
                                                 (*this.browser.borrow_mut()).clone_from(&browser);
                                                 (*this.code_editor.borrow_mut()).clone_from(&editor);
                                                 save_preferences(
-                                                    &platform::config_base_dir(),
+                                                    &platform::config_dir(),
                                                     &Preferences {
                                                         lang: Some(lang_str.into()),
                                                         theme: Some(this.theme_name.id().into()),
@@ -2479,6 +2547,7 @@ pub fn run() {
     info!("starting Tab Atelier v{}", env!("CARGO_PKG_VERSION"));
     Application::new().run(|cx: &mut App| {
         let prefs = load_preferences_with_legacy(
+            &platform::config_dir(),
             &platform::config_base_dir(),
             &platform::state_base_dir(),
         );

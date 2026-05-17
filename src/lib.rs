@@ -104,6 +104,48 @@ pub fn tab_power_path(state_base: &std::path::Path, tab_name: &str) -> PathBuf {
 }
 
 #[must_use]
+pub fn tab_uptime_path(state_base: &std::path::Path, tab_name: &str) -> PathBuf {
+    state_dir(state_base).join(format!("uptime_tab-{}.json", sanitize_tab_filename(tab_name)))
+}
+
+pub fn save_tab_uptime(state_base: &std::path::Path, tab_name: &str, uptime_secs: f64) {
+    let dir = state_dir(state_base);
+    let path = tab_uptime_path(state_base, tab_name);
+    write_atomic_with_rotation(&dir, &path, &uptime_secs);
+}
+
+#[must_use]
+pub fn load_tab_uptime(state_base: &std::path::Path, tab_name: &str) -> Option<f64> {
+    load_f64_with_bak(&tab_uptime_path(state_base, tab_name))
+}
+
+pub fn save_tab_energy(state_base: &std::path::Path, tab_name: &str, energy_wh: f64) {
+    let dir = state_dir(state_base);
+    let path = tab_power_path(state_base, tab_name);
+    write_atomic_with_rotation(&dir, &path, &energy_wh);
+}
+
+#[must_use]
+pub fn load_tab_energy(state_base: &std::path::Path, tab_name: &str) -> Option<f64> {
+    load_f64_with_bak(&tab_power_path(state_base, tab_name))
+}
+
+fn load_f64_with_bak(path: &std::path::Path) -> Option<f64> {
+    if let Ok(data) = std::fs::read_to_string(path)
+        && let Ok(v) = serde_json::from_str::<f64>(&data)
+    {
+        return Some(v);
+    }
+    let bak = path.with_extension("json.bak");
+    if let Ok(data) = std::fs::read_to_string(&bak)
+        && let Ok(v) = serde_json::from_str::<f64>(&data)
+    {
+        return Some(v);
+    }
+    None
+}
+
+#[must_use]
 pub fn load_state_from(base: &std::path::Path) -> Option<SavedState> {
     load_state_at(&state_path(base))
 }
@@ -143,17 +185,18 @@ pub fn load_state_with_outputs(
     let legacy_path = state_path(state_base);
 
     // Migration: if the new layout is empty but legacy data exists, copy it
-    // forward (metadata to config_dir, output to per-tab files).
+    // forward (metadata to config_dir, output + uptime to per-tab files).
     if !new_path.exists()
         && let Some(legacy) = load_state_at(&legacy_path)
     {
         log::warn!("migrating tab state from {} to new layout", legacy_path.display());
-        let mut split = SavedState {
+        let split = SavedState {
             tabs: legacy.tabs.iter().map(|t| TabState {
                 name: t.name.clone(),
                 cwd: t.cwd.clone(),
                 output: None,
-                uptime_secs: t.uptime_secs,
+                // Uptime now lives in its own per-tab file.
+                uptime_secs: None,
                 energy_wh: t.energy_wh,
             }).collect(),
             active: legacy.active,
@@ -163,18 +206,27 @@ pub fn load_state_with_outputs(
             if let Some(ref out) = t.output {
                 save_tab_output(state_base, &t.name, out);
             }
+            if let Some(secs) = t.uptime_secs {
+                save_tab_uptime(state_base, &t.name, secs);
+            }
+            if let Some(wh) = t.energy_wh {
+                save_tab_energy(state_base, &t.name, wh);
+            }
         }
-        // Reload after migration so this function returns the new canonical
-        // state (in case anything went wrong with the write we just did).
-        split.tabs = legacy.tabs;
-        return Some(split);
+        return Some(legacy);
     }
 
     let mut state = load_state_at(&new_path)?;
-    // Hydrate output from the per-tab files.
+    // Hydrate per-tab files for output, uptime, energy.
     for t in &mut state.tabs {
         if t.output.is_none() {
             t.output = load_tab_output(state_base, &t.name);
+        }
+        if t.uptime_secs.is_none() {
+            t.uptime_secs = load_tab_uptime(state_base, &t.name);
+        }
+        if t.energy_wh.is_none() {
+            t.energy_wh = load_tab_energy(state_base, &t.name);
         }
     }
     Some(state)
@@ -760,27 +812,35 @@ pub fn load_preferences(config_base: &std::path::Path) -> Preferences {
         .unwrap_or_default()
 }
 
-/// Load preferences with one-shot migration from the legacy path.
+/// Load preferences with one-shot migration from legacy paths.
 ///
-/// When the new file (`{config_base}/tab-atelier/preferences.json`) is absent
-/// but the legacy `{state_base}/tab-atelier/preferences.json` exists, copy
-/// the contents forward so the user keeps their settings across upgrade.
+/// Tries `{xdg_config_base}/tab-atelier/preferences.json` first
+/// (`~/.config/...`). If absent, walks two older locations in age order —
+/// `{tabs_config_base}/tab-atelier/preferences.json` (`~/.local/...`) and
+/// `{state_base}/tab-atelier/preferences.json` — and migrates whichever it
+/// finds forward to the canonical XDG path.
 #[must_use]
 pub fn load_preferences_with_legacy(
-    config_base: &std::path::Path,
+    xdg_config_base: &std::path::Path,
+    tabs_config_base: &std::path::Path,
     state_base: &std::path::Path,
 ) -> Preferences {
-    let new_path = config_dir(config_base).join("preferences.json");
+    let new_path = config_dir(xdg_config_base).join("preferences.json");
     if new_path.exists() {
-        return load_preferences(config_base);
+        return load_preferences(xdg_config_base);
     }
-    let legacy_path = state_dir(state_base).join("preferences.json");
-    if let Ok(data) = std::fs::read_to_string(&legacy_path)
-        && let Ok(prefs) = serde_json::from_str::<Preferences>(&data)
-    {
-        log::warn!("migrating preferences from {}", legacy_path.display());
-        save_preferences(config_base, &prefs);
-        return prefs;
+    let legacy_paths = [
+        config_dir(tabs_config_base).join("preferences.json"),
+        state_dir(state_base).join("preferences.json"),
+    ];
+    for legacy in legacy_paths {
+        if let Ok(data) = std::fs::read_to_string(&legacy)
+            && let Ok(prefs) = serde_json::from_str::<Preferences>(&data)
+        {
+            log::warn!("migrating preferences from {}", legacy.display());
+            save_preferences(xdg_config_base, &prefs);
+            return prefs;
+        }
     }
     Preferences::default()
 }
