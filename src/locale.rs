@@ -87,6 +87,7 @@ pub struct Strings {
     pub browser_placeholder: &'static str,
     pub code_editor: &'static str,
     pub code_editor_placeholder: &'static str,
+    pub api_port: &'static str,
     pub save: &'static str,
 }
 
@@ -148,6 +149,7 @@ pub static EN: Strings = Strings {
     browser_placeholder: "xdg-open (system default)",
     code_editor: "Code editor",
     code_editor_placeholder: "xdg-open (system default)",
+    api_port: "Remote API port (restart required)",
     save: "Save",
 };
 
@@ -209,6 +211,7 @@ pub static FR: Strings = Strings {
     browser_placeholder: "xdg-open (par défaut)",
     code_editor: "Éditeur de code",
     code_editor_placeholder: "xdg-open (par défaut)",
+    api_port: "Port de l'API distante (redémarrage requis)",
     save: "Enregistrer",
 };
 
