@@ -685,6 +685,7 @@ component TerminalView inherits Rectangle {
     in property <length> safe-left;
     in property <length> safe-right;
     in-out property <string> input-text;
+    in-out property <length> font-size: 13px;
     callback back();
     callback send-input();
     callback key-tapped(string);
@@ -758,6 +759,41 @@ component TerminalView inherits Rectangle {
                     font-size: 12px;
                     vertical-alignment: center;
                 }
+                TouchArea {
+                    width: 34px;
+                    clicked => {
+                        if (root.font-size > 9px) { root.font-size -= 1px; }
+                    }
+                    Rectangle {
+                        background: parent.has-hover ? #2a2a2a : transparent;
+                        border-radius: 6px;
+                        Text {
+                            text: "A−";
+                            color: #aaa;
+                            font-size: 14px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+                TouchArea {
+                    width: 34px;
+                    clicked => {
+                        if (root.font-size < 26px) { root.font-size += 1px; }
+                    }
+                    Rectangle {
+                        background: parent.has-hover ? #2a2a2a : transparent;
+                        border-radius: 6px;
+                        Text {
+                            text: "A+";
+                            color: #e0e0e0;
+                            font-size: 16px;
+                            font-weight: 700;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
             }
         }
 
@@ -777,14 +813,14 @@ component TerminalView inherits Rectangle {
                     text: root.output-text;
                     color: #d0d0d0;
                     font-family: "monospace";
-                    font-size: 13px;
+                    font-size: root.font-size;
                     wrap: no-wrap;
                 }
                 if root.output-text == "" : Text {
                     text: "Waiting for output…";
                     color: #666;
                     font-family: "monospace";
-                    font-size: 13px;
+                    font-size: root.font-size;
                 }
             }
         }
@@ -816,7 +852,7 @@ component TerminalView inherits Rectangle {
                             text <=> root.input-text;
                             color: #e0e0e0;
                             font-family: "monospace";
-                            font-size: 14px;
+                            font-size: root.font-size + 1px;
                             single-line: true;
                             vertical-alignment: center;
                             accepted => { root.send-input(); }
