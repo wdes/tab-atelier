@@ -16,35 +16,75 @@ slint::include_modules!();
 
 /// Read the URI the activity was launched with, if any (e.g. via the
 /// `taremote://onboard?url=...&token=...` deep link).
-/// Open the system camera in viewfinder mode. Most modern Android camera
-/// apps detect QR codes natively and surface the deep link as a tap-to-
-/// open chip — when the user taps the `taremote://onboard?...` URL the
-/// existing intent-filter brings the user back into ta-remote with the
-/// onboard parameters filled in.
-fn launch_system_camera(app: &slint::android::AndroidApp) -> Option<()> {
+/// Read the system clipboard's primary text item via JNI. Returns `None` if
+/// the clipboard is empty or doesn't contain a CharSequence.
+fn read_clipboard(app: &slint::android::AndroidApp) -> Option<String> {
     let vm = unsafe { JavaVM::from_raw(app.vm_as_ptr().cast()) }.ok()?;
     let mut env = vm.attach_current_thread().ok()?;
     let activity = unsafe { JObject::from_raw(app.activity_as_ptr().cast()) };
 
-    let intent_class = env.find_class("android/content/Intent").ok()?;
-    let action = env
-        .new_string("android.media.action.STILL_IMAGE_CAMERA")
+    let context_class = env.find_class("android/content/Context").ok()?;
+    let key = env
+        .get_static_field(&context_class, "CLIPBOARD_SERVICE", "Ljava/lang/String;")
+        .ok()?
+        .l()
         .ok()?;
-    let intent = env
-        .new_object(&intent_class, "(Ljava/lang/String;)V", &[(&action).into()])
+    let manager = env
+        .call_method(
+            &activity,
+            "getSystemService",
+            "(Ljava/lang/String;)Ljava/lang/Object;",
+            &[(&key).into()],
+        )
+        .ok()?
+        .l()
         .ok()?;
-    // FLAG_ACTIVITY_NEW_TASK = 0x10000000 — required when launching from a
-    // non-Activity JNI context.
-    env.call_method(&intent, "addFlags", "(I)Landroid/content/Intent;", &[0x1000_0000_i32.into()])
+    let clip = env
+        .call_method(
+            &manager,
+            "getPrimaryClip",
+            "()Landroid/content/ClipData;",
+            &[],
+        )
+        .ok()?
+        .l()
         .ok()?;
-    env.call_method(
-        &activity,
-        "startActivity",
-        "(Landroid/content/Intent;)V",
-        &[(&intent).into()],
-    )
-    .ok()?;
-    Some(())
+    if clip.is_null() {
+        return None;
+    }
+    let count = env
+        .call_method(&clip, "getItemCount", "()I", &[])
+        .ok()?
+        .i()
+        .ok()?;
+    if count < 1 {
+        return None;
+    }
+    let item = env
+        .call_method(
+            &clip,
+            "getItemAt",
+            "(I)Landroid/content/ClipData$Item;",
+            &[0_i32.into()],
+        )
+        .ok()?
+        .l()
+        .ok()?;
+    let cs = env
+        .call_method(&item, "getText", "()Ljava/lang/CharSequence;", &[])
+        .ok()?
+        .l()
+        .ok()?;
+    if cs.is_null() {
+        return None;
+    }
+    let s = env
+        .call_method(&cs, "toString", "()Ljava/lang/String;", &[])
+        .ok()?
+        .l()
+        .ok()?;
+    let jstr: JString = s.into();
+    env.get_string(&jstr).ok().map(|j| j.into())
 }
 
 fn launch_intent_uri(app: &slint::android::AndroidApp) -> Option<String> {
@@ -733,10 +773,42 @@ pub fn android_main(app: slint::android::AndroidApp) {
         }
     });
 
+    let scan_weak = ui_weak.clone();
     ui.on_request_scan_qr(move || {
-        if launch_system_camera(&app_for_callbacks).is_none() {
-            log::warn!("scan-qr: failed to launch system camera");
-        }
+        // The Android intents for "open camera" only invoke the photo
+        // viewfinder on many devices — they don't run the QR detector. So
+        // instead of guessing which camera launcher might scan QRs, we
+        // read the clipboard: the user copies the `taremote://onboard…`
+        // URL from the desktop QR dialog, hits this button, and the
+        // editor opens pre-filled. Falls back gracefully if the clipboard
+        // doesn't contain a recognisable onboard URL.
+        let pasted = read_clipboard(&app_for_callbacks).unwrap_or_default();
+        let parsed = pasted
+            .lines()
+            .find(|l| l.trim_start().starts_with("taremote://onboard?"))
+            .and_then(|l| crate::onboard::parse_onboard_url(l.trim()));
+        let weak = scan_weak.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            ui.set_editor_edit_index(-1);
+            ui.set_editor_name(SharedString::new());
+            ui.set_editor_remote_url(SharedString::new());
+            match parsed {
+                Some((url, token)) => {
+                    ui.set_editor_url(SharedString::from(url));
+                    ui.set_editor_token(SharedString::from(token));
+                    ui.set_editor_error(SharedString::new());
+                }
+                None => {
+                    ui.set_editor_url(SharedString::new());
+                    ui.set_editor_token(SharedString::new());
+                    ui.set_editor_error(SharedString::from(
+                        "Clipboard didn't contain a taremote:// URL. Copy the URL under the QR code on the desktop and try again.",
+                    ));
+                }
+            }
+            ui.set_editor_open(true);
+        });
     });
 
     ui.run().unwrap();
