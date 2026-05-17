@@ -112,6 +112,18 @@ impl TerminalView {
         font_config: FontConfig,
         browser: Rc<RefCell<Option<String>>>,
         code_editor: Rc<RefCell<Option<String>>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new_with_colors(cwd, font_config, browser, code_editor, true, window, cx)
+    }
+
+    pub fn new_with_colors(
+        cwd: Option<&Path>,
+        font_config: FontConfig,
+        browser: Rc<RefCell<Option<String>>>,
+        code_editor: Rc<RefCell<Option<String>>>,
+        initial_colors_enabled: bool,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -123,7 +135,7 @@ impl TerminalView {
         };
         let opts = tty::Options {
             working_directory: cwd.map(std::path::Path::to_path_buf),
-            env: pty_env(true),
+            env: pty_env(initial_colors_enabled),
             ..Default::default()
         };
         let pty = tty::new(&opts, ws, 0).expect("failed to create pty");
@@ -207,7 +219,7 @@ impl TerminalView {
             hover_grid: Rc::new(Cell::new(None)),
             click_origin: Rc::new(Cell::new(None)),
             last_input: Rc::new(Cell::new(None)),
-            colors_enabled: Cell::new(true),
+            colors_enabled: Cell::new(initial_colors_enabled),
         }
     }
 

@@ -18,6 +18,19 @@ pub struct TabState {
     pub uptime_secs: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub energy_wh: Option<f64>,
+    /// `colors_enabled` for this tab — false means the shell was started
+    /// with `TERM=dumb` (right-click → Disable colors). Skipped when
+    /// `true` so the common case stays out of the serialized file.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub colors_enabled: bool,
+}
+
+const fn default_true() -> bool {
+    true
+}
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_true(b: &bool) -> bool {
+    *b
 }
 
 #[derive(Serialize, Deserialize)]
@@ -996,6 +1009,7 @@ mod tests {
                     output: None,
                     uptime_secs: None,
                     energy_wh: None,
+                    colors_enabled: true,
                 },
                 TabState {
                     name: "Build".into(),
@@ -1003,6 +1017,7 @@ mod tests {
                     output: None,
                     uptime_secs: None,
                     energy_wh: None,
+                    colors_enabled: true,
                 },
             ],
             active: 1,
@@ -1018,6 +1033,34 @@ mod tests {
     }
 
     #[test]
+    fn test_tab_state_colors_enabled_round_trip() {
+        // false survives a round-trip; true is omitted from the JSON.
+        let state = SavedState {
+            tabs: vec![TabState {
+                name: "dumb".into(),
+                cwd: None,
+                output: None,
+                uptime_secs: None,
+                energy_wh: None,
+                colors_enabled: false,
+            }],
+            active: 0,
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(
+            json.contains("\"colors_enabled\":false"),
+            "expected colors_enabled=false in {json}",
+        );
+        let restored: SavedState = serde_json::from_str(&json).unwrap();
+        assert!(!restored.tabs[0].colors_enabled);
+
+        // Missing field deserializes to the default (true).
+        let restored: SavedState =
+            serde_json::from_str(r#"{"tabs":[{"name":"x","cwd":null}],"active":0}"#).unwrap();
+        assert!(restored.tabs[0].colors_enabled);
+    }
+
+    #[test]
     fn test_tab_state_uptime_energy_round_trip() {
         let state = SavedState {
             tabs: vec![TabState {
@@ -1026,6 +1069,7 @@ mod tests {
                 output: None,
                 uptime_secs: Some(123.5),
                 energy_wh: Some(0.042),
+                colors_enabled: true,
             }],
             active: 0,
         };
@@ -1124,6 +1168,7 @@ mod tests {
                 output: None,
                 uptime_secs: None,
                 energy_wh: None,
+                colors_enabled: true,
             }],
             active: 0,
         };
@@ -1163,6 +1208,7 @@ mod tests {
                 output: None,
                 uptime_secs: None,
                 energy_wh: None,
+                colors_enabled: true,
             }],
             active: 0,
         };
@@ -1193,6 +1239,7 @@ mod tests {
                     output: None,
                     uptime_secs: None,
                     energy_wh: None,
+                    colors_enabled: true,
                 },
                 TabState {
                     name: "Two".into(),
@@ -1200,6 +1247,7 @@ mod tests {
                     output: None,
                     uptime_secs: None,
                     energy_wh: None,
+                    colors_enabled: true,
                 },
             ],
             active: 1,
@@ -1382,6 +1430,7 @@ mod tests {
                 output: None,
                 uptime_secs: None,
                 energy_wh: None,
+                colors_enabled: true,
             }],
             active: 0,
         };
@@ -1530,6 +1579,7 @@ mod tests {
                 output: None,
                 uptime_secs: None,
                 energy_wh: None,
+                colors_enabled: true,
             }],
             active: 999,
         };

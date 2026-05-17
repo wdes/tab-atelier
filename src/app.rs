@@ -197,8 +197,17 @@ impl AppState {
                 let fc = font_config.clone();
                 let br = browser.clone();
                 let ce = code_editor.clone();
+                let colors = ts.colors_enabled;
                 let view = cx.new(|cx| {
-                    let mut tv = TerminalView::new(cwd.as_deref(), fc, br, ce, window, cx);
+                    let mut tv = TerminalView::new_with_colors(
+                        cwd.as_deref(),
+                        fc,
+                        br,
+                        ce,
+                        colors,
+                        window,
+                        cx,
+                    );
                     tv.theme = theme_name;
                     tv
                 });
@@ -536,6 +545,7 @@ impl AppState {
                     energy_wh: None,
                     #[cfg(not(feature = "energy"))]
                     energy_wh: None,
+                    colors_enabled: tab.view.read(cx).colors_enabled(),
                 }
             })
             .collect();
@@ -744,6 +754,7 @@ impl AppState {
                     energy_wh: None,
                     #[cfg(not(feature = "energy"))]
                     energy_wh: None,
+                    colors_enabled: tab.view.read(cx).colors_enabled(),
                 }
             })
             .collect();
