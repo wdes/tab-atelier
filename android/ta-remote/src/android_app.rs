@@ -79,6 +79,8 @@ struct ApiTab {
     #[serde(default)]
     cpu_percent: f64,
     #[serde(default)]
+    watts: Option<f64>,
+    #[serde(default)]
     preview: String,
 }
 
@@ -328,7 +330,13 @@ fn push_tabs(ui_weak: &Weak<AppWindow>, tabs: Vec<ApiTab>, seen: &SeenPreviews) 
                     name: SharedString::from(t.name.clone()),
                     cwd: SharedString::from(t.cwd.unwrap_or_default()),
                     active: t.active,
-                    cpu: SharedString::from(format!("{:.1}%", t.cpu_percent)),
+                    cpu: SharedString::from(match t.watts {
+                        // Mirror wattaouille's two-decimal `0.43 W` style;
+                        // CPU % shown without watts when RAPL is unavailable.
+                        Some(w) if w >= 0.005 => format!("{:.1}% · {:.2}W", t.cpu_percent, w),
+                        Some(w) if w > 0.0 => format!("{:.1}% · {:.0}mW", t.cpu_percent, w * 1000.0),
+                        _ => format!("{:.1}%", t.cpu_percent),
+                    }),
                     preview: SharedString::from(t.preview),
                     has_new,
                 }
