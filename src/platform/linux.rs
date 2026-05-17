@@ -22,6 +22,15 @@ pub fn state_base_dir() -> PathBuf {
     )
 }
 
+/// Tab metadata (tabs.json) and preferences.json live here.
+/// Deliberately separate from `state_base_dir()` so a bad write to one
+/// tab's per-output file cannot corrupt the global tab list, and vice
+/// versa.
+pub fn config_base_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    PathBuf::from(home).join(".local")
+}
+
 pub fn config_dir() -> PathBuf {
     std::env::var("XDG_CONFIG_HOME").map_or_else(
         |_| {
