@@ -25,7 +25,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use tab_atelier::{
     DEFAULT_HOTKEYS, FontConfig, Preferences, SavedState, TabState, gpui_key_to_keycode, keycode_label,
-    load_font_config, load_preferences_with_legacy, load_state_with_outputs, load_wakatime_key,
+    load_font_config, load_preferences, load_state_with_outputs, load_wakatime_key,
     save_preferences, save_state, save_tab_energy, save_tab_output, save_tab_uptime,
 };
 
@@ -40,6 +40,10 @@ struct Tab {
     /// meaningful additional energy has been consumed since last save.
     #[cfg(feature = "energy")]
     energy_wh_last_saved: f64,
+    /// CRC32 of the last output snapshot written to disk. Skips the
+    /// per-tab `output_tab-...json` write+rotate when nothing changed
+    /// (idle tabs, no new output since last persist tick).
+    output_hash_last_saved: u32,
 }
 
 impl Tab {
@@ -146,6 +150,9 @@ struct AppState {
     /// every 2s would burn through disk writes for a value that only
     /// advances by ~2s anyway; we batch writes to once every 30s.
     last_uptime_save: std::cell::Cell<Option<std::time::Instant>>,
+    /// CRC32 of the last serialized `tabs.json` content. Skips the write+
+    /// rotate when nothing in the tab list changed since last tick.
+    last_state_hash: std::cell::Cell<u32>,
 }
 
 impl AppState {
@@ -163,11 +170,7 @@ impl AppState {
         let pref_browser_focus = cx.focus_handle();
         let pref_editor_focus = cx.focus_handle();
         let font_config = load_font_config(&platform::config_dir());
-        let prefs = load_preferences_with_legacy(
-            &platform::config_dir(),
-            &platform::config_base_dir(),
-            &platform::state_base_dir(),
-        );
+        let prefs = load_preferences(&platform::config_dir());
         let browser: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(prefs.browser.clone()));
         let code_editor: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(prefs.code_editor.clone()));
         let lang = match prefs.lang.as_deref() {
@@ -212,6 +215,13 @@ impl AppState {
                     energy_wh: ts.energy_wh.unwrap_or(0.0),
                     #[cfg(feature = "energy")]
                     energy_wh_last_saved: ts.energy_wh.unwrap_or(0.0),
+                    // Seed with the hash of the just-restored output so the
+                    // first persist tick after launch doesn't rewrite an
+                    // identical file.
+                    output_hash_last_saved: ts
+                        .output
+                        .as_deref()
+                        .map_or(0, |s| tab_atelier::crc32(s.as_bytes())),
                 });
             }
             if tabs.is_empty() {
@@ -232,6 +242,7 @@ impl AppState {
                     energy_wh: 0.0,
                     #[cfg(feature = "energy")]
                     energy_wh_last_saved: 0.0,
+                    output_hash_last_saved: 0,
                 });
             }
             let active = saved.active.min(tabs.len() - 1);
@@ -256,6 +267,7 @@ impl AppState {
                     energy_wh: 0.0,
                     #[cfg(feature = "energy")]
                     energy_wh_last_saved: 0.0,
+                    output_hash_last_saved: 0,
                 }],
                 0,
             )
@@ -383,6 +395,7 @@ impl AppState {
             pref_editor_focus,
             hotkey_handle: None,
             last_uptime_save: std::cell::Cell::new(None),
+            last_state_hash: std::cell::Cell::new(0),
         }
     }
 
@@ -421,6 +434,7 @@ impl AppState {
                 energy_wh: 0.0,
                 #[cfg(feature = "energy")]
                 energy_wh_last_saved: 0.0,
+                output_hash_last_saved: 0,
             },
         );
         self.active = idx;
@@ -536,17 +550,28 @@ impl AppState {
             })
             .collect();
 
-        save_state(
-            &platform::config_base_dir(),
-            &SavedState {
-                tabs,
-                active: self.active,
-            },
-        );
-        for (name, output) in outputs {
-            if !output.is_empty() {
-                save_tab_output(&state_base, &name, &output);
+        let saved = SavedState {
+            tabs,
+            active: self.active,
+        };
+        // Skip the write+rotate when the serialized content is identical to
+        // last tick — the common case once the user stops poking the UI.
+        let serialized = serde_json::to_string_pretty(&saved).unwrap_or_default();
+        let new_hash = tab_atelier::crc32(serialized.as_bytes());
+        if new_hash != self.last_state_hash.get() {
+            save_state(&platform::config_base_dir(), &saved);
+            self.last_state_hash.set(new_hash);
+        }
+        for (i, (name, output)) in outputs.into_iter().enumerate() {
+            if output.is_empty() {
+                continue;
             }
+            let h = tab_atelier::crc32(output.as_bytes());
+            if h == self.tabs[i].output_hash_last_saved {
+                continue;
+            }
+            save_tab_output(&state_base, &name, &output);
+            self.tabs[i].output_hash_last_saved = h;
         }
         // Uptime grows ~2s per tick; only flush every 30s to spare writes.
         let should_save_uptime = self
@@ -2553,11 +2578,7 @@ pub fn run() {
 
     info!("starting Tab Atelier v{}", env!("CARGO_PKG_VERSION"));
     Application::new().run(|cx: &mut App| {
-        let prefs = load_preferences_with_legacy(
-            &platform::config_dir(),
-            &platform::config_base_dir(),
-            &platform::state_base_dir(),
-        );
+        let prefs = load_preferences(&platform::config_dir());
         let keycodes: Vec<u8> = if prefs.hotkeys.is_empty() {
             DEFAULT_HOTKEYS.to_vec()
         } else {
