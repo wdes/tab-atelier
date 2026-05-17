@@ -358,6 +358,7 @@ component HostEditor inherits Rectangle {
     in-out property <string> url-text;
     in-out property <string> remote-url-text;
     in-out property <string> token-text;
+    in-out property <string> error;
     callback save(string, string, string, string);
     callback dismiss();
 
@@ -369,7 +370,7 @@ component HostEditor inherits Rectangle {
 
     Rectangle {
         width: min(parent.width * 88%, 480px);
-        height: 440px;
+        height: root.error == "" ? 440px : 472px;
         background: #1c1c1c;
         border-radius: 14px;
         border-width: 1px;
@@ -470,6 +471,13 @@ component HostEditor inherits Rectangle {
                         }
                     }
                 }
+                if root.error != "" : Text {
+                    text: root.error;
+                    color: #ef5350;
+                    font-size: 12px;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
             }
 
             HorizontalLayout {
@@ -525,6 +533,7 @@ component HostPicker inherits Rectangle {
     callback pick(int);
     callback edit(int);
     callback remove(int);
+    callback add();
     callback dismiss();
 
     background: #000000aa;
@@ -579,7 +588,7 @@ component HostPicker inherits Rectangle {
             }
             TouchArea {
                 height: 48px;
-                clicked => { root.dismiss() }
+                clicked => { root.add() }
                 Rectangle {
                     background: parent.has-hover ? #2a2a2a : transparent;
                     border-bottom-left-radius: 14px;
@@ -902,6 +911,7 @@ export component AppWindow inherits Window {
     in-out property <string> editor-url: "";
     in-out property <string> editor-remote-url: "";
     in-out property <string> editor-token: "";
+    in-out property <string> editor-error: "";
     in-out property <string> open-tab-output: "";
     /// -1 = no close confirmation dialog open; >= 0 = index of the tab the
     /// user just hit the X on.
@@ -922,6 +932,7 @@ export component AppWindow inherits Window {
     callback request-close-tab(int);
     callback request-new-tab();
     callback request-rename-tab(int, string);
+    callback request-scan-qr();
     callback request-set-active-host(int);
     callback request-remove-host(int);
     callback open-tab-changed(int);
@@ -976,6 +987,7 @@ export component AppWindow inherits Window {
                 root.editor-url = "";
                 root.editor-remote-url = "";
                 root.editor-token = "";
+                root.editor-error = "";
                 root.editor-open = true;
             }
         }
@@ -1003,6 +1015,39 @@ export component AppWindow inherits Window {
                     font-size: 13px;
                     horizontal-alignment: center;
                     wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    alignment: center;
+                    TouchArea {
+                        width: 200px;
+                        clicked => { root.request-scan-qr() }
+                        Rectangle {
+                            height: 44px;
+                            background: parent.has-hover ? #5599ff : #4a8cff;
+                            border-radius: 8px;
+                            HorizontalLayout {
+                                alignment: center;
+                                spacing: 8px;
+                                // Material qr_code_scanner icon
+                                Path {
+                                    width: 22px;
+                                    height: 22px;
+                                    y: parent.height / 2 - 11px;
+                                    viewbox-width: 24;
+                                    viewbox-height: 24;
+                                    fill: white;
+                                    commands: "M 9.5 6.5 L 9.5 9.5 L 6.5 9.5 L 6.5 6.5 L 9.5 6.5 Z M 11 5 L 5 5 L 5 11 L 11 11 L 11 5 Z M 9.5 14.5 L 9.5 17.5 L 6.5 17.5 L 6.5 14.5 L 9.5 14.5 Z M 11 13 L 5 13 L 5 19 L 11 19 L 11 13 Z M 17.5 6.5 L 17.5 9.5 L 14.5 9.5 L 14.5 6.5 L 17.5 6.5 Z M 19 5 L 13 5 L 13 11 L 19 11 L 19 5 Z M 13 13 L 15 13 L 15 15 L 13 15 L 13 13 Z M 15 15 L 17 15 L 17 17 L 15 17 L 15 15 Z M 17 13 L 19 13 L 19 15 L 17 15 L 17 13 Z M 13 17 L 15 17 L 15 19 L 13 19 L 13 17 Z M 15 19 L 17 19 L 17 21 L 15 21 L 15 19 Z M 17 17 L 19 17 L 19 19 L 17 19 L 17 17 Z";
+                                }
+                                Text {
+                                    text: "Scan QR";
+                                    color: white;
+                                    font-size: 15px;
+                                    font-weight: 700;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1123,6 +1168,7 @@ export component AppWindow inherits Window {
             root.editor-url = root.hosts[i].url;
             root.editor-remote-url = root.hosts[i].remote-url;
             root.editor-token = root.hosts[i].token;
+            root.editor-error = "";
             root.picker-open = false;
             root.editor-open = true;
         }
@@ -1131,6 +1177,16 @@ export component AppWindow inherits Window {
             if (root.hosts.length <= 1) {
                 root.picker-open = false;
             }
+        }
+        add => {
+            root.picker-open = false;
+            root.editor-edit-index = -1;
+            root.editor-name = "";
+            root.editor-url = "";
+            root.editor-remote-url = "";
+            root.editor-token = "";
+            root.editor-error = "";
+            root.editor-open = true;
         }
         dismiss => { root.picker-open = false; }
     }
@@ -1144,12 +1200,18 @@ export component AppWindow inherits Window {
         url-text <=> root.editor-url;
         remote-url-text <=> root.editor-remote-url;
         token-text <=> root.editor-token;
+        error <=> root.editor-error;
         save(n, u, r, t) => {
-            root.editor-open = false;
-            if (root.editor-edit-index >= 0) {
-                root.request-update-host(root.editor-edit-index, n, u, r, t);
+            if (u == "" || t == "") {
+                root.editor-error = "URL and Token are required.";
             } else {
-                root.request-add-host(n, u, r, t);
+                root.editor-error = "";
+                root.editor-open = false;
+                if (root.editor-edit-index >= 0) {
+                    root.request-update-host(root.editor-edit-index, n, u, r, t);
+                } else {
+                    root.request-add-host(n, u, r, t);
+                }
             }
         }
         dismiss => { root.editor-open = false; }
