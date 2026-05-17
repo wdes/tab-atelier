@@ -689,6 +689,15 @@ component TerminalView inherits Rectangle {
     callback send-input();
     callback key-tapped(string);
 
+    // Auto-scroll to bottom whenever the output text grows. Setting
+    // viewport-y to a negative value scrolls the content upwards — the
+    // bottom of output-content lines up with the bottom of the flickable.
+    // A subsequent user scroll-up briefly moves away from the bottom; the
+    // next 2 s poll re-anchors.
+    changed output-text => {
+        flick.viewport-y = min(0px, flick.height - flick.viewport-height);
+    }
+
     background: #0e0e0e;
 
     VerticalLayout {
@@ -757,12 +766,13 @@ component TerminalView inherits Rectangle {
             background: #2a2a2a;
         }
 
-        Rectangle {
+        flick := Flickable {
             vertical-stretch: 1;
-            VerticalLayout {
+            interactive: true;
+            viewport-height: output-content.preferred-height;
+            output-content := VerticalLayout {
                 padding: 10px;
                 spacing: 0;
-                alignment: end;
                 if root.output-text != "" : Text {
                     text: root.output-text;
                     color: #d0d0d0;
