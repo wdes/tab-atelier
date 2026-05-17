@@ -723,6 +723,12 @@ component TerminalView inherits Rectangle {
     changed output-text => {
         flick.viewport-y = min(0px, flick.height - flick.viewport-height);
     }
+    // Same re-anchor whenever the IME shows or hides: the layout shrinks
+    // by `ime-height`, so the previous viewport-y leaves the bottom rows
+    // cut off behind the keyboard.
+    changed ime-height => {
+        flick.viewport-y = min(0px, flick.height - flick.viewport-height);
+    }
 
     background: #0e0e0e;
 
@@ -861,15 +867,32 @@ component TerminalView inherits Rectangle {
 
         KeyboardHeader {
             key-tapped(k) => {
-                if (k == "kbd") {
-                    if (root.ime-height > 0px) {
-                        hide-focus.focus();
-                    } else {
-                        input-field.focus();
-                    }
-                } else {
-                    root.key-tapped(k)
-                }
+                // KBD toggles the IME locally; every other key maps to a
+                // byte sequence sent to the active tab. Keep the mapping
+                // here (instead of bouncing through AppWindow) so each
+                // arm is one statement and Slint doesn't lose any of
+                // them to ambiguous block parsing.
+                if (k == "kbd" && root.ime-height > 0px) { hide-focus.focus(); }
+                if (k == "kbd" && root.ime-height <= 0px) { input-field.focus(); }
+                if (k == "tab")    { root.key-tapped("\u{0009}"); }
+                if (k == "esc")    { root.key-tapped("\u{001b}"); }
+                if (k == "up")     { root.key-tapped("\u{001b}[A"); }
+                if (k == "down")   { root.key-tapped("\u{001b}[B"); }
+                if (k == "right")  { root.key-tapped("\u{001b}[C"); }
+                if (k == "left")   { root.key-tapped("\u{001b}[D"); }
+                if (k == "home")   { root.key-tapped("\u{001b}[H"); }
+                if (k == "end")    { root.key-tapped("\u{001b}[F"); }
+                if (k == "pgup")   { root.key-tapped("\u{001b}[5~"); }
+                if (k == "pgdn")   { root.key-tapped("\u{001b}[6~"); }
+                // Common Ctrl chords for terminal control:
+                // ^C = SIGINT (0x03), ^D = EOF (0x04),
+                // ^L = readline clear-screen (0x0c), ^Z = SIGTSTP (0x1a).
+                if (k == "ctrl-c") { root.key-tapped("\u{0003}"); }
+                if (k == "ctrl-d") { root.key-tapped("\u{0004}"); }
+                if (k == "ctrl-l") { root.key-tapped("\u{000c}"); }
+                if (k == "ctrl-z") { root.key-tapped("\u{001a}"); }
+                if (k == "/")      { root.key-tapped("/"); }
+                if (k == "|")      { root.key-tapped("|"); }
             }
         }
 
@@ -1168,25 +1191,9 @@ export component AppWindow inherits Window {
                 root.input-text = "";
             }
         }
-        key-tapped(k) => {
-            if (k == "tab")    { root.request-send-input(root.open-tab, "\u{0009}"); }
-            if (k == "esc")    { root.request-send-input(root.open-tab, "\u{001b}"); }
-            if (k == "up")     { root.request-send-input(root.open-tab, "\u{001b}[A"); }
-            if (k == "down")   { root.request-send-input(root.open-tab, "\u{001b}[B"); }
-            if (k == "right")  { root.request-send-input(root.open-tab, "\u{001b}[C"); }
-            if (k == "left")   { root.request-send-input(root.open-tab, "\u{001b}[D"); }
-            if (k == "home")   { root.request-send-input(root.open-tab, "\u{001b}[H"); }
-            if (k == "end")    { root.request-send-input(root.open-tab, "\u{001b}[F"); }
-            if (k == "pgup")   { root.request-send-input(root.open-tab, "\u{001b}[5~"); }
-            if (k == "pgdn")   { root.request-send-input(root.open-tab, "\u{001b}[6~"); }
-            // Common Ctrl chords for terminal control:
-            // ^C = SIGINT (0x03), ^D = EOF (0x04), ^L = readline clear-screen
-            // (0x0c), ^Z = SIGTSTP (0x1a).
-            if (k == "ctrl-c") { root.request-send-input(root.open-tab, "\u{0003}"); }
-            if (k == "ctrl-d") { root.request-send-input(root.open-tab, "\u{0004}"); }
-            if (k == "ctrl-l") { root.request-send-input(root.open-tab, "\u{000c}"); }
-            if (k == "ctrl-z") { root.request-send-input(root.open-tab, "\u{001a}"); }
-        }
+        // TerminalView already turns each shortcut button into the
+        // matching byte sequence, so this handler just forwards it.
+        key-tapped(bytes) => { root.request-send-input(root.open-tab, bytes); }
     }
 
     if root.picker-open : HostPicker {
