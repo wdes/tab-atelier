@@ -44,6 +44,11 @@ struct Tab {
     /// per-tab `output_tab-...json` write+rotate when nothing changed
     /// (idle tabs, no new output since last persist tick).
     output_hash_last_saved: u32,
+    /// Saved scrollback that hasn't been fed back into the terminal yet.
+    /// Tabs other than the active one defer this work until first focus
+    /// so cold-launch with many tabs doesn't block on vte-parsing each
+    /// one's entire history up front.
+    pending_restore: Option<String>,
 }
 
 impl Tab {
@@ -54,6 +59,15 @@ impl Tab {
     fn activate(&mut self) {
         if self.last_activated.is_none() {
             self.last_activated = Some(std::time::Instant::now());
+        }
+    }
+
+    /// If this tab had its scrollback restore deferred until first focus,
+    /// feed it through vte now. Cheaper than blocking the cold launch on
+    /// every tab's parser pass.
+    fn flush_pending_restore(&mut self, cx: &mut gpui::App) {
+        if let Some(out) = self.pending_restore.take() {
+            self.view.read(cx).restore_output(&out);
         }
     }
 
@@ -211,10 +225,21 @@ impl AppState {
                     tv.theme = theme_name;
                     tv
                 });
-                if let Some(ref output) = ts.output {
-                    debug!("restoring {} chars of output for '{}'", output.len(), ts.name);
-                    view.read(cx).restore_output(output);
-                }
+                // Defer restore_output for non-active tabs — feeding the
+                // whole scrollback through vte for every tab synchronously
+                // is what makes cold launch slow when there's a lot of
+                // history. The active tab is restored eagerly so the user
+                // sees their last screen the moment the window paints.
+                let is_active = tabs.len() == saved.active;
+                let pending_restore = ts.output.clone().and_then(|output| {
+                    if is_active {
+                        debug!("restoring {} chars of output for '{}'", output.len(), ts.name);
+                        view.read(cx).restore_output(&output);
+                        None
+                    } else {
+                        Some(output)
+                    }
+                });
                 tabs.push(Tab {
                     view,
                     name: ts.name.clone(),
@@ -231,6 +256,7 @@ impl AppState {
                         .output
                         .as_deref()
                         .map_or(0, |s| tab_atelier::crc32(s.as_bytes())),
+                    pending_restore,
                 });
             }
             if tabs.is_empty() {
@@ -252,6 +278,7 @@ impl AppState {
                     #[cfg(feature = "energy")]
                     energy_wh_last_saved: 0.0,
                     output_hash_last_saved: 0,
+                    pending_restore: None,
                 });
             }
             let active = saved.active.min(tabs.len() - 1);
@@ -277,6 +304,7 @@ impl AppState {
                     #[cfg(feature = "energy")]
                     energy_wh_last_saved: 0.0,
                     output_hash_last_saved: 0,
+                    pending_restore: None,
                 }],
                 0,
                 false,
@@ -448,6 +476,7 @@ impl AppState {
                 #[cfg(feature = "energy")]
                 energy_wh_last_saved: 0.0,
                 output_hash_last_saved: 0,
+                pending_restore: None,
             },
         );
         self.active = idx;
@@ -493,6 +522,7 @@ impl AppState {
         }
         if was_active {
             self.tabs[self.active].activate();
+            self.tabs[self.active].flush_pending_restore(cx);
         }
         self.context_menu = None;
         cx.notify();
@@ -659,6 +689,7 @@ impl AppState {
                 self.tabs[self.active].deactivate();
                 self.active = idx;
                 self.tabs[idx].activate();
+                self.tabs[idx].flush_pending_restore(cx);
                 cx.notify();
             }
             for (idx, bytes) in inputs {
@@ -945,6 +976,7 @@ impl AppState {
                                         app.tabs[app.active].deactivate();
                                         app.active = i;
                                         app.tabs[i].activate();
+                                        app.tabs[i].flush_pending_restore(cx);
                                         app.context_menu = None;
                                         app.tabs[app.active].view.read(cx).focus_handle(cx).focus(window);
                                         cx.notify();
@@ -2403,6 +2435,7 @@ impl Render for AppState {
                     this.tabs[this.active].deactivate();
                     this.active = (this.active + 1) % this.tabs.len();
                     this.tabs[this.active].activate();
+                    this.tabs[this.active].flush_pending_restore(cx);
                     this.tabs[this.active].view.read(cx).focus_handle(cx).focus(window);
                     cx.notify();
                 }
