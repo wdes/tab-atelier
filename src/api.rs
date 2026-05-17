@@ -76,6 +76,38 @@ pub fn generate_token() -> String {
     s
 }
 
+/// Load the API token from disk, generating + persisting a fresh one
+/// when none exists yet. Stored next to the TLS cert under
+/// `{state_base}/tab-atelier/api.token` with mode 600. Persisting the
+/// token means already-paired mobile clients keep working across
+/// desktop restarts instead of falling out to 401 every time.
+pub fn load_or_generate_token() -> String {
+    let dir = crate::platform::state_base_dir().join(tab_atelier::APP_DIR);
+    let path = dir.join("api.token");
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let trimmed = existing.trim();
+        // 32 hex chars = 16-byte token. Reject anything shorter or
+        // containing non-hex; a truncated file means we'd rather
+        // regenerate than serve with a half-token attackers could
+        // brute-force.
+        if trimmed.len() == 32 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+            return trimmed.to_string();
+        }
+    }
+    let token = generate_token();
+    if std::fs::create_dir_all(&dir).is_ok() {
+        // Best-effort write; ignore failures so a read-only home
+        // doesn't keep the API server from starting.
+        let _ = std::fs::write(&path, &token);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+    token
+}
+
 pub fn local_ip() -> String {
     std::net::UdpSocket::bind("0.0.0.0:0")
         .and_then(|s| {

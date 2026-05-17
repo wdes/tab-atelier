@@ -106,6 +106,7 @@ component HeaderBar inherits Rectangle {
                             background: root.reachability == "lan" ? #66bb6a
                                 : root.reachability == "remote" ? #ffa726
                                 : root.reachability == "connecting" ? #aaaaaa
+                                : root.reachability == "forbidden" ? #ab47bc
                                 : #ef5350;
                             y: parent.height / 2 - 4px;
                         }
@@ -113,10 +114,12 @@ component HeaderBar inherits Rectangle {
                             text: (root.reachability == "lan" ? "LAN · "
                                 : root.reachability == "remote" ? "Remote · "
                                 : root.reachability == "connecting" ? "Connecting · "
+                                : root.reachability == "forbidden" ? "Token rejected · "
                                 : "Offline · ") + root.detail;
                             color: root.reachability == "lan" ? #66bb6a
                                 : root.reachability == "remote" ? #ffa726
                                 : root.reachability == "connecting" ? #aaaaaa
+                                : root.reachability == "forbidden" ? #ab47bc
                                 : #ef5350;
                             font-size: 12px;
                             vertical-alignment: center;
