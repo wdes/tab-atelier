@@ -430,15 +430,21 @@ pub fn serve(
     }
 }
 
-pub fn start_api_server(state: Arc<Mutex<TabSnapshot>>, token: String, read_only: bool) {
+pub fn start_api_server(
+    state: Arc<Mutex<TabSnapshot>>,
+    token: String,
+    read_only: bool,
+    port: u16,
+) {
     std::thread::spawn(move || {
-        let listener = match TcpListener::bind("0.0.0.0:7890") {
+        let addr = format!("0.0.0.0:{port}");
+        let listener = match TcpListener::bind(&addr) {
             Ok(l) => {
-                info!("API: listening on 0.0.0.0:7890");
+                info!("API: listening on {addr}");
                 l
             }
             Err(e) => {
-                error!("API: failed to bind :7890: {e}");
+                error!("API: failed to bind {addr}: {e}");
                 return;
             }
         };
@@ -454,7 +460,12 @@ pub fn start_api_server(state: Arc<Mutex<TabSnapshot>>, token: String, read_only
 /// validate via either. Pin-on-first-use clients (the Android remote) can
 /// trust the cert directly; browsers will warn until added to their
 /// trust store — fine for personal use.
-pub fn start_api_server_tls(state: Arc<Mutex<TabSnapshot>>, token: String, read_only: bool) {
+pub fn start_api_server_tls(
+    state: Arc<Mutex<TabSnapshot>>,
+    token: String,
+    read_only: bool,
+    port: u16,
+) {
     use rustls::ServerConfig;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
@@ -480,13 +491,14 @@ pub fn start_api_server_tls(state: Arc<Mutex<TabSnapshot>>, token: String, read_
     };
 
     std::thread::spawn(move || {
-        let listener = match TcpListener::bind("0.0.0.0:7891") {
+        let addr = format!("0.0.0.0:{port}");
+        let listener = match TcpListener::bind(&addr) {
             Ok(l) => {
-                info!("API: TLS listening on 0.0.0.0:7891");
+                info!("API: TLS listening on {addr}");
                 l
             }
             Err(e) => {
-                error!("API: failed to bind :7891: {e}");
+                error!("API: failed to bind {addr}: {e}");
                 return;
             }
         };

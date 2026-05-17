@@ -352,7 +352,15 @@ pub struct Preferences {
     pub browser: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_editor: Option<String>,
+    /// HTTP API listener port. Defaults to 7890 when absent; exposed as
+    /// a preference so users who already have something on that port,
+    /// or who want a different one across machines, can change it
+    /// without recompiling. TLS listener uses `api_port + 1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_port: Option<u16>,
 }
+
+pub const DEFAULT_API_PORT: u16 = 7890;
 
 fn deserialize_hotkeys<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
     let raw: Vec<serde_json::Value> = serde::Deserialize::deserialize(deserializer)?;

@@ -149,6 +149,10 @@ struct AppState {
     font_config: FontConfig,
     tracker: Option<WakatimeTracker>,
     api_token: String,
+    /// HTTP API port (TLS uses port + 1). Sourced from the saved
+    /// preference at startup; live changes require a restart since the
+    /// `TcpListener`s are bound in spawned threads.
+    api_port: u16,
     api_state: Arc<Mutex<api::TabSnapshot>>,
     #[cfg(feature = "energy")]
     power_pids: Arc<Mutex<Vec<u32>>>,
@@ -172,6 +176,11 @@ struct AppState {
     pref_browser_focus: FocusHandle,
     pref_editor_text: String,
     pref_editor_focus: FocusHandle,
+    /// Editable copy of `api_port` shown in the preferences dialog.
+    /// Persisted to `api_port` only on Save and applied on next launch
+    /// (the API listener threads bind once at startup).
+    pref_api_port_text: String,
+    pref_api_port_focus: FocusHandle,
     hotkey_handle: Option<platform::HotkeyHandle>,
     /// When the per-tab uptime files were last written. Persisting uptime
     /// every 2s would burn through disk writes for a value that only
@@ -196,6 +205,7 @@ impl AppState {
         let hotkey_picker_focus = cx.focus_handle();
         let pref_browser_focus = cx.focus_handle();
         let pref_editor_focus = cx.focus_handle();
+        let pref_api_port_focus = cx.focus_handle();
         let font_config = load_font_config(&platform::config_dir());
         let prefs = load_preferences(&platform::config_dir());
         let browser: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(prefs.browser.clone()));
@@ -394,7 +404,8 @@ impl AppState {
         });
 
         let api_token = api::generate_token();
-        info!("API server starting on 0.0.0.0:7890");
+        let api_port = prefs.api_port.unwrap_or(tab_atelier::DEFAULT_API_PORT);
+        info!("API server starting on 0.0.0.0:{api_port}");
         let api_state = Arc::new(Mutex::new(api::TabSnapshot {
             tabs: Vec::<api::SnapshotTab>::new(),
             active: 0,
@@ -407,8 +418,8 @@ impl AppState {
             pending_renames: Vec::new(),
         }));
         let api_read_only = crate::read_only();
-        api::start_api_server(api_state.clone(), api_token.clone(), api_read_only);
-        api::start_api_server_tls(api_state.clone(), api_token.clone(), api_read_only);
+        api::start_api_server(api_state.clone(), api_token.clone(), api_read_only, api_port);
+        api::start_api_server_tls(api_state.clone(), api_token.clone(), api_read_only, api_port + 1);
 
         #[cfg(feature = "energy")]
         let power_pids: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
@@ -434,6 +445,7 @@ impl AppState {
             font_config,
             tracker,
             api_token,
+            api_port,
             api_state,
             #[cfg(feature = "energy")]
             power_pids,
@@ -457,6 +469,8 @@ impl AppState {
             pref_browser_focus,
             pref_editor_text: String::new(),
             pref_editor_focus,
+            pref_api_port_text: String::new(),
+            pref_api_port_focus,
             hotkey_handle: None,
             last_uptime_save: std::cell::Cell::new(None),
             last_state_hash: std::cell::Cell::new(0),
@@ -1472,6 +1486,7 @@ impl AppState {
                         cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
                             this.pref_browser_text = this.browser.borrow().clone().unwrap_or_default();
                             this.pref_editor_text = this.code_editor.borrow().clone().unwrap_or_default();
+                            this.pref_api_port_text = this.api_port.to_string();
                             this.show_preferences = true;
                             this.context_menu = None;
                             cx.notify();
@@ -1827,8 +1842,8 @@ impl AppState {
         // than whatever IPs were live when the process started.
         let ips = api::local_ips_all();
         let primary_ip = ips.first().cloned().unwrap_or_else(|| "127.0.0.1".into());
-        let lan_url = format!("http://{primary_ip}:7890");
-        let lan_url_tls = format!("https://{primary_ip}:7891");
+        let lan_url = format!("http://{primary_ip}:{}", self.api_port);
+        let lan_url_tls = format!("https://{primary_ip}:{}", self.api_port + 1);
         // Pass both the plain-HTTP and TLS URLs into the deep link; the
         // mobile client picks whichever its current build supports.
         let qr_payload = format!(
@@ -1943,7 +1958,7 @@ impl AppState {
                                 list = list.child(
                                     div()
                                         .text_color(link_fg)
-                                        .child(format!("http://{ip}:7890")),
+                                        .child(format!("http://{ip}:{}", self.api_port)),
                                 );
                             }
                             el.child(list)
@@ -2178,6 +2193,61 @@ impl AppState {
                     .child(div().w(px(1.0)).h(px(16.0)).bg(cursor_color))
             });
 
+        let api_port_text = self.pref_api_port_text.clone();
+        let api_port_input = div()
+            .id("pref-api-port-input")
+            .key_context("pref-api-port")
+            .track_focus(&self.pref_api_port_focus)
+            .mt(px(8.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .bg(th.bg_hsla())
+            .border_1()
+            .border_color(input_border)
+            .rounded(px(3.0))
+            .px(px(8.0))
+            .py(px(4.0))
+            .min_h(px(28.0))
+            .cursor_text()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _ev: &MouseDownEvent, window, cx| {
+                    this.pref_api_port_focus.focus(window);
+                    cx.notify();
+                }),
+            )
+            .on_key_down(
+                cx.listener(|this, ev: &KeyDownEvent, _window, cx| match ev.keystroke.key.as_str() {
+                    "backspace" => {
+                        this.pref_api_port_text.pop();
+                        cx.notify();
+                    }
+                    _ => {
+                        // Numeric only so the parsed `u16` on Save can't
+                        // silently drop junk the user typed.
+                        if let Some(ref ch) = ev.keystroke.key_char
+                            && ch.chars().all(|c| c.is_ascii_digit())
+                            && this.pref_api_port_text.len() < 5
+                        {
+                            this.pref_api_port_text.push_str(ch);
+                            cx.notify();
+                        }
+                    }
+                }),
+            )
+            .when(api_port_text.is_empty(), |el| {
+                el.child(
+                    div()
+                        .text_color(placeholder_fg)
+                        .child(tab_atelier::DEFAULT_API_PORT.to_string()),
+                )
+            })
+            .when(!api_port_text.is_empty(), |el| {
+                el.child(api_port_text)
+                    .child(div().w(px(1.0)).h(px(16.0)).bg(cursor_color))
+            });
+
         let editor_text = self.pref_editor_text.clone();
         let editor_input = div()
             .id("pref-editor-input")
@@ -2256,6 +2326,7 @@ impl AppState {
                         .child(div().mt(px(16.0)).child(t.language).child(lang_options))
                         .child(div().mt(px(16.0)).child(t.browser).child(browser_input))
                         .child(div().mt(px(16.0)).child(t.code_editor).child(editor_input))
+                        .child(div().mt(px(16.0)).child(t.api_port).child(api_port_input))
                         .child(
                             div()
                                 .mt(px(20.0))
@@ -2321,6 +2392,18 @@ impl AppState {
                                                     };
                                                     (*this.browser.borrow_mut()).clone_from(&browser);
                                                     (*this.code_editor.borrow_mut()).clone_from(&editor);
+                                                    // Parse the port field. Anything
+                                                    // that fails sanity-checks (empty,
+                                                    // non-numeric, > 65534) falls back
+                                                    // to whatever was already loaded.
+                                                    let parsed_port = this
+                                                        .pref_api_port_text
+                                                        .parse::<u16>()
+                                                        .ok()
+                                                        .filter(|&p| p > 0 && p < u16::MAX);
+                                                    if let Some(p) = parsed_port {
+                                                        this.api_port = p;
+                                                    }
                                                     save_preferences(
                                                         &platform::config_dir(),
                                                         &Preferences {
@@ -2330,6 +2413,7 @@ impl AppState {
                                                             hotkeys: this.hotkeys.clone(),
                                                             browser,
                                                             code_editor: editor,
+                                                            api_port: Some(this.api_port),
                                                         },
                                                     );
                                                     if let Some(ref handle) = this.hotkey_handle {
