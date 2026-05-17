@@ -30,6 +30,7 @@ slint-build = "1"
 package = "fr.wdes.tab_atelier"
 build_targets = ["aarch64-linux-android"]
 apk_name = "ta-remote"
+resources = "res"
 
 [package.metadata.android.sdk]
 min_sdk_version = 23
@@ -44,6 +45,7 @@ name = "android.permission.INTERNET"
 
 [package.metadata.android.application]
 label = "Tab Atelier Remote"
+icon = "@mipmap/ic_launcher"
 
 [[package.metadata.android.application.activity]]
 name = "android.app.NativeActivity"
