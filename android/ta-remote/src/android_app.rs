@@ -225,6 +225,22 @@ fn post_input(agent: &ureq::Agent, host: &HostConfig, reach: &Reach, idx: i32, b
     }
 }
 
+fn delete_tab(agent: &ureq::Agent, host: &HostConfig, reach: &Reach, idx: i32) {
+    let base = base_url(host, reach);
+    if base.is_empty() {
+        return;
+    }
+    let url = format!("{base}/tabs/{idx}");
+    if let Err(e) = agent
+        .delete(&url)
+        .set("Authorization", &format!("Bearer {}", host.token))
+        .timeout(Duration::from_secs(2))
+        .call()
+    {
+        log::warn!("delete_tab failed: {e}");
+    }
+}
+
 fn post_activate(agent: &ureq::Agent, host: &HostConfig, reach: &Reach, idx: i32) {
     let base = base_url(host, reach);
     if base.is_empty() {
@@ -399,6 +415,16 @@ pub fn android_main(app: slint::android::AndroidApp) {
         let agent = send_agent.clone();
         let bytes = text.as_bytes().to_vec();
         std::thread::spawn(move || post_input(&agent, &host, &reach, idx, &bytes));
+    });
+
+    let close_agent = agent.clone();
+    let close_data = data.clone();
+    let close_reach = last_reach.clone();
+    ui.on_request_close_tab(move |idx| {
+        let Some(host) = close_data.lock().unwrap().active_host() else { return };
+        let reach = *close_reach.lock().unwrap();
+        let agent = close_agent.clone();
+        std::thread::spawn(move || delete_tab(&agent, &host, &reach, idx));
     });
 
     let open_tab_for_cb = open_tab.clone();
