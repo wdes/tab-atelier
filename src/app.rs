@@ -385,6 +385,7 @@ impl AppState {
             pending_activate: None,
             pending_input: Vec::new(),
             pending_new_tabs: 0,
+            pending_renames: Vec::new(),
         }));
         api::start_api_server(api_state.clone(), api_token.clone());
 
@@ -675,7 +676,11 @@ impl AppState {
             let mut closes: Vec<usize> = snapshot.pending_closes.drain(..).collect();
             let activate = snapshot.pending_activate.take();
             let inputs: Vec<(usize, Vec<u8>)> = snapshot.pending_input.drain(..).collect();
+            let renames: Vec<(usize, String)> = snapshot.pending_renames.drain(..).collect();
             drop(snapshot);
+            for (idx, name) in renames {
+                self.rename_tab(idx, name);
+            }
             closes.sort_unstable();
             closes.dedup();
             for idx in closes.into_iter().rev() {
@@ -761,6 +766,39 @@ impl AppState {
         self.exit_confirm = None;
         self.tabs[self.active].view.read(cx).focus_handle(cx).focus(window);
         cx.notify();
+    }
+
+    /// Rename a tab in place, moving the per-tab output/uptime/power files
+    /// across so history sticks to the tab through the rename. No-op for
+    /// out-of-range index or when the name doesn't change.
+    fn rename_tab(&mut self, idx: usize, new_name: String) {
+        if idx >= self.tabs.len() {
+            return;
+        }
+        let old_name = self.tabs[idx].name.clone();
+        if old_name == new_name {
+            return;
+        }
+        if !crate::read_only() {
+            let base = platform::state_base_dir();
+            for resolver in [
+                tab_atelier::tab_output_path
+                    as fn(&std::path::Path, &str) -> std::path::PathBuf,
+                tab_atelier::tab_uptime_path,
+                tab_atelier::tab_power_path,
+            ] {
+                let old_path = resolver(&base, &old_name);
+                let new_path = resolver(&base, &new_name);
+                if old_path.exists() {
+                    let _ = std::fs::rename(&old_path, &new_path);
+                    let _ = std::fs::rename(
+                        old_path.with_extension("json.bak"),
+                        new_path.with_extension("json.bak"),
+                    );
+                }
+            }
+        }
+        self.tabs[idx].name = new_name;
     }
 
     fn close_all_tabs(&mut self, cx: &mut Context<Self>) {
@@ -1462,30 +1500,7 @@ impl AppState {
                                     if let Some((i, ref text)) = this.renaming
                                         && i < this.tabs.len()
                                     {
-                                        let old_name = this.tabs[i].name.clone();
-                                        let new_name = text.clone();
-                                        if old_name != new_name && !crate::read_only() {
-                                            // Move per-tab files across so we don't orphan
-                                            // history or uptime when the user renames a tab.
-                                            let base = platform::state_base_dir();
-                                            for resolver in [
-                                                tab_atelier::tab_output_path
-                                                    as fn(&std::path::Path, &str) -> std::path::PathBuf,
-                                                tab_atelier::tab_uptime_path,
-                                                tab_atelier::tab_power_path,
-                                            ] {
-                                                let old_path = resolver(&base, &old_name);
-                                                let new_path = resolver(&base, &new_name);
-                                                if old_path.exists() {
-                                                    let _ = std::fs::rename(&old_path, &new_path);
-                                                    let _ = std::fs::rename(
-                                                        old_path.with_extension("json.bak"),
-                                                        new_path.with_extension("json.bak"),
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        this.tabs[i].name = new_name;
+                                        this.rename_tab(i, text.clone());
                                     }
                                     this.renaming = None;
                                     this.rename_select_all = false;
