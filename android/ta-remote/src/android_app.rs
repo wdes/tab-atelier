@@ -475,5 +475,30 @@ pub fn android_main(app: slint::android::AndroidApp) {
         push_hosts(&add_weak, &data);
     });
 
+    let upd_data = data.clone();
+    let upd_weak = ui_weak.clone();
+    ui.on_request_update_host(move |idx, name, url, remote_url, token| {
+        let idx = idx as usize;
+        let url = url.trim_end_matches('/').to_string();
+        let remote_url = remote_url.trim_end_matches('/').to_string();
+        let token = token.to_string();
+        if url.is_empty() || token.is_empty() {
+            return;
+        }
+        let name = {
+            let name = name.to_string();
+            if name.is_empty() { host_detail(&url) } else { name }
+        };
+        let mut data = upd_data.lock().unwrap();
+        if let Some(h) = data.hosts.get_mut(idx) {
+            h.name = name;
+            h.url = url;
+            h.remote_url = remote_url;
+            h.token = token;
+            data.save();
+            push_hosts(&upd_weak, &data);
+        }
+    });
+
     ui.run().unwrap();
 }
