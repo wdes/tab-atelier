@@ -1,14 +1,16 @@
 Bundled font attributions
 =========================
 
-DejaVuSansMono.ttf
-------------------
-Source: DejaVu Fonts project (https://dejavu-fonts.github.io/)
-License: Bitstream Vera Fonts License + DejaVu Fonts public license
-         (free for any use, including embedding and redistribution).
-Why bundled: Android's default `monospace` alias resolves to a font
-without Latin Extended / Cyrillic / Greek glyphs needed in shell
-output (accented filenames, prompts, etc.).
+FreeMono.ttf
+------------
+Source: GNU FreeFont project (https://www.gnu.org/software/freefont/)
+License: GNU GPL v3 with font embedding exception (free for any use,
+         including embedding in proprietary documents/apps).
+Why bundled: Android's default `monospace` alias has neither
+Latin Extended, Cyrillic / Greek, nor the Miscellaneous Technical
+block (U+2300–U+23FF). FreeMono covers all of these, including
+glyphs like ⏵, ⏴, ⎿ used by modern TUIs (Claude Code, Crush, etc.).
+DejaVu Sans Mono was tried first but lacks the U+23xx range.
 
 NotoEmoji.ttf
 -------------

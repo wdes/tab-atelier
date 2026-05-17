@@ -1,10 +1,10 @@
 // Bundle a monospace font with broad Unicode coverage plus a monochrome
 // emoji font, since Android's "monospace" alias (DroidSans/RobotoMono)
 // has neither extended Latin nor pictographs — emojis show as tofu and
-// accented chars in tab previews/output go missing. Slint registers both
-// at compile time; fontique then resolves codepoints by trying the
-// requested family first and falling back across the registered fonts.
-import "../fonts/DejaVuSansMono.ttf";
+// accented chars in tab previews/output go missing. FreeMono covers the
+// Miscellaneous Technical block (U+23xx) used by TUIs like Claude Code
+// for double-arrows and tree connectors that DejaVu Sans Mono lacks.
+import "../fonts/FreeMono.ttf";
 import "../fonts/NotoEmoji.ttf";
 
 struct TabRow {
@@ -188,7 +188,7 @@ component TabCard inherits Rectangle {
                         text: tab.preview;
                         color: #6b8caf;
                         font-size: 11px;
-                        font-family: "DejaVu Sans Mono";
+                        font-family: "FreeMono";
                         overflow: elide;
                     }
                 }
@@ -841,21 +841,36 @@ component TerminalView inherits Rectangle {
                 if root.output-text != "" : Text {
                     text: root.output-text;
                     color: #d0d0d0;
-                    font-family: "DejaVu Sans Mono";
+                    font-family: "FreeMono";
                     font-size: root.font-size;
                     wrap: no-wrap;
                 }
                 if root.output-text == "" : Text {
                     text: "Waiting for output…";
                     color: #666;
-                    font-family: "DejaVu Sans Mono";
+                    font-family: "FreeMono";
                     font-size: root.font-size;
                 }
             }
         }
 
+        // Sink FocusScope used to dismiss the IME — focusing a non-text
+        // item makes Slint drop TextInputInterface.text-input-focused
+        // which the Android backend wires to InputMethodManager.hide(...).
+        hide-focus := FocusScope { width: 0; height: 0; }
+
         KeyboardHeader {
-            key-tapped(k) => { root.key-tapped(k) }
+            key-tapped(k) => {
+                if (k == "kbd") {
+                    if (root.ime-height > 0px) {
+                        hide-focus.focus();
+                    } else {
+                        input-field.focus();
+                    }
+                } else {
+                    root.key-tapped(k)
+                }
+            }
         }
 
         Rectangle {
@@ -877,10 +892,10 @@ component TerminalView inherits Rectangle {
                     HorizontalLayout {
                         padding-left: 8px;
                         padding-right: 8px;
-                        TextInput {
+                        input-field := TextInput {
                             text <=> root.input-text;
                             color: #e0e0e0;
-                            font-family: "DejaVu Sans Mono";
+                            font-family: "FreeMono";
                             font-size: root.font-size + 1px;
                             single-line: true;
                             vertical-alignment: center;
@@ -1405,7 +1420,7 @@ export component AppWindow inherits Window {
                         color: #f0f0f0;
                         font-size: 15px;
                         font-weight: 600;
-                        font-family: "DejaVu Sans Mono";
+                        font-family: "FreeMono";
                         horizontal-alignment: center;
                         overflow: elide;
                     }
