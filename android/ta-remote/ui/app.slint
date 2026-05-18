@@ -802,6 +802,10 @@ component TerminalView inherits Rectangle {
     in property <length> safe-right;
     in property <length> ime-height;
     in-out property <length> font-size: 13px;
+    // Host-reported cursor position (logical row + column). -1 hides
+    // the cursor; otherwise it's drawn at that exact spot.
+    in property <int> cursor-row: -1;
+    in property <int> cursor-col: -1;
     // Transient buffer fed by the hidden TextInput. Always empty
     // outside of an in-flight `edited` flush.
     in-out property <string> capture-buffer: "";
@@ -988,25 +992,19 @@ component TerminalView inherits Rectangle {
                         font-weight: span.bold ? 700 : 400;
                         wrap: no-wrap;
                     }
-                    // Pseudo-cursor: a Rectangle (rather than a Text
-                    // with "█") because the text-content gating
-                    // apparently didn't re-render reactively on
-                    // device. Width/height are tied to the font size
-                    // so it scales with A−/A+, and background is
-                    // driven by the blink toggle. Only the last line
-                    // gets a non-zero width; every other line renders
-                    // a 0-width Rectangle so the layout stays
-                    // consistent.
-                    Rectangle {
-                        width: i == root.output-lines.length - 1
-                            ? root.font-size * 0.6
-                            : 0px;
-                        height: root.font-size * 1.1;
-                        background: i == root.output-lines.length - 1 && root._cursor_blink
-                            ? #d0d0d0
-                            : transparent;
-                    }
                 }
+            }
+            // Cursor overlay — positioned at the host-reported
+            // (cursor-row, cursor-col) in logical-line coordinates.
+            // FreeMono is monospace so glyph advance ≈ font-size×0.6;
+            // line height ≈ font-size×1.2. Sits inside the Flickable
+            // so it scrolls with the content.
+            if root.cursor-row >= 0 : Rectangle {
+                x: 10px + root.cursor-col * (root.font-size * 0.6);
+                y: 10px + root.cursor-row * (root.font-size * 1.2);
+                width: root.font-size * 0.6;
+                height: root.font-size * 1.1;
+                background: root._cursor_blink ? #d0d0d0 : transparent;
             }
         }
 
@@ -1084,6 +1082,10 @@ export component AppWindow inherits Window {
     in-out property <string> editor-token: "";
     in-out property <string> editor-error: "";
     in-out property <[ColorLine]> open-tab-output-lines: [];
+    /// Cursor position the host reports for the currently-open tab,
+    /// in logical-line coordinates (row, col). -1 = unknown / hide.
+    in-out property <int> cursor-row: -1;
+    in-out property <int> cursor-col: -1;
     /// -1 = no close confirmation dialog open; >= 0 = index of the tab the
     /// user just hit the X on.
     in-out property <int> close-confirm-idx: -1;
@@ -1310,6 +1312,8 @@ export component AppWindow inherits Window {
         height: 100%;
         tab: root.tabs[root.open-tab];
         output-lines: root.open-tab-output-lines;
+        cursor-row: root.cursor-row;
+        cursor-col: root.cursor-col;
         safe-top: root.safe-area-insets.top;
         safe-bottom: root.safe-area-insets.bottom;
         safe-left: root.safe-area-insets.left;

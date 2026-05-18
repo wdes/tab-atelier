@@ -615,14 +615,19 @@ impl AppState {
             .tabs
             .iter()
             .zip(tabs.iter())
-            .map(|(tab, ts)| api::SnapshotTab {
-                name: ts.name.clone(),
-                cwd: ts.cwd.clone(),
-                // Cache 200 lines so remote clients can request scrollback.
-                // ANSI escapes are kept so the mobile remote can render
-                // colours instead of the previous flat-grey text.
-                output: tab.view.read(cx).ansi_text(Some(200)),
-                uptime_secs: tab.uptime().as_secs_f64(),
+            .map(|(tab, ts)| {
+                let (output, cursor) =
+                    tab.view.read(cx).ansi_text_with_cursor(Some(200));
+                api::SnapshotTab {
+                    name: ts.name.clone(),
+                    cwd: ts.cwd.clone(),
+                    // Cache 200 lines so remote clients can request scrollback.
+                    // ANSI escapes are kept so the mobile remote can render
+                    // colours instead of the previous flat-grey text.
+                    output,
+                    uptime_secs: tab.uptime().as_secs_f64(),
+                    cursor,
+                }
             })
             .collect();
 

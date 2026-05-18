@@ -402,26 +402,37 @@ impl TerminalView {
 
     #[allow(clippy::significant_drop_tightening)]
     pub fn copy_all_history(&self) -> String {
-        self.ansi_lines(None).join("\n")
+        self.ansi_lines(None).0.join("\n")
     }
 
     /// Same view as `plain_text` but with SGR escape sequences preserved
     /// per fg/bg/flags change, so a remote client can render colours.
     /// `max_lines` caps the result to the last N lines (visible screen
     /// plus scrollback) — pass `None` to dump the full history.
-    pub fn ansi_text(&self, max_lines: Option<usize>) -> String {
-        self.ansi_lines(max_lines).join("\n")
+    /// Same as `ansi_text` but also returns the cursor's position in
+    /// the *logical* line space (i.e. after wrapped rows have been
+    /// joined). Returns None when the cursor is in scrollback or
+    /// outside the requested window. Used by the mobile remote to
+    /// render the cursor at the right (row, col).
+    pub fn ansi_text_with_cursor(
+        &self,
+        max_lines: Option<usize>,
+    ) -> (String, Option<(usize, usize)>) {
+        let (lines, cursor) = self.ansi_lines(max_lines);
+        (lines.join("\n"), cursor)
     }
 
     #[allow(clippy::significant_drop_tightening)]
-    fn ansi_lines(&self, max_lines: Option<usize>) -> Vec<String> {
+    fn ansi_lines(&self, max_lines: Option<usize>) -> (Vec<String>, Option<(usize, usize)>) {
         use std::fmt::Write;
-        let lines = {
+        let (lines, cursor_logical) = {
             let t = self.term.lock();
             let grid = t.grid();
             let cols = grid.columns();
             let history = grid.history_size();
             let screen = grid.screen_lines();
+            let cursor_grid_row = grid.cursor.point.line.0;
+            let cursor_grid_col = grid.cursor.point.column.0;
 
             let default_fg = Color::Named(NamedColor::Foreground);
             let default_bg = Color::Named(NamedColor::Background);
@@ -429,6 +440,7 @@ impl TerminalView {
             let mut cur_bg = default_bg;
             let mut cur_flags = CellFlags::empty();
             let mut lines: Vec<String> = Vec::new();
+            let mut cursor_logical: Option<(usize, usize)> = None;
 
             // Visible screen + scrollback, optionally clipped to the last
             // `max_lines` rows so the API doesn't have to ship the entire
@@ -442,6 +454,11 @@ impl TerminalView {
             // logical line lets long URLs survive the trip to the
             // mobile remote without being chopped in half.
             let mut continues_prev = false;
+            // Column offset within the *current* logical line that any
+            // continuation row would inherit. After joining, the cursor's
+            // column in logical-line coordinates is `prefix_cols +
+            // cursor_grid_col`.
+            let mut prefix_cols: usize = 0;
             for row in start_row..screen as i32 {
                 let last_cell_wraps = grid[GridPoint::new(Line(row), Column(cols - 1))]
                     .flags
@@ -535,29 +552,59 @@ impl TerminalView {
                 } else {
                     line.trim_end().to_string()
                 };
+                // Capture cursor logical position BEFORE we push the
+                // row — `lines.len()` then refers to the index this
+                // row will occupy (or extend).
+                if row == cursor_grid_row {
+                    let logical_idx = if continues_prev {
+                        lines.len().saturating_sub(1)
+                    } else {
+                        lines.len()
+                    };
+                    cursor_logical = Some((logical_idx, prefix_cols + cursor_grid_col as usize));
+                }
                 if continues_prev {
                     if let Some(prev) = lines.last_mut() {
                         prev.push_str(&row_text);
                     } else {
                         lines.push(row_text);
                     }
+                    prefix_cols += cols;
                 } else {
                     lines.push(row_text);
+                    prefix_cols = if last_cell_wraps { cols } else { 0 };
                 }
                 continues_prev = last_cell_wraps;
             }
-            lines
+            (lines, cursor_logical)
         };
         // Lock released.
 
         let mut lines = lines;
+        let mut cursor = cursor_logical;
+        let mut leading_trimmed = 0usize;
         while lines.first().is_some_and(std::string::String::is_empty) {
             lines.remove(0);
+            leading_trimmed += 1;
+        }
+        // Adjust the cursor's row for any blank lines we trimmed off
+        // the top so it still indexes into the emitted lines vector.
+        if let Some((r, c)) = cursor {
+            cursor = if r >= leading_trimmed {
+                Some((r - leading_trimmed, c))
+            } else {
+                None
+            };
         }
         while lines.last().is_some_and(std::string::String::is_empty) {
             lines.pop();
         }
-        lines
+        if let Some((r, _)) = cursor
+            && r >= lines.len()
+        {
+            cursor = None;
+        }
+        (lines, cursor)
     }
 
     fn url_at_grid(&self, line: usize, col: usize) -> Option<DetectedUrl> {
