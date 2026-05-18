@@ -221,12 +221,7 @@ fn error_json<W: Write>(stream: &mut W, status: u16, msg: &str) {
     respond_json(stream, status, &body);
 }
 
-fn handle_connection<S: Read + Write>(
-    stream: &mut S,
-    state: &Arc<Mutex<TabSnapshot>>,
-    token: &str,
-    read_only: bool,
-) {
+fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnapshot>>, token: &str, read_only: bool) {
     // Owned BufReader around the stream itself — `try_clone` was only used
     // to dodge the read/write borrow on TcpStream, but it doesn't exist on
     // rustls::Stream. Buffering on `&mut S` works for both, and the read
@@ -325,13 +320,7 @@ fn handle_connection<S: Read + Write>(
                     // remote-side colouring, but the tab-list preview is
                     // rendered as plain Text — strip them first so the
                     // ESC byte and `[…m` payload don't show up as junk.
-                    preview: strip_ansi(
-                        t.output
-                            .lines()
-                            .rev()
-                            .find(|l| !l.trim().is_empty())
-                            .unwrap_or(""),
-                    ),
+                    preview: strip_ansi(t.output.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("")),
                     uptime_secs: t.uptime_secs,
                     #[cfg(feature = "energy")]
                     cpu_percent: state.power.get(i).map_or(0.0, |p| p.cpu_percent),
@@ -353,7 +342,11 @@ fn handle_connection<S: Read + Write>(
             #[cfg(not(feature = "energy"))]
             let host = HostInfo::default();
             drop(state);
-            let resp = ApiResponse { app: USER_AGENT, host, tabs };
+            let resp = ApiResponse {
+                app: USER_AGENT,
+                host,
+                tabs,
+            };
             let body = serde_json::to_string_pretty(&resp).unwrap_or_default();
             respond_json(stream, 200, &body);
         }
@@ -427,7 +420,8 @@ fn handle_connection<S: Read + Write>(
                     info!("API: renaming tab {idx} to {new_name}");
                     state.pending_renames.push((idx, new_name.clone()));
                     drop(state);
-                    let body = serde_json::to_string(&serde_json::json!({"renamed": idx, "name": new_name})).unwrap_or_default();
+                    let body = serde_json::to_string(&serde_json::json!({"renamed": idx, "name": new_name}))
+                        .unwrap_or_default();
                     respond_json(stream, 200, &body);
                 } else {
                     error_json(stream, 404, "tab index out of range");
@@ -483,24 +477,14 @@ fn handle_connection<S: Read + Write>(
     }
 }
 
-pub fn serve(
-    listener: &TcpListener,
-    state: &Arc<Mutex<TabSnapshot>>,
-    token: &str,
-    read_only: bool,
-) {
+pub fn serve(listener: &TcpListener, state: &Arc<Mutex<TabSnapshot>>, token: &str, read_only: bool) {
     for stream in listener.incoming() {
         let Ok(mut stream) = stream else { continue };
         handle_connection(&mut stream, state, token, read_only);
     }
 }
 
-pub fn start_api_server(
-    state: Arc<Mutex<TabSnapshot>>,
-    token: String,
-    read_only: bool,
-    port: u16,
-) {
+pub fn start_api_server(state: Arc<Mutex<TabSnapshot>>, token: String, read_only: bool, port: u16) {
     std::thread::spawn(move || {
         let addr = format!("0.0.0.0:{port}");
         let listener = match TcpListener::bind(&addr) {
@@ -525,12 +509,7 @@ pub fn start_api_server(
 /// validate via either. Pin-on-first-use clients (the Android remote) can
 /// trust the cert directly; browsers will warn until added to their
 /// trust store — fine for personal use.
-pub fn start_api_server_tls(
-    state: Arc<Mutex<TabSnapshot>>,
-    token: String,
-    read_only: bool,
-    port: u16,
-) {
+pub fn start_api_server_tls(state: Arc<Mutex<TabSnapshot>>, token: String, read_only: bool, port: u16) {
     use rustls::ServerConfig;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
@@ -542,12 +521,12 @@ pub fn start_api_server_tls(
         }
     };
 
-    let cfg = match ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(
-            vec![CertificateDer::from(cert_der)],
-            PrivateKeyDer::try_from(key_der).map_err(std::string::ToString::to_string).unwrap(),
-        ) {
+    let cfg = match ServerConfig::builder().with_no_client_auth().with_single_cert(
+        vec![CertificateDer::from(cert_der)],
+        PrivateKeyDer::try_from(key_der)
+            .map_err(std::string::ToString::to_string)
+            .unwrap(),
+    ) {
         Ok(c) => Arc::new(c),
         Err(e) => {
             error!("API/TLS: rustls config build failed: {e}");
@@ -604,17 +583,11 @@ fn load_or_generate_cert() -> std::io::Result<(Vec<u8>, Vec<u8>)> {
     }
 
     info!("API/TLS: generating self-signed certificate at {}", dir.display());
-    let mut params = rcgen::CertificateParams::new(vec![
-        "localhost".to_string(),
-        local_ip(),
-    ])
-    .map_err(|e| std::io::Error::other(e.to_string()))?;
-    params.distinguished_name = rcgen::DistinguishedName::new();
-    params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, "tab-atelier");
-    let key_pair = rcgen::KeyPair::generate()
+    let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string(), local_ip()])
         .map_err(|e| std::io::Error::other(e.to_string()))?;
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params.distinguished_name.push(rcgen::DnType::CommonName, "tab-atelier");
+    let key_pair = rcgen::KeyPair::generate().map_err(|e| std::io::Error::other(e.to_string()))?;
     let cert = params
         .self_signed(&key_pair)
         .map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -1030,9 +1003,7 @@ mod tests {
         let (port, state, token) = spawn_server();
         let resp = request(
             port,
-            &format!(
-                "POST /tabs/0/input HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\n\r\n"
-            ),
+            &format!("POST /tabs/0/input HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\n\r\n"),
         );
         assert_eq!(status_code(&resp), 200);
         let json: serde_json::Value = serde_json::from_str(body(&resp)).unwrap();
@@ -1047,9 +1018,7 @@ mod tests {
         let (port, _, token) = spawn_server();
         let resp = request(
             port,
-            &format!(
-                "POST /tabs/99/input HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: 1\r\n\r\nx"
-            ),
+            &format!("POST /tabs/99/input HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: 1\r\n\r\nx"),
         );
         assert_eq!(status_code(&resp), 404);
     }
@@ -1097,8 +1066,7 @@ mod tests {
     #[test]
     fn get_tab_output_lines_param_tails() {
         let (port, state, token) = spawn_server();
-        state.lock().unwrap().tabs[0].output =
-            (1..=10).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        state.lock().unwrap().tabs[0].output = (1..=10).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
         let resp = request(
             port,
             &format!("GET /tabs/0/output?lines=3&token={token} HTTP/1.1\r\n\r\n"),

@@ -24,10 +24,7 @@ pub fn percent_decode(s: &str) -> String {
     while i < bytes.len() {
         if bytes[i] == b'%'
             && i + 2 < bytes.len()
-            && let (Some(hi), Some(lo)) = (
-                (bytes[i + 1] as char).to_digit(16),
-                (bytes[i + 2] as char).to_digit(16),
-            )
+            && let (Some(hi), Some(lo)) = ((bytes[i + 1] as char).to_digit(16), (bytes[i + 2] as char).to_digit(16))
         {
             out.push(((hi << 4) | lo) as u8);
             i += 3;
@@ -74,20 +71,15 @@ mod tests {
 
     #[test]
     fn parse_url_encoded() {
-        let (u, t) = parse_onboard_url(
-            "taremote://onboard?url=http%3A%2F%2F1.2.3.4%3A7890&token=deadbeef0123",
-        )
-        .unwrap();
+        let (u, t) =
+            parse_onboard_url("taremote://onboard?url=http%3A%2F%2F1.2.3.4%3A7890&token=deadbeef0123").unwrap();
         assert_eq!(u, "http://1.2.3.4:7890");
         assert_eq!(t, "deadbeef0123");
     }
 
     #[test]
     fn parse_extra_params_ignored() {
-        let (u, t) = parse_onboard_url(
-            "taremote://onboard?foo=bar&url=http://x:7890&extra=baz&token=tok",
-        )
-        .unwrap();
+        let (u, t) = parse_onboard_url("taremote://onboard?foo=bar&url=http://x:7890&extra=baz&token=tok").unwrap();
         assert_eq!(u, "http://x:7890");
         assert_eq!(t, "tok");
     }
