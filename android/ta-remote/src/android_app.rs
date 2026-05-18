@@ -234,7 +234,21 @@ impl AppData {
     }
 }
 
-fn fetch_output(agent: &ureq::Agent, host: &HostConfig, reach: Reach, idx: i32) -> Option<String> {
+/// Output payload + cursor logical position, as returned by the host's
+/// `/tabs/N/output` endpoint. The cursor headers are optional; absent
+/// → `cursor = (-1, -1)` which the Slint side renders as "no cursor".
+struct OutputResult {
+    text: String,
+    cursor_row: i32,
+    cursor_col: i32,
+}
+
+fn fetch_output(
+    agent: &ureq::Agent,
+    host: &HostConfig,
+    reach: Reach,
+    idx: i32,
+) -> Option<OutputResult> {
     let base = base_url(host, reach);
     if base.is_empty() {
         return None;
@@ -245,14 +259,29 @@ fn fetch_output(agent: &ureq::Agent, host: &HostConfig, reach: Reach, idx: i32) 
         .timeout(Duration::from_millis(1500))
         .call()
         .ok()?;
-    resp.into_string().ok()
+    let cursor_row = resp
+        .header("X-Cursor-Row")
+        .and_then(|v| v.parse::<i32>().ok())
+        .unwrap_or(-1);
+    let cursor_col = resp
+        .header("X-Cursor-Col")
+        .and_then(|v| v.parse::<i32>().ok())
+        .unwrap_or(-1);
+    let text = resp.into_string().ok()?;
+    Some(OutputResult {
+        text,
+        cursor_row,
+        cursor_col,
+    })
 }
 
-fn push_output(ui_weak: &Weak<AppWindow>, text: String) {
+fn push_output(ui_weak: &Weak<AppWindow>, output: OutputResult) {
     // Parsing runs on whatever thread called us, but the Slint structs
     // (`ColorLine` carries a `ModelRc` which is `!Send`) must be built
     // on the UI thread.
-    let lines = parse_ansi(&text);
+    let lines = parse_ansi(&output.text);
+    let cursor_row = output.cursor_row;
+    let cursor_col = output.cursor_col;
     let weak = ui_weak.clone();
     let _ = slint::invoke_from_event_loop(move || {
         let Some(ui) = weak.upgrade() else { return };
@@ -273,6 +302,8 @@ fn push_output(ui_weak: &Weak<AppWindow>, text: String) {
             })
             .collect();
         ui.set_open_tab_output_lines(VecModel::from_slice(&model));
+        ui.set_cursor_row(cursor_row);
+        ui.set_cursor_col(cursor_col);
     });
 }
 
@@ -1032,7 +1063,14 @@ pub fn android_main(app: slint::android::AndroidApp) {
     ui.on_open_tab_changed(move |idx| {
         open_tab_for_cb.store(idx, Ordering::Relaxed);
         if idx < 0 {
-            push_output(&open_weak, String::new());
+            push_output(
+                &open_weak,
+                OutputResult {
+                    text: String::new(),
+                    cursor_row: -1,
+                    cursor_col: -1,
+                },
+            );
             return;
         }
         // Mark this tab's current preview as seen so the green "new

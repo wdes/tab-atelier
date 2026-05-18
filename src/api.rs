@@ -65,6 +65,11 @@ pub struct SnapshotTab {
     pub cwd: Option<String>,
     pub output: String,
     pub uptime_secs: f64,
+    /// Cursor (logical-row, logical-column) within `output` — after
+    /// alacritty's WRAPLINE rows have been joined into single lines.
+    /// None when the cursor is outside the emitted lines (e.g. in
+    /// scrollback beyond the cached window).
+    pub cursor: Option<(usize, usize)>,
 }
 
 pub struct TabSnapshot {
@@ -356,18 +361,35 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 let state = state.lock().unwrap();
                 if let Some(t) = state.tabs.get(idx) {
                     let mut body = t.output.clone();
+                    let mut cursor = t.cursor;
                     drop(state);
+                    // If the client asked for the tail only, drop
+                    // leading lines and shift the cursor row to match.
                     if let Some(n) = query_lines
                         && n > 0
                     {
                         let lines: Vec<&str> = body.lines().collect();
                         if lines.len() > n {
-                            body = lines[lines.len() - n..].join("\n");
+                            let drop_count = lines.len() - n;
+                            body = lines[drop_count..].join("\n");
+                            cursor = cursor.and_then(|(r, c)| {
+                                if r >= drop_count {
+                                    Some((r - drop_count, c))
+                                } else {
+                                    None
+                                }
+                            });
                         }
                     }
+                    let cursor_headers = match cursor {
+                        Some((row, col)) => format!(
+                            "X-Cursor-Row: {row}\r\nX-Cursor-Col: {col}\r\n"
+                        ),
+                        None => String::new(),
+                    };
                     let _ = write!(
                         stream,
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n{cursor_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
                         body.len(),
                         body
                     );
@@ -614,12 +636,14 @@ mod tests {
                     cwd: Some("/home/user".into()),
                     output: "$ ls\nfoo bar baz".into(),
                     uptime_secs: 0.0,
+                    cursor: None,
                 },
                 SnapshotTab {
                     name: "build".into(),
                     cwd: None,
                     output: String::new(),
                     uptime_secs: 0.0,
+                    cursor: None,
                 },
             ],
             active: 0,
