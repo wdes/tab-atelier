@@ -825,18 +825,18 @@ component TerminalView inherits Rectangle {
     }
     // Re-anchor when the IME opens or closes. Slint propagates
     // `ime-height` synchronously but only re-lays out (and thus updates
-    // `flick.height`) on the next frame — sampling immediately reads
-    // stale geometry and the bottom row gets parked behind the
-    // keyboard. Defer via a one-shot Timer so the new flick.height is
-    // in place by the time we compute viewport-y.
-    in-out property <bool> _reanchor_pending: false;
-    changed ime-height => { root._reanchor_pending = true; }
+    // `flick.height`) on the next frame, and IME-show animations on
+    // Android can take 200–300 ms to settle. Fire the anchor twice
+    // (early + late) via a counter-driven Timer so we catch both the
+    // pre- and post-animation geometry.
+    in-out property <int> _reanchor_ticks: 0;
+    changed ime-height => { root._reanchor_ticks = 4; }
     Timer {
-        interval: 80ms;
-        running: root._reanchor_pending;
+        interval: 100ms;
+        running: root._reanchor_ticks > 0;
         triggered => {
             flick.viewport-y = min(0px, flick.height - flick.viewport-height);
-            root._reanchor_pending = false;
+            root._reanchor_ticks = root._reanchor_ticks - 1;
         }
     }
 
@@ -988,21 +988,23 @@ component TerminalView inherits Rectangle {
                         font-weight: span.bold ? 700 : 400;
                         wrap: no-wrap;
                     }
-                    // Pseudo-cursor parked at the end of the last
-                    // logical line — approximates the prompt position
-                    // for interactive shells. Always-rendered Text
-                    // (rather than a `if … : Text`) because Slint's
-                    // for-loop+conditional combo silently dropped the
-                    // element on this code path; only the text content
-                    // is gated instead.
-                    Text {
-                        text: i == root.output-lines.length - 1 && root._cursor_blink
-                            ? "█"
-                            : "";
-                        color: #e0e0e0;
-                        font-family: "FreeMono";
-                        font-size: root.font-size;
-                        wrap: no-wrap;
+                    // Pseudo-cursor: a Rectangle (rather than a Text
+                    // with "█") because the text-content gating
+                    // apparently didn't re-render reactively on
+                    // device. Width/height are tied to the font size
+                    // so it scales with A−/A+, and background is
+                    // driven by the blink toggle. Only the last line
+                    // gets a non-zero width; every other line renders
+                    // a 0-width Rectangle so the layout stays
+                    // consistent.
+                    Rectangle {
+                        width: i == root.output-lines.length - 1
+                            ? root.font-size * 0.6
+                            : 0px;
+                        height: root.font-size * 1.1;
+                        background: i == root.output-lines.length - 1 && root._cursor_blink
+                            ? #d0d0d0
+                            : transparent;
                     }
                 }
             }
@@ -1013,20 +1015,23 @@ component TerminalView inherits Rectangle {
         // which the Android backend wires to InputMethodManager.hide(...).
         hide-focus := FocusScope { width: 0; height: 0; }
 
-        // Hidden capture buffer — kept invisible so the user types
-        // straight "into the terminal". Each `edited` flush forwards
-        // the new characters (with sticky CTRL/ALT applied on the Rust
-        // side) and clears the buffer so it never grows. The IME only
-        // shows while this widget has focus, which is what KBD toggles.
+        // Hidden capture buffer — sized 1×1 px (not 0×0) so Android
+        // IMEs actually deliver key events to it; some IMEs drop
+        // anything aimed at a zero-area field. Multi-line so Enter
+        // arrives in the text stream as `\n` and goes through the
+        // same `typed` path as every other character — the previous
+        // `single-line: true` + `accepted` fallback only worked when
+        // the IME's action-button was wired (which Android IMEs
+        // mostly aren't, for terminal-style fields).
         Rectangle {
-            height: 0px;
-            width: 0px;
+            height: 1px;
+            width: 1px;
+            opacity: 0;
             clip: true;
             input-field := TextInput {
                 text <=> root.capture-buffer;
                 color: transparent;
                 font-size: 1px;
-                single-line: true;
                 edited => {
                     if (root.capture-buffer != "") {
                         root.typed(
@@ -1038,12 +1043,6 @@ component TerminalView inherits Rectangle {
                         kh.ctrl-sticky = false;
                         kh.alt-sticky = false;
                     }
-                }
-                accepted => {
-                    // Standard Enter is sent as part of the regular text
-                    // stream, but some IMEs swallow the trailing newline —
-                    // fire one explicitly here as a safety net.
-                    root.key-tapped("\n");
                 }
             }
         }
