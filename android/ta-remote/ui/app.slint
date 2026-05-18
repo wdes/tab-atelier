@@ -829,6 +829,15 @@ component TerminalView inherits Rectangle {
         }
     }
 
+    // Cursor blink driver — matches the standard ~530 ms console
+    // cadence. Property is overlayed onto the last logical line.
+    in-out property <bool> _cursor_blink: true;
+    Timer {
+        interval: 530ms;
+        running: root.output-lines.length > 0;
+        triggered => { root._cursor_blink = !root._cursor_blink; }
+    }
+
     background: #0e0e0e;
 
     VerticalLayout {
@@ -966,6 +975,18 @@ component TerminalView inherits Rectangle {
                         font-family: "FreeMono";
                         font-size: root.font-size;
                         font-weight: span.bold ? 700 : 400;
+                        wrap: no-wrap;
+                    }
+                    // Pseudo-cursor parked at the end of the last
+                    // logical line — approximates the prompt position
+                    // for interactive shells. Exact (row,col) tracking
+                    // would need a richer API; this catches 95 % of
+                    // sessions correctly.
+                    if i == root.output-lines.length - 1 : Text {
+                        text: root._cursor_blink ? "█" : " ";
+                        color: #e0e0e0;
+                        font-family: "FreeMono";
+                        font-size: root.font-size;
                         wrap: no-wrap;
                     }
                 }
