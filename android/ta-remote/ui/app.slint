@@ -990,11 +990,15 @@ component TerminalView inherits Rectangle {
                     }
                     // Pseudo-cursor parked at the end of the last
                     // logical line — approximates the prompt position
-                    // for interactive shells. Exact (row,col) tracking
-                    // would need a richer API; this catches 95 % of
-                    // sessions correctly.
-                    if i == root.output-lines.length - 1 : Text {
-                        text: root._cursor_blink ? "█" : " ";
+                    // for interactive shells. Always-rendered Text
+                    // (rather than a `if … : Text`) because Slint's
+                    // for-loop+conditional combo silently dropped the
+                    // element on this code path; only the text content
+                    // is gated instead.
+                    Text {
+                        text: i == root.output-lines.length - 1 && root._cursor_blink
+                            ? "█"
+                            : "";
                         color: #e0e0e0;
                         font-family: "FreeMono";
                         font-size: root.font-size;
