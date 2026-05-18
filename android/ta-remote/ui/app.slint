@@ -428,6 +428,17 @@ component HostEditor inherits Rectangle {
             ? max(root.safe-top + 8px, parent.height - root.ime-height - self.height - 8px)
             : root.safe-top + 24px;
 
+        // Absorbing TouchArea so taps that land on the dialog's
+        // background (label rows, gaps between fields) don't fall
+        // through to the backdrop `TouchArea` and dismiss the modal.
+        // Without this, tapping the Name label or the empty space
+        // between fields closes the editor — and even tapping a
+        // TextInput could race the backdrop and lose focus, which is
+        // why the user couldn't edit the name. TextInputs and child
+        // TouchAreas still get their own taps because Slint hit-tests
+        // them ahead of the parent.
+        TouchArea {}
+
         VerticalLayout {
             padding: 0;
             spacing: 0;
@@ -1391,6 +1402,8 @@ export component AppWindow inherits Window {
             border-radius: 14px;
             border-width: 1px;
             border-color: #2a2a2a;
+            // Absorb background taps so they don't dismiss the sheet.
+            TouchArea {}
 
             VerticalLayout {
                 padding: 0;
@@ -1532,6 +1545,8 @@ export component AppWindow inherits Window {
             border-radius: 14px;
             border-width: 1px;
             border-color: #2a2a2a;
+            // Absorb background taps so they don't dismiss the modal.
+            TouchArea {}
 
             VerticalLayout {
                 padding: 0;
@@ -1642,6 +1657,8 @@ export component AppWindow inherits Window {
             border-radius: 14px;
             border-width: 1px;
             border-color: #2a2a2a;
+            // Absorb background taps so they don't dismiss the modal.
+            TouchArea {}
 
             VerticalLayout {
                 padding: 0;
