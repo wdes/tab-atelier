@@ -723,6 +723,27 @@ fn refresh_soon(
     });
 }
 
+/// After the user sends input, the 2 s background poll is too slow —
+/// the screen sits stale for almost half a second on average. Schedule
+/// two follow-up fetches at 120 ms and 380 ms so the terminal output
+/// catches up to the keystroke well before the next poll tick.
+fn nudge_output_refresh(
+    ui_weak: Weak<AppWindow>,
+    agent: Arc<ureq::Agent>,
+    host: HostConfig,
+    reach: Reach,
+    idx: i32,
+) {
+    std::thread::spawn(move || {
+        for delay in [Duration::from_millis(120), Duration::from_millis(380)] {
+            std::thread::sleep(delay);
+            if let Some(text) = fetch_output(&agent, &host, reach, idx) {
+                push_output(&ui_weak, text);
+            }
+        }
+    });
+}
+
 /// Forward the API's `host` block to the Slint side. The UI shows the
 /// workstation's battery and total power draw in the header — these
 /// are the user's own machine's stats, not the phone's.
@@ -922,6 +943,7 @@ pub fn android_main(app: slint::android::AndroidApp) {
     let send_agent = agent.clone();
     let send_data = data.clone();
     let send_reach = last_reach.clone();
+    let send_weak = ui_weak.clone();
     ui.on_request_send_input(move |idx, text| {
         let Some(host) = send_data.lock().unwrap().active_host() else {
             return;
@@ -929,12 +951,17 @@ pub fn android_main(app: slint::android::AndroidApp) {
         let reach = *send_reach.lock().unwrap();
         let agent = send_agent.clone();
         let bytes = text.as_bytes().to_vec();
+        let nudge_agent = send_agent.clone();
+        let nudge_host = host.clone();
+        let nudge_weak = send_weak.clone();
         std::thread::spawn(move || post_input(&agent, &host, reach, idx, &bytes));
+        nudge_output_refresh(nudge_weak, nudge_agent, nudge_host, reach, idx);
     });
 
     let typed_agent = agent.clone();
     let typed_data = data.clone();
     let typed_reach = last_reach.clone();
+    let typed_weak = ui_weak.clone();
     ui.on_request_typed_text(move |idx, text, ctrl, alt| {
         let Some(host) = typed_data.lock().unwrap().active_host() else {
             return;
@@ -942,7 +969,11 @@ pub fn android_main(app: slint::android::AndroidApp) {
         let reach = *typed_reach.lock().unwrap();
         let agent = typed_agent.clone();
         let bytes = apply_modifiers(text.as_str(), ctrl, alt);
+        let nudge_agent = typed_agent.clone();
+        let nudge_host = host.clone();
+        let nudge_weak = typed_weak.clone();
         std::thread::spawn(move || post_input(&agent, &host, reach, idx, &bytes));
+        nudge_output_refresh(nudge_weak, nudge_agent, nudge_host, reach, idx);
     });
 
     let close_agent = agent.clone();
