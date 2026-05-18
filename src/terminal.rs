@@ -400,7 +400,6 @@ impl TerminalView {
         t.selection_to_string()
     }
 
-
     #[allow(clippy::significant_drop_tightening)]
     pub fn copy_all_history(&self) -> String {
         self.ansi_lines(None).join("\n")

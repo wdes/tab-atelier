@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 
 use jni::JavaVM;
@@ -40,23 +40,14 @@ fn read_clipboard(app: &slint::android::AndroidApp) -> Option<String> {
         .l()
         .ok()?;
     let clip = env
-        .call_method(
-            &manager,
-            "getPrimaryClip",
-            "()Landroid/content/ClipData;",
-            &[],
-        )
+        .call_method(&manager, "getPrimaryClip", "()Landroid/content/ClipData;", &[])
         .ok()?
         .l()
         .ok()?;
     if clip.is_null() {
         return None;
     }
-    let count = env
-        .call_method(&clip, "getItemCount", "()I", &[])
-        .ok()?
-        .i()
-        .ok()?;
+    let count = env.call_method(&clip, "getItemCount", "()I", &[]).ok()?.i().ok()?;
     if count < 1 {
         return None;
     }
@@ -213,8 +204,12 @@ impl AppData {
             hosts: self.hosts.clone(),
             active: self.active,
         };
-        let Ok(text) = serde_json::to_string_pretty(&stored) else { return };
-        let Some(parent) = self.config_path.parent() else { return };
+        let Ok(text) = serde_json::to_string_pretty(&stored) else {
+            return;
+        };
+        let Some(parent) = self.config_path.parent() else {
+            return;
+        };
         let _ = std::fs::create_dir_all(parent);
 
         let tmp = self.config_path.with_extension("json.tmp");
@@ -239,12 +234,7 @@ impl AppData {
     }
 }
 
-fn fetch_output(
-    agent: &ureq::Agent,
-    host: &HostConfig,
-    reach: Reach,
-    idx: i32,
-) -> Option<String> {
+fn fetch_output(agent: &ureq::Agent, host: &HostConfig, reach: Reach, idx: i32) -> Option<String> {
     let base = base_url(host, reach);
     if base.is_empty() {
         return None;
@@ -381,11 +371,7 @@ fn apply_sgr(params: &str, cur: &mut [u8; 3], bold: &mut bool) {
                     *cur = ansi256(parts[i + 2] as u8);
                     i += 2;
                 } else if i + 4 < parts.len() && parts[i + 1] == 2 {
-                    *cur = [
-                        parts[i + 2] as u8,
-                        parts[i + 3] as u8,
-                        parts[i + 4] as u8,
-                    ];
+                    *cur = [parts[i + 2] as u8, parts[i + 3] as u8, parts[i + 4] as u8];
                     i += 4;
                 }
             }
@@ -454,9 +440,7 @@ fn try_fetch_tabs(agent: &ureq::Agent, base: &str, token: &str, timeout: Duratio
         Ok(resp) => resp
             .into_json::<ApiResponse>()
             .map_or(FetchOutcome::NoResponse, FetchOutcome::Ok),
-        Err(ureq::Error::Status(code, _)) if code == 401 || code == 403 => {
-            FetchOutcome::Forbidden
-        }
+        Err(ureq::Error::Status(code, _)) if code == 401 || code == 403 => FetchOutcome::Forbidden,
         Err(_) => FetchOutcome::NoResponse,
     }
 }
@@ -499,7 +483,11 @@ fn fetch_tabs(agent: &ureq::Agent, host: &HostConfig) -> TabsFetch {
         }
     }
     TabsFetch {
-        reach: if saw_forbidden { Reach::Forbidden } else { Reach::Offline },
+        reach: if saw_forbidden {
+            Reach::Forbidden
+        } else {
+            Reach::Offline
+        },
         tabs: None,
         host: ApiHost::default(),
     }
@@ -723,7 +711,9 @@ fn refresh_soon(
     let seen = seen.clone();
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(250));
-        let Some(host) = data.lock().unwrap().active_host() else { return };
+        let Some(host) = data.lock().unwrap().active_host() else {
+            return;
+        };
         let result = fetch_tabs(&agent, &host);
         if let Some(t) = result.tabs {
             push_tabs(&weak, t, &seen);
@@ -808,9 +798,7 @@ fn push_reachability(ui_weak: &Weak<AppWindow>, active: usize, reach: Reach) {
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(ui) = weak.upgrade() {
             let model = ui.get_hosts();
-            let mut list: Vec<Host> = (0..model.row_count())
-                .filter_map(|i| model.row_data(i))
-                .collect();
+            let mut list: Vec<Host> = (0..model.row_count()).filter_map(|i| model.row_data(i)).collect();
             if let Some(h) = list.get_mut(active) {
                 h.reachability = SharedString::from(label);
             }
@@ -826,9 +814,7 @@ fn push_reachability(ui_weak: &Weak<AppWindow>, active: usize, reach: Reach) {
 #[allow(clippy::no_mangle_with_rust_abi)]
 #[unsafe(no_mangle)]
 pub fn android_main(app: slint::android::AndroidApp) {
-    android_logger::init_once(
-        android_logger::Config::default().with_max_level(log::LevelFilter::Debug),
-    );
+    android_logger::init_once(android_logger::Config::default().with_max_level(log::LevelFilter::Debug));
 
     let data_dir = app
         .internal_data_path()
@@ -857,11 +843,7 @@ pub fn android_main(app: slint::android::AndroidApp) {
         ui.set_editor_open(true);
     }
 
-    let agent: Arc<ureq::Agent> = Arc::new(
-        ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(5))
-            .build(),
-    );
+    let agent: Arc<ureq::Agent> = Arc::new(ureq::AgentBuilder::new().timeout(Duration::from_secs(5)).build());
 
     let last_reach: Arc<Mutex<Reach>> = Arc::new(Mutex::new(Reach::Offline));
     let seen_previews: SeenPreviews = Arc::new(Mutex::new(HashMap::new()));
@@ -874,60 +856,64 @@ pub fn android_main(app: slint::android::AndroidApp) {
     let poll_reach = last_reach.clone();
     let poll_open = open_tab.clone();
     let poll_seen = seen_previews.clone();
-    std::thread::spawn(move || loop {
-        let (host, active_idx) = {
-            let d = poll_data.lock().unwrap();
-            (d.active_host(), d.active)
-        };
-        if let Some(host) = host {
-            let result = fetch_tabs(&poll_agent, &host);
-            let reach = result.reach;
-            if let Some(t) = result.tabs {
-                push_tabs(&poll_weak, t, &poll_seen);
-            }
-            push_host_stats(&poll_weak, &result.host);
-            log::debug!("poll {}: {reach:?}", host.name);
-            // Show a toast when reachability transitions between online and
-            // offline so a connection drop doesn't go unnoticed.
-            // Forbidden gets its own message — the host answered, the
-            // saved token just doesn't match, so "Disconnected" would
-            // be misleading.
-            {
-                let mut last = poll_reach.lock().unwrap();
-                let was_online = matches!(*last, Reach::Lan | Reach::Remote);
-                let is_online = matches!(reach, Reach::Lan | Reach::Remote);
-                let was_forbidden = matches!(*last, Reach::Forbidden);
-                let is_forbidden = matches!(reach, Reach::Forbidden);
-                if (was_online || was_forbidden) && !is_online && !is_forbidden {
-                    show_toast(&poll_weak, format!("Disconnected from {}", host.name));
-                } else if !was_forbidden && is_forbidden {
-                    show_toast(
-                        &poll_weak,
-                        format!("{} rejected the saved token — re-pair to reconnect", host.name),
-                    );
-                } else if !was_online && is_online {
-                    let via = if matches!(reach, Reach::Lan) { "LAN" } else { "remote" };
-                    show_toast(&poll_weak, format!("Connected to {} via {via}", host.name));
+    std::thread::spawn(move || {
+        loop {
+            let (host, active_idx) = {
+                let d = poll_data.lock().unwrap();
+                (d.active_host(), d.active)
+            };
+            if let Some(host) = host {
+                let result = fetch_tabs(&poll_agent, &host);
+                let reach = result.reach;
+                if let Some(t) = result.tabs {
+                    push_tabs(&poll_weak, t, &poll_seen);
                 }
-                *last = reach;
-            }
-            push_reachability(&poll_weak, active_idx, reach);
+                push_host_stats(&poll_weak, &result.host);
+                log::debug!("poll {}: {reach:?}", host.name);
+                // Show a toast when reachability transitions between online and
+                // offline so a connection drop doesn't go unnoticed.
+                // Forbidden gets its own message — the host answered, the
+                // saved token just doesn't match, so "Disconnected" would
+                // be misleading.
+                {
+                    let mut last = poll_reach.lock().unwrap();
+                    let was_online = matches!(*last, Reach::Lan | Reach::Remote);
+                    let is_online = matches!(reach, Reach::Lan | Reach::Remote);
+                    let was_forbidden = matches!(*last, Reach::Forbidden);
+                    let is_forbidden = matches!(reach, Reach::Forbidden);
+                    if (was_online || was_forbidden) && !is_online && !is_forbidden {
+                        show_toast(&poll_weak, format!("Disconnected from {}", host.name));
+                    } else if !was_forbidden && is_forbidden {
+                        show_toast(
+                            &poll_weak,
+                            format!("{} rejected the saved token — re-pair to reconnect", host.name),
+                        );
+                    } else if !was_online && is_online {
+                        let via = if matches!(reach, Reach::Lan) { "LAN" } else { "remote" };
+                        show_toast(&poll_weak, format!("Connected to {} via {via}", host.name));
+                    }
+                    *last = reach;
+                }
+                push_reachability(&poll_weak, active_idx, reach);
 
-            let idx = poll_open.load(Ordering::Relaxed);
-            if idx >= 0
-                && let Some(text) = fetch_output(&poll_agent, &host, reach, idx)
-            {
-                push_output(&poll_weak, text);
+                let idx = poll_open.load(Ordering::Relaxed);
+                if idx >= 0
+                    && let Some(text) = fetch_output(&poll_agent, &host, reach, idx)
+                {
+                    push_output(&poll_weak, text);
+                }
             }
+            std::thread::sleep(Duration::from_secs(2));
         }
-        std::thread::sleep(Duration::from_secs(2));
     });
 
     let act_agent = agent.clone();
     let act_data = data.clone();
     let act_reach = last_reach.clone();
     ui.on_request_activate(move |idx| {
-        let Some(host) = act_data.lock().unwrap().active_host() else { return };
+        let Some(host) = act_data.lock().unwrap().active_host() else {
+            return;
+        };
         let reach = *act_reach.lock().unwrap();
         let agent = act_agent.clone();
         std::thread::spawn(move || post_activate(&agent, &host, reach, idx));
@@ -937,7 +923,9 @@ pub fn android_main(app: slint::android::AndroidApp) {
     let send_data = data.clone();
     let send_reach = last_reach.clone();
     ui.on_request_send_input(move |idx, text| {
-        let Some(host) = send_data.lock().unwrap().active_host() else { return };
+        let Some(host) = send_data.lock().unwrap().active_host() else {
+            return;
+        };
         let reach = *send_reach.lock().unwrap();
         let agent = send_agent.clone();
         let bytes = text.as_bytes().to_vec();
@@ -948,7 +936,9 @@ pub fn android_main(app: slint::android::AndroidApp) {
     let typed_data = data.clone();
     let typed_reach = last_reach.clone();
     ui.on_request_typed_text(move |idx, text, ctrl, alt| {
-        let Some(host) = typed_data.lock().unwrap().active_host() else { return };
+        let Some(host) = typed_data.lock().unwrap().active_host() else {
+            return;
+        };
         let reach = *typed_reach.lock().unwrap();
         let agent = typed_agent.clone();
         let bytes = apply_modifiers(text.as_str(), ctrl, alt);
@@ -961,7 +951,9 @@ pub fn android_main(app: slint::android::AndroidApp) {
     let close_weak = ui_weak.clone();
     let close_seen = seen_previews.clone();
     ui.on_request_close_tab(move |idx| {
-        let Some(host) = close_data.lock().unwrap().active_host() else { return };
+        let Some(host) = close_data.lock().unwrap().active_host() else {
+            return;
+        };
         let reach = *close_reach.lock().unwrap();
         let agent = close_agent.clone();
         std::thread::spawn(move || delete_tab(&agent, &host, reach, idx));
@@ -974,7 +966,9 @@ pub fn android_main(app: slint::android::AndroidApp) {
     let new_weak = ui_weak.clone();
     let new_seen = seen_previews.clone();
     ui.on_request_new_tab(move || {
-        let Some(host) = new_data.lock().unwrap().active_host() else { return };
+        let Some(host) = new_data.lock().unwrap().active_host() else {
+            return;
+        };
         let reach = *new_reach.lock().unwrap();
         let agent = new_agent.clone();
         std::thread::spawn(move || post_new_tab(&agent, &host, reach));
@@ -987,7 +981,9 @@ pub fn android_main(app: slint::android::AndroidApp) {
     let rename_weak = ui_weak.clone();
     let rename_seen = seen_previews.clone();
     ui.on_request_rename_tab(move |idx, name| {
-        let Some(host) = rename_data.lock().unwrap().active_host() else { return };
+        let Some(host) = rename_data.lock().unwrap().active_host() else {
+            return;
+        };
         let reach = *rename_reach.lock().unwrap();
         let agent = rename_agent.clone();
         let name = name.to_string();

@@ -25,8 +25,8 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use tab_atelier::{
     DEFAULT_HOTKEYS, FontConfig, Preferences, SavedState, TabState, gpui_key_to_keycode, keycode_label,
-    load_font_config, load_preferences, load_state_with_outputs, load_wakatime_key,
-    save_preferences, save_state, save_tab_energy, save_tab_output, save_tab_uptime,
+    load_font_config, load_preferences, load_state_with_outputs, load_wakatime_key, save_preferences, save_state,
+    save_tab_energy, save_tab_output, save_tab_uptime,
 };
 
 struct Tab {
@@ -223,68 +223,82 @@ impl AppState {
             prefs.hotkeys
         };
 
-        let (tabs, active, restored_windowed) = if let Some(saved) = load_state_with_outputs(
-            &platform::config_base_dir(),
-            &platform::state_base_dir(),
-        ) {
-            info!("restoring {} tab(s) from saved state", saved.tabs.len());
-            let mut tabs = Vec::new();
-            for ts in &saved.tabs {
-                let cwd = ts.cwd.as_ref().map(PathBuf::from);
-                let fc = font_config.clone();
-                let br = browser.clone();
-                let ce = code_editor.clone();
-                let colors = ts.colors_enabled;
-                let view = cx.new(|cx| {
-                    let mut tv = TerminalView::new_with_colors(
-                        cwd.as_deref(),
-                        fc,
-                        br,
-                        ce,
-                        colors,
-                        window,
-                        cx,
-                    );
-                    tv.theme = theme_name;
-                    tv
-                });
-                // Defer restore_output for non-active tabs — feeding the
-                // whole scrollback through vte for every tab synchronously
-                // is what makes cold launch slow when there's a lot of
-                // history. The active tab is restored eagerly so the user
-                // sees their last screen the moment the window paints.
-                let is_active = tabs.len() == saved.active;
-                let pending_restore = ts.output.clone().and_then(|output| {
-                    if is_active {
-                        debug!("restoring {} chars of output for '{}'", output.len(), ts.name);
-                        view.read(cx).restore_output(&output);
-                        None
-                    } else {
-                        Some(output)
-                    }
-                });
-                tabs.push(Tab {
-                    view,
-                    name: ts.name.clone(),
-                    created_at: std::time::Instant::now(),
-                    prior_uptime: std::time::Duration::from_secs_f64(ts.uptime_secs.unwrap_or(0.0)),
-                    active_duration: std::time::Duration::ZERO,
-                    last_activated: None,
-                    #[cfg(feature = "energy")]
-                    energy_wh: ts.energy_wh.unwrap_or(0.0),
-                    #[cfg(feature = "energy")]
-                    energy_wh_last_saved: ts.energy_wh.unwrap_or(0.0),
-                    // Seed with the hash of the just-restored output so the
-                    // first persist tick after launch doesn't rewrite an
-                    // identical file.
-                    output_hash_last_saved: ts
-                        .output
-                        .as_deref()
-                        .map_or(0, |s| tab_atelier::crc32(s.as_bytes())),
-                    pending_restore,
-                });
-            }
-            if tabs.is_empty() {
+        let (tabs, active, restored_windowed) =
+            if let Some(saved) = load_state_with_outputs(&platform::config_base_dir(), &platform::state_base_dir()) {
+                info!("restoring {} tab(s) from saved state", saved.tabs.len());
+                let mut tabs = Vec::new();
+                for ts in &saved.tabs {
+                    let cwd = ts.cwd.as_ref().map(PathBuf::from);
+                    let fc = font_config.clone();
+                    let br = browser.clone();
+                    let ce = code_editor.clone();
+                    let colors = ts.colors_enabled;
+                    let view = cx.new(|cx| {
+                        let mut tv = TerminalView::new_with_colors(cwd.as_deref(), fc, br, ce, colors, window, cx);
+                        tv.theme = theme_name;
+                        tv
+                    });
+                    // Defer restore_output for non-active tabs — feeding the
+                    // whole scrollback through vte for every tab synchronously
+                    // is what makes cold launch slow when there's a lot of
+                    // history. The active tab is restored eagerly so the user
+                    // sees their last screen the moment the window paints.
+                    let is_active = tabs.len() == saved.active;
+                    let pending_restore = ts.output.clone().and_then(|output| {
+                        if is_active {
+                            debug!("restoring {} chars of output for '{}'", output.len(), ts.name);
+                            view.read(cx).restore_output(&output);
+                            None
+                        } else {
+                            Some(output)
+                        }
+                    });
+                    tabs.push(Tab {
+                        view,
+                        name: ts.name.clone(),
+                        created_at: std::time::Instant::now(),
+                        prior_uptime: std::time::Duration::from_secs_f64(ts.uptime_secs.unwrap_or(0.0)),
+                        active_duration: std::time::Duration::ZERO,
+                        last_activated: None,
+                        #[cfg(feature = "energy")]
+                        energy_wh: ts.energy_wh.unwrap_or(0.0),
+                        #[cfg(feature = "energy")]
+                        energy_wh_last_saved: ts.energy_wh.unwrap_or(0.0),
+                        // Seed with the hash of the just-restored output so the
+                        // first persist tick after launch doesn't rewrite an
+                        // identical file.
+                        output_hash_last_saved: ts.output.as_deref().map_or(0, |s| tab_atelier::crc32(s.as_bytes())),
+                        pending_restore,
+                    });
+                }
+                if tabs.is_empty() {
+                    let fc = font_config.clone();
+                    let br = browser.clone();
+                    let ce = code_editor.clone();
+                    let view = cx.new(|cx| {
+                        let mut tv = TerminalView::new(None, fc, br, ce, window, cx);
+                        tv.theme = theme_name;
+                        tv
+                    });
+                    tabs.push(Tab {
+                        view,
+                        name: locale::strings(lang).terminal.into(),
+                        created_at: std::time::Instant::now(),
+                        prior_uptime: std::time::Duration::ZERO,
+                        active_duration: std::time::Duration::ZERO,
+                        last_activated: None,
+                        #[cfg(feature = "energy")]
+                        energy_wh: 0.0,
+                        #[cfg(feature = "energy")]
+                        energy_wh_last_saved: 0.0,
+                        output_hash_last_saved: 0,
+                        pending_restore: None,
+                    });
+                }
+                let active = saved.active.min(tabs.len() - 1);
+                tabs[active].activate();
+                (tabs, active, saved.windowed)
+            } else {
                 let fc = font_config.clone();
                 let br = browser.clone();
                 let ce = code_editor.clone();
@@ -293,52 +307,25 @@ impl AppState {
                     tv.theme = theme_name;
                     tv
                 });
-                tabs.push(Tab {
-                    view,
-                    name: locale::strings(lang).terminal.into(),
-                    created_at: std::time::Instant::now(),
-                    prior_uptime: std::time::Duration::ZERO,
-                    active_duration: std::time::Duration::ZERO,
-                    last_activated: None,
-                    #[cfg(feature = "energy")]
-                    energy_wh: 0.0,
-                    #[cfg(feature = "energy")]
-                    energy_wh_last_saved: 0.0,
-                    output_hash_last_saved: 0,
-                    pending_restore: None,
-                });
-            }
-            let active = saved.active.min(tabs.len() - 1);
-            tabs[active].activate();
-            (tabs, active, saved.windowed)
-        } else {
-            let fc = font_config.clone();
-            let br = browser.clone();
-            let ce = code_editor.clone();
-            let view = cx.new(|cx| {
-                let mut tv = TerminalView::new(None, fc, br, ce, window, cx);
-                tv.theme = theme_name;
-                tv
-            });
-            (
-                vec![Tab {
-                    view,
-                    name: locale::strings(lang).terminal.into(),
-                    created_at: std::time::Instant::now(),
-                    prior_uptime: std::time::Duration::ZERO,
-                    active_duration: std::time::Duration::ZERO,
-                    last_activated: Some(std::time::Instant::now()),
-                    #[cfg(feature = "energy")]
-                    energy_wh: 0.0,
-                    #[cfg(feature = "energy")]
-                    energy_wh_last_saved: 0.0,
-                    output_hash_last_saved: 0,
-                    pending_restore: None,
-                }],
-                0,
-                false,
-            )
-        };
+                (
+                    vec![Tab {
+                        view,
+                        name: locale::strings(lang).terminal.into(),
+                        created_at: std::time::Instant::now(),
+                        prior_uptime: std::time::Duration::ZERO,
+                        active_duration: std::time::Duration::ZERO,
+                        last_activated: Some(std::time::Instant::now()),
+                        #[cfg(feature = "energy")]
+                        energy_wh: 0.0,
+                        #[cfg(feature = "energy")]
+                        energy_wh_last_saved: 0.0,
+                        output_hash_last_saved: 0,
+                        pending_restore: None,
+                    }],
+                    0,
+                    false,
+                )
+            };
         if restored_windowed {
             window.toggle_fullscreen();
         }
@@ -832,8 +819,7 @@ impl AppState {
         if !crate::read_only() {
             let base = platform::state_base_dir();
             for resolver in [
-                tab_atelier::tab_output_path
-                    as fn(&std::path::Path, &str) -> std::path::PathBuf,
+                tab_atelier::tab_output_path as fn(&std::path::Path, &str) -> std::path::PathBuf,
                 tab_atelier::tab_uptime_path,
                 tab_atelier::tab_power_path,
             ] {
@@ -841,10 +827,7 @@ impl AppState {
                 let new_path = resolver(&base, &new_name);
                 if old_path.exists() {
                     let _ = std::fs::rename(&old_path, &new_path);
-                    let _ = std::fs::rename(
-                        old_path.with_extension("json.bak"),
-                        new_path.with_extension("json.bak"),
-                    );
+                    let _ = std::fs::rename(old_path.with_extension("json.bak"), new_path.with_extension("json.bak"));
                 }
             }
         }
@@ -2376,60 +2359,57 @@ impl AppState {
                                     if ro {
                                         btn = btn.opacity(0.4);
                                     } else {
-                                        btn = btn
-                                            .cursor_pointer()
-                                            .hover(|s| s.bg(btn_hover))
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
-                                                    let lang_str = match this.lang {
-                                                        Lang::En => "en",
-                                                        Lang::Fr => "fr",
-                                                    };
-                                                    let browser = if this.pref_browser_text.is_empty() {
-                                                        None
-                                                    } else {
-                                                        Some(this.pref_browser_text.clone())
-                                                    };
-                                                    let editor = if this.pref_editor_text.is_empty() {
-                                                        None
-                                                    } else {
-                                                        Some(this.pref_editor_text.clone())
-                                                    };
-                                                    (*this.browser.borrow_mut()).clone_from(&browser);
-                                                    (*this.code_editor.borrow_mut()).clone_from(&editor);
-                                                    // Parse the port field. Anything
-                                                    // that fails sanity-checks (empty,
-                                                    // non-numeric, > 65534) falls back
-                                                    // to whatever was already loaded.
-                                                    let parsed_port = this
-                                                        .pref_api_port_text
-                                                        .parse::<u16>()
-                                                        .ok()
-                                                        .filter(|&p| p > 0 && p < u16::MAX);
-                                                    if let Some(p) = parsed_port {
-                                                        this.api_port = p;
-                                                    }
-                                                    save_preferences(
-                                                        &platform::config_dir(),
-                                                        &Preferences {
-                                                            lang: Some(lang_str.into()),
-                                                            theme: Some(this.theme_name.id().into()),
-                                                            opacity: Some(this.opacity),
-                                                            hotkeys: this.hotkeys.clone(),
-                                                            browser,
-                                                            code_editor: editor,
-                                                            api_port: Some(this.api_port),
-                                                        },
-                                                    );
-                                                    if let Some(ref handle) = this.hotkey_handle {
-                                                        handle.update_keys(&this.hotkeys);
-                                                    }
-                                                    this.show_preferences = false;
-                                                    this.show_hotkey_picker = false;
-                                                    cx.notify();
-                                                }),
-                                            );
+                                        btn = btn.cursor_pointer().hover(|s| s.bg(btn_hover)).on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                                                let lang_str = match this.lang {
+                                                    Lang::En => "en",
+                                                    Lang::Fr => "fr",
+                                                };
+                                                let browser = if this.pref_browser_text.is_empty() {
+                                                    None
+                                                } else {
+                                                    Some(this.pref_browser_text.clone())
+                                                };
+                                                let editor = if this.pref_editor_text.is_empty() {
+                                                    None
+                                                } else {
+                                                    Some(this.pref_editor_text.clone())
+                                                };
+                                                (*this.browser.borrow_mut()).clone_from(&browser);
+                                                (*this.code_editor.borrow_mut()).clone_from(&editor);
+                                                // Parse the port field. Anything
+                                                // that fails sanity-checks (empty,
+                                                // non-numeric, > 65534) falls back
+                                                // to whatever was already loaded.
+                                                let parsed_port = this
+                                                    .pref_api_port_text
+                                                    .parse::<u16>()
+                                                    .ok()
+                                                    .filter(|&p| p > 0 && p < u16::MAX);
+                                                if let Some(p) = parsed_port {
+                                                    this.api_port = p;
+                                                }
+                                                save_preferences(
+                                                    &platform::config_dir(),
+                                                    &Preferences {
+                                                        lang: Some(lang_str.into()),
+                                                        theme: Some(this.theme_name.id().into()),
+                                                        opacity: Some(this.opacity),
+                                                        hotkeys: this.hotkeys.clone(),
+                                                        browser,
+                                                        code_editor: editor,
+                                                        api_port: Some(this.api_port),
+                                                    },
+                                                );
+                                                if let Some(ref handle) = this.hotkey_handle {
+                                                    handle.update_keys(&this.hotkeys);
+                                                }
+                                                this.show_preferences = false;
+                                                this.show_hotkey_picker = false;
+                                                cx.notify();
+                                            }),
+                                        );
                                     }
                                     btn
                                 }),

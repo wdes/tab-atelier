@@ -196,10 +196,7 @@ pub fn load_state_at(path: &std::path::Path) -> Option<SavedState> {
 /// Load tab list and hydrate each tab's output / uptime / energy from its
 /// per-tab file under `state_base`.
 #[must_use]
-pub fn load_state_with_outputs(
-    config_base: &std::path::Path,
-    state_base: &std::path::Path,
-) -> Option<SavedState> {
+pub fn load_state_with_outputs(config_base: &std::path::Path, state_base: &std::path::Path) -> Option<SavedState> {
     let mut state = load_state_at(&config_state_path(config_base))?;
     for t in &mut state.tabs {
         if t.output.is_none() {
@@ -855,14 +852,12 @@ pub fn load_tab_output(state_base: &std::path::Path, tab_name: &str) -> Option<S
     None
 }
 
-fn write_atomic_with_rotation<T: serde::Serialize>(
-    dir: &std::path::Path,
-    path: &std::path::Path,
-    value: &T,
-) {
+fn write_atomic_with_rotation<T: serde::Serialize>(dir: &std::path::Path, path: &std::path::Path, value: &T) {
     use std::io::Write;
     let _ = std::fs::create_dir_all(dir);
-    let Ok(data) = serde_json::to_string_pretty(value) else { return };
+    let Ok(data) = serde_json::to_string_pretty(value) else {
+        return;
+    };
 
     let tmp = path.with_extension("json.tmp");
     let Ok(mut f) = std::fs::File::create(&tmp) else { return };
@@ -1075,8 +1070,7 @@ mod tests {
         assert!(!restored.tabs[0].colors_enabled);
 
         // Missing field deserializes to the default (true).
-        let restored: SavedState =
-            serde_json::from_str(r#"{"tabs":[{"name":"x","cwd":null}],"active":0}"#).unwrap();
+        let restored: SavedState = serde_json::from_str(r#"{"tabs":[{"name":"x","cwd":null}],"active":0}"#).unwrap();
         assert!(restored.tabs[0].colors_enabled);
     }
 
@@ -1172,7 +1166,10 @@ mod tests {
         save_tab_output(&base, "build_run", "different tab");
         assert_eq!(load_tab_output(&base, "build_run").as_deref(), Some("different tab"));
         // Original is untouched.
-        assert_eq!(load_tab_output(&base, "build/run").as_deref(), Some("lots of output\nhere\n"));
+        assert_eq!(
+            load_tab_output(&base, "build/run").as_deref(),
+            Some("lots of output\nhere\n")
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -1237,11 +1234,7 @@ mod tests {
             windowed: false,
         };
         std::fs::write(sd.join("tabs.json"), "broken json").unwrap();
-        std::fs::write(
-            sd.join("tabs.json.bak"),
-            serde_json::to_string(&good).unwrap(),
-        )
-        .unwrap();
+        std::fs::write(sd.join("tabs.json.bak"), serde_json::to_string(&good).unwrap()).unwrap();
 
         let loaded = load_state_from(&dir).expect("should fall back to .bak");
         assert_eq!(loaded.tabs.len(), 1);
