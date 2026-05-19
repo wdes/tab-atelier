@@ -4,7 +4,7 @@
 
 mod api;
 mod app;
-mod claude;
+mod catbus_agent;
 mod locale;
 mod platform;
 #[cfg(feature = "energy")]

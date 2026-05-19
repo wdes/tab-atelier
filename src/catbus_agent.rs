@@ -2,33 +2,38 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Discovery + parsing of Claude Code session transcripts.
+//! Discovery + parsing of catbus-agent session transcripts (with
+//! the legacy Claude Code TUI as a recognised fallback).
 //!
-//! Claude Code persists every session at
-//! `~/.claude/projects/{escaped-cwd}/{session-id}.jsonl`, where the
-//! escaping rule is "every non-ASCII-alphanumeric byte → `-`". The
-//! file is append-only, one JSON object per line, mixing meta entries
-//! (permission mode, file-history snapshots) with the conversation
-//! itself (`type = "user" | "assistant"`).
+//! Sessions persist at `~/.claude/projects/{escaped-cwd}/{session-id}
+//! .jsonl`, where the escaping rule is "every non-ASCII-alphanumeric
+//! byte → `-`". The file is append-only, one JSON object per line,
+//! mixing meta entries (permission mode, file-history snapshots)
+//! with the conversation itself (`type = "user" | "assistant"`).
 //!
-//! The mobile remote treats each Claude-running tab as a chat thread:
+//! The mobile remote treats each agent-running tab as a chat thread:
 //! this module is what turns a tab's shell PID into the transcript
 //! file and walks the file into a flat list of messages the remote
-//! can render as chat bubbles.
+//! can render as chat bubbles. It also speaks the catbus-agent
+//! NDJSON socket protocol so `POST /tabs/N/catbus/message` can
+//! forward prompts.
 
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-/// One detected Claude Code session attached to a tab.
+/// One detected agent session attached to a tab.
 #[derive(Debug, Clone, Serialize)]
-pub struct ClaudeSession {
+pub struct AgentSession {
     pub session_id: String,
     pub file_path: PathBuf,
     pub cwd: PathBuf,
-    /// `claude` process PID — handy for kill / signal later.
-    pub claude_pid: u32,
+    /// Agent process PID — handy for kill / signal later.
+    pub agent_pid: u32,
 }
 
 /// A single conversation turn after the transcript has been flattened.
@@ -50,12 +55,12 @@ pub enum MessageSegment {
     Thinking { text: String },
 }
 
-/// Walk descendant processes of `shell_pid` looking for any agent
-/// runtime — Claude Code's `claude` TUI *or* our own `catbus-agent`.
-/// Both write the same JSONL layout under `~/.claude/projects/`, so a
-/// single lookup serves the `/catbus` endpoints regardless of which
-/// implementation the tab is hosting.
-pub fn find_session(shell_pid: u32) -> Option<ClaudeSession> {
+/// Walk descendant processes of `shell_pid` looking for an agent
+/// runtime — catbus-agent (preferred) or the legacy Claude Code TUI
+/// as a fallback. Both write the same JSONL layout under
+/// `~/.claude/projects/`, so a single lookup serves the /catbus
+/// endpoints regardless of which one the tab is hosting.
+pub fn find_session(shell_pid: u32) -> Option<AgentSession> {
     let agent_pid = find_agent_descendant(shell_pid)?;
     let cwd = fs::read_link(format!("/proc/{agent_pid}/cwd")).ok()?;
     let project_dir = home_projects_dir()?.join(escape_cwd(&cwd));
@@ -63,21 +68,20 @@ pub fn find_session(shell_pid: u32) -> Option<ClaudeSession> {
         return None;
     }
     let (path, session_id) = newest_session(&project_dir)?;
-    Some(ClaudeSession {
+    Some(AgentSession {
         session_id,
         file_path: path,
         cwd,
-        claude_pid: agent_pid,
+        agent_pid,
     })
 }
 
-/// BFS over `/proc/{pid}/task/{pid}/children`. Match `claude` (the
-/// Claude Code TUI) or `catbus-agent` (our own runtime). We don't
-/// recurse into kernel threads or pids in different namespaces —
-/// sticking to /proc handles this for us, those entries simply don't
-/// exist.
+/// BFS over `/proc/{pid}/task/{pid}/children`. Match `catbus-agent`
+/// or the legacy `claude` TUI by `comm`. We don't recurse into
+/// kernel threads or pids in different namespaces — sticking to
+/// /proc handles this for us, those entries simply don't exist.
 fn find_agent_descendant(root_pid: u32) -> Option<u32> {
-    const AGENT_COMMS: &[&str] = &["claude", "catbus-agent"];
+    const AGENT_COMMS: &[&str] = &["catbus-agent", "claude"];
     let mut queue = vec![root_pid];
     while let Some(pid) = queue.pop() {
         if let Some(comm) = read_comm(pid)
@@ -108,9 +112,10 @@ fn home_projects_dir() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".claude").join("projects"))
 }
 
-/// Claude Code's escaping rule: every byte that isn't `[A-Za-z0-9]`
-/// becomes `-`. Consecutive non-alphanumerics produce consecutive
-/// dashes (e.g. `/@` → `--`).
+/// Escaping rule used by both catbus-agent and Claude Code when
+/// mapping a cwd to a project directory name: every byte that isn't
+/// `[A-Za-z0-9]` becomes `-`. Consecutive non-alphanumerics produce
+/// consecutive dashes (e.g. `/@` → `--`).
 #[must_use]
 pub fn escape_cwd(cwd: &Path) -> String {
     let s = cwd.to_string_lossy();
@@ -121,7 +126,7 @@ pub fn escape_cwd(cwd: &Path) -> String {
 
 /// Pick the JSONL file with the latest modified-time in the project
 /// directory. Multiple sessions in the same cwd are unusual but
-/// possible (multiple Claude tabs in the same dir); the newest one
+/// possible (multiple agent tabs in the same dir); the newest one
 /// is the most likely current session.
 fn newest_session(project_dir: &Path) -> Option<(PathBuf, String)> {
     let mut best: Option<(PathBuf, String, std::time::SystemTime)> = None;
@@ -241,6 +246,83 @@ struct RawBlock {
     is_error: Option<bool>,
 }
 
+/// Open the per-session UNIX socket, send a `prompt` frame, and
+/// block until the agent emits a `done` or `error` reply. Used by
+/// `POST /tabs/N/catbus/message` to forward the mobile remote's
+/// prompts. Sync (synchronous `std::os::unix::net::UnixStream`)
+/// because the rest of the api crate is on threads, not tokio.
+///
+/// `socket_path` is typically `{transcript-stem}.sock` — i.e. the
+/// session's transcript with the extension swapped to `.sock`.
+pub fn send_prompt_to_socket(socket_path: &Path, text: &str) -> Result<String, String> {
+    use serde_json::Value;
+    let stream = UnixStream::connect(socket_path)
+        .map_err(|e| format!("connect {}: {e}", socket_path.display()))?;
+    // 10-minute ceiling — agent answers shouldn't take longer; if
+    // they do, something's wrong on the agent side and we'd rather
+    // free the API thread than hang it forever.
+    let timeout = Duration::from_mins(10);
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+    let mut writer = stream.try_clone().map_err(|e| format!("clone: {e}"))?;
+    let mut reader = BufReader::new(stream);
+
+    // The server greets every connection with {"kind":"started"} —
+    // drain it before sending, so frames stay request/reply aligned.
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .map_err(|e| format!("read greeting: {e}"))?;
+
+    let payload = format!(r#"{{"kind":"prompt","text":{}}}"#, json_encode_string(text));
+    writeln!(writer, "{payload}").map_err(|e| format!("write: {e}"))?;
+    writer.flush().map_err(|e| format!("flush: {e}"))?;
+
+    // Read until we see a `done`/`error`. Other frame kinds
+    // (`chunk`, future additions) are ignored — we only need the
+    // final answer for now.
+    loop {
+        line.clear();
+        let n = reader
+            .read_line(&mut line)
+            .map_err(|e| format!("read: {e}"))?;
+        if n == 0 {
+            return Err("agent closed connection before replying".into());
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let frame: Value =
+            serde_json::from_str(trimmed).map_err(|e| format!("malformed frame: {e}"))?;
+        match frame.get("kind").and_then(Value::as_str) {
+            Some("done") => {
+                return Ok(frame
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string());
+            }
+            Some("error") => {
+                return Err(frame
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("(unknown)")
+                    .to_string());
+            }
+            _ => {}
+        }
+    }
+}
+
+/// JSON-encode a string for inline injection. We don't pull in
+/// `serde_json::to_string` for the whole payload because that'd
+/// build a full `Value`; the text is the only field that needs
+/// escaping.
+fn json_encode_string(s: &str) -> String {
+    serde_json::to_string(s).expect("string is always serializable")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,7 +342,7 @@ mod tests {
 
     #[test]
     fn parse_messages_skips_meta_lines() {
-        let dir = std::env::temp_dir().join(format!("ta-claude-test-{}-skip", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ta-catbus-test-{}-skip", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("s.jsonl");
         std::fs::write(
@@ -286,7 +368,7 @@ mod tests {
 
     #[test]
     fn parse_messages_extracts_tool_use_and_result() {
-        let dir = std::env::temp_dir().join(format!("ta-claude-test-{}-tools", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ta-catbus-test-{}-tools", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("s.jsonl");
         std::fs::write(

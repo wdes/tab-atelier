@@ -70,8 +70,9 @@ pub struct SnapshotTab {
     /// None when the cursor is outside the emitted lines (e.g. in
     /// scrollback beyond the cached window).
     pub cursor: Option<(usize, usize)>,
-    /// PID of the tab's shell. Used by the Claude-session endpoints
-    /// to walk descendant processes and find a `claude` instance.
+    /// PID of the tab's shell. The /catbus endpoints walk its
+    /// descendant processes to find a catbus-agent (or fallback
+    /// `claude` TUI) and resolve the session's transcript file.
     pub shell_pid: u32,
 }
 
@@ -380,11 +381,11 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             };
             let pid = t.shell_pid;
             drop(snap);
-            match crate::claude::find_session(pid) {
+            match crate::catbus_agent::find_session(pid) {
                 Some(session) => {
                     let body = serde_json::to_string(&serde_json::json!({
                         "session_id": session.session_id,
-                        "agent_pid": session.claude_pid,
+                        "agent_pid": session.agent_pid,
                         "cwd": session.cwd.to_string_lossy(),
                         "file": session.file_path.to_string_lossy(),
                     }))
@@ -392,6 +393,54 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                     respond_json(stream, 200, &body);
                 }
                 None => error_json(stream, 404, "no agent session under this tab"),
+            }
+        }
+        ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/catbus/message") => {
+            // Forward a user prompt to the tab's catbus-agent over
+            // its UNIX socket. Sync — we block here until the agent
+            // produces a `done` frame or errors out. The mobile
+            // client picks up the appended assistant turn via the
+            // existing GET messages endpoint on its next poll.
+            let idx_str = &p["/tabs/".len()..p.len() - "/catbus/message".len()];
+            let Ok(idx) = idx_str.parse::<usize>() else {
+                error_json(stream, 404, "invalid tab index");
+                return;
+            };
+            let snap = state.lock().unwrap();
+            let Some(t) = snap.tabs.get(idx) else {
+                error_json(stream, 404, "tab index out of range");
+                return;
+            };
+            let pid = t.shell_pid;
+            drop(snap);
+            let Some(session) = crate::catbus_agent::find_session(pid) else {
+                error_json(stream, 404, "no agent session under this tab");
+                return;
+            };
+            let socket_path = session.file_path.with_extension("sock");
+            // Body is `{"text":"…"}` — JSON keeps the door open for
+            // future fields (plan-mode toggle, model override, …).
+            let req: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+                Ok(v) => v,
+                Err(e) => {
+                    error_json(stream, 400, &format!("invalid JSON body: {e}"));
+                    return;
+                }
+            };
+            let Some(text) = req.get("text").and_then(|v| v.as_str()) else {
+                error_json(stream, 400, "missing `text` field");
+                return;
+            };
+            match crate::catbus_agent::send_prompt_to_socket(&socket_path, text) {
+                Ok(reply) => {
+                    let body = serde_json::to_string(&serde_json::json!({
+                        "session_id": session.session_id,
+                        "reply": reply,
+                    }))
+                    .unwrap_or_default();
+                    respond_json(stream, 200, &body);
+                }
+                Err(e) => error_json(stream, 502, &format!("agent socket: {e}")),
             }
         }
         ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/catbus/messages") => {
@@ -412,11 +461,11 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             };
             let pid = t.shell_pid;
             drop(snap);
-            let Some(session) = crate::claude::find_session(pid) else {
+            let Some(session) = crate::catbus_agent::find_session(pid) else {
                 error_json(stream, 404, "no agent session under this tab");
                 return;
             };
-            let all = crate::claude::parse_messages(&session.file_path);
+            let all = crate::catbus_agent::parse_messages(&session.file_path);
             let since = query_since.unwrap_or(0);
             let tail = if since >= all.len() {
                 Vec::new()
