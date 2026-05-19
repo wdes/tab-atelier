@@ -39,10 +39,16 @@ struct Args {
     #[arg(long)]
     cwd: Option<PathBuf>,
 
-    /// Resume an existing session by id. Without this flag a fresh
-    /// session is started and a new UUID is allocated.
+    /// Resume an existing session by id. Without this flag the
+    /// newest session in the working directory is auto-resumed
+    /// (use --new-session to override).
     #[arg(long)]
     resume: Option<String>,
+
+    /// Force a brand-new session even when a previous transcript
+    /// exists in this cwd. Default behaviour is to resume.
+    #[arg(long)]
+    new_session: bool,
 
     /// Path to the UNIX socket the agent listens on. Defaults to
     /// `~/.claude/projects/{escaped-cwd}/{session-id}.sock`, so any
@@ -64,13 +70,15 @@ struct Args {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // When the user runs this in a tab they want to see, redirect
-    // logger output to stderr only — the stdout stream belongs to
-    // the REPL.
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+    let args = Args::parse();
+    // REPL mode shares the tab with stdout, so even "to stderr" logs
+    // print in the same window. Quiet the floor to `warn` unless the
+    // user explicitly set RUST_LOG — the socket-only path still gets
+    // info-level chatter because nobody's reading those tabs.
+    let default_level = if args.no_tui { "info" } else { "warn" };
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level))
         .target(env_logger::Target::Stderr)
         .init();
-    let args = Args::parse();
 
     let cwd = match args.cwd {
         Some(p) => p,
@@ -80,7 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Auth must succeed *before* we open the socket — no point
     // accepting prompts we can't service.
     let auth = auth::load()?;
-    let session = session::open(&cwd, args.resume.as_deref())?;
+    let session = session::open(&cwd, args.resume.as_deref(), args.new_session)?;
     let socket_path = args
         .socket
         .clone()
@@ -92,6 +100,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     log::info!("session {} ready at {}", session.id, socket_path.display());
+    let session_id_for_banner = session.id.clone();
+    let cwd_for_banner = session.cwd.clone();
     let agent = Arc::new(agent::Agent::new(auth, session));
 
     let socket_task = tokio::spawn({
@@ -104,7 +114,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Headless: just block on the socket task.
         socket_task.await??;
     } else {
-        run_repl(Arc::clone(&agent)).await?;
+        run_repl(Arc::clone(&agent), &session_id_for_banner, &cwd_for_banner).await?;
         // REPL exit (Ctrl-D) brings the whole process down so the
         // tab the user closed feels "closed". Aborting the socket
         // task removes its file in Drop on a best-effort basis.
@@ -120,12 +130,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// highlighting. Tab-atelier hosts the actual terminal so things
 /// like cursor movement / line editing come from there. If a power
 /// user wants `rlwrap catbus-agent`, that works too.
-async fn run_repl(agent: Arc<agent::Agent>) -> std::io::Result<()> {
+async fn run_repl(
+    agent: Arc<agent::Agent>,
+    session_id: &str,
+    cwd: &std::path::Path,
+) -> std::io::Result<()> {
     let mut stdout = tokio::io::stdout();
     let mut reader = BufReader::new(tokio::io::stdin());
     stdout
-        .write_all(b"\x1b[1m\xf0\x9f\x90\x88\xef\xb8\x8f\xf0\x9f\x9a\x8c Catbus\x1b[0m \xe2\x80\x94 type a prompt, Ctrl-D to exit.\n\n")
+        .write_all(b"\x1b[1m\xf0\x9f\x90\x88\xef\xb8\x8f\xf0\x9f\x9a\x8c Catbus\x1b[0m \xe2\x80\x94 type a prompt, /help for commands, Ctrl-D to exit.\n")
         .await?;
+    stdout
+        .write_all(format!("session \x1b[2m{session_id}\x1b[0m\n\n").as_bytes())
+        .await?;
+    let cwd = cwd.to_path_buf();
     let mut line = String::new();
     loop {
         stdout.write_all(b"\x1b[36m>\x1b[0m ").await?;
@@ -142,6 +160,20 @@ async fn run_repl(agent: Arc<agent::Agent>) -> std::io::Result<()> {
         }
         // Slash commands are interpreted locally; everything else
         // becomes a user turn for the model.
+        if prompt == "/help" {
+            stdout
+                .write_all(
+                    b"slash commands:\n  \
+                      /help              show this list\n  \
+                      /plan              enable plan-mode (write/edit/bash refuse)\n  \
+                      /noplan            disable plan-mode\n  \
+                      /resume            list previous sessions in this cwd\n\n\
+                      to switch to a previous session, exit and run:\n  \
+                      catbus-agent --resume <session-id>\n\n",
+                )
+                .await?;
+            continue;
+        }
         if prompt == "/plan" {
             agent.set_plan_mode(true);
             stdout.write_all(b"plan-mode = true\n").await?;
@@ -150,6 +182,34 @@ async fn run_repl(agent: Arc<agent::Agent>) -> std::io::Result<()> {
         if prompt == "/noplan" {
             agent.set_plan_mode(false);
             stdout.write_all(b"plan-mode = false\n").await?;
+            continue;
+        }
+        if prompt == "/resume" {
+            let sessions = session::list_sessions(&cwd);
+            if sessions.is_empty() {
+                stdout
+                    .write_all(b"no previous sessions in this cwd.\n\n")
+                    .await?;
+                continue;
+            }
+            // Format times as relative-to-now for readability —
+            // the absolute mtime isn't useful to a human.
+            stdout
+                .write_all(format!("{} session(s) for {}:\n", sessions.len(), cwd.display()).as_bytes())
+                .await?;
+            let now = std::time::SystemTime::now();
+            for (id, ts) in &sessions {
+                let age = now
+                    .duration_since(*ts)
+                    .map_or_else(|_| "in the future".to_string(), |d| humanise_age(d.as_secs()));
+                let marker = if id == session_id { " (current)" } else { "" };
+                stdout
+                    .write_all(format!("  {id}  {age}{marker}\n").as_bytes())
+                    .await?;
+            }
+            stdout
+                .write_all(b"\nto switch, exit and run: catbus-agent --resume <session-id>\n\n")
+                .await?;
             continue;
         }
         match agent.run_user_prompt(prompt.to_string()).await {
@@ -166,4 +226,16 @@ async fn run_repl(agent: Arc<agent::Agent>) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn humanise_age(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86_400)
+    }
 }
