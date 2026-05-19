@@ -32,7 +32,7 @@ pub enum SocketError {
     Io(#[from] std::io::Error),
 }
 
-pub async fn serve(agent: Agent, path: PathBuf) -> Result<(), SocketError> {
+pub async fn serve(agent: Arc<Agent>, path: PathBuf) -> Result<(), SocketError> {
     // Stale socket from a crashed previous run blocks bind otherwise.
     let _ = std::fs::remove_file(&path);
     if let Some(parent) = path.parent() {
@@ -44,7 +44,6 @@ pub async fn serve(agent: Agent, path: PathBuf) -> Result<(), SocketError> {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
     }
-    let agent = Arc::new(agent);
     log::info!("listening on {}", path.display());
 
     // Clean shutdown on SIGINT/SIGTERM so the socket file gets removed.
