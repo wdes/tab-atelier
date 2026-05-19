@@ -11,7 +11,9 @@
 use std::path::Path;
 
 mod bash;
+mod delegate;
 mod edit;
+mod list_agents;
 mod read;
 mod write;
 
@@ -39,6 +41,12 @@ pub async fn dispatch(name: &str, input: &serde_json::Value, cwd: &Path, plan_mo
             }
             bash::run(input, cwd).await
         }
+        // Inter-agent tools — observation always allowed; delegation
+        // is reads-and-writes-by-proxy, so plan-mode wouldn't really
+        // gate it on this side anyway (the *target* enforces its
+        // own plan-mode).
+        "ListAgents" => list_agents::run(input, cwd).await,
+        "Delegate" => delegate::run(input, cwd).await,
         other => Err(format!("unknown tool: {other}")),
     }
 }
@@ -85,6 +93,24 @@ pub fn tool_specs() -> Vec<serde_json::Value> {
                     "new_string": { "type": "string" }
                 },
                 "required": ["path", "old_string", "new_string"]
+            }
+        }),
+        serde_json::json!({
+            "name": "ListAgents",
+            "description": "List every catbus-agent currently running (anywhere on the machine) along with its session id and socket path. Use this to discover peer agents to delegate work to.",
+            "input_schema": { "type": "object", "properties": {} }
+        }),
+        serde_json::json!({
+            "name": "Delegate",
+            "description": "Send a sub-prompt to another catbus-agent and wait for its reply. The target's own plan-mode + tools apply; the caller does not share context with it. Use sparingly — every level of delegation eats the caller's tool-loop budget.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "target": { "type": "string", "description": "Session id (UUID) of the peer agent, or an absolute path to its UNIX socket." },
+                    "prompt": { "type": "string", "description": "The sub-prompt the peer should run." },
+                    "timeout_secs": { "type": "integer", "description": "Override the 5-minute default. Capped at 1800." }
+                },
+                "required": ["target", "prompt"]
             }
         }),
         serde_json::json!({

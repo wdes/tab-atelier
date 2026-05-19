@@ -1030,6 +1030,11 @@ impl AppState {
                 .h(px(32.0))
                 .min_w(px(120.0))
                 .flex_shrink_0()
+                // Left border so the first tab of each wrapped row
+                // shows a separator on its left edge — right-only
+                // borders left the bar looking unbounded at every
+                // row start.
+                .border_l_1()
                 .bg(if blink_red {
                     tab_blink_bg
                 } else if is_active {
@@ -1128,10 +1133,22 @@ impl AppState {
             .flex()
             .items_center()
             .justify_center()
-            .w(px(32.0))
-            .h_full()
+            // Same fixed 32 px height as a tab. `h_full` made the
+            // button stretch over the entire wrapped bar (so the "+"
+            // ended up vertically centred in 64 px and looked too
+            // low). Min-width + no-shrink keeps it discoverable when
+            // the bar fills up.
+            .h(px(32.0))
+            .min_w(px(40.0))
+            .flex_shrink_0()
+            .border_l_1()
+            .border_color(tab_border)
             .text_color(tab_fg)
-            .text_size(px(18.0))
+            // Bumped from 18 → 22 px and weight 700; at 18 the glyph
+            // was barely above the bar background and read as a
+            // faint dash on most themes.
+            .text_size(px(22.0))
+            .font_weight(gpui::FontWeight::BOLD)
             .cursor_pointer()
             .hover(|s| s.bg(tab_active_bg))
             .on_click(cx.listener(|this, _ev: &ClickEvent, window, cx| {
