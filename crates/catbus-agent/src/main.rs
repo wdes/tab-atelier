@@ -162,6 +162,10 @@ async fn run_repl(agent: Arc<agent::Agent>, cwd: &std::path::Path) -> std::io::R
             continue;
         }
 
+        // Erase the prompt line (move up one, clear to end-of-line) so
+        // the terminal shows a clean slate before the reply or spinner.
+        stdout.write_all(b"\x1b[1A\x1b[2K").await?;
+
         // Slash commands are interpreted locally; everything else
         // becomes a user turn for the model.
         if prompt == "/help" {
