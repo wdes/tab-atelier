@@ -72,6 +72,9 @@ maintainer = "William Desportes <williamdes@wdes.fr>"
 extended-description = "A Guake-style drop-down terminal emulator built with alacritty_terminal and gpui. Features tabbed terminals, i18n (English/French), power monitoring, screenshots, remote control via QR code, and Wakatime integration."
 assets = [
     ["target/release/tab-atelier", "/usr/bin/", "755"],
+    # Bundled so the "Switch to catbus" tab menu entry resolves the
+    # binary against the user's PATH without extra config.
+    ["target/release/catbus-agent", "/usr/bin/", "755"],
     ["assets/tab-atelier.desktop", "/usr/share/applications/", "644"],
     ["assets/tab-atelier.svg", "/usr/share/icons/hicolor/scalable/apps/tab-atelier.svg", "644"],
     ["README.md", "/usr/share/doc/tab-atelier/", "644"],

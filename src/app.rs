@@ -1227,6 +1227,33 @@ impl AppState {
                 );
             }
 
+            // Switch the active shell into a catbus session by exec'ing
+            // catbus-agent inside the existing PTY. `exec` replaces the
+            // shell so the tab's PID stays the same and the existing
+            // session-discovery walker finds the new process by `comm`.
+            // The U+FE0F variation selectors after each emoji nudge
+            // font fallback toward the colour-emoji face for both
+            // glyphs, which on Linux otherwise picks different fonts.
+            container = container.child(
+                div()
+                    .id("menu-catbus")
+                    .px(px(12.0))
+                    .py(px(4.0))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(menu_hover))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                            let view = &this.tabs[idx].view;
+                            view.read(cx)
+                                .send_clipboard("clear && exec catbus-agent\n");
+                            this.context_menu = None;
+                            cx.notify();
+                        }),
+                    )
+                    .child("\u{1f408}\u{fe0f}\u{1f68c}\u{fe0f} Catbus"),
+            );
+
             let colors_enabled = self.tabs[idx].view.read(cx).colors_enabled();
             let toggle_label = if colors_enabled {
                 self.t().disable_colors
