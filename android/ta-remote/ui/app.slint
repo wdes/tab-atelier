@@ -1401,6 +1401,8 @@ export component AppWindow inherits Window {
     // Bottom action sheet for a single tab — invoked from the TabCard's
     // "..." button. Pulls Rename / Close out of the row so the inline
     // buttons stop competing with the tab name and preview text.
+    // Bumped from 220 → 280 px to fit the new Convert-to-Catbus row.
+    // Computed-vs-fixed is fine because the row count is static.
     if root.actions-idx >= 0 : Rectangle {
         width: 100%;
         height: 100%;
@@ -1409,7 +1411,7 @@ export component AppWindow inherits Window {
 
         Rectangle {
             width: min(parent.width * 92%, 480px);
-            height: 220px;
+            height: 280px;
             y: parent.height - self.height - 16px - root.safe-area-insets.bottom;
             background: #1c1c1c;
             border-radius: 14px;
@@ -1511,6 +1513,48 @@ export component AppWindow inherits Window {
                             Text {
                                 text: "Close tab";
                                 color: #ef5350;
+                                font-size: 15px;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                }
+
+                Rectangle { height: 1px; background: #2a2a2a; }
+
+                // Convert this tab's shell into a catbus-agent REPL
+                // by sending `clear && exec catbus-agent\n` through
+                // the existing per-tab input endpoint. exec replaces
+                // the shell so the tab PID is unchanged and the
+                // `/catbus` lookup finds the new process automatically.
+                TouchArea {
+                    height: 56px;
+                    clicked => {
+                        if (root.actions-idx >= 0) {
+                            root.request-send-input(
+                                root.actions-idx,
+                                "clear && exec catbus-agent\n",
+                            );
+                            root.actions-idx = -1;
+                        }
+                    }
+                    Rectangle {
+                        background: parent.has-hover ? #1f2a3a : transparent;
+                        HorizontalLayout {
+                            padding-left: 16px;
+                            spacing: 12px;
+                            alignment: start;
+                            Text {
+                                // U+FE0F variation selectors push gpui /
+                                // fontique toward the colour-emoji face
+                                // for both glyphs.
+                                text: "\u{1f408}\u{fe0f}\u{1f68c}\u{fe0f}";
+                                font-size: 18px;
+                                vertical-alignment: center;
+                            }
+                            Text {
+                                text: "Convert to Catbus";
+                                color: #80a0ff;
                                 font-size: 15px;
                                 vertical-alignment: center;
                             }
