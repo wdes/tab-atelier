@@ -27,7 +27,7 @@ cast_lossless = "allow"
 anthropic-auth = "0.1"
 # Async runtime — single-threaded suffices for one session per
 # process. multi_thread would be overkill for an I/O-bound loop.
-tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "fs", "sync", "time", "process", "signal"] }
+tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "io-std", "fs", "sync", "time", "process", "signal"] }
 # HTTPS client. reqwest with rustls keeps us off OpenSSL.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 serde = { version = "1", features = ["derive"] }
