@@ -294,20 +294,21 @@ async fn run_repl(agent: Arc<agent::Agent>, cwd: &std::path::Path) -> std::io::R
         // can drive the spinner on stdout.
         let work = tokio::spawn(async move { agent_clone.run_user_prompt(prompt_owned).await });
 
-        // Spinner loop: tick every 120 ms while `working` is set.
+        // Spinner loop: tick every 120 ms while `status` is set.
         let spinner_agent = Arc::clone(&agent);
         let mut frame: usize = 0;
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-            if !spinner_agent.working.load(std::sync::atomic::Ordering::Relaxed) {
+            let current_status = spinner_agent.status.lock().expect("status mutex").clone();
+            let Some(label) = current_status else {
                 // Erase the spinner line before printing the reply.
                 stdout.write_all(b"\r\x1b[K").await?;
                 stdout.flush().await?;
                 break;
-            }
+            };
             let spinner_char = SPINNER[frame % SPINNER.len()];
             stdout
-                .write_all(format!("\r\x1b[36m{spinner_char}\x1b[0m working…").as_bytes())
+                .write_all(format!("\r\x1b[36m{spinner_char}\x1b[0m {label}").as_bytes())
                 .await?;
             stdout.flush().await?;
             frame += 1;

@@ -51,9 +51,9 @@ pub struct Agent {
     /// model to propose instead — same shape as Claude Code's
     /// shift-tab toggle.
     plan_mode: std::sync::atomic::AtomicBool,
-    /// Set to `true` while the agent is running a prompt. The REPL
-    /// polls this to drive its progress spinner.
-    pub working: std::sync::atomic::AtomicBool,
+    /// Current activity description shown in the REPL spinner.
+    /// `None` = idle, `Some(s)` = description of what's happening.
+    pub status: std::sync::Mutex<Option<String>>,
     /// Cumulative tokens consumed across all turns in this process.
     /// Both counters accumulate monotonically and are never reset.
     pub tokens_in: std::sync::atomic::AtomicU64,
@@ -74,7 +74,7 @@ impl Agent {
                 history: Vec::new(),
             }),
             plan_mode: std::sync::atomic::AtomicBool::new(false),
-            working: std::sync::atomic::AtomicBool::new(false),
+            status: std::sync::Mutex::new(None),
             tokens_in: std::sync::atomic::AtomicU64::new(0),
             tokens_out: std::sync::atomic::AtomicU64::new(0),
         }
@@ -131,9 +131,9 @@ impl Agent {
     /// drive the tool loop until the assistant stops asking for
     /// tools. Returns the model's final assistant text concatenated.
     pub async fn run_user_prompt(&self, text: String) -> Result<String, AgentError> {
-        self.working.store(true, std::sync::atomic::Ordering::Relaxed);
+        *self.status.lock().expect("status mutex") = Some("thinking".into());
         let result = self.run_user_prompt_inner(text).await;
-        self.working.store(false, std::sync::atomic::Ordering::Relaxed);
+        *self.status.lock().expect("status mutex") = None;
         result
     }
 
@@ -162,6 +162,7 @@ impl Agent {
             .and_then(|s| s.parse().ok())
             .unwrap_or(200);
         for _ in 0..max_rounds {
+            *self.status.lock().expect("status mutex") = Some("thinking".into());
             let resp = self.call_messages().await?;
             // Accumulate token usage immediately so the sidecar file
             // written after each prompt is always up to date.
@@ -209,6 +210,10 @@ impl Agent {
             let plan = self.plan_mode.load(std::sync::atomic::Ordering::Relaxed);
             let mut results: Vec<Block> = Vec::with_capacity(tool_uses.len());
             for (id, name, input) in tool_uses {
+                // Show the tool name (and a short input summary for Bash)
+                // in the status so the spinner reflects what's running.
+                let label = tool_status_label(&name, &input);
+                *self.status.lock().expect("status mutex") = Some(label);
                 let (content, is_error) = tools::dispatch(&name, &input, &session.cwd, plan)
                     .await
                     .map_or_else(|e| (format!("Error: {e}"), true), |out| (out, false));
@@ -339,6 +344,42 @@ fn rebuild_history(project_dir: &std::path::Path, id: &str) -> Vec<ApiMessage> {
         }
     }
     out
+}
+
+/// Build a short human-readable label for the spinner while a tool runs.
+/// For Bash we include the first 60 chars of the command so it's clear
+/// what's executing; for Read/Write/Edit we show the filename.
+fn tool_status_label(name: &str, input: &serde_json::Value) -> String {
+    match name {
+        "Bash" => {
+            let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            let short: String = cmd.chars().take(60).collect();
+            let ellipsis = if cmd.len() > 60 { "…" } else { "" };
+            format!("Bash: {short}{ellipsis}")
+        }
+        "Read" | "Write" | "Edit" => {
+            let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+            // Show only the last two components so long paths don't overflow.
+            let short = std::path::Path::new(path)
+                .components()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .take(2)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/");
+            format!("{name}: {short}")
+        }
+        "Delegate" => {
+            let target = input.get("target").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("Delegate → {target}")
+        }
+        other => other.to_string(),
+    }
 }
 
 // --- API wire types --------------------------------------------------------
