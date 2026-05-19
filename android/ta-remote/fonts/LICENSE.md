@@ -1,8 +1,8 @@
 Bundled font attributions
 =========================
 
-FreeMono.ttf
-------------
+FreeMono.ttf, FreeMonoBold.ttf
+------------------------------
 Source: GNU FreeFont project (https://www.gnu.org/software/freefont/)
 License: GNU GPL v3 with font embedding exception (free for any use,
          including embedding in proprietary documents/apps).
@@ -11,6 +11,12 @@ Latin Extended, Cyrillic / Greek, nor the Miscellaneous Technical
 block (U+2300–U+23FF). FreeMono covers all of these, including
 glyphs like ⏵, ⏴, ⎿ used by modern TUIs (Claude Code, Crush, etc.).
 DejaVu Sans Mono was tried first but lacks the U+23xx range.
+
+The Bold companion is bundled because Slint's synthesised bold
+(when only Regular is loaded) produces uneven weight at span
+boundaries — the first glyph of each bold run rendered lighter
+than the rest. With both faces registered, fontique picks the
+right one per font-weight.
 
 NotoEmoji.ttf
 -------------
