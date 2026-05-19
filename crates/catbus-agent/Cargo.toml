@@ -1,0 +1,44 @@
+[package]
+name = "catbus-agent"
+version = "0.1.0-dev"
+edition = "2024"
+rust-version = "1.92"
+authors = ["William Desportes <williamdes@wdes.fr>"]
+description = "Claude agent runner for tab-atelier — many tabs, many windows."
+license = "MPL-2.0"
+publish = false
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+
+# Narrowing casts in this crate are deliberate (ms-since-epoch
+# truncation for filenames, etc.); silence the noisy variants.
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_lossless = "allow"
+
+[dependencies]
+# Anthropic OAuth + Max-subscription credential reader.
+anthropic-auth = "0.1"
+# Async runtime — single-threaded suffices for one session per
+# process. multi_thread would be overkill for an I/O-bound loop.
+tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "fs", "sync", "time", "process", "signal"] }
+# HTTPS client. reqwest with rustls keeps us off OpenSSL.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+env_logger = "0.11"
+clap = { version = "4", features = ["derive"] }
+# Time formatting for JSONL timestamps in the exact format Claude
+# Code emits (ISO-8601 with millisecond precision and `Z` suffix).
+jiff = "0.2"
+# UUID generation for `uuid` / `parentUuid` fields in the
+# transcript. Claude Code uses v4 UUIDs there.
+uuid = { version = "1", features = ["v4"] }
+thiserror = "2"
