@@ -157,7 +157,7 @@ async fn run_repl(agent: Arc<agent::Agent>, cwd: &std::path::Path) -> std::io::R
             stdout.write_all(b"\n").await?;
             break;
         }
-        let prompt = line.trim();
+        let prompt = line.trim().trim_matches('`');
         if prompt.is_empty() {
             continue;
         }
@@ -207,6 +207,7 @@ async fn run_repl(agent: Arc<agent::Agent>, cwd: &std::path::Path) -> std::io::R
                     // line of stdout.
                     let text = String::from_utf8_lossy(&o.stdout);
                     let path = text.lines().rfind(|l| !l.trim().is_empty()).unwrap_or("(no output)");
+                    let path = path.trim().trim_matches('`');
                     stdout
                         .write_all(format!("\x1b[1m{path}\x1b[0m\n").as_bytes())
                         .await?;
