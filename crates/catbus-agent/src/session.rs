@@ -6,7 +6,7 @@
 //!
 //! Catbus writes the same JSONL files Claude Code does, in the same
 //! place (`~/.claude/projects/{escaped-cwd}/{session-id}.jsonl`).
-//! That keeps the existing tab-atelier `/tabs/N/claude/messages`
+//! That keeps the existing tab-atelier `/tabs/N/catbus/messages`
 //! endpoint working unchanged — it doesn't know or care whether the
 //! transcript came from `claude` or from us.
 

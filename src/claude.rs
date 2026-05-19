@@ -50,12 +50,14 @@ pub enum MessageSegment {
     Thinking { text: String },
 }
 
-/// Walk descendant processes of `shell_pid` looking for a `claude`
-/// process. Returns the deepest match — when claude is nested inside
-/// `tmux`/`sudo`/etc. we still find it.
+/// Walk descendant processes of `shell_pid` looking for any agent
+/// runtime — Claude Code's `claude` TUI *or* our own `catbus-agent`.
+/// Both write the same JSONL layout under `~/.claude/projects/`, so a
+/// single lookup serves the `/catbus` endpoints regardless of which
+/// implementation the tab is hosting.
 pub fn find_session(shell_pid: u32) -> Option<ClaudeSession> {
-    let claude_pid = find_claude_descendant(shell_pid)?;
-    let cwd = fs::read_link(format!("/proc/{claude_pid}/cwd")).ok()?;
+    let agent_pid = find_agent_descendant(shell_pid)?;
+    let cwd = fs::read_link(format!("/proc/{agent_pid}/cwd")).ok()?;
     let project_dir = home_projects_dir()?.join(escape_cwd(&cwd));
     if !project_dir.is_dir() {
         return None;
@@ -65,18 +67,22 @@ pub fn find_session(shell_pid: u32) -> Option<ClaudeSession> {
         session_id,
         file_path: path,
         cwd,
-        claude_pid,
+        claude_pid: agent_pid,
     })
 }
 
-/// BFS over `/proc/{pid}/task/{pid}/children` to find a `claude`
-/// process under `root_pid`. We don't recurse into kernel threads or
-/// pids in different namespaces — sticking to /proc handles this for
-/// us, those entries simply don't exist.
-fn find_claude_descendant(root_pid: u32) -> Option<u32> {
+/// BFS over `/proc/{pid}/task/{pid}/children`. Match `claude` (the
+/// Claude Code TUI) or `catbus-agent` (our own runtime). We don't
+/// recurse into kernel threads or pids in different namespaces —
+/// sticking to /proc handles this for us, those entries simply don't
+/// exist.
+fn find_agent_descendant(root_pid: u32) -> Option<u32> {
+    const AGENT_COMMS: &[&str] = &["claude", "catbus-agent"];
     let mut queue = vec![root_pid];
     while let Some(pid) = queue.pop() {
-        if read_comm(pid).as_deref() == Some("claude") {
+        if let Some(comm) = read_comm(pid)
+            && AGENT_COMMS.contains(&comm.as_str())
+        {
             return Some(pid);
         }
         if let Some(kids) = read_children(pid) {

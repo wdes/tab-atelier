@@ -8,14 +8,23 @@ use std::time::Duration;
 
 use tokio::process::Command;
 
-const TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_OUTPUT: usize = 64 * 1024;
+/// Default ceiling — most builds / test suites / curl-and-jq pipes
+/// finish well under this. Real cargo compiles take longer; the model
+/// can pass `timeout_secs` to override per-call.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
+const MAX_TIMEOUT: Duration = Duration::from_secs(3600);
+const MAX_OUTPUT: usize = 256 * 1024;
 
 pub async fn run(input: &serde_json::Value, cwd: &Path) -> Result<String, String> {
     let command = input
         .get("command")
         .and_then(|v| v.as_str())
         .ok_or_else(|| "missing command".to_string())?;
+    let timeout = input
+        .get("timeout_secs")
+        .and_then(serde_json::Value::as_u64)
+        .map(Duration::from_secs)
+        .map_or(DEFAULT_TIMEOUT, |d| d.min(MAX_TIMEOUT));
 
     // `bash -lc` so we inherit the user's PATH / aliases. Stderr is
     // merged with stdout to give the model one chunk of context.
@@ -28,10 +37,10 @@ pub async fn run(input: &serde_json::Value, cwd: &Path) -> Result<String, String
         .stderr(std::process::Stdio::piped());
 
     let child = cmd.spawn().map_err(|e| format!("spawn bash: {e}"))?;
-    let out = match tokio::time::timeout(TIMEOUT, child.wait_with_output()).await {
+    let out = match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Ok(Ok(out)) => out,
         Ok(Err(e)) => return Err(format!("wait: {e}")),
-        Err(_) => return Err(format!("timed out after {}s", TIMEOUT.as_secs())),
+        Err(_) => return Err(format!("timed out after {}s", timeout.as_secs())),
     };
     let mut combined = String::new();
     combined.push_str(&String::from_utf8_lossy(&out.stdout));

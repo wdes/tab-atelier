@@ -377,8 +377,7 @@ impl TerminalView {
                 // cleanup easy (`rm /tmp/tab-atelier-paste-*`).
                 let ts = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis())
-                    .unwrap_or(0);
+                    .map_or(0, |d| d.as_millis());
                 let dir = std::env::temp_dir();
                 let path = dir.join(format!("tab-atelier-paste-{ts}.{ext}"));
                 if std::fs::write(&path, img.bytes()).is_ok() {

@@ -10,7 +10,7 @@
 //! authenticates via Claude Code's OAuth credentials (so a Max
 //! subscription works without an API key), persists the conversation
 //! in the same JSONL shape Claude Code uses (so the existing
-//! `/tabs/N/claude/messages` endpoint Just Works), and runs a small
+//! `/tabs/N/catbus/messages` endpoint Just Works), and runs a small
 //! Read / Write / Edit / Bash tool loop.
 
 #![allow(clippy::module_name_repetitions)]

@@ -101,12 +101,13 @@ pub fn tool_specs() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "Bash",
-            "description": "Run a shell command in the agent's working directory. 30-second timeout. Refused in plan-mode.",
+            "description": "Run a shell command in the agent's working directory. Default 10-minute timeout; pass timeout_secs (up to 3600) for long builds. Refused in plan-mode.",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "command": { "type": "string" },
-                    "description": { "type": "string", "description": "What this command is for." }
+                    "description": { "type": "string", "description": "What this command is for." },
+                    "timeout_secs": { "type": "integer", "description": "Override the default 600s timeout. Capped at 3600." }
                 },
                 "required": ["command"]
             }
