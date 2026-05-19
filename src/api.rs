@@ -70,6 +70,9 @@ pub struct SnapshotTab {
     /// None when the cursor is outside the emitted lines (e.g. in
     /// scrollback beyond the cached window).
     pub cursor: Option<(usize, usize)>,
+    /// PID of the tab's shell. Used by the Claude-session endpoints
+    /// to walk descendant processes and find a `claude` instance.
+    pub shell_pid: u32,
 }
 
 pub struct TabSnapshot {
@@ -261,7 +264,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
     let method = parts[0].to_string();
     let raw_path = parts[1].to_string();
 
-    let (path, query_token, query_lines) = if let Some((p, q)) = raw_path.split_once('?') {
+    let (path, query_token, query_lines, query_since) = if let Some((p, q)) = raw_path.split_once('?') {
         let qt = q
             .split('&')
             .find_map(|pair| pair.strip_prefix("token="))
@@ -270,9 +273,13 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             .split('&')
             .find_map(|pair| pair.strip_prefix("lines="))
             .and_then(|s| s.parse::<usize>().ok());
-        (p.to_string(), qt, ql)
+        let qs = q
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("since="))
+            .and_then(|s| s.parse::<usize>().ok());
+        (p.to_string(), qt, ql, qs)
     } else {
-        (raw_path, None, None)
+        (raw_path, None, None, None)
     };
 
     // Read the body (if any) before dropping the reader so we can write the
@@ -353,6 +360,74 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 tabs,
             };
             let body = serde_json::to_string_pretty(&resp).unwrap_or_default();
+            respond_json(stream, 200, &body);
+        }
+        ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/claude") => {
+            // Lightweight metadata endpoint — "does this tab have a
+            // detectable Claude Code session, and if so, which file
+            // is the transcript living in?". 404 when no `claude`
+            // process is found under the tab's shell.
+            let idx_str = &p["/tabs/".len()..p.len() - "/claude".len()];
+            let Ok(idx) = idx_str.parse::<usize>() else {
+                error_json(stream, 404, "invalid tab index");
+                return;
+            };
+            let snap = state.lock().unwrap();
+            let Some(t) = snap.tabs.get(idx) else {
+                error_json(stream, 404, "tab index out of range");
+                return;
+            };
+            let pid = t.shell_pid;
+            drop(snap);
+            match crate::claude::find_session(pid) {
+                Some(session) => {
+                    let body = serde_json::to_string(&serde_json::json!({
+                        "session_id": session.session_id,
+                        "claude_pid": session.claude_pid,
+                        "cwd": session.cwd.to_string_lossy(),
+                        "file": session.file_path.to_string_lossy(),
+                    }))
+                    .unwrap_or_default();
+                    respond_json(stream, 200, &body);
+                }
+                None => error_json(stream, 404, "no claude session under this tab"),
+            }
+        }
+        ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/claude/messages") => {
+            // Parsed conversation. Skips meta entries (permission
+            // mode, file snapshots). Returns the full message list;
+            // the mobile remote diffs on its end. `?since=N` lets a
+            // client skip the first N messages once incremental
+            // updates land.
+            let idx_str = &p["/tabs/".len()..p.len() - "/claude/messages".len()];
+            let Ok(idx) = idx_str.parse::<usize>() else {
+                error_json(stream, 404, "invalid tab index");
+                return;
+            };
+            let snap = state.lock().unwrap();
+            let Some(t) = snap.tabs.get(idx) else {
+                error_json(stream, 404, "tab index out of range");
+                return;
+            };
+            let pid = t.shell_pid;
+            drop(snap);
+            let Some(session) = crate::claude::find_session(pid) else {
+                error_json(stream, 404, "no claude session under this tab");
+                return;
+            };
+            let all = crate::claude::parse_messages(&session.file_path);
+            let since = query_since.unwrap_or(0);
+            let tail = if since >= all.len() {
+                Vec::new()
+            } else {
+                all[since..].to_vec()
+            };
+            let body = serde_json::to_string(&serde_json::json!({
+                "session_id": session.session_id,
+                "total": all.len(),
+                "messages": tail,
+            }))
+            .unwrap_or_default();
             respond_json(stream, 200, &body);
         }
         ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/output") => {
@@ -637,6 +712,7 @@ mod tests {
                     output: "$ ls\nfoo bar baz".into(),
                     uptime_secs: 0.0,
                     cursor: None,
+                    shell_pid: 0,
                 },
                 SnapshotTab {
                     name: "build".into(),
@@ -644,6 +720,7 @@ mod tests {
                     output: String::new(),
                     uptime_secs: 0.0,
                     cursor: None,
+                    shell_pid: 0,
                 },
             ],
             active: 0,
