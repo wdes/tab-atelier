@@ -154,10 +154,14 @@ impl Agent {
         }
 
         let mut final_text = String::new();
-        // Hard cap on tool rounds to avoid runaway loops if the
-        // model keeps calling tools forever. 32 is generous —
-        // typical interactions resolve in 1–6.
-        for _ in 0..32 {
+        // Cap on tool rounds. 200 is intentionally high — the model
+        // self-terminates via end_turn long before this in normal use.
+        // The env-var escape hatch exists for unusually long tasks.
+        let max_rounds: u32 = std::env::var("CATBUS_MAX_ROUNDS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(200);
+        for _ in 0..max_rounds {
             let resp = self.call_messages().await?;
             // Accumulate token usage immediately so the sidecar file
             // written after each prompt is always up to date.
@@ -396,6 +400,6 @@ pub enum AgentError {
     Http(String),
     #[error("transcript: {0}")]
     Transcript(#[from] crate::session::SessionError),
-    #[error("tool loop ran longer than 32 rounds")]
+    #[error("tool loop exceeded the round cap (set CATBUS_MAX_ROUNDS to raise it)")]
     TooManyRounds,
 }
