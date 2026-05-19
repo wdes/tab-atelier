@@ -89,6 +89,12 @@ impl Agent {
         self.active.read().await.session.cwd.clone()
     }
 
+    /// Transcript path for the current session — used to print the
+    /// resume preview.
+    pub async fn transcript_path(&self) -> std::path::PathBuf {
+        self.active.read().await.session.transcript_path()
+    }
+
     /// Current session name (empty = unnamed).
     pub async fn session_name(&self) -> String {
         self.active.read().await.session.session_name()

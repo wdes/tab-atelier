@@ -230,8 +230,11 @@ async fn run_repl(agent: Arc<agent::Agent>, cwd: &std::path::Path) -> std::io::R
                                 format!("\x1b[1m{new_name}\x1b[0m  \x1b[2m{new_id}\x1b[0m")
                             };
                             stdout
-                                .write_all(format!("switched to session {label}\n\n").as_bytes())
+                                .write_all(format!("switched to session {label}\n").as_bytes())
                                 .await?;
+                            let path = agent.transcript_path().await;
+                            print_exchanges(&mut stdout, &path).await?;
+                            stdout.write_all(b"\n").await?;
                         }
                         Err(e) => {
                             stdout
@@ -330,13 +333,16 @@ async fn print_banner(stdout: &mut tokio::io::Stdout, agent: &agent::Agent) -> s
     let name = agent.session_name().await;
     if name.is_empty() {
         stdout
-            .write_all(format!("session \x1b[2m{id}\x1b[0m\n\n").as_bytes())
+            .write_all(format!("session \x1b[2m{id}\x1b[0m\n").as_bytes())
             .await?;
     } else {
         stdout
-            .write_all(format!("session \x1b[1m{name}\x1b[0m  \x1b[2m{id}\x1b[0m\n\n").as_bytes())
+            .write_all(format!("session \x1b[1m{name}\x1b[0m  \x1b[2m{id}\x1b[0m\n").as_bytes())
             .await?;
     }
+    let path = agent.transcript_path().await;
+    print_exchanges(stdout, &path).await?;
+    stdout.write_all(b"\n").await?;
     stdout.flush().await
 }
 
@@ -350,6 +356,34 @@ async fn print_prompt(stdout: &mut tokio::io::Stdout, agent: &agent::Agent) -> s
             .await?;
     }
     stdout.flush().await
+}
+
+/// Print the last 3 exchanges from `path` as a compact recap.
+/// Each exchange is: dim user prompt, then assistant reply (possibly
+/// truncated). A separator line precedes the block when exchanges exist.
+async fn print_exchanges(stdout: &mut tokio::io::Stdout, path: &std::path::Path) -> std::io::Result<()> {
+    let exchanges = session::last_exchanges(path, 3);
+    if exchanges.is_empty() {
+        return Ok(());
+    }
+    stdout.write_all(b"\x1b[2m--- recent exchanges ---\x1b[0m\n").await?;
+    for ex in &exchanges {
+        // User line: cyan >, dim text, truncated at 120 chars.
+        let user_preview: String = ex.user_text.lines().next().unwrap_or("").chars().take(120).collect();
+        stdout
+            .write_all(format!("\x1b[36m>\x1b[0m \x1b[2m{user_preview}\x1b[0m\n").as_bytes())
+            .await?;
+        // Assistant reply: indent, wrap long lines with a continuation marker.
+        for part in ex.assistant_text.lines().take(4) {
+            stdout
+                .write_all(format!("  \x1b[2m{part}\x1b[0m\n").as_bytes())
+                .await?;
+        }
+        if ex.assistant_text.lines().count() > 4 {
+            stdout.write_all(b"  \x1b[2m...\x1b[0m\n").await?;
+        }
+    }
+    Ok(())
 }
 
 fn humanise_age(secs: u64) -> String {
