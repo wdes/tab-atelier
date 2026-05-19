@@ -35,26 +35,120 @@ pub struct Session {
     last_uuid: Mutex<Option<String>>,
 }
 
-/// Open (or resume) a session. Resuming just appends to the existing
-/// JSONL; conversation history is reconstructed by re-reading the
-/// file (Claude Code's behaviour).
-pub fn open(cwd: &Path, resume_id: Option<&str>) -> Result<Session, SessionError> {
+/// Open (or resume) a session.
+///
+/// Decision tree:
+///   * Explicit `Some(id)` → resume that exact session.
+///   * `None` + `new_session = true` → fresh UUID, fresh transcript.
+///   * `None` + `new_session = false` (default) → resume the newest
+///     `.jsonl` in the project directory if one exists; otherwise
+///     start fresh. This is the "I closed the tab, I reopened the
+///     tab, please pick up where I left off" path.
+///
+/// `last_uuid` is seeded from the resumed transcript's last entry
+/// so `parentUuid` chaining stays intact across the restart.
+pub fn open(cwd: &Path, resume_id: Option<&str>, new_session: bool) -> Result<Session, SessionError> {
     let home = std::env::var_os("HOME").ok_or(SessionError::NoHome)?;
     let project_dir = PathBuf::from(home)
         .join(".claude")
         .join("projects")
         .join(escape_cwd(cwd));
     std::fs::create_dir_all(&project_dir)?;
-    let id = resume_id.map_or_else(|| Uuid::new_v4().to_string(), str::to_string);
+    // Three-way decision; `map_or_else` would obscure it.
+    #[allow(clippy::option_if_let_else)]
+    let id = if let Some(id) = resume_id {
+        id.to_string()
+    } else if new_session {
+        Uuid::new_v4().to_string()
+    } else {
+        latest_session_id(&project_dir).unwrap_or_else(|| Uuid::new_v4().to_string())
+    };
     let transcript = project_dir.join(format!("{id}.jsonl"));
     let file = OpenOptions::new().create(true).append(true).open(&transcript)?;
+    let last_uuid = last_entry_uuid(&transcript).ok().flatten();
     Ok(Session {
         id,
         cwd: cwd.to_path_buf(),
         project_dir,
         file: Mutex::new(file),
-        last_uuid: Mutex::new(None),
+        last_uuid: Mutex::new(last_uuid),
     })
+}
+
+/// Newest `.jsonl` stem in `dir`, ignoring zero-byte files (those
+/// are sessions that were opened but never written to — typically
+/// crashes immediately after start). Returns the session id.
+fn latest_session_id(dir: &Path) -> Option<String> {
+    let mut best: Option<(String, std::time::SystemTime)> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        if meta.len() == 0 {
+            continue;
+        }
+        let Ok(mtime) = meta.modified() else { continue };
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(_, t)| mtime > *t) {
+            best = Some((stem.to_string(), mtime));
+        }
+    }
+    best.map(|(id, _)| id)
+}
+
+/// Read the last non-empty JSONL line of `path` and pluck its
+/// `uuid`. Used to chain `parentUuid` correctly on resume.
+fn last_entry_uuid(path: &Path) -> std::io::Result<Option<String>> {
+    let text = std::fs::read_to_string(path)?;
+    for line in text.lines().rev() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if let Some(uuid) = v.get("uuid").and_then(|u| u.as_str()) {
+            return Ok(Some(uuid.to_string()));
+        }
+    }
+    Ok(None)
+}
+
+/// All session ids in this cwd, newest first. Used by the
+/// REPL's `/resume` slash command to surface what's available.
+#[must_use]
+pub fn list_sessions(cwd: &Path) -> Vec<(String, std::time::SystemTime)> {
+    let Some(home) = std::env::var_os("HOME") else {
+        return Vec::new();
+    };
+    let dir = PathBuf::from(home)
+        .join(".claude")
+        .join("projects")
+        .join(escape_cwd(cwd));
+    let Ok(read_dir) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, std::time::SystemTime)> = Vec::new();
+    for entry in read_dir.flatten() {
+        let p = entry.path();
+        if p.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        if meta.len() == 0 {
+            continue;
+        }
+        let Ok(mtime) = meta.modified() else { continue };
+        if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+            out.push((stem.to_string(), mtime));
+        }
+    }
+    out.sort_by_key(|(_, t)| std::cmp::Reverse(*t));
+    out
 }
 
 impl Session {
