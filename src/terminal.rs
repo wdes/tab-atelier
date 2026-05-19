@@ -455,10 +455,7 @@ impl TerminalView {
     /// joined). Returns None when the cursor is in scrollback or
     /// outside the requested window. Used by the mobile remote to
     /// render the cursor at the right (row, col).
-    pub fn ansi_text_with_cursor(
-        &self,
-        max_lines: Option<usize>,
-    ) -> (String, Option<(usize, usize)>) {
+    pub fn ansi_text_with_cursor(&self, max_lines: Option<usize>) -> (String, Option<(usize, usize)>) {
         let (lines, cursor) = self.ansi_lines(max_lines);
         (lines.join("\n"), cursor)
     }

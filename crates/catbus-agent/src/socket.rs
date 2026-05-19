@@ -108,11 +108,7 @@ async fn handle(stream: UnixStream, agent: Arc<Agent>) -> Result<(), SocketError
                     write_line(&mut write_half, &Response::Done { text: reply }).await?;
                 }
                 Err(e) => {
-                    write_line(
-                        &mut write_half,
-                        &Response::Error { message: e.to_string() },
-                    )
-                    .await?;
+                    write_line(&mut write_half, &Response::Error { message: e.to_string() }).await?;
                 }
             },
             Request::SetPlanMode { on } => {
@@ -130,10 +126,7 @@ async fn handle(stream: UnixStream, agent: Arc<Agent>) -> Result<(), SocketError
     Ok(())
 }
 
-async fn write_line(
-    stream: &mut tokio::net::unix::OwnedWriteHalf,
-    resp: &Response,
-) -> Result<(), SocketError> {
+async fn write_line(stream: &mut tokio::net::unix::OwnedWriteHalf, resp: &Response) -> Result<(), SocketError> {
     let mut s = serde_json::to_string(resp).expect("Response is Serialize");
     s.push('\n');
     stream.write_all(s.as_bytes()).await?;

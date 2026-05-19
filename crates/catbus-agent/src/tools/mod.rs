@@ -18,36 +18,24 @@ mod write;
 /// Run a tool by name. `plan_mode = true` makes Write/Edit/Bash
 /// refuse with a polite message asking the model to propose instead.
 /// Read remains unrestricted — pure observation is always safe.
-pub async fn dispatch(
-    name: &str,
-    input: &serde_json::Value,
-    cwd: &Path,
-    plan_mode: bool,
-) -> Result<String, String> {
+pub async fn dispatch(name: &str, input: &serde_json::Value, cwd: &Path, plan_mode: bool) -> Result<String, String> {
     match name {
         "Read" => read::run(input, cwd).await,
         "Write" => {
             if plan_mode {
-                return Err(
-                    "Plan-mode is on. Describe the file you want to create instead of writing it."
-                        .to_string(),
-                );
+                return Err("Plan-mode is on. Describe the file you want to create instead of writing it.".to_string());
             }
             write::run(input, cwd).await
         }
         "Edit" => {
             if plan_mode {
-                return Err(
-                    "Plan-mode is on. Describe the edit instead of applying it.".to_string(),
-                );
+                return Err("Plan-mode is on. Describe the edit instead of applying it.".to_string());
             }
             edit::run(input, cwd).await
         }
         "Bash" => {
             if plan_mode {
-                return Err(
-                    "Plan-mode is on. Describe the command instead of running it.".to_string(),
-                );
+                return Err("Plan-mode is on. Describe the command instead of running it.".to_string());
             }
             bash::run(input, cwd).await
         }

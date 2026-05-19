@@ -47,10 +47,7 @@ pub fn open(cwd: &Path, resume_id: Option<&str>) -> Result<Session, SessionError
     std::fs::create_dir_all(&project_dir)?;
     let id = resume_id.map_or_else(|| Uuid::new_v4().to_string(), str::to_string);
     let transcript = project_dir.join(format!("{id}.jsonl"));
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&transcript)?;
+    let file = OpenOptions::new().create(true).append(true).open(&transcript)?;
     Ok(Session {
         id,
         cwd: cwd.to_path_buf(),
@@ -142,14 +139,8 @@ pub enum Entry {
 #[derive(Debug, Serialize, Clone)]
 #[serde(untagged)]
 pub enum UserMessage {
-    Plain {
-        role: &'static str,
-        content: String,
-    },
-    Blocks {
-        role: &'static str,
-        content: Vec<Block>,
-    },
+    Plain { role: &'static str, content: String },
+    Blocks { role: &'static str, content: Vec<Block> },
 }
 
 #[derive(Debug, Serialize, Clone)]

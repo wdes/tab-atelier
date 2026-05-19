@@ -24,8 +24,7 @@ use crate::tools;
 
 /// Identifier the server requires at the start of the first system
 /// block on every OAuth-authenticated Messages call.
-const CLAUDE_CODE_PREFIX: &str =
-    "You are Claude Code, Anthropic's official CLI for Claude.";
+const CLAUDE_CODE_PREFIX: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 
 /// Beta-flag list our OAuth tokens need. Server rejects requests
 /// without `oauth-2025-04-20` + `claude-code-20250219` and the list
@@ -67,8 +66,7 @@ impl Agent {
     }
 
     pub fn set_plan_mode(&self, on: bool) {
-        self.plan_mode
-            .store(on, std::sync::atomic::Ordering::Relaxed);
+        self.plan_mode.store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// One full turn: append the user's text to the transcript, then
@@ -90,8 +88,7 @@ impl Agent {
         for _ in 0..32 {
             let resp = self.call_messages().await?;
             // Persist + record what the model produced.
-            let entry =
-                session::assistant_blocks(&self.session, resp.model.clone(), resp.content.clone());
+            let entry = session::assistant_blocks(&self.session, resp.model.clone(), resp.content.clone());
             self.session.append(&entry)?;
             self.history.lock().await.push(ApiMessage {
                 role: "assistant".into(),
@@ -116,9 +113,7 @@ impl Agent {
                 }
             }
 
-            if matches!(resp.stop_reason.as_deref(), Some("end_turn" | "stop_sequence"))
-                || tool_uses.is_empty()
-            {
+            if matches!(resp.stop_reason.as_deref(), Some("end_turn" | "stop_sequence")) || tool_uses.is_empty() {
                 return Ok(final_text);
             }
 
@@ -131,10 +126,7 @@ impl Agent {
             for (id, name, input) in tool_uses {
                 let (content, is_error) = tools::dispatch(&name, &input, &self.session.cwd, plan)
                     .await
-                    .map_or_else(
-                        |e| (format!("Error: {e}"), true),
-                        |out| (out, false),
-                    );
+                    .map_or_else(|e| (format!("Error: {e}"), true), |out| (out, false));
                 results.push(Block::ToolResult {
                     tool_use_id: id,
                     content,
@@ -158,7 +150,10 @@ impl Agent {
             model: DEFAULT_MODEL,
             max_tokens: 8192,
             system: vec![
-                SystemBlock { kind: "text", text: CLAUDE_CODE_PREFIX.into() },
+                SystemBlock {
+                    kind: "text",
+                    text: CLAUDE_CODE_PREFIX.into(),
+                },
                 SystemBlock {
                     kind: "text",
                     text: format!(
@@ -250,4 +245,3 @@ pub enum AgentError {
     #[error("tool loop ran longer than 32 rounds")]
     TooManyRounds,
 }
-
