@@ -1023,7 +1023,13 @@ impl AppState {
                 .flex()
                 .items_center()
                 .px(px(12.0))
-                .h_full()
+                // Fixed height (not `h_full`) so the bar wraps into
+                // 32 px rows instead of a single tall row, and a
+                // min-width + flex-shrink:0 so flex-wrap actually
+                // engages rather than compressing every tab.
+                .h(px(32.0))
+                .min_w(px(120.0))
+                .flex_shrink_0()
                 .bg(if blink_red {
                     tab_blink_bg
                 } else if is_active {
