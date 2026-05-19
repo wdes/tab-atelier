@@ -50,6 +50,10 @@ struct Args {
     #[arg(long)]
     new_session: bool,
 
+    /// Set or update the human-readable name for this session.
+    #[arg(long)]
+    name: Option<String>,
+
     /// Path to the UNIX socket the agent listens on. Defaults to
     /// `~/.claude/projects/{escaped-cwd}/{session-id}.sock`, so any
     /// external client that knows the session id can connect.
@@ -89,6 +93,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // accepting prompts we can't service.
     let auth = auth::load()?;
     let session = session::open(&cwd, args.resume.as_deref(), args.new_session)?;
+
+    // Apply --name if provided (also works as a rename on resume).
+    if let Some(ref name) = args.name {
+        session.rename(name)?;
+    }
+
     let socket_path = args
         .socket
         .clone()
@@ -100,8 +110,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     log::info!("session {} ready at {}", session.id, socket_path.display());
-    let session_id_for_banner = session.id.clone();
-    let cwd_for_banner = session.cwd.clone();
     let agent = Arc::new(agent::Agent::new(auth, session));
 
     let socket_task = tokio::spawn({
@@ -114,7 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Headless: just block on the socket task.
         socket_task.await??;
     } else {
-        run_repl(Arc::clone(&agent), &session_id_for_banner, &cwd_for_banner).await?;
+        run_repl(Arc::clone(&agent), &cwd).await?;
         // REPL exit (Ctrl-D) brings the whole process down so the
         // tab the user closed feels "closed". Aborting the socket
         // task removes its file in Drop on a best-effort basis.
@@ -123,6 +131,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Spinner frames — simple ASCII so any font renders them.
+const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
 /// In-tab REPL: print a prompt, read a line, hand it to the agent,
 /// print the answer, repeat. Ctrl-D exits.
 ///
@@ -130,24 +141,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// highlighting. Tab-atelier hosts the actual terminal so things
 /// like cursor movement / line editing come from there. If a power
 /// user wants `rlwrap catbus-agent`, that works too.
-async fn run_repl(
-    agent: Arc<agent::Agent>,
-    session_id: &str,
-    cwd: &std::path::Path,
-) -> std::io::Result<()> {
+#[allow(clippy::too_many_lines)]
+async fn run_repl(agent: Arc<agent::Agent>, cwd: &std::path::Path) -> std::io::Result<()> {
     let mut stdout = tokio::io::stdout();
     let mut reader = BufReader::new(tokio::io::stdin());
-    stdout
-        .write_all(b"\x1b[1m\xf0\x9f\x90\x88\xef\xb8\x8f\xf0\x9f\x9a\x8c Catbus\x1b[0m \xe2\x80\x94 type a prompt, /help for commands, Ctrl-D to exit.\n")
-        .await?;
-    stdout
-        .write_all(format!("session \x1b[2m{session_id}\x1b[0m\n\n").as_bytes())
-        .await?;
-    let cwd = cwd.to_path_buf();
+
+    print_banner(&mut stdout, &agent).await?;
+
     let mut line = String::new();
     loop {
-        stdout.write_all(b"\x1b[36m>\x1b[0m ").await?;
-        stdout.flush().await?;
+        print_prompt(&mut stdout, &agent).await?;
         line.clear();
         if reader.read_line(&mut line).await? == 0 {
             // EOF (Ctrl-D)
@@ -158,6 +161,7 @@ async fn run_repl(
         if prompt.is_empty() {
             continue;
         }
+
         // Slash commands are interpreted locally; everything else
         // becomes a user turn for the model.
         if prompt == "/help" {
@@ -167,9 +171,9 @@ async fn run_repl(
                       /help              show this list\n  \
                       /plan              enable plan-mode (write/edit/bash refuse)\n  \
                       /noplan            disable plan-mode\n  \
-                      /resume            list previous sessions in this cwd\n\n\
-                      to switch to a previous session, exit and run:\n  \
-                      catbus-agent --resume <session-id>\n\n",
+                      /rename <name>     rename the current session\n  \
+                      /resume            list previous sessions in this cwd\n  \
+                      /resume <id>       switch to a previous session in-place\n\n",
                 )
                 .await?;
             continue;
@@ -184,35 +188,125 @@ async fn run_repl(
             stdout.write_all(b"plan-mode = false\n").await?;
             continue;
         }
-        if prompt == "/resume" {
-            let sessions = session::list_sessions(&cwd);
-            if sessions.is_empty() {
-                stdout
-                    .write_all(b"no previous sessions in this cwd.\n\n")
-                    .await?;
+        if let Some(new_name) = prompt.strip_prefix("/rename ") {
+            let new_name = new_name.trim();
+            if new_name.is_empty() {
+                stdout.write_all(b"usage: /rename <name>\n").await?;
                 continue;
             }
-            // Format times as relative-to-now for readability —
-            // the absolute mtime isn't useful to a human.
+            match agent.rename_session(new_name).await {
+                Ok(()) => {
+                    stdout
+                        .write_all(format!("session renamed to \x1b[1m{new_name}\x1b[0m\n").as_bytes())
+                        .await?;
+                }
+                Err(e) => {
+                    stdout
+                        .write_all(format!("\x1b[31merror:\x1b[0m {e}\n").as_bytes())
+                        .await?;
+                }
+            }
+            continue;
+        }
+        if prompt == "/rename" {
+            stdout.write_all(b"usage: /rename <name>\n").await?;
+            continue;
+        }
+        if let Some(target_id) = prompt.strip_prefix("/resume ") {
+            let target_id = target_id.trim();
+            if target_id.is_empty() {
+                stdout.write_all(b"usage: /resume <session-id>\n").await?;
+                continue;
+            }
+            match session::open(cwd, Some(target_id), false) {
+                Ok(new_session) => {
+                    let new_id = new_session.id.clone();
+                    let new_name = new_session.session_name();
+                    match agent.swap_session(new_session).await {
+                        Ok(()) => {
+                            let label = if new_name.is_empty() {
+                                format!("\x1b[2m{new_id}\x1b[0m")
+                            } else {
+                                format!("\x1b[1m{new_name}\x1b[0m  \x1b[2m{new_id}\x1b[0m")
+                            };
+                            stdout
+                                .write_all(format!("switched to session {label}\n\n").as_bytes())
+                                .await?;
+                        }
+                        Err(e) => {
+                            stdout
+                                .write_all(format!("\x1b[31merror:\x1b[0m swap failed: {e}\n").as_bytes())
+                                .await?;
+                        }
+                    }
+                }
+                Err(e) => {
+                    stdout
+                        .write_all(format!("\x1b[31merror:\x1b[0m could not open session: {e}\n").as_bytes())
+                        .await?;
+                }
+            }
+            continue;
+        }
+        if prompt == "/resume" {
+            let sessions = session::list_sessions(cwd);
+            if sessions.is_empty() {
+                stdout.write_all(b"no previous sessions in this cwd.\n\n").await?;
+                continue;
+            }
+            let current_id = agent.session_id().await;
             stdout
                 .write_all(format!("{} session(s) for {}:\n", sessions.len(), cwd.display()).as_bytes())
                 .await?;
             let now = std::time::SystemTime::now();
-            for (id, ts) in &sessions {
+            for (id, name, ts) in &sessions {
                 let age = now
                     .duration_since(*ts)
                     .map_or_else(|_| "in the future".to_string(), |d| humanise_age(d.as_secs()));
-                let marker = if id == session_id { " (current)" } else { "" };
+                let marker = if id == &current_id { " \x1b[32m(current)\x1b[0m" } else { "" };
+                let label = if name.is_empty() {
+                    format!("\x1b[2m{id}\x1b[0m")
+                } else {
+                    format!("\x1b[1m{name}\x1b[0m  \x1b[2m{id}\x1b[0m")
+                };
                 stdout
-                    .write_all(format!("  {id}  {age}{marker}\n").as_bytes())
+                    .write_all(format!("  {label}  {age}{marker}\n").as_bytes())
                     .await?;
             }
             stdout
-                .write_all(b"\nto switch, exit and run: catbus-agent --resume <session-id>\n\n")
+                .write_all(b"\nto switch in-place: /resume <session-id>\n\n")
                 .await?;
             continue;
         }
-        match agent.run_user_prompt(prompt.to_string()).await {
+
+        // Regular prompt — run through the agent, show spinner while working.
+        let agent_clone = Arc::clone(&agent);
+        let prompt_owned = prompt.to_string();
+
+        // Spawn the agent work on a concurrent task so the main task
+        // can drive the spinner on stdout.
+        let work = tokio::spawn(async move { agent_clone.run_user_prompt(prompt_owned).await });
+
+        // Spinner loop: tick every 120 ms while `working` is set.
+        let spinner_agent = Arc::clone(&agent);
+        let mut frame: usize = 0;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            if !spinner_agent.working.load(std::sync::atomic::Ordering::Relaxed) {
+                // Erase the spinner line before printing the reply.
+                stdout.write_all(b"\r\x1b[K").await?;
+                stdout.flush().await?;
+                break;
+            }
+            let spinner_char = SPINNER[frame % SPINNER.len()];
+            stdout
+                .write_all(format!("\r\x1b[36m{spinner_char}\x1b[0m working…").as_bytes())
+                .await?;
+            stdout.flush().await?;
+            frame += 1;
+        }
+
+        match work.await.expect("agent task panicked") {
             Ok(reply) => {
                 stdout.write_all(b"\n").await?;
                 stdout.write_all(reply.as_bytes()).await?;
@@ -226,6 +320,36 @@ async fn run_repl(
         }
     }
     Ok(())
+}
+
+async fn print_banner(stdout: &mut tokio::io::Stdout, agent: &agent::Agent) -> std::io::Result<()> {
+    stdout
+        .write_all(b"\x1b[1m\xf0\x9f\x90\x88\xef\xb8\x8f\xf0\x9f\x9a\x8c Catbus\x1b[0m \xe2\x80\x94 type a prompt, /help for commands, Ctrl-D to exit.\n")
+        .await?;
+    let id = agent.session_id().await;
+    let name = agent.session_name().await;
+    if name.is_empty() {
+        stdout
+            .write_all(format!("session \x1b[2m{id}\x1b[0m\n\n").as_bytes())
+            .await?;
+    } else {
+        stdout
+            .write_all(format!("session \x1b[1m{name}\x1b[0m  \x1b[2m{id}\x1b[0m\n\n").as_bytes())
+            .await?;
+    }
+    stdout.flush().await
+}
+
+async fn print_prompt(stdout: &mut tokio::io::Stdout, agent: &agent::Agent) -> std::io::Result<()> {
+    let name = agent.session_name().await;
+    if name.is_empty() {
+        stdout.write_all(b"\x1b[36m>\x1b[0m ").await?;
+    } else {
+        stdout
+            .write_all(format!("\x1b[36m{name}>\x1b[0m ").as_bytes())
+            .await?;
+    }
+    stdout.flush().await
 }
 
 fn humanise_age(secs: u64) -> String {
