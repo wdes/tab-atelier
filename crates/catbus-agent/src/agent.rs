@@ -263,7 +263,14 @@ impl Agent {
                     text: format!(
                         "You are operating as `catbus-agent` inside tab-atelier. \
                          Current working directory: {cwd}. \
-                         Plan-mode is {}.",
+                         Plan-mode is {}. \
+                         Your text replies are rendered directly in a terminal emulator \
+                         that supports ANSI colour and formatting — use ANSI SGR escapes \
+                         (bold, colours, etc.) to make output readable. Do NOT use \
+                         markdown — no asterisks, no backtick fences, no hashes. \
+                         Use ANSI instead: \\x1b[1m for bold, \\x1b[32m for green, \
+                         \\x1b[33m for yellow, \\x1b[31m for red, \\x1b[36m for cyan, \
+                         \\x1b[0m to reset.",
                         if self.plan_mode.load(std::sync::atomic::Ordering::Relaxed) {
                             "ON — propose changes, do not execute write/edit/bash."
                         } else {
