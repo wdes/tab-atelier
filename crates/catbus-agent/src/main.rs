@@ -68,10 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // accepting prompts we can't service.
     let auth = auth::load()?;
     let session = session::open(&cwd, args.resume.as_deref())?;
-    let socket_path = args
-        .socket
-        .clone()
-        .unwrap_or_else(|| session.default_socket_path());
+    let socket_path = args.socket.clone().unwrap_or_else(|| session.default_socket_path());
 
     if args.print_socket {
         println!("{}", socket_path.display());

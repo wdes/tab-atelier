@@ -119,8 +119,7 @@ impl Auth {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ =
-                std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600));
+            let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600));
         }
         Ok(blob.access_token.clone())
     }

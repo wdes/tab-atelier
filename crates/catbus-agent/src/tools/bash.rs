@@ -11,8 +11,8 @@ use tokio::process::Command;
 /// Default ceiling — most builds / test suites / curl-and-jq pipes
 /// finish well under this. Real cargo compiles take longer; the model
 /// can pass `timeout_secs` to override per-call.
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
-const MAX_TIMEOUT: Duration = Duration::from_secs(3600);
+const DEFAULT_TIMEOUT: Duration = Duration::from_mins(10);
+const MAX_TIMEOUT: Duration = Duration::from_hours(1);
 const MAX_OUTPUT: usize = 256 * 1024;
 
 pub async fn run(input: &serde_json::Value, cwd: &Path) -> Result<String, String> {

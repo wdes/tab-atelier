@@ -243,12 +243,7 @@ struct OutputResult {
     cursor_col: i32,
 }
 
-fn fetch_output(
-    agent: &ureq::Agent,
-    host: &HostConfig,
-    reach: Reach,
-    idx: i32,
-) -> Option<OutputResult> {
+fn fetch_output(agent: &ureq::Agent, host: &HostConfig, reach: Reach, idx: i32) -> Option<OutputResult> {
     let base = base_url(host, reach);
     if base.is_empty() {
         return None;
@@ -758,13 +753,7 @@ fn refresh_soon(
 /// the screen sits stale for almost half a second on average. Schedule
 /// two follow-up fetches at 120 ms and 380 ms so the terminal output
 /// catches up to the keystroke well before the next poll tick.
-fn nudge_output_refresh(
-    ui_weak: Weak<AppWindow>,
-    agent: Arc<ureq::Agent>,
-    host: HostConfig,
-    reach: Reach,
-    idx: i32,
-) {
+fn nudge_output_refresh(ui_weak: Weak<AppWindow>, agent: Arc<ureq::Agent>, host: HostConfig, reach: Reach, idx: i32) {
     std::thread::spawn(move || {
         for delay in [Duration::from_millis(120), Duration::from_millis(380)] {
             std::thread::sleep(delay);

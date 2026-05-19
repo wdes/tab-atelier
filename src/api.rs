@@ -458,9 +458,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                         }
                     }
                     let cursor_headers = match cursor {
-                        Some((row, col)) => format!(
-                            "X-Cursor-Row: {row}\r\nX-Cursor-Col: {col}\r\n"
-                        ),
+                        Some((row, col)) => format!("X-Cursor-Row: {row}\r\nX-Cursor-Col: {col}\r\n"),
                         None => String::new(),
                     };
                     let _ = write!(
