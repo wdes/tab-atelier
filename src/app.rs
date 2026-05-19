@@ -1262,8 +1262,10 @@ impl AppState {
                         MouseButton::Left,
                         cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
                             let view = &this.tabs[idx].view;
-                            view.read(cx)
-                                .send_clipboard("clear && exec catbus-agent\n");
+                            // Ctrl-L clears the screen without spawning a subprocess,
+                            // then exec replaces the shell with catbus-agent in-place.
+                            view.read(cx).send_input_bytes(vec![0x0c]);
+                            view.read(cx).send_clipboard("exec catbus-agent\n");
                             this.context_menu = None;
                             cx.notify();
                         }),

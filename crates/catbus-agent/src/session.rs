@@ -31,6 +31,9 @@ pub struct Session {
     pub id: String,
     pub cwd: PathBuf,
     pub project_dir: PathBuf,
+    /// Human-readable label stored in `{id}.name` alongside the transcript.
+    /// Empty string means unnamed.
+    pub name: Mutex<String>,
     file: Mutex<File>,
     last_uuid: Mutex<Option<String>>,
 }
@@ -66,13 +69,24 @@ pub fn open(cwd: &Path, resume_id: Option<&str>, new_session: bool) -> Result<Se
     let transcript = project_dir.join(format!("{id}.jsonl"));
     let file = OpenOptions::new().create(true).append(true).open(&transcript)?;
     let last_uuid = last_entry_uuid(&transcript).ok().flatten();
+    let name = load_session_name(&project_dir, &id);
     Ok(Session {
         id,
         cwd: cwd.to_path_buf(),
         project_dir,
+        name: Mutex::new(name),
         file: Mutex::new(file),
         last_uuid: Mutex::new(last_uuid),
     })
+}
+
+/// Load the `.name` sidecar for a session, if it exists and is non-empty.
+fn load_session_name(project_dir: &Path, id: &str) -> String {
+    let path = project_dir.join(format!("{id}.name"));
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
 }
 
 /// Newest `.jsonl` stem in `dir`, ignoring zero-byte files (those
@@ -121,7 +135,7 @@ fn last_entry_uuid(path: &Path) -> std::io::Result<Option<String>> {
 /// All session ids in this cwd, newest first. Used by the
 /// REPL's `/resume` slash command to surface what's available.
 #[must_use]
-pub fn list_sessions(cwd: &Path) -> Vec<(String, std::time::SystemTime)> {
+pub fn list_sessions(cwd: &Path) -> Vec<(String, String, std::time::SystemTime)> {
     let Some(home) = std::env::var_os("HOME") else {
         return Vec::new();
     };
@@ -132,7 +146,7 @@ pub fn list_sessions(cwd: &Path) -> Vec<(String, std::time::SystemTime)> {
     let Ok(read_dir) = std::fs::read_dir(&dir) else {
         return Vec::new();
     };
-    let mut out: Vec<(String, std::time::SystemTime)> = Vec::new();
+    let mut out: Vec<(String, String, std::time::SystemTime)> = Vec::new();
     for entry in read_dir.flatten() {
         let p = entry.path();
         if p.extension().and_then(|s| s.to_str()) != Some("jsonl") {
@@ -144,14 +158,29 @@ pub fn list_sessions(cwd: &Path) -> Vec<(String, std::time::SystemTime)> {
         }
         let Ok(mtime) = meta.modified() else { continue };
         if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
-            out.push((stem.to_string(), mtime));
+            let name = load_session_name(&dir, stem);
+            out.push((stem.to_string(), name, mtime));
         }
     }
-    out.sort_by_key(|(_, t)| std::cmp::Reverse(*t));
+    out.sort_by_key(|(_, _, t)| std::cmp::Reverse(*t));
     out
 }
 
 impl Session {
+    /// Persist a human-readable name for this session in a `.name`
+    /// sidecar file next to the transcript.
+    pub fn rename(&self, new_name: &str) -> Result<(), SessionError> {
+        let path = self.project_dir.join(format!("{}.name", self.id));
+        std::fs::write(&path, new_name)?;
+        *self.name.lock().expect("name mutex") = new_name.to_string();
+        Ok(())
+    }
+
+    /// Return the current name (empty string = unnamed).
+    pub fn session_name(&self) -> String {
+        self.name.lock().expect("name mutex").clone()
+    }
+
     /// `~/.claude/projects/{escaped}/{session-id}.sock` — same dir
     /// as the transcript so anything that can find one can find the
     /// other.
