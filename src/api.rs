@@ -362,12 +362,13 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             let body = serde_json::to_string_pretty(&resp).unwrap_or_default();
             respond_json(stream, 200, &body);
         }
-        ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/claude") => {
+        ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/catbus") => {
             // Lightweight metadata endpoint — "does this tab have a
-            // detectable Claude Code session, and if so, which file
-            // is the transcript living in?". 404 when no `claude`
-            // process is found under the tab's shell.
-            let idx_str = &p["/tabs/".len()..p.len() - "/claude".len()];
+            // detectable agent session (Claude Code TUI or
+            // catbus-agent), and if so, which file is the transcript
+            // living in?". 404 when no candidate process is found
+            // under the tab's shell.
+            let idx_str = &p["/tabs/".len()..p.len() - "/catbus".len()];
             let Ok(idx) = idx_str.parse::<usize>() else {
                 error_json(stream, 404, "invalid tab index");
                 return;
@@ -383,23 +384,23 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 Some(session) => {
                     let body = serde_json::to_string(&serde_json::json!({
                         "session_id": session.session_id,
-                        "claude_pid": session.claude_pid,
+                        "agent_pid": session.claude_pid,
                         "cwd": session.cwd.to_string_lossy(),
                         "file": session.file_path.to_string_lossy(),
                     }))
                     .unwrap_or_default();
                     respond_json(stream, 200, &body);
                 }
-                None => error_json(stream, 404, "no claude session under this tab"),
+                None => error_json(stream, 404, "no agent session under this tab"),
             }
         }
-        ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/claude/messages") => {
+        ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/catbus/messages") => {
             // Parsed conversation. Skips meta entries (permission
             // mode, file snapshots). Returns the full message list;
             // the mobile remote diffs on its end. `?since=N` lets a
             // client skip the first N messages once incremental
             // updates land.
-            let idx_str = &p["/tabs/".len()..p.len() - "/claude/messages".len()];
+            let idx_str = &p["/tabs/".len()..p.len() - "/catbus/messages".len()];
             let Ok(idx) = idx_str.parse::<usize>() else {
                 error_json(stream, 404, "invalid tab index");
                 return;
@@ -412,7 +413,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             let pid = t.shell_pid;
             drop(snap);
             let Some(session) = crate::claude::find_session(pid) else {
-                error_json(stream, 404, "no claude session under this tab");
+                error_json(stream, 404, "no agent session under this tab");
                 return;
             };
             let all = crate::claude::parse_messages(&session.file_path);
