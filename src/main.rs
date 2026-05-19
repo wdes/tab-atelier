@@ -4,6 +4,7 @@
 
 mod api;
 mod app;
+mod claude;
 mod locale;
 mod platform;
 #[cfg(feature = "energy")]

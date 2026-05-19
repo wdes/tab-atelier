@@ -616,8 +616,8 @@ impl AppState {
             .iter()
             .zip(tabs.iter())
             .map(|(tab, ts)| {
-                let (output, cursor) =
-                    tab.view.read(cx).ansi_text_with_cursor(Some(200));
+                let view = tab.view.read(cx);
+                let (output, cursor) = view.ansi_text_with_cursor(Some(200));
                 api::SnapshotTab {
                     name: ts.name.clone(),
                     cwd: ts.cwd.clone(),
@@ -627,6 +627,7 @@ impl AppState {
                     output,
                     uptime_secs: tab.uptime().as_secs_f64(),
                     cursor,
+                    shell_pid: view.pid(),
                 }
             })
             .collect();
