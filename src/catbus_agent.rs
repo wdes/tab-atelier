@@ -246,6 +246,20 @@ struct RawBlock {
     is_error: Option<bool>,
 }
 
+/// Read the `{session-id}.tokens.json` sidecar written by catbus-agent
+/// after each prompt. Returns `None` when no agent session is running
+/// or the file doesn't exist yet.
+#[must_use]
+pub fn read_session_tokens(session: &AgentSession) -> Option<tab_atelier::TokenUsage> {
+    let path = session.file_path.with_extension("tokens.json");
+    let data = fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&data).ok()?;
+    Some(tab_atelier::TokenUsage {
+        input: v.get("input").and_then(serde_json::Value::as_u64).unwrap_or(0),
+        output: v.get("output").and_then(serde_json::Value::as_u64).unwrap_or(0),
+    })
+}
+
 /// Open the per-session UNIX socket, send a `prompt` frame, and
 /// block until the agent emits a `done` or `error` reply. Used by
 /// `POST /tabs/N/catbus/message` to forward the mobile remote's

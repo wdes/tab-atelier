@@ -18,6 +18,11 @@ pub struct TabState {
     pub uptime_secs: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub energy_wh: Option<f64>,
+    /// Cumulative catbus-agent token usage for this tab. Both fields are
+    /// zero when no agent session has run yet; skipped entirely in the
+    /// serialized file when absent so the common (non-agent) case stays clean.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<TokenUsage>,
     /// `colors_enabled` for this tab — false means the shell was started
     /// with `TERM=dumb` (right-click → Disable colors). Skipped when
     /// `true` so the common case stays out of the serialized file.
@@ -153,6 +158,41 @@ pub fn load_tab_energy(state_base: &std::path::Path, tab_name: &str) -> Option<f
     load_f64_with_bak(&tab_power_path(state_base, tab_name))
 }
 
+/// Cumulative token usage for one tab's catbus-agent session.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub input: u64,
+    pub output: u64,
+}
+
+#[must_use]
+pub fn tab_tokens_path(state_base: &std::path::Path, tab_name: &str) -> PathBuf {
+    state_dir(state_base).join(format!("tokens_tab-{}.json", sanitize_tab_filename(tab_name)))
+}
+
+pub fn save_tab_tokens(state_base: &std::path::Path, tab_name: &str, usage: &TokenUsage) {
+    let dir = state_dir(state_base);
+    let path = tab_tokens_path(state_base, tab_name);
+    write_atomic_with_rotation(&dir, &path, usage);
+}
+
+#[must_use]
+pub fn load_tab_tokens(state_base: &std::path::Path, tab_name: &str) -> Option<TokenUsage> {
+    let path = tab_tokens_path(state_base, tab_name);
+    if let Ok(data) = std::fs::read_to_string(&path)
+        && let Ok(v) = serde_json::from_str::<TokenUsage>(&data)
+    {
+        return Some(v);
+    }
+    let bak = path.with_extension("json.bak");
+    if let Ok(data) = std::fs::read_to_string(&bak)
+        && let Ok(v) = serde_json::from_str::<TokenUsage>(&data)
+    {
+        return Some(v);
+    }
+    None
+}
+
 fn load_f64_with_bak(path: &std::path::Path) -> Option<f64> {
     if let Ok(data) = std::fs::read_to_string(path)
         && let Ok(v) = serde_json::from_str::<f64>(&data)
@@ -207,6 +247,9 @@ pub fn load_state_with_outputs(config_base: &std::path::Path, state_base: &std::
         }
         if t.energy_wh.is_none() {
             t.energy_wh = load_tab_energy(state_base, &t.name);
+        }
+        if t.tokens.is_none() {
+            t.tokens = load_tab_tokens(state_base, &t.name);
         }
     }
     Some(state)
@@ -1023,6 +1066,7 @@ mod tests {
                     uptime_secs: None,
                     energy_wh: None,
                     colors_enabled: true,
+                    tokens: None,
                 },
                 TabState {
                     name: "Build".into(),
@@ -1031,6 +1075,7 @@ mod tests {
                     uptime_secs: None,
                     energy_wh: None,
                     colors_enabled: true,
+                    tokens: None,
                 },
             ],
             active: 1,
@@ -1057,6 +1102,7 @@ mod tests {
                 uptime_secs: None,
                 energy_wh: None,
                 colors_enabled: false,
+                    tokens: None,
             }],
             active: 0,
             windowed: false,
@@ -1084,6 +1130,7 @@ mod tests {
                 uptime_secs: Some(123.5),
                 energy_wh: Some(0.042),
                 colors_enabled: true,
+                    tokens: None,
             }],
             active: 0,
             windowed: false,
@@ -1188,6 +1235,7 @@ mod tests {
                 uptime_secs: None,
                 energy_wh: None,
                 colors_enabled: true,
+                    tokens: None,
             }],
             active: 0,
             windowed: false,
@@ -1229,6 +1277,7 @@ mod tests {
                 uptime_secs: None,
                 energy_wh: None,
                 colors_enabled: true,
+                    tokens: None,
             }],
             active: 0,
             windowed: false,
@@ -1257,6 +1306,7 @@ mod tests {
                     uptime_secs: None,
                     energy_wh: None,
                     colors_enabled: true,
+                    tokens: None,
                 },
                 TabState {
                     name: "Two".into(),
@@ -1265,6 +1315,7 @@ mod tests {
                     uptime_secs: None,
                     energy_wh: None,
                     colors_enabled: true,
+                    tokens: None,
                 },
             ],
             active: 1,
@@ -1449,6 +1500,7 @@ mod tests {
                 uptime_secs: None,
                 energy_wh: None,
                 colors_enabled: true,
+                    tokens: None,
             }],
             active: 0,
             windowed: false,
@@ -1599,6 +1651,7 @@ mod tests {
                 uptime_secs: None,
                 energy_wh: None,
                 colors_enabled: true,
+                    tokens: None,
             }],
             active: 999,
             windowed: false,

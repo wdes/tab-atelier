@@ -311,6 +311,12 @@ async fn run_repl(agent: Arc<agent::Agent>, cwd: &std::path::Path) -> std::io::R
 
         match work.await.expect("agent task panicked") {
             Ok(reply) => {
+                // Persist token usage sidecar so tab-atelier can pick it up.
+                let session = agent.active_session().await;
+                let _ = session.save_tokens(
+                    agent.tokens_in.load(std::sync::atomic::Ordering::Relaxed),
+                    agent.tokens_out.load(std::sync::atomic::Ordering::Relaxed),
+                );
                 stdout.write_all(b"\n").await?;
                 stdout.write_all(reply.as_bytes()).await?;
                 stdout.write_all(b"\n\n").await?;

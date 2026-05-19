@@ -54,6 +54,10 @@ pub struct Agent {
     /// Set to `true` while the agent is running a prompt. The REPL
     /// polls this to drive its progress spinner.
     pub working: std::sync::atomic::AtomicBool,
+    /// Cumulative tokens consumed across all turns in this process.
+    /// Both counters accumulate monotonically and are never reset.
+    pub tokens_in: std::sync::atomic::AtomicU64,
+    pub tokens_out: std::sync::atomic::AtomicU64,
 }
 
 impl Agent {
@@ -71,6 +75,8 @@ impl Agent {
             }),
             plan_mode: std::sync::atomic::AtomicBool::new(false),
             working: std::sync::atomic::AtomicBool::new(false),
+            tokens_in: std::sync::atomic::AtomicU64::new(0),
+            tokens_out: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -93,6 +99,11 @@ impl Agent {
     /// resume preview.
     pub async fn transcript_path(&self) -> std::path::PathBuf {
         self.active.read().await.session.transcript_path()
+    }
+
+    /// Arc to the active session — used to save token sidecars after each turn.
+    pub async fn active_session(&self) -> Arc<Session> {
+        Arc::clone(&self.active.read().await.session)
     }
 
     /// Current session name (empty = unnamed).
@@ -148,6 +159,12 @@ impl Agent {
         // typical interactions resolve in 1–6.
         for _ in 0..32 {
             let resp = self.call_messages().await?;
+            // Accumulate token usage immediately so the sidecar file
+            // written after each prompt is always up to date.
+            self.tokens_in
+                .fetch_add(resp.usage.input_tokens, std::sync::atomic::Ordering::Relaxed);
+            self.tokens_out
+                .fetch_add(resp.usage.output_tokens, std::sync::atomic::Ordering::Relaxed);
             // Persist + record what the model produced.
             let entry = session::assistant_blocks(&session, resp.model.clone(), resp.content.clone());
             session.append(&entry)?;
@@ -207,7 +224,15 @@ impl Agent {
                 });
             }
         }
-        Err(AgentError::TooManyRounds)
+        // 32 rounds exhausted. Return whatever text was collected so far
+        // so the REPL shows it, and append a warning so the user knows
+        // the loop was cut short rather than silently losing output.
+        if final_text.is_empty() {
+            Err(AgentError::TooManyRounds)
+        } else {
+            final_text.push_str("\n\n\x1b[33m[tool loop hit the 32-round cap — response may be incomplete]\x1b[0m");
+            Ok(final_text)
+        }
     }
 
     async fn call_messages(&self) -> Result<MessagesResp, AgentError> {
@@ -336,6 +361,16 @@ struct MessagesResp {
     model: String,
     #[serde(default)]
     stop_reason: Option<String>,
+    #[serde(default)]
+    usage: Usage,
+}
+
+#[derive(Deserialize, Debug, Clone, Default)]
+struct Usage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
 }
 
 #[derive(Serialize, Clone)]
