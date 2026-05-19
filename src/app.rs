@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 use tab_atelier::{
     DEFAULT_HOTKEYS, FontConfig, Preferences, SavedState, TabState, gpui_key_to_keycode, keycode_label,
     load_font_config, load_preferences, load_state_with_outputs, load_wakatime_key, save_preferences, save_state,
-    save_tab_energy, save_tab_output, save_tab_uptime,
+    save_tab_energy, save_tab_output, save_tab_tokens, save_tab_uptime,
 };
 
 struct Tab {
@@ -608,6 +608,7 @@ impl AppState {
                     #[cfg(not(feature = "energy"))]
                     energy_wh: None,
                     colors_enabled: tab.view.read(cx).colors_enabled(),
+                    tokens: None,
                 }
             })
             .collect();
@@ -681,6 +682,18 @@ impl AppState {
                         save_tab_energy(&state_base, &tab.name, tab.energy_wh);
                         tab.energy_wh_last_saved = tab.energy_wh;
                     }
+                }
+            }
+            // Token usage: read the sidecar written by catbus-agent and
+            // persist it to the standard per-tab state file so the rest of
+            // the app (and the mobile remote) can read cumulative totals
+            // without knowing about the ~/.claude/projects layout.
+            for tab in &self.tabs {
+                let pid = tab.view.read(cx).pid();
+                if let Some(session) = crate::catbus_agent::find_session(pid)
+                    && let Some(usage) = crate::catbus_agent::read_session_tokens(&session)
+                {
+                    save_tab_tokens(&state_base, &tab.name, &usage);
                 }
             }
         }
@@ -869,6 +882,7 @@ impl AppState {
                     #[cfg(not(feature = "energy"))]
                     energy_wh: None,
                     colors_enabled: tab.view.read(cx).colors_enabled(),
+                    tokens: None,
                 }
             })
             .collect();

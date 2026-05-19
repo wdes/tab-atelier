@@ -263,6 +263,20 @@ pub fn list_sessions(cwd: &Path) -> Vec<(String, String, std::time::SystemTime)>
 }
 
 impl Session {
+    /// Persist cumulative token usage to a `{id}.tokens.json` sidecar
+    /// alongside the transcript. Written after every prompt so
+    /// tab-atelier can poll it from the session's project dir.
+    pub fn save_tokens(&self, input: u64, output: u64) -> Result<(), SessionError> {
+        let path = self.project_dir.join(format!("{}.tokens.json", self.id));
+        let json = serde_json::to_string(&serde_json::json!({
+            "input": input,
+            "output": output,
+        }))
+        .expect("token JSON is always valid");
+        std::fs::write(&path, json)?;
+        Ok(())
+    }
+
     /// Persist a human-readable name for this session in a `.name`
     /// sidecar file next to the transcript.
     pub fn rename(&self, new_name: &str) -> Result<(), SessionError> {
