@@ -5,6 +5,12 @@
 // Miscellaneous Technical block (U+23xx) used by TUIs like Claude Code
 // for double-arrows and tree connectors that DejaVu Sans Mono lacks.
 import "../fonts/FreeMono.ttf";
+// Real bold variant — without it Slint synthesises bold per Text
+// element and the rendering drifts at span boundaries (the first
+// glyph of a bold run looks lighter than the rest). Adding the
+// proper weight lets fontique route font-weight:700 to the right
+// face per glyph.
+import "../fonts/FreeMonoBold.ttf";
 import "../fonts/NotoEmoji.ttf";
 
 struct TabRow {

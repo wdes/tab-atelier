@@ -1,3 +1,9 @@
+# Kept out of the desktop workspace on purpose — different target
+# (aarch64-linux-android), different lockfile, completely disjoint
+# dependency tree. An empty [workspace] table tells Cargo to stop
+# walking up looking for a parent workspace.
+[workspace]
+
 [package]
 name = "ta-remote"
 version = "0.1.0"
