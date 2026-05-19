@@ -347,6 +347,48 @@ impl TerminalView {
         term.grid_mut().scroll_display(Scroll::Bottom);
     }
 
+    /// Turn whatever's on the clipboard (text or image) into a string
+    /// the shell can usefully receive. Image entries are written to a
+    /// fresh file under `$TMPDIR/tab-atelier-paste-…` and the path is
+    /// returned — interactive TUIs (Claude Code, claude-cli, image
+    /// viewers) accept a path; plain shells still get something
+    /// reasonable. Returns `None` when the clipboard is empty.
+    pub fn clipboard_to_paste_text(item: &ClipboardItem) -> Option<String> {
+        use gpui::ClipboardEntry;
+        // Prefer text when present — covers the "copied a URL from a
+        // browser tab" case where Wayland/X11 ships both text and
+        // image previews together.
+        if let Some(s) = item.text() {
+            return Some(s);
+        }
+        for entry in item.entries() {
+            if let ClipboardEntry::Image(img) = entry {
+                let ext = match img.format() {
+                    gpui::ImageFormat::Png => "png",
+                    gpui::ImageFormat::Jpeg => "jpg",
+                    gpui::ImageFormat::Webp => "webp",
+                    gpui::ImageFormat::Gif => "gif",
+                    gpui::ImageFormat::Bmp => "bmp",
+                    gpui::ImageFormat::Tiff => "tiff",
+                    gpui::ImageFormat::Svg => "svg",
+                };
+                // Unique per ms + counter so successive pastes don't
+                // collide; keeping the files under one prefix makes
+                // cleanup easy (`rm /tmp/tab-atelier-paste-*`).
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                let dir = std::env::temp_dir();
+                let path = dir.join(format!("tab-atelier-paste-{ts}.{ext}"));
+                if std::fs::write(&path, img.bytes()).is_ok() {
+                    return Some(path.to_string_lossy().into_owned());
+                }
+            }
+        }
+        None
+    }
+
     pub fn send_clipboard(&self, text: &str) {
         self.last_input.set(Some(std::time::Instant::now()));
         let mut term = self.term.lock();
@@ -561,7 +603,7 @@ impl TerminalView {
                     } else {
                         lines.len()
                     };
-                    cursor_logical = Some((logical_idx, prefix_cols + cursor_grid_col as usize));
+                    cursor_logical = Some((logical_idx, prefix_cols + cursor_grid_col));
                 }
                 if continues_prev {
                     if let Some(prev) = lines.last_mut() {
@@ -763,7 +805,7 @@ impl Render for TerminalView {
                         }
                         "v" => {
                             if let Some(item) = cx.read_from_clipboard()
-                                && let Some(text) = item.text()
+                                && let Some(text) = Self::clipboard_to_paste_text(&item)
                             {
                                 this.send_clipboard(&text);
                             }
@@ -796,7 +838,7 @@ impl Render for TerminalView {
                         }
                         "insert" => {
                             if let Some(item) = cx.read_from_clipboard()
-                                && let Some(text) = item.text()
+                                && let Some(text) = Self::clipboard_to_paste_text(&item)
                             {
                                 this.send_clipboard(&text);
                             }

@@ -978,8 +978,12 @@ impl AppState {
             .id("tab-bar")
             .flex()
             .flex_row()
+            .flex_wrap()
             .w_full()
-            .h(px(32.0))
+            // `min_h` instead of fixed `h` so the bar grows when tabs
+            // wrap to a second/third row. One row is still 32 px, two
+            // rows is 64 px, etc.
+            .min_h(px(32.0))
             .bg(tab_bg)
             .border_t_1()
             .border_color(tab_border)
@@ -1347,7 +1351,7 @@ impl AppState {
                         MouseButton::Left,
                         cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
                             if let Some(item) = cx.read_from_clipboard()
-                                && let Some(text) = item.text()
+                                && let Some(text) = TerminalView::clipboard_to_paste_text(&item)
                             {
                                 let view = &this.tabs[this.active].view;
                                 view.read(cx).send_clipboard(&text);
