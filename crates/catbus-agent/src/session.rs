@@ -114,6 +114,102 @@ fn latest_session_id(dir: &Path) -> Option<String> {
     best.map(|(id, _)| id)
 }
 
+/// One rendered exchange for the resume preview.
+#[derive(Debug)]
+pub struct Exchange {
+    pub user_text: String,
+    /// First text block from the assistant turn. Tool-only turns
+    /// (no text block at all) are skipped when building the preview.
+    pub assistant_text: String,
+}
+
+/// Return up to `n` most-recent complete exchanges (user prompt +
+/// assistant reply) from the transcript at `path`. Only plain text
+/// blocks are surfaced — tool calls and tool results are collapsed
+/// to a one-line summary so the preview stays readable.
+#[must_use]
+pub fn last_exchanges(path: &Path, n: usize) -> Vec<Exchange> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    // Walk all lines, collect (role, text_summary) pairs, then slice
+    // the tail so we always get the newest exchanges.
+    let mut turns: Vec<(bool, String)> = Vec::new(); // (is_assistant, text)
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(role) = v.get("type").and_then(|t| t.as_str()) else {
+            continue;
+        };
+        let Some(msg) = v.get("message") else { continue };
+        match role {
+            "user" => {
+                // Plain string content = a real user prompt.
+                // Array content = tool results — skip those.
+                if let Some(serde_json::Value::String(s)) = msg.get("content") {
+                    turns.push((false, s.clone()));
+                }
+            }
+            "assistant" => {
+                if let Some(serde_json::Value::Array(blocks)) = msg.get("content") {
+                    // Collect text blocks; note tool calls as <tool>.
+                    let mut parts: Vec<String> = Vec::new();
+                    let mut tool_count = 0usize;
+                    for b in blocks {
+                        match b.get("type").and_then(|t| t.as_str()) {
+                            Some("text") => {
+                                if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                                    // Trim to ~200 chars so the preview is compact.
+                                    let trimmed = t.trim();
+                                    if !trimmed.is_empty() {
+                                        parts.push(trimmed.chars().take(200).collect::<String>());
+                                    }
+                                }
+                            }
+                            Some("tool_use") => tool_count += 1,
+                            _ => {}
+                        }
+                    }
+                    if tool_count > 0 {
+                        parts.push(format!(
+                            "\x1b[2m[{} tool call{}]\x1b[0m",
+                            tool_count,
+                            if tool_count == 1 { "" } else { "s" }
+                        ));
+                    }
+                    if !parts.is_empty() {
+                        turns.push((true, parts.join(" ")));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    // Pair consecutive user→assistant turns, take the last `n`.
+    let mut exchanges: Vec<Exchange> = Vec::new();
+    let mut i = 0;
+    while i + 1 < turns.len() {
+        let (user_is_assistant, ref user_text) = turns[i];
+        let (assistant_is_assistant, ref asst_text) = turns[i + 1];
+        if !user_is_assistant && assistant_is_assistant {
+            exchanges.push(Exchange {
+                user_text: user_text.clone(),
+                assistant_text: asst_text.clone(),
+            });
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    // Return the last `n`.
+    let skip = exchanges.len().saturating_sub(n);
+    exchanges.into_iter().skip(skip).collect()
+}
+
 /// Read the last non-empty JSONL line of `path` and pluck its
 /// `uuid`. Used to chain `parentUuid` correctly on resume.
 fn last_entry_uuid(path: &Path) -> std::io::Result<Option<String>> {
@@ -179,6 +275,11 @@ impl Session {
     /// Return the current name (empty string = unnamed).
     pub fn session_name(&self) -> String {
         self.name.lock().expect("name mutex").clone()
+    }
+
+    /// Path to the JSONL transcript file for this session.
+    pub fn transcript_path(&self) -> PathBuf {
+        self.project_dir.join(format!("{}.jsonl", self.id))
     }
 
     /// `~/.claude/projects/{escaped}/{session-id}.sock` — same dir
