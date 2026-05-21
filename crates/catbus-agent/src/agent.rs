@@ -17,6 +17,7 @@
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 use crate::auth::Auth;
 use crate::session::{self, Block, Session};
@@ -58,6 +59,10 @@ pub struct Agent {
     /// Both counters accumulate monotonically and are never reset.
     pub tokens_in: std::sync::atomic::AtomicU64,
     pub tokens_out: std::sync::atomic::AtomicU64,
+    /// Cancellation flag for the currently-running turn. Re-built at
+    /// the start of every `run_user_prompt` so Ctrl+C only kills the
+    /// in-flight request, not future ones.
+    cancel: std::sync::Mutex<CancellationToken>,
 }
 
 impl Agent {
@@ -77,7 +82,15 @@ impl Agent {
             status: std::sync::Mutex::new(None),
             tokens_in: std::sync::atomic::AtomicU64::new(0),
             tokens_out: std::sync::atomic::AtomicU64::new(0),
+            cancel: std::sync::Mutex::new(CancellationToken::new()),
         }
+    }
+
+    /// Trip the cancellation token for the in-flight turn (if any).
+    /// Safe to call when nothing is running — the next `run_user_prompt`
+    /// installs a fresh token before doing any work.
+    pub fn cancel_current(&self) {
+        self.cancel.lock().expect("cancel mutex").cancel();
     }
 
     pub fn set_plan_mode(&self, on: bool) {
@@ -131,13 +144,21 @@ impl Agent {
     /// drive the tool loop until the assistant stops asking for
     /// tools. Returns the model's final assistant text concatenated.
     pub async fn run_user_prompt(&self, text: String) -> Result<String, AgentError> {
+        // Fresh token per turn so a stale cancel doesn't kill the next
+        // request before it even starts. Hold the lock only long enough
+        // to swap; the inner future borrows the new clone.
+        let token = {
+            let mut slot = self.cancel.lock().expect("cancel mutex");
+            *slot = CancellationToken::new();
+            slot.clone()
+        };
         *self.status.lock().expect("status mutex") = Some("thinking".into());
-        let result = self.run_user_prompt_inner(text).await;
+        let result = self.run_user_prompt_inner(text, &token).await;
         *self.status.lock().expect("status mutex") = None;
         result
     }
 
-    async fn run_user_prompt_inner(&self, text: String) -> Result<String, AgentError> {
+    async fn run_user_prompt_inner(&self, text: String, cancel: &CancellationToken) -> Result<String, AgentError> {
         // Snapshot session Arc so we're not holding the RwLock across
         // await points in the tool loop.
         let session = Arc::clone(&self.active.read().await.session);
@@ -162,8 +183,14 @@ impl Agent {
             .and_then(|s| s.parse().ok())
             .unwrap_or(200);
         for _ in 0..max_rounds {
+            if cancel.is_cancelled() {
+                return Err(AgentError::Cancelled);
+            }
             *self.status.lock().expect("status mutex") = Some("thinking".into());
-            let resp = self.call_messages().await?;
+            let resp = tokio::select! {
+                res = self.call_messages() => res?,
+                () = cancel.cancelled() => return Err(AgentError::Cancelled),
+            };
             // Accumulate token usage immediately so the sidecar file
             // written after each prompt is always up to date.
             self.tokens_in
@@ -210,13 +237,19 @@ impl Agent {
             let plan = self.plan_mode.load(std::sync::atomic::Ordering::Relaxed);
             let mut results: Vec<Block> = Vec::with_capacity(tool_uses.len());
             for (id, name, input) in tool_uses {
+                if cancel.is_cancelled() {
+                    return Err(AgentError::Cancelled);
+                }
                 // Show the tool name (and a short input summary for Bash)
                 // in the status so the spinner reflects what's running.
                 let label = tool_status_label(&name, &input);
                 *self.status.lock().expect("status mutex") = Some(label);
-                let (content, is_error) = tools::dispatch(&name, &input, &session.cwd, plan)
-                    .await
-                    .map_or_else(|e| (format!("Error: {e}"), true), |out| (out, false));
+                let (content, is_error) = tokio::select! {
+                    out = tools::dispatch(&name, &input, &session.cwd, plan) => {
+                        out.map_or_else(|e| (format!("Error: {e}"), true), |out| (out, false))
+                    }
+                    () = cancel.cancelled() => return Err(AgentError::Cancelled),
+                };
                 results.push(Block::ToolResult {
                     tool_use_id: id,
                     content,
@@ -268,9 +301,9 @@ impl Agent {
                          that supports ANSI colour and formatting — use ANSI SGR escapes \
                          (bold, colours, etc.) to make output readable. Do NOT use \
                          markdown — no asterisks, no backtick fences, no hashes. \
-                         Use ANSI instead: \\x1b[1m for bold, \\x1b[32m for green, \
-                         \\x1b[33m for yellow, \\x1b[31m for red, \\x1b[36m for cyan, \
-                         \\x1b[0m to reset.",
+                         Use ANSI instead: \x1b[1m for bold, \x1b[32m for green, \
+                         \x1b[33m for yellow, \x1b[31m for red, \x1b[36m for cyan, \
+                         \x1b[0m to reset.",
                         if self.plan_mode.load(std::sync::atomic::Ordering::Relaxed) {
                             "ON — propose changes, do not execute write/edit/bash."
                         } else {
@@ -329,16 +362,20 @@ fn rebuild_history(project_dir: &std::path::Path, id: &str) -> Vec<ApiMessage> {
                 let content = match msg.get("content") {
                     Some(serde_json::Value::String(s)) => ApiContent::Plain(s.clone()),
                     Some(serde_json::Value::Array(_)) => {
-                        let blocks: Vec<Block> =
-                            serde_json::from_value(msg["content"].clone()).unwrap_or_default();
+                        let blocks: Vec<Block> = serde_json::from_value(msg["content"].clone()).unwrap_or_default();
                         ApiContent::Blocks(blocks)
                     }
                     _ => continue,
                 };
-                out.push(ApiMessage { role: "user".into(), content });
+                out.push(ApiMessage {
+                    role: "user".into(),
+                    content,
+                });
             }
             "assistant" => {
-                let Some(content_val) = msg.get("content") else { continue };
+                let Some(content_val) = msg.get("content") else {
+                    continue;
+                };
                 let blocks: Vec<Block> = serde_json::from_value(content_val.clone()).unwrap_or_default();
                 if !blocks.is_empty() {
                     out.push(ApiMessage {
@@ -450,4 +487,6 @@ pub enum AgentError {
     Transcript(#[from] crate::session::SessionError),
     #[error("tool loop exceeded the round cap (set CATBUS_MAX_ROUNDS to raise it)")]
     TooManyRounds,
+    #[error("cancelled by user")]
+    Cancelled,
 }

@@ -270,8 +270,7 @@ pub fn read_session_tokens(session: &AgentSession) -> Option<tab_atelier::TokenU
 /// session's transcript with the extension swapped to `.sock`.
 pub fn send_prompt_to_socket(socket_path: &Path, text: &str) -> Result<String, String> {
     use serde_json::Value;
-    let stream = UnixStream::connect(socket_path)
-        .map_err(|e| format!("connect {}: {e}", socket_path.display()))?;
+    let stream = UnixStream::connect(socket_path).map_err(|e| format!("connect {}: {e}", socket_path.display()))?;
     // 10-minute ceiling — agent answers shouldn't take longer; if
     // they do, something's wrong on the agent side and we'd rather
     // free the API thread than hang it forever.
@@ -284,9 +283,7 @@ pub fn send_prompt_to_socket(socket_path: &Path, text: &str) -> Result<String, S
     // The server greets every connection with {"kind":"started"} —
     // drain it before sending, so frames stay request/reply aligned.
     let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .map_err(|e| format!("read greeting: {e}"))?;
+    reader.read_line(&mut line).map_err(|e| format!("read greeting: {e}"))?;
 
     let payload = format!(r#"{{"kind":"prompt","text":{}}}"#, json_encode_string(text));
     writeln!(writer, "{payload}").map_err(|e| format!("write: {e}"))?;
@@ -297,9 +294,7 @@ pub fn send_prompt_to_socket(socket_path: &Path, text: &str) -> Result<String, S
     // final answer for now.
     loop {
         line.clear();
-        let n = reader
-            .read_line(&mut line)
-            .map_err(|e| format!("read: {e}"))?;
+        let n = reader.read_line(&mut line).map_err(|e| format!("read: {e}"))?;
         if n == 0 {
             return Err("agent closed connection before replying".into());
         }
@@ -307,8 +302,7 @@ pub fn send_prompt_to_socket(socket_path: &Path, text: &str) -> Result<String, S
         if trimmed.is_empty() {
             continue;
         }
-        let frame: Value =
-            serde_json::from_str(trimmed).map_err(|e| format!("malformed frame: {e}"))?;
+        let frame: Value = serde_json::from_str(trimmed).map_err(|e| format!("malformed frame: {e}"))?;
         match frame.get("kind").and_then(Value::as_str) {
             Some("done") => {
                 return Ok(frame

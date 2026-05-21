@@ -202,28 +202,7 @@ fn respond_json<W: Write>(stream: &mut W, status: u16, body: &str) {
     );
 }
 
-/// Strip ANSI CSI/SGR escapes (`ESC [ … final`) from `s`. Used to flatten
-/// the tab-list preview line; the full /output endpoint keeps its escapes
-/// so mobile clients can render colour.
-fn strip_ansi(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' && chars.peek() == Some(&'[') {
-            chars.next();
-            for nc in chars.by_ref() {
-                // CSI parameters are `0x30..=0x3F`, intermediates `0x20..=0x2F`,
-                // and the sequence ends at the first byte in `0x40..=0x7E`.
-                if ('\x40'..='\x7e').contains(&nc) {
-                    break;
-                }
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
+use tab_atelier::strip_ansi;
 
 fn error_json<W: Write>(stream: &mut W, status: u16, msg: &str) {
     let body = serde_json::to_string(&ErrorResponse { error: msg.to_string() }).unwrap_or_default();

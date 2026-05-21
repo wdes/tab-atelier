@@ -81,9 +81,7 @@ pub async fn run(input: &serde_json::Value, _cwd: &Path) -> Result<String, Strin
             if line.trim().is_empty() {
                 continue;
             }
-            match serde_json::from_str::<Frame>(&line)
-                .map_err(|e| format!("malformed frame `{line}`: {e}"))?
-            {
+            match serde_json::from_str::<Frame>(&line).map_err(|e| format!("malformed frame `{line}`: {e}"))? {
                 Frame::Done { text } => return Ok(text),
                 Frame::Error { message } => return Err(format!("agent error: {message}")),
                 Frame::Started | Frame::Chunk { .. } => {}
@@ -139,6 +137,10 @@ enum Frame {
         #[allow(dead_code)] // future: streaming relay through to caller.
         text: String,
     },
-    Done { text: String },
-    Error { message: String },
+    Done {
+        text: String,
+    },
+    Error {
+        message: String,
+    },
 }

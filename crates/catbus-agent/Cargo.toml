@@ -42,3 +42,9 @@ jiff = "0.2"
 # transcript. Claude Code uses v4 UUIDs there.
 uuid = { version = "1", features = ["v4"] }
 thiserror = "2"
+# Line editor for the in-tab REPL: history, multi-line edit, Ctrl+C as
+# a signal instead of SIGINT. Used in place of a raw stdin BufReader.
+reedline = "0.42"
+# CancellationToken — propagates Ctrl+C from the REPL into the agent's
+# HTTP / tool loop so an in-flight request can be aborted cleanly.
+tokio-util = { version = "0.7", default-features = false }
