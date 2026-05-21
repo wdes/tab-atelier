@@ -57,16 +57,21 @@ struct Tab {
     /// so cold-launch with many tabs doesn't block on vte-parsing each
     /// one's entire history up front.
     pending_restore: Option<String>,
+    /// Last cwd we successfully read from /proc/PID/cwd for this tab's
+    /// shell. Used as a sticky fallback so that a dead or exited shell
+    /// doesn't blank out the persisted cwd on the next tick.
+    last_known_cwd: Option<PathBuf>,
 }
 
 impl Tab {
-    /// Wall-clock time this tab has existed (live run + persisted prior
-    /// runs). The mobile remote's per-tab counter reads from this, so it
-    /// keeps ticking even when no input is happening — the "actively
-    /// typing" semantic of the old `active_duration` field surprised
-    /// users who only viewed tabs from the phone.
+    /// Active time this tab has been used (live run + persisted prior runs).
+    /// Counts only periods when the user typed in the last 30s — the same
+    /// idle threshold `persist()` uses to flip activate/deactivate. Idle
+    /// minutes (and time while the drop-down is hidden) don't accumulate,
+    /// so a tab left open overnight shows ~the same number in the morning.
     fn uptime(&self) -> std::time::Duration {
-        self.prior_uptime + self.created_at.elapsed()
+        let live = self.last_activated.map(|t| t.elapsed()).unwrap_or_default();
+        self.prior_uptime + self.active_duration + live
     }
 
     fn activate(&mut self) {
@@ -269,6 +274,10 @@ impl AppState {
                         // identical file.
                         output_hash_last_saved: ts.output.as_deref().map_or(0, |s| tab_atelier::crc32(s.as_bytes())),
                         pending_restore,
+                        // Seed from saved state so an immediate persist tick
+                        // before the new shell has a /proc/PID/cwd readable
+                        // doesn't overwrite the restored value with None.
+                        last_known_cwd: cwd.clone(),
                     });
                 }
                 if tabs.is_empty() {
@@ -293,6 +302,7 @@ impl AppState {
                         energy_wh_last_saved: 0.0,
                         output_hash_last_saved: 0,
                         pending_restore: None,
+                        last_known_cwd: None,
                     });
                 }
                 let active = saved.active.min(tabs.len() - 1);
@@ -321,6 +331,7 @@ impl AppState {
                         energy_wh_last_saved: 0.0,
                         output_hash_last_saved: 0,
                         pending_restore: None,
+                        last_known_cwd: None,
                     }],
                     0,
                     false,
@@ -385,10 +396,16 @@ impl AppState {
 
         tabs[active].view.read(cx).focus_handle(cx).focus(window);
 
-        let tracker = load_wakatime_key(&platform::config_dir()).map(|key| {
+        // Pick up the api key from Zed's settings when present so the
+        // user doesn't need a separate `~/.wakatime.cfg` entry. When
+        // absent, wakatime-cli falls back to its own config. Tracking
+        // ultimately needs both a key (anywhere) and the cli binary on
+        // disk; WakatimeTracker::new returns None if the cli is missing.
+        let key = load_wakatime_key(&platform::config_dir());
+        let tracker = WakatimeTracker::new(key);
+        if tracker.is_some() {
             info!("wakatime tracking enabled");
-            WakatimeTracker::new(key)
-        });
+        }
 
         let api_token = api::load_or_generate_token();
         let api_port = prefs.api_port.unwrap_or(tab_atelier::DEFAULT_API_PORT);
@@ -477,7 +494,7 @@ impl AppState {
     fn insert_tab(&mut self, at: usize, window: &mut Window, cx: &mut Context<Self>) {
         let cwd = {
             let pid = self.tabs[self.active].view.read(cx).pid();
-            platform::process_cwd(pid)
+            platform::process_cwd(pid).or_else(|| self.tabs[self.active].last_known_cwd.clone())
         };
         self.tabs[self.active].deactivate();
         let fc = self.font_config.clone();
@@ -493,7 +510,7 @@ impl AppState {
         self.tabs.insert(
             idx,
             Tab {
-                view,
+                view: view.clone(),
                 name: format!("{} {}", self.t().terminal_n, self.tabs.len()),
                 created_at: std::time::Instant::now(),
                 prior_uptime: std::time::Duration::ZERO,
@@ -505,10 +522,29 @@ impl AppState {
                 energy_wh_last_saved: 0.0,
                 output_hash_last_saved: 0,
                 pending_restore: None,
+                last_known_cwd: cwd,
             },
         );
         self.active = idx;
         self.tabs[self.active].view.read(cx).focus_handle(cx).focus(window);
+        // After the shell initialises, clear history + input line, then
+        // launch catbus-agent automatically.
+        cx.spawn(async move |_this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            // Give the shell a moment to print its prompt before we send input.
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(300))
+                .await;
+            let _ = cx.update(|cx| {
+                view.read(cx).send_input_bytes(
+                    // Ctrl-U: kill any text already on the input line
+                    // Ctrl-L: clear screen
+                    // "catbus-agent" typed into readline — no \n so the user
+                    // can navigate/edit with arrows before pressing Enter.
+                    b"\x15\x0ccatbus-agent".to_vec(),
+                );
+            });
+        })
+        .detach();
         cx.notify();
     }
 
@@ -591,12 +627,20 @@ impl AppState {
             .iter()
             .map(|tab| (tab.name.clone(), tab.uptime().as_secs_f64()))
             .collect();
+        // Refresh last_known_cwd for any tab whose PTY child is still alive,
+        // so a later persist tick after the shell exits still has a value
+        // to fall back on instead of blanking the cwd to None.
+        for tab in &mut self.tabs {
+            let pid = tab.view.read(cx).pid();
+            if let Some(p) = platform::process_cwd(pid) {
+                tab.last_known_cwd = Some(p);
+            }
+        }
         let tabs: Vec<TabState> = self
             .tabs
             .iter()
             .map(|tab| {
-                let pid = tab.view.read(cx).pid();
-                let cwd = platform::process_cwd(pid).map(|p| p.to_string_lossy().into_owned());
+                let cwd = tab.last_known_cwd.as_ref().map(|p| p.to_string_lossy().into_owned());
                 TabState {
                     name: tab.name.clone(),
                     cwd,
@@ -758,9 +802,16 @@ impl AppState {
         }
 
         if let Some(ref tracker) = self.tracker {
-            let pid = self.tabs[self.active].view.read(cx).pid();
-            let cwd = platform::process_cwd(pid);
-            tracker.record_activity(cwd);
+            // Only ping Wakatime when the user has actually touched the
+            // active tab in the last 30s. Otherwise the persist tick
+            // would flood the API with heartbeats while the terminal
+            // sits idle in the system tray.
+            let view = self.tabs[self.active].view.read(cx);
+            let recently_active = view.last_input_time().is_some_and(|t| t.elapsed().as_secs() < 30);
+            if recently_active {
+                let cwd = platform::process_cwd(view.pid());
+                tracker.record_activity(cwd);
+            }
         }
     }
 
@@ -866,12 +917,19 @@ impl AppState {
             .iter()
             .map(|tab| (tab.name.clone(), tab.uptime().as_secs_f64()))
             .collect();
+        // Snapshot cwd from /proc one last time before child processes
+        // disappear; fall back to the cached last_known_cwd otherwise.
+        for tab in &mut self.tabs {
+            let pid = tab.view.read(cx).pid();
+            if let Some(p) = platform::process_cwd(pid) {
+                tab.last_known_cwd = Some(p);
+            }
+        }
         let tabs: Vec<TabState> = self
             .tabs
             .iter()
             .map(|tab| {
-                let pid = tab.view.read(cx).pid();
-                let cwd = platform::process_cwd(pid).map(|p| p.to_string_lossy().into_owned());
+                let cwd = tab.last_known_cwd.as_ref().map(|p| p.to_string_lossy().into_owned());
                 TabState {
                     name: tab.name.clone(),
                     cwd,
@@ -1000,6 +1058,7 @@ impl AppState {
             .min_h(px(32.0))
             .bg(tab_bg)
             .border_t_1()
+            .border_b_1()
             .border_color(tab_border)
             .on_mouse_down(
                 MouseButton::Right,
@@ -1258,13 +1317,10 @@ impl AppState {
                 );
             }
 
-            // Switch the active shell into a catbus session by exec'ing
-            // catbus-agent inside the existing PTY. `exec` replaces the
-            // shell so the tab's PID stays the same and the existing
-            // session-discovery walker finds the new process by `comm`.
-            // The U+FE0F variation selectors after each emoji nudge
-            // font fallback toward the colour-emoji face for both
-            // glyphs, which on Linux otherwise picks different fonts.
+            // Drop catbus-agent into this tab's shell. Ctrl-U clears any
+            // half-typed input, then `catbus-agent\n` runs it. No exec —
+            // the shell stays alive underneath, so exiting catbus returns
+            // the user to their session.
             container = container.child(
                 div()
                     .id("menu-catbus")
@@ -1275,11 +1331,10 @@ impl AppState {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
-                            let view = &this.tabs[idx].view;
-                            // Ctrl-L clears the screen without spawning a subprocess,
-                            // then exec replaces the shell with catbus-agent in-place.
-                            view.read(cx).send_input_bytes(vec![0x0c]);
-                            view.read(cx).send_clipboard("exec catbus-agent\n");
+                            this.tabs[idx]
+                                .view
+                                .read(cx)
+                                .send_input_bytes(b"\x15catbus-agent\n".to_vec());
                             this.context_menu = None;
                             cx.notify();
                         }),
@@ -1396,7 +1451,12 @@ impl AppState {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
-                            let text = this.tabs[this.active].view.read(cx).copy_all_history();
+                            // Clipboard gets plain text so other apps don't see
+                            // raw `\x1b[...m` escapes. The persistence call
+                            // sites that need colours go through copy_all_history
+                            // directly.
+                            let text =
+                                tab_atelier::strip_ansi(&this.tabs[this.active].view.read(cx).copy_all_history());
                             if !text.is_empty() {
                                 cx.write_to_clipboard(ClipboardItem::new_string(text));
                             }

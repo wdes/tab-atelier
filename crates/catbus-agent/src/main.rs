@@ -15,11 +15,15 @@
 
 #![allow(clippy::module_name_repetitions)]
 
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use reedline::{
+    FileBackedHistory, Prompt, PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus, Reedline, Signal,
+};
+use tokio::io::AsyncWriteExt;
 
 mod agent;
 mod auth;
@@ -99,10 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         session.rename(name)?;
     }
 
-    let socket_path = args
-        .socket
-        .clone()
-        .unwrap_or_else(|| session.default_socket_path());
+    let socket_path = args.socket.clone().unwrap_or_else(|| session.default_socket_path());
 
     if args.print_socket {
         println!("{}", socket_path.display());
@@ -134,37 +135,115 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Spinner frames — simple ASCII so any font renders them.
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/// reedline `Prompt` impl that renders the session-name prefix in cyan.
+/// The name is snapshotted once per `read_line()` call so reedline can
+/// keep calling these methods without touching the async lock.
+struct CatbusPrompt {
+    name: String,
+}
+
+impl Prompt for CatbusPrompt {
+    fn render_prompt_left(&self) -> Cow<'_, str> {
+        Cow::Borrowed("")
+    }
+    fn render_prompt_right(&self) -> Cow<'_, str> {
+        Cow::Borrowed("")
+    }
+    fn render_prompt_indicator(&self, _: PromptEditMode) -> Cow<'_, str> {
+        if self.name.is_empty() {
+            Cow::Borrowed("\x1b[36m>\x1b[0m ")
+        } else {
+            Cow::Owned(format!("\x1b[36m{}>\x1b[0m ", self.name))
+        }
+    }
+    fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
+        Cow::Borrowed("\x1b[36m·\x1b[0m ")
+    }
+    fn render_prompt_history_search_indicator(&self, s: PromptHistorySearch) -> Cow<'_, str> {
+        let prefix = match s.status {
+            PromptHistorySearchStatus::Passing => "search",
+            PromptHistorySearchStatus::Failing => "search failed",
+        };
+        Cow::Owned(format!("({prefix}: {}) ", s.term))
+    }
+}
+
+/// History file lives under `XDG_STATE_HOME` (or `~/.local/state`) so it
+/// survives across sessions but stays out of the user's `$HOME`.
+fn history_path() -> PathBuf {
+    let base = std::env::var("XDG_STATE_HOME")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join(".local/state"))
+        })
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    base.join("catbus-agent").join("history.txt")
+}
+
+/// Build a reedline editor with file-backed history. Caps at 5000
+/// entries so the file doesn't grow without bound.
+fn make_editor() -> Reedline {
+    let path = history_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let history = FileBackedHistory::with_file(5000, path).map(Box::new).ok();
+    let mut editor = Reedline::create();
+    if let Some(h) = history {
+        editor = editor.with_history(h);
+    }
+    editor
+}
+
 /// In-tab REPL: print a prompt, read a line, hand it to the agent,
-/// print the answer, repeat. Ctrl-D exits.
+/// print the answer, repeat.
 ///
-/// Intentionally minimal — no readline, no history, no syntax
-/// highlighting. Tab-atelier hosts the actual terminal so things
-/// like cursor movement / line editing come from there. If a power
-/// user wants `rlwrap catbus-agent`, that works too.
+/// Line editing comes from `reedline` (history, cursor movement,
+/// Ctrl-R search). Ctrl-C while typing clears the buffer and re-prompts;
+/// Ctrl-C while the agent is working cancels the in-flight request via
+/// `agent.cancel_current()`. Ctrl-D exits.
 #[allow(clippy::too_many_lines)]
 async fn run_repl(agent: Arc<agent::Agent>, cwd: &std::path::Path) -> std::io::Result<()> {
     let mut stdout = tokio::io::stdout();
-    let mut reader = BufReader::new(tokio::io::stdin());
 
     print_banner(&mut stdout, &agent).await?;
 
-    let mut line = String::new();
+    // reedline is sync — we move it into a `spawn_blocking` for each
+    // read_line and pull it back so the main task can keep driving the
+    // tokio runtime (signals, agent work, etc.).
+    let mut editor_slot: Option<Reedline> = Some(make_editor());
+
     loop {
-        print_prompt(&mut stdout, &agent).await?;
-        line.clear();
-        if reader.read_line(&mut line).await? == 0 {
-            // EOF (Ctrl-D)
-            stdout.write_all(b"\n").await?;
-            break;
-        }
+        let name = agent.session_name().await;
+        let prompt = CatbusPrompt { name };
+        let mut editor = editor_slot.take().expect("editor present");
+        let (sig, returned) = tokio::task::spawn_blocking(move || {
+            let res = editor.read_line(&prompt);
+            (res, editor)
+        })
+        .await
+        .expect("reedline task panicked");
+        editor_slot = Some(returned);
+
+        let line = match sig? {
+            Signal::Success(line) => line,
+            Signal::CtrlC => {
+                // Just clear the line; don't kill the process.
+                continue;
+            }
+            Signal::CtrlD => {
+                stdout.write_all(b"\n").await?;
+                break;
+            }
+        };
+
         let prompt = line.trim().trim_matches('`');
         if prompt.is_empty() {
             continue;
         }
-
-        // Erase the prompt line (move up one, clear to end-of-line) so
-        // the terminal shows a clean slate before the reply or spinner.
-        stdout.write_all(b"\x1b[1A\x1b[2K").await?;
 
         // Slash commands are interpreted locally; everything else
         // becomes a user turn for the model.
@@ -208,9 +287,7 @@ async fn run_repl(agent: Arc<agent::Agent>, cwd: &std::path::Path) -> std::io::R
                     let text = String::from_utf8_lossy(&o.stdout);
                     let path = text.lines().rfind(|l| !l.trim().is_empty()).unwrap_or("(no output)");
                     let path = path.trim().trim_matches('`');
-                    stdout
-                        .write_all(format!("\x1b[1m{path}\x1b[0m\n").as_bytes())
-                        .await?;
+                    stdout.write_all(format!("\x1b[1m{path}\x1b[0m\n").as_bytes()).await?;
                 }
                 Ok(o) => {
                     let stderr = String::from_utf8_lossy(&o.stderr);
@@ -304,7 +381,11 @@ async fn run_repl(agent: Arc<agent::Agent>, cwd: &std::path::Path) -> std::io::R
                 let age = now
                     .duration_since(*ts)
                     .map_or_else(|_| "in the future".to_string(), |d| humanise_age(d.as_secs()));
-                let marker = if id == &current_id { " \x1b[32m(current)\x1b[0m" } else { "" };
+                let marker = if id == &current_id {
+                    " \x1b[32m(current)\x1b[0m"
+                } else {
+                    ""
+                };
                 let label = if name.is_empty() {
                     format!("\x1b[2m{id}\x1b[0m")
                 } else {
@@ -325,14 +406,30 @@ async fn run_repl(agent: Arc<agent::Agent>, cwd: &std::path::Path) -> std::io::R
         let prompt_owned = prompt.to_string();
 
         // Spawn the agent work on a concurrent task so the main task
-        // can drive the spinner on stdout.
+        // can drive the spinner + a SIGINT watcher.
         let work = tokio::spawn(async move { agent_clone.run_user_prompt(prompt_owned).await });
 
-        // Spinner loop: tick every 120 ms while `status` is set.
+        // Reedline puts the terminal back into canonical mode when
+        // read_line returns, so Ctrl+C now reaches us as a real SIGINT.
+        // Race it against the spinner loop: first to fire wins.
         let spinner_agent = Arc::clone(&agent);
         let mut frame: usize = 0;
+        let mut interrupted = false;
         loop {
-            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_millis(120)) => {}
+                res = tokio::signal::ctrl_c() => {
+                    // Best-effort — if the signal handler can't install
+                    // (rare), just fall through and let the spinner finish.
+                    if res.is_ok() {
+                        agent.cancel_current();
+                        interrupted = true;
+                        stdout.write_all(b"\r\x1b[K\x1b[33minterrupted\x1b[0m, cancelling...\n").await?;
+                        stdout.flush().await?;
+                        break;
+                    }
+                }
+            }
             let current_status = spinner_agent.status.lock().expect("status mutex").clone();
             let Some(label) = current_status else {
                 // Erase the spinner line before printing the reply.
@@ -348,8 +445,16 @@ async fn run_repl(agent: Arc<agent::Agent>, cwd: &std::path::Path) -> std::io::R
             frame += 1;
         }
 
-        match work.await.expect("agent task panicked") {
-            Ok(reply) => {
+        // If we requested cancel, wait briefly for the work task to
+        // notice — but don't hang the REPL on a stuck tool.
+        let result = if interrupted {
+            tokio::time::timeout(std::time::Duration::from_secs(5), work).await
+        } else {
+            Ok(work.await)
+        };
+
+        match result {
+            Ok(Ok(Ok(reply))) => {
                 // Persist token usage sidecar so tab-atelier can pick it up.
                 let session = agent.active_session().await;
                 let _ = session.save_tokens(
@@ -360,9 +465,19 @@ async fn run_repl(agent: Arc<agent::Agent>, cwd: &std::path::Path) -> std::io::R
                 stdout.write_all(reply.as_bytes()).await?;
                 stdout.write_all(b"\n\n").await?;
             }
-            Err(e) => {
+            Ok(Ok(Err(e))) => {
                 stdout
                     .write_all(format!("\n\x1b[31merror:\x1b[0m {e}\n\n").as_bytes())
+                    .await?;
+            }
+            Ok(Err(join)) => {
+                stdout
+                    .write_all(format!("\n\x1b[31merror:\x1b[0m agent task: {join}\n\n").as_bytes())
+                    .await?;
+            }
+            Err(_timeout) => {
+                stdout
+                    .write_all(b"\n\x1b[31merror:\x1b[0m cancel timed out; abandoning task\n\n")
                     .await?;
             }
         }
@@ -391,18 +506,6 @@ async fn print_banner(stdout: &mut tokio::io::Stdout, agent: &agent::Agent) -> s
     stdout.flush().await
 }
 
-async fn print_prompt(stdout: &mut tokio::io::Stdout, agent: &agent::Agent) -> std::io::Result<()> {
-    let name = agent.session_name().await;
-    if name.is_empty() {
-        stdout.write_all(b"\x1b[36m>\x1b[0m ").await?;
-    } else {
-        stdout
-            .write_all(format!("\x1b[36m{name}>\x1b[0m ").as_bytes())
-            .await?;
-    }
-    stdout.flush().await
-}
-
 /// Print the last 3 exchanges from `path` as a compact recap.
 /// Each exchange is: dim user prompt, then assistant reply (possibly
 /// truncated). A separator line precedes the block when exchanges exist.
@@ -420,9 +523,7 @@ async fn print_exchanges(stdout: &mut tokio::io::Stdout, path: &std::path::Path)
             .await?;
         // Assistant reply: indent, wrap long lines with a continuation marker.
         for part in ex.assistant_text.lines().take(4) {
-            stdout
-                .write_all(format!("  \x1b[2m{part}\x1b[0m\n").as_bytes())
-                .await?;
+            stdout.write_all(format!("  \x1b[2m{part}\x1b[0m\n").as_bytes()).await?;
         }
         if ex.assistant_text.lines().count() > 4 {
             stdout.write_all(b"  \x1b[2m...\x1b[0m\n").await?;

@@ -2,19 +2,42 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//! Delegate Wakatime heartbeats to the canonical `wakatime-cli` binary
+//! instead of talking HTTP ourselves. This mirrors the architecture
+//! every official Wakatime editor extension uses — see
+//! <https://github.com/wakatime/zed-wakatime> for a reference — so
+//! auth handling, offline queueing, project / language detection and
+//! the User-Agent header are all maintained by Wakatime upstream.
+//!
+//! We do not download the CLI; the user is expected to already have it
+//! (Zed-wakatime, the official wakatime-cli installer, or
+//! `~/.wakatime/wakatime-cli-*` left over from another editor all
+//! work). If the binary isn't found, tracking is silently disabled.
+
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use log::{debug, warn};
 
-const DEBOUNCE_SECS: u64 = 2;
+/// Mirror wakatime-cli's own `--heartbeat-rate-limit-seconds` default.
+/// Anything more frequent would be batched away by the CLI anyway, so
+/// skipping the subprocess spawn is the only saving here.
+const DEBOUNCE_SECS: u64 = 120;
 
+/// Generic identifier returned by the `/tabs` API and shown in the
+/// mobile remote's "app" field. Unrelated to the Wakatime UA — that
+/// one is now owned entirely by wakatime-cli.
 pub const USER_AGENT: &str = concat!(
     "tab-atelier/",
     env!("CARGO_PKG_VERSION"),
     " (terminal; +https://github.com/wdes/tab-atelier)"
 );
+
+/// Sentinel passed to `wakatime-cli --plugin` so the dashboard groups
+/// heartbeats under a "tab-atelier" editor row instead of the catch-all
+/// "Other" bucket. Format follows wakatime-cli's documented convention:
+/// `EditorName/version`.
+const PLUGIN_NAME: &str = concat!("tab-atelier/", env!("CARGO_PKG_VERSION"));
 
 pub enum HeartbeatEvent {
     Activity { cwd: Option<PathBuf> },
@@ -26,7 +49,13 @@ pub struct WakatimeTracker {
 }
 
 impl WakatimeTracker {
-    pub fn new(api_key: String) -> Self {
+    /// Create a tracker if a usable `wakatime-cli` is on disk. Returns
+    /// `None` (and logs) otherwise so the rest of the app can run
+    /// without time tracking. The api key is optional — when omitted,
+    /// wakatime-cli reads `api_key` from `~/.wakatime.cfg` itself.
+    pub fn new(api_key: Option<String>) -> Option<Self> {
+        let cli = locate_wakatime_cli()?;
+        debug!("wakatime: using cli at {}", cli.display());
         let (tx, rx) = mpsc::channel::<HeartbeatEvent>();
 
         std::thread::spawn(move || {
@@ -41,17 +70,17 @@ impl WakatimeTracker {
                 if now - last_sent < DEBOUNCE_SECS && !project_changed {
                     continue;
                 }
-
                 last_sent = now;
                 last_project.clone_from(&project);
+
                 debug!("wakatime: heartbeat project={project:?}");
-                if let Err(e) = send_heartbeat(&api_key, now, project.as_deref()) {
+                if let Err(e) = send_heartbeat(&cli, api_key.as_deref(), cwd.as_deref(), project.as_deref()) {
                     warn!("{e}");
                 }
             }
         });
 
-        Self { tx }
+        Some(Self { tx })
     }
 
     pub fn record_activity(&self, cwd: Option<PathBuf>) {
@@ -64,8 +93,8 @@ impl WakatimeTracker {
 }
 
 fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
 }
@@ -83,30 +112,69 @@ fn detect_project(cwd: &Path) -> Option<String> {
     cwd.file_name().map(|n| n.to_string_lossy().into_owned())
 }
 
-fn send_heartbeat(api_key: &str, time: u64, project: Option<&str>) -> Result<(), String> {
-    let mut body = serde_json::json!({
-        "entity": "tab-atelier-terminal",
-        "type": "app",
-        "time": time as f64,
-        "category": "coding",
-    });
+/// Find `wakatime-cli`, preferring whatever's on `$PATH` (the official
+/// installer drops a symlink there) and falling back to the per-user
+/// install Zed-wakatime, Claude-wakatime, etc. land at
+/// `~/.wakatime/wakatime-cli-<os>-<arch>`.
+fn locate_wakatime_cli() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join("wakatime-cli");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    let home = std::env::var("HOME").ok()?;
+    let waka_dir = PathBuf::from(home).join(".wakatime");
+    let entries = std::fs::read_dir(&waka_dir).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // wakatime-cli ships as `wakatime-cli-linux-amd64`,
+        // `wakatime-cli-darwin-arm64`, `wakatime-cli-windows-amd64.exe`,
+        // etc. Match the prefix and pick the first hit — there's only
+        // one valid binary per host.
+        if name.starts_with("wakatime-cli-") && !name.ends_with(".sha256") {
+            let p = entry.path();
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+fn send_heartbeat(cli: &Path, api_key: Option<&str>, cwd: Option<&Path>, project: Option<&str>) -> Result<(), String> {
+    let mut cmd = std::process::Command::new(cli);
+    cmd.arg("--entity")
+        .arg("tab-atelier")
+        .arg("--entity-type")
+        .arg("app")
+        .arg("--plugin")
+        .arg(PLUGIN_NAME)
+        .arg("--category")
+        .arg("coding");
 
     if let Some(p) = project {
-        body["project"] = serde_json::json!(p);
+        cmd.arg("--alternate-project").arg(p);
+    }
+    if let Some(d) = cwd {
+        cmd.arg("--project-folder").arg(d);
+    }
+    if let Some(k) = api_key {
+        cmd.arg("--key").arg(k);
     }
 
-    let resp = ureq::post("https://api.wakatime.com/api/v1/users/current/heartbeats")
-        .header("User-Agent", USER_AGENT)
-        .header("Authorization", &format!("Bearer {api_key}"))
-        .header("Content-Type", "application/json")
-        .send(body.to_string().as_bytes());
-
-    match resp {
-        Ok(_) => {
-            debug!("wakatime: heartbeat sent");
-            Ok(())
-        }
-        Err(e) => Err(format!("wakatime: {e}")),
+    let out = cmd
+        .output()
+        .map_err(|e| format!("wakatime: spawn {}: {e}", cli.display()))?;
+    if out.status.success() {
+        debug!("wakatime: heartbeat sent");
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        Err(format!("wakatime: cli exit {:?}: {}", out.status.code(), stderr.trim()))
     }
 }
 
@@ -147,15 +215,26 @@ mod tests {
     }
 
     #[test]
+    fn plugin_name_has_editor_version_shape() {
+        // wakatime-cli's --plugin parser splits on `/`; the dashboard
+        // shows the left side as editor name, right side as version.
+        let (editor, ver) = PLUGIN_NAME.split_once('/').expect("plugin name has /");
+        assert_eq!(editor, "tab-atelier");
+        assert!(!ver.is_empty());
+    }
+
+    #[test]
     fn unix_now_is_reasonable() {
         let now = unix_now();
         assert!(now > 1_700_000_000);
     }
 
     #[test]
-    fn shutdown_stops_thread() {
-        let tracker = WakatimeTracker::new("fake-key".into());
-        tracker.record_activity(None);
-        tracker.shutdown();
+    fn locate_cli_or_none() {
+        // Whatever the host has — just verify the function doesn't panic
+        // and returns either a valid file path or None.
+        if let Some(path) = locate_wakatime_cli() {
+            assert!(path.is_file(), "{} should exist", path.display());
+        }
     }
 }

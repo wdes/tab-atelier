@@ -1033,6 +1033,32 @@ pub fn detect_urls(text: &str) -> Vec<(usize, usize, String, bool)> {
     urls
 }
 
+/// Strip ANSI CSI/SGR escapes (`ESC [ … final`) from `s`.
+///
+/// Used when copying scrollback to the system clipboard so the receiving
+/// app doesn't see raw escape sequences. Persistence and the mobile API
+/// endpoints keep colours intentionally and bypass this helper.
+#[must_use]
+pub fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            for nc in chars.by_ref() {
+                // CSI parameters are `0x30..=0x3F`, intermediates `0x20..=0x2F`,
+                // and the sequence ends at the first byte in `0x40..=0x7E`.
+                if ('\x40'..='\x7e').contains(&nc) {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 #[must_use]
 pub fn file_path_for_open(path: &str) -> &str {
     if let Some(colon_pos) = path.rfind(':') {
@@ -1054,6 +1080,19 @@ pub fn file_path_for_open(path: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_ansi_removes_sgr_and_keeps_text() {
+        let s = "\x1b[1;31mhello\x1b[0m, \x1b[32mworld\x1b[0m";
+        assert_eq!(strip_ansi(s), "hello, world");
+    }
+
+    #[test]
+    fn strip_ansi_handles_no_escapes_and_partial_sequence() {
+        assert_eq!(strip_ansi("plain text"), "plain text");
+        // Lone ESC without `[` is preserved verbatim.
+        assert_eq!(strip_ansi("ab\x1bcd"), "ab\x1bcd");
+    }
 
     #[test]
     fn test_tab_state_serialization() {
@@ -1102,7 +1141,7 @@ mod tests {
                 uptime_secs: None,
                 energy_wh: None,
                 colors_enabled: false,
-                    tokens: None,
+                tokens: None,
             }],
             active: 0,
             windowed: false,
@@ -1130,7 +1169,7 @@ mod tests {
                 uptime_secs: Some(123.5),
                 energy_wh: Some(0.042),
                 colors_enabled: true,
-                    tokens: None,
+                tokens: None,
             }],
             active: 0,
             windowed: false,
@@ -1235,7 +1274,7 @@ mod tests {
                 uptime_secs: None,
                 energy_wh: None,
                 colors_enabled: true,
-                    tokens: None,
+                tokens: None,
             }],
             active: 0,
             windowed: false,
@@ -1277,7 +1316,7 @@ mod tests {
                 uptime_secs: None,
                 energy_wh: None,
                 colors_enabled: true,
-                    tokens: None,
+                tokens: None,
             }],
             active: 0,
             windowed: false,
@@ -1500,7 +1539,7 @@ mod tests {
                 uptime_secs: None,
                 energy_wh: None,
                 colors_enabled: true,
-                    tokens: None,
+                tokens: None,
             }],
             active: 0,
             windowed: false,
@@ -1651,7 +1690,7 @@ mod tests {
                 uptime_secs: None,
                 energy_wh: None,
                 colors_enabled: true,
-                    tokens: None,
+                tokens: None,
             }],
             active: 999,
             windowed: false,
