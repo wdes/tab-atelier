@@ -436,6 +436,23 @@ impl TerminalView {
         t.selection = None;
     }
 
+    /// Expand selection to the word around `grid_point` using alacritty's
+    /// semantic-search rules. Boundaries come from
+    /// `term.config.semantic_escape_chars`, which defaults to the set
+    /// `, ¦ ' " ( ) [ ] { } < > tab space`, so this picks up whatever
+    /// non-whitespace token you double-clicked on.
+    fn select_semantic(&self, grid_point: GridPoint, side: Side) {
+        let mut t = self.term.lock();
+        t.selection = Some(Selection::new(SelectionType::Semantic, grid_point, side));
+    }
+
+    /// Select the entire logical line containing `grid_point`. Used for
+    /// triple-click.
+    fn select_line(&self, grid_point: GridPoint) {
+        let mut t = self.term.lock();
+        t.selection = Some(Selection::new(SelectionType::Lines, grid_point, Side::Left));
+    }
+
     pub fn copy_selection(&self) -> Option<String> {
         let t = self.term.lock();
         t.selection_to_string()
@@ -931,6 +948,29 @@ impl Render for TerminalView {
                     if let Some(origin_gp) = this.click_origin.take() {
                         let origin = this.content_origin.get();
                         let (gp, _) = this.pixel_to_grid(ev.position, origin);
+                        // Triple-click selects the whole logical line; falls
+                        // through neither to URL-open nor word-select. The
+                        // 33 ms repaint loop picks the new selection up; no
+                        // explicit cx.notify() needed (the listener is Fn,
+                        // not FnMut).
+                        if origin_gp == gp && ev.click_count >= 3 {
+                            let (abs_gp, _) = this.pixel_to_absolute_grid(ev.position, origin);
+                            this.select_line(abs_gp);
+                            return;
+                        }
+                        if origin_gp == gp && ev.click_count == 2 {
+                            let line = gp.line.0.max(0) as usize;
+                            let col = gp.column.0;
+                            // Double-click on a URL opens it; anywhere else
+                            // expands the selection to the surrounding word
+                            // using alacritty's semantic-escape boundaries
+                            // (space / quotes / brackets / parens / pipes…).
+                            if this.url_at_grid(line, col).is_none() {
+                                let (abs_gp, side) = this.pixel_to_absolute_grid(ev.position, origin);
+                                this.select_semantic(abs_gp, side);
+                                return;
+                            }
+                        }
                         if origin_gp == gp && ev.click_count >= 2 {
                             let line = gp.line.0.max(0) as usize;
                             let col = gp.column.0;
