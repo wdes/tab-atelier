@@ -510,7 +510,7 @@ impl AppState {
         self.tabs.insert(
             idx,
             Tab {
-                view: view.clone(),
+                view,
                 name: format!("{} {}", self.t().terminal_n, self.tabs.len()),
                 created_at: std::time::Instant::now(),
                 prior_uptime: std::time::Duration::ZERO,
@@ -527,24 +527,6 @@ impl AppState {
         );
         self.active = idx;
         self.tabs[self.active].view.read(cx).focus_handle(cx).focus(window);
-        // After the shell initialises, clear history + input line, then
-        // launch catbus-agent automatically.
-        cx.spawn(async move |_this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            // Give the shell a moment to print its prompt before we send input.
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(300))
-                .await;
-            let _ = cx.update(|cx| {
-                view.read(cx).send_input_bytes(
-                    // Ctrl-U: kill any text already on the input line
-                    // Ctrl-L: clear screen
-                    // "catbus-agent" typed into readline — no \n so the user
-                    // can navigate/edit with arrows before pressing Enter.
-                    b"\x15\x0ccatbus-agent".to_vec(),
-                );
-            });
-        })
-        .detach();
         cx.notify();
     }
 
