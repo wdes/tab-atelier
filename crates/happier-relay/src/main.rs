@@ -23,6 +23,7 @@ mod jwt;
 mod kv;
 mod sessions;
 mod socket;
+mod sse;
 mod state;
 mod tab_input;
 mod web;
@@ -84,18 +85,18 @@ async fn main() -> anyhow::Result<()> {
     // axum boundaries); they push into an mpsc, and a dedicated task
     // owns the handle and drains the channel.
     let (socket_layer, io) = SocketIo::builder().build_layer();
-    let (broadcast_tx, broadcast_rx) = tokio::sync::mpsc::unbounded_channel::<state::BroadcastMsg>();
+    let (broadcast_tx, _broadcast_rx_initial) = tokio::sync::broadcast::channel::<state::BroadcastMsg>(256);
 
     let state = state::AppState {
         db: pool,
         jwt_secret: Arc::new(secret),
         owner_pubkey_hex: args.owner_pubkey.map(|s| s.to_lowercase()),
         shared_account: args.shared_account,
-        broadcast_tx,
+        broadcast_tx: broadcast_tx.clone(),
         input_notifier: tab_input::InputNotifier::default(),
     };
 
-    tokio::spawn(state::broadcast_loop(io.clone(), broadcast_rx));
+    tokio::spawn(state::broadcast_loop(io.clone(), broadcast_tx.subscribe()));
 
     let connect_state = state.clone();
     io.ns("/", move |socket: socketioxide::extract::SocketRef, data: socketioxide::extract::Data<socket::AuthPayload>| {
@@ -122,6 +123,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/artifacts/{id}/append", post(artifacts::append))
         .route("/v1/tab-input", post(tab_input::post_input))
         .route("/v1/tab-input/pending", get(tab_input::pending))
+        .route("/v1/events", get(sse::events))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_auth));
 
     let app = Router::new()

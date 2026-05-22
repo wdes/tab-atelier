@@ -15,7 +15,7 @@ use axum::{
 };
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::broadcast;
 
 use crate::auth::UserId;
 use crate::state::{AppState, BroadcastMsg};
@@ -389,11 +389,10 @@ pub async fn delete(
     Ok(Json(serde_json::json!({ "success": true })))
 }
 
-/// Drop a broadcast request into the dedicated socket.io fan-out
-/// channel. Send failures (channel closed, receiver dropped) are
-/// logged but never propagate — the HTTP write already succeeded and
-/// the real-time hint is gravy on top.
-fn fanout<T: serde::Serialize>(tx: &mpsc::UnboundedSender<BroadcastMsg>, user_id: &str, event: &str, payload: &T) {
+/// Drop a broadcast request into the fan-out channel. `send` returns
+/// the count of receivers; zero is normal (no devices subscribed) and
+/// not worth logging.
+fn fanout<T: serde::Serialize>(tx: &broadcast::Sender<BroadcastMsg>, user_id: &str, event: &str, payload: &T) {
     let body = match serde_json::to_value(payload) {
         Ok(v) => v,
         Err(e) => {
@@ -401,11 +400,9 @@ fn fanout<T: serde::Serialize>(tx: &mpsc::UnboundedSender<BroadcastMsg>, user_id
             return;
         }
     };
-    if let Err(e) = tx.send(BroadcastMsg {
+    let _ = tx.send(BroadcastMsg {
         user_id: user_id.to_string(),
         event: event.to_string(),
         payload: body,
-    }) {
-        tracing::warn!(error = ?e, event, user = user_id, "fanout: channel send failed");
-    }
+    });
 }
