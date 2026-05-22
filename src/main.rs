@@ -5,6 +5,8 @@
 mod api;
 mod app;
 mod catbus_agent;
+#[cfg(feature = "happier-bridge")]
+mod happier_bridge;
 mod locale;
 mod platform;
 #[cfg(feature = "energy")]

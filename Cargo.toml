@@ -24,6 +24,11 @@ include = ["/src/**/*.rs", "/Cargo.toml", "/LICENSE", "/README.md"]
 [features]
 default = ["energy"]
 energy = ["dep:wattaouille"]
+# Opt-in bridge that publishes every tab as a happier artifact against a
+# user-provided relay (`--happier-relay-url`). Off by default to keep
+# the regular build slim — when enabled, pulls in ed25519 / base64 /
+# happier-style wire types via the `happier-relay` workspace member.
+happier-bridge = ["dep:ed25519-dalek", "dep:base64", "dep:rand"]
 
 [lints.rust]
 unsafe_code = "deny"
@@ -65,6 +70,10 @@ fs2 = "0.4"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 rustls-pemfile = "2"
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+# Optional happier-bridge deps (only compiled with `--features happier-bridge`).
+ed25519-dalek = { version = "2", optional = true }
+base64 = { version = "0.22", optional = true }
+rand = { version = "0.8", optional = true }
 # gzip for the mobile-remote HTTP responses (3–4× smaller for terminal
 # scrollback). Already in the transitive tree; pulling it in directly
 # so we can wrap our own write path.

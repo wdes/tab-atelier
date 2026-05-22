@@ -6872,13 +6872,16 @@ name = "tab-atelier"
 version = "0.4.0-dev"
 dependencies = [
  "alacritty_terminal",
+ "base64 0.22.1",
  "ctrlc",
+ "ed25519-dalek",
  "env_logger",
  "flate2",
  "fs2",
  "gpui",
  "log",
  "qrcode",
+ "rand 0.8.6",
  "rcgen",
  "rustls",
  "rustls-pemfile",
