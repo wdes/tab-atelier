@@ -139,7 +139,7 @@ pub fn tab_uptime_path(state_base: &std::path::Path, tab_name: &str) -> PathBuf 
 pub fn save_tab_uptime(state_base: &std::path::Path, tab_name: &str, uptime_secs: f64) {
     let dir = state_dir(state_base);
     let path = tab_uptime_path(state_base, tab_name);
-    write_atomic_with_rotation(&dir, &path, &uptime_secs);
+    write_atomic_with_rotation(&dir, &path, &uptime_secs, false);
 }
 
 #[must_use]
@@ -150,7 +150,7 @@ pub fn load_tab_uptime(state_base: &std::path::Path, tab_name: &str) -> Option<f
 pub fn save_tab_energy(state_base: &std::path::Path, tab_name: &str, energy_wh: f64) {
     let dir = state_dir(state_base);
     let path = tab_power_path(state_base, tab_name);
-    write_atomic_with_rotation(&dir, &path, &energy_wh);
+    write_atomic_with_rotation(&dir, &path, &energy_wh, false);
 }
 
 #[must_use]
@@ -173,7 +173,7 @@ pub fn tab_tokens_path(state_base: &std::path::Path, tab_name: &str) -> PathBuf 
 pub fn save_tab_tokens(state_base: &std::path::Path, tab_name: &str, usage: &TokenUsage) {
     let dir = state_dir(state_base);
     let path = tab_tokens_path(state_base, tab_name);
-    write_atomic_with_rotation(&dir, &path, usage);
+    write_atomic_with_rotation(&dir, &path, usage, false);
 }
 
 #[must_use]
@@ -860,12 +860,12 @@ pub fn save_preferences(config_base: &std::path::Path, prefs: &Preferences) {
 pub fn save_state(config_base: &std::path::Path, state: &SavedState) {
     let dir = config_dir(config_base);
     let path = dir.join("tabs.json");
-    write_atomic_with_rotation(&dir, &path, state);
+    write_atomic_with_rotation(&dir, &path, state, true);
 }
 
 pub fn save_preferences_at(path: &std::path::Path, prefs: &Preferences) {
     if let Some(parent) = path.parent() {
-        write_atomic_with_rotation(parent, path, prefs);
+        write_atomic_with_rotation(parent, path, prefs, true);
     }
 }
 
@@ -875,7 +875,7 @@ pub fn save_preferences_at(path: &std::path::Path, prefs: &Preferences) {
 pub fn save_tab_output(state_base: &std::path::Path, tab_name: &str, output: &str) {
     let dir = state_dir(state_base);
     let path = tab_output_path(state_base, tab_name);
-    write_atomic_with_rotation(&dir, &path, &output);
+    write_atomic_with_rotation(&dir, &path, &output, false);
 }
 
 #[must_use]
@@ -895,10 +895,20 @@ pub fn load_tab_output(state_base: &std::path::Path, tab_name: &str) -> Option<S
     None
 }
 
-fn write_atomic_with_rotation<T: serde::Serialize>(dir: &std::path::Path, path: &std::path::Path, value: &T) {
+fn write_atomic_with_rotation<T: serde::Serialize>(
+    dir: &std::path::Path,
+    path: &std::path::Path,
+    value: &T,
+    pretty: bool,
+) {
     use std::io::Write;
     let _ = std::fs::create_dir_all(dir);
-    let Ok(data) = serde_json::to_string_pretty(value) else {
+    let result = if pretty {
+        serde_json::to_string_pretty(value)
+    } else {
+        serde_json::to_string(value)
+    };
+    let Ok(data) = result else {
         return;
     };
 
