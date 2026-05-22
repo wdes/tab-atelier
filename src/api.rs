@@ -92,6 +92,11 @@ pub struct TabSnapshot {
     pub pending_new_tabs: usize,
     /// (tab index, new name) pairs queued by `POST /tabs/{idx}/rename`.
     pub pending_renames: Vec<(usize, String)>,
+    /// Cached serialized `/tabs` JSON body. Built lazily on the first GET
+    /// after invalidation; cleared by `persist()` whenever the snapshot
+    /// changes. Avoids rebuilding the whole response (`strip_ansi` per tab,
+    /// pretty-printed JSON) on every mobile-remote poll.
+    pub cached_response: Option<String>,
 }
 
 pub fn generate_token() -> String {
@@ -298,7 +303,13 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
 
     match (method.as_str(), path.as_str()) {
         ("GET", "/" | "/tabs") => {
-            let state = state.lock().unwrap();
+            let mut state = state.lock().unwrap();
+            if let Some(cached) = state.cached_response.as_deref() {
+                let body = cached.to_owned();
+                drop(state);
+                respond_json(stream, 200, &body);
+                return;
+            }
             let tabs: Vec<TabInfo> = state
                 .tabs
                 .iter()
@@ -333,13 +344,14 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             };
             #[cfg(not(feature = "energy"))]
             let host = HostInfo::default();
-            drop(state);
             let resp = ApiResponse {
                 app: USER_AGENT,
                 host,
                 tabs,
             };
             let body = serde_json::to_string_pretty(&resp).unwrap_or_default();
+            state.cached_response = Some(body.clone());
+            drop(state);
             respond_json(stream, 200, &body);
         }
         ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/catbus") => {
@@ -760,6 +772,7 @@ mod tests {
             pending_input: vec![],
             pending_new_tabs: 0,
             pending_renames: vec![],
+            cached_response: None,
         }))
     }
 
