@@ -19,6 +19,7 @@ use tracing_subscriber::EnvFilter;
 mod auth;
 mod db;
 mod jwt;
+mod kv;
 mod sessions;
 mod socket;
 mod state;
@@ -84,6 +85,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/v2/sessions/{id}", get(sessions::get_one).patch(sessions::patch))
         .route("/v1/sessions/{id}/messages", get(sessions::list_messages))
         .route("/v2/sessions/{id}/messages", post(sessions::post_message))
+        .route("/v1/kv", get(kv::list).post(kv::mutate))
+        .route("/v1/kv/bulk", post(kv::bulk_get))
+        .route("/v1/kv/{key}", get(kv::get_one))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_auth));
 
     let app = Router::new()
