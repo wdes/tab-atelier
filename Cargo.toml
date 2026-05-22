@@ -1,5 +1,10 @@
 [workspace]
 members = ["crates/catbus-agent", "crates/happier-relay"]
+# happier-relay is an opt-in experimental sub-binary; keep it out of
+# the default workspace build so `cargo build` / `cargo check` from the
+# root stays lean. Build it explicitly with
+# `cargo build -p happier-relay --features happier-dev`.
+default-members = [".", "crates/catbus-agent"]
 
 [package]
 name = "tab-atelier"

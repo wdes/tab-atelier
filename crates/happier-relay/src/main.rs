@@ -13,11 +13,13 @@ use std::sync::Arc;
 
 use axum::{middleware, routing::{get, post}, Router};
 use clap::Parser;
+use socketioxide::SocketIo;
 use tracing_subscriber::EnvFilter;
 
 mod auth;
 mod db;
 mod jwt;
+mod socket;
 mod state;
 
 #[derive(Parser, Debug)]
@@ -67,6 +69,12 @@ async fn main() -> anyhow::Result<()> {
         owner_pubkey_hex: args.owner_pubkey.map(|s| s.to_lowercase()),
     };
 
+    // socket.io v4 — registered with the same AppState so the connect
+    // handler can verify the JWT against our shared secret. socketioxide
+    // returns a Tower layer we mount on the axum router below.
+    let (socket_layer, io) = SocketIo::builder().with_state(state.clone()).build_layer();
+    io.ns("/", socket::on_connect);
+
     // Authed routes get the middleware; public ones (just /v1/auth) don't.
     let authed = Router::new()
         .route("/v1/auth/ping", get(auth::ping_handler))
@@ -75,11 +83,12 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/v1/auth", post(auth::auth_handler))
         .merge(authed)
-        .with_state(state);
+        .with_state(state)
+        .layer(socket_layer);
 
     let addr = format!("{}:{}", args.bind, args.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    tracing::info!("happier-relay listening on http://{addr}");
+    tracing::info!("happier-relay listening on http://{addr} (socket.io at /socket.io/)");
     axum::serve(listener, app).await?;
     Ok(())
 }
