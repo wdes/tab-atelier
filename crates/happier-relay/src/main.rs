@@ -25,6 +25,7 @@ mod sessions;
 mod socket;
 mod state;
 mod tab_input;
+mod web;
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Single-tenant happier relay (auth spike).", long_about = None)]
@@ -124,6 +125,14 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/v1/auth", post(auth::auth_handler))
+        // In-browser UI lives at /web. The HTML/JS bundle authenticates
+        // through /v1/auth like any other client; the static routes
+        // themselves don't carry the auth middleware.
+        .route("/web", get(web::index))
+        .route("/web/", get(web::index))
+        .route("/web/index.html", get(web::index))
+        .route("/web/app.js", get(web::app_js))
+        .route("/web/style.css", get(web::style_css))
         .merge(authed)
         .with_state(state)
         .layer(socket_layer);
