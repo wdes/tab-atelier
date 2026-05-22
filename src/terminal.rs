@@ -536,7 +536,13 @@ impl TerminalView {
                     }
 
                     if cell.fg != cur_fg || cell.bg != cur_bg || cell.flags != cur_flags {
-                        let mut sgr = Vec::new();
+                        let mut sgr = String::new();
+                        let push_code = |buf: &mut String, code: &str| {
+                            if !buf.is_empty() {
+                                buf.push(';');
+                            }
+                            buf.push_str(code);
+                        };
 
                         let removed = cur_flags & !cell.flags;
                         if removed.intersects(
@@ -548,32 +554,32 @@ impl TerminalView {
                                 | CellFlags::HIDDEN
                                 | CellFlags::STRIKEOUT,
                         ) {
-                            sgr.push("0".to_string());
+                            push_code(&mut sgr, "0");
                             cur_fg = default_fg;
                             cur_bg = default_bg;
                             cur_flags = CellFlags::empty();
                         }
 
                         if cell.flags.contains(CellFlags::BOLD) && !cur_flags.contains(CellFlags::BOLD) {
-                            sgr.push("1".into());
+                            push_code(&mut sgr, "1");
                         }
                         if cell.flags.contains(CellFlags::DIM) && !cur_flags.contains(CellFlags::DIM) {
-                            sgr.push("2".into());
+                            push_code(&mut sgr, "2");
                         }
                         if cell.flags.contains(CellFlags::ITALIC) && !cur_flags.contains(CellFlags::ITALIC) {
-                            sgr.push("3".into());
+                            push_code(&mut sgr, "3");
                         }
                         if cell.flags.contains(CellFlags::UNDERLINE) && !cur_flags.contains(CellFlags::UNDERLINE) {
-                            sgr.push("4".into());
+                            push_code(&mut sgr, "4");
                         }
                         if cell.flags.contains(CellFlags::INVERSE) && !cur_flags.contains(CellFlags::INVERSE) {
-                            sgr.push("7".into());
+                            push_code(&mut sgr, "7");
                         }
                         if cell.flags.contains(CellFlags::HIDDEN) && !cur_flags.contains(CellFlags::HIDDEN) {
-                            sgr.push("8".into());
+                            push_code(&mut sgr, "8");
                         }
                         if cell.flags.contains(CellFlags::STRIKEOUT) && !cur_flags.contains(CellFlags::STRIKEOUT) {
-                            sgr.push("9".into());
+                            push_code(&mut sgr, "9");
                         }
 
                         if cell.fg != cur_fg {
@@ -588,7 +594,7 @@ impl TerminalView {
                         cur_flags = cell.flags;
 
                         if !sgr.is_empty() {
-                            let _ = write!(line, "\x1b[{}m", sgr.join(";"));
+                            let _ = write!(line, "\x1b[{sgr}m");
                         }
                     }
                     line.push(ch);
@@ -709,7 +715,15 @@ impl TerminalView {
     }
 }
 
-fn sgr_color(sgr: &mut Vec<String>, color: Color, foreground: bool) {
+/// Append an SGR parameter for `color` into `sgr`, separating from any
+/// previous parameter with `;`. Writes directly into the buffer instead
+/// of allocating per-code Strings — this is on the per-paint hot path
+/// and a typical coloured frame calls it hundreds of times.
+fn sgr_color(sgr: &mut String, color: Color, foreground: bool) {
+    use std::fmt::Write as _;
+    if !sgr.is_empty() {
+        sgr.push(';');
+    }
     match color {
         Color::Named(n) => {
             let code = match n {
@@ -734,31 +748,31 @@ fn sgr_color(sgr: &mut Vec<String>, color: Color, foreground: bool) {
                 | NamedColor::DimForeground
                 | NamedColor::Background
                 | NamedColor::Cursor => {
-                    if foreground {
-                        sgr.push("39".into());
-                    } else {
-                        sgr.push("49".into());
-                    }
+                    sgr.push_str(if foreground { "39" } else { "49" });
                     return;
                 }
             };
-            if code < 8 {
-                sgr.push(format!("{}", if foreground { 30 + code } else { 40 + code }));
+            let n = if code < 8 {
+                if foreground { 30 + code } else { 40 + code }
+            } else if foreground {
+                90 + code - 8
             } else {
-                sgr.push(format!("{}", if foreground { 90 + code - 8 } else { 100 + code - 8 }));
-            }
+                100 + code - 8
+            };
+            let _ = write!(sgr, "{n}");
         }
         Color::Indexed(idx) => {
-            sgr.push(format!("{};5;{}", if foreground { 38 } else { 48 }, idx));
+            let _ = write!(sgr, "{};5;{}", if foreground { 38 } else { 48 }, idx);
         }
         Color::Spec(rgb) => {
-            sgr.push(format!(
+            let _ = write!(
+                sgr,
                 "{};2;{};{};{}",
                 if foreground { 38 } else { 48 },
                 rgb.r,
                 rgb.g,
                 rgb.b
-            ));
+            );
         }
     }
 }
@@ -1939,53 +1953,60 @@ mod tests {
 
     #[test]
     fn test_sgr_color_named() {
-        let mut sgr = Vec::new();
+        let mut sgr = String::new();
         sgr_color(&mut sgr, Color::Named(NamedColor::Red), true);
-        assert_eq!(sgr, vec!["31"]);
+        assert_eq!(sgr, "31");
 
         sgr.clear();
         sgr_color(&mut sgr, Color::Named(NamedColor::Red), false);
-        assert_eq!(sgr, vec!["41"]);
+        assert_eq!(sgr, "41");
     }
 
     #[test]
     fn test_sgr_color_bright() {
-        let mut sgr = Vec::new();
+        let mut sgr = String::new();
         sgr_color(&mut sgr, Color::Named(NamedColor::BrightRed), true);
-        assert_eq!(sgr, vec!["91"]);
+        assert_eq!(sgr, "91");
 
         sgr.clear();
         sgr_color(&mut sgr, Color::Named(NamedColor::BrightRed), false);
-        assert_eq!(sgr, vec!["101"]);
+        assert_eq!(sgr, "101");
     }
 
     #[test]
     fn test_sgr_color_foreground_default() {
-        let mut sgr = Vec::new();
+        let mut sgr = String::new();
         sgr_color(&mut sgr, Color::Named(NamedColor::Foreground), true);
-        assert_eq!(sgr, vec!["39"]);
+        assert_eq!(sgr, "39");
 
         sgr.clear();
         sgr_color(&mut sgr, Color::Named(NamedColor::Foreground), false);
-        assert_eq!(sgr, vec!["49"]);
+        assert_eq!(sgr, "49");
     }
 
     #[test]
     fn test_sgr_color_indexed() {
-        let mut sgr = Vec::new();
+        let mut sgr = String::new();
         sgr_color(&mut sgr, Color::Indexed(196), true);
-        assert_eq!(sgr, vec!["38;5;196"]);
+        assert_eq!(sgr, "38;5;196");
 
         sgr.clear();
         sgr_color(&mut sgr, Color::Indexed(196), false);
-        assert_eq!(sgr, vec!["48;5;196"]);
+        assert_eq!(sgr, "48;5;196");
     }
 
     #[test]
     fn test_sgr_color_rgb() {
-        let mut sgr = Vec::new();
+        let mut sgr = String::new();
         sgr_color(&mut sgr, Color::Spec(vte::ansi::Rgb { r: 255, g: 128, b: 0 }), true);
-        assert_eq!(sgr, vec!["38;2;255;128;0"]);
+        assert_eq!(sgr, "38;2;255;128;0");
+    }
+
+    #[test]
+    fn test_sgr_color_appends_semicolon() {
+        let mut sgr = String::from("1");
+        sgr_color(&mut sgr, Color::Named(NamedColor::Red), true);
+        assert_eq!(sgr, "1;31");
     }
 
     #[test]
