@@ -435,6 +435,15 @@ impl AppState {
         api::start_api_server(api_state.clone(), api_token.clone(), api_read_only, api_port);
         api::start_api_server_tls(api_state.clone(), api_token.clone(), api_read_only, api_port + 1);
 
+        // Opt-in publish bridge: when the user passes `--happier-relay-url <url>`,
+        // spawn a background thread that publishes each tab as a happier
+        // artifact against the configured relay. Off by default; the
+        // module isn't even compiled unless built with `--features happier-bridge`.
+        #[cfg(feature = "happier-bridge")]
+        if let Some(url) = happier_relay_url_from_args() {
+            crate::happier_bridge::spawn(url, api_state.clone());
+        }
+
         #[cfg(feature = "energy")]
         let power_pids: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
         #[cfg(feature = "energy")]
@@ -2839,6 +2848,29 @@ impl Render for AppState {
 
         root
     }
+}
+
+/// Read the optional `--happier-relay-url <url>` (or `=`) flag without
+/// pulling in clap on the main binary. Returns `None` if the flag
+/// isn't present, the value is empty, or the feature is disabled (in
+/// which case this fn isn't even compiled).
+#[cfg(feature = "happier-bridge")]
+fn happier_relay_url_from_args() -> Option<String> {
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        if let Some(rest) = a.strip_prefix("--happier-relay-url=")
+            && !rest.is_empty()
+        {
+            return Some(rest.to_string());
+        }
+        if a == "--happier-relay-url"
+            && let Some(v) = args.next()
+            && !v.is_empty()
+        {
+            return Some(v);
+        }
+    }
+    None
 }
 
 fn format_duration(d: std::time::Duration) -> String {
