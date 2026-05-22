@@ -261,10 +261,38 @@ function logout() {
 
 function startPolling() {
   if (pollTimer) clearInterval(pollTimer);
+  // 10s polling is the safety net for when the SSE stream is down.
+  // With sockets healthy, every artifact-update wakes us instantly via
+  // `startEventStream` below, so the long interval is fine.
   pollTimer = setInterval(() => {
     if (activeTabId) renderDetail(activeTabId, /* refreshOnly */ true);
     else renderList();
-  }, 2000);
+  }, 10000);
+}
+
+let eventSource = null;
+function startEventStream() {
+  if (eventSource) eventSource.close();
+  // EventSource can't set headers, so we pass the token as a query
+  // param. The relay's auth middleware already accepts ?token=.
+  const url = `/v1/events?token=${encodeURIComponent(TOKEN)}`;
+  eventSource = new EventSource(url);
+  const onUpdate = () => {
+    if (activeTabId) renderDetail(activeTabId, /* refreshOnly */ true);
+    else renderList();
+  };
+  eventSource.addEventListener("artifact-create", onUpdate);
+  eventSource.addEventListener("artifact-update", onUpdate);
+  eventSource.addEventListener("artifact-delete", onUpdate);
+  eventSource.addEventListener("lagged", () => {
+    // Channel dropped events; force a full re-fetch.
+    if (activeTabId) renderDetail(activeTabId, /* refreshOnly */ true);
+    else renderList();
+  });
+  eventSource.addEventListener("error", () => {
+    // Browser auto-reconnects EventSource with backoff — nothing for us
+    // to do here. Polling stays running as a safety net.
+  });
 }
 
 function humanAge(epochSecs) {
@@ -426,6 +454,7 @@ function escapeHtml(s) {
     TOKEN = await ensureToken();
     await renderList();
     startPolling();
+    startEventStream();
   } catch (e) {
     root.innerHTML = `
       <h1>happier-relay</h1>

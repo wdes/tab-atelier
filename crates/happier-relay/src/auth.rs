@@ -156,13 +156,26 @@ pub async fn ping_handler() -> Json<serde_json::Value> {
 pub struct UserId(pub String);
 
 pub async fn require_auth(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
-    let Some(header) = req.headers().get(AUTHORIZATION).and_then(|h| h.to_str().ok()) else {
-        return AuthError::unauthorized("missing Authorization header").into_response();
+    // Two ways to supply the bearer token:
+    //   1. `Authorization: Bearer <jwt>` header — preferred.
+    //   2. `?token=<jwt>` query param — needed by browsers using
+    //      EventSource (the API can't set headers on SSE connections).
+    let token = req
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(std::string::ToString::to_string)
+        .or_else(|| {
+            req.uri().query().and_then(|q| {
+                q.split('&').find_map(|pair| pair.strip_prefix("token=").map(|t| t.to_string()))
+            })
+        });
+    let Some(token) = token else {
+        return AuthError::unauthorized("missing bearer token (Authorization header or ?token=)")
+            .into_response();
     };
-    let Some(token) = header.strip_prefix("Bearer ") else {
-        return AuthError::unauthorized("expected Bearer scheme").into_response();
-    };
-    match crate::jwt::verify(&state.jwt_secret, token) {
+    match crate::jwt::verify(&state.jwt_secret, &token) {
         Ok(claims) => {
             req.extensions_mut().insert(UserId(claims.user));
             next.run(req).await
