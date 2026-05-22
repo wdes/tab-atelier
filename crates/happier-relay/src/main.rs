@@ -11,7 +11,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::{middleware, routing::{get, post}, Router};
+use axum::{middleware, routing::{delete as axum_delete, get, post}, Router};
 use clap::Parser;
 use socketioxide::SocketIo;
 use tracing_subscriber::EnvFilter;
@@ -19,6 +19,7 @@ use tracing_subscriber::EnvFilter;
 mod auth;
 mod db;
 mod jwt;
+mod sessions;
 mod socket;
 mod state;
 
@@ -78,6 +79,11 @@ async fn main() -> anyhow::Result<()> {
     // Authed routes get the middleware; public ones (just /v1/auth) don't.
     let authed = Router::new()
         .route("/v1/auth/ping", get(auth::ping_handler))
+        .route("/v1/sessions", post(sessions::create).get(sessions::list_all))
+        .route("/v1/sessions/{id}", axum_delete(sessions::delete))
+        .route("/v2/sessions/{id}", get(sessions::get_one).patch(sessions::patch))
+        .route("/v1/sessions/{id}/messages", get(sessions::list_messages))
+        .route("/v2/sessions/{id}/messages", post(sessions::post_message))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_auth));
 
     let app = Router::new()
