@@ -422,6 +422,7 @@ impl AppState {
             pending_input: Vec::new(),
             pending_new_tabs: 0,
             pending_renames: Vec::new(),
+            cached_response: None,
         }));
         let api_read_only = crate::read_only();
         api::start_api_server(api_state.clone(), api_token.clone(), api_read_only, api_port);
@@ -735,6 +736,8 @@ impl AppState {
             let mut snapshot = self.api_state.lock().unwrap();
             snapshot.tabs = api_tabs;
             snapshot.active = self.active;
+            // Invalidate the /tabs cache; next GET rebuilds it once.
+            snapshot.cached_response = None;
             #[cfg(feature = "energy")]
             snapshot.power.clone_from(&self.power_watts.lock().unwrap());
             #[cfg(feature = "energy")]
