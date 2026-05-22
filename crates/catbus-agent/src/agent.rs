@@ -37,6 +37,17 @@ const ANTHROPIC_BETA: &str = "oauth-2025-04-20,claude-code-20250219";
 const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 
+/// Static portion of our second system block. The dynamic prefix (cwd,
+/// plan-mode flag) is `format!()`'d once per call; this 1.5 KB tail is
+/// a `&'static str` and no longer copied per round.
+const SYSTEM_STATIC_INSTRUCTIONS: &str = "Your text replies are rendered directly in a terminal emulator \
+    that supports ANSI colour and formatting — use ANSI SGR escapes \
+    (bold, colours, etc.) to make output readable. Do NOT use \
+    markdown — no asterisks, no backtick fences, no hashes. \
+    Use ANSI instead: \x1b[1m for bold, \x1b[32m for green, \
+    \x1b[33m for yellow, \x1b[31m for red, \x1b[36m for cyan, \
+    \x1b[0m to reset.";
+
 /// Session + history bundled together so swapping sessions mid-REPL
 /// is atomic — we hold one write-lock and replace both at once.
 struct ActiveSession {
@@ -298,27 +309,24 @@ impl Agent {
             system: vec![
                 SystemBlock {
                     kind: "text",
-                    text: CLAUDE_CODE_PREFIX.into(),
+                    text: std::borrow::Cow::Borrowed(CLAUDE_CODE_PREFIX),
                 },
                 SystemBlock {
                     kind: "text",
-                    text: format!(
+                    text: std::borrow::Cow::Owned(format!(
                         "You are operating as `catbus-agent` inside tab-atelier. \
                          Current working directory: {cwd}. \
-                         Plan-mode is {}. \
-                         Your text replies are rendered directly in a terminal emulator \
-                         that supports ANSI colour and formatting — use ANSI SGR escapes \
-                         (bold, colours, etc.) to make output readable. Do NOT use \
-                         markdown — no asterisks, no backtick fences, no hashes. \
-                         Use ANSI instead: \x1b[1m for bold, \x1b[32m for green, \
-                         \x1b[33m for yellow, \x1b[31m for red, \x1b[36m for cyan, \
-                         \x1b[0m to reset.",
-                        if self.plan_mode.load(std::sync::atomic::Ordering::Relaxed) {
+                         Plan-mode is {plan}.",
+                        plan = if self.plan_mode.load(std::sync::atomic::Ordering::Relaxed) {
                             "ON — propose changes, do not execute write/edit/bash."
                         } else {
                             "off"
                         },
-                    ),
+                    )),
+                },
+                SystemBlock {
+                    kind: "text",
+                    text: std::borrow::Cow::Borrowed(SYSTEM_STATIC_INSTRUCTIONS),
                 },
             ],
             tools: &tool_specs,
@@ -446,16 +454,16 @@ fn tool_status_label(name: &str, input: &serde_json::Value) -> String {
 struct MessagesReq<'a> {
     model: &'a str,
     max_tokens: u32,
-    system: Vec<SystemBlock>,
+    system: Vec<SystemBlock<'a>>,
     tools: &'a [serde_json::Value],
     messages: &'a [ApiMessage],
 }
 
 #[derive(Serialize)]
-struct SystemBlock {
+struct SystemBlock<'a> {
     #[serde(rename = "type")]
     kind: &'static str,
-    text: String,
+    text: std::borrow::Cow<'a, str>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
