@@ -476,27 +476,39 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             if let Ok(idx) = idx_str.parse::<usize>() {
                 let state = state.lock().unwrap();
                 if let Some(t) = state.tabs.get(idx) {
-                    let mut body = t.output.clone();
-                    let mut cursor = t.cursor;
-                    drop(state);
-                    // If the client asked for the tail only, drop
-                    // leading lines and shift the cursor row to match.
-                    if let Some(n) = query_lines
-                        && n > 0
-                    {
-                        let lines: Vec<&str> = body.lines().collect();
-                        if lines.len() > n {
-                            let drop_count = lines.len() - n;
-                            body = lines[drop_count..].join("\n");
-                            cursor = cursor.and_then(|(r, c)| {
-                                if r >= drop_count {
-                                    Some((r - drop_count, c))
-                                } else {
-                                    None
+                    // For ?lines=N we only need the tail; compute the byte
+                    // offset of the first kept newline in-place and clone
+                    // just that slice instead of `Vec<&str> + join()`-ing
+                    // through the whole scrollback.
+                    let (body, cursor) = match query_lines {
+                        Some(n) if n > 0 => {
+                            let total_lines = t.output.lines().count();
+                            let drop_count = total_lines.saturating_sub(n);
+                            if drop_count == 0 {
+                                (t.output.clone(), t.cursor)
+                            } else {
+                                let mut offset = 0;
+                                for _ in 0..drop_count {
+                                    if let Some(nl) = t.output[offset..].find('\n') {
+                                        offset += nl + 1;
+                                    } else {
+                                        offset = t.output.len();
+                                        break;
+                                    }
                                 }
-                            });
+                                let cur = t.cursor.and_then(|(r, c)| {
+                                    if r >= drop_count {
+                                        Some((r - drop_count, c))
+                                    } else {
+                                        None
+                                    }
+                                });
+                                (t.output[offset..].to_string(), cur)
+                            }
                         }
-                    }
+                        _ => (t.output.clone(), t.cursor),
+                    };
+                    drop(state);
                     let cursor_headers = match cursor {
                         Some((row, col)) => format!("X-Cursor-Row: {row}\r\nX-Cursor-Col: {col}\r\n"),
                         None => String::new(),
