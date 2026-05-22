@@ -61,6 +61,10 @@ struct Tab {
     /// shell. Used as a sticky fallback so that a dead or exited shell
     /// doesn't blank out the persisted cwd on the next tick.
     last_known_cwd: Option<PathBuf>,
+    /// String form of `last_known_cwd`. Held alongside the `PathBuf` so the
+    /// 2 s persist tick doesn't redo `to_string_lossy` for every tab on
+    /// every tick — most ticks see no cwd change at all.
+    last_known_cwd_string: Option<String>,
 }
 
 impl Tab {
@@ -277,6 +281,7 @@ impl AppState {
                         // Seed from saved state so an immediate persist tick
                         // before the new shell has a /proc/PID/cwd readable
                         // doesn't overwrite the restored value with None.
+                        last_known_cwd_string: cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
                         last_known_cwd: cwd.clone(),
                     });
                 }
@@ -303,6 +308,7 @@ impl AppState {
                         output_hash_last_saved: 0,
                         pending_restore: None,
                         last_known_cwd: None,
+                        last_known_cwd_string: None,
                     });
                 }
                 let active = saved.active.min(tabs.len() - 1);
@@ -332,6 +338,7 @@ impl AppState {
                         output_hash_last_saved: 0,
                         pending_restore: None,
                         last_known_cwd: None,
+                        last_known_cwd_string: None,
                     }],
                     0,
                     false,
@@ -523,6 +530,7 @@ impl AppState {
                 energy_wh_last_saved: 0.0,
                 output_hash_last_saved: 0,
                 pending_restore: None,
+                last_known_cwd_string: cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
                 last_known_cwd: cwd,
             },
         );
@@ -601,10 +609,15 @@ impl AppState {
         let state_base = platform::state_base_dir();
         // Refresh last_known_cwd for any tab whose PTY child is still alive,
         // so a later persist tick after the shell exits still has a value
-        // to fall back on instead of blanking the cwd to None.
+        // to fall back on instead of blanking the cwd to None. Update the
+        // stringified mirror only when the PathBuf actually changed, so
+        // unchanged tabs allocate nothing here.
         for tab in &mut self.tabs {
             let pid = tab.view.read(cx).pid();
-            if let Some(p) = platform::process_cwd(pid) {
+            if let Some(p) = platform::process_cwd(pid)
+                && tab.last_known_cwd.as_deref() != Some(p.as_path())
+            {
+                tab.last_known_cwd_string = Some(p.to_string_lossy().into_owned());
                 tab.last_known_cwd = Some(p);
             }
         }
@@ -612,7 +625,7 @@ impl AppState {
             .tabs
             .iter()
             .map(|tab| {
-                let cwd = tab.last_known_cwd.as_ref().map(|p| p.to_string_lossy().into_owned());
+                let cwd = tab.last_known_cwd_string.clone();
                 TabState {
                     name: tab.name.clone(),
                     cwd,
@@ -885,7 +898,10 @@ impl AppState {
         // disappear; fall back to the cached last_known_cwd otherwise.
         for tab in &mut self.tabs {
             let pid = tab.view.read(cx).pid();
-            if let Some(p) = platform::process_cwd(pid) {
+            if let Some(p) = platform::process_cwd(pid)
+                && tab.last_known_cwd.as_deref() != Some(p.as_path())
+            {
+                tab.last_known_cwd_string = Some(p.to_string_lossy().into_owned());
                 tab.last_known_cwd = Some(p);
             }
         }
@@ -893,7 +909,7 @@ impl AppState {
             .tabs
             .iter()
             .map(|tab| {
-                let cwd = tab.last_known_cwd.as_ref().map(|p| p.to_string_lossy().into_owned());
+                let cwd = tab.last_known_cwd_string.clone();
                 TabState {
                     name: tab.name.clone(),
                     cwd,
