@@ -42,14 +42,13 @@ pub async fn run(input: &serde_json::Value, cwd: &Path) -> Result<String, String
         Ok(Err(e)) => return Err(format!("wait: {e}")),
         Err(_) => return Err(format!("timed out after {}s", timeout.as_secs())),
     };
-    let mut combined = String::new();
-    combined.push_str(&String::from_utf8_lossy(&out.stdout));
+    let mut combined = bytes_to_string(out.stdout);
     if !out.stderr.is_empty() {
         if !combined.is_empty() && !combined.ends_with('\n') {
             combined.push('\n');
         }
         combined.push_str("--- stderr ---\n");
-        combined.push_str(&String::from_utf8_lossy(&out.stderr));
+        combined.push_str(&bytes_to_string(out.stderr));
     }
     if combined.len() > MAX_OUTPUT {
         // Keep the tail — typical when a build dumps thousands of
@@ -61,4 +60,15 @@ pub async fn run(input: &serde_json::Value, cwd: &Path) -> Result<String, String
         let _ = write!(combined, "\n[exit {}]", out.status.code().unwrap_or(-1));
     }
     Ok(combined)
+}
+
+/// Move-friendly bytes → String conversion: for valid UTF-8 (the common
+/// case for build logs / curl output) this hands the Vec's buffer
+/// straight to the String without copying. Falls back to the lossy path
+/// only when the bytes contain invalid sequences.
+fn bytes_to_string(bytes: Vec<u8>) -> String {
+    match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    }
 }
