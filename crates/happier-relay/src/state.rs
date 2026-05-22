@@ -32,6 +32,10 @@ pub struct AppState {
     /// connected devices. Best-effort: a full or closed channel just
     /// drops the message (HTTP response is already committed).
     pub broadcast_tx: mpsc::UnboundedSender<BroadcastMsg>,
+    /// Per-user wake-up channel for the `/v1/tab-input/pending`
+    /// long-poll. POST handlers tap this so waiters return immediately
+    /// instead of waiting out the full timeout.
+    pub input_notifier: crate::tab_input::InputNotifier,
 }
 
 /// Background task that owns the `SocketIo` handle and forwards each
