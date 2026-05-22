@@ -12,7 +12,7 @@
 //! happier's `validateCurrentMachineSocket()` pattern.
 
 use serde::{Deserialize, Serialize};
-use socketioxide::extract::{AckSender, Data, SocketRef, State};
+use socketioxide::extract::{AckSender, Data, SocketRef};
 
 use crate::state::AppState;
 
@@ -52,10 +52,12 @@ pub fn room_for_user(user_id: &str) -> String {
 
 /// Register all socket-side handlers on the default namespace.
 ///
-/// The connect handler is async because we touch the shared state
-/// (JWT secret); event handlers are sync where possible to keep the
-/// hot path lean.
-pub async fn on_connect(socket: SocketRef, Data(auth): Data<AuthPayload>, State(state): State<AppState>) {
+/// We capture `AppState` from the caller's closure rather than going
+/// through socketioxide's `State` extractor — the extractor pattern
+/// makes it awkward to build the `SocketIo` handle *before* `AppState`
+/// (which itself needs the `SocketIo` for HTTP-side fan-out).
+#[allow(clippy::unused_async)] // required by socketioxide's ConnectHandler signature.
+pub async fn on_connect_with_state(socket: SocketRef, Data(auth): Data<AuthPayload>, state: AppState) {
     match crate::jwt::verify(&state.jwt_secret, &auth.token) {
         Ok(claims) => {
             tracing::info!(user = %claims.user, sid = ?socket.id, "socket authed");

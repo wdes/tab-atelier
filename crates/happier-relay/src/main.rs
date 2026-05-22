@@ -16,6 +16,7 @@ use clap::Parser;
 use socketioxide::SocketIo;
 use tracing_subscriber::EnvFilter;
 
+mod artifacts;
 mod auth;
 mod db;
 mod jwt;
@@ -65,17 +66,27 @@ async fn main() -> anyhow::Result<()> {
     let db_path = args.db_path.unwrap_or_else(default_db_path);
     let pool = db::open(&db_path).await?;
 
+    // socket.io v4 and the fan-out task. The HTTP handlers don't talk
+    // to SocketIo directly (its broadcast future isn't Send across
+    // axum boundaries); they push into an mpsc, and a dedicated task
+    // owns the handle and drains the channel.
+    let (socket_layer, io) = SocketIo::builder().build_layer();
+    let (broadcast_tx, broadcast_rx) = tokio::sync::mpsc::unbounded_channel::<state::BroadcastMsg>();
+
     let state = state::AppState {
         db: pool,
         jwt_secret: Arc::new(secret),
         owner_pubkey_hex: args.owner_pubkey.map(|s| s.to_lowercase()),
+        broadcast_tx,
     };
 
-    // socket.io v4 — registered with the same AppState so the connect
-    // handler can verify the JWT against our shared secret. socketioxide
-    // returns a Tower layer we mount on the axum router below.
-    let (socket_layer, io) = SocketIo::builder().with_state(state.clone()).build_layer();
-    io.ns("/", socket::on_connect);
+    tokio::spawn(state::broadcast_loop(io.clone(), broadcast_rx));
+
+    let connect_state = state.clone();
+    io.ns("/", move |socket: socketioxide::extract::SocketRef, data: socketioxide::extract::Data<socket::AuthPayload>| {
+        let st = connect_state.clone();
+        async move { socket::on_connect_with_state(socket, data, st).await }
+    });
 
     // Authed routes get the middleware; public ones (just /v1/auth) don't.
     let authed = Router::new()
@@ -88,6 +99,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/kv", get(kv::list).post(kv::mutate))
         .route("/v1/kv/bulk", post(kv::bulk_get))
         .route("/v1/kv/{key}", get(kv::get_one))
+        .route("/v1/artifacts", post(artifacts::create).get(artifacts::list))
+        .route(
+            "/v1/artifacts/{id}",
+            get(artifacts::get_one).post(artifacts::update).delete(artifacts::delete),
+        )
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_auth));
 
     let app = Router::new()

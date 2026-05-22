@@ -41,6 +41,11 @@ name = "kv_e2e"
 path = "tests/kv_e2e.rs"
 required-features = ["happier-dev"]
 
+[[test]]
+name = "artifacts_e2e"
+path = "tests/artifacts_e2e.rs"
+required-features = ["happier-dev"]
+
 [lints.rust]
 unsafe_code = "deny"
 

@@ -4,8 +4,21 @@
 
 use std::sync::Arc;
 
+use socketioxide::SocketIo;
+use tokio::sync::mpsc;
+
+/// One fan-out request from an HTTP handler to the socket.io broadcast
+/// loop. The loop runs on a dedicated tokio task that owns `SocketIo`,
+/// sidestepping the Send-future constraint on axum handlers.
+#[derive(Debug)]
+pub struct BroadcastMsg {
+    pub user_id: String,
+    pub event: String,
+    pub payload: serde_json::Value,
+}
+
 /// Shared application state handed to every axum handler. Cheap to
-/// clone (everything inside is an Arc / Pool / `&'static`-ish).
+/// clone (everything inside is an Arc / Pool / channel sender).
 #[derive(Clone)]
 pub struct AppState {
     pub db: sqlx::SqlitePool,
@@ -15,4 +28,19 @@ pub struct AppState {
     /// When set, only accept `/v1/auth` from this exact hex-encoded
     /// Ed25519 public key. None = accept-and-pin on first login.
     pub owner_pubkey_hex: Option<String>,
+    /// Send into this channel to fan out a socket.io event to a user's
+    /// connected devices. Best-effort: a full or closed channel just
+    /// drops the message (HTTP response is already committed).
+    pub broadcast_tx: mpsc::UnboundedSender<BroadcastMsg>,
+}
+
+/// Background task that owns the `SocketIo` handle and forwards each
+/// `BroadcastMsg` into the right room. Returns when `rx` closes.
+pub async fn broadcast_loop(io: SocketIo, mut rx: mpsc::UnboundedReceiver<BroadcastMsg>) {
+    while let Some(msg) = rx.recv().await {
+        let room = crate::socket::room_for_user(&msg.user_id);
+        if let Err(e) = io.to(room).emit(&msg.event, &msg.payload).await {
+            tracing::warn!(error = ?e, event = msg.event, user = msg.user_id, "fanout failed");
+        }
+    }
 }
