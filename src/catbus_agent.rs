@@ -146,19 +146,32 @@ fn newest_session(project_dir: &Path) -> Option<(PathBuf, String)> {
     best.map(|(p, id, _)| (p, id))
 }
 
-/// Read every line of `file_path` and turn each conversation entry
-/// into a `ParsedMessage`. Skips meta entries (permission-mode,
-/// snapshots, anything that isn't an obvious user/assistant turn).
+/// Convenience wrapper that returns every parsed message — equivalent
+/// to `parse_messages_since(path, 0)`. Used by tests and any caller
+/// that wants the full transcript.
+#[cfg(test)]
 pub fn parse_messages(file_path: &Path) -> Vec<ParsedMessage> {
-    let Ok(text) = fs::read_to_string(file_path) else {
+    parse_messages_since(file_path, 0)
+}
+
+/// Read every conversation entry from `file_path`, skipping the first
+/// `since` parsed messages without keeping them in memory. Used by
+/// `/catbus/messages?since=N` so the mobile remote's incremental polls
+/// don't force a full-file re-allocation on every tick.
+pub fn parse_messages_since(file_path: &Path, since: usize) -> Vec<ParsedMessage> {
+    use std::io::BufRead;
+    let Ok(file) = fs::File::open(file_path) else {
         return Vec::new();
     };
+    let reader = std::io::BufReader::new(file);
     let mut out = Vec::with_capacity(64);
-    for line in text.lines() {
+    let mut parsed = 0usize;
+    for line in reader.lines() {
+        let Ok(line) = line else { continue };
         if line.trim().is_empty() {
             continue;
         }
-        let Ok(raw) = serde_json::from_str::<RawLine>(line) else {
+        let Ok(raw) = serde_json::from_str::<RawLine>(&line) else {
             continue;
         };
         let role = match raw.r#type.as_str() {
@@ -174,11 +187,14 @@ pub fn parse_messages(file_path: &Path) -> Vec<ParsedMessage> {
         if segments.is_empty() {
             continue;
         }
-        out.push(ParsedMessage {
-            role,
-            segments,
-            timestamp: raw.timestamp,
-        });
+        if parsed >= since {
+            out.push(ParsedMessage {
+                role,
+                segments,
+                timestamp: raw.timestamp,
+            });
+        }
+        parsed += 1;
     }
     out
 }
