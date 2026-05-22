@@ -129,29 +129,38 @@ pub struct Exchange {
 /// to a one-line summary so the preview stays readable.
 #[must_use]
 pub fn last_exchanges(path: &Path, n: usize) -> Vec<Exchange> {
-    let Ok(text) = std::fs::read_to_string(path) else {
+    use std::collections::VecDeque;
+    use std::io::BufRead;
+    let Ok(file) = std::fs::File::open(path) else {
         return Vec::new();
     };
-    // Walk all lines, collect (role, text_summary) pairs, then slice
-    // the tail so we always get the newest exchanges.
-    let mut turns: Vec<(bool, String)> = Vec::new(); // (is_assistant, text)
-    for line in text.lines() {
+    let reader = std::io::BufReader::new(file);
+    // Walk lines, keeping only the last 2*n turns in a ring buffer so we
+    // never hold the whole transcript in memory. (The previous version
+    // read the entire file into a String, which scaled with transcript
+    // size and was called every banner draw.)
+    let max_turns = (n.saturating_mul(2)).max(4);
+    let mut turns: VecDeque<(bool, String)> = VecDeque::with_capacity(max_turns + 1);
+    for line in reader.lines() {
+        let Ok(line) = line else { continue };
         if line.trim().is_empty() {
             continue;
         }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
         let Some(role) = v.get("type").and_then(|t| t.as_str()) else {
             continue;
         };
         let Some(msg) = v.get("message") else { continue };
-        match role {
+        let pushed: Option<(bool, String)> = match role {
             "user" => {
                 // Plain string content = a real user prompt.
                 // Array content = tool results — skip those.
                 if let Some(serde_json::Value::String(s)) = msg.get("content") {
-                    turns.push((false, s.clone()));
+                    Some((false, s.clone()))
+                } else {
+                    None
                 }
             }
             "assistant" => {
@@ -181,15 +190,22 @@ pub fn last_exchanges(path: &Path, n: usize) -> Vec<Exchange> {
                             if tool_count == 1 { "" } else { "s" }
                         ));
                     }
-                    if !parts.is_empty() {
-                        turns.push((true, parts.join(" ")));
-                    }
+                    if parts.is_empty() { None } else { Some((true, parts.join(" "))) }
+                } else {
+                    None
                 }
             }
-            _ => {}
+            _ => None,
+        };
+        if let Some(t) = pushed {
+            turns.push_back(t);
+            if turns.len() > max_turns {
+                turns.pop_front();
+            }
         }
     }
     // Pair consecutive user→assistant turns, take the last `n`.
+    let turns: Vec<_> = turns.into_iter().collect();
     let mut exchanges: Vec<Exchange> = Vec::new();
     let mut i = 0;
     while i + 1 < turns.len() {
