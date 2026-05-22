@@ -81,30 +81,30 @@ pub fn find_session(shell_pid: u32) -> Option<AgentSession> {
 /// kernel threads or pids in different namespaces — sticking to
 /// /proc handles this for us, those entries simply don't exist.
 fn find_agent_descendant(root_pid: u32) -> Option<u32> {
+    use std::fmt::Write as _;
     const AGENT_COMMS: &[&str] = &["catbus-agent", "claude"];
+    // Reused across both /proc reads per BFS step so neither
+    // `read_comm` nor `read_children` allocates a fresh path String.
+    let mut path = String::with_capacity(48);
     let mut queue = vec![root_pid];
     while let Some(pid) = queue.pop() {
-        if let Some(comm) = read_comm(pid)
-            && AGENT_COMMS.contains(&comm.as_str())
-        {
-            return Some(pid);
+        path.clear();
+        let _ = write!(path, "/proc/{pid}/comm");
+        if let Ok(mut comm) = fs::read_to_string(&path) {
+            if comm.ends_with('\n') {
+                comm.pop();
+            }
+            if AGENT_COMMS.contains(&comm.as_str()) {
+                return Some(pid);
+            }
         }
-        if let Some(kids) = read_children(pid) {
-            queue.extend(kids);
+        path.clear();
+        let _ = write!(path, "/proc/{pid}/task/{pid}/children");
+        if let Ok(raw) = fs::read_to_string(&path) {
+            queue.extend(raw.split_ascii_whitespace().filter_map(|s| s.parse::<u32>().ok()));
         }
     }
     None
-}
-
-fn read_comm(pid: u32) -> Option<String> {
-    fs::read_to_string(format!("/proc/{pid}/comm"))
-        .ok()
-        .map(|s| s.trim_end_matches('\n').to_string())
-}
-
-fn read_children(pid: u32) -> Option<Vec<u32>> {
-    let raw = fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")).ok()?;
-    Some(raw.split_ascii_whitespace().filter_map(|s| s.parse().ok()).collect())
 }
 
 fn home_projects_dir() -> Option<PathBuf> {
