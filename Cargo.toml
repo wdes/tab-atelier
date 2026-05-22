@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/catbus-agent"]
+members = ["crates/catbus-agent", "crates/happier-relay"]
 
 [package]
 name = "tab-atelier"

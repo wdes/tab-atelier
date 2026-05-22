@@ -1,0 +1,45 @@
+[package]
+name = "happier-relay"
+version = "0.1.0-dev"
+edition = "2024"
+rust-version = "1.92"
+authors = ["William Desportes <williamdes@wdes.fr>"]
+description = "Single-tenant Rust relay implementing the happier (slopus/happy fork) wire protocol."
+license = "MPL-2.0"
+publish = false
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+
+# Same allows as catbus-agent — narrowing casts are deliberate here too.
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_lossless = "allow"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "fs", "process", "time"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
+sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio", "macros", "migrate"] }
+ed25519-dalek = "2"
+base64 = "0.22"
+jsonwebtoken = { version = "9", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+uuid = { version = "1", features = ["v4"] }
+hex = "0.4"
+thiserror = "2"
+anyhow = "1"
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+rand = "0.8"
