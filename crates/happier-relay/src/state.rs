@@ -28,6 +28,10 @@ pub struct AppState {
     /// When set, only accept `/v1/auth` from this exact hex-encoded
     /// Ed25519 public key. None = accept-and-pin on first login.
     pub owner_pubkey_hex: Option<String>,
+    /// When true, every authed device shares the same `account_id`
+    /// (the first one created). Used for the local-LAN self-host
+    /// case where tab-atelier + web UI need to see the same artifacts.
+    pub shared_account: bool,
     /// Send into this channel to fan out a socket.io event to a user's
     /// connected devices. Best-effort: a full or closed channel just
     /// drops the message (HTTP response is already committed).

@@ -54,6 +54,17 @@ struct Args {
     /// first successful `/v1/auth` call defines the owner implicitly.
     #[arg(long)]
     owner_pubkey: Option<String>,
+
+    /// When set, every successful `/v1/auth` binds to the *same*
+    /// account regardless of which keypair signed the challenge.
+    ///
+    /// The first auth seeds the shared account; subsequent auths reuse
+    /// it. Designed for a single-user self-hosted setup where
+    /// tab-atelier + web UI + mobile all need to see one another's
+    /// artifacts. Trust model: anyone who can reach the relay can join
+    /// the account, so run on loopback or a private network.
+    #[arg(long)]
+    shared_account: bool,
 }
 
 #[tokio::main]
@@ -78,6 +89,7 @@ async fn main() -> anyhow::Result<()> {
         db: pool,
         jwt_secret: Arc::new(secret),
         owner_pubkey_hex: args.owner_pubkey.map(|s| s.to_lowercase()),
+        shared_account: args.shared_account,
         broadcast_tx,
         input_notifier: tab_input::InputNotifier::default(),
     };

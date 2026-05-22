@@ -134,7 +134,7 @@ async fn long_poll_wakes_on_post() {
     let url_for_poll = url.clone();
     let token_for_poll = token.clone();
     let poll = tokio::spawn(async move {
-        let resp = reqwest::Client::new()
+        reqwest::Client::new()
             .get(format!("{url_for_poll}/v1/tab-input/pending?since=0&waitMs=5000"))
             .bearer_auth(&token_for_poll)
             .send()
@@ -142,19 +142,18 @@ async fn long_poll_wakes_on_post() {
             .expect("long poll send")
             .json::<serde_json::Value>()
             .await
-            .expect("long poll json");
-        resp
+            .expect("long poll json")
     });
 
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let post = reqwest::Client::new()
+    let posted = reqwest::Client::new()
         .post(format!("{url}/v1/tab-input"))
         .bearer_auth(&token)
         .json(&serde_json::json!({ "tabName": "build", "bytes": b64.encode([0x03_u8]) }))
         .send()
         .await
         .unwrap();
-    assert_eq!(post.status(), 200);
+    assert_eq!(posted.status(), 200);
 
     let resp = tokio::time::timeout(Duration::from_secs(2), poll)
         .await

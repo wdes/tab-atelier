@@ -51,6 +51,11 @@ name = "tab_input_e2e"
 path = "tests/tab_input_e2e.rs"
 required-features = ["happier-dev"]
 
+[[test]]
+name = "shared_account_e2e"
+path = "tests/shared_account_e2e.rs"
+required-features = ["happier-dev"]
+
 [lints.rust]
 unsafe_code = "deny"
 

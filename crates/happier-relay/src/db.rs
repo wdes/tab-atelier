@@ -70,3 +70,41 @@ pub async fn upsert_account(
         .await?;
     Ok(id)
 }
+
+/// Shared-account variant: the first auth ever seeds the one row in
+/// `accounts`; every subsequent auth — regardless of which public key
+/// signed the challenge — returns that same id. The signature was
+/// already verified at this point, so we don't lose any security
+/// guarantee from the request: the caller proved possession of *a*
+/// keypair, we just stop caring *which* one.
+///
+/// The seeding row's `public_key_hex` belongs to whichever device got
+/// here first; we never update it on subsequent calls because that
+/// would churn the `UNIQUE` index for no benefit.
+pub async fn upsert_account_shared(
+    pool: &SqlitePool,
+    public_key_hex: &str,
+    content_public_key: Option<&[u8]>,
+    content_public_key_sig: Option<&[u8]>,
+) -> anyhow::Result<String> {
+    let existing: Option<(String,)> = sqlx::query_as("SELECT id FROM accounts ORDER BY created_at ASC LIMIT 1")
+        .fetch_optional(pool)
+        .await?;
+    if let Some((id,)) = existing {
+        return Ok(id);
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0_i64, |d| d.as_secs().cast_signed());
+    let id = uuid::Uuid::new_v4().to_string();
+    sqlx::query("INSERT INTO accounts (id, public_key_hex, content_public_key, content_public_key_sig, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)")
+        .bind(&id)
+        .bind(public_key_hex)
+        .bind(content_public_key)
+        .bind(content_public_key_sig)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await?;
+    Ok(id)
+}
