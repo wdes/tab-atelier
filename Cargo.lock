@@ -6874,6 +6874,7 @@ dependencies = [
  "alacritty_terminal",
  "ctrlc",
  "env_logger",
+ "flate2",
  "fs2",
  "gpui",
  "log",
