@@ -456,16 +456,16 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 error_json(stream, 404, "no agent session under this tab");
                 return;
             };
-            let all = crate::catbus_agent::parse_messages(&session.file_path);
             let since = query_since.unwrap_or(0);
-            let tail = if since >= all.len() {
-                Vec::new()
-            } else {
-                all[since..].to_vec()
-            };
+            let tail = crate::catbus_agent::parse_messages_since(&session.file_path, since);
+            // parse_messages_since walks the full file and only keeps
+            // entries from index `since` onward, so the absolute total
+            // is `since + tail.len()`. Same value the client used to see
+            // from `all.len()`, without the all-into-memory hop.
+            let total = since.saturating_add(tail.len());
             let body = serde_json::to_string(&serde_json::json!({
                 "session_id": session.session_id,
-                "total": all.len(),
+                "total": total,
                 "messages": tail,
             }))
             .unwrap_or_default();
