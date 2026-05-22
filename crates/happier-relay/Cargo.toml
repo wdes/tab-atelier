@@ -8,6 +8,29 @@ description = "Single-tenant Rust relay implementing the happier (slopus/happy f
 license = "MPL-2.0"
 publish = false
 
+[features]
+# The whole crate is opt-in. Build with
+# `cargo build -p happier-relay --features happier-dev`. The bin and
+# the integration test below carry `required-features = ["happier-dev"]`
+# so they're silently skipped when the feature isn't set.
+default = []
+happier-dev = []
+
+[[bin]]
+name = "happier-relay"
+path = "src/main.rs"
+required-features = ["happier-dev"]
+
+[[test]]
+name = "auth_e2e"
+path = "tests/auth_e2e.rs"
+required-features = ["happier-dev"]
+
+[[test]]
+name = "socket_e2e"
+path = "tests/socket_e2e.rs"
+required-features = ["happier-dev"]
+
 [lints.rust]
 unsafe_code = "deny"
 
@@ -39,7 +62,15 @@ uuid = { version = "1", features = ["v4"] }
 hex = "0.4"
 thiserror = "2"
 anyhow = "1"
+# socket.io v4 server. The `tracing` feature wires its internal logs
+# into our tracing-subscriber output; `extensions` gives us per-socket
+# storage for the authed user id.
+socketioxide = { version = "0.18", features = ["tracing", "extensions", "state"] }
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 rand = "0.8"
+# Minimal Engine.IO / socket.io client for integration tests. Two
+# sockets connect, exchange a machine-update, assert it routed.
+rust_socketio = { version = "0.6", features = ["async"] }
+futures-util = "0.3"
