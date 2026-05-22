@@ -296,6 +296,81 @@ pub async fn update(
     Ok(Json(resp))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppendReq {
+    pub expected_body_version: i64,
+    /// Raw bytes (base64) to concatenate onto the existing body.
+    pub suffix: String,
+}
+
+/// Append-only update path. Mirrors the regular CAS update but skips
+/// the "upload the full body every tick" tax that dominates bandwidth
+/// for terminal-scrollback artifacts (which are 99 %% just-appended).
+/// Header is untouched; only the body field grows + its version bumps.
+pub async fn append(
+    State(state): State<AppState>,
+    Extension(user): Extension<UserId>,
+    Path(id): Path<String>,
+    Json(req): Json<AppendReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let suffix = decode_b64("suffix", &req.suffix)?;
+    if suffix.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "suffix is empty"));
+    }
+    let row: Option<ArtifactRow> = sqlx::query_as(
+        "SELECT id, header, header_version, body, body_version, data_encryption_key, seq, created_at, updated_at
+         FROM artifacts WHERE id = ?1 AND account_id = ?2",
+    )
+    .bind(&id)
+    .bind(&user.0)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "internal error"))?;
+    let mut row = row.ok_or_else(|| err(StatusCode::NOT_FOUND, "artifact not found"))?;
+
+    if req.expected_body_version != row.body_version {
+        return Ok(Json(serde_json::json!({
+            "success": false,
+            "error": "version-mismatch",
+            "currentBodyVersion": row.body_version,
+            // Returning the current body lets the client rebase + retry
+            // without a separate GET round-trip. Matches the
+            // version-mismatch shape used by the regular update path.
+            "currentBody": B64.encode(&row.body),
+        })));
+    }
+
+    row.body.extend_from_slice(&suffix);
+    row.body_version += 1;
+    let now = now_secs();
+    sqlx::query("UPDATE artifacts SET body = ?1, body_version = ?2, updated_at = ?3 WHERE id = ?4")
+        .bind(&row.body)
+        .bind(row.body_version)
+        .bind(now)
+        .bind(&row.id)
+        .execute(&state.db)
+        .await
+        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "internal error"))?;
+
+    let resp = serde_json::json!({
+        "success": true,
+        "bodyVersion": row.body_version,
+        "bodyLen": row.body.len(),
+    });
+    fanout(
+        &state.broadcast_tx,
+        &user.0,
+        "artifact-update",
+        &serde_json::json!({
+            "id": row.id,
+            "headerVersion": row.header_version,
+            "bodyVersion": row.body_version,
+        }),
+    );
+    Ok(Json(resp))
+}
+
 pub async fn delete(
     State(state): State<AppState>,
     Extension(user): Extension<UserId>,

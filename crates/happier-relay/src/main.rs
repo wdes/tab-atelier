@@ -119,6 +119,7 @@ async fn main() -> anyhow::Result<()> {
             "/v1/artifacts/{id}",
             get(artifacts::get_one).post(artifacts::update).delete(artifacts::delete),
         )
+        .route("/v1/artifacts/{id}/append", post(artifacts::append))
         .route("/v1/tab-input", post(tab_input::post_input))
         .route("/v1/tab-input/pending", get(tab_input::pending))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_auth));

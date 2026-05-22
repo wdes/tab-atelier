@@ -212,6 +212,72 @@ async fn artifact_lifecycle_and_fanout() {
     let _ = child.kill().await;
 }
 
+#[tokio::test]
+async fn append_grows_body_with_cas() {
+    let port = free_port();
+    let tmpdir = tempfile_dir("artifacts_append");
+    let mut child = spawn_relay(port, "append-test-secret", &tmpdir.join("db.sqlite")).await;
+    let url = format!("http://127.0.0.1:{port}");
+    let token = obtain_token(port).await;
+    let http = reqwest::Client::new();
+    let b64 = base64::engine::general_purpose::STANDARD;
+
+    let id = uuid::Uuid::new_v4().to_string();
+    http.post(format!("{url}/v1/artifacts"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "id": id,
+            "header": b64.encode(b"h"),
+            "body": b64.encode(b"$ ls\n"),
+            "dataEncryptionKey": b64.encode([0_u8; 32]),
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    // Append once with the right version → body grows + version bumps.
+    let resp = http
+        .post(format!("{url}/v1/artifacts/{id}/append"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "expectedBodyVersion": 1, "suffix": b64.encode(b"foo bar baz\n") }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["success"], serde_json::Value::Bool(true));
+    assert_eq!(body["bodyVersion"], serde_json::Value::Number(2.into()));
+
+    // GET shows the concatenated body.
+    let got: serde_json::Value = http
+        .get(format!("{url}/v1/artifacts/{id}"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(got["body"], serde_json::Value::String(b64.encode("$ ls\nfoo bar baz\n")));
+
+    // Stale append → version-mismatch with currentBody surfaced.
+    let stale: serde_json::Value = http
+        .post(format!("{url}/v1/artifacts/{id}/append"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "expectedBodyVersion": 1, "suffix": b64.encode(b"nope") }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(stale["success"], serde_json::Value::Bool(false));
+    assert_eq!(stale["currentBodyVersion"], serde_json::Value::Number(2.into()));
+    assert_eq!(stale["currentBody"], serde_json::Value::String(b64.encode("$ ls\nfoo bar baz\n")));
+
+    let _ = child.kill().await;
+}
+
 fn tempfile_dir(label: &str) -> std::path::PathBuf {
     let p = std::env::temp_dir().join(format!("happier-relay-{label}-{}", std::process::id()));
     std::fs::create_dir_all(&p).unwrap();

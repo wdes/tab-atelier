@@ -59,6 +59,12 @@ struct TabState {
     last_crc: u32,
     body_version: i64,
     header_version: i64,
+    /// Last successfully-published full text. Used to detect pure
+    /// "append-only" ticks so we ship just the suffix instead of the
+    /// whole scrollback. On a true append, `current.starts_with(last_text)`
+    /// holds; anything else (clear, alt-screen, scrollback-ring shift)
+    /// falls back to a full overwrite.
+    last_text: String,
 }
 
 /// Public entry point: spin up both bridge threads (publisher +
@@ -315,10 +321,14 @@ impl Bridge {
     }
 
     fn publish_tab(&mut self, name: &str, output: &str, crc: u32) -> Result<(), String> {
-        // Gzip + base64 the scrollback body. Header carries a tiny JSON
-        // descriptor so a mobile UI can render a tab list without
-        // pulling the body.
-        let body_b64 = B64.encode(gzip(output.as_bytes()));
+        // Bodies are raw bytes (no gzip) so the relay can concatenate
+        // them on append-only updates. Compression is reintroduced on
+        // the wire by `Accept-Encoding: gzip` (browser side handles it
+        // transparently — `flate2` is in the relay's dep tree for the
+        // mobile-remote endpoint and we'll route artifacts through it
+        // in a follow-up). Header keeps the same lightweight JSON
+        // descriptor a mobile UI can render without pulling the body.
+        let body_b64 = B64.encode(output.as_bytes());
         let header = serde_json::json!({
             "kind": "tab-atelier:tab",
             "name": name,
@@ -357,7 +367,7 @@ impl Bridge {
                 if status.as_u16() == 409 {
                     // Artifact already exists (we restarted with a new
                     // local CRC). Resync by fetching the current versions.
-                    return self.resync_then_update(name, &header_b64, &body_b64, crc);
+                    return self.resync_then_update(name, output, crc);
                 }
                 if !status.is_success() {
                     return Err(format!("create status: {status}"));
@@ -371,17 +381,89 @@ impl Bridge {
                         last_crc: crc,
                         header_version: v["headerVersion"].as_i64().unwrap_or(1),
                         body_version: v["bodyVersion"].as_i64().unwrap_or(1),
+                        last_text: output.to_string(),
                     },
                 );
             }
-            Some(_) => {
-                self.update_existing(name, &header_b64, &body_b64, crc)?;
+            Some(state) => {
+                // Append-only fast path: if the new content extends the
+                // previously-published text, ship just the new suffix.
+                // Anything else (alt-screen swap, clear, scrollback ring
+                // shifted) goes through a full overwrite.
+                if output.starts_with(&state.last_text) && output.len() > state.last_text.len() {
+                    let suffix = &output[state.last_text.len()..];
+                    self.append_existing(name, suffix, output, &header_b64, crc)?;
+                } else {
+                    self.update_existing(name, &header_b64, &body_b64, output, crc)?;
+                }
             }
         }
         Ok(())
     }
 
-    fn update_existing(&mut self, name: &str, header_b64: &str, body_b64: &str, crc: u32) -> Result<(), String> {
+    fn append_existing(
+        &mut self,
+        name: &str,
+        suffix: &str,
+        full_output: &str,
+        header_b64: &str,
+        crc: u32,
+    ) -> Result<(), String> {
+        let token = self.token.clone().ok_or("no token")?;
+        let state = self.seen.get(name).ok_or("missing tab state")?;
+        let url = format!("{}/v1/artifacts/{}/append", self.relay_url, state.artifact_id);
+        let req = serde_json::json!({
+            "expectedBodyVersion": state.body_version,
+            "suffix": B64.encode(suffix.as_bytes()),
+        });
+        let resp = self
+            .http
+            .post(&url)
+            .header("Authorization", &format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
+            .send(req.to_string().as_bytes())
+            .map_err(|e| format!("append POST: {e}"))?;
+        if resp.status().as_u16() == 401 {
+            self.token = None;
+            return Err("append: 401, re-authenticating next tick".into());
+        }
+        let parsed: serde_json::Value =
+            resp.into_body().read_json().map_err(|e| format!("append parse: {e}"))?;
+        if parsed["success"] == serde_json::Value::Bool(false) {
+            // CAS lost (some other process updated). Re-fetch current
+            // versions and retry on the next tick as a full update.
+            if let Some(state) = self.seen.get_mut(name)
+                && let Some(v) = parsed["currentBodyVersion"].as_i64()
+            {
+                state.body_version = v;
+                // Drop last_text so the next tick takes the full-overwrite path.
+                state.last_text.clear();
+            }
+            return Err("append: version-mismatch, will retry next tick".into());
+        }
+        if let Some(state) = self.seen.get_mut(name) {
+            if let Some(v) = parsed["bodyVersion"].as_i64() {
+                state.body_version = v;
+            }
+            state.last_crc = crc;
+            state.last_text = full_output.to_string();
+        }
+        // Header version (tab name / line count / etc) stays stale on
+        // append-only ticks. Bump it via a follow-up update if any of
+        // those fields changed materially. For now header skew is fine —
+        // the mobile UI cares about freshness of body, not header.
+        let _ = header_b64;
+        Ok(())
+    }
+
+    fn update_existing(
+        &mut self,
+        name: &str,
+        header_b64: &str,
+        body_b64: &str,
+        full_output: &str,
+        crc: u32,
+    ) -> Result<(), String> {
         let token = self.token.clone().ok_or("no token")?;
         let state = self.seen.get(name).ok_or("missing tab state")?;
         let url = format!("{}/v1/artifacts/{}", self.relay_url, state.artifact_id);
@@ -425,6 +507,7 @@ impl Bridge {
                 state.body_version = v;
             }
             state.last_crc = crc;
+            state.last_text = full_output.to_string();
         }
         Ok(())
     }
@@ -432,7 +515,7 @@ impl Bridge {
     /// Fetch the relay's current versions for an artifact id we don't
     /// know about (e.g. after a process restart where we lost in-memory
     /// state but the artifact persists on the relay) and seed our table.
-    fn resync_then_update(&mut self, name: &str, header_b64: &str, body_b64: &str, crc: u32) -> Result<(), String> {
+    fn resync_then_update(&mut self, name: &str, output: &str, crc: u32) -> Result<(), String> {
         let token = self.token.clone().ok_or("no token")?;
         let id = artifact_id_for(name);
         let url = format!("{}/v1/artifacts/{}", self.relay_url, id);
@@ -454,9 +537,20 @@ impl Bridge {
                 last_crc: 0, // force re-upload below
                 header_version: v["headerVersion"].as_i64().unwrap_or(1),
                 body_version: v["bodyVersion"].as_i64().unwrap_or(1),
+                last_text: String::new(),
             },
         );
-        self.update_existing(name, header_b64, body_b64, crc)
+        // Rebuild a fresh header + body and overwrite.
+        let header = serde_json::json!({
+            "kind": "tab-atelier:tab",
+            "name": name,
+            "lines": output.lines().count(),
+            "bytes": output.len(),
+            "crc": format!("{crc:08x}"),
+        });
+        let header_b64 = B64.encode(header.to_string().as_bytes());
+        let body_b64 = B64.encode(output.as_bytes());
+        self.update_existing(name, &header_b64, &body_b64, output, crc)
     }
 }
 
@@ -506,12 +600,6 @@ fn persist_key_atomic(path: &Path, bytes: &[u8; 32]) -> Result<(), String> {
     std::fs::rename(&tmp, path).map_err(|e| format!("rename {}: {e}", path.display()))
 }
 
-fn gzip(bytes: &[u8]) -> Vec<u8> {
-    let mut enc = flate2::write::GzEncoder::new(Vec::with_capacity(bytes.len() / 4), flate2::Compression::default());
-    let _ = enc.write_all(bytes);
-    enc.finish().unwrap_or_default()
-}
-
 /// Stable artifact id derived from a tab name. We don't have a real
 /// UUID v5 dep in tree, but four CRC32s of differently-prefixed
 /// strings give us a 128-bit-ish identifier rendered in the same
@@ -553,14 +641,4 @@ mod tests {
         assert_ne!(artifact_id_for("foo"), artifact_id_for("bar"));
     }
 
-    #[test]
-    fn gzip_round_trip() {
-        let input = b"$ ls\nfoo bar baz\n".repeat(200);
-        let gz = gzip(&input);
-        assert!(gz.len() < input.len(), "gzip should shrink repeated text");
-        let mut dec = flate2::read::GzDecoder::new(gz.as_slice());
-        let mut out = Vec::new();
-        std::io::Read::read_to_end(&mut dec, &mut out).unwrap();
-        assert_eq!(out, input);
-    }
 }

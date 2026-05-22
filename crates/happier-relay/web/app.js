@@ -150,14 +150,6 @@ function decodeHeader(b64) {
   }
 }
 
-async function gunzip(bytes) {
-  // DecompressionStream is in all modern browsers; same compat window
-  // as native Ed25519 (Chrome 80+, Firefox 113+, Safari 16.4+).
-  const ds = new DecompressionStream("gzip");
-  const stream = new Blob([bytes]).stream().pipeThrough(ds);
-  return new Uint8Array(await new Response(stream).arrayBuffer());
-}
-
 async function renderList() {
   activeTabId = null;
   let list;
@@ -203,13 +195,10 @@ async function renderDetail(id, refreshOnly = false) {
   }
   const header = decodeHeader(body.header);
   const name = header.name ?? id;
-  const gz = fromBase64(body.body);
-  let text;
-  try {
-    text = new TextDecoder().decode(await gunzip(gz));
-  } catch (e) {
-    text = `(failed to gunzip body: ${e})`;
-  }
+  // Body is raw bytes (the bridge stopped gzipping so the relay can
+  // append-concatenate suffixes). Just decode the UTF-8 directly.
+  const rawBytes = fromBase64(body.body);
+  const text = new TextDecoder().decode(rawBytes);
 
   // Refresh path: don't rebuild the whole page, just update the
   // scrollback + version line. Otherwise typing in the input gets
@@ -235,7 +224,7 @@ async function renderDetail(id, refreshOnly = false) {
       <button type="button" id="send-ctrlc" title="ctrl-c">^C</button>
       <button type="button" id="send-enter" title="bare enter">↵</button>
     </form>
-    <p class="dim" id="detail-meta">version ${body.bodyVersion} · ${formatBytes(header.bytes ?? gz.length)}</p>
+    <p class="dim" id="detail-meta">version ${body.bodyVersion} · ${formatBytes(header.bytes ?? rawBytes.length)}</p>
   `;
   $("#back").addEventListener("click", renderList);
   $("#tab-input").addEventListener("submit", async (ev) => {
