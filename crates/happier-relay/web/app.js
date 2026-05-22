@@ -217,14 +217,18 @@ async function renderDetail(id, refreshOnly = false) {
 
   root.innerHTML = `
     <h1>${escapeHtml(name)} <button id="back" style="float:right">← back</button></h1>
-    <pre id="scrollback">${ansiToHtml(text)}</pre>
-    <form id="tab-input">
-      <input id="bytes" autocomplete="off" placeholder="type and press enter" />
-      <button type="submit">send</button>
-      <button type="button" id="send-ctrlc" title="ctrl-c">^C</button>
-      <button type="button" id="send-enter" title="bare enter">↵</button>
-    </form>
-    <p class="dim" id="detail-meta">version ${body.bodyVersion} · ${formatBytes(header.bytes ?? rawBytes.length)}</p>
+    <pre id="scrollback" tabindex="0" autofocus>${ansiToHtml(text)}</pre>
+    <p class="dim" id="detail-meta">
+      version ${body.bodyVersion} · ${formatBytes(header.bytes ?? rawBytes.length)}
+      <span style="margin-left:1em">live keys: <kbd>click scrollback</kbd></span>
+    </p>
+    <details>
+      <summary class="dim">multi-line / paste mode</summary>
+      <form id="tab-input">
+        <input id="bytes" autocomplete="off" placeholder="type a line and press send" />
+        <button type="submit">send + ↵</button>
+      </form>
+    </details>
   `;
   $("#back").addEventListener("click", renderList);
   $("#tab-input").addEventListener("submit", async (ev) => {
@@ -234,11 +238,76 @@ async function renderDetail(id, refreshOnly = false) {
     await sendInput(name, v + "\n");
     $("#bytes").value = "";
   });
-  $("#send-ctrlc").addEventListener("click", () => sendInput(name, "\x03"));
-  $("#send-enter").addEventListener("click", () => sendInput(name, "\n"));
-  // Auto-scroll to the bottom on first render.
+
   const pre = $("#scrollback");
-  if (pre) pre.scrollTop = pre.scrollHeight;
+  if (pre) {
+    pre.scrollTop = pre.scrollHeight;
+    attachLiveKeyboard(pre, name);
+  }
+}
+
+/// Capture every keydown on `pre` and POST the corresponding bytes
+/// to /v1/tab-input. Translates printable keys (with shift / numlock),
+/// arrows / function keys to ANSI escapes, ctrl-* combos to control
+/// bytes, plus the usual specials (Enter, Backspace, Tab, Esc, Delete).
+function attachLiveKeyboard(pre, tabName) {
+  pre.addEventListener("focus", () => pre.classList.add("focused"));
+  pre.addEventListener("blur", () => pre.classList.remove("focused"));
+  pre.focus();
+  pre.addEventListener("keydown", (ev) => {
+    const bytes = keyToBytes(ev);
+    if (bytes === null) return;
+    ev.preventDefault();
+    sendInput(tabName, bytes);
+  });
+}
+
+/// Map a KeyboardEvent to the byte sequence a Unix PTY expects.
+/// Returns null when we don't know what to send (e.g. raw Shift /
+/// Alt with no character).
+function keyToBytes(ev) {
+  const key = ev.key;
+  const ctrl = ev.ctrlKey;
+  const alt = ev.altKey;
+  const meta = ev.metaKey;
+  // Specials: arrows / function keys / nav cluster → ANSI CSI / SS3.
+  const csi = (suffix) => `\x1b[${suffix}`;
+  const map = {
+    "ArrowUp": csi("A"),
+    "ArrowDown": csi("B"),
+    "ArrowRight": csi("C"),
+    "ArrowLeft": csi("D"),
+    "Home": csi("H"),
+    "End": csi("F"),
+    "PageUp": csi("5~"),
+    "PageDown": csi("6~"),
+    "Insert": csi("2~"),
+    "Delete": csi("3~"),
+    "F1": "\x1bOP",  "F2": "\x1bOQ",  "F3": "\x1bOR",  "F4": "\x1bOS",
+    "F5": csi("15~"), "F6": csi("17~"), "F7": csi("18~"), "F8": csi("19~"),
+    "F9": csi("20~"), "F10": csi("21~"), "F11": csi("23~"), "F12": csi("24~"),
+    "Enter": "\r",
+    "Backspace": "\x7f",
+    "Tab": "\t",
+    "Escape": "\x1b",
+  };
+  if (map[key] !== undefined) return map[key];
+  // Ctrl-* combos (a-z and a few common punctuations).
+  if (ctrl && !alt && !meta && key.length === 1) {
+    const c = key.toLowerCase().charCodeAt(0);
+    if (c >= 97 && c <= 122) return String.fromCharCode(c - 96);   // ^a..^z
+    if (key === " ") return "\x00";                                 // ^space
+    if (key === "[") return "\x1b";                                 // ^[ = esc
+    if (key === "]") return "\x1d";                                 // ^]
+    if (key === "\\") return "\x1c";                                // ^\
+  }
+  // Alt-<key>: ESC prefix.
+  if (alt && !ctrl && !meta && key.length === 1) {
+    return "\x1b" + key;
+  }
+  // Bare printable.
+  if (key.length === 1 && !ctrl && !meta) return key;
+  return null;
 }
 
 async function sendInput(tabName, text) {

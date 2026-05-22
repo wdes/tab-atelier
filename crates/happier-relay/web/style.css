@@ -56,7 +56,8 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 .tab-row:hover { background: var(--bg-panel); }
 .tab-row .meta { color: var(--fg-dim); font-size: 11px; }
 
-#tab-view pre {
+#tab-view pre,
+#scrollback {
   background: #111;
   padding: 12px;
   overflow: auto;
@@ -65,6 +66,25 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
   word-break: break-word;
   font-size: 12px;
   margin: 0;
+  outline: none;
+  border: 1px solid transparent;
+}
+#scrollback.focused {
+  border-color: var(--accent);
+}
+
+details {
+  margin-top: 12px;
+}
+details summary {
+  cursor: pointer;
+  padding: 4px 0;
+}
+kbd {
+  background: #333;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 10px;
 }
 
 #tab-input {

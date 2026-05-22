@@ -168,7 +168,7 @@ pub async fn require_auth(State(state): State<AppState>, mut req: Request, next:
         .map(std::string::ToString::to_string)
         .or_else(|| {
             req.uri().query().and_then(|q| {
-                q.split('&').find_map(|pair| pair.strip_prefix("token=").map(|t| t.to_string()))
+                q.split('&').find_map(|pair| pair.strip_prefix("token=").map(std::string::ToString::to_string))
             })
         });
     let Some(token) = token else {
