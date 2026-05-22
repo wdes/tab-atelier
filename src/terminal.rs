@@ -72,6 +72,10 @@ struct CachedLine {
     /// a cache hit costs one atomic bump instead of deep-cloning the whole
     /// `Vec<TermSegment>` (each segment carries a `ShapedLine`).
     segments: std::rc::Rc<Vec<TermSegment>>,
+    /// URLs detected in this line, computed once on cache miss and reused
+    /// on every subsequent hit so `detect_urls` doesn't re-run every frame.
+    /// The tuple shape matches `tab_atelier::detect_urls`'s return.
+    urls: std::rc::Rc<Vec<(usize, usize, String, bool)>>,
 }
 
 pub struct TerminalView {
@@ -1438,9 +1442,8 @@ impl Element for TerminalElement {
         let mut cache = self.line_cache.borrow_mut();
         let mut new_cache = HashMap::with_capacity(raw_lines.len());
         let mut result_lines = Vec::with_capacity(raw_lines.len());
-        let mut line_texts: Vec<String> = Vec::with_capacity(raw_lines.len());
-        for raw in raw_lines {
-            line_texts.push(raw.text.clone());
+        let mut detected: Vec<DetectedUrl> = Vec::new();
+        for (line_idx, raw) in raw_lines.into_iter().enumerate() {
             if let Some(cached) = cache.remove(&raw.grid_line)
                 && cached.text == raw.text
             {
@@ -1449,6 +1452,16 @@ impl Element for TerminalElement {
                     segments: std::rc::Rc::clone(&cached.segments),
                     bg_runs: raw.bg_runs,
                 });
+                // Gather cached URLs without re-running detection.
+                for (start, end, url, is_file) in cached.urls.iter() {
+                    detected.push(DetectedUrl {
+                        line: line_idx,
+                        start_col: *start,
+                        end_col: *end,
+                        url: url.clone(),
+                        is_file: *is_file,
+                    });
+                }
                 new_cache.insert(raw.grid_line, cached);
                 continue;
             }
@@ -1464,11 +1477,22 @@ impl Element for TerminalElement {
                 })
                 .collect();
             let shaped_rc = std::rc::Rc::new(shaped_segments);
+            let urls_rc = std::rc::Rc::new(detect_urls(&raw.text));
+            for (start, end, url, is_file) in urls_rc.iter() {
+                detected.push(DetectedUrl {
+                    line: line_idx,
+                    start_col: *start,
+                    end_col: *end,
+                    url: url.clone(),
+                    is_file: *is_file,
+                });
+            }
             new_cache.insert(
                 raw.grid_line,
                 CachedLine {
                     text: raw.text,
                     segments: std::rc::Rc::clone(&shaped_rc),
+                    urls: urls_rc,
                 },
             );
             result_lines.push(TermLine {
@@ -1478,19 +1502,6 @@ impl Element for TerminalElement {
         }
 
         *cache = new_cache;
-
-        let mut detected = Vec::new();
-        for (line_idx, text) in line_texts.iter().enumerate() {
-            for (start, end, url, is_file) in detect_urls(text) {
-                detected.push(DetectedUrl {
-                    line: line_idx,
-                    start_col: start,
-                    end_col: end,
-                    url,
-                    is_file,
-                });
-            }
-        }
         *self.detected_urls.borrow_mut() = detected;
 
         Some(TermPrepaint {
