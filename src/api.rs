@@ -2,6 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
@@ -189,6 +190,75 @@ pub fn local_ips_all() -> Vec<String> {
     ips
 }
 
+/// Hex-encoded CRC32 of `bytes`, used as our `ETag` value. Cheap to
+/// compute and matches the per-tab persist hash so cached responses
+/// align with cache-skip logic.
+fn etag_for(bytes: &[u8]) -> String {
+    format!("{:08x}", tab_atelier::crc32(bytes))
+}
+
+/// Gzip `bytes` if the client supports it and the body is big enough
+/// for compression to be worthwhile (under ~4 KB the headers + CPU
+/// don't pay back). Returns `None` for "send the body uncompressed".
+fn maybe_gzip(bytes: &[u8], accept_gzip: bool) -> Option<Vec<u8>> {
+    const MIN_BODY: usize = 4096;
+    if !accept_gzip || bytes.len() < MIN_BODY {
+        return None;
+    }
+    let mut enc = flate2::write::GzEncoder::new(Vec::with_capacity(bytes.len() / 4), flate2::Compression::default());
+    Write::write_all(&mut enc, bytes).ok()?;
+    enc.finish().ok()
+}
+
+/// Generic body writer with `Accept-Encoding: gzip` and `ETag` support.
+/// `extra_headers` is appended verbatim (each line should end with `\r\n`);
+/// callers pass per-endpoint metadata there (e.g. X-Output-* on
+/// `/tabs/{idx}/output`). Cursor / cwd headers etc.
+fn respond_with_etag<W: Write>(
+    stream: &mut W,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+    accept_gzip: bool,
+    if_none_match: Option<&str>,
+    extra_headers: &str,
+) {
+    let etag = etag_for(body);
+    if status == 200 && if_none_match.is_some_and(|v| v == etag) {
+        // Content is byte-identical to what the client already has.
+        let _ = write!(
+            stream,
+            "HTTP/1.1 304 Not Modified\r\nETag: \"{etag}\"\r\n{extra_headers}Connection: close\r\n\r\n"
+        );
+        return;
+    }
+    let reason = match status {
+        201 => "Created",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        500 => "Internal Server Error",
+        // 200 and anything we haven't enumerated still render "OK".
+        _ => "OK",
+    };
+    if let Some(gz) = maybe_gzip(body, accept_gzip) {
+        let _ = write!(
+            stream,
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Encoding: gzip\r\nETag: \"{etag}\"\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
+            gz.len()
+        );
+        let _ = stream.write_all(&gz);
+    } else {
+        let _ = write!(
+            stream,
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nETag: \"{etag}\"\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(body);
+    }
+}
+
 fn respond_json<W: Write>(stream: &mut W, status: u16, body: &str) {
     let reason = match status {
         200 => "OK",
@@ -227,6 +297,8 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
 
     let mut auth_token = None;
     let mut content_length: usize = 0;
+    let mut accept_gzip = false;
+    let mut if_none_match: Option<String> = None;
     let mut line = String::new();
     loop {
         line.clear();
@@ -236,8 +308,17 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
         if let Some(val) = line.strip_prefix("Authorization: Bearer ") {
             auth_token = Some(val.trim().to_string());
         }
-        if let Some(val) = line.to_ascii_lowercase().strip_prefix("content-length: ") {
+        let lower = line.to_ascii_lowercase();
+        if let Some(val) = lower.strip_prefix("content-length: ") {
             content_length = val.trim().parse().unwrap_or(0);
+        }
+        if let Some(val) = lower.strip_prefix("accept-encoding: ")
+            && val.split(',').any(|tok| tok.trim().eq_ignore_ascii_case("gzip"))
+        {
+            accept_gzip = true;
+        }
+        if let Some(val) = lower.strip_prefix("if-none-match: ") {
+            if_none_match = Some(val.trim().trim_matches('"').to_string());
         }
     }
 
@@ -249,7 +330,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
     let method = parts[0].to_string();
     let raw_path = parts[1].to_string();
 
-    let (path, query_token, query_lines, query_since) = if let Some((p, q)) = raw_path.split_once('?') {
+    let (path, query_token, query_lines, query_since, query_crc) = if let Some((p, q)) = raw_path.split_once('?') {
         let qt = q
             .split('&')
             .find_map(|pair| pair.strip_prefix("token="))
@@ -262,9 +343,13 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             .split('&')
             .find_map(|pair| pair.strip_prefix("since="))
             .and_then(|s| s.parse::<usize>().ok());
-        (p.to_string(), qt, ql, qs)
+        let qc = q
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("crc="))
+            .and_then(|s| u32::from_str_radix(s, 16).ok());
+        (p.to_string(), qt, ql, qs, qc)
     } else {
-        (raw_path, None, None, None)
+        (raw_path, None, None, None, None)
     };
 
     // Read the body (if any) before dropping the reader so we can write the
@@ -307,7 +392,15 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             if let Some(cached) = state.cached_response.as_deref() {
                 let body = cached.to_owned();
                 drop(state);
-                respond_json(stream, 200, &body);
+                respond_with_etag(
+                    stream,
+                    200,
+                    "application/json",
+                    body.as_bytes(),
+                    accept_gzip,
+                    if_none_match.as_deref(),
+                    "",
+                );
                 return;
             }
             let tabs: Vec<TabInfo> = state
@@ -352,7 +445,15 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             let body = serde_json::to_string_pretty(&resp).unwrap_or_default();
             state.cached_response = Some(body.clone());
             drop(state);
-            respond_json(stream, 200, &body);
+            respond_with_etag(
+                stream,
+                200,
+                "application/json",
+                body.as_bytes(),
+                accept_gzip,
+                if_none_match.as_deref(),
+                "",
+            );
         }
         ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/catbus") => {
             // Lightweight metadata endpoint — "does this tab have a
@@ -473,58 +574,93 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
         }
         ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/output") => {
             let idx_str = &p["/tabs/".len()..p.len() - "/output".len()];
-            if let Ok(idx) = idx_str.parse::<usize>() {
-                let state = state.lock().unwrap();
-                if let Some(t) = state.tabs.get(idx) {
-                    // For ?lines=N we only need the tail; compute the byte
-                    // offset of the first kept newline in-place and clone
-                    // just that slice instead of `Vec<&str> + join()`-ing
-                    // through the whole scrollback.
-                    let (body, cursor) = match query_lines {
-                        Some(n) if n > 0 => {
-                            let total_lines = t.output.lines().count();
-                            let drop_count = total_lines.saturating_sub(n);
-                            if drop_count == 0 {
-                                (t.output.clone(), t.cursor)
-                            } else {
-                                let mut offset = 0;
-                                for _ in 0..drop_count {
-                                    if let Some(nl) = t.output[offset..].find('\n') {
-                                        offset += nl + 1;
-                                    } else {
-                                        offset = t.output.len();
-                                        break;
-                                    }
-                                }
-                                let cur = t.cursor.and_then(|(r, c)| {
-                                    if r >= drop_count {
-                                        Some((r - drop_count, c))
-                                    } else {
-                                        None
-                                    }
-                                });
-                                (t.output[offset..].to_string(), cur)
-                            }
-                        }
-                        _ => (t.output.clone(), t.cursor),
-                    };
-                    drop(state);
-                    let cursor_headers = match cursor {
-                        Some((row, col)) => format!("X-Cursor-Row: {row}\r\nX-Cursor-Col: {col}\r\n"),
-                        None => String::new(),
-                    };
-                    let _ = write!(
-                        stream,
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n{cursor_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                } else {
-                    error_json(stream, 404, "tab index out of range");
-                }
-            } else {
+            let Ok(idx) = idx_str.parse::<usize>() else {
                 error_json(stream, 404, "invalid tab index");
+                return;
+            };
+            let state = state.lock().unwrap();
+            let Some(t) = state.tabs.get(idx) else {
+                drop(state);
+                error_json(stream, 404, "tab index out of range");
+                return;
+            };
+
+            // Three response modes, picked in this order:
+            //   1. ?since=N&crc=HHHHHHHH  — append-only patching. Server
+            //      checks CRC32 of its own first N bytes; on match we
+            //      ship only [N..]. Mismatch (cleared screen, alt-screen
+            //      swap, scrollback ring-shifted) falls through to a
+            //      full body.
+            //   2. ?lines=N  — tail by line count (the existing behaviour).
+            //   3. neither   — full scrollback.
+            //
+            // Mode 1 is what turns a noisy LAN poll into a few-byte delta
+            // for the steady-state append case (>99% of the time, a tab
+            // is just appending output).
+            let total_crc = tab_atelier::crc32(t.output.as_bytes());
+            let total_len = t.output.len();
+
+            let (body, cursor, start_offset) = match (query_since, query_crc) {
+                (Some(n), Some(client_crc)) if n <= total_len => {
+                    let prefix_crc = tab_atelier::crc32(&t.output.as_bytes()[..n]);
+                    if prefix_crc == client_crc {
+                        // The client's history is still a real prefix of
+                        // ours. Ship the suffix only — cursor row is
+                        // relative to the full buffer, the client knows
+                        // how to add its own line count.
+                        (t.output[n..].to_string(), t.cursor, n)
+                    } else {
+                        (t.output.clone(), t.cursor, 0)
+                    }
+                }
+                _ => match query_lines {
+                    Some(n) if n > 0 => {
+                        let total_lines = t.output.lines().count();
+                        let drop_count = total_lines.saturating_sub(n);
+                        if drop_count == 0 {
+                            (t.output.clone(), t.cursor, 0)
+                        } else {
+                            let mut offset = 0;
+                            for _ in 0..drop_count {
+                                if let Some(nl) = t.output[offset..].find('\n') {
+                                    offset += nl + 1;
+                                } else {
+                                    offset = t.output.len();
+                                    break;
+                                }
+                            }
+                            let cur = t.cursor.and_then(|(r, c)| {
+                                if r >= drop_count {
+                                    Some((r - drop_count, c))
+                                } else {
+                                    None
+                                }
+                            });
+                            (t.output[offset..].to_string(), cur, offset)
+                        }
+                    }
+                    _ => (t.output.clone(), t.cursor, 0),
+                },
+            };
+            drop(state);
+
+            let mut extra = String::new();
+            if let Some((row, col)) = cursor {
+                let _ = write!(extra, "X-Cursor-Row: {row}\r\nX-Cursor-Col: {col}\r\n");
             }
+            let _ = write!(
+                extra,
+                "X-Output-Length: {total_len}\r\nX-Output-Crc: {total_crc:08x}\r\nX-Output-Start: {start_offset}\r\n"
+            );
+            respond_with_etag(
+                stream,
+                200,
+                "text/plain; charset=utf-8",
+                body.as_bytes(),
+                accept_gzip,
+                if_none_match.as_deref(),
+                &extra,
+            );
         }
         ("DELETE", p) if p.starts_with("/tabs/") && !p[6..].contains('/') => {
             let idx_str = &p[6..];
@@ -1257,5 +1393,142 @@ mod tests {
         assert_eq!(status_code(&buf), 200);
         let pending = state.lock().unwrap().pending_input.clone();
         assert_eq!(pending, vec![(1_usize, vec![0x03_u8, 0x0a])]);
+    }
+
+    /// Like `request` but returns the full raw response bytes — needed
+    /// when the server might respond with gzip-encoded body.
+    fn request_bytes(port: u16, req: &str) -> Vec<u8> {
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+        stream.write_all(req.as_bytes()).unwrap();
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).unwrap();
+        buf
+    }
+
+    /// Split a raw response into its header block (text) and body bytes.
+    fn split_response(bytes: &[u8]) -> (String, Vec<u8>) {
+        let sep = b"\r\n\r\n";
+        let idx = bytes.windows(4).position(|w| w == sep).unwrap_or(bytes.len());
+        let headers = String::from_utf8_lossy(&bytes[..idx]).into_owned();
+        let body = if idx + 4 <= bytes.len() {
+            bytes[idx + 4..].to_vec()
+        } else {
+            Vec::new()
+        };
+        (headers, body)
+    }
+
+    fn header_value<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
+        let prefix = format!("{}: ", name.to_lowercase());
+        headers
+            .lines()
+            .find(|l| l.to_lowercase().starts_with(&prefix))
+            .map(|l| l[prefix.len()..].trim())
+    }
+
+    fn ungzip(bytes: &[u8]) -> Vec<u8> {
+        use std::io::Read as _;
+        let mut dec = flate2::read::GzDecoder::new(bytes);
+        let mut out = Vec::new();
+        dec.read_to_end(&mut out).unwrap();
+        out
+    }
+
+    /// Helper to populate a tab with a large enough scrollback that the
+    /// gzip path kicks in (we threshold at 4 KB).
+    fn fill_output(state: &Arc<Mutex<TabSnapshot>>, idx: usize, content: &str) {
+        let mut snap = state.lock().unwrap();
+        snap.tabs[idx].output = content.to_string();
+        snap.cached_response = None; // invalidate /tabs cache
+    }
+
+    #[test]
+    fn output_gzip_when_accept_encoding_offered() {
+        let (port, state, token) = spawn_server();
+        let big = "x".repeat(8000); // > 4 KB threshold
+        fill_output(&state, 0, &big);
+
+        let raw = request_bytes(
+            port,
+            &format!(
+                "GET /tabs/0/output HTTP/1.1\r\nAuthorization: Bearer {token}\r\nAccept-Encoding: gzip\r\n\r\n"
+            ),
+        );
+        let (headers, body) = split_response(&raw);
+        assert!(headers.starts_with("HTTP/1.1 200 OK"), "got: {headers}");
+        assert_eq!(header_value(&headers, "content-encoding"), Some("gzip"));
+        assert!(header_value(&headers, "etag").is_some());
+        let decoded = ungzip(&body);
+        assert_eq!(decoded.len(), big.len(), "decoded size matches original");
+    }
+
+    #[test]
+    fn output_etag_returns_304_on_match() {
+        let (port, state, token) = spawn_server();
+        let big = "y".repeat(8000);
+        fill_output(&state, 0, &big);
+
+        // First request: capture ETag.
+        let raw = request_bytes(
+            port,
+            &format!("GET /tabs/0/output HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        let (h, _) = split_response(&raw);
+        let etag = header_value(&h, "etag").unwrap().trim_matches('"').to_string();
+
+        // Second request with If-None-Match: same content → 304.
+        let raw2 = request_bytes(
+            port,
+            &format!(
+                "GET /tabs/0/output HTTP/1.1\r\nAuthorization: Bearer {token}\r\nIf-None-Match: \"{etag}\"\r\n\r\n"
+            ),
+        );
+        let (h2, b2) = split_response(&raw2);
+        assert!(h2.starts_with("HTTP/1.1 304"), "got: {h2}");
+        assert!(b2.is_empty(), "304 must have empty body");
+    }
+
+    #[test]
+    fn output_patching_returns_suffix_when_crc_matches() {
+        let (port, state, token) = spawn_server();
+        let prefix = "$ ls\nfoo bar baz\n";
+        let suffix = "$ pwd\n/home/user\n";
+        let full = format!("{prefix}{suffix}");
+        fill_output(&state, 0, &full);
+
+        let prefix_crc = format!("{:08x}", tab_atelier::crc32(prefix.as_bytes()));
+        let raw = request_bytes(
+            port,
+            &format!(
+                "GET /tabs/0/output?since={}&crc={prefix_crc} HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n",
+                prefix.len()
+            ),
+        );
+        let (h, b) = split_response(&raw);
+        assert!(h.starts_with("HTTP/1.1 200"), "got: {h}");
+        assert_eq!(header_value(&h, "x-output-start"), Some(prefix.len().to_string().as_str()));
+        assert_eq!(header_value(&h, "x-output-length"), Some(full.len().to_string().as_str()));
+        assert_eq!(b, suffix.as_bytes(), "body must be just the suffix");
+    }
+
+    #[test]
+    fn output_patching_falls_back_when_crc_mismatches() {
+        let (port, state, token) = spawn_server();
+        let full = "$ ls\nfoo bar baz\n$ pwd\n/home/user\n".to_string();
+        fill_output(&state, 0, &full);
+
+        // Stale CRC (claims first 10 bytes were "different" by 1).
+        let bogus_crc = format!("{:08x}", tab_atelier::crc32(b"different"));
+        let raw = request_bytes(
+            port,
+            &format!(
+                "GET /tabs/0/output?since=10&crc={bogus_crc} HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"
+            ),
+        );
+        let (h, b) = split_response(&raw);
+        assert!(h.starts_with("HTTP/1.1 200"));
+        assert_eq!(header_value(&h, "x-output-start"), Some("0"));
+        assert_eq!(b, full.as_bytes(), "body must be the full output");
     }
 }

@@ -65,6 +65,10 @@ fs2 = "0.4"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 rustls-pemfile = "2"
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+# gzip for the mobile-remote HTTP responses (3–4× smaller for terminal
+# scrollback). Already in the transitive tree; pulling it in directly
+# so we can wrap our own write path.
+flate2 = "1"
 
 [dev-dependencies]
 gpui = { version = "0.2", default-features = false, features = ["x11", "test-support"] }
