@@ -68,7 +68,10 @@ impl Dimensions for TermDims {
 
 struct CachedLine {
     text: String,
-    segments: Vec<TermSegment>,
+    /// Shared with the per-frame `TermLine::segments`. Wrapping in `Rc` so
+    /// a cache hit costs one atomic bump instead of deep-cloning the whole
+    /// `Vec<TermSegment>` (each segment carries a `ShapedLine`).
+    segments: std::rc::Rc<Vec<TermSegment>>,
 }
 
 pub struct TerminalView {
@@ -1129,7 +1132,7 @@ impl Clone for TermSegment {
 }
 
 struct TermLine {
-    segments: Vec<TermSegment>,
+    segments: std::rc::Rc<Vec<TermSegment>>,
     bg_runs: Vec<BgRun>,
 }
 
@@ -1428,13 +1431,13 @@ impl Element for TerminalElement {
                 && cached.text == raw.text
             {
                 result_lines.push(TermLine {
-                    segments: cached.segments.clone(),
+                    // Cheap atomic bump — no Vec/ShapedLine deep clone.
+                    segments: std::rc::Rc::clone(&cached.segments),
                     bg_runs: raw.bg_runs,
                 });
                 new_cache.insert(raw.grid_line, cached);
                 continue;
             }
-            let text_clone = raw.text.clone();
             let shaped_segments: Vec<TermSegment> = raw
                 .segments
                 .into_iter()
@@ -1446,15 +1449,16 @@ impl Element for TerminalElement {
                     }
                 })
                 .collect();
+            let shaped_rc = std::rc::Rc::new(shaped_segments);
             new_cache.insert(
                 raw.grid_line,
                 CachedLine {
-                    text: text_clone,
-                    segments: shaped_segments.clone(),
+                    text: raw.text,
+                    segments: std::rc::Rc::clone(&shaped_rc),
                 },
             );
             result_lines.push(TermLine {
-                segments: shaped_segments,
+                segments: shaped_rc,
                 bg_runs: raw.bg_runs,
             });
         }
@@ -1555,7 +1559,7 @@ impl Element for TerminalElement {
 
             // Paint text segments at grid-aligned positions.
             for (line_idx, line) in state.lines.iter().enumerate() {
-                for seg in &line.segments {
+                for seg in line.segments.iter() {
                     let pos = point(
                         origin.x + cell.width * seg.col_start as f32,
                         origin.y + cell.height * line_idx as f32,
