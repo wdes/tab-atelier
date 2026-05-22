@@ -113,13 +113,27 @@ pub async fn auth_handler(
         return Err(AuthError::forbidden("only the configured owner can log in"));
     }
 
-    let user_id = crate::db::upsert_account(
-        &state.db,
-        &public_key_hex,
-        content_pk.as_deref(),
-        content_pk_sig.as_deref(),
-    )
-    .await
+    let user_id = if state.shared_account {
+        // Map every successful auth onto the single shared account.
+        // First device through gets to create it; everyone else just
+        // returns the existing id. Per-device key/content-key records
+        // are still upserted alongside so the audit trail survives.
+        crate::db::upsert_account_shared(
+            &state.db,
+            &public_key_hex,
+            content_pk.as_deref(),
+            content_pk_sig.as_deref(),
+        )
+        .await
+    } else {
+        crate::db::upsert_account(
+            &state.db,
+            &public_key_hex,
+            content_pk.as_deref(),
+            content_pk_sig.as_deref(),
+        )
+        .await
+    }
     .map_err(|e| {
         tracing::warn!(error = ?e, "account upsert failed");
         AuthError::internal()
