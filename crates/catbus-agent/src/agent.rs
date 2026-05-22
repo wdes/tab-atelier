@@ -197,16 +197,11 @@ impl Agent {
                 .fetch_add(resp.usage.input_tokens, std::sync::atomic::Ordering::Relaxed);
             self.tokens_out
                 .fetch_add(resp.usage.output_tokens, std::sync::atomic::Ordering::Relaxed);
-            // Persist + record what the model produced.
+            // Persist what the model produced first (clones the blocks
+            // into the transcript entry — one clone), then iterate by
+            // borrow, then move into in-memory history (no second clone).
             let entry = session::assistant_blocks(&session, resp.model.clone(), resp.content.clone());
             session.append(&entry)?;
-            {
-                let mut active = self.active.write().await;
-                active.history.push(ApiMessage {
-                    role: "assistant".into(),
-                    content: ApiContent::Blocks(resp.content.clone()),
-                });
-            }
 
             // Collect tool_use blocks; pull any text into the visible
             // answer so the caller has *something* even mid-tool-use.
@@ -226,7 +221,18 @@ impl Agent {
                 }
             }
 
-            if matches!(resp.stop_reason.as_deref(), Some("end_turn" | "stop_sequence")) || tool_uses.is_empty() {
+            // Move the content into the in-memory history; subsequent
+            // code paths no longer need `resp.content`.
+            let stop_reason = resp.stop_reason;
+            {
+                let mut active = self.active.write().await;
+                active.history.push(ApiMessage {
+                    role: "assistant".into(),
+                    content: ApiContent::Blocks(resp.content),
+                });
+            }
+
+            if matches!(stop_reason.as_deref(), Some("end_turn" | "stop_sequence")) || tool_uses.is_empty() {
                 return Ok(final_text);
             }
 
@@ -280,9 +286,12 @@ impl Agent {
     async fn call_messages(&self) -> Result<MessagesResp, AgentError> {
         let token = self.auth.access_token().await.map_err(AgentError::Auth)?;
         let active = self.active.read().await;
-        let history = active.history.clone();
         let cwd = active.session.cwd.display().to_string();
-        drop(active);
+        let tool_specs = tools::tool_specs();
+        // Hold the read lock across .json(&body) so MessagesReq can
+        // borrow `&active.history` instead of cloning the full Vec.
+        // reqwest serializes the body synchronously in .json(), so the
+        // lock is released right after that call returns.
         let body = MessagesReq {
             model: DEFAULT_MODEL,
             max_tokens: 8192,
@@ -312,16 +321,18 @@ impl Agent {
                     ),
                 },
             ],
-            tools: tools::tool_specs(),
-            messages: history,
+            tools: &tool_specs,
+            messages: &active.history,
         };
-        let resp = self
+        let request = self
             .http
             .post(MESSAGES_URL)
             .bearer_auth(token)
             .header("anthropic-version", "2023-06-01")
             .header("anthropic-beta", ANTHROPIC_BETA)
-            .json(&body)
+            .json(&body);
+        drop(active);
+        let resp = request
             .send()
             .await
             .map_err(|e| AgentError::Http(e.to_string()))?;
@@ -433,8 +444,8 @@ struct MessagesReq<'a> {
     model: &'a str,
     max_tokens: u32,
     system: Vec<SystemBlock>,
-    tools: Vec<serde_json::Value>,
-    messages: Vec<ApiMessage>,
+    tools: &'a [serde_json::Value],
+    messages: &'a [ApiMessage],
 }
 
 #[derive(Serialize)]
