@@ -64,6 +64,7 @@ async fn obtain_token(port: u16) -> String {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn kv_lifecycle() {
     let port = free_port();
     let tmpdir = tempfile_dir("kv_lifecycle");
