@@ -228,8 +228,49 @@ pub fn last_exchanges(path: &Path, n: usize) -> Vec<Exchange> {
 
 /// Read the last non-empty JSONL line of `path` and pluck its
 /// `uuid`. Used to chain `parentUuid` correctly on resume.
+///
+/// Seeks backwards from EOF in `READ_CHUNK`-byte chunks until the buffer
+/// contains at least two newlines (or the file's start is reached), so we
+/// only touch the tail of the transcript instead of `read_to_string`-ing
+/// the entire (potentially MB-sized) file every session-open.
 fn last_entry_uuid(path: &Path) -> std::io::Result<Option<String>> {
-    let text = std::fs::read_to_string(path)?;
+    use std::io::{Read, Seek, SeekFrom};
+    const READ_CHUNK: u64 = 4096;
+    let mut file = std::fs::File::open(path)?;
+    let total = file.seek(SeekFrom::End(0))?;
+    if total == 0 {
+        return Ok(None);
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    let mut pos = total;
+    // Grow the tail buffer backwards until we've captured at least one
+    // line *before* the trailing newline at EOF, or we've slurped the
+    // whole file. The 2-newline criterion guards against bailing out
+    // when only the EOF newline is in view.
+    loop {
+        let want = READ_CHUNK.min(pos);
+        pos -= want;
+        file.seek(SeekFrom::Start(pos))?;
+        let mut chunk = vec![0u8; want as usize];
+        file.read_exact(&mut chunk)?;
+        chunk.extend_from_slice(&buf);
+        buf = chunk;
+        // Two-newline criterion guarantees at least one complete line
+        // *before* the trailing EOF newline is in view.
+        let mut found = 0usize;
+        for &b in &buf {
+            if b == b'\n' {
+                found += 1;
+                if found >= 2 {
+                    break;
+                }
+            }
+        }
+        if found >= 2 || pos == 0 {
+            break;
+        }
+    }
+    let text = String::from_utf8_lossy(&buf);
     for line in text.lines().rev() {
         if line.trim().is_empty() {
             continue;
