@@ -422,18 +422,14 @@ fn tool_status_label(name: &str, input: &serde_json::Value) -> String {
         "Read" | "Write" | "Edit" => {
             let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("?");
             // Show only the last two components so long paths don't overflow.
-            let short = std::path::Path::new(path)
-                .components()
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .take(2)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .map(|c| c.as_os_str().to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
-                .join("/");
+            // `file_name()` + `parent().and_then(|p| p.file_name())` gets us
+            // both in O(1) without the previous quadruple-collect dance.
+            let p = std::path::Path::new(path);
+            let short = match (p.file_name(), p.parent().and_then(|par| par.file_name())) {
+                (Some(file), Some(parent)) => format!("{}/{}", parent.to_string_lossy(), file.to_string_lossy()),
+                (Some(file), None) => file.to_string_lossy().into_owned(),
+                _ => path.to_string(),
+            };
             format!("{name}: {short}")
         }
         "Delegate" => {
