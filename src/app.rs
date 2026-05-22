@@ -599,17 +599,6 @@ impl AppState {
             }
         }
         let state_base = platform::state_base_dir();
-        #[allow(clippy::needless_collect)]
-        let outputs: Vec<(String, String)> = self
-            .tabs
-            .iter()
-            .map(|tab| (tab.name.clone(), tab.view.read(cx).copy_all_history()))
-            .collect();
-        let uptimes: Vec<(String, f64)> = self
-            .tabs
-            .iter()
-            .map(|tab| (tab.name.clone(), tab.uptime().as_secs_f64()))
-            .collect();
         // Refresh last_known_cwd for any tab whose PTY child is still alive,
         // so a later persist tick after the shell exits still has a value
         // to fall back on instead of blanking the cwd to None.
@@ -675,16 +664,17 @@ impl AppState {
             self.last_state_hash.set(new_hash);
         }
         if !read_only {
-            for (i, (name, output)) in outputs.into_iter().enumerate() {
+            for tab in &mut self.tabs {
+                let output = tab.view.read(cx).copy_all_history();
                 if output.is_empty() {
                     continue;
                 }
                 let h = tab_atelier::crc32(output.as_bytes());
-                if h == self.tabs[i].output_hash_last_saved {
+                if h == tab.output_hash_last_saved {
                     continue;
                 }
-                save_tab_output(&state_base, &name, &output);
-                self.tabs[i].output_hash_last_saved = h;
+                save_tab_output(&state_base, &tab.name, &output);
+                tab.output_hash_last_saved = h;
             }
         }
         // Uptime + energy are never written in read-only mode; in normal
@@ -696,8 +686,8 @@ impl AppState {
                 .get()
                 .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(30));
             if should_save_uptime {
-                for (name, secs) in &uptimes {
-                    save_tab_uptime(&state_base, name, *secs);
+                for tab in &self.tabs {
+                    save_tab_uptime(&state_base, &tab.name, tab.uptime().as_secs_f64());
                 }
                 self.last_uptime_save.set(Some(std::time::Instant::now()));
             }
@@ -891,17 +881,6 @@ impl AppState {
 
     fn close_all_tabs(&mut self, cx: &mut Context<Self>) {
         let state_base = platform::state_base_dir();
-        #[allow(clippy::needless_collect)]
-        let outputs: Vec<(String, String)> = self
-            .tabs
-            .iter()
-            .map(|tab| (tab.name.clone(), tab.view.read(cx).copy_all_history()))
-            .collect();
-        let uptimes: Vec<(String, f64)> = self
-            .tabs
-            .iter()
-            .map(|tab| (tab.name.clone(), tab.uptime().as_secs_f64()))
-            .collect();
         // Snapshot cwd from /proc one last time before child processes
         // disappear; fall back to the cached last_known_cwd otherwise.
         for tab in &mut self.tabs {
@@ -938,15 +917,16 @@ impl AppState {
                     windowed: self.windowed,
                 },
             );
-            for (name, output) in outputs {
+            for tab in &self.tabs {
+                let output = tab.view.read(cx).copy_all_history();
                 if !output.is_empty() {
-                    save_tab_output(&state_base, &name, &output);
+                    save_tab_output(&state_base, &tab.name, &output);
                 }
             }
             // Always flush uptime + energy on shutdown — bypass throttles so
             // the last tick isn't lost.
-            for (name, secs) in &uptimes {
-                save_tab_uptime(&state_base, name, *secs);
+            for tab in &self.tabs {
+                save_tab_uptime(&state_base, &tab.name, tab.uptime().as_secs_f64());
             }
             #[cfg(feature = "energy")]
             for tab in &mut self.tabs {
