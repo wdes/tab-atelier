@@ -352,28 +352,38 @@ impl Agent {
 /// Only user/assistant turns are loaded; tool results are part of user turns.
 fn rebuild_history(project_dir: &std::path::Path, id: &str) -> Vec<ApiMessage> {
     use crate::session::Block;
+    use std::io::BufRead;
     let path = project_dir.join(format!("{id}.jsonl"));
-    let Ok(text) = std::fs::read_to_string(&path) else {
+    let Ok(file) = std::fs::File::open(&path) else {
         return Vec::new();
     };
+    let reader = std::io::BufReader::new(file);
     let mut out = Vec::new();
-    for line in text.lines() {
+    for line in reader.lines() {
+        let Ok(line) = line else { continue };
         if line.trim().is_empty() {
             continue;
         }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
-        let Some(role) = v.get("type").and_then(|t| t.as_str()) else {
-            continue;
+        let role = match v.get("type").and_then(|t| t.as_str()) {
+            Some("user") => "user",
+            Some("assistant") => "assistant",
+            _ => continue,
         };
-        let Some(msg) = v.get("message") else { continue };
+        // We hold `v` mutably so we can `mem::take` the content sub-tree
+        // instead of cloning it before `from_value`. The owned `v` is
+        // dropped at the end of the loop iteration anyway.
+        let Some(msg) = v.get_mut("message") else { continue };
+        let Some(content_val) = msg.get_mut("content") else { continue };
+        let content_owned = std::mem::take(content_val);
         match role {
             "user" => {
-                let content = match msg.get("content") {
-                    Some(serde_json::Value::String(s)) => ApiContent::Plain(s.clone()),
-                    Some(serde_json::Value::Array(_)) => {
-                        let blocks: Vec<Block> = serde_json::from_value(msg["content"].clone()).unwrap_or_default();
+                let content = match content_owned {
+                    serde_json::Value::String(s) => ApiContent::Plain(s),
+                    arr @ serde_json::Value::Array(_) => {
+                        let blocks: Vec<Block> = serde_json::from_value(arr).unwrap_or_default();
                         ApiContent::Blocks(blocks)
                     }
                     _ => continue,
@@ -384,10 +394,7 @@ fn rebuild_history(project_dir: &std::path::Path, id: &str) -> Vec<ApiMessage> {
                 });
             }
             "assistant" => {
-                let Some(content_val) = msg.get("content") else {
-                    continue;
-                };
-                let blocks: Vec<Block> = serde_json::from_value(content_val.clone()).unwrap_or_default();
+                let blocks: Vec<Block> = serde_json::from_value(content_owned).unwrap_or_default();
                 if !blocks.is_empty() {
                     out.push(ApiMessage {
                         role: "assistant".into(),
