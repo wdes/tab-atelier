@@ -61,25 +61,185 @@ struct TabState {
     header_version: i64,
 }
 
-/// Public entry point: spin up the publisher thread. Returns
-/// immediately; the thread runs until the process exits.
+/// Public entry point: spin up both bridge threads (publisher +
+/// input poller). Returns immediately; the threads run until the
+/// process exits.
 pub fn spawn(relay_url: String, api_state: Arc<Mutex<TabSnapshot>>) {
+    // Publisher: pushes tab snapshots upstream every PUBLISH_INTERVAL.
+    let publisher_url = relay_url.clone();
+    let publisher_state = api_state.clone();
     std::thread::spawn(move || {
-        let mut bridge = match Bridge::new(relay_url) {
+        let mut bridge = match Bridge::new(publisher_url) {
             Ok(b) => b,
             Err(e) => {
-                warn!("happier-bridge: init failed: {e}; bridge disabled");
+                warn!("happier-bridge: publisher init failed: {e}; bridge disabled");
                 return;
             }
         };
         info!("happier-bridge: publishing tabs to {}", bridge.relay_url);
         loop {
             std::thread::sleep(PUBLISH_INTERVAL);
-            if let Err(e) = bridge.tick(&api_state) {
-                warn!("happier-bridge tick: {e}");
+            if let Err(e) = bridge.tick(&publisher_state) {
+                warn!("happier-bridge publisher tick: {e}");
             }
         }
     });
+
+    // Input poller: long-polls the relay for keystrokes from connected
+    // mobile clients and shovels them into TabSnapshot.pending_input
+    // so the existing PTY-flush mechanism delivers them. Runs in its
+    // own thread so a stalled long-poll never blocks publishes.
+    std::thread::spawn(move || {
+        let mut poller = match InputPoller::new(relay_url) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("happier-bridge: input-poller init failed: {e}");
+                return;
+            }
+        };
+        info!("happier-bridge: polling for tab-input on {}", poller.relay_url);
+        loop {
+            if let Err(e) = poller.tick(&api_state) {
+                warn!("happier-bridge poller tick: {e}");
+                // Back off briefly so we don't hammer on a dead network.
+                std::thread::sleep(Duration::from_secs(5));
+            }
+        }
+    });
+}
+
+/// Long-polls the relay's `/v1/tab-input/pending` and drops keystrokes
+/// into the shared `TabSnapshot.pending_input` queue. Auth uses the
+/// same persisted keypair as the publisher, so both end up bound to
+/// the same relay account.
+struct InputPoller {
+    relay_url: String,
+    signing_key: SigningKey,
+    token: Option<String>,
+    since: i64,
+    http: ureq::Agent,
+}
+
+impl InputPoller {
+    fn new(relay_url: String) -> Result<Self, String> {
+        let signing_key = load_or_create_signing_key()?;
+        let http = ureq::Agent::config_builder()
+            // Slightly larger than the relay's MAX_WAIT (30 s) so a
+            // wedged server can't make us spuriously time out below it.
+            .timeout_global(Some(Duration::from_secs(45)))
+            .build()
+            .into();
+        Ok(Self {
+            relay_url,
+            signing_key,
+            token: None,
+            since: 0,
+            http,
+        })
+    }
+
+    fn tick(&mut self, api_state: &Arc<Mutex<TabSnapshot>>) -> Result<(), String> {
+        if self.token.is_none() {
+            self.authenticate()?;
+        }
+        let token = self.token.clone().ok_or("no token")?;
+        // Long-poll the relay; it'll return early when a POST lands,
+        // or after ~25 s of nothing happening. Either way we re-loop.
+        let url = format!(
+            "{}/v1/tab-input/pending?since={}&waitMs=25000",
+            self.relay_url, self.since
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .header("Authorization", &format!("Bearer {token}"))
+            .call()
+            .map_err(|e| format!("pending GET: {e}"))?;
+        if resp.status().as_u16() == 401 {
+            self.token = None;
+            return Err("pending: 401, re-authenticating next tick".into());
+        }
+        if !resp.status().is_success() {
+            return Err(format!("pending status: {}", resp.status()));
+        }
+        let body: serde_json::Value = resp
+            .into_body()
+            .read_json()
+            .map_err(|e| format!("pending parse: {e}"))?;
+        let Some(events) = body["events"].as_array() else {
+            return Ok(());
+        };
+        if events.is_empty() {
+            // Refresh the highestSeq cursor even on a no-event reply so
+            // we don't keep replaying older rows that already drained.
+            if let Some(h) = body["highestSeq"].as_i64() {
+                self.since = h.max(self.since);
+            }
+            return Ok(());
+        }
+        // Look up tab names → indexes once, with the snapshot lock
+        // held briefly, then enqueue the bytes in a second pass.
+        let names: std::collections::HashMap<String, usize> = {
+            let snap = api_state.lock().map_err(|e| format!("api_state lock: {e}"))?;
+            snap.tabs
+                .iter()
+                .enumerate()
+                .map(|(i, t)| (t.name.clone(), i))
+                .collect()
+        };
+        // Decode events first; touch the snapshot mutex only once at the end.
+        let mut to_deliver: Vec<(usize, Vec<u8>)> = Vec::with_capacity(events.len());
+        let mut highest = self.since;
+        for ev in events {
+            let Some(seq) = ev["seq"].as_i64() else { continue };
+            highest = highest.max(seq);
+            let Some(name) = ev["tabName"].as_str() else { continue };
+            let Some(b64_bytes) = ev["bytes"].as_str() else { continue };
+            let Ok(bytes) = B64.decode(b64_bytes) else { continue };
+            if let Some(&idx) = names.get(name) {
+                to_deliver.push((idx, bytes));
+            } else {
+                debug!("happier-bridge: tab-input for unknown tab '{name}', dropping");
+            }
+        }
+        let delivered = to_deliver.len();
+        if delivered > 0 {
+            let mut snap = api_state.lock().map_err(|e| format!("api_state lock: {e}"))?;
+            snap.pending_input.extend(to_deliver);
+            drop(snap);
+        }
+        self.since = highest;
+        if delivered > 0 {
+            debug!("happier-bridge: delivered {delivered} tab-input event(s) up to seq {highest}");
+        }
+        Ok(())
+    }
+
+    fn authenticate(&mut self) -> Result<(), String> {
+        let mut challenge = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut challenge);
+        let signature = self.signing_key.sign(&challenge).to_bytes();
+        let body = serde_json::json!({
+            "publicKey": B64.encode(self.signing_key.verifying_key().to_bytes()),
+            "challenge": B64.encode(challenge),
+            "signature": B64.encode(signature),
+        });
+        let url = format!("{}/v1/auth", self.relay_url);
+        let resp = self
+            .http
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .send(body.to_string().as_bytes())
+            .map_err(|e| format!("poller auth POST: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("poller auth status: {}", resp.status()));
+        }
+        let body: serde_json::Value =
+            resp.into_body().read_json().map_err(|e| format!("poller auth parse: {e}"))?;
+        let token = body["token"].as_str().ok_or("no token in auth response")?.to_string();
+        self.token = Some(token);
+        Ok(())
+    }
 }
 
 impl Bridge {
@@ -352,6 +512,25 @@ fn gzip(bytes: &[u8]) -> Vec<u8> {
     enc.finish().unwrap_or_default()
 }
 
+/// Stable artifact id derived from a tab name. We don't have a real
+/// UUID v5 dep in tree, but four CRC32s of differently-prefixed
+/// strings give us a 128-bit-ish identifier rendered in the same
+/// 8-4-4-4-12 hex layout — the relay treats this as an opaque id.
+fn artifact_id_for(name: &str) -> String {
+    let a = tab_atelier::crc32(format!("tab:{name}").as_bytes());
+    let b = tab_atelier::crc32(format!("body:{name}").as_bytes());
+    let c = tab_atelier::crc32(format!("meta:{name}").as_bytes());
+    let d = tab_atelier::crc32(format!("seed:{name}").as_bytes());
+    format!(
+        "{a:08x}-{:04x}-{:04x}-{:04x}-{:08x}{:04x}",
+        b >> 16,
+        b & 0xFFFF,
+        d & 0xFFFF,
+        c,
+        (d >> 16) & 0xFFFF,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,29 +558,9 @@ mod tests {
         let input = b"$ ls\nfoo bar baz\n".repeat(200);
         let gz = gzip(&input);
         assert!(gz.len() < input.len(), "gzip should shrink repeated text");
-        // Decompress with flate2 and check parity.
         let mut dec = flate2::read::GzDecoder::new(gz.as_slice());
         let mut out = Vec::new();
         std::io::Read::read_to_end(&mut dec, &mut out).unwrap();
         assert_eq!(out, input);
     }
-}
-
-/// Stable artifact id derived from a tab name. We don't have a real
-/// UUID v5 dep in tree, but four CRC32s of differently-prefixed
-/// strings give us a 128-bit-ish identifier rendered in the same
-/// 8-4-4-4-12 hex layout — the relay treats this as an opaque id.
-fn artifact_id_for(name: &str) -> String {
-    let a = tab_atelier::crc32(format!("tab:{name}").as_bytes());
-    let b = tab_atelier::crc32(format!("body:{name}").as_bytes());
-    let c = tab_atelier::crc32(format!("meta:{name}").as_bytes());
-    let d = tab_atelier::crc32(format!("seed:{name}").as_bytes());
-    format!(
-        "{a:08x}-{:04x}-{:04x}-{:04x}-{:08x}{:04x}",
-        b >> 16,
-        b & 0xFFFF,
-        d & 0xFFFF,
-        c,
-        (d >> 16) & 0xFFFF,
-    )
 }

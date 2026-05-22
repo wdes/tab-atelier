@@ -24,6 +24,7 @@ mod kv;
 mod sessions;
 mod socket;
 mod state;
+mod tab_input;
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Single-tenant happier relay (auth spike).", long_about = None)]
@@ -78,6 +79,7 @@ async fn main() -> anyhow::Result<()> {
         jwt_secret: Arc::new(secret),
         owner_pubkey_hex: args.owner_pubkey.map(|s| s.to_lowercase()),
         broadcast_tx,
+        input_notifier: tab_input::InputNotifier::default(),
     };
 
     tokio::spawn(state::broadcast_loop(io.clone(), broadcast_rx));
@@ -104,6 +106,8 @@ async fn main() -> anyhow::Result<()> {
             "/v1/artifacts/{id}",
             get(artifacts::get_one).post(artifacts::update).delete(artifacts::delete),
         )
+        .route("/v1/tab-input", post(tab_input::post_input))
+        .route("/v1/tab-input/pending", get(tab_input::pending))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_auth));
 
     let app = Router::new()

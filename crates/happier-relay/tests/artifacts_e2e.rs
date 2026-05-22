@@ -123,9 +123,9 @@ async fn artifact_lifecycle_and_fanout() {
         .await
         .unwrap();
     assert_eq!(created.status(), 200);
-    let created_body: serde_json::Value = created.json().await.unwrap();
-    assert_eq!(created_body["id"], serde_json::Value::String(id.clone()));
-    assert_eq!(created_body["headerVersion"], serde_json::Value::Number(1.into()));
+    let resp_body: serde_json::Value = created.json().await.unwrap();
+    assert_eq!(resp_body["id"], serde_json::Value::String(id.clone()));
+    assert_eq!(resp_body["headerVersion"], serde_json::Value::Number(1.into()));
 
     // GET single
     let one = http

@@ -46,6 +46,11 @@ name = "artifacts_e2e"
 path = "tests/artifacts_e2e.rs"
 required-features = ["happier-dev"]
 
+[[test]]
+name = "tab_input_e2e"
+path = "tests/tab_input_e2e.rs"
+required-features = ["happier-dev"]
+
 [lints.rust]
 unsafe_code = "deny"
 
