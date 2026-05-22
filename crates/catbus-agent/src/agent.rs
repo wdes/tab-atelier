@@ -169,6 +169,7 @@ impl Agent {
         result
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn run_user_prompt_inner(&self, text: String, cancel: &CancellationToken) -> Result<String, AgentError> {
         // Snapshot session Arc so we're not holding the RwLock across
         // await points in the tool loop.
@@ -214,9 +215,12 @@ impl Agent {
             let entry = session::assistant_blocks(&session, resp.model.clone(), resp.content.clone());
             session.append(&entry)?;
 
-            // Collect tool_use blocks; pull any text into the visible
-            // answer so the caller has *something* even mid-tool-use.
-            let mut tool_uses: Vec<(String, String, serde_json::Value)> = Vec::new();
+            // Collect tool_use blocks by reference; pull any text into
+            // the visible answer so the caller has *something* even
+            // mid-tool-use. The borrows into `resp.content` survive the
+            // tool dispatch awaits below — the history push that moves
+            // `resp.content` happens *after* this borrow goes out of scope.
+            let mut tool_uses: Vec<(&str, &str, &serde_json::Value)> = Vec::new();
             for block in &resp.content {
                 match block {
                     Block::Text { text } => {
@@ -226,24 +230,25 @@ impl Agent {
                         final_text.push_str(text);
                     }
                     Block::ToolUse { id, name, input } => {
-                        tool_uses.push((id.clone(), name.clone(), input.clone()));
+                        tool_uses.push((id.as_str(), name.as_str(), input));
                     }
                     Block::ToolResult { .. } => {}
                 }
             }
 
-            // Move the content into the in-memory history; subsequent
-            // code paths no longer need `resp.content`.
-            let stop_reason = resp.stop_reason;
-            {
-                let mut active = self.active.write().await;
-                active.history.push(ApiMessage {
-                    role: "assistant".into(),
-                    content: ApiContent::Blocks(resp.content),
-                });
-            }
-
+            let stop_reason = resp.stop_reason.clone();
             if matches!(stop_reason.as_deref(), Some("end_turn" | "stop_sequence")) || tool_uses.is_empty() {
+                // No tool work to do — end the borrow into resp.content and
+                // move it straight into history. Inner scope keeps the
+                // write-lock guard tight (clippy::significant_drop_tightening).
+                let _ = tool_uses;
+                {
+                    let mut active = self.active.write().await;
+                    active.history.push(ApiMessage {
+                        role: "assistant".into(),
+                        content: ApiContent::Blocks(resp.content),
+                    });
+                }
                 return Ok(final_text);
             }
 
@@ -253,24 +258,33 @@ impl Agent {
             // blocks).
             let plan = self.plan_mode.load(std::sync::atomic::Ordering::Relaxed);
             let mut results: Vec<Block> = Vec::with_capacity(tool_uses.len());
-            for (id, name, input) in tool_uses {
+            for (id, name, input) in &tool_uses {
                 if cancel.is_cancelled() {
                     return Err(AgentError::Cancelled);
                 }
                 // Show the tool name (and a short input summary for Bash)
                 // in the status so the spinner reflects what's running.
-                let label = tool_status_label(&name, &input);
+                let label = tool_status_label(name, input);
                 *self.status.lock().expect("status mutex") = Some(label);
                 let (content, is_error) = tokio::select! {
-                    out = tools::dispatch(&name, &input, &session.cwd, plan) => {
+                    out = tools::dispatch(name, input, &session.cwd, plan) => {
                         out.map_or_else(|e| (format!("Error: {e}"), true), |out| (out, false))
                     }
                     () = cancel.cancelled() => return Err(AgentError::Cancelled),
                 };
                 results.push(Block::ToolResult {
-                    tool_use_id: id,
+                    tool_use_id: (*id).to_string(),
                     content,
                     is_error,
+                });
+            }
+            // Done with the borrows — move resp.content into history now.
+            let _ = tool_uses;
+            {
+                let mut active = self.active.write().await;
+                active.history.push(ApiMessage {
+                    role: "assistant".into(),
+                    content: ApiContent::Blocks(resp.content),
                 });
             }
             let entry = session::tool_results(&session, results.clone());
