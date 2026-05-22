@@ -218,7 +218,7 @@ async function renderDetail(id, refreshOnly = false) {
     const pre = $("#scrollback");
     if (pre) {
       const atBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 20;
-      pre.textContent = text;
+      pre.innerHTML = ansiToHtml(text);
       if (atBottom) pre.scrollTop = pre.scrollHeight;
     }
     const meta = $("#detail-meta");
@@ -228,7 +228,7 @@ async function renderDetail(id, refreshOnly = false) {
 
   root.innerHTML = `
     <h1>${escapeHtml(name)} <button id="back" style="float:right">← back</button></h1>
-    <pre id="scrollback">${escapeHtml(text)}</pre>
+    <pre id="scrollback">${ansiToHtml(text)}</pre>
     <form id="tab-input">
       <input id="bytes" autocomplete="off" placeholder="type and press enter" />
       <button type="submit">send</button>
@@ -293,6 +293,143 @@ function formatBytes(n) {
 }
 function escapeAttr(s) { return escapeHtml(s).replace(/"/g, "&quot;"); }
 
+// --- ANSI → HTML --------------------------------------------------------
+
+// Minimal SGR parser. Handles:
+//   * standard + bright fg (30-37, 90-97) / bg (40-47, 100-107)
+//   * 8-bit indexed colours (38;5;N / 48;5;N)
+//   * 24-bit truecolour (38;2;R;G;B / 48;2;R;G;B)
+//   * bold / dim / italic / underline / inverse / strikethrough
+//   * reset codes (0, 22..29, 39, 49)
+// Anything we don't recognise is silently dropped — better than a
+// broken-looking page when the shell emits an exotic OSC.
+const ANSI_NAMED = [
+  "#000000", "#cc0000", "#4e9a06", "#c4a000",
+  "#3465a4", "#75507b", "#06989a", "#d3d7cf",
+];
+const ANSI_BRIGHT = [
+  "#555753", "#ef2929", "#8ae234", "#fce94f",
+  "#729fcf", "#ad7fa8", "#34e2e2", "#eeeeec",
+];
+
+function expandIndexed(idx) {
+  if (idx < 8) return ANSI_NAMED[idx];
+  if (idx < 16) return ANSI_BRIGHT[idx - 8];
+  if (idx < 232) {
+    // 6×6×6 colour cube.
+    const n = idx - 16;
+    const r = Math.floor(n / 36);
+    const g = Math.floor((n / 6) % 6);
+    const b = n % 6;
+    const step = (c) => (c === 0 ? 0 : 55 + c * 40);
+    return `rgb(${step(r)},${step(g)},${step(b)})`;
+  }
+  // 232..255: greyscale ramp.
+  const v = 8 + (idx - 232) * 10;
+  return `rgb(${v},${v},${v})`;
+}
+
+function ansiToHtml(text) {
+  let out = "";
+  let i = 0;
+  let style = { fg: null, bg: null, bold: false, dim: false, italic: false, underline: false, inverse: false, strike: false };
+  let pendingText = "";
+
+  function flushSpan() {
+    if (!pendingText) return;
+    let css = [];
+    if (style.fg) css.push(`color:${style.fg}`);
+    if (style.bg) css.push(`background:${style.bg}`);
+    if (style.bold) css.push("font-weight:bold");
+    if (style.dim) css.push("opacity:0.65");
+    if (style.italic) css.push("font-style:italic");
+    if (style.underline) css.push("text-decoration:underline");
+    if (style.strike) css.push("text-decoration:line-through");
+    if (style.inverse) {
+      const fg = style.fg ?? "var(--bg)";
+      const bg = style.bg ?? "var(--fg)";
+      css = css.filter((c) => !c.startsWith("color:") && !c.startsWith("background:"));
+      css.push(`color:${bg}`);
+      css.push(`background:${fg}`);
+    }
+    const escaped = escapeHtml(pendingText);
+    if (css.length === 0) out += escaped;
+    else out += `<span style="${css.join(";")}">${escaped}</span>`;
+    pendingText = "";
+  }
+
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === "\x1b" && text[i + 1] === "[") {
+      // CSI: ESC [ params final
+      let j = i + 2;
+      let params = "";
+      while (j < text.length && (text.charCodeAt(j) < 0x40 || text.charCodeAt(j) > 0x7e)) {
+        params += text[j];
+        j++;
+      }
+      const final = text[j];
+      i = j + 1;
+      if (final === "m") {
+        flushSpan();
+        applyParams(style, params);
+      }
+      // Other CSI verbs (cursor movement, clear) get swallowed — the
+      // body is a flat scrollback dump where motion has already been
+      // resolved into character positions by the desktop.
+      continue;
+    }
+    pendingText += ch;
+    i++;
+  }
+  flushSpan();
+  return out;
+}
+
+function applyParams(style, raw) {
+  const nums = raw.split(";").map((s) => (s === "" ? 0 : parseInt(s, 10)));
+  let k = 0;
+  while (k < nums.length) {
+    const n = nums[k];
+    if (n === 0) {
+      style.fg = null; style.bg = null;
+      style.bold = false; style.dim = false; style.italic = false;
+      style.underline = false; style.inverse = false; style.strike = false;
+    } else if (n === 1) style.bold = true;
+    else if (n === 2) style.dim = true;
+    else if (n === 3) style.italic = true;
+    else if (n === 4) style.underline = true;
+    else if (n === 7) style.inverse = true;
+    else if (n === 9) style.strike = true;
+    else if (n === 22) { style.bold = false; style.dim = false; }
+    else if (n === 23) style.italic = false;
+    else if (n === 24) style.underline = false;
+    else if (n === 27) style.inverse = false;
+    else if (n === 29) style.strike = false;
+    else if (n >= 30 && n <= 37) style.fg = ANSI_NAMED[n - 30];
+    else if (n === 38 && nums[k + 1] === 5) { style.fg = expandIndexed(nums[k + 2] ?? 0); k += 2; }
+    else if (n === 38 && nums[k + 1] === 2) { style.fg = `rgb(${nums[k + 2] ?? 0},${nums[k + 3] ?? 0},${nums[k + 4] ?? 0})`; k += 4; }
+    else if (n === 39) style.fg = null;
+    else if (n >= 40 && n <= 47) style.bg = ANSI_NAMED[n - 40];
+    else if (n === 48 && nums[k + 1] === 5) { style.bg = expandIndexed(nums[k + 2] ?? 0); k += 2; }
+    else if (n === 48 && nums[k + 1] === 2) { style.bg = `rgb(${nums[k + 2] ?? 0},${nums[k + 3] ?? 0},${nums[k + 4] ?? 0})`; k += 4; }
+    else if (n === 49) style.bg = null;
+    else if (n >= 90 && n <= 97) style.fg = ANSI_BRIGHT[n - 90];
+    else if (n >= 100 && n <= 107) style.bg = ANSI_BRIGHT[n - 100];
+    k++;
+  }
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  }[c]));
+}
+
 // --- entrypoint ----------------------------------------------------------
 
 (async function main() {
@@ -310,13 +447,3 @@ function escapeAttr(s) { return escapeHtml(s).replace(/"/g, "&quot;"); }
     `;
   }
 })();
-
-function escapeHtml(s) {
-  return s.replace(/[&<>"']/g, (c) => ({
-    "&": "&amp;",
-    "<": "&lt;",
-    ">": "&gt;",
-    '"': "&quot;",
-    "'": "&#39;",
-  }[c]));
-}
