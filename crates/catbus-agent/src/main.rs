@@ -257,10 +257,14 @@ async fn run_repl(agent: Arc<agent::Agent>, cwd: &std::path::Path) -> std::io::R
                       /rename <name>     rename the current session\n  \
                       /resume            list previous sessions in this cwd\n  \
                       /resume <id>       switch to a previous session in-place\n  \
-                      /deb               build the .deb and print its path\n\n",
+                      /deb               build the .deb and print its path\n  \
+                      /exit              quit (same as Ctrl-D)\n\n",
                 )
                 .await?;
             continue;
+        }
+        if prompt == "/exit" || prompt == "/quit" {
+            break;
         }
         if prompt == "/plan" {
             agent.set_plan_mode(true);
@@ -377,6 +381,7 @@ async fn run_repl(agent: Arc<agent::Agent>, cwd: &std::path::Path) -> std::io::R
                 .write_all(format!("{} session(s) for {}:\n", sessions.len(), cwd.display()).as_bytes())
                 .await?;
             let now = std::time::SystemTime::now();
+            let project_dir = session::project_dir_for(cwd);
             for (id, name, ts) in &sessions {
                 let age = now
                     .duration_since(*ts)
@@ -386,10 +391,23 @@ async fn run_repl(agent: Arc<agent::Agent>, cwd: &std::path::Path) -> std::io::R
                 } else {
                     ""
                 };
-                let label = if name.is_empty() {
-                    format!("\x1b[2m{id}\x1b[0m")
+                // Use the /rename'd name when set; otherwise fall back
+                // to the session's first user prompt (truncated) so
+                // every row carries something recognisable, not just a
+                // UUID. The id is always shown after the label.
+                let derived_label = if name.is_empty() {
+                    project_dir.as_ref().and_then(|d| {
+                        session::first_prompt(&d.join(format!("{id}.jsonl")), 60)
+                    })
                 } else {
-                    format!("\x1b[1m{name}\x1b[0m  \x1b[2m{id}\x1b[0m")
+                    None
+                };
+                let label = match (name.is_empty(), derived_label) {
+                    (false, _) => format!("\x1b[1m{name}\x1b[0m  \x1b[2m{id}\x1b[0m"),
+                    (true, Some(prompt_label)) => {
+                        format!("\x1b[1m{prompt_label}\x1b[0m  \x1b[2m{id}\x1b[0m")
+                    }
+                    (true, None) => format!("\x1b[2m{id}\x1b[0m"),
                 };
                 stdout
                     .write_all(format!("  {label}  {age}{marker}\n").as_bytes())
@@ -438,8 +456,12 @@ async fn run_repl(agent: Arc<agent::Agent>, cwd: &std::path::Path) -> std::io::R
                 break;
             };
             let spinner_char = SPINNER[frame % SPINNER.len()];
+            // `\r` parks the cursor; `\x1b[K` erases from the cursor
+            // to end-of-line so a shorter label never leaves the tail
+            // of a previous longer one behind (e.g. "thinking" written
+            // over "Bash: grep -ri ..." used to show "thinking ri ...").
             stdout
-                .write_all(format!("\r\x1b[36m{spinner_char}\x1b[0m {label}").as_bytes())
+                .write_all(format!("\r\x1b[K\x1b[36m{spinner_char}\x1b[0m {label}").as_bytes())
                 .await?;
             stdout.flush().await?;
             frame += 1;
