@@ -392,15 +392,28 @@ pub struct Preferences {
     pub browser: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_editor: Option<String>,
-    /// HTTP API listener port. Defaults to 7890 when absent; exposed as
-    /// a preference so users who already have something on that port,
-    /// or who want a different one across machines, can change it
-    /// without recompiling. TLS listener uses `api_port + 1`.
+    /// `addr:port` of the plain-HTTP API listener. Defaults to
+    /// `0.0.0.0:7890`. Set to `127.0.0.1:N` to restrict to loopback.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_port: Option<u16>,
+    pub api_addr: Option<String>,
+
+    /// `addr:port` of the TLS API listener (self-signed cert).
+    /// Defaults to `0.0.0.0:7891`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_tls_addr: Option<String>,
+
+    /// `addr:port` of the embedded happier-relay (when enabled).
+    /// Defaults to `127.0.0.1:7892` — kept adjacent to the HTTP /
+    /// TLS API ports (7890 / 7891). Loopback by default because the
+    /// relay isn't hardened against LAN attackers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub happier_relay_addr: Option<String>,
 }
 
 pub const DEFAULT_API_PORT: u16 = 7890;
+pub const DEFAULT_API_ADDR: &str = "0.0.0.0:7890";
+pub const DEFAULT_API_TLS_ADDR: &str = "0.0.0.0:7891";
+pub const DEFAULT_HAPPIER_RELAY_ADDR: &str = "127.0.0.1:7892";
 
 fn deserialize_hotkeys<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
     let raw: Vec<serde_json::Value> = serde::Deserialize::deserialize(deserializer)?;

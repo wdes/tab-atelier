@@ -768,16 +768,15 @@ pub fn serve(listener: &TcpListener, state: &Arc<Mutex<TabSnapshot>>, token: &st
     }
 }
 
-pub fn start_api_server(state: Arc<Mutex<TabSnapshot>>, token: String, read_only: bool, port: u16) {
+pub fn start_api_server(state: Arc<Mutex<TabSnapshot>>, token: String, read_only: bool, bind: String) {
     std::thread::spawn(move || {
-        let addr = format!("0.0.0.0:{port}");
-        let listener = match TcpListener::bind(&addr) {
+        let listener = match TcpListener::bind(&bind) {
             Ok(l) => {
-                info!("API: listening on {addr}");
+                info!("API: listening on {bind}");
                 l
             }
             Err(e) => {
-                error!("API: failed to bind {addr}: {e}");
+                error!("API: failed to bind {bind}: {e}");
                 return;
             }
         };
@@ -793,7 +792,7 @@ pub fn start_api_server(state: Arc<Mutex<TabSnapshot>>, token: String, read_only
 /// validate via either. Pin-on-first-use clients (the Android remote) can
 /// trust the cert directly; browsers will warn until added to their
 /// trust store — fine for personal use.
-pub fn start_api_server_tls(state: Arc<Mutex<TabSnapshot>>, token: String, read_only: bool, port: u16) {
+pub fn start_api_server_tls(state: Arc<Mutex<TabSnapshot>>, token: String, read_only: bool, bind: String) {
     use rustls::ServerConfig;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
@@ -819,14 +818,13 @@ pub fn start_api_server_tls(state: Arc<Mutex<TabSnapshot>>, token: String, read_
     };
 
     std::thread::spawn(move || {
-        let addr = format!("0.0.0.0:{port}");
-        let listener = match TcpListener::bind(&addr) {
+        let listener = match TcpListener::bind(&bind) {
             Ok(l) => {
-                info!("API: TLS listening on {addr}");
+                info!("API: TLS listening on {bind}");
                 l
             }
             Err(e) => {
-                error!("API: failed to bind {addr}: {e}");
+                error!("API: failed to bind {bind}: {e}");
                 return;
             }
         };
@@ -845,13 +843,68 @@ pub fn start_api_server_tls(state: Arc<Mutex<TabSnapshot>>, token: String, read_
     });
 }
 
+/// Self-signed cert validity, kept under Chrome's 398-day cap for
+/// publicly-trusted certs so cert hygiene matches current browser
+/// expectations even though we're not a public CA.
+const CERT_VALIDITY_DAYS: i64 = 365;
+/// Regenerate when the cert's `not_after` is closer than this many
+/// days from now. Gives any device that pinned the previous cert
+/// (mobile, browser trust store) a 30-day window to re-pin before
+/// the relay starts serving a different cert.
+const CERT_RENEW_BEFORE_EXPIRY_DAYS: i64 = 30;
+
+/// Check that we can write `path`. If the file exists, opens it
+/// for writing without truncating (so a successful check leaves
+/// the file alone). If the file doesn't exist, attempts to create
+/// and immediately remove a sibling temp file to probe the parent
+/// directory's write permission. Any failure bubbles up so we
+/// surface "the cert is on a read-only mount" instead of letting
+/// the relay run on a stale cert.
+fn ensure_writable(path: &std::path::Path) -> std::io::Result<()> {
+    if path.exists() {
+        std::fs::OpenOptions::new().write(true).open(path)?;
+        return Ok(());
+    }
+    let Some(parent) = path.parent() else {
+        return Err(std::io::Error::other(format!(
+            "no parent directory for {}",
+            path.display()
+        )));
+    };
+    let probe = parent.join(".write-probe");
+    std::fs::write(&probe, b"")?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
+}
+
+/// Parse the cert's actual `not_after` and decide whether we're
+/// within the renewal window. Source of truth is what the cert
+/// itself says — not the file's mtime — so importing a cert from
+/// another host works correctly. Returns true on any parse error
+/// so a malformed cert gets replaced rather than silently kept.
+fn cert_needs_renewal(crt_path: &std::path::Path) -> bool {
+    let renewal_window = time::Duration::days(CERT_RENEW_BEFORE_EXPIRY_DAYS);
+    let Ok(pem) = std::fs::read_to_string(crt_path) else {
+        return true;
+    };
+    let Ok(parsed) = rcgen::CertificateParams::from_ca_cert_pem(&pem) else {
+        // `from_ca_cert_pem` parses any X.509 cert (despite the
+        // name — the `is_ca` flag is read back from the cert's
+        // BasicConstraints, not enforced as an input). Any failure
+        // here means the file isn't a valid cert we can use.
+        return true;
+    };
+    let now = time::OffsetDateTime::now_utc();
+    parsed.not_after - now < renewal_window
+}
+
 fn load_or_generate_cert() -> std::io::Result<(Vec<u8>, Vec<u8>)> {
     let dir = crate::platform::state_base_dir().join(tab_atelier::APP_DIR);
     std::fs::create_dir_all(&dir)?;
     let crt_path = dir.join("tls.crt");
     let key_path = dir.join("tls.key");
 
-    if crt_path.exists() && key_path.exists() {
+    if crt_path.exists() && key_path.exists() && !cert_needs_renewal(&crt_path) {
         let crt_pem = std::fs::read(&crt_path)?;
         let key_pem = std::fs::read(&key_path)?;
         let cert_der = rustls_pemfile::certs(&mut crt_pem.as_slice())
@@ -865,12 +918,35 @@ fn load_or_generate_cert() -> std::io::Result<(Vec<u8>, Vec<u8>)> {
             .to_vec();
         return Ok((cert_der, key_der));
     }
+    if crt_path.exists() {
+        info!(
+            "API/TLS: cert within {CERT_RENEW_BEFORE_EXPIRY_DAYS} days of expiry (or unparseable), regenerating at {}",
+            dir.display()
+        );
+    } else {
+        info!("API/TLS: generating self-signed certificate at {}", dir.display());
+    }
 
-    info!("API/TLS: generating self-signed certificate at {}", dir.display());
+    // Bail loudly if we can't actually write the target files. A
+    // half-finished regeneration would leave the relay either using
+    // a stale cert (silently) or no cert at all (silently). Better
+    // to fail fast so the user sees the permission problem and
+    // decides what to do with the existing files.
+    ensure_writable(&crt_path)?;
+    ensure_writable(&key_path)?;
+
     let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string(), local_ip()])
         .map_err(|e| std::io::Error::other(e.to_string()))?;
     params.distinguished_name = rcgen::DistinguishedName::new();
     params.distinguished_name.push(rcgen::DnType::CommonName, "tab-atelier");
+    // rcgen's defaults are `not_before = 1975-01-01` and
+    // `not_after = 4096-01-01`. That's syntactically valid but
+    // unusual — pin the window to (now, now + 365d), under Chrome's
+    // 398-day cap. Renewal is handled at the call site above by
+    // checking file mtime on each startup.
+    let now = time::OffsetDateTime::now_utc();
+    params.not_before = now;
+    params.not_after = now + time::Duration::days(CERT_VALIDITY_DAYS);
     let key_pair = rcgen::KeyPair::generate().map_err(|e| std::io::Error::other(e.to_string()))?;
     let cert = params
         .self_signed(&key_pair)

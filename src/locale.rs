@@ -35,6 +35,7 @@ pub struct Strings {
     pub copy: &'static str,
     pub copy_all: &'static str,
     pub paste: &'static str,
+    pub paste_selection: &'static str,
     pub reset_input_color: &'static str,
     pub disable_colors: &'static str,
     pub enable_colors: &'static str,
@@ -87,7 +88,9 @@ pub struct Strings {
     pub browser_placeholder: &'static str,
     pub code_editor: &'static str,
     pub code_editor_placeholder: &'static str,
-    pub api_port: &'static str,
+    pub api_addr: &'static str,
+    pub api_tls_addr: &'static str,
+    pub happier_relay_addr: &'static str,
     pub save: &'static str,
 }
 
@@ -104,6 +107,7 @@ pub static EN: Strings = Strings {
     copy: "Copy",
     copy_all: "Copy All",
     paste: "Paste",
+    paste_selection: "Paste selection",
     reset_input_color: "Reset input & color",
     disable_colors: "Disable colors",
     enable_colors: "Enable colors",
@@ -149,7 +153,9 @@ pub static EN: Strings = Strings {
     browser_placeholder: "xdg-open (system default)",
     code_editor: "Code editor",
     code_editor_placeholder: "xdg-open (system default)",
-    api_port: "Remote API port (restart required)",
+    api_addr: "Remote API bind (addr:port, restart required)",
+    api_tls_addr: "Remote API TLS bind (addr:port, restart required)",
+    happier_relay_addr: "Happier relay bind (addr:port, restart required)",
     save: "Save",
 };
 
@@ -166,6 +172,7 @@ pub static FR: Strings = Strings {
     copy: "Copier",
     copy_all: "Tout copier",
     paste: "Coller",
+    paste_selection: "Coller la sélection",
     reset_input_color: "Réinitialiser saisie et couleur",
     disable_colors: "Désactiver les couleurs",
     enable_colors: "Activer les couleurs",
@@ -211,7 +218,9 @@ pub static FR: Strings = Strings {
     browser_placeholder: "xdg-open (par défaut)",
     code_editor: "Éditeur de code",
     code_editor_placeholder: "xdg-open (par défaut)",
-    api_port: "Port de l'API distante (redémarrage requis)",
+    api_addr: "API distante (adresse:port, redémarrage requis)",
+    api_tls_addr: "API distante TLS (adresse:port, redémarrage requis)",
+    happier_relay_addr: "Relais happier (adresse:port, redémarrage requis)",
     save: "Enregistrer",
 };
 

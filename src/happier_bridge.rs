@@ -33,7 +33,12 @@ use crate::api::TabSnapshot;
 
 /// Poll interval in seconds. Matches the persist tick so we never lag
 /// the on-disk state by more than ~one cycle.
-const PUBLISH_INTERVAL: Duration = Duration::from_secs(5);
+/// Publisher tick rate. At 200 ms a key typed on the mobile side
+/// appears in the web UI ~200 ms after tab-atelier renders it locally,
+/// which feels instantaneous. The per-tick work is cheap when nothing
+/// changed (CRC compare, no network), and append-only deltas keep
+/// the bytes per tick tiny when typing.
+const PUBLISH_INTERVAL: Duration = Duration::from_millis(200);
 
 /// `data_encryption_key` sentinel used in plain mode. Real happier
 /// clients send a `NaCl` box public key here; until R2.5 ships the
@@ -123,7 +128,33 @@ struct InputPoller {
     signing_key: SigningKey,
     token: Option<String>,
     since: i64,
+    /// `false` until the first tick advances `since` to the relay's
+    /// current `highestSeq`. Drives the "drop any pending input on
+    /// boot" behaviour so a tab-atelier restart never replays
+    /// keystrokes typed before the process started.
+    booted: bool,
     http: ureq::Agent,
+}
+
+/// On-disk cursor for `InputPoller.since`. Written after every
+/// advance so an external observer (or a debug aid) can read where
+/// we are. Not read at startup any more — the boot-drain in `tick`
+/// makes the persisted value irrelevant for behaviour; we only keep
+/// the file for diagnostics.
+fn tab_input_cursor_path() -> PathBuf {
+    crate::platform::state_base_dir()
+        .join(tab_atelier::APP_DIR)
+        .join("tab-input.cursor")
+}
+
+fn save_tab_input_cursor(since: i64) {
+    let path = tab_input_cursor_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::write(&path, since.to_string()) {
+        warn!("happier-bridge: persist tab-input cursor: {e}");
+    }
 }
 
 impl InputPoller {
@@ -133,13 +164,34 @@ impl InputPoller {
             // Slightly larger than the relay's MAX_WAIT (30 s) so a
             // wedged server can't make us spuriously time out below it.
             .timeout_global(Some(Duration::from_secs(45)))
+            // Same reason as the publisher agent: branch on `.status()`
+            // rather than catching every 4xx as a transport error.
+            .http_status_as_error(false)
+            // The relay serves TLS with a self-signed cert that none
+            // of the system roots trust. We connect over loopback to
+            // a process we just spawned ourselves, so the entire TLS
+            // verification step exists only to satisfy the protocol.
+            // Skip it.
+            .tls_config(
+                ureq::tls::TlsConfig::builder()
+                    .disable_verification(true)
+                    .build(),
+            )
             .build()
             .into();
+        // Deliberately start with since=0 instead of loading the
+        // persisted cursor. The first tick will advance us to the
+        // relay's current `highestSeq` (see `tick`'s drain-on-boot
+        // path) — anything typed on the web UI / phone before this
+        // process started is treated as stale and dropped. Without
+        // this, a tab-atelier restart re-injects whatever the user
+        // had typed earlier (the "zzzz" replay bug).
         Ok(Self {
             relay_url,
             signing_key,
             token: None,
             since: 0,
+            booted: false,
             http,
         })
     }
@@ -149,10 +201,14 @@ impl InputPoller {
             self.authenticate()?;
         }
         let token = self.token.clone().ok_or("no token")?;
-        // Long-poll the relay; it'll return early when a POST lands,
-        // or after ~25 s of nothing happening. Either way we re-loop.
+        // First tick after boot: fast-poll with `waitMs=0` to learn
+        // the relay's current `highestSeq`, then advance `since` to
+        // that and persist. Anything that was queued before we
+        // started is treated as stale — no replay. Subsequent ticks
+        // long-poll normally.
+        let wait_ms = if self.booted { 25_000 } else { 0 };
         let url = format!(
-            "{}/v1/tab-input/pending?since={}&waitMs=25000",
+            "{}/v1/tab-input/pending?since={}&waitMs={wait_ms}",
             self.relay_url, self.since
         );
         let resp = self
@@ -172,6 +228,19 @@ impl InputPoller {
             .into_body()
             .read_json()
             .map_err(|e| format!("pending parse: {e}"))?;
+        // Boot drain: regardless of whether the relay returned events
+        // or not, jump `since` to the current `highestSeq` and mark
+        // ourselves booted. Anything queued before this process
+        // started is intentionally dropped on the floor.
+        if !self.booted {
+            if let Some(h) = body["highestSeq"].as_i64() {
+                self.since = h;
+                save_tab_input_cursor(self.since);
+                debug!("happier-bridge: boot drain — advancing tab-input cursor to seq {}", self.since);
+            }
+            self.booted = true;
+            return Ok(());
+        }
         let Some(events) = body["events"].as_array() else {
             return Ok(());
         };
@@ -179,7 +248,11 @@ impl InputPoller {
             // Refresh the highestSeq cursor even on a no-event reply so
             // we don't keep replaying older rows that already drained.
             if let Some(h) = body["highestSeq"].as_i64() {
-                self.since = h.max(self.since);
+                let new_since = h.max(self.since);
+                if new_since != self.since {
+                    self.since = new_since;
+                    save_tab_input_cursor(self.since);
+                }
             }
             return Ok(());
         }
@@ -214,7 +287,10 @@ impl InputPoller {
             snap.pending_input.extend(to_deliver);
             drop(snap);
         }
-        self.since = highest;
+        if highest != self.since {
+            self.since = highest;
+            save_tab_input_cursor(self.since);
+        }
         if delivered > 0 {
             debug!("happier-bridge: delivered {delivered} tab-input event(s) up to seq {highest}");
         }
@@ -251,8 +327,24 @@ impl InputPoller {
 impl Bridge {
     fn new(relay_url: String) -> Result<Self, String> {
         let signing_key = load_or_create_signing_key()?;
+        // ureq 3.x defaults `http_status_as_error = true`, which turns
+        // every 4xx into an `Err` before our code can read `.status()`.
+        // That breaks our 409-→-update_existing recovery in publish_tab.
+        // Flip it off so HTTP status codes flow back through `Ok(resp)`
+        // and the branch-on-status logic actually runs.
         let http = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(10)))
+            .http_status_as_error(false)
+            // The relay serves TLS with a self-signed cert that none
+            // of the system roots trust. We connect over loopback to
+            // a process we just spawned ourselves, so the entire TLS
+            // verification step exists only to satisfy the protocol.
+            // Skip it.
+            .tls_config(
+                ureq::tls::TlsConfig::builder()
+                    .disable_verification(true)
+                    .build(),
+            )
             .build()
             .into();
         Ok(Self {
@@ -365,9 +457,24 @@ impl Bridge {
                     return Err("create: 401, re-authenticating next tick".into());
                 }
                 if status.as_u16() == 409 {
-                    // Artifact already exists (we restarted with a new
-                    // local CRC). Resync by fetching the current versions.
-                    return self.resync_then_update(name, output, crc);
+                    // Artifact already exists on the relay (we restarted,
+                    // or another publisher seeded it). Seed our table
+                    // optimistically with version=1; if those are wrong
+                    // `update_existing`'s CAS-mismatch path corrects
+                    // `self.seen` from the relay's response, and the
+                    // next tick succeeds. Avoids a separate GET that
+                    // can itself fail and loop forever.
+                    self.seen.insert(
+                        name.to_string(),
+                        TabState {
+                            artifact_id: id,
+                            last_crc: 0,
+                            header_version: 1,
+                            body_version: 1,
+                            last_text: String::new(),
+                        },
+                    );
+                    return self.update_existing(name, &header_b64, &body_b64, output, crc);
                 }
                 if !status.is_success() {
                     return Err(format!("create status: {status}"));
@@ -515,6 +622,12 @@ impl Bridge {
     /// Fetch the relay's current versions for an artifact id we don't
     /// know about (e.g. after a process restart where we lost in-memory
     /// state but the artifact persists on the relay) and seed our table.
+    ///
+    /// Kept for now as a fallback; the 409-on-CREATE path now seeds
+    /// `self.seen` optimistically and relies on `update_existing`'s
+    /// CAS-correction instead, which is more robust when GET would
+    /// itself fail (404 on stale-id mismatch, etc).
+    #[allow(dead_code)]
     fn resync_then_update(&mut self, name: &str, output: &str, crc: u32) -> Result<(), String> {
         let token = self.token.clone().ok_or("no token")?;
         let id = artifact_id_for(name);
@@ -555,9 +668,146 @@ impl Bridge {
 }
 
 fn key_path() -> PathBuf {
+    crate::platform::config_dir()
+        .join("happier-bridge.key")
+}
+
+/// Path of the master secret used to sign JWTs inside the embedded
+/// happier-relay. Persisted so all tab-atelier launches issue tokens
+/// the same relay binary can verify — restarting the daemon mustn't
+/// log every device out.
+fn relay_secret_path() -> PathBuf {
+    crate::platform::config_dir()
+        .join("happier-relay.secret")
+}
+
+/// Read or freshly generate the relay's master secret. 64 hex chars
+/// (= 32 random bytes) — enough entropy for HS256 and small enough
+/// to pass on the command line without surprising shells.
+fn ensure_relay_secret() -> Result<String, String> {
+    let path = relay_secret_path();
+    if let Ok(s) = std::fs::read_to_string(&path) {
+        let trimmed = s.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    }
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let mut hex = String::with_capacity(64);
+    for b in bytes {
+        use std::fmt::Write;
+        let _ = write!(hex, "{b:02x}");
+    }
+    persist_bytes_atomic(&path, hex.as_bytes())?;
+    Ok(hex)
+}
+
+/// Owning handle for the spawned `happier-relay` child. Dropping
+/// the handle SIGTERMs the relay and reaps it — so storing this on
+/// `AppState` ties the relay's lifetime to tab-atelier's. If
+/// tab-atelier dies via `SIGKILL` or a panic that skips destructors,
+/// `Drop` won't run and the relay will outlive it; recover with
+/// `pkill happier-relay`.
+pub struct RelayHandle {
+    child: std::process::Child,
+}
+
+impl RelayHandle {
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+}
+
+impl Drop for RelayHandle {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Launch the bundled `happier-relay` binary as a child process so
+/// the mobile + web clients always have a relay to talk to. The
+/// HS256 master secret is passed via the `HAPPIER_MASTER_SECRET`
+/// environment variable rather than a CLI argument — `/proc/<pid>/
+/// cmdline` is world-readable on Linux while `environ` is owner-
+/// only, so this keeps the secret off `ps` for other users.
+///
+/// stderr is captured to `$XDG_STATE_HOME/tab-atelier/happier-relay.log`
+/// (truncated each launch) so the request-trace and any panic
+/// messages are inspectable after the fact. The relay defaults to
+/// `tracing::info` for its `happier_relay::http` target, so every
+/// HTTP request lands in that file.
+pub fn spawn_relay(bind_addr: &str) -> Result<RelayHandle, String> {
+    let secret = ensure_relay_secret()?;
+    let log_path = relay_log_path();
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&log_path)
+        .map_err(|e| format!("open {}: {e}", log_path.display()))?;
+    let mut cmd = std::process::Command::new("happier-relay");
+    cmd.arg("--bind").arg(bind_host(bind_addr))
+        .arg("--port").arg(bind_port(bind_addr).to_string())
+        // `resolve_secret(&str)` in the relay's main.rs strips the
+        // `env:` prefix and reads from std::env::var.
+        .arg("--master-secret").arg("env:HAPPIER_MASTER_SECRET")
+        .arg("--shared-account")
+        .env("HAPPIER_MASTER_SECRET", &secret)
+        // Force colored output off and use a stable filter — the
+        // user (and us via `tail -f`) reads this raw.
+        .env("RUST_LOG", "info,happier_relay=debug")
+        .env("NO_COLOR", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(log_file.try_clone().map_err(|e| format!("dup log fd: {e}"))?))
+        .stderr(std::process::Stdio::from(log_file));
+
+    // Reuse tab-atelier's existing self-signed cert if it's there.
+    // Without TLS the happier mobile app (cleartext-blocked on modern
+    // Android / iOS) refuses to even open a TCP connection. Cert is
+    // generated/used by `src/api.rs::start_api_server_tls` at startup,
+    // so by the time the bridge spawns, both files exist.
+    let cert_path = tls_cert_path();
+    let key_path = tls_key_path();
+    if cert_path.exists() && key_path.exists() {
+        cmd.arg("--tls-cert").arg(&cert_path).arg("--tls-key").arg(&key_path);
+    }
+
+    let child = cmd.spawn().map_err(|e| format!("spawn happier-relay: {e}"))?;
+    Ok(RelayHandle { child })
+}
+
+fn tls_cert_path() -> PathBuf {
     crate::platform::state_base_dir()
         .join(tab_atelier::APP_DIR)
-        .join("happier-bridge.key")
+        .join("tls.crt")
+}
+
+fn tls_key_path() -> PathBuf {
+    crate::platform::state_base_dir()
+        .join(tab_atelier::APP_DIR)
+        .join("tls.key")
+}
+
+fn relay_log_path() -> PathBuf {
+    crate::platform::state_base_dir()
+        .join(tab_atelier::APP_DIR)
+        .join("happier-relay.log")
+}
+
+fn bind_host(addr: &str) -> String {
+    addr.rsplit_once(':').map_or_else(|| "127.0.0.1".into(), |(h, _)| h.to_string())
+}
+
+fn bind_port(addr: &str) -> u16 {
+    addr.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()).unwrap_or(7892)
 }
 
 fn load_or_create_signing_key() -> Result<SigningKey, String> {
@@ -581,6 +831,12 @@ fn load_or_create_signing_key() -> Result<SigningKey, String> {
 }
 
 fn persist_key_atomic(path: &Path, bytes: &[u8; 32]) -> Result<(), String> {
+    persist_bytes_atomic(path, bytes)
+}
+
+/// Same atomic write but accepts any byte slice. Used by both the
+/// 32-byte signing key and the 64-hex-char relay master secret.
+fn persist_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let tmp = path.with_extension("key.tmp");
     let mut f = std::fs::OpenOptions::new()
         .write(true)
@@ -591,7 +847,6 @@ fn persist_key_atomic(path: &Path, bytes: &[u8; 32]) -> Result<(), String> {
     f.write_all(bytes).map_err(|e| format!("write {}: {e}", tmp.display()))?;
     f.sync_all().ok();
     drop(f);
-    // Best-effort 0600 perms on unix.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
