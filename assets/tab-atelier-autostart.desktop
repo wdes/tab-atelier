@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Tab Atelier
+GenericName=Terminal
+Comment=Guake-style drop-down terminal emulator
+Exec=/usr/bin/tab-atelier
+Icon=tab-atelier
+Terminal=false
+Categories=System;TerminalEmulator;Utility;
+StartupNotify=true
+StartupWMClass=tab-atelier
+# Enabled by default. Users can untick it via:
+# Settings → Session and Startup → Application Autostart.
+X-GNOME-Autostart-enabled=true
