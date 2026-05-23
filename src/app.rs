@@ -18,7 +18,7 @@ use gpui::{
     Point, Render, Rgba, SharedString, Stateful, StatefulInteractiveElement, Styled, WeakEntity, Window,
     WindowBackgroundAppearance, WindowHandle, WindowOptions, div, px, rgba,
 };
-use log::{debug, info};
+use log::{debug, info, warn};
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -158,10 +158,12 @@ struct AppState {
     font_config: FontConfig,
     tracker: Option<WakatimeTracker>,
     api_token: String,
-    /// HTTP API port (TLS uses port + 1). Sourced from the saved
-    /// preference at startup; live changes require a restart since the
-    /// `TcpListener`s are bound in spawned threads.
-    api_port: u16,
+    /// `addr:port` bind strings for the three listeners. Sourced from
+    /// saved preferences at startup; live changes require a restart
+    /// since the `TcpListener`s are bound in spawned threads.
+    api_addr: String,
+    api_tls_addr: String,
+    happier_relay_addr: String,
     api_state: Arc<Mutex<api::TabSnapshot>>,
     #[cfg(feature = "energy")]
     power_pids: Arc<Mutex<Vec<u32>>>,
@@ -185,11 +187,21 @@ struct AppState {
     pref_browser_focus: FocusHandle,
     pref_editor_text: String,
     pref_editor_focus: FocusHandle,
-    /// Editable copy of `api_port` shown in the preferences dialog.
-    /// Persisted to `api_port` only on Save and applied on next launch
-    /// (the API listener threads bind once at startup).
-    pref_api_port_text: String,
-    pref_api_port_focus: FocusHandle,
+    /// Editable copies of the bind strings shown in the preferences
+    /// dialog. Persisted only on Save and applied on next launch (the
+    /// API listener threads bind once at startup).
+    pref_api_addr_text: String,
+    pref_api_addr_focus: FocusHandle,
+    pref_api_tls_addr_text: String,
+    pref_api_tls_addr_focus: FocusHandle,
+    pref_happier_relay_addr_text: String,
+    pref_happier_relay_addr_focus: FocusHandle,
+    /// Owns the spawned happier-relay child. Dropping this struct
+    /// SIGTERMs the relay; storing it here ties the relay's lifetime
+    /// to the running app.
+    #[cfg(feature = "happier-bridge")]
+    #[allow(dead_code)]
+    relay_handle: Option<crate::happier_bridge::RelayHandle>,
     hotkey_handle: Option<platform::HotkeyHandle>,
     /// When the per-tab uptime files were last written. Persisting uptime
     /// every 2s would burn through disk writes for a value that only
@@ -214,7 +226,9 @@ impl AppState {
         let hotkey_picker_focus = cx.focus_handle();
         let pref_browser_focus = cx.focus_handle();
         let pref_editor_focus = cx.focus_handle();
-        let pref_api_port_focus = cx.focus_handle();
+        let pref_api_addr_focus = cx.focus_handle();
+        let pref_api_tls_addr_focus = cx.focus_handle();
+        let pref_happier_relay_addr_focus = cx.focus_handle();
         let font_config = load_font_config(&platform::config_dir());
         let prefs = load_preferences(&platform::config_dir());
         let browser: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(prefs.browser.clone()));
@@ -415,8 +429,10 @@ impl AppState {
         }
 
         let api_token = api::load_or_generate_token();
-        let api_port = prefs.api_port.unwrap_or(tab_atelier::DEFAULT_API_PORT);
-        info!("API server starting on 0.0.0.0:{api_port}");
+        let api_addr = prefs.api_addr.unwrap_or_else(|| tab_atelier::DEFAULT_API_ADDR.into());
+        let api_tls_addr = prefs.api_tls_addr.unwrap_or_else(|| tab_atelier::DEFAULT_API_TLS_ADDR.into());
+        let happier_relay_addr = prefs.happier_relay_addr.unwrap_or_else(|| tab_atelier::DEFAULT_HAPPIER_RELAY_ADDR.into());
+        info!("API server starting on {api_addr} (TLS {api_tls_addr})");
         let api_state = Arc::new(Mutex::new(api::TabSnapshot {
             tabs: Vec::<api::SnapshotTab>::new(),
             active: 0,
@@ -432,8 +448,25 @@ impl AppState {
             cached_response: None,
         }));
         let api_read_only = crate::read_only();
-        api::start_api_server(api_state.clone(), api_token.clone(), api_read_only, api_port);
-        api::start_api_server_tls(api_state.clone(), api_token.clone(), api_read_only, api_port + 1);
+        api::start_api_server(api_state.clone(), api_token.clone(), api_read_only, api_addr.clone());
+        api::start_api_server_tls(api_state.clone(), api_token.clone(), api_read_only, api_tls_addr.clone());
+
+        // Auto-spawn the bundled happier-relay so mobile + web clients
+        // always have something to connect to. Best-effort: if the
+        // binary isn't on PATH (someone running a custom build) or it
+        // fails to bind, log and continue — the GUI still works.
+        #[cfg(feature = "happier-bridge")]
+        let relay_handle: Option<crate::happier_bridge::RelayHandle> =
+            match crate::happier_bridge::spawn_relay(&happier_relay_addr) {
+                Ok(handle) => {
+                    info!("happier-relay spawned at https://{happier_relay_addr} (pid {})", handle.pid());
+                    Some(handle)
+                }
+                Err(e) => {
+                    warn!("happier-relay not spawned: {e}");
+                    None
+                }
+            };
 
         // Opt-in publish bridge: when the user passes `--happier-relay-url <url>`,
         // spawn a background thread that publishes each tab as a happier
@@ -442,6 +475,12 @@ impl AppState {
         #[cfg(feature = "happier-bridge")]
         if let Some(url) = happier_relay_url_from_args() {
             crate::happier_bridge::spawn(url, api_state.clone());
+        } else {
+            // Default to the auto-spawned relay so the bridge has a
+            // place to publish to without the user needing the CLI
+            // flag. The relay serves TLS (cert reused from
+            // start_api_server_tls), so the bridge needs `https://`.
+            crate::happier_bridge::spawn(format!("https://{happier_relay_addr}"), api_state.clone());
         }
 
         #[cfg(feature = "energy")]
@@ -468,7 +507,9 @@ impl AppState {
             font_config,
             tracker,
             api_token,
-            api_port,
+            api_addr,
+            api_tls_addr,
+            happier_relay_addr,
             api_state,
             #[cfg(feature = "energy")]
             power_pids,
@@ -492,8 +533,14 @@ impl AppState {
             pref_browser_focus,
             pref_editor_text: String::new(),
             pref_editor_focus,
-            pref_api_port_text: String::new(),
-            pref_api_port_focus,
+            pref_api_addr_text: String::new(),
+            pref_api_addr_focus,
+            pref_api_tls_addr_text: String::new(),
+            pref_api_tls_addr_focus,
+            pref_happier_relay_addr_text: String::new(),
+            pref_happier_relay_addr_focus,
+            #[cfg(feature = "happier-bridge")]
+            relay_handle,
             hotkey_handle: None,
             last_uptime_save: std::cell::Cell::new(None),
             last_state_hash: std::cell::Cell::new(0),
@@ -1478,6 +1525,31 @@ impl AppState {
                     )
                     .child(self.t().paste),
             )
+            // "Paste selection" — send the current visual selection
+            // straight into the PTY without touching the system
+            // clipboard. Useful for one-off "select-then-paste"
+            // workflows that don't want to clobber whatever's in the
+            // clipboard.
+            .child(
+                div()
+                    .id("menu-paste-selection")
+                    .px(px(12.0))
+                    .py(px(4.0))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(menu_hover))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                            let view = &this.tabs[this.active].view;
+                            if let Some(text) = view.read(cx).copy_selection() {
+                                view.read(cx).send_clipboard(&text);
+                            }
+                            this.context_menu = None;
+                            cx.notify();
+                        }),
+                    )
+                    .child(self.t().paste_selection),
+            )
             // Terminal section
             .child(sep())
             .child(
@@ -1601,7 +1673,9 @@ impl AppState {
                         cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
                             this.pref_browser_text = this.browser.borrow().clone().unwrap_or_default();
                             this.pref_editor_text = this.code_editor.borrow().clone().unwrap_or_default();
-                            this.pref_api_port_text = this.api_port.to_string();
+                            this.pref_api_addr_text = this.api_addr.clone();
+                            this.pref_api_tls_addr_text = this.api_tls_addr.clone();
+                            this.pref_happier_relay_addr_text = this.happier_relay_addr.clone();
                             this.show_preferences = true;
                             this.context_menu = None;
                             cx.notify();
@@ -1957,8 +2031,8 @@ impl AppState {
         // than whatever IPs were live when the process started.
         let ips = api::local_ips_all();
         let primary_ip = ips.first().cloned().unwrap_or_else(|| "127.0.0.1".into());
-        let lan_url = format!("http://{primary_ip}:{}", self.api_port);
-        let lan_url_tls = format!("https://{primary_ip}:{}", self.api_port + 1);
+        let lan_url = format!("http://{primary_ip}:{}", port_of(&self.api_addr, tab_atelier::DEFAULT_API_PORT));
+        let lan_url_tls = format!("https://{primary_ip}:{}", port_of(&self.api_tls_addr, tab_atelier::DEFAULT_API_PORT + 1));
         // Pass both the plain-HTTP and TLS URLs into the deep link; the
         // mobile client picks whichever its current build supports.
         let qr_payload = format!(
@@ -2073,7 +2147,7 @@ impl AppState {
                                 list = list.child(
                                     div()
                                         .text_color(link_fg)
-                                        .child(format!("http://{ip}:{}", self.api_port)),
+                                        .child(format!("http://{ip}:{}", port_of(&self.api_addr, tab_atelier::DEFAULT_API_PORT))),
                                 );
                             }
                             el.child(list)
@@ -2308,60 +2382,89 @@ impl AppState {
                     .child(div().w(px(1.0)).h(px(16.0)).bg(cursor_color))
             });
 
-        let api_port_text = self.pref_api_port_text.clone();
-        let api_port_input = div()
-            .id("pref-api-port-input")
-            .key_context("pref-api-port")
-            .track_focus(&self.pref_api_port_focus)
+        let api_addr_text = self.pref_api_addr_text.clone();
+        let api_addr_input = div()
+            .id("pref-api-addr-input")
+            .key_context("pref-api-addr")
+            .track_focus(&self.pref_api_addr_focus)
             .mt(px(8.0))
-            .flex()
-            .flex_row()
-            .items_center()
+            .w_full()
+            .flex().flex_row().items_center()
             .bg(th.bg_hsla())
-            .border_1()
-            .border_color(input_border)
-            .rounded(px(3.0))
-            .px(px(8.0))
-            .py(px(4.0))
-            .min_h(px(28.0))
-            .cursor_text()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _ev: &MouseDownEvent, window, cx| {
-                    this.pref_api_port_focus.focus(window);
+            .border_1().border_color(input_border).rounded(px(3.0))
+            .px(px(8.0)).py(px(4.0)).min_h(px(28.0)).cursor_text()
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev: &MouseDownEvent, window, cx| {
+                this.pref_api_addr_focus.focus(window);
+                cx.notify();
+            }))
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _window, cx| match ev.keystroke.key.as_str() {
+                "backspace" => { this.pref_api_addr_text.pop(); cx.notify(); }
+                _ => if let Some(ref ch) = ev.keystroke.key_char
+                    && ch.chars().all(is_addr_port_char)
+                    && this.pref_api_addr_text.len() + ch.len() <= MAX_ADDR_LEN
+                {
+                    this.pref_api_addr_text.push_str(ch);
                     cx.notify();
-                }),
-            )
-            .on_key_down(
-                cx.listener(|this, ev: &KeyDownEvent, _window, cx| match ev.keystroke.key.as_str() {
-                    "backspace" => {
-                        this.pref_api_port_text.pop();
-                        cx.notify();
-                    }
-                    _ => {
-                        // Numeric only so the parsed `u16` on Save can't
-                        // silently drop junk the user typed.
-                        if let Some(ref ch) = ev.keystroke.key_char
-                            && ch.chars().all(|c| c.is_ascii_digit())
-                            && this.pref_api_port_text.len() < 5
-                        {
-                            this.pref_api_port_text.push_str(ch);
-                            cx.notify();
-                        }
-                    }
-                }),
-            )
-            .when(api_port_text.is_empty(), |el| {
-                el.child(
-                    div()
-                        .text_color(placeholder_fg)
-                        .child(tab_atelier::DEFAULT_API_PORT.to_string()),
-                )
-            })
-            .when(!api_port_text.is_empty(), |el| {
-                el.child(api_port_text)
-                    .child(div().w(px(1.0)).h(px(16.0)).bg(cursor_color))
-            });
+                }
+            }))
+            .when(api_addr_text.is_empty(), |el| el.child(div().text_color(placeholder_fg).child(tab_atelier::DEFAULT_API_ADDR)))
+            .when(!api_addr_text.is_empty(), |el| el.child(api_addr_text).child(div().w(px(1.0)).h(px(16.0)).bg(cursor_color)));
+
+        let api_tls_addr_text = self.pref_api_tls_addr_text.clone();
+        let api_tls_addr_input = div()
+            .id("pref-api-tls-addr-input")
+            .key_context("pref-api-tls-addr")
+            .track_focus(&self.pref_api_tls_addr_focus)
+            .mt(px(8.0))
+            .w_full()
+            .flex().flex_row().items_center()
+            .bg(th.bg_hsla())
+            .border_1().border_color(input_border).rounded(px(3.0))
+            .px(px(8.0)).py(px(4.0)).min_h(px(28.0)).cursor_text()
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev: &MouseDownEvent, window, cx| {
+                this.pref_api_tls_addr_focus.focus(window);
+                cx.notify();
+            }))
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _window, cx| match ev.keystroke.key.as_str() {
+                "backspace" => { this.pref_api_tls_addr_text.pop(); cx.notify(); }
+                _ => if let Some(ref ch) = ev.keystroke.key_char
+                    && ch.chars().all(is_addr_port_char)
+                    && this.pref_api_tls_addr_text.len() + ch.len() <= MAX_ADDR_LEN
+                {
+                    this.pref_api_tls_addr_text.push_str(ch);
+                    cx.notify();
+                }
+            }))
+            .when(api_tls_addr_text.is_empty(), |el| el.child(div().text_color(placeholder_fg).child(tab_atelier::DEFAULT_API_TLS_ADDR)))
+            .when(!api_tls_addr_text.is_empty(), |el| el.child(api_tls_addr_text).child(div().w(px(1.0)).h(px(16.0)).bg(cursor_color)));
+
+        let happier_relay_addr_text = self.pref_happier_relay_addr_text.clone();
+        let happier_relay_addr_input = div()
+            .id("pref-happier-relay-addr-input")
+            .key_context("pref-happier-relay-addr")
+            .track_focus(&self.pref_happier_relay_addr_focus)
+            .mt(px(8.0))
+            .w_full()
+            .flex().flex_row().items_center()
+            .bg(th.bg_hsla())
+            .border_1().border_color(input_border).rounded(px(3.0))
+            .px(px(8.0)).py(px(4.0)).min_h(px(28.0)).cursor_text()
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev: &MouseDownEvent, window, cx| {
+                this.pref_happier_relay_addr_focus.focus(window);
+                cx.notify();
+            }))
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _window, cx| match ev.keystroke.key.as_str() {
+                "backspace" => { this.pref_happier_relay_addr_text.pop(); cx.notify(); }
+                _ => if let Some(ref ch) = ev.keystroke.key_char
+                    && ch.chars().all(is_addr_port_char)
+                    && this.pref_happier_relay_addr_text.len() + ch.len() <= MAX_ADDR_LEN
+                {
+                    this.pref_happier_relay_addr_text.push_str(ch);
+                    cx.notify();
+                }
+            }))
+            .when(happier_relay_addr_text.is_empty(), |el| el.child(div().text_color(placeholder_fg).child(tab_atelier::DEFAULT_HAPPIER_RELAY_ADDR)))
+            .when(!happier_relay_addr_text.is_empty(), |el| el.child(happier_relay_addr_text).child(div().w(px(1.0)).h(px(16.0)).bg(cursor_color)));
 
         let editor_text = self.pref_editor_text.clone();
         let editor_input = div()
@@ -2441,7 +2544,9 @@ impl AppState {
                         .child(div().mt(px(16.0)).child(t.language).child(lang_options))
                         .child(div().mt(px(16.0)).child(t.browser).child(browser_input))
                         .child(div().mt(px(16.0)).child(t.code_editor).child(editor_input))
-                        .child(div().mt(px(16.0)).child(t.api_port).child(api_port_input))
+                        .child(div().mt(px(16.0)).child(t.api_addr).child(api_addr_input))
+                        .child(div().mt(px(16.0)).child(t.api_tls_addr).child(api_tls_addr_input))
+                        .child(div().mt(px(16.0)).child(t.happier_relay_addr).child(happier_relay_addr_input))
                         .child(
                             div()
                                 .mt(px(20.0))
@@ -2504,17 +2609,31 @@ impl AppState {
                                                 };
                                                 (*this.browser.borrow_mut()).clone_from(&browser);
                                                 (*this.code_editor.borrow_mut()).clone_from(&editor);
-                                                // Parse the port field. Anything
-                                                // that fails sanity-checks (empty,
-                                                // non-numeric, > 65534) falls back
-                                                // to whatever was already loaded.
-                                                let parsed_port = this
-                                                    .pref_api_port_text
-                                                    .parse::<u16>()
-                                                    .ok()
-                                                    .filter(|&p| p > 0 && p < u16::MAX);
-                                                if let Some(p) = parsed_port {
-                                                    this.api_port = p;
+                                                // Validate each addr:port field
+                                                // via `SocketAddr::parse`. Anything
+                                                // that fails is kept as-is in the
+                                                // edit buffer but not persisted —
+                                                // the previous good value sticks.
+                                                let parsed_api = this
+                                                    .pref_api_addr_text
+                                                    .parse::<std::net::SocketAddr>()
+                                                    .ok();
+                                                if parsed_api.is_some() {
+                                                    this.api_addr.clone_from(&this.pref_api_addr_text);
+                                                }
+                                                let parsed_tls = this
+                                                    .pref_api_tls_addr_text
+                                                    .parse::<std::net::SocketAddr>()
+                                                    .ok();
+                                                if parsed_tls.is_some() {
+                                                    this.api_tls_addr.clone_from(&this.pref_api_tls_addr_text);
+                                                }
+                                                let parsed_relay = this
+                                                    .pref_happier_relay_addr_text
+                                                    .parse::<std::net::SocketAddr>()
+                                                    .ok();
+                                                if parsed_relay.is_some() {
+                                                    this.happier_relay_addr.clone_from(&this.pref_happier_relay_addr_text);
                                                 }
                                                 save_preferences(
                                                     &platform::config_dir(),
@@ -2525,7 +2644,9 @@ impl AppState {
                                                         hotkeys: this.hotkeys.clone(),
                                                         browser,
                                                         code_editor: editor,
-                                                        api_port: Some(this.api_port),
+                                                        api_addr: Some(this.api_addr.clone()),
+                                                        api_tls_addr: Some(this.api_tls_addr.clone()),
+                                                        happier_relay_addr: Some(this.happier_relay_addr.clone()),
                                                     },
                                                 );
                                                 if let Some(ref handle) = this.hotkey_handle {
@@ -2872,6 +2993,23 @@ fn happier_relay_url_from_args() -> Option<String> {
     }
     None
 }
+
+/// Pull the port out of an `addr:port` bind string. Falls back to
+/// `fallback` when the string is malformed (covers IPv4, IPv6 like
+/// `[::1]:N`, and bare `:N`).
+fn port_of(bind: &str, fallback: u16) -> u16 {
+    bind.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()).unwrap_or(fallback)
+}
+
+/// `addr:port` is a small, well-bounded ASCII subset (digits, dots,
+/// colons, brackets, hex letters for IPv6). Anything else is junk and
+/// we refuse to insert it so the `SocketAddr` parse on Save can't fail
+/// in subtle ways.
+fn is_addr_port_char(c: char) -> bool {
+    c.is_ascii_digit() || matches!(c, '.' | ':' | '[' | ']') || ('a'..='f').contains(&c.to_ascii_lowercase())
+}
+
+const MAX_ADDR_LEN: usize = 64;
 
 fn format_duration(d: std::time::Duration) -> String {
     let secs = d.as_secs();

@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use log::info;
 
-use alacritty_terminal::event::{EventListener, WindowSize};
+use alacritty_terminal::event::{Event as AlacrittyEvent, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point as GridPoint, Side};
@@ -46,9 +46,39 @@ pub struct DetectedUrl {
     pub is_file: bool,
 }
 
-#[derive(Clone)]
-struct EventProxy;
-impl EventListener for EventProxy {}
+/// Alacritty calls `send_event(Event::PtyWrite(text))` whenever the
+/// VT parser produces a reply that has to travel back into the PTY's
+/// stdin — Device Status Report (`ESC[6n`), primary device attributes,
+/// window-size queries, color queries, and so on. The default trait
+/// impl is a no-op, which silently drops those replies and breaks
+/// anything that waits on them (reedline times out on its cursor-
+/// position probe, for instance). This proxy holds a slot for the
+/// `EventLoopSender` that the caller fills in once `EventLoop::spawn`
+/// has handed it back; until then events are buffered into the void,
+/// which is fine because no PTY exists to read them yet.
+#[derive(Clone, Default)]
+struct EventProxy {
+    notifier: Arc<std::sync::Mutex<Option<EventLoopSender>>>,
+}
+
+impl EventProxy {
+    fn set_notifier(&self, sender: EventLoopSender) {
+        if let Ok(mut slot) = self.notifier.lock() {
+            *slot = Some(sender);
+        }
+    }
+}
+
+impl EventListener for EventProxy {
+    fn send_event(&self, event: AlacrittyEvent) {
+        if let AlacrittyEvent::PtyWrite(text) = event
+            && let Ok(slot) = self.notifier.lock()
+            && let Some(sender) = slot.as_ref()
+        {
+            let _ = sender.send(Msg::Input(text.into_bytes().into()));
+        }
+    }
+}
 
 struct TermDims {
     columns: usize,
@@ -81,6 +111,7 @@ struct CachedLine {
 pub struct TerminalView {
     term: Arc<FairMutex<Term<EventProxy>>>,
     notifier: EventLoopSender,
+    event_proxy: EventProxy,
     focus: FocusHandle,
     cell_size: Option<Size<Pixels>>,
     last_size: Rc<Cell<Option<(usize, usize)>>>,
@@ -151,17 +182,19 @@ impl TerminalView {
             scrolling_history: 10_000,
             ..Config::default()
         };
+        let proxy = EventProxy::default();
         let term = Term::new(
             config,
             &TermDims {
                 columns: INITIAL_COLS,
                 screen_lines: INITIAL_LINES,
             },
-            EventProxy,
+            proxy.clone(),
         );
         let term = Arc::new(FairMutex::new(term));
-        let el = EventLoop::new(term.clone(), EventProxy, pty, false, false).expect("failed to create event loop");
+        let el = EventLoop::new(term.clone(), proxy.clone(), pty, false, false).expect("failed to create event loop");
         let notifier = el.channel();
+        proxy.set_notifier(notifier.clone());
         el.spawn();
 
         let focus = cx.focus_handle();
@@ -208,6 +241,7 @@ impl TerminalView {
         Self {
             term,
             notifier,
+            event_proxy: proxy,
             focus,
             cell_size: None,
             last_size: Rc::new(Cell::new(None)),
@@ -297,8 +331,9 @@ impl TerminalView {
 
         self.term.lock().grid_mut().scroll_display(Scroll::Bottom);
 
-        let el = EventLoop::new(self.term.clone(), EventProxy, pty, false, false).expect("failed to create event loop");
+        let el = EventLoop::new(self.term.clone(), self.event_proxy.clone(), pty, false, false).expect("failed to create event loop");
         self.notifier = el.channel();
+        self.event_proxy.set_notifier(self.notifier.clone());
         el.spawn();
 
         self.pid = pid;
