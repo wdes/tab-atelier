@@ -106,7 +106,7 @@ pub struct PostMessageReq {
     pub message_role: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct MessagesQuery {
     #[serde(default)]
     pub limit: Option<i64>,

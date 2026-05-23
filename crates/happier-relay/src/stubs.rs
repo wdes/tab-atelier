@@ -14,15 +14,34 @@
 //! upgrade the stub here to read from real state.
 
 use axum::{
-    extract::{Extension, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     Json,
 };
 use base64::Engine;
+use serde::Deserialize;
 use sqlx::Row;
 
 use crate::auth::UserId;
 use crate::state::AppState;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)] // limit / after_seq / scope reserved for paging
+pub struct TabMessagesQuery {
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub after_seq: Option<i64>,
+    #[serde(default)]
+    pub before_seq: Option<i64>,
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub roles: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
+}
 
 /// `GET /v1/machines` — laptop appears as a single "active" machine.
 ///
@@ -125,6 +144,203 @@ pub async fn friends() -> Json<serde_json::Value> {
 /// Empty / no-badge so the UI clears it.
 pub async fn activity_badge_snapshot() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "snapshot": null }))
+}
+
+/// Fetch an artifact row by id, scoped to `user_id`, and return its
+/// decoded header + raw body when the artifact represents a tab
+/// (header.kind == "tab-atelier:tab"). Returns `Ok(None)` for any
+/// non-tab artifact so the caller can fall through to the regular
+/// sessions handler. Sql / decode errors propagate as `Err`.
+async fn load_tab_artifact(
+    state: &AppState,
+    user_id: &str,
+    id: &str,
+) -> Result<Option<(serde_json::Value, Vec<u8>, i64, i64)>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT header, body, created_at, updated_at
+         FROM artifacts WHERE id = ?1 AND account_id = ?2",
+    )
+    .bind(id)
+    .bind(user_id)
+    .fetch_optional(&state.db)
+    .await?;
+    let Some(row) = row else { return Ok(None) };
+    let header_b64: Vec<u8> = row.get("header");
+    let body: Vec<u8> = row.get("body");
+    let created_at: i64 = row.get("created_at");
+    let updated_at: i64 = row.get("updated_at");
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let header_json: serde_json::Value = b64
+        .decode(&header_b64)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or(serde_json::Value::Null);
+    if header_json.get("kind").and_then(serde_json::Value::as_str) != Some("tab-atelier:tab") {
+        return Ok(None);
+    }
+    Ok(Some((header_json, body, created_at, updated_at)))
+}
+
+/// `GET /v1/sessions/{id}/messages` — tab variant.
+///
+/// Returns a single synthetic `ApiMessage` whose `content.v` carries
+/// the tab's scrollback wrapped in the `RawRecord` shape the mobile
+/// UI's `normalizeRawMessage` accepts (an agent→assistant text
+/// block). Prompt-history calls (`role=user`) get an empty page so
+/// the UI back-pagination terminates without offering "previous
+/// prompts" that don't exist.
+///
+/// Returns `Err(404, {error:"not-a-tab-artifact"})` for ids that
+/// aren't tab artifacts; the dispatcher in main.rs reads that
+/// sentinel to chain to the existing `sessions::list_messages`.
+pub async fn list_tab_messages_v1(
+    State(state): State<AppState>,
+    Extension(user): Extension<UserId>,
+    Path(session_id): Path<String>,
+    Query(q): Query<TabMessagesQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let Some((header, body, created_at, updated_at)) =
+        load_tab_artifact(&state, &user.0, &session_id).await.map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "internal error" })),
+            )
+        })?
+    else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "not-a-tab-artifact" })),
+        ));
+    };
+
+    let wants_user_only = q.role.as_deref() == Some("user")
+        || q.roles
+            .as_deref()
+            .is_some_and(|s| s.split(',').all(|r| r.trim() == "user"));
+    if wants_user_only || q.before_seq.is_some_and(|b| b <= 1) {
+        return Ok(Json(serde_json::json!({
+            "messages": [],
+            "hasMore": false,
+            "nextBeforeSeq": null,
+            "nextAfterSeq": null,
+        })));
+    }
+
+    let text = String::from_utf8_lossy(&body).into_owned();
+    let name = header
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("tab")
+        .to_string();
+
+    // RawRecord agent-output envelope — `normalizeRawMessage` collapses
+    // this into an `agent-text` Message that renders as a monospace
+    // assistant bubble.
+    let content_v = serde_json::json!({
+        "role": "agent",
+        "content": {
+            "type": "output",
+            "data": {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [{ "type": "text", "text": text }],
+                },
+            },
+        },
+        "meta": { "displayName": name },
+    });
+
+    let msg = serde_json::json!({
+        "id": format!("{session_id}:scrollback"),
+        "seq": 1,
+        "localId": null,
+        "sidechainId": null,
+        "messageRole": "agent",
+        "content": { "t": "plain", "v": content_v },
+        "createdAt": created_at,
+        "updatedAt": updated_at,
+    });
+
+    Ok(Json(serde_json::json!({
+        "messages": [msg],
+        "hasMore": false,
+        "nextBeforeSeq": null,
+        "nextAfterSeq": null,
+    })))
+}
+
+/// `GET /v2/sessions/{id}` — tab variant. Returns the full session
+/// detail object the mobile fetches when opening a chat view. Matches
+/// the `V2SessionByIdResponse` shape (`encryptionMode: "plain"`, no DEK,
+/// no share). Falls through to `sessions::get_one` (via the
+/// dispatcher in main.rs) for non-tab ids.
+pub async fn get_tab_session_v2(
+    State(state): State<AppState>,
+    Extension(user): Extension<UserId>,
+    Path(session_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let Some((header, _body, created_at, updated_at)) =
+        load_tab_artifact(&state, &user.0, &session_id).await.map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "internal error" })),
+            )
+        })?
+    else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "not-a-tab-artifact" })),
+        ));
+    };
+
+    let name = header
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("(unnamed tab)")
+        .to_string();
+    let metadata = serde_json::json!({
+        "name": &name,
+        "summary": { "text": &name, "updatedAt": updated_at },
+        "path": &name,
+        "host": "tab-atelier",
+    })
+    .to_string();
+
+    Ok(Json(serde_json::json!({
+        "session": {
+            "id": session_id,
+            "seq": 1,
+            "encryptionMode": "plain",
+            "metadata": metadata,
+            "metadataVersion": 1,
+            "agentState": null,
+            "agentStateVersion": 0,
+            "dataEncryptionKey": null,
+            "lastViewedSessionSeq": 1,
+            "pendingPermissionRequestCount": 0,
+            "pendingUserActionRequestCount": 0,
+            "share": null,
+            "archivedAt": null,
+            "active": true,
+            "activeAt": updated_at,
+            "createdAt": created_at,
+            "updatedAt": updated_at,
+            "pendingCount": 0,
+            "pendingVersion": 0,
+            "lastMessage": null,
+        }
+    })))
+}
+
+/// `GET /v2/sessions/{id}/pending` — always empty for tabs.
+pub async fn tab_session_pending(Path(_id): Path<String>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "pending": [] }))
+}
+
+/// `GET /v2/session-folder-assignments?sessionIds=...` — empty.
+pub async fn session_folder_assignments() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "assignments": [] }))
 }
 
 fn now_ms() -> i64 {
