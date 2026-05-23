@@ -285,17 +285,66 @@ fn last_entry_uuid(path: &Path) -> std::io::Result<Option<String>> {
     Ok(None)
 }
 
+/// First non-empty user prompt in a session, truncated to `max_chars`,
+/// stripped of newlines. Used by `/resume` as a fallback label when
+/// the session has no explicit `/rename`-set name yet — gives the
+/// user *something* recognisable instead of a bare UUID.
+#[must_use]
+pub fn first_prompt(path: &Path, max_chars: usize) -> Option<String> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    for line in reader.lines() {
+        let Ok(line) = line else { continue };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if v.get("type").and_then(|t| t.as_str()) != Some("user") {
+            continue;
+        }
+        // Plain string = a real user prompt. Array content = tool
+        // results, which we skip — they aren't what the human typed.
+        let Some(serde_json::Value::String(s)) = v.get("message").and_then(|m| m.get("content")) else {
+            continue;
+        };
+        let one_line: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+        let trimmed = one_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let label: String = trimmed.chars().take(max_chars).collect();
+        return Some(if trimmed.chars().count() > max_chars {
+            format!("{label}…")
+        } else {
+            label
+        });
+    }
+    None
+}
+
+/// `~/.claude/projects/<escaped-cwd>` — where session transcripts and
+/// sidecars for `cwd` live. Returns `None` if `HOME` isn't set.
+#[must_use]
+pub fn project_dir_for(cwd: &Path) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(
+        PathBuf::from(home)
+            .join(".claude")
+            .join("projects")
+            .join(escape_cwd(cwd)),
+    )
+}
+
 /// All session ids in this cwd, newest first. Used by the
 /// REPL's `/resume` slash command to surface what's available.
 #[must_use]
 pub fn list_sessions(cwd: &Path) -> Vec<(String, String, std::time::SystemTime)> {
-    let Some(home) = std::env::var_os("HOME") else {
+    let Some(dir) = project_dir_for(cwd) else {
         return Vec::new();
     };
-    let dir = PathBuf::from(home)
-        .join(".claude")
-        .join("projects")
-        .join(escape_cwd(cwd));
     let Ok(read_dir) = std::fs::read_dir(&dir) else {
         return Vec::new();
     };

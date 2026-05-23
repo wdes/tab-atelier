@@ -402,10 +402,20 @@ fn rebuild_history(project_dir: &std::path::Path, id: &str) -> Vec<ApiMessage> {
         let content_owned = std::mem::take(content_val);
         match role {
             "user" => {
+                // Anthropic's API rejects user turns whose content is
+                // empty (`messages.N: user messages must have non-empty
+                // content`). Older transcripts can contain empty turns
+                // — placeholders written by aborted runs, /resume
+                // bookkeeping, etc. — so skip anything that would
+                // round-trip as an empty Plain string or an empty
+                // Blocks array.
                 let content = match content_owned {
-                    serde_json::Value::String(s) => ApiContent::Plain(s),
+                    serde_json::Value::String(s) if !s.is_empty() => ApiContent::Plain(s),
                     arr @ serde_json::Value::Array(_) => {
                         let blocks: Vec<Block> = serde_json::from_value(arr).unwrap_or_default();
+                        if blocks.is_empty() {
+                            continue;
+                        }
                         ApiContent::Blocks(blocks)
                     }
                     _ => continue,
@@ -427,7 +437,60 @@ fn rebuild_history(project_dir: &std::path::Path, id: &str) -> Vec<ApiMessage> {
             _ => {}
         }
     }
+    truncate_at_orphan_tool_use(&mut out);
     out
+}
+
+/// Anthropic's API requires every `tool_use` in an assistant turn to
+/// be answered by a matching `tool_result` in the very next user
+/// turn. Old transcripts can dangle — process killed mid-tool, /resume
+/// after a crash, etc. — leaving an assistant turn whose `tool_use`
+/// ids are never satisfied. Truncate the loaded history at the first
+/// such orphan so the rebuild remains a valid wire sequence.
+fn truncate_at_orphan_tool_use(out: &mut Vec<ApiMessage>) {
+    use crate::session::Block;
+    use std::collections::HashSet;
+
+    let mut keep = out.len();
+    let mut i = 0;
+    while i < out.len() {
+        if out[i].role != "assistant" {
+            i += 1;
+            continue;
+        }
+        let uses: HashSet<String> = match &out[i].content {
+            ApiContent::Blocks(blocks) => blocks
+                .iter()
+                .filter_map(|b| if let Block::ToolUse { id, .. } = b { Some(id.clone()) } else { None })
+                .collect(),
+            ApiContent::Plain(_) => HashSet::new(),
+        };
+        if uses.is_empty() {
+            i += 1;
+            continue;
+        }
+        let Some(next) = out.get(i + 1) else {
+            keep = i;
+            break;
+        };
+        if next.role != "user" {
+            keep = i;
+            break;
+        }
+        let results: HashSet<String> = match &next.content {
+            ApiContent::Blocks(blocks) => blocks
+                .iter()
+                .filter_map(|b| if let Block::ToolResult { tool_use_id, .. } = b { Some(tool_use_id.clone()) } else { None })
+                .collect(),
+            ApiContent::Plain(_) => HashSet::new(),
+        };
+        if !uses.is_subset(&results) {
+            keep = i;
+            break;
+        }
+        i += 2;
+    }
+    out.truncate(keep);
 }
 
 /// Build a short human-readable label for the spinner while a tool runs.
