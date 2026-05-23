@@ -86,6 +86,12 @@ socketioxide = { version = "0.18", features = ["tracing", "extensions", "state"]
 # SSE response. Tiny crate (~30 KB compiled), already a transitive dep.
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures-util = "0.3"
+# Used by the session dispatchers in main.rs to re-parse the raw
+# query string into two different typed structs (one for the tab
+# path, one for the SQL-backed sessions path) without forcing a
+# single Query<T> extractor at the handler level. Already in the
+# transitive tree via axum.
+serde_urlencoded = "0.7"
 # TLS listener so the happier mobile app (cleartext-blocked on
 # modern Android / iOS) can actually connect. Reads the same
 # self-signed cert tab-atelier already generates for its own

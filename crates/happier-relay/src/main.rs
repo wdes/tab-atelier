@@ -91,6 +91,7 @@ struct Args {
 }
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)] // route registration dominates
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,happier_relay=debug")))
@@ -141,8 +142,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/auth/ping", get(auth::ping_handler))
         .route("/v1/sessions", post(sessions::create).get(sessions::list_all))
         .route("/v1/sessions/{id}", axum_delete(sessions::delete))
-        .route("/v2/sessions/{id}", get(sessions::get_one).patch(sessions::patch))
-        .route("/v1/sessions/{id}/messages", get(sessions::list_messages))
+        .route("/v2/sessions/{id}", get(dispatch_session_get_v2).patch(sessions::patch))
+        .route("/v1/sessions/{id}/messages", get(dispatch_session_messages_v1))
         .route("/v2/sessions/{id}/messages", post(sessions::post_message))
         .route("/v1/kv", get(kv::list).post(kv::mutate))
         .route("/v1/kv/bulk", post(kv::bulk_get))
@@ -171,6 +172,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/feed", get(stubs::feed))
         .route("/v1/friends", get(stubs::friends))
         .route("/v1/account/activity/badge-snapshot", get(stubs::activity_badge_snapshot))
+        // Session-detail aux endpoints the mobile fires when opening
+        // a chat view. Empty payloads keep the page from spinning.
+        .route("/v2/sessions/{id}/pending", get(stubs::tab_session_pending))
+        .route("/v2/session-folder-assignments", get(stubs::session_folder_assignments))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_auth));
 
     let app = Router::new()
@@ -342,6 +347,75 @@ async fn unmatched_route(req: Request) -> impl IntoResponse {
             "path": uri.path(),
         })),
     )
+}
+
+/// `GET /v2/sessions/{id}` dispatcher. tab-atelier tab artifacts are
+/// surfaced as sessions to the mobile UI by `stubs::list_sessions_v2`,
+/// but the existing `sessions::get_one` queries the `sessions` SQL
+/// table — which never contains those ids. Try the tab path first;
+/// fall back to the real session handler for ids that aren't tabs.
+async fn dispatch_session_get_v2(
+    axum::extract::State(state): axum::extract::State<state::AppState>,
+    axum::Extension(user): axum::Extension<auth::UserId>,
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+) -> axum::response::Response {
+    use axum::extract::{Path, State};
+    use axum::response::IntoResponse;
+    use axum::Extension;
+    let cloned_state = state.clone();
+    let cloned_user = user.clone();
+    let cloned_id = session_id.clone();
+    match stubs::get_tab_session_v2(State(state), Extension(user), Path(session_id)).await {
+        Ok(json) => json.into_response(),
+        Err((status, body))
+            if status == axum::http::StatusCode::NOT_FOUND
+                && body.0.get("error").and_then(serde_json::Value::as_str) == Some("not-a-tab-artifact") =>
+        {
+            sessions::get_one(State(cloned_state), Extension(cloned_user), Path(cloned_id))
+                .await
+                .into_response()
+        }
+        Err((status, body)) => (status, body).into_response(),
+    }
+}
+
+/// `GET /v1/sessions/{id}/messages` dispatcher. Same idea — synthesise
+/// a single scrollback message for tab artifacts; otherwise delegate
+/// to the SQL-backed `sessions::list_messages`.
+async fn dispatch_session_messages_v1(
+    axum::extract::State(state): axum::extract::State<state::AppState>,
+    axum::Extension(user): axum::Extension<auth::UserId>,
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+) -> axum::response::Response {
+    use axum::extract::{Path, Query, State};
+    use axum::response::IntoResponse;
+    use axum::Extension;
+    let raw = raw_query.unwrap_or_default();
+    let tab_q: stubs::TabMessagesQuery = serde_urlencoded::from_str(&raw).unwrap_or(stubs::TabMessagesQuery {
+        limit: None,
+        after_seq: None,
+        before_seq: None,
+        role: None,
+        roles: None,
+        scope: None,
+    });
+    let cloned_state = state.clone();
+    let cloned_user = user.clone();
+    let cloned_id = session_id.clone();
+    match stubs::list_tab_messages_v1(State(state), Extension(user), Path(session_id), Query(tab_q)).await {
+        Ok(json) => json.into_response(),
+        Err((status, body))
+            if status == axum::http::StatusCode::NOT_FOUND
+                && body.0.get("error").and_then(serde_json::Value::as_str) == Some("not-a-tab-artifact") =>
+        {
+            let session_q: sessions::MessagesQuery = serde_urlencoded::from_str(&raw).unwrap_or_default();
+            sessions::list_messages(State(cloned_state), Extension(cloned_user), Path(cloned_id), Query(session_q))
+                .await
+                .into_response()
+        }
+        Err((status, body)) => (status, body).into_response(),
+    }
 }
 
 /// Stable host identifier shown as the machine name in the mobile
