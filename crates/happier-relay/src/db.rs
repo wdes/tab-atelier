@@ -108,3 +108,106 @@ pub async fn upsert_account_shared(
         .await?;
     Ok(id)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{open, upsert_account, upsert_account_shared};
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use sqlx::SqlitePool;
+    use std::path::Path;
+
+    async fn fresh_pool() -> SqlitePool {
+        let opts = SqliteConnectOptions::new()
+            .filename(":memory:")
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .expect("connect :memory:");
+        sqlx::migrate!("./migrations").run(&pool).await.expect("migrate");
+        pool
+    }
+
+    #[tokio::test]
+    async fn open_memory_runs_migrations() {
+        let pool = open(Path::new(":memory:")).await.expect("open :memory:");
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn upsert_account_inserts_then_updates_same_id() {
+        let pool = fresh_pool().await;
+        let pk = "aa".repeat(32);
+        let id1 = upsert_account(&pool, &pk, Some(&[1, 2, 3]), Some(&[4, 5, 6])).await.unwrap();
+        let id2 = upsert_account(&pool, &pk, Some(&[9, 9]), Some(&[8, 8])).await.unwrap();
+        assert_eq!(id1, id2, "same pubkey must return same id");
+
+        let (content,): (Option<Vec<u8>>,) =
+            sqlx::query_as("SELECT content_public_key FROM accounts WHERE id = ?1")
+                .bind(&id1)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(content.as_deref(), Some(&[9_u8, 9][..]), "update path ran");
+
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM accounts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn upsert_account_different_pubkey_returns_new_id() {
+        let pool = fresh_pool().await;
+        let id1 = upsert_account(&pool, &"aa".repeat(32), None, None).await.unwrap();
+        let id2 = upsert_account(&pool, &"bb".repeat(32), None, None).await.unwrap();
+        assert_ne!(id1, id2);
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM accounts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[tokio::test]
+    async fn upsert_account_handles_none_content() {
+        let pool = fresh_pool().await;
+        let id = upsert_account(&pool, &"cc".repeat(32), None, None).await.unwrap();
+        let (ck, sig): (Option<Vec<u8>>, Option<Vec<u8>>) = sqlx::query_as(
+            "SELECT content_public_key, content_public_key_sig FROM accounts WHERE id = ?1",
+        )
+        .bind(&id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(ck.is_none() && sig.is_none());
+    }
+
+    #[tokio::test]
+    async fn upsert_account_shared_seeds_then_pins_first_pubkey() {
+        let pool = fresh_pool().await;
+        let first_pk = "aa".repeat(32);
+        let id1 = upsert_account_shared(&pool, &first_pk, Some(&[1]), Some(&[2])).await.unwrap();
+        let id2 = upsert_account_shared(&pool, &"bb".repeat(32), Some(&[3]), Some(&[4])).await.unwrap();
+        let id3 = upsert_account_shared(&pool, &"cc".repeat(32), None, None).await.unwrap();
+        assert_eq!(id1, id2);
+        assert_eq!(id1, id3);
+
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM accounts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "shared variant never inserts a second row");
+
+        let (stored_pk,): (String,) =
+            sqlx::query_as("SELECT public_key_hex FROM accounts WHERE id = ?1")
+                .bind(&id1)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored_pk, first_pk, "seeder pubkey is never overwritten");
+    }
+}
