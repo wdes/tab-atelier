@@ -9,13 +9,25 @@ use tokio::sync::broadcast;
 
 /// One fan-out request from an HTTP handler. Sent into a broadcast
 /// channel so both the socket.io loop (which echoes it to connected
-/// devices) and the SSE handler (which pipes it to browser tabs) see
-/// every event without competing for the receiver.
+/// happier-mobile devices) and the SSE handler (which pipes it to
+/// browser tabs / the relay's built-in web UI) see every event
+/// without competing for the receiver.
+///
+/// The two transports want different shapes:
+/// - SSE consumers use `event` + `payload` directly so the
+///   relay's web UI can subscribe to "artifact-create" /
+///   "artifact-update" / "artifact-delete" as before.
+/// - happier-mobile listens only for `update` and `ephemeral`
+///   events whose payload is `{id, seq, body, createdAt}` with
+///   `body.t` as the discriminator. When `body` is Some, the
+///   socket.io fan-out wraps it in that envelope and emits as
+///   `update`. None = legacy/SSE-only.
 #[derive(Debug, Clone)]
 pub struct BroadcastMsg {
     pub user_id: String,
     pub event: String,
     pub payload: serde_json::Value,
+    pub body: Option<serde_json::Value>,
 }
 
 /// Shared application state handed to every axum handler. Cheap to
@@ -55,13 +67,35 @@ pub struct AppState {
 /// Background task that owns the `SocketIo` handle and forwards each
 /// broadcast event into the right room. Returns when the channel
 /// closes (i.e. on process shutdown).
+///
+/// When a message carries a `body`, it's wrapped in the happier
+/// `{id, seq, body, createdAt}` envelope and emitted as the literal
+/// event name `update`. That's the only kind of socket.io event the
+/// mobile UI registers a listener for (see
+/// `apps/ui/sources/sync/sync.ts`'s `onMessage('update', ...)`).
+/// Legacy event names continue to be emitted alongside so any older
+/// socket.io consumer keeps working — but in practice nothing
+/// listens for those today.
 pub async fn broadcast_loop(io: SocketIo, mut rx: broadcast::Receiver<BroadcastMsg>) {
+    let mut update_seq: u64 = 0;
     loop {
         match rx.recv().await {
             Ok(msg) => {
                 let room = crate::socket::room_for_user(&msg.user_id);
+                if let Some(body) = msg.body.as_ref() {
+                    update_seq = update_seq.wrapping_add(1);
+                    let envelope = serde_json::json!({
+                        "id":  format!("u{}", update_seq),
+                        "seq": update_seq,
+                        "body": body,
+                        "createdAt": now_ms(),
+                    });
+                    if let Err(e) = io.to(room.clone()).emit("update", &envelope).await {
+                        tracing::warn!(error = ?e, user = msg.user_id, "update fanout failed");
+                    }
+                }
                 if let Err(e) = io.to(room).emit(&msg.event, &msg.payload).await {
-                    tracing::warn!(error = ?e, event = msg.event, user = msg.user_id, "fanout failed");
+                    tracing::warn!(error = ?e, event = msg.event, user = msg.user_id, "legacy fanout failed");
                 }
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -70,4 +104,10 @@ pub async fn broadcast_loop(io: SocketIo, mut rx: broadcast::Receiver<BroadcastM
             Err(broadcast::error::RecvError::Closed) => break,
         }
     }
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
