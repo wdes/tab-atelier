@@ -33,6 +33,13 @@ pub struct AppState {
     /// (the first one created). Used for the local-LAN self-host
     /// case where tab-atelier + web UI need to see the same artifacts.
     pub shared_account: bool,
+    /// Stable, human-readable host identifier surfaced as the
+    /// machine `id` in `GET /v1/machines`. The mobile UI's
+    /// `getMachineDisplayName` falls back to this when (as in our
+    /// case) the encrypted `metadata` is empty, so it's effectively
+    /// the displayed machine name. Sourced from a file at startup;
+    /// persisted across restarts.
+    pub machine_id: String,
     /// Multi-consumer broadcast channel for relay-wide events.
     /// HTTP handlers send into it; the socket.io loop + every SSE
     /// stream subscribe. Capacity matters only for slow consumers,
