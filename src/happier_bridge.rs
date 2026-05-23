@@ -33,12 +33,14 @@ use crate::api::TabSnapshot;
 
 /// Poll interval in seconds. Matches the persist tick so we never lag
 /// the on-disk state by more than ~one cycle.
-/// Publisher tick rate. At 200 ms a key typed on the mobile side
-/// appears in the web UI ~200 ms after tab-atelier renders it locally,
-/// which feels instantaneous. The per-tick work is cheap when nothing
-/// changed (CRC compare, no network), and append-only deltas keep
-/// the bytes per tick tiny when typing.
-const PUBLISH_INTERVAL: Duration = Duration::from_millis(200);
+/// Publisher tick rate. 50 ms is low enough that typing feels
+/// real-time on a phone over LAN/VPN — the user sees their own
+/// character render within ~80 ms (50 ms tick + ~30 ms network)
+/// instead of 200+ ms. Idle ticks are cheap: a CRC compare per tab
+/// against `state.last_crc`, no network if unchanged. When a tab
+/// IS changing rapidly (typing), append-only deltas keep payloads
+/// tiny so 20 ticks/sec doesn't saturate anything.
+const PUBLISH_INTERVAL: Duration = Duration::from_millis(50);
 
 /// `data_encryption_key` sentinel used in plain mode. Real happier
 /// clients send a `NaCl` box public key here; until R2.5 ships the
