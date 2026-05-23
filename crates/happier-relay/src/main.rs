@@ -105,7 +105,16 @@ async fn main() -> anyhow::Result<()> {
     // to SocketIo directly (its broadcast future isn't Send across
     // axum boundaries); they push into an mpsc, and a dedicated task
     // owns the handle and drains the channel.
-    let (socket_layer, io) = SocketIo::builder().build_layer();
+    //
+    // happier's mobile UI dials path `/v1/updates/` (see
+    // `apps/ui/sources/sync/api/session/connection/
+    // createSyncSocketTransport.ts`). The default `/socket.io/` makes
+    // every reconnect attempt land on a 404 → the UI's status panel
+    // shows "Socket: disconnected" with "server error". Match the
+    // upstream wire path.
+    let (socket_layer, io) = SocketIo::builder()
+        .req_path("/v1/updates/")
+        .build_layer();
     let (broadcast_tx, _broadcast_rx_initial) = tokio::sync::broadcast::channel::<state::BroadcastMsg>(256);
 
     let machine_id = resolve_machine_id();
@@ -213,14 +222,14 @@ async fn main() -> anyhow::Result<()> {
                 .map_err(|e| {
                     anyhow::anyhow!("load TLS cert={} key={}: {e}", cert_path.display(), key_path.display())
                 })?;
-            tracing::info!("happier-relay listening on https://{addr} (socket.io at /socket.io/)");
+            tracing::info!("happier-relay listening on https://{addr} (socket.io at /v1/updates/)");
             axum_server::bind_rustls(socket_addr, tls_config)
                 .serve(app.into_make_service())
                 .await?;
         }
         (None, None) => {
             let listener = tokio::net::TcpListener::bind(&addr).await?;
-            tracing::info!("happier-relay listening on http://{addr} (socket.io at /socket.io/)");
+            tracing::info!("happier-relay listening on http://{addr} (socket.io at /v1/updates/)");
             axum::serve(listener, app).await?;
         }
         _ => {
@@ -310,7 +319,7 @@ async fn root_discovery(headers: axum::http::HeaderMap) -> axum::response::Respo
   <h1>happier-relay · v{}</h1>
   <p>Single-tenant Rust relay for the <a href="https://github.com/happier-dev/happier">happier</a> wire protocol, bundled inside tab-atelier.</p>
   <p><a href="/web">Open the web UI →</a></p>
-  <p class="dim">Endpoints: <code>/v1/auth</code> · <code>/v1/sessions</code> · <code>/v1/kv</code> · <code>/v1/artifacts</code> · <code>/v1/events</code> · <code>/socket.io/</code></p>
+  <p class="dim">Endpoints: <code>/v1/auth</code> · <code>/v1/sessions</code> · <code>/v1/kv</code> · <code>/v1/artifacts</code> · <code>/v1/events</code> · <code>/v1/updates/</code> (socket.io)</p>
   <p class="dim">Pass <code>Accept: application/json</code> for a machine-readable discovery doc.</p>
 </body>
 </html>"#,
