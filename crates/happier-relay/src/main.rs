@@ -11,7 +11,14 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::{middleware, routing::{delete as axum_delete, get, post}, Router};
+use axum::{
+    extract::Request,
+    http::StatusCode,
+    middleware::{self, Next},
+    response::IntoResponse,
+    routing::{delete as axum_delete, get, post},
+    Json, Router,
+};
 use clap::Parser;
 use socketioxide::SocketIo;
 use tracing_subscriber::EnvFilter;
@@ -19,8 +26,10 @@ use tracing_subscriber::EnvFilter;
 mod artifacts;
 mod auth;
 mod db;
+mod features;
 mod jwt;
 mod kv;
+mod pairing;
 mod sessions;
 mod socket;
 mod sse;
@@ -67,6 +76,17 @@ struct Args {
     /// the account, so run on loopback or a private network.
     #[arg(long)]
     shared_account: bool,
+
+    /// PEM-encoded TLS certificate file. When passed together with
+    /// `--tls-key`, the relay listens over HTTPS instead of plain
+    /// HTTP. Required for the happier mobile app, which blocks
+    /// cleartext traffic on modern Android / iOS.
+    #[arg(long)]
+    tls_cert: Option<PathBuf>,
+
+    /// PEM-encoded TLS private key file. Pairs with `--tls-cert`.
+    #[arg(long)]
+    tls_key: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -127,7 +147,31 @@ async fn main() -> anyhow::Result<()> {
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_auth));
 
     let app = Router::new()
+        // Some clients (and casual `curl http://host:7892`) probe the
+        // root to confirm the server is up; return a minimal JSON
+        // discovery doc instead of a 404 so liveness checks pass.
+        .route("/", get(root_discovery))
+        // Liveness probe used by the mobile app's sync layer before
+        // it'll attempt anything else. Must return `{ok: true}` with
+        // no auth, matching `apps/server/sources/app/api/routes/
+        // version/versionRoutes.ts` in happier upstream.
+        .route("/v1/version", get(version_probe))
+        // Connectivity gate the mobile homepage uses. Plain text
+        // "ok", status 200, no auth — see
+        // `apps/ui/sources/sync/http/client.connectivityGate.test.ts`.
+        .route("/health", get(health_probe))
         .route("/v1/auth", post(auth::auth_handler))
+        // Mobile clients (happier UI) probe `GET /v1/features` over
+        // 800 ms before doing anything else; if it 404s they decide
+        // the server is incompatible and abort.
+        .route("/v1/features", get(features::features))
+        // Pairing-style auth used by the mobile app. The desktop CLI
+        // uses `/v1/auth` (Ed25519 challenge); the mobile UI uses this
+        // flow. In single-tenant `--shared-account` mode we
+        // short-circuit pairing approval and mint a token immediately
+        // — anyone who can reach the relay is trusted by definition.
+        .route("/v1/auth/account/request", post(pairing::account_request))
+        .route("/v2/auth/account/request", post(pairing::account_request_v2))
         // In-browser UI lives at /web. The HTML/JS bundle authenticates
         // through /v1/auth like any other client; the static routes
         // themselves don't carry the auth middleware.
@@ -137,13 +181,34 @@ async fn main() -> anyhow::Result<()> {
         .route("/web/app.js", get(web::app_js))
         .route("/web/style.css", get(web::style_css))
         .merge(authed)
+        .fallback(unmatched_route)
         .with_state(state)
+        .layer(middleware::from_fn(log_requests))
         .layer(socket_layer);
 
     let addr = format!("{}:{}", args.bind, args.port);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    tracing::info!("happier-relay listening on http://{addr} (socket.io at /socket.io/)");
-    axum::serve(listener, app).await?;
+    let socket_addr: std::net::SocketAddr = addr.parse()?;
+    match (args.tls_cert, args.tls_key) {
+        (Some(cert_path), Some(key_path)) => {
+            let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("load TLS cert={} key={}: {e}", cert_path.display(), key_path.display())
+                })?;
+            tracing::info!("happier-relay listening on https://{addr} (socket.io at /socket.io/)");
+            axum_server::bind_rustls(socket_addr, tls_config)
+                .serve(app.into_make_service())
+                .await?;
+        }
+        (None, None) => {
+            let listener = tokio::net::TcpListener::bind(&addr).await?;
+            tracing::info!("happier-relay listening on http://{addr} (socket.io at /socket.io/)");
+            axum::serve(listener, app).await?;
+        }
+        _ => {
+            anyhow::bail!("--tls-cert and --tls-key must be passed together");
+        }
+    }
     Ok(())
 }
 
@@ -155,6 +220,101 @@ fn resolve_secret(input: &str) -> anyhow::Result<Vec<u8>> {
     } else {
         Ok(input.as_bytes().to_vec())
     }
+}
+
+/// Log every request after the response is built. INFO for 2xx/3xx
+/// (one tidy line per call), WARN for 4xx/5xx so unexpected failures
+/// surface in default-level output. Designed to make "what is the
+/// mobile app actually hitting?" a one-glance question.
+async fn log_requests(req: Request, next: Next) -> axum::response::Response {
+    let method = req.method().clone();
+    let uri = req.uri().clone();
+    let started = std::time::Instant::now();
+    let resp = next.run(req).await;
+    let status = resp.status();
+    let elapsed_ms = started.elapsed().as_millis();
+    let path = uri.path();
+    let query = uri.query().unwrap_or("");
+    if status.is_success() || status.is_redirection() {
+        tracing::info!(target: "happier_relay::http", "{method} {path}{}{query} -> {status} ({elapsed_ms} ms)", if query.is_empty() { "" } else { "?" });
+    } else {
+        tracing::warn!(target: "happier_relay::http", "{method} {path}{}{query} -> {status} ({elapsed_ms} ms)", if query.is_empty() { "" } else { "?" });
+    }
+    resp
+}
+
+/// `GET /v1/version` — happier mobile sync gate. Returns `{ok: true}`.
+async fn version_probe() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "ok": true }))
+}
+
+/// `GET /health` — connectivity gate the mobile homepage hits to
+/// decide "can I reach this relay". Body must be the plain text
+/// `ok` with status 200.
+async fn health_probe() -> &'static str {
+    "ok"
+}
+
+/// `GET /` — friendly landing page. Browsers, curl, and casual
+/// liveness checks all hit this, so it's a small HTML doc instead of
+/// a JSON discovery blob — easier to read at a glance. Clients that
+/// need a machine-readable shape can pass `Accept: application/json`
+/// and get a discovery payload back.
+async fn root_discovery(headers: axum::http::HeaderMap) -> axum::response::Response {
+    let wants_json = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|h| h.to_str().ok())
+        .is_some_and(|a| a.contains("application/json"));
+    if wants_json {
+        return Json(serde_json::json!({
+            "ok": true,
+            "name": "happier-relay",
+            "version": env!("CARGO_PKG_VERSION"),
+            "endpoints": ["/v1/auth", "/v1/auth/ping", "/v1/sessions", "/v1/kv", "/v1/artifacts", "/web"],
+        }))
+        .into_response();
+    }
+    let body = format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>happier-relay</title>
+  <style>
+    body {{ font-family: ui-monospace, Menlo, Consolas, monospace; background: #1a1a1a; color: #ddd; max-width: 720px; margin: 4em auto; padding: 0 1em; line-height: 1.6; }}
+    h1 {{ color: #4ec9b0; font-size: 18px; }}
+    a {{ color: #4ec9b0; }}
+    code {{ background: #2a2a2a; padding: 1px 6px; border-radius: 3px; }}
+    .dim {{ color: #888; }}
+  </style>
+</head>
+<body>
+  <h1>happier-relay · v{}</h1>
+  <p>Single-tenant Rust relay for the <a href="https://github.com/happier-dev/happier">happier</a> wire protocol, bundled inside tab-atelier.</p>
+  <p><a href="/web">Open the web UI →</a></p>
+  <p class="dim">Endpoints: <code>/v1/auth</code> · <code>/v1/sessions</code> · <code>/v1/kv</code> · <code>/v1/artifacts</code> · <code>/v1/events</code> · <code>/socket.io/</code></p>
+  <p class="dim">Pass <code>Accept: application/json</code> for a machine-readable discovery doc.</p>
+</body>
+</html>"#,
+        env!("CARGO_PKG_VERSION")
+    );
+    axum::response::Html(body).into_response()
+}
+
+/// 404 fallback that logs the unmatched route at WARN. The mobile app
+/// hitting an unimplemented endpoint shows up here.
+async fn unmatched_route(req: Request) -> impl IntoResponse {
+    let method = req.method().clone();
+    let uri = req.uri().clone();
+    tracing::warn!(target: "happier_relay::http", "UNMATCHED {method} {uri}");
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "error": "route not implemented in happier-relay",
+            "method": method.as_str(),
+            "path": uri.path(),
+        })),
+    )
 }
 
 fn default_db_path() -> PathBuf {

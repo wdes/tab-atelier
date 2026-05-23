@@ -9,52 +9,43 @@ license = "MPL-2.0"
 publish = false
 
 [features]
-# The whole crate is opt-in. Build with
-# `cargo build -p happier-relay --features happier-dev`. The bin and
-# the integration test below carry `required-features = ["happier-dev"]`
-# so they're silently skipped when the feature isn't set.
 default = []
+# Historical opt-in flag. Now an empty alias kept so older `cargo
+# build --features happier-dev` invocations still work — the crate
+# builds unconditionally since it ships in the tab-atelier deb.
 happier-dev = []
 
 [[bin]]
 name = "happier-relay"
 path = "src/main.rs"
-required-features = ["happier-dev"]
 
 [[test]]
 name = "auth_e2e"
 path = "tests/auth_e2e.rs"
-required-features = ["happier-dev"]
 
 [[test]]
 name = "socket_e2e"
 path = "tests/socket_e2e.rs"
-required-features = ["happier-dev"]
 
 [[test]]
 name = "sessions_e2e"
 path = "tests/sessions_e2e.rs"
-required-features = ["happier-dev"]
 
 [[test]]
 name = "kv_e2e"
 path = "tests/kv_e2e.rs"
-required-features = ["happier-dev"]
 
 [[test]]
 name = "artifacts_e2e"
 path = "tests/artifacts_e2e.rs"
-required-features = ["happier-dev"]
 
 [[test]]
 name = "tab_input_e2e"
 path = "tests/tab_input_e2e.rs"
-required-features = ["happier-dev"]
 
 [[test]]
 name = "shared_account_e2e"
 path = "tests/shared_account_e2e.rs"
-required-features = ["happier-dev"]
 
 [lints.rust]
 unsafe_code = "deny"
@@ -95,6 +86,12 @@ socketioxide = { version = "0.18", features = ["tracing", "extensions", "state"]
 # SSE response. Tiny crate (~30 KB compiled), already a transitive dep.
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures-util = "0.3"
+# TLS listener so the happier mobile app (cleartext-blocked on
+# modern Android / iOS) can actually connect. Reads the same
+# self-signed cert tab-atelier already generates for its own
+# port 7891.
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rustls-pemfile = "2"
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }

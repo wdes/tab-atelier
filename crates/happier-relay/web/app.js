@@ -12,7 +12,8 @@ const root = $("#root");
 
 // --- key + auth ----------------------------------------------------------
 
-const SEED_KEY = "happier-relay:seed";
+const JWK_KEY = "happier-relay:jwk";
+const SEED_KEY = "happier-relay:seed"; // legacy; migrated forward
 const TOKEN_KEY = "happier-relay:token";
 
 function toBase64(bytes) {
@@ -26,58 +27,55 @@ function fromBase64(s) {
   for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
   return out;
 }
-
-async function loadOrCreateKeyPair() {
-  let seed = null;
-  const stored = localStorage.getItem(SEED_KEY);
-  if (stored) seed = fromBase64(stored);
-  else {
-    seed = crypto.getRandomValues(new Uint8Array(32));
-    localStorage.setItem(SEED_KEY, toBase64(seed));
-  }
-  // Web Crypto's "Ed25519" raw private key import takes the 32-byte
-  // seed directly. Browsers without Ed25519 support throw NotSupportedError
-  // here — surface the error in the UI rather than crashing silently.
-  const privateKey = await crypto.subtle.importKey(
-    "raw",
-    seed,
-    { name: "Ed25519" },
-    false,
-    ["sign"],
-  );
-  // We need the matching public key. The seed -> pubkey derivation isn't
-  // exposed by Web Crypto, so we generate from JWK round-trip: import the
-  // private as pkcs8 form-derivable JWK, request the matching public.
-  // Simplest path: generate an ephemeral pair, then sign with the seed-
-  // derived private key only. But we *need* the matching public — so we
-  // export the private as JWK and synthesize the public from the `x` field.
-  const jwk = await crypto.subtle.exportKey("jwk", privateKey).catch(() => null);
-  let publicBytes;
-  if (jwk && jwk.x) {
-    publicBytes = fromBase64Url(jwk.x);
-  } else {
-    // Fallback: re-import the seed as a key-pair-capable key so we can
-    // export the public side.
-    const pair = await deriveKeyPairFromSeed(seed);
-    publicBytes = pair.publicBytes;
-    return { privateKey: pair.privateKey, publicBytes, seed };
-  }
-  return { privateKey, publicBytes, seed };
-}
-
-// Per WebCrypto spec, importing the raw seed should yield a key whose
-// JWK has `x` (the public key). If a browser doesn't expose that, we
-// fall back to generateKey + manual seed override (not actually possible
-// — so we just regenerate, persisting the new seed and warning the user).
-async function deriveKeyPairFromSeed(seed) {
-  // No-op shim — flag clearly that we couldn't recover the pubkey.
-  throw new Error("Web Crypto JWK export didn't include 'x' — browser too old?");
-}
-
 function fromBase64Url(s) {
   s = s.replace(/-/g, "+").replace(/_/g, "/");
   while (s.length % 4) s += "=";
   return fromBase64(s);
+}
+
+// WebCrypto's Ed25519 `importKey("raw", …)` is *public-key only* per
+// the spec. Chrome accepts a 32-byte raw private seed too; Firefox /
+// LibreWolf strictly reject it with `DataError → "invalid or illegal
+// string"`. The portable path is `generateKey` once, then JWK
+// round-trip via localStorage so the key survives reloads.
+async function loadOrCreateKeyPair() {
+  let jwk = null;
+  const storedJwk = localStorage.getItem(JWK_KEY);
+  if (storedJwk) {
+    try {
+      jwk = JSON.parse(storedJwk);
+    } catch (_) {
+      jwk = null;
+    }
+  }
+  // Drop any pre-migration raw-seed value — we can't recover the
+  // matching pubkey without the JWK so the cleanest path is a fresh
+  // key. Browsers that worked on the old code (Chrome) will re-auth.
+  if (!jwk) {
+    localStorage.removeItem(SEED_KEY);
+    const pair = await crypto.subtle.generateKey(
+      { name: "Ed25519" },
+      true,
+      ["sign", "verify"],
+    );
+    jwk = await crypto.subtle.exportKey("jwk", pair.privateKey);
+    localStorage.setItem(JWK_KEY, JSON.stringify(jwk));
+  }
+  // Import the *private* side via JWK (spec-compliant for Ed25519).
+  // `extractable: false` so the seed can't be exfiltrated by JS that
+  // gets injected later via XSS.
+  const privateKey = await crypto.subtle.importKey(
+    "jwk",
+    jwk,
+    { name: "Ed25519" },
+    false,
+    ["sign"],
+  );
+  if (!jwk.x) {
+    throw new Error("stored JWK is missing the public-key field 'x'");
+  }
+  const publicBytes = fromBase64Url(jwk.x);
+  return { privateKey, publicBytes };
 }
 
 async function signChallenge(privateKey, challenge) {
@@ -519,18 +517,50 @@ function escapeHtml(s) {
 // --- entrypoint ----------------------------------------------------------
 
 (async function main() {
+  // crypto.subtle is *only* exposed in a "secure context" — HTTPS or
+  // http://localhost / http://127.0.0.1. Hitting the web UI by LAN IP
+  // (e.g. http://192.168.1.15:7892) over plain HTTP makes the whole
+  // SubtleCrypto API undefined, which the user sees as a confusing
+  // "Ed25519 not supported" message. Detect that case up front and
+  // explain.
+  if (!window.isSecureContext || !window.crypto || !window.crypto.subtle) {
+    const here = window.location.href;
+    const loopback = here
+      .replace(/^http:\/\/[^/:]+/, "http://127.0.0.1");
+    root.innerHTML = `
+      <h1>happier-relay</h1>
+      <p class="err">This page needs a secure context, but it was opened over plain HTTP on a non-loopback address.</p>
+      <p class="dim">Browsers only expose <code>crypto.subtle</code> (needed for Ed25519 sign-in) over <strong>HTTPS</strong> or <strong>http://localhost</strong> / <strong>http://127.0.0.1</strong>.</p>
+      <p>Try one of:</p>
+      <ul>
+        <li>Open <a href="${escapeHtml(loopback)}">${escapeHtml(loopback)}</a> from this machine.</li>
+        <li>SSH-port-forward 7892 to your laptop and open it locally.</li>
+        <li>Put a TLS proxy (Caddy, nginx) in front of the relay for LAN access.</li>
+      </ul>
+      <p class="dim">Currently at <code>${escapeHtml(here)}</code>; secure context = <code>${window.isSecureContext}</code>.</p>
+    `;
+    return;
+  }
+
   try {
     TOKEN = await ensureToken();
     await renderList();
     startPolling();
     startEventStream();
   } catch (e) {
+    const msg = String(e);
+    // Distinguish "no subtle at all" (caught above) from "subtle is
+    // here but Ed25519 throws NotSupportedError" — only the latter is
+    // a browser-version issue.
+    const isEd25519Issue = /Ed25519|NotSupportedError/i.test(msg);
     root.innerHTML = `
       <h1>happier-relay</h1>
-      <p class="err">${escapeHtml(String(e))}</p>
-      <p class="dim">
-        This browser needs native Ed25519 (Chrome 126+, Firefox 130+, Safari 17+).
-      </p>
+      <p class="err">${escapeHtml(msg)}</p>
+      ${isEd25519Issue ? `
+        <p class="dim">
+          This browser is missing native Ed25519 support. Need Chrome 126+, Firefox 130+, or Safari 17+.
+        </p>
+      ` : ""}
     `;
   }
 })();
