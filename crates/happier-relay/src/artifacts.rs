@@ -392,17 +392,48 @@ pub async fn delete(
 /// Drop a broadcast request into the fan-out channel. `send` returns
 /// the count of receivers; zero is normal (no devices subscribed) and
 /// not worth logging.
+///
+/// SSE consumers see the literal `event` name (e.g. `artifact-update`)
+/// with `payload` as the data. Socket.io consumers see an `update`
+/// event whose body has a `t` discriminator built from `event`
+/// (`artifact-create` → `new-artifact`, `artifact-update` →
+/// `update-artifact`, `artifact-delete` → `delete-artifact`) — that
+/// `t` shape is what happier-mobile's update handlers dispatch on.
 fn fanout<T: serde::Serialize>(tx: &broadcast::Sender<BroadcastMsg>, user_id: &str, event: &str, payload: &T) {
-    let body = match serde_json::to_value(payload) {
+    let payload_v = match serde_json::to_value(payload) {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(error = ?e, event, user = user_id, "fanout: serialize failed");
             return;
         }
     };
+    let body = happier_body_for(event, &payload_v);
     let _ = tx.send(BroadcastMsg {
         user_id: user_id.to_string(),
         event: event.to_string(),
-        payload: body,
+        payload: payload_v,
+        body,
     });
+}
+
+/// Convert our internal `artifact-*` event names + payload into a
+/// happier `UpdatePayload.body` (with `t` discriminator). Returns
+/// `None` for events the mobile doesn't have a body shape for —
+/// in that case socket.io clients get no `update` emit, only SSE
+/// receives the legacy event.
+fn happier_body_for(event: &str, payload: &serde_json::Value) -> Option<serde_json::Value> {
+    let t = match event {
+        "artifact-create" => "new-artifact",
+        "artifact-update" => "update-artifact",
+        "artifact-delete" => "delete-artifact",
+        _ => return None,
+    };
+    let mut body = serde_json::json!({ "t": t });
+    if let Some(obj) = payload.as_object() {
+        let body_obj = body.as_object_mut().expect("just built");
+        for (k, v) in obj {
+            body_obj.insert(k.clone(), v.clone());
+        }
+    }
+    Some(body)
 }
