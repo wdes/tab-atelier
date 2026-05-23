@@ -4,7 +4,7 @@ members = ["crates/catbus-agent", "crates/happier-relay"]
 # the default workspace build so `cargo build` / `cargo check` from the
 # root stays lean. Build it explicitly with
 # `cargo build -p happier-relay --features happier-dev`.
-default-members = [".", "crates/catbus-agent"]
+default-members = [".", "crates/catbus-agent", "crates/happier-relay"]
 
 [package]
 name = "tab-atelier"
@@ -69,7 +69,11 @@ ctrlc = { version = "3.4", default-features = false }
 fs2 = "0.4"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 rustls-pemfile = "2"
-rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem", "x509-parser"] }
+# Used to pin self-signed cert validity to (now, now+5y). rcgen's
+# default is `1975-01-01 → 4096-01-01`, which strict mobile TLS
+# stacks (Android) reject.
+time = "0.3"
 # Optional happier-bridge deps (only compiled with `--features happier-bridge`).
 ed25519-dalek = { version = "2", optional = true }
 base64 = { version = "0.22", optional = true }
@@ -79,12 +83,17 @@ rand = { version = "0.8", optional = true }
 # so we can wrap our own write path.
 flate2 = "1"
 
+
 [dev-dependencies]
 gpui = { version = "0.2", default-features = false, features = ["x11", "test-support"] }
 
 [package.metadata.deb]
 section = "x11"
 priority = "optional"
+# The bundled happier-relay auto-spawn lives behind the
+# `happier-bridge` feature. `cargo build` keeps it off for fast dev
+# rebuilds; the deb always wants it.
+features = ["happier-bridge"]
 depends = "libc6, libgcc-s1, libfreetype6, libxkbcommon0, libxkbcommon-x11-0, libxcb1, libxcb-xkb1"
 maintainer = "William Desportes <williamdes@wdes.fr>"
 extended-description = "A Guake-style drop-down terminal emulator built with alacritty_terminal and gpui. Features tabbed terminals, i18n (English/French), power monitoring, screenshots, remote control via QR code, and Wakatime integration."
@@ -93,7 +102,15 @@ assets = [
     # Bundled so the "Switch to catbus" tab menu entry resolves the
     # binary against the user's PATH without extra config.
     ["target/release/catbus-agent", "/usr/bin/", "755"],
+    # tab-atelier spawns this on startup (when `happier-bridge` is
+    # built in) so the mobile/web clients have a relay to talk to
+    # without the user managing a separate process.
+    ["target/release/happier-relay", "/usr/bin/", "755"],
     ["assets/tab-atelier.desktop", "/usr/share/applications/", "644"],
+    # Drops a system-wide autostart entry so the app appears in
+    # session-manager autostart lists (XFCE: Session and Startup →
+    # Application Autostart). Defaults to enabled; users can untick.
+    ["assets/tab-atelier-autostart.desktop", "/etc/xdg/autostart/tab-atelier.desktop", "644"],
     ["assets/tab-atelier.svg", "/usr/share/icons/hicolor/scalable/apps/tab-atelier.svg", "644"],
     ["README.md", "/usr/share/doc/tab-atelier/", "644"],
     ["LICENSE", "/usr/share/doc/tab-atelier/", "644"],
