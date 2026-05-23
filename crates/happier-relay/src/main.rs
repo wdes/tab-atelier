@@ -34,6 +34,7 @@ mod sessions;
 mod socket;
 mod sse;
 mod state;
+mod stubs;
 mod tab_input;
 mod web;
 
@@ -107,11 +108,13 @@ async fn main() -> anyhow::Result<()> {
     let (socket_layer, io) = SocketIo::builder().build_layer();
     let (broadcast_tx, _broadcast_rx_initial) = tokio::sync::broadcast::channel::<state::BroadcastMsg>(256);
 
+    let machine_id = resolve_machine_id();
     let state = state::AppState {
         db: pool,
         jwt_secret: Arc::new(secret),
         owner_pubkey_hex: args.owner_pubkey.map(|s| s.to_lowercase()),
         shared_account: args.shared_account,
+        machine_id,
         broadcast_tx: broadcast_tx.clone(),
         input_notifier: tab_input::InputNotifier::default(),
     };
@@ -144,6 +147,21 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/tab-input", post(tab_input::post_input))
         .route("/v1/tab-input/pending", get(tab_input::pending))
         .route("/v1/events", get(sse::events))
+        // Mobile UI stubs — minimal-shape returns so the homepage,
+        // machine list, account screens, and sync poll all stop
+        // 404'ing. Real data wiring is a follow-up; the goal here
+        // is "no spinner forever" / "no 'offline' badge".
+        .route("/v1/machines", get(stubs::list_machines))
+        .route("/v2/sessions", get(stubs::list_sessions_v2))
+        .route("/v1/account/profile", get(stubs::account_profile))
+        .route("/v1/account/encryption", get(stubs::account_encryption))
+        .route("/v2/changes", get(stubs::v2_changes))
+        .route("/v2/cursor", get(stubs::v2_cursor))
+        .route("/v1/push-tokens", get(stubs::list_push_tokens).post(stubs::register_push_token))
+        .route("/v1/push-tokens/{token}", axum_delete(stubs::delete_push_token))
+        .route("/v1/feed", get(stubs::feed))
+        .route("/v1/friends", get(stubs::friends))
+        .route("/v1/account/activity/badge-snapshot", get(stubs::activity_badge_snapshot))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_auth));
 
     let app = Router::new()
@@ -315,6 +333,49 @@ async fn unmatched_route(req: Request) -> impl IntoResponse {
             "path": uri.path(),
         })),
     )
+}
+
+/// Stable host identifier shown as the machine name in the mobile
+/// UI. Persisted to `$XDG_CONFIG_HOME/tab-atelier/machine-id` on
+/// first use so it survives restarts. Falls back to a literal
+/// `"tab-atelier"` if neither HOSTNAME nor the file is usable —
+/// the relay should still come up.
+fn resolve_machine_id() -> String {
+    let dir = std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".config")))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let path = dir.join("tab-atelier").join("machine-id");
+    if let Ok(s) = std::fs::read_to_string(&path) {
+        let trimmed = s.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    let hostname = std::env::var("HOSTNAME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "host".to_string())
+        });
+    let id = format!("tab-atelier@{}", sanitize_machine_id(&hostname));
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, &id);
+    id
+}
+
+fn sanitize_machine_id(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
+        .take(64)
+        .collect()
 }
 
 fn default_db_path() -> PathBuf {
