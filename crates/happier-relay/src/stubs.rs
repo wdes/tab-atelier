@@ -18,7 +18,6 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use base64::Engine;
 use serde::Deserialize;
 use sqlx::Row;
 
@@ -152,16 +151,15 @@ async fn load_tab_artifact(
     .fetch_optional(&state.db)
     .await?;
     let Some(row) = row else { return Ok(None) };
-    let header_b64: Vec<u8> = row.get("header");
+    // The header column stores the JSON bytes already decoded — the
+    // create/update handlers base64-decode the wire field before
+    // insert. JSON-parse directly.
+    let header_bytes: Vec<u8> = row.get("header");
     let body: Vec<u8> = row.get("body");
     let created_at: i64 = row.get("created_at");
     let updated_at: i64 = row.get("updated_at");
-    let b64 = base64::engine::general_purpose::STANDARD;
-    let header_json: serde_json::Value = b64
-        .decode(&header_b64)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or(serde_json::Value::Null);
+    let header_json: serde_json::Value =
+        serde_json::from_slice(&header_bytes).unwrap_or(serde_json::Value::Null);
     if header_json.get("kind").and_then(serde_json::Value::as_str) != Some("tab-atelier:tab") {
         return Ok(None);
     }
@@ -463,22 +461,19 @@ pub async fn list_sessions_v2(
         )
     })?;
 
-    let b64 = base64::engine::general_purpose::STANDARD;
     let mut sessions = Vec::with_capacity(rows.len());
     for row in rows {
         let id: String = row.get("id");
-        let header_b64: Vec<u8> = row.get("header");
+        let header_bytes: Vec<u8> = row.get("header");
         let seq: i64 = row.get("seq");
         let created_at: i64 = row.get("created_at");
         let updated_at: i64 = row.get("updated_at");
 
-        // Tab name lives in the bridge-written header JSON. Pull it
-        // out so the mobile UI shows the tab's name rather than the
-        // raw UUID.
-        let header_json: Option<serde_json::Value> = b64
-            .decode(&header_b64)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+        // Header on the wire is base64; the create/update handlers
+        // already base64-decode before storing, so the column holds
+        // the raw JSON bytes — JSON-parse directly, do NOT base64
+        // a second time.
+        let header_json: Option<serde_json::Value> = serde_json::from_slice(&header_bytes).ok();
         let name = header_json
             .as_ref()
             .and_then(|v| v.get("name"))
