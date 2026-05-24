@@ -25,6 +25,7 @@ use tracing_subscriber::EnvFilter;
 
 mod artifacts;
 mod auth;
+mod changes;
 mod db;
 mod features;
 mod jwt;
@@ -127,6 +128,7 @@ async fn main() -> anyhow::Result<()> {
         machine_id,
         broadcast_tx: broadcast_tx.clone(),
         input_notifier: tab_input::InputNotifier::default(),
+        changes: changes::ChangesRingBuffer::default(),
     };
 
     tokio::spawn(state::broadcast_loop(io.clone(), broadcast_tx.subscribe()));
@@ -165,8 +167,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/v2/sessions", get(stubs::list_sessions_v2))
         .route("/v1/account/profile", get(stubs::account_profile))
         .route("/v1/account/encryption", get(stubs::account_encryption))
-        .route("/v2/changes", get(stubs::v2_changes))
-        .route("/v2/cursor", get(stubs::v2_cursor))
+        .route("/v2/changes", get(changes::changes))
+        .route("/v2/cursor", get(changes::cursor))
         .route("/v1/push-tokens", get(stubs::list_push_tokens).post(stubs::register_push_token))
         .route("/v1/push-tokens/{token}", axum_delete(stubs::delete_push_token))
         .route("/v1/feed", get(stubs::feed))

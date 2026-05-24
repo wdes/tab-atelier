@@ -99,19 +99,6 @@ pub async fn account_encryption() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "mode": "plain", "updatedAt": 0 }))
 }
 
-/// `GET /v2/changes` — incremental sync cursor pagination. Empty
-/// payload tells the UI "no changes since your cursor".
-pub async fn v2_changes() -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "changes": [], "cursor": 0 }))
-}
-
-/// `GET /v2/cursor` — the UI reads this to learn its starting
-/// cursor before polling `/v2/changes`. Returning 0 means "from
-/// the beginning"; we have no real change log anyway.
-pub async fn v2_cursor() -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "cursor": 0 }))
-}
-
 /// `GET /v1/push-tokens` — list registered push tokens. We don't
 /// integrate with FCM/APNS, so always empty.
 pub async fn list_push_tokens() -> Json<serde_json::Value> {

@@ -3163,6 +3163,7 @@ dependencies = [
  "futures-util",
  "hex",
  "jsonwebtoken",
+ "parking_lot",
  "rand 0.8.6",
  "reqwest",
  "rust_socketio",
