@@ -213,7 +213,11 @@ pub async fn list_tab_messages_v1(
         })));
     }
 
-    let text = String::from_utf8_lossy(&body).into_owned();
+    // The on-disk body keeps full ANSI so the relay's own web UI can
+    // colour it. The mobile UI renders message text plain — without
+    // stripping, scrollback shows literal `^[[31m` everywhere.
+    let raw = String::from_utf8_lossy(&body);
+    let text = strip_ansi(&raw);
     let name = header
         .get("name")
         .and_then(serde_json::Value::as_str)
@@ -328,6 +332,95 @@ pub async fn tab_session_pending(Path(_id): Path<String>) -> Json<serde_json::Va
 /// `GET /v2/session-folder-assignments?sessionIds=...` — empty.
 pub async fn session_folder_assignments() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "assignments": [] }))
+}
+
+/// Strip ANSI escape sequences from a terminal scrollback string so
+/// the mobile renders plain text. Handles:
+/// - CSI: `ESC [ params final` (colors, cursor moves, erase, etc.)
+/// - OSC: `ESC ] params ST|BEL` (window titles, OSC-8 hyperlinks)
+/// - Single-char ESC sequences: `ESC <char>` (e.g. `ESC =`, `ESC >`)
+///
+/// Mirrors the semantics of `tab_atelier::strip_ansi` (which the
+/// desktop uses for the clipboard-as-plaintext path) plus OSC
+/// handling, since terminal apps (Claude Code, ripgrep) often emit
+/// OSC-8 links the mobile shouldn't show literally.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some(&'[') => {
+                // CSI — consume params/intermediates until a final
+                // byte in `0x40..=0x7e`.
+                chars.next();
+                for nc in chars.by_ref() {
+                    if ('\x40'..='\x7e').contains(&nc) {
+                        break;
+                    }
+                }
+            }
+            Some(&']') => {
+                // OSC — terminated by ST (`ESC \`) or BEL (`\x07`).
+                chars.next();
+                while let Some(nc) = chars.next() {
+                    if nc == '\x07' {
+                        break;
+                    }
+                    if nc == '\x1b' && chars.peek() == Some(&'\\') {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            Some(_) => {
+                // Two-char escape sequence (`ESC =`, `ESC >`, …);
+                // drop the next char and move on.
+                chars.next();
+            }
+            None => {
+                // Lone trailing ESC. Drop it.
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_ansi;
+
+    #[test]
+    fn strips_sgr_colors() {
+        assert_eq!(strip_ansi("\x1b[31mhello\x1b[0m world"), "hello world");
+    }
+
+    #[test]
+    fn strips_cursor_moves_and_erase() {
+        assert_eq!(strip_ansi("\x1b[2Jabc\x1b[1;1H"), "abc");
+    }
+
+    #[test]
+    fn strips_osc_hyperlink() {
+        // OSC 8 hyperlink — both BEL- and ST-terminated forms.
+        assert_eq!(strip_ansi("\x1b]8;;https://x\x07link\x1b]8;;\x07"), "link");
+        assert_eq!(strip_ansi("\x1b]0;title\x1b\\rest"), "rest");
+    }
+
+    #[test]
+    fn passes_plain_text_through() {
+        let s = "no escapes here\nsecond line\ttabbed";
+        assert_eq!(strip_ansi(s), s);
+    }
+
+    #[test]
+    fn drops_lone_escape() {
+        assert_eq!(strip_ansi("a\x1bb"), "a"); // ESC b = two-char escape, both consumed
+        assert_eq!(strip_ansi("trailing\x1b"), "trailing");
+    }
 }
 
 fn now_ms() -> i64 {
