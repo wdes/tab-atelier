@@ -328,6 +328,133 @@ pub async fn get_tab_session_v2(
     })))
 }
 
+/// `POST /v2/sessions/{id}/messages` — tab variant. The mobile user
+/// typing a message into the session chat-input gets piped straight
+/// into the tab's PTY via the existing `tab_input` table.
+///
+/// Request body shape (what happier mobile sends):
+///   { content: "<stringified SessionStoredMessageContent>", localId, ... }
+/// where the content string decodes to
+///   { t:"plain", v:{ role:"user", content:{ type:"text", text:"..." } } }
+///
+/// We:
+/// 1. Look up the tab artifact by session id → its header carries the
+///    tab name.
+/// 2. Parse the content envelope, extract the text.
+/// 3. Append `\n` (the user typed a line; the chat-style input doesn't
+///    include a trailing newline but the PTY needs one to advance).
+/// 4. INSERT into `tab_input` — the bridge's input poller picks it up
+///    within the next long-poll cycle and writes the bytes into the
+///    matching tab's PTY.
+/// 5. Return a synthetic `ApiMessage` echoing the user's text so the
+///    mobile chat-view renders it immediately as a user bubble.
+pub async fn post_tab_session_message(
+    State(state): State<AppState>,
+    Extension(user): Extension<UserId>,
+    Path(session_id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let Some((header, _body, _ca, _ua)) =
+        load_tab_artifact(&state, &user.0, &session_id).await.map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "internal error" })),
+            )
+        })?
+    else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "not-a-tab-artifact" })),
+        ));
+    };
+
+    let tab_name = header
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "tab artifact missing name" })),
+            )
+        })?
+        .to_string();
+    let local_id = body
+        .get("localId")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let text = extract_user_text(&body).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "no user text in content" })),
+        )
+    })?;
+
+    let mut bytes = text.into_bytes();
+    if !bytes.ends_with(b"\n") {
+        bytes.push(b'\n');
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0_i64, |d| {
+            i64::try_from(d.as_secs()).unwrap_or(i64::MAX)
+        });
+
+    let res = sqlx::query(
+        "INSERT INTO tab_input (account_id, tab_name, bytes, created_at) VALUES (?1, ?2, ?3, ?4)",
+    )
+    .bind(&user.0)
+    .bind(&tab_name)
+    .bind(&bytes)
+    .bind(now)
+    .execute(&state.db)
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "internal error" })),
+        )
+    })?;
+    let seq = res.last_insert_rowid();
+    state.input_notifier.notify_user(&user.0).await;
+
+    let now_ms = now.saturating_mul(1000);
+    let echo_text = String::from_utf8_lossy(&bytes).trim_end_matches('\n').to_string();
+    Ok(Json(serde_json::json!({
+        "message": {
+            "id": format!("{session_id}:user:{seq}"),
+            "seq": seq,
+            "localId": local_id,
+            "sidechainId": null,
+            "messageRole": "user",
+            "content": {
+                "t": "plain",
+                "v": {
+                    "role": "user",
+                    "content": { "type": "text", "text": echo_text },
+                },
+            },
+            "createdAt": now_ms,
+            "updatedAt": now_ms,
+        }
+    })))
+}
+
+/// Best-effort extraction of the user's typed text out of a posted
+/// message body. happier mobile sends `content` as a stringified
+/// `SessionStoredMessageContent` envelope; in plain mode that's
+/// `{t:"plain", v:{role:"user", content:{type:"text", text:"..."}}}`.
+fn extract_user_text(body: &serde_json::Value) -> Option<String> {
+    let content_str = body.get("content").and_then(serde_json::Value::as_str)?;
+    let envelope: serde_json::Value = serde_json::from_str(content_str).ok()?;
+    envelope
+        .get("v")
+        .and_then(|v| v.get("content"))
+        .and_then(|c| c.get("text"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
 /// `GET /v2/sessions/{id}/pending` — always empty for tabs.
 pub async fn tab_session_pending(Path(_id): Path<String>) -> Json<serde_json::Value> {
     Json(serde_json::json!({ "pending": [] }))
