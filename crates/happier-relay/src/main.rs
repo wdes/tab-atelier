@@ -133,11 +133,34 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::spawn(state::broadcast_loop(io.clone(), broadcast_tx.subscribe()));
 
+    // socket.io interprets anything after the host in the client's
+    // endpoint URL as a *namespace*, not as a path prefix. Clients
+    // configured with a serverUrl like
+    // `https://host/~williamdes/.tab-atelier` therefore try to
+    // connect to namespace `/~williamdes/.tab-atelier`, which would
+    // mismatch a bare `io.ns("/", ...)` registration and the client
+    // would see "invalid namespace". Register both: the canonical
+    // root for clients hitting the bare host, AND a wildcard that
+    // routes everything else to the same handler.
     let connect_state = state.clone();
-    io.ns("/", move |socket: socketioxide::extract::SocketRef, data: socketioxide::extract::Data<socket::AuthPayload>| {
-        let st = connect_state.clone();
-        async move { socket::on_connect_with_state(socket, data, st).await }
-    });
+    let dyn_state = state.clone();
+    io.ns(
+        "/",
+        move |socket: socketioxide::extract::SocketRef,
+              data: socketioxide::extract::Data<socket::AuthPayload>| {
+            let st = connect_state.clone();
+            async move { socket::on_connect_with_state(socket, data, st).await }
+        },
+    );
+    io.dyn_ns(
+        "/{*rest}",
+        move |socket: socketioxide::extract::SocketRef,
+              data: socketioxide::extract::Data<socket::AuthPayload>| {
+            let st = dyn_state.clone();
+            async move { socket::on_connect_with_state(socket, data, st).await }
+        },
+    )
+    .expect("dyn_ns pattern is valid");
 
     // Authed routes get the middleware; public ones (just /v1/auth) don't.
     let authed = Router::new()
