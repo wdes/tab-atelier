@@ -15,7 +15,6 @@ use axum::{
 };
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast;
 
 use crate::auth::UserId;
 use crate::state::{AppState, BroadcastMsg};
@@ -212,7 +211,7 @@ pub async fn create(
         created_at: now,
         updated_at: now,
     };
-    fanout(&state.broadcast_tx, &user.0, "artifact-create", &view);
+    fanout(&state, &user.0, "artifact-create", &view);
     Ok(Json(serde_json::to_value(&view).unwrap()))
 }
 
@@ -284,7 +283,7 @@ pub async fn update(
         "bodyVersion": row.body_version,
     });
     fanout(
-        &state.broadcast_tx,
+        &state,
         &user.0,
         "artifact-update",
         &serde_json::json!({
@@ -359,7 +358,7 @@ pub async fn append(
         "bodyLen": row.body.len(),
     });
     fanout(
-        &state.broadcast_tx,
+        &state,
         &user.0,
         "artifact-update",
         &serde_json::json!({
@@ -385,7 +384,7 @@ pub async fn delete(
     if result.rows_affected() == 0 {
         return Err(err(StatusCode::NOT_FOUND, "artifact not found"));
     }
-    fanout(&state.broadcast_tx, &user.0, "artifact-delete", &serde_json::json!({ "id": id }));
+    fanout(&state, &user.0, "artifact-delete", &serde_json::json!({ "id": id }));
     Ok(Json(serde_json::json!({ "success": true })))
 }
 
@@ -399,7 +398,7 @@ pub async fn delete(
 /// (`artifact-create` → `new-artifact`, `artifact-update` →
 /// `update-artifact`, `artifact-delete` → `delete-artifact`) — that
 /// `t` shape is what happier-mobile's update handlers dispatch on.
-fn fanout<T: serde::Serialize>(tx: &broadcast::Sender<BroadcastMsg>, user_id: &str, event: &str, payload: &T) {
+fn fanout<T: serde::Serialize>(state: &AppState, user_id: &str, event: &str, payload: &T) {
     let payload_v = match serde_json::to_value(payload) {
         Ok(v) => v,
         Err(e) => {
@@ -408,7 +407,18 @@ fn fanout<T: serde::Serialize>(tx: &broadcast::Sender<BroadcastMsg>, user_id: &s
         }
     };
     let body = happier_body_for(event, &payload_v);
-    let _ = tx.send(BroadcastMsg {
+    // Also append to the /v2/changes ring so an offline client can
+    // catch up on reconnect. `entityId` is the artifact id when we
+    // can find it in the payload; otherwise skip the ring (the
+    // event is then socket-only).
+    if let Some(entity_id) = payload_v.get("id").and_then(serde_json::Value::as_str) {
+        state.changes.append(crate::changes::ChangeRecord {
+            kind: "artifact",
+            entity_id: entity_id.to_string(),
+            hint: None,
+        });
+    }
+    let _ = state.broadcast_tx.send(BroadcastMsg {
         user_id: user_id.to_string(),
         event: event.to_string(),
         payload: payload_v,

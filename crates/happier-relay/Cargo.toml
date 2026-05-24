@@ -92,6 +92,9 @@ futures-util = "0.3"
 # single Query<T> extractor at the handler level. Already in the
 # transitive tree via axum.
 serde_urlencoded = "0.7"
+# Cheap RwLock for the /v2/changes ring buffer (no async needed — the
+# critical section is a couple of VecDeque ops, microsecond scale).
+parking_lot = "0.12"
 # TLS listener so the happier mobile app (cleartext-blocked on
 # modern Android / iOS) can actually connect. Reads the same
 # self-signed cert tab-atelier already generates for its own

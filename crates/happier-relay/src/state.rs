@@ -62,6 +62,10 @@ pub struct AppState {
     /// long-poll. POST handlers tap this so waiters return immediately
     /// instead of waiting out the full timeout.
     pub input_notifier: crate::tab_input::InputNotifier,
+    /// `/v2/changes` ring buffer. Every artifact mutation appends a
+    /// row; the mobile polls this when reconnecting after offline so
+    /// no real-time `update` events get missed silently.
+    pub changes: crate::changes::ChangesRingBuffer,
 }
 
 /// Background task that owns the `SocketIo` handle and forwards each
