@@ -169,7 +169,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/sessions/{id}", axum_delete(sessions::delete))
         .route("/v2/sessions/{id}", get(dispatch_session_get_v2).patch(sessions::patch))
         .route("/v1/sessions/{id}/messages", get(dispatch_session_messages_v1))
-        .route("/v2/sessions/{id}/messages", post(sessions::post_message))
+        .route("/v2/sessions/{id}/messages", post(dispatch_session_post_message_v2))
         .route("/v1/kv", get(kv::list).post(kv::mutate))
         .route("/v1/kv/bulk", post(kv::bulk_get))
         .route("/v1/kv/{key}", get(kv::get_one))
@@ -399,6 +399,53 @@ async fn dispatch_session_get_v2(
             sessions::get_one(State(cloned_state), Extension(cloned_user), Path(cloned_id))
                 .await
                 .into_response()
+        }
+        Err((status, body)) => (status, body).into_response(),
+    }
+}
+
+/// `POST /v2/sessions/{id}/messages` dispatcher. For tab artifacts,
+/// the typed text becomes PTY input on the matching desktop tab.
+/// For non-tab session ids, hand off to the SQL-backed
+/// `sessions::post_message`.
+async fn dispatch_session_post_message_v2(
+    axum::extract::State(state): axum::extract::State<state::AppState>,
+    axum::Extension(user): axum::Extension<auth::UserId>,
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> axum::response::Response {
+    use axum::extract::{Path, State};
+    use axum::response::IntoResponse;
+    use axum::{Extension, Json};
+    let cloned_state = state.clone();
+    let cloned_user = user.clone();
+    let cloned_id = session_id.clone();
+    let cloned_body = body.clone();
+    match stubs::post_tab_session_message(State(state), Extension(user), Path(session_id), Json(body)).await {
+        Ok(json) => json.into_response(),
+        Err((status, err_body))
+            if status == axum::http::StatusCode::NOT_FOUND
+                && err_body.0.get("error").and_then(serde_json::Value::as_str) == Some("not-a-tab-artifact") =>
+        {
+            // Deserialize back into PostMessageReq for the SQL handler.
+            // Round-trip via to_value/from_value because we already
+            // consumed the original Json extractor.
+            match serde_json::from_value::<sessions::PostMessageReq>(cloned_body) {
+                Ok(req) => sessions::post_message(
+                    State(cloned_state),
+                    Extension(cloned_user),
+                    axum::http::HeaderMap::new(),
+                    Path(cloned_id),
+                    Json(req),
+                )
+                .await
+                .into_response(),
+                Err(e) => (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": format!("invalid PostMessageReq: {e}") })),
+                )
+                    .into_response(),
+            }
         }
         Err((status, body)) => (status, body).into_response(),
     }
