@@ -156,14 +156,20 @@ async fn load_tab_artifact(
     // insert. JSON-parse directly.
     let header_bytes: Vec<u8> = row.get("header");
     let body: Vec<u8> = row.get("body");
-    let created_at: i64 = row.get("created_at");
-    let updated_at: i64 = row.get("updated_at");
+    // Artifacts' created_at/updated_at are stored in UNIX seconds
+    // (see artifacts::now_secs). The mobile UI's session list
+    // interprets timestamps in milliseconds — without converting,
+    // the "uptime" / "last activity" labels render as "56 years
+    // ago" (~ epoch seconds interpreted as epoch ms). Convert once
+    // here so all callers see ms.
+    let created_at_ms: i64 = row.get::<i64, _>("created_at").saturating_mul(1000);
+    let updated_at_ms: i64 = row.get::<i64, _>("updated_at").saturating_mul(1000);
     let header_json: serde_json::Value =
         serde_json::from_slice(&header_bytes).unwrap_or(serde_json::Value::Null);
     if header_json.get("kind").and_then(serde_json::Value::as_str) != Some("tab-atelier:tab") {
         return Ok(None);
     }
-    Ok(Some((header_json, body, created_at, updated_at)))
+    Ok(Some((header_json, body, created_at_ms, updated_at_ms)))
 }
 
 /// `GET /v1/sessions/{id}/messages` — tab variant.
@@ -466,8 +472,10 @@ pub async fn list_sessions_v2(
         let id: String = row.get("id");
         let header_bytes: Vec<u8> = row.get("header");
         let seq: i64 = row.get("seq");
-        let created_at: i64 = row.get("created_at");
-        let updated_at: i64 = row.get("updated_at");
+        // Stored as UNIX seconds; happier mobile reads as ms (see
+        // `load_tab_artifact` for the same conversion + note).
+        let created_at: i64 = row.get::<i64, _>("created_at").saturating_mul(1000);
+        let updated_at: i64 = row.get::<i64, _>("updated_at").saturating_mul(1000);
 
         // Header on the wire is base64; the create/update handlers
         // already base64-decode before storing, so the column holds
