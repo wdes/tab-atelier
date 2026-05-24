@@ -294,11 +294,16 @@ pub async fn get_tab_session_v2(
         .and_then(serde_json::Value::as_str)
         .unwrap_or("(unnamed tab)")
         .to_string();
+    // `machineId` ties the session to our `/v1/machines` entry —
+    // without it the mobile session detail shows "Unknown machine"
+    // as the machine label even though the machine list itself is
+    // populated.
     let metadata = serde_json::json!({
         "name": &name,
         "summary": { "text": &name, "updatedAt": updated_at },
         "path": &name,
         "host": "tab-atelier",
+        "machineId": &state.machine_id,
     })
     .to_string();
 
@@ -631,7 +636,9 @@ pub async fn list_sessions_v2(
         // `parsePlainSessionMetadata` JSON.parses it directly. The
         // mobile session list renderer reads `name`, `summary.text`,
         // and `path` in that order — without `name` every tab shows
-        // as "unknown". Setting all three keeps the list useful.
+        // as "unknown". `machineId` ties the row to our /v1/machines
+        // entry so the session detail's machine label doesn't render
+        // as "Unknown machine".
         let metadata = serde_json::json!({
             "name": name.clone(),
             "summary": {
@@ -640,6 +647,7 @@ pub async fn list_sessions_v2(
             },
             "path": name.clone(),
             "host": "tab-atelier",
+            "machineId": &state.machine_id,
         })
         .to_string();
 
