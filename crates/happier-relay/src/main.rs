@@ -223,7 +223,7 @@ async fn main() -> anyhow::Result<()> {
         // it'll attempt anything else. Must return `{ok: true}` with
         // no auth, matching `apps/server/sources/app/api/routes/
         // version/versionRoutes.ts` in happier upstream.
-        .route("/v1/version", get(version_probe))
+        .route("/v1/version", get(version_probe).post(version_register))
         // Connectivity gate the mobile homepage uses. Plain text
         // "ok", status 200, no auth — see
         // `apps/ui/sources/sync/http/client.connectivityGate.test.ts`.
@@ -313,6 +313,17 @@ async fn log_requests(req: Request, next: Next) -> axum::response::Response {
 
 /// `GET /v1/version` — happier mobile sync gate. Returns `{ok: true}`.
 async fn version_probe() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "ok": true }))
+}
+
+/// `POST /v1/version` — happier mobile app pushes its build info
+/// (`appVersion`, `osVersion`, `platform`, …) on first contact and
+/// expects a 200 ok. Until this route existed we returned 405, which
+/// the mobile treats as "incompatible server" and consequently skips
+/// the entire bootstrap (no /v1/machines, no /v2/sessions, no
+/// socket.io handshake) — leaving the UI stuck on "action required"
+/// / "machines: offline". Accept any JSON body, ignore the contents.
+async fn version_register(_body: axum::body::Bytes) -> Json<serde_json::Value> {
     Json(serde_json::json!({ "ok": true }))
 }
 
