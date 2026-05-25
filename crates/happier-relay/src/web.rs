@@ -10,7 +10,7 @@
 //! files. We keep the asset set tiny on purpose (three files); the
 //! moment we need a real bundler, we revisit.
 
-use axum::http::{header, StatusCode};
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
 const INDEX_HTML: &str = include_str!("../web/index.html");

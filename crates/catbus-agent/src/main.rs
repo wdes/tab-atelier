@@ -396,9 +396,9 @@ async fn run_repl(agent: Arc<agent::Agent>, cwd: &std::path::Path) -> std::io::R
                 // every row carries something recognisable, not just a
                 // UUID. The id is always shown after the label.
                 let derived_label = if name.is_empty() {
-                    project_dir.as_ref().and_then(|d| {
-                        session::first_prompt(&d.join(format!("{id}.jsonl")), 60)
-                    })
+                    project_dir
+                        .as_ref()
+                        .and_then(|d| session::first_prompt(&d.join(format!("{id}.jsonl")), 60))
                 } else {
                     None
                 };
@@ -422,6 +422,12 @@ async fn run_repl(agent: Arc<agent::Agent>, cwd: &std::path::Path) -> std::io::R
         // Regular prompt — run through the agent, show spinner while working.
         let agent_clone = Arc::clone(&agent);
         let prompt_owned = prompt.to_string();
+
+        // Publish "thinking" state to tab-atelier before we hand the
+        // prompt off. Captures the current session id so a /resume
+        // mid-REPL moves the badge to the new session.
+        let session_id_for_status = agent.session_id().await;
+        set_tab_status("thinking", Some(&session_id_for_status));
 
         // Spawn the agent work on a concurrent task so the main task
         // can drive the spinner + a SIGINT watcher.
@@ -475,6 +481,7 @@ async fn run_repl(agent: Arc<agent::Agent>, cwd: &std::path::Path) -> std::io::R
             Ok(work.await)
         };
 
+        let session_id_after = agent.session_id().await;
         match result {
             Ok(Ok(Ok(reply))) => {
                 // Persist token usage sidecar so tab-atelier can pick it up.
@@ -486,25 +493,45 @@ async fn run_repl(agent: Arc<agent::Agent>, cwd: &std::path::Path) -> std::io::R
                 stdout.write_all(b"\n").await?;
                 stdout.write_all(reply.as_bytes()).await?;
                 stdout.write_all(b"\n\n").await?;
+                set_tab_status("waiting", Some(&session_id_after));
             }
             Ok(Ok(Err(e))) => {
                 stdout
                     .write_all(format!("\n\x1b[31merror:\x1b[0m {e}\n\n").as_bytes())
                     .await?;
+                set_tab_status("error", Some(&session_id_after));
             }
             Ok(Err(join)) => {
                 stdout
                     .write_all(format!("\n\x1b[31merror:\x1b[0m agent task: {join}\n\n").as_bytes())
                     .await?;
+                set_tab_status("error", Some(&session_id_after));
             }
             Err(_timeout) => {
                 stdout
                     .write_all(b"\n\x1b[31merror:\x1b[0m cancel timed out; abandoning task\n\n")
                     .await?;
+                set_tab_status("error", Some(&session_id_after));
             }
         }
     }
     Ok(())
+}
+
+/// Fire-and-forget `tab-atelier set-status <state> --kind catbus
+/// [--session <id>]`. Errors are swallowed: if the CLI isn't on
+/// PATH (catbus invoked outside a desktop install) or returns
+/// non-zero, the REPL keeps running. The set-status CLI itself
+/// silently no-ops when the `_TAB_ID` env var isn't set.
+fn set_tab_status(state: &str, session: Option<&str>) {
+    let mut cmd = std::process::Command::new("tab-atelier");
+    cmd.arg("set-status").arg(state).arg("--kind").arg("catbus");
+    if let Some(s) = session {
+        cmd.arg("--session").arg(s);
+    }
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
+    let _ = cmd.spawn();
 }
 
 async fn print_banner(stdout: &mut tokio::io::Stdout, agent: &agent::Agent) -> std::io::Result<()> {

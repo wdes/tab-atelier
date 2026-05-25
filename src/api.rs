@@ -62,6 +62,10 @@ struct ErrorResponse {
 
 #[derive(Clone)]
 pub struct SnapshotTab {
+    /// Stable per-tab UUID, mirrored from `TabState.id`. Used to route
+    /// `POST /tabs/by-id/{id}/status` to the right tab independent of
+    /// its position in the list (renames don't change it).
+    pub id: String,
     pub name: String,
     pub cwd: Option<String>,
     pub output: String,
@@ -75,6 +79,30 @@ pub struct SnapshotTab {
     /// descendant processes to find a catbus-agent (or fallback
     /// `claude` TUI) and resolve the session's transcript file.
     pub shell_pid: u32,
+    /// Transient agent state, mirrored from the in-RAM Tab. Only read
+    /// when the `happier-bridge` feature is enabled (the publisher
+    /// surfaces it in the artifact header so mobile sees the same
+    /// thinking/waiting badge as the desktop LED).
+    #[cfg_attr(not(feature = "happier-bridge"), allow(dead_code))]
+    pub agent_state: Option<tab_atelier::AgentStateSnapshot>,
+    /// Durable agent session UUID, mirrored from the in-RAM Tab. Only
+    /// read when the `happier-bridge` feature is enabled.
+    #[cfg_attr(not(feature = "happier-bridge"), allow(dead_code))]
+    pub agent_session_id: Option<String>,
+}
+
+/// A status update queued by `POST /tabs/by-id/{id}/status` — drained
+/// by the main loop, which writes both the transient `agent_state`
+/// snapshot and the durable `agent_session_id` / `agent_kind` /
+/// `agent_plan_mode` fields onto the matching tab.
+#[derive(Clone, Debug)]
+pub struct PendingStatusUpdate {
+    pub tab_id: String,
+    pub state: tab_atelier::AgentState,
+    pub label: Option<String>,
+    pub session_id: Option<String>,
+    pub agent_kind: Option<String>,
+    pub plan_mode: Option<bool>,
 }
 
 pub struct TabSnapshot {
@@ -93,6 +121,11 @@ pub struct TabSnapshot {
     pub pending_new_tabs: usize,
     /// (tab index, new name) pairs queued by `POST /tabs/{idx}/rename`.
     pub pending_renames: Vec<(usize, String)>,
+    /// Queued agent-status updates from `POST /tabs/by-id/{id}/status`.
+    /// Drained by the main loop, which writes both the transient
+    /// LED state and the durable session/kind/plan fields onto the
+    /// matching tab.
+    pub pending_status_updates: Vec<PendingStatusUpdate>,
     /// Cached serialized `/tabs` JSON body. Built lazily on the first GET
     /// after invalidation; cleared by `persist()` whenever the snapshot
     /// changes. Avoids rebuilding the whole response (`strip_ansi` per tab,
@@ -305,10 +338,14 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
         if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
             break;
         }
-        if let Some(val) = line.strip_prefix("Authorization: Bearer ") {
+        let lower = line.to_ascii_lowercase();
+        // RFC 9110 §5.1: header field names are case-insensitive. ureq
+        // (and most HTTP/2 clients) send `authorization` lowercase, so
+        // match against the lowercased copy instead of the original
+        // line.
+        if let Some(val) = lower.strip_prefix("authorization: bearer ") {
             auth_token = Some(val.trim().to_string());
         }
-        let lower = line.to_ascii_lowercase();
         if let Some(val) = lower.strip_prefix("content-length: ") {
             content_length = val.trim().parse().unwrap_or(0);
         }
@@ -731,6 +768,94 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 error_json(stream, 404, "invalid tab index");
             }
         }
+        ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/status") => {
+            // Per-tab agent state hook. Looked up by stable UUID
+            // (`_TAB_ID` env var) rather than position, so a rename
+            // doesn't break the mapping.
+            let tab_id = &p["/tabs/by-id/".len()..p.len() - "/status".len()];
+            if tab_id.is_empty() {
+                error_json(stream, 404, "missing tab id");
+                return;
+            }
+            let parsed: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+                Ok(v) => v,
+                Err(e) => {
+                    error_json(stream, 400, &format!("invalid JSON body: {e}"));
+                    return;
+                }
+            };
+            let Some(state_str) = parsed.get("state").and_then(|v| v.as_str()) else {
+                error_json(stream, 400, "missing `state` field");
+                return;
+            };
+            let agent_state = match state_str {
+                "thinking" => tab_atelier::AgentState::Thinking,
+                "waiting" => tab_atelier::AgentState::Waiting,
+                "error" => tab_atelier::AgentState::Error,
+                "idle" => {
+                    // "idle" = clear the indicator. Queue an Error-shaped
+                    // marker the loop interprets as "wipe"; simpler than
+                    // adding a fourth enum variant just for the wire.
+                    let mut snap = state.lock().unwrap();
+                    let Some(t) = snap.tabs.iter().find(|t| t.id == tab_id) else {
+                        drop(snap);
+                        error_json(stream, 404, "tab not found");
+                        return;
+                    };
+                    let id = t.id.clone();
+                    snap.pending_status_updates.push(PendingStatusUpdate {
+                        tab_id: id,
+                        state: tab_atelier::AgentState::Thinking, // ignored — clear flag below
+                        label: Some("__clear__".into()),
+                        session_id: None,
+                        agent_kind: None,
+                        plan_mode: None,
+                    });
+                    drop(snap);
+                    respond_json(stream, 200, r#"{"cleared":true}"#);
+                    return;
+                }
+                _ => {
+                    error_json(stream, 400, "invalid state (idle/thinking/waiting/error)");
+                    return;
+                }
+            };
+            let label = parsed
+                .get("label")
+                .and_then(|v| v.as_str())
+                .map(std::string::ToString::to_string);
+            let session_id = parsed
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .map(std::string::ToString::to_string);
+            let agent_kind = parsed
+                .get("agentKind")
+                .and_then(|v| v.as_str())
+                .map(std::string::ToString::to_string);
+            let plan_mode = parsed.get("planMode").and_then(serde_json::Value::as_bool);
+            let mut snap = state.lock().unwrap();
+            let Some(t) = snap.tabs.iter().find(|t| t.id == tab_id) else {
+                drop(snap);
+                error_json(stream, 404, "tab not found");
+                return;
+            };
+            let id = t.id.clone();
+            info!(
+                "API: set-status tab={id} state={state_str} session={} kind={}",
+                session_id.as_deref().unwrap_or("-"),
+                agent_kind.as_deref().unwrap_or("-")
+            );
+            snap.pending_status_updates.push(PendingStatusUpdate {
+                tab_id: id,
+                state: agent_state,
+                label,
+                session_id,
+                agent_kind,
+                plan_mode,
+            });
+            drop(snap);
+            respond_json(stream, 200, r#"{"ok":true}"#);
+        }
         ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/input") => {
             let idx_str = &p["/tabs/".len()..p.len() - "/input".len()];
             if let Ok(idx) = idx_str.parse::<usize>() {
@@ -970,20 +1095,26 @@ mod tests {
         Arc::new(Mutex::new(TabSnapshot {
             tabs: vec![
                 SnapshotTab {
+                    id: "tab-a".into(),
                     name: "shell".into(),
                     cwd: Some("/home/user".into()),
                     output: "$ ls\nfoo bar baz".into(),
                     uptime_secs: 0.0,
                     cursor: None,
                     shell_pid: 0,
+                    agent_state: None,
+                    agent_session_id: None,
                 },
                 SnapshotTab {
+                    id: "tab-b".into(),
                     name: "build".into(),
                     cwd: None,
                     output: String::new(),
                     uptime_secs: 0.0,
                     cursor: None,
                     shell_pid: 0,
+                    agent_state: None,
+                    agent_session_id: None,
                 },
             ],
             active: 0,
@@ -996,6 +1127,7 @@ mod tests {
             pending_input: vec![],
             pending_new_tabs: 0,
             pending_renames: vec![],
+            pending_status_updates: vec![],
             cached_response: None,
         }))
     }
@@ -1120,6 +1252,23 @@ mod tests {
         let (port, _, _) = spawn_server();
         let resp = request(port, "GET /tabs HTTP/1.1\r\nAuthorization: Bearer wrong\r\n\r\n");
         assert_eq!(status_code(&resp), 401);
+    }
+
+    /// RFC 9110 §5.1: header field names are case-insensitive. ureq
+    /// (and most HTTP/2 clients) send `authorization` lowercase —
+    /// this regression test guards against re-tightening the match to
+    /// the capitalised form, which silently 401s every CLI call.
+    #[test]
+    fn authorization_header_is_case_insensitive() {
+        let (port, _, token) = spawn_server();
+        for header in ["Authorization", "authorization", "AUTHORIZATION", "AuThOrIzAtIoN"] {
+            let resp = request(port, &format!("GET /tabs HTTP/1.1\r\n{header}: Bearer {token}\r\n\r\n"));
+            assert_eq!(
+                status_code(&resp),
+                200,
+                "header `{header}` should be accepted (RFC 9110 §5.1)"
+            );
+        }
     }
 
     #[test]
@@ -1527,9 +1676,7 @@ mod tests {
 
         let raw = request_bytes(
             port,
-            &format!(
-                "GET /tabs/0/output HTTP/1.1\r\nAuthorization: Bearer {token}\r\nAccept-Encoding: gzip\r\n\r\n"
-            ),
+            &format!("GET /tabs/0/output HTTP/1.1\r\nAuthorization: Bearer {token}\r\nAccept-Encoding: gzip\r\n\r\n"),
         );
         let (headers, body) = split_response(&raw);
         assert!(headers.starts_with("HTTP/1.1 200 OK"), "got: {headers}");
@@ -1583,8 +1730,14 @@ mod tests {
         );
         let (h, b) = split_response(&raw);
         assert!(h.starts_with("HTTP/1.1 200"), "got: {h}");
-        assert_eq!(header_value(&h, "x-output-start"), Some(prefix.len().to_string().as_str()));
-        assert_eq!(header_value(&h, "x-output-length"), Some(full.len().to_string().as_str()));
+        assert_eq!(
+            header_value(&h, "x-output-start"),
+            Some(prefix.len().to_string().as_str())
+        );
+        assert_eq!(
+            header_value(&h, "x-output-length"),
+            Some(full.len().to_string().as_str())
+        );
         assert_eq!(b, suffix.as_bytes(), "body must be just the suffix");
     }
 
@@ -1598,9 +1751,7 @@ mod tests {
         let bogus_crc = format!("{:08x}", tab_atelier::crc32(b"different"));
         let raw = request_bytes(
             port,
-            &format!(
-                "GET /tabs/0/output?since=10&crc={bogus_crc} HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"
-            ),
+            &format!("GET /tabs/0/output?since=10&crc={bogus_crc} HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
         );
         let (h, b) = split_response(&raw);
         assert!(h.starts_with("HTTP/1.1 200"));

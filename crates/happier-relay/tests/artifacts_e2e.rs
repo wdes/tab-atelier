@@ -12,8 +12,8 @@ use std::time::Duration;
 use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};
 use futures_util::FutureExt;
-use rust_socketio::asynchronous::{Client, ClientBuilder};
 use rust_socketio::Payload;
+use rust_socketio::asynchronous::{Client, ClientBuilder};
 use tokio::sync::mpsc;
 
 fn free_port() -> u16 {
@@ -40,7 +40,12 @@ async fn spawn_relay(port: u16, secret: &str, db_path: &std::path::Path) -> toki
     let client = reqwest::Client::new();
     for _ in 0..50 {
         tokio::time::sleep(Duration::from_millis(100)).await;
-        if client.get(format!("http://127.0.0.1:{port}/__ping")).send().await.is_ok() {
+        if client
+            .get(format!("http://127.0.0.1:{port}/__ping"))
+            .send()
+            .await
+            .is_ok()
+        {
             return child;
         }
     }
@@ -258,7 +263,10 @@ async fn append_grows_body_with_cas() {
         .json()
         .await
         .unwrap();
-    assert_eq!(got["body"], serde_json::Value::String(b64.encode("$ ls\nfoo bar baz\n")));
+    assert_eq!(
+        got["body"],
+        serde_json::Value::String(b64.encode("$ ls\nfoo bar baz\n"))
+    );
 
     // Stale append → version-mismatch with currentBody surfaced.
     let stale: serde_json::Value = http
@@ -273,7 +281,10 @@ async fn append_grows_body_with_cas() {
         .unwrap();
     assert_eq!(stale["success"], serde_json::Value::Bool(false));
     assert_eq!(stale["currentBodyVersion"], serde_json::Value::Number(2.into()));
-    assert_eq!(stale["currentBody"], serde_json::Value::String(b64.encode("$ ls\nfoo bar baz\n")));
+    assert_eq!(
+        stale["currentBody"],
+        serde_json::Value::String(b64.encode("$ ls\nfoo bar baz\n"))
+    );
 
     let _ = child.kill().await;
 }

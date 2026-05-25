@@ -12,12 +12,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{
+    Json, Router,
     extract::Request,
     http::StatusCode,
     middleware::{self, Next},
     response::IntoResponse,
     routing::{delete as axum_delete, get, post},
-    Json, Router,
 };
 use clap::Parser;
 use socketioxide::SocketIo;
@@ -95,8 +95,15 @@ struct Args {
 #[allow(clippy::too_many_lines)] // route registration dominates
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,happier_relay=debug")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,happier_relay=debug")),
+        )
         .init();
+
+    // Workspace feature unification compiles rustls with both `ring`
+    // and `aws_lc_rs` (axum-server + reqwest), so the auto-pick
+    // panics. Pin to ring before any TLS bring-up.
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
     let args = Args::parse();
     let secret = resolve_secret(&args.master_secret)?;
@@ -114,9 +121,7 @@ async fn main() -> anyhow::Result<()> {
     // every reconnect attempt land on a 404 → the UI's status panel
     // shows "Socket: disconnected" with "server error". Match the
     // upstream wire path.
-    let (socket_layer, io) = SocketIo::builder()
-        .req_path("/v1/updates/")
-        .build_layer();
+    let (socket_layer, io) = SocketIo::builder().req_path("/v1/updates/").build_layer();
     let (broadcast_tx, _broadcast_rx_initial) = tokio::sync::broadcast::channel::<state::BroadcastMsg>(256);
 
     let machine_id = resolve_machine_id();
@@ -146,16 +151,14 @@ async fn main() -> anyhow::Result<()> {
     let dyn_state = state.clone();
     io.ns(
         "/",
-        move |socket: socketioxide::extract::SocketRef,
-              data: socketioxide::extract::Data<socket::AuthPayload>| {
+        move |socket: socketioxide::extract::SocketRef, data: socketioxide::extract::Data<socket::AuthPayload>| {
             let st = connect_state.clone();
             async move { socket::on_connect_with_state(socket, data, st).await }
         },
     );
     io.dyn_ns(
         "/{*rest}",
-        move |socket: socketioxide::extract::SocketRef,
-              data: socketioxide::extract::Data<socket::AuthPayload>| {
+        move |socket: socketioxide::extract::SocketRef, data: socketioxide::extract::Data<socket::AuthPayload>| {
             let st = dyn_state.clone();
             async move { socket::on_connect_with_state(socket, data, st).await }
         },
@@ -176,7 +179,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/artifacts", post(artifacts::create).get(artifacts::list))
         .route(
             "/v1/artifacts/{id}",
-            get(artifacts::get_one).post(artifacts::update).delete(artifacts::delete),
+            get(artifacts::get_one)
+                .post(artifacts::update)
+                .delete(artifacts::delete),
         )
         .route("/v1/artifacts/{id}/append", post(artifacts::append))
         .route("/v1/tab-input", post(tab_input::post_input))
@@ -192,11 +197,17 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/account/encryption", get(stubs::account_encryption))
         .route("/v2/changes", get(changes::changes))
         .route("/v2/cursor", get(changes::cursor))
-        .route("/v1/push-tokens", get(stubs::list_push_tokens).post(stubs::register_push_token))
+        .route(
+            "/v1/push-tokens",
+            get(stubs::list_push_tokens).post(stubs::register_push_token),
+        )
         .route("/v1/push-tokens/{token}", axum_delete(stubs::delete_push_token))
         .route("/v1/feed", get(stubs::feed))
         .route("/v1/friends", get(stubs::friends))
-        .route("/v1/account/activity/badge-snapshot", get(stubs::activity_badge_snapshot))
+        .route(
+            "/v1/account/activity/badge-snapshot",
+            get(stubs::activity_badge_snapshot),
+        )
         // Session-detail aux endpoints the mobile fires when opening
         // a chat view. Empty payloads keep the page from spinning.
         .route("/v2/sessions/{id}/pending", get(stubs::tab_session_pending))
@@ -384,9 +395,9 @@ async fn dispatch_session_get_v2(
     axum::Extension(user): axum::Extension<auth::UserId>,
     axum::extract::Path(session_id): axum::extract::Path<String>,
 ) -> axum::response::Response {
+    use axum::Extension;
     use axum::extract::{Path, State};
     use axum::response::IntoResponse;
-    use axum::Extension;
     let cloned_state = state.clone();
     let cloned_user = user.clone();
     let cloned_id = session_id.clone();
@@ -460,9 +471,9 @@ async fn dispatch_session_messages_v1(
     axum::extract::Path(session_id): axum::extract::Path<String>,
     axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> axum::response::Response {
+    use axum::Extension;
     use axum::extract::{Path, Query, State};
     use axum::response::IntoResponse;
-    use axum::Extension;
     let raw = raw_query.unwrap_or_default();
     let tab_q: stubs::TabMessagesQuery = serde_urlencoded::from_str(&raw).unwrap_or(stubs::TabMessagesQuery {
         limit: None,
@@ -482,9 +493,14 @@ async fn dispatch_session_messages_v1(
                 && body.0.get("error").and_then(serde_json::Value::as_str) == Some("not-a-tab-artifact") =>
         {
             let session_q: sessions::MessagesQuery = serde_urlencoded::from_str(&raw).unwrap_or_default();
-            sessions::list_messages(State(cloned_state), Extension(cloned_user), Path(cloned_id), Query(session_q))
-                .await
-                .into_response()
+            sessions::list_messages(
+                State(cloned_state),
+                Extension(cloned_user),
+                Path(cloned_id),
+                Query(session_q),
+            )
+            .await
+            .into_response()
         }
         Err((status, body)) => (status, body).into_response(),
     }
@@ -537,7 +553,11 @@ fn default_db_path() -> PathBuf {
     let base = std::env::var("XDG_STATE_HOME")
         .ok()
         .map(PathBuf::from)
-        .or_else(|| std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".local/state")))
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join(".local/state"))
+        })
         .unwrap_or_else(|| PathBuf::from("/tmp"));
     base.join("happier-relay").join("db.sqlite")
 }

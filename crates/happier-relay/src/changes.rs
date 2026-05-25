@@ -25,9 +25,9 @@
 use std::sync::Arc;
 
 use axum::{
+    Json,
     extract::{Query, State},
     http::StatusCode,
-    Json,
 };
 use parking_lot::RwLock;
 use serde::Deserialize;

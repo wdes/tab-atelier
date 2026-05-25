@@ -145,6 +145,10 @@ fn pty_env(colors_enabled: bool) -> HashMap<String, String> {
 }
 
 impl TerminalView {
+    /// Bare-spawn helper, used by the unit tests. Production spawn
+    /// sites all go through `new_with_colors_and_env` because they
+    /// need to inject per-tab API env vars.
+    #[cfg(test)]
     pub fn new(
         cwd: Option<&Path>,
         font_config: FontConfig,
@@ -153,15 +157,20 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::new_with_colors(cwd, font_config, browser, code_editor, true, window, cx)
+        Self::new_with_colors_and_env(cwd, font_config, browser, code_editor, true, HashMap::new(), window, cx)
     }
 
-    pub fn new_with_colors(
+    /// `new` plus per-tab env-var injection (`_TAB_ID`,
+    /// `TAB_ATELIER_API_URL`, `TAB_ATELIER_API_TOKEN`) so tools
+    /// running inside the tab can call back into the local API.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_colors_and_env(
         cwd: Option<&Path>,
         font_config: FontConfig,
         browser: Rc<RefCell<Option<String>>>,
         code_editor: Rc<RefCell<Option<String>>>,
         initial_colors_enabled: bool,
+        extra_env: HashMap<String, String>,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -171,9 +180,11 @@ impl TerminalView {
             cell_width: 9,
             cell_height: 18,
         };
+        let mut env = pty_env(initial_colors_enabled);
+        env.extend(extra_env);
         let opts = tty::Options {
             working_directory: cwd.map(std::path::Path::to_path_buf),
-            env: pty_env(initial_colors_enabled),
+            env,
             ..Default::default()
         };
         let pty = tty::new(&opts, ws, 0).expect("failed to create pty");
@@ -331,7 +342,8 @@ impl TerminalView {
 
         self.term.lock().grid_mut().scroll_display(Scroll::Bottom);
 
-        let el = EventLoop::new(self.term.clone(), self.event_proxy.clone(), pty, false, false).expect("failed to create event loop");
+        let el = EventLoop::new(self.term.clone(), self.event_proxy.clone(), pty, false, false)
+            .expect("failed to create event loop");
         self.notifier = el.channel();
         self.event_proxy.set_notifier(self.notifier.clone());
         el.spawn();

@@ -14,9 +14,9 @@
 //! upgrade the stub here to read from real state.
 
 use axum::{
+    Json,
     extract::{Extension, Path, Query, State},
     http::StatusCode,
-    Json,
 };
 use serde::Deserialize;
 use sqlx::Row;
@@ -164,8 +164,7 @@ async fn load_tab_artifact(
     // here so all callers see ms.
     let created_at_ms: i64 = row.get::<i64, _>("created_at").saturating_mul(1000);
     let updated_at_ms: i64 = row.get::<i64, _>("updated_at").saturating_mul(1000);
-    let header_json: serde_json::Value =
-        serde_json::from_slice(&header_bytes).unwrap_or(serde_json::Value::Null);
+    let header_json: serde_json::Value = serde_json::from_slice(&header_bytes).unwrap_or(serde_json::Value::Null);
     if header_json.get("kind").and_then(serde_json::Value::as_str) != Some("tab-atelier:tab") {
         return Ok(None);
     }
@@ -294,16 +293,26 @@ pub async fn get_tab_session_v2(
         .and_then(serde_json::Value::as_str)
         .unwrap_or("(unnamed tab)")
         .to_string();
+    // `agentState` / `agentSessionId` are surfaced so the mobile UI
+    // can show a per-tab agent badge. The mobile app doesn't read
+    // these natively yet — we also drop the state into `summary.text`
+    // as a "<name> — <state>" hint so it lights up the session row
+    // until a follow-up patch teaches the client the new keys.
+    let agent_state = header.get("agentState").and_then(serde_json::Value::as_str);
+    let agent_session = header.get("agentSessionId").and_then(serde_json::Value::as_str);
+    let summary_text = agent_state.map_or_else(|| name.clone(), |s| format!("{name} — {s}"));
     // `machineId` ties the session to our `/v1/machines` entry —
     // without it the mobile session detail shows "Unknown machine"
     // as the machine label even though the machine list itself is
     // populated.
     let metadata = serde_json::json!({
         "name": &name,
-        "summary": { "text": &name, "updatedAt": updated_at },
+        "summary": { "text": summary_text, "updatedAt": updated_at },
         "path": &name,
         "host": "tab-atelier",
         "machineId": &state.machine_id,
+        "agentState": agent_state,
+        "agentSessionId": agent_session,
     })
     .to_string();
 
@@ -359,13 +368,12 @@ pub async fn post_tab_session_message(
     Path(session_id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let Some((header, _body, _ca, _ua)) =
-        load_tab_artifact(&state, &user.0, &session_id).await.map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": "internal error" })),
-            )
-        })?
+    let Some((header, _body, _ca, _ua)) = load_tab_artifact(&state, &user.0, &session_id).await.map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "internal error" })),
+        )
+    })?
     else {
         return Err((
             StatusCode::NOT_FOUND,
@@ -401,25 +409,21 @@ pub async fn post_tab_session_message(
     }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0_i64, |d| {
-            i64::try_from(d.as_secs()).unwrap_or(i64::MAX)
-        });
+        .map_or(0_i64, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
 
-    let res = sqlx::query(
-        "INSERT INTO tab_input (account_id, tab_name, bytes, created_at) VALUES (?1, ?2, ?3, ?4)",
-    )
-    .bind(&user.0)
-    .bind(&tab_name)
-    .bind(&bytes)
-    .bind(now)
-    .execute(&state.db)
-    .await
-    .map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "internal error" })),
-        )
-    })?;
+    let res = sqlx::query("INSERT INTO tab_input (account_id, tab_name, bytes, created_at) VALUES (?1, ?2, ?3, ?4)")
+        .bind(&user.0)
+        .bind(&tab_name)
+        .bind(&bytes)
+        .bind(now)
+        .execute(&state.db)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "internal error" })),
+            )
+        })?;
     let seq = res.last_insert_rowid();
     state.input_notifier.notify_user(&user.0).await;
 
@@ -525,46 +529,10 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
-#[cfg(test)]
-mod tests {
-    use super::strip_ansi;
-
-    #[test]
-    fn strips_sgr_colors() {
-        assert_eq!(strip_ansi("\x1b[31mhello\x1b[0m world"), "hello world");
-    }
-
-    #[test]
-    fn strips_cursor_moves_and_erase() {
-        assert_eq!(strip_ansi("\x1b[2Jabc\x1b[1;1H"), "abc");
-    }
-
-    #[test]
-    fn strips_osc_hyperlink() {
-        // OSC 8 hyperlink — both BEL- and ST-terminated forms.
-        assert_eq!(strip_ansi("\x1b]8;;https://x\x07link\x1b]8;;\x07"), "link");
-        assert_eq!(strip_ansi("\x1b]0;title\x1b\\rest"), "rest");
-    }
-
-    #[test]
-    fn passes_plain_text_through() {
-        let s = "no escapes here\nsecond line\ttabbed";
-        assert_eq!(strip_ansi(s), s);
-    }
-
-    #[test]
-    fn drops_lone_escape() {
-        assert_eq!(strip_ansi("a\x1bb"), "a"); // ESC b = two-char escape, both consumed
-        assert_eq!(strip_ansi("trailing\x1b"), "trailing");
-    }
-}
-
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| {
-            i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
-        })
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 /// `GET /v2/sessions` — list happier sessions. We don't run real
@@ -632,6 +600,16 @@ pub async fn list_sessions_v2(
             continue;
         }
 
+        let agent_state = header_json
+            .as_ref()
+            .and_then(|v| v.get("agentState"))
+            .and_then(|v| v.as_str());
+        let agent_session = header_json
+            .as_ref()
+            .and_then(|v| v.get("agentSessionId"))
+            .and_then(|v| v.as_str());
+        let summary_text = agent_state.map_or_else(|| name.clone(), |s| format!("{name} — {s}"));
+
         // Plain-mode session metadata is raw JSON; the client's
         // `parsePlainSessionMetadata` JSON.parses it directly. The
         // mobile session list renderer reads `name`, `summary.text`,
@@ -642,12 +620,14 @@ pub async fn list_sessions_v2(
         let metadata = serde_json::json!({
             "name": name.clone(),
             "summary": {
-                "text": name.clone(),
+                "text": summary_text,
                 "updatedAt": updated_at,
             },
             "path": name.clone(),
             "host": "tab-atelier",
             "machineId": &state.machine_id,
+            "agentState": agent_state,
+            "agentSessionId": agent_session,
         })
         .to_string();
 
@@ -677,4 +657,38 @@ pub async fn list_sessions_v2(
         "nextCursor": null,
         "hasNext": false,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_ansi;
+
+    #[test]
+    fn strips_sgr_colors() {
+        assert_eq!(strip_ansi("\x1b[31mhello\x1b[0m world"), "hello world");
+    }
+
+    #[test]
+    fn strips_cursor_moves_and_erase() {
+        assert_eq!(strip_ansi("\x1b[2Jabc\x1b[1;1H"), "abc");
+    }
+
+    #[test]
+    fn strips_osc_hyperlink() {
+        // OSC 8 hyperlink — both BEL- and ST-terminated forms.
+        assert_eq!(strip_ansi("\x1b]8;;https://x\x07link\x1b]8;;\x07"), "link");
+        assert_eq!(strip_ansi("\x1b]0;title\x1b\\rest"), "rest");
+    }
+
+    #[test]
+    fn passes_plain_text_through() {
+        let s = "no escapes here\nsecond line\ttabbed";
+        assert_eq!(strip_ansi(s), s);
+    }
+
+    #[test]
+    fn drops_lone_escape() {
+        assert_eq!(strip_ansi("a\x1bb"), "a"); // ESC b = two-char escape, both consumed
+        assert_eq!(strip_ansi("trailing\x1b"), "trailing");
+    }
 }

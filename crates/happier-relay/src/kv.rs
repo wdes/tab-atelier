@@ -6,9 +6,9 @@
 //! semantics matching happier's `UserKVStore`.
 
 use axum::{
+    Json,
     extract::{Extension, Path, Query, State},
     http::StatusCode,
-    Json,
 };
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -112,12 +112,14 @@ pub async fn list(
     // prefix is bounded by `limit` and the index covers (account_id, key).
     let pattern = q.prefix.as_deref().map(|p| format!("{p}%"));
     let rows: Vec<KvRow> = if let Some(pat) = pattern {
-        sqlx::query_as("SELECT key, value, version FROM user_kv WHERE account_id = ?1 AND key LIKE ?2 ORDER BY key ASC LIMIT ?3")
-            .bind(&user.0)
-            .bind(pat)
-            .bind(limit)
-            .fetch_all(&state.db)
-            .await
+        sqlx::query_as(
+            "SELECT key, value, version FROM user_kv WHERE account_id = ?1 AND key LIKE ?2 ORDER BY key ASC LIMIT ?3",
+        )
+        .bind(&user.0)
+        .bind(pat)
+        .bind(limit)
+        .fetch_all(&state.db)
+        .await
     } else {
         sqlx::query_as("SELECT key, value, version FROM user_kv WHERE account_id = ?1 ORDER BY key ASC LIMIT ?2")
             .bind(&user.0)
@@ -136,7 +138,10 @@ pub async fn bulk_get(
     Json(req): Json<BulkGetReq>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     if req.keys.is_empty() || req.keys.len() > 100 {
-        return Err(err(StatusCode::BAD_REQUEST, "keys must contain between 1 and 100 entries"));
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "keys must contain between 1 and 100 entries",
+        ));
     }
     // We don't trust input strings for SQL building, so use parameter
     // binding via repeated query. For 100 keys that's still fast
@@ -158,13 +163,17 @@ pub async fn bulk_get(
     Ok(Json(serde_json::json!({ "values": values })))
 }
 
+#[allow(clippy::too_many_lines)] // SQL batch handler, hard to split without obscuring the flow
 pub async fn mutate(
     State(state): State<AppState>,
     Extension(user): Extension<UserId>,
     Json(req): Json<MutateReq>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     if req.mutations.is_empty() || req.mutations.len() > 100 {
-        return Err(err(StatusCode::BAD_REQUEST, "mutations must contain between 1 and 100 entries"));
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "mutations must contain between 1 and 100 entries",
+        ));
     }
 
     // Pre-validate all base64 payloads so we either accept the whole
@@ -175,12 +184,19 @@ pub async fn mutate(
     for m in req.mutations {
         let bytes = match m.value.as_deref() {
             None => None,
-            Some(s) => Some(B64.decode(s).map_err(|_| err(StatusCode::BAD_REQUEST, "invalid base64 in mutation value"))?),
+            Some(s) => Some(
+                B64.decode(s)
+                    .map_err(|_| err(StatusCode::BAD_REQUEST, "invalid base64 in mutation value"))?,
+            ),
         };
         decoded.push((m.key, bytes, m.version));
     }
 
-    let mut tx = state.db.begin().await.map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "internal error"))?;
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "internal error"))?;
     let now = now_secs();
     let mut results: Vec<serde_json::Value> = Vec::with_capacity(decoded.len());
     let mut errors: Vec<serde_json::Value> = Vec::new();
@@ -234,12 +250,13 @@ pub async fn mutate(
             }
             // Version mismatch — surface the current state.
             (Some((cur_v,)), _) => {
-                let cur_val: Option<Vec<u8>> = sqlx::query_scalar("SELECT value FROM user_kv WHERE account_id = ?1 AND key = ?2")
-                    .bind(&user.0)
-                    .bind(&key)
-                    .fetch_one(&mut *tx)
-                    .await
-                    .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "internal error"))?;
+                let cur_val: Option<Vec<u8>> =
+                    sqlx::query_scalar("SELECT value FROM user_kv WHERE account_id = ?1 AND key = ?2")
+                        .bind(&user.0)
+                        .bind(&key)
+                        .fetch_one(&mut *tx)
+                        .await
+                        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "internal error"))?;
                 errors.push(serde_json::json!({
                     "key": key,
                     "error": "version-mismatch",
@@ -259,7 +276,9 @@ pub async fn mutate(
     }
 
     if errors.is_empty() {
-        tx.commit().await.map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "internal error"))?;
+        tx.commit()
+            .await
+            .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "internal error"))?;
         Ok(Json(serde_json::json!({ "success": true, "results": results })))
     } else {
         // Roll back so partial successes don't sneak in. Clients re-fetch.

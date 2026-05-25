@@ -23,13 +23,16 @@ A Guake-style drop-down terminal emulator for Linux (X11), built with Rust using
 **Tabs**
 - Multiple tabs with drag-and-drop reordering
 - Double-click to rename, right-click context menu
+- "Copy path" right-click entry copies the tab's working directory to the clipboard
 - **Ctrl+Shift+T** to open a new tab (inherits working directory)
 - **Alt+Tab** to cycle between tabs
 - Shell exit detection with close/respawn confirmation
+- Per-tab **agent state LED** to the left of the tab name (thinking / waiting / error), driven by an in-tab CLI (see [Agent state](#agent-state))
 
 **Session**
 - Tabs, working directories, and full terminal output persisted across restarts
 - Active tab selection restored on startup
+- **Agent auto-resume**: tabs that were running `catbus-agent` or `claude` at last save reopen with `catbus-agent --resume <uuid>` / `claude --resume <uuid>` typed into the freshly-spawned shell
 
 **Preferences**
 - Theme selection (Dark, Tomorrow Night Blue)
@@ -43,7 +46,9 @@ A Guake-style drop-down terminal emulator for Linux (X11), built with Rust using
 - Low battery warning with visual indicator
 
 **Integration**
-- HTTP API with token auth and QR code for remote tab management from a phone
+- HTTP API (port 7890) + TLS variant (port 7891) with token auth and QR code for remote tab management from a phone
+- `tab-atelier set-status` CLI for in-tab tools (agents, hooks, scripts) to publish thinking/waiting/error state to the desktop LED
+- Optional `happier-bridge` (off by default) republishes tab state into a bundled `happier-relay` so the [happier](https://github.com/maximegris/happier) mobile companion can view sessions, send keystrokes, and see per-tab agent state
 - Wakatime time tracking (reads API key from Zed settings)
 - Screenshots (per-tab or full app) saved as BMP
 
@@ -151,7 +156,83 @@ After either, **restart tab-atelier**. `PowerSensor::detect` runs once at startu
 
 ## HTTP API
 
-Tab Atelier exposes tab state on `http://<local-ip>:7890` as JSON. Access requires a bearer token, shown via a QR code in the right-click menu ("Remote control"). The response includes tab names, working directories, active tab index, and per-tab power stats. Tabs can be closed remotely via `DELETE /tabs/{index}`.
+Tab Atelier exposes tab state on `http://<local-ip>:7890` as JSON (and `https://<local-ip>:7891` over TLS with a self-signed cert auto-generated under `~/.local/state/tab-atelier/tls.{crt,key}`). Access requires a bearer token, shown via a QR code in the right-click menu ("Remote control"). The response includes tab names, working directories, active tab index, and per-tab power stats.
+
+Selected routes:
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/tabs` | List tabs (cwd, name, preview, watts, cpu, uptime) |
+| `GET` | `/tabs/{idx}/output` | Tab scrollback (supports `?since=N&crc=…` for delta patching) |
+| `POST` | `/tabs/{idx}/input` | Send raw bytes to the tab's PTY |
+| `POST` | `/tabs/{idx}/activate` | Switch to a tab |
+| `POST` | `/tabs/{idx}/rename` | Rename a tab |
+| `POST` | `/tabs/by-id/{tab_id}/status` | Publish agent state — see [Agent state](#agent-state) |
+| `DELETE` | `/tabs/{idx}` | Close a tab |
+
+Bind addresses for both listeners are configurable in preferences (`api_addr`, `api_tls_addr`); pass `--read-only` to launch a second instance that serves the API but refuses every mutating verb.
+
+## Agent state
+
+Each tab carries an optional **agent state** (`thinking`, `waiting`, `error`) rendered as a colored LED to the left of the tab name. `waiting` blinks at the same 500 ms cadence as the low-battery indicator. The state is stored in RAM only (the durable session id and agent kind are persisted to `tabs.json` for auto-resume).
+
+Every PTY tab-atelier spawns gets three env vars so in-tab tools can publish state without configuration:
+
+| Variable | Value |
+|---|---|
+| `_TAB_ID` | Stable per-tab UUID. Survives renames. |
+| `TAB_ATELIER_API_URL` | `http://127.0.0.1:<api_port>` |
+| `TAB_ATELIER_API_TOKEN` | Same token shown by the "Remote control" QR code |
+
+### `tab-atelier set-status` CLI
+
+```sh
+tab-atelier set-status <state> [--label <hint>] \
+                                [--session <uuid>] \
+                                [--kind <catbus|claude|…>] \
+                                [--plan|--no-plan]
+
+# state: idle | thinking | waiting | error
+```
+
+The CLI silently exits 0 when `_TAB_ID` is unset (i.e. invoked outside a tab), so it is safe to call unconditionally from `.bashrc` snippets, agents, or build hooks.
+
+`catbus-agent` calls this internally at each lifecycle point. To get the same LED behaviour out of an external Claude Code session, configure a hook in `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "matcher": "", "hooks": [{ "type": "command",
+        "command": "bash -c 'sid=$(jq -r .session_id); tab-atelier set-status thinking --kind claude --session \"$sid\"' >/dev/null 2>&1" }] }
+    ],
+    "Stop": [
+      { "matcher": "", "hooks": [{ "type": "command",
+        "command": "bash -c 'sid=$(jq -r .session_id); tab-atelier set-status waiting --kind claude --session \"$sid\"' >/dev/null 2>&1" }] }
+    ]
+  }
+}
+```
+
+### Auto-resume on restart
+
+When a tab carries both `agent_kind` and `agent_session_id` in `tabs.json`, the restored tab — about 500 ms after its shell has come up — receives a Ctrl-U followed by the appropriate resume command:
+
+| `agent_kind` | Injected command |
+|---|---|
+| `catbus` | `catbus-agent --resume <uuid>` (plus ` --plan` if the agent was in plan mode at save time) |
+| `claude` | `claude --resume <uuid>` |
+| anything else | no-op |
+
+If the agent CLI is no longer on `PATH`, the shell prints `command not found` and the tab is otherwise unaffected.
+
+## Mobile companion (happier-bridge)
+
+The `happier-bridge` feature (off by default — enabled in the bundled `.deb`) republishes each tab as an artifact in a local **happier-relay** instance, so the [happier](https://github.com/maximegris/happier) mobile/web client can browse sessions, view scrollback, type into the PTY, and see per-tab agent state. The relay binds on port 7892 with TLS, sharing the same self-signed cert as the API TLS listener.
+
+```sh
+cargo build --release --features happier-bridge
+```
 
 ## Wakatime
 
@@ -172,6 +253,17 @@ RUST_LOG=tab_atelier=debug cargo run   # Verbose
 cargo test
 cargo clippy
 ```
+
+After a fresh clone, opt-in to the repo's pre-commit hook so CI's
+`Check formatting` step can't fail on a freshly-pushed commit:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+The hook runs `cargo fmt -- --check` and aborts the commit (with the
+offending diff) when the tree drifts from rustfmt. Pass `--no-verify`
+to skip for a one-off WIP commit.
 
 ## License
 

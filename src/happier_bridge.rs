@@ -72,6 +72,12 @@ struct TabState {
     /// holds; anything else (clear, alt-screen, scrollback-ring shift)
     /// falls back to a full overwrite.
     last_text: String,
+    /// Last published agent state string. Tracked separately from CRC
+    /// so a state-only change (e.g. thinking → waiting on idle output)
+    /// still triggers a re-publish of the header.
+    last_agent_state: Option<String>,
+    /// Last published agent session UUID — same reason.
+    last_agent_session: Option<String>,
 }
 
 /// Public entry point: spin up both bridge threads (publisher +
@@ -174,11 +180,7 @@ impl InputPoller {
             // a process we just spawned ourselves, so the entire TLS
             // verification step exists only to satisfy the protocol.
             // Skip it.
-            .tls_config(
-                ureq::tls::TlsConfig::builder()
-                    .disable_verification(true)
-                    .build(),
-            )
+            .tls_config(ureq::tls::TlsConfig::builder().disable_verification(true).build())
             .build()
             .into();
         // Deliberately start with since=0 instead of loading the
@@ -238,7 +240,10 @@ impl InputPoller {
             if let Some(h) = body["highestSeq"].as_i64() {
                 self.since = h;
                 save_tab_input_cursor(self.since);
-                debug!("happier-bridge: boot drain — advancing tab-input cursor to seq {}", self.since);
+                debug!(
+                    "happier-bridge: boot drain — advancing tab-input cursor to seq {}",
+                    self.since
+                );
             }
             self.booted = true;
             return Ok(());
@@ -262,11 +267,7 @@ impl InputPoller {
         // held briefly, then enqueue the bytes in a second pass.
         let names: std::collections::HashMap<String, usize> = {
             let snap = api_state.lock().map_err(|e| format!("api_state lock: {e}"))?;
-            snap.tabs
-                .iter()
-                .enumerate()
-                .map(|(i, t)| (t.name.clone(), i))
-                .collect()
+            snap.tabs.iter().enumerate().map(|(i, t)| (t.name.clone(), i)).collect()
         };
         // Decode events first; touch the snapshot mutex only once at the end.
         let mut to_deliver: Vec<(usize, Vec<u8>)> = Vec::with_capacity(events.len());
@@ -275,7 +276,9 @@ impl InputPoller {
             let Some(seq) = ev["seq"].as_i64() else { continue };
             highest = highest.max(seq);
             let Some(name) = ev["tabName"].as_str() else { continue };
-            let Some(b64_bytes) = ev["bytes"].as_str() else { continue };
+            let Some(b64_bytes) = ev["bytes"].as_str() else {
+                continue;
+            };
             let Ok(bytes) = B64.decode(b64_bytes) else { continue };
             if let Some(&idx) = names.get(name) {
                 to_deliver.push((idx, bytes));
@@ -318,8 +321,10 @@ impl InputPoller {
         if !resp.status().is_success() {
             return Err(format!("poller auth status: {}", resp.status()));
         }
-        let body: serde_json::Value =
-            resp.into_body().read_json().map_err(|e| format!("poller auth parse: {e}"))?;
+        let body: serde_json::Value = resp
+            .into_body()
+            .read_json()
+            .map_err(|e| format!("poller auth parse: {e}"))?;
         let token = body["token"].as_str().ok_or("no token in auth response")?.to_string();
         self.token = Some(token);
         Ok(())
@@ -342,11 +347,7 @@ impl Bridge {
             // a process we just spawned ourselves, so the entire TLS
             // verification step exists only to satisfy the protocol.
             // Skip it.
-            .tls_config(
-                ureq::tls::TlsConfig::builder()
-                    .disable_verification(true)
-                    .build(),
-            )
+            .tls_config(ureq::tls::TlsConfig::builder().disable_verification(true).build())
             .build()
             .into();
         Ok(Self {
@@ -366,21 +367,33 @@ impl Bridge {
         }
         // Snapshot the tabs under the mutex then release it before doing
         // I/O — `ureq` calls can take seconds.
-        let snap: Vec<(String, String)> = {
+        let snap: Vec<(String, String, Option<String>, Option<String>)> = {
             let s = api_state.lock().map_err(|e| format!("api_state lock: {e}"))?;
-            s.tabs.iter().map(|t| (t.name.clone(), t.output.clone())).collect()
+            s.tabs
+                .iter()
+                .map(|t| {
+                    let state_str = t.agent_state.as_ref().map(|snap| match snap.state {
+                        tab_atelier::AgentState::Thinking => "thinking".to_string(),
+                        tab_atelier::AgentState::Waiting => "waiting".to_string(),
+                        tab_atelier::AgentState::Error => "error".to_string(),
+                    });
+                    (t.name.clone(), t.output.clone(), state_str, t.agent_session_id.clone())
+                })
+                .collect()
         };
-        for (name, output) in snap {
+        for (name, output, agent_state, agent_session) in snap {
             if output.is_empty() {
                 continue;
             }
             let crc = tab_atelier::crc32(output.as_bytes());
             if let Some(state) = self.seen.get(&name)
                 && state.last_crc == crc
+                && state.last_agent_state == agent_state
+                && state.last_agent_session == agent_session
             {
                 continue;
             }
-            if let Err(e) = self.publish_tab(&name, &output, crc) {
+            if let Err(e) = self.publish_tab(&name, &output, crc, agent_state.as_deref(), agent_session.as_deref()) {
                 warn!("happier-bridge: publish {name}: {e}");
             }
         }
@@ -414,7 +427,14 @@ impl Bridge {
         Ok(())
     }
 
-    fn publish_tab(&mut self, name: &str, output: &str, crc: u32) -> Result<(), String> {
+    fn publish_tab(
+        &mut self,
+        name: &str,
+        output: &str,
+        crc: u32,
+        agent_state: Option<&str>,
+        agent_session: Option<&str>,
+    ) -> Result<(), String> {
         // Bodies are raw bytes (no gzip) so the relay can concatenate
         // them on append-only updates. Compression is reintroduced on
         // the wire by `Accept-Encoding: gzip` (browser side handles it
@@ -429,6 +449,8 @@ impl Bridge {
             "lines": output.lines().count(),
             "bytes": output.len(),
             "crc": format!("{crc:08x}"),
+            "agentState": agent_state,
+            "agentSessionId": agent_session,
         });
         let header_b64 = B64.encode(header.to_string().as_bytes());
         let dek_b64 = B64.encode(PLAIN_DEK_BYTES);
@@ -474,15 +496,23 @@ impl Bridge {
                             header_version: 1,
                             body_version: 1,
                             last_text: String::new(),
+                            last_agent_state: None,
+                            last_agent_session: None,
                         },
                     );
-                    return self.update_existing(name, &header_b64, &body_b64, output, crc);
+                    let r = self.update_existing(name, &header_b64, &body_b64, output, crc);
+                    if r.is_ok()
+                        && let Some(state) = self.seen.get_mut(name)
+                    {
+                        state.last_agent_state = agent_state.map(str::to_string);
+                        state.last_agent_session = agent_session.map(str::to_string);
+                    }
+                    return r;
                 }
                 if !status.is_success() {
                     return Err(format!("create status: {status}"));
                 }
-                let v: serde_json::Value =
-                    resp.into_body().read_json().map_err(|e| format!("create parse: {e}"))?;
+                let v: serde_json::Value = resp.into_body().read_json().map_err(|e| format!("create parse: {e}"))?;
                 self.seen.insert(
                     name.to_string(),
                     TabState {
@@ -491,6 +521,8 @@ impl Bridge {
                         header_version: v["headerVersion"].as_i64().unwrap_or(1),
                         body_version: v["bodyVersion"].as_i64().unwrap_or(1),
                         last_text: output.to_string(),
+                        last_agent_state: agent_state.map(str::to_string),
+                        last_agent_session: agent_session.map(str::to_string),
                     },
                 );
             }
@@ -504,6 +536,10 @@ impl Bridge {
                     self.append_existing(name, suffix, output, &header_b64, crc)?;
                 } else {
                     self.update_existing(name, &header_b64, &body_b64, output, crc)?;
+                }
+                if let Some(state) = self.seen.get_mut(name) {
+                    state.last_agent_state = agent_state.map(str::to_string);
+                    state.last_agent_session = agent_session.map(str::to_string);
                 }
             }
         }
@@ -536,8 +572,7 @@ impl Bridge {
             self.token = None;
             return Err("append: 401, re-authenticating next tick".into());
         }
-        let parsed: serde_json::Value =
-            resp.into_body().read_json().map_err(|e| format!("append parse: {e}"))?;
+        let parsed: serde_json::Value = resp.into_body().read_json().map_err(|e| format!("append parse: {e}"))?;
         if parsed["success"] == serde_json::Value::Bool(false) {
             // CAS lost (some other process updated). Re-fetch current
             // versions and retry on the next tick as a full update.
@@ -593,8 +628,7 @@ impl Bridge {
             self.token = None;
             return Err("update: 401, re-authenticating next tick".into());
         }
-        let parsed: serde_json::Value =
-            resp.into_body().read_json().map_err(|e| format!("update parse: {e}"))?;
+        let parsed: serde_json::Value = resp.into_body().read_json().map_err(|e| format!("update parse: {e}"))?;
         if parsed["success"] == serde_json::Value::Bool(false) {
             // Version mismatch (another device updated). Adopt the
             // current versions and retry on the next tick.
@@ -643,8 +677,7 @@ impl Bridge {
         if !resp.status().is_success() {
             return Err(format!("resync status: {}", resp.status()));
         }
-        let v: serde_json::Value =
-            resp.into_body().read_json().map_err(|e| format!("resync parse: {e}"))?;
+        let v: serde_json::Value = resp.into_body().read_json().map_err(|e| format!("resync parse: {e}"))?;
         self.seen.insert(
             name.to_string(),
             TabState {
@@ -653,6 +686,8 @@ impl Bridge {
                 header_version: v["headerVersion"].as_i64().unwrap_or(1),
                 body_version: v["bodyVersion"].as_i64().unwrap_or(1),
                 last_text: String::new(),
+                last_agent_state: None,
+                last_agent_session: None,
             },
         );
         // Rebuild a fresh header + body and overwrite.
@@ -670,8 +705,7 @@ impl Bridge {
 }
 
 fn key_path() -> PathBuf {
-    crate::platform::config_dir()
-        .join("happier-bridge.key")
+    crate::platform::config_dir().join("happier-bridge.key")
 }
 
 /// Path of the master secret used to sign JWTs inside the embedded
@@ -679,8 +713,7 @@ fn key_path() -> PathBuf {
 /// the same relay binary can verify — restarting the daemon mustn't
 /// log every device out.
 fn relay_secret_path() -> PathBuf {
-    crate::platform::config_dir()
-        .join("happier-relay.secret")
+    crate::platform::config_dir().join("happier-relay.secret")
 }
 
 /// Read or freshly generate the relay's master secret. 64 hex chars
@@ -756,11 +789,14 @@ pub fn spawn_relay(bind_addr: &str) -> Result<RelayHandle, String> {
         .open(&log_path)
         .map_err(|e| format!("open {}: {e}", log_path.display()))?;
     let mut cmd = std::process::Command::new("happier-relay");
-    cmd.arg("--bind").arg(bind_host(bind_addr))
-        .arg("--port").arg(bind_port(bind_addr).to_string())
+    cmd.arg("--bind")
+        .arg(bind_host(bind_addr))
+        .arg("--port")
+        .arg(bind_port(bind_addr).to_string())
         // `resolve_secret(&str)` in the relay's main.rs strips the
         // `env:` prefix and reads from std::env::var.
-        .arg("--master-secret").arg("env:HAPPIER_MASTER_SECRET")
+        .arg("--master-secret")
+        .arg("env:HAPPIER_MASTER_SECRET")
         .arg("--shared-account")
         .env("HAPPIER_MASTER_SECRET", &secret)
         // Force colored output off and use a stable filter — the
@@ -768,7 +804,9 @@ pub fn spawn_relay(bind_addr: &str) -> Result<RelayHandle, String> {
         .env("RUST_LOG", "info,happier_relay=debug")
         .env("NO_COLOR", "1")
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::from(log_file.try_clone().map_err(|e| format!("dup log fd: {e}"))?))
+        .stdout(std::process::Stdio::from(
+            log_file.try_clone().map_err(|e| format!("dup log fd: {e}"))?,
+        ))
         .stderr(std::process::Stdio::from(log_file));
 
     // Reuse tab-atelier's existing self-signed cert if it's there.
@@ -805,11 +843,15 @@ fn relay_log_path() -> PathBuf {
 }
 
 fn bind_host(addr: &str) -> String {
-    addr.rsplit_once(':').map_or_else(|| "127.0.0.1".into(), |(h, _)| h.to_string())
+    addr.rsplit_once(':')
+        .map_or_else(|| "127.0.0.1".into(), |(h, _)| h.to_string())
 }
 
 fn bind_port(addr: &str) -> u16 {
-    addr.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()).unwrap_or(7892)
+    addr.rsplit(':')
+        .next()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(7892)
 }
 
 fn load_or_create_signing_key() -> Result<SigningKey, String> {
@@ -846,7 +888,8 @@ fn persist_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .truncate(true)
         .open(&tmp)
         .map_err(|e| format!("open {}: {e}", tmp.display()))?;
-    f.write_all(bytes).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    f.write_all(bytes)
+        .map_err(|e| format!("write {}: {e}", tmp.display()))?;
     f.sync_all().ok();
     drop(f);
     #[cfg(unix)]
@@ -897,5 +940,4 @@ mod tests {
         assert_eq!(artifact_id_for("foo"), artifact_id_for("foo"));
         assert_ne!(artifact_id_for("foo"), artifact_id_for("bar"));
     }
-
 }

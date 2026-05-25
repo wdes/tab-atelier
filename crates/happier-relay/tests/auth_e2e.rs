@@ -48,7 +48,12 @@ async fn spawn_relay(port: u16, secret: &str, db_path: &std::path::Path) -> toki
         tokio::time::sleep(Duration::from_millis(100)).await;
         // Anything that resolves the TCP connect is good enough; we'll
         // get a 404 or 400 since the path is bogus.
-        if client.get(format!("http://127.0.0.1:{port}/__ping")).send().await.is_ok() {
+        if client
+            .get(format!("http://127.0.0.1:{port}/__ping"))
+            .send()
+            .await
+            .is_ok()
+        {
             return child;
         }
     }

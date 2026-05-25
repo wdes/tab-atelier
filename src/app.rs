@@ -18,8 +18,9 @@ use gpui::{
     Point, Render, Rgba, SharedString, Stateful, StatefulInteractiveElement, Styled, WeakEntity, Window,
     WindowBackgroundAppearance, WindowHandle, WindowOptions, div, px, rgba,
 };
-use log::{debug, info, warn};
+use log::{debug, info};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -65,6 +66,33 @@ struct Tab {
     /// 2 s persist tick doesn't redo `to_string_lossy` for every tab on
     /// every tick — most ticks see no cwd change at all.
     last_known_cwd_string: Option<String>,
+    /// Stable per-tab UUID — sourced from `TabState.id` on first
+    /// load, generated fresh on tab creation. Exported into the
+    /// shell as `_TAB_ID` so tools can call `POST /tabs/by-id/{id}/
+    /// status` without caring about renames.
+    id: String,
+    /// Transient agent status published by a tool inside the tab
+    /// (via the local API). Drives the tab-strip LED. Cleared by
+    /// the staleness sweep after 5 minutes of no updates.
+    agent_state: Option<tab_atelier::AgentStateSnapshot>,
+    /// Durable: last agent session UUID associated with this tab.
+    /// Persisted to tabs.json so auto-resume can pick the same
+    /// session back up after a restart.
+    agent_session_id: Option<String>,
+    /// Durable: which agent CLI owns the session ("catbus" or
+    /// "claude" today). Free-form string so future agents can
+    /// register without a code change. Used by the resume path
+    /// to decide which command to type.
+    agent_kind: Option<String>,
+    /// Durable: whether the agent was in plan / read-only mode
+    /// at last save. Restored along with the session so the tab
+    /// comes back in the same mode.
+    agent_plan_mode: Option<bool>,
+    /// One-shot resume command queued on tab restore — when the
+    /// shell is up the next tick types `<command>\n` into the
+    /// PTY, then clears this. Set in `insert_tab` from the
+    /// restored `agent_kind` / `agent_session_id` pair.
+    pending_agent_resume: Option<String>,
 }
 
 impl Tab {
@@ -90,6 +118,20 @@ impl Tab {
     fn flush_pending_restore(&mut self, cx: &mut gpui::App) {
         if let Some(out) = self.pending_restore.take() {
             self.view.read(cx).restore_output(&out);
+        }
+    }
+
+    /// Type the queued auto-resume command into the shell, if any.
+    /// Fires Ctrl-U first to clear whatever the user may have started
+    /// typing, then the command + LF. Same pattern as the "Switch to
+    /// catbus" menu item.
+    fn flush_pending_agent_resume(&mut self, cx: &mut gpui::App) {
+        if let Some(cmd) = self.pending_agent_resume.take() {
+            let view = self.view.read(cx);
+            view.send_input_bytes(vec![0x15]); // Ctrl-U
+            let mut bytes = cmd.into_bytes();
+            bytes.push(b'\n');
+            view.send_input_bytes(bytes);
         }
     }
 
@@ -246,6 +288,18 @@ impl AppState {
             prefs.hotkeys
         };
 
+        // Resolved early so we can export _TAB_ID / TAB_ATELIER_API_URL /
+        // TAB_ATELIER_API_TOKEN into each PTY at spawn time. The token
+        // file is whatever load_or_generate_token() reads/writes; the
+        // API server itself starts later in this same function with the
+        // same values.
+        let api_token = api::load_or_generate_token();
+        let api_addr_resolved = prefs
+            .api_addr
+            .clone()
+            .unwrap_or_else(|| tab_atelier::DEFAULT_API_ADDR.into());
+        let api_url_for_pty = api_url_for_local_clients(&api_addr_resolved);
+
         let (tabs, active, restored_windowed) =
             if let Some(saved) = load_state_with_outputs(&platform::config_base_dir(), &platform::state_base_dir()) {
                 info!("restoring {} tab(s) from saved state", saved.tabs.len());
@@ -256,8 +310,10 @@ impl AppState {
                     let br = browser.clone();
                     let ce = code_editor.clone();
                     let colors = ts.colors_enabled;
+                    let env = tab_env_extras(&ts.id, &api_url_for_pty, &api_token);
                     let view = cx.new(|cx| {
-                        let mut tv = TerminalView::new_with_colors(cwd.as_deref(), fc, br, ce, colors, window, cx);
+                        let mut tv =
+                            TerminalView::new_with_colors_and_env(cwd.as_deref(), fc, br, ce, colors, env, window, cx);
                         tv.theme = theme_name;
                         tv
                     });
@@ -276,8 +332,16 @@ impl AppState {
                             Some(output)
                         }
                     });
+                    // Auto-resume: if this tab had an agent session
+                    // and kind persisted, queue the resume command
+                    // to be typed into the freshly-spawned shell.
+                    let pending_agent_resume = match (&ts.agent_kind, &ts.agent_session_id) {
+                        (Some(kind), Some(sid)) => build_agent_resume_command(kind, sid, ts.agent_plan_mode),
+                        _ => None,
+                    };
                     tabs.push(Tab {
                         view,
+                        id: ts.id.clone(),
                         name: ts.name.clone(),
                         created_at: std::time::Instant::now(),
                         prior_uptime: std::time::Duration::from_secs_f64(ts.uptime_secs.unwrap_or(0.0)),
@@ -297,14 +361,21 @@ impl AppState {
                         // doesn't overwrite the restored value with None.
                         last_known_cwd_string: cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
                         last_known_cwd: cwd.clone(),
+                        agent_state: None,
+                        agent_session_id: ts.agent_session_id.clone(),
+                        agent_kind: ts.agent_kind.clone(),
+                        agent_plan_mode: ts.agent_plan_mode,
+                        pending_agent_resume,
                     });
                 }
                 if tabs.is_empty() {
                     let fc = font_config.clone();
                     let br = browser.clone();
                     let ce = code_editor.clone();
+                    let new_id = tab_atelier::default_tab_id();
+                    let env = tab_env_extras(&new_id, &api_url_for_pty, &api_token);
                     let view = cx.new(|cx| {
-                        let mut tv = TerminalView::new(None, fc, br, ce, window, cx);
+                        let mut tv = TerminalView::new_with_colors_and_env(None, fc, br, ce, true, env, window, cx);
                         tv.theme = theme_name;
                         tv
                     });
@@ -323,6 +394,12 @@ impl AppState {
                         pending_restore: None,
                         last_known_cwd: None,
                         last_known_cwd_string: None,
+                        id: new_id,
+                        agent_state: None,
+                        agent_session_id: None,
+                        agent_kind: None,
+                        agent_plan_mode: None,
+                        pending_agent_resume: None,
                     });
                 }
                 let active = saved.active.min(tabs.len() - 1);
@@ -332,8 +409,10 @@ impl AppState {
                 let fc = font_config.clone();
                 let br = browser.clone();
                 let ce = code_editor.clone();
+                let new_id = tab_atelier::default_tab_id();
+                let env = tab_env_extras(&new_id, &api_url_for_pty, &api_token);
                 let view = cx.new(|cx| {
-                    let mut tv = TerminalView::new(None, fc, br, ce, window, cx);
+                    let mut tv = TerminalView::new_with_colors_and_env(None, fc, br, ce, true, env, window, cx);
                     tv.theme = theme_name;
                     tv
                 });
@@ -353,6 +432,12 @@ impl AppState {
                         pending_restore: None,
                         last_known_cwd: None,
                         last_known_cwd_string: None,
+                        id: new_id,
+                        agent_state: None,
+                        agent_session_id: None,
+                        agent_kind: None,
+                        agent_plan_mode: None,
+                        pending_agent_resume: None,
                     }],
                     0,
                     false,
@@ -428,10 +513,15 @@ impl AppState {
             info!("wakatime tracking enabled");
         }
 
-        let api_token = api::load_or_generate_token();
-        let api_addr = prefs.api_addr.unwrap_or_else(|| tab_atelier::DEFAULT_API_ADDR.into());
-        let api_tls_addr = prefs.api_tls_addr.unwrap_or_else(|| tab_atelier::DEFAULT_API_TLS_ADDR.into());
-        let happier_relay_addr = prefs.happier_relay_addr.unwrap_or_else(|| tab_atelier::DEFAULT_HAPPIER_RELAY_ADDR.into());
+        // api_token + api_addr were resolved earlier so they could be
+        // exported into each PTY's env; reuse them here.
+        let api_addr = api_addr_resolved;
+        let api_tls_addr = prefs
+            .api_tls_addr
+            .unwrap_or_else(|| tab_atelier::DEFAULT_API_TLS_ADDR.into());
+        let happier_relay_addr = prefs
+            .happier_relay_addr
+            .unwrap_or_else(|| tab_atelier::DEFAULT_HAPPIER_RELAY_ADDR.into());
         info!("API server starting on {api_addr} (TLS {api_tls_addr})");
         let api_state = Arc::new(Mutex::new(api::TabSnapshot {
             tabs: Vec::<api::SnapshotTab>::new(),
@@ -445,11 +535,17 @@ impl AppState {
             pending_input: Vec::new(),
             pending_new_tabs: 0,
             pending_renames: Vec::new(),
+            pending_status_updates: Vec::new(),
             cached_response: None,
         }));
         let api_read_only = crate::read_only();
         api::start_api_server(api_state.clone(), api_token.clone(), api_read_only, api_addr.clone());
-        api::start_api_server_tls(api_state.clone(), api_token.clone(), api_read_only, api_tls_addr.clone());
+        api::start_api_server_tls(
+            api_state.clone(),
+            api_token.clone(),
+            api_read_only,
+            api_tls_addr.clone(),
+        );
 
         // Auto-spawn the bundled happier-relay so mobile + web clients
         // always have something to connect to. Best-effort: if the
@@ -459,7 +555,10 @@ impl AppState {
         let relay_handle: Option<crate::happier_bridge::RelayHandle> =
             match crate::happier_bridge::spawn_relay(&happier_relay_addr) {
                 Ok(handle) => {
-                    info!("happier-relay spawned at https://{happier_relay_addr} (pid {})", handle.pid());
+                    info!(
+                        "happier-relay spawned at https://{happier_relay_addr} (pid {})",
+                        handle.pid()
+                    );
                     Some(handle)
                 }
                 Err(e) => {
@@ -565,8 +664,10 @@ impl AppState {
         let br = self.browser.clone();
         let ce = self.code_editor.clone();
         let tn = self.theme_name;
+        let new_id = tab_atelier::default_tab_id();
+        let env = tab_env_extras(&new_id, &api_url_for_local_clients(&self.api_addr), &self.api_token);
         let view = cx.new(|cx| {
-            let mut tv = TerminalView::new(cwd.as_deref(), fc, br, ce, window, cx);
+            let mut tv = TerminalView::new_with_colors_and_env(cwd.as_deref(), fc, br, ce, true, env, window, cx);
             tv.theme = tn;
             tv
         });
@@ -588,6 +689,12 @@ impl AppState {
                 pending_restore: None,
                 last_known_cwd_string: cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
                 last_known_cwd: cwd,
+                id: new_id,
+                agent_state: None,
+                agent_session_id: None,
+                agent_kind: None,
+                agent_plan_mode: None,
+                pending_agent_resume: None,
             },
         );
         self.active = idx;
@@ -683,17 +790,14 @@ impl AppState {
             .map(|tab| {
                 let cwd = tab.last_known_cwd_string.clone();
                 TabState {
+                    id: tab.id.clone(),
                     name: tab.name.clone(),
                     cwd,
-                    // Output and uptime are now persisted in per-tab files.
-                    output: None,
-                    uptime_secs: None,
-                    #[cfg(feature = "energy")]
-                    energy_wh: None,
-                    #[cfg(not(feature = "energy"))]
-                    energy_wh: None,
                     colors_enabled: tab.view.read(cx).colors_enabled(),
-                    tokens: None,
+                    agent_session_id: tab.agent_session_id.clone(),
+                    agent_kind: tab.agent_kind.clone(),
+                    agent_plan_mode: tab.agent_plan_mode,
+                    ..TabState::default()
                 }
             })
             .collect();
@@ -705,6 +809,7 @@ impl AppState {
                 let view = tab.view.read(cx);
                 let (output, cursor) = view.ansi_text_with_cursor(Some(200));
                 api::SnapshotTab {
+                    id: tab.id.clone(),
                     name: ts.name.clone(),
                     cwd: ts.cwd.clone(),
                     // Cache 200 lines so remote clients can request scrollback.
@@ -714,6 +819,8 @@ impl AppState {
                     uptime_secs: tab.uptime().as_secs_f64(),
                     cursor,
                     shell_pid: view.pid(),
+                    agent_state: tab.agent_state.clone(),
+                    agent_session_id: tab.agent_session_id.clone(),
                 }
             })
             .collect();
@@ -817,7 +924,52 @@ impl AppState {
             let activate = snapshot.pending_activate.take();
             let inputs: Vec<(usize, Vec<u8>)> = snapshot.pending_input.drain(..).collect();
             let renames: Vec<(usize, String)> = snapshot.pending_renames.drain(..).collect();
+            let status_updates: Vec<api::PendingStatusUpdate> = snapshot.pending_status_updates.drain(..).collect();
             drop(snapshot);
+            for upd in status_updates {
+                let Some(tab) = self.tabs.iter_mut().find(|t| t.id == upd.tab_id) else {
+                    continue;
+                };
+                // "__clear__" sentinel from a POST with state=idle.
+                if upd.label.as_deref() == Some("__clear__") {
+                    tab.agent_state = None;
+                } else {
+                    tab.agent_state = Some(tab_atelier::AgentStateSnapshot {
+                        state: upd.state,
+                        label: upd.label,
+                        updated_at: std::time::Instant::now(),
+                    });
+                }
+                if upd.session_id.is_some() {
+                    tab.agent_session_id = upd.session_id;
+                }
+                if upd.agent_kind.is_some() {
+                    tab.agent_kind = upd.agent_kind;
+                }
+                if upd.plan_mode.is_some() {
+                    tab.agent_plan_mode = upd.plan_mode;
+                }
+            }
+            // Staleness sweep: drop transient LED state when the last
+            // update is older than 5 min. Keeps a crashed agent from
+            // pinning the badge on forever.
+            let now = std::time::Instant::now();
+            for tab in &mut self.tabs {
+                if let Some(snap) = &tab.agent_state
+                    && now.duration_since(snap.updated_at).as_secs() > 300
+                {
+                    tab.agent_state = None;
+                }
+            }
+            // Auto-resume sweep: type the queued resume command into
+            // any tab whose shell has had ~500ms to print its prompt.
+            // `flush_pending_agent_resume` takes the queued command,
+            // so each tab fires at most once.
+            for tab in &mut self.tabs {
+                if tab.pending_agent_resume.is_some() && tab.created_at.elapsed().as_millis() >= 500 {
+                    tab.flush_pending_agent_resume(cx);
+                }
+            }
             for (idx, name) in renames {
                 self.rename_tab(idx, name);
             }
@@ -870,8 +1022,13 @@ impl AppState {
         let br = self.browser.clone();
         let ce = self.code_editor.clone();
         let tn = self.theme_name;
+        let env = tab_env_extras(
+            &self.tabs[idx].id,
+            &api_url_for_local_clients(&self.api_addr),
+            &self.api_token,
+        );
         let view = cx.new(|cx| {
-            let mut tv = TerminalView::new(cwd.as_deref(), fc, br, ce, window, cx);
+            let mut tv = TerminalView::new_with_colors_and_env(cwd.as_deref(), fc, br, ce, true, env, window, cx);
             tv.theme = tn;
             tv
         });
@@ -967,16 +1124,14 @@ impl AppState {
             .map(|tab| {
                 let cwd = tab.last_known_cwd_string.clone();
                 TabState {
+                    id: tab.id.clone(),
                     name: tab.name.clone(),
                     cwd,
-                    output: None,
-                    uptime_secs: None,
-                    #[cfg(feature = "energy")]
-                    energy_wh: None,
-                    #[cfg(not(feature = "energy"))]
-                    energy_wh: None,
                     colors_enabled: tab.view.read(cx).colors_enabled(),
-                    tokens: None,
+                    agent_session_id: tab.agent_session_id.clone(),
+                    agent_kind: tab.agent_kind.clone(),
+                    agent_plan_mode: tab.agent_plan_mode,
+                    ..TabState::default()
                 }
             })
             .collect();
@@ -1116,6 +1271,7 @@ impl AppState {
                 }),
             );
 
+        let blink_on = self.blink_on;
         for (i, tab) in self.tabs.iter().enumerate() {
             let is_active = i == self.active;
             let name = if let Some((ri, ref text)) = self.renaming {
@@ -1123,6 +1279,33 @@ impl AppState {
             } else {
                 tab.name.clone()
             };
+            // Optional agent-state LED to the left of the tab name.
+            // Waiting blinks via the same `blink_on` toggle as the
+            // battery indicator; thinking/error stay steady.
+            let agent_led = tab.agent_state.as_ref().map(|snap| {
+                let visible = snap.state != tab_atelier::AgentState::Waiting || blink_on;
+                let color = match snap.state {
+                    tab_atelier::AgentState::Thinking => Hsla::from(Rgba {
+                        r: 0.306,
+                        g: 0.788,
+                        b: 0.690,
+                        a: 1.0,
+                    }),
+                    tab_atelier::AgentState::Waiting => Hsla::from(Rgba {
+                        r: 0.851,
+                        g: 0.467,
+                        b: 0.024,
+                        a: if visible { 1.0 } else { 0.25 },
+                    }),
+                    tab_atelier::AgentState::Error => Hsla::from(Rgba {
+                        r: 0.937,
+                        g: 0.267,
+                        b: 0.267,
+                        a: 1.0,
+                    }),
+                };
+                div().w(px(7.0)).h(px(7.0)).mr(px(5.0)).rounded_full().bg(color)
+            });
 
             #[cfg(feature = "energy")]
             let power_label = watts.get(i).map(power::TabPower::label).unwrap_or_default();
@@ -1223,6 +1406,7 @@ impl AppState {
                 .on_drop(cx.listener(move |this, dragged: &DraggedTab, window, cx| {
                     this.move_tab(dragged.idx, i, window, cx);
                 }))
+                .when_some(agent_led, ParentElement::child)
                 .child(name);
 
             #[cfg(feature = "energy")]
@@ -1349,12 +1533,9 @@ impl AppState {
                         MouseButton::Left,
                         cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
                             let pid = this.tabs[idx].view.read(cx).pid();
-                            let path = platform::process_cwd(pid)
-                                .or_else(|| this.tabs[idx].last_known_cwd.clone());
+                            let path = platform::process_cwd(pid).or_else(|| this.tabs[idx].last_known_cwd.clone());
                             if let Some(p) = path {
-                                cx.write_to_clipboard(ClipboardItem::new_string(
-                                    p.to_string_lossy().into_owned(),
-                                ));
+                                cx.write_to_clipboard(ClipboardItem::new_string(p.to_string_lossy().into_owned()));
                             }
                             this.context_menu = None;
                             cx.notify();
@@ -2060,8 +2241,14 @@ impl AppState {
         // than whatever IPs were live when the process started.
         let ips = api::local_ips_all();
         let primary_ip = ips.first().cloned().unwrap_or_else(|| "127.0.0.1".into());
-        let lan_url = format!("http://{primary_ip}:{}", port_of(&self.api_addr, tab_atelier::DEFAULT_API_PORT));
-        let lan_url_tls = format!("https://{primary_ip}:{}", port_of(&self.api_tls_addr, tab_atelier::DEFAULT_API_PORT + 1));
+        let lan_url = format!(
+            "http://{primary_ip}:{}",
+            port_of(&self.api_addr, tab_atelier::DEFAULT_API_PORT)
+        );
+        let lan_url_tls = format!(
+            "https://{primary_ip}:{}",
+            port_of(&self.api_tls_addr, tab_atelier::DEFAULT_API_PORT + 1)
+        );
         // Pass both the plain-HTTP and TLS URLs into the deep link; the
         // mobile client picks whichever its current build supports.
         let qr_payload = format!(
@@ -2173,11 +2360,10 @@ impl AppState {
                                 .gap(px(2.0))
                                 .child(div().text_color(dialog_fg).child("Also reachable at:"));
                             for ip in ips.iter().skip(1) {
-                                list = list.child(
-                                    div()
-                                        .text_color(link_fg)
-                                        .child(format!("http://{ip}:{}", port_of(&self.api_addr, tab_atelier::DEFAULT_API_PORT))),
-                                );
+                                list = list.child(div().text_color(link_fg).child(format!(
+                                    "http://{ip}:{}",
+                                    port_of(&self.api_addr, tab_atelier::DEFAULT_API_PORT)
+                                )));
                             }
                             el.child(list)
                         })
@@ -2418,26 +2604,48 @@ impl AppState {
             .track_focus(&self.pref_api_addr_focus)
             .mt(px(8.0))
             .w_full()
-            .flex().flex_row().items_center()
+            .flex()
+            .flex_row()
+            .items_center()
             .bg(th.bg_hsla())
-            .border_1().border_color(input_border).rounded(px(3.0))
-            .px(px(8.0)).py(px(4.0)).min_h(px(28.0)).cursor_text()
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev: &MouseDownEvent, window, cx| {
-                this.pref_api_addr_focus.focus(window);
-                cx.notify();
-            }))
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _window, cx| match ev.keystroke.key.as_str() {
-                "backspace" => { this.pref_api_addr_text.pop(); cx.notify(); }
-                _ => if let Some(ref ch) = ev.keystroke.key_char
-                    && ch.chars().all(is_addr_port_char)
-                    && this.pref_api_addr_text.len() + ch.len() <= MAX_ADDR_LEN
-                {
-                    this.pref_api_addr_text.push_str(ch);
+            .border_1()
+            .border_color(input_border)
+            .rounded(px(3.0))
+            .px(px(8.0))
+            .py(px(4.0))
+            .min_h(px(28.0))
+            .cursor_text()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _ev: &MouseDownEvent, window, cx| {
+                    this.pref_api_addr_focus.focus(window);
                     cx.notify();
-                }
-            }))
-            .when(api_addr_text.is_empty(), |el| el.child(div().text_color(placeholder_fg).child(tab_atelier::DEFAULT_API_ADDR)))
-            .when(!api_addr_text.is_empty(), |el| el.child(api_addr_text).child(div().w(px(1.0)).h(px(16.0)).bg(cursor_color)));
+                }),
+            )
+            .on_key_down(
+                cx.listener(|this, ev: &KeyDownEvent, _window, cx| match ev.keystroke.key.as_str() {
+                    "backspace" => {
+                        this.pref_api_addr_text.pop();
+                        cx.notify();
+                    }
+                    _ => {
+                        if let Some(ref ch) = ev.keystroke.key_char
+                            && ch.chars().all(is_addr_port_char)
+                            && this.pref_api_addr_text.len() + ch.len() <= MAX_ADDR_LEN
+                        {
+                            this.pref_api_addr_text.push_str(ch);
+                            cx.notify();
+                        }
+                    }
+                }),
+            )
+            .when(api_addr_text.is_empty(), |el| {
+                el.child(div().text_color(placeholder_fg).child(tab_atelier::DEFAULT_API_ADDR))
+            })
+            .when(!api_addr_text.is_empty(), |el| {
+                el.child(api_addr_text)
+                    .child(div().w(px(1.0)).h(px(16.0)).bg(cursor_color))
+            });
 
         let api_tls_addr_text = self.pref_api_tls_addr_text.clone();
         let api_tls_addr_input = div()
@@ -2446,26 +2654,52 @@ impl AppState {
             .track_focus(&self.pref_api_tls_addr_focus)
             .mt(px(8.0))
             .w_full()
-            .flex().flex_row().items_center()
+            .flex()
+            .flex_row()
+            .items_center()
             .bg(th.bg_hsla())
-            .border_1().border_color(input_border).rounded(px(3.0))
-            .px(px(8.0)).py(px(4.0)).min_h(px(28.0)).cursor_text()
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev: &MouseDownEvent, window, cx| {
-                this.pref_api_tls_addr_focus.focus(window);
-                cx.notify();
-            }))
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _window, cx| match ev.keystroke.key.as_str() {
-                "backspace" => { this.pref_api_tls_addr_text.pop(); cx.notify(); }
-                _ => if let Some(ref ch) = ev.keystroke.key_char
-                    && ch.chars().all(is_addr_port_char)
-                    && this.pref_api_tls_addr_text.len() + ch.len() <= MAX_ADDR_LEN
-                {
-                    this.pref_api_tls_addr_text.push_str(ch);
+            .border_1()
+            .border_color(input_border)
+            .rounded(px(3.0))
+            .px(px(8.0))
+            .py(px(4.0))
+            .min_h(px(28.0))
+            .cursor_text()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _ev: &MouseDownEvent, window, cx| {
+                    this.pref_api_tls_addr_focus.focus(window);
                     cx.notify();
-                }
-            }))
-            .when(api_tls_addr_text.is_empty(), |el| el.child(div().text_color(placeholder_fg).child(tab_atelier::DEFAULT_API_TLS_ADDR)))
-            .when(!api_tls_addr_text.is_empty(), |el| el.child(api_tls_addr_text).child(div().w(px(1.0)).h(px(16.0)).bg(cursor_color)));
+                }),
+            )
+            .on_key_down(
+                cx.listener(|this, ev: &KeyDownEvent, _window, cx| match ev.keystroke.key.as_str() {
+                    "backspace" => {
+                        this.pref_api_tls_addr_text.pop();
+                        cx.notify();
+                    }
+                    _ => {
+                        if let Some(ref ch) = ev.keystroke.key_char
+                            && ch.chars().all(is_addr_port_char)
+                            && this.pref_api_tls_addr_text.len() + ch.len() <= MAX_ADDR_LEN
+                        {
+                            this.pref_api_tls_addr_text.push_str(ch);
+                            cx.notify();
+                        }
+                    }
+                }),
+            )
+            .when(api_tls_addr_text.is_empty(), |el| {
+                el.child(
+                    div()
+                        .text_color(placeholder_fg)
+                        .child(tab_atelier::DEFAULT_API_TLS_ADDR),
+                )
+            })
+            .when(!api_tls_addr_text.is_empty(), |el| {
+                el.child(api_tls_addr_text)
+                    .child(div().w(px(1.0)).h(px(16.0)).bg(cursor_color))
+            });
 
         let happier_relay_addr_text = self.pref_happier_relay_addr_text.clone();
         let happier_relay_addr_input = div()
@@ -2474,26 +2708,52 @@ impl AppState {
             .track_focus(&self.pref_happier_relay_addr_focus)
             .mt(px(8.0))
             .w_full()
-            .flex().flex_row().items_center()
+            .flex()
+            .flex_row()
+            .items_center()
             .bg(th.bg_hsla())
-            .border_1().border_color(input_border).rounded(px(3.0))
-            .px(px(8.0)).py(px(4.0)).min_h(px(28.0)).cursor_text()
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev: &MouseDownEvent, window, cx| {
-                this.pref_happier_relay_addr_focus.focus(window);
-                cx.notify();
-            }))
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _window, cx| match ev.keystroke.key.as_str() {
-                "backspace" => { this.pref_happier_relay_addr_text.pop(); cx.notify(); }
-                _ => if let Some(ref ch) = ev.keystroke.key_char
-                    && ch.chars().all(is_addr_port_char)
-                    && this.pref_happier_relay_addr_text.len() + ch.len() <= MAX_ADDR_LEN
-                {
-                    this.pref_happier_relay_addr_text.push_str(ch);
+            .border_1()
+            .border_color(input_border)
+            .rounded(px(3.0))
+            .px(px(8.0))
+            .py(px(4.0))
+            .min_h(px(28.0))
+            .cursor_text()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _ev: &MouseDownEvent, window, cx| {
+                    this.pref_happier_relay_addr_focus.focus(window);
                     cx.notify();
-                }
-            }))
-            .when(happier_relay_addr_text.is_empty(), |el| el.child(div().text_color(placeholder_fg).child(tab_atelier::DEFAULT_HAPPIER_RELAY_ADDR)))
-            .when(!happier_relay_addr_text.is_empty(), |el| el.child(happier_relay_addr_text).child(div().w(px(1.0)).h(px(16.0)).bg(cursor_color)));
+                }),
+            )
+            .on_key_down(
+                cx.listener(|this, ev: &KeyDownEvent, _window, cx| match ev.keystroke.key.as_str() {
+                    "backspace" => {
+                        this.pref_happier_relay_addr_text.pop();
+                        cx.notify();
+                    }
+                    _ => {
+                        if let Some(ref ch) = ev.keystroke.key_char
+                            && ch.chars().all(is_addr_port_char)
+                            && this.pref_happier_relay_addr_text.len() + ch.len() <= MAX_ADDR_LEN
+                        {
+                            this.pref_happier_relay_addr_text.push_str(ch);
+                            cx.notify();
+                        }
+                    }
+                }),
+            )
+            .when(happier_relay_addr_text.is_empty(), |el| {
+                el.child(
+                    div()
+                        .text_color(placeholder_fg)
+                        .child(tab_atelier::DEFAULT_HAPPIER_RELAY_ADDR),
+                )
+            })
+            .when(!happier_relay_addr_text.is_empty(), |el| {
+                el.child(happier_relay_addr_text)
+                    .child(div().w(px(1.0)).h(px(16.0)).bg(cursor_color))
+            });
 
         let editor_text = self.pref_editor_text.clone();
         let editor_input = div()
@@ -2575,7 +2835,12 @@ impl AppState {
                         .child(div().mt(px(16.0)).child(t.code_editor).child(editor_input))
                         .child(div().mt(px(16.0)).child(t.api_addr).child(api_addr_input))
                         .child(div().mt(px(16.0)).child(t.api_tls_addr).child(api_tls_addr_input))
-                        .child(div().mt(px(16.0)).child(t.happier_relay_addr).child(happier_relay_addr_input))
+                        .child(
+                            div()
+                                .mt(px(16.0))
+                                .child(t.happier_relay_addr)
+                                .child(happier_relay_addr_input),
+                        )
                         .child(
                             div()
                                 .mt(px(20.0))
@@ -2643,17 +2908,13 @@ impl AppState {
                                                 // that fails is kept as-is in the
                                                 // edit buffer but not persisted —
                                                 // the previous good value sticks.
-                                                let parsed_api = this
-                                                    .pref_api_addr_text
-                                                    .parse::<std::net::SocketAddr>()
-                                                    .ok();
+                                                let parsed_api =
+                                                    this.pref_api_addr_text.parse::<std::net::SocketAddr>().ok();
                                                 if parsed_api.is_some() {
                                                     this.api_addr.clone_from(&this.pref_api_addr_text);
                                                 }
-                                                let parsed_tls = this
-                                                    .pref_api_tls_addr_text
-                                                    .parse::<std::net::SocketAddr>()
-                                                    .ok();
+                                                let parsed_tls =
+                                                    this.pref_api_tls_addr_text.parse::<std::net::SocketAddr>().ok();
                                                 if parsed_tls.is_some() {
                                                     this.api_tls_addr.clone_from(&this.pref_api_tls_addr_text);
                                                 }
@@ -2662,7 +2923,8 @@ impl AppState {
                                                     .parse::<std::net::SocketAddr>()
                                                     .ok();
                                                 if parsed_relay.is_some() {
-                                                    this.happier_relay_addr.clone_from(&this.pref_happier_relay_addr_text);
+                                                    this.happier_relay_addr
+                                                        .clone_from(&this.pref_happier_relay_addr_text);
                                                 }
                                                 save_preferences(
                                                     &platform::config_dir(),
@@ -3000,6 +3262,45 @@ impl Render for AppState {
     }
 }
 
+/// Build the `TAB_ATELIER_API_URL` value handed to each PTY. The
+/// stored `api_addr` is a bind spec ("0.0.0.0:7890", ":7890",
+/// "127.0.0.1:9000") — we always rewrite the host to 127.0.0.1
+/// because in-tab tools live on the same machine and shouldn't
+/// be talking to themselves via the LAN address.
+fn api_url_for_local_clients(api_addr: &str) -> String {
+    let port = api_addr
+        .rsplit(':')
+        .next()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(tab_atelier::DEFAULT_API_PORT);
+    format!("http://127.0.0.1:{port}")
+}
+
+/// Build the per-tab env map for `_TAB_ID` / `TAB_ATELIER_API_URL` /
+/// `TAB_ATELIER_API_TOKEN`. Pulled out so the four PTY-spawn paths
+/// stay terse.
+fn tab_env_extras(tab_id: &str, api_url: &str, api_token: &str) -> HashMap<String, String> {
+    let mut m = HashMap::new();
+    m.insert("_TAB_ID".into(), tab_id.to_string());
+    m.insert("TAB_ATELIER_API_URL".into(), api_url.to_string());
+    m.insert("TAB_ATELIER_API_TOKEN".into(), api_token.to_string());
+    m
+}
+
+/// Translate a persisted (`agent_kind`, `session_id`, `plan_mode`) into
+/// the shell command to type for auto-resume. Returns None when
+/// the `agent_kind` isn't one we know how to drive.
+fn build_agent_resume_command(kind: &str, session_id: &str, plan: Option<bool>) -> Option<String> {
+    match kind {
+        "catbus" => {
+            let flag = if plan == Some(true) { " --plan" } else { "" };
+            Some(format!("catbus-agent --resume {session_id}{flag}"))
+        }
+        "claude" => Some(format!("claude --resume {session_id}")),
+        _ => None,
+    }
+}
+
 /// Read the optional `--happier-relay-url <url>` (or `=`) flag without
 /// pulling in clap on the main binary. Returns `None` if the flag
 /// isn't present, the value is empty, or the feature is disabled (in
@@ -3027,7 +3328,10 @@ fn happier_relay_url_from_args() -> Option<String> {
 /// `fallback` when the string is malformed (covers IPv4, IPv6 like
 /// `[::1]:N`, and bare `:N`).
 fn port_of(bind: &str, fallback: u16) -> u16 {
-    bind.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()).unwrap_or(fallback)
+    bind.rsplit(':')
+        .next()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(fallback)
 }
 
 /// `addr:port` is a small, well-bounded ASCII subset (digits, dots,

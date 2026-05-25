@@ -17,9 +17,9 @@ use axum::{
     response::sse::{Event, KeepAlive, Sse},
 };
 use futures_util::stream::Stream;
-use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
-use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
 use crate::auth::UserId;
 use crate::state::{AppState, BroadcastMsg};
@@ -32,7 +32,12 @@ pub async fn events(
     let user_id = user.0;
 
     let stream = BroadcastStream::new(rx).filter_map(move |msg| match msg {
-        Ok(BroadcastMsg { user_id: msg_user, event, payload, .. }) if msg_user == user_id => {
+        Ok(BroadcastMsg {
+            user_id: msg_user,
+            event,
+            payload,
+            ..
+        }) if msg_user == user_id => {
             // SSE: `event:` line + `data:` JSON line. Browser-side
             // listeners use addEventListener("artifact-update", ...).
             let body = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
