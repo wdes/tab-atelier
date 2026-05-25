@@ -76,6 +76,16 @@ pub fn find_session(shell_pid: u32) -> Option<AgentSession> {
     })
 }
 
+/// Returns true if any descendant of `shell_pid` (inclusive) has
+/// a `comm` matching one of the known agent CLIs. Used by the
+/// app's per-tick sweep to clear the LED when an agent silently
+/// exited without firing a `SessionEnd` hook (Ctrl-C, crash,
+/// terminal closed without `/exit`, …).
+#[must_use]
+pub fn has_agent_descendant(shell_pid: u32) -> bool {
+    find_agent_descendant(shell_pid).is_some()
+}
+
 /// BFS over `/proc/{pid}/task/{pid}/children`. Match `catbus-agent`
 /// or the legacy `claude` TUI by `comm`. We don't recurse into
 /// kernel threads or pids in different namespaces — sticking to
