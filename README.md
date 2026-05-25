@@ -242,6 +242,7 @@ The CLI silently exits 0 when `_TAB_ID` is unset (i.e. invoked outside a tab), s
 |---|---|---|
 | `SessionStart` | `waiting` (label `session`) | Claude attached to the tab — LED appears immediately, not only at first prompt |
 | `UserPromptSubmit` | `thinking` | You sent a prompt — work has started |
+| `PreToolUse` | `thinking` (label `tool`) | Refreshes the LED on every tool call so a long turn never gets reclaimed by the staleness sweep |
 | `Stop` | `waiting` | Claude finished its turn, awaiting next prompt |
 | `PermissionRequest` | `waiting` (label `permission`) | Claude paused for tool/file approval — needs you |
 | `StopFailure` | `error` | Turn aborted (API error, crash) |

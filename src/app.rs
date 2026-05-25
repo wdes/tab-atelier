@@ -960,12 +960,18 @@ impl AppState {
                 }
             }
             // Staleness sweep: drop transient LED state when the last
-            // update is older than 5 min. Keeps a crashed agent from
-            // pinning the badge on forever.
+            // update is older than 30 min. A long Claude turn doing
+            // pure text generation (no tool calls) emits zero hook
+            // events between UserPromptSubmit and Stop — at 5 min the
+            // LED was falling back to the grey "session attached" dot
+            // mid-work, which read as "Claude finished" when it
+            // hadn't. 30 min is well past the longest realistic
+            // single-turn time and still bounded enough to recover
+            // from a truly crashed agent.
             let now = std::time::Instant::now();
             for tab in &mut self.tabs {
                 if let Some(snap) = &tab.agent_state
-                    && now.duration_since(snap.updated_at).as_secs() > 300
+                    && now.duration_since(snap.updated_at).as_secs() > 1800
                 {
                     tab.agent_state = None;
                 }
