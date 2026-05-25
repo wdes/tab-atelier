@@ -960,18 +960,16 @@ impl AppState {
                 }
             }
             // Staleness sweep: drop transient LED state when the last
-            // update is older than 30 min. A long Claude turn doing
-            // pure text generation (no tool calls) emits zero hook
-            // events between UserPromptSubmit and Stop — at 5 min the
-            // LED was falling back to the grey "session attached" dot
-            // mid-work, which read as "Claude finished" when it
-            // hadn't. 30 min is well past the longest realistic
-            // single-turn time and still bounded enough to recover
-            // from a truly crashed agent.
+            // update is older than 2 min. Real Claude turns are
+            // tool-heavy and the `PreToolUse` hook refreshes the LED
+            // on every tool call, so 2 min of total silence is a
+            // strong signal the agent is actually idle (or wedged) —
+            // we want the LED to demote back to the grey "session
+            // attached" dot quickly so the user notices.
             let now = std::time::Instant::now();
             for tab in &mut self.tabs {
                 if let Some(snap) = &tab.agent_state
-                    && now.duration_since(snap.updated_at).as_secs() > 1800
+                    && now.duration_since(snap.updated_at).as_secs() > 120
                 {
                     tab.agent_state = None;
                 }
