@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Run `cargo fmt -- --check` so the CI `Check formatting` step can't
+# fail on a freshly-pushed commit. If you really want to commit
+# unformatted code (e.g. for a partial work-in-progress branch), pass
+# `--no-verify` to git commit.
+#
+# Enable once with: `git config core.hooksPath .githooks`
+set -euo pipefail
+
+if ! cargo fmt -- --check >/dev/null 2>&1; then
+    echo "pre-commit: cargo fmt -- --check failed."
+    echo "            run 'cargo fmt' and re-stage the changes."
+    echo "            (or 'git commit --no-verify' to skip)"
+    cargo fmt -- --check
+    exit 1
+fi

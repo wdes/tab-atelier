@@ -82,6 +82,9 @@ rand = { version = "0.8", optional = true }
 # scrollback). Already in the transitive tree; pulling it in directly
 # so we can wrap our own write path.
 flate2 = "1"
+# Stable per-tab IDs persisted into tabs.json — used by the
+# `POST /tabs/by-id/{id}/status` API + the auto-resume path.
+uuid = { version = "1", features = ["v4"] }
 
 
 [dev-dependencies]

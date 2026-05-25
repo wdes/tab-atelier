@@ -36,7 +36,12 @@ async fn spawn_relay(port: u16, secret: &str, db_path: &std::path::Path) -> toki
     let client = reqwest::Client::new();
     for _ in 0..50 {
         tokio::time::sleep(Duration::from_millis(100)).await;
-        if client.get(format!("http://127.0.0.1:{port}/__ping")).send().await.is_ok() {
+        if client
+            .get(format!("http://127.0.0.1:{port}/__ping"))
+            .send()
+            .await
+            .is_ok()
+        {
             return child;
         }
     }
@@ -60,7 +65,10 @@ async fn obtain_token(port: u16) -> String {
         .send()
         .await
         .expect("post /v1/auth");
-    resp.json::<serde_json::Value>().await.unwrap()["token"].as_str().unwrap().to_string()
+    resp.json::<serde_json::Value>().await.unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_string()
 }
 
 #[tokio::test]
@@ -139,7 +147,10 @@ async fn kv_lifecycle() {
         .await
         .unwrap();
     assert_eq!(stale["success"], serde_json::Value::Bool(false));
-    assert_eq!(stale["errors"][0]["error"], serde_json::Value::String("version-mismatch".into()));
+    assert_eq!(
+        stale["errors"][0]["error"],
+        serde_json::Value::String("version-mismatch".into())
+    );
     assert_eq!(stale["errors"][0]["version"], serde_json::Value::Number(2.into()));
 
     // Add a second key for LIST + BULK GET.

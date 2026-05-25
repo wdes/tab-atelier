@@ -190,7 +190,11 @@ pub fn last_exchanges(path: &Path, n: usize) -> Vec<Exchange> {
                             if tool_count == 1 { "" } else { "s" }
                         ));
                     }
-                    if parts.is_empty() { None } else { Some((true, parts.join(" "))) }
+                    if parts.is_empty() {
+                        None
+                    } else {
+                        Some((true, parts.join(" ")))
+                    }
                 } else {
                     None
                 }

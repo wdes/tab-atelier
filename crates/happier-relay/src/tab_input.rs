@@ -15,9 +15,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
+    Json,
     extract::{Extension, Query, State},
     http::StatusCode,
-    Json,
 };
 use base64::Engine;
 use serde::{Deserialize, Serialize};

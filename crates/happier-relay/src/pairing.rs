@@ -22,7 +22,7 @@
 //! the box yet — clients that ask for v2 fall back to v1's plaintext
 //! token (the JS client in `qrWait.ts` accepts both shapes).
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use serde::{Deserialize, Serialize};
 
 use crate::state::AppState;

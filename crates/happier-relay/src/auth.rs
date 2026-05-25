@@ -6,11 +6,11 @@
 //! used by every subsequent authenticated route.
 
 use axum::{
+    Json,
     extract::{Request, State},
-    http::{header::AUTHORIZATION, StatusCode},
+    http::{StatusCode, header::AUTHORIZATION},
     middleware::Next,
     response::{IntoResponse, Response},
-    Json,
 };
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -54,9 +54,15 @@ pub async fn auth_handler(
     use base64::Engine;
     let b64 = base64::engine::general_purpose::STANDARD;
 
-    let public_key = b64.decode(&req.public_key).map_err(|_| AuthError::bad_request("invalid publicKey base64"))?;
-    let challenge = b64.decode(&req.challenge).map_err(|_| AuthError::bad_request("invalid challenge base64"))?;
-    let signature = b64.decode(&req.signature).map_err(|_| AuthError::bad_request("invalid signature base64"))?;
+    let public_key = b64
+        .decode(&req.public_key)
+        .map_err(|_| AuthError::bad_request("invalid publicKey base64"))?;
+    let challenge = b64
+        .decode(&req.challenge)
+        .map_err(|_| AuthError::bad_request("invalid challenge base64"))?;
+    let signature = b64
+        .decode(&req.signature)
+        .map_err(|_| AuthError::bad_request("invalid signature base64"))?;
 
     if public_key.len() != 32 {
         return Err(AuthError::bad_request("publicKey must be 32 bytes"));
@@ -69,7 +75,8 @@ pub async fn auth_handler(
     }
 
     let pk_array: [u8; 32] = public_key.as_slice().try_into().expect("checked above");
-    let verifying_key = VerifyingKey::from_bytes(&pk_array).map_err(|_| AuthError::unauthorized("malformed Ed25519 key"))?;
+    let verifying_key =
+        VerifyingKey::from_bytes(&pk_array).map_err(|_| AuthError::unauthorized("malformed Ed25519 key"))?;
     let sig_array: [u8; 64] = signature.as_slice().try_into().expect("checked above");
     let signature = Signature::from_bytes(&sig_array);
 
@@ -78,14 +85,21 @@ pub async fn auth_handler(
         .map_err(|_| AuthError::unauthorized("challenge signature invalid"))?;
 
     // Content-key binding is optional, but its two halves must travel together.
-    let (content_pk, content_pk_sig) = match (req.content_public_key.as_deref(), req.content_public_key_sig.as_deref()) {
+    let (content_pk, content_pk_sig) = match (req.content_public_key.as_deref(), req.content_public_key_sig.as_deref())
+    {
         (None, None) => (None, None),
         (Some(_), None) | (None, Some(_)) => {
-            return Err(AuthError::bad_request("contentPublicKey and contentPublicKeySig must be provided together"));
+            return Err(AuthError::bad_request(
+                "contentPublicKey and contentPublicKeySig must be provided together",
+            ));
         }
         (Some(pk_b64), Some(sig_b64)) => {
-            let pk = b64.decode(pk_b64).map_err(|_| AuthError::bad_request("invalid contentPublicKey base64"))?;
-            let sig = b64.decode(sig_b64).map_err(|_| AuthError::bad_request("invalid contentPublicKeySig base64"))?;
+            let pk = b64
+                .decode(pk_b64)
+                .map_err(|_| AuthError::bad_request("invalid contentPublicKey base64"))?;
+            let sig = b64
+                .decode(sig_b64)
+                .map_err(|_| AuthError::bad_request("invalid contentPublicKeySig base64"))?;
             if pk.len() != 32 {
                 return Err(AuthError::bad_request("contentPublicKey must be 32 bytes"));
             }
@@ -168,12 +182,12 @@ pub async fn require_auth(State(state): State<AppState>, mut req: Request, next:
         .map(std::string::ToString::to_string)
         .or_else(|| {
             req.uri().query().and_then(|q| {
-                q.split('&').find_map(|pair| pair.strip_prefix("token=").map(std::string::ToString::to_string))
+                q.split('&')
+                    .find_map(|pair| pair.strip_prefix("token=").map(std::string::ToString::to_string))
             })
         });
     let Some(token) = token else {
-        return AuthError::unauthorized("missing bearer token (Authorization header or ?token=)")
-            .into_response();
+        return AuthError::unauthorized("missing bearer token (Authorization header or ?token=)").into_response();
     };
     match crate::jwt::verify(&state.jwt_secret, &token) {
         Ok(claims) => {
@@ -192,16 +206,28 @@ pub struct AuthError {
 
 impl AuthError {
     fn bad_request(msg: &str) -> Self {
-        Self { status: StatusCode::BAD_REQUEST, message: msg.into() }
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: msg.into(),
+        }
     }
     fn unauthorized(msg: &str) -> Self {
-        Self { status: StatusCode::UNAUTHORIZED, message: msg.into() }
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            message: msg.into(),
+        }
     }
     fn forbidden(msg: &str) -> Self {
-        Self { status: StatusCode::FORBIDDEN, message: msg.into() }
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: msg.into(),
+        }
     }
     fn internal() -> Self {
-        Self { status: StatusCode::INTERNAL_SERVER_ERROR, message: "internal error".into() }
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "internal error".into(),
+        }
     }
 }
 

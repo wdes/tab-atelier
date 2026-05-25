@@ -101,6 +101,12 @@ parking_lot = "0.12"
 # port 7891.
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 rustls-pemfile = "2"
+# Direct dep so main() can pin the rustls CryptoProvider to `ring`
+# at startup. Without this, workspace feature unification leaves
+# both `ring` and `aws_lc_rs` enabled and any ServerConfig::builder()
+# call panics with "Could not automatically determine the
+# process-level CryptoProvider".
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }

@@ -7,9 +7,9 @@
 //! simplifications are flagged inline.
 
 use axum::{
+    Json,
     extract::{Extension, Path, Query, State},
     http::{HeaderMap, StatusCode},
-    Json,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -196,7 +196,10 @@ pub async fn create(
         return Err(err(StatusCode::BAD_REQUEST, "invalid encryption mode"));
     }
     let data_key_bytes = match req.data_encryption_key.as_deref() {
-        Some(s) => Some(b64.decode(s).map_err(|_| err(StatusCode::BAD_REQUEST, "invalid dataEncryptionKey base64"))?),
+        Some(s) => Some(
+            b64.decode(s)
+                .map_err(|_| err(StatusCode::BAD_REQUEST, "invalid dataEncryptionKey base64"))?,
+        ),
         None => None,
     };
     let id = uuid::Uuid::new_v4().to_string();
@@ -421,7 +424,12 @@ pub async fn list_messages(
     // beforeSeq returns rows with seq < before_seq descending. The
     // client uses the latter for back-pagination.
     let rows: Vec<MessageRow> = match (q.after_seq, q.before_seq) {
-        (Some(_), Some(_)) => return Err(err(StatusCode::BAD_REQUEST, "afterSeq and beforeSeq are mutually exclusive")),
+        (Some(_), Some(_)) => {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "afterSeq and beforeSeq are mutually exclusive",
+            ));
+        }
         (Some(after), None) => {
             sqlx::query_as(
                 "SELECT id, seq, local_id, sidechain_id, message_role, content, created_at, updated_at
@@ -520,11 +528,12 @@ pub async fn post_message(
     }
 
     // Allocate the next seq within this session.
-    let next_seq: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) + 1 FROM session_messages WHERE session_id = ?1")
-        .bind(&session_id)
-        .fetch_one(&state.db)
-        .await
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "internal error"))?;
+    let next_seq: i64 =
+        sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) + 1 FROM session_messages WHERE session_id = ?1")
+            .bind(&session_id)
+            .fetch_one(&state.db)
+            .await
+            .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "internal error"))?;
 
     let id = uuid::Uuid::new_v4().to_string();
     let now = now_secs();

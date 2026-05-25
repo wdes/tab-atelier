@@ -9,9 +9,9 @@
 //! a large body.
 
 use axum::{
+    Json,
     extract::{Extension, Path, State},
     http::StatusCode,
-    Json,
 };
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -121,7 +121,8 @@ fn err(status: StatusCode, msg: &str) -> (StatusCode, Json<serde_json::Value>) {
 }
 
 fn decode_b64(field: &str, value: &str) -> Result<Vec<u8>, (StatusCode, Json<serde_json::Value>)> {
-    B64.decode(value).map_err(|_| err(StatusCode::BAD_REQUEST, &format!("invalid base64 in {field}")))
+    B64.decode(value)
+        .map_err(|_| err(StatusCode::BAD_REQUEST, &format!("invalid base64 in {field}")))
 }
 
 // --- handlers ---------------------------------------------------------------
@@ -234,15 +235,19 @@ pub async fn update(
     let mut row = row.ok_or_else(|| err(StatusCode::NOT_FOUND, "artifact not found"))?;
 
     if req.header.is_some() && req.expected_header_version.is_none() {
-        return Err(err(StatusCode::BAD_REQUEST, "expectedHeaderVersion required when updating header"));
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "expectedHeaderVersion required when updating header",
+        ));
     }
     if req.body.is_some() && req.expected_body_version.is_none() {
-        return Err(err(StatusCode::BAD_REQUEST, "expectedBodyVersion required when updating body"));
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "expectedBodyVersion required when updating body",
+        ));
     }
 
-    let header_mismatch = req
-        .expected_header_version
-        .is_some_and(|v| v != row.header_version);
+    let header_mismatch = req.expected_header_version.is_some_and(|v| v != row.header_version);
     let body_mismatch = req.expected_body_version.is_some_and(|v| v != row.body_version);
     if header_mismatch || body_mismatch {
         return Ok(Json(serde_json::json!({

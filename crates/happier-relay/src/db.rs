@@ -4,8 +4,8 @@
 
 use std::path::Path;
 
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
 /// Open (or create) the `SQLite` file at `path` and run pending migrations.
 ///
@@ -19,10 +19,7 @@ pub async fn open(path: &Path) -> anyhow::Result<SqlitePool> {
         .filename(path)
         .create_if_missing(true)
         .foreign_keys(true);
-    let pool = SqlitePoolOptions::new()
-        .max_connections(8)
-        .connect_with(opts)
-        .await?;
+    let pool = SqlitePoolOptions::new().max_connections(8).connect_with(opts).await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
     Ok(pool)
 }
@@ -48,13 +45,15 @@ pub async fn upsert_account(
         .fetch_optional(pool)
         .await?;
     if let Some((id,)) = existing {
-        sqlx::query("UPDATE accounts SET content_public_key = ?1, content_public_key_sig = ?2, updated_at = ?3 WHERE id = ?4")
-            .bind(content_public_key)
-            .bind(content_public_key_sig)
-            .bind(now)
-            .bind(&id)
-            .execute(pool)
-            .await?;
+        sqlx::query(
+            "UPDATE accounts SET content_public_key = ?1, content_public_key_sig = ?2, updated_at = ?3 WHERE id = ?4",
+        )
+        .bind(content_public_key)
+        .bind(content_public_key_sig)
+        .bind(now)
+        .bind(&id)
+        .execute(pool)
+        .await?;
         return Ok(id);
     }
 
@@ -112,8 +111,8 @@ pub async fn upsert_account_shared(
 #[cfg(test)]
 mod tests {
     use super::{open, upsert_account, upsert_account_shared};
-    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use sqlx::SqlitePool;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use std::path::Path;
 
     async fn fresh_pool() -> SqlitePool {
@@ -140,16 +139,17 @@ mod tests {
     async fn upsert_account_inserts_then_updates_same_id() {
         let pool = fresh_pool().await;
         let pk = "aa".repeat(32);
-        let id1 = upsert_account(&pool, &pk, Some(&[1, 2, 3]), Some(&[4, 5, 6])).await.unwrap();
+        let id1 = upsert_account(&pool, &pk, Some(&[1, 2, 3]), Some(&[4, 5, 6]))
+            .await
+            .unwrap();
         let id2 = upsert_account(&pool, &pk, Some(&[9, 9]), Some(&[8, 8])).await.unwrap();
         assert_eq!(id1, id2, "same pubkey must return same id");
 
-        let (content,): (Option<Vec<u8>>,) =
-            sqlx::query_as("SELECT content_public_key FROM accounts WHERE id = ?1")
-                .bind(&id1)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let (content,): (Option<Vec<u8>>,) = sqlx::query_as("SELECT content_public_key FROM accounts WHERE id = ?1")
+            .bind(&id1)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(content.as_deref(), Some(&[9_u8, 9][..]), "update path ran");
 
         let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM accounts")
@@ -176,13 +176,12 @@ mod tests {
     async fn upsert_account_handles_none_content() {
         let pool = fresh_pool().await;
         let id = upsert_account(&pool, &"cc".repeat(32), None, None).await.unwrap();
-        let (ck, sig): (Option<Vec<u8>>, Option<Vec<u8>>) = sqlx::query_as(
-            "SELECT content_public_key, content_public_key_sig FROM accounts WHERE id = ?1",
-        )
-        .bind(&id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let (ck, sig): (Option<Vec<u8>>, Option<Vec<u8>>) =
+            sqlx::query_as("SELECT content_public_key, content_public_key_sig FROM accounts WHERE id = ?1")
+                .bind(&id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert!(ck.is_none() && sig.is_none());
     }
 
@@ -190,9 +189,15 @@ mod tests {
     async fn upsert_account_shared_seeds_then_pins_first_pubkey() {
         let pool = fresh_pool().await;
         let first_pk = "aa".repeat(32);
-        let id1 = upsert_account_shared(&pool, &first_pk, Some(&[1]), Some(&[2])).await.unwrap();
-        let id2 = upsert_account_shared(&pool, &"bb".repeat(32), Some(&[3]), Some(&[4])).await.unwrap();
-        let id3 = upsert_account_shared(&pool, &"cc".repeat(32), None, None).await.unwrap();
+        let id1 = upsert_account_shared(&pool, &first_pk, Some(&[1]), Some(&[2]))
+            .await
+            .unwrap();
+        let id2 = upsert_account_shared(&pool, &"bb".repeat(32), Some(&[3]), Some(&[4]))
+            .await
+            .unwrap();
+        let id3 = upsert_account_shared(&pool, &"cc".repeat(32), None, None)
+            .await
+            .unwrap();
         assert_eq!(id1, id2);
         assert_eq!(id1, id3);
 
@@ -202,12 +207,11 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1, "shared variant never inserts a second row");
 
-        let (stored_pk,): (String,) =
-            sqlx::query_as("SELECT public_key_hex FROM accounts WHERE id = ?1")
-                .bind(&id1)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let (stored_pk,): (String,) = sqlx::query_as("SELECT public_key_hex FROM accounts WHERE id = ?1")
+            .bind(&id1)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(stored_pk, first_pk, "seeder pubkey is never overwritten");
     }
 }

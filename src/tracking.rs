@@ -274,9 +274,8 @@ mod tests {
 
     #[test]
     fn debounce_predicate_matches_inline_logic() {
-        let should_skip = |now: u64, last_sent: u64, project_changed: bool| {
-            now - last_sent < DEBOUNCE_SECS && !project_changed
-        };
+        let should_skip =
+            |now: u64, last_sent: u64, project_changed: bool| now - last_sent < DEBOUNCE_SECS && !project_changed;
         assert_eq!(DEBOUNCE_SECS, 120);
         assert!(should_skip(1_000, 999, false));
         assert!(!should_skip(1_000, 999, true));
@@ -298,7 +297,10 @@ mod tests {
     fn heartbeat_event_variants_send_through_channel() {
         let (tx, rx) = mpsc::channel::<HeartbeatEvent>();
         tx.send(HeartbeatEvent::Activity { cwd: None }).unwrap();
-        tx.send(HeartbeatEvent::Activity { cwd: Some(PathBuf::from("/x")) }).unwrap();
+        tx.send(HeartbeatEvent::Activity {
+            cwd: Some(PathBuf::from("/x")),
+        })
+        .unwrap();
         tx.send(HeartbeatEvent::Shutdown).unwrap();
 
         assert!(matches!(rx.recv().unwrap(), HeartbeatEvent::Activity { cwd: None }));
@@ -315,5 +317,4 @@ mod tests {
         tracker.record_activity(None);
         tracker.shutdown();
     }
-
 }

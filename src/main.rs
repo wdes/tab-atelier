@@ -5,6 +5,7 @@
 mod api;
 mod app;
 mod catbus_agent;
+mod cli;
 #[cfg(feature = "happier-bridge")]
 mod happier_bridge;
 mod locale;
@@ -43,6 +44,30 @@ pub fn read_only() -> bool {
 static INSTANCE_LOCK: OnceLock<std::fs::File> = OnceLock::new();
 
 fn main() {
+    // Subcommand dispatch — keeps the entry point short and lets
+    // shell-side helpers (`tab-atelier set-status …`) run without
+    // ever touching the gpui app::run path.
+    if let Some(sub) = std::env::args().nth(1)
+        && sub == "set-status"
+    {
+        let rest: Vec<String> = std::env::args().skip(2).collect();
+        std::process::exit(cli::set_status::run(&rest));
+    }
+
+    install_rustls_provider();
+
+    // Smoke check used by tests/rustls_provider.rs to guard against
+    // future regressions of the install_default() call above OR any
+    // change to the workspace feature graph that re-introduces the
+    // panic. Exercises the same rustls path the API TLS server uses
+    // and exits 0 if the provider is happy.
+    if std::env::args().any(|a| a == "--check-crypto") {
+        let _config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(std::sync::Arc::new(rustls::server::ResolvesServerCertUsingSni::new()));
+        std::process::exit(0);
+    }
+
     let read_only = std::env::args().any(|a| a == "--read-only");
     READ_ONLY.store(read_only, Ordering::SeqCst);
 
@@ -59,6 +84,21 @@ fn main() {
         SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
     });
     app::run();
+}
+
+/// Pin the rustls `CryptoProvider` to `ring` at process start.
+///
+/// Workspace feature unification compiles `rustls` with both `ring`
+/// and `aws_lc_rs` enabled (axum-server / reqwest pull the latter in
+/// via happier-relay + catbus-agent). Without an explicit install,
+/// `ServerConfig::builder()` panics: "Could not automatically
+/// determine the process-level `CryptoProvider`". Calling
+/// `install_default()` here makes TLS startup deterministic.
+///
+/// Idempotent — second-and-later calls return `Err` (which we ignore)
+/// rather than re-installing.
+fn install_rustls_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
 fn try_acquire_single_instance_lock() -> bool {

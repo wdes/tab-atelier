@@ -354,10 +354,7 @@ impl Agent {
             .header("anthropic-beta", ANTHROPIC_BETA)
             .json(&body);
         drop(active);
-        let resp = request
-            .send()
-            .await
-            .map_err(|e| AgentError::Http(e.to_string()))?;
+        let resp = request.send().await.map_err(|e| AgentError::Http(e.to_string()))?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -398,7 +395,9 @@ fn rebuild_history(project_dir: &std::path::Path, id: &str) -> Vec<ApiMessage> {
         // instead of cloning it before `from_value`. The owned `v` is
         // dropped at the end of the loop iteration anyway.
         let Some(msg) = v.get_mut("message") else { continue };
-        let Some(content_val) = msg.get_mut("content") else { continue };
+        let Some(content_val) = msg.get_mut("content") else {
+            continue;
+        };
         let content_owned = std::mem::take(content_val);
         match role {
             "user" => {
@@ -461,7 +460,13 @@ fn truncate_at_orphan_tool_use(out: &mut Vec<ApiMessage>) {
         let uses: HashSet<String> = match &out[i].content {
             ApiContent::Blocks(blocks) => blocks
                 .iter()
-                .filter_map(|b| if let Block::ToolUse { id, .. } = b { Some(id.clone()) } else { None })
+                .filter_map(|b| {
+                    if let Block::ToolUse { id, .. } = b {
+                        Some(id.clone())
+                    } else {
+                        None
+                    }
+                })
                 .collect(),
             ApiContent::Plain(_) => HashSet::new(),
         };
@@ -480,7 +485,13 @@ fn truncate_at_orphan_tool_use(out: &mut Vec<ApiMessage>) {
         let results: HashSet<String> = match &next.content {
             ApiContent::Blocks(blocks) => blocks
                 .iter()
-                .filter_map(|b| if let Block::ToolResult { tool_use_id, .. } = b { Some(tool_use_id.clone()) } else { None })
+                .filter_map(|b| {
+                    if let Block::ToolResult { tool_use_id, .. } = b {
+                        Some(tool_use_id.clone())
+                    } else {
+                        None
+                    }
+                })
                 .collect(),
             ApiContent::Plain(_) => HashSet::new(),
         };

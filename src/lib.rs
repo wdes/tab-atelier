@@ -10,6 +10,14 @@ pub const APP_DIR: &str = "tab-atelier";
 
 #[derive(Serialize, Deserialize)]
 pub struct TabState {
+    /// Stable per-tab UUID. Used by the local API
+    /// (`POST /tabs/by-id/{tab_id}/status`) and exported into the
+    /// tab's shell as `_TAB_ID` so tools can identify themselves
+    /// across rename. Assigned on first creation, persisted across
+    /// restarts. `#[serde(default)]` so old tabs.json files generate
+    /// a fresh id on first load.
+    #[serde(default = "default_tab_id")]
+    pub id: String,
     pub name: String,
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -28,6 +36,72 @@ pub struct TabState {
     /// `true` so the common case stays out of the serialized file.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub colors_enabled: bool,
+    /// Transient agent state — UI hint only, never serialised.
+    /// Posted via `POST /tabs/by-id/{id}/status`, cleared by the
+    /// staleness sweep after 5 min of no updates.
+    #[serde(skip)]
+    pub agent_state: Option<AgentStateSnapshot>,
+    /// Durable — the last agent session UUID reported on this tab.
+    /// Drives auto-resume on next launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session_id: Option<String>,
+    /// Durable — which agent CLI owns the persisted `agent_session_id`.
+    /// Known values: "catbus" (catbus-agent), "claude" (official
+    /// Claude Code CLI). Free-form string for future agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_kind: Option<String>,
+    /// Durable — whether the agent was in plan / read-only mode at
+    /// last save. Restored along with the session uuid so auto-resume
+    /// brings the tab back into the same mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_plan_mode: Option<bool>,
+}
+
+#[must_use]
+pub fn default_tab_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+impl Default for TabState {
+    fn default() -> Self {
+        Self {
+            id: default_tab_id(),
+            name: String::new(),
+            cwd: None,
+            output: None,
+            uptime_secs: None,
+            energy_wh: None,
+            tokens: None,
+            colors_enabled: true,
+            agent_state: None,
+            agent_session_id: None,
+            agent_kind: None,
+            agent_plan_mode: None,
+        }
+    }
+}
+
+/// Discrete agent runtime states a tool inside a tab can publish via
+/// `POST /tabs/by-id/{id}/status`. Drives the desktop LED colour and
+/// the happier mobile session badge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentState {
+    Thinking,
+    Waiting,
+    Error,
+}
+
+/// In-memory snapshot stored on each `TabState`.
+///
+/// Carries the state plus an optional short label ("tool: Bash")
+/// and the wall-clock at which it was reported, so the staleness
+/// sweep can evict abandoned indicators.
+#[derive(Clone, Debug)]
+pub struct AgentStateSnapshot {
+    pub state: AgentState,
+    pub label: Option<String>,
+    pub updated_at: std::time::Instant,
 }
 
 const fn default_true() -> bool {
@@ -1129,6 +1203,7 @@ mod tests {
                     energy_wh: None,
                     colors_enabled: true,
                     tokens: None,
+                    ..Default::default()
                 },
                 TabState {
                     name: "Build".into(),
@@ -1138,6 +1213,7 @@ mod tests {
                     energy_wh: None,
                     colors_enabled: true,
                     tokens: None,
+                    ..Default::default()
                 },
             ],
             active: 1,
@@ -1165,6 +1241,7 @@ mod tests {
                 energy_wh: None,
                 colors_enabled: false,
                 tokens: None,
+                ..Default::default()
             }],
             active: 0,
             windowed: false,
@@ -1193,6 +1270,7 @@ mod tests {
                 energy_wh: Some(0.042),
                 colors_enabled: true,
                 tokens: None,
+                ..Default::default()
             }],
             active: 0,
             windowed: false,
@@ -1298,6 +1376,7 @@ mod tests {
                 energy_wh: None,
                 colors_enabled: true,
                 tokens: None,
+                ..Default::default()
             }],
             active: 0,
             windowed: false,
@@ -1340,6 +1419,7 @@ mod tests {
                 energy_wh: None,
                 colors_enabled: true,
                 tokens: None,
+                ..Default::default()
             }],
             active: 0,
             windowed: false,
@@ -1369,6 +1449,7 @@ mod tests {
                     energy_wh: None,
                     colors_enabled: true,
                     tokens: None,
+                    ..Default::default()
                 },
                 TabState {
                     name: "Two".into(),
@@ -1378,6 +1459,7 @@ mod tests {
                     energy_wh: None,
                     colors_enabled: true,
                     tokens: None,
+                    ..Default::default()
                 },
             ],
             active: 1,
@@ -1563,6 +1645,7 @@ mod tests {
                 energy_wh: None,
                 colors_enabled: true,
                 tokens: None,
+                ..Default::default()
             }],
             active: 0,
             windowed: false,
@@ -1714,6 +1797,7 @@ mod tests {
                 energy_wh: None,
                 colors_enabled: true,
                 tokens: None,
+                ..Default::default()
             }],
             active: 999,
             windowed: false,

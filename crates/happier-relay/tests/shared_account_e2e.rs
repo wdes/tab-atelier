@@ -37,7 +37,12 @@ async fn spawn_relay_shared(port: u16, db_path: &std::path::Path) -> tokio::proc
     let client = reqwest::Client::new();
     for _ in 0..50 {
         tokio::time::sleep(Duration::from_millis(100)).await;
-        if client.get(format!("http://127.0.0.1:{port}/__ping")).send().await.is_ok() {
+        if client
+            .get(format!("http://127.0.0.1:{port}/__ping"))
+            .send()
+            .await
+            .is_ok()
+        {
             return child;
         }
     }
