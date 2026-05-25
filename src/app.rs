@@ -974,6 +974,24 @@ impl AppState {
                     tab.agent_state = None;
                 }
             }
+            // Process-presence sweep: clear the whole agent attachment
+            // (state + session + kind) when the agent CLI is no longer
+            // a descendant of the tab's shell. Catches Ctrl-D / crash
+            // / "closed claude without /exit" cases where the SessionEnd
+            // hook never gets a chance to run — without this the LED
+            // would keep amber-blinking from a stale Stop event until
+            // the 2-min staleness sweep above eventually fires.
+            for tab in &mut self.tabs {
+                if tab.agent_kind.is_some() {
+                    let pid = tab.view.read(cx).pid();
+                    if !crate::catbus_agent::has_agent_descendant(pid) {
+                        tab.agent_state = None;
+                        tab.agent_session_id = None;
+                        tab.agent_kind = None;
+                        tab.agent_plan_mode = None;
+                    }
+                }
+            }
             // Auto-resume sweep: type the queued resume command into
             // any tab whose shell has had ~500ms to print its prompt.
             // `flush_pending_agent_resume` takes the queued command,
