@@ -18,6 +18,8 @@ use gpui::{
     Point, Render, Rgba, SharedString, Stateful, StatefulInteractiveElement, Styled, WeakEntity, Window,
     WindowBackgroundAppearance, WindowHandle, WindowOptions, div, px, rgba,
 };
+#[cfg(feature = "happier-bridge")]
+use log::warn;
 use log::{debug, info};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -931,23 +933,30 @@ impl AppState {
                     continue;
                 };
                 // "__clear__" sentinel from a POST with state=idle.
+                // Wipes BOTH the transient state and the durable
+                // session attachment, so the LED actually disappears
+                // on Claude Code's SessionEnd hook (otherwise the
+                // grey "session attached" dot would stick around).
                 if upd.label.as_deref() == Some("__clear__") {
                     tab.agent_state = None;
+                    tab.agent_session_id = None;
+                    tab.agent_kind = None;
+                    tab.agent_plan_mode = None;
                 } else {
                     tab.agent_state = Some(tab_atelier::AgentStateSnapshot {
                         state: upd.state,
                         label: upd.label,
                         updated_at: std::time::Instant::now(),
                     });
-                }
-                if upd.session_id.is_some() {
-                    tab.agent_session_id = upd.session_id;
-                }
-                if upd.agent_kind.is_some() {
-                    tab.agent_kind = upd.agent_kind;
-                }
-                if upd.plan_mode.is_some() {
-                    tab.agent_plan_mode = upd.plan_mode;
+                    if upd.session_id.is_some() {
+                        tab.agent_session_id = upd.session_id;
+                    }
+                    if upd.agent_kind.is_some() {
+                        tab.agent_kind = upd.agent_kind;
+                    }
+                    if upd.plan_mode.is_some() {
+                        tab.agent_plan_mode = upd.plan_mode;
+                    }
                 }
             }
             // Staleness sweep: drop transient LED state when the last
@@ -1279,33 +1288,55 @@ impl AppState {
             } else {
                 tab.name.clone()
             };
-            // Optional agent-state LED to the left of the tab name.
-            // Waiting blinks via the same `blink_on` toggle as the
-            // battery indicator; thinking/error stay steady.
-            let agent_led = tab.agent_state.as_ref().map(|snap| {
-                let visible = snap.state != tab_atelier::AgentState::Waiting || blink_on;
-                let color = match snap.state {
-                    tab_atelier::AgentState::Thinking => Hsla::from(Rgba {
+            // Agent-state LED to the left of the tab name. Visible
+            // whenever a session is attached (agent_kind set) OR a
+            // transient state is live; cleared only when the session
+            // actually ends (the `idle` POST wipes agent_kind too).
+            // Waiting alternates amber ↔ grey with the same 500 ms
+            // `blink_on` toggle that drives the battery indicator;
+            // thinking / error stay steady.
+            let session_attached = tab.agent_kind.is_some();
+            let agent_led = if tab.agent_state.is_some() || session_attached {
+                let grey = Hsla::from(Rgba {
+                    r: 0.45,
+                    g: 0.45,
+                    b: 0.45,
+                    a: 1.0,
+                });
+                let color = match tab.agent_state.as_ref().map(|s| s.state) {
+                    Some(tab_atelier::AgentState::Thinking) => Hsla::from(Rgba {
                         r: 0.306,
                         g: 0.788,
                         b: 0.690,
                         a: 1.0,
                     }),
-                    tab_atelier::AgentState::Waiting => Hsla::from(Rgba {
-                        r: 0.851,
-                        g: 0.467,
-                        b: 0.024,
-                        a: if visible { 1.0 } else { 0.25 },
-                    }),
-                    tab_atelier::AgentState::Error => Hsla::from(Rgba {
+                    Some(tab_atelier::AgentState::Waiting) => {
+                        if blink_on {
+                            Hsla::from(Rgba {
+                                r: 0.851,
+                                g: 0.467,
+                                b: 0.024,
+                                a: 1.0,
+                            })
+                        } else {
+                            grey
+                        }
+                    }
+                    Some(tab_atelier::AgentState::Error) => Hsla::from(Rgba {
                         r: 0.937,
                         g: 0.267,
                         b: 0.267,
                         a: 1.0,
                     }),
+                    // Session attached but no recent activity — show
+                    // the LED in steady grey so the user still sees a
+                    // claude/catbus is running in this tab.
+                    None => grey,
                 };
-                div().w(px(7.0)).h(px(7.0)).mr(px(5.0)).rounded_full().bg(color)
-            });
+                Some(div().w(px(7.0)).h(px(7.0)).mr(px(5.0)).rounded_full().bg(color))
+            } else {
+                None
+            };
 
             #[cfg(feature = "energy")]
             let power_label = watts.get(i).map(power::TabPower::label).unwrap_or_default();

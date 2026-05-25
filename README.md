@@ -174,7 +174,19 @@ Bind addresses for both listeners are configurable in preferences (`api_addr`, `
 
 ## Agent state
 
-Each tab carries an optional **agent state** (`thinking`, `waiting`, `error`) rendered as a colored LED to the left of the tab name. `waiting` blinks at the same 500 ms cadence as the low-battery indicator. The state is stored in RAM only (the durable session id and agent kind are persisted to `tabs.json` for auto-resume).
+Each tab carries an optional **agent state** rendered as a small colored LED to the left of the tab name:
+
+| State | LED |
+|---|---|
+| `thinking` | steady cyan |
+| `waiting` | amber that alternates with grey every 500 ms (same cadence as the low-battery indicator) — easy to spot from across the room without strobing the eye |
+| `error` | steady red |
+| _none, but a session is attached_ | steady grey — "agent CLI lives here, no recent activity" |
+| _none, no session_ | hidden |
+
+The grey-when-idle behaviour means the LED stays visible for the entire life of an attached agent session: once your shell sends a `--session <uuid>` it sticks until the session genuinely ends. Claude Code's `SessionEnd` hook (or a manual `tab-atelier set-status idle`) wipes both the transient state and the durable session attachment so the LED disappears.
+
+State is stored in RAM only (the durable session id, agent kind, and plan-mode flag are persisted to `tabs.json` for auto-resume).
 
 Every PTY tab-atelier spawns gets three env vars so in-tab tools can publish state without configuration:
 
@@ -228,6 +240,7 @@ The CLI silently exits 0 when `_TAB_ID` is unset (i.e. invoked outside a tab), s
 
 | Event | State | Why |
 |---|---|---|
+| `SessionStart` | `waiting` (label `session`) | Claude attached to the tab — LED appears immediately, not only at first prompt |
 | `UserPromptSubmit` | `thinking` | You sent a prompt — work has started |
 | `Stop` | `waiting` | Claude finished its turn, awaiting next prompt |
 | `PermissionRequest` | `waiting` (label `permission`) | Claude paused for tool/file approval — needs you |
