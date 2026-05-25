@@ -1334,6 +1334,35 @@ impl AppState {
                     .child(self.t().rename),
             );
 
+            // Copy the tab's working directory to the clipboard.
+            // Reads /proc/<pid>/cwd via the platform helper; falls
+            // back to the last known cwd captured at spawn time when
+            // the live read fails (process gone, /proc unreadable).
+            container = container.child(
+                div()
+                    .id("menu-copy-path")
+                    .px(px(12.0))
+                    .py(px(4.0))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(menu_hover))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                            let pid = this.tabs[idx].view.read(cx).pid();
+                            let path = platform::process_cwd(pid)
+                                .or_else(|| this.tabs[idx].last_known_cwd.clone());
+                            if let Some(p) = path {
+                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                    p.to_string_lossy().into_owned(),
+                                ));
+                            }
+                            this.context_menu = None;
+                            cx.notify();
+                        }),
+                    )
+                    .child(self.t().copy_path),
+            );
+
             if self.tabs.len() > 1 {
                 container = container.child(
                     div()
