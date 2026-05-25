@@ -209,10 +209,30 @@ The CLI silently exits 0 when `_TAB_ID` is unset (i.e. invoked outside a tab), s
     "Stop": [
       { "matcher": "", "hooks": [{ "type": "command",
         "command": "bash -c 'sid=$(jq -r .session_id); tab-atelier set-status waiting --kind claude --session \"$sid\"' >/dev/null 2>&1" }] }
+    ],
+    "PermissionRequest": [
+      { "matcher": "", "hooks": [{ "type": "command",
+        "command": "bash -c 'sid=$(jq -r .session_id); tab-atelier set-status waiting --label permission --kind claude --session \"$sid\"' >/dev/null 2>&1" }] }
+    ],
+    "StopFailure": [
+      { "matcher": "", "hooks": [{ "type": "command",
+        "command": "bash -c 'sid=$(jq -r .session_id); tab-atelier set-status error --kind claude --session \"$sid\"' >/dev/null 2>&1" }] }
+    ],
+    "SessionEnd": [
+      { "matcher": "", "hooks": [{ "type": "command",
+        "command": "bash -c 'sid=$(jq -r .session_id); tab-atelier set-status idle --kind claude --session \"$sid\"' >/dev/null 2>&1" }] }
     ]
   }
 }
 ```
+
+| Event | State | Why |
+|---|---|---|
+| `UserPromptSubmit` | `thinking` | You sent a prompt — work has started |
+| `Stop` | `waiting` | Claude finished its turn, awaiting next prompt |
+| `PermissionRequest` | `waiting` (label `permission`) | Claude paused for tool/file approval — needs you |
+| `StopFailure` | `error` | Turn aborted (API error, crash) |
+| `SessionEnd` | `idle` | Session terminated — clear the LED |
 
 ### Auto-resume on restart
 
