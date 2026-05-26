@@ -21,6 +21,7 @@ pub(crate) mod locale;
 pub(crate) mod platform;
 #[cfg(feature = "energy")]
 pub(crate) mod power;
+pub mod remote;
 #[cfg(feature = "gui")]
 pub(crate) mod screenshot;
 pub(crate) mod term_export;
