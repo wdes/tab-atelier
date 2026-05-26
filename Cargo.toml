@@ -144,3 +144,26 @@ assets = [
 # user's home directory, so dpkg has no business managing it. Setting
 # this to [] makes that intentional rather than implicit.
 conf-files = []
+
+# Headless variant — produces tab-atelier-headless_<version>.deb.
+# Built with `cargo deb -p tab-atelier --variant headless`. Uses
+# `--no-default-features --features headless,happier-bridge,energy`
+# under the hood so the binary depends only on libc / libgcc and
+# never pulls in libfreetype / libxkbcommon / libxcb / libqrcode.
+[package.metadata.deb.variants.headless]
+name = "tab-atelier-headless"
+features = ["headless", "happier-bridge", "energy"]
+default-features = false
+depends = "libc6, libgcc-s1"
+extended-description = "Display-less companion to tab-atelier. Restores tabs from tabs.json, spawns their PTYs, and runs the same local HTTP/TLS API + happier-bridge as the desktop GUI — without any X11 / gpui dependency. Designed for servers, CI runners, and remote shells where the mobile/web remote should still see the same set of named tabs."
+assets = [
+    ["target/release/tab-atelier-headless", "/usr/bin/", "755"],
+    ["target/release/catbus-agent", "/usr/bin/", "755"],
+    ["target/release/happier-relay", "/usr/bin/", "755"],
+    # Systemd user unit so `systemctl --user enable --now
+    # tab-atelier-headless` is the only thing the user has to run
+    # after installing the deb.
+    ["assets/tab-atelier-headless.service", "/usr/lib/systemd/user/", "644"],
+    ["README.md", "/usr/share/doc/tab-atelier-headless/", "644"],
+    ["LICENSE", "/usr/share/doc/tab-atelier-headless/", "644"],
+]
