@@ -97,6 +97,23 @@ pub struct Strings {
     pub api_tls_addr: &'static str,
     pub happier_relay_addr: &'static str,
     pub save: &'static str,
+
+    // Remote endpoints (Preferences > Remote endpoints)
+    pub remote_endpoints: &'static str,
+    pub remote_endpoint_add: &'static str,
+    pub remote_endpoint_remove: &'static str,
+    pub remote_endpoint_edit: &'static str,
+    pub remote_endpoint_test: &'static str,
+    pub remote_endpoint_label: &'static str,
+    pub remote_endpoint_url: &'static str,
+    pub remote_endpoint_token: &'static str,
+    pub remote_endpoint_pin_cert: &'static str,
+    pub remote_endpoint_autoconnect: &'static str,
+    pub remote_endpoint_cert_fingerprint: &'static str,
+    pub remote_endpoint_saved: &'static str,
+    pub remote_endpoint_test_ok: &'static str,
+    pub remote_endpoint_test_failed: &'static str,
+    pub remote_endpoint_reconnect: &'static str,
 }
 
 pub static EN: Strings = Strings {
@@ -163,6 +180,22 @@ pub static EN: Strings = Strings {
     api_tls_addr: "Remote API TLS bind (addr:port, restart required)",
     happier_relay_addr: "Happier relay bind (addr:port, restart required)",
     save: "Save",
+
+    remote_endpoints: "Remote endpoints",
+    remote_endpoint_add: "Add endpoint",
+    remote_endpoint_remove: "Remove",
+    remote_endpoint_edit: "Edit",
+    remote_endpoint_test: "Test connection",
+    remote_endpoint_label: "Label",
+    remote_endpoint_url: "URL",
+    remote_endpoint_token: "Token",
+    remote_endpoint_pin_cert: "Pin certificate",
+    remote_endpoint_autoconnect: "Auto-connect on startup",
+    remote_endpoint_cert_fingerprint: "Cert fingerprint",
+    remote_endpoint_saved: "Endpoint saved",
+    remote_endpoint_test_ok: "Endpoint test: OK",
+    remote_endpoint_test_failed: "Endpoint test failed",
+    remote_endpoint_reconnect: "Reconnect",
 };
 
 pub static FR: Strings = Strings {
@@ -229,6 +262,22 @@ pub static FR: Strings = Strings {
     api_tls_addr: "API distante TLS (adresse:port, redémarrage requis)",
     happier_relay_addr: "Relais happier (adresse:port, redémarrage requis)",
     save: "Enregistrer",
+
+    remote_endpoints: "Points d'accès distants",
+    remote_endpoint_add: "Ajouter un point d'accès",
+    remote_endpoint_remove: "Supprimer",
+    remote_endpoint_edit: "Modifier",
+    remote_endpoint_test: "Tester la connexion",
+    remote_endpoint_label: "Nom",
+    remote_endpoint_url: "URL",
+    remote_endpoint_token: "Jeton",
+    remote_endpoint_pin_cert: "Épingler le certificat",
+    remote_endpoint_autoconnect: "Connexion automatique au démarrage",
+    remote_endpoint_cert_fingerprint: "Empreinte du certificat",
+    remote_endpoint_saved: "Point d'accès enregistré",
+    remote_endpoint_test_ok: "Test du point d'accès : OK",
+    remote_endpoint_test_failed: "Échec du test du point d'accès",
+    remote_endpoint_reconnect: "Reconnecter",
 };
 
 pub fn detect_lang() -> Lang {
