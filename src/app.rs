@@ -5,6 +5,8 @@
 #![cfg(feature = "gui")]
 
 use crate::api;
+#[cfg(feature = "happier-bridge")]
+use crate::happier_relay_url_from_args;
 use crate::locale::{self, Lang, Strings};
 use crate::platform;
 #[cfg(feature = "energy")]
@@ -18,6 +20,7 @@ use crate::{
     load_font_config, load_preferences, load_state_with_outputs, load_wakatime_key, save_preferences, save_state,
     save_tab_energy, save_tab_output, save_tab_tokens, save_tab_uptime,
 };
+use crate::{api_url_for_local_clients, build_agent_resume_command, tab_env_extras};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Application, AsyncApp, ClickEvent, ClipboardItem, Context, Div, ElementId, Entity, FocusHandle,
@@ -29,7 +32,6 @@ use gpui::{
 use log::warn;
 use log::{debug, info};
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -3353,67 +3355,9 @@ impl Render for AppState {
     }
 }
 
-/// Build the `TAB_ATELIER_API_URL` value handed to each PTY. The
-/// stored `api_addr` is a bind spec ("0.0.0.0:7890", ":7890",
-/// "127.0.0.1:9000") — we always rewrite the host to 127.0.0.1
-/// because in-tab tools live on the same machine and shouldn't
-/// be talking to themselves via the LAN address.
-fn api_url_for_local_clients(api_addr: &str) -> String {
-    let port = api_addr
-        .rsplit(':')
-        .next()
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(crate::DEFAULT_API_PORT);
-    format!("http://127.0.0.1:{port}")
-}
-
-/// Build the per-tab env map for `_TAB_ID` / `TAB_ATELIER_API_URL` /
-/// `TAB_ATELIER_API_TOKEN`. Pulled out so the four PTY-spawn paths
-/// stay terse.
-fn tab_env_extras(tab_id: &str, api_url: &str, api_token: &str) -> HashMap<String, String> {
-    let mut m = HashMap::new();
-    m.insert("_TAB_ID".into(), tab_id.to_string());
-    m.insert("TAB_ATELIER_API_URL".into(), api_url.to_string());
-    m.insert("TAB_ATELIER_API_TOKEN".into(), api_token.to_string());
-    m
-}
-
-/// Translate a persisted (`agent_kind`, `session_id`, `plan_mode`) into
-/// the shell command to type for auto-resume. Returns None when
-/// the `agent_kind` isn't one we know how to drive.
-fn build_agent_resume_command(kind: &str, session_id: &str, plan: Option<bool>) -> Option<String> {
-    match kind {
-        "catbus" => {
-            let flag = if plan == Some(true) { " --plan" } else { "" };
-            Some(format!("catbus-agent --resume {session_id}{flag}"))
-        }
-        "claude" => Some(format!("claude --resume {session_id}")),
-        _ => None,
-    }
-}
-
-/// Read the optional `--happier-relay-url <url>` (or `=`) flag without
-/// pulling in clap on the main binary. Returns `None` if the flag
-/// isn't present, the value is empty, or the feature is disabled (in
-/// which case this fn isn't even compiled).
-#[cfg(feature = "happier-bridge")]
-fn happier_relay_url_from_args() -> Option<String> {
-    let mut args = std::env::args().skip(1);
-    while let Some(a) = args.next() {
-        if let Some(rest) = a.strip_prefix("--happier-relay-url=")
-            && !rest.is_empty()
-        {
-            return Some(rest.to_string());
-        }
-        if a == "--happier-relay-url"
-            && let Some(v) = args.next()
-            && !v.is_empty()
-        {
-            return Some(v);
-        }
-    }
-    None
-}
+// Shared with the headless binary — see `crate::tab_env_extras`,
+// `crate::api_url_for_local_clients`, `crate::build_agent_resume_command`,
+// and `crate::happier_relay_url_from_args` in lib.rs.
 
 /// Pull the port out of an `addr:port` bind string. Falls back to
 /// `fallback` when the string is malformed (covers IPv4, IPv6 like

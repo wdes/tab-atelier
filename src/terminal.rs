@@ -33,7 +33,9 @@ use gpui::{
     Pixels, Render, Rgba, ScrollWheelEvent, ShapedLine, Size, StrikethroughStyle, Style, Styled, TextRun,
     UnderlineStyle, WeakEntity, Window, div, fill, font, point, px, relative, size,
 };
-use vte::ansi::{Color, NamedColor};
+// Color / NamedColor are no longer referenced directly — the SGR emit
+// loop lives in `crate::term_export` and the tests below import what
+// they need from there.
 
 const INITIAL_COLS: usize = 80;
 const INITIAL_LINES: usize = 24;
@@ -82,21 +84,7 @@ impl EventListener for EventProxy {
     }
 }
 
-struct TermDims {
-    columns: usize,
-    screen_lines: usize,
-}
-impl Dimensions for TermDims {
-    fn total_lines(&self) -> usize {
-        self.screen_lines
-    }
-    fn screen_lines(&self) -> usize {
-        self.screen_lines
-    }
-    fn columns(&self) -> usize {
-        self.columns
-    }
-}
+use crate::term_export::TermDims;
 
 struct CachedLine {
     text: String,
@@ -533,194 +521,12 @@ impl TerminalView {
         (lines.join("\n"), cursor)
     }
 
-    #[allow(clippy::significant_drop_tightening)]
+    /// Delegates to the shared `term_export` so the GUI and headless
+    /// paths can't drift. Kept private to preserve the existing
+    /// public surface (`plain_text`, `ansi_text_with_cursor`).
     fn ansi_lines(&self, max_lines: Option<usize>) -> (Vec<String>, Option<(usize, usize)>) {
-        use std::fmt::Write;
-        let (lines, cursor_logical) = {
-            let t = self.term.lock();
-            let grid = t.grid();
-            let cols = grid.columns();
-            let history = grid.history_size();
-            let screen = grid.screen_lines();
-            let cursor_grid_row = grid.cursor.point.line.0;
-            let cursor_grid_col = grid.cursor.point.column.0;
-
-            let default_fg = Color::Named(NamedColor::Foreground);
-            let default_bg = Color::Named(NamedColor::Background);
-            let mut cur_fg = default_fg;
-            let mut cur_bg = default_bg;
-            let mut cur_flags = CellFlags::empty();
-            let mut lines: Vec<String> = Vec::new();
-            let mut cursor_logical: Option<(usize, usize)> = None;
-
-            // Visible screen + scrollback, optionally clipped to the last
-            // `max_lines` rows so the API doesn't have to ship the entire
-            // history on every poll.
-            let want = max_lines.unwrap_or(screen + history).min(screen + history);
-            let extra = want.saturating_sub(screen);
-            let start_row = -(extra as i32);
-            // Track when the previous row's last cell carried WRAPLINE —
-            // alacritty sets that flag when a line was soft-wrapped to
-            // fit the grid width. Concatenating wrapped rows into one
-            // logical line lets long URLs survive the trip to the
-            // mobile remote without being chopped in half.
-            let mut continues_prev = false;
-            // Column offset within the *current* logical line that any
-            // continuation row would inherit. After joining, the cursor's
-            // column in logical-line coordinates is `prefix_cols +
-            // cursor_grid_col`.
-            let mut prefix_cols: usize = 0;
-            for row in start_row..screen as i32 {
-                let last_cell_wraps = grid[GridPoint::new(Line(row), Column(cols - 1))]
-                    .flags
-                    .contains(CellFlags::WRAPLINE);
-                let mut line = String::with_capacity(cols * 2);
-                for col in 0..cols {
-                    let cell = &grid[GridPoint::new(Line(row), Column(col))];
-                    if cell.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
-                        continue;
-                    }
-                    let ch = if cell.c == '\0' { ' ' } else { cell.c };
-
-                    let is_default = cell.fg == default_fg && cell.bg == default_bg && cell.flags.is_empty();
-                    if is_default && ch == ' ' && cur_fg == default_fg && cur_bg == default_bg && cur_flags.is_empty() {
-                        line.push(' ');
-                        continue;
-                    }
-
-                    if cell.fg != cur_fg || cell.bg != cur_bg || cell.flags != cur_flags {
-                        let mut sgr = String::new();
-                        let push_code = |buf: &mut String, code: &str| {
-                            if !buf.is_empty() {
-                                buf.push(';');
-                            }
-                            buf.push_str(code);
-                        };
-
-                        let removed = cur_flags & !cell.flags;
-                        if removed.intersects(
-                            CellFlags::BOLD
-                                | CellFlags::DIM
-                                | CellFlags::ITALIC
-                                | CellFlags::UNDERLINE
-                                | CellFlags::INVERSE
-                                | CellFlags::HIDDEN
-                                | CellFlags::STRIKEOUT,
-                        ) {
-                            push_code(&mut sgr, "0");
-                            cur_fg = default_fg;
-                            cur_bg = default_bg;
-                            cur_flags = CellFlags::empty();
-                        }
-
-                        if cell.flags.contains(CellFlags::BOLD) && !cur_flags.contains(CellFlags::BOLD) {
-                            push_code(&mut sgr, "1");
-                        }
-                        if cell.flags.contains(CellFlags::DIM) && !cur_flags.contains(CellFlags::DIM) {
-                            push_code(&mut sgr, "2");
-                        }
-                        if cell.flags.contains(CellFlags::ITALIC) && !cur_flags.contains(CellFlags::ITALIC) {
-                            push_code(&mut sgr, "3");
-                        }
-                        if cell.flags.contains(CellFlags::UNDERLINE) && !cur_flags.contains(CellFlags::UNDERLINE) {
-                            push_code(&mut sgr, "4");
-                        }
-                        if cell.flags.contains(CellFlags::INVERSE) && !cur_flags.contains(CellFlags::INVERSE) {
-                            push_code(&mut sgr, "7");
-                        }
-                        if cell.flags.contains(CellFlags::HIDDEN) && !cur_flags.contains(CellFlags::HIDDEN) {
-                            push_code(&mut sgr, "8");
-                        }
-                        if cell.flags.contains(CellFlags::STRIKEOUT) && !cur_flags.contains(CellFlags::STRIKEOUT) {
-                            push_code(&mut sgr, "9");
-                        }
-
-                        if cell.fg != cur_fg {
-                            sgr_color(&mut sgr, cell.fg, true);
-                        }
-                        if cell.bg != cur_bg {
-                            sgr_color(&mut sgr, cell.bg, false);
-                        }
-
-                        cur_fg = cell.fg;
-                        cur_bg = cell.bg;
-                        cur_flags = cell.flags;
-
-                        if !sgr.is_empty() {
-                            let _ = write!(line, "\x1b[{sgr}m");
-                        }
-                    }
-                    line.push(ch);
-                }
-
-                if cur_fg != default_fg || cur_bg != default_bg || !cur_flags.is_empty() {
-                    line.push_str("\x1b[0m");
-                    cur_fg = default_fg;
-                    cur_bg = default_bg;
-                    cur_flags = CellFlags::empty();
-                }
-                // Soft-wrapped rows in alacritty are full-width with no
-                // trailing whitespace — preserve every cell so the
-                // joined result reads back as the original logical
-                // line. Only trim the right edge when this row stands
-                // alone (the next row is *not* a continuation).
-                let row_text = if last_cell_wraps {
-                    line
-                } else {
-                    line.trim_end().to_string()
-                };
-                // Capture cursor logical position BEFORE we push the
-                // row — `lines.len()` then refers to the index this
-                // row will occupy (or extend).
-                if row == cursor_grid_row {
-                    let logical_idx = if continues_prev {
-                        lines.len().saturating_sub(1)
-                    } else {
-                        lines.len()
-                    };
-                    cursor_logical = Some((logical_idx, prefix_cols + cursor_grid_col));
-                }
-                if continues_prev {
-                    if let Some(prev) = lines.last_mut() {
-                        prev.push_str(&row_text);
-                    } else {
-                        lines.push(row_text);
-                    }
-                    prefix_cols += cols;
-                } else {
-                    lines.push(row_text);
-                    prefix_cols = if last_cell_wraps { cols } else { 0 };
-                }
-                continues_prev = last_cell_wraps;
-            }
-            (lines, cursor_logical)
-        };
-        // Lock released.
-
-        let mut lines = lines;
-        let mut cursor = cursor_logical;
-        let mut leading_trimmed = 0usize;
-        while lines.first().is_some_and(std::string::String::is_empty) {
-            lines.remove(0);
-            leading_trimmed += 1;
-        }
-        // Adjust the cursor's row for any blank lines we trimmed off
-        // the top so it still indexes into the emitted lines vector.
-        if let Some((r, c)) = cursor {
-            cursor = if r >= leading_trimmed {
-                Some((r - leading_trimmed, c))
-            } else {
-                None
-            };
-        }
-        while lines.last().is_some_and(std::string::String::is_empty) {
-            lines.pop();
-        }
-        if let Some((r, _)) = cursor
-            && r >= lines.len()
-        {
-            cursor = None;
-        }
+        let (text, cursor) = crate::term_export::term_to_ansi_text_with_cursor(&self.term, max_lines);
+        let lines: Vec<String> = text.split('\n').map(str::to_string).collect();
         (lines, cursor)
     }
 
@@ -768,67 +574,9 @@ impl TerminalView {
     }
 }
 
-/// Append an SGR parameter for `color` into `sgr`, separating from any
-/// previous parameter with `;`. Writes directly into the buffer instead
-/// of allocating per-code Strings — this is on the per-paint hot path
-/// and a typical coloured frame calls it hundreds of times.
-fn sgr_color(sgr: &mut String, color: Color, foreground: bool) {
-    use std::fmt::Write as _;
-    if !sgr.is_empty() {
-        sgr.push(';');
-    }
-    match color {
-        Color::Named(n) => {
-            let code = match n {
-                NamedColor::Black | NamedColor::DimBlack => 0,
-                NamedColor::Red | NamedColor::DimRed => 1,
-                NamedColor::Green | NamedColor::DimGreen => 2,
-                NamedColor::Yellow | NamedColor::DimYellow => 3,
-                NamedColor::Blue | NamedColor::DimBlue => 4,
-                NamedColor::Magenta | NamedColor::DimMagenta => 5,
-                NamedColor::Cyan | NamedColor::DimCyan => 6,
-                NamedColor::White | NamedColor::DimWhite => 7,
-                NamedColor::BrightBlack => 8,
-                NamedColor::BrightRed => 9,
-                NamedColor::BrightGreen => 10,
-                NamedColor::BrightYellow => 11,
-                NamedColor::BrightBlue => 12,
-                NamedColor::BrightMagenta => 13,
-                NamedColor::BrightCyan => 14,
-                NamedColor::BrightWhite => 15,
-                NamedColor::Foreground
-                | NamedColor::BrightForeground
-                | NamedColor::DimForeground
-                | NamedColor::Background
-                | NamedColor::Cursor => {
-                    sgr.push_str(if foreground { "39" } else { "49" });
-                    return;
-                }
-            };
-            let n = if code < 8 {
-                if foreground { 30 + code } else { 40 + code }
-            } else if foreground {
-                90 + code - 8
-            } else {
-                100 + code - 8
-            };
-            let _ = write!(sgr, "{n}");
-        }
-        Color::Indexed(idx) => {
-            let _ = write!(sgr, "{};5;{}", if foreground { 38 } else { 48 }, idx);
-        }
-        Color::Spec(rgb) => {
-            let _ = write!(
-                sgr,
-                "{};2;{};{};{}",
-                if foreground { 38 } else { 48 },
-                rgb.r,
-                rgb.g,
-                rgb.b
-            );
-        }
-    }
-}
+// `sgr_color` was inlined into `crate::term_export::sgr_color` so the
+// GUI render + the headless ANSI dump don't drift. Tests below
+// import the shared one directly.
 
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1737,7 +1485,9 @@ impl Element for TerminalElement {
 mod tests {
     use super::*;
     use crate::FontConfig;
+    use crate::term_export::sgr_color;
     use gpui::TestAppContext;
+    use vte::ansi::{Color, NamedColor};
 
     fn default_browser() -> Rc<RefCell<Option<String>>> {
         Rc::new(RefCell::new(None))
