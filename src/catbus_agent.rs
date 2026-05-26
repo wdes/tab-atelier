@@ -86,6 +86,26 @@ pub fn has_agent_descendant(shell_pid: u32) -> bool {
     find_agent_descendant(shell_pid).is_some()
 }
 
+/// Returns true when the agent CLI under `shell_pid` has at least
+/// one child process — i.e. it's actively running a tool subprocess
+/// (Bash, Read, …). Used by the LED sweep to keep the indicator on
+/// "thinking" for as long as a tool is alive, even when the
+/// `PostToolUse` / `PreToolUse` hook cadence leaves a quiet window
+/// longer than the 2-min staleness sweep (long `cargo build`, sleep,
+/// pytest run, …).
+#[must_use]
+pub fn agent_has_active_subprocess(shell_pid: u32) -> bool {
+    use std::fmt::Write as _;
+    let Some(agent_pid) = find_agent_descendant(shell_pid) else {
+        return false;
+    };
+    let mut path = String::with_capacity(48);
+    let _ = write!(path, "/proc/{agent_pid}/task/{agent_pid}/children");
+    fs::read_to_string(&path)
+        .ok()
+        .is_some_and(|s| s.split_ascii_whitespace().any(|tok| tok.parse::<u32>().is_ok()))
+}
+
 /// BFS over `/proc/{pid}/task/{pid}/children`. Match `catbus-agent`
 /// or the legacy `claude` TUI by `comm`. We don't recurse into
 /// kernel threads or pids in different namespaces — sticking to
