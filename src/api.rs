@@ -16,6 +16,10 @@ use crate::tracking::USER_AGENT;
 #[derive(Serialize)]
 struct TabInfo {
     index: usize,
+    /// Stable per-tab UUID. Exposed so the `tab-atelier tabs` viewer
+    /// (and any other client polling /tabs) can correlate the row
+    /// with `_TAB_ID` shells / set-status calls / auto-resume state.
+    id: String,
     name: String,
     cwd: Option<String>,
     active: bool,
@@ -32,6 +36,15 @@ struct TabInfo {
     #[cfg(feature = "energy")]
     #[serde(skip_serializing_if = "Option::is_none")]
     watts: Option<f64>,
+    /// Transient agent indicator state ("thinking" / "waiting" /
+    /// "error"). Omitted when no agent is attached, so existing
+    /// consumers don't see a new field unless they look.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_state: Option<&'static str>,
+    /// Durable agent kind ("catbus" / "claude" / …) when a session
+    /// is attached, even if no transient state is current.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_kind: Option<String>,
 }
 
 /// Host-wide stats reported alongside the per-tab list. Keeps the
@@ -79,16 +92,19 @@ pub struct SnapshotTab {
     /// descendant processes to find a catbus-agent (or fallback
     /// `claude` TUI) and resolve the session's transcript file.
     pub shell_pid: u32,
-    /// Transient agent state, mirrored from the in-RAM Tab. Only read
-    /// when the `happier-bridge` feature is enabled (the publisher
-    /// surfaces it in the artifact header so mobile sees the same
-    /// thinking/waiting badge as the desktop LED).
-    #[cfg_attr(not(feature = "happier-bridge"), allow(dead_code))]
+    /// Transient agent state, mirrored from the in-RAM Tab. Surfaced
+    /// in the `/tabs` response (so the CLI viewer can render the LED
+    /// without a per-tab probe) and in the happier-bridge artifact
+    /// header.
     pub agent_state: Option<crate::AgentStateSnapshot>,
-    /// Durable agent session UUID, mirrored from the in-RAM Tab. Only
-    /// read when the `happier-bridge` feature is enabled.
+    /// Durable agent session UUID, mirrored from the in-RAM Tab.
+    /// Only read by the happier-bridge publisher today.
     #[cfg_attr(not(feature = "happier-bridge"), allow(dead_code))]
     pub agent_session_id: Option<String>,
+    /// Durable agent CLI kind (`catbus` / `claude` / …). Same
+    /// "session attached" semantic the desktop LED uses to render a
+    /// steady grey dot when there's no transient state.
+    pub agent_kind: Option<String>,
 }
 
 /// A status update queued by `POST /tabs/by-id/{id}/status` — drained
@@ -119,6 +135,12 @@ pub struct TabSnapshot {
     pub pending_activate: Option<usize>,
     pub pending_input: Vec<(usize, Vec<u8>)>,
     pub pending_new_tabs: usize,
+    /// Optional explicit cwd hints for the next `pending_new_tabs`
+    /// creations, in FIFO order. Populated by `POST /tabs` with a
+    /// JSON body `{"cwd": "..."}`. Shorter than `pending_new_tabs`
+    /// is fine — the remainder fall back to inheriting from the
+    /// currently-active tab as before.
+    pub pending_new_tab_cwds: std::collections::VecDeque<std::path::PathBuf>,
     /// (tab index, new name) pairs queued by `POST /tabs/{idx}/rename`.
     pub pending_renames: Vec<(usize, String)>,
     /// Queued agent-status updates from `POST /tabs/by-id/{id}/status`.
@@ -447,6 +469,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 .enumerate()
                 .map(|(i, t)| TabInfo {
                     index: i,
+                    id: t.id.clone(),
                     name: t.name.clone(),
                     cwd: t.cwd.clone(),
                     active: i == state.active,
@@ -460,6 +483,12 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                     cpu_percent: state.power.get(i).map_or(0.0, |p| p.cpu_percent),
                     #[cfg(feature = "energy")]
                     watts: state.power.get(i).and_then(|p| p.watts),
+                    agent_state: t.agent_state.as_ref().map(|s| match s.state {
+                        crate::AgentState::Thinking => "thinking",
+                        crate::AgentState::Waiting => "waiting",
+                        crate::AgentState::Error => "error",
+                    }),
+                    agent_kind: t.agent_kind.clone(),
                 })
                 .collect();
             #[cfg(feature = "energy")]
@@ -718,9 +747,30 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             }
         }
         ("POST", "/tabs") => {
+            // Optional JSON body: `{"cwd": "<path>"}` opens the tab
+            // rooted at that path instead of inheriting from the
+            // active tab. Missing or invalid body → falls back to the
+            // legacy inherit-cwd behaviour.
+            let cwd_hint: Option<std::path::PathBuf> = if body_bytes.is_empty() {
+                None
+            } else {
+                serde_json::from_slice::<serde_json::Value>(&body_bytes)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("cwd")
+                            .and_then(serde_json::Value::as_str)
+                            .map(std::path::PathBuf::from)
+                    })
+            };
             let mut state = state.lock().unwrap();
-            info!("API: queueing new tab creation");
+            info!(
+                "API: queueing new tab creation (cwd: {})",
+                cwd_hint.as_ref().map_or("inherit", |p| p.to_str().unwrap_or("?"))
+            );
             state.pending_new_tabs += 1;
+            if let Some(cwd) = cwd_hint {
+                state.pending_new_tab_cwds.push_back(cwd);
+            }
             drop(state);
             let body = serde_json::to_string(&serde_json::json!({"queued": "new"})).unwrap_or_default();
             respond_json(stream, 200, &body);
@@ -1105,6 +1155,7 @@ mod tests {
                     shell_pid: 0,
                     agent_state: None,
                     agent_session_id: None,
+                    agent_kind: None,
                 },
                 SnapshotTab {
                     id: "tab-b".into(),
@@ -1116,6 +1167,7 @@ mod tests {
                     shell_pid: 0,
                     agent_state: None,
                     agent_session_id: None,
+                    agent_kind: None,
                 },
             ],
             active: 0,
@@ -1127,6 +1179,7 @@ mod tests {
             pending_activate: None,
             pending_input: vec![],
             pending_new_tabs: 0,
+            pending_new_tab_cwds: std::collections::VecDeque::new(),
             pending_renames: vec![],
             pending_status_updates: vec![],
             cached_response: None,

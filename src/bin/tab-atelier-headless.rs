@@ -16,11 +16,18 @@ fn main() {
     // Same `set-status` shortcut as the GUI binary — useful when a
     // shell rc file calls `tab-atelier-headless set-status thinking`
     // from inside a tab.
-    if let Some(sub) = std::env::args().nth(1)
-        && sub == "set-status"
-    {
-        let rest: Vec<String> = std::env::args().skip(2).collect();
-        std::process::exit(cli::set_status::run(&rest));
+    if let Some(sub) = std::env::args().nth(1) {
+        match sub.as_str() {
+            "set-status" => {
+                let rest: Vec<String> = std::env::args().skip(2).collect();
+                std::process::exit(cli::set_status::run(&rest));
+            }
+            "tabs" => {
+                let rest: Vec<String> = std::env::args().skip(2).collect();
+                std::process::exit(cli::tabs::run(&rest));
+            }
+            _ => {}
+        }
     }
 
     install_rustls_provider();
