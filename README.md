@@ -108,6 +108,8 @@ Tab Atelier reads font configuration from your Zed editor settings:
 | `buffer_font_size`   | Fallback if no ui_font_size  | `16`         |
 | `scroll_sensitivity` | Scroll speed multiplier      | `1.0`        |
 
+**Font weight tip.** When `ui_font_weight` is something other than a multiple of 100 that maps to a real static face (e.g. `250`), use a **variable** font family — fontconfig otherwise picks the closest static face per glyph and rarely-used codepoints (`€`, `—`, …) can end up in a different face than the digits next to them, which reads as "uneven bold". `scripts/install-monaspace.sh` installs Monaspace v1.400 (variable build) into `~/.local/share/fonts/Monaspace/`; pair it with `"ui_font_family": "Monaspace Neon Var"`.
+
 ### Preferences
 
 In-app preferences (theme, opacity, language, browser, code editor) are stored in:
