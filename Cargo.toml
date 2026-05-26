@@ -26,6 +26,15 @@ include = ["/src/**/*.rs", "/Cargo.toml", "/LICENSE", "/README.md"]
 name = "tab-atelier"
 required-features = ["gui"]
 
+# Headless companion that restores tabs and runs the local API but
+# never touches a display server. Built with
+# `--no-default-features --features headless` so it pulls in neither
+# gpui nor x11rb nor qrcode — only libc + alacritty_terminal + rustls.
+[[bin]]
+name = "tab-atelier-headless"
+path = "src/bin/tab-atelier-headless.rs"
+required-features = ["headless"]
+
 [features]
 default = ["gui", "energy"]
 # Desktop GUI build: gpui + x11rb (hotkeys + screenshot) + qrcode.

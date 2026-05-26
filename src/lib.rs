@@ -15,6 +15,8 @@ pub(crate) mod catbus_agent;
 pub mod cli;
 #[cfg(feature = "happier-bridge")]
 pub(crate) mod happier_bridge;
+#[cfg(not(feature = "gui"))]
+pub mod headless;
 pub(crate) mod locale;
 pub(crate) mod platform;
 #[cfg(feature = "energy")]
