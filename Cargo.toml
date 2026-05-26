@@ -90,6 +90,10 @@ fs2 = "0.4"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 rustls-pemfile = "2"
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem", "x509-parser"] }
+# Used to hex-encode the TOFU SHA-256 fingerprint of a remote
+# `tab-atelier-headless`'s self-signed TLS cert (Preferences > Remote
+# endpoints > Pin certificate).
+sha2 = { version = "0.10", default-features = false }
 # Used to pin self-signed cert validity to (now, now+5y). rcgen's
 # default is `1975-01-01 → 4096-01-01`, which strict mobile TLS
 # stacks (Android) reject.
