@@ -31,10 +31,19 @@
 
 use std::process::Command;
 
+/// Pick the right `tab-atelier` binary based on which feature set
+/// the test was built against. Both binaries exercise the same
+/// `install_default()` call (it lives in the shared lib), so the
+/// regression check applies to either one.
+#[cfg(feature = "gui")]
+const BIN: &str = env!("CARGO_BIN_EXE_tab-atelier");
+#[cfg(all(not(feature = "gui"), feature = "headless"))]
+const BIN: &str = env!("CARGO_BIN_EXE_tab-atelier-headless");
+
+#[cfg(any(feature = "gui", feature = "headless"))]
 #[test]
 fn tab_atelier_installs_rustls_crypto_provider() {
-    let bin = env!("CARGO_BIN_EXE_tab-atelier");
-    let out = Command::new(bin)
+    let out = Command::new(BIN)
         .arg("--check-crypto")
         .output()
         .expect("spawn tab-atelier --check-crypto");

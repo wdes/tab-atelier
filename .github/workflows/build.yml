@@ -40,23 +40,29 @@ jobs:
             - name: Cache cargo artifacts
               uses: Swatinem/rust-cache@v2
             - name: Build without energy feature
-              run: cargo check --locked --no-default-features
+              run: cargo check --locked --no-default-features --features gui
             - name: Build
               run: cargo build --locked --all-targets
               env:
                   CARGO_INCREMENTAL: "0"
                   RUSTFLAGS: "-Cinstrument-coverage"
                   RUSTDOCFLAGS: "-Cinstrument-coverage"
+            - name: Build headless
+              run: cargo build --locked --no-default-features --features headless,happier-bridge,energy
             - name: Run tests
               run: cargo test --locked --all-targets --no-fail-fast
               env:
                   CARGO_INCREMENTAL: "0"
                   RUSTFLAGS: "-Cinstrument-coverage"
                   RUSTDOCFLAGS: "-Cinstrument-coverage"
+            - name: Run headless tests
+              run: cargo test --locked --no-default-features --features headless --no-fail-fast
             - name: Check formatting
               run: cargo fmt -- --check
-            - name: Clippy
+            - name: Clippy (GUI)
               run: cargo clippy --all-targets --locked -- -D warnings
+            - name: Clippy (headless)
+              run: cargo clippy --no-default-features --features headless,happier-bridge,energy --all-targets --locked -- -D warnings
             - name: Install grcov
               run: |
                   mkdir -p "${HOME}/.local/bin"
@@ -70,9 +76,12 @@ jobs:
                   flags: rust
                   fail_ci_if_error: true
                   token: ${{ secrets.CODECOV_TOKEN }}
-            - name: Build .deb package
-              run: cargo install cargo-deb && cargo deb --locked
-            - name: Upload .deb package
+            - name: Build .deb packages
+              run: |
+                  cargo install cargo-deb
+                  cargo deb -p tab-atelier --locked
+                  cargo deb -p tab-atelier --variant headless --locked
+            - name: Upload .deb packages
               id: upload-deb
               uses: actions/upload-artifact@v7
               with:
