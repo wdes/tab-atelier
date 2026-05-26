@@ -2,12 +2,18 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use std::path::{Path, PathBuf};
+#[cfg(feature = "gui")]
+use std::path::Path;
+use std::path::PathBuf;
 
+#[cfg(feature = "gui")]
 use log::debug;
+#[cfg(feature = "gui")]
 use x11rb::connection::Connection;
+#[cfg(feature = "gui")]
 use x11rb::protocol::xproto::{ConnectionExt, ImageFormat};
 
+#[cfg(feature = "gui")]
 use crate::platform::CapturedImage;
 
 // --- Directories ---
@@ -41,6 +47,7 @@ pub fn config_dir() -> PathBuf {
     )
 }
 
+#[cfg(feature = "gui")]
 pub fn pictures_dir() -> PathBuf {
     let pictures = std::process::Command::new("xdg-user-dir")
         .arg("PICTURES")
@@ -62,6 +69,7 @@ pub fn process_cwd(pid: u32) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
 }
 
+#[cfg(feature = "gui")]
 pub fn process_alive(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }
@@ -85,6 +93,7 @@ pub fn random_bytes(buf: &mut [u8]) {
 
 // --- Screenshot (X11) ---
 
+#[cfg(feature = "gui")]
 pub fn capture_focused_window() -> Result<CapturedImage, String> {
     let (conn, screen_num) = x11rb::connect(None).map_err(|e| format!("x11 connect: {e}"))?;
     let screen = &conn.setup().roots[screen_num];
@@ -149,6 +158,7 @@ pub fn capture_focused_window() -> Result<CapturedImage, String> {
 
 // --- Openers ---
 
+#[cfg(feature = "gui")]
 pub fn open_url(url: &str, browser: Option<&str>) {
     let cmd = browser.unwrap_or("xdg-open");
     let _ = std::process::Command::new(cmd)
@@ -159,6 +169,7 @@ pub fn open_url(url: &str, browser: Option<&str>) {
         .spawn();
 }
 
+#[cfg(feature = "gui")]
 pub fn open_path(path: &std::path::Path, editor: Option<&str>) {
     let cmd = editor.unwrap_or("xdg-open");
     let _ = std::process::Command::new(cmd)
@@ -171,12 +182,14 @@ pub fn open_path(path: &std::path::Path, editor: Option<&str>) {
 
 // --- Hotkeys (X11) ---
 
+#[cfg(feature = "gui")]
 enum HotkeyCommand {
     UpdateKeys(Vec<u8>),
     Suspend,
     Resume,
 }
 
+#[cfg(feature = "gui")]
 pub fn grab_hotkeys<F>(keycodes: &[u8], on_press: F) -> HotkeyHandle
 where
     F: Fn() + Send + 'static,
@@ -272,10 +285,12 @@ where
     HotkeyHandle { cmd_tx }
 }
 
+#[cfg(feature = "gui")]
 pub struct HotkeyHandle {
     cmd_tx: std::sync::mpsc::Sender<HotkeyCommand>,
 }
 
+#[cfg(feature = "gui")]
 impl HotkeyHandle {
     pub fn update_keys(&self, new_keycodes: &[u8]) {
         let _ = self.cmd_tx.send(HotkeyCommand::UpdateKeys(new_keycodes.to_vec()));
@@ -306,6 +321,7 @@ mod tests {
         assert!(!dir.as_os_str().is_empty());
     }
 
+    #[cfg(feature = "gui")]
     #[test]
     fn pictures_dir_not_empty() {
         let dir = pictures_dir();
@@ -326,11 +342,13 @@ mod tests {
         assert!(cwd.is_some());
     }
 
+    #[cfg(feature = "gui")]
     #[test]
     fn process_alive_self() {
         assert!(process_alive(std::process::id()));
     }
 
+    #[cfg(feature = "gui")]
     #[test]
     fn process_alive_bogus() {
         assert!(!process_alive(u32::MAX));
@@ -350,6 +368,7 @@ mod tests {
         assert_ne!(a, b);
     }
 
+    #[cfg(feature = "gui")]
     #[test]
     fn open_url_does_not_panic() {
         // Only exercise the explicit-handler path: passing `None` would
@@ -358,11 +377,13 @@ mod tests {
         open_url("http://localhost:1", Some("false"));
     }
 
+    #[cfg(feature = "gui")]
     #[test]
     fn open_path_does_not_panic() {
         open_path(std::path::Path::new("/dev/null"), Some("false"));
     }
 
+    #[cfg(feature = "gui")]
     #[test]
     fn hotkey_handle_methods_without_display() {
         use std::sync::mpsc;

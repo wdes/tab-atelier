@@ -2,8 +2,16 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+// The palette (`Theme`, `ThemeName`) compiles in both builds; the
+// `*_hsla` adapters that actually need gpui are gated behind `gui`.
+// Headless never uses any of it but the module sticks around because
+// removing the cfg-gate would mean a third module split.
+#![cfg_attr(not(feature = "gui"), allow(dead_code))]
+
+#[cfg(feature = "gui")]
 use gpui::{Hsla, Rgba, rgb};
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "gui")]
 use vte::ansi::{Color, NamedColor, Rgb};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
@@ -55,6 +63,7 @@ pub struct Theme {
     pub danger: u32,
 }
 
+#[cfg(feature = "gui")]
 impl Theme {
     pub fn named_to_hsla(&self, c: NamedColor) -> Hsla {
         let idx = match c {
@@ -246,6 +255,38 @@ pub fn theme(name: ThemeName) -> &'static Theme {
 }
 
 #[cfg(test)]
+mod tests_palette {
+    use super::*;
+
+    #[test]
+    fn all_themes_have_labels() {
+        for t in ThemeName::ALL {
+            assert!(!t.label().is_empty());
+        }
+    }
+
+    #[test]
+    fn from_id_roundtrip_no_gui() {
+        for t in ThemeName::ALL {
+            assert_eq!(ThemeName::from_id(t.id()), Some(*t));
+        }
+        assert_eq!(ThemeName::from_id("nonexistent"), None);
+    }
+
+    #[test]
+    fn ansi_16_colors_populated() {
+        for name in ThemeName::ALL {
+            let t = theme(*name);
+            assert_eq!(t.ansi.len(), 16);
+            for &c in &t.ansi {
+                assert!(c <= 0xff_ffff);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "gui")]
 mod tests {
     use super::*;
 

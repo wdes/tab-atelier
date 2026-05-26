@@ -296,11 +296,11 @@ struct RawBlock {
 /// after each prompt. Returns `None` when no agent session is running
 /// or the file doesn't exist yet.
 #[must_use]
-pub fn read_session_tokens(session: &AgentSession) -> Option<tab_atelier::TokenUsage> {
+pub fn read_session_tokens(session: &AgentSession) -> Option<crate::TokenUsage> {
     let path = session.file_path.with_extension("tokens.json");
     let data = fs::read_to_string(path).ok()?;
     let v: serde_json::Value = serde_json::from_str(&data).ok()?;
-    Some(tab_atelier::TokenUsage {
+    Some(crate::TokenUsage {
         input: v.get("input").and_then(serde_json::Value::as_u64).unwrap_or(0),
         output: v.get("output").and_then(serde_json::Value::as_u64).unwrap_or(0),
     })

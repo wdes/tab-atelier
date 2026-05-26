@@ -12,6 +12,7 @@
 
 use std::time::Duration;
 
+#[must_use]
 pub fn run(args: &[String]) -> i32 {
     let Ok(tab_id) = std::env::var("_TAB_ID") else {
         // Outside a tab-atelier tab — silent no-op.

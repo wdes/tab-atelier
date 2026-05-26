@@ -2,6 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+#![cfg(feature = "gui")]
+
 use crate::api;
 use crate::locale::{self, Lang, Strings};
 use crate::platform;
@@ -11,6 +13,11 @@ use crate::screenshot;
 use crate::terminal::TerminalView;
 use crate::theme::{self, ThemeName};
 use crate::tracking::WakatimeTracker;
+use crate::{
+    DEFAULT_HOTKEYS, FontConfig, Preferences, SavedState, TabState, gpui_key_to_keycode, keycode_label,
+    load_font_config, load_preferences, load_state_with_outputs, load_wakatime_key, save_preferences, save_state,
+    save_tab_energy, save_tab_output, save_tab_tokens, save_tab_uptime,
+};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Application, AsyncApp, ClickEvent, ClipboardItem, Context, Div, ElementId, Entity, FocusHandle,
@@ -26,11 +33,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
-use tab_atelier::{
-    DEFAULT_HOTKEYS, FontConfig, Preferences, SavedState, TabState, gpui_key_to_keycode, keycode_label,
-    load_font_config, load_preferences, load_state_with_outputs, load_wakatime_key, save_preferences, save_state,
-    save_tab_energy, save_tab_output, save_tab_tokens, save_tab_uptime,
-};
 
 struct Tab {
     view: Entity<TerminalView>,
@@ -76,7 +78,7 @@ struct Tab {
     /// Transient agent status published by a tool inside the tab
     /// (via the local API). Drives the tab-strip LED. Cleared by
     /// the staleness sweep after 5 minutes of no updates.
-    agent_state: Option<tab_atelier::AgentStateSnapshot>,
+    agent_state: Option<crate::AgentStateSnapshot>,
     /// Durable: last agent session UUID associated with this tab.
     /// Persisted to tabs.json so auto-resume can pick the same
     /// session back up after a restart.
@@ -296,10 +298,7 @@ impl AppState {
         // API server itself starts later in this same function with the
         // same values.
         let api_token = api::load_or_generate_token();
-        let api_addr_resolved = prefs
-            .api_addr
-            .clone()
-            .unwrap_or_else(|| tab_atelier::DEFAULT_API_ADDR.into());
+        let api_addr_resolved = prefs.api_addr.clone().unwrap_or_else(|| crate::DEFAULT_API_ADDR.into());
         let api_url_for_pty = api_url_for_local_clients(&api_addr_resolved);
 
         let (tabs, active, restored_windowed) =
@@ -356,7 +355,7 @@ impl AppState {
                         // Seed with the hash of the just-restored output so the
                         // first persist tick after launch doesn't rewrite an
                         // identical file.
-                        output_hash_last_saved: ts.output.as_deref().map_or(0, |s| tab_atelier::crc32(s.as_bytes())),
+                        output_hash_last_saved: ts.output.as_deref().map_or(0, |s| crate::crc32(s.as_bytes())),
                         pending_restore,
                         // Seed from saved state so an immediate persist tick
                         // before the new shell has a /proc/PID/cwd readable
@@ -374,7 +373,7 @@ impl AppState {
                     let fc = font_config.clone();
                     let br = browser.clone();
                     let ce = code_editor.clone();
-                    let new_id = tab_atelier::default_tab_id();
+                    let new_id = crate::default_tab_id();
                     let env = tab_env_extras(&new_id, &api_url_for_pty, &api_token);
                     let view = cx.new(|cx| {
                         let mut tv = TerminalView::new_with_colors_and_env(None, fc, br, ce, true, env, window, cx);
@@ -411,7 +410,7 @@ impl AppState {
                 let fc = font_config.clone();
                 let br = browser.clone();
                 let ce = code_editor.clone();
-                let new_id = tab_atelier::default_tab_id();
+                let new_id = crate::default_tab_id();
                 let env = tab_env_extras(&new_id, &api_url_for_pty, &api_token);
                 let view = cx.new(|cx| {
                     let mut tv = TerminalView::new_with_colors_and_env(None, fc, br, ce, true, env, window, cx);
@@ -518,12 +517,10 @@ impl AppState {
         // api_token + api_addr were resolved earlier so they could be
         // exported into each PTY's env; reuse them here.
         let api_addr = api_addr_resolved;
-        let api_tls_addr = prefs
-            .api_tls_addr
-            .unwrap_or_else(|| tab_atelier::DEFAULT_API_TLS_ADDR.into());
+        let api_tls_addr = prefs.api_tls_addr.unwrap_or_else(|| crate::DEFAULT_API_TLS_ADDR.into());
         let happier_relay_addr = prefs
             .happier_relay_addr
-            .unwrap_or_else(|| tab_atelier::DEFAULT_HAPPIER_RELAY_ADDR.into());
+            .unwrap_or_else(|| crate::DEFAULT_HAPPIER_RELAY_ADDR.into());
         info!("API server starting on {api_addr} (TLS {api_tls_addr})");
         let api_state = Arc::new(Mutex::new(api::TabSnapshot {
             tabs: Vec::<api::SnapshotTab>::new(),
@@ -666,7 +663,7 @@ impl AppState {
         let br = self.browser.clone();
         let ce = self.code_editor.clone();
         let tn = self.theme_name;
-        let new_id = tab_atelier::default_tab_id();
+        let new_id = crate::default_tab_id();
         let env = tab_env_extras(&new_id, &api_url_for_local_clients(&self.api_addr), &self.api_token);
         let view = cx.new(|cx| {
             let mut tv = TerminalView::new_with_colors_and_env(cwd.as_deref(), fc, br, ce, true, env, window, cx);
@@ -836,7 +833,7 @@ impl AppState {
         // Skip the write+rotate when the serialized content is identical to
         // last tick — the common case once the user stops poking the UI.
         let serialized = serde_json::to_string_pretty(&saved).unwrap_or_default();
-        let new_hash = tab_atelier::crc32(serialized.as_bytes());
+        let new_hash = crate::crc32(serialized.as_bytes());
         if !read_only && new_hash != self.last_state_hash.get() {
             save_state(&platform::config_base_dir(), &saved);
             self.last_state_hash.set(new_hash);
@@ -847,7 +844,7 @@ impl AppState {
                 if output.is_empty() {
                     continue;
                 }
-                let h = tab_atelier::crc32(output.as_bytes());
+                let h = crate::crc32(output.as_bytes());
                 if h == tab.output_hash_last_saved {
                     continue;
                 }
@@ -943,7 +940,7 @@ impl AppState {
                     tab.agent_kind = None;
                     tab.agent_plan_mode = None;
                 } else {
-                    tab.agent_state = Some(tab_atelier::AgentStateSnapshot {
+                    tab.agent_state = Some(crate::AgentStateSnapshot {
                         state: upd.state,
                         label: upd.label,
                         updated_at: std::time::Instant::now(),
@@ -977,14 +974,14 @@ impl AppState {
                     continue;
                 }
                 tab.agent_state = Some(match tab.agent_state.take() {
-                    Some(mut snap) if snap.state != tab_atelier::AgentState::Error => {
-                        snap.state = tab_atelier::AgentState::Thinking;
+                    Some(mut snap) if snap.state != crate::AgentState::Error => {
+                        snap.state = crate::AgentState::Thinking;
                         snap.updated_at = now;
                         snap
                     }
                     Some(snap) => snap, // keep Error sticky
-                    None => tab_atelier::AgentStateSnapshot {
-                        state: tab_atelier::AgentState::Thinking,
+                    None => crate::AgentStateSnapshot {
+                        state: crate::AgentState::Thinking,
                         label: Some("subproc".into()),
                         updated_at: now,
                     },
@@ -1151,9 +1148,9 @@ impl AppState {
         if !crate::read_only() {
             let base = platform::state_base_dir();
             for resolver in [
-                tab_atelier::tab_output_path as fn(&std::path::Path, &str) -> std::path::PathBuf,
-                tab_atelier::tab_uptime_path,
-                tab_atelier::tab_power_path,
+                crate::tab_output_path as fn(&std::path::Path, &str) -> std::path::PathBuf,
+                crate::tab_uptime_path,
+                crate::tab_power_path,
             ] {
                 let old_path = resolver(&base, &old_name);
                 let new_path = resolver(&base, &new_name);
@@ -1356,13 +1353,13 @@ impl AppState {
                     a: 1.0,
                 });
                 let color = match tab.agent_state.as_ref().map(|s| s.state) {
-                    Some(tab_atelier::AgentState::Thinking) => Hsla::from(Rgba {
+                    Some(crate::AgentState::Thinking) => Hsla::from(Rgba {
                         r: 0.306,
                         g: 0.788,
                         b: 0.690,
                         a: 1.0,
                     }),
-                    Some(tab_atelier::AgentState::Waiting) => {
+                    Some(crate::AgentState::Waiting) => {
                         if blink_on {
                             Hsla::from(Rgba {
                                 r: 0.851,
@@ -1374,7 +1371,7 @@ impl AppState {
                             grey
                         }
                     }
-                    Some(tab_atelier::AgentState::Error) => Hsla::from(Rgba {
+                    Some(crate::AgentState::Error) => Hsla::from(Rgba {
                         r: 0.937,
                         g: 0.267,
                         b: 0.267,
@@ -1785,8 +1782,7 @@ impl AppState {
                             // raw `\x1b[...m` escapes. The persistence call
                             // sites that need colours go through copy_all_history
                             // directly.
-                            let text =
-                                tab_atelier::strip_ansi(&this.tabs[this.active].view.read(cx).copy_all_history());
+                            let text = crate::strip_ansi(&this.tabs[this.active].view.read(cx).copy_all_history());
                             if !text.is_empty() {
                                 cx.write_to_clipboard(ClipboardItem::new_string(text));
                             }
@@ -2326,11 +2322,11 @@ impl AppState {
         let primary_ip = ips.first().cloned().unwrap_or_else(|| "127.0.0.1".into());
         let lan_url = format!(
             "http://{primary_ip}:{}",
-            port_of(&self.api_addr, tab_atelier::DEFAULT_API_PORT)
+            port_of(&self.api_addr, crate::DEFAULT_API_PORT)
         );
         let lan_url_tls = format!(
             "https://{primary_ip}:{}",
-            port_of(&self.api_tls_addr, tab_atelier::DEFAULT_API_PORT + 1)
+            port_of(&self.api_tls_addr, crate::DEFAULT_API_PORT + 1)
         );
         // Pass both the plain-HTTP and TLS URLs into the deep link; the
         // mobile client picks whichever its current build supports.
@@ -2445,7 +2441,7 @@ impl AppState {
                             for ip in ips.iter().skip(1) {
                                 list = list.child(div().text_color(link_fg).child(format!(
                                     "http://{ip}:{}",
-                                    port_of(&self.api_addr, tab_atelier::DEFAULT_API_PORT)
+                                    port_of(&self.api_addr, crate::DEFAULT_API_PORT)
                                 )));
                             }
                             el.child(list)
@@ -2723,7 +2719,7 @@ impl AppState {
                 }),
             )
             .when(api_addr_text.is_empty(), |el| {
-                el.child(div().text_color(placeholder_fg).child(tab_atelier::DEFAULT_API_ADDR))
+                el.child(div().text_color(placeholder_fg).child(crate::DEFAULT_API_ADDR))
             })
             .when(!api_addr_text.is_empty(), |el| {
                 el.child(api_addr_text)
@@ -2773,11 +2769,7 @@ impl AppState {
                 }),
             )
             .when(api_tls_addr_text.is_empty(), |el| {
-                el.child(
-                    div()
-                        .text_color(placeholder_fg)
-                        .child(tab_atelier::DEFAULT_API_TLS_ADDR),
-                )
+                el.child(div().text_color(placeholder_fg).child(crate::DEFAULT_API_TLS_ADDR))
             })
             .when(!api_tls_addr_text.is_empty(), |el| {
                 el.child(api_tls_addr_text)
@@ -2830,7 +2822,7 @@ impl AppState {
                 el.child(
                     div()
                         .text_color(placeholder_fg)
-                        .child(tab_atelier::DEFAULT_HAPPIER_RELAY_ADDR),
+                        .child(crate::DEFAULT_HAPPIER_RELAY_ADDR),
                 )
             })
             .when(!happier_relay_addr_text.is_empty(), |el| {
@@ -3355,7 +3347,7 @@ fn api_url_for_local_clients(api_addr: &str) -> String {
         .rsplit(':')
         .next()
         .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(tab_atelier::DEFAULT_API_PORT);
+        .unwrap_or(crate::DEFAULT_API_PORT);
     format!("http://127.0.0.1:{port}")
 }
 
@@ -3490,6 +3482,10 @@ fn run_check() {
     }
 }
 
+/// Launch the gpui application. Blocks until the window closes.
+///
+/// # Panics
+/// Panics if gpui fails to open its initial window (e.g. no X server).
 pub fn run() {
     env_logger::init();
 
