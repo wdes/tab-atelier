@@ -10,11 +10,18 @@ fn main() {
     // Subcommand dispatch — keeps the entry point short and lets
     // shell-side helpers (`tab-atelier set-status …`) run without
     // ever touching the gpui app::run path.
-    if let Some(sub) = std::env::args().nth(1)
-        && sub == "set-status"
-    {
-        let rest: Vec<String> = std::env::args().skip(2).collect();
-        std::process::exit(cli::set_status::run(&rest));
+    if let Some(sub) = std::env::args().nth(1) {
+        match sub.as_str() {
+            "set-status" => {
+                let rest: Vec<String> = std::env::args().skip(2).collect();
+                std::process::exit(cli::set_status::run(&rest));
+            }
+            "tabs" => {
+                let rest: Vec<String> = std::env::args().skip(2).collect();
+                std::process::exit(cli::tabs::run(&rest));
+            }
+            _ => {}
+        }
     }
 
     install_rustls_provider();

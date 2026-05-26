@@ -533,6 +533,7 @@ impl AppState {
             pending_activate: None,
             pending_input: Vec::new(),
             pending_new_tabs: 0,
+            pending_new_tab_cwds: std::collections::VecDeque::new(),
             pending_renames: Vec::new(),
             pending_status_updates: Vec::new(),
             cached_response: None,
@@ -646,18 +647,25 @@ impl AppState {
     }
 
     fn add_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.insert_tab(self.tabs.len(), window, cx);
+        self.insert_tab(self.tabs.len(), None, window, cx);
+    }
+
+    /// Like `add_tab` but with an explicit cwd hint from the API
+    /// (`POST /tabs` with `{cwd: ...}`). Falls back to the existing
+    /// inherit-from-active behaviour when the path doesn't exist.
+    fn add_tab_in(&mut self, cwd: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.insert_tab(self.tabs.len(), Some(cwd), window, cx);
     }
 
     fn add_tab_after_current(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.insert_tab(self.active + 1, window, cx);
+        self.insert_tab(self.active + 1, None, window, cx);
     }
 
-    fn insert_tab(&mut self, at: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let cwd = {
+    fn insert_tab(&mut self, at: usize, hint: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        let cwd = hint.filter(|p| p.is_dir()).or_else(|| {
             let pid = self.tabs[self.active].view.read(cx).pid();
             platform::process_cwd(pid).or_else(|| self.tabs[self.active].last_known_cwd.clone())
-        };
+        });
         self.tabs[self.active].deactivate();
         let fc = self.font_config.clone();
         let br = self.browser.clone();
@@ -820,6 +828,7 @@ impl AppState {
                     shell_pid: view.pid(),
                     agent_state: tab.agent_state.clone(),
                     agent_session_id: tab.agent_session_id.clone(),
+                    agent_kind: tab.agent_kind.clone(),
                 }
             })
             .collect();
@@ -3147,12 +3156,19 @@ impl Render for AppState {
         // insert_tab from persist() because that path doesn't have a
         // Window handle; piggy-backing on render() is the simplest place
         // to react to remote POST /tabs requests.
-        let new_tab_count = {
+        let (new_tab_count, new_tab_cwds): (usize, Vec<PathBuf>) = {
             let mut snap = self.api_state.lock().unwrap();
-            std::mem::take(&mut snap.pending_new_tabs)
+            let n = std::mem::take(&mut snap.pending_new_tabs);
+            let cwds: Vec<PathBuf> = std::mem::take(&mut snap.pending_new_tab_cwds).into_iter().collect();
+            drop(snap);
+            (n, cwds)
         };
+        let mut cwd_iter = new_tab_cwds.into_iter();
         for _ in 0..new_tab_count {
-            self.add_tab(window, cx);
+            match cwd_iter.next() {
+                Some(cwd) => self.add_tab_in(cwd, window, cx),
+                None => self.add_tab(window, cx),
+            }
         }
         window.set_window_title(&format!("{}{}", self.tabs[self.active].name, self.t().title_suffix));
         let active_terminal = self.tabs[self.active].view.clone();

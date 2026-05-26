@@ -684,6 +684,7 @@ pub fn run() -> std::io::Result<()> {
         pending_activate: None,
         pending_input: Vec::new(),
         pending_new_tabs: 0,
+        pending_new_tab_cwds: std::collections::VecDeque::new(),
         pending_renames: Vec::new(),
         pending_status_updates: Vec::new(),
         cached_response: None,
@@ -874,6 +875,7 @@ fn persist(
                 shell_pid: tab.pid,
                 agent_state: tab.agent_state.clone(),
                 agent_session_id: tab.agent_session_id.clone(),
+                agent_kind: tab.agent_kind.clone(),
             }
         })
         .collect();
@@ -966,6 +968,7 @@ fn drain_pending(
     let renames: Vec<(usize, String)> = s.pending_renames.drain(..).collect();
     let status_updates: Vec<api::PendingStatusUpdate> = s.pending_status_updates.drain(..).collect();
     let new_tabs = std::mem::take(&mut s.pending_new_tabs);
+    let new_tab_cwds: std::collections::VecDeque<std::path::PathBuf> = std::mem::take(&mut s.pending_new_tab_cwds);
     drop(s);
 
     // Status updates: write transient + durable agent fields.
@@ -1106,12 +1109,15 @@ fn drain_pending(
     }
 
     // New tabs from the API.
+    let mut cwd_hint_iter = new_tab_cwds.into_iter();
     for _ in 0..new_tabs {
-        let cwd = if *active < tabs.len() {
-            platform::process_cwd(tabs[*active].pid).or_else(|| tabs[*active].last_known_cwd.clone())
-        } else {
-            None
-        };
+        let cwd = cwd_hint_iter.next().filter(|p| p.is_dir()).or_else(|| {
+            if *active < tabs.len() {
+                platform::process_cwd(tabs[*active].pid).or_else(|| tabs[*active].last_known_cwd.clone())
+            } else {
+                None
+            }
+        });
         let id = default_tab_id();
         let env = tab_env_extras(&id, api_url_for_pty, api_token);
         let name = format!("Terminal {}", tabs.len());
