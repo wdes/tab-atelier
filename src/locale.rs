@@ -2,6 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+// Localization strings drive the GUI. Headless builds compile the
+// module but never read it.
+#![cfg_attr(not(feature = "gui"), allow(dead_code))]
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lang {
     En,

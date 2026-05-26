@@ -2,6 +2,12 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+// A few helper methods on `TabPower` (`label` / `cpu_label` / `watts_label`)
+// are GUI-rendering helpers; headless builds compile the type because
+// the API snapshot still carries `Vec<TabPower>`, but never invokes
+// the formatting helpers.
+#![cfg_attr(not(feature = "gui"), allow(dead_code))]
+
 use std::sync::{Arc, Mutex};
 
 use log::info;

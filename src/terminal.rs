@@ -2,6 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+#![cfg(feature = "gui")]
+
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::Path;
@@ -19,6 +21,7 @@ use alacritty_terminal::selection::{Selection, SelectionType};
 
 use crate::terminal_utils::{hsla_eq, is_default_bg, is_default_fg, keystroke_to_bytes};
 use crate::theme::{self, ThemeName};
+use crate::{FontConfig, detect_urls, file_path_for_open};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags as CellFlags;
 use alacritty_terminal::term::{Config, Term, TermMode};
@@ -30,7 +33,6 @@ use gpui::{
     Pixels, Render, Rgba, ScrollWheelEvent, ShapedLine, Size, StrikethroughStyle, Style, Styled, TextRun,
     UnderlineStyle, WeakEntity, Window, div, fill, font, point, px, relative, size,
 };
-use tab_atelier::{FontConfig, detect_urls, file_path_for_open};
 use vte::ansi::{Color, NamedColor};
 
 const INITIAL_COLS: usize = 80;
@@ -104,7 +106,7 @@ struct CachedLine {
     segments: std::rc::Rc<Vec<TermSegment>>,
     /// URLs detected in this line, computed once on cache miss and reused
     /// on every subsequent hit so `detect_urls` doesn't re-run every frame.
-    /// The tuple shape matches `tab_atelier::detect_urls`'s return.
+    /// The tuple shape matches `crate::detect_urls`'s return.
     urls: std::rc::Rc<Vec<(usize, usize, String, bool)>>,
 }
 
@@ -1734,8 +1736,8 @@ impl Element for TerminalElement {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FontConfig;
     use gpui::TestAppContext;
-    use tab_atelier::FontConfig;
 
     fn default_browser() -> Rc<RefCell<Option<String>>> {
         Rc::new(RefCell::new(None))

@@ -3,10 +3,93 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 
+pub(crate) mod api;
+#[cfg(feature = "gui")]
+pub mod app;
+pub(crate) mod catbus_agent;
+pub mod cli;
+#[cfg(feature = "happier-bridge")]
+pub(crate) mod happier_bridge;
+pub(crate) mod locale;
+pub(crate) mod platform;
+#[cfg(feature = "energy")]
+pub(crate) mod power;
+#[cfg(feature = "gui")]
+pub(crate) mod screenshot;
+#[cfg(feature = "gui")]
+pub(crate) mod terminal;
+#[cfg(feature = "gui")]
+pub(crate) mod terminal_utils;
+pub(crate) mod theme;
+pub(crate) mod tracking;
+
 pub const APP_DIR: &str = "tab-atelier";
+
+/// Set by the SIGINT/SIGTERM handler. The persist tick checks it and runs
+/// `close_all_tabs` (which does an unconditional flush of every tab's
+/// output / uptime / energy file) before letting gpui shut down.
+pub static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Set to true when `--read-only` was passed.
+///
+/// In read-only mode the app does not acquire the single-instance lock,
+/// never writes any persisted state, and disables the preferences "Save"
+/// button. Useful for inspecting an existing workspace alongside a normal
+/// instance.
+pub static READ_ONLY: AtomicBool = AtomicBool::new(false);
+
+#[must_use]
+pub fn read_only() -> bool {
+    READ_ONLY.load(Ordering::SeqCst)
+}
+
+/// Kept alive for the lifetime of the process so the file lock isn't
+/// released until the process exits.
+static INSTANCE_LOCK: OnceLock<std::fs::File> = OnceLock::new();
+
+/// Pin the rustls `CryptoProvider` to `ring` at process start.
+///
+/// Workspace feature unification compiles `rustls` with both `ring`
+/// and `aws_lc_rs` enabled (axum-server / reqwest pull the latter in
+/// via happier-relay + catbus-agent). Without an explicit install,
+/// `ServerConfig::builder()` panics: "Could not automatically
+/// determine the process-level `CryptoProvider`". Calling
+/// `install_default()` here makes TLS startup deterministic.
+///
+/// Idempotent — second-and-later calls return `Err` (which we ignore)
+/// rather than re-installing.
+pub fn install_rustls_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+pub fn try_acquire_single_instance_lock() -> bool {
+    use fs2::FileExt;
+    let dir = platform::state_base_dir().join(APP_DIR);
+    if std::fs::create_dir_all(&dir).is_err() {
+        return true; // can't lock, but don't block startup
+    }
+    let path = dir.join("tab-atelier.lock");
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+    else {
+        return true;
+    };
+    if file.try_lock_exclusive().is_err() {
+        return false;
+    }
+    // Stash the handle so the lock stays held for the process lifetime.
+    let _ = INSTANCE_LOCK.set(file);
+    true
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct TabState {

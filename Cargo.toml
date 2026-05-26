@@ -21,8 +21,19 @@ keywords = ["terminal", "guake", "dropdown", "x11", "emulator"]
 categories = ["command-line-utilities"]
 include = ["/src/**/*.rs", "/Cargo.toml", "/LICENSE", "/README.md"]
 
+# Default GUI binary. Built when the `gui` feature is on (default).
+[[bin]]
+name = "tab-atelier"
+required-features = ["gui"]
+
 [features]
-default = ["energy"]
+default = ["gui", "energy"]
+# Desktop GUI build: gpui + x11rb (hotkeys + screenshot) + qrcode.
+gui = ["dep:gpui", "dep:x11rb", "dep:qrcode"]
+# Display-less variant: only the API server + PTY-driven tab restore
+# + happier-bridge spawn. Selected with `--no-default-features
+# --features headless[,...]`.
+headless = []
 energy = ["dep:wattaouille"]
 # Opt-in bridge that publishes every tab as a happier artifact against a
 # user-provided relay (`--happier-relay-url`). Off by default to keep
@@ -56,12 +67,12 @@ needless_pass_by_ref_mut = "allow"
 [dependencies]
 alacritty_terminal = "0.26"
 env_logger = "0.11"
-gpui = { version = "0.2", default-features = false, features = ["x11"] }
+gpui = { version = "0.2", default-features = false, features = ["x11"], optional = true }
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-x11rb = { version = "0.13", features = ["allow-unsafe-code"] }
-qrcode = { version = "0.14", default-features = false }
+x11rb = { version = "0.13", features = ["allow-unsafe-code"], optional = true }
+qrcode = { version = "0.14", default-features = false, optional = true }
 ureq = { version = "3", features = ["json"] }
 vte = { version = "0.15", default-features = false, features = ["std", "ansi"] }
 wattaouille = { version = "1.4.0", optional = true }

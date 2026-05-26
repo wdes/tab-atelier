@@ -2,6 +2,12 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+// `WakatimeTracker` is currently a GUI-only feature. Headless builds
+// still need `USER_AGENT` (the API server identifies itself with it),
+// so the module is compiled in both cases — just silence dead-code
+// lints on the cli-spawning helpers.
+#![cfg_attr(not(feature = "gui"), allow(dead_code))]
+
 //! Delegate Wakatime heartbeats to the canonical `wakatime-cli` binary
 //! instead of talking HTTP ourselves. This mirrors the architecture
 //! every official Wakatime editor extension uses — see

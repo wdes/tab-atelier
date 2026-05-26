@@ -151,7 +151,7 @@ struct InputPoller {
 /// the file for diagnostics.
 fn tab_input_cursor_path() -> PathBuf {
     crate::platform::state_base_dir()
-        .join(tab_atelier::APP_DIR)
+        .join(crate::APP_DIR)
         .join("tab-input.cursor")
 }
 
@@ -373,9 +373,9 @@ impl Bridge {
                 .iter()
                 .map(|t| {
                     let state_str = t.agent_state.as_ref().map(|snap| match snap.state {
-                        tab_atelier::AgentState::Thinking => "thinking".to_string(),
-                        tab_atelier::AgentState::Waiting => "waiting".to_string(),
-                        tab_atelier::AgentState::Error => "error".to_string(),
+                        crate::AgentState::Thinking => "thinking".to_string(),
+                        crate::AgentState::Waiting => "waiting".to_string(),
+                        crate::AgentState::Error => "error".to_string(),
                     });
                     (t.name.clone(), t.output.clone(), state_str, t.agent_session_id.clone())
                 })
@@ -385,7 +385,7 @@ impl Bridge {
             if output.is_empty() {
                 continue;
             }
-            let crc = tab_atelier::crc32(output.as_bytes());
+            let crc = crate::crc32(output.as_bytes());
             if let Some(state) = self.seen.get(&name)
                 && state.last_crc == crc
                 && state.last_agent_state == agent_state
@@ -825,20 +825,16 @@ pub fn spawn_relay(bind_addr: &str) -> Result<RelayHandle, String> {
 }
 
 fn tls_cert_path() -> PathBuf {
-    crate::platform::state_base_dir()
-        .join(tab_atelier::APP_DIR)
-        .join("tls.crt")
+    crate::platform::state_base_dir().join(crate::APP_DIR).join("tls.crt")
 }
 
 fn tls_key_path() -> PathBuf {
-    crate::platform::state_base_dir()
-        .join(tab_atelier::APP_DIR)
-        .join("tls.key")
+    crate::platform::state_base_dir().join(crate::APP_DIR).join("tls.key")
 }
 
 fn relay_log_path() -> PathBuf {
     crate::platform::state_base_dir()
-        .join(tab_atelier::APP_DIR)
+        .join(crate::APP_DIR)
         .join("happier-relay.log")
 }
 
@@ -905,10 +901,10 @@ fn persist_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
 /// strings give us a 128-bit-ish identifier rendered in the same
 /// 8-4-4-4-12 hex layout — the relay treats this as an opaque id.
 fn artifact_id_for(name: &str) -> String {
-    let a = tab_atelier::crc32(format!("tab:{name}").as_bytes());
-    let b = tab_atelier::crc32(format!("body:{name}").as_bytes());
-    let c = tab_atelier::crc32(format!("meta:{name}").as_bytes());
-    let d = tab_atelier::crc32(format!("seed:{name}").as_bytes());
+    let a = crate::crc32(format!("tab:{name}").as_bytes());
+    let b = crate::crc32(format!("body:{name}").as_bytes());
+    let c = crate::crc32(format!("meta:{name}").as_bytes());
+    let d = crate::crc32(format!("seed:{name}").as_bytes());
     format!(
         "{a:08x}-{:04x}-{:04x}-{:04x}-{:08x}{:04x}",
         b >> 16,

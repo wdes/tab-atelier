@@ -84,7 +84,7 @@ pub struct SnapshotTab {
     /// surfaces it in the artifact header so mobile sees the same
     /// thinking/waiting badge as the desktop LED).
     #[cfg_attr(not(feature = "happier-bridge"), allow(dead_code))]
-    pub agent_state: Option<tab_atelier::AgentStateSnapshot>,
+    pub agent_state: Option<crate::AgentStateSnapshot>,
     /// Durable agent session UUID, mirrored from the in-RAM Tab. Only
     /// read when the `happier-bridge` feature is enabled.
     #[cfg_attr(not(feature = "happier-bridge"), allow(dead_code))]
@@ -98,7 +98,7 @@ pub struct SnapshotTab {
 #[derive(Clone, Debug)]
 pub struct PendingStatusUpdate {
     pub tab_id: String,
-    pub state: tab_atelier::AgentState,
+    pub state: crate::AgentState,
     pub label: Option<String>,
     pub session_id: Option<String>,
     pub agent_kind: Option<String>,
@@ -150,7 +150,7 @@ pub fn generate_token() -> String {
 /// token means already-paired mobile clients keep working across
 /// desktop restarts instead of falling out to 401 every time.
 pub fn load_or_generate_token() -> String {
-    let dir = crate::platform::state_base_dir().join(tab_atelier::APP_DIR);
+    let dir = crate::platform::state_base_dir().join(crate::APP_DIR);
     let path = dir.join("api.token");
     if let Ok(existing) = std::fs::read_to_string(&path) {
         let trimmed = existing.trim();
@@ -194,6 +194,7 @@ pub fn local_ip() -> String {
 /// Implementation note: shelling out to `ip -4 -o addr show scope
 /// global` keeps us inside Rust's safe code — `getifaddrs` would
 /// require an `unsafe` FFI block and the crate denies that globally.
+#[cfg(feature = "gui")]
 pub fn local_ips_all() -> Vec<String> {
     let output = std::process::Command::new("ip")
         .args(["-4", "-o", "addr", "show", "scope", "global"])
@@ -227,7 +228,7 @@ pub fn local_ips_all() -> Vec<String> {
 /// compute and matches the per-tab persist hash so cached responses
 /// align with cache-skip logic.
 fn etag_for(bytes: &[u8]) -> String {
-    format!("{:08x}", tab_atelier::crc32(bytes))
+    format!("{:08x}", crate::crc32(bytes))
 }
 
 /// Gzip `bytes` if the client supports it and the body is big enough
@@ -310,7 +311,7 @@ fn respond_json<W: Write>(stream: &mut W, status: u16, body: &str) {
     );
 }
 
-use tab_atelier::strip_ansi;
+use crate::strip_ansi;
 
 fn error_json<W: Write>(stream: &mut W, status: u16, msg: &str) {
     let body = serde_json::to_string(&ErrorResponse { error: msg.to_string() }).unwrap_or_default();
@@ -634,12 +635,12 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             // Mode 1 is what turns a noisy LAN poll into a few-byte delta
             // for the steady-state append case (>99% of the time, a tab
             // is just appending output).
-            let total_crc = tab_atelier::crc32(t.output.as_bytes());
+            let total_crc = crate::crc32(t.output.as_bytes());
             let total_len = t.output.len();
 
             let (body, cursor, start_offset) = match (query_since, query_crc) {
                 (Some(n), Some(client_crc)) if n <= total_len => {
-                    let prefix_crc = tab_atelier::crc32(&t.output.as_bytes()[..n]);
+                    let prefix_crc = crate::crc32(&t.output.as_bytes()[..n]);
                     if prefix_crc == client_crc {
                         // The client's history is still a real prefix of
                         // ours. Ship the suffix only — cursor row is
@@ -789,9 +790,9 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 return;
             };
             let agent_state = match state_str {
-                "thinking" => tab_atelier::AgentState::Thinking,
-                "waiting" => tab_atelier::AgentState::Waiting,
-                "error" => tab_atelier::AgentState::Error,
+                "thinking" => crate::AgentState::Thinking,
+                "waiting" => crate::AgentState::Waiting,
+                "error" => crate::AgentState::Error,
                 "idle" => {
                     // "idle" = clear the indicator. Queue an Error-shaped
                     // marker the loop interprets as "wipe"; simpler than
@@ -805,7 +806,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                     let id = t.id.clone();
                     snap.pending_status_updates.push(PendingStatusUpdate {
                         tab_id: id,
-                        state: tab_atelier::AgentState::Thinking, // ignored — clear flag below
+                        state: crate::AgentState::Thinking, // ignored — clear flag below
                         label: Some("__clear__".into()),
                         session_id: None,
                         agent_kind: None,
@@ -1024,7 +1025,7 @@ fn cert_needs_renewal(crt_path: &std::path::Path) -> bool {
 }
 
 fn load_or_generate_cert() -> std::io::Result<(Vec<u8>, Vec<u8>)> {
-    let dir = crate::platform::state_base_dir().join(tab_atelier::APP_DIR);
+    let dir = crate::platform::state_base_dir().join(crate::APP_DIR);
     std::fs::create_dir_all(&dir)?;
     let crt_path = dir.join("tls.crt");
     let key_path = dir.join("tls.key");
@@ -1720,7 +1721,7 @@ mod tests {
         let full = format!("{prefix}{suffix}");
         fill_output(&state, 0, &full);
 
-        let prefix_crc = format!("{:08x}", tab_atelier::crc32(prefix.as_bytes()));
+        let prefix_crc = format!("{:08x}", crate::crc32(prefix.as_bytes()));
         let raw = request_bytes(
             port,
             &format!(
@@ -1748,7 +1749,7 @@ mod tests {
         fill_output(&state, 0, &full);
 
         // Stale CRC (claims first 10 bytes were "different" by 1).
-        let bogus_crc = format!("{:08x}", tab_atelier::crc32(b"different"));
+        let bogus_crc = format!("{:08x}", crate::crc32(b"different"));
         let raw = request_bytes(
             port,
             &format!("GET /tabs/0/output?since=10&crc={bogus_crc} HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
