@@ -7159,6 +7159,7 @@ dependencies = [
  "flate2",
  "fs2",
  "gpui",
+ "http",
  "log",
  "qrcode",
  "rand 0.8.6",

@@ -115,6 +115,10 @@ uuid = { version = "1", features = ["v4"] }
 # the viewer is up.
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
 crossterm = { version = "0.28", default-features = false, features = ["events"] }
+# Transitive of ureq today but the remote-tab client reads response
+# headers directly, so import it explicitly to insulate against ureq
+# bumps.
+http = "1"
 
 
 [dev-dependencies]
