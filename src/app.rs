@@ -959,6 +959,37 @@ impl AppState {
                     }
                 }
             }
+            // Working-subprocess sweep: if the agent CLI has a child
+            // process alive (Bash tool running `cargo build`, a long
+            // `pytest`, …) keep the LED on "thinking" by refreshing
+            // the snapshot timestamp. Long-running tool calls would
+            // otherwise fall through the 2-min staleness sweep below
+            // because no hook fires between `PreToolUse` and
+            // `PostToolUse`. Also covers manual subshell commands the
+            // user starts inside an active agent tab.
+            let now = std::time::Instant::now();
+            for tab in &mut self.tabs {
+                if tab.agent_kind.is_none() {
+                    continue;
+                }
+                let pid = tab.view.read(cx).pid();
+                if !crate::catbus_agent::agent_has_active_subprocess(pid) {
+                    continue;
+                }
+                tab.agent_state = Some(match tab.agent_state.take() {
+                    Some(mut snap) if snap.state != tab_atelier::AgentState::Error => {
+                        snap.state = tab_atelier::AgentState::Thinking;
+                        snap.updated_at = now;
+                        snap
+                    }
+                    Some(snap) => snap, // keep Error sticky
+                    None => tab_atelier::AgentStateSnapshot {
+                        state: tab_atelier::AgentState::Thinking,
+                        label: Some("subproc".into()),
+                        updated_at: now,
+                    },
+                });
+            }
             // Staleness sweep: drop transient LED state when the last
             // update is older than 2 min. Real Claude turns are
             // tool-heavy and the `PreToolUse` hook refreshes the LED
@@ -966,7 +997,6 @@ impl AppState {
             // strong signal the agent is actually idle (or wedged) —
             // we want the LED to demote back to the grey "session
             // attached" dot quickly so the user notices.
-            let now = std::time::Instant::now();
             for tab in &mut self.tabs {
                 if let Some(snap) = &tab.agent_state
                     && now.duration_since(snap.updated_at).as_secs() > 120
