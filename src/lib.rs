@@ -682,6 +682,153 @@ pub const DEFAULT_API_ADDR: &str = "0.0.0.0:7890";
 pub const DEFAULT_API_TLS_ADDR: &str = "0.0.0.0:7891";
 pub const DEFAULT_HAPPIER_RELAY_ADDR: &str = "127.0.0.1:7892";
 
+/// Hex-encoded SHA-256 of a remote's TLS cert, captured without
+/// validating anything (trust-on-first-use).
+///
+/// Used by the Preferences "Pin certificate" button to fill the
+/// `cert_sha256` field on a `RemoteEndpoint`. This is intentionally
+/// NOT a security check — it accepts any cert the server offers. The
+/// fingerprint becomes load-bearing only once the user saves the
+/// endpoint and subsequent connections compare against it.
+///
+/// Errors come back as plain strings so callers can render them in a
+/// toast.
+///
+/// # Errors
+///
+/// Returns `Err` when the URL can't be parsed, the TCP connect fails,
+/// the TLS handshake never reaches the certificate stage, or the
+/// server presents no certificate.
+pub fn fetch_cert_fingerprint(url: &str) -> Result<String, String> {
+    use sha2::Digest;
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+
+    let (host, port) = parse_https_host_port(url)?;
+    let server_name =
+        rustls::pki_types::ServerName::try_from(host.clone()).map_err(|e| format!("invalid host {host:?}: {e}"))?;
+
+    let captured: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+    let verifier = Arc::new(CertCapturingVerifier {
+        captured: captured.clone(),
+    });
+
+    let config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+    let mut conn =
+        rustls::ClientConnection::new(Arc::new(config), server_name).map_err(|e| format!("rustls client init: {e}"))?;
+
+    let mut sock = std::net::TcpStream::connect((host.as_str(), port)).map_err(|e| format!("tcp connect: {e}"))?;
+    sock.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .map_err(|e| format!("set read timeout: {e}"))?;
+    sock.set_write_timeout(Some(std::time::Duration::from_secs(5)))
+        .map_err(|e| format!("set write timeout: {e}"))?;
+
+    // Drive the handshake until the verifier has captured the cert
+    // (which happens as part of the server's ServerHello / Certificate
+    // exchange). We don't care whether the handshake "succeeds" past
+    // that point — TOFU pinning doesn't validate.
+    let mut stream = rustls::Stream::new(&mut conn, &mut sock);
+    let _ = stream.flush();
+    if captured.lock().is_ok_and(|g| g.is_none()) {
+        // Send a minimal probe to nudge the handshake forward if
+        // flush() returned before the certificate arrived.
+        let _ = stream.write_all(b"GET / HTTP/1.0\r\n\r\n");
+        let mut buf = [0u8; 1];
+        let _ = stream.read(&mut buf);
+    }
+
+    let der = captured
+        .lock()
+        .map_err(|_| "cert capture mutex poisoned".to_string())?
+        .clone()
+        .ok_or_else(|| "server presented no certificate".to_string())?;
+
+    let digest = sha2::Sha256::digest(&der);
+    Ok(hex_encode(&digest))
+}
+
+fn parse_https_host_port(url: &str) -> Result<(String, u16), String> {
+    let rest = url
+        .strip_prefix("https://")
+        .ok_or_else(|| format!("expected https:// URL, got {url:?}"))?;
+    // Strip path/query if present.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        // IPv6 literal: [::1]:7891
+        let (h, after) = rest
+            .split_once(']')
+            .ok_or_else(|| format!("unterminated IPv6 in {url:?}"))?;
+        let port = after
+            .strip_prefix(':')
+            .ok_or_else(|| format!("missing port after IPv6 literal in {url:?}"))?;
+        (h.to_string(), port)
+    } else if let Some((h, p)) = authority.rsplit_once(':') {
+        (h.to_string(), p)
+    } else {
+        (authority.to_string(), "443")
+    };
+    let port = port.parse::<u16>().map_err(|e| format!("bad port {port:?}: {e}"))?;
+    Ok((host, port))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+#[derive(Debug)]
+struct CertCapturingVerifier {
+    captured: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for CertCapturingVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if let Ok(mut g) = self.captured.lock() {
+            *g = Some(end_entity.as_ref().to_vec());
+        }
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
 fn deserialize_hotkeys<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
     let raw: Vec<serde_json::Value> = serde::Deserialize::deserialize(deserializer)?;
     Ok(raw
