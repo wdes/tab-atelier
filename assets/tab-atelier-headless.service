@@ -1,0 +1,11 @@
+[Unit]
+Description=tab-atelier headless tab daemon
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/tab-atelier-headless
+Restart=on-failure
+Environment=RUST_LOG=tab_atelier=info
+
+[Install]
+WantedBy=default.target
