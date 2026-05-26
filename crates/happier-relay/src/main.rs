@@ -429,11 +429,15 @@ async fn dispatch_session_get_v2(
 /// `POST /v2/sessions/{id}/messages` dispatcher. For tab artifacts,
 /// the typed text becomes PTY input on the matching desktop tab.
 /// For non-tab session ids, hand off to the SQL-backed
-/// `sessions::post_message`.
+/// `sessions::post_message`. The original request headers are
+/// forwarded so `Idempotency-Key` survives the dispatch (without
+/// this the second POST of a retried message wrote twice — the
+/// `message_post_and_idempotency` e2e test caught it).
 async fn dispatch_session_post_message_v2(
     axum::extract::State(state): axum::extract::State<state::AppState>,
     axum::Extension(user): axum::Extension<auth::UserId>,
     axum::extract::Path(session_id): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
     axum::Json(body): axum::Json<serde_json::Value>,
 ) -> axum::response::Response {
     use axum::extract::{Path, State};
@@ -456,7 +460,7 @@ async fn dispatch_session_post_message_v2(
                 Ok(req) => sessions::post_message(
                     State(cloned_state),
                     Extension(cloned_user),
-                    axum::http::HeaderMap::new(),
+                    headers,
                     Path(cloned_id),
                     Json(req),
                 )

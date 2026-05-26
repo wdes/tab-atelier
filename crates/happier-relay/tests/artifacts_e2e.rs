@@ -103,7 +103,13 @@ async fn artifact_lifecycle_and_fanout() {
             .boxed()
         }
     };
-    let sub: Client = ClientBuilder::new(&url)
+    // Relay mounts socket.io at /v1/updates/ (the happier mobile
+    // client dials there). rust_socketio leaves the path alone when
+    // it's not literally "/", so we pass the explicit path here —
+    // otherwise the default /socket.io/ would 404 and the server's
+    // JSON error reaches the engine.io parser as
+    // InvalidPacketId(123).
+    let sub: Client = ClientBuilder::new(format!("{url}/v1/updates/"))
         .auth(serde_json::json!({ "token": &token }))
         .on("artifact-create", make_cb("create", sock_tx.clone()))
         .on("artifact-update", make_cb("update", sock_tx.clone()))

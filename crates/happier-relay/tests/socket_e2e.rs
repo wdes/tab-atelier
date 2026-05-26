@@ -87,7 +87,12 @@ async fn machine_update_broadcasts_to_user_room() {
     // call would normally be made on each device; we shortcut by reusing
     // one token — single-tenant means same user_id either way).
     let token = obtain_token(port).await;
-    let url = format!("http://127.0.0.1:{port}");
+    // Relay mounts socket.io at /v1/updates/ (matches the happier
+    // mobile client). Without overriding the path here rust_socketio
+    // would dial the default /socket.io/ and the server's 404 page
+    // would arrive at the engine.io parser as an InvalidPacketId(123)
+    // — the '{' byte of the JSON error response.
+    let url = format!("http://127.0.0.1:{port}/v1/updates/");
 
     // Channel for client B's received machine-update events.
     let (tx, mut rx) = mpsc::unbounded_channel::<serde_json::Value>();
@@ -143,7 +148,12 @@ async fn bad_token_is_disconnected() {
     let port = free_port();
     let tmpdir = tempfile_dir("socket_e2e_bad_token");
     let mut child = spawn_relay(port, "test-socket-secret-2", &tmpdir.join("db.sqlite")).await;
-    let url = format!("http://127.0.0.1:{port}");
+    // Relay mounts socket.io at /v1/updates/ (matches the happier
+    // mobile client). Without overriding the path here rust_socketio
+    // would dial the default /socket.io/ and the server's 404 page
+    // would arrive at the engine.io parser as an InvalidPacketId(123)
+    // — the '{' byte of the JSON error response.
+    let url = format!("http://127.0.0.1:{port}/v1/updates/");
 
     // rust_socketio's ClientBuilder::connect resolves OK on a successful
     // engine.io handshake even if the namespace connect is then rejected.
