@@ -23,6 +23,7 @@ pub(crate) mod platform;
 pub(crate) mod power;
 #[cfg(feature = "gui")]
 pub(crate) mod screenshot;
+pub(crate) mod term_export;
 #[cfg(feature = "gui")]
 pub(crate) mod terminal;
 #[cfg(feature = "gui")]
@@ -53,6 +54,77 @@ pub fn read_only() -> bool {
 /// Kept alive for the lifetime of the process so the file lock isn't
 /// released until the process exits.
 static INSTANCE_LOCK: OnceLock<std::fs::File> = OnceLock::new();
+
+/// Build the per-tab env map for `_TAB_ID` / `TAB_ATELIER_API_URL` /
+/// `TAB_ATELIER_API_TOKEN`.
+///
+/// Both binaries inject these at PTY spawn time so any tool running
+/// inside the tab can locate the local API without manual config
+/// (the `tab-atelier set-status` / `tabs` subcommands both rely on
+/// them).
+#[must_use]
+pub fn tab_env_extras(tab_id: &str, api_url: &str, api_token: &str) -> std::collections::HashMap<String, String> {
+    let mut m = std::collections::HashMap::new();
+    m.insert("_TAB_ID".into(), tab_id.to_string());
+    m.insert("TAB_ATELIER_API_URL".into(), api_url.to_string());
+    m.insert("TAB_ATELIER_API_TOKEN".into(), api_token.to_string());
+    m
+}
+
+/// Build the value handed to in-tab tools as `TAB_ATELIER_API_URL`.
+///
+/// The stored `api_addr` is a bind spec (`0.0.0.0:7890`, `:7890`,
+/// `127.0.0.1:9000`); we always rewrite the host to `127.0.0.1`
+/// because in-tab tools live on the same machine.
+#[must_use]
+pub fn api_url_for_local_clients(api_addr: &str) -> String {
+    let port = api_addr
+        .rsplit(':')
+        .next()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(DEFAULT_API_PORT);
+    format!("http://127.0.0.1:{port}")
+}
+
+/// Translate a persisted (`agent_kind`, `session_id`, `plan_mode`) into
+/// the shell command to type for auto-resume. Returns None when the
+/// `agent_kind` isn't one we know how to drive.
+#[must_use]
+pub fn build_agent_resume_command(kind: &str, session_id: &str, plan: Option<bool>) -> Option<String> {
+    match kind {
+        "catbus" => {
+            let flag = if plan == Some(true) { " --plan" } else { "" };
+            Some(format!("catbus-agent --resume {session_id}{flag}"))
+        }
+        "claude" => Some(format!("claude --resume {session_id}")),
+        _ => None,
+    }
+}
+
+/// Read the optional `--happier-relay-url <url>` (or `=`) flag.
+///
+/// No clap dep — returns `None` if the flag isn't present, the
+/// value is empty, or the feature is disabled (in which case this
+/// fn isn't even compiled).
+#[cfg(feature = "happier-bridge")]
+#[must_use]
+pub fn happier_relay_url_from_args() -> Option<String> {
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        if let Some(rest) = a.strip_prefix("--happier-relay-url=")
+            && !rest.is_empty()
+        {
+            return Some(rest.to_string());
+        }
+        if a == "--happier-relay-url"
+            && let Some(v) = args.next()
+            && !v.is_empty()
+        {
+            return Some(v);
+        }
+    }
+    None
+}
 
 /// Pin the rustls `CryptoProvider` to `ring` at process start.
 ///
