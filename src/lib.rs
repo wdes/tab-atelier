@@ -639,6 +639,42 @@ pub struct Preferences {
     /// relay isn't hardened against LAN attackers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub happier_relay_addr: Option<String>,
+
+    /// Saved remote `tab-atelier-headless` endpoints the GUI can
+    /// mirror tabs from. Each entry carries its own bearer token +
+    /// TOFU-pinned cert fingerprint. The list is allowed to be empty
+    /// (the common case for users who only run the local instance).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remote_endpoints: Vec<RemoteEndpoint>,
+}
+
+/// One persisted remote `tab-atelier-headless` instance the desktop
+/// GUI can mirror tabs from. Stored under `Preferences::remote_endpoints`
+/// in `preferences.json`.
+///
+/// The `cert_sha256` is filled in by the "Pin certificate" flow in the
+/// Preferences dialog (trust-on-first-use). The `token` mirrors the
+/// bearer token from the remote's `api.token` file.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct RemoteEndpoint {
+    /// Local UUID v4 — used as a stable key across renames of the
+    /// `label` field. Generated on first save.
+    pub id: String,
+    /// Short human-friendly label rendered in the tab badge
+    /// ("colossus", "build-box"). Free-form.
+    pub label: String,
+    /// Full base URL of the remote API. Either `http://host:port`
+    /// (plain) or `https://host:port` (TLS — `cert_sha256` is then
+    /// required).
+    pub url: String,
+    /// Bearer token. Mirrors the remote's `~/.local/state/tab-atelier/api.token`.
+    pub token: String,
+    /// Hex SHA-256 of the remote's TLS cert (TOFU-pinned).
+    pub cert_sha256: String,
+    /// When true, the GUI connects to this endpoint at startup
+    /// instead of waiting for an explicit "Connect" click.
+    #[serde(default)]
+    pub autoconnect: bool,
 }
 
 pub const DEFAULT_API_PORT: u16 = 7890;
@@ -2051,5 +2087,56 @@ mod tests {
         let json = r#"{"hotkeys": ["grave", "bogus", null, 300, 49]}"#;
         let prefs: Preferences = serde_json::from_str(json).unwrap();
         assert_eq!(prefs.hotkeys, vec![49, 49]);
+    }
+
+    #[test]
+    fn deserialize_preferences_without_remote_endpoints_defaults_to_empty() {
+        let json = r"{}";
+        let prefs: Preferences = serde_json::from_str(json).unwrap();
+        assert!(prefs.remote_endpoints.is_empty());
+    }
+
+    #[test]
+    fn serialize_preferences_skips_empty_remote_endpoints() {
+        let prefs = Preferences::default();
+        let json = serde_json::to_string(&prefs).unwrap();
+        assert!(
+            !json.contains("remote_endpoints"),
+            "expected remote_endpoints to be skipped when empty, got {json}"
+        );
+    }
+
+    #[test]
+    fn remote_endpoint_round_trip() {
+        let prefs = Preferences {
+            remote_endpoints: vec![
+                RemoteEndpoint {
+                    id: "11111111-2222-3333-4444-555555555555".into(),
+                    label: "colossus".into(),
+                    url: "https://192.168.1.42:7891".into(),
+                    token: "deadbeef".into(),
+                    cert_sha256: "a".repeat(64),
+                    autoconnect: true,
+                },
+                RemoteEndpoint {
+                    id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
+                    label: "build-box".into(),
+                    url: "http://127.0.0.1:7890".into(),
+                    token: "feedface".into(),
+                    cert_sha256: String::new(),
+                    autoconnect: false,
+                },
+            ],
+            ..Preferences::default()
+        };
+        let json = serde_json::to_string(&prefs).unwrap();
+        let restored: Preferences = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.remote_endpoints.len(), 2);
+        assert_eq!(restored.remote_endpoints[0].label, "colossus");
+        assert_eq!(restored.remote_endpoints[0].url, "https://192.168.1.42:7891");
+        assert!(restored.remote_endpoints[0].autoconnect);
+        assert_eq!(restored.remote_endpoints[1].label, "build-box");
+        assert_eq!(restored.remote_endpoints[1].cert_sha256, "");
+        assert!(!restored.remote_endpoints[1].autoconnect);
     }
 }

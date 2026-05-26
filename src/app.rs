@@ -244,6 +244,10 @@ struct AppState {
     pref_api_tls_addr_focus: FocusHandle,
     pref_happier_relay_addr_text: String,
     pref_happier_relay_addr_focus: FocusHandle,
+    /// Saved remote `tab-atelier-headless` endpoints. Loaded from
+    /// `preferences.json` at startup, edited via the "Remote endpoints"
+    /// section of the Preferences modal, and persisted back on Save.
+    remote_endpoints: Vec<crate::RemoteEndpoint>,
     /// Owns the spawned happier-relay child. Dropping this struct
     /// SIGTERMs the relay; storing it here ties the relay's lifetime
     /// to the running app.
@@ -523,6 +527,7 @@ impl AppState {
         let happier_relay_addr = prefs
             .happier_relay_addr
             .unwrap_or_else(|| crate::DEFAULT_HAPPIER_RELAY_ADDR.into());
+        let remote_endpoints = prefs.remote_endpoints;
         info!("API server starting on {api_addr} (TLS {api_tls_addr})");
         let api_state = Arc::new(Mutex::new(api::TabSnapshot {
             tabs: Vec::<api::SnapshotTab>::new(),
@@ -640,6 +645,7 @@ impl AppState {
             pref_api_tls_addr_focus,
             pref_happier_relay_addr_text: String::new(),
             pref_happier_relay_addr_focus,
+            remote_endpoints,
             #[cfg(feature = "happier-bridge")]
             relay_handle,
             hotkey_handle: None,
@@ -3024,6 +3030,7 @@ impl AppState {
                                                         api_addr: Some(this.api_addr.clone()),
                                                         api_tls_addr: Some(this.api_tls_addr.clone()),
                                                         happier_relay_addr: Some(this.happier_relay_addr.clone()),
+                                                        remote_endpoints: this.remote_endpoints.clone(),
                                                     },
                                                 );
                                                 if let Some(ref handle) = this.hotkey_handle {
