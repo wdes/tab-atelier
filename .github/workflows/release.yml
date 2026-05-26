@@ -35,8 +35,11 @@ jobs:
               uses: dtolnay/rust-toolchain@stable
             - name: Cache cargo artifacts
               uses: Swatinem/rust-cache@v2
-            - name: Build .deb package
-              run: cargo install cargo-deb && cargo deb --locked
+            - name: Build .deb packages
+              run: |
+                  cargo install cargo-deb
+                  cargo deb -p tab-atelier --locked
+                  cargo deb -p tab-atelier --variant headless --locked
             - name: Attest .deb
               uses: actions/attest-build-provenance@v2
               with:
@@ -46,7 +49,9 @@ jobs:
               with:
                   name: tab-atelier-deb
                   path: target/debian/*.deb
-                  archive: false
+                  # Two .deb files (GUI + headless); upload-artifact's
+                  # `archive: false` requires exactly one. Default
+                  # `archive: true` bundles them into the artifact zip.
 
     release:
         name: Create draft release

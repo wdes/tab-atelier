@@ -88,7 +88,10 @@ jobs:
                   name: tab-atelier-deb
                   path: target/debian/*.deb
                   retention-days: 5
-                  archive: false
+                  # Two .deb files now (GUI + headless). upload-artifact@v7
+                  # with `archive: false` requires exactly one file; default
+                  # (archive: true) bundles them into a zip that the
+                  # download step unpacks on its end.
 
     integration:
         name: Integration test (debian:trixie-slim)
@@ -99,12 +102,12 @@ jobs:
               with:
                   artifact-ids: ${{ needs.build.outputs.deb-artifact-id }}
                   merge-multiple: true
-                  skip-decompress: true
-            - name: Install .deb and run --check
+            - name: Install .deb and run --check-crypto
               run: |
                   docker run --rm \
                       -v "$PWD:/debs:ro" \
                       debian:trixie-slim \
                       sh -c "apt-get update \
                           && apt-get install -y --no-install-recommends /debs/*.deb \
-                          && tab-atelier --check"
+                          && tab-atelier --check-crypto \
+                          && tab-atelier-headless --check-crypto"
