@@ -54,13 +54,13 @@ err()  { printf '\033[31m  ✗ %s\033[0m\n' "$*" >&2; }
 # ───── prereqs ──────────────────────────────────────────────────────────
 
 step "Checking prerequisites"
-for cmd in gpg gh dig; do
+for cmd in gpg gh dig jq; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
         err "$cmd not on PATH"
         exit 1
     fi
 done
-ok "gpg / gh / dig found"
+ok "gpg / gh / dig / jq found"
 
 if ! gh auth status >/dev/null 2>&1; then
     err "gh is not authenticated. Run \`gh auth login\` first."
@@ -169,6 +169,34 @@ ok "APT_SIGNING_KEY set"
 # email-independent reference.
 printf '%s' "$FPR" | gh secret set APT_SIGNING_KEY_ID -R "$REPO_SLUG"
 ok "APT_SIGNING_KEY_ID set to fingerprint ${FPR:0:16}…"
+
+# ───── register key on the GH user account ─────────────────────────────
+#
+# `crazy-max/ghaction-import-gpg` configures git to sign commits
+# with this key during the apt-publish workflow. For GitHub to
+# render those commits with the green "Verified" badge it also
+# needs to know about the key under the committer's account.
+#
+# Idempotent: skip if a key with the same fingerprint is already
+# registered.
+
+step "Register public key on $GH_USER's GitHub account"
+if gh api user/gpg_keys --jq '.[].raw_key' 2>/dev/null \
+        | gpg --show-keys --with-colons 2>/dev/null \
+        | awk -F: -v fpr="$FPR" '/^fpr:/ { if ($10 == fpr) found=1 } END { exit found ? 0 : 1 }'; then
+    ok "key ${FPR:0:16}… already registered on github.com/$GH_USER"
+else
+    # gh api expects --input <file|->. We hand-roll the JSON
+    # because `-f key=value` doesn't tolerate newlines in armored
+    # GPG blocks.
+    if jq -n --arg key "$(gpg --armor --export "$FPR")" '{armored_public_key: $key}' \
+            | gh api user/gpg_keys --method POST --input - >/dev/null 2>&1; then
+        ok "uploaded public key to github.com/$GH_USER (commits signed by this key will show as Verified)"
+    else
+        warn "could not upload public key to github.com/$GH_USER — likely missing the 'admin:gpg_key' scope on the gh token"
+        warn "Run: gh auth refresh -s admin:gpg_key   then re-run this script."
+    fi
+fi
 
 # ───── GitHub Pages ───────────────────────────────────────────────────
 

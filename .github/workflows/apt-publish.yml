@@ -134,13 +134,28 @@ jobs:
                       dists/$CHANNEL/ > dists/$CHANNEL/Release
                   rm apt-ftparchive-$CHANNEL.conf
 
+            # Import the apt signing key into the runner's GPG
+            # keyring AND configure git to use it for commit
+            # signatures. The same key signs both the apt Release
+            # file AND the gh-pages commits — anyone with the
+            # public key (curlable from deb.tab-atelier.wdes.eu)
+            # can verify both ends with one trust anchor.
+            - name: Import GPG signing key
+              id: gpg
+              uses: crazy-max/ghaction-import-gpg@v7
+              with:
+                  gpg_private_key: ${{ secrets.APT_SIGNING_KEY }}
+                  fingerprint: ${{ secrets.APT_SIGNING_KEY_ID }}
+                  git_user_signingkey: true
+                  git_commit_gpgsign: true
+                  git_committer_name: 'Wdes Bot'
+                  git_committer_email: 'williamdes+wdes-bot@wdes.fr'
+
             - name: Sign Release
               env:
                   CHANNEL: ${{ steps.ver.outputs.channel }}
-                  GPG_KEY:    ${{ secrets.APT_SIGNING_KEY }}
-                  GPG_KEY_ID: ${{ secrets.APT_SIGNING_KEY_ID }}
+                  GPG_KEY_ID: ${{ steps.gpg.outputs.fingerprint }}
               run: |
-                  echo "$GPG_KEY" | gpg --batch --import
                   cd site
                   gpg --batch --yes --local-user "$GPG_KEY_ID" \
                       --output dists/$CHANNEL/Release.gpg \
@@ -148,9 +163,9 @@ jobs:
                   gpg --batch --yes --local-user "$GPG_KEY_ID" --clearsign \
                       --output dists/$CHANNEL/InRelease \
                       dists/$CHANNEL/Release
-                  # Public key is committed once so users can fetch it
-                  # with curl. Overwrite on every run so a re-key
-                  # propagates automatically.
+                  # Public key is republished on every run so a
+                  # re-key propagates automatically to users on
+                  # their next `apt update`.
                   gpg --batch --yes --armor --export "$GPG_KEY_ID" \
                       > tab-atelier.gpg
 
@@ -175,7 +190,12 @@ jobs:
                   HTML
 
             # peaceiris/actions-gh-pages handles the orphan branch
-            # case (first run), the commit identity, and the push.
+            # case (first run) and the push. The commit it creates
+            # picks up the global git config crazy-max set above —
+            # so `git commit` runs with commit.gpgsign=true and
+            # user.signingkey = the apt key fingerprint. Result:
+            # every gh-pages commit shows up as Verified on GitHub,
+            # signed by the same key that signs the apt Release.
             # `keep_files: false` means the action REPLACES gh-pages
             # with our `site/` tree wholesale — pruning + the prior
             # checkout above gave us exactly the desired final
