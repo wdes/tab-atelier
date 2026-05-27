@@ -302,6 +302,96 @@ fn sanitize_basename(raw: &str) -> Option<String> {
     Some(last.to_string())
 }
 
+/// File-transport sandbox: every path served by the file routes
+/// MUST be inside one of these subdirectories of the tab's cwd.
+///
+/// Anything else (the user's source tree, `~/.ssh/`, `/etc/passwd`,
+/// …) is off-limits — the file routes are explicitly the "drop a
+/// payload, pick up a result" surface, not a general file server.
+/// If a future feature needs broader access, add a separate route
+/// with its own consent model.
+const FILE_SANDBOX_DIRS: &[&str] = &["inbox", "outbox"];
+
+/// Resolve a relative path against `cwd` and confirm it lands inside
+/// one of `FILE_SANDBOX_DIRS`. Performs syntactic rejection (`..`,
+/// absolute paths, NUL bytes) BEFORE touching the filesystem, then a
+/// canonicalised-prefix check as belt-and-suspenders against
+/// symlinks that point out of the sandbox.
+///
+/// Returns the absolute resolved path on success; the error string
+/// is suitable for surfacing in an `error_json` 4xx body.
+fn resolve_sandbox_path(cwd: &str, raw: &str) -> Result<std::path::PathBuf, (u16, String)> {
+    use std::path::{Component, Path, PathBuf};
+
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err((400, "empty path".into()));
+    }
+    if trimmed.contains('\0') {
+        return Err((400, "path contains NUL".into()));
+    }
+    let p = Path::new(trimmed);
+    if p.is_absolute() {
+        return Err((400, "absolute paths rejected".into()));
+    }
+    // Reject `..` / drive-prefix / `\\?\` components syntactically.
+    let mut components = p.components();
+    let first = match components.next() {
+        Some(Component::Normal(c)) => c.to_str().unwrap_or(""),
+        Some(_) | None => return Err((400, "path must start with inbox/ or outbox/".into())),
+    };
+    if !FILE_SANDBOX_DIRS.contains(&first) {
+        return Err((
+            400,
+            format!(
+                "path must start with {} — got {trimmed:?}",
+                FILE_SANDBOX_DIRS
+                    .iter()
+                    .map(|d| format!("{d}/"))
+                    .collect::<Vec<_>>()
+                    .join(" or ")
+            ),
+        ));
+    }
+    for c in components {
+        if !matches!(c, Component::Normal(_)) {
+            return Err((400, format!("path contains {c:?}; only normal components allowed")));
+        }
+    }
+
+    // Belt + suspenders: canonicalise and confirm prefix. If the cwd
+    // or the candidate doesn't exist on disk yet, canonicalise the
+    // parent we know exists and accept the relative remainder.
+    let candidate = PathBuf::from(cwd).join(p);
+    let cwd_canonical = Path::new(cwd)
+        .canonicalize()
+        .map_err(|e| (404, format!("cwd unreadable: {e}")))?;
+    match candidate.canonicalize() {
+        Ok(canonical) => {
+            if !canonical.starts_with(&cwd_canonical) {
+                return Err((403, "symlink escapes the tab's cwd".into()));
+            }
+            // Re-verify the sandbox segment survives the symlink resolution.
+            let rel = canonical
+                .strip_prefix(&cwd_canonical)
+                .map_err(|_| (403, "path strip failed".into()))?;
+            let resolved_first = rel
+                .components()
+                .next()
+                .and_then(|c| match c {
+                    Component::Normal(n) => n.to_str(),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if !FILE_SANDBOX_DIRS.contains(&resolved_first) {
+                return Err((403, "symlink escapes the sandbox dirs".into()));
+            }
+            Ok(canonical)
+        }
+        Err(e) => Err((404, format!("read {}: {e}", candidate.display()))),
+    }
+}
+
 fn maybe_gzip(bytes: &[u8], accept_gzip: bool) -> Option<Vec<u8>> {
     const MIN_BODY: usize = 4096;
     if !accept_gzip || bytes.len() < MIN_BODY {
@@ -1001,9 +1091,11 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             respond_json(stream, 200, &body);
         }
         ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/files") => {
-            // Download a file relative to the tab's cwd.
-            // `?path=<relative path>` rejects `..` traversal but
-            // otherwise lets any cwd-rooted path through.
+            // Download a file from the tab's sandbox. `?path=…` must
+            // resolve inside one of `FILE_SANDBOX_DIRS` (currently
+            // `inbox/` + `outbox/`) of the tab's cwd — anything
+            // else is rejected before any filesystem access. See
+            // `resolve_sandbox_path` for the full check.
             let idx_str = &p["/tabs/".len()..p.len() - "/files".len()];
             let Ok(idx) = idx_str.parse::<usize>() else {
                 error_json(stream, 404, "invalid tab index");
@@ -1025,22 +1117,13 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 error_json(stream, 400, "missing ?path=<relative-path>");
                 return;
             };
-            // Reject anything that escapes the tab's cwd. We compare
-            // canonicalised paths so symlinks pointing outside the
-            // sandbox don't slip through.
-            let candidate = std::path::Path::new(&cwd).join(raw_path);
-            let canonical = match candidate.canonicalize() {
+            let canonical = match resolve_sandbox_path(&cwd, raw_path) {
                 Ok(p) => p,
-                Err(e) => {
-                    error_json(stream, 404, &format!("read {}: {e}", candidate.display()));
+                Err((status, msg)) => {
+                    error_json(stream, status, &msg);
                     return;
                 }
             };
-            let cwd_canonical = std::path::Path::new(&cwd).canonicalize().unwrap_or_else(|_| cwd.into());
-            if !canonical.starts_with(&cwd_canonical) {
-                error_json(stream, 403, "path escapes the tab's cwd");
-                return;
-            }
             let bytes = match std::fs::read(&canonical) {
                 Ok(b) => b,
                 Err(e) => {
@@ -1300,6 +1383,78 @@ mod tests {
     use super::*;
     use std::io::Read;
     use std::net::TcpStream;
+
+    #[test]
+    fn sandbox_path_accepts_inbox_files() {
+        let cwd = tempfile::tempdir().unwrap();
+        let inbox = cwd.path().join("inbox");
+        std::fs::create_dir_all(&inbox).unwrap();
+        let file = inbox.join("ok.txt");
+        std::fs::write(&file, b"hello").unwrap();
+        let resolved = resolve_sandbox_path(cwd.path().to_str().unwrap(), "inbox/ok.txt").unwrap();
+        assert_eq!(resolved, file.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn sandbox_path_accepts_outbox_files() {
+        let cwd = tempfile::tempdir().unwrap();
+        let outbox = cwd.path().join("outbox");
+        std::fs::create_dir_all(&outbox).unwrap();
+        std::fs::write(outbox.join("r.txt"), b"x").unwrap();
+        assert!(resolve_sandbox_path(cwd.path().to_str().unwrap(), "outbox/r.txt").is_ok());
+    }
+
+    #[test]
+    fn sandbox_path_rejects_dotdot_traversal() {
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cwd.path().join("inbox")).unwrap();
+        let (status, _msg) = resolve_sandbox_path(cwd.path().to_str().unwrap(), "inbox/../../etc/passwd").unwrap_err();
+        assert_eq!(status, 400);
+    }
+
+    #[test]
+    fn sandbox_path_rejects_absolute() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (status, _msg) = resolve_sandbox_path(cwd.path().to_str().unwrap(), "/etc/passwd").unwrap_err();
+        assert_eq!(status, 400);
+    }
+
+    #[test]
+    fn sandbox_path_rejects_non_sandbox_dir() {
+        let cwd = tempfile::tempdir().unwrap();
+        // Create a sibling dir + file that's INSIDE cwd but not in
+        // `inbox/` or `outbox/` — the old code would have served
+        // this; the sandbox check now refuses.
+        let secrets = cwd.path().join("secrets");
+        std::fs::create_dir_all(&secrets).unwrap();
+        std::fs::write(secrets.join("k"), b"top secret").unwrap();
+        let (status, _msg) = resolve_sandbox_path(cwd.path().to_str().unwrap(), "secrets/k").unwrap_err();
+        assert_eq!(status, 400);
+    }
+
+    #[test]
+    fn sandbox_path_rejects_symlink_out_of_sandbox() {
+        let cwd = tempfile::tempdir().unwrap();
+        let inbox = cwd.path().join("inbox");
+        std::fs::create_dir_all(&inbox).unwrap();
+        let target_outside = tempfile::tempdir().unwrap();
+        std::fs::write(target_outside.path().join("secret"), b"nope").unwrap();
+        // Symlink inbox/escape -> /tmp/.../secret
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target_outside.path().join("secret"), inbox.join("escape")).unwrap();
+            let (status, _msg) = resolve_sandbox_path(cwd.path().to_str().unwrap(), "inbox/escape").unwrap_err();
+            assert_eq!(status, 403);
+        }
+    }
+
+    #[test]
+    fn sandbox_path_rejects_empty_and_nul() {
+        let cwd = tempfile::tempdir().unwrap();
+        let dir = cwd.path().to_str().unwrap();
+        assert_eq!(resolve_sandbox_path(dir, "").unwrap_err().0, 400);
+        assert_eq!(resolve_sandbox_path(dir, "inbox/foo\0bar").unwrap_err().0, 400);
+    }
 
     fn test_state() -> Arc<Mutex<TabSnapshot>> {
         Arc::new(Mutex::new(TabSnapshot {

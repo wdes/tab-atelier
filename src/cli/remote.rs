@@ -73,10 +73,11 @@ fn usage() {
          test <label-or-id>                            connect, list remote tabs, exit\n\
          watch <label-or-id>                           follow scrollback events until Ctrl-C\n\
          attach <label-or-id> <tab-name-or-id|#idx>    interactive mirror of one remote tab\n\
-         put    <label-or-id> <local-path> [--tab T] [--remote-path P]\n\
+         put    <label-or-id> <local-path> [--tab T] [--remote-name N]\n\
                                                        upload a file into the tab's inbox/\n\
          get    <label-or-id> <remote-path> [--tab T] [-o local-path]\n\
-                                                       download a file from the tab's outbox/\n\
+                                                       download a file — remote-path MUST start\n\
+                                                       with inbox/ or outbox/ (sandboxed)\n\
          pin-cert <https-url>                          print the cert SHA-256 fingerprint\n\
          re-pin   <label-or-id>                        re-capture an endpoint's pinned cert"
     );
