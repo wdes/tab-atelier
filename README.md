@@ -57,6 +57,25 @@ A Guake-style drop-down terminal emulator for Linux (X11), built with Rust using
 
 ## Installation
 
+### Debian / Ubuntu — apt repo (recommended)
+
+```sh
+curl -fsSL https://deb.tab-atelier.wdes.eu/tab-atelier.gpg \
+    | sudo tee /usr/share/keyrings/tab-atelier.gpg > /dev/null
+echo "deb [signed-by=/usr/share/keyrings/tab-atelier.gpg] https://deb.tab-atelier.wdes.eu stable main" \
+    | sudo tee /etc/apt/sources.list.d/tab-atelier.list > /dev/null
+sudo apt update
+sudo apt install tab-atelier            # desktop / GUI
+# or:
+sudo apt install tab-atelier-headless   # display-less server variant
+```
+
+Replace `stable` with `nightly` to track `main` (versions look like `0.4.0~nightly20260527.123000-1` — the `~` makes them sort strictly **before** the next stable release per [Debian Versioning](https://wiki.debian.org/Versioning), so apt auto-downgrades-then-upgrades on the next stable bump).
+
+The two packages **conflict by design** (they both ship `/usr/bin/catbus-agent` + `happier-relay`). `apt install tab-atelier-headless` after `tab-atelier` swaps cleanly; `dpkg -i …` on both at once is what produced the file-collision error you saw on early `.deb` builds.
+
+### Build from source
+
 ```sh
 cargo build --release
 # Binary at target/release/tab-atelier
@@ -64,10 +83,11 @@ cargo build --release
 
 Requires Rust 2024 edition (rustc 1.92+).
 
-### Debian package
+### Debian package — local build
 
 ```sh
-cargo deb
+cargo deb                                         # → tab-atelier_*.deb
+cargo deb -p tab-atelier --variant headless       # → tab-atelier-headless_*.deb
 sudo apt install ./target/debian/tab-atelier_*.deb
 ```
 
