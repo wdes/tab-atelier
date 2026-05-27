@@ -84,6 +84,8 @@ Generates an `ed25519` signing key dedicated to this repo (NOT a personal key), 
 
 The public half is exported to `assets/tab-atelier-release.gpg` for reference; the same key is re-exported onto `gh-pages` by every workflow run so users can `curl` it.
 
+The script also drops a **revocation certificate** at `$XDG_CONFIG_HOME/tab-atelier/apt-signing-revocation.asc` (mode 600). Move that file off the machine — encrypted USB, password manager, printout — so a compromised laptop doesn't take the kill-switch with it. If the live key ever leaks, `gpg --import` the cert and `gpg --keyserver keys.openpgp.org --send-keys <fpr>` publishes the revocation.
+
 ### Build from source
 
 ```sh

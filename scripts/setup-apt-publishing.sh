@@ -111,6 +111,32 @@ mkdir -p "$(dirname "$PUB_PATH")"
 gpg --armor --export "$KEY_EMAIL" > "$PUB_PATH"
 ok "public key exported to $PUB_PATH"
 
+# Revocation certificate.
+#
+# GnuPG 2.1+ auto-creates one at `~/.gnupg/openpgp-revocs.d/<FPR>.rev`
+# the moment a key is generated. That file is "use only as a last
+# resort" by design — its presence on the same disk as the live
+# secret key means a laptop compromise loses BOTH. So we copy it
+# into a location the user is supposed to move off-machine, and
+# loudly say so.
+REVOKE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/tab-atelier"
+REVOKE_PATH="$REVOKE_DIR/apt-signing-revocation.asc"
+AUTO_REVOKE="$HOME/.gnupg/openpgp-revocs.d/${FPR}.rev"
+mkdir -p "$REVOKE_DIR"
+if [[ -f "$AUTO_REVOKE" ]]; then
+    cp "$AUTO_REVOKE" "$REVOKE_PATH"
+    chmod 600 "$REVOKE_PATH"
+    ok "revocation cert copied to $REVOKE_PATH (mode 600)"
+else
+    warn "no auto-generated revocation cert at $AUTO_REVOKE — falling back to interactive --gen-revoke"
+    gpg --output "$REVOKE_PATH" --gen-revoke "$KEY_EMAIL"
+    chmod 600 "$REVOKE_PATH"
+    ok "revocation cert written to $REVOKE_PATH"
+fi
+warn "MOVE $REVOKE_PATH OFF THIS MACHINE — encrypted USB / password manager / printout."
+warn "If it stays here, a laptop theft loses the live key AND the emergency stop."
+warn "To publish a revocation later: gpg --import $REVOKE_PATH && gpg --keyserver keys.openpgp.org --send-keys $FPR"
+
 # ───── repo secrets ────────────────────────────────────────────────────
 
 step "Repo secrets on $REPO_SLUG"
