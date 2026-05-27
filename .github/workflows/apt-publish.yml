@@ -103,8 +103,8 @@ jobs:
                       git -C site symbolic-ref HEAD refs/heads/gh-pages
                       git -C site remote add origin "$REMOTE"
                   fi
-                  git -C site config user.name  "github-actions[bot]"
-                  git -C site config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+                  git -C site config user.name  "Wdes Bot"
+                  git -C site config user.email "williamdes+wdes-bot@wdes.fr"
 
             - name: Drop .debs into pool/
               env:
