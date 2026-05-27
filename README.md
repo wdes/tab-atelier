@@ -48,6 +48,9 @@ A Guake-style drop-down terminal emulator for Linux (X11), built with Rust using
 **Integration**
 - HTTP API (port 7890) + TLS variant (port 7891) with token auth and QR code for remote tab management from a phone
 - `tab-atelier set-status` CLI for in-tab tools (agents, hooks, scripts) to publish thinking/waiting/error state to the desktop LED
+- `tab-atelier tabs` — ratatui live-table viewer of every running tab (mirror of the desktop's bottom bar; works from any SSH shell). `tab-atelier tabs --once` for scriptable output
+- `tab-atelier remote …` — mirror tabs from another instance, attach a sidecar terminal, transfer files (sandboxed). See [Remote tabs](#remote-tabs)
+- **Headless variant** ships as a separate `tab-atelier-headless.deb` (no gpui / x11rb / qrcode deps, 7.9 MB vs 12 MB) for servers — same HTTP API, no display required
 - Optional `happier-bridge` (off by default) republishes tab state into a bundled `happier-relay` so the [happier](https://github.com/maximegris/happier) mobile companion can view sessions, send keystrokes, and see per-tab agent state
 - Wakatime time tracking (reads API key from Zed settings)
 - Screenshots (per-tab or full app) saved as BMP
@@ -91,6 +94,16 @@ tab-atelier --read-only   # second instance, no writes
 A normal launch acquires a single-instance lock on `~/.local/state/tab-atelier/tab-atelier.lock` and exits if another normal instance is already running — concurrent writers would race each other and produce inconsistent state files.
 
 `--read-only` skips the lock so any number of read-only instances can run alongside the primary one. In that mode tab-atelier never writes anything: no `tabs.json` rewrites, no per-tab output / uptime / energy files, no preference saves, no rename-time file moves. The preferences "Save" button is visually disabled. Useful for snapshotting the running workspace from a script or for poking around without disturbing live state.
+
+### Headless variant
+
+For servers (no display, no gpui), install `tab-atelier-headless.deb` instead. Same HTTP API, same persistence files, same `set-status` / `tabs` / `remote` CLI subcommands — just no window. Ships with a systemd user unit:
+
+```sh
+systemctl --user enable --now tab-atelier-headless
+```
+
+The headless binary holds the same `tab-atelier.lock` as the GUI, so the two CANNOT run concurrently for the same user (they'd race on `tabs.json` etc.).
 
 ## Configuration
 
@@ -164,15 +177,82 @@ Selected routes:
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/tabs` | List tabs (cwd, name, preview, watts, cpu, uptime) |
+| `GET` | `/tabs` | List tabs (cwd, name, preview, watts, cpu, uptime, agent state) |
 | `GET` | `/tabs/{idx}/output` | Tab scrollback (supports `?since=N&crc=…` for delta patching) |
 | `POST` | `/tabs/{idx}/input` | Send raw bytes to the tab's PTY |
 | `POST` | `/tabs/{idx}/activate` | Switch to a tab |
 | `POST` | `/tabs/{idx}/rename` | Rename a tab |
 | `POST` | `/tabs/by-id/{tab_id}/status` | Publish agent state — see [Agent state](#agent-state) |
+| `POST` | `/tabs/{idx}/files?name=…` | Upload bytes into `<cwd>/inbox/<name>` (see [Remote tabs](#remote-tabs)) |
+| `GET` | `/tabs/{idx}/files?path=…` | Download from the tab's `inbox/` or `outbox/` sandbox |
 | `DELETE` | `/tabs/{idx}` | Close a tab |
 
 Bind addresses for both listeners are configurable in preferences (`api_addr`, `api_tls_addr`); pass `--read-only` to launch a second instance that serves the API but refuses every mutating verb.
+
+## Remote tabs
+
+`tab-atelier` can mirror tabs from another `tab-atelier` / `tab-atelier-headless` instance. Useful for keeping long-running agents on a server and driving them from the laptop, file transport included.
+
+Endpoints persist in `~/.config/tab-atelier/preferences.json` under `remote_endpoints` (each one has `label`, `url`, `token`, `cert_sha256` for TOFU pinning, `autoconnect`).
+
+### CLI subcommands
+
+```sh
+# Add a remote — captures the TLS cert fingerprint via TOFU.
+tab-atelier remote add --label colossus \
+                       --url https://colossus.lan:7891 \
+                       --token <bearer>
+
+# List + remove
+tab-atelier remote list
+tab-atelier remote remove colossus
+
+# One-shot tab list (handy for scripts)
+tab-atelier remote test colossus
+
+# Live "what's running over there" view
+tab-atelier remote watch colossus
+
+# Re-capture the cert after a renewal (Ctrl-C-safe)
+tab-atelier remote re-pin colossus
+```
+
+### Sidecar attach — drive a single remote tab from your terminal
+
+```sh
+tab-atelier remote attach colossus build       # or `#3`, or the UUID
+```
+
+The local terminal switches to raw mode. Stdin bytes → `RemoteCommand::SendInput`. Remote scrollback deltas → stdout, with SGR escapes intact (the relay re-serialises alacritty's grid as ANSI). `Ctrl-Q` detaches; `Ctrl-C` is forwarded to the remote process. Polling cadence is ~250 ms — type-then-see is noticeably slower than a local shell but workable for `cargo build` / `pytest` / agent sessions.
+
+### File transport — `put` / `get`
+
+```sh
+# Upload — lands at <remote tab cwd>/inbox/<basename>
+tab-atelier remote put colossus ./input.csv --tab build
+
+# Download — remote path MUST start with inbox/ or outbox/
+tab-atelier remote get colossus outbox/result.csv --tab build -o ./result.csv
+```
+
+**The file routes are sandboxed.** Even with a valid bearer token, a client can only:
+- write to `<tab cwd>/inbox/<basename>` (no `..`, no path separators in the name)
+- read from `<tab cwd>/inbox/…` or `<tab cwd>/outbox/…` (no `..`, no absolute paths, symlinks pointing out are 403'd)
+
+Anything else — your source tree, `~/.ssh/`, `/etc/passwd`, `.git/config` — is unreachable through this API. If you need broader file access, set up a dedicated `inbox/` symlink at agent-startup time and the agent can stash references inside it.
+
+### Cert renewal
+
+The relay rotates its self-signed cert ~30 days before expiry (see `cert_needs_renewal` in `src/api.rs`). On the next `attach` / `put` / `get` the CLI prints a warning when the live fingerprint no longer matches the pinned `cert_sha256`:
+
+```
+⚠ pinned cert fingerprint for colossus has changed.
+  pinned: <old hex>
+  live:   <new hex>
+  run `tab-atelier remote re-pin colossus` to accept the new cert.
+```
+
+The connection is allowed through (Phase 2 uses `disable_verification` on the wire) — the warning is the opt-in signal for the user to ack the rotation. Phase 3 will store the cert DER and switch to strict pinning, at which point the warning becomes a hard refuse-until-repinned.
 
 ## Agent state
 
