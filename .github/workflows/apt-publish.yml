@@ -76,14 +76,14 @@ jobs:
                   cargo deb -p tab-atelier --variant headless --locked --deb-version "${{ steps.ver.outputs.version }}"
                   ls -la target/debian/
 
-            # Pull the existing gh-pages tree (or bootstrap a fresh
-            # orphan branch on the very first run). One step instead
-            # of the previous checkout+continue-on-error+init combo,
-            # which left site/.git in a "HEAD on master" state when
-            # the branch didn't yet exist and made `git push origin
-            # gh-pages` fail with `src refspec gh-pages does not
-            # match any`.
-            - name: Bootstrap gh-pages workspace
+            # Pull the existing gh-pages tree into site/ so the
+            # next steps can prune + regenerate against it. First
+            # run on a fresh repo: the branch doesn't exist; we
+            # init an empty site/ instead. peaceiris/actions-gh-pages
+            # at the end handles the orphan-branch case for the
+            # actual push, so this step just gets the prior state
+            # in front of us.
+            - name: Fetch existing gh-pages state
               env:
                   GH_TOKEN_X: ${{ github.token }}
               run: |
@@ -93,18 +93,9 @@ jobs:
                       echo "→ gh-pages exists upstream — clone shallow"
                       git clone --depth=1 -b gh-pages --single-branch "$REMOTE" site
                   else
-                      echo "→ gh-pages does NOT exist — bootstrap orphan branch"
+                      echo "→ gh-pages does NOT exist — start with empty site/"
                       mkdir -p site
-                      git -C site init --quiet
-                      # `symbolic-ref HEAD` pins the (yet-uncreated)
-                      # branch name BEFORE any commit. Works on every
-                      # git ≥ 2.0, unlike `git init -b` which the
-                      # current Actions runner doesn't honor.
-                      git -C site symbolic-ref HEAD refs/heads/gh-pages
-                      git -C site remote add origin "$REMOTE"
                   fi
-                  git -C site config user.name  "Wdes Bot"
-                  git -C site config user.email "williamdes+wdes-bot@wdes.fr"
 
             - name: Drop .debs into pool/
               env:
@@ -183,18 +174,19 @@ jobs:
                   <p>Replace <code>stable</code> with <code>nightly</code> to track <code>main</code>. Source: <a href="https://github.com/wdes/tab-atelier">github.com/wdes/tab-atelier</a>.</p>
                   HTML
 
-            - name: Commit + push gh-pages
-              env:
-                  CHANNEL: ${{ steps.ver.outputs.channel }}
-                  VERSION: ${{ steps.ver.outputs.version }}
-              run: |
-                  cd site
-                  # user.name / user.email + remote URL are set by
-                  # the Bootstrap step.
-                  git add .
-                  if git diff --cached --quiet; then
-                      echo "(no changes)"
-                      exit 0
-                  fi
-                  git commit -m "Publish $VERSION to $CHANNEL"
-                  git push origin gh-pages
+            # peaceiris/actions-gh-pages handles the orphan branch
+            # case (first run), the commit identity, and the push.
+            # `keep_files: false` means the action REPLACES gh-pages
+            # with our `site/` tree wholesale — pruning + the prior
+            # checkout above gave us exactly the desired final
+            # state, so wipe-and-replace is the right behaviour.
+            - name: Publish to gh-pages
+              uses: peaceiris/actions-gh-pages@v4
+              with:
+                  github_token: ${{ secrets.GITHUB_TOKEN }}
+                  publish_dir: ./site
+                  publish_branch: gh-pages
+                  user_name: 'Wdes Bot'
+                  user_email: 'williamdes+wdes-bot@wdes.fr'
+                  commit_message: 'Publish ${{ steps.ver.outputs.version }} to ${{ steps.ver.outputs.channel }}'
+                  keep_files: false
