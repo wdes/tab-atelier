@@ -19,7 +19,12 @@
 set -euo pipefail
 
 REPO_SLUG="wdes/tab-atelier"
-KEY_EMAIL="tab-atelier-release@wdes.fr"
+# `+tab-atelier-deb` alias keeps the signing-key UID off the main
+# inbox and gives `gpg --search-keys` something to anchor on.
+# (GPG User IDs don't actually require an email — see README — but
+# keys.openpgp.org refuses email-less uploads, which would block
+# publishing a revocation cert later.)
+KEY_EMAIL="williamdes+tab-atelier-deb@wdes.fr"
 KEY_NAME="tab-atelier release signing"
 KEY_EXPIRE="5y"
 DOMAIN="deb.tab-atelier.wdes.eu"
