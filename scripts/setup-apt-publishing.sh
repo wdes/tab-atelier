@@ -62,13 +62,13 @@ err()  { printf '\033[31m  ✗ %s\033[0m\n' "$*" >&2; }
 # ───── prereqs ──────────────────────────────────────────────────────────
 
 step "Checking prerequisites"
-for cmd in gpg gh dig jq; do
+for cmd in gpg gh dig; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
         err "$cmd not on PATH"
         exit 1
     fi
 done
-ok "gpg / gh / dig / jq found"
+ok "gpg / gh / dig found"
 
 if ! gh auth status >/dev/null 2>&1; then
     err "gh is not authenticated. Run \`gh auth login\` first."
@@ -192,60 +192,12 @@ ok "APT_SIGNING_KEY set"
 printf '%s' "$FPR" | gh secret set APT_SIGNING_KEY_ID -R "$REPO_SLUG"
 ok "APT_SIGNING_KEY_ID set to fingerprint ${FPR:0:16}…"
 
-# ───── register key on the GH user account ─────────────────────────────
-#
-# `crazy-max/ghaction-import-gpg` configures git to sign commits
-# with this key during the apt-publish workflow. For GitHub to
-# render those commits with the green "Verified" badge it also
-# needs to know about the key under the committer's account.
-#
-# Idempotent: skip if a key with the same fingerprint is already
-# registered.
-
-step "Register public key on $GH_USER's GitHub account"
-
-# GitHub stores each GPG key as immutable — adding a UID locally
-# means we have to DELETE the previously-uploaded copy and POST
-# again. Look up our key id by fingerprint, then verify whether
-# the bot UID is present; if not, drop + re-add.
-#
-# `gh api user/gpg_keys` requires the `admin:gpg_key` token
-# scope. If the call fails we treat the response as empty and
-# fall through to the "warn + suggest refresh" branch below.
-GH_KEYS_JSON=$(gh api user/gpg_keys 2>/dev/null || echo "[]")
-if ! echo "$GH_KEYS_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
-    GH_KEYS_JSON="[]"
-fi
-GH_KEY_ROW=$(echo "$GH_KEYS_JSON" | jq --arg fpr "$FPR" '.[] | select(.key_id == ($fpr | .[-16:]))')
-GH_KEY_ID=$(printf '%s' "$GH_KEY_ROW" | jq -r '.id // empty')
-GH_KEY_HAS_BOT_UID=$(printf '%s' "$GH_KEY_ROW" \
-    | jq --arg email "$BOT_EMAIL" -r 'any(.emails[]?; .email == $email) // false')
-
-upload_gh_key() {
-    # gh api expects --input <file|->. Hand-roll the JSON because
-    # `-f key=value` doesn't tolerate newlines in armored PGP blocks.
-    jq -n --arg key "$(gpg --armor --export "$FPR")" '{armored_public_key: $key}' \
-        | gh api user/gpg_keys --method POST --input - >/dev/null
-}
-
-if [[ -n "$GH_KEY_ID" && "$GH_KEY_HAS_BOT_UID" == "true" ]]; then
-    ok "key ${FPR:0:16}… already registered on github.com/$GH_USER (with bot UID)"
-elif [[ -n "$GH_KEY_ID" ]]; then
-    echo "  Key is registered but missing the bot UID; deleting + re-adding…"
-    if gh api -X DELETE "user/gpg_keys/$GH_KEY_ID" >/dev/null 2>&1 && upload_gh_key 2>/dev/null; then
-        ok "refreshed key on github.com/$GH_USER (bot UID now present)"
-    else
-        warn "could not refresh key on github.com/$GH_USER — likely missing the 'admin:gpg_key' scope"
-        warn "Run: gh auth refresh -s admin:gpg_key   then re-run this script."
-    fi
-else
-    if upload_gh_key 2>/dev/null; then
-        ok "uploaded public key to github.com/$GH_USER (commits signed by this key will show as Verified)"
-    else
-        warn "could not upload public key to github.com/$GH_USER — likely missing the 'admin:gpg_key' scope on the gh token"
-        warn "Run: gh auth refresh -s admin:gpg_key   then re-run this script."
-    fi
-fi
+# The signing key is intentionally NOT added to the maintainer's
+# personal GitHub account. Doing so would have made the gh-pages
+# commits render with a green "Verified" badge, but it'd also
+# attach a CI-rotated bot key to the human's GH profile — a poor
+# trade. The apt InRelease signature is the canonical proof of
+# authenticity; commit-level verification is nice-to-have.
 
 # ───── GitHub Pages ───────────────────────────────────────────────────
 
