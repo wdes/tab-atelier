@@ -1,0 +1,13 @@
+<!DOCTYPE html><meta charset=utf-8><title>tab-atelier apt repo</title>
+<style>body{font-family:system-ui;max-width:42em;margin:3em auto;padding:0 1em}
+pre{background:#f4f4f4;padding:1em;border-radius:4px;overflow-x:auto}
+code{background:#f4f4f4;padding:.1em .3em;border-radius:3px}</style>
+<h1>tab-atelier apt repo</h1>
+<p>Debian / Ubuntu install:</p>
+<pre>curl -fsSL https://deb.tab-atelier.wdes.eu/tab-atelier.gpg \
+    | sudo tee /usr/share/keyrings/tab-atelier.gpg > /dev/null
+echo "deb [signed-by=/usr/share/keyrings/tab-atelier.gpg] https://deb.tab-atelier.wdes.eu stable main" \
+    | sudo tee /etc/apt/sources.list.d/tab-atelier.list > /dev/null
+sudo apt update
+sudo apt install tab-atelier            # or tab-atelier-headless</pre>
+<p>Replace <code>stable</code> with <code>nightly</code> to track <code>main</code>. Source: <a href="https://github.com/wdes/tab-atelier">github.com/wdes/tab-atelier</a>.</p>
