@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+# One-shot setup for the apt repo publishing flow:
+#
+#   1. Generate (or import) a dedicated GPG key for signing the
+#      Release file. NOT the maintainer's personal key — that'd be
+#      a single point of failure if the GitHub Actions secret leaks.
+#   2. Upload the private half + key id to repo secrets via `gh`.
+#   3. Enable GitHub Pages on the `gh-pages` branch.
+#   4. Print the DNS record the user must still add by hand.
+#
+# Idempotent: re-running detects already-configured pieces and
+# only does the missing ones. The private key never lands in a
+# named file on disk — it's piped directly into `gh secret set`.
+#
+# Usage: ./scripts/setup-apt-publishing.sh [--force-key]
+#
+# --force-key generates a fresh signing key even if one already
+# lives in this user's GPG keyring. Use after a suspected leak.
+set -euo pipefail
+
+REPO_SLUG="wdes/tab-atelier"
+KEY_EMAIL="tab-atelier-release@wdes.fr"
+KEY_NAME="tab-atelier release signing"
+KEY_EXPIRE="5y"
+DOMAIN="deb.tab-atelier.wdes.eu"
+PAGES_BRANCH="gh-pages"
+
+FORCE_KEY=0
+for arg in "$@"; do
+    case "$arg" in
+        --force-key) FORCE_KEY=1 ;;
+        -h|--help)
+            sed -n '1,/^set -e/p' "$0" | grep '^#'
+            exit 0
+            ;;
+        *)
+            echo "unknown argument: $arg" >&2
+            exit 2
+            ;;
+    esac
+done
+
+step() { printf '\n\033[1;36m→ %s\033[0m\n' "$*"; }
+ok()   { printf '\033[32m  ✓ %s\033[0m\n' "$*"; }
+warn() { printf '\033[33m  ⚠ %s\033[0m\n' "$*"; }
+err()  { printf '\033[31m  ✗ %s\033[0m\n' "$*" >&2; }
+
+# ───── prereqs ──────────────────────────────────────────────────────────
+
+step "Checking prerequisites"
+for cmd in gpg gh dig; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        err "$cmd not on PATH"
+        exit 1
+    fi
+done
+ok "gpg / gh / dig found"
+
+if ! gh auth status >/dev/null 2>&1; then
+    err "gh is not authenticated. Run \`gh auth login\` first."
+    exit 1
+fi
+GH_USER=$(gh api user --jq .login)
+ok "gh authenticated as $GH_USER"
+
+# Confirm we're pointing at the right repo. `gh repo view` against
+# REPO_SLUG fails fast if the user lacks access.
+if ! gh repo view "$REPO_SLUG" --json name >/dev/null 2>&1; then
+    err "cannot reach $REPO_SLUG with the current gh auth. Set REPO_SLUG in the script and re-run."
+    exit 1
+fi
+ok "gh has access to $REPO_SLUG"
+
+# ───── GPG signing key ─────────────────────────────────────────────────
+
+step "Signing key"
+KEY_ID=""
+if [[ $FORCE_KEY -eq 0 ]] && gpg --list-secret-keys "$KEY_EMAIL" >/dev/null 2>&1; then
+    KEY_ID="$KEY_EMAIL"
+    FPR=$(gpg --list-secret-keys --with-colons "$KEY_EMAIL" \
+        | awk -F: '/^fpr:/ { print $10; exit }')
+    ok "key for $KEY_EMAIL already in keyring (fpr ${FPR:0:16}…)"
+else
+    if [[ $FORCE_KEY -eq 1 ]] && gpg --list-secret-keys "$KEY_EMAIL" >/dev/null 2>&1; then
+        warn "--force-key: deleting existing $KEY_EMAIL key from local keyring"
+        gpg --batch --yes --delete-secret-keys "$KEY_EMAIL" >/dev/null 2>&1 || true
+        gpg --batch --yes --delete-keys "$KEY_EMAIL" >/dev/null 2>&1 || true
+    fi
+    echo "  Generating a fresh ed25519 signing key (no passphrase — it's a CI-side secret)…"
+    gpg --batch --gen-key <<EOF >/dev/null
+%no-protection
+Key-Type: EDDSA
+Key-Curve: ed25519
+Key-Usage: sign
+Name-Real: $KEY_NAME
+Name-Email: $KEY_EMAIL
+Expire-Date: $KEY_EXPIRE
+EOF
+    KEY_ID="$KEY_EMAIL"
+    FPR=$(gpg --list-secret-keys --with-colons "$KEY_EMAIL" \
+        | awk -F: '/^fpr:/ { print $10; exit }')
+    ok "generated key (fpr ${FPR:0:16}…)"
+fi
+
+# Save the public key into the repo so users can curl it during
+# install. The workflow re-exports the same key onto gh-pages on
+# every publish, but committing it under `assets/` means the source
+# repo is also a usable reference for the fingerprint.
+PUB_PATH="assets/tab-atelier-release.gpg"
+mkdir -p "$(dirname "$PUB_PATH")"
+gpg --armor --export "$KEY_EMAIL" > "$PUB_PATH"
+ok "public key exported to $PUB_PATH"
+
+# ───── repo secrets ────────────────────────────────────────────────────
+
+step "Repo secrets on $REPO_SLUG"
+
+# Pipe the private key straight into gh; never lands on disk.
+gpg --armor --export-secret-keys "$KEY_EMAIL" \
+    | gh secret set APT_SIGNING_KEY -R "$REPO_SLUG"
+ok "APT_SIGNING_KEY set"
+
+printf '%s' "$KEY_EMAIL" | gh secret set APT_SIGNING_KEY_ID -R "$REPO_SLUG"
+ok "APT_SIGNING_KEY_ID set to $KEY_EMAIL"
+
+# ───── GitHub Pages ───────────────────────────────────────────────────
+
+step "GitHub Pages on $REPO_SLUG"
+
+# `GET /repos/.../pages` returns 404 if Pages isn't enabled yet.
+if gh api "repos/$REPO_SLUG/pages" >/dev/null 2>&1; then
+    # Already enabled — PUT to make sure the source branch is right.
+    gh api -X PUT "repos/$REPO_SLUG/pages" \
+        -f "build_type=legacy" \
+        -f "source[branch]=$PAGES_BRANCH" \
+        -f "source[path]=/" \
+        >/dev/null
+    ok "Pages already enabled, source pinned to $PAGES_BRANCH:/"
+else
+    # The gh-pages branch may not exist yet; that's fine — POST
+    # creates the Pages site config now, the apt-publish workflow
+    # will create the branch on its first run.
+    if ! gh api "repos/$REPO_SLUG/branches/$PAGES_BRANCH" >/dev/null 2>&1; then
+        warn "$PAGES_BRANCH branch doesn't exist yet — the first apt-publish CI run will create it."
+        warn "Re-run this script AFTER that first run to finish the Pages setup."
+    else
+        gh api -X POST "repos/$REPO_SLUG/pages" \
+            -f "build_type=legacy" \
+            -f "source[branch]=$PAGES_BRANCH" \
+            -f "source[path]=/" \
+            >/dev/null
+        ok "Pages enabled, source = $PAGES_BRANCH:/"
+    fi
+fi
+
+# ───── custom domain ──────────────────────────────────────────────────
+
+step "Custom domain $DOMAIN"
+
+CURRENT_DOMAIN=$(gh api "repos/$REPO_SLUG/pages" --jq .cname 2>/dev/null || true)
+if [[ "$CURRENT_DOMAIN" == "$DOMAIN" ]]; then
+    ok "GitHub Pages already configured for $DOMAIN"
+else
+    # Pages picks the CNAME up from the file in gh-pages, but
+    # setting it explicitly via the API enforces HTTPS even before
+    # the branch has the file.
+    if gh api "repos/$REPO_SLUG/pages" >/dev/null 2>&1; then
+        gh api -X PUT "repos/$REPO_SLUG/pages" -f "cname=$DOMAIN" >/dev/null || \
+            warn "could not PUT cname yet (likely because the gh-pages branch is empty)"
+        ok "API-side cname set to $DOMAIN (will fully apply after the first publish)"
+    fi
+fi
+
+# Live DNS sanity check.
+RESOLVED=$(dig +short CNAME "$DOMAIN" 2>/dev/null | head -1 | sed 's/\.$//')
+EXPECTED="$GH_USER.github.io"
+if [[ "$RESOLVED" == "$EXPECTED" ]]; then
+    ok "DNS: $DOMAIN → $EXPECTED"
+else
+    warn "DNS: $DOMAIN resolves to ${RESOLVED:-<no record>}; expected $EXPECTED"
+    echo "      Add a CNAME record at your DNS provider:"
+    echo "          $DOMAIN.   CNAME   $EXPECTED."
+fi
+
+# ───── done ───────────────────────────────────────────────────────────
+
+step "Done"
+cat <<EOF
+The apt-publish workflow is now ready. Trigger it the usual way:
+
+    git push origin main      # produces a NIGHTLY build
+    git tag v0.4.1 && git push origin v0.4.1
+                              # produces a STABLE build
+
+Once gh-pages is populated, install on Debian/Ubuntu with:
+
+    curl -fsSL https://$DOMAIN/tab-atelier.gpg \\
+        | sudo tee /usr/share/keyrings/tab-atelier.gpg > /dev/null
+    echo "deb [signed-by=/usr/share/keyrings/tab-atelier.gpg] https://$DOMAIN stable main" \\
+        | sudo tee /etc/apt/sources.list.d/tab-atelier.list > /dev/null
+    sudo apt update
+    sudo apt install tab-atelier
+
+Replace 'stable' with 'nightly' to track main.
+
+Public signing key kept at $PUB_PATH for reference;
+the same key is re-exported onto gh-pages by every publish run.
+EOF
