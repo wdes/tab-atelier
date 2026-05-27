@@ -76,21 +76,35 @@ jobs:
                   cargo deb -p tab-atelier --variant headless --locked --deb-version "${{ steps.ver.outputs.version }}"
                   ls -la target/debian/
 
-            # Pull the existing gh-pages tree (or initialise a fresh
-            # orphan branch on the very first run).
-            - name: Checkout gh-pages
-              uses: actions/checkout@v6
-              with:
-                  ref: gh-pages
-                  path: site
-              continue-on-error: true
-            - name: Initialise empty gh-pages if missing
+            # Pull the existing gh-pages tree (or bootstrap a fresh
+            # orphan branch on the very first run). One step instead
+            # of the previous checkout+continue-on-error+init combo,
+            # which left site/.git in a "HEAD on master" state when
+            # the branch didn't yet exist and made `git push origin
+            # gh-pages` fail with `src refspec gh-pages does not
+            # match any`.
+            - name: Bootstrap gh-pages workspace
+              env:
+                  GH_TOKEN_X: ${{ github.token }}
               run: |
-                  if [ ! -d site/.git ]; then
-                      mkdir -p site && cd site
-                      git init -b gh-pages
-                      git remote add origin "https://github.com/${{ github.repository }}.git"
+                  REMOTE="https://x-access-token:${GH_TOKEN_X}@github.com/${{ github.repository }}.git"
+                  rm -rf site
+                  if git ls-remote --heads "$REMOTE" gh-pages | grep -q '\<gh-pages$'; then
+                      echo "→ gh-pages exists upstream — clone shallow"
+                      git clone --depth=1 -b gh-pages --single-branch "$REMOTE" site
+                  else
+                      echo "→ gh-pages does NOT exist — bootstrap orphan branch"
+                      mkdir -p site
+                      git -C site init --quiet
+                      # `symbolic-ref HEAD` pins the (yet-uncreated)
+                      # branch name BEFORE any commit. Works on every
+                      # git ≥ 2.0, unlike `git init -b` which the
+                      # current Actions runner doesn't honor.
+                      git -C site symbolic-ref HEAD refs/heads/gh-pages
+                      git -C site remote add origin "$REMOTE"
                   fi
+                  git -C site config user.name  "github-actions[bot]"
+                  git -C site config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
             - name: Drop .debs into pool/
               env:
@@ -175,8 +189,8 @@ jobs:
                   VERSION: ${{ steps.ver.outputs.version }}
               run: |
                   cd site
-                  git config user.name  "github-actions[bot]"
-                  git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+                  # user.name / user.email + remote URL are set by
+                  # the Bootstrap step.
                   git add .
                   if git diff --cached --quiet; then
                       echo "(no changes)"
