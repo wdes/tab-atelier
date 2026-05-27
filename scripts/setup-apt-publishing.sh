@@ -19,12 +19,13 @@
 set -euo pipefail
 
 REPO_SLUG="wdes/tab-atelier"
-# `+tab-atelier-deb` alias keeps the signing-key UID off the main
-# inbox and gives `gpg --search-keys` something to anchor on.
-# (GPG User IDs don't actually require an email — see README — but
-# keys.openpgp.org refuses email-less uploads, which would block
-# publishing a revocation cert later.)
-KEY_EMAIL="williamdes+tab-atelier-deb@wdes.fr"
+# RFC 4880 §5.11 lets a User ID be any UTF-8 string; apt only
+# cares about the cryptographic signature + fingerprint pinned via
+# `[signed-by=…]`. We ship the public key from
+# https://deb.tab-atelier.wdes.eu/tab-atelier.gpg so we don't need
+# `gpg --search-keys` / `keys.openpgp.org` lookup — which means no
+# email on the User ID. After key gen the script references the
+# key by FINGERPRINT everywhere, which is what GPG itself prefers.
 KEY_NAME="tab-atelier release signing"
 KEY_EXPIRE="5y"
 DOMAIN="deb.tab-atelier.wdes.eu"
@@ -79,31 +80,40 @@ ok "gh has access to $REPO_SLUG"
 # ───── GPG signing key ─────────────────────────────────────────────────
 
 step "Signing key"
-KEY_ID=""
-if [[ $FORCE_KEY -eq 0 ]] && gpg --list-secret-keys "$KEY_EMAIL" >/dev/null 2>&1; then
-    KEY_ID="$KEY_EMAIL"
-    FPR=$(gpg --list-secret-keys --with-colons "$KEY_EMAIL" \
-        | awk -F: '/^fpr:/ { print $10; exit }')
-    ok "key for $KEY_EMAIL already in keyring (fpr ${FPR:0:16}…)"
+
+# Look the key up by its User ID string. With no email on the UID
+# this is the only stable handle we have until the fingerprint is
+# captured.
+find_fpr_by_name() {
+    gpg --list-secret-keys --with-colons "$KEY_NAME" 2>/dev/null \
+        | awk -F: '/^fpr:/ { print $10; exit }'
+}
+
+FPR=$(find_fpr_by_name || true)
+if [[ -n "$FPR" && $FORCE_KEY -eq 0 ]]; then
+    ok "key '$KEY_NAME' already in keyring (fpr ${FPR:0:16}…)"
 else
-    if [[ $FORCE_KEY -eq 1 ]] && gpg --list-secret-keys "$KEY_EMAIL" >/dev/null 2>&1; then
-        warn "--force-key: deleting existing $KEY_EMAIL key from local keyring"
-        gpg --batch --yes --delete-secret-keys "$KEY_EMAIL" >/dev/null 2>&1 || true
-        gpg --batch --yes --delete-keys "$KEY_EMAIL" >/dev/null 2>&1 || true
+    if [[ -n "$FPR" && $FORCE_KEY -eq 1 ]]; then
+        warn "--force-key: deleting existing '$KEY_NAME' key from local keyring (fpr ${FPR:0:16}…)"
+        gpg --batch --yes --delete-secret-keys "$FPR" >/dev/null 2>&1 || true
+        gpg --batch --yes --delete-keys "$FPR" >/dev/null 2>&1 || true
     fi
     echo "  Generating a fresh ed25519 signing key (no passphrase — it's a CI-side secret)…"
+    # No `Name-Email` field → User ID is just `Name-Real`. Valid
+    # per RFC 4880 §5.11 and apt verifies by fingerprint anyway.
     gpg --batch --gen-key <<EOF >/dev/null
 %no-protection
 Key-Type: EDDSA
 Key-Curve: ed25519
 Key-Usage: sign
 Name-Real: $KEY_NAME
-Name-Email: $KEY_EMAIL
 Expire-Date: $KEY_EXPIRE
 EOF
-    KEY_ID="$KEY_EMAIL"
-    FPR=$(gpg --list-secret-keys --with-colons "$KEY_EMAIL" \
-        | awk -F: '/^fpr:/ { print $10; exit }')
+    FPR=$(find_fpr_by_name)
+    if [[ -z "$FPR" ]]; then
+        err "key generation appeared to succeed but no fingerprint visible — aborting"
+        exit 1
+    fi
     ok "generated key (fpr ${FPR:0:16}…)"
 fi
 
@@ -113,7 +123,7 @@ fi
 # repo is also a usable reference for the fingerprint.
 PUB_PATH="assets/tab-atelier-release.gpg"
 mkdir -p "$(dirname "$PUB_PATH")"
-gpg --armor --export "$KEY_EMAIL" > "$PUB_PATH"
+gpg --armor --export "$FPR" > "$PUB_PATH"
 ok "public key exported to $PUB_PATH"
 
 # Revocation certificate.
@@ -134,25 +144,31 @@ if [[ -f "$AUTO_REVOKE" ]]; then
     ok "revocation cert copied to $REVOKE_PATH (mode 600)"
 else
     warn "no auto-generated revocation cert at $AUTO_REVOKE — falling back to interactive --gen-revoke"
-    gpg --output "$REVOKE_PATH" --gen-revoke "$KEY_EMAIL"
+    gpg --output "$REVOKE_PATH" --gen-revoke "$FPR"
     chmod 600 "$REVOKE_PATH"
     ok "revocation cert written to $REVOKE_PATH"
 fi
 warn "MOVE $REVOKE_PATH OFF THIS MACHINE — encrypted USB / password manager / printout."
 warn "If it stays here, a laptop theft loses the live key AND the emergency stop."
-warn "To publish a revocation later: gpg --import $REVOKE_PATH && gpg --keyserver keys.openpgp.org --send-keys $FPR"
+warn "To publish a revocation later:"
+warn "    gpg --import $REVOKE_PATH"
+warn "    gpg --armor --export $FPR > tab-atelier.gpg     # contains the revocation"
+warn "Then replace tab-atelier.gpg on the gh-pages branch — apt clients re-fetch it on update."
 
 # ───── repo secrets ────────────────────────────────────────────────────
 
 step "Repo secrets on $REPO_SLUG"
 
 # Pipe the private key straight into gh; never lands on disk.
-gpg --armor --export-secret-keys "$KEY_EMAIL" \
+gpg --armor --export-secret-keys "$FPR" \
     | gh secret set APT_SIGNING_KEY -R "$REPO_SLUG"
 ok "APT_SIGNING_KEY set"
 
-printf '%s' "$KEY_EMAIL" | gh secret set APT_SIGNING_KEY_ID -R "$REPO_SLUG"
-ok "APT_SIGNING_KEY_ID set to $KEY_EMAIL"
+# Store the fingerprint (not the User ID) so the workflow can pass
+# it verbatim to `gpg --local-user` — that's an unambiguous,
+# email-independent reference.
+printf '%s' "$FPR" | gh secret set APT_SIGNING_KEY_ID -R "$REPO_SLUG"
+ok "APT_SIGNING_KEY_ID set to fingerprint ${FPR:0:16}…"
 
 # ───── GitHub Pages ───────────────────────────────────────────────────
 
