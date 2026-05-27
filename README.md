@@ -80,13 +80,13 @@ The two packages **conflict by design** (they both ship `/usr/bin/catbus-agent` 
 ./scripts/setup-apt-publishing.sh
 ```
 
-Generates an `ed25519` signing key dedicated to this repo (NOT a personal key), uploads its private half + key id to `APT_SIGNING_KEY` / `APT_SIGNING_KEY_ID` via `gh secret set` (private bytes pipe straight into `gh`, never written to disk), enables GitHub Pages on the `gh-pages` branch, and points the API-side `cname` at `deb.tab-atelier.wdes.eu`. The DNS `CNAME` record still has to be added by hand at the user's DNS provider; the script reports the expected target.
+Generates an `ed25519` signing key dedicated to this repo (NOT a personal key), uploads its private half + fingerprint to `APT_SIGNING_KEY` / `APT_SIGNING_KEY_ID` via `gh secret set` (private bytes pipe straight into `gh`, never written to disk), enables GitHub Pages on the `gh-pages` branch, and points the API-side `cname` at `deb.tab-atelier.wdes.eu`. The DNS `CNAME` record still has to be added by hand at the user's DNS provider; the script reports the expected target.
 
-The key's User ID is `tab-atelier release signing <williamdes+tab-atelier-deb@wdes.fr>`. The email is technically optional — RFC 4880 lets a User ID be any UTF-8 string, and apt only cares about the fingerprint pinned via `[signed-by=…]` — but `keys.openpgp.org` refuses uploads without one, which would block publishing a revocation cert later. The `+tab-atelier-deb` alias keeps it off the main inbox.
+The key's User ID is just `tab-atelier release signing` — **no email**. RFC 4880 §5.11 lets a User ID be any UTF-8 string, and `apt`'s `[signed-by=…]` verifies via fingerprint only (see `apt-secure(8)`). Public keyservers like `keys.openpgp.org` require an email for uploads, but we publish the public key directly at `https://deb.tab-atelier.wdes.eu/tab-atelier.gpg` so users `curl` it — no keyserver path involved. `APT_SIGNING_KEY_ID` therefore holds the 40-char fingerprint, not an email, which is what `gpg --local-user` actually wants anyway.
 
 The public half is exported to `assets/tab-atelier-release.gpg` for reference; the same key is re-exported onto `gh-pages` by every workflow run so users can `curl` it.
 
-The script also drops a **revocation certificate** at `$XDG_CONFIG_HOME/tab-atelier/apt-signing-revocation.asc` (mode 600). Move that file off the machine — encrypted USB, password manager, printout — so a compromised laptop doesn't take the kill-switch with it. If the live key ever leaks, `gpg --import` the cert and `gpg --keyserver keys.openpgp.org --send-keys <fpr>` publishes the revocation.
+The script also drops a **revocation certificate** at `$XDG_CONFIG_HOME/tab-atelier/apt-signing-revocation.asc` (mode 600). Move that file off the machine — encrypted USB, password manager, printout — so a compromised laptop doesn't take the kill-switch with it. If the live key ever leaks, `gpg --import` the cert, re-export the public key (now with the revocation signature baked in), and replace `tab-atelier.gpg` on `gh-pages`. Clients re-fetch the key on `apt update` and refuse the now-revoked signature.
 
 ### Build from source
 
