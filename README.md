@@ -74,6 +74,16 @@ Replace `stable` with `nightly` to track `main` (versions look like `0.4.0~night
 
 The two packages **conflict by design** (they both ship `/usr/bin/catbus-agent` + `happier-relay`). `apt install tab-atelier-headless` after `tab-atelier` swaps cleanly; `dpkg -i …` on both at once is what produced the file-collision error you saw on early `.deb` builds.
 
+### Setting up the apt repo (maintainer)
+
+```sh
+./scripts/setup-apt-publishing.sh
+```
+
+Generates an `ed25519` signing key dedicated to this repo (NOT a personal key), uploads its private half + key id to `APT_SIGNING_KEY` / `APT_SIGNING_KEY_ID` via `gh secret set` (private bytes pipe straight into `gh`, never written to disk), enables GitHub Pages on the `gh-pages` branch, and points the API-side `cname` at `deb.tab-atelier.wdes.eu`. The DNS `CNAME` record still has to be added by hand at the user's DNS provider; the script reports the expected target.
+
+The public half is exported to `assets/tab-atelier-release.gpg` for reference; the same key is re-exported onto `gh-pages` by every workflow run so users can `curl` it.
+
 ### Build from source
 
 ```sh
