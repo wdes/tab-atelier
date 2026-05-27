@@ -256,6 +256,52 @@ fn etag_for(bytes: &[u8]) -> String {
 /// Gzip `bytes` if the client supports it and the body is big enough
 /// for compression to be worthwhile (under ~4 KB the headers + CPU
 /// don't pay back). Returns `None` for "send the body uncompressed".
+/// Percent-decode a query value. Tolerant — unknown escapes pass
+/// through verbatim. Used by `?name=…` / `?path=…` on the file
+/// transport routes; the basename sanitiser handles the actual
+/// safety check separately.
+fn url_decode(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'+' {
+            out.push(b' ');
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Ok(hi), Ok(lo)) = (
+                u8::from_str_radix(&raw[i + 1..i + 2], 16),
+                u8::from_str_radix(&raw[i + 2..i + 3], 16),
+            )
+        {
+            out.push(hi * 16 + lo);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Strip any path separators / parent-dir refs from a candidate
+/// filename. Returns `None` for inputs that collapse to empty or
+/// contain nothing safe to use.
+fn sanitize_basename(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        return None;
+    }
+    let last = std::path::Path::new(trimmed).file_name()?.to_str()?;
+    if last.is_empty() || last == "." || last == ".." {
+        return None;
+    }
+    Some(last.to_string())
+}
+
 fn maybe_gzip(bytes: &[u8], accept_gzip: bool) -> Option<Vec<u8>> {
     const MIN_BODY: usize = 4096;
     if !accept_gzip || bytes.len() < MIN_BODY {
@@ -390,27 +436,30 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
     let method = parts[0].to_string();
     let raw_path = parts[1].to_string();
 
-    let (path, query_token, query_lines, query_since, query_crc) = if let Some((p, q)) = raw_path.split_once('?') {
-        let qt = q
-            .split('&')
-            .find_map(|pair| pair.strip_prefix("token="))
-            .map(std::string::ToString::to_string);
-        let ql = q
-            .split('&')
-            .find_map(|pair| pair.strip_prefix("lines="))
-            .and_then(|s| s.parse::<usize>().ok());
-        let qs = q
-            .split('&')
-            .find_map(|pair| pair.strip_prefix("since="))
-            .and_then(|s| s.parse::<usize>().ok());
-        let qc = q
-            .split('&')
-            .find_map(|pair| pair.strip_prefix("crc="))
-            .and_then(|s| u32::from_str_radix(s, 16).ok());
-        (p.to_string(), qt, ql, qs, qc)
-    } else {
-        (raw_path, None, None, None, None)
-    };
+    let (path, query_token, query_lines, query_since, query_crc, query_name, query_path) =
+        if let Some((p, q)) = raw_path.split_once('?') {
+            let qt = q
+                .split('&')
+                .find_map(|pair| pair.strip_prefix("token="))
+                .map(std::string::ToString::to_string);
+            let ql = q
+                .split('&')
+                .find_map(|pair| pair.strip_prefix("lines="))
+                .and_then(|s| s.parse::<usize>().ok());
+            let qs = q
+                .split('&')
+                .find_map(|pair| pair.strip_prefix("since="))
+                .and_then(|s| s.parse::<usize>().ok());
+            let qc = q
+                .split('&')
+                .find_map(|pair| pair.strip_prefix("crc="))
+                .and_then(|s| u32::from_str_radix(s, 16).ok());
+            let qn = q.split('&').find_map(|pair| pair.strip_prefix("name=")).map(url_decode);
+            let qp = q.split('&').find_map(|pair| pair.strip_prefix("path=")).map(url_decode);
+            (p.to_string(), qt, ql, qs, qc, qn, qp)
+        } else {
+            (raw_path, None, None, None, None, None, None)
+        };
 
     // Read the body (if any) before dropping the reader so we can write the
     // response back through `stream` without a borrow conflict.
@@ -906,6 +955,116 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             });
             drop(snap);
             respond_json(stream, 200, r#"{"ok":true}"#);
+        }
+        ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/files") => {
+            // Upload file body into the tab's `cwd/inbox/<name>`.
+            // `?name=<basename>` is required and is sanitised to a
+            // path-component (no `..`, no separators) so a malicious
+            // remote can't write outside `inbox/`.
+            let idx_str = &p["/tabs/".len()..p.len() - "/files".len()];
+            let Ok(idx) = idx_str.parse::<usize>() else {
+                error_json(stream, 404, "invalid tab index");
+                return;
+            };
+            let snap = state.lock().unwrap();
+            let Some(t) = snap.tabs.get(idx) else {
+                drop(snap);
+                error_json(stream, 404, "tab index out of range");
+                return;
+            };
+            let cwd = t.cwd.clone();
+            drop(snap);
+            let Some(cwd) = cwd else {
+                error_json(stream, 400, "tab has no known cwd");
+                return;
+            };
+            let Some(name) = query_name.as_deref().and_then(sanitize_basename) else {
+                error_json(stream, 400, "missing or invalid ?name=<basename>");
+                return;
+            };
+            let inbox = std::path::Path::new(&cwd).join("inbox");
+            if let Err(e) = std::fs::create_dir_all(&inbox) {
+                error_json(stream, 500, &format!("mkdir inbox: {e}"));
+                return;
+            }
+            let dest = inbox.join(&name);
+            if let Err(e) = std::fs::write(&dest, &body_bytes) {
+                error_json(stream, 500, &format!("write {}: {e}", dest.display()));
+                return;
+            }
+            info!("API: stored {} bytes in {}", body_bytes.len(), dest.display());
+            let body = serde_json::to_string(&serde_json::json!({
+                "path": dest.to_string_lossy(),
+                "bytes": body_bytes.len(),
+            }))
+            .unwrap_or_default();
+            respond_json(stream, 200, &body);
+        }
+        ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/files") => {
+            // Download a file relative to the tab's cwd.
+            // `?path=<relative path>` rejects `..` traversal but
+            // otherwise lets any cwd-rooted path through.
+            let idx_str = &p["/tabs/".len()..p.len() - "/files".len()];
+            let Ok(idx) = idx_str.parse::<usize>() else {
+                error_json(stream, 404, "invalid tab index");
+                return;
+            };
+            let snap = state.lock().unwrap();
+            let Some(t) = snap.tabs.get(idx) else {
+                drop(snap);
+                error_json(stream, 404, "tab index out of range");
+                return;
+            };
+            let cwd = t.cwd.clone();
+            drop(snap);
+            let Some(cwd) = cwd else {
+                error_json(stream, 400, "tab has no known cwd");
+                return;
+            };
+            let Some(raw_path) = query_path.as_deref() else {
+                error_json(stream, 400, "missing ?path=<relative-path>");
+                return;
+            };
+            // Reject anything that escapes the tab's cwd. We compare
+            // canonicalised paths so symlinks pointing outside the
+            // sandbox don't slip through.
+            let candidate = std::path::Path::new(&cwd).join(raw_path);
+            let canonical = match candidate.canonicalize() {
+                Ok(p) => p,
+                Err(e) => {
+                    error_json(stream, 404, &format!("read {}: {e}", candidate.display()));
+                    return;
+                }
+            };
+            let cwd_canonical = std::path::Path::new(&cwd).canonicalize().unwrap_or_else(|_| cwd.into());
+            if !canonical.starts_with(&cwd_canonical) {
+                error_json(stream, 403, "path escapes the tab's cwd");
+                return;
+            }
+            let bytes = match std::fs::read(&canonical) {
+                Ok(b) => b,
+                Err(e) => {
+                    error_json(stream, 404, &format!("read {}: {e}", canonical.display()));
+                    return;
+                }
+            };
+            info!("API: served {} bytes from {}", bytes.len(), canonical.display());
+            respond_with_etag(
+                stream,
+                200,
+                "application/octet-stream",
+                &bytes,
+                accept_gzip,
+                if_none_match.as_deref(),
+                &format!(
+                    "Content-Disposition: attachment; filename=\"{}\"\r\n",
+                    canonical
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("download")
+                        .replace('"', "")
+                ),
+            );
         }
         ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/input") => {
             let idx_str = &p["/tabs/".len()..p.len() - "/input".len()];

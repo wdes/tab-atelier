@@ -17,7 +17,11 @@
 //! tab-atelier remote remove <label-or-id>
 //! tab-atelier remote test   <label-or-id>            # one-shot tab list
 //! tab-atelier remote watch  <label-or-id>            # follow until Ctrl-C
+//! tab-atelier remote attach <label-or-id> <tab>      # interactive mirror (sidecar)
+//! tab-atelier remote put    <label-or-id> <local-path> [--tab T]
+//! tab-atelier remote get    <label-or-id> <remote-path> [--tab T] [-o local-path]
 //! tab-atelier remote pin-cert <https-url>            # print fingerprint
+//! tab-atelier remote re-pin <label-or-id>            # re-capture pinned cert
 //! ```
 
 use std::time::Duration;
@@ -37,7 +41,11 @@ pub fn run(args: &[String]) -> i32 {
         "remove" | "rm" => cmd_remove(rest),
         "test" => cmd_test(rest, false),
         "watch" => cmd_test(rest, true),
+        "attach" => attach::run(rest),
+        "put" => files::cmd_put(rest),
+        "get" => files::cmd_get(rest),
         "pin-cert" | "pin" => cmd_pin_cert(rest),
+        "re-pin" | "repin" => cmd_repin(rest),
         "-h" | "--help" | "help" => {
             usage();
             0
@@ -50,9 +58,13 @@ pub fn run(args: &[String]) -> i32 {
     }
 }
 
+mod attach;
+mod files;
+mod resolver;
+
 fn usage() {
     eprintln!(
-        "usage: tab-atelier remote <list|add|remove|test|watch|pin-cert> [args]\n\
+        "usage: tab-atelier remote <list|add|remove|test|watch|attach|put|get|pin-cert|re-pin> [args]\n\
          \n\
          list                                          list configured endpoints\n\
          add --label L --url U --token T [--no-pin] [--autoconnect]\n\
@@ -60,7 +72,13 @@ fn usage() {
          remove <label-or-id>                          drop one\n\
          test <label-or-id>                            connect, list remote tabs, exit\n\
          watch <label-or-id>                           follow scrollback events until Ctrl-C\n\
-         pin-cert <https-url>                          print the cert SHA-256 fingerprint"
+         attach <label-or-id> <tab-name-or-id|#idx>    interactive mirror of one remote tab\n\
+         put    <label-or-id> <local-path> [--tab T] [--remote-path P]\n\
+                                                       upload a file into the tab's inbox/\n\
+         get    <label-or-id> <remote-path> [--tab T] [-o local-path]\n\
+                                                       download a file from the tab's outbox/\n\
+         pin-cert <https-url>                          print the cert SHA-256 fingerprint\n\
+         re-pin   <label-or-id>                        re-capture an endpoint's pinned cert"
     );
 }
 
@@ -303,6 +321,45 @@ fn cmd_test(args: &[String], watch: bool) -> i32 {
         return 1;
     }
     0
+}
+
+fn cmd_repin(args: &[String]) -> i32 {
+    let Some(key) = args.first() else {
+        eprintln!("usage: tab-atelier remote re-pin <label-or-id>");
+        return 2;
+    };
+    let mut prefs = load_preferences(&platform::config_dir());
+    let Some(ep) = prefs
+        .remote_endpoints
+        .iter_mut()
+        .find(|e| e.label.eq_ignore_ascii_case(key) || e.id == *key)
+    else {
+        eprintln!("tab-atelier remote re-pin: no endpoint matched {key:?}");
+        return 1;
+    };
+    if !ep.url.starts_with("https://") {
+        eprintln!("tab-atelier remote re-pin: endpoint {key:?} is plain HTTP — nothing to pin");
+        return 1;
+    }
+    match fetch_cert_fingerprint(&ep.url) {
+        Ok(fp) => {
+            if fp.eq_ignore_ascii_case(&ep.cert_sha256) {
+                println!("✓ fingerprint unchanged: {fp}");
+            } else {
+                println!("⚠ fingerprint changed");
+                println!("  old: {}", ep.cert_sha256);
+                println!("  new: {fp}");
+                ep.cert_sha256 = fp;
+                save_preferences(&platform::config_dir(), &prefs);
+                println!("✓ updated");
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("tab-atelier remote re-pin: {e}");
+            1
+        }
+    }
 }
 
 fn cmd_pin_cert(args: &[String]) -> i32 {
