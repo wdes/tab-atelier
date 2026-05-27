@@ -1,0 +1,186 @@
+name: Publish apt repo
+
+# Two channels:
+#  * `stable`  — populated when a `v*` tag is pushed. The package
+#    version is whatever Cargo.toml says (the `release.yml` tag flow
+#    is expected to bump that to the release version).
+#  * `nightly` — populated on every push to `main`. The package
+#    version is rewritten on the fly to
+#        <base>~nightly<UTC YYYYMMDD>.<UTC HHMMSS>-1
+#    `~` is the Debian pre-release separator (Debian Versioning
+#    wiki) so e.g. `0.4.0~nightly20260527.123000` sorts strictly
+#    BEFORE `0.4.0`. That gives users a "track main" channel that
+#    auto-downgrades-and-upgrades when a stable lands.
+#
+# Single output: a Debian "pool" repo on the `gh-pages` branch,
+# served from https://deb.tab-atelier.wdes.eu/ (CNAME → GH Pages).
+# Signed with the key whose private half lives in the
+# `APT_SIGNING_KEY` repo secret.
+
+on:
+    push:
+        branches: [main]
+        tags: ['v*']
+
+permissions:
+    contents: write
+
+env:
+    RUST_VERSION: "1.95.0"
+
+jobs:
+    publish:
+        name: Build .debs + publish to gh-pages
+        runs-on: ubuntu-latest
+        # Skip if the commit is a `[skip apt]` chore (e.g. README-only
+        # tweaks from the release workflow itself).
+        if: ${{ !contains(github.event.head_commit.message, '[skip apt]') }}
+        steps:
+            - uses: actions/checkout@v6
+              with:
+                  fetch-depth: 0
+            - name: Decide channel + version
+              id: ver
+              run: |
+                  if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+                      CHANNEL=stable
+                      VERSION="${GITHUB_REF#refs/tags/v}"
+                  else
+                      CHANNEL=nightly
+                      BASE=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2 | sed 's/-dev$//')
+                      DATE=$(date -u +%Y%m%d.%H%M%S)
+                      VERSION="${BASE}~nightly${DATE}-1"
+                  fi
+                  echo "channel=$CHANNEL" >> $GITHUB_OUTPUT
+                  echo "version=$VERSION" >> $GITHUB_OUTPUT
+                  echo "→ publishing $VERSION to $CHANNEL"
+
+            - name: Install system dependencies
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y --no-install-recommends \
+                      libvulkan-dev libwayland-dev libxkbcommon-dev \
+                      libxkbcommon-x11-dev libx11-dev libxcb1-dev \
+                      libxcb-render0-dev libxcb-shm0-dev libxcb-xkb-dev \
+                      libfontconfig-dev libfreetype-dev \
+                      apt-utils gnupg
+            - uses: dtolnay/rust-toolchain@stable
+              with:
+                  toolchain: ${{ env.RUST_VERSION }}
+            - uses: Swatinem/rust-cache@v2
+
+            - name: Build .deb (both variants)
+              run: |
+                  cargo install cargo-deb --locked
+                  cargo deb -p tab-atelier --locked --deb-version "${{ steps.ver.outputs.version }}"
+                  cargo deb -p tab-atelier --variant headless --locked --deb-version "${{ steps.ver.outputs.version }}"
+                  ls -la target/debian/
+
+            # Pull the existing gh-pages tree (or initialise a fresh
+            # orphan branch on the very first run).
+            - name: Checkout gh-pages
+              uses: actions/checkout@v6
+              with:
+                  ref: gh-pages
+                  path: site
+              continue-on-error: true
+            - name: Initialise empty gh-pages if missing
+              run: |
+                  if [ ! -d site/.git ]; then
+                      mkdir -p site && cd site
+                      git init -b gh-pages
+                      git remote add origin "https://github.com/${{ github.repository }}.git"
+                  fi
+
+            - name: Drop .debs into pool/
+              env:
+                  CHANNEL: ${{ steps.ver.outputs.channel }}
+              run: |
+                  cd site
+                  mkdir -p pool/$CHANNEL/main/t/tab-atelier
+                  cp ../target/debian/*.deb pool/$CHANNEL/main/t/tab-atelier/
+                  # Cap the pool at the 10 most recent .debs per package
+                  # so the repo doesn't balloon forever. Sort by mtime
+                  # then prune the tail.
+                  for pkg in tab-atelier tab-atelier-headless; do
+                      ls -1t pool/$CHANNEL/main/t/tab-atelier/${pkg}_*.deb 2>/dev/null \
+                          | tail -n +11 | xargs -r rm -f
+                  done
+
+            - name: Regenerate Packages + Release
+              env:
+                  CHANNEL: ${{ steps.ver.outputs.channel }}
+              run: |
+                  cd site
+                  mkdir -p dists/$CHANNEL/main/binary-amd64
+                  apt-ftparchive --arch amd64 packages pool/$CHANNEL/ \
+                      > dists/$CHANNEL/main/binary-amd64/Packages
+                  gzip -9 --force --keep dists/$CHANNEL/main/binary-amd64/Packages
+                  cat > apt-ftparchive-$CHANNEL.conf <<EOF
+                  APT::FTPArchive::Release::Origin "tab-atelier";
+                  APT::FTPArchive::Release::Label "tab-atelier";
+                  APT::FTPArchive::Release::Suite "$CHANNEL";
+                  APT::FTPArchive::Release::Codename "$CHANNEL";
+                  APT::FTPArchive::Release::Architectures "amd64";
+                  APT::FTPArchive::Release::Components "main";
+                  APT::FTPArchive::Release::Description "tab-atelier $CHANNEL channel";
+                  EOF
+                  apt-ftparchive -c apt-ftparchive-$CHANNEL.conf release \
+                      dists/$CHANNEL/ > dists/$CHANNEL/Release
+                  rm apt-ftparchive-$CHANNEL.conf
+
+            - name: Sign Release
+              env:
+                  CHANNEL: ${{ steps.ver.outputs.channel }}
+                  GPG_KEY:    ${{ secrets.APT_SIGNING_KEY }}
+                  GPG_KEY_ID: ${{ secrets.APT_SIGNING_KEY_ID }}
+              run: |
+                  echo "$GPG_KEY" | gpg --batch --import
+                  cd site
+                  gpg --batch --yes --local-user "$GPG_KEY_ID" \
+                      --output dists/$CHANNEL/Release.gpg \
+                      --detach-sign dists/$CHANNEL/Release
+                  gpg --batch --yes --local-user "$GPG_KEY_ID" --clearsign \
+                      --output dists/$CHANNEL/InRelease \
+                      dists/$CHANNEL/Release
+                  # Public key is committed once so users can fetch it
+                  # with curl. Overwrite on every run so a re-key
+                  # propagates automatically.
+                  gpg --batch --yes --armor --export "$GPG_KEY_ID" \
+                      > tab-atelier.gpg
+
+            - name: Write CNAME + landing page
+              run: |
+                  cd site
+                  echo "deb.tab-atelier.wdes.eu" > CNAME
+                  cat > index.html <<'HTML'
+                  <!DOCTYPE html><meta charset=utf-8><title>tab-atelier apt repo</title>
+                  <style>body{font-family:system-ui;max-width:42em;margin:3em auto;padding:0 1em}
+                  pre{background:#f4f4f4;padding:1em;border-radius:4px;overflow-x:auto}
+                  code{background:#f4f4f4;padding:.1em .3em;border-radius:3px}</style>
+                  <h1>tab-atelier apt repo</h1>
+                  <p>Debian / Ubuntu install:</p>
+                  <pre>curl -fsSL https://deb.tab-atelier.wdes.eu/tab-atelier.gpg \
+                      | sudo tee /usr/share/keyrings/tab-atelier.gpg > /dev/null
+                  echo "deb [signed-by=/usr/share/keyrings/tab-atelier.gpg] https://deb.tab-atelier.wdes.eu stable main" \
+                      | sudo tee /etc/apt/sources.list.d/tab-atelier.list > /dev/null
+                  sudo apt update
+                  sudo apt install tab-atelier            # or tab-atelier-headless</pre>
+                  <p>Replace <code>stable</code> with <code>nightly</code> to track <code>main</code>. Source: <a href="https://github.com/wdes/tab-atelier">github.com/wdes/tab-atelier</a>.</p>
+                  HTML
+
+            - name: Commit + push gh-pages
+              env:
+                  CHANNEL: ${{ steps.ver.outputs.channel }}
+                  VERSION: ${{ steps.ver.outputs.version }}
+              run: |
+                  cd site
+                  git config user.name  "github-actions[bot]"
+                  git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+                  git add .
+                  if git diff --cached --quiet; then
+                      echo "(no changes)"
+                      exit 0
+                  fi
+                  git commit -m "Publish $VERSION to $CHANNEL"
+                  git push origin gh-pages

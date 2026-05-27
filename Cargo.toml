@@ -133,6 +133,15 @@ priority = "optional"
 # rebuilds; the deb always wants it.
 features = ["happier-bridge"]
 depends = "libc6, libgcc-s1, libfreetype6, libxkbcommon0, libxkbcommon-x11-0, libxcb1, libxcb-xkb1"
+# Desktop and headless ship the same `catbus-agent` and
+# `happier-relay` helper binaries in `/usr/bin/`, so they can't both
+# be installed at once. `Conflicts:` makes apt refuse the second
+# install with a clean message instead of letting dpkg unpack-then-
+# crash on a colliding path. `Replaces:` is the matching half so a
+# user who installed one and wants to switch can `apt install
+# tab-atelier-headless` and apt does the swap.
+conflicts = "tab-atelier-headless"
+replaces = "tab-atelier-headless"
 maintainer = "William Desportes <williamdes@wdes.fr>"
 extended-description = "A Guake-style drop-down terminal emulator built with alacritty_terminal and gpui. Features tabbed terminals, i18n (English/French), power monitoring, screenshots, remote control via QR code, and Wakatime integration."
 assets = [
@@ -170,6 +179,10 @@ name = "tab-atelier-headless"
 features = ["headless", "happier-bridge", "energy"]
 default-features = false
 depends = "libc6, libgcc-s1"
+# Mirror of the default variant — see the comment on
+# `[package.metadata.deb].conflicts`. apt picks one or the other.
+conflicts = "tab-atelier"
+replaces = "tab-atelier"
 extended-description = "Display-less companion to tab-atelier. Restores tabs from tabs.json, spawns their PTYs, and runs the same local HTTP/TLS API + happier-bridge as the desktop GUI — without any X11 / gpui dependency. Designed for servers, CI runners, and remote shells where the mobile/web remote should still see the same set of named tabs."
 assets = [
     ["target/release/tab-atelier-headless", "/usr/bin/", "755"],
