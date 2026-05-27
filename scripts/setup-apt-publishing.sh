@@ -24,9 +24,17 @@ REPO_SLUG="wdes/tab-atelier"
 # `[signed-by=…]`. We ship the public key from
 # https://deb.tab-atelier.wdes.eu/tab-atelier.gpg so we don't need
 # `gpg --search-keys` / `keys.openpgp.org` lookup — which means no
-# email on the User ID. After key gen the script references the
-# key by FINGERPRINT everywhere, which is what GPG itself prefers.
+# email on the PRIMARY User ID. After key gen the script
+# references the key by FINGERPRINT everywhere, which is what GPG
+# itself prefers.
 KEY_NAME="tab-atelier release signing"
+# Second User ID matching the gh-pages committer identity. The
+# `crazy-max/ghaction-import-gpg` action refuses to configure
+# git-signing unless the committer email matches one of the key's
+# UIDs; this UID exists purely to satisfy that check (apt and
+# the keyserver flow ignore it).
+BOT_NAME="Wdes Bot"
+BOT_EMAIL="williamdes+wdes-bot@wdes.fr"
 KEY_EXPIRE="5y"
 DOMAIN="deb.tab-atelier.wdes.eu"
 PAGES_BRANCH="gh-pages"
@@ -117,6 +125,20 @@ EOF
     ok "generated key (fpr ${FPR:0:16}…)"
 fi
 
+# Ensure the bot User ID exists on the key. crazy-max's
+# ghaction-import-gpg enforces a committer-email/UID match before
+# it'll configure git signing; this UID exists for that check.
+# `--quick-add-uid` is idempotent at the protocol level but
+# *adds duplicates* if invoked twice — so check first.
+BOT_UID="$BOT_NAME <$BOT_EMAIL>"
+if gpg --list-keys --with-colons "$FPR" 2>/dev/null \
+        | awk -F: -v want="$BOT_UID" '/^uid:/ { if ($10 == want) found=1 } END { exit found ? 0 : 1 }'; then
+    ok "key already carries UID '$BOT_UID'"
+else
+    gpg --batch --yes --quick-add-uid "$FPR" "$BOT_UID"
+    ok "added UID '$BOT_UID' to key ${FPR:0:16}…"
+fi
+
 # Save the public key into the repo so users can curl it during
 # install. The workflow re-exports the same key onto gh-pages on
 # every publish, but committing it under `assets/` means the source
@@ -181,16 +203,43 @@ ok "APT_SIGNING_KEY_ID set to fingerprint ${FPR:0:16}…"
 # registered.
 
 step "Register public key on $GH_USER's GitHub account"
-if gh api user/gpg_keys --jq '.[].raw_key' 2>/dev/null \
-        | gpg --show-keys --with-colons 2>/dev/null \
-        | awk -F: -v fpr="$FPR" '/^fpr:/ { if ($10 == fpr) found=1 } END { exit found ? 0 : 1 }'; then
-    ok "key ${FPR:0:16}… already registered on github.com/$GH_USER"
+
+# GitHub stores each GPG key as immutable — adding a UID locally
+# means we have to DELETE the previously-uploaded copy and POST
+# again. Look up our key id by fingerprint, then verify whether
+# the bot UID is present; if not, drop + re-add.
+#
+# `gh api user/gpg_keys` requires the `admin:gpg_key` token
+# scope. If the call fails we treat the response as empty and
+# fall through to the "warn + suggest refresh" branch below.
+GH_KEYS_JSON=$(gh api user/gpg_keys 2>/dev/null || echo "[]")
+if ! echo "$GH_KEYS_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
+    GH_KEYS_JSON="[]"
+fi
+GH_KEY_ROW=$(echo "$GH_KEYS_JSON" | jq --arg fpr "$FPR" '.[] | select(.key_id == ($fpr | .[-16:]))')
+GH_KEY_ID=$(printf '%s' "$GH_KEY_ROW" | jq -r '.id // empty')
+GH_KEY_HAS_BOT_UID=$(printf '%s' "$GH_KEY_ROW" \
+    | jq --arg email "$BOT_EMAIL" -r 'any(.emails[]?; .email == $email) // false')
+
+upload_gh_key() {
+    # gh api expects --input <file|->. Hand-roll the JSON because
+    # `-f key=value` doesn't tolerate newlines in armored PGP blocks.
+    jq -n --arg key "$(gpg --armor --export "$FPR")" '{armored_public_key: $key}' \
+        | gh api user/gpg_keys --method POST --input - >/dev/null
+}
+
+if [[ -n "$GH_KEY_ID" && "$GH_KEY_HAS_BOT_UID" == "true" ]]; then
+    ok "key ${FPR:0:16}… already registered on github.com/$GH_USER (with bot UID)"
+elif [[ -n "$GH_KEY_ID" ]]; then
+    echo "  Key is registered but missing the bot UID; deleting + re-adding…"
+    if gh api -X DELETE "user/gpg_keys/$GH_KEY_ID" >/dev/null 2>&1 && upload_gh_key 2>/dev/null; then
+        ok "refreshed key on github.com/$GH_USER (bot UID now present)"
+    else
+        warn "could not refresh key on github.com/$GH_USER — likely missing the 'admin:gpg_key' scope"
+        warn "Run: gh auth refresh -s admin:gpg_key   then re-run this script."
+    fi
 else
-    # gh api expects --input <file|->. We hand-roll the JSON
-    # because `-f key=value` doesn't tolerate newlines in armored
-    # GPG blocks.
-    if jq -n --arg key "$(gpg --armor --export "$FPR")" '{armored_public_key: $key}' \
-            | gh api user/gpg_keys --method POST --input - >/dev/null 2>&1; then
+    if upload_gh_key 2>/dev/null; then
         ok "uploaded public key to github.com/$GH_USER (commits signed by this key will show as Verified)"
     else
         warn "could not upload public key to github.com/$GH_USER — likely missing the 'admin:gpg_key' scope on the gh token"
