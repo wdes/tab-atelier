@@ -40,7 +40,7 @@ use crate::save_tab_energy;
 use crate::{
     AgentStateSnapshot, DEFAULT_API_ADDR, DEFAULT_API_TLS_ADDR, DEFAULT_HAPPIER_RELAY_ADDR, SHUTDOWN_REQUESTED,
     SavedState, TabState, crc32, default_tab_id, load_preferences, load_state_with_outputs, save_state,
-    save_tab_output, save_tab_tokens, save_tab_uptime,
+    save_tab_output, save_tab_uptime,
 };
 
 const INITIAL_COLS: usize = 80;
@@ -229,7 +229,14 @@ fn spawn_pty_tab(
             return None;
         }
     };
+    #[cfg(unix)]
     let pid = pty.child().id();
+    // ConPTY's Pty doesn't expose the child the way the Unix one does.
+    // Every PID consumer (catbus, energy, /proc cwd) is disabled on
+    // Windows, so a sentinel keeps the build going until a real ConPTY
+    // child-PID lookup is wired up.
+    #[cfg(windows)]
+    let pid = 0u32;
     let config = Config {
         scrolling_history: 10_000,
         ..Config::default()
@@ -651,7 +658,7 @@ fn persist(
             if let Some(session) = crate::catbus_agent::find_session(tab.pid)
                 && let Some(usage) = crate::catbus_agent::read_session_tokens(&session)
             {
-                save_tab_tokens(&state_base, &tab.name, &usage);
+                crate::save_tab_tokens(&state_base, &tab.name, &usage);
             }
         }
     }
