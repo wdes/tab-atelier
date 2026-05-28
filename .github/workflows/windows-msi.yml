@@ -89,7 +89,12 @@ jobs:
       - name: Publish MSI as a release asset (raw, not zipped)
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'windows-latest' }}
+          # Rolling builds use the 'windows-rolling' tag (NOT
+          # 'windows-latest', which a pre-draft run already published as
+          # an immutable release that can no longer take assets). Created
+          # as a draft from the start, it is never auto-published, so
+          # later runs can keep refreshing its asset.
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'windows-rolling' }}
           name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'Windows headless (rolling build)' }}
           prerelease: ${{ !startsWith(github.ref, 'refs/tags/v') }}
           draft: true
