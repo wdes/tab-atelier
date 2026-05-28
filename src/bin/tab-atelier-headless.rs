@@ -55,6 +55,16 @@ fn main() {
         std::process::exit(1);
     }
 
+    // When the Service Control Manager launches us (the MSI-installed
+    // Windows service), run under the dispatcher — which owns the
+    // daemon loop and returns when the service is stopped — then exit.
+    // A normal console launch returns false here and falls through to
+    // the console path below.
+    #[cfg(windows)]
+    if tab_atelier::win_service::try_run_as_service() {
+        return;
+    }
+
     let _ = ctrlc::set_handler(|| {
         SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
     });
