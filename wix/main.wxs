@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="windows-1252"?>
+<!--
+  WiX 3 source for the tab-atelier-headless MSI.
+
+  Built on a Windows runner by .github/workflows/windows-msi.yml, which
+  pre-builds the binaries with
+    cargo build --release -p tab-atelier \
+        --no-default-features --features headless,happier-bridge \
+        --bin tab-atelier-headless
+    cargo build --release -p happier-relay
+  then invokes `cargo wix --no-build`. The `catbus` and `energy`
+  features are intentionally off (Linux-only: /proc + UNIX sockets and
+  /sys powercap respectively), so this MSI ships only the two
+  cross-platform binaries.
+
+  This v1 installs the binaries to Program Files and puts the folder on
+  the system PATH. Running the daemon as a Windows Service (the analogue
+  of the systemd unit) is a follow-up — tab-atelier-headless is a plain
+  console app today and would need SCM integration first.
+
+  cargo-wix supplies these preprocessor variables:
+    $(var.Version)            product version (overridable via --install-version)
+    $(var.CargoTargetBinDir)  directory holding the built .exe files
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product
+    Id="*"
+    Name="tab-atelier-headless"
+    UpgradeCode="de89554f-ff28-4a56-bed7-3c3319c0c2ea"
+    Language="1033"
+    Codepage="1252"
+    Version="$(var.Version)"
+    Manufacturer="William Desportes">
+
+    <Package
+      Id="*"
+      Keywords="Installer"
+      Description="tab-atelier headless tab daemon"
+      Manufacturer="William Desportes"
+      InstallerVersion="450"
+      Languages="1033"
+      Compressed="yes"
+      InstallScope="perMachine"
+      SummaryCodepage="1252" />
+
+    <MajorUpgrade
+      Schedule="afterInstallInitialize"
+      DowngradeErrorMessage="A newer version of tab-atelier-headless is already installed. Setup will now exit." />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="APPLICATIONFOLDER" Name="tab-atelier">
+          <Component Id="HeadlessExe" Guid="*">
+            <File
+              Id="TabAtelierHeadlessExe"
+              Name="tab-atelier-headless.exe"
+              Source="$(var.CargoTargetBinDir)\tab-atelier-headless.exe"
+              KeyPath="yes" />
+          </Component>
+          <Component Id="RelayExe" Guid="*">
+            <File
+              Id="HappierRelayExe"
+              Name="happier-relay.exe"
+              Source="$(var.CargoTargetBinDir)\happier-relay.exe"
+              KeyPath="yes" />
+          </Component>
+          <!-- Put the install dir on the system PATH so both binaries
+               are runnable from any terminal. -->
+          <Component Id="PathEntry" Guid="*">
+            <CreateFolder />
+            <Environment
+              Id="UpdatePath"
+              Name="PATH"
+              Value="[APPLICATIONFOLDER]"
+              Permanent="no"
+              Part="last"
+              Action="set"
+              System="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+    </Directory>
+
+    <Feature Id="MainFeature" Title="tab-atelier-headless" Level="1">
+      <ComponentRef Id="HeadlessExe" />
+      <ComponentRef Id="RelayExe" />
+      <ComponentRef Id="PathEntry" />
+    </Feature>
+  </Product>
+</Wix>

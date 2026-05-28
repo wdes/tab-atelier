@@ -1,0 +1,88 @@
+name: windows-msi
+
+# Builds the headless Windows binaries and packages them into an MSI.
+# This is the verification loop for the Windows port: the build step
+# below is the first place the cross-platform code is actually compiled
+# for windows-msvc, so portability breakages surface here.
+#
+# Run it on demand (Actions tab -> windows-msi -> Run workflow) for fast
+# iteration, or push a vX.Y.Z tag to also attach the MSI to the release.
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write # only needed for the release-attach step on tags
+
+jobs:
+  msi:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable, MSVC)
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Compute MSI version
+        shell: bash
+        run: |
+          # MSI ProductVersion must be numeric (x.y.z); the Cargo version
+          # is "0.4.0-dev", so derive from the tag or fall back.
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "MSI_VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_ENV"
+          else
+            echo "MSI_VERSION=0.4.0" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build headless binaries
+        shell: bash
+        run: |
+          # Explicit -p so the Linux-only catbus-agent workspace member
+          # (in default-members) is NOT built. catbus + energy features
+          # are off: both are Linux-only (/proc + AF_UNIX, /sys powercap).
+          cargo build --release -p tab-atelier \
+            --no-default-features --features headless,happier-bridge \
+            --bin tab-atelier-headless
+          cargo build --release -p happier-relay
+
+      - name: Install WiX 3 toolset
+        shell: pwsh
+        run: |
+          # cargo-wix drives WiX 3 (candle/light); pull the standalone
+          # binaries and put them on PATH. Bump the tag if WiX moves.
+          $url = "https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip"
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\wix.zip"
+          Expand-Archive "$env:RUNNER_TEMP\wix.zip" -DestinationPath "$env:RUNNER_TEMP\wix"
+          "$env:RUNNER_TEMP\wix" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Install cargo-wix
+        run: cargo install cargo-wix --version "^0.3" --locked
+
+      - name: Build MSI
+        shell: bash
+        run: |
+          # --no-build: reuse the binaries compiled above (so the feature
+          #   flags stick); cargo-wix would otherwise rebuild with default
+          #   features and pull in the GUI/gpui stack.
+          cargo wix --no-build --nocapture \
+            --package tab-atelier \
+            --install-version "${MSI_VERSION}" \
+            --output "target/wix/tab-atelier-headless-${MSI_VERSION}-x86_64.msi"
+
+      - name: Upload MSI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tab-atelier-headless-msi
+          path: target/wix/*.msi
+          if-no-files-found: error
+
+      - name: Attach MSI to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/wix/*.msi
