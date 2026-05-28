@@ -113,9 +113,18 @@
             <File
               Id="TabAtelierUrl"
               Name="tab-atelier.url"
-              Source="assets\windows\tab-atelier.url"
-              KeyPath="yes" />
+              Source="assets\windows\tab-atelier.url" />
             <RemoveFolder Id="RemoveAppMenuFolder" On="uninstall" />
+            <!-- ICE38: a component installing into the user profile
+                 (Start Menu) must use an HKCU registry value as its
+                 KeyPath, not the file. Standard WiX shortcut pattern. -->
+            <RegistryValue
+              Root="HKCU"
+              Key="Software\tab-atelier"
+              Name="StartMenuShortcut"
+              Type="integer"
+              Value="1"
+              KeyPath="yes" />
           </Component>
         </Directory>
       </Directory>
