@@ -109,7 +109,9 @@
            the way launching the daemon exe directly does. -->
       <Directory Id="ProgramMenuFolder">
         <Directory Id="AppMenuFolder" Name="tab-atelier">
-          <Component Id="StartMenuShortcut" Guid="*">
+          <!-- Explicit GUID required: this component mixes a File and a
+               RegistryValue keypath, so WiX can't auto-generate one. -->
+          <Component Id="StartMenuShortcut" Guid="9d507611-ade1-4318-9a76-2d975fd3b4ad">
             <File
               Id="TabAtelierUrl"
               Name="tab-atelier.url"
