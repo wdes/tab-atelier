@@ -80,11 +80,18 @@ jobs:
       # publish it as a release asset instead — release assets are
       # served raw. A manual dispatch updates a rolling "windows-latest"
       # prerelease; a vX.Y.Z tag publishes to that version's release.
+      # draft: true is required because this repo has immutable releases
+      # enabled — GitHub only accepts asset uploads while a release is
+      # still a draft. The draft is downloadable by maintainers; click
+      # "Publish" to make it public (which then bakes the asset in
+      # immutably). A version tag produces that version's draft release;
+      # a manual dispatch refreshes the rolling "windows-latest" draft.
       - name: Publish MSI as a release asset (raw, not zipped)
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'windows-latest' }}
           name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'Windows headless (rolling build)' }}
           prerelease: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+          draft: true
           files: target/wix/*.msi
           fail_on_unmatched_files: true
