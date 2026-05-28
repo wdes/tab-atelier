@@ -65,8 +65,10 @@
               KeyPath="yes" />
           </Component>
           <!-- Put the install dir on the system PATH so both binaries
-               are runnable from any terminal. -->
-          <Component Id="PathEntry" Guid="*">
+               are runnable from any terminal. Needs an explicit GUID:
+               it has no File keypath (Environment + CreateFolder only),
+               so WiX cannot auto-generate one. -->
+          <Component Id="PathEntry" Guid="eccf247c-a6cd-4fbb-9c34-6dc02c56863f">
             <CreateFolder />
             <Environment
               Id="UpdatePath"
