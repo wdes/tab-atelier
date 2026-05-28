@@ -661,6 +661,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 "",
             );
         }
+        #[cfg(feature = "catbus")]
         ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/catbus") => {
             // Lightweight metadata endpoint — "does this tab have a
             // detectable agent session (Claude Code TUI or
@@ -693,6 +694,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 None => error_json(stream, 404, "no agent session under this tab"),
             }
         }
+        #[cfg(feature = "catbus")]
         ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/catbus/message") => {
             // Forward a user prompt to the tab's catbus-agent over
             // its UNIX socket. Sync — we block here until the agent
@@ -741,6 +743,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 Err(e) => error_json(stream, 502, &format!("agent socket: {e}")),
             }
         }
+        #[cfg(feature = "catbus")]
         ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/catbus/messages") => {
             // Parsed conversation. Skips meta entries (permission
             // mode, file snapshots). Returns the full message list;

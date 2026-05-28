@@ -1,0 +1,19 @@
+#!/bin/sh
+# prerm for tab-atelier-headless. Stops the running unit before the
+# binary is removed so we don't leave an orphan process holding
+# /usr/bin/tab-atelier-headless open.
+set -e
+
+UNIT=tab-atelier-headless.service
+
+case "$1" in
+  remove|upgrade|deconfigure)
+    if [ -d /run/systemd/system ]; then
+      deb-systemd-invoke stop "$UNIT" >/dev/null || true
+    fi
+    ;;
+  failed-upgrade)
+    ;;
+esac
+
+exit 0
