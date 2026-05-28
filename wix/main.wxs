@@ -58,9 +58,15 @@
               KeyPath="yes" />
             <!-- Register + run as a background Windows service (no
                  console window). The exe detects the SCM launch via
-                 win_service.rs and runs under the dispatcher. Runs as
-                 LocalSystem for now; a lower-privilege account (the
-                 analogue of the Linux service user) is a follow-up. -->
+                 win_service.rs and runs under the dispatcher.
+
+                 Runs as the built-in low-privilege LocalService account
+                 (the Windows analogue of the Linux service user) rather
+                 than LocalSystem: no password, no account to create, and
+                 it already holds the "log on as a service" right. Its
+                 per-service profile under
+                 C:\Windows\ServiceProfiles\LocalService backs the
+                 %APPDATA% / %USERPROFILE% paths the daemon writes to. -->
             <ServiceInstall
               Id="HeadlessServiceInstall"
               Name="tab-atelier-headless"
@@ -69,6 +75,7 @@
               Type="ownProcess"
               Start="auto"
               ErrorControl="normal"
+              Account="NT AUTHORITY\LocalService"
               Vital="yes" />
             <ServiceControl
               Id="HeadlessServiceControl"
