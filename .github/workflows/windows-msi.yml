@@ -74,15 +74,17 @@ jobs:
             --install-version "${MSI_VERSION}" \
             --output "target/wix/tab-atelier-headless-${MSI_VERSION}-x86_64.msi"
 
-      - name: Upload MSI artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: tab-atelier-headless-msi
-          path: target/wix/*.msi
-          if-no-files-found: error
-
-      - name: Attach MSI to release
-        if: startsWith(github.ref, 'refs/tags/v')
+      # GitHub workflow artifacts are ALWAYS wrapped in a .zip on
+      # download (actions/upload-artifact has no "archive: false"
+      # option). To hand out a directly-runnable, un-zipped .msi we
+      # publish it as a release asset instead — release assets are
+      # served raw. A manual dispatch updates a rolling "windows-latest"
+      # prerelease; a vX.Y.Z tag publishes to that version's release.
+      - name: Publish MSI as a release asset (raw, not zipped)
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'windows-latest' }}
+          name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'Windows headless (rolling build)' }}
+          prerelease: ${{ !startsWith(github.ref, 'refs/tags/v') }}
           files: target/wix/*.msi
+          fail_on_unmatched_files: true

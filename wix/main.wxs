@@ -56,6 +56,27 @@
               Name="tab-atelier-headless.exe"
               Source="$(var.CargoTargetBinDir)\tab-atelier-headless.exe"
               KeyPath="yes" />
+            <!-- Register + run as a background Windows service (no
+                 console window). The exe detects the SCM launch via
+                 win_service.rs and runs under the dispatcher. Runs as
+                 LocalSystem for now; a lower-privilege account (the
+                 analogue of the Linux service user) is a follow-up. -->
+            <ServiceInstall
+              Id="HeadlessServiceInstall"
+              Name="tab-atelier-headless"
+              DisplayName="tab-atelier headless tab daemon"
+              Description="Restores tabs and serves the local HTTP/TLS API plus happier-bridge."
+              Type="ownProcess"
+              Start="auto"
+              ErrorControl="normal"
+              Vital="yes" />
+            <ServiceControl
+              Id="HeadlessServiceControl"
+              Name="tab-atelier-headless"
+              Start="install"
+              Stop="both"
+              Remove="uninstall"
+              Wait="yes" />
           </Component>
           <Component Id="RelayExe" Guid="*">
             <File
@@ -81,12 +102,30 @@
           </Component>
         </Directory>
       </Directory>
+
+      <!-- Start Menu entry. A .url Internet Shortcut (installed as a
+           plain file) opens the local API in the default browser, so
+           there is a Programs entry that doesn't pop a console window
+           the way launching the daemon exe directly does. -->
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="AppMenuFolder" Name="tab-atelier">
+          <Component Id="StartMenuShortcut" Guid="*">
+            <File
+              Id="TabAtelierUrl"
+              Name="tab-atelier.url"
+              Source="assets\windows\tab-atelier.url"
+              KeyPath="yes" />
+            <RemoveFolder Id="RemoveAppMenuFolder" On="uninstall" />
+          </Component>
+        </Directory>
+      </Directory>
     </Directory>
 
     <Feature Id="MainFeature" Title="tab-atelier-headless" Level="1">
       <ComponentRef Id="HeadlessExe" />
       <ComponentRef Id="RelayExe" />
       <ComponentRef Id="PathEntry" />
+      <ComponentRef Id="StartMenuShortcut" />
     </Feature>
   </Product>
 </Wix>

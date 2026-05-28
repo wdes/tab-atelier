@@ -139,6 +139,10 @@ tempfile = "3"
 # is untouched.
 [target.'cfg(windows)'.dependencies]
 getrandom = "0.2"
+# SCM integration so the installed MSI can run the daemon as a Windows
+# service (no console window). The crate's FFI dispatcher macro needs
+# `unsafe`, confined to src/win_service.rs via an explicit allow.
+windows-service = "0.6"
 
 [package.metadata.deb]
 section = "x11"
