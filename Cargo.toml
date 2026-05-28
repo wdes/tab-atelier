@@ -38,12 +38,20 @@ required-features = ["headless"]
 [features]
 default = ["gui", "energy"]
 # Desktop GUI build: gpui + x11rb (hotkeys + screenshot) + qrcode.
-gui = ["dep:gpui", "dep:x11rb", "dep:qrcode"]
+# Pulls in `catbus` because the GUI's "Switch to catbus" flow and the
+# per-tab token/agent readouts call into that module unconditionally.
+gui = ["dep:gpui", "dep:x11rb", "dep:qrcode", "catbus"]
 # Display-less variant: only the API server + PTY-driven tab restore
 # + happier-bridge spawn. Selected with `--no-default-features
 # --features headless[,...]`.
 headless = []
 energy = ["dep:wattaouille"]
+# catbus-agent integration: per-tab Claude session detection (walks
+# /proc), token-usage sidecars, and the `/tabs/N/catbus*` API endpoints
+# that talk to the agent over a UNIX socket. Hard Linux dependency
+# (/proc + AF_UNIX), so it's a separate feature that the Windows build
+# leaves off. Implied by `gui`; included in the Linux headless .deb.
+catbus = []
 # Opt-in bridge that publishes every tab as a happier artifact against a
 # user-provided relay (`--happier-relay-url`). Off by default to keep
 # the regular build slim — when enabled, pulls in ed25519 / base64 /
@@ -125,6 +133,13 @@ http = "1"
 gpui = { version = "0.2", default-features = false, features = ["x11", "test-support"] }
 tempfile = "3"
 
+# Windows has no /dev/urandom; getrandom wraps BCryptGenRandom so
+# platform::random_bytes() has a real CSPRNG. Already present
+# transitively (rand, uuid) — gated to Windows so the Linux dep graph
+# is untouched.
+[target.'cfg(windows)'.dependencies]
+getrandom = "0.2"
+
 [package.metadata.deb]
 section = "x11"
 priority = "optional"
@@ -159,26 +174,34 @@ assets = [
     # Application Autostart). Defaults to enabled; users can untick.
     ["assets/tab-atelier-autostart.desktop", "/etc/xdg/autostart/tab-atelier.desktop", "644"],
     ["assets/tab-atelier.svg", "/usr/share/icons/hicolor/scalable/apps/tab-atelier.svg", "644"],
+    # System-wide preferences fallback. `lib.rs::load_preferences()`
+    # reads this when no per-user $HOME/.local/tab-atelier/preferences.json
+    # exists — so an admin can pre-seed bind addresses for a fresh
+    # install. Listed in `conf-files` below so dpkg treats local
+    # edits the policy-correct way on upgrade.
+    ["assets/preferences.default.json", "/etc/tab-atelier/preferences.json", "644"],
     ["README.md", "/usr/share/doc/tab-atelier/", "644"],
     ["LICENSE", "/usr/share/doc/tab-atelier/", "644"],
 ]
 # Per debian-policy §10.7.2, conffiles are files in /etc that dpkg
-# treats as user-modifiable. tab-atelier ships none — every piece of
-# user state lives under $XDG_CONFIG_HOME / $XDG_STATE_HOME in the
-# user's home directory, so dpkg has no business managing it. Setting
-# this to [] makes that intentional rather than implicit.
-conf-files = []
+# treats as user-modifiable: on upgrade, dpkg prompts the admin if
+# both we and they changed the file. The autostart .desktop entry
+# above is deliberately NOT a conffile — admins shouldn't be editing
+# it. `preferences.json` IS, so admins can tune defaults and keep
+# those edits across upgrades.
+conf-files = ["/etc/tab-atelier/preferences.json"]
 
 # Headless variant — produces tab-atelier-headless_<version>.deb.
 # Built with `cargo deb -p tab-atelier --variant headless`. Uses
-# `--no-default-features --features headless,happier-bridge,energy`
+# `--no-default-features --features headless,happier-bridge,energy,catbus`
 # under the hood so the binary depends only on libc / libgcc and
 # never pulls in libfreetype / libxkbcommon / libxcb / libqrcode.
+# `catbus` stays on for the Linux .deb; a future Windows headless build
+# is the only configuration that drops it.
 [package.metadata.deb.variants.headless]
 name = "tab-atelier-headless"
-features = ["headless", "happier-bridge", "energy"]
+features = ["headless", "happier-bridge", "energy", "catbus"]
 default-features = false
-depends = "libc6, libgcc-s1"
 # Mirror of the default variant — see the comment on
 # `[package.metadata.deb].conflicts`. apt picks one or the other.
 conflicts = "tab-atelier"
@@ -188,10 +211,30 @@ assets = [
     ["target/release/tab-atelier-headless", "/usr/bin/", "755"],
     ["target/release/catbus-agent", "/usr/bin/", "755"],
     ["target/release/happier-relay", "/usr/bin/", "755"],
-    # Systemd user unit so `systemctl --user enable --now
-    # tab-atelier-headless` is the only thing the user has to run
-    # after installing the deb.
-    ["assets/tab-atelier-headless.service", "/usr/lib/systemd/user/", "644"],
+    # Systemd *system* unit — runs as the unprivileged `tab-atelier`
+    # service account (created by the postinst). State lives under
+    # /var/lib/tab-atelier via the unit's StateDirectory=. Designed for
+    # unattended boxes (Proxmox VMs, build runners) where no human is
+    # logged in to start a `--user` unit.
+    ["assets/tab-atelier-headless.service", "/usr/lib/systemd/system/", "644"],
+    # Same system-wide preferences fallback as the desktop variant —
+    # see the comment over there. Particularly useful for the
+    # headless box where there's no GUI Preferences dialog to write
+    # the per-user file.
+    ["assets/preferences.default.json", "/etc/tab-atelier/preferences.json", "644"],
     ["README.md", "/usr/share/doc/tab-atelier-headless/", "644"],
     ["LICENSE", "/usr/share/doc/tab-atelier-headless/", "644"],
 ]
+# Service-account lifecycle (adduser/deluser) and unit enable/start
+# are handled by these scripts; cargo-deb installs them as the deb's
+# maintainer scripts with mode 0755.
+maintainer-scripts = "assets/headless-debian/"
+# `adduser` for the `tab-atelier` service account in postinst.
+# `init-system-helpers` is essential but listed explicitly to make
+# the deb-systemd-helper / deb-systemd-invoke dependency obvious.
+depends = "libc6, libgcc-s1, adduser, init-system-helpers"
+# Mirror the default variant: the shipped preferences.json fallback
+# is a real conffile so admin edits survive `apt upgrade`. Listed
+# explicitly because cargo-deb variants don't always inherit
+# `conf-files`.
+conf-files = ["/etc/tab-atelier/preferences.json"]

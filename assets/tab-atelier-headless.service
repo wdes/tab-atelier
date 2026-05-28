@@ -3,9 +3,67 @@ Description=tab-atelier headless tab daemon
 After=network.target
 
 [Service]
+Type=simple
 ExecStart=/usr/bin/tab-atelier-headless
 Restart=on-failure
+RestartSec=2s
+
+User=tab-atelier
+Group=tab-atelier
+
+# Pin HOME into the state dir so platform::config_dir() / state_base_dir()
+# land at /var/lib/tab-atelier/.{config,local/state} — under our own
+# StateDirectory, never /root or /home.
+Environment=HOME=/var/lib/tab-atelier
 Environment=RUST_LOG=tab_atelier=info
 
+# systemd creates /var/lib/tab-atelier, chowns it to the service user,
+# and persists it across restarts (only wiped on dpkg `purge` via postrm).
+StateDirectory=tab-atelier
+StateDirectoryMode=0750
+UMask=0077
+
+# --- Hardening ---
+# Privilege containment
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=true
+
+# Filesystem
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# NOTE: PrivateDevices=true would mask /dev/ptmx + /dev/pts and break
+# every PTY this daemon opens. Leave it off and rely on the rest of
+# the protections for the kernel/device attack surface.
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+
+# Network — TCP only (happier-relay is loopback, API binds INADDR_ANY).
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# Namespaces / IPC / keyring
+RestrictNamespaces=true
+RestrictRealtime=true
+RemoveIPC=true
+KeyringMode=private
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+
+# Allowlist with the standard service-syscall baseline, then carve
+# out the dangerous groups. @system-service already includes the
+# openpty / fork / exec / mmap calls this daemon needs.
+SystemCallFilter=@system-service
+SystemCallFilter=~@clock @cpu-emulation @debug @module @mount @obsolete @privileged @raw-io @reboot @resources @swap @keyring @pkey
+SystemCallErrorNumber=EPERM
+
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target

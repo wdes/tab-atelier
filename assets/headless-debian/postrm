@@ -1,0 +1,44 @@
+#!/bin/sh
+# postrm for tab-atelier-headless.
+#
+#   remove → mask the unit, leave state + user in place (admin may
+#            reinstall).
+#   purge  → delete the service account and wipe /var/lib/tab-atelier.
+set -e
+
+UNIT=tab-atelier-headless.service
+SVC_USER=tab-atelier
+SVC_HOME=/var/lib/tab-atelier
+
+case "$1" in
+  remove)
+    if [ -d /run/systemd/system ]; then
+      systemctl --system daemon-reload >/dev/null || true
+    fi
+    deb-systemd-helper mask "$UNIT" >/dev/null || true
+    ;;
+
+  purge)
+    if [ -d /run/systemd/system ]; then
+      systemctl --system daemon-reload >/dev/null || true
+    fi
+    deb-systemd-helper purge "$UNIT" >/dev/null || true
+    deb-systemd-helper unmask "$UNIT" >/dev/null || true
+
+    if getent passwd "$SVC_USER" >/dev/null; then
+      deluser --quiet --system "$SVC_USER" >/dev/null 2>&1 || true
+    fi
+    if getent group "$SVC_USER" >/dev/null; then
+      delgroup --quiet --system --only-if-empty "$SVC_USER" >/dev/null 2>&1 || true
+    fi
+
+    # Wipe state. Mirrors debian-policy §6.8: only purge removes
+    # state files outside /etc.
+    rm -rf "$SVC_HOME"
+    ;;
+
+  upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+    ;;
+esac
+
+exit 0

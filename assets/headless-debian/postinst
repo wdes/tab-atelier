@@ -1,0 +1,99 @@
+#!/bin/sh
+# postinst for tab-atelier-headless — runs as root.
+#
+# cargo-deb has no `debian/dirs` equivalent, and StateDirectory= only
+# materialises /var/lib/tab-atelier when the unit actually starts. We
+# `install -d` it here so the directory exists with correct owner +
+# mode the moment the .deb is unpacked, even if the admin chose not
+# to enable the service yet.
+
+set -e
+
+UNIT=tab-atelier-headless.service
+SVC_USER=tab-atelier
+SVC_HOME=/var/lib/tab-atelier
+
+case "$1" in
+  configure)
+    # 1. Service account. --system keeps the UID in the system range
+    #    and skips password / aging. --no-create-home because we hand
+    #    the directory ourselves below (and StateDirectory= would
+    #    chown-clobber a pre-existing one anyway).
+    if ! getent passwd "$SVC_USER" >/dev/null; then
+      adduser --system --group \
+              --home "$SVC_HOME" --no-create-home \
+              --shell /usr/sbin/nologin \
+              --gecos "tab-atelier headless daemon" \
+              "$SVC_USER" >/dev/null
+    fi
+
+    # 2. Equivalent of debian/dirs: pre-create the state dir so the
+    #    daemon can write tabs.json / happier-bridge.key on first run
+    #    even if a sysadmin runs it manually for debugging.
+    install -d -o "$SVC_USER" -g "$SVC_USER" -m 0750 "$SVC_HOME"
+
+    # 3. systemd integration via the standard helpers (provided by
+    #    init-system-helpers, which we depend on explicitly in
+    #    Cargo.toml).
+    deb-systemd-helper unmask "$UNIT" >/dev/null || true
+    if deb-systemd-helper --quiet was-enabled "$UNIT"; then
+      deb-systemd-helper enable "$UNIT" >/dev/null || true
+    else
+      deb-systemd-helper update-state "$UNIT" >/dev/null || true
+    fi
+    if [ -d /run/systemd/system ]; then
+      systemctl --system daemon-reload >/dev/null || true
+      deb-systemd-invoke start "$UNIT" >/dev/null || true
+    fi
+
+    # 4. Cheat-sheet — printed once on install / upgrade. Keep it
+    #    short; the only thing worse than no docs is wall-of-text
+    #    docs nobody reads.
+    cat <<'EOF'
+
+==> tab-atelier-headless installed.
+
+  Service control
+    systemctl status tab-atelier-headless
+    systemctl restart tab-atelier-headless
+    journalctl -u tab-atelier-headless -f
+
+  Where things live (owned by tab-atelier:tab-atelier, mode 0750)
+    state:     /var/lib/tab-atelier/.local/state/tab-atelier
+    config:    /var/lib/tab-atelier/.config           (signing keys, secrets)
+    relay log: /var/lib/tab-atelier/.local/state/tab-atelier/happier-relay.log
+
+  System-wide defaults (dpkg conffile — edit then restart the unit):
+    /etc/tab-atelier/preferences.json
+    Per-user file at /var/lib/tab-atelier/.local/tab-atelier/preferences.json
+    overrides it; the GUI Preferences dialog writes there, the daemon
+    falls back to /etc when no per-user file exists.
+
+  Interacting with the daemon — there is NO TUI in the headless variant.
+  Pick one:
+
+    a) HTTP API (plain, loopback or LAN)
+         curl http://127.0.0.1:7890/tabs
+         curl http://127.0.0.1:7890/tabs/0/output
+         curl -X POST http://127.0.0.1:7890/tabs \
+              -H 'content-type: application/json' \
+              -d '{"name":"work"}'
+         curl -X POST http://127.0.0.1:7890/tabs/0/input \
+              -H 'content-type: application/json' \
+              -d '{"data":"ls\n"}'
+
+    b) HTTPS API (self-signed cert generated on first boot)
+         curl -k https://127.0.0.1:7891/tabs
+
+    c) Mobile / web client via the bundled happier-relay
+         relay base:   https://127.0.0.1:7892
+         point your tab-atelier mobile/web client at that URL.
+
+EOF
+    ;;
+
+  abort-upgrade|abort-remove|abort-deconfigure)
+    ;;
+esac
+
+exit 0

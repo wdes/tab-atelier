@@ -646,6 +646,7 @@ fn persist(
                 }
             }
         }
+        #[cfg(feature = "catbus")]
         for tab in tabs.iter() {
             if let Some(session) = crate::catbus_agent::find_session(tab.pid)
                 && let Some(usage) = crate::catbus_agent::read_session_tokens(&session)
@@ -722,6 +723,7 @@ fn drain_pending(
 
     // Working-subprocess sweep — same logic as the GUI tick.
     let now = Instant::now();
+    #[cfg(feature = "catbus")]
     for tab in tabs.iter_mut() {
         if tab.agent_kind.is_none() {
             continue;
@@ -754,6 +756,7 @@ fn drain_pending(
     }
 
     // Process-presence sweep: clear agent attachment when CLI is gone.
+    #[cfg(feature = "catbus")]
     for tab in tabs.iter_mut() {
         if tab.agent_kind.is_some() && !crate::catbus_agent::has_agent_descendant(tab.pid) {
             tab.agent_state = None;

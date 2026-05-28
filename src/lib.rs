@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 pub(crate) mod api;
 #[cfg(feature = "gui")]
 pub mod app;
+#[cfg(feature = "catbus")]
 pub(crate) mod catbus_agent;
 pub mod cli;
 #[cfg(feature = "happier-bridge")]
@@ -683,6 +684,13 @@ pub const DEFAULT_API_ADDR: &str = "0.0.0.0:7890";
 pub const DEFAULT_API_TLS_ADDR: &str = "0.0.0.0:7891";
 pub const DEFAULT_HAPPIER_RELAY_ADDR: &str = "127.0.0.1:7892";
 
+/// System-wide preferences file shipped by the .deb as a dpkg-managed
+/// conffile. `load_preferences()` reads this as a fallback when the
+/// per-user file is absent or unparsable, so an admin can set defaults
+/// (bind addresses, relay address) without each user having to create
+/// their own `preferences.json`. Per-user settings always win.
+pub const SYSTEM_PREFERENCES_PATH: &str = "/etc/tab-atelier/preferences.json";
+
 /// Hex-encoded SHA-256 of a remote's TLS cert, captured without
 /// validating anything (trust-on-first-use).
 ///
@@ -1264,11 +1272,19 @@ pub fn keycode_label(keycode: u8) -> String {
 
 #[must_use]
 pub fn load_preferences(config_base: &std::path::Path) -> Preferences {
-    let path = config_dir(config_base).join("preferences.json");
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|data| serde_json::from_str(&data).ok())
-        .unwrap_or_default()
+    let user_path = config_dir(config_base).join("preferences.json");
+    if let Some(prefs) = read_preferences_file(&user_path) {
+        return prefs;
+    }
+    if let Some(prefs) = read_preferences_file(std::path::Path::new(SYSTEM_PREFERENCES_PATH)) {
+        return prefs;
+    }
+    Preferences::default()
+}
+
+fn read_preferences_file(path: &std::path::Path) -> Option<Preferences> {
+    let data = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&data).ok()
 }
 
 pub fn save_preferences(config_base: &std::path::Path, prefs: &Preferences) {
