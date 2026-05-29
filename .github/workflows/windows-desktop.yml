@@ -1,0 +1,37 @@
+name: windows-desktop
+
+# Probe + (eventually) build the DESKTOP GUI variant for Windows.
+#
+# Step 1 (now): `cargo check` the gui feature on windows-msvc. This is
+# the feasibility gate — it compiles gpui (whose published 0.2 crate may
+# or may not support Windows) and our gui-gated code, surfacing where it
+# breaks without a full build/MSI. Once it's green, this workflow grows
+# the WiX packaging like windows-msi.yml.
+#
+# energy is left off (power.rs reads /sys, Linux-only). catbus is pulled
+# in by the gui feature today and uses /proc + AF_UNIX, so the check is
+# expected to flag it until that coupling is broken on Windows.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust (stable, MSVC)
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo check — desktop GUI on Windows
+        shell: bash
+        run: |
+          cargo check --release -p tab-atelier \
+            --no-default-features --features gui \
+            --bin tab-atelier
