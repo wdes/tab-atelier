@@ -84,7 +84,9 @@ needless_pass_by_ref_mut = "allow"
 [dependencies]
 alacritty_terminal = "0.26"
 env_logger = "0.11"
-gpui = { version = "0.2", default-features = false, features = ["x11"], optional = true }
+# gpui's windowing backend is platform-specific, so it's declared in the
+# per-target tables below (x11 feature on Linux; the auto-selected
+# Windows backend with no feature on Windows) rather than here.
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -137,12 +139,20 @@ tempfile = "3"
 # platform::random_bytes() has a real CSPRNG. Already present
 # transitively (rand, uuid) — gated to Windows so the Linux dep graph
 # is untouched.
+# gpui with the X11 backend — Linux desktop build only.
+[target.'cfg(target_os = "linux")'.dependencies]
+gpui = { version = "0.2", default-features = false, features = ["x11"], optional = true }
+
 [target.'cfg(windows)'.dependencies]
 getrandom = "0.2"
 # SCM integration so the installed MSI can run the daemon as a Windows
 # service (no console window). The crate's FFI dispatcher macro needs
 # `unsafe`, confined to src/win_service.rs via an explicit allow.
 windows-service = "0.6"
+# gpui with no backend feature → gpui auto-selects its Windows (DirectX)
+# backend. Whether the published 0.2 crate actually supports Windows is
+# what the windows-desktop probe build verifies.
+gpui = { version = "0.2", default-features = false, optional = true }
 
 [package.metadata.deb]
 section = "x11"
