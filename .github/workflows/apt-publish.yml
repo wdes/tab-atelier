@@ -24,6 +24,7 @@ on:
 
 permissions:
     contents: write
+    actions: read # download the latest windows-msi artifact for /windows/
 
 env:
     RUST_VERSION: "1.95.0"
@@ -112,6 +113,49 @@ jobs:
                           | tail -n +11 | xargs -r rm -f
                   done
 
+            # Windows MSIs are built on a windows runner by
+            # windows-msi.yml and can't be produced here. Pull the .msi
+            # from the most recent successful run into site/windows/ and
+            # regenerate that folder's index. The gh-pages clone above
+            # already preserved any previously-published MSIs, so if no
+            # fresh artifact is found the existing set just carries over.
+            - name: Add Windows MSI builds + index
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  cd site
+                  mkdir -p windows
+                  RUN_ID=$(gh run list --repo "$GITHUB_REPOSITORY" \
+                      --workflow=windows-msi.yml --status=success \
+                      -L 1 --json databaseId --jq '.[0].databaseId // empty')
+                  if [ -n "$RUN_ID" ]; then
+                      echo "→ pulling MSI from windows-msi run $RUN_ID"
+                      rm -rf ../win-tmp && mkdir -p ../win-tmp
+                      if gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" -D ../win-tmp; then
+                          find ../win-tmp -name '*.msi' -exec cp -f {} windows/ \;
+                      fi
+                      rm -rf ../win-tmp
+                  else
+                      echo "→ no successful windows-msi run yet; keeping existing MSIs"
+                  fi
+                  # Cap at the 10 most recent MSIs.
+                  ls -1t windows/*.msi 2>/dev/null | tail -n +11 | xargs -r rm -f
+                  # Regenerate the folder index (newest first).
+                  {
+                      echo '<!DOCTYPE html><meta charset=utf-8><title>tab-atelier Windows builds</title>'
+                      echo '<style>body{font-family:system-ui;max-width:42em;margin:3em auto;padding:0 1em}'
+                      echo 'code{background:#f4f4f4;padding:.1em .3em;border-radius:3px}</style>'
+                      echo '<h1>tab-atelier Windows builds</h1>'
+                      echo '<p>Headless daemon MSI installers (<code>tab-atelier-headless</code> + <code>happier-relay</code>), newest first. Each filename carries the commit short SHA.</p>'
+                      echo '<ul>'
+                      for f in $(ls -1t windows/*.msi 2>/dev/null); do
+                          bn=$(basename "$f")
+                          sz=$(du -h "$f" | cut -f1)
+                          echo "<li><a href=\"$bn\">$bn</a> &mdash; $sz</li>"
+                      done
+                      echo '</ul><p><a href="../">&larr; back to the apt repo</a></p>'
+                  } > windows/index.html
+
             - name: Regenerate Packages + Release
               env:
                   CHANNEL: ${{ steps.ver.outputs.channel }}
@@ -186,7 +230,10 @@ jobs:
                       | sudo tee /etc/apt/sources.list.d/tab-atelier.list > /dev/null
                   sudo apt update
                   sudo apt install tab-atelier            # or tab-atelier-headless</pre>
-                  <p>Replace <code>stable</code> with <code>nightly</code> to track <code>main</code>. Source: <a href="https://github.com/wdes/tab-atelier">github.com/wdes/tab-atelier</a>.</p>
+                  <p>Replace <code>stable</code> with <code>nightly</code> to track <code>main</code>.</p>
+                  <h2>Windows</h2>
+                  <p>Headless MSI installers for Windows are at <a href="/windows/">/windows/</a>.</p>
+                  <p>Source: <a href="https://github.com/wdes/tab-atelier">github.com/wdes/tab-atelier</a>.</p>
                   HTML
 
             # peaceiris/actions-gh-pages handles the orphan branch
