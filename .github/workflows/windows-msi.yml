@@ -1,12 +1,12 @@
 name: windows-msi
 
-# Builds the headless Windows binaries and packages them into an MSI.
-# This is the verification loop for the Windows port: the build step
-# below is the first place the cross-platform code is actually compiled
-# for windows-msvc, so portability breakages surface here.
+# Builds the headless Windows binaries and packages them into an MSI,
+# emitted as a raw (un-zipped) build artifact named with the short commit
+# SHA — the Windows analogue of the per-build .deb naming. No GitHub
+# (pre)release is created.
 #
-# Run it on demand (Actions tab -> windows-msi -> Run workflow) for fast
-# iteration, or push a vX.Y.Z tag to also attach the MSI to the release.
+# Run it on demand (Actions tab -> windows-msi -> Run workflow), or push
+# a vX.Y.Z tag to build a tagged MSI artifact.
 
 on:
   workflow_dispatch:
@@ -15,20 +15,20 @@ on:
       - 'v*'
 
 permissions:
-  contents: write # only needed for the release-attach step on tags
+  contents: read
 
 jobs:
   msi:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust (stable, MSVC)
         uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Compute MSI version
+      - name: Compute MSI version + short SHA
         shell: bash
         run: |
           # MSI ProductVersion must be numeric (x.y.z); the Cargo version
@@ -38,6 +38,9 @@ jobs:
           else
             echo "MSI_VERSION=0.4.0" >> "$GITHUB_ENV"
           fi
+          # Short commit SHA — uniquely identifies each build, like the
+          # ~nightly<timestamp> suffix the .debs carry.
+          echo "SHORT_SHA=${GITHUB_SHA::8}" >> "$GITHUB_ENV"
 
       - name: Build headless binaries
         shell: bash
@@ -72,31 +75,14 @@ jobs:
           cargo wix --no-build --nocapture \
             --package tab-atelier \
             --install-version "${MSI_VERSION}" \
-            --output "target/wix/tab-atelier-headless-${MSI_VERSION}-x86_64.msi"
+            --output "target/wix/tab-atelier-headless-${SHORT_SHA}-${MSI_VERSION}-x86_64.msi"
 
-      # GitHub workflow artifacts are ALWAYS wrapped in a .zip on
-      # download (actions/upload-artifact has no "archive: false"
-      # option). To hand out a directly-runnable, un-zipped .msi we
-      # publish it as a release asset instead — release assets are
-      # served raw. A manual dispatch updates a rolling "windows-latest"
-      # prerelease; a vX.Y.Z tag publishes to that version's release.
-      # draft: true is required because this repo has immutable releases
-      # enabled — GitHub only accepts asset uploads while a release is
-      # still a draft. The draft is downloadable by maintainers; click
-      # "Publish" to make it public (which then bakes the asset in
-      # immutably). A version tag produces that version's draft release;
-      # a manual dispatch refreshes the rolling "windows-latest" draft.
-      - name: Publish MSI as a release asset (raw, not zipped)
-        uses: softprops/action-gh-release@v2
+      # archive: false emits the .msi as-is (single raw file), not wrapped
+      # in the usual artifact .zip. Requires exactly one matched file.
+      - name: Upload MSI artifact (raw)
+        uses: actions/upload-artifact@v7
         with:
-          # Rolling builds use the 'windows-rolling' tag (NOT
-          # 'windows-latest', which a pre-draft run already published as
-          # an immutable release that can no longer take assets). Created
-          # as a draft from the start, it is never auto-published, so
-          # later runs can keep refreshing its asset.
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'windows-rolling' }}
-          name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'Windows headless (rolling build)' }}
-          prerelease: ${{ !startsWith(github.ref, 'refs/tags/v') }}
-          draft: true
-          files: target/wix/*.msi
-          fail_on_unmatched_files: true
+          name: tab-atelier-headless-msi-${{ env.SHORT_SHA }}
+          path: target/wix/tab-atelier-headless-${{ env.SHORT_SHA }}-${{ env.MSI_VERSION }}-x86_64.msi
+          archive: false
+          if-no-files-found: error
