@@ -2,15 +2,17 @@ name: windows-desktop
 
 # Probe + (eventually) build the DESKTOP GUI variant for Windows.
 #
-# Step 1 (now): `cargo check` the gui feature on windows-msvc. This is
-# the feasibility gate — it compiles gpui (whose published 0.2 crate may
-# or may not support Windows) and our gui-gated code, surfacing where it
-# breaks without a full build/MSI. Once it's green, this workflow grows
-# the WiX packaging like windows-msi.yml.
+# Step 1 (passed): `cargo check --features gui` on windows-msvc — proved
+# gpui 0.2 compiles on Windows AND our crate type-checks once the
+# catbus + Pty::child Unix usages were gated out.
 #
-# energy is left off (power.rs reads /sys, Linux-only). catbus is pulled
-# in by the gui feature today and uses /proc + AF_UNIX, so the check is
-# expected to flag it until that coupling is broken on Windows.
+# Step 2 (now): full `cargo build --release` of the GUI bin. Codegen +
+# linker surface issues that `check` doesn't (DirectX/Vulkan adapter
+# symbols, blade backend native code). Once green, this workflow grows
+# WiX packaging like windows-msi.yml.
+#
+# energy is left off (power.rs reads /sys, Linux-only); catbus is off
+# on Windows (default feature on Linux only — see Cargo.toml).
 
 on:
   workflow_dispatch:
@@ -29,9 +31,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: cargo check — desktop GUI on Windows
+      - name: cargo build — desktop GUI on Windows
         shell: bash
         run: |
-          cargo check --release -p tab-atelier \
+          cargo build --release -p tab-atelier \
             --no-default-features --features gui \
             --bin tab-atelier
