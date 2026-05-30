@@ -178,7 +178,13 @@ impl TerminalView {
             ..Default::default()
         };
         let pty = tty::new(&opts, ws, 0).expect("failed to create pty");
+        // ConPTY's Pty doesn't expose the child the way the Unix one does.
+        // The PID feeds /proc cwd + catbus detection — both Linux-only, so
+        // a 0 sentinel is fine on Windows.
+        #[cfg(unix)]
         let pid = pty.child().id();
+        #[cfg(windows)]
+        let pid = 0u32;
         let config = Config {
             scrolling_history: 10_000,
             ..Config::default()
@@ -328,7 +334,13 @@ impl TerminalView {
             ..Default::default()
         };
         let pty = tty::new(&opts, ws, 0).expect("failed to create pty");
+        // ConPTY's Pty doesn't expose the child the way the Unix one does.
+        // The PID feeds /proc cwd + catbus detection — both Linux-only, so
+        // a 0 sentinel is fine on Windows.
+        #[cfg(unix)]
         let pid = pty.child().id();
+        #[cfg(windows)]
+        let pid = 0u32;
 
         self.term.lock().grid_mut().scroll_display(Scroll::Bottom);
 
