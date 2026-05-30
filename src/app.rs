@@ -897,6 +897,7 @@ impl AppState {
             // persist it to the standard per-tab state file so the rest of
             // the app (and the mobile remote) can read cumulative totals
             // without knowing about the ~/.claude/projects layout.
+            #[cfg(feature = "catbus")]
             for tab in &self.tabs {
                 let pid = tab.view.read(cx).pid();
                 if let Some(session) = crate::catbus_agent::find_session(pid)
@@ -982,6 +983,7 @@ impl AppState {
             // `PostToolUse`. Also covers manual subshell commands the
             // user starts inside an active agent tab.
             let now = std::time::Instant::now();
+            #[cfg(feature = "catbus")]
             for tab in &mut self.tabs {
                 if tab.agent_kind.is_none() {
                     continue;
@@ -1025,6 +1027,7 @@ impl AppState {
             // hook never gets a chance to run — without this the LED
             // would keep amber-blinking from a stale Stop event until
             // the 2-min staleness sweep above eventually fires.
+            #[cfg(feature = "catbus")]
             for tab in &mut self.tabs {
                 if tab.agent_kind.is_some() {
                     let pid = tab.view.read(cx).pid();

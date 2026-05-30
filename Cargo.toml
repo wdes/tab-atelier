@@ -36,11 +36,13 @@ path = "src/bin/tab-atelier-headless.rs"
 required-features = ["headless"]
 
 [features]
-default = ["gui", "energy"]
+default = ["gui", "energy", "catbus"]
 # Desktop GUI build: gpui + x11rb (hotkeys + screenshot) + qrcode.
-# Pulls in `catbus` because the GUI's "Switch to catbus" flow and the
-# per-tab token/agent readouts call into that module unconditionally.
-gui = ["dep:gpui", "dep:x11rb", "dep:qrcode", "catbus"]
+# Does NOT pull `catbus` — the GUI uses catbus on Linux, but a Windows
+# desktop build must drop it (catbus_agent uses AF_UNIX + /proc).
+# `catbus` is in the `default` feature instead, so Linux builds keep it
+# while `--no-default-features --features gui` on Windows omits it.
+gui = ["dep:gpui", "dep:x11rb", "dep:qrcode"]
 # Display-less variant: only the API server + PTY-driven tab restore
 # + happier-bridge spawn. Selected with `--no-default-features
 # --features headless[,...]`.
