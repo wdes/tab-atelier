@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="windows-1252"?>
+<!--
+  WiX 3 source for the DESKTOP (GUI) tab-atelier MSI on Windows.
+
+  Same UpgradeCode as wix/main.wxs (the headless MSI) on purpose:
+  installing this package triggers MajorUpgrade against any prior
+  install with that UpgradeCode and removes it first. The headless
+  install's ServiceControl Remove runs as part of that, so its
+  Windows service is unregistered before the GUI files land.
+
+  AllowSameVersionUpgrades is on so a 0.4.0 desktop MSI cleanly
+  replaces a 0.4.0 headless install (the common case during this port).
+
+  Preprocessor variables come from the workflow's candle invocation:
+    $(var.Version)            product version (numeric x.y.z)
+    $(var.CargoTargetBinDir)  directory holding the built tab-atelier.exe
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product
+    Id="*"
+    Name="tab-atelier"
+    UpgradeCode="de89554f-ff28-4a56-bed7-3c3319c0c2ea"
+    Language="1033"
+    Codepage="1252"
+    Version="$(var.Version)"
+    Manufacturer="William Desportes">
+
+    <Package
+      Id="*"
+      Keywords="Installer"
+      Description="tab-atelier desktop terminal"
+      Manufacturer="William Desportes"
+      InstallerVersion="450"
+      Languages="1033"
+      Compressed="yes"
+      InstallScope="perMachine"
+      SummaryCodepage="1252" />
+
+    <MajorUpgrade
+      AllowSameVersionUpgrades="yes"
+      Schedule="afterInstallInitialize"
+      DowngradeErrorMessage="A newer version of tab-atelier is already installed. Setup will now exit." />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="APPLICATIONFOLDER" Name="tab-atelier">
+          <Component Id="DesktopExe" Guid="*">
+            <File
+              Id="TabAtelierExe"
+              Name="tab-atelier.exe"
+              Source="$(var.CargoTargetBinDir)\tab-atelier.exe"
+              KeyPath="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="AppMenuFolder" Name="tab-atelier">
+          <!-- Explicit GUID required: this component mixes a Shortcut
+               with an HKCU RegistryValue keypath (the standard WiX
+               shortcut-component shape; ICE38 disallows file keypaths
+               for components under a per-user folder). -->
+          <Component Id="StartMenuShortcut" Guid="d8662b62-199a-4f3b-ba2e-7c2f172a41c9">
+            <Shortcut
+              Id="TabAtelierShortcut"
+              Name="tab-atelier"
+              Description="tab-atelier terminal"
+              Target="[#TabAtelierExe]"
+              WorkingDirectory="APPLICATIONFOLDER" />
+            <RemoveFolder Id="RemoveAppMenuFolder" On="uninstall" />
+            <RegistryValue
+              Root="HKCU"
+              Key="Software\tab-atelier"
+              Name="StartMenuShortcut"
+              Type="integer"
+              Value="1"
+              KeyPath="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+    </Directory>
+
+    <Feature Id="MainFeature" Title="tab-atelier" Level="1">
+      <ComponentRef Id="DesktopExe" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+  </Product>
+</Wix>
