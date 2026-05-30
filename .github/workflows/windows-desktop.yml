@@ -1,27 +1,29 @@
 name: windows-desktop
 
-# Probe + (eventually) build the DESKTOP GUI variant for Windows.
+# Build + package the DESKTOP (GUI) tab-atelier MSI for Windows.
 #
-# Step 1 (passed): `cargo check --features gui` on windows-msvc — proved
-# gpui 0.2 compiles on Windows AND our crate type-checks once the
-# catbus + Pty::child Unix usages were gated out.
+# Probe history: `cargo check --features gui` on windows-msvc proved
+# gpui 0.2 supports Windows; the full `cargo build --release` then
+# proved codegen + linker work too. This workflow now goes the rest of
+# the way: build the GUI .exe, hand it to WiX 3 against wix/desktop.wxs,
+# and emit a raw, hash-named .msi artifact.
 #
-# Step 2 (now): full `cargo build --release` of the GUI bin. Codegen +
-# linker surface issues that `check` doesn't (DirectX/Vulkan adapter
-# symbols, blade backend native code). Once green, this workflow grows
-# WiX packaging like windows-msi.yml.
-#
-# energy is left off (power.rs reads /sys, Linux-only); catbus is off
-# on Windows (default feature on Linux only — see Cargo.toml).
+# energy is off (power.rs reads /sys, Linux-only); catbus is off (the
+# default feature on Linux only — Cargo.toml puts it in `default`, not
+# `gui`). happier-bridge is also off for this first cut — easy to add
+# once the GUI MSI itself is verified working end-to-end.
 
 on:
   workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
 
 permissions:
   contents: read
 
 jobs:
-  check:
+  build:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
@@ -31,9 +33,55 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Compute MSI version + short SHA
+        shell: bash
+        run: |
+          # MSI ProductVersion must be numeric (x.y.z); the Cargo version
+          # is "0.4.0-dev", so derive from the tag or fall back.
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "MSI_VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_ENV"
+          else
+            echo "MSI_VERSION=0.4.0" >> "$GITHUB_ENV"
+          fi
+          echo "SHORT_SHA=${GITHUB_SHA::8}" >> "$GITHUB_ENV"
+
       - name: cargo build — desktop GUI on Windows
         shell: bash
         run: |
           cargo build --release -p tab-atelier \
             --no-default-features --features gui \
             --bin tab-atelier
+
+      - name: Install WiX 3 toolset
+        shell: pwsh
+        run: |
+          $url = "https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip"
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\wix.zip"
+          Expand-Archive "$env:RUNNER_TEMP\wix.zip" -DestinationPath "$env:RUNNER_TEMP\wix"
+          "$env:RUNNER_TEMP\wix" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Build desktop MSI with candle + light
+        shell: bash
+        run: |
+          # cargo-wix's defaults expect wix/main.wxs (used by the headless
+          # MSI) — calling candle/light directly lets us keep two parallel
+          # WiX sources in the same package and pick which one to build.
+          mkdir -p target/wix
+          OUT="target/wix/tab-atelier-${SHORT_SHA}-${MSI_VERSION}-x86_64.msi"
+          candle.exe wix/desktop.wxs \
+            -arch x64 \
+            -dVersion="${MSI_VERSION}" \
+            -dCargoTargetBinDir="$(pwd)/target/release" \
+            -out target/wix/desktop.wixobj
+          light.exe target/wix/desktop.wixobj \
+            -ext WixUIExtension \
+            -out "${OUT}"
+          echo "MSI_PATH=${OUT}" >> "$GITHUB_ENV"
+
+      - name: Upload desktop MSI artifact (raw)
+        uses: actions/upload-artifact@v7
+        with:
+          name: tab-atelier-desktop-msi-${{ env.SHORT_SHA }}
+          path: ${{ env.MSI_PATH }}
+          archive: false
+          if-no-files-found: error
