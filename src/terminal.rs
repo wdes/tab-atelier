@@ -711,7 +711,16 @@ impl Render for TerminalView {
             }))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, ev: &MouseDownEvent, _window, _cx| {
+                cx.listener(move |this, ev: &MouseDownEvent, window, _cx| {
+                    // Clicking the terminal MUST take focus. `track_focus`
+                    // above wires the FocusHandle, but it is only ever
+                    // focused programmatically (initial mount, tab
+                    // switch, dismissing prefs/rename/hotkey-picker), so
+                    // any prior focus shift to another input leaves the
+                    // terminal eating no keys — that's the "Enter doesn't
+                    // work / typing is broken" report. Focusing on click
+                    // matches every other terminal/text-input app.
+                    this.focus.focus(window);
                     let origin = this.content_origin.get();
                     let bounds = this.bounds_size.get();
                     let scrollbar_left = origin.x + bounds.width - px(SCROLLBAR_WIDTH);
