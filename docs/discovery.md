@@ -37,70 +37,84 @@ maintains tokens — not URLs.
 - A custom UDP broadcast would re-invent port allocation, retry/jitter,
   IPv6 multicast group choice, NAT-helper logic. mDNS already solves it.
 
-## Announcer: delegate to the system, do not run our own
+## Use system DNS-SD APIs — no bundled mDNS responder, no static file
 
-Original sketch had `src/discovery.rs` spin up an `mdns_sd::ServiceDaemon`
-inside the headless process — that's a second mDNS responder racing the
-one the OS already runs. Every Linux desktop ships `avahi-daemon`; macOS
-ships `mDNSResponder`; Windows 10 1809+ ships native DNS-SD APIs. Use
-those — register a service with the OS responder instead of bringing our
-own.
+Every modern OS already runs a DNS-SD service. We register with it
+rather than ship our own:
+
+- **Linux:** `avahi-daemon` (D-Bus interface `org.freedesktop.Avahi`)
+- **macOS:** `mDNSResponder` (`libdns_sd`, system framework)
+- **Windows 10 1809+:** `DnsServiceRegister` / `DnsServiceBrowse` in
+  `windns.dll`
 
 Wins:
 
-- No extra background thread or socket inside headless. The OS daemon
-  already holds the multicast group and answers queries from any process.
-- Two responders on the same host fighting over `:5353` is a known
-  source of "works for some clients, not for others" bugs. One responder
-  per host is the contract avahi/Bonjour assumes.
-- On Linux the cleanest path is fully declarative (drop an XML file in
-  `/etc/avahi/services/`) — zero Rust code for the announce side, the
-  package install can do it.
+- No second mDNS responder fighting over `:5353` with avahi/Bonjour.
+- No extra background thread, no UDP socket, no bound port in the
+  headless process. D-Bus client traffic is `AF_UNIX` — already
+  permitted by `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`.
+- No filesystem write under `/etc` (would otherwise need to widen
+  `ProtectSystem=strict` — see "Why not the avahi service file"
+  below).
+- Cross-platform symmetry: announce and browse both use the same
+  per-OS native APIs, so there is no `mdns-sd` Cargo dep at all.
 
 ### Per platform
 
-**Linux — avahi service file (preferred).** avahi-daemon watches
-`/etc/avahi/services/*.service` and (re-)publishes anything dropped
-there. Plan: headless writes `/etc/avahi/services/tab-atelier.service`
-on startup with the live TLS fingerprint baked into a `<txt-record>`,
-and removes it on clean shutdown. The file is small (<1 KB) and the
-write is a single fsync. No D-Bus, no FFI, no extra dependency.
+**Linux — avahi D-Bus (preferred).** Talk to
+`org.freedesktop.Avahi.Server` on the system bus and ask it to
+publish via `EntryGroupNew` → `AddService` → `Commit`. The default
+D-Bus policy
+(`/usr/share/dbus-1/system.d/avahi-dbus.conf`) already allows the
+`tab-atelier` user to call EntryGroup methods — only `SetHostName`
+is root-only — so no extra policy drop-in is needed.
 
-Skeleton (template; fingerprint + port substituted at runtime):
+Use the `zbus` crate (async, pure Rust, no native dep) with proxies
+generated from the system-shipped XML at
+`/usr/share/dbus-1/interfaces/org.freedesktop.Avahi.{Server,EntryGroup,
+ServiceBrowser,ServiceResolver}.xml`. The `EntryGroup` handle is held
+for the lifetime of headless; dropping it (or calling `Reset`)
+withdraws the announcement immediately. `avahi-daemon` is the only
+runtime requirement — `libavahi-client3` is **not** pulled in (we
+bypass the C client lib).
 
-```xml
-<?xml version="1.0" standalone='no'?>
-<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
-<service-group>
-  <name replace-wildcards="yes">tab-atelier on %h</name>
-  <service>
-    <type>_tab-atelier._tcp</type>
-    <port>7891</port>
-    <txt-record>v=1</txt-record>
-    <txt-record>fp=&lt;hex sha256&gt;</txt-record>
-    <txt-record>feat=happier-bridge,catbus</txt-record>
-  </service>
-</service-group>
-```
+If `avahi-daemon` is not running on the host, `Server` is simply
+unreachable on the bus — log "discovery: avahi-daemon not available,
+skipping announce" and move on. Discovery is opportunistic; failure
+is non-fatal.
 
-If avahi-daemon is not running (servers without it), fall back to
-talking the system D-Bus interface (`org.freedesktop.Avahi.Server`)
-via `zbus` — still no extra mDNS stack in our process.
-
-**macOS — `libdns_sd` (preferred).** Always present (system framework).
-~40 lines of `unsafe` calling `DNSServiceRegister` from `<dns_sd.h>`,
-or use the `astro-dnssd` crate (thin wrapper, no external deps on Mac).
-The returned `DNSServiceRef` is held for the lifetime of headless;
+**macOS — `libdns_sd` (preferred).** Always present (system
+framework). Either ~40 lines of `unsafe` calling `DNSServiceRegister`
+/ `DNSServiceBrowse` from `<dns_sd.h>`, or the `astro-dnssd` crate
+(thin wrapper over `libdns_sd`, no external deps on macOS). The
+returned `DNSServiceRef` is held for the lifetime of headless;
 dropping it deregisters automatically.
 
 **Windows — native DNS-SD (preferred).** Windows 10 1809+ exposes
-`DnsServiceRegister` in `windns.dll`. The `windows` crate already
-bundles its bindings. ~30 lines of `unsafe`. For Win10 < 1809 (rare
-on the boxes we target) and headless-on-Windows-without-Bonjour,
-fall back to `mdns-sd` — but headless-on-Windows is not currently a
-shipped configuration, so this fallback is unlikely to fire in
-practice. The desktop GUI Windows install does not announce (it is a
-client only).
+`DnsServiceRegister` / `DnsServiceBrowse` in `windns.dll`. The
+`windows` crate already in our `[target.'cfg(windows)'.dependencies]`
+covers it under the `Win32_NetworkManagement_Dns` feature. ~30 lines
+of `unsafe`. Headless-on-Windows is not currently shipped, so this is
+forward-looking; the desktop GUI Windows install only browses.
+
+### Why not the avahi service file approach (rejected)
+
+Earlier sketch had headless write
+`/etc/avahi/services/tab-atelier.service` and let avahi-daemon pick it
+up. Two problems killed it:
+
+1. **`ProtectSystem=strict`** in the hardened unit makes `/etc`
+   read-only for the process. Allowing it would require
+   `ReadWritePaths=/etc/avahi/services` — which simultaneously gives
+   us write access to every *other* package's service file in that
+   directory. A regression in the hardening profile we just landed.
+2. **Stale-file risk on crash.** A crash leaves the file behind,
+   advertising a service that's not running. D-Bus EntryGroup
+   automatically vanishes when the bus connection drops, so the
+   announcement disappears the instant headless dies.
+
+The file approach is fine for *static* services (e.g. CUPS) but not
+for a daemon advertising its own runtime TLS fingerprint.
 
 ### Code shape
 
@@ -131,23 +145,20 @@ let _announce = discovery::announce(api_tls_port, &tls_fingerprint);
 No thread, no event loop, no `ServiceDaemon` struct, no `:5353`
 binding on our side.
 
-## Browser side
+## Browser side — same system APIs
 
-Browsing is a different question — we have to actively listen for
-service announcements. Options:
+The browser uses the same per-OS facilities as the announcer:
 
-- **`mdns-sd`** (pure-Rust): in-process socket on `:5353` in passive
-  query mode. Conflicts with system responder only when we try to
-  *publish* — passive querying coexists fine.
-- **avahi (Linux)** via D-Bus `org.freedesktop.Avahi.ServiceBrowser`
-  / **`libdns_sd` browse on macOS / Win10+**: mirror the announcer
-  choice for symmetry.
+- **Linux:** `org.freedesktop.Avahi.Server.ServiceBrowserNew("_tab-atelier._tcp", "local")`
+  returns a path; subscribe to `ItemNew` / `ItemRemove` / `AllForNow`
+  signals on that object. For each `ItemNew`, call
+  `Server.ResolveService` to expand into host/port/TXT. zbus.
+- **macOS:** `DNSServiceBrowse` + `DNSServiceResolve` via `libdns_sd`
+  (or `astro-dnssd`).
+- **Windows:** `DnsServiceBrowse` + `DnsServiceResolve` via the
+  `windows` crate.
 
-Lean toward `mdns-sd` for the browser to keep the GUI cross-platform
-without a per-OS code path. The desktop install already pulls
-`mdns-sd` for the browser even if announce is system-delegated, so we
-pay the dependency once. (If pure-Rust dep budget matters more than
-cross-platform symmetry, swap browser to system-delegated too.)
+No `mdns-sd` Cargo dep anywhere.
 
 **`src/app.rs`** Preferences dialog `remote_endpoints` section:
 
@@ -158,30 +169,81 @@ cross-platform symmetry, swap browser to system-delegated too.)
 - Browser lives on the gpui background runtime, sends `DiscoveredPeer`
   events into AppState via `cx.update_global`.
 
-**`Cargo.toml`:**
+**`Cargo.toml`** — no cross-platform mDNS crate; per-OS deps gate on
+the `discovery` feature:
 
 ```toml
 [features]
 default = ["gui", "energy", "catbus", "discovery"]
-discovery = ["dep:mdns-sd"]
+discovery = []
 
-# mdns-sd is used by the browser only. The announce side uses
-# system facilities: avahi service file on Linux (no dep),
-# libdns_sd on macOS (system framework, no Cargo dep), and the
-# `windows` crate's already-vendored DNS-SD bindings on Windows.
-[dependencies]
-mdns-sd = { version = "0.13", optional = true }
+# Linux: pure-Rust D-Bus to avahi-daemon. No FFI, no libavahi-client3.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "5", default-features = false, features = ["tokio"], optional = true }
+
+# macOS: libdns_sd is a system framework — no Cargo dep needed if we
+# write the FFI ourselves; astro-dnssd if we want a wrapper.
+# [target.'cfg(target_os = "macos")'.dependencies]
+# astro-dnssd = { version = "0.3", optional = true }
+
+# Windows: already pulls the `windows` crate; just enable the DNS feature.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "...", features = [
+    "Win32_NetworkManagement_Dns",
+    "Win32_Foundation",
+], optional = true }
 ```
 
-Add `discovery` to the headless variant features in
-`[package.metadata.deb.variants.headless]` and to the desktop MSI build
-line in `.github/workflows/windows-desktop.yml`.
+Wire `zbus` / `windows` under the `discovery` feature in
+`[features]`. Add `discovery` to the headless variant features in
+`[package.metadata.deb.variants.headless]` and to the desktop MSI
+build line in `.github/workflows/windows-desktop.yml`.
 
-The headless `.deb` postinst should also ensure `avahi-daemon` is at
-least *recommended* — `Recommends: avahi-daemon` in
-`[package.metadata.deb.variants.headless]` so Debian/Ubuntu pulls it in
-by default. If the user explicitly opts out, the service file is
-harmless (just an unread file in `/etc/avahi/services/`).
+### Debian packaging — the canonical way
+
+The `.deb` headless variant grows two changes:
+
+```toml
+[package.metadata.deb.variants.headless]
+features = ["headless", "happier-relay-binary", "catbus", "discovery"]
+recommends = "avahi-daemon"
+```
+
+Why **Recommends**, not Depends:
+
+- Discovery is *opportunistic*. If `avahi-daemon` is absent (servers
+  with mDNS deliberately off, embedded boxes), headless still works —
+  it just logs "avahi unavailable, skipping announce" and continues.
+- Debian Policy §7.2: Recommends is for "packages that would be found
+  together with this one in all but unusual installations". That fits
+  exactly. A headless server without LAN discovery is unusual but
+  legitimate; forcing avahi-daemon onto every install would be
+  policy-aggressive.
+- Debian/Ubuntu default `APT::Install-Recommends true`, so end-users
+  on desktop installs get it automatically. Server admins can
+  `--no-install-recommends`.
+
+What we deliberately do **not** declare:
+
+- ~~`Depends: libavahi-client3`~~ — we talk D-Bus directly, the C
+  client lib is unused.
+- ~~A drop-in in `/etc/dbus-1/system.d/`~~ — avahi's own policy
+  already grants our user EntryGroup access.
+- ~~A `Conflicts: tab-atelier-discovery` for some hypothetical
+  separate-package alternative~~ — discovery is in-binary, feature-gated.
+
+`postinst` echo (cheatsheet block) gains one line:
+
+```
+LAN discovery: avahi-daemon advertises this host as
+_tab-atelier._tcp on the local network. Verify with:
+  avahi-browse -r _tab-atelier._tcp
+Disable per-user in preferences.json: "discovery_enabled": false
+```
+
+`postrm` does **not** need to touch anything D-Bus-related — when the
+headless process exits, its EntryGroup vanishes from the bus
+automatically (D-Bus owns the lifecycle, not us).
 
 **`src/lib.rs`** `Preferences`:
 
@@ -229,25 +291,44 @@ First cut: discovery fills URL + fingerprint, user pastes token.
 
 ## Sequencing
 
-1. Add `discovery` feature + `mdns-sd` dep (browser side only).
-   Land `src/discovery.rs` with platform-gated `announce()` /
-   `browse()` skeletons.
-2. **Linux announce (file-based)** — write
-   `/etc/avahi/services/tab-atelier.service` from `headless::run`,
-   delete on clean shutdown. Verify externally with
-   `avahi-browse -r _tab-atelier._tcp`.
-3. Wire browser into Preferences UI as a read-only debug list
-   ("found N peers"). End-to-end Linux ↔ Linux test possible at this
-   point.
-4. Add the `+` button → prefill add-endpoint form. Token still manual.
-5. macOS announce via `libdns_sd` (when/if a macOS port is wanted).
-6. Windows announce via `DnsServiceRegister` (only if/when
-   tab-atelier-headless ships on Windows; not currently shipped).
+1. Add `discovery` feature; add Linux-gated `zbus` dep.
+   Generate proxies from the system-shipped XML at
+   `/usr/share/dbus-1/interfaces/org.freedesktop.Avahi.*.xml` (commit
+   the generated `.rs` to avoid a build-script avahi-daemon dep).
+   Land `src/discovery.rs` with `announce_linux` /
+   `browse_linux` skeletons.
+2. **Linux announce** — call from `headless::run` after the TLS
+   listener binds. Verify externally with `avahi-browse -r _tab-atelier._tcp`.
+3. **Linux browse** — wire into Preferences UI as a read-only debug
+   list ("found N peers"). End-to-end Linux ↔ Linux test possible at
+   this point.
+4. `+` button → prefill add-endpoint form. Token still manual.
+5. macOS announce/browse via `libdns_sd` (when/if a macOS port is
+   wanted).
+6. Windows announce/browse via the `windows` crate (announce only
+   relevant if tab-atelier-headless ever ships on Windows; browse
+   useful immediately for the desktop GUI).
 7. (Later) enrollment shortcut (QR or relay-mediated).
 
-Steps 1–4 are one session of work and cover the actual current
-shipping configuration (Linux headless + cross-platform GUI browser).
-5 and 6 wait until those platforms grow a headless variant.
+Steps 1–4 = one session of work and cover the actual current shipping
+configuration (Linux headless + GUI Linux browse). Steps 5–6 unlock
+cross-platform discovery from the Windows desktop and a future macOS
+build.
+
+## Debugging / verification commands
+
+External tools (no tab-atelier knowledge required):
+
+```sh
+# Watch the bus for any Avahi traffic from our process:
+sudo dbus-monitor --system "interface=org.freedesktop.Avahi.EntryGroup"
+
+# Browse the network for our service type:
+avahi-browse -r _tab-atelier._tcp
+
+# Confirm avahi-daemon is up and reachable on the bus:
+busctl --system status org.freedesktop.Avahi
+```
 
 ## Off-LAN fallback
 
