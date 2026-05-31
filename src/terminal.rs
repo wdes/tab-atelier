@@ -1349,6 +1349,13 @@ impl Element for TerminalElement {
         let origin = bounds.origin;
 
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
+            // Opaque base fill so default-bg cells overwrite the previous
+            // frame. Per-cell bg quads (below) skip default-bg cells —
+            // without this base, anything left in the framebuffer from the
+            // last redraw (other windows, scrolled-off rows) shows through.
+            let term_bg = theme::theme(self.theme).term_bg_hsla();
+            window.paint_quad(fill(bounds, term_bg));
+
             // Paint backgrounds.
             for (line_idx, line) in state.lines.iter().enumerate() {
                 for bg in &line.bg_runs {
