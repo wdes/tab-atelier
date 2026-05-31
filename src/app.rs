@@ -3242,8 +3242,16 @@ impl Render for AppState {
             .child(
                 div()
                     .id("terminal-area")
+                    // Take full width but DON'T claim full height — the
+                    // tab bar below uses flex-wrap to grow to 2/3 rows
+                    // (32 px each) and needs space to expand into. With
+                    // `size_full()` here the terminal-area pinned itself
+                    // to 100% of parent height and the tab bar's 3rd row
+                    // overflowed (only ~3/4 visible). `flex_grow()` is
+                    // enough to absorb whatever the tab bar doesn't use.
+                    .w_full()
+                    .min_h(px(0.0))
                     .flex_grow()
-                    .size_full()
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(|this, ev: &MouseDownEvent, _window, cx| {
