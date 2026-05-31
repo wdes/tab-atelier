@@ -72,11 +72,13 @@ is root-only — so no extra policy drop-in is needed.
 Use the `zbus` crate (async, pure Rust, no native dep) with proxies
 generated from the system-shipped XML at
 `/usr/share/dbus-1/interfaces/org.freedesktop.Avahi.{Server,EntryGroup,
-ServiceBrowser,ServiceResolver}.xml`. The `EntryGroup` handle is held
-for the lifetime of headless; dropping it (or calling `Reset`)
-withdraws the announcement immediately. `avahi-daemon` is the only
-runtime requirement — `libavahi-client3` is **not** pulled in (we
-bypass the C client lib).
+ServiceBrowser,ServiceResolver}.xml`. The `EntryGroup` handle has no
+explicit `Free` method on the bus — cleanup is owned by the D-Bus
+connection lifecycle: when our process exits and the connection drops,
+avahi-daemon garbage-collects every EntryGroup we own. `Reset` is
+available if we need to clear records without dropping the connection
+(e.g. cert rotation). `avahi-daemon` is the only runtime requirement —
+`libavahi-client3` is **not** pulled in (we bypass the C client lib).
 
 If `avahi-daemon` is not running on the host, `Server` is simply
 unreachable on the bus — log "discovery: avahi-daemon not available,
