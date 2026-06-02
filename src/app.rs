@@ -838,6 +838,7 @@ impl AppState {
             .map(|(tab, ts)| {
                 let view = tab.view.read(cx);
                 let (output, cursor) = view.ansi_text_with_cursor(Some(200));
+                let raw_output = view.raw_screen_text(Some(200));
                 let (cols, rows) = view.dims();
                 api::SnapshotTab {
                     id: tab.id.clone(),
@@ -847,6 +848,7 @@ impl AppState {
                     // ANSI escapes are kept so the mobile remote can render
                     // colours instead of the previous flat-grey text.
                     output,
+                    raw_output,
                     uptime_secs: tab.uptime().as_secs_f64(),
                     cursor,
                     cols,

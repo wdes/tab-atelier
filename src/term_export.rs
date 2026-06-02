@@ -199,6 +199,122 @@ pub fn term_to_ansi_lines<E: EventListener>(
     (lines, cursor_logical)
 }
 
+/// Row-by-row dump for the xterm.js viewer — does NOT join WRAPLINE
+/// rows back into logical lines. Each emitted row corresponds 1:1
+/// with a server-grid row, so xterm.js (resized to the same cols)
+/// reproduces the visual layout cell-for-cell instead of relying on
+/// auto-wrap to land at the same column the server's auto-wrap did.
+/// `\n` between rows; no trim.
+pub fn term_to_ansi_rows<E: EventListener>(term: &FairMutex<Term<E>>, max_lines: Option<usize>) -> String {
+    // term_to_ansi_lines glues wrap-continued rows into one entry.
+    // We need the raw row-by-row dump, so re-walk the grid directly.
+    let t = term.lock();
+    let grid = t.grid();
+    let cols = grid.columns();
+    let history = grid.history_size();
+    let screen = grid.screen_lines();
+    let want = max_lines.unwrap_or(screen + history).min(screen + history);
+    let extra = want.saturating_sub(screen);
+    let start_row = -(extra as i32);
+
+    let default_fg = Color::Named(NamedColor::Foreground);
+    let default_bg = Color::Named(NamedColor::Background);
+    let mut cur_fg = default_fg;
+    let mut cur_bg = default_bg;
+    let mut cur_flags = CellFlags::empty();
+    let mut out = String::with_capacity(cols * screen * 2);
+
+    for row in start_row..screen as i32 {
+        let mut line = String::with_capacity(cols * 2);
+        for col in 0..cols {
+            let cell = &grid[GridPoint::new(Line(row), Column(col))];
+            if cell.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            let ch = if cell.c == '\0' { ' ' } else { cell.c };
+            let is_default = cell.fg == default_fg && cell.bg == default_bg && cell.flags.is_empty();
+            if is_default && ch == ' ' && cur_fg == default_fg && cur_bg == default_bg && cur_flags.is_empty() {
+                line.push(' ');
+                continue;
+            }
+            if cell.fg != cur_fg || cell.bg != cur_bg || cell.flags != cur_flags {
+                let mut sgr = String::new();
+                let removed = cur_flags & !cell.flags;
+                if removed.intersects(
+                    CellFlags::BOLD
+                        | CellFlags::DIM
+                        | CellFlags::ITALIC
+                        | CellFlags::UNDERLINE
+                        | CellFlags::INVERSE
+                        | CellFlags::HIDDEN
+                        | CellFlags::STRIKEOUT,
+                ) {
+                    sgr.push('0');
+                    cur_fg = default_fg;
+                    cur_bg = default_bg;
+                    cur_flags = CellFlags::empty();
+                }
+                let mut push = |code: &str| {
+                    if !sgr.is_empty() {
+                        sgr.push(';');
+                    }
+                    sgr.push_str(code);
+                };
+                if cell.flags.contains(CellFlags::BOLD) && !cur_flags.contains(CellFlags::BOLD) {
+                    push("1");
+                }
+                if cell.flags.contains(CellFlags::DIM) && !cur_flags.contains(CellFlags::DIM) {
+                    push("2");
+                }
+                if cell.flags.contains(CellFlags::ITALIC) && !cur_flags.contains(CellFlags::ITALIC) {
+                    push("3");
+                }
+                if cell.flags.contains(CellFlags::UNDERLINE) && !cur_flags.contains(CellFlags::UNDERLINE) {
+                    push("4");
+                }
+                if cell.flags.contains(CellFlags::INVERSE) && !cur_flags.contains(CellFlags::INVERSE) {
+                    push("7");
+                }
+                if cell.flags.contains(CellFlags::HIDDEN) && !cur_flags.contains(CellFlags::HIDDEN) {
+                    push("8");
+                }
+                if cell.flags.contains(CellFlags::STRIKEOUT) && !cur_flags.contains(CellFlags::STRIKEOUT) {
+                    push("9");
+                }
+                drop(push);
+                if cell.fg != cur_fg {
+                    sgr_color(&mut sgr, cell.fg, true);
+                }
+                if cell.bg != cur_bg {
+                    sgr_color(&mut sgr, cell.bg, false);
+                }
+                cur_fg = cell.fg;
+                cur_bg = cell.bg;
+                cur_flags = cell.flags;
+                if !sgr.is_empty() {
+                    let _ = write!(line, "\x1b[{sgr}m");
+                }
+            }
+            line.push(ch);
+        }
+        if cur_fg != default_fg || cur_bg != default_bg || !cur_flags.is_empty() {
+            line.push_str("\x1b[0m");
+            cur_fg = default_fg;
+            cur_bg = default_bg;
+            cur_flags = CellFlags::empty();
+        }
+        // Trim trailing default-bg space so a line of 240 default
+        // spaces doesn't bloat the transfer. xterm.js advances cursor
+        // to col 0 on \n, so the missing trailing spaces don't change
+        // the layout when the next row is written.
+        let trimmed = line.trim_end_matches(' ').to_string();
+        out.push_str(&trimmed);
+        out.push('\n');
+    }
+    drop(t);
+    out
+}
+
 /// `term_to_ansi_lines` then trim leading / trailing empty rows and
 /// re-anchor the cursor, finally joining with `\n`. Matches the
 /// shape the API (`GET /tabs/{idx}/output`) and the happier-bridge

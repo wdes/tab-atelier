@@ -108,6 +108,13 @@ pub struct SnapshotTab {
     pub name: String,
     pub cwd: Option<String>,
     pub output: String,
+    /// Row-by-row dump for the xterm.js viewer — server grid rows
+    /// emitted as separate `\n`-terminated lines (NO WRAPLINE join),
+    /// so the browser-side terminal at the same cols reproduces the
+    /// server's layout cell-for-cell. The mobile remote and CLI
+    /// viewer keep using `output` (logical lines, easier to word-wrap
+    /// on a phone).
+    pub raw_output: String,
     pub uptime_secs: f64,
     /// Cursor (logical-row, logical-column) within `output` — after
     /// alacritty's WRAPLINE rows have been joined into single lines.
@@ -934,37 +941,46 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             // Mode 1 is what turns a noisy LAN poll into a few-byte delta
             // for the steady-state append case (>99% of the time, a tab
             // is just appending output).
-            let total_crc = crate::crc32(t.output.as_bytes());
-            let total_len = t.output.len();
+            // Use raw_output (row-by-row, no WRAPLINE join) so xterm.js
+            // can reproduce the server's layout exactly when it's
+            // resized to the same cols/rows. The mobile remote keeps
+            // talking to /tabs (which returns the joined `output`).
+            let payload = if t.raw_output.is_empty() {
+                &t.output
+            } else {
+                &t.raw_output
+            };
+            let total_crc = crate::crc32(payload.as_bytes());
+            let total_len = payload.len();
             let pty_cols = t.cols;
             let pty_rows = t.rows;
 
             let (body, cursor, start_offset) = match (query_since, query_crc) {
                 (Some(n), Some(client_crc)) if n <= total_len => {
-                    let prefix_crc = crate::crc32(&t.output.as_bytes()[..n]);
+                    let prefix_crc = crate::crc32(&payload.as_bytes()[..n]);
                     if prefix_crc == client_crc {
                         // The client's history is still a real prefix of
                         // ours. Ship the suffix only — cursor row is
                         // relative to the full buffer, the client knows
                         // how to add its own line count.
-                        (t.output[n..].to_string(), t.cursor, n)
+                        (payload[n..].to_string(), t.cursor, n)
                     } else {
-                        (t.output.clone(), t.cursor, 0)
+                        (payload.clone(), t.cursor, 0)
                     }
                 }
                 _ => match query_lines {
                     Some(n) if n > 0 => {
-                        let total_lines = t.output.lines().count();
+                        let total_lines = payload.lines().count();
                         let drop_count = total_lines.saturating_sub(n);
                         if drop_count == 0 {
-                            (t.output.clone(), t.cursor, 0)
+                            (payload.clone(), t.cursor, 0)
                         } else {
                             let mut offset = 0;
                             for _ in 0..drop_count {
-                                if let Some(nl) = t.output[offset..].find('\n') {
+                                if let Some(nl) = payload[offset..].find('\n') {
                                     offset += nl + 1;
                                 } else {
-                                    offset = t.output.len();
+                                    offset = payload.len();
                                     break;
                                 }
                             }
@@ -975,10 +991,10 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                                     None
                                 }
                             });
-                            (t.output[offset..].to_string(), cur, offset)
+                            (payload[offset..].to_string(), cur, offset)
                         }
                     }
-                    _ => (t.output.clone(), t.cursor, 0),
+                    _ => (payload.clone(), t.cursor, 0),
                 },
             };
             drop(state);
@@ -1601,6 +1617,7 @@ mod tests {
                     cursor: None,
                     cols: 80,
                     rows: 24,
+                    raw_output: String::new(),
                     share_token_rw: String::new(),
                     share_token_ro: String::new(),
                     shell_pid: 0,
@@ -1617,6 +1634,7 @@ mod tests {
                     cursor: None,
                     cols: 80,
                     rows: 24,
+                    raw_output: String::new(),
                     share_token_rw: String::new(),
                     share_token_ro: String::new(),
                     shell_pid: 0,
