@@ -205,7 +205,10 @@ pub fn term_to_ansi_lines<E: EventListener>(
 /// reproduces the visual layout cell-for-cell instead of relying on
 /// auto-wrap to land at the same column the server's auto-wrap did.
 /// `\n` between rows; no trim.
-pub fn term_to_ansi_rows<E: EventListener>(term: &FairMutex<Term<E>>, max_lines: Option<usize>) -> String {
+pub fn term_to_ansi_rows<E: EventListener>(
+    term: &FairMutex<Term<E>>,
+    max_lines: Option<usize>,
+) -> (String, Option<(usize, usize)>) {
     // term_to_ansi_lines glues wrap-continued rows into one entry.
     // We need the raw row-by-row dump, so re-walk the grid directly.
     let t = term.lock();
@@ -213,9 +216,19 @@ pub fn term_to_ansi_rows<E: EventListener>(term: &FairMutex<Term<E>>, max_lines:
     let cols = grid.columns();
     let history = grid.history_size();
     let screen = grid.screen_lines();
+    let cursor_grid_row = grid.cursor.point.line.0;
+    let cursor_grid_col = grid.cursor.point.column.0;
     let want = max_lines.unwrap_or(screen + history).min(screen + history);
     let extra = want.saturating_sub(screen);
     let start_row = -(extra as i32);
+    // Cursor row in the emitted dump (0-indexed from first emitted
+    // row). None when the cursor is in scrollback above the window
+    // we're shipping — e.g. user scrolled the GUI up past max_lines.
+    let cursor_dump = if cursor_grid_row >= start_row && cursor_grid_row < screen as i32 {
+        Some(((cursor_grid_row - start_row) as usize, cursor_grid_col))
+    } else {
+        None
+    };
 
     let default_fg = Color::Named(NamedColor::Foreground);
     let default_bg = Color::Named(NamedColor::Background);
@@ -312,7 +325,7 @@ pub fn term_to_ansi_rows<E: EventListener>(term: &FairMutex<Term<E>>, max_lines:
         out.push('\n');
     }
     drop(t);
-    out
+    (out, cursor_dump)
 }
 
 /// `term_to_ansi_lines` then trim leading / trailing empty rows and

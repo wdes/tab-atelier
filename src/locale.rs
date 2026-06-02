@@ -99,6 +99,7 @@ pub struct Strings {
     pub api_addr: &'static str,
     pub api_tls_addr: &'static str,
     pub happier_relay_addr: &'static str,
+    pub share_url_base: &'static str,
     pub save: &'static str,
 
     // Remote endpoints (Preferences > Remote endpoints)
@@ -185,6 +186,7 @@ pub static EN: Strings = Strings {
     api_addr: "Remote API bind (addr:port, restart required)",
     api_tls_addr: "Remote API TLS bind (addr:port, restart required)",
     happier_relay_addr: "Happier relay bind (addr:port, restart required)",
+    share_url_base: "Share URL base (public URL of a reverse proxy, optional)",
     save: "Save",
 
     remote_endpoints: "Remote endpoints",
@@ -270,6 +272,7 @@ pub static FR: Strings = Strings {
     api_addr: "API distante (adresse:port, redémarrage requis)",
     api_tls_addr: "API distante TLS (adresse:port, redémarrage requis)",
     happier_relay_addr: "Relais happier (adresse:port, redémarrage requis)",
+    share_url_base: "URL de base pour le partage (URL publique d'un proxy inverse, optionnel)",
     save: "Enregistrer",
 
     remote_endpoints: "Points d'accès distants",

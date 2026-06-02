@@ -217,6 +217,10 @@ struct AppState {
     api_addr: String,
     api_tls_addr: String,
     happier_relay_addr: String,
+    /// Public base URL for share links (e.g.
+    /// `https://example.com/~user/tab-atelier`). Read at "Copy share
+    /// link" menu time. Empty → use the LAN URL.
+    share_url_base: String,
     api_state: Arc<Mutex<api::TabSnapshot>>,
     #[cfg(feature = "energy")]
     power_pids: Arc<Mutex<Vec<u32>>>,
@@ -249,6 +253,8 @@ struct AppState {
     pref_api_tls_addr_focus: FocusHandle,
     pref_happier_relay_addr_text: String,
     pref_happier_relay_addr_focus: FocusHandle,
+    pref_share_url_base_text: String,
+    pref_share_url_base_focus: FocusHandle,
     /// Saved remote `tab-atelier-headless` endpoints. Loaded from
     /// `preferences.json` at startup, edited via the "Remote endpoints"
     /// section of the Preferences modal, and persisted back on Save.
@@ -286,6 +292,7 @@ impl AppState {
         let pref_api_addr_focus = cx.focus_handle();
         let pref_api_tls_addr_focus = cx.focus_handle();
         let pref_happier_relay_addr_focus = cx.focus_handle();
+        let pref_share_url_base_focus = cx.focus_handle();
         let font_config = load_font_config(&platform::config_dir());
         let prefs = load_preferences(&platform::config_dir());
         let browser: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(prefs.browser.clone()));
@@ -538,6 +545,7 @@ impl AppState {
         let happier_relay_addr = prefs
             .happier_relay_addr
             .unwrap_or_else(|| crate::DEFAULT_HAPPIER_RELAY_ADDR.into());
+        let share_url_base = prefs.share_url_base.unwrap_or_default();
         let remote_endpoints = prefs.remote_endpoints;
         info!("API server starting on {api_addr} (TLS {api_tls_addr})");
         let api_state = Arc::new(Mutex::new(api::TabSnapshot {
@@ -627,6 +635,7 @@ impl AppState {
             api_addr,
             api_tls_addr,
             happier_relay_addr,
+            share_url_base,
             api_state,
             #[cfg(feature = "energy")]
             power_pids,
@@ -656,6 +665,8 @@ impl AppState {
             pref_api_tls_addr_focus,
             pref_happier_relay_addr_text: String::new(),
             pref_happier_relay_addr_focus,
+            pref_share_url_base_text: String::new(),
+            pref_share_url_base_focus,
             remote_endpoints,
             #[cfg(feature = "happier-bridge")]
             relay_handle,
@@ -838,7 +849,7 @@ impl AppState {
             .map(|(tab, ts)| {
                 let view = tab.view.read(cx);
                 let (output, cursor) = view.ansi_text_with_cursor(Some(200));
-                let raw_output = view.raw_screen_text(Some(200));
+                let (raw_output, raw_cursor) = view.raw_screen_text(Some(200));
                 let (cols, rows) = view.dims();
                 api::SnapshotTab {
                     id: tab.id.clone(),
@@ -849,6 +860,7 @@ impl AppState {
                     // colours instead of the previous flat-grey text.
                     output,
                     raw_output,
+                    raw_cursor,
                     uptime_secs: tab.uptime().as_secs_f64(),
                     cursor,
                     cols,
@@ -1685,6 +1697,10 @@ impl AppState {
                 let tab_id = self.tabs[idx].id.clone();
                 let toast_msg = self.t().share_link_copied;
                 let id = if ro { "menu-share-link-ro" } else { "menu-share-link" };
+                // If the user configured a public base (reverse-proxy
+                // URL) use that. Strip any trailing slash so we can
+                // unconditionally prepend "/tabs/...".
+                let share_base = self.share_url_base.trim_end_matches('/').to_string();
                 container = container.child(
                     div()
                         .id(id)
@@ -1722,10 +1738,15 @@ impl AppState {
                                         }
                                     }
                                 }
-                                let url = if ro {
-                                    format!("http://{lan_ip}:{port}/tabs/by-id/{tab_id}/view?token={token}&ro=1")
+                                let base = if share_base.is_empty() {
+                                    format!("http://{lan_ip}:{port}")
                                 } else {
-                                    format!("http://{lan_ip}:{port}/tabs/by-id/{tab_id}/view?token={token}")
+                                    share_base.clone()
+                                };
+                                let url = if ro {
+                                    format!("{base}/tabs/by-id/{tab_id}/view?token={token}&ro=1")
+                                } else {
+                                    format!("{base}/tabs/by-id/{tab_id}/view?token={token}")
                                 };
                                 cx.write_to_clipboard(ClipboardItem::new_string(url));
                                 let toast_time = std::time::Instant::now();
@@ -2095,6 +2116,7 @@ impl AppState {
                             this.pref_api_addr_text = this.api_addr.clone();
                             this.pref_api_tls_addr_text = this.api_tls_addr.clone();
                             this.pref_happier_relay_addr_text = this.happier_relay_addr.clone();
+                            this.pref_share_url_base_text = this.share_url_base.clone();
                             this.show_preferences = true;
                             this.context_menu = None;
                             cx.notify();
@@ -2960,6 +2982,64 @@ impl AppState {
                     .child(div().w(px(1.0)).h(px(16.0)).bg(cursor_color))
             });
 
+        // Free-form URL field — share-link base for reverse-proxied
+        // setups (Caddy at https://example.com/~user/path). Permissive
+        // char filter (letters, digits, URL-safe punctuation) and a
+        // higher max length than the addr:port inputs.
+        let share_url_base_text = self.pref_share_url_base_text.clone();
+        let share_url_base_input = div()
+            .id("pref-share-url-base-input")
+            .key_context("pref-share-url-base")
+            .track_focus(&self.pref_share_url_base_focus)
+            .mt(px(8.0))
+            .w_full()
+            .flex()
+            .flex_row()
+            .items_center()
+            .bg(th.bg_hsla())
+            .border_1()
+            .border_color(input_border)
+            .rounded(px(3.0))
+            .px(px(8.0))
+            .py(px(4.0))
+            .min_h(px(28.0))
+            .cursor_text()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _ev: &MouseDownEvent, window, cx| {
+                    this.pref_share_url_base_focus.focus(window);
+                    cx.notify();
+                }),
+            )
+            .on_key_down(
+                cx.listener(|this, ev: &KeyDownEvent, _window, cx| match ev.keystroke.key.as_str() {
+                    "backspace" => {
+                        this.pref_share_url_base_text.pop();
+                        cx.notify();
+                    }
+                    _ => {
+                        if let Some(ref ch) = ev.keystroke.key_char
+                            && ch.chars().all(is_url_char)
+                            && this.pref_share_url_base_text.len() + ch.len() <= MAX_URL_LEN
+                        {
+                            this.pref_share_url_base_text.push_str(ch);
+                            cx.notify();
+                        }
+                    }
+                }),
+            )
+            .when(share_url_base_text.is_empty(), |el| {
+                el.child(
+                    div()
+                        .text_color(placeholder_fg)
+                        .child("https://example.com/tab-atelier"),
+                )
+            })
+            .when(!share_url_base_text.is_empty(), |el| {
+                el.child(share_url_base_text)
+                    .child(div().w(px(1.0)).h(px(16.0)).bg(cursor_color))
+            });
+
         let editor_text = self.pref_editor_text.clone();
         let editor_input = div()
             .id("pref-editor-input")
@@ -3046,6 +3126,7 @@ impl AppState {
                                 .child(t.happier_relay_addr)
                                 .child(happier_relay_addr_input),
                         )
+                        .child(div().mt(px(16.0)).child(t.share_url_base).child(share_url_base_input))
                         .child(
                             div()
                                 .mt(px(20.0))
@@ -3131,6 +3212,14 @@ impl AppState {
                                                     this.happier_relay_addr
                                                         .clone_from(&this.pref_happier_relay_addr_text);
                                                 }
+                                                // share_url_base is a free-form URL; accept whatever
+                                                // the user typed (trimmed), empty means "use LAN URL".
+                                                this.share_url_base = this.pref_share_url_base_text.trim().to_string();
+                                                let share_url_base = if this.share_url_base.is_empty() {
+                                                    None
+                                                } else {
+                                                    Some(this.share_url_base.clone())
+                                                };
                                                 save_preferences(
                                                     &platform::config_dir(),
                                                     &Preferences {
@@ -3143,6 +3232,7 @@ impl AppState {
                                                         api_addr: Some(this.api_addr.clone()),
                                                         api_tls_addr: Some(this.api_tls_addr.clone()),
                                                         happier_relay_addr: Some(this.happier_relay_addr.clone()),
+                                                        share_url_base,
                                                         remote_endpoints: this.remote_endpoints.clone(),
                                                     },
                                                 );
@@ -3506,6 +3596,36 @@ fn is_addr_port_char(c: char) -> bool {
 }
 
 const MAX_ADDR_LEN: usize = 64;
+
+/// Char predicate for the share-URL-base input — accepts the URL-safe
+/// ASCII set (RFC 3986 reserved + unreserved + a few practical extras
+/// like spaces / `?` not really allowed but tolerated for paste).
+fn is_url_char(c: char) -> bool {
+    c.is_ascii_alphanumeric()
+        || matches!(
+            c,
+            ':' | '/'
+                | '.'
+                | '-'
+                | '_'
+                | '~'
+                | '?'
+                | '#'
+                | '['
+                | ']'
+                | '@'
+                | '!'
+                | '$'
+                | '&'
+                | '+'
+                | ','
+                | ';'
+                | '='
+                | '%'
+        )
+}
+
+const MAX_URL_LEN: usize = 256;
 
 fn format_duration(d: std::time::Duration) -> String {
     let secs = d.as_secs();

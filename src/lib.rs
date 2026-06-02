@@ -659,6 +659,15 @@ pub struct Preferences {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_tls_addr: Option<String>,
 
+    /// Public base URL for share links — when set, the "Copy share
+    /// link" menu emits `<this>/tabs/by-id/<uuid>/view?...` instead
+    /// of `http://<LAN-IP>:<port>/...`. Useful when the API is
+    /// reverse-proxied (Caddy, nginx) under a public hostname so
+    /// recipients can reach the share without VPN'ing into the LAN.
+    /// No trailing slash; leave unset to use the LAN URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share_url_base: Option<String>,
+
     /// `addr:port` of the embedded happier-relay (when enabled).
     /// Defaults to `127.0.0.1:7892` — kept adjacent to the HTTP /
     /// TLS API ports (7890 / 7891). Loopback by default because the
