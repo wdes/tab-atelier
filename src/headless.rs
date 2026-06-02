@@ -114,6 +114,7 @@ struct HeadlessTab {
     agent_plan_mode: Option<bool>,
     share_token_rw: String,
     share_token_ro: String,
+    locked: bool,
     pending_agent_resume: Option<String>,
     colors_enabled: bool,
 }
@@ -223,6 +224,7 @@ fn spawn_pty_tab(
     agent_plan_mode: Option<bool>,
     share_token_rw: String,
     share_token_ro: String,
+    locked: bool,
 ) -> Option<HeadlessTab> {
     let ws = WindowSize {
         num_lines: INITIAL_LINES as u16,
@@ -306,6 +308,7 @@ fn spawn_pty_tab(
         agent_plan_mode,
         share_token_rw,
         share_token_ro,
+        locked,
         pending_agent_resume,
         colors_enabled,
     })
@@ -379,6 +382,7 @@ pub fn run() -> std::io::Result<()> {
                 ts.agent_plan_mode,
                 ts.share_token_rw.clone(),
                 ts.share_token_ro.clone(),
+                ts.locked,
             ) {
                 if let Some(out) = eager {
                     debug!("restoring {} chars of output for '{}'", out.len(), ts.name);
@@ -411,6 +415,7 @@ pub fn run() -> std::io::Result<()> {
             None,
             String::new(),
             String::new(),
+            false,
         ) {
             t.activate();
             tabs.push(t);
@@ -607,6 +612,7 @@ fn persist(
             agent_plan_mode: tab.agent_plan_mode,
             share_token_rw: tab.share_token_rw.clone(),
             share_token_ro: tab.share_token_ro.clone(),
+            locked: tab.locked,
             ..TabState::default()
         })
         .collect();
@@ -631,6 +637,7 @@ fn persist(
                 rows,
                 share_token_rw: ts.share_token_rw.clone(),
                 share_token_ro: ts.share_token_ro.clone(),
+                locked: ts.locked,
                 shell_pid: tab.pid,
                 agent_state: tab.agent_state.clone(),
                 agent_session_id: tab.agent_session_id.clone(),
@@ -898,6 +905,7 @@ fn drain_pending(
             None,
             String::new(),
             String::new(),
+            false,
         ) {
             if *active < tabs.len() {
                 tabs[*active].deactivate();

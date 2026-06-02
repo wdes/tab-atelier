@@ -227,6 +227,15 @@ pub struct TabState {
     pub share_token_rw: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub share_token_ro: String,
+
+    /// Locked tabs refuse every input source: local typing, paste,
+    /// hotkeys, remote API (master token included), and share links.
+    /// /output and /view still serve; only writes are blocked. Useful
+    /// for parking a tab on a long-running command and not nudging it
+    /// by accident. Toggled by the right-click menu; persisted across
+    /// restarts.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub locked: bool,
 }
 
 #[must_use]
@@ -260,6 +269,7 @@ impl Default for TabState {
             agent_plan_mode: None,
             share_token_rw: String::new(),
             share_token_ro: String::new(),
+            locked: false,
         }
     }
 }
