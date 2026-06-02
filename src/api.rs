@@ -119,6 +119,14 @@ pub struct SnapshotTab {
     /// resize its grid to match the server, avoiding wrap mismatch.
     pub cols: u16,
     pub rows: u16,
+    /// Per-tab share secrets. The "read-write" one authorises every
+    /// `/tabs/by-id/{uuid}/...` route on this tab; the "read-only"
+    /// one is rejected on `/input` with 403, so the URL itself is
+    /// the permission scope (stripping `&ro=1` does nothing because
+    /// the *token* is what's checked). Both default to empty until
+    /// the GUI menu mints them on first share.
+    pub share_token_rw: String,
+    pub share_token_ro: String,
     /// PID of the tab's shell. The /catbus endpoints walk its
     /// descendant processes to find a catbus-agent (or fallback
     /// `claude` TUI) and resolve the session's transcript file.
@@ -598,11 +606,67 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
     drop(reader);
 
     let provided_token = auth_token.or(query_token);
+    // Permission gate, in order:
+    //
+    // 1. Master token (`api.token`) — full access to every route, no
+    //    scoping. Same as before.
+    // 2. Per-tab share token, recognised only on `/tabs/by-id/{uuid}/...`.
+    //    Two flavours: `share_token_rw` and `share_token_ro`. RW grants
+    //    everything (read + input); RO grants read endpoints but is
+    //    refused on `/input` with 403, so a recipient cannot promote
+    //    a read-only link to interactive by editing `&ro=1` out of
+    //    the URL (the *token* is the wrong type for `/input`).
+    //
+    // Auth happens before route dispatch, so the inner match arms
+    // don't need to re-check; if execution reaches them, this gate
+    // has already accepted the request at the right level.
+    let mut share_token_authorised = false;
     if provided_token.as_deref() != Some(token) {
-        debug!("API: 401 unauthorized request to {path}");
-        error_json(stream, 401, "invalid or missing token");
-        return;
+        let allowed = if let Some(p) = provided_token.as_deref()
+            && let Some(rest) = path.strip_prefix("/tabs/by-id/")
+            && let Some((uuid, action)) = rest.split_once('/')
+            && matches!(action, "view" | "output" | "input")
+        {
+            let state_g = state.lock().unwrap();
+            if let Some(t) = state_g.tabs.iter().find(|t| t.id == uuid) {
+                let rw_match = !t.share_token_rw.is_empty() && t.share_token_rw == p;
+                let ro_match = !t.share_token_ro.is_empty() && t.share_token_ro == p;
+                if action == "input" {
+                    // RO tokens can never write input. RW tokens can.
+                    if rw_match {
+                        Some(true)
+                    } else if ro_match {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                } else if rw_match || ro_match {
+                    Some(true)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        match allowed {
+            Some(true) => {
+                share_token_authorised = true;
+            }
+            Some(false) => {
+                error_json(stream, 403, "share token is read-only");
+                return;
+            }
+            None => {
+                debug!("API: 401 unauthorized request to {path}");
+                error_json(stream, 401, "invalid or missing token");
+                return;
+            }
+        }
     }
+    let _ = share_token_authorised;
 
     debug!("API: {method} {path}");
 
@@ -1537,6 +1601,8 @@ mod tests {
                     cursor: None,
                     cols: 80,
                     rows: 24,
+                    share_token_rw: String::new(),
+                    share_token_ro: String::new(),
                     shell_pid: 0,
                     agent_state: None,
                     agent_session_id: None,
@@ -1551,6 +1617,8 @@ mod tests {
                     cursor: None,
                     cols: 80,
                     rows: 24,
+                    share_token_rw: String::new(),
+                    share_token_ro: String::new(),
                     shell_pid: 0,
                     agent_state: None,
                     agent_session_id: None,

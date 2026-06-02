@@ -31,6 +31,14 @@
     const headers = TOKEN ? { Authorization: "Bearer " + TOKEN } : {};
     const status = document.getElementById("status");
 
+    // The page lives at `<some-prefix>/tabs/<TAB_KEY>/view`. Resolve
+    // siblings (`output`, `input`) as relative paths so a reverse
+    // proxy (Caddy, nginx) that mounts us under any prefix continues
+    // to work — absolute `/tabs/...` URLs bypass the prefix and 404.
+    // Strip the trailing `view` to land on the parent directory;
+    // fetch('output') from that base resolves correctly.
+    const BASE = location.pathname.replace(/\/view\/?$/, "/");
+
     const term = new Terminal({
       convertEol: false,
       cursorBlink: !READ_ONLY,
@@ -60,8 +68,8 @@
 
     async function poll() {
       const url = bootstrapped
-        ? `/tabs/${TAB_KEY}/output?since=${since}&crc=${crc}`
-        : `/tabs/${TAB_KEY}/output`;
+        ? `${BASE}output?since=${since}&crc=${crc}`
+        : `${BASE}output`;
       try {
         const r = await fetch(url, { headers });
         if (!r.ok) { status.textContent = `http ${r.status}`; return; }
@@ -100,7 +108,7 @@
 
     if (!READ_ONLY) {
       term.onData(data => {
-        fetch(`/tabs/${TAB_KEY}/input`, {
+        fetch(`${BASE}input`, {
           method: "POST",
           headers: { ...headers, "Content-Type": "application/octet-stream" },
           body: new TextEncoder().encode(data),
