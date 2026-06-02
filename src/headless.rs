@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{Event as AlacrittyEvent, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
+use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::tty;
@@ -176,6 +177,12 @@ impl HeadlessTab {
     /// `term_export` so the GUI and headless paths can't drift.
     fn ansi_text_with_cursor(&self, max_lines: Option<usize>) -> (String, Option<(usize, usize)>) {
         crate::term_export::term_to_ansi_text_with_cursor(&self.term, max_lines)
+    }
+
+    fn dims(&self) -> (u16, u16) {
+        let t = self.term.lock();
+        let g = t.grid();
+        (g.columns() as u16, g.screen_lines() as u16)
     }
 
     fn copy_all_history(&self) -> String {
@@ -593,6 +600,7 @@ fn persist(
         .zip(tab_states.iter())
         .map(|(tab, ts)| {
             let (output, cursor) = tab.ansi_text_with_cursor(Some(200));
+            let (cols, rows) = tab.dims();
             api::SnapshotTab {
                 id: tab.id.clone(),
                 name: ts.name.clone(),
@@ -600,6 +608,8 @@ fn persist(
                 output,
                 uptime_secs: tab.uptime().as_secs_f64(),
                 cursor,
+                cols,
+                rows,
                 shell_pid: tab.pid,
                 agent_state: tab.agent_state.clone(),
                 agent_session_id: tab.agent_session_id.clone(),

@@ -823,6 +823,7 @@ impl AppState {
             .map(|(tab, ts)| {
                 let view = tab.view.read(cx);
                 let (output, cursor) = view.ansi_text_with_cursor(Some(200));
+                let (cols, rows) = view.dims();
                 api::SnapshotTab {
                     id: tab.id.clone(),
                     name: ts.name.clone(),
@@ -833,6 +834,8 @@ impl AppState {
                     output,
                     uptime_secs: tab.uptime().as_secs_f64(),
                     cursor,
+                    cols,
+                    rows,
                     shell_pid: view.pid(),
                     agent_state: tab.agent_state.clone(),
                     agent_session_id: tab.agent_session_id.clone(),
@@ -1643,6 +1646,49 @@ impl AppState {
                     )
                     .child(self.t().copy_path),
             );
+
+            // Copy a shareable LAN URL to the clipboard — points at the
+            // xterm.js viewer (/tabs/by-id/<UUID>/view). UUID rather
+            // than tab index so a leaked link is bound to one tab and
+            // can't be rewritten to address another by tweaking 0/1/2.
+            // The bearer token is the same one the rest of the API
+            // accepts — sharing the link grants the recipient API
+            // access; ?ro=1 caps them to read-only (no keystrokes).
+            for (label, ro) in [(self.t().copy_share_link, false), (self.t().copy_share_link_ro, true)] {
+                let lan_ip = api::local_ip();
+                let port = port_of(&self.api_addr, crate::DEFAULT_API_PORT);
+                let tab_id = self.tabs[idx].id.clone();
+                let token = self.api_token.clone();
+                let url = if ro {
+                    format!("http://{lan_ip}:{port}/tabs/by-id/{tab_id}/view?token={token}&ro=1")
+                } else {
+                    format!("http://{lan_ip}:{port}/tabs/by-id/{tab_id}/view?token={token}")
+                };
+                let toast_msg = self.t().share_link_copied;
+                let id = if ro { "menu-share-link-ro" } else { "menu-share-link" };
+                container = container.child(
+                    div()
+                        .id(id)
+                        .px(px(12.0))
+                        .py(px(4.0))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(menu_hover))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
+                                this.toasts.push(Toast {
+                                    message: toast_msg.into(),
+                                    time: std::time::Instant::now(),
+                                    path: None,
+                                });
+                                this.context_menu = None;
+                                cx.notify();
+                            }),
+                        )
+                        .child(label),
+                );
+            }
 
             if self.tabs.len() > 1 {
                 container = container.child(
