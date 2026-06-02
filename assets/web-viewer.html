@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>tab-atelier · tab __TAB_IDX__</title>
+  <link rel="stylesheet" href="https://unpkg.com/xterm@5.3.0/css/xterm.css">
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; background: #000; color: #ccc; font-family: monospace; }
+    #term { width: 100%; height: 100vh; }
+    #status { position: fixed; bottom: 4px; right: 8px; font-size: 11px; opacity: 0.5; pointer-events: none; }
+  </style>
+</head>
+<body>
+  <div id="term"></div>
+  <div id="status">connecting…</div>
+  <script src="https://unpkg.com/xterm@5.3.0/lib/xterm.js"></script>
+  <script src="https://unpkg.com/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+  <script>
+    const TAB_IDX = __TAB_IDX__;
+    const PARAMS = new URLSearchParams(location.search);
+    const TOKEN = PARAMS.get("token") || "";
+    const READ_ONLY = PARAMS.get("ro") === "1";
+    const headers = TOKEN ? { Authorization: "Bearer " + TOKEN } : {};
+    const status = document.getElementById("status");
+
+    const term = new Terminal({
+      convertEol: false,
+      cursorBlink: true,
+      fontFamily: 'ui-monospace, "JetBrains Mono", "Fira Code", Menlo, monospace',
+      fontSize: 13,
+      theme: { background: "#000000", foreground: "#cccccc" },
+    });
+    const fit = new FitAddon.FitAddon();
+    term.loadAddon(fit);
+    term.open(document.getElementById("term"));
+    fit.fit();
+    window.addEventListener("resize", () => fit.fit());
+
+    let since = 0;
+    let crc = "00000000";
+    let bootstrapped = false;
+    let lastErr = 0;
+
+    async function poll() {
+      const url = bootstrapped
+        ? `/tabs/${TAB_IDX}/output?since=${since}&crc=${crc}`
+        : `/tabs/${TAB_IDX}/output`;
+      try {
+        const r = await fetch(url, { headers });
+        if (!r.ok) { status.textContent = `http ${r.status}`; return; }
+        const len = parseInt(r.headers.get("X-Output-Length") || "0", 10);
+        const newCrc = r.headers.get("X-Output-Crc") || "00000000";
+        const start = parseInt(r.headers.get("X-Output-Start") || "0", 10);
+        const body = await r.text();
+        if (!bootstrapped) {
+          term.reset();
+          term.write(body);
+          bootstrapped = true;
+        } else if (start === since && body.length > 0) {
+          term.write(body);
+        } else if (start === 0 && body.length > 0) {
+          term.reset();
+          term.write(body);
+        }
+        since = len;
+        crc = newCrc;
+        status.textContent = `tab ${TAB_IDX} · ${len}B`;
+      } catch (e) {
+        lastErr = Date.now();
+        status.textContent = `offline · ${e.message || e}`;
+      }
+    }
+
+    if (!READ_ONLY) {
+      term.onData(data => {
+        fetch(`/tabs/${TAB_IDX}/input`, {
+          method: "POST",
+          headers: { ...headers, "Content-Type": "application/octet-stream" },
+          body: new TextEncoder().encode(data),
+        }).catch(() => {});
+      });
+    } else {
+      term.options.disableStdin = true;
+      term.options.cursorBlink = false;
+    }
+
+    setInterval(poll, 150);
+    poll();
+  </script>
+</body>
+</html>
