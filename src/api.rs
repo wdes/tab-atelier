@@ -4,7 +4,6 @@
 
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
@@ -472,7 +471,7 @@ fn respond_with_etag<W: Write>(
         // Content is byte-identical to what the client already has.
         let _ = write!(
             stream,
-            "HTTP/1.1 304 Not Modified\r\nETag: \"{etag}\"\r\n{extra_headers}Connection: close\r\n\r\n"
+            "HTTP/1.1 304 Not Modified\r\nETag: \"{etag}\"\r\n{extra_headers}\r\n"
         );
         return;
     }
@@ -489,14 +488,14 @@ fn respond_with_etag<W: Write>(
     if let Some(gz) = maybe_gzip(body, accept_gzip) {
         let _ = write!(
             stream,
-            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Encoding: gzip\r\nETag: \"{etag}\"\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Encoding: gzip\r\nETag: \"{etag}\"\r\n{extra_headers}Content-Length: {}\r\n\r\n",
             gz.len()
         );
         let _ = stream.write_all(&gz);
     } else {
         let _ = write!(
             stream,
-            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nETag: \"{etag}\"\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nETag: \"{etag}\"\r\n{extra_headers}Content-Length: {}\r\n\r\n",
             body.len()
         );
         let _ = stream.write_all(body);
@@ -515,7 +514,7 @@ fn respond_json<W: Write>(stream: &mut W, status: u16, body: &str) {
     };
     let _ = write!(
         stream,
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
         body.len(),
         body
     );
@@ -1363,37 +1362,209 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
     }
 }
 
-pub fn serve(listener: &TcpListener, state: &Arc<Mutex<TabSnapshot>>, token: &str, read_only: bool) {
-    for stream in listener.incoming() {
-        let Ok(mut stream) = stream else { continue };
-        handle_connection(&mut stream, state, token, read_only);
+// Async I/O — hyper drives connection setup, ALPN negotiation
+// (h2/http/1.1) and keep-alive; the sync `handle_connection`
+// handler runs unmodified per request via spawn_blocking against a
+// `MemAdapter` (Cursor reader + Vec writer). Each persistent
+// connection thus amortises TCP+TLS setup across every keystroke
+// POST and every output poll — the change the user could feel.
+
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper::body::Incoming;
+use hyper::server::conn::http1 as h1_conn;
+use hyper::server::conn::http2 as h2_conn;
+use hyper::service::service_fn;
+use hyper::{Request, Response};
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use std::convert::Infallible;
+use tokio::net::TcpListener as TokioListener;
+
+/// In-memory adapter that lets the existing sync handler read a
+/// pre-formatted HTTP/1.1 request and write its response into a
+/// `Vec<u8>` we can hand back to hyper.
+struct MemAdapter {
+    input: std::io::Cursor<Vec<u8>>,
+    output: Vec<u8>,
+}
+impl Read for MemAdapter {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.input.read(buf)
+    }
+}
+impl Write for MemAdapter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.output.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Format a hyper `Request` (already-collected body) as raw HTTP/1.1
+/// bytes the existing handler can parse. The handler reads method +
+/// path from the request line, headers (Authorization, Content-Length,
+/// Accept-Encoding, If-None-Match), and then a body of `Content-Length`
+/// bytes — everything else hyper sent is dropped.
+fn format_h1_request(method: &str, uri: &str, headers: &hyper::HeaderMap, body: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(256 + body.len());
+    let _ = write!(&mut buf, "{method} {uri} HTTP/1.1\r\n");
+    for (name, value) in headers.iter() {
+        if name == hyper::header::CONTENT_LENGTH {
+            // Force a length consistent with the actual body we ship.
+            continue;
+        }
+        if let Ok(v) = value.to_str() {
+            let _ = write!(&mut buf, "{}: {}\r\n", name.as_str(), v);
+        }
+    }
+    let _ = write!(&mut buf, "Content-Length: {}\r\n\r\n", body.len());
+    buf.extend_from_slice(body);
+    buf
+}
+
+/// Parse the bytes emitted by `handle_connection` and return a
+/// hyper `Response`. The handler always emits `HTTP/1.1 STATUS REASON`
+/// + headers + body. We ignore the reason phrase (hyper rebuilds it)
+/// and pass headers + body through.
+fn parse_h1_response(bytes: &[u8]) -> Response<Full<Bytes>> {
+    // Find header/body split.
+    let split = bytes.windows(4).position(|w| w == b"\r\n\r\n");
+    let (head, body) = match split {
+        Some(i) => (&bytes[..i], &bytes[i + 4..]),
+        None => (bytes, &[][..]),
+    };
+    let head_text = std::str::from_utf8(head).unwrap_or("");
+    let mut lines = head_text.split("\r\n");
+    let status = lines
+        .next()
+        .and_then(|l| {
+            let mut parts = l.split_whitespace();
+            parts.next(); // HTTP/1.1
+            parts.next()
+        })
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(500);
+    let mut builder = Response::builder().status(status);
+    let mut content_encoding_gzip = false;
+    let mut content_length: Option<usize> = None;
+    for line in lines {
+        if let Some(colon) = line.find(':') {
+            let name = line[..colon].trim();
+            let value = line[colon + 1..].trim();
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = value.parse().ok();
+            }
+            if name.eq_ignore_ascii_case("content-encoding") && value.eq_ignore_ascii_case("gzip") {
+                content_encoding_gzip = true;
+            }
+            builder = builder.header(name, value);
+        }
+    }
+    let _ = content_encoding_gzip;
+    let body_bytes = if let Some(n) = content_length {
+        Bytes::copy_from_slice(&body[..n.min(body.len())])
+    } else {
+        Bytes::copy_from_slice(body)
+    };
+    builder
+        .body(Full::new(body_bytes))
+        .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))
+}
+
+/// hyper service: collects the body, hands the request to the sync
+/// handler on the blocking pool, parses the response back.
+async fn handle_hyper_request(
+    req: Request<Incoming>,
+    state: Arc<Mutex<TabSnapshot>>,
+    token: String,
+    read_only: bool,
+) -> Result<Response<Full<Bytes>>, Infallible> {
+    let method = req.method().to_string();
+    let uri = req
+        .uri()
+        .path_and_query()
+        .map_or_else(|| req.uri().to_string(), std::string::ToString::to_string);
+    let headers = req.headers().clone();
+    let body = match req.into_body().collect().await {
+        Ok(c) => c.to_bytes(),
+        Err(_) => {
+            return Ok(Response::builder()
+                .status(400)
+                .body(Full::new(Bytes::from("bad body")))
+                .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()))));
+        }
+    };
+    let req_bytes = format_h1_request(&method, &uri, &headers, &body);
+    let resp = tokio::task::spawn_blocking(move || {
+        let mut adapter = MemAdapter {
+            input: std::io::Cursor::new(req_bytes),
+            output: Vec::with_capacity(1024),
+        };
+        handle_connection(&mut adapter, &state, &token, read_only);
+        adapter.output
+    })
+    .await
+    .unwrap_or_default();
+    Ok(parse_h1_response(&resp))
+}
+
+/// Pick the right hyper connection driver for the negotiated ALPN.
+/// Called from both the plain (no ALPN, default to h1) and TLS
+/// (ALPN-negotiated) listener paths.
+async fn serve_connection<I>(io: I, h2: bool, state: Arc<Mutex<TabSnapshot>>, token: String, read_only: bool)
+where
+    I: hyper::rt::Read + hyper::rt::Write + Send + Unpin + 'static,
+{
+    let svc = service_fn(move |req| handle_hyper_request(req, state.clone(), token.clone(), read_only));
+    if h2 {
+        let _ = h2_conn::Builder::new(TokioExecutor::new())
+            .serve_connection(io, svc)
+            .await;
+    } else {
+        let _ = h1_conn::Builder::new().keep_alive(true).serve_connection(io, svc).await;
     }
 }
 
 pub fn start_api_server(state: Arc<Mutex<TabSnapshot>>, token: String, read_only: bool, bind: String) {
     std::thread::spawn(move || {
-        let listener = match TcpListener::bind(&bind) {
-            Ok(l) => {
-                info!("API: listening on {bind}");
-                l
-            }
+        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(rt) => rt,
             Err(e) => {
-                error!("API: failed to bind {bind}: {e}");
+                error!("API: tokio runtime build failed: {e}");
                 return;
             }
         };
-        serve(&listener, &state, &token, read_only);
+        rt.block_on(async move {
+            let listener = match TokioListener::bind(&bind).await {
+                Ok(l) => {
+                    info!("API: listening on {bind} (HTTP/1.1)");
+                    l
+                }
+                Err(e) => {
+                    error!("API: failed to bind {bind}: {e}");
+                    return;
+                }
+            };
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    continue;
+                };
+                let state = state.clone();
+                let token = token.clone();
+                tokio::spawn(async move {
+                    // Plain HTTP: no ALPN, so we serve HTTP/1.1
+                    // (with keep-alive). HTTP/2 only over TLS.
+                    serve_connection(TokioIo::new(stream), false, state, token, read_only).await;
+                });
+            }
+        });
     });
 }
 
-/// Start a second listener on `:7891` that serves the same API over TLS.
-///
-/// Uses a self-signed certificate generated on first launch and cached at
-/// `{state_base}/tab-atelier/{tls.crt,tls.key}`. The cert is created with
-/// the host's local IP and `localhost` as SANs so clients on the LAN can
-/// validate via either. Pin-on-first-use clients (the Android remote) can
-/// trust the cert directly; browsers will warn until added to their
-/// trust store — fine for personal use.
+/// TLS listener — ALPN advertises `h2` and `http/1.1`, so modern
+/// browsers negotiate HTTP/2 and we get multiplexing + persistent
+/// connection for free over the share-link viewer.
 pub fn start_api_server_tls(state: Arc<Mutex<TabSnapshot>>, token: String, read_only: bool, bind: String) {
     use rustls::ServerConfig;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -1406,42 +1577,64 @@ pub fn start_api_server_tls(state: Arc<Mutex<TabSnapshot>>, token: String, read_
         }
     };
 
-    let cfg = match ServerConfig::builder().with_no_client_auth().with_single_cert(
+    let mut cfg = match ServerConfig::builder().with_no_client_auth().with_single_cert(
         vec![CertificateDer::from(cert_der)],
         PrivateKeyDer::try_from(key_der)
             .map_err(std::string::ToString::to_string)
             .unwrap(),
     ) {
-        Ok(c) => Arc::new(c),
+        Ok(c) => c,
         Err(e) => {
             error!("API/TLS: rustls config build failed: {e}");
             return;
         }
     };
+    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    let cfg = Arc::new(cfg);
 
     std::thread::spawn(move || {
-        let listener = match TcpListener::bind(&bind) {
-            Ok(l) => {
-                info!("API: TLS listening on {bind}");
-                l
-            }
+        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(rt) => rt,
             Err(e) => {
-                error!("API: failed to bind {bind}: {e}");
+                error!("API/TLS: tokio runtime build failed: {e}");
                 return;
             }
         };
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
-            let mut conn = match rustls::ServerConnection::new(cfg.clone()) {
-                Ok(c) => c,
+        rt.block_on(async move {
+            let listener = match TokioListener::bind(&bind).await {
+                Ok(l) => {
+                    info!("API: TLS listening on {bind} (HTTP/2 + HTTP/1.1 via ALPN)");
+                    l
+                }
                 Err(e) => {
-                    debug!("API/TLS: handshake init failed: {e}");
-                    continue;
+                    error!("API: failed to bind {bind}: {e}");
+                    return;
                 }
             };
-            let mut tls = rustls::Stream::new(&mut conn, &mut stream);
-            handle_connection(&mut tls, &state, &token, read_only);
-        }
+            let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    continue;
+                };
+                let acceptor = acceptor.clone();
+                let state = state.clone();
+                let token = token.clone();
+                tokio::spawn(async move {
+                    let tls = match acceptor.accept(stream).await {
+                        Ok(t) => t,
+                        Err(e) => {
+                            debug!("API/TLS: handshake failed: {e}");
+                            return;
+                        }
+                    };
+                    // After ALPN: pick h2 or h1 from the negotiated
+                    // protocol so hyper uses the right framing.
+                    let alpn = tls.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
+                    let is_h2 = alpn.as_deref() == Some(b"h2");
+                    serve_connection(TokioIo::new(tls), is_h2, state, token, read_only).await;
+                });
+            }
+        });
     });
 }
 
