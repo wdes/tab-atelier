@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>tab-atelier · tab __TAB_KEY__</title>
+  <title>__TAB_NAME_HTML__ · tab-atelier</title>
   <link rel="stylesheet" href="https://unpkg.com/xterm@5.3.0/css/xterm.css">
   <style>
     html, body { margin: 0; padding: 0; height: 100%; background: #000; color: #ccc; font-family: monospace; }
@@ -25,6 +25,9 @@
     // `by-id/<uuid>` form). The same value is what every subrequest
     // uses, so the share URL identifies one tab end-to-end.
     const TAB_KEY = "__TAB_KEY__";
+    // __TAB_NAME_JS__ is JSON-encoded server-side (handles quotes,
+    // backslashes, newlines), so wrapping it in quotes here is safe.
+    const TAB_NAME = "__TAB_NAME_JS__";
     const PARAMS = new URLSearchParams(location.search);
     const TOKEN = PARAMS.get("token") || "";
     const READ_ONLY = PARAMS.get("ro") === "1";
@@ -56,6 +59,12 @@
     });
     const termEl = document.getElementById("term");
     term.open(termEl);
+    // Tell xterm.js what this terminal is called (OSC 2). Drives the
+    // value xterm.js exposes via onTitleChange / its internal `title`
+    // property so addons or screencap tools see the real tab name
+    // instead of an empty string. Browser tab title is set via the
+    // <title> element from the same __TAB_NAME__ substitution.
+    if (TAB_NAME) term.write(`\x1b]2;${TAB_NAME}\x07`);
     // Auto-focus so typing works without an extra click. Skipped in
     // read-only mode so the recipient can scroll without their
     // keypresses being silently dropped into a disabled stdin.
@@ -82,6 +91,11 @@
         const start = parseInt(r.headers.get("X-Output-Start") || "0", 10);
         const cols = parseInt(r.headers.get("X-Output-Cols") || "0", 10);
         const rows = parseInt(r.headers.get("X-Output-Rows") || "0", 10);
+        // Cursor in raw-output coords (0-indexed). NaN when the
+        // server didn't ship it, in which case we leave xterm.js's
+        // cursor wherever the last write landed.
+        const curRow = parseInt(r.headers.get("X-Raw-Cursor-Row") || "", 10);
+        const curCol = parseInt(r.headers.get("X-Raw-Cursor-Col") || "", 10);
         // Resize xterm.js to match the server's PTY grid. Without
         // this the browser's wider grid breaks the server's wrapping
         // (long lines stay short, prompt header floats over empty
@@ -92,19 +106,30 @@
           serverRows = rows;
         }
         const body = await r.text();
+        // Tail the body with a cursor-position escape so xterm.js
+        // ends up with the cursor at the SERVER's position, not at
+        // the end of the dump. CSI ROW;COL H is 1-indexed.
+        const cursorTail = (Number.isFinite(curRow) && Number.isFinite(curCol))
+          ? `\x1b[${curRow + 1};${curCol + 1}H`
+          : "";
         if (!bootstrapped) {
           term.reset();
-          term.write(body);
+          term.write(body + cursorTail);
           bootstrapped = true;
         } else if (start === since && body.length > 0) {
-          term.write(body);
+          term.write(body + cursorTail);
         } else if (start === 0 && body.length > 0) {
           term.reset();
-          term.write(body);
+          term.write(body + cursorTail);
+        } else if (cursorTail) {
+          // No body change but cursor may have moved — keep the
+          // blink tracking even when only the cursor's position
+          // changed (common while typing on the same line).
+          term.write(cursorTail);
         }
         since = len;
         crc = newCrc;
-        status.textContent = `tab ${TAB_KEY} · ${serverCols}x${serverRows} · ${len}B`;
+        status.textContent = `${TAB_NAME} · ${serverCols}x${serverRows} · ${len}B`;
       } catch (e) {
         status.textContent = `offline · ${e.message || e}`;
       }

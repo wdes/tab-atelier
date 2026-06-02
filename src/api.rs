@@ -115,6 +115,12 @@ pub struct SnapshotTab {
     /// viewer keep using `output` (logical lines, easier to word-wrap
     /// on a phone).
     pub raw_output: String,
+    /// Cursor (row_in_raw_output, col) — coordinates inside
+    /// `raw_output` so the xterm.js viewer can issue a
+    /// cursor-position escape after each write and the blinking
+    /// cursor lands where the user is actually typing. Distinct
+    /// from `cursor` which is in `output` (joined-line) coords.
+    pub raw_cursor: Option<(usize, usize)>,
     pub uptime_secs: f64,
     /// Cursor (logical-row, logical-column) within `output` — after
     /// alacritty's WRAPLINE rows have been joined into single lines.
@@ -888,20 +894,39 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 error_json(stream, 404, "invalid tab key");
                 return;
             };
-            {
+            let tab_name = {
                 let state = state.lock().unwrap();
-                if resolve_tab_idx(&state, key_raw, is_uuid).is_none() {
+                let Some(idx) = resolve_tab_idx(&state, key_raw, is_uuid) else {
                     drop(state);
                     error_json(stream, 404, "tab not found");
                     return;
-                }
-            }
+                };
+                state.tabs[idx].name.clone()
+            };
             let key_for_html = if is_uuid {
                 format!("by-id/{key_raw}")
             } else {
                 key_raw.to_string()
             };
-            let html = VIEWER_HTML.replace("__TAB_KEY__", &key_for_html);
+            // The tab name lands in two distinct contexts: inside
+            // <title> (HTML-escape) and inside a JS string literal
+            // (JSON-encode — handles quotes, backslashes, newlines,
+            // and any future weirdness in one go). Using two
+            // substitution markers keeps each context safe.
+            let html_name = tab_name
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+                .replace('"', "&quot;");
+            // serde_json::to_string yields a quoted JS-safe string
+            // literal; strip the surrounding quotes so the template
+            // can wrap it in its own quotes.
+            let js_name_quoted = serde_json::to_string(&tab_name).unwrap_or_else(|_| "\"\"".into());
+            let js_name = js_name_quoted.trim_matches('"');
+            let html = VIEWER_HTML
+                .replace("__TAB_KEY__", &key_for_html)
+                .replace("__TAB_NAME_HTML__", &html_name)
+                .replace("__TAB_NAME_JS__", js_name);
             respond_with_etag(
                 stream,
                 200,
@@ -954,6 +979,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             let total_len = payload.len();
             let pty_cols = t.cols;
             let pty_rows = t.rows;
+            let raw_cursor = t.raw_cursor;
 
             let (body, cursor, start_offset) = match (query_since, query_crc) {
                 (Some(n), Some(client_crc)) if n <= total_len => {
@@ -1007,6 +1033,15 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 extra,
                 "X-Output-Length: {total_len}\r\nX-Output-Crc: {total_crc:08x}\r\nX-Output-Start: {start_offset}\r\nX-Output-Cols: {pty_cols}\r\nX-Output-Rows: {pty_rows}\r\n"
             );
+            // Cursor position in raw-output coords — the viewer
+            // reapplies it after each write so xterm.js puts its
+            // blink at the server's real cursor (otherwise the
+            // cursor sits at the end of the last written byte =
+            // bottom-right corner of the dump, never where the user
+            // is actually typing).
+            if let Some((row, col)) = raw_cursor {
+                let _ = write!(extra, "X-Raw-Cursor-Row: {row}\r\nX-Raw-Cursor-Col: {col}\r\n");
+            }
             respond_with_etag(
                 stream,
                 200,
@@ -1618,6 +1653,7 @@ mod tests {
                     cols: 80,
                     rows: 24,
                     raw_output: String::new(),
+                    raw_cursor: None,
                     share_token_rw: String::new(),
                     share_token_ro: String::new(),
                     shell_pid: 0,
@@ -1635,6 +1671,7 @@ mod tests {
                     cols: 80,
                     rows: 24,
                     raw_output: String::new(),
+                    raw_cursor: None,
                     share_token_rw: String::new(),
                     share_token_ro: String::new(),
                     shell_pid: 0,
