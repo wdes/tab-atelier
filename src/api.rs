@@ -15,6 +15,30 @@ use crate::tracking::USER_AGENT;
 
 const VIEWER_HTML: &str = include_str!("../assets/web-viewer.html");
 
+/// Parse the tab segment between `/tabs/` and a suffix into either
+/// a numeric index or a UUID. Returns `(idx, key_for_html)` after
+/// resolution against the snapshot: the index is what every internal
+/// path uses; the key is the string the share URL carries (numeric
+/// or `by-id/UUID`) so the HTML viewer rewrites every subrequest with
+/// the same form.
+fn parse_tab_key<'a>(path: &'a str, suffix: &str) -> Option<(&'a str, bool)> {
+    let inner = path.strip_prefix("/tabs/")?.strip_suffix(suffix)?;
+    if let Some(uuid) = inner.strip_prefix("by-id/") {
+        Some((uuid, true))
+    } else {
+        Some((inner, false))
+    }
+}
+
+fn resolve_tab_idx(state: &TabSnapshot, key_raw: &str, is_uuid: bool) -> Option<usize> {
+    if is_uuid {
+        state.tabs.iter().position(|t| t.id == key_raw)
+    } else {
+        let idx: usize = key_raw.parse().ok()?;
+        state.tabs.get(idx).map(|_| idx)
+    }
+}
+
 #[derive(Serialize)]
 struct TabInfo {
     index: usize,
@@ -90,6 +114,11 @@ pub struct SnapshotTab {
     /// None when the cursor is outside the emitted lines (e.g. in
     /// scrollback beyond the cached window).
     pub cursor: Option<(usize, usize)>,
+    /// Current PTY dimensions (cols, rows). Surfaced on /output as
+    /// `X-Output-Cols` / `X-Output-Rows` so the xterm.js viewer can
+    /// resize its grid to match the server, avoiding wrap mismatch.
+    pub cols: u16,
+    pub rows: u16,
     /// PID of the tab's shell. The /catbus endpoints walk its
     /// descendant processes to find a catbus-agent (or fallback
     /// `claude` TUI) and resolve the session's transcript file.
@@ -784,20 +813,24 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             respond_json(stream, 200, &body);
         }
         ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/view") => {
-            let idx_str = &p["/tabs/".len()..p.len() - "/view".len()];
-            let Ok(idx) = idx_str.parse::<usize>() else {
-                error_json(stream, 404, "invalid tab index");
+            let Some((key_raw, is_uuid)) = parse_tab_key(p, "/view") else {
+                error_json(stream, 404, "invalid tab key");
                 return;
             };
             {
                 let state = state.lock().unwrap();
-                if state.tabs.get(idx).is_none() {
+                if resolve_tab_idx(&state, key_raw, is_uuid).is_none() {
                     drop(state);
-                    error_json(stream, 404, "tab index out of range");
+                    error_json(stream, 404, "tab not found");
                     return;
                 }
             }
-            let html = VIEWER_HTML.replace("__TAB_IDX__", &idx.to_string());
+            let key_for_html = if is_uuid {
+                format!("by-id/{key_raw}")
+            } else {
+                key_raw.to_string()
+            };
+            let html = VIEWER_HTML.replace("__TAB_KEY__", &key_for_html);
             respond_with_etag(
                 stream,
                 200,
@@ -809,12 +842,16 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             );
         }
         ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/output") => {
-            let idx_str = &p["/tabs/".len()..p.len() - "/output".len()];
-            let Ok(idx) = idx_str.parse::<usize>() else {
-                error_json(stream, 404, "invalid tab index");
+            let Some((key_raw, is_uuid)) = parse_tab_key(p, "/output") else {
+                error_json(stream, 404, "invalid tab key");
                 return;
             };
             let state = state.lock().unwrap();
+            let Some(idx) = resolve_tab_idx(&state, key_raw, is_uuid) else {
+                drop(state);
+                error_json(stream, 404, "tab not found");
+                return;
+            };
             let Some(t) = state.tabs.get(idx) else {
                 drop(state);
                 error_json(stream, 404, "tab index out of range");
@@ -835,6 +872,8 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             // is just appending output).
             let total_crc = crate::crc32(t.output.as_bytes());
             let total_len = t.output.len();
+            let pty_cols = t.cols;
+            let pty_rows = t.rows;
 
             let (body, cursor, start_offset) = match (query_since, query_crc) {
                 (Some(n), Some(client_crc)) if n <= total_len => {
@@ -886,7 +925,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             }
             let _ = write!(
                 extra,
-                "X-Output-Length: {total_len}\r\nX-Output-Crc: {total_crc:08x}\r\nX-Output-Start: {start_offset}\r\n"
+                "X-Output-Length: {total_len}\r\nX-Output-Crc: {total_crc:08x}\r\nX-Output-Start: {start_offset}\r\nX-Output-Cols: {pty_cols}\r\nX-Output-Rows: {pty_rows}\r\n"
             );
             respond_with_etag(
                 stream,
@@ -1180,21 +1219,21 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             );
         }
         ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/input") => {
-            let idx_str = &p["/tabs/".len()..p.len() - "/input".len()];
-            if let Ok(idx) = idx_str.parse::<usize>() {
-                let mut state = state.lock().unwrap();
-                if idx < state.tabs.len() {
-                    info!("API: sending {} bytes of input to tab {idx}", body_bytes.len());
-                    let n = body_bytes.len();
-                    state.pending_input.push((idx, body_bytes));
-                    drop(state);
-                    let resp = serde_json::to_string(&serde_json::json!({"sent": n})).unwrap_or_default();
-                    respond_json(stream, 200, &resp);
-                } else {
-                    error_json(stream, 404, "tab index out of range");
-                }
+            let Some((key_raw, is_uuid)) = parse_tab_key(p, "/input") else {
+                error_json(stream, 404, "invalid tab key");
+                return;
+            };
+            let mut state = state.lock().unwrap();
+            if let Some(idx) = resolve_tab_idx(&state, key_raw, is_uuid) {
+                info!("API: sending {} bytes of input to tab {idx}", body_bytes.len());
+                let n = body_bytes.len();
+                state.pending_input.push((idx, body_bytes));
+                drop(state);
+                let resp = serde_json::to_string(&serde_json::json!({"sent": n})).unwrap_or_default();
+                respond_json(stream, 200, &resp);
             } else {
-                error_json(stream, 404, "invalid tab index");
+                drop(state);
+                error_json(stream, 404, "tab not found");
             }
         }
         (_, "/" | "/tabs") => {
@@ -1496,6 +1535,8 @@ mod tests {
                     output: "$ ls\nfoo bar baz".into(),
                     uptime_secs: 0.0,
                     cursor: None,
+                    cols: 80,
+                    rows: 24,
                     shell_pid: 0,
                     agent_state: None,
                     agent_session_id: None,
@@ -1508,6 +1549,8 @@ mod tests {
                     output: String::new(),
                     uptime_secs: 0.0,
                     cursor: None,
+                    cols: 80,
+                    rows: 24,
                     shell_pid: 0,
                     agent_state: None,
                     agent_session_id: None,

@@ -509,6 +509,16 @@ impl TerminalView {
         t.selection = Some(Selection::new(SelectionType::Lines, grid_point, Side::Left));
     }
 
+    /// Current PTY dimensions in cells — exposed so the API snapshot
+    /// can ship the per-tab cols/rows to remote viewers (xterm.js
+    /// resizes its grid to match, otherwise the server-side wrapping
+    /// renders weird when the browser window is wider than the PTY).
+    pub fn dims(&self) -> (u16, u16) {
+        let t = self.term.lock();
+        let g = t.grid();
+        (g.columns() as u16, g.screen_lines() as u16)
+    }
+
     pub fn copy_selection(&self) -> Option<String> {
         let t = self.term.lock();
         t.selection_to_string()

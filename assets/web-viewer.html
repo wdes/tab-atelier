@@ -3,11 +3,16 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>tab-atelier · tab __TAB_IDX__</title>
+  <title>tab-atelier · tab __TAB_KEY__</title>
   <link rel="stylesheet" href="https://unpkg.com/xterm@5.3.0/css/xterm.css">
   <style>
     html, body { margin: 0; padding: 0; height: 100%; background: #000; color: #ccc; font-family: monospace; }
-    #term { width: 100%; height: 100vh; }
+    /* Centre the terminal so the server-sized grid stays aligned in
+       the middle of a wider browser window. Vertical anchor at top
+       (alignItems: start) so the scrollback grows downward, not from
+       the centre. */
+    body { display: flex; align-items: flex-start; justify-content: center; }
+    #term { width: max-content; }
     #status { position: fixed; bottom: 4px; right: 8px; font-size: 11px; opacity: 0.5; pointer-events: none; }
   </style>
 </head>
@@ -15,9 +20,11 @@
   <div id="term"></div>
   <div id="status">connecting…</div>
   <script src="https://unpkg.com/xterm@5.3.0/lib/xterm.js"></script>
-  <script src="https://unpkg.com/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
   <script>
-    const TAB_IDX = __TAB_IDX__;
+    // __TAB_KEY__ is the route segment after `/tabs/` (numeric idx or
+    // `by-id/<uuid>` form). The same value is what every subrequest
+    // uses, so the share URL identifies one tab end-to-end.
+    const TAB_KEY = "__TAB_KEY__";
     const PARAMS = new URLSearchParams(location.search);
     const TOKEN = PARAMS.get("token") || "";
     const READ_ONLY = PARAMS.get("ro") === "1";
@@ -26,32 +33,52 @@
 
     const term = new Terminal({
       convertEol: false,
-      cursorBlink: true,
+      cursorBlink: !READ_ONLY,
+      disableStdin: READ_ONLY,
       fontFamily: 'ui-monospace, "JetBrains Mono", "Fira Code", Menlo, monospace',
       fontSize: 13,
+      cols: 80,
+      rows: 24,
+      scrollback: 5000,
       theme: { background: "#000000", foreground: "#cccccc" },
     });
-    const fit = new FitAddon.FitAddon();
-    term.loadAddon(fit);
-    term.open(document.getElementById("term"));
-    fit.fit();
-    window.addEventListener("resize", () => fit.fit());
+    const termEl = document.getElementById("term");
+    term.open(termEl);
+    // Auto-focus so typing works without an extra click. Skipped in
+    // read-only mode so the recipient can scroll without their
+    // keypresses being silently dropped into a disabled stdin.
+    if (!READ_ONLY) term.focus();
+    // Clicking the surrounding area refocuses too — easy to lose
+    // focus by tabbing to another browser pane.
+    document.body.addEventListener("click", () => { if (!READ_ONLY) term.focus(); });
 
     let since = 0;
     let crc = "00000000";
     let bootstrapped = false;
-    let lastErr = 0;
+    let serverCols = 0;
+    let serverRows = 0;
 
     async function poll() {
       const url = bootstrapped
-        ? `/tabs/${TAB_IDX}/output?since=${since}&crc=${crc}`
-        : `/tabs/${TAB_IDX}/output`;
+        ? `/tabs/${TAB_KEY}/output?since=${since}&crc=${crc}`
+        : `/tabs/${TAB_KEY}/output`;
       try {
         const r = await fetch(url, { headers });
         if (!r.ok) { status.textContent = `http ${r.status}`; return; }
         const len = parseInt(r.headers.get("X-Output-Length") || "0", 10);
         const newCrc = r.headers.get("X-Output-Crc") || "00000000";
         const start = parseInt(r.headers.get("X-Output-Start") || "0", 10);
+        const cols = parseInt(r.headers.get("X-Output-Cols") || "0", 10);
+        const rows = parseInt(r.headers.get("X-Output-Rows") || "0", 10);
+        // Resize xterm.js to match the server's PTY grid. Without
+        // this the browser's wider grid breaks the server's wrapping
+        // (long lines stay short, prompt header floats over empty
+        // space on the right).
+        if (cols > 0 && rows > 0 && (cols !== serverCols || rows !== serverRows)) {
+          term.resize(cols, rows);
+          serverCols = cols;
+          serverRows = rows;
+        }
         const body = await r.text();
         if (!bootstrapped) {
           term.reset();
@@ -65,24 +92,20 @@
         }
         since = len;
         crc = newCrc;
-        status.textContent = `tab ${TAB_IDX} · ${len}B`;
+        status.textContent = `tab ${TAB_KEY} · ${serverCols}x${serverRows} · ${len}B`;
       } catch (e) {
-        lastErr = Date.now();
         status.textContent = `offline · ${e.message || e}`;
       }
     }
 
     if (!READ_ONLY) {
       term.onData(data => {
-        fetch(`/tabs/${TAB_IDX}/input`, {
+        fetch(`/tabs/${TAB_KEY}/input`, {
           method: "POST",
           headers: { ...headers, "Content-Type": "application/octet-stream" },
           body: new TextEncoder().encode(data),
         }).catch(() => {});
       });
-    } else {
-      term.options.disableStdin = true;
-      term.options.cursorBlink = false;
     }
 
     setInterval(poll, 150);
