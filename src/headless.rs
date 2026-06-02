@@ -181,6 +181,10 @@ impl HeadlessTab {
         crate::term_export::term_to_ansi_text_with_cursor(&self.term, max_lines)
     }
 
+    fn raw_screen_text(&self, max_lines: Option<usize>) -> String {
+        crate::term_export::term_to_ansi_rows(&self.term, max_lines)
+    }
+
     fn dims(&self) -> (u16, u16) {
         let t = self.term.lock();
         let g = t.grid();
@@ -612,12 +616,14 @@ fn persist(
         .zip(tab_states.iter())
         .map(|(tab, ts)| {
             let (output, cursor) = tab.ansi_text_with_cursor(Some(200));
+            let raw_output = tab.raw_screen_text(Some(200));
             let (cols, rows) = tab.dims();
             api::SnapshotTab {
                 id: tab.id.clone(),
                 name: ts.name.clone(),
                 cwd: ts.cwd.clone(),
                 output,
+                raw_output,
                 uptime_secs: tab.uptime().as_secs_f64(),
                 cursor,
                 cols,

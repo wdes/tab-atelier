@@ -519,6 +519,15 @@ impl TerminalView {
         (g.columns() as u16, g.screen_lines() as u16)
     }
 
+    /// Row-by-row dump for the xterm.js viewer (no WRAPLINE join).
+    /// Each server-grid row → one `\n`-terminated line, so the
+    /// browser-side terminal at matching cols reproduces the layout
+    /// cell-for-cell instead of relying on xterm.js auto-wrap to
+    /// re-land the wrap point.
+    pub fn raw_screen_text(&self, max_lines: Option<usize>) -> String {
+        crate::term_export::term_to_ansi_rows(&self.term, max_lines)
+    }
+
     pub fn copy_selection(&self) -> Option<String> {
         let t = self.term.lock();
         t.selection_to_string()
