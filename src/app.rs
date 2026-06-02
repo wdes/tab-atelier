@@ -99,6 +99,10 @@ struct Tab {
     /// restarts. Empty until first share.
     share_token_rw: String,
     share_token_ro: String,
+    /// Lock state — when true, every input source is refused:
+    /// local typing, paste, hotkeys, remote API, share links.
+    /// Toggled by the right-click menu; persisted to tabs.json.
+    locked: bool,
     /// One-shot resume command queued on tab restore — when the
     /// shell is up the next tick types `<command>\n` into the
     /// PTY, then clears this. Set in `insert_tab` from the
@@ -351,6 +355,12 @@ impl AppState {
                             Some(output)
                         }
                     });
+                    // Push the persisted lock state onto the view so
+                    // input is blocked from the moment the tab loads,
+                    // not just after the menu is opened.
+                    if ts.locked {
+                        view.read(cx).set_locked(true);
+                    }
                     // Auto-resume: if this tab had an agent session
                     // and kind persisted, queue the resume command
                     // to be typed into the freshly-spawned shell.
@@ -386,6 +396,7 @@ impl AppState {
                         agent_plan_mode: ts.agent_plan_mode,
                         share_token_rw: ts.share_token_rw.clone(),
                         share_token_ro: ts.share_token_ro.clone(),
+                        locked: ts.locked,
                         pending_agent_resume,
                     });
                 }
@@ -422,6 +433,7 @@ impl AppState {
                         agent_plan_mode: None,
                         share_token_rw: String::new(),
                         share_token_ro: String::new(),
+                        locked: false,
                         pending_agent_resume: None,
                     });
                 }
@@ -462,6 +474,7 @@ impl AppState {
                         agent_plan_mode: None,
                         share_token_rw: String::new(),
                         share_token_ro: String::new(),
+                        locked: false,
                         pending_agent_resume: None,
                     }],
                     0,
@@ -733,6 +746,7 @@ impl AppState {
                 agent_plan_mode: None,
                 share_token_rw: String::new(),
                 share_token_ro: String::new(),
+                locked: false,
                 pending_agent_resume: None,
             },
         );
@@ -838,6 +852,7 @@ impl AppState {
                     agent_plan_mode: tab.agent_plan_mode,
                     share_token_rw: tab.share_token_rw.clone(),
                     share_token_ro: tab.share_token_ro.clone(),
+                    locked: tab.locked,
                     ..TabState::default()
                 }
             })
@@ -867,6 +882,7 @@ impl AppState {
                     rows,
                     share_token_rw: ts.share_token_rw.clone(),
                     share_token_ro: ts.share_token_ro.clone(),
+                    locked: ts.locked,
                     shell_pid: view.pid(),
                     agent_state: tab.agent_state.clone(),
                     agent_session_id: tab.agent_session_id.clone(),
@@ -1245,6 +1261,7 @@ impl AppState {
                     agent_plan_mode: tab.agent_plan_mode,
                     share_token_rw: tab.share_token_rw.clone(),
                     share_token_ro: tab.share_token_ro.clone(),
+                    locked: tab.locked,
                     ..TabState::default()
                 }
             })
@@ -1388,10 +1405,19 @@ impl AppState {
         let blink_on = self.blink_on;
         for (i, tab) in self.tabs.iter().enumerate() {
             let is_active = i == self.active;
-            let name = if let Some((ri, ref text)) = self.renaming {
+            // Visual lock marker — a 🔒 ahead of the name is enough to
+            // make "this tab won't accept input" obvious at a glance,
+            // and stays out of the rename text (still raw name in the
+            // rename editor).
+            let base_name = if let Some((ri, ref text)) = self.renaming {
                 if ri == i { text.clone() } else { tab.name.clone() }
             } else {
                 tab.name.clone()
+            };
+            let name = if tab.locked && self.renaming.as_ref().is_none_or(|(ri, _)| *ri != i) {
+                format!("🔒 {base_name}")
+            } else {
+                base_name
             };
             // Agent-state LED to the left of the tab name. Visible
             // whenever a session is attached (agent_kind set) OR a
@@ -1842,6 +1868,41 @@ impl AppState {
                         }),
                     )
                     .child(toggle_label),
+            );
+
+            // Lock toggle — flips Tab.locked and pushes the new value
+            // into the view so every input path (keyboard, paste,
+            // hotkeys, programmatic) refuses immediately. Mirrored
+            // into the API snapshot so /input and the share-link
+            // viewer both observe the new state without waiting for
+            // the next persist tick.
+            let locked = self.tabs[idx].locked;
+            let lock_label = if locked { self.t().unlock_tab } else { self.t().lock_tab };
+            let tab_id_for_lock = self.tabs[idx].id.clone();
+            container = container.child(
+                div()
+                    .id("menu-toggle-lock")
+                    .px(px(12.0))
+                    .py(px(4.0))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(menu_hover))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                            let next = !locked;
+                            this.tabs[idx].locked = next;
+                            this.tabs[idx].view.read(cx).set_locked(next);
+                            {
+                                let mut snap = this.api_state.lock().unwrap();
+                                if let Some(t) = snap.tabs.iter_mut().find(|t| t.id == tab_id_for_lock) {
+                                    t.locked = next;
+                                }
+                            }
+                            this.context_menu = None;
+                            cx.notify();
+                        }),
+                    )
+                    .child(lock_label),
             );
         }
 

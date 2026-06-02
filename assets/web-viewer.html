@@ -14,9 +14,25 @@
     body { display: flex; align-items: flex-start; justify-content: center; }
     #term { width: max-content; }
     #status { position: fixed; bottom: 4px; right: 8px; font-size: 11px; opacity: 0.5; pointer-events: none; }
+    /* Locked banner — solid red strip across the top of the page
+       so a recipient cannot miss that this tab refuses input. The
+       JS toggles `.locked` on <body> when X-Tab-Locked is set. */
+    #locked-banner {
+      display: none;
+      position: fixed; top: 0; left: 0; right: 0;
+      background: #cc1f1a; color: #fff;
+      text-align: center; font-weight: bold; font-size: 13px;
+      padding: 6px 8px; letter-spacing: 1px;
+      box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+      z-index: 10;
+    }
+    body.locked #locked-banner { display: block; }
+    body.locked { padding-top: 32px; box-sizing: border-box; }
+    body.locked #term { outline: 1px solid #cc1f1a; }
   </style>
 </head>
 <body>
+  <div id="locked-banner">🔒 TAB LOCKED — INPUT DISABLED</div>
   <div id="term"></div>
   <div id="status">connecting…</div>
   <script src="https://unpkg.com/xterm@5.3.0/lib/xterm.js"></script>
@@ -78,6 +94,12 @@
     let bootstrapped = false;
     let serverCols = 0;
     let serverRows = 0;
+    // Live mirror of the server's X-Tab-Locked header. Toggling this
+    // disables stdin on xterm.js, hides the cursor blink, drops the
+    // input POST wiring, and reveals the red banner. The lock state
+    // can change at any poll — the user may flip it from the GUI
+    // right-click menu mid-session.
+    let serverLocked = false;
 
     async function poll() {
       const url = bootstrapped
@@ -91,6 +113,13 @@
         const start = parseInt(r.headers.get("X-Output-Start") || "0", 10);
         const cols = parseInt(r.headers.get("X-Output-Cols") || "0", 10);
         const rows = parseInt(r.headers.get("X-Output-Rows") || "0", 10);
+        const lockedNow = r.headers.get("X-Tab-Locked") === "1";
+        if (lockedNow !== serverLocked) {
+          serverLocked = lockedNow;
+          document.body.classList.toggle("locked", serverLocked);
+          term.options.disableStdin = serverLocked || READ_ONLY;
+          term.options.cursorBlink = !(serverLocked || READ_ONLY);
+        }
         // Cursor in raw-output coords (0-indexed). NaN when the
         // server didn't ship it, in which case we leave xterm.js's
         // cursor wherever the last write landed.
@@ -129,7 +158,8 @@
         }
         since = len;
         crc = newCrc;
-        status.textContent = `${TAB_NAME} · ${serverCols}x${serverRows} · ${len}B`;
+        const lockTag = serverLocked ? " · LOCKED" : "";
+        status.textContent = `${TAB_NAME} · ${serverCols}x${serverRows} · ${len}B${lockTag}`;
       } catch (e) {
         status.textContent = `offline · ${e.message || e}`;
       }
@@ -137,6 +167,12 @@
 
     if (!READ_ONLY) {
       term.onData(data => {
+        // Server-enforced lock is the source of truth — but we
+        // also short-circuit here so we don't fire pointless POSTs
+        // that will 403. xterm.js's disableStdin should already
+        // suppress these, but a tab that locks mid-session may
+        // have keypresses already in flight.
+        if (serverLocked) return;
         fetch(`${BASE}input`, {
           method: "POST",
           headers: { ...headers, "Content-Type": "application/octet-stream" },

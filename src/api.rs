@@ -139,6 +139,11 @@ pub struct SnapshotTab {
     /// the GUI menu mints them on first share.
     pub share_token_rw: String,
     pub share_token_ro: String,
+    /// When true, every input source (master token, share tokens,
+    /// local typing in the GUI) is refused on this tab. Surfaced
+    /// as `X-Tab-Locked: 1` on /output so the xterm.js viewer can
+    /// render a locked banner.
+    pub locked: bool,
     /// PID of the tab's shell. The /catbus endpoints walk its
     /// descendant processes to find a catbus-agent (or fallback
     /// `claude` TUI) and resolve the session's transcript file.
@@ -979,6 +984,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             let pty_cols = t.cols;
             let pty_rows = t.rows;
             let raw_cursor = t.raw_cursor;
+            let locked = t.locked;
 
             let (body, cursor, start_offset) = match (query_since, query_crc) {
                 (Some(n), Some(client_crc)) if n <= total_len => {
@@ -1040,6 +1046,9 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             // is actually typing).
             if let Some((row, col)) = raw_cursor {
                 let _ = write!(extra, "X-Raw-Cursor-Row: {row}\r\nX-Raw-Cursor-Col: {col}\r\n");
+            }
+            if locked {
+                let _ = write!(extra, "X-Tab-Locked: 1\r\n");
             }
             respond_with_etag(
                 stream,
@@ -1339,6 +1348,14 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             };
             let mut state = state.lock().unwrap();
             if let Some(idx) = resolve_tab_idx(&state, key_raw, is_uuid) {
+                // Refuse every write source — master token, share tokens, all
+                // routes — when the tab is locked. The lock is set per-tab
+                // via the right-click menu and persisted in tabs.json.
+                if state.tabs[idx].locked {
+                    drop(state);
+                    error_json(stream, 403, "tab is locked");
+                    return;
+                }
                 info!("API: sending {} bytes of input to tab {idx}", body_bytes.len());
                 let n = body_bytes.len();
                 state.pending_input.push((idx, body_bytes));
@@ -1849,6 +1866,7 @@ mod tests {
                     raw_cursor: None,
                     share_token_rw: String::new(),
                     share_token_ro: String::new(),
+                    locked: false,
                     shell_pid: 0,
                     agent_state: None,
                     agent_session_id: None,
@@ -1867,6 +1885,7 @@ mod tests {
                     raw_cursor: None,
                     share_token_rw: String::new(),
                     share_token_ro: String::new(),
+                    locked: false,
                     shell_pid: 0,
                     agent_state: None,
                     agent_session_id: None,

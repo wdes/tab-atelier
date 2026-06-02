@@ -121,6 +121,12 @@ pub struct TerminalView {
     click_origin: Rc<Cell<Option<GridPoint>>>,
     last_input: Rc<Cell<Option<std::time::Instant>>>,
     colors_enabled: Cell<bool>,
+    /// When true, every write path (typing, paste, programmatic
+    /// send_input_bytes) early-returns. The lock state lives on the
+    /// view so input is blocked at the chokepoint regardless of
+    /// caller — keyboard event handlers, the API drain, the catbus
+    /// menu item, etc.
+    locked: Rc<Cell<bool>>,
 }
 
 fn pty_env(colors_enabled: bool) -> HashMap<String, String> {
@@ -268,6 +274,7 @@ impl TerminalView {
             click_origin: Rc::new(Cell::new(None)),
             last_input: Rc::new(Cell::new(None)),
             colors_enabled: Cell::new(initial_colors_enabled),
+            locked: Rc::new(Cell::new(false)),
         }
     }
 
@@ -378,6 +385,9 @@ impl TerminalView {
     }
 
     fn send_input(&self, bytes: Vec<u8>) {
+        if self.locked.get() {
+            return;
+        }
         self.last_input.set(Some(std::time::Instant::now()));
         self.term.lock().grid_mut().scroll_display(Scroll::Bottom);
         let _ = self.notifier.send(Msg::Input(bytes.into()));
@@ -385,6 +395,14 @@ impl TerminalView {
 
     pub fn send_input_bytes(&self, bytes: Vec<u8>) {
         self.send_input(bytes);
+    }
+
+    pub fn is_locked(&self) -> bool {
+        self.locked.get()
+    }
+
+    pub fn set_locked(&self, value: bool) {
+        self.locked.set(value);
     }
 
     pub fn reset_terminal(&self) {
@@ -445,6 +463,9 @@ impl TerminalView {
     }
 
     pub fn send_clipboard(&self, text: &str) {
+        if self.locked.get() {
+            return;
+        }
         self.last_input.set(Some(std::time::Instant::now()));
         let mut term = self.term.lock();
         let bracketed = term.mode().contains(TermMode::BRACKETED_PASTE);
