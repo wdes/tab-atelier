@@ -112,6 +112,8 @@ struct HeadlessTab {
     agent_session_id: Option<String>,
     agent_kind: Option<String>,
     agent_plan_mode: Option<bool>,
+    share_token_rw: String,
+    share_token_ro: String,
     pending_agent_resume: Option<String>,
     colors_enabled: bool,
 }
@@ -215,6 +217,8 @@ fn spawn_pty_tab(
     agent_session_id: Option<String>,
     agent_kind: Option<String>,
     agent_plan_mode: Option<bool>,
+    share_token_rw: String,
+    share_token_ro: String,
 ) -> Option<HeadlessTab> {
     let ws = WindowSize {
         num_lines: INITIAL_LINES as u16,
@@ -296,6 +300,8 @@ fn spawn_pty_tab(
         agent_session_id,
         agent_kind,
         agent_plan_mode,
+        share_token_rw,
+        share_token_ro,
         pending_agent_resume,
         colors_enabled,
     })
@@ -367,6 +373,8 @@ pub fn run() -> std::io::Result<()> {
                 ts.agent_session_id.clone(),
                 ts.agent_kind.clone(),
                 ts.agent_plan_mode,
+                ts.share_token_rw.clone(),
+                ts.share_token_ro.clone(),
             ) {
                 if let Some(out) = eager {
                     debug!("restoring {} chars of output for '{}'", out.len(), ts.name);
@@ -397,6 +405,8 @@ pub fn run() -> std::io::Result<()> {
             None,
             None,
             None,
+            String::new(),
+            String::new(),
         ) {
             t.activate();
             tabs.push(t);
@@ -591,6 +601,8 @@ fn persist(
             agent_session_id: tab.agent_session_id.clone(),
             agent_kind: tab.agent_kind.clone(),
             agent_plan_mode: tab.agent_plan_mode,
+            share_token_rw: tab.share_token_rw.clone(),
+            share_token_ro: tab.share_token_ro.clone(),
             ..TabState::default()
         })
         .collect();
@@ -610,6 +622,8 @@ fn persist(
                 cursor,
                 cols,
                 rows,
+                share_token_rw: ts.share_token_rw.clone(),
+                share_token_ro: ts.share_token_ro.clone(),
                 shell_pid: tab.pid,
                 agent_state: tab.agent_state.clone(),
                 agent_session_id: tab.agent_session_id.clone(),
@@ -862,7 +876,22 @@ fn drain_pending(
         let id = default_tab_id();
         let env = tab_env_extras(&id, api_url_for_pty, api_token);
         let name = format!("Terminal {}", tabs.len());
-        if let Some(mut t) = spawn_pty_tab(id, name, cwd, true, env, 0.0, 0.0, 0, None, None, None, None) {
+        if let Some(mut t) = spawn_pty_tab(
+            id,
+            name,
+            cwd,
+            true,
+            env,
+            0.0,
+            0.0,
+            0,
+            None,
+            None,
+            None,
+            None,
+            String::new(),
+            String::new(),
+        ) {
             if *active < tabs.len() {
                 tabs[*active].deactivate();
             }

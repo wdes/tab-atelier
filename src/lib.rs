@@ -216,11 +216,31 @@ pub struct TabState {
     /// brings the tab back into the same mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_plan_mode: Option<bool>,
+
+    /// Per-tab share secrets. Carried in the `?token=` query of share
+    /// URLs and validated server-side on the `/tabs/by-id/{uuid}/...`
+    /// routes so a read-only link can't be promoted to interactive by
+    /// stripping `&ro=1` from the URL (the *token* is the wrong type
+    /// for `/input`, not the URL flag). Empty string when not minted;
+    /// the API server lazily fills them on first share menu use.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub share_token_rw: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub share_token_ro: String,
 }
 
 #[must_use]
 pub fn default_tab_id() -> String {
     uuid::Uuid::new_v4().to_string()
+}
+
+/// 16 random bytes hex-encoded — used for per-tab share secrets.
+/// Distinct from the master api.token (which authorises every tab).
+#[must_use]
+pub fn mint_share_token() -> String {
+    let mut buf = [0u8; 16];
+    platform::random_bytes(&mut buf);
+    buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 impl Default for TabState {
@@ -238,6 +258,8 @@ impl Default for TabState {
             agent_session_id: None,
             agent_kind: None,
             agent_plan_mode: None,
+            share_token_rw: String::new(),
+            share_token_ro: String::new(),
         }
     }
 }

@@ -94,6 +94,11 @@ struct Tab {
     /// at last save. Restored along with the session so the tab
     /// comes back in the same mode.
     agent_plan_mode: Option<bool>,
+    /// Per-tab share secrets. Minted lazily by the right-click
+    /// share-link menu and persisted to tabs.json so URLs survive
+    /// restarts. Empty until first share.
+    share_token_rw: String,
+    share_token_ro: String,
     /// One-shot resume command queued on tab restore — when the
     /// shell is up the next tick types `<command>\n` into the
     /// PTY, then clears this. Set in `insert_tab` from the
@@ -372,6 +377,8 @@ impl AppState {
                         agent_session_id: ts.agent_session_id.clone(),
                         agent_kind: ts.agent_kind.clone(),
                         agent_plan_mode: ts.agent_plan_mode,
+                        share_token_rw: ts.share_token_rw.clone(),
+                        share_token_ro: ts.share_token_ro.clone(),
                         pending_agent_resume,
                     });
                 }
@@ -406,6 +413,8 @@ impl AppState {
                         agent_session_id: None,
                         agent_kind: None,
                         agent_plan_mode: None,
+                        share_token_rw: String::new(),
+                        share_token_ro: String::new(),
                         pending_agent_resume: None,
                     });
                 }
@@ -444,6 +453,8 @@ impl AppState {
                         agent_session_id: None,
                         agent_kind: None,
                         agent_plan_mode: None,
+                        share_token_rw: String::new(),
+                        share_token_ro: String::new(),
                         pending_agent_resume: None,
                     }],
                     0,
@@ -709,6 +720,8 @@ impl AppState {
                 agent_session_id: None,
                 agent_kind: None,
                 agent_plan_mode: None,
+                share_token_rw: String::new(),
+                share_token_ro: String::new(),
                 pending_agent_resume: None,
             },
         );
@@ -812,6 +825,8 @@ impl AppState {
                     agent_session_id: tab.agent_session_id.clone(),
                     agent_kind: tab.agent_kind.clone(),
                     agent_plan_mode: tab.agent_plan_mode,
+                    share_token_rw: tab.share_token_rw.clone(),
+                    share_token_ro: tab.share_token_ro.clone(),
                     ..TabState::default()
                 }
             })
@@ -836,6 +851,8 @@ impl AppState {
                     cursor,
                     cols,
                     rows,
+                    share_token_rw: ts.share_token_rw.clone(),
+                    share_token_ro: ts.share_token_ro.clone(),
                     shell_pid: view.pid(),
                     agent_state: tab.agent_state.clone(),
                     agent_session_id: tab.agent_session_id.clone(),
@@ -1212,6 +1229,8 @@ impl AppState {
                     agent_session_id: tab.agent_session_id.clone(),
                     agent_kind: tab.agent_kind.clone(),
                     agent_plan_mode: tab.agent_plan_mode,
+                    share_token_rw: tab.share_token_rw.clone(),
+                    share_token_ro: tab.share_token_ro.clone(),
                     ..TabState::default()
                 }
             })
@@ -1647,23 +1666,21 @@ impl AppState {
                     .child(self.t().copy_path),
             );
 
-            // Copy a shareable LAN URL to the clipboard — points at the
-            // xterm.js viewer (/tabs/by-id/<UUID>/view). UUID rather
-            // than tab index so a leaked link is bound to one tab and
-            // can't be rewritten to address another by tweaking 0/1/2.
-            // The bearer token is the same one the rest of the API
-            // accepts — sharing the link grants the recipient API
-            // access; ?ro=1 caps them to read-only (no keystrokes).
+            // Copy a shareable LAN URL — points at the xterm.js viewer
+            // (/tabs/by-id/<UUID>/view). UUID rather than tab index so
+            // a leaked link is bound to one tab and can't address
+            // another by tweaking 0/1/2. The link carries a per-tab
+            // share token (not the master api.token): RW for the
+            // interactive link, RO for the read-only one. The server
+            // refuses RO on `/input` with 403, so the URL *and* the
+            // permission level are bound — stripping `&ro=1` does not
+            // grant write access. Tokens are minted lazily here on
+            // first menu use and persisted via tabs.json so URLs
+            // survive restarts.
             for (label, ro) in [(self.t().copy_share_link, false), (self.t().copy_share_link_ro, true)] {
                 let lan_ip = api::local_ip();
                 let port = port_of(&self.api_addr, crate::DEFAULT_API_PORT);
                 let tab_id = self.tabs[idx].id.clone();
-                let token = self.api_token.clone();
-                let url = if ro {
-                    format!("http://{lan_ip}:{port}/tabs/by-id/{tab_id}/view?token={token}&ro=1")
-                } else {
-                    format!("http://{lan_ip}:{port}/tabs/by-id/{tab_id}/view?token={token}")
-                };
                 let toast_msg = self.t().share_link_copied;
                 let id = if ro { "menu-share-link-ro" } else { "menu-share-link" };
                 container = container.child(
@@ -1676,14 +1693,59 @@ impl AppState {
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
-                                cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
+                                // Mint the share token on the runtime Tab if
+                                // not yet present so it survives the next
+                                // persist tick (snapshot is rebuilt from the
+                                // runtime Tab each tick — writing only into
+                                // the snapshot would be overwritten in 2s).
+                                // Mirror immediately into the snapshot so the
+                                // first request against the freshly-copied
+                                // URL doesn't 401 during that window.
+                                let slot_ref = if ro {
+                                    &mut this.tabs[idx].share_token_ro
+                                } else {
+                                    &mut this.tabs[idx].share_token_rw
+                                };
+                                if slot_ref.is_empty() {
+                                    *slot_ref = crate::mint_share_token();
+                                }
+                                let token = slot_ref.clone();
+                                {
+                                    let mut snap = this.api_state.lock().unwrap();
+                                    if let Some(t) = snap.tabs.iter_mut().find(|t| t.id == tab_id) {
+                                        if ro {
+                                            t.share_token_ro = token.clone();
+                                        } else {
+                                            t.share_token_rw = token.clone();
+                                        }
+                                    }
+                                }
+                                let url = if ro {
+                                    format!("http://{lan_ip}:{port}/tabs/by-id/{tab_id}/view?token={token}&ro=1")
+                                } else {
+                                    format!("http://{lan_ip}:{port}/tabs/by-id/{tab_id}/view?token={token}")
+                                };
+                                cx.write_to_clipboard(ClipboardItem::new_string(url));
+                                let toast_time = std::time::Instant::now();
                                 this.toasts.push(Toast {
                                     message: toast_msg.into(),
-                                    time: std::time::Instant::now(),
+                                    time: toast_time,
                                     path: None,
                                 });
                                 this.context_menu = None;
                                 cx.notify();
+                                // Auto-dismiss after 1s — copy confirmation is
+                                // ephemeral; lingering reads as "something
+                                // failed".
+                                let weak = cx.entity().downgrade();
+                                cx.spawn(async move |_, cx: &mut AsyncApp| {
+                                    cx.background_executor().timer(std::time::Duration::from_secs(1)).await;
+                                    let _ = weak.update(cx, |this, cx| {
+                                        this.toasts.retain(|t| t.time != toast_time);
+                                        cx.notify();
+                                    });
+                                })
+                                .detach();
                             }),
                         )
                         .child(label),
