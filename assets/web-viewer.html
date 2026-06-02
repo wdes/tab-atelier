@@ -40,7 +40,11 @@
     const BASE = location.pathname.replace(/\/view\/?$/, "/");
 
     const term = new Terminal({
-      convertEol: false,
+      // LF must reset to col 0; without convertEol xterm.js leaves the
+      // cursor at the previous column on the next row, so each row of
+      // the row-by-row /output dump starts wherever the previous row
+      // happened to end (= mid-line garbage in the screenshot).
+      convertEol: true,
       cursorBlink: !READ_ONLY,
       disableStdin: READ_ONLY,
       fontFamily: 'ui-monospace, "JetBrains Mono", "Fira Code", Menlo, monospace',
