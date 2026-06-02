@@ -89,6 +89,10 @@ case "$1" in
          relay base:   https://127.0.0.1:7892
          point your tab-atelier mobile/web client at that URL.
 
+    d) Browser viewer (xterm.js, polls /output, sends keystrokes to /input)
+         http://127.0.0.1:7890/tabs/0/view?token=$(cat /var/lib/tab-atelier/api.token)
+         Add &ro=1 to share a read-only view (recipient cannot type).
+
 EOF
     ;;
 

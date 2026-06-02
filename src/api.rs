@@ -13,6 +13,8 @@ use log::{debug, error, info};
 
 use crate::tracking::USER_AGENT;
 
+const VIEWER_HTML: &str = include_str!("../assets/web-viewer.html");
+
 #[derive(Serialize)]
 struct TabInfo {
     index: usize,
@@ -780,6 +782,31 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             }))
             .unwrap_or_default();
             respond_json(stream, 200, &body);
+        }
+        ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/view") => {
+            let idx_str = &p["/tabs/".len()..p.len() - "/view".len()];
+            let Ok(idx) = idx_str.parse::<usize>() else {
+                error_json(stream, 404, "invalid tab index");
+                return;
+            };
+            {
+                let state = state.lock().unwrap();
+                if state.tabs.get(idx).is_none() {
+                    drop(state);
+                    error_json(stream, 404, "tab index out of range");
+                    return;
+                }
+            }
+            let html = VIEWER_HTML.replace("__TAB_IDX__", &idx.to_string());
+            respond_with_etag(
+                stream,
+                200,
+                "text/html; charset=utf-8",
+                html.as_bytes(),
+                accept_gzip,
+                if_none_match.as_deref(),
+                "",
+            );
         }
         ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/output") => {
             let idx_str = &p["/tabs/".len()..p.len() - "/output".len()];
