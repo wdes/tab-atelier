@@ -30,23 +30,39 @@ CapabilityBoundingSet=
 AmbientCapabilities=
 RestrictSUIDSGID=true
 
-# Filesystem
+# Filesystem — explicit bind-mount sandbox.
 #
-# `full` keeps /usr, /boot, /efi, AND /etc read-only — system
-# binaries + system config stay tamper-proof — while leaving /var,
-# /srv, /opt, /home, /root writable for the user's actual work. We
-# need writability outside StateDirectory because the daemon
-# spawns interactive shells where the user expects to edit files,
-# git pull, etc. With `strict` every shell hit "Read-only file
-# system" on save. Keeping `strict` would require listing every
-# project dir in ReadWritePaths, which is no fun for a personal
-# workstation.
-ProtectSystem=full
-# ProtectHome left OFF so users can keep tabs rooted in /home or
-# /root without ReadWritePaths gymnastics. If you don't want the
-# daemon to see home dirs, set `ProtectHome=read-only` (lets the
-# shell `ls` them but not write) or `true` (hides them entirely)
-# via `systemctl edit tab-atelier-headless`.
+# TemporaryFileSystem=/ replaces the root with a tmpfs so nothing
+# from the host is visible by default. Then BindReadOnlyPaths
+# selectively grants read-only access to the system paths the
+# daemon and spawned shells need (binaries, libraries, /etc for
+# passwd / resolv.conf / SSL trust store). BindPaths selectively
+# grants read-write access to the user's actual work dirs.
+#
+# To open a tab in a new directory, add that dir to BindPaths via
+# `systemctl edit tab-atelier-headless` (or extend this list and
+# restart). The daemon's own state survives under StateDirectory
+# (mounted automatically into the namespace).
+TemporaryFileSystem=/
+BindReadOnlyPaths=/usr /lib /lib64 /bin /sbin /etc /opt
+# Optional but commonly needed at run time:
+#   /run/systemd/resolve  — symlink target for /etc/resolv.conf on
+#                            systemd-resolved systems; without it
+#                            DNS lookups from the shell fail.
+#   /sys/fs/cgroup        — read-only cgroup info (some tools probe
+#                            it; harmless when absent).
+# Leading `-` makes the bind optional, so the unit still starts on
+# systems where the path doesn't exist.
+BindReadOnlyPaths=-/run/systemd/resolve -/sys/fs/cgroup
+# Read-write work directories. Add yours here (or via
+# `systemctl edit`). /srv is the conventional spot for site data;
+# extend with /home, /opt/projects, etc. as you go.
+#
+# The daemon's own home — /var/lib/tab-atelier — is writable
+# automatically: StateDirectory= mounts it into the namespace
+# regardless of TemporaryFileSystem=/, so tabs that `cd $HOME` or
+# write to `$HOME/...` (the tab-atelier service user's home) work.
+BindPaths=/srv
 PrivateTmp=true
 # NOTE: PrivateDevices=true would mask /dev/ptmx + /dev/pts and break
 # every PTY this daemon opens. Leave it off and rely on the rest of
