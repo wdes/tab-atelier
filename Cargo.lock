@@ -7153,6 +7153,7 @@ dependencies = [
  "alacritty_terminal",
  "base64 0.22.1",
  "bytes",
+ "clap",
  "crossterm",
  "ctrlc",
  "ed25519-dalek",

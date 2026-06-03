@@ -5,101 +5,45 @@
 //! Headless binary shim — runs everything except gpui. Built by
 //! `cargo build --no-default-features --features headless`. Same
 //! tab-atelier crate, same persistence files, same local API.
+//!
+//! Subcommand parsing goes through `clap` (`src/cli/dispatch.rs`).
+//! No subcommand = run the daemon.
 
 use std::sync::atomic::Ordering;
 
+use clap::Parser;
 use tab_atelier::{
     READ_ONLY, SHUTDOWN_REQUESTED, cli, headless, install_rustls_provider, try_acquire_single_instance_lock,
 };
 
 fn main() {
-    // Same `set-status` shortcut as the GUI binary — useful when a
-    // shell rc file calls `tab-atelier-headless set-status thinking`
-    // from inside a tab.
-    if let Some(sub) = std::env::args().nth(1) {
-        match sub.as_str() {
-            "set-status" => {
-                let rest: Vec<String> = std::env::args().skip(2).collect();
-                std::process::exit(cli::set_status::run(&rest));
-            }
-            "tabs" => {
-                let rest: Vec<String> = std::env::args().skip(2).collect();
-                std::process::exit(cli::tabs::run(&rest));
-            }
-            "remote" => {
-                let rest: Vec<String> = std::env::args().skip(2).collect();
-                std::process::exit(cli::remote::run(&rest));
-            }
-            "share-link" => std::process::exit(cli::share_link::run(&std::env::args().skip(2).collect::<Vec<_>>())),
-            "add" => std::process::exit(cli::share_link::add(&std::env::args().skip(2).collect::<Vec<_>>())),
-            "close" => std::process::exit(cli::share_link::close(&std::env::args().skip(2).collect::<Vec<_>>())),
-            "rename" => std::process::exit(cli::share_link::rename(&std::env::args().skip(2).collect::<Vec<_>>())),
-            "lock" => std::process::exit(cli::share_link::lock(&std::env::args().skip(2).collect::<Vec<_>>())),
-            "unlock" => std::process::exit(cli::share_link::unlock(&std::env::args().skip(2).collect::<Vec<_>>())),
-            "input" => std::process::exit(cli::share_link::send_input(
-                &std::env::args().skip(2).collect::<Vec<_>>(),
-            )),
-            "output" => std::process::exit(cli::share_link::output(&std::env::args().skip(2).collect::<Vec<_>>())),
-            // `settings` is the canonical name; `ports` kept as an
-            // alias for muscle memory from the early days.
-            "settings" | "ports" => {
-                std::process::exit(cli::share_link::ports(&std::env::args().skip(2).collect::<Vec<_>>()))
-            }
-            "claude-hook" => std::process::exit(cli::claude_hook::run(&std::env::args().skip(2).collect::<Vec<_>>())),
-            "bg-color" => std::process::exit(cli::share_link::bg_color(&std::env::args().skip(2).collect::<Vec<_>>())),
-            "--help" | "-h" => {
-                eprintln!(
-                    "tab-atelier-headless [run a tab-atelier server] OR one of:\n  \
-                     tabs [--once]                live tab listing\n  \
-                     add <path> [name]            create a new tab rooted at <path>\n  \
-                     close <idx|uuid>             close a tab\n  \
-                     rename <idx|uuid> <name>     rename a tab\n  \
-                     lock <idx|uuid>              lock a tab (refuse all input)\n  \
-                     unlock <idx|uuid>            unlock a tab\n  \
-                     input <idx|uuid> <text>      send keystrokes (\\n escapes ok)\n  \
-                     output <idx|uuid>            print current scrollback\n  \
-                     share-link <idx|uuid> [--ro] copy a browser URL for /view\n  \
-                     settings [--api-addr ...]    show/edit daemon settings (bind addrs, PTY dims, share-URL base)\n  \
-                     bg-color <idx|uuid|--global> <hex|clear>  set viewer background color\n  \
-                     set-status <state> [label]   used by Claude Code hooks etc.\n  \
-                     claude-hook <event>          dispatch a Claude Code hook event (reads JSON on stdin)\n  \
-                     remote ...                   talk to a remote tab-atelier"
-                );
-                std::process::exit(0);
-            }
-            // Daemon-launch path: only when no subcommand was given.
-            // Anything else (e.g. `tab-atelier-headless share` —
-            // typo for `share-link`) gets a clear error instead of
-            // silently starting the daemon and conflicting with the
-            // running one over the API port.
-            other if other.starts_with('-') => {
-                // Long/short flags like --read-only, --check-crypto
-                // fall through to the daemon path; the launch code
-                // below parses them again.
-            }
-            other => {
-                eprintln!(
-                    "tab-atelier-headless: unknown subcommand {other:?}\n\
-                     Run `tab-atelier-headless --help` to see the list."
-                );
-                std::process::exit(2);
-            }
-        }
-    }
+    let cli_args = cli::dispatch::Cli::parse();
 
-    install_rustls_provider();
-
-    if std::env::args().any(|a| a == "--check-crypto") {
+    // `--check-crypto` is a CI sanity probe — build the rustls server
+    // config with the bundled crypto provider, then exit 0. Runs
+    // before anything else so a missing toolchain bit surfaces here
+    // instead of during the daemon's startup.
+    if cli_args.check_crypto {
+        install_rustls_provider();
         let _config = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_cert_resolver(std::sync::Arc::new(rustls::server::ResolvesServerCertUsingSni::new()));
         std::process::exit(0);
     }
 
-    let read_only = std::env::args().any(|a| a == "--read-only");
-    READ_ONLY.store(read_only, Ordering::SeqCst);
+    // A subcommand short-circuits via std::process::exit inside the
+    // dispatcher. Returns here only when the user gave no subcommand,
+    // which means: start the daemon.
+    if cli::dispatch::dispatch(cli_args) {
+        // unreachable in practice — dispatch() exits inside.
+        return;
+    }
 
-    if !read_only && !try_acquire_single_instance_lock() {
+    install_rustls_provider();
+
+    READ_ONLY.store(cli::dispatch::Cli::parse().read_only, Ordering::SeqCst);
+
+    if !READ_ONLY.load(Ordering::SeqCst) && !try_acquire_single_instance_lock() {
         eprintln!(
             "tab-atelier-headless: another instance is already running.\n\
              Pass --read-only to start an inspect-only copy that won't \

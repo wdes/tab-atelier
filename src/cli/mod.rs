@@ -3,6 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 pub mod claude_hook;
+pub mod dispatch;
 pub mod remote;
 pub mod set_status;
 /// Headless-side basic-action subcommands.
