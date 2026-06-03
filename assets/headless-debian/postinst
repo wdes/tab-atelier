@@ -32,9 +32,43 @@ case "$1" in
     #    even if a sysadmin runs it manually for debugging.
     install -d -o "$SVC_USER" -g "$SVC_USER" -m 0750 "$SVC_HOME"
 
-    # 3. systemd integration via the standard helpers (provided by
-    #    init-system-helpers, which we depend on explicitly in
-    #    Cargo.toml).
+    # 3a. First-install prompt for additional writable workspace.
+    #     The unit's TemporaryFileSystem=/ sandbox makes only /srv
+    #     writable by default. On an interactive install we ask
+    #     for one more path (typical case: /home/<name>/projects
+    #     or /opt/work). Non-interactive (CI, automated installs)
+    #     skip the prompt and stick with /srv. The answer lands
+    #     in a systemd drop-in, so `dpkg reconfigure` style edits
+    #     don't touch the shipped unit.
+    DROPIN_DIR=/etc/systemd/system/${UNIT}.d
+    DROPIN_FILE=$DROPIN_DIR/30-extra-workspace.conf
+    if [ ! -e "$DROPIN_FILE" ] && [ -t 0 ] && [ -t 1 ]; then
+      echo
+      echo "  tab-atelier runs tabs in a mount-namespace sandbox."
+      echo "  Only /srv is writable by default. Add one more workspace?"
+      echo "  (absolute path, must exist; empty = skip)"
+      printf "  workspace path: "
+      read WS_PATH || WS_PATH=""
+      if [ -n "$WS_PATH" ]; then
+        if [ -d "$WS_PATH" ]; then
+          mkdir -p "$DROPIN_DIR"
+          {
+            echo "# Added by tab-atelier-headless postinst on first install."
+            echo "# To remove this workspace, delete this file or run"
+            echo "#   systemctl revert ${UNIT}"
+            echo "[Service]"
+            echo "BindPaths=$WS_PATH"
+          } > "$DROPIN_FILE"
+          echo "  → wrote BindPaths=$WS_PATH to $DROPIN_FILE"
+        else
+          echo "  ⚠  $WS_PATH does not exist; skipping."
+        fi
+      fi
+    fi
+
+    # 3b. systemd integration via the standard helpers (provided by
+    #     init-system-helpers, which we depend on explicitly in
+    #     Cargo.toml).
     deb-systemd-helper unmask "$UNIT" >/dev/null || true
     if deb-systemd-helper --quiet was-enabled "$UNIT"; then
       deb-systemd-helper enable "$UNIT" >/dev/null || true
