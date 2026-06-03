@@ -3,7 +3,7 @@
   "hooks": {
     "SessionStart": [
       {
-        "matcher": "",
+        "matcher": "*",
         "hooks": [
           { "type": "command", "command": "tab-atelier-headless claude-hook session-start" }
         ]
@@ -11,7 +11,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "",
+        "matcher": "*",
         "hooks": [
           { "type": "command", "command": "tab-atelier-headless claude-hook pre-tool" }
         ]
@@ -19,7 +19,7 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "",
+        "matcher": "*",
         "hooks": [
           { "type": "command", "command": "tab-atelier-headless claude-hook post-tool" }
         ]
@@ -27,7 +27,7 @@
     ],
     "Notification": [
       {
-        "matcher": "",
+        "matcher": "*",
         "hooks": [
           { "type": "command", "command": "tab-atelier-headless claude-hook notification" }
         ]
@@ -35,7 +35,7 @@
     ],
     "Stop": [
       {
-        "matcher": "",
+        "matcher": "*",
         "hooks": [
           { "type": "command", "command": "tab-atelier-headless claude-hook stop" }
         ]
@@ -43,7 +43,7 @@
     ],
     "SessionEnd": [
       {
-        "matcher": "",
+        "matcher": "*",
         "hooks": [
           { "type": "command", "command": "tab-atelier-headless claude-hook session-end" }
         ]
