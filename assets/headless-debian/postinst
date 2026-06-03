@@ -36,13 +36,22 @@ case "$1" in
     #     The unit's TemporaryFileSystem=/ sandbox makes only /srv
     #     writable by default. On an interactive install we ask
     #     for one more path (typical case: /home/<name>/projects
-    #     or /opt/work). Non-interactive (CI, automated installs)
-    #     skip the prompt and stick with /srv. The answer lands
-    #     in a systemd drop-in, so `dpkg reconfigure` style edits
-    #     don't touch the shipped unit.
+    #     or /opt/work). Skip the prompt when:
+    #       - the shipped drop-in already exists (this install or
+    #         an earlier one already set a workspace)
+    #       - ANY other drop-in under the unit's .d dir already
+    #         carries a `BindPaths=` line (admin used
+    #         `systemctl edit` for their own setup — don't double-add)
+    #       - DEBIAN_FRONTEND=noninteractive (ansible / CI / cloud-init)
+    #       - stdin or stdout isn't a TTY (running through a pipe,
+    #         apt-get under a wrapper)
     DROPIN_DIR=/etc/systemd/system/${UNIT}.d
     DROPIN_FILE=$DROPIN_DIR/30-extra-workspace.conf
-    if [ ! -e "$DROPIN_FILE" ] && [ -t 0 ] && [ -t 1 ]; then
+    EXISTING_BIND=$(grep -lE '^[[:space:]]*BindPaths=' "$DROPIN_DIR"/*.conf 2>/dev/null | head -n1)
+    if [ ! -e "$DROPIN_FILE" ] \
+        && [ -z "$EXISTING_BIND" ] \
+        && [ "${DEBIAN_FRONTEND:-}" != "noninteractive" ] \
+        && [ -t 0 ] && [ -t 1 ]; then
       echo
       echo "  tab-atelier runs tabs in a mount-namespace sandbox."
       echo "  Only /srv is writable by default. Add one more workspace?"

@@ -314,16 +314,38 @@ fn set_lock(args: &[String], on: bool, verb: &str) -> i32 {
         }
     };
     let body = serde_json::json!({"on": on}).to_string();
-    if let Err(e) = agent()
+    let mut resp = match agent()
         .post(format!("{}/tabs/by-id/{uuid}/lock", ep.url))
         .header("Authorization", format!("Bearer {}", ep.token))
         .header("Content-Type", "application/json")
         .send(body.as_bytes())
     {
-        eprintln!("{verb}: {e}");
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{verb}: {e}");
+            return 1;
+        }
+    };
+    // Parse the server's reply (`{"locked": <bool>}`) and report the
+    // ACTUAL post-change state. Previously this just printed the
+    // verb unconditionally, which hid bugs where the toggle didn't
+    // take effect.
+    let actual: bool = resp
+        .body_mut()
+        .read_json::<serde_json::Value>()
+        .ok()
+        .and_then(|v| v.get("locked").and_then(serde_json::Value::as_bool))
+        .unwrap_or(on);
+    if actual == on {
+        println!("{verb}ed tab {idx}");
+    } else {
+        eprintln!(
+            "{verb}: server reports tab {idx} is {} (expected {})",
+            if actual { "locked" } else { "unlocked" },
+            if on { "locked" } else { "unlocked" }
+        );
         return 1;
     }
-    println!("{verb}ed tab {idx}");
     0
 }
 
