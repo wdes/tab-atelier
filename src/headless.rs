@@ -236,7 +236,23 @@ fn spawn_pty_tab(
     };
     let mut env = pty_env(colors_enabled);
     env.extend(extra_env);
+    // Pick the shell explicitly. Alacritty defaults to the user's
+    // login shell from /etc/passwd. The headless deb creates
+    // `tab-atelier` as a system user with `nologin` as its login
+    // shell (correct hardening — nobody should `su` into the
+    // daemon's account), so without overriding here, every spawned
+    // PTY would print "this account is currently not available"
+    // and exit. Prefer /bin/bash, fall back to /bin/sh.
+    let shell_program = if std::path::Path::new("/bin/bash").exists() {
+        "/bin/bash"
+    } else {
+        "/bin/sh"
+    };
     let opts = tty::Options {
+        // No `-l`: a login shell would source /etc/profile +
+        // ~/.profile, which under ProtectHome=true can fail noisily
+        // for the service account that has no profile files.
+        shell: Some(tty::Shell::new(shell_program.into(), vec![])),
         working_directory: cwd.clone(),
         env,
         ..Default::default()
