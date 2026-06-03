@@ -592,6 +592,7 @@ impl AppState {
             pending_activate: None,
             pending_input: Vec::new(),
             pending_lock_changes: Vec::new(),
+            pending_bg_color_changes: Vec::new(),
             pending_new_tabs: 0,
             pending_new_tab_cwds: std::collections::VecDeque::new(),
             pending_renames: Vec::new(),
@@ -1024,6 +1025,7 @@ impl AppState {
             let renames: Vec<(usize, String)> = snapshot.pending_renames.drain(..).collect();
             let status_updates: Vec<api::PendingStatusUpdate> = snapshot.pending_status_updates.drain(..).collect();
             let lock_changes: Vec<(String, bool)> = snapshot.pending_lock_changes.drain(..).collect();
+            let bg_color_changes: Vec<(String, Option<String>)> = snapshot.pending_bg_color_changes.drain(..).collect();
             drop(snapshot);
             // Apply lock toggles from the API/CLI onto the runtime Tab
             // + its view, mirroring the right-click menu path. Both
@@ -1033,6 +1035,11 @@ impl AppState {
                 if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
                     tab.locked = locked;
                     tab.view.read(cx).set_locked(locked);
+                }
+            }
+            for (tab_id, color) in bg_color_changes {
+                if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+                    tab.bg_color = color;
                 }
             }
             for upd in status_updates {

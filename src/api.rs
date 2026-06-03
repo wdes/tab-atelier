@@ -198,6 +198,10 @@ pub struct TabSnapshot {
     /// the new lock state too (snapshot mutation alone would be lost
     /// on the next persist tick).
     pub pending_lock_changes: Vec<(String, bool)>,
+    /// (`tab_id`, color-or-None) queued by `POST /tabs/by-id/{id}/bg-color`.
+    /// `None` clears the per-tab override → tab falls back to the
+    /// global default. Same drain shape as `pending_lock_changes`.
+    pub pending_bg_color_changes: Vec<(String, Option<String>)>,
     pub pending_new_tabs: usize,
     /// Optional explicit cwd hints for the next `pending_new_tabs`
     /// creations, in FIFO order. Populated by `POST /tabs` with a
@@ -1424,6 +1428,56 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             let body = serde_json::to_string(&serde_json::json!({"locked": new_val})).unwrap_or_default();
             respond_json(stream, 200, &body);
         }
+        ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/bg-color") => {
+            // Set or clear the per-tab background color override.
+            // Master token only. Body: {"color": "#RRGGBB"} to set,
+            // {"color": null} to clear (tab falls back to global
+            // default). Validates the hex before accepting.
+            let inner = &p["/tabs/by-id/".len()..p.len() - "/bg-color".len()];
+            let parsed: Option<Option<String>> = if body_bytes.is_empty() {
+                None
+            } else {
+                serde_json::from_slice::<serde_json::Value>(&body_bytes)
+                    .ok()
+                    .and_then(|v| {
+                        let c = v.get("color")?;
+                        if c.is_null() {
+                            Some(None)
+                        } else {
+                            c.as_str().map(|s| Some(s.to_string()))
+                        }
+                    })
+            };
+            let Some(color_opt) = parsed else {
+                error_json(stream, 400, "missing {\"color\": \"#RRGGBB\"} or {\"color\": null}");
+                return;
+            };
+            // Validate hex if Some.
+            if let Some(ref c) = color_opt
+                && (c.len() != 7 || !c.starts_with('#') || !c[1..].chars().all(|x| x.is_ascii_hexdigit()))
+            {
+                error_json(stream, 400, "color must be #RRGGBB");
+                return;
+            }
+            let mut state = state.lock().unwrap();
+            let Some(idx) = state.tabs.iter().position(|t| t.id == inner) else {
+                drop(state);
+                error_json(stream, 404, "tab not found");
+                return;
+            };
+            let tab_id = state.tabs[idx].id.clone();
+            // Reflect immediately in the snapshot so the next /output
+            // poll already returns the new color; persist tick syncs
+            // the runtime Tab on the next 100 ms tick.
+            state.tabs[idx].bg_color = color_opt.clone().unwrap_or_default();
+            state.pending_bg_color_changes.push((tab_id, color_opt.clone()));
+            drop(state);
+            let body = serde_json::to_string(&serde_json::json!({
+                "color": color_opt
+            }))
+            .unwrap_or_default();
+            respond_json(stream, 200, &body);
+        }
         ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/input") => {
             let Some((key_raw, is_uuid)) = parse_tab_key(p, "/input") else {
                 error_json(stream, 404, "invalid tab key");
@@ -2018,6 +2072,7 @@ mod tests {
             pending_activate: None,
             pending_input: vec![],
             pending_lock_changes: vec![],
+            pending_bg_color_changes: vec![],
             pending_new_tabs: 0,
             pending_new_tab_cwds: std::collections::VecDeque::new(),
             pending_renames: vec![],
