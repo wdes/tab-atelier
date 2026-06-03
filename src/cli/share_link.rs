@@ -82,13 +82,16 @@ fn fetch_tabs(ep: &Endpoint) -> Result<Vec<serde_json::Value>, String> {
 /// and some are uuid-based (view/output/input via /by-id/).
 fn resolve(ep: &Endpoint, key: &str) -> Result<(usize, String), String> {
     let tabs = fetch_tabs(ep)?;
-    let pick = if let Ok(idx) = key.parse::<usize>() {
-        tabs.iter()
-            .find(|t| t.get("index").and_then(serde_json::Value::as_u64) == Some(idx as u64))
-    } else {
-        tabs.iter()
-            .find(|t| t.get("id").and_then(serde_json::Value::as_str) == Some(key))
-    };
+    let pick = key.parse::<usize>().map_or_else(
+        |_| {
+            tabs.iter()
+                .find(|t| t.get("id").and_then(serde_json::Value::as_str) == Some(key))
+        },
+        |idx| {
+            tabs.iter()
+                .find(|t| t.get("index").and_then(serde_json::Value::as_u64) == Some(idx as u64))
+        },
+    );
     let t = pick.ok_or_else(|| format!("no tab matches {key:?}"))?;
     let idx = t
         .get("index")
@@ -112,6 +115,7 @@ fn http_port(ep: &Endpoint) -> u16 {
 
 // --- subcommands ---------------------------------------------------
 
+#[must_use]
 pub fn run(args: &[String]) -> i32 {
     let mut key: Option<String> = None;
     let mut ro = false;
@@ -155,6 +159,7 @@ pub fn run(args: &[String]) -> i32 {
     0
 }
 
+#[must_use]
 pub fn add(args: &[String]) -> i32 {
     if args.is_empty() {
         eprintln!("usage: tab-atelier-headless add <path> [name]");
@@ -169,7 +174,7 @@ pub fn add(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let before = fetch_tabs(&ep).map(|v| v.len()).unwrap_or(0);
+    let before = fetch_tabs(&ep).map_or(0, |v| v.len());
     let body = serde_json::json!({"cwd": path.to_string_lossy()}).to_string();
     if let Err(e) = agent()
         .post(format!("{}/tabs", ep.url))
@@ -215,6 +220,7 @@ pub fn add(args: &[String]) -> i32 {
     0
 }
 
+#[must_use]
 pub fn close(args: &[String]) -> i32 {
     let Some(key) = args.first() else {
         eprintln!("usage: tab-atelier-headless close <tab-index-or-uuid>");
@@ -246,6 +252,7 @@ pub fn close(args: &[String]) -> i32 {
     0
 }
 
+#[must_use]
 pub fn rename(args: &[String]) -> i32 {
     if args.len() < 2 {
         eprintln!("usage: tab-atelier-headless rename <tab-index-or-uuid> <new-name>");
@@ -320,14 +327,17 @@ fn set_lock(args: &[String], on: bool, verb: &str) -> i32 {
     0
 }
 
+#[must_use]
 pub fn lock(args: &[String]) -> i32 {
     set_lock(args, true, "lock")
 }
 
+#[must_use]
 pub fn unlock(args: &[String]) -> i32 {
     set_lock(args, false, "unlock")
 }
 
+#[must_use]
 pub fn send_input(args: &[String]) -> i32 {
     if args.len() < 2 {
         eprintln!("usage: tab-atelier-headless input <tab-index-or-uuid> <text>");
@@ -364,6 +374,7 @@ pub fn send_input(args: &[String]) -> i32 {
     0
 }
 
+#[must_use]
 pub fn output(args: &[String]) -> i32 {
     let Some(key) = args.first() else {
         eprintln!("usage: tab-atelier-headless output <tab-index-or-uuid>");
@@ -405,13 +416,22 @@ pub fn output(args: &[String]) -> i32 {
     }
 }
 
-/// `tab-atelier-headless ports` — shows current bind addresses and
-/// the optional share-URL base. With flags, rewrites the daemon's
-/// `preferences.json` (no API roundtrip — the listeners are bound at
-/// startup, so a restart is required for changes to take effect; we
-/// say so on stdout). Updates the user-level prefs file (or
-/// /etc/tab-atelier/preferences.json if that's the only one and
-/// it's writable — usually means root).
+/// `tab-atelier-headless settings` — shows / edits daemon settings.
+///
+/// Without flags, prints the current bind addresses, share-URL base,
+/// and PTY dims. With flags, rewrites the daemon's `preferences.json`
+/// (no API roundtrip — the listeners are bound at startup, so a
+/// restart is required for changes to take effect; we say so on
+/// stdout). Updates the user-level prefs file, falling back to
+/// `/etc/tab-atelier/preferences.json` if that's the only one
+/// present (the system-service case).
+///
+/// # Panics
+/// Panics if the existing JSON file is well-formed but its root is
+/// not a JSON object — `as_object_mut` returns `None` and we expect
+/// to mutate. This is unreachable in practice because
+/// `serde_json::json!({})` is always an object and the daemon never
+/// writes anything else into the file.
 pub fn ports(args: &[String]) -> i32 {
     let mut new_api: Option<String> = None;
     let mut new_tls: Option<String> = None;
@@ -604,12 +624,11 @@ fn unescape(s: &str) -> String {
                 Some('n') => out.push('\n'),
                 Some('r') => out.push('\r'),
                 Some('t') => out.push('\t'),
-                Some('\\') => out.push('\\'),
+                Some('\\') | None => out.push('\\'),
                 Some(other) => {
                     out.push('\\');
                     out.push(other);
                 }
-                None => out.push('\\'),
             }
         } else {
             out.push(c);

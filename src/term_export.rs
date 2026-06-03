@@ -267,34 +267,37 @@ pub fn term_to_ansi_rows<E: EventListener>(
                     cur_bg = default_bg;
                     cur_flags = CellFlags::empty();
                 }
-                let mut push = |code: &str| {
-                    if !sgr.is_empty() {
-                        sgr.push(';');
+                // Scope the closure in a block so its borrow of `sgr`
+                // is released before sgr_color() takes another &mut.
+                {
+                    let mut push = |code: &str| {
+                        if !sgr.is_empty() {
+                            sgr.push(';');
+                        }
+                        sgr.push_str(code);
+                    };
+                    if cell.flags.contains(CellFlags::BOLD) && !cur_flags.contains(CellFlags::BOLD) {
+                        push("1");
                     }
-                    sgr.push_str(code);
-                };
-                if cell.flags.contains(CellFlags::BOLD) && !cur_flags.contains(CellFlags::BOLD) {
-                    push("1");
+                    if cell.flags.contains(CellFlags::DIM) && !cur_flags.contains(CellFlags::DIM) {
+                        push("2");
+                    }
+                    if cell.flags.contains(CellFlags::ITALIC) && !cur_flags.contains(CellFlags::ITALIC) {
+                        push("3");
+                    }
+                    if cell.flags.contains(CellFlags::UNDERLINE) && !cur_flags.contains(CellFlags::UNDERLINE) {
+                        push("4");
+                    }
+                    if cell.flags.contains(CellFlags::INVERSE) && !cur_flags.contains(CellFlags::INVERSE) {
+                        push("7");
+                    }
+                    if cell.flags.contains(CellFlags::HIDDEN) && !cur_flags.contains(CellFlags::HIDDEN) {
+                        push("8");
+                    }
+                    if cell.flags.contains(CellFlags::STRIKEOUT) && !cur_flags.contains(CellFlags::STRIKEOUT) {
+                        push("9");
+                    }
                 }
-                if cell.flags.contains(CellFlags::DIM) && !cur_flags.contains(CellFlags::DIM) {
-                    push("2");
-                }
-                if cell.flags.contains(CellFlags::ITALIC) && !cur_flags.contains(CellFlags::ITALIC) {
-                    push("3");
-                }
-                if cell.flags.contains(CellFlags::UNDERLINE) && !cur_flags.contains(CellFlags::UNDERLINE) {
-                    push("4");
-                }
-                if cell.flags.contains(CellFlags::INVERSE) && !cur_flags.contains(CellFlags::INVERSE) {
-                    push("7");
-                }
-                if cell.flags.contains(CellFlags::HIDDEN) && !cur_flags.contains(CellFlags::HIDDEN) {
-                    push("8");
-                }
-                if cell.flags.contains(CellFlags::STRIKEOUT) && !cur_flags.contains(CellFlags::STRIKEOUT) {
-                    push("9");
-                }
-                drop(push);
                 if cell.fg != cur_fg {
                     sgr_color(&mut sgr, cell.fg, true);
                 }

@@ -189,7 +189,10 @@ impl HeadlessTab {
     fn dims(&self) -> (u16, u16) {
         let t = self.term.lock();
         let g = t.grid();
-        (g.columns() as u16, g.screen_lines() as u16)
+        let cols = g.columns() as u16;
+        let rows = g.screen_lines() as u16;
+        drop(t);
+        (cols, rows)
     }
 
     fn copy_all_history(&self) -> String {
