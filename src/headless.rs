@@ -476,6 +476,7 @@ pub fn run() -> std::io::Result<()> {
         pending_activate: None,
         pending_input: Vec::new(),
         pending_lock_changes: Vec::new(),
+        pending_bg_color_changes: Vec::new(),
         pending_new_tabs: 0,
         pending_new_tab_cwds: std::collections::VecDeque::new(),
         pending_renames: Vec::new(),
@@ -825,6 +826,7 @@ fn drain_pending(
     let renames: Vec<(usize, String)> = s.pending_renames.drain(..).collect();
     let status_updates: Vec<api::PendingStatusUpdate> = s.pending_status_updates.drain(..).collect();
     let lock_changes: Vec<(String, bool)> = s.pending_lock_changes.drain(..).collect();
+    let bg_color_changes: Vec<(String, Option<String>)> = s.pending_bg_color_changes.drain(..).collect();
     let new_tabs = std::mem::take(&mut s.pending_new_tabs);
     let new_tab_cwds: std::collections::VecDeque<std::path::PathBuf> = std::mem::take(&mut s.pending_new_tab_cwds);
     drop(s);
@@ -833,6 +835,12 @@ fn drain_pending(
     for (tab_id, locked) in lock_changes {
         if let Some(t) = tabs.iter_mut().find(|t| t.id == tab_id) {
             t.locked = locked;
+        }
+    }
+    // Same path for the bg-color override.
+    for (tab_id, color) in bg_color_changes {
+        if let Some(t) = tabs.iter_mut().find(|t| t.id == tab_id) {
+            t.bg_color = color;
         }
     }
 
