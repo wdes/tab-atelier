@@ -248,6 +248,12 @@ assets = [
     # headless box where there's no GUI Preferences dialog to write
     # the per-user file.
     ["assets/preferences.default.json", "/etc/tab-atelier/preferences.json", "644"],
+    # System-wide Claude Code hooks — `claude` reads this for every
+    # user on the box and pipes SessionStart / Stop / etc. events
+    # through `tab-atelier-headless claude-hook` so the desktop LED
+    # and the mobile remote both track agent state without each user
+    # editing their own ~/.claude/settings.json.
+    ["assets/claude-code-managed-settings.json", "/etc/claude-code/managed-settings.json", "644"],
     ["README.md", "/usr/share/doc/tab-atelier-headless/", "644"],
     ["LICENSE", "/usr/share/doc/tab-atelier-headless/", "644"],
 ]
@@ -260,7 +266,10 @@ maintainer-scripts = "assets/headless-debian/"
 # the deb-systemd-helper / deb-systemd-invoke dependency obvious.
 depends = "libc6, libgcc-s1, adduser, init-system-helpers"
 # Mirror the default variant: the shipped preferences.json fallback
-# is a real conffile so admin edits survive `apt upgrade`. Listed
-# explicitly because cargo-deb variants don't always inherit
-# `conf-files`.
-conf-files = ["/etc/tab-atelier/preferences.json"]
+# is a real conffile so admin edits survive `apt upgrade`. The Claude
+# Code system hooks live in a different /etc subdir; making it a
+# conffile too means user edits survive upgrades.
+conf-files = [
+    "/etc/tab-atelier/preferences.json",
+    "/etc/claude-code/managed-settings.json",
+]
