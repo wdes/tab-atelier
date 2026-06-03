@@ -1954,6 +1954,72 @@ impl AppState {
                     )
                     .child(lock_label),
             );
+
+            // Background color submenu — five preset swatches +
+            // "clear override". Custom hex still available via the
+            // headless CLI (`bg-color <tab> #RRGGBB`); a full color
+            // picker is more chrome than this app currently has.
+            let bg_presets: &[(&str, &str)] = &[
+                ("Tomorrow Night Blue", "#002451"),
+                ("Catppuccin Mocha", "#1e1e2e"),
+                ("Nord", "#2e3440"),
+                ("Solarized Dark", "#002b36"),
+                ("Pitch black", "#000000"),
+            ];
+            for (preset_label, preset_hex) in bg_presets {
+                let tab_id_for_bg = self.tabs[idx].id.clone();
+                let hex = (*preset_hex).to_string();
+                let label = format!("Background: {preset_label} ({preset_hex})");
+                container = container.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "menu-bg-{}",
+                            preset_hex.trim_start_matches('#')
+                        )))
+                        .px(px(12.0))
+                        .py(px(4.0))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(menu_hover))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                                this.tabs[idx].bg_color = Some(hex.clone());
+                                let mut snap = this.api_state.lock().unwrap();
+                                if let Some(t) = snap.tabs.iter_mut().find(|t| t.id == tab_id_for_bg) {
+                                    t.bg_color.clone_from(&hex);
+                                }
+                                drop(snap);
+                                this.context_menu = None;
+                                cx.notify();
+                            }),
+                        )
+                        .child(label),
+                );
+            }
+            // Clear per-tab override → tab inherits global.
+            let tab_id_for_bg_clear = self.tabs[idx].id.clone();
+            container = container.child(
+                div()
+                    .id("menu-bg-clear")
+                    .px(px(12.0))
+                    .py(px(4.0))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(menu_hover))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                            this.tabs[idx].bg_color = None;
+                            let mut snap = this.api_state.lock().unwrap();
+                            if let Some(t) = snap.tabs.iter_mut().find(|t| t.id == tab_id_for_bg_clear) {
+                                t.bg_color = String::new();
+                            }
+                            drop(snap);
+                            this.context_menu = None;
+                            cx.notify();
+                        }),
+                    )
+                    .child("Background: use global"),
+            );
         }
 
         {
