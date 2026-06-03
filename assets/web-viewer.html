@@ -202,15 +202,19 @@
         // exposes an empty terminal + top-left cursor (the "1-second
         // cursor flash" the user reported during heavy redraws).
         // Instead emit a single ANSI sequence:
-        //   \x1b[H  cursor home
-        //   <body>  the row-by-row dump
-        //   \x1b[J  erase from cursor to end of screen (kills any
-        //           leftover rows the previous buffer had)
-        //   <cursorTail>  reposition to server's cursor
-        // xterm.js executes the full sequence atomically — no
-        // visible intermediate state.
-        const FULL_PREFIX = "\x1b[H";
-        const FULL_SUFFIX = "\x1b[J";
+        //   \x1b[2J  erase entire viewport (kills leftover chars on
+        //            any row the new body's shorter than the old)
+        //   \x1b[H   cursor home
+        //   <body>   the row-by-row dump
+        //   <tail>   reposition to server's cursor
+        // xterm.js executes the full sequence atomically inside one
+        // term.write(), no visible intermediate state. The post-body
+        // \x1b[J trick used to work for clearing below — but each
+        // ROW past the new body's end still had leftover chars from
+        // the old paint (cursor moves col-by-col, doesn't auto-erase
+        // to end-of-line), producing the "cascade" overlay.
+        const FULL_PREFIX = "\x1b[2J\x1b[H";
+        const FULL_SUFFIX = "";
         if (!bootstrapped) {
           term.write(FULL_PREFIX + body + FULL_SUFFIX + cursorTail);
           bootstrapped = true;
