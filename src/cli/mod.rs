@@ -4,8 +4,9 @@
 
 pub mod remote;
 pub mod set_status;
-/// Headless-side basic-action subcommands (share-link, add, close,
-/// rename, lock, unlock, input, output). Named after the first one
-/// added; see the module docstring.
+/// Headless-side basic-action subcommands.
+///
+/// share-link, add, close, rename, lock, unlock, input, output. Named
+/// after the first one added; see the module docstring for details.
 pub mod share_link;
 pub mod tabs;

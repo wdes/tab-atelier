@@ -247,9 +247,14 @@ pub fn default_tab_id() -> String {
 /// Distinct from the master api.token (which authorises every tab).
 #[must_use]
 pub fn mint_share_token() -> String {
+    use std::fmt::Write as _;
     let mut buf = [0u8; 16];
     platform::random_bytes(&mut buf);
-    buf.iter().map(|b| format!("{b:02x}")).collect()
+    let mut out = String::with_capacity(32);
+    for b in &buf {
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
 }
 
 impl Default for TabState {
@@ -738,10 +743,11 @@ pub const DEFAULT_API_ADDR: &str = "0.0.0.0:7890";
 pub const DEFAULT_API_TLS_ADDR: &str = "0.0.0.0:7891";
 pub const DEFAULT_HAPPIER_RELAY_ADDR: &str = "127.0.0.1:7892";
 
-/// System-wide preferences file shipped by the .deb as a dpkg-managed
-/// conffile. `load_preferences()` reads this as a fallback when the
-/// per-user file is absent or unparsable, so an admin can set defaults
-/// (bind addresses, relay address) without each user having to create
+/// System-wide preferences file shipped by the .deb as a dpkg conffile.
+///
+/// `load_preferences()` reads this as a fallback when the per-user
+/// file is absent or unparsable, so an admin can set defaults (bind
+/// addresses, relay address) without each user having to create
 /// their own `preferences.json`. Per-user settings always win.
 pub const SYSTEM_PREFERENCES_PATH: &str = "/etc/tab-atelier/preferences.json";
 

@@ -18,7 +18,7 @@ use crate::tracking::WakatimeTracker;
 use crate::{
     DEFAULT_HOTKEYS, FontConfig, Preferences, SavedState, TabState, gpui_key_to_keycode, keycode_label,
     load_font_config, load_preferences, load_state_with_outputs, load_wakatime_key, save_preferences, save_state,
-    save_tab_energy, save_tab_output, save_tab_tokens, save_tab_uptime,
+    save_tab_output, save_tab_uptime,
 };
 use crate::{api_url_for_local_clients, build_agent_resume_command, tab_env_extras};
 use gpui::prelude::FluentBuilder;
@@ -1775,9 +1775,9 @@ impl AppState {
                                     let mut snap = this.api_state.lock().unwrap();
                                     if let Some(t) = snap.tabs.iter_mut().find(|t| t.id == tab_id) {
                                         if ro {
-                                            t.share_token_ro = token.clone();
+                                            t.share_token_ro.clone_from(&token);
                                         } else {
-                                            t.share_token_rw = token.clone();
+                                            t.share_token_rw.clone_from(&token);
                                         }
                                     }
                                 }
@@ -3685,7 +3685,7 @@ const MAX_ADDR_LEN: usize = 64;
 /// Char predicate for the share-URL-base input — accepts the URL-safe
 /// ASCII set (RFC 3986 reserved + unreserved + a few practical extras
 /// like spaces / `?` not really allowed but tolerated for paste).
-fn is_url_char(c: char) -> bool {
+const fn is_url_char(c: char) -> bool {
     c.is_ascii_alphanumeric()
         || matches!(
             c,

@@ -22,11 +22,7 @@ const VIEWER_HTML: &str = include_str!("../assets/web-viewer.html");
 /// the same form.
 fn parse_tab_key<'a>(path: &'a str, suffix: &str) -> Option<(&'a str, bool)> {
     let inner = path.strip_prefix("/tabs/")?.strip_suffix(suffix)?;
-    if let Some(uuid) = inner.strip_prefix("by-id/") {
-        Some((uuid, true))
-    } else {
-        Some((inner, false))
-    }
+    Some(inner.strip_prefix("by-id/").map_or((inner, false), |uuid| (uuid, true)))
 }
 
 fn resolve_tab_idx(state: &TabSnapshot, key_raw: &str, is_uuid: bool) -> Option<usize> {
@@ -114,7 +110,7 @@ pub struct SnapshotTab {
     /// viewer keep using `output` (logical lines, easier to word-wrap
     /// on a phone).
     pub raw_output: String,
-    /// Cursor (row_in_raw_output, col) — coordinates inside
+    /// Cursor (`row_in_raw_output`, col) — coordinates inside
     /// `raw_output` so the xterm.js viewer can issue a
     /// cursor-position escape after each write and the blinking
     /// cursor lands where the user is actually typing. Distinct
@@ -147,6 +143,7 @@ pub struct SnapshotTab {
     /// PID of the tab's shell. The /catbus endpoints walk its
     /// descendant processes to find a catbus-agent (or fallback
     /// `claude` TUI) and resolve the session's transcript file.
+    #[cfg_attr(not(feature = "catbus"), allow(dead_code))]
     pub shell_pid: u32,
     /// Transient agent state, mirrored from the in-RAM Tab. Surfaced
     /// in the `/tabs` response (so the CLI viewer can render the LED
@@ -190,9 +187,9 @@ pub struct TabSnapshot {
     pub pending_closes: Vec<usize>,
     pub pending_activate: Option<usize>,
     pub pending_input: Vec<(usize, Vec<u8>)>,
-    /// (tab_id, locked) flips queued by the new
+    /// (`tab_id`, locked) flips queued by the new
     /// `POST /tabs/by-id/{id}/lock` endpoint — drained by the main
-    /// loop on the next tick so the runtime Tab / HeadlessTab gets
+    /// loop on the next tick so the runtime Tab / `HeadlessTab` gets
     /// the new lock state too (snapshot mutation alone would be lost
     /// on the next persist tick).
     pub pending_lock_changes: Vec<(String, bool)>,
@@ -668,7 +665,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             && matches!(action, "view" | "output" | "input")
         {
             let state_g = state.lock().unwrap();
-            if let Some(t) = state_g.tabs.iter().find(|t| t.id == uuid) {
+            state_g.tabs.iter().find(|t| t.id == uuid).and_then(|t| {
                 let rw_match = !t.share_token_rw.is_empty() && t.share_token_rw == p;
                 let ro_match = !t.share_token_ro.is_empty() && t.share_token_ro == p;
                 if action == "input" {
@@ -685,9 +682,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 } else {
                     None
                 }
-            } else {
-                None
-            }
+            })
         } else {
             None
         };
@@ -1481,7 +1476,7 @@ impl Write for MemAdapter {
 fn format_h1_request(method: &str, uri: &str, headers: &hyper::HeaderMap, body: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(256 + body.len());
     let _ = write!(&mut buf, "{method} {uri} HTTP/1.1\r\n");
-    for (name, value) in headers.iter() {
+    for (name, value) in headers {
         if name == hyper::header::CONTENT_LENGTH {
             // Force a length consistent with the actual body we ship.
             continue;
@@ -1495,17 +1490,15 @@ fn format_h1_request(method: &str, uri: &str, headers: &hyper::HeaderMap, body: 
     buf
 }
 
-/// Parse the bytes emitted by `handle_connection` and return a
-/// hyper `Response`. The handler always emits `HTTP/1.1 STATUS REASON`
-/// + headers + body. We ignore the reason phrase (hyper rebuilds it)
-/// and pass headers + body through.
+/// Parse the bytes emitted by `handle_connection` and return a hyper response.
+///
+/// The handler always emits `HTTP/1.1 STATUS REASON` + headers + body.
+/// We ignore the reason phrase (hyper rebuilds it) and pass headers +
+/// body through.
 fn parse_h1_response(bytes: &[u8]) -> Response<Full<Bytes>> {
     // Find header/body split.
     let split = bytes.windows(4).position(|w| w == b"\r\n\r\n");
-    let (head, body) = match split {
-        Some(i) => (&bytes[..i], &bytes[i + 4..]),
-        None => (bytes, &[][..]),
-    };
+    let (head, body) = split.map_or((bytes, &[][..]), |i| (&bytes[..i], &bytes[i + 4..]));
     let head_text = std::str::from_utf8(head).unwrap_or("");
     let mut lines = head_text.split("\r\n");
     let status = lines
@@ -1534,11 +1527,10 @@ fn parse_h1_response(bytes: &[u8]) -> Response<Full<Bytes>> {
         }
     }
     let _ = content_encoding_gzip;
-    let body_bytes = if let Some(n) = content_length {
-        Bytes::copy_from_slice(&body[..n.min(body.len())])
-    } else {
-        Bytes::copy_from_slice(body)
-    };
+    let body_bytes = content_length.map_or_else(
+        || Bytes::copy_from_slice(body),
+        |n| Bytes::copy_from_slice(&body[..n.min(body.len())]),
+    );
     builder
         .body(Full::new(body_bytes))
         .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))

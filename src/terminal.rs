@@ -122,7 +122,7 @@ pub struct TerminalView {
     last_input: Rc<Cell<Option<std::time::Instant>>>,
     colors_enabled: Cell<bool>,
     /// When true, every write path (typing, paste, programmatic
-    /// send_input_bytes) early-returns. The lock state lives on the
+    /// `send_input_bytes`) early-returns. The lock state lives on the
     /// view so input is blocked at the chokepoint regardless of
     /// caller — keyboard event handlers, the API drain, the catbus
     /// menu item, etc.
@@ -397,6 +397,11 @@ impl TerminalView {
         self.send_input(bytes);
     }
 
+    // Lock-state read accessor — currently used by the right-click
+    // menu render to label the toggle, and reserved for any future
+    // call site that needs to peek at the gate (paste, hotkey
+    // dispatchers). Keep it even if the menu is the only caller.
+    #[allow(dead_code)]
     pub fn is_locked(&self) -> bool {
         self.locked.get()
     }
@@ -535,9 +540,14 @@ impl TerminalView {
     /// resizes its grid to match, otherwise the server-side wrapping
     /// renders weird when the browser window is wider than the PTY).
     pub fn dims(&self) -> (u16, u16) {
+        // Hold the lock only for the two field reads, not for the
+        // whole function (clippy:significant_drop_tightening).
         let t = self.term.lock();
         let g = t.grid();
-        (g.columns() as u16, g.screen_lines() as u16)
+        let cols = g.columns() as u16;
+        let rows = g.screen_lines() as u16;
+        drop(t);
+        (cols, rows)
     }
 
     /// Row-by-row dump for the xterm.js viewer (no WRAPLINE join).
@@ -545,7 +555,7 @@ impl TerminalView {
     /// browser-side terminal at matching cols reproduces the layout
     /// cell-for-cell instead of relying on xterm.js auto-wrap to
     /// re-land the wrap point. Returns (text, optional cursor at
-    /// (row_in_dump, col)).
+    /// (`row_in_dump`, col)).
     pub fn raw_screen_text(&self, max_lines: Option<usize>) -> (String, Option<(usize, usize)>) {
         crate::term_export::term_to_ansi_rows(&self.term, max_lines)
     }
