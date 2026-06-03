@@ -30,6 +30,33 @@ fn main() {
                 let rest: Vec<String> = std::env::args().skip(2).collect();
                 std::process::exit(cli::remote::run(&rest));
             }
+            "share-link" => std::process::exit(cli::share_link::run(&std::env::args().skip(2).collect::<Vec<_>>())),
+            "add" => std::process::exit(cli::share_link::add(&std::env::args().skip(2).collect::<Vec<_>>())),
+            "close" => std::process::exit(cli::share_link::close(&std::env::args().skip(2).collect::<Vec<_>>())),
+            "rename" => std::process::exit(cli::share_link::rename(&std::env::args().skip(2).collect::<Vec<_>>())),
+            "lock" => std::process::exit(cli::share_link::lock(&std::env::args().skip(2).collect::<Vec<_>>())),
+            "unlock" => std::process::exit(cli::share_link::unlock(&std::env::args().skip(2).collect::<Vec<_>>())),
+            "input" => std::process::exit(cli::share_link::send_input(
+                &std::env::args().skip(2).collect::<Vec<_>>(),
+            )),
+            "output" => std::process::exit(cli::share_link::output(&std::env::args().skip(2).collect::<Vec<_>>())),
+            "--help" | "-h" => {
+                eprintln!(
+                    "tab-atelier-headless [run a tab-atelier server] OR one of:\n  \
+                     tabs [--once]                live tab listing\n  \
+                     add <path> [name]            create a new tab rooted at <path>\n  \
+                     close <idx|uuid>             close a tab\n  \
+                     rename <idx|uuid> <name>     rename a tab\n  \
+                     lock <idx|uuid>              lock a tab (refuse all input)\n  \
+                     unlock <idx|uuid>            unlock a tab\n  \
+                     input <idx|uuid> <text>      send keystrokes (\\n escapes ok)\n  \
+                     output <idx|uuid>            print current scrollback\n  \
+                     share-link <idx|uuid> [--ro] copy a browser URL for /view\n  \
+                     set-status <state> [label]   used by Claude Code hooks etc.\n  \
+                     remote ...                   talk to a remote tab-atelier"
+                );
+                std::process::exit(0);
+            }
             _ => {}
         }
     }

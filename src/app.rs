@@ -571,6 +571,7 @@ impl AppState {
             pending_closes: Vec::new(),
             pending_activate: None,
             pending_input: Vec::new(),
+            pending_lock_changes: Vec::new(),
             pending_new_tabs: 0,
             pending_new_tab_cwds: std::collections::VecDeque::new(),
             pending_renames: Vec::new(),
@@ -992,7 +993,18 @@ impl AppState {
             let inputs: Vec<(usize, Vec<u8>)> = snapshot.pending_input.drain(..).collect();
             let renames: Vec<(usize, String)> = snapshot.pending_renames.drain(..).collect();
             let status_updates: Vec<api::PendingStatusUpdate> = snapshot.pending_status_updates.drain(..).collect();
+            let lock_changes: Vec<(String, bool)> = snapshot.pending_lock_changes.drain(..).collect();
             drop(snapshot);
+            // Apply lock toggles from the API/CLI onto the runtime Tab
+            // + its view, mirroring the right-click menu path. Both
+            // sites must update — the view gate is what makes typing
+            // stop, the Tab field is what persists into tabs.json.
+            for (tab_id, locked) in lock_changes {
+                if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+                    tab.locked = locked;
+                    tab.view.read(cx).set_locked(locked);
+                }
+            }
             for upd in status_updates {
                 let Some(tab) = self.tabs.iter_mut().find(|t| t.id == upd.tab_id) else {
                     continue;

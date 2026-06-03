@@ -190,6 +190,12 @@ pub struct TabSnapshot {
     pub pending_closes: Vec<usize>,
     pub pending_activate: Option<usize>,
     pub pending_input: Vec<(usize, Vec<u8>)>,
+    /// (tab_id, locked) flips queued by the new
+    /// `POST /tabs/by-id/{id}/lock` endpoint — drained by the main
+    /// loop on the next tick so the runtime Tab / HeadlessTab gets
+    /// the new lock state too (snapshot mutation alone would be lost
+    /// on the next persist tick).
+    pub pending_lock_changes: Vec<(String, bool)>,
     pub pending_new_tabs: usize,
     /// Optional explicit cwd hints for the next `pending_new_tabs`
     /// creations, in FIFO order. Populated by `POST /tabs` with a
@@ -1341,6 +1347,38 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 ),
             );
         }
+        ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/lock") => {
+            // Flip the per-tab lock from the CLI / API. Master token
+            // only (share-token gate above does not allow `/lock`).
+            // ?on=1/0 takes precedence; absent → toggle.
+            let inner = &p["/tabs/by-id/".len()..p.len() - "/lock".len()];
+            // Pull `?on=` from the original path. `path` here is the
+            // already-stripped form; the original is `raw_path` but
+            // it's already been moved by this point — re-derive from
+            // the body for the body-driven form, or accept the URL
+            // form by looking at the request line earlier captures.
+            // Simplest: accept `{"on": true|false}` in the JSON body.
+            let on_body: Option<bool> = if body_bytes.is_empty() {
+                None
+            } else {
+                serde_json::from_slice::<serde_json::Value>(&body_bytes)
+                    .ok()
+                    .and_then(|v| v.get("on").and_then(serde_json::Value::as_bool))
+            };
+            let mut state = state.lock().unwrap();
+            let Some(idx) = state.tabs.iter().position(|t| t.id == inner) else {
+                drop(state);
+                error_json(stream, 404, "tab not found");
+                return;
+            };
+            let tab_id = state.tabs[idx].id.clone();
+            let new_val = on_body.unwrap_or(!state.tabs[idx].locked);
+            state.tabs[idx].locked = new_val;
+            state.pending_lock_changes.push((tab_id, new_val));
+            drop(state);
+            let body = serde_json::to_string(&serde_json::json!({"locked": new_val})).unwrap_or_default();
+            respond_json(stream, 200, &body);
+        }
         ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/input") => {
             let Some((key_raw, is_uuid)) = parse_tab_key(p, "/input") else {
                 error_json(stream, 404, "invalid tab key");
@@ -1900,6 +1938,7 @@ mod tests {
             pending_closes: vec![],
             pending_activate: None,
             pending_input: vec![],
+            pending_lock_changes: vec![],
             pending_new_tabs: 0,
             pending_new_tab_cwds: std::collections::VecDeque::new(),
             pending_renames: vec![],
