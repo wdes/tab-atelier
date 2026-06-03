@@ -198,15 +198,26 @@
         const cursorTail = (Number.isFinite(curRow) && Number.isFinite(curCol))
           ? `\x1b[${curRow + 1};${curCol + 1}H`
           : "";
+        // Full-repaint without term.reset() — `reset()` briefly
+        // exposes an empty terminal + top-left cursor (the "1-second
+        // cursor flash" the user reported during heavy redraws).
+        // Instead emit a single ANSI sequence:
+        //   \x1b[H  cursor home
+        //   <body>  the row-by-row dump
+        //   \x1b[J  erase from cursor to end of screen (kills any
+        //           leftover rows the previous buffer had)
+        //   <cursorTail>  reposition to server's cursor
+        // xterm.js executes the full sequence atomically — no
+        // visible intermediate state.
+        const FULL_PREFIX = "\x1b[H";
+        const FULL_SUFFIX = "\x1b[J";
         if (!bootstrapped) {
-          term.reset();
-          term.write(body + cursorTail);
+          term.write(FULL_PREFIX + body + FULL_SUFFIX + cursorTail);
           bootstrapped = true;
         } else if (start === since && body.length > 0) {
           term.write(body + cursorTail);
         } else if (start === 0 && body.length > 0) {
-          term.reset();
-          term.write(body + cursorTail);
+          term.write(FULL_PREFIX + body + FULL_SUFFIX + cursorTail);
         } else if (cursorTail) {
           term.write(cursorTail);
         }
