@@ -396,6 +396,149 @@ pub fn output(args: &[String]) -> i32 {
     }
 }
 
+/// `tab-atelier-headless ports` — shows current bind addresses and
+/// the optional share-URL base. With flags, rewrites the daemon's
+/// `preferences.json` (no API roundtrip — the listeners are bound at
+/// startup, so a restart is required for changes to take effect; we
+/// say so on stdout). Updates the user-level prefs file (or
+/// /etc/tab-atelier/preferences.json if that's the only one and
+/// it's writable — usually means root).
+pub fn ports(args: &[String]) -> i32 {
+    let mut new_api: Option<String> = None;
+    let mut new_tls: Option<String> = None;
+    let mut new_relay: Option<String> = None;
+    let mut new_share_url: Option<String> = None;
+    let mut clear_share_url = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--api-addr" => {
+                i += 1;
+                new_api = args.get(i).cloned();
+            }
+            "--api-tls-addr" => {
+                i += 1;
+                new_tls = args.get(i).cloned();
+            }
+            "--happier-relay-addr" => {
+                i += 1;
+                new_relay = args.get(i).cloned();
+            }
+            "--share-url-base" => {
+                i += 1;
+                let v = args.get(i).cloned().unwrap_or_default();
+                if v.is_empty() {
+                    clear_share_url = true;
+                } else {
+                    new_share_url = Some(v);
+                }
+            }
+            "--help" | "-h" => {
+                eprintln!(
+                    "usage: tab-atelier-headless ports [--api-addr ADDR] [--api-tls-addr ADDR] \
+                     [--happier-relay-addr ADDR] [--share-url-base URL]\n\
+                     With no args, prints the current values.\n\
+                     Set --share-url-base \"\" to clear.\n\
+                     Restart the daemon for changes to take effect."
+                );
+                return 0;
+            }
+            other => {
+                eprintln!("ports: unexpected argument: {other}");
+                return 2;
+            }
+        }
+        i += 1;
+    }
+
+    // Resolve the preferences file path. Prefer the per-user one;
+    // fall back to /etc for the system service case.
+    let user_path = crate::platform::config_base_dir()
+        .join("tab-atelier")
+        .join("preferences.json");
+    let system_path = std::path::PathBuf::from("/etc/tab-atelier/preferences.json");
+    let path = if user_path.exists() {
+        user_path
+    } else if system_path.exists() {
+        system_path
+    } else {
+        // Default to the user path so we *create* one rather than
+        // touching /etc by surprise.
+        user_path
+    };
+
+    // Read and patch in-place. Use raw JSON so we don't lose fields
+    // the binary doesn't know about (forward compat).
+    let mut doc: serde_json::Value = if path.exists() {
+        match std::fs::read_to_string(&path) {
+            Ok(s) => serde_json::from_str(&s).unwrap_or(serde_json::json!({})),
+            Err(e) => {
+                eprintln!("ports: read {}: {e}", path.display());
+                return 1;
+            }
+        }
+    } else {
+        serde_json::json!({})
+    };
+
+    if new_api.is_none() && new_tls.is_none() && new_relay.is_none() && new_share_url.is_none() && !clear_share_url {
+        // Read-only mode — print whatever's in the file (or defaults).
+        let api = doc
+            .get("api_addr")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(crate::DEFAULT_API_ADDR);
+        let tls = doc
+            .get("api_tls_addr")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(crate::DEFAULT_API_TLS_ADDR);
+        let relay = doc
+            .get("happier_relay_addr")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(crate::DEFAULT_HAPPIER_RELAY_ADDR);
+        let share = doc
+            .get("share_url_base")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        println!("api_addr          = {api}");
+        println!("api_tls_addr      = {tls}");
+        println!("happier_relay_addr = {relay}");
+        println!("share_url_base    = {share}");
+        println!("(preferences file: {})", path.display());
+        return 0;
+    }
+
+    let obj = doc.as_object_mut().expect("doc should be a JSON object");
+    if let Some(v) = new_api {
+        obj.insert("api_addr".into(), serde_json::Value::String(v));
+    }
+    if let Some(v) = new_tls {
+        obj.insert("api_tls_addr".into(), serde_json::Value::String(v));
+    }
+    if let Some(v) = new_relay {
+        obj.insert("happier_relay_addr".into(), serde_json::Value::String(v));
+    }
+    if let Some(v) = new_share_url {
+        obj.insert("share_url_base".into(), serde_json::Value::String(v));
+    }
+    if clear_share_url {
+        obj.remove("share_url_base");
+    }
+
+    if let Some(parent) = path.parent()
+        && !parent.exists()
+    {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let pretty = serde_json::to_string_pretty(&doc).unwrap_or_default();
+    if let Err(e) = std::fs::write(&path, pretty) {
+        eprintln!("ports: write {}: {e}", path.display());
+        return 1;
+    }
+    println!("updated {}", path.display());
+    println!("restart the daemon for the new bind addresses to take effect");
+    0
+}
+
 fn unescape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();

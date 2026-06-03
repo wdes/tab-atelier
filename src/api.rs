@@ -585,7 +585,15 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
     if parts.len() < 2 {
         return;
     }
-    let method = parts[0].to_string();
+    // Treat HEAD as GET for routing. Cloudflare Tunnel health checks
+    // (and curl -I) hit endpoints with HEAD; we don't want them to
+    // 405. Response writers honour the convention by including a
+    // body — fine for HEAD since clients are expected to discard it.
+    let method = if parts[0].eq_ignore_ascii_case("HEAD") {
+        "GET".to_string()
+    } else {
+        parts[0].to_string()
+    };
     let raw_path = parts[1].to_string();
 
     let (path, query_token, query_lines, query_since, query_crc, query_name, query_path) =
@@ -612,6 +620,15 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
         } else {
             (raw_path, None, None, None, None, None, None)
         };
+    // Strip a trailing slash so a path like `/tabs/.../view/` (added
+    // by some reverse proxies / Cloudflare Tunnel normalisation)
+    // still matches the `ends_with("/view")` route arms below.
+    // `/` itself is preserved so the root keeps working.
+    let path = if path.len() > 1 && path.ends_with('/') {
+        path.trim_end_matches('/').to_string()
+    } else {
+        path
+    };
 
     // Read the body (if any) before dropping the reader so we can write the
     // response back through `stream` without a borrow conflict.
