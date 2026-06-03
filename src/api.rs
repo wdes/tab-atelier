@@ -949,6 +949,10 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 .replace("__TAB_KEY__", &key_for_html)
                 .replace("__TAB_NAME_HTML__", &html_name)
                 .replace("__TAB_NAME_JS__", js_name);
+            // Tell browsers (and any intervening CDN) not to cache
+            // the viewer HTML — we ship JS fixes in the deb and
+            // users would otherwise see a stale banner / poll loop
+            // until a hard reload.
             respond_with_etag(
                 stream,
                 200,
@@ -956,7 +960,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 html.as_bytes(),
                 accept_gzip,
                 if_none_match.as_deref(),
-                "",
+                "Cache-Control: no-store, no-cache, must-revalidate\r\nPragma: no-cache\r\n",
             );
         }
         ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/output") => {
