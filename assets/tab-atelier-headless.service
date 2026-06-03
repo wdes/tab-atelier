@@ -54,6 +54,14 @@ BindReadOnlyPaths=/usr /lib /lib64 /bin /sbin /etc /opt
 # Leading `-` makes the bind optional, so the unit still starts on
 # systems where the path doesn't exist.
 BindReadOnlyPaths=-/run/systemd/resolve -/sys/fs/cgroup
+
+# Local sockets users typically expect to reach from a tab — IPC
+# with daemons running on the host. Both paths covered for docker
+# because /var/run is usually a symlink to /run, but with our
+# private tmpfs the symlink doesn't follow until we bind the
+# target into the namespace too. Extend with the same pattern if
+# you use podman, libvirt, etc.
+BindPaths=-/run/docker.sock -/var/run/docker.sock
 # Read-write work directories. Add yours here (or via
 # `systemctl edit`). /srv is the conventional spot for site data;
 # extend with /home, /opt/projects, etc. as you go.
