@@ -101,6 +101,11 @@ ctrlc = { version = "3.4", default-features = false }
 fs2 = "0.4"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 rustls-pemfile = "2"
+# Top-level CLI parser. Already in the dep tree transitively (via
+# `wakatime-rs`-style crates pulled in by gpui); promote to a direct
+# dep so the headless + desktop binaries can `#[derive(Parser)]`
+# their subcommand routing instead of hand-rolling `match args[0]`.
+clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
 # Async HTTP/1+2 server. Tokio runtime is single-thread inside the
 # API server thread — no global tokio dep is exported to anything
 # else in the crate. h3+quinn live alongside on a UDP listener
