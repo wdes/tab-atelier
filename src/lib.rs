@@ -669,6 +669,17 @@ pub struct Preferences {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_tls_addr: Option<String>,
 
+    /// Headless PTY dimensions. The GUI re-sizes its terminals from
+    /// the window, but the headless daemon has no display — the
+    /// alacritty PTY stays at whatever it spawned with. Default is
+    /// 80×24, which is too narrow for modern TUIs (Claude Code etc.)
+    /// and makes the share-link viewer at xterm.js look cramped.
+    /// Tune via `tab-atelier-headless ports --pty-cols 200 --pty-rows 50`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pty_cols: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pty_rows: Option<u16>,
+
     /// Public base URL for share links — when set, the "Copy share
     /// link" menu emits `<this>/tabs/by-id/<uuid>/view?...` instead
     /// of `http://<LAN-IP>:<port>/...`. Useful when the API is
