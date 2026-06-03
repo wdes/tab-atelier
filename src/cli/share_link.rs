@@ -459,6 +459,8 @@ pub fn ports(args: &[String]) -> i32 {
     let mut new_tls: Option<String> = None;
     let mut new_relay: Option<String> = None;
     let mut new_share_url: Option<String> = None;
+    let mut new_bg: Option<String> = None;
+    let mut new_bg_clear = false;
     let mut clear_share_url = false;
     let mut new_cols: Option<u16> = None;
     let mut new_rows: Option<u16> = None;
@@ -504,6 +506,18 @@ pub fn ports(args: &[String]) -> i32 {
                         eprintln!("ports: --pty-rows expects a number >= 4");
                         return 2;
                     }
+                }
+            }
+            "--bg-color" => {
+                i += 1;
+                let v = args.get(i).cloned().unwrap_or_default();
+                if v.eq_ignore_ascii_case("clear") {
+                    new_bg_clear = true;
+                } else if is_valid_hex(&v) {
+                    new_bg = Some(v);
+                } else {
+                    eprintln!("settings: --bg-color expects #RRGGBB (or `clear`)");
+                    return 2;
                 }
             }
             "--help" | "-h" => {
@@ -563,6 +577,8 @@ pub fn ports(args: &[String]) -> i32 {
         && !clear_share_url
         && new_cols.is_none()
         && new_rows.is_none()
+        && new_bg.is_none()
+        && !new_bg_clear
     {
         // Read-only mode — print whatever's in the file (or defaults).
         let api = doc
@@ -589,12 +605,17 @@ pub fn ports(args: &[String]) -> i32 {
             .get("pty_rows")
             .and_then(serde_json::Value::as_u64)
             .map_or_else(|| "24 (default)".into(), |v| v.to_string());
+        let bg = doc
+            .get("tab_bg_color")
+            .and_then(serde_json::Value::as_str)
+            .map_or_else(|| format!("{} (default)", crate::DEFAULT_TAB_BG_COLOR), str::to_owned);
         println!("api_addr           = {api}");
         println!("api_tls_addr       = {tls}");
         println!("happier_relay_addr = {relay}");
         println!("share_url_base     = {share}");
         println!("pty_cols           = {cols}");
         println!("pty_rows           = {rows}");
+        println!("tab_bg_color       = {bg}");
         println!("(preferences file: {})", path.display());
         return 0;
     }
@@ -621,6 +642,12 @@ pub fn ports(args: &[String]) -> i32 {
     if let Some(n) = new_rows {
         obj.insert("pty_rows".into(), serde_json::Value::from(n));
     }
+    if let Some(c) = new_bg {
+        obj.insert("tab_bg_color".into(), serde_json::Value::String(c));
+    }
+    if new_bg_clear {
+        obj.remove("tab_bg_color");
+    }
 
     if let Some(parent) = path.parent()
         && !parent.exists()
@@ -634,6 +661,142 @@ pub fn ports(args: &[String]) -> i32 {
     }
     println!("updated {}", path.display());
     println!("restart the daemon for the new bind addresses to take effect");
+    0
+}
+
+/// `tab-atelier-headless bg-color <tab|--global> <hex|clear>`
+///
+/// Set the viewer background color for one tab, or with `--global`
+/// set the daemon-wide default in preferences.json. `clear` removes
+/// the per-tab override → tab inherits the global default.
+#[must_use]
+pub fn bg_color(args: &[String]) -> i32 {
+    let mut global = false;
+    let mut positional: Vec<String> = Vec::new();
+    for a in args {
+        match a.as_str() {
+            "--global" | "-g" => global = true,
+            "--help" | "-h" => {
+                eprintln!(
+                    "usage:\n  \
+                     tab-atelier-headless bg-color <tab-idx-or-uuid> <hex|clear>\n  \
+                     tab-atelier-headless bg-color --global <hex|clear>"
+                );
+                return 0;
+            }
+            other => positional.push(other.to_string()),
+        }
+    }
+    if global {
+        let Some(color) = positional.first() else {
+            eprintln!("bg-color: missing color (hex #RRGGBB or `clear`)");
+            return 2;
+        };
+        return write_global_bg(color);
+    }
+    if positional.len() != 2 {
+        eprintln!("usage: tab-atelier-headless bg-color <tab-idx-or-uuid> <hex|clear>");
+        return 2;
+    }
+    let key = &positional[0];
+    let color_arg = &positional[1];
+    let ep = match discover_endpoint() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("bg-color: {e}");
+            return 1;
+        }
+    };
+    let (_, uuid) = match resolve(&ep, key) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("bg-color: {e}");
+            return 1;
+        }
+    };
+    let body = if color_arg.eq_ignore_ascii_case("clear") {
+        serde_json::json!({"color": serde_json::Value::Null}).to_string()
+    } else {
+        if !is_valid_hex(color_arg) {
+            eprintln!("bg-color: {color_arg:?} is not #RRGGBB (or `clear`)");
+            return 2;
+        }
+        serde_json::json!({"color": color_arg}).to_string()
+    };
+    match agent()
+        .post(format!("{}/tabs/by-id/{uuid}/bg-color", ep.url))
+        .header("Authorization", format!("Bearer {}", ep.token))
+        .header("Content-Type", "application/json")
+        .send(body.as_bytes())
+    {
+        Ok(_) => {
+            if color_arg.eq_ignore_ascii_case("clear") {
+                println!("cleared bg-color override on tab {uuid}");
+            } else {
+                println!("set bg-color={color_arg} on tab {uuid}");
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("bg-color: {e}");
+            1
+        }
+    }
+}
+
+fn is_valid_hex(s: &str) -> bool {
+    s.len() == 7 && s.starts_with('#') && s[1..].chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Patch `preferences.json` `tab_bg_color` to the given value (or
+/// drop the key if `color` is "clear"). Mirrors the in-place patching
+/// `ports`/`settings` does for the other prefs fields.
+fn write_global_bg(color: &str) -> i32 {
+    let user_path = crate::platform::config_base_dir()
+        .join("tab-atelier")
+        .join("preferences.json");
+    let system_path = std::path::PathBuf::from("/etc/tab-atelier/preferences.json");
+    let path = if user_path.exists() {
+        user_path
+    } else if system_path.exists() {
+        system_path
+    } else {
+        user_path
+    };
+    let mut doc: serde_json::Value = if path.exists() {
+        match std::fs::read_to_string(&path) {
+            Ok(s) => serde_json::from_str(&s).unwrap_or(serde_json::json!({})),
+            Err(e) => {
+                eprintln!("bg-color: read {}: {e}", path.display());
+                return 1;
+            }
+        }
+    } else {
+        serde_json::json!({})
+    };
+    let Some(obj) = doc.as_object_mut() else {
+        eprintln!("bg-color: preferences.json root is not an object");
+        return 1;
+    };
+    if color.eq_ignore_ascii_case("clear") {
+        obj.remove("tab_bg_color");
+    } else if is_valid_hex(color) {
+        obj.insert("tab_bg_color".into(), serde_json::Value::String(color.to_string()));
+    } else {
+        eprintln!("bg-color: {color:?} is not #RRGGBB (or `clear`)");
+        return 2;
+    }
+    if let Some(parent) = path.parent()
+        && !parent.exists()
+    {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let pretty = serde_json::to_string_pretty(&doc).unwrap_or_default();
+    if let Err(e) = std::fs::write(&path, pretty) {
+        eprintln!("bg-color: write {}: {e}", path.display());
+        return 1;
+    }
+    println!("updated {} (restart daemon for new tabs to use it)", path.display());
     0
 }
 
