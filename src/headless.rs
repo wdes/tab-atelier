@@ -225,10 +225,12 @@ fn spawn_pty_tab(
     share_token_rw: String,
     share_token_ro: String,
     locked: bool,
+    pty_cols: usize,
+    pty_rows: usize,
 ) -> Option<HeadlessTab> {
     let ws = WindowSize {
-        num_lines: INITIAL_LINES as u16,
-        num_cols: INITIAL_COLS as u16,
+        num_lines: pty_rows as u16,
+        num_cols: pty_cols as u16,
         cell_width: 9,
         cell_height: 18,
     };
@@ -262,8 +264,8 @@ fn spawn_pty_tab(
     let term = Term::new(
         config,
         &TermDims {
-            columns: INITIAL_COLS,
-            screen_lines: INITIAL_LINES,
+            columns: pty_cols,
+            screen_lines: pty_rows,
         },
         proxy.clone(),
     );
@@ -336,6 +338,13 @@ pub fn run() -> std::io::Result<()> {
     let api_token = api::load_or_generate_token();
     let api_addr = prefs.api_addr.unwrap_or_else(|| DEFAULT_API_ADDR.into());
     let api_tls_addr = prefs.api_tls_addr.unwrap_or_else(|| DEFAULT_API_TLS_ADDR.into());
+    // PTY dims used by every spawn_pty_tab call below. Headless has
+    // no display so the dims stay constant for the process lifetime;
+    // override via `tab-atelier-headless ports --pty-cols N
+    // --pty-rows M`. Clamp to >=4 so a typo can't produce a useless
+    // grid.
+    let pty_cols = prefs.pty_cols.map_or(INITIAL_COLS, |v| (v as usize).max(4));
+    let pty_rows = prefs.pty_rows.map_or(INITIAL_LINES, |v| (v as usize).max(4));
     #[cfg_attr(not(feature = "happier-bridge"), allow(unused_variables))]
     let happier_relay_addr = prefs
         .happier_relay_addr
@@ -383,6 +392,8 @@ pub fn run() -> std::io::Result<()> {
                 ts.share_token_rw.clone(),
                 ts.share_token_ro.clone(),
                 ts.locked,
+                pty_cols,
+                pty_rows,
             ) {
                 if let Some(out) = eager {
                     debug!("restoring {} chars of output for '{}'", out.len(), ts.name);
@@ -416,6 +427,8 @@ pub fn run() -> std::io::Result<()> {
             String::new(),
             String::new(),
             false,
+            pty_cols,
+            pty_rows,
         ) {
             t.activate();
             tabs.push(t);
@@ -523,7 +536,15 @@ pub fn run() -> std::io::Result<()> {
         }
 
         // Drain pending actions every tick.
-        drain_pending(&mut tabs, &mut active, &api_state, &api_token, &api_url_for_pty);
+        drain_pending(
+            &mut tabs,
+            &mut active,
+            &api_state,
+            &api_token,
+            &api_url_for_pty,
+            pty_cols,
+            pty_rows,
+        );
 
         // Persist on a 2 Hz tick like the GUI's `cx.spawn(timer(2s))`.
         if last_persist.elapsed() >= Duration::from_secs(2) {
@@ -728,6 +749,8 @@ fn drain_pending(
     api_state: &Arc<Mutex<api::TabSnapshot>>,
     api_token: &str,
     api_url_for_pty: &str,
+    pty_cols: usize,
+    pty_rows: usize,
 ) {
     let mut s = api_state.lock().unwrap();
     let mut closes: Vec<usize> = s.pending_closes.drain(..).collect();
@@ -915,6 +938,8 @@ fn drain_pending(
             String::new(),
             String::new(),
             false,
+            pty_cols,
+            pty_rows,
         ) {
             if *active < tabs.len() {
                 tabs[*active].deactivate();

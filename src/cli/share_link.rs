@@ -409,6 +409,8 @@ pub fn ports(args: &[String]) -> i32 {
     let mut new_relay: Option<String> = None;
     let mut new_share_url: Option<String> = None;
     let mut clear_share_url = false;
+    let mut new_cols: Option<u16> = None;
+    let mut new_rows: Option<u16> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -433,13 +435,35 @@ pub fn ports(args: &[String]) -> i32 {
                     new_share_url = Some(v);
                 }
             }
+            "--pty-cols" => {
+                i += 1;
+                match args.get(i).and_then(|v| v.parse::<u16>().ok()) {
+                    Some(n) if n >= 4 => new_cols = Some(n),
+                    _ => {
+                        eprintln!("ports: --pty-cols expects a number >= 4");
+                        return 2;
+                    }
+                }
+            }
+            "--pty-rows" => {
+                i += 1;
+                match args.get(i).and_then(|v| v.parse::<u16>().ok()) {
+                    Some(n) if n >= 4 => new_rows = Some(n),
+                    _ => {
+                        eprintln!("ports: --pty-rows expects a number >= 4");
+                        return 2;
+                    }
+                }
+            }
             "--help" | "-h" => {
                 eprintln!(
                     "usage: tab-atelier-headless ports [--api-addr ADDR] [--api-tls-addr ADDR] \
                      [--happier-relay-addr ADDR] [--share-url-base URL]\n\
+                     \x20            [--pty-cols N] [--pty-rows N]\n\
                      With no args, prints the current values.\n\
                      Set --share-url-base \"\" to clear.\n\
-                     Restart the daemon for changes to take effect."
+                     PTY dims apply on next spawn (restart the daemon \
+                     to resize existing tabs)."
                 );
                 return 0;
             }
@@ -481,7 +505,14 @@ pub fn ports(args: &[String]) -> i32 {
         serde_json::json!({})
     };
 
-    if new_api.is_none() && new_tls.is_none() && new_relay.is_none() && new_share_url.is_none() && !clear_share_url {
+    if new_api.is_none()
+        && new_tls.is_none()
+        && new_relay.is_none()
+        && new_share_url.is_none()
+        && !clear_share_url
+        && new_cols.is_none()
+        && new_rows.is_none()
+    {
         // Read-only mode — print whatever's in the file (or defaults).
         let api = doc
             .get("api_addr")
@@ -499,10 +530,20 @@ pub fn ports(args: &[String]) -> i32 {
             .get("share_url_base")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
-        println!("api_addr          = {api}");
-        println!("api_tls_addr      = {tls}");
+        let cols = doc
+            .get("pty_cols")
+            .and_then(serde_json::Value::as_u64)
+            .map_or_else(|| "80 (default)".into(), |v| v.to_string());
+        let rows = doc
+            .get("pty_rows")
+            .and_then(serde_json::Value::as_u64)
+            .map_or_else(|| "24 (default)".into(), |v| v.to_string());
+        println!("api_addr           = {api}");
+        println!("api_tls_addr       = {tls}");
         println!("happier_relay_addr = {relay}");
-        println!("share_url_base    = {share}");
+        println!("share_url_base     = {share}");
+        println!("pty_cols           = {cols}");
+        println!("pty_rows           = {rows}");
         println!("(preferences file: {})", path.display());
         return 0;
     }
@@ -522,6 +563,12 @@ pub fn ports(args: &[String]) -> i32 {
     }
     if clear_share_url {
         obj.remove("share_url_base");
+    }
+    if let Some(n) = new_cols {
+        obj.insert("pty_cols".into(), serde_json::Value::from(n));
+    }
+    if let Some(n) = new_rows {
+        obj.insert("pty_rows".into(), serde_json::Value::from(n));
     }
 
     if let Some(parent) = path.parent()
