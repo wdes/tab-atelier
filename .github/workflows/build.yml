@@ -104,10 +104,18 @@ jobs:
                   merge-multiple: true
             - name: Install .deb and run --check-crypto
               run: |
+                  # The two variants ship with `Conflicts:` against
+                  # each other (Cargo.toml metadata.deb), so installing
+                  # both at once breaks apt's solver. Install + probe
+                  # them sequentially. The GUI variant's --check-crypto
+                  # works headless because it only spins up rustls,
+                  # not gpui.
                   docker run --rm \
                       -v "$PWD:/debs:ro" \
                       debian:trixie-slim \
                       sh -c "apt-get update \
-                          && apt-get install -y --no-install-recommends /debs/*.deb \
-                          && tab-atelier --check-crypto \
-                          && tab-atelier-headless --check-crypto"
+                          && apt-get install -y --no-install-recommends /debs/tab-atelier-headless_*.deb \
+                          && tab-atelier-headless --check-crypto \
+                          && apt-get remove -y --purge tab-atelier-headless \
+                          && apt-get install -y --no-install-recommends /debs/tab-atelier_*.deb \
+                          && tab-atelier --check-crypto"
