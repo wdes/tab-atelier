@@ -115,6 +115,7 @@ struct HeadlessTab {
     share_token_rw: String,
     share_token_ro: String,
     locked: bool,
+    bg_color: Option<String>,
     pending_agent_resume: Option<String>,
     colors_enabled: bool,
 }
@@ -228,6 +229,7 @@ fn spawn_pty_tab(
     share_token_rw: String,
     share_token_ro: String,
     locked: bool,
+    bg_color: Option<String>,
     pty_cols: usize,
     pty_rows: usize,
 ) -> Option<HeadlessTab> {
@@ -330,6 +332,7 @@ fn spawn_pty_tab(
         share_token_rw,
         share_token_ro,
         locked,
+        bg_color,
         pending_agent_resume,
         colors_enabled,
     })
@@ -364,6 +367,7 @@ pub fn run() -> std::io::Result<()> {
     // grid.
     let pty_cols = prefs.pty_cols.map_or(INITIAL_COLS, |v| (v as usize).max(4));
     let pty_rows = prefs.pty_rows.map_or(INITIAL_LINES, |v| (v as usize).max(4));
+    let global_bg = prefs.tab_bg_color.unwrap_or_else(|| crate::DEFAULT_TAB_BG_COLOR.into());
     #[cfg_attr(not(feature = "happier-bridge"), allow(unused_variables))]
     let happier_relay_addr = prefs
         .happier_relay_addr
@@ -411,6 +415,7 @@ pub fn run() -> std::io::Result<()> {
                 ts.share_token_rw.clone(),
                 ts.share_token_ro.clone(),
                 ts.locked,
+                ts.bg_color.clone(),
                 pty_cols,
                 pty_rows,
             ) {
@@ -446,6 +451,7 @@ pub fn run() -> std::io::Result<()> {
             String::new(),
             String::new(),
             false,
+            None,
             pty_cols,
             pty_rows,
         ) {
@@ -575,6 +581,7 @@ pub fn run() -> std::io::Result<()> {
         refresh_snapshot(
             &tabs,
             active,
+            &global_bg,
             &api_state,
             #[cfg(feature = "energy")]
             &power_watts,
@@ -611,14 +618,15 @@ pub fn run() -> std::io::Result<()> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 /// Rebuild the API snapshot from the runtime tab state and write it
 /// into `api_state`. Called every drain tick (not just every 2 s
 /// `persist`) so /output reflects keystroke echoes within ~tick
 /// duration instead of waiting for the next disk-persist cycle.
+#[allow(clippy::too_many_arguments)]
 fn refresh_snapshot(
     tabs: &[HeadlessTab],
     active: usize,
+    global_bg: &str,
     api_state: &Arc<Mutex<api::TabSnapshot>>,
     #[cfg(feature = "energy")] power_watts: &Arc<Mutex<Vec<crate::power::TabPower>>>,
     #[cfg(feature = "energy")] battery_percent: &Arc<Mutex<Option<u8>>>,
@@ -643,6 +651,7 @@ fn refresh_snapshot(
                 share_token_rw: tab.share_token_rw.clone(),
                 share_token_ro: tab.share_token_ro.clone(),
                 locked: tab.locked,
+                bg_color: crate::effective_tab_bg(tab.bg_color.as_deref(), Some(global_bg)).to_string(),
                 shell_pid: tab.pid,
                 agent_state: tab.agent_state.clone(),
                 agent_session_id: tab.agent_session_id.clone(),
@@ -728,6 +737,7 @@ fn persist(
             share_token_rw: tab.share_token_rw.clone(),
             share_token_ro: tab.share_token_ro.clone(),
             locked: tab.locked,
+            bg_color: tab.bg_color.clone(),
             ..TabState::default()
         })
         .collect();
@@ -994,6 +1004,7 @@ fn drain_pending(
             String::new(),
             String::new(),
             false,
+            None,
             pty_cols,
             pty_rows,
         ) {

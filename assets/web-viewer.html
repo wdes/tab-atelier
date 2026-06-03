@@ -6,7 +6,7 @@
   <title>__TAB_NAME_HTML__ · tab-atelier</title>
   <link rel="stylesheet" href="https://unpkg.com/xterm@5.3.0/css/xterm.css">
   <style>
-    html, body { margin: 0; padding: 0; height: 100%; background: #000; color: #ccc; font-family: monospace; }
+    html, body { margin: 0; padding: 0; height: 100%; background: __TAB_BG__; color: #ccc; font-family: monospace; }
     /* Centre the terminal so the server-sized grid stays aligned in
        the middle of a wider browser window. Vertical anchor at top
        (alignItems: start) so the scrollback grows downward, not from
@@ -71,7 +71,7 @@
       cols: 80,
       rows: 24,
       scrollback: 5000,
-      theme: { background: "#000000", foreground: "#cccccc" },
+      theme: { background: "__TAB_BG__", foreground: "#cccccc" },
     });
     const termEl = document.getElementById("term");
     term.open(termEl);
@@ -100,6 +100,7 @@
     // can change at any poll — the user may flip it from the GUI
     // right-click menu mid-session.
     let serverLocked = false;
+    let serverBg = "__TAB_BG__";
     // True while the user has scrolled up into xterm.js's scrollback.
     // While in this state we drop ALL writes — Claude's spinner or
     // any TUI redrawing would otherwise twitch the viewport and we
@@ -131,6 +132,16 @@
         const start = parseInt(r.headers.get("X-Output-Start") || "0", 10);
         const cols = parseInt(r.headers.get("X-Output-Cols") || "0", 10);
         const rows = parseInt(r.headers.get("X-Output-Rows") || "0", 10);
+        // Background color can change mid-session via the daemon's
+        // /bg-color endpoint or a Preferences write. Validate the
+        // hex and apply to both <body> and xterm.js theme so the
+        // gutter matches the terminal.
+        const bgNow = r.headers.get("X-Tab-Bg") || "";
+        if (/^#[0-9a-fA-F]{6}$/.test(bgNow) && bgNow !== serverBg) {
+          serverBg = bgNow;
+          document.body.style.background = bgNow;
+          term.options.theme = { ...term.options.theme, background: bgNow };
+        }
         const lockedNow = r.headers.get("X-Tab-Locked") === "1";
         if (lockedNow !== serverLocked) {
           serverLocked = lockedNow;
