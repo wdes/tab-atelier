@@ -864,8 +864,13 @@ impl AppState {
             .zip(tabs.iter())
             .map(|(tab, ts)| {
                 let view = tab.view.read(cx);
+                // 200 lines for the joined `output` (logical lines —
+                // the mobile remote word-wraps them, more is wasted
+                // bandwidth on a phone screen). 2000 for `raw_output`
+                // so xterm.js's scrollback has actual history to
+                // browse through instead of just the visible viewport.
                 let (output, cursor) = view.ansi_text_with_cursor(Some(200));
-                let (raw_output, raw_cursor) = view.raw_screen_text(Some(200));
+                let (raw_output, raw_cursor) = view.raw_screen_text(Some(2000));
                 let (cols, rows) = view.dims();
                 api::SnapshotTab {
                     id: tab.id.clone(),
