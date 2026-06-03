@@ -437,6 +437,7 @@ pub fn run() -> std::io::Result<()> {
         pending_closes: Vec::new(),
         pending_activate: None,
         pending_input: Vec::new(),
+        pending_lock_changes: Vec::new(),
         pending_new_tabs: 0,
         pending_new_tab_cwds: std::collections::VecDeque::new(),
         pending_renames: Vec::new(),
@@ -734,9 +735,17 @@ fn drain_pending(
     let inputs: Vec<(usize, Vec<u8>)> = s.pending_input.drain(..).collect();
     let renames: Vec<(usize, String)> = s.pending_renames.drain(..).collect();
     let status_updates: Vec<api::PendingStatusUpdate> = s.pending_status_updates.drain(..).collect();
+    let lock_changes: Vec<(String, bool)> = s.pending_lock_changes.drain(..).collect();
     let new_tabs = std::mem::take(&mut s.pending_new_tabs);
     let new_tab_cwds: std::collections::VecDeque<std::path::PathBuf> = std::mem::take(&mut s.pending_new_tab_cwds);
     drop(s);
+    // CLI / API lock toggles → runtime HeadlessTab. tabs.json picks
+    // it up on the same persist tick a few lines below.
+    for (tab_id, locked) in lock_changes {
+        if let Some(t) = tabs.iter_mut().find(|t| t.id == tab_id) {
+            t.locked = locked;
+        }
+    }
 
     // Status updates: write transient + durable agent fields.
     for upd in status_updates {
