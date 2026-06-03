@@ -111,6 +111,10 @@ struct Tab {
     /// local typing, paste, hotkeys, remote API, share links.
     /// Toggled by the right-click menu; persisted to tabs.json.
     locked: bool,
+    /// Per-tab background color override (`#RRGGBB`). `None` ⇒ use
+    /// the global `Preferences::tab_bg_color`, which itself falls
+    /// back to Tomorrow Night Blue.
+    bg_color: Option<String>,
     /// One-shot resume command queued on tab restore — when the
     /// shell is up the next tick types `<command>\n` into the
     /// PTY, then clears this. Set in `insert_tab` from the
@@ -233,6 +237,10 @@ struct AppState {
     /// `https://example.com/~user/tab-atelier`). Read at "Copy share
     /// link" menu time. Empty → use the LAN URL.
     share_url_base: String,
+    /// Global default viewer background color (`#RRGGBB`). `None` →
+    /// fall back to the Tomorrow Night Blue default. Per-tab
+    /// `Tab::bg_color` wins when set.
+    tab_bg_global: Option<String>,
     api_state: Arc<Mutex<api::TabSnapshot>>,
     #[cfg(feature = "energy")]
     power_pids: Arc<Mutex<Vec<u32>>>,
@@ -405,6 +413,7 @@ impl AppState {
                         share_token_rw: ts.share_token_rw.clone(),
                         share_token_ro: ts.share_token_ro.clone(),
                         locked: ts.locked,
+                        bg_color: ts.bg_color.clone(),
                         pending_agent_resume,
                     });
                 }
@@ -442,6 +451,7 @@ impl AppState {
                         share_token_rw: String::new(),
                         share_token_ro: String::new(),
                         locked: false,
+                        bg_color: None,
                         pending_agent_resume: None,
                     });
                 }
@@ -483,6 +493,7 @@ impl AppState {
                         share_token_rw: String::new(),
                         share_token_ro: String::new(),
                         locked: false,
+                        bg_color: None,
                         pending_agent_resume: None,
                     }],
                     0,
@@ -567,6 +578,7 @@ impl AppState {
             .happier_relay_addr
             .unwrap_or_else(|| crate::DEFAULT_HAPPIER_RELAY_ADDR.into());
         let share_url_base = prefs.share_url_base.unwrap_or_default();
+        let tab_bg_global = prefs.tab_bg_color;
         let remote_endpoints = prefs.remote_endpoints;
         info!("API server starting on {api_addr} (TLS {api_tls_addr})");
         let api_state = Arc::new(Mutex::new(api::TabSnapshot {
@@ -658,6 +670,7 @@ impl AppState {
             api_tls_addr,
             happier_relay_addr,
             share_url_base,
+            tab_bg_global,
             api_state,
             #[cfg(feature = "energy")]
             power_pids,
@@ -756,6 +769,7 @@ impl AppState {
                 share_token_rw: String::new(),
                 share_token_ro: String::new(),
                 locked: false,
+                bg_color: None,
                 pending_agent_resume: None,
             },
         );
@@ -862,6 +876,7 @@ impl AppState {
                     share_token_rw: tab.share_token_rw.clone(),
                     share_token_ro: tab.share_token_ro.clone(),
                     locked: tab.locked,
+                    bg_color: tab.bg_color.clone(),
                     ..TabState::default()
                 }
             })
@@ -897,6 +912,8 @@ impl AppState {
                     share_token_rw: ts.share_token_rw.clone(),
                     share_token_ro: ts.share_token_ro.clone(),
                     locked: ts.locked,
+                    bg_color: crate::effective_tab_bg(tab.bg_color.as_deref(), self.tab_bg_global.as_deref())
+                        .to_string(),
                     shell_pid: view.pid(),
                     agent_state: tab.agent_state.clone(),
                     agent_session_id: tab.agent_session_id.clone(),
@@ -1287,6 +1304,7 @@ impl AppState {
                     share_token_rw: tab.share_token_rw.clone(),
                     share_token_ro: tab.share_token_ro.clone(),
                     locked: tab.locked,
+                    bg_color: tab.bg_color.clone(),
                     ..TabState::default()
                 }
             })
@@ -3327,6 +3345,7 @@ impl AppState {
                                                         // directly into the JSON.
                                                         pty_cols: None,
                                                         pty_rows: None,
+                                                        tab_bg_color: this.tab_bg_global.clone(),
                                                     },
                                                 );
                                                 if let Some(ref handle) = this.hotkey_handle {

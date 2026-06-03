@@ -236,6 +236,25 @@ pub struct TabState {
     /// restarts.
     #[serde(default, skip_serializing_if = "is_false")]
     pub locked: bool,
+
+    /// Per-tab override of the viewer background color (hex
+    /// `#RRGGBB`). When `Some`, beats the global
+    /// `Preferences::tab_bg_color`. Set via the right-click "Background
+    /// color..." menu (GUI) or `tab-atelier-headless bg-color <tab>
+    /// <hex>` (CLI). Skipped from JSON when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bg_color: Option<String>,
+}
+
+/// Default viewer background — Tomorrow Night Blue. Softer than pitch
+/// black; legible foreground contrast on most monitors.
+pub const DEFAULT_TAB_BG_COLOR: &str = "#002451";
+
+/// Resolve the effective background color for a tab: per-tab override
+/// → global pref → Tomorrow Night Blue.
+#[must_use]
+pub fn effective_tab_bg<'a>(per_tab: Option<&'a str>, global: Option<&'a str>) -> &'a str {
+    per_tab.or(global).unwrap_or(DEFAULT_TAB_BG_COLOR)
 }
 
 #[must_use]
@@ -275,6 +294,7 @@ impl Default for TabState {
             share_token_rw: String::new(),
             share_token_ro: String::new(),
             locked: false,
+            bg_color: None,
         }
     }
 }
@@ -673,6 +693,14 @@ pub struct Preferences {
     /// Defaults to `0.0.0.0:7891`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_tls_addr: Option<String>,
+
+    /// Default terminal background color (hex `#RRGGBB`). Applied
+    /// in the share-link xterm.js viewer; per-tab override lives on
+    /// `TabState::bg_color` and wins when set. None ⇒ falls back to
+    /// the Tomorrow Night Blue default (`#002451`) which is softer
+    /// on the eyes than pure black.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_bg_color: Option<String>,
 
     /// Headless PTY dimensions. The GUI re-sizes its terminals from
     /// the window, but the headless daemon has no display — the

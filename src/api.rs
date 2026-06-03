@@ -140,6 +140,11 @@ pub struct SnapshotTab {
     /// as `X-Tab-Locked: 1` on /output so the xterm.js viewer can
     /// render a locked banner.
     pub locked: bool,
+    /// Effective background color for this tab's viewer (per-tab
+    /// override or global default; never `None`). Shipped to the
+    /// viewer via `X-Tab-Bg` on /output + `__TAB_BG__` template
+    /// substitution on /view.
+    pub bg_color: String,
     /// PID of the tab's shell. The /catbus endpoints walk its
     /// descendant processes to find a catbus-agent (or fallback
     /// `claude` TUI) and resolve the session's transcript file.
@@ -916,15 +921,20 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 error_json(stream, 404, "invalid tab key");
                 return;
             };
-            let tab_name = {
-                let state = state.lock().unwrap();
-                let Some(idx) = resolve_tab_idx(&state, key_raw, is_uuid) else {
-                    drop(state);
-                    error_json(stream, 404, "tab not found");
-                    return;
-                };
-                state.tabs[idx].name.clone()
+            let state_g = state.lock().unwrap();
+            let Some(idx) = resolve_tab_idx(&state_g, key_raw, is_uuid) else {
+                drop(state_g);
+                error_json(stream, 404, "tab not found");
+                return;
             };
+            let t = &state_g.tabs[idx];
+            let tab_name = t.name.clone();
+            let tab_bg = if t.bg_color.is_empty() {
+                crate::DEFAULT_TAB_BG_COLOR.to_string()
+            } else {
+                t.bg_color.clone()
+            };
+            drop(state_g);
             let key_for_html = if is_uuid {
                 format!("by-id/{key_raw}")
             } else {
@@ -945,10 +955,22 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             // can wrap it in its own quotes.
             let js_name_quoted = serde_json::to_string(&tab_name).unwrap_or_else(|_| "\"\"".into());
             let js_name = js_name_quoted.trim_matches('"');
+            // Validate that bg_color looks like #RRGGBB before
+            // inlining into HTML / CSS (defense against a malformed
+            // value in tabs.json or someone POSTing junk into the
+            // bg-color endpoint). Fall back to the default on
+            // anything sketchy.
+            let safe_bg: &str =
+                if tab_bg.len() == 7 && tab_bg.starts_with('#') && tab_bg[1..].chars().all(|c| c.is_ascii_hexdigit()) {
+                    &tab_bg
+                } else {
+                    crate::DEFAULT_TAB_BG_COLOR
+                };
             let html = VIEWER_HTML
                 .replace("__TAB_KEY__", &key_for_html)
                 .replace("__TAB_NAME_HTML__", &html_name)
-                .replace("__TAB_NAME_JS__", js_name);
+                .replace("__TAB_NAME_JS__", js_name)
+                .replace("__TAB_BG__", safe_bg);
             // Tell browsers (and any intervening CDN) not to cache
             // the viewer HTML — we ship JS fixes in the deb and
             // users would otherwise see a stale banner / poll loop
@@ -1006,6 +1028,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             let pty_cols = t.cols;
             let pty_rows = t.rows;
             let raw_cursor = t.raw_cursor;
+            let bg_color = t.bg_color.clone();
             let locked = t.locked;
 
             let (body, cursor, start_offset) = match (query_since, query_crc) {
@@ -1068,6 +1091,12 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             // is actually typing).
             if let Some((row, col)) = raw_cursor {
                 let _ = write!(extra, "X-Raw-Cursor-Row: {row}\r\nX-Raw-Cursor-Col: {col}\r\n");
+            }
+            // Effective background color (per-tab override OR global
+            // default, resolved server-side). The JS reads this on
+            // every poll and updates theme.background mid-session.
+            if !bg_color.is_empty() {
+                let _ = write!(extra, "X-Tab-Bg: {bg_color}\r\n");
             }
             if locked {
                 let _ = write!(extra, "X-Tab-Locked: 1\r\n");
@@ -1953,6 +1982,7 @@ mod tests {
                     share_token_rw: String::new(),
                     share_token_ro: String::new(),
                     locked: false,
+                    bg_color: String::new(),
                     shell_pid: 0,
                     agent_state: None,
                     agent_session_id: None,
@@ -1972,6 +2002,7 @@ mod tests {
                     share_token_rw: String::new(),
                     share_token_ro: String::new(),
                     locked: false,
+                    bg_color: String::new(),
                     shell_pid: 0,
                     agent_state: None,
                     agent_session_id: None,
