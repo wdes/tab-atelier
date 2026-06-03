@@ -101,13 +101,22 @@
     // right-click menu mid-session.
     let serverLocked = false;
     // True while the user has scrolled up into xterm.js's scrollback.
-    // We skip the cursor-position escape and pause full-repaint resets
-    // in that state — both would yank the viewport back to the bottom
-    // and make history-scrolling impossible.
+    // While in this state we drop ALL writes — Claude's spinner or
+    // any TUI redrawing would otherwise twitch the viewport and we
+    // already have everything we need in xterm.js's local buffer to
+    // browse history undisturbed. On return-to-bottom we reset the
+    // delta cursor so the next poll triggers a full repaint and the
+    // user catches up to whatever happened while they were reading.
     let inScrollback = false;
+    let wasInScrollback = false;
     term.onScroll(() => {
       const buf = term.buffer.active;
       inScrollback = buf.viewportY < buf.baseY;
+      if (wasInScrollback && !inScrollback) {
+        since = 0;
+        crc = "00000000";
+      }
+      wasInScrollback = inScrollback;
     });
 
     async function poll() {
@@ -143,14 +152,21 @@
           serverCols = cols;
           serverRows = rows;
         }
+        // Drop EVERYTHING while the user is reading history. Claude
+        // and other TUIs that rewrite lines on `\r` would otherwise
+        // keep nudging the viewport. We update `since`/`crc` further
+        // down regardless, so when the user scrolls back to bottom
+        // (which resets these via the onScroll handler) we issue a
+        // clean full-state refresh.
+        if (inScrollback) {
+          status.textContent = `${TAB_NAME} · paused (scrolled up) · ${len}B`;
+          return;
+        }
         const body = await r.text();
         // Tail the body with a cursor-position escape so xterm.js
         // ends up with the cursor at the SERVER's position, not at
-        // the end of the dump. CSI ROW;COL H is 1-indexed. Skip
-        // it when the user has scrolled up — moving the cursor
-        // would force xterm.js to scroll to track it and we'd
-        // lose the user's history position on every poll.
-        const cursorTail = (!inScrollback && Number.isFinite(curRow) && Number.isFinite(curCol))
+        // the end of the dump. CSI ROW;COL H is 1-indexed.
+        const cursorTail = (Number.isFinite(curRow) && Number.isFinite(curCol))
           ? `\x1b[${curRow + 1};${curCol + 1}H`
           : "";
         if (!bootstrapped) {
@@ -158,19 +174,10 @@
           term.write(body + cursorTail);
           bootstrapped = true;
         } else if (start === since && body.length > 0) {
-          // Append delta. xterm.js doesn't auto-scroll to bottom
-          // on writes when the user is in scrollback, so this is
-          // safe to keep firing — only the cursor tail (skipped
-          // above) would snap the viewport.
           term.write(body + cursorTail);
         } else if (start === 0 && body.length > 0) {
-          // Full-buffer repaint (CRC mismatch — alt-screen swap,
-          // clear, etc.). Defer while the user is reading history;
-          // we'll catch up when they scroll back to the bottom.
-          if (!inScrollback) {
-            term.reset();
-            term.write(body + cursorTail);
-          }
+          term.reset();
+          term.write(body + cursorTail);
         } else if (cursorTail) {
           term.write(cursorTail);
         }
