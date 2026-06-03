@@ -45,6 +45,7 @@ fn main() {
             "settings" | "ports" => {
                 std::process::exit(cli::share_link::ports(&std::env::args().skip(2).collect::<Vec<_>>()))
             }
+            "claude-hook" => std::process::exit(cli::claude_hook::run(&std::env::args().skip(2).collect::<Vec<_>>())),
             "--help" | "-h" => {
                 eprintln!(
                     "tab-atelier-headless [run a tab-atelier server] OR one of:\n  \
@@ -59,6 +60,7 @@ fn main() {
                      share-link <idx|uuid> [--ro] copy a browser URL for /view\n  \
                      settings [--api-addr ...]    show/edit daemon settings (bind addrs, PTY dims, share-URL base)\n  \
                      set-status <state> [label]   used by Claude Code hooks etc.\n  \
+                     claude-hook <event>          dispatch a Claude Code hook event (reads JSON on stdin)\n  \
                      remote ...                   talk to a remote tab-atelier"
                 );
                 std::process::exit(0);
