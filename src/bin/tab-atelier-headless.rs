@@ -59,7 +59,23 @@ fn main() {
                 );
                 std::process::exit(0);
             }
-            _ => {}
+            // Daemon-launch path: only when no subcommand was given.
+            // Anything else (e.g. `tab-atelier-headless share` —
+            // typo for `share-link`) gets a clear error instead of
+            // silently starting the daemon and conflicting with the
+            // running one over the API port.
+            other if other.starts_with('-') => {
+                // Long/short flags like --read-only, --check-crypto
+                // fall through to the daemon path; the launch code
+                // below parses them again.
+            }
+            other => {
+                eprintln!(
+                    "tab-atelier-headless: unknown subcommand {other:?}\n\
+                     Run `tab-atelier-headless --help` to see the list."
+                );
+                std::process::exit(2);
+            }
         }
     }
 

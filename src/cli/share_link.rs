@@ -33,11 +33,20 @@ fn discover_endpoint() -> Result<Endpoint, String> {
     ) {
         return Ok(Endpoint { url, token });
     }
+    // Order matters: the system-service install runs under
+    // HOME=/var/lib/tab-atelier so XDG_STATE_HOME resolves to
+    // `/var/lib/tab-atelier/.local/state`. Check that path FIRST so
+    // a stale per-user token (left over from a direct
+    // `tab-atelier-headless` invocation as root) doesn't trump the
+    // live daemon's token. Per-user comes after for non-service installs.
     let candidates = [
-        crate::platform::state_base_dir().join("tab-atelier").join("api.token"),
+        std::path::PathBuf::from("/var/lib/tab-atelier/.local/state/tab-atelier/api.token"),
         std::path::PathBuf::from("/var/lib/tab-atelier/api.token"),
+        crate::platform::state_base_dir().join("tab-atelier").join("api.token"),
     ];
+    let mut tried = Vec::new();
     for path in &candidates {
+        tried.push(path.display().to_string());
         if let Ok(t) = std::fs::read_to_string(path) {
             let token = t.trim().to_string();
             if !token.is_empty() {
@@ -48,7 +57,7 @@ fn discover_endpoint() -> Result<Endpoint, String> {
             }
         }
     }
-    Err("no api.token found (tried env vars, ~/.local/state/tab-atelier, /var/lib/tab-atelier)".into())
+    Err(format!("no api.token found (tried env vars + {})", tried.join(", ")))
 }
 
 fn agent() -> ureq::Agent {
