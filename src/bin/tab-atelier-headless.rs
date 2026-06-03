@@ -40,7 +40,11 @@ fn main() {
                 &std::env::args().skip(2).collect::<Vec<_>>(),
             )),
             "output" => std::process::exit(cli::share_link::output(&std::env::args().skip(2).collect::<Vec<_>>())),
-            "ports" => std::process::exit(cli::share_link::ports(&std::env::args().skip(2).collect::<Vec<_>>())),
+            // `settings` is the canonical name; `ports` kept as an
+            // alias for muscle memory from the early days.
+            "settings" | "ports" => {
+                std::process::exit(cli::share_link::ports(&std::env::args().skip(2).collect::<Vec<_>>()))
+            }
             "--help" | "-h" => {
                 eprintln!(
                     "tab-atelier-headless [run a tab-atelier server] OR one of:\n  \
@@ -53,7 +57,7 @@ fn main() {
                      input <idx|uuid> <text>      send keystrokes (\\n escapes ok)\n  \
                      output <idx|uuid>            print current scrollback\n  \
                      share-link <idx|uuid> [--ro] copy a browser URL for /view\n  \
-                     ports [--api-addr ...]       show/edit bind addresses\n  \
+                     settings [--api-addr ...]    show/edit daemon settings (bind addrs, PTY dims, share-URL base)\n  \
                      set-status <state> [label]   used by Claude Code hooks etc.\n  \
                      remote ...                   talk to a remote tab-atelier"
                 );

@@ -2004,22 +2004,75 @@ mod tests {
     }
 
     fn spawn_server_with_read_only(read_only: bool) -> (u16, Arc<Mutex<TabSnapshot>>, String) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        // Hand a pre-bound std listener to a fresh tokio runtime so
+        // the test can know the port without racing with rebind.
+        // A oneshot channel signals "listener is accepting" so the
+        // caller can't connect before the loop starts.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
         let state = test_state();
         let token = "test-secret-token".to_string();
         let s = state.clone();
         let t = token.clone();
-        std::thread::spawn(move || serve(&listener, &s, &t, read_only));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                let _ = ready_tx.send(());
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        continue;
+                    };
+                    let state = s.clone();
+                    let token = t.clone();
+                    tokio::spawn(async move {
+                        serve_connection(TokioIo::new(stream), false, state, token, read_only).await;
+                    });
+                }
+            });
+        });
+        ready_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
         (port, state, token)
     }
 
+    /// Inject `Connection: close` into a raw HTTP/1.1 request so
+    /// hyper closes the socket after the response — otherwise the
+    /// keep-alive default leaves `read_to_end` blocked forever.
+    fn add_close_header(req: &str) -> String {
+        if req.to_ascii_lowercase().contains("connection:") {
+            return req.to_string();
+        }
+        // Insert just before the empty line that ends the headers.
+        if let Some(idx) = req.find("\r\n\r\n") {
+            let mut out = String::with_capacity(req.len() + 18);
+            out.push_str(&req[..idx]);
+            out.push_str("\r\nConnection: close");
+            out.push_str(&req[idx..]);
+            return out;
+        }
+        req.to_string()
+    }
+
     fn request(port: u16, req: &str) -> String {
+        // Send via raw TCP. `Connection: close` in the request makes
+        // hyper close after responding — we read until EOF. We
+        // deliberately do NOT half-close from the client side
+        // (`shutdown(Write)`) because hyper interprets a premature
+        // read-side EOF as the client giving up and aborts before
+        // writing the response.
+        let req = add_close_header(req);
         let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
         stream.write_all(req.as_bytes()).unwrap();
-        stream.shutdown(std::net::Shutdown::Write).unwrap();
         let mut buf = String::new();
-        stream.read_to_string(&mut buf).unwrap();
+        let _ = stream.read_to_string(&mut buf);
         buf
     }
 
@@ -2473,15 +2526,17 @@ mod tests {
         let (port, state, token) = spawn_server();
         let payload: &[u8] = &[0x03, 0x0a];
         let header = format!(
-            "POST /tabs/1/input HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n",
+            "POST /tabs/1/input HTTP/1.1\r\nAuthorization: Bearer {token}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
             payload.len()
         );
         let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
         stream.write_all(header.as_bytes()).unwrap();
         stream.write_all(payload).unwrap();
-        stream.shutdown(std::net::Shutdown::Write).unwrap();
         let mut buf = String::new();
-        stream.read_to_string(&mut buf).unwrap();
+        let _ = stream.read_to_string(&mut buf);
         assert_eq!(status_code(&buf), 200);
         let pending = state.lock().unwrap().pending_input.clone();
         assert_eq!(pending, vec![(1_usize, vec![0x03_u8, 0x0a])]);
@@ -2490,11 +2545,14 @@ mod tests {
     /// Like `request` but returns the full raw response bytes — needed
     /// when the server might respond with gzip-encoded body.
     fn request_bytes(port: u16, req: &str) -> Vec<u8> {
+        let req = add_close_header(req);
         let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
         stream.write_all(req.as_bytes()).unwrap();
-        stream.shutdown(std::net::Shutdown::Write).unwrap();
         let mut buf = Vec::new();
-        stream.read_to_end(&mut buf).unwrap();
+        let _ = stream.read_to_end(&mut buf);
         buf
     }
 

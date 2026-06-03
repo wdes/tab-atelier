@@ -466,7 +466,7 @@ pub fn ports(args: &[String]) -> i32 {
             }
             "--help" | "-h" => {
                 eprintln!(
-                    "usage: tab-atelier-headless ports [--api-addr ADDR] [--api-tls-addr ADDR] \
+                    "usage: tab-atelier-headless settings [--api-addr ADDR] [--api-tls-addr ADDR] \
                      [--happier-relay-addr ADDR] [--share-url-base URL]\n\
                      \x20            [--pty-cols N] [--pty-rows N]\n\
                      With no args, prints the current values.\n\
