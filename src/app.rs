@@ -3307,6 +3307,13 @@ impl AppState {
                                                         happier_relay_addr: Some(this.happier_relay_addr.clone()),
                                                         share_url_base,
                                                         remote_endpoints: this.remote_endpoints.clone(),
+                                                        // Headless-only fields the GUI never edits;
+                                                        // preserve whatever was on disk by leaving
+                                                        // them at the Default (None). The headless
+                                                        // CLI (`ports --pty-cols N`) writes them
+                                                        // directly into the JSON.
+                                                        pty_cols: None,
+                                                        pty_rows: None,
                                                     },
                                                 );
                                                 if let Some(ref handle) = this.hotkey_handle {
