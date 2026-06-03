@@ -50,21 +50,26 @@ fn discover_endpoint() -> Result<Endpoint, String> {
     ) {
         return Ok(Endpoint { url, token });
     }
-    // Fall back to the on-disk token + default loopback URL. Same
-    // resolution `set-status` falls back to in spirit; keeps the
-    // viewer usable from SSH where the per-tab env isn't exported.
-    let token_path = crate::platform::state_base_dir().join("tab-atelier").join("api.token");
-    let token = std::fs::read_to_string(&token_path)
-        .map_err(|e| format!("could not read {}: {e}", token_path.display()))?
-        .trim()
-        .to_string();
-    if token.is_empty() {
-        return Err(format!("token file is empty: {}", token_path.display()));
+    // System-service path first, then per-user, so a stale token left
+    // by a direct root invocation can't trump the daemon's live one.
+    let candidates = [
+        std::path::PathBuf::from("/var/lib/tab-atelier/.local/state/tab-atelier/api.token"),
+        crate::platform::state_base_dir().join("tab-atelier").join("api.token"),
+    ];
+    let mut tried = Vec::new();
+    for path in &candidates {
+        tried.push(path.display().to_string());
+        if let Ok(t) = std::fs::read_to_string(path) {
+            let token = t.trim().to_string();
+            if !token.is_empty() {
+                return Ok(Endpoint {
+                    url: "http://127.0.0.1:7890".into(),
+                    token,
+                });
+            }
+        }
     }
-    Ok(Endpoint {
-        url: "http://127.0.0.1:7890".into(),
-        token,
-    })
+    Err(format!("no api.token found (tried env vars + {})", tried.join(", ")))
 }
 
 #[derive(Debug, Default, Clone)]
