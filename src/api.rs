@@ -1598,6 +1598,22 @@ where
     }
 }
 
+/// Poll the global `SHUTDOWN_REQUESTED` and trigger the supplied
+/// `Notify` when it flips. Used by both listeners to break out of
+/// their accept loops on SIGTERM so the runtime can return, the
+/// listening socket can be dropped, and the next daemon instance
+/// can rebind without "Address already in use".
+async fn shutdown_watcher(notify: Arc<tokio::sync::Notify>) {
+    use std::sync::atomic::Ordering;
+    loop {
+        if crate::SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+            notify.notify_waiters();
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
 pub fn start_api_server(state: Arc<Mutex<TabSnapshot>>, token: String, read_only: bool, bind: String) {
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
@@ -1618,18 +1634,29 @@ pub fn start_api_server(state: Arc<Mutex<TabSnapshot>>, token: String, read_only
                     return;
                 }
             };
+            let shutdown = Arc::new(tokio::sync::Notify::new());
+            tokio::spawn(shutdown_watcher(shutdown.clone()));
             loop {
-                let Ok((stream, _)) = listener.accept().await else {
-                    continue;
-                };
-                let state = state.clone();
-                let token = token.clone();
-                tokio::spawn(async move {
-                    // Plain HTTP: no ALPN, so we serve HTTP/1.1
-                    // (with keep-alive). HTTP/2 only over TLS.
-                    serve_connection(TokioIo::new(stream), false, state, token, read_only).await;
-                });
+                tokio::select! {
+                    res = listener.accept() => {
+                        let Ok((stream, _)) = res else { continue };
+                        let state = state.clone();
+                        let token = token.clone();
+                        tokio::spawn(async move {
+                            // Plain HTTP: no ALPN, HTTP/1.1 with
+                            // keep-alive. HTTP/2 only over TLS.
+                            serve_connection(TokioIo::new(stream), false, state, token, read_only).await;
+                        });
+                    }
+                    () = shutdown.notified() => {
+                        info!("API: SIGTERM received, closing :{bind} listener");
+                        break;
+                    }
+                }
             }
+            // Listener drops here, freeing the port for the next
+            // process. In-flight connections finish on their own
+            // tokio::spawn'd tasks before the runtime shuts down.
         });
     });
 }
@@ -1684,27 +1711,35 @@ pub fn start_api_server_tls(state: Arc<Mutex<TabSnapshot>>, token: String, read_
                 }
             };
             let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
+            let shutdown = Arc::new(tokio::sync::Notify::new());
+            tokio::spawn(shutdown_watcher(shutdown.clone()));
             loop {
-                let Ok((stream, _)) = listener.accept().await else {
-                    continue;
-                };
-                let acceptor = acceptor.clone();
-                let state = state.clone();
-                let token = token.clone();
-                tokio::spawn(async move {
-                    let tls = match acceptor.accept(stream).await {
-                        Ok(t) => t,
-                        Err(e) => {
-                            debug!("API/TLS: handshake failed: {e}");
-                            return;
-                        }
-                    };
-                    // After ALPN: pick h2 or h1 from the negotiated
-                    // protocol so hyper uses the right framing.
-                    let alpn = tls.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
-                    let is_h2 = alpn.as_deref() == Some(b"h2");
-                    serve_connection(TokioIo::new(tls), is_h2, state, token, read_only).await;
-                });
+                tokio::select! {
+                    res = listener.accept() => {
+                        let Ok((stream, _)) = res else { continue };
+                        let acceptor = acceptor.clone();
+                        let state = state.clone();
+                        let token = token.clone();
+                        tokio::spawn(async move {
+                            let tls = match acceptor.accept(stream).await {
+                                Ok(t) => t,
+                                Err(e) => {
+                                    debug!("API/TLS: handshake failed: {e}");
+                                    return;
+                                }
+                            };
+                            // After ALPN: pick h2 or h1 from the negotiated
+                            // protocol so hyper uses the right framing.
+                            let alpn = tls.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
+                            let is_h2 = alpn.as_deref() == Some(b"h2");
+                            serve_connection(TokioIo::new(tls), is_h2, state, token, read_only).await;
+                        });
+                    }
+                    () = shutdown.notified() => {
+                        info!("API/TLS: SIGTERM received, closing :{bind} listener");
+                        break;
+                    }
+                }
             }
         });
     });
