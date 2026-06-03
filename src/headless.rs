@@ -662,6 +662,10 @@ fn refresh_snapshot(
     }
 }
 
+// Too many parameters because cfg-gated energy features triple the
+// arg count. Easier than packaging them into a Context struct that
+// only adds plumbing.
+#[allow(clippy::too_many_arguments)]
 fn persist(
     tabs: &mut [HeadlessTab],
     active: usize,
