@@ -46,6 +46,7 @@ fn main() {
                 std::process::exit(cli::share_link::ports(&std::env::args().skip(2).collect::<Vec<_>>()))
             }
             "claude-hook" => std::process::exit(cli::claude_hook::run(&std::env::args().skip(2).collect::<Vec<_>>())),
+            "bg-color" => std::process::exit(cli::share_link::bg_color(&std::env::args().skip(2).collect::<Vec<_>>())),
             "--help" | "-h" => {
                 eprintln!(
                     "tab-atelier-headless [run a tab-atelier server] OR one of:\n  \
@@ -59,6 +60,7 @@ fn main() {
                      output <idx|uuid>            print current scrollback\n  \
                      share-link <idx|uuid> [--ro] copy a browser URL for /view\n  \
                      settings [--api-addr ...]    show/edit daemon settings (bind addrs, PTY dims, share-URL base)\n  \
+                     bg-color <idx|uuid|--global> <hex|clear>  set viewer background color\n  \
                      set-status <state> [label]   used by Claude Code hooks etc.\n  \
                      claude-hook <event>          dispatch a Claude Code hook event (reads JSON on stdin)\n  \
                      remote ...                   talk to a remote tab-atelier"
