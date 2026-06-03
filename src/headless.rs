@@ -659,8 +659,10 @@ fn persist(
         .iter()
         .zip(tab_states.iter())
         .map(|(tab, ts)| {
+            // 2000 for raw_output so xterm.js has actual scrollback;
+            // 200 stays fine for the joined `output` (mobile remote).
             let (output, cursor) = tab.ansi_text_with_cursor(Some(200));
-            let (raw_output, raw_cursor) = tab.raw_screen_text(Some(200));
+            let (raw_output, raw_cursor) = tab.raw_screen_text(Some(2000));
             let (cols, rows) = tab.dims();
             api::SnapshotTab {
                 id: tab.id.clone(),
