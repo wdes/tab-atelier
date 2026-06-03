@@ -20,6 +20,14 @@ use crate::{
     load_font_config, load_preferences, load_state_with_outputs, load_wakatime_key, save_preferences, save_state,
     save_tab_output, save_tab_uptime,
 };
+// Feature-gated extras: clippy --features gui flagged these as
+// "unused imports" because the cfg(feature = "energy"/"catbus")
+// call sites don't compile in that profile; but the default-features
+// build (CI) does need them.
+#[cfg(feature = "energy")]
+use crate::save_tab_energy;
+#[cfg(feature = "catbus")]
+use crate::save_tab_tokens;
 use crate::{api_url_for_local_clients, build_agent_resume_command, tab_env_extras};
 use gpui::prelude::FluentBuilder;
 use gpui::{
