@@ -11,8 +11,8 @@
        the middle of a wider browser window. Vertical anchor at top
        (alignItems: start) so the scrollback grows downward, not from
        the centre. */
-    body { display: flex; align-items: flex-start; justify-content: center; }
-    #term { width: max-content; }
+    body { display: flex; align-items: flex-start; justify-content: center; overflow-x: hidden; }
+    #term { width: max-content; max-width: 100vw; }
     #status { position: fixed; bottom: 4px; right: 8px; font-size: 11px; opacity: 0.5; pointer-events: none; }
     /* Locked banner — solid red strip across the top of the page
        so a recipient cannot miss that this tab refuses input. The
@@ -75,6 +75,23 @@
     });
     const termEl = document.getElementById("term");
     term.open(termEl);
+
+    // Pick an xterm.js font size so the server's full PTY grid fits
+    // the browser viewport width. Monospace char width on the JBM /
+    // Fira stack is ~0.6 × fontSize; subtract a small gutter so the
+    // page scroll doesn't appear. Clamped 8–18 px — below 8 reads as
+    // pixel noise, above 18 the terminal looks comically large on a
+    // narrow PTY.
+    function fitFontToViewport() {
+      if (serverCols <= 0) return;
+      const vw = window.innerWidth - 12;
+      let target = Math.floor(vw / serverCols / 0.6);
+      target = Math.max(8, Math.min(18, target));
+      if (target !== term.options.fontSize) {
+        term.options.fontSize = target;
+      }
+    }
+    window.addEventListener("resize", fitFontToViewport);
     // Tell xterm.js what this terminal is called (OSC 2). Drives the
     // value xterm.js exposes via onTitleChange / its internal `title`
     // property so addons or screencap tools see the real tab name
@@ -162,6 +179,7 @@
           term.resize(cols, rows);
           serverCols = cols;
           serverRows = rows;
+          fitFontToViewport();
         }
         // Drop EVERYTHING while the user is reading history. Claude
         // and other TUIs that rewrite lines on `\r` would otherwise
