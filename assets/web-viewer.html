@@ -206,7 +206,11 @@
       });
     }
 
-    setInterval(poll, 150);
+    // 80 ms is a good balance — fast enough that typed-then-echoed
+    // chars render in ~one frame on a LAN, slow enough that 12 polls
+    // per second don't saturate the server. CRC delta keeps each
+    // request tiny (a few bytes when only the cursor moves).
+    setInterval(poll, 80);
     poll();
   </script>
 </body>

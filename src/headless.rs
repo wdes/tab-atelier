@@ -520,8 +520,13 @@ pub fn run() -> std::io::Result<()> {
     let mut last_uptime_save: Option<Instant> = None;
     let mut last_state_hash: u32 = 0;
 
-    // --- Main tick: 500ms, mirrors the GUI persist + tick fan-out ---
-    let tick_interval = Duration::from_millis(500);
+    // --- Main tick: 100 ms ---
+    // Drives input drain + snapshot refresh, so a keystroke posted
+    // to /input lands in the PTY within ~100 ms and its echo is in
+    // the snapshot by the next tick. Persist-to-disk runs on its own
+    // 2 s cadence inside the loop, so this faster tick adds no disk
+    // I/O.
+    let tick_interval = Duration::from_millis(100);
     // Seed the persist clock 2s in the past so the very first tick
     // forces a flush (state hashing then deduplicates on subsequent
     // ticks). `checked_sub` defensively handles a boot-time clock
@@ -564,6 +569,18 @@ pub fn run() -> std::io::Result<()> {
             pty_cols,
             pty_rows,
         );
+        // Refresh the API snapshot on every tick so /output reflects
+        // shell echo within one tick (~500 ms) instead of waiting up
+        // to 2 s for the next disk-persist. Cheap — just grid reads.
+        refresh_snapshot(
+            &tabs,
+            active,
+            &api_state,
+            #[cfg(feature = "energy")]
+            &power_watts,
+            #[cfg(feature = "energy")]
+            &battery_percent,
+        );
 
         // Persist on a 2 Hz tick like the GUI's `cx.spawn(timer(2s))`.
         if last_persist.elapsed() >= Duration::from_secs(2) {
@@ -595,13 +612,66 @@ pub fn run() -> std::io::Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Rebuild the API snapshot from the runtime tab state and write it
+/// into `api_state`. Called every drain tick (not just every 2 s
+/// `persist`) so /output reflects keystroke echoes within ~tick
+/// duration instead of waiting for the next disk-persist cycle.
+fn refresh_snapshot(
+    tabs: &[HeadlessTab],
+    active: usize,
+    api_state: &Arc<Mutex<api::TabSnapshot>>,
+    #[cfg(feature = "energy")] power_watts: &Arc<Mutex<Vec<crate::power::TabPower>>>,
+    #[cfg(feature = "energy")] battery_percent: &Arc<Mutex<Option<u8>>>,
+) {
+    let api_tabs: Vec<api::SnapshotTab> = tabs
+        .iter()
+        .map(|tab| {
+            let (output, cursor) = tab.ansi_text_with_cursor(Some(200));
+            let (raw_output, raw_cursor) = tab.raw_screen_text(Some(2000));
+            let (cols, rows) = tab.dims();
+            api::SnapshotTab {
+                id: tab.id.clone(),
+                name: tab.name.clone(),
+                cwd: tab.last_known_cwd_string.clone(),
+                output,
+                raw_output,
+                raw_cursor,
+                uptime_secs: tab.uptime().as_secs_f64(),
+                cursor,
+                cols,
+                rows,
+                share_token_rw: tab.share_token_rw.clone(),
+                share_token_ro: tab.share_token_ro.clone(),
+                locked: tab.locked,
+                shell_pid: tab.pid,
+                agent_state: tab.agent_state.clone(),
+                agent_session_id: tab.agent_session_id.clone(),
+                agent_kind: tab.agent_kind.clone(),
+            }
+        })
+        .collect();
+    let mut snapshot = api_state.lock().unwrap();
+    snapshot.tabs = api_tabs;
+    snapshot.active = active;
+    snapshot.cached_response = None;
+    #[cfg(feature = "energy")]
+    snapshot.power.clone_from(&power_watts.lock().unwrap());
+    #[cfg(feature = "energy")]
+    {
+        snapshot.battery_percent = *battery_percent.lock().unwrap();
+    }
+}
+
 fn persist(
     tabs: &mut [HeadlessTab],
     active: usize,
-    api_state: &Arc<Mutex<api::TabSnapshot>>,
+    // Snapshot writeback moved to refresh_snapshot; this is kept on
+    // the signature for forward compat (callers shouldn't have to
+    // change). _-prefixed to silence unused-warning.
+    _api_state: &Arc<Mutex<api::TabSnapshot>>,
     #[cfg(feature = "energy")] power_pids: &Arc<Mutex<Vec<u32>>>,
     #[cfg(feature = "energy")] power_watts: &Arc<Mutex<Vec<crate::power::TabPower>>>,
-    #[cfg(feature = "energy")] battery_percent: &Arc<Mutex<Option<u8>>>,
+    #[cfg(feature = "energy")] _battery_percent: &Arc<Mutex<Option<u8>>>,
     last_uptime_save: &mut Option<Instant>,
     last_state_hash: &mut u32,
     final_flush: bool,
@@ -658,36 +728,8 @@ fn persist(
         })
         .collect();
 
-    let api_tabs: Vec<api::SnapshotTab> = tabs
-        .iter()
-        .zip(tab_states.iter())
-        .map(|(tab, ts)| {
-            // 2000 for raw_output so xterm.js has actual scrollback;
-            // 200 stays fine for the joined `output` (mobile remote).
-            let (output, cursor) = tab.ansi_text_with_cursor(Some(200));
-            let (raw_output, raw_cursor) = tab.raw_screen_text(Some(2000));
-            let (cols, rows) = tab.dims();
-            api::SnapshotTab {
-                id: tab.id.clone(),
-                name: ts.name.clone(),
-                cwd: ts.cwd.clone(),
-                output,
-                raw_output,
-                raw_cursor,
-                uptime_secs: tab.uptime().as_secs_f64(),
-                cursor,
-                cols,
-                rows,
-                share_token_rw: ts.share_token_rw.clone(),
-                share_token_ro: ts.share_token_ro.clone(),
-                locked: ts.locked,
-                shell_pid: tab.pid,
-                agent_state: tab.agent_state.clone(),
-                agent_session_id: tab.agent_session_id.clone(),
-                agent_kind: tab.agent_kind.clone(),
-            }
-        })
-        .collect();
+    // (Snapshot rebuild moved to `refresh_snapshot` which runs every
+    // tick — persist() now only does disk I/O.)
 
     let saved = SavedState {
         tabs: tab_states,
@@ -744,19 +786,8 @@ fn persist(
         }
     }
 
-    {
-        let mut snapshot = api_state.lock().unwrap();
-        snapshot.tabs = api_tabs;
-        snapshot.active = active;
-        snapshot.cached_response = None;
-        #[cfg(feature = "energy")]
-        snapshot.power.clone_from(&power_watts.lock().unwrap());
-        #[cfg(feature = "energy")]
-        {
-            snapshot.battery_percent = *battery_percent.lock().unwrap();
-        }
-    }
-
+    // Snapshot is owned by `refresh_snapshot` now — nothing to write
+    // back here. Power PIDs still tracked for the energy feature.
     #[cfg(feature = "energy")]
     {
         let pids: Vec<u32> = tabs.iter().map(|tab| tab.pid).collect();
