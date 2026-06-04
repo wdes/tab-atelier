@@ -119,12 +119,16 @@ pub enum Commands {
     },
 
     /// Set the per-tab viewer background color (or the global default with `--global`).
+    ///
+    /// Note: `--tab` is a flag (not a positional) so clap can model the
+    /// mutual exclusion with `--global` at parse time without falling
+    /// foul of "optional positional before required positional".
     BgColor {
         /// Apply to the global default in preferences.json instead of one tab.
         #[arg(long, short = 'g', conflicts_with = "tab")]
         global: bool,
         /// Tab index or UUID. Required unless `--global`.
-        #[arg(required_unless_present = "global")]
+        #[arg(long, short = 't', required_unless_present = "global", conflicts_with = "global")]
         tab: Option<String>,
         /// Color as `#RRGGBB`, or `clear` to remove an existing override.
         color: String,
@@ -312,4 +316,165 @@ pub fn dispatch(cli: Cli) -> bool {
         Commands::Remote { args } => crate::cli::remote::run(&args),
     };
     std::process::exit(code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// Catches accidental subcommand drift: every variant must keep
+    /// parsing from a representative command line.
+    #[test]
+    fn each_subcommand_round_trips_through_parse_from() {
+        let cases: Vec<(&[&str], &str)> = vec![
+            (&["tab-atelier-headless"], "no subcommand"),
+            (&["tab-atelier-headless", "tabs"], "tabs"),
+            (&["tab-atelier-headless", "tabs", "--once"], "tabs --once"),
+            (&["tab-atelier-headless", "add", "/tmp"], "add path"),
+            (&["tab-atelier-headless", "add", "/tmp", "name"], "add path name"),
+            (&["tab-atelier-headless", "close", "0"], "close idx"),
+            (&["tab-atelier-headless", "rename", "0", "newname"], "rename"),
+            (&["tab-atelier-headless", "lock", "0"], "lock"),
+            (&["tab-atelier-headless", "unlock", "0"], "unlock"),
+            (&["tab-atelier-headless", "input", "0", "ls"], "input"),
+            (&["tab-atelier-headless", "output", "0"], "output"),
+            (&["tab-atelier-headless", "share-link", "0"], "share-link"),
+            (&["tab-atelier-headless", "share-link", "0", "--ro"], "share-link --ro"),
+            (
+                &["tab-atelier-headless", "bg-color", "--global", "#002451"],
+                "bg-color global",
+            ),
+            (
+                &["tab-atelier-headless", "bg-color", "--tab", "0", "#112233"],
+                "bg-color --tab",
+            ),
+            (
+                &["tab-atelier-headless", "bg-color", "--tab", "0", "clear"],
+                "bg-color --tab clear",
+            ),
+            (&["tab-atelier-headless", "settings"], "settings (no flags)"),
+            (
+                &[
+                    "tab-atelier-headless",
+                    "settings",
+                    "--bg-color",
+                    "#111111",
+                    "--pty-cols",
+                    "200",
+                ],
+                "settings --flag",
+            ),
+            (&["tab-atelier-headless", "set-status", "thinking"], "set-status state"),
+            (
+                &["tab-atelier-headless", "set-status", "waiting", "--label", "tool: Bash"],
+                "set-status with --label",
+            ),
+            (
+                &["tab-atelier-headless", "claude-hook", "pre-tool"],
+                "claude-hook event",
+            ),
+            (
+                &[
+                    "tab-atelier-headless",
+                    "remote",
+                    "add",
+                    "--label",
+                    "L",
+                    "--url",
+                    "U",
+                    "--token",
+                    "T",
+                ],
+                "remote pass-through",
+            ),
+        ];
+        for (argv, label) in cases {
+            let _ = Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("parse failed for {label}: {e}"));
+        }
+    }
+
+    /// `bg-color --global` and `bg-color --tab` must be mutually
+    /// exclusive — clap enforces this via `conflicts_with`. Regression
+    /// guard: removing the attribute would silently let both through
+    /// and the dispatcher's branch would pick one arbitrarily.
+    #[test]
+    fn bg_color_global_and_tab_are_mutually_exclusive() {
+        let err = Cli::try_parse_from(["tab-atelier-headless", "bg-color", "--global", "--tab", "0", "#111111"])
+            .expect_err("must conflict");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cannot be used with") || msg.contains("conflict"),
+            "expected conflict error, got: {msg}"
+        );
+    }
+
+    /// `bg-color` needs either `--global` or a TAB. Bare colour alone
+    /// should fail at parse time, not silently no-op in the dispatcher.
+    #[test]
+    fn bg_color_without_tab_or_global_fails() {
+        let err = Cli::try_parse_from(["tab-atelier-headless", "bg-color", "#112233"]).expect_err("missing tab");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("required") || msg.contains("missing"),
+            "expected required-arg error, got: {msg}"
+        );
+    }
+
+    /// Unknown subcommands must error out — they used to silently
+    /// fall through to the daemon launch path under the hand-rolled
+    /// router, which booted the server on a typo.
+    #[test]
+    fn unknown_subcommand_errors() {
+        let err = Cli::try_parse_from(["tab-atelier-headless", "nope-does-not-exist"]).expect_err("unknown subcommand");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::InvalidSubcommand,
+            "expected InvalidSubcommand, got: {:?}",
+            err.kind()
+        );
+    }
+
+    /// The global flags propagate when given before OR after a
+    /// subcommand. Tests that `global = true` on the arg attr works.
+    #[test]
+    fn read_only_works_globally() {
+        let pre = Cli::try_parse_from(["tab-atelier-headless", "--read-only"]).unwrap();
+        assert!(pre.read_only);
+        assert!(pre.command.is_none());
+
+        let mid = Cli::try_parse_from(["tab-atelier-headless", "tabs", "--read-only"]).unwrap();
+        assert!(mid.read_only);
+        assert!(matches!(mid.command, Some(Commands::Tabs { once: false })));
+    }
+
+    /// The clap `Command` builds without panicking — catches mistakes
+    /// like duplicated arg names or conflicting `conflicts_with`
+    /// targets that only surface at runtime otherwise.
+    #[test]
+    fn command_factory_builds() {
+        let cmd = Cli::command();
+        let names: Vec<&str> = cmd.get_subcommands().map(clap::Command::get_name).collect();
+        for expected in [
+            "tabs",
+            "add",
+            "close",
+            "rename",
+            "lock",
+            "unlock",
+            "input",
+            "output",
+            "share-link",
+            "bg-color",
+            "settings",
+            "set-status",
+            "claude-hook",
+            "remote",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "missing subcommand {expected}, got: {names:?}"
+            );
+        }
+    }
 }

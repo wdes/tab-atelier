@@ -2799,4 +2799,119 @@ mod tests {
         assert_eq!(header_value(&h, "x-output-start"), Some("0"));
         assert_eq!(b, full.as_bytes(), "body must be the full output");
     }
+
+    fn set_agent_state(state: &Arc<Mutex<TabSnapshot>>, idx: usize, snap: Option<crate::AgentStateSnapshot>) {
+        let mut s = state.lock().unwrap();
+        s.tabs[idx].agent_state = snap;
+        s.cached_response = None;
+    }
+
+    #[test]
+    fn output_emits_no_agent_headers_when_no_agent_attached() {
+        let (port, state, token) = spawn_server();
+        fill_output(&state, 0, "hello\n");
+        let raw = request_bytes(
+            port,
+            &format!("GET /tabs/0/output HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        let (h, _) = split_response(&raw);
+        assert!(h.starts_with("HTTP/1.1 200"), "got: {h}");
+        assert!(
+            header_value(&h, "x-agent-state").is_none(),
+            "no agent attached → header must be omitted"
+        );
+        assert!(header_value(&h, "x-agent-label").is_none(), "no label without state");
+    }
+
+    #[test]
+    fn output_emits_agent_state_header_for_each_variant() {
+        let (port, state, token) = spawn_server();
+        fill_output(&state, 0, "x\n");
+        for (variant, expected) in [
+            (crate::AgentState::Thinking, "thinking"),
+            (crate::AgentState::Waiting, "waiting"),
+            (crate::AgentState::Error, "error"),
+        ] {
+            set_agent_state(
+                &state,
+                0,
+                Some(crate::AgentStateSnapshot {
+                    state: variant,
+                    label: None,
+                    updated_at: std::time::Instant::now(),
+                }),
+            );
+            let raw = request_bytes(
+                port,
+                &format!("GET /tabs/0/output HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+            );
+            let (h, _) = split_response(&raw);
+            assert_eq!(
+                header_value(&h, "x-agent-state"),
+                Some(expected),
+                "variant {variant:?} → header {expected:?}"
+            );
+            // No label set → label header must be absent.
+            assert!(header_value(&h, "x-agent-label").is_none());
+        }
+    }
+
+    #[test]
+    fn output_percent_encodes_non_ascii_label() {
+        let (port, state, token) = spawn_server();
+        fill_output(&state, 0, "x\n");
+        // Label contains accented chars + an embedded newline (must be
+        // dropped via the sanitiser) + a `%` (must be percent-encoded
+        // since it's our escape char).
+        set_agent_state(
+            &state,
+            0,
+            Some(crate::AgentStateSnapshot {
+                state: crate::AgentState::Thinking,
+                label: Some("tool: Crédités\nx 100%".into()),
+                updated_at: std::time::Instant::now(),
+            }),
+        );
+        let raw = request_bytes(
+            port,
+            &format!("GET /tabs/0/output HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        let (h, _) = split_response(&raw);
+        let label = header_value(&h, "x-agent-label").expect("label header present");
+        // Strict-ASCII on the wire.
+        assert!(
+            label.bytes().all(|b| (0x20..=0x7e).contains(&b)),
+            "label must be strict-ASCII on the wire, got: {label:?}"
+        );
+        // Decoding round-trips to the cleaned label (the `\n` percent-
+        // encodes to `%0A`, the `%` to `%25`, `é` to `%C3%A9`).
+        assert!(label.contains("%C3%A9"), "accent encoded: {label}");
+        assert!(label.contains("%25"), "% encoded: {label}");
+        assert!(label.contains("%0A"), "newline encoded: {label}");
+    }
+
+    #[test]
+    fn output_caps_agent_label_at_256_chars() {
+        let (port, state, token) = spawn_server();
+        fill_output(&state, 0, "x\n");
+        // 1000 ASCII bytes → server takes first 256 chars, encodes
+        // them (each ASCII char encodes 1:1 except `%`), and emits.
+        let huge = "A".repeat(1000);
+        set_agent_state(
+            &state,
+            0,
+            Some(crate::AgentStateSnapshot {
+                state: crate::AgentState::Waiting,
+                label: Some(huge),
+                updated_at: std::time::Instant::now(),
+            }),
+        );
+        let raw = request_bytes(
+            port,
+            &format!("GET /tabs/0/output HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        let (h, _) = split_response(&raw);
+        let label = header_value(&h, "x-agent-label").expect("present");
+        assert_eq!(label.len(), 256, "encoded label length capped at 256 chars: {label:?}");
+    }
 }
