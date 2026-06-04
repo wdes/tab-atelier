@@ -1034,6 +1034,18 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             let raw_cursor = t.raw_cursor;
             let bg_color = t.bg_color.clone();
             let locked = t.locked;
+            // Agent indicator surfaced to the share-link viewer so the
+            // browser tab title can mirror what the desktop GUI shows
+            // (\u{1f9e0} Thinking / ⌛ Waiting / ❗ Error). Strictly
+            // additive: omitted when no agent is attached.
+            let (agent_state_str, agent_label) = t.agent_state.as_ref().map_or((None, None), |s| {
+                let key = match s.state {
+                    crate::AgentState::Thinking => "thinking",
+                    crate::AgentState::Waiting => "waiting",
+                    crate::AgentState::Error => "error",
+                };
+                (Some(key), s.label.clone())
+            });
 
             let (body, cursor, start_offset) = match (query_since, query_crc) {
                 (Some(n), Some(client_crc)) if n <= total_len => {
@@ -1104,6 +1116,28 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             }
             if locked {
                 let _ = write!(extra, "X-Tab-Locked: 1\r\n");
+            }
+            if let Some(state_str) = agent_state_str {
+                let _ = write!(extra, "X-Agent-State: {state_str}\r\n");
+                // Label can be any UTF-8 reported via `set-status
+                // --label`. Percent-encode every non-ASCII byte +
+                // CRLF / `%` so the wire stays strict-ASCII and the
+                // viewer can `decodeURIComponent` it back. Cap at
+                // 256 chars before encoding.
+                if let Some(label) = agent_label {
+                    let truncated: String = label.chars().take(256).collect();
+                    let mut encoded = String::with_capacity(truncated.len());
+                    for byte in truncated.bytes() {
+                        if matches!(byte, 0x20..=0x7e) && byte != b'%' && byte != b'\r' && byte != b'\n' {
+                            encoded.push(byte as char);
+                        } else {
+                            let _ = write!(encoded, "%{byte:02X}");
+                        }
+                    }
+                    if !encoded.is_empty() {
+                        let _ = write!(extra, "X-Agent-Label: {encoded}\r\n");
+                    }
+                }
             }
             respond_with_etag(
                 stream,
