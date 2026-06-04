@@ -166,6 +166,23 @@
           term.options.disableStdin = serverLocked || READ_ONLY;
           term.options.cursorBlink = !(serverLocked || READ_ONLY);
         }
+        // Agent state badge in the browser tab title, mirroring the
+        // desktop GUI's per-tab indicator. Server omits the header
+        // when no agent is attached, in which case we reset to plain
+        // TAB_NAME.
+        const agentState = r.headers.get("X-Agent-State") || "";
+        const agentLabelRaw = r.headers.get("X-Agent-Label") || "";
+        let agentLabel = "";
+        if (agentLabelRaw) {
+          try { agentLabel = decodeURIComponent(agentLabelRaw); }
+          catch { agentLabel = agentLabelRaw; }
+        }
+        const STATE_ICON = { thinking: "\u{1f9e0}", waiting: "⏳", error: "❗" };
+        const nextTitleTag = agentState && STATE_ICON[agentState]
+          ? ` ${STATE_ICON[agentState]}${agentLabel ? " " + agentLabel : ""}`
+          : "";
+        const nextTitle = `${nextTitleTag ? nextTitleTag.trim() + " · " : ""}${TAB_NAME} · tab-atelier`;
+        if (document.title !== nextTitle) document.title = nextTitle;
         // Cursor in raw-output coords (0-indexed). NaN when the
         // server didn't ship it, in which case we leave xterm.js's
         // cursor wherever the last write landed.
