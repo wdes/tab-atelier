@@ -7,6 +7,13 @@ use std::sync::atomic::Ordering;
 use tab_atelier::{READ_ONLY, SHUTDOWN_REQUESTED, app, cli, install_rustls_provider, try_acquire_single_instance_lock};
 
 fn main() {
+    // Install the rustls crypto provider BEFORE any subcommand can run.
+    // `cli::remote::*` makes HTTPS calls (TOFU cert fetch on `remote add`,
+    // every `remote test|watch|attach|put|get` request) and panics if
+    // the process-level CryptoProvider isn't picked yet. The helper is
+    // idempotent — second call is a no-op.
+    install_rustls_provider();
+
     // Subcommand dispatch — keeps the entry point short and lets
     // shell-side helpers (`tab-atelier set-status …`) run without
     // ever touching the gpui app::run path.
@@ -27,8 +34,6 @@ fn main() {
             _ => {}
         }
     }
-
-    install_rustls_provider();
 
     // Smoke check used by tests/rustls_provider.rs to guard against
     // future regressions of the install_default() call above OR any
