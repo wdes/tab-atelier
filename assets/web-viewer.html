@@ -106,8 +106,15 @@
     // focus by tabbing to another browser pane.
     document.body.addEventListener("click", () => { if (!READ_ONLY) term.focus(); });
 
-    let since = 0;
-    let crc = "00000000";
+    // Monotonic PTY-byte offset we've fed into xterm.js. The server's
+    // /stream endpoint hands us `[since, X-Stream-Length)` on each
+    // poll — the ring captures every byte the PTY emitted, BEFORE
+    // alacritty's parser saw it, so it survives Claude's `\x1b[3J`
+    // wipes and contains content from in-place TUI redraws that
+    // alacritty's grid history never accumulates. xterm.js's own
+    // terminal emulation runs over those bytes here and produces a
+    // matching scrollback as a side effect.
+    let streamOffset = 0;
     let bootstrapped = false;
     let serverCols = 0;
     let serverRows = 0;
@@ -130,23 +137,19 @@
     term.onScroll(() => {
       const buf = term.buffer.active;
       inScrollback = buf.viewportY < buf.baseY;
-      if (wasInScrollback && !inScrollback) {
-        since = 0;
-        crc = "00000000";
-      }
+      // Returning to bottom no longer needs a resync — /stream is
+      // append-only, so xterm.js's scrollback is already coherent
+      // with whatever the server thinks the current state is.
       wasInScrollback = inScrollback;
     });
 
     async function poll() {
-      const url = bootstrapped
-        ? `${BASE}output?since=${since}&crc=${crc}`
-        : `${BASE}output`;
+      const url = `${BASE}stream?since=${streamOffset}`;
       try {
         const r = await fetch(url, { headers });
         if (!r.ok) { status.textContent = `http ${r.status}`; return; }
-        const len = parseInt(r.headers.get("X-Output-Length") || "0", 10);
-        const newCrc = r.headers.get("X-Output-Crc") || "00000000";
-        const start = parseInt(r.headers.get("X-Output-Start") || "0", 10);
+        const len = parseInt(r.headers.get("X-Stream-Length") || "0", 10);
+        const start = parseInt(r.headers.get("X-Stream-Start") || "0", 10);
         const cols = parseInt(r.headers.get("X-Output-Cols") || "0", 10);
         const rows = parseInt(r.headers.get("X-Output-Rows") || "0", 10);
         // Background color can change mid-session via the daemon's
@@ -183,11 +186,6 @@
           : "";
         const nextTitle = `${nextTitleTag ? nextTitleTag.trim() + " · " : ""}${TAB_NAME} · tab-atelier`;
         if (document.title !== nextTitle) document.title = nextTitle;
-        // Cursor in raw-output coords (0-indexed). NaN when the
-        // server didn't ship it, in which case we leave xterm.js's
-        // cursor wherever the last write landed.
-        const curRow = parseInt(r.headers.get("X-Raw-Cursor-Row") || "", 10);
-        const curCol = parseInt(r.headers.get("X-Raw-Cursor-Col") || "", 10);
         // Resize xterm.js to match the server's PTY grid. Without
         // this the browser's wider grid breaks the server's wrapping
         // (long lines stay short, prompt header floats over empty
@@ -198,52 +196,39 @@
           serverRows = rows;
           fitFontToViewport();
         }
-        // Drop EVERYTHING while the user is reading history. Claude
-        // and other TUIs that rewrite lines on `\r` would otherwise
-        // keep nudging the viewport. We update `since`/`crc` further
-        // down regardless, so when the user scrolls back to bottom
-        // (which resets these via the onScroll handler) we issue a
-        // clean full-state refresh.
+        // Drop the playback while the user is reading history. Claude
+        // and other TUIs would otherwise jerk the viewport — xterm.js
+        // already has every byte it needs to browse history
+        // undisturbed. `streamOffset` is still advanced from the
+        // header so the catch-up write on return-to-bottom only
+        // contains bytes that arrived during the pause.
         if (inScrollback) {
+          streamOffset = len;
           status.textContent = `${TAB_NAME} · paused (scrolled up) · ${len}B`;
           return;
         }
         const body = await r.text();
-        // Tail the body with a cursor-position escape so xterm.js
-        // ends up with the cursor at the SERVER's position, not at
-        // the end of the dump. CSI ROW;COL H is 1-indexed.
-        const cursorTail = (Number.isFinite(curRow) && Number.isFinite(curCol))
-          ? `\x1b[${curRow + 1};${curCol + 1}H`
-          : "";
-        // Full-repaint without term.reset() — `reset()` briefly
-        // exposes an empty terminal + top-left cursor (the "1-second
-        // cursor flash" the user reported during heavy redraws).
-        // Instead emit a single ANSI sequence:
-        //   \x1b[2J  erase entire viewport (kills leftover chars on
-        //            any row the new body's shorter than the old)
-        //   \x1b[H   cursor home
-        //   <body>   the row-by-row dump
-        //   <tail>   reposition to server's cursor
-        // xterm.js executes the full sequence atomically inside one
-        // term.write(), no visible intermediate state. The post-body
-        // \x1b[J trick used to work for clearing below — but each
-        // ROW past the new body's end still had leftover chars from
-        // the old paint (cursor moves col-by-col, doesn't auto-erase
-        // to end-of-line), producing the "cascade" overlay.
-        const FULL_PREFIX = "\x1b[2J\x1b[H";
-        const FULL_SUFFIX = "";
-        if (!bootstrapped) {
-          term.write(FULL_PREFIX + body + FULL_SUFFIX + cursorTail);
-          bootstrapped = true;
-        } else if (start === since && body.length > 0) {
-          term.write(body + cursorTail);
-        } else if (start === 0 && body.length > 0) {
-          term.write(FULL_PREFIX + body + FULL_SUFFIX + cursorTail);
-        } else if (cursorTail) {
-          term.write(cursorTail);
+        // /stream is append-only by construction: each response is
+        // exactly the bytes the PTY emitted since our `since` offset.
+        // xterm.js's terminal emulator runs over them and reproduces
+        // the server's grid (including in-place redraws that
+        // alacritty's history can never accumulate) and naturally
+        // builds up scrollback as old rows are pushed off the top.
+        // No `\x1b[2J\x1b[H` resync — that would obliterate xterm.js's
+        // local scrollback, defeating the whole point of the ring.
+        if (body.length > 0) {
+          if (start > streamOffset) {
+            // Ring's `base_offset` raced ahead of our `since` —
+            // we lost bytes. Best we can do is play the available
+            // suffix; the missing prefix would have to come from a
+            // ring with bigger capacity. log() to surface in the
+            // browser console so users can size up the ring.
+            console.warn(`stream gap: requested since=${streamOffset}, got start=${start} (${start - streamOffset} bytes aged out)`);
+          }
+          term.write(body);
         }
-        since = len;
-        crc = newCrc;
+        streamOffset = len;
+        bootstrapped = true;
         const lockTag = serverLocked ? " · LOCKED" : "";
         status.textContent = `${TAB_NAME} · ${serverCols}x${serverRows} · ${len}B${lockTag}`;
       } catch (e) {

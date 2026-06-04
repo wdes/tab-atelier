@@ -118,6 +118,11 @@ struct HeadlessTab {
     bg_color: Option<String>,
     pending_agent_resume: Option<String>,
     colors_enabled: bool,
+    /// Raw PTY byte ring captured BEFORE alacritty's parser sees the
+    /// bytes. Source of truth for the share-link viewer's scrollback
+    /// — alacritty's grid history is wiped by `\x1b[3J` and never
+    /// grows when the TUI redraws in-place (Claude Code, htop, …).
+    pty_ring: Arc<Mutex<crate::pty_ring::PtyRing>>,
 }
 
 impl HeadlessTab {
@@ -291,6 +296,13 @@ fn spawn_pty_tab(
         proxy.clone(),
     );
     let term = Arc::new(FairMutex::new(term));
+    // Tap the PTY before alacritty sees it. Every byte goes into the
+    // ring first; only then is it forwarded to the parser. The ring
+    // survives `\x1b[3J` (alacritty would otherwise wipe its history)
+    // and captures Claude / htop / `less` in-place redraws that never
+    // reach alacritty's scrollback.
+    let pty_ring = Arc::new(Mutex::new(crate::pty_ring::PtyRing::default()));
+    let pty = crate::pty_ring::PtyTap::new(pty, pty_ring.clone());
     let el = EventLoop::new(term.clone(), proxy.clone(), pty, false, false).ok()?;
     let notifier = el.channel();
     proxy.set_notifier(notifier.clone());
@@ -335,6 +347,7 @@ fn spawn_pty_tab(
         bg_color,
         pending_agent_resume,
         colors_enabled,
+        pty_ring,
     })
 }
 
@@ -657,6 +670,7 @@ fn refresh_snapshot(
                 agent_state: tab.agent_state.clone(),
                 agent_session_id: tab.agent_session_id.clone(),
                 agent_kind: tab.agent_kind.clone(),
+                pty_ring: Some(tab.pty_ring.clone()),
             }
         })
         .collect();

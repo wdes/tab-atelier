@@ -919,6 +919,7 @@ impl AppState {
                     agent_state: tab.agent_state.clone(),
                     agent_session_id: tab.agent_session_id.clone(),
                     agent_kind: tab.agent_kind.clone(),
+                    pty_ring: Some(view.pty_ring()),
                 }
             })
             .collect();

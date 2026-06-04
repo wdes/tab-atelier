@@ -163,6 +163,14 @@ pub struct SnapshotTab {
     /// "session attached" semantic the desktop LED uses to render a
     /// steady grey dot when there's no transient state.
     pub agent_kind: Option<String>,
+    /// Per-tab raw PTY byte ring captured BEFORE alacritty's parser.
+    /// `GET /tabs/by-id/{id}/stream[?since=N]` reads from this; the
+    /// xterm.js share-link viewer uses it to populate scrollback,
+    /// because alacritty's grid history is wiped by `\x1b[3J` and
+    /// doesn't grow when TUIs (Claude, htop, less) redraw in-place.
+    /// `None` for tabs that pre-date PTY-tap wiring — endpoint
+    /// responds 404 in that case.
+    pub pty_ring: Option<std::sync::Arc<std::sync::Mutex<crate::pty_ring::PtyRing>>>,
 }
 
 /// A status update queued by `POST /tabs/by-id/{id}/status` — drained
@@ -671,7 +679,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
         let allowed = if let Some(p) = provided_token.as_deref()
             && let Some(rest) = path.strip_prefix("/tabs/by-id/")
             && let Some((uuid, action)) = rest.split_once('/')
-            && matches!(action, "view" | "output" | "input")
+            && matches!(action, "view" | "output" | "stream" | "input")
         {
             let state_g = state.lock().unwrap();
             state_g.tabs.iter().find(|t| t.id == uuid).and_then(|t| {
@@ -1144,6 +1152,108 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 200,
                 "text/plain; charset=utf-8",
                 body.as_bytes(),
+                accept_gzip,
+                if_none_match.as_deref(),
+                &extra,
+            );
+        }
+        // Raw PTY byte stream. The xterm.js share-link viewer uses this
+        // to feed its own scrollback — alacritty's grid history is
+        // wiped by `\x1b[3J` and doesn't grow when TUIs redraw in-place,
+        // so the /output snapshot can't surface anything past the
+        // visible viewport. The ring is captured at the PTY read site
+        // (see `src/pty_ring.rs`) and so survives both pathologies.
+        //
+        // Query: ?since=<offset>  (default 0 → full ring).
+        // Response headers:
+        //   X-Stream-Length: monotonic high-water mark (total bytes
+        //                     ever emitted through this ring)
+        //   X-Stream-Start:  offset of the first byte in this body
+        //                     (== since when no truncation happened)
+        //   X-Stream-Cap:    ring capacity, so the client can detect
+        //                     when its `since` aged out.
+        ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/stream") => {
+            let Some((key_raw, is_uuid)) = parse_tab_key(p, "/stream") else {
+                error_json(stream, 404, "invalid tab key");
+                return;
+            };
+            let state_g = state.lock().unwrap();
+            let Some(idx) = resolve_tab_idx(&state_g, key_raw, is_uuid) else {
+                drop(state_g);
+                error_json(stream, 404, "tab not found");
+                return;
+            };
+            let Some(t) = state_g.tabs.get(idx) else {
+                drop(state_g);
+                error_json(stream, 404, "tab index out of range");
+                return;
+            };
+            let Some(ring) = t.pty_ring.clone() else {
+                drop(state_g);
+                // The GUI side may be running a build that pre-dates
+                // PTY-tap wiring, OR a test snapshot left it None.
+                error_json(stream, 404, "stream unavailable for this tab");
+                return;
+            };
+            // Capture the same metadata /output exposes so the viewer
+            // doesn't need a second poll for cols/rows/bg/lock/agent.
+            let pty_cols = t.cols;
+            let pty_rows = t.rows;
+            let bg_color = t.bg_color.clone();
+            let locked = t.locked;
+            let (agent_state_str, agent_label) = t.agent_state.as_ref().map_or((None, None), |s| {
+                let key = match s.state {
+                    crate::AgentState::Thinking => "thinking",
+                    crate::AgentState::Waiting => "waiting",
+                    crate::AgentState::Error => "error",
+                };
+                (Some(key), s.label.clone())
+            });
+            drop(state_g);
+
+            // Reuses the same `?since=N` we parse for /output's CRC
+            // patching; the ring offsets are monotonic so the semantic
+            // is identical (skip the first N bytes the ring has seen).
+            let since = query_since.unwrap_or(0) as u64;
+
+            let (body, total_len, base_offset, cap) = {
+                let r = ring.lock().unwrap();
+                (r.since(since), r.total_len(), r.base_offset(), r.capacity())
+            };
+            // The actual start offset of `body` clamps to the ring's
+            // base_offset when `since` aged out.
+            let body_start = since.max(base_offset);
+            let mut extra = format!(
+                "X-Stream-Length: {total_len}\r\nX-Stream-Start: {body_start}\r\nX-Stream-Cap: {cap}\r\nX-Output-Cols: {pty_cols}\r\nX-Output-Rows: {pty_rows}\r\n"
+            );
+            if !bg_color.is_empty() {
+                let _ = write!(extra, "X-Tab-Bg: {bg_color}\r\n");
+            }
+            if locked {
+                let _ = write!(extra, "X-Tab-Locked: 1\r\n");
+            }
+            if let Some(state_str) = agent_state_str {
+                let _ = write!(extra, "X-Agent-State: {state_str}\r\n");
+                if let Some(label) = agent_label {
+                    let truncated: String = label.chars().take(256).collect();
+                    let mut encoded = String::with_capacity(truncated.len());
+                    for byte in truncated.bytes() {
+                        if matches!(byte, 0x20..=0x7e) && byte != b'%' && byte != b'\r' && byte != b'\n' {
+                            encoded.push(byte as char);
+                        } else {
+                            let _ = write!(encoded, "%{byte:02X}");
+                        }
+                    }
+                    if !encoded.is_empty() {
+                        let _ = write!(extra, "X-Agent-Label: {encoded}\r\n");
+                    }
+                }
+            }
+            respond_with_etag(
+                stream,
+                200,
+                "text/plain; charset=utf-8",
+                &body,
                 accept_gzip,
                 if_none_match.as_deref(),
                 &extra,
@@ -2075,6 +2185,7 @@ mod tests {
                     agent_state: None,
                     agent_session_id: None,
                     agent_kind: None,
+                    pty_ring: None,
                 },
                 SnapshotTab {
                     id: "tab-b".into(),
@@ -2095,6 +2206,7 @@ mod tests {
                     agent_state: None,
                     agent_session_id: None,
                     agent_kind: None,
+                    pty_ring: None,
                 },
             ],
             active: 0,
@@ -2888,6 +3000,118 @@ mod tests {
         assert!(label.contains("%C3%A9"), "accent encoded: {label}");
         assert!(label.contains("%25"), "% encoded: {label}");
         assert!(label.contains("%0A"), "newline encoded: {label}");
+    }
+
+    fn attach_ring(state: &Arc<Mutex<TabSnapshot>>, idx: usize, ring: Arc<Mutex<crate::pty_ring::PtyRing>>) {
+        let mut s = state.lock().unwrap();
+        s.tabs[idx].pty_ring = Some(ring);
+        s.cached_response = None;
+    }
+
+    #[test]
+    fn stream_returns_full_ring_when_since_is_zero() {
+        let (port, state, token) = spawn_server();
+        let ring = Arc::new(Mutex::new(crate::pty_ring::PtyRing::with_capacity(1024)));
+        ring.lock().unwrap().push(b"hello\x1b[K world");
+        attach_ring(&state, 0, ring);
+
+        let raw = request_bytes(
+            port,
+            &format!("GET /tabs/0/stream HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        let (h, b) = split_response(&raw);
+        assert!(h.starts_with("HTTP/1.1 200"), "got: {h}");
+        // "hello" + ESC + "[K" + " world" = 14 bytes.
+        assert_eq!(header_value(&h, "x-stream-length"), Some("14"));
+        assert_eq!(header_value(&h, "x-stream-start"), Some("0"));
+        assert_eq!(b, b"hello\x1b[K world", "body must be the full ring");
+    }
+
+    #[test]
+    fn stream_since_offset_returns_only_new_bytes() {
+        let (port, state, token) = spawn_server();
+        let ring = Arc::new(Mutex::new(crate::pty_ring::PtyRing::with_capacity(1024)));
+        ring.lock().unwrap().push(b"abcdef");
+        attach_ring(&state, 0, ring);
+
+        let raw = request_bytes(
+            port,
+            &format!("GET /tabs/0/stream?since=3 HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        let (h, b) = split_response(&raw);
+        assert!(h.starts_with("HTTP/1.1 200"));
+        assert_eq!(header_value(&h, "x-stream-length"), Some("6"));
+        assert_eq!(header_value(&h, "x-stream-start"), Some("3"));
+        assert_eq!(b, b"def");
+    }
+
+    #[test]
+    fn stream_reports_truncation_via_x_stream_start_gap() {
+        // Tiny ring that aged out the first three bytes. A client
+        // asking for `since=0` gets the survivors, with X-Stream-Start
+        // bumped to the new base offset so the client knows to log a
+        // gap.
+        let (port, state, token) = spawn_server();
+        let ring = Arc::new(Mutex::new(crate::pty_ring::PtyRing::with_capacity(3)));
+        ring.lock().unwrap().push(b"abcdef"); // → "def", base_offset = 3
+        attach_ring(&state, 0, ring);
+
+        let raw = request_bytes(
+            port,
+            &format!("GET /tabs/0/stream HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        let (h, b) = split_response(&raw);
+        assert_eq!(header_value(&h, "x-stream-length"), Some("6"));
+        assert_eq!(
+            header_value(&h, "x-stream-start"),
+            Some("3"),
+            "start = base_offset when since aged out"
+        );
+        assert_eq!(header_value(&h, "x-stream-cap"), Some("3"));
+        assert_eq!(b, b"def");
+    }
+
+    #[test]
+    fn stream_404_when_tab_has_no_ring() {
+        let (port, _state, token) = spawn_server();
+        // Default test fixture: pty_ring is None on both tabs.
+        let raw = request_bytes(
+            port,
+            &format!("GET /tabs/0/stream HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        let (h, _) = split_response(&raw);
+        assert!(h.starts_with("HTTP/1.1 404"), "expected 404, got: {h}");
+    }
+
+    #[test]
+    fn stream_carries_same_metadata_headers_as_output() {
+        // Viewer uses /stream exclusively; it would otherwise miss
+        // the agent badge / lock banner / theme color.
+        let (port, state, token) = spawn_server();
+        let ring = Arc::new(Mutex::new(crate::pty_ring::PtyRing::default()));
+        ring.lock().unwrap().push(b"hi");
+        attach_ring(&state, 0, ring);
+        {
+            let mut s = state.lock().unwrap();
+            s.tabs[0].bg_color = "#002451".into();
+            s.tabs[0].locked = true;
+            s.tabs[0].agent_state = Some(crate::AgentStateSnapshot {
+                state: crate::AgentState::Thinking,
+                label: None,
+                updated_at: std::time::Instant::now(),
+            });
+            s.cached_response = None;
+        }
+        let raw = request_bytes(
+            port,
+            &format!("GET /tabs/0/stream HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        let (h, _) = split_response(&raw);
+        assert_eq!(header_value(&h, "x-tab-bg"), Some("#002451"));
+        assert_eq!(header_value(&h, "x-tab-locked"), Some("1"));
+        assert_eq!(header_value(&h, "x-agent-state"), Some("thinking"));
+        assert!(header_value(&h, "x-output-cols").is_some());
+        assert!(header_value(&h, "x-output-rows").is_some());
     }
 
     #[test]

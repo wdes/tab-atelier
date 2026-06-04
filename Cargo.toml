@@ -85,6 +85,11 @@ needless_pass_by_ref_mut = "allow"
 
 [dependencies]
 alacritty_terminal = "0.26"
+# Same `polling` alacritty pulls in transitively; promoted to a direct
+# dep so we can implement `EventedReadWrite` on our PTY tap wrapper
+# (the trait's register/reregister take `Arc<polling::Poller>` and
+# `polling::{Event, PollMode}`, so we need the type names in scope).
+polling = "3"
 env_logger = "0.11"
 # gpui's windowing backend is platform-specific, so it's declared in the
 # per-target tables below (x11 feature on Linux; the auto-selected

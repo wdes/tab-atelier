@@ -560,7 +560,7 @@ pub fn ports(args: &[String]) -> i32 {
     // the binary doesn't know about (forward compat).
     let mut doc: serde_json::Value = if path.exists() {
         match std::fs::read_to_string(&path) {
-            Ok(s) => serde_json::from_str(&s).unwrap_or(serde_json::json!({})),
+            Ok(s) => serde_json::from_str(&s).unwrap_or_else(|_| serde_json::json!({})),
             Err(e) => {
                 eprintln!("ports: read {}: {e}", path.display());
                 return 1;
@@ -765,7 +765,7 @@ fn write_global_bg(color: &str) -> i32 {
     };
     let mut doc: serde_json::Value = if path.exists() {
         match std::fs::read_to_string(&path) {
-            Ok(s) => serde_json::from_str(&s).unwrap_or(serde_json::json!({})),
+            Ok(s) => serde_json::from_str(&s).unwrap_or_else(|_| serde_json::json!({})),
             Err(e) => {
                 eprintln!("bg-color: read {}: {e}", path.display());
                 return 1;

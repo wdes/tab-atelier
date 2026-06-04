@@ -127,6 +127,13 @@ pub struct TerminalView {
     /// caller — keyboard event handlers, the API drain, the catbus
     /// menu item, etc.
     locked: Rc<Cell<bool>>,
+    /// Raw PTY byte ring captured BEFORE alacritty parses anything.
+    /// Source of truth for share-link viewer scrollback because
+    /// alacritty's grid history is wiped by `\x1b[3J` and doesn't
+    /// grow for in-place TUI redraws (Claude Code, htop, less, …).
+    /// Survives PTY respawn — the same Arc threads into the next
+    /// `PtyTap` so the user can scroll past the restart boundary.
+    pty_ring: Arc<std::sync::Mutex<crate::pty_ring::PtyRing>>,
 }
 
 fn pty_env(colors_enabled: bool) -> HashMap<String, String> {
@@ -205,6 +212,8 @@ impl TerminalView {
             proxy.clone(),
         );
         let term = Arc::new(FairMutex::new(term));
+        let pty_ring = Arc::new(std::sync::Mutex::new(crate::pty_ring::PtyRing::default()));
+        let pty = crate::pty_ring::PtyTap::new(pty, pty_ring.clone());
         let el = EventLoop::new(term.clone(), proxy.clone(), pty, false, false).expect("failed to create event loop");
         let notifier = el.channel();
         proxy.set_notifier(notifier.clone());
@@ -275,7 +284,16 @@ impl TerminalView {
             last_input: Rc::new(Cell::new(None)),
             colors_enabled: Cell::new(initial_colors_enabled),
             locked: Rc::new(Cell::new(false)),
+            pty_ring,
         }
+    }
+
+    /// Clone of the per-tab PTY ring's Arc. Lets the snapshot
+    /// pipeline expose the ring to the API layer without giving the
+    /// snapshot mutable access to the rest of the view.
+    #[must_use]
+    pub fn pty_ring(&self) -> Arc<std::sync::Mutex<crate::pty_ring::PtyRing>> {
+        self.pty_ring.clone()
     }
 
     pub const fn colors_enabled(&self) -> bool {
@@ -351,6 +369,11 @@ impl TerminalView {
 
         self.term.lock().grid_mut().scroll_display(Scroll::Bottom);
 
+        // Carry the same Arc into the new tap so the viewer's
+        // scrollback survives a PTY respawn (shell exited, user
+        // hit Enter to relaunch). Bytes from the old process stay
+        // in the ring; new bytes append.
+        let pty = crate::pty_ring::PtyTap::new(pty, self.pty_ring.clone());
         let el = EventLoop::new(self.term.clone(), self.event_proxy.clone(), pty, false, false)
             .expect("failed to create event loop");
         self.notifier = el.channel();

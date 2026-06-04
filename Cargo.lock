@@ -7167,6 +7167,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "log",
+ "polling",
  "qrcode",
  "rand 0.8.6",
  "ratatui",
