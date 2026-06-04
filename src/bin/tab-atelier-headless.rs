@@ -17,6 +17,12 @@ use tab_atelier::{
 };
 
 fn main() {
+    // Install the rustls crypto provider FIRST. `cli::remote::*` and
+    // the `remote add` TOFU cert fetch panic without it, and the
+    // daemon's TLS server needs it too. Idempotent — second call is
+    // a no-op.
+    install_rustls_provider();
+
     let cli_args = cli::dispatch::Cli::parse();
 
     // `--check-crypto` is a CI sanity probe — build the rustls server
@@ -24,12 +30,13 @@ fn main() {
     // before anything else so a missing toolchain bit surfaces here
     // instead of during the daemon's startup.
     if cli_args.check_crypto {
-        install_rustls_provider();
         let _config = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_cert_resolver(std::sync::Arc::new(rustls::server::ResolvesServerCertUsingSni::new()));
         std::process::exit(0);
     }
+
+    let read_only = cli_args.read_only;
 
     // A subcommand short-circuits via std::process::exit inside the
     // dispatcher. Returns here only when the user gave no subcommand,
@@ -39,9 +46,7 @@ fn main() {
         return;
     }
 
-    install_rustls_provider();
-
-    READ_ONLY.store(cli::dispatch::Cli::parse().read_only, Ordering::SeqCst);
+    READ_ONLY.store(read_only, Ordering::SeqCst);
 
     if !READ_ONLY.load(Ordering::SeqCst) && !try_acquire_single_instance_lock() {
         eprintln!(
