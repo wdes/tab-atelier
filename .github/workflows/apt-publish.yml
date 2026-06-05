@@ -119,24 +119,57 @@ jobs:
             # regenerate that folder's index. The gh-pages clone above
             # already preserved any previously-published MSIs, so if no
             # fresh artifact is found the existing set just carries over.
-            - name: Add Windows MSI builds + index
+            #
+            # `gh run download` would be the obvious tool but it assumes
+            # actions/upload-artifact@v7 wraps single files in a zip;
+            # v7 actually ships them BARE (we verified: the artifact
+            # bytes start with the MSI OLE2 magic `d0cf 11e0`, not the
+            # zip magic `50 4b 03 04`), which makes `gh run download`
+            # error out with "zip: not a valid zip file" and leave
+            # site/windows/ empty. Use the artifacts API directly:
+            # the `/zip` endpoint returns whatever was uploaded — for
+            # single-file v7 artifacts, that's the file itself, named
+            # after the artifact.
+            - name: Find latest Windows MSI run
+              id: msi_run
               env:
                   GH_TOKEN: ${{ github.token }}
               run: |
-                  cd site
-                  mkdir -p windows
                   RUN_ID=$(gh run list --repo "$GITHUB_REPOSITORY" \
                       --workflow=windows-msi.yml --status=success \
                       -L 1 --json databaseId --jq '.[0].databaseId // empty')
+                  echo "run_id=${RUN_ID}" >> "$GITHUB_OUTPUT"
                   if [ -n "$RUN_ID" ]; then
-                      echo "→ pulling MSI from windows-msi run $RUN_ID"
-                      rm -rf ../win-tmp && mkdir -p ../win-tmp
-                      if gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" -D ../win-tmp; then
-                          find ../win-tmp -name '*.msi' -exec cp -f {} windows/ \;
-                      fi
-                      rm -rf ../win-tmp
+                      echo "→ will pull MSIs from windows-msi run $RUN_ID"
                   else
                       echo "→ no successful windows-msi run yet; keeping existing MSIs"
+                  fi
+            - name: Stage MSI artifacts + regenerate index
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  RUN_ID: ${{ steps.msi_run.outputs.run_id }}
+              run: |
+                  cd site
+                  mkdir -p windows
+                  if [ -n "$RUN_ID" ]; then
+                      # Walk every artifact on that run, fetch the raw
+                      # bytes via the API (NOT via gh run download —
+                      # see comment on the previous step). Each
+                      # artifact's `name` is already the destination
+                      # filename, including the .msi extension.
+                      gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts" \
+                          --jq '.artifacts[] | "\(.id)\t\(.name)"' \
+                      | while IFS=$'\t' read -r ID NAME; do
+                          case "$NAME" in
+                              *.msi)
+                                  echo "→ fetching artifact $ID → windows/$NAME"
+                                  gh api -H "Accept: application/octet-stream" \
+                                      "repos/$GITHUB_REPOSITORY/actions/artifacts/$ID/zip" \
+                                      > "windows/$NAME"
+                                  ;;
+                              *) echo "→ skipping non-MSI artifact: $NAME" ;;
+                          esac
+                      done
                   fi
                   # Cap at the 10 most recent MSIs.
                   ls -1t windows/*.msi 2>/dev/null | tail -n +11 | xargs -r rm -f

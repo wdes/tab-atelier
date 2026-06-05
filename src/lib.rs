@@ -1365,6 +1365,17 @@ pub fn save_preferences_at(path: &std::path::Path, prefs: &Preferences) {
     if let Some(parent) = path.parent() {
         write_atomic_with_rotation(parent, path, prefs, true);
     }
+    // preferences.json holds plaintext bearer tokens for every
+    // configured remote_endpoint. Default umask (0o022 on most
+    // distros) would leave the file world-readable; tighten to
+    // owner-only the same way `save_api_token` does for api.token.
+    // No-op on Windows (mode bits not enforced by NTFS the same
+    // way).
+    #[cfg(unix)]
+    if path.exists() {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
 }
 
 /// Persist a single tab's output buffer to its own file
