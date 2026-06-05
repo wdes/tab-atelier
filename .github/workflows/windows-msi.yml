@@ -76,6 +76,40 @@ jobs:
             --install-version "${MSI_VERSION}" \
             --output "target/wix/tab-atelier-headless-${SHORT_SHA}-${MSI_VERSION}-x86_64.msi"
 
+      # End-to-end smoke test: install the MSI silently, then run the
+      # installed binary with --check-crypto and --version. Catches
+      # regressions where the MSI builds OK but the install fails (e.g.
+      # missing dependency) OR the installed exe is broken (e.g. wrong
+      # CRT linkage). Same role as the .deb integration test in
+      # build.yml.
+      - name: Install MSI + smoke-test the binary
+        shell: pwsh
+        run: |
+          $msi = "target/wix/tab-atelier-headless-${env:SHORT_SHA}-${env:MSI_VERSION}-x86_64.msi"
+          $log = "${env:RUNNER_TEMP}\msi-install.log"
+          Write-Host "→ msiexec /i $msi /qn /L*v $log"
+          $p = Start-Process msiexec -ArgumentList '/i', $msi, '/qn', '/L*v', $log -Wait -PassThru
+          if ($p.ExitCode -ne 0) {
+              Write-Host "── install log tail ────────────────────────"
+              Get-Content $log -Tail 60
+              throw "msiexec exited $($p.ExitCode)"
+          }
+
+          $exe = "C:\Program Files\tab-atelier\tab-atelier-headless.exe"
+          if (!(Test-Path $exe)) {
+              Write-Host "── install log tail ────────────────────────"
+              Get-Content $log -Tail 60
+              throw "binary missing after install: $exe"
+          }
+
+          Write-Host "→ $exe --version"
+          & $exe --version
+          if ($LASTEXITCODE -ne 0) { throw "--version exited $LASTEXITCODE" }
+
+          Write-Host "→ $exe --check-crypto"
+          & $exe --check-crypto
+          if ($LASTEXITCODE -ne 0) { throw "--check-crypto exited $LASTEXITCODE" }
+
       # archive: false emits the .msi as-is (single raw file), not wrapped
       # in the usual artifact .zip. Requires exactly one matched file.
       - name: Upload MSI artifact (raw)
