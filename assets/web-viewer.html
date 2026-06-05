@@ -29,12 +29,29 @@
     body.locked #locked-banner { display: block; }
     body.locked { padding-top: 32px; box-sizing: border-box; }
     body.locked #term { outline: 1px solid #cc1f1a; }
+    /* Update-available chip. Surfaces when the server's X-Boot-Id
+       no longer matches the value baked into this page (typically
+       after a `apt upgrade tab-atelier-headless` on the host).
+       Intentionally quiet — a banner reload prompt would clobber a
+       user's mid-thought share session. */
+    #update-chip {
+      display: none;
+      position: fixed; bottom: 4px; left: 8px; font-size: 11px;
+      padding: 3px 8px; border-radius: 10px;
+      background: rgba(255, 215, 100, 0.18); color: #ffd764;
+      border: 1px solid rgba(255, 215, 100, 0.35);
+      cursor: pointer; pointer-events: auto; z-index: 11;
+      font-family: ui-monospace, monospace;
+    }
+    body.update-available #update-chip { display: inline-block; }
+    #update-chip:hover { background: rgba(255, 215, 100, 0.3); }
   </style>
 </head>
 <body>
   <div id="locked-banner">🔒 TAB LOCKED — INPUT DISABLED</div>
   <div id="term"></div>
   <div id="status">connecting…</div>
+  <div id="update-chip" title="The server was upgraded — click to reload this viewer">↻ update available</div>
   <script src="https://unpkg.com/xterm@5.3.0/lib/xterm.js"></script>
   <script>
     // __TAB_KEY__ is the route segment after `/tabs/` (numeric idx or
@@ -44,6 +61,10 @@
     // __TAB_NAME_JS__ is JSON-encoded server-side (handles quotes,
     // backslashes, newlines), so wrapping it in quotes here is safe.
     const TAB_NAME = "__TAB_NAME_JS__";
+    // Daemon-start identity. Compared to every `/stream` response's
+    // X-Boot-Id; mismatch means the daemon restarted (likely with a
+    // new binary) and this page is running stale JS.
+    const BOOT_ID = "__BOOT_ID__";
     const PARAMS = new URLSearchParams(location.search);
     const TOKEN = PARAMS.get("token") || "";
     const READ_ONLY = PARAMS.get("ro") === "1";
@@ -105,6 +126,11 @@
     // Clicking the surrounding area refocuses too — easy to lose
     // focus by tabbing to another browser pane.
     document.body.addEventListener("click", () => { if (!READ_ONLY) term.focus(); });
+    // Click handler on the update-available chip — opt-in reload.
+    document.getElementById("update-chip").addEventListener("click", (e) => {
+      e.stopPropagation();
+      location.reload();
+    });
 
     // Monotonic PTY-byte offset we've fed into xterm.js. The server's
     // /stream endpoint hands us `[since, X-Stream-Length)` on each
@@ -161,6 +187,15 @@
           serverBg = bgNow;
           document.body.style.background = bgNow;
           term.options.theme = { ...term.options.theme, background: bgNow };
+        }
+        // Stale-viewer detection. X-Boot-Id changes on every daemon
+        // start; if it stops matching the value baked into this
+        // page, the user is running yesterday's JS. Show the chip,
+        // don't force a reload (mid-share interruption would be
+        // worse than a stale UI).
+        const serverBoot = r.headers.get("X-Boot-Id") || "";
+        if (BOOT_ID && serverBoot && serverBoot !== BOOT_ID) {
+          document.body.classList.add("update-available");
         }
         const lockedNow = r.headers.get("X-Tab-Locked") === "1";
         if (lockedNow !== serverLocked) {

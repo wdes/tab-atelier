@@ -4,7 +4,7 @@
 
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use serde::Serialize;
 
@@ -13,6 +13,18 @@ use log::{debug, error, info};
 use crate::tracking::USER_AGENT;
 
 const VIEWER_HTML: &str = include_str!("../assets/web-viewer.html");
+
+/// Random hex token minted once per daemon start. Embedded into the
+/// `/view` HTML as `__BOOT_ID__` and echoed on every `/stream`
+/// response as `X-Boot-Id`. The viewer compares the two; a mismatch
+/// means the daemon was restarted (likely with a new binary), and
+/// the page is running stale JS — show a quiet "↻ update available"
+/// chip prompting a manual reload.
+///
+/// First-version policy: chip-only, no auto-reload. The user might be
+/// mid-thought; a surprise reload would lose typing in interactive
+/// share-links.
+pub static BOOT_ID: LazyLock<String> = LazyLock::new(generate_token);
 
 /// Parse the tab segment between `/tabs/` and a suffix into either
 /// a numeric index or a UUID. Returns `(idx, key_for_html)` after
@@ -982,7 +994,8 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 .replace("__TAB_KEY__", &key_for_html)
                 .replace("__TAB_NAME_HTML__", &html_name)
                 .replace("__TAB_NAME_JS__", js_name)
-                .replace("__TAB_BG__", safe_bg);
+                .replace("__TAB_BG__", safe_bg)
+                .replace("__BOOT_ID__", &BOOT_ID);
             // Tell browsers (and any intervening CDN) not to cache
             // the viewer HTML — we ship JS fixes in the deb and
             // users would otherwise see a stale banner / poll loop
@@ -1224,7 +1237,8 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             // base_offset when `since` aged out.
             let body_start = since.max(base_offset);
             let mut extra = format!(
-                "X-Stream-Length: {total_len}\r\nX-Stream-Start: {body_start}\r\nX-Stream-Cap: {cap}\r\nX-Output-Cols: {pty_cols}\r\nX-Output-Rows: {pty_rows}\r\n"
+                "X-Stream-Length: {total_len}\r\nX-Stream-Start: {body_start}\r\nX-Stream-Cap: {cap}\r\nX-Output-Cols: {pty_cols}\r\nX-Output-Rows: {pty_rows}\r\nX-Boot-Id: {boot}\r\n",
+                boot = &*BOOT_ID,
             );
             if !bg_color.is_empty() {
                 let _ = write!(extra, "X-Tab-Bg: {bg_color}\r\n");
@@ -3081,6 +3095,54 @@ mod tests {
         );
         let (h, _) = split_response(&raw);
         assert!(h.starts_with("HTTP/1.1 404"), "expected 404, got: {h}");
+    }
+
+    #[test]
+    fn stream_emits_x_boot_id_matching_module_constant() {
+        let (port, state, token) = spawn_server();
+        let ring = Arc::new(Mutex::new(crate::pty_ring::PtyRing::default()));
+        ring.lock().unwrap().push(b"hi");
+        attach_ring(&state, 0, ring);
+        let raw = request_bytes(
+            port,
+            &format!("GET /tabs/0/stream HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        let (h, _) = split_response(&raw);
+        let server_boot = header_value(&h, "x-boot-id").expect("X-Boot-Id header present");
+        // Must match the process-wide BOOT_ID lazyo-init and be a
+        // non-empty hex token (same shape as the auth token).
+        assert_eq!(server_boot, *crate::api::BOOT_ID);
+        assert!(server_boot.len() >= 16, "boot id looks too short: {server_boot:?}");
+        assert!(server_boot.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn view_html_embeds_boot_id_placeholder_substituted() {
+        // Sanity: the template includes `const BOOT_ID = "..."` and
+        // after substitution the value is the current BOOT_ID.
+        // Catches a future template rename that loses the wiring.
+        let (port, state, token) = spawn_server();
+        // /view needs a share token on the path; mint one for tab 0.
+        {
+            let mut s = state.lock().unwrap();
+            s.tabs[0].share_token_rw = "view-token".into();
+        }
+        let raw = request_bytes(
+            port,
+            &format!("GET /tabs/by-id/tab-a/view HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        let (h, b) = split_response(&raw);
+        assert!(h.starts_with("HTTP/1.1 200"), "got: {h}");
+        let body = String::from_utf8_lossy(&b);
+        assert!(
+            !body.contains("__BOOT_ID__"),
+            "template placeholder must be substituted, not left raw"
+        );
+        let expected = format!(r#"const BOOT_ID = "{}";"#, *crate::api::BOOT_ID);
+        assert!(
+            body.contains(&expected),
+            "viewer JS must embed the live BOOT_ID — looked for {expected:?}"
+        );
     }
 
     #[test]
