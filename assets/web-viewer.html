@@ -207,7 +207,21 @@
           status.textContent = `${TAB_NAME} · paused (scrolled up) · ${len}B`;
           return;
         }
-        const body = await r.text();
+        const rawBody = await r.text();
+        // Strip alt-screen toggles from the byte stream. Claude Code's
+        // TUI (and vim/less/htop/…) emits `\x1b[?1049h` to enter the
+        // scratch alt-buffer; xterm.js correctly honors it, and the
+        // alt-buffer has no scrollback by spec. With our byte-stream
+        // replay model that means EVERY post-toggle byte writes into
+        // a buffer the user can never scroll into — the scrollbar
+        // visually disappears. Keep xterm.js in the main buffer so
+        // scrollback accumulates for all session content. Side effect:
+        // alt-screen TUIs render inline rather than in a scratch
+        // overlay — desirable for a read-only viewer (the user wants
+        // history, not isolation). Also strip the older 1047 / 47
+        // variants for the same reason.
+        // eslint-disable-next-line no-control-regex
+        const body = rawBody.replace(/\x1b\[\?(?:1049|1047|47)[hl]/g, "");
         // /stream is append-only by construction: each response is
         // exactly the bytes the PTY emitted since our `since` offset.
         // xterm.js's terminal emulator runs over them and reproduces
