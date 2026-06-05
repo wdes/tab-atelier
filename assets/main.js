@@ -463,6 +463,16 @@
           status.textContent = `${TAB_NAME} · paused (scrolled up) · ${len}B`;
           return;
         }
+        // Pause writes while there's an active selection. Any
+        // term.write() clears the selection on most xterm.js versions,
+        // making text impossible to copy when the stream is busy
+        // (Claude polling at 80 ms ≈ a new write every poll). We do
+        // NOT advance streamOffset, so when the selection clears the
+        // very next poll plays the queued bytes in one go.
+        if (term.hasSelection()) {
+          status.textContent = `${TAB_NAME} · selection — Cmd/Ctrl+C to copy (${len - streamOffset}B queued)`;
+          return;
+        }
         const rawBody = await r.text();
         // Strip alt-screen toggles from the byte stream. Claude Code's
         // TUI (and vim/less/htop/…) emits `\x1b[?1049h` to enter the
