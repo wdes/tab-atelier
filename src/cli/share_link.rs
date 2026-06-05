@@ -21,12 +21,12 @@
 use std::time::Duration;
 
 #[derive(Debug)]
-struct Endpoint {
-    url: String,
-    token: String,
+pub(crate) struct Endpoint {
+    pub(crate) url: String,
+    pub(crate) token: String,
 }
 
-fn discover_endpoint() -> Result<Endpoint, String> {
+pub(crate) fn discover_endpoint() -> Result<Endpoint, String> {
     if let (Ok(url), Ok(token)) = (
         std::env::var("TAB_ATELIER_API_URL"),
         std::env::var("TAB_ATELIER_API_TOKEN"),
@@ -60,7 +60,7 @@ fn discover_endpoint() -> Result<Endpoint, String> {
     Err(format!("no api.token found (tried env vars + {})", tried.join(", ")))
 }
 
-fn agent() -> ureq::Agent {
+pub(crate) fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(3)))
         .build()
