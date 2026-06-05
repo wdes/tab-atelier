@@ -179,6 +179,13 @@
         e.preventDefault();
         dragDepth = 0;
         document.body.classList.remove("drag-over");
+        // Mirror the server-side refusal: POST /files returns 423
+        // Locked when serverLocked is true, so suppress the upload
+        // pre-flight too and give the user immediate feedback.
+        if (serverLocked) {
+          toast("tab is locked — uploads refused");
+          return;
+        }
         const files = Array.from(e.dataTransfer?.files || []);
         if (!files.length) return;
         for (const f of files) {
@@ -186,7 +193,7 @@
         }
         // Refresh the outbox panel in case a server-side script
         // moves uploads into outbox/ on receipt.
-        refreshOutbox();
+        if (panelKind === "outbox") refreshFiles("outbox");
       });
     }
     // Files panel — single slide-in container, two buttons. The

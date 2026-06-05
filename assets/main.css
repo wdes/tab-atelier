@@ -90,6 +90,18 @@
     /* The locked banner takes the top 32 px when active; nudge the
        container down so the buttons don't collide with it. */
     body.locked #files-controls { top: 38px; }
+    /* When the tab is locked, uploads + downloads are refused
+       server-side (POST /files returns 423; the buttons would
+       still render but click handlers would 4xx). Dim them out
+       and refuse pointer events so the disabled state is
+       discoverable. Drag-drop overlay also gates on
+       `body.locked` so a drop is a no-op too. */
+    body.locked .files-btn {
+      opacity: 0.4;
+      pointer-events: none;
+      cursor: not-allowed;
+    }
+    body.locked #files-panel { display: none; }
     .files-btn .badge {
       display: inline-block; min-width: 14px; padding: 0 4px;
       margin-left: 4px; border-radius: 8px;

@@ -669,6 +669,7 @@ fn respond_json<W: Write>(stream: &mut W, status: u16, body: &str) {
         404 => "Not Found",
         405 => "Method Not Allowed",
         413 => "Payload Too Large",
+        423 => "Locked",
         429 => "Too Many Requests",
         _ => "Error",
     };
@@ -1357,13 +1358,24 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                     }
                 }
             }
+            // Pass `None` for if_none_match — /output is a live
+            // polling endpoint whose live state lives in headers
+            // (X-Tab-Locked, X-Agent-State, X-Outbox-Count, …).
+            // Returning 304 on an idle poll (when the body's CRC
+            // hasn't changed) ships those headers via the 304's
+            // header block, but browsers vary on whether fetch()
+            // exposes 304 headers — Chrome / Safari sometimes serve
+            // the cached 200's header set instead, which means a
+            // mid-session unlock / agent-state flip wouldn't reach
+            // the JS until a full page reload. Force 200 so every
+            // poll carries fresh headers in a fresh response.
             respond_with_etag(
                 stream,
                 200,
                 "text/plain; charset=utf-8",
                 body.as_bytes(),
                 accept_gzip,
-                if_none_match.as_deref(),
+                None,
                 &extra,
             );
         }
@@ -1481,13 +1493,19 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                     }
                 }
             }
+            // Pass `None` for if_none_match — same rationale as on
+            // /output: the live state (lock / agent / counts /
+            // build hash) rides on response headers and we want
+            // those refreshed on every poll. Idle polls return an
+            // empty body so the 200 instead of 304 costs almost
+            // nothing.
             respond_with_etag(
                 stream,
                 200,
                 "text/plain; charset=utf-8",
                 &body,
                 accept_gzip,
-                if_none_match.as_deref(),
+                None,
                 &extra,
             );
         }
@@ -1709,6 +1727,16 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 error_json(stream, 404, "tab index out of range");
                 return;
             };
+            // Refuse uploads to a locked tab — same policy as POST
+            // /input. Lock means "this tab is read-only right now";
+            // a share recipient shouldn't be able to drop files
+            // into the agent's inbox while the operator has paused
+            // the session.
+            if t.locked {
+                drop(snap);
+                error_json(stream, 423, "tab is locked");
+                return;
+            }
             let cwd = t.cwd.clone();
             drop(snap);
             let Some(cwd) = cwd else {
@@ -3196,29 +3224,65 @@ mod tests {
     }
 
     #[test]
-    fn output_etag_returns_304_on_match() {
+    fn output_returns_200_even_with_matching_if_none_match() {
+        // /output (and /stream) are live-polling endpoints whose
+        // mutable state lives in response HEADERS (X-Tab-Locked,
+        // X-Agent-State, …). Returning 304 on an idle poll would
+        // ship updated headers but browsers vary on whether
+        // fetch() exposes 304 headers — mid-session unlock would
+        // not always reach the JS until a manual reload. So we
+        // force 200 even when the body's ETag matches, trading a
+        // few KB of repeated headers for live state correctness.
         let (port, state, token) = spawn_server();
         let big = "y".repeat(8000);
         fill_output(&state, 0, &big);
 
-        // First request: capture ETag.
         let raw = request_bytes(
             port,
             &format!("GET /tabs/0/output HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
         );
         let (h, _) = split_response(&raw);
         let etag = header_value(&h, "etag").unwrap().trim_matches('"').to_string();
-
-        // Second request with If-None-Match: same content → 304.
+        // Second request matches the previous ETag — must still be 200.
         let raw2 = request_bytes(
             port,
             &format!(
                 "GET /tabs/0/output HTTP/1.1\r\nAuthorization: Bearer {token}\r\nIf-None-Match: \"{etag}\"\r\n\r\n"
             ),
         );
-        let (h2, b2) = split_response(&raw2);
-        assert!(h2.starts_with("HTTP/1.1 304"), "got: {h2}");
-        assert!(b2.is_empty(), "304 must have empty body");
+        let (h2, _) = split_response(&raw2);
+        assert!(
+            h2.starts_with("HTTP/1.1 200"),
+            "expected 200 (no 304 on /output), got: {h2}"
+        );
+    }
+
+    #[test]
+    fn upload_to_locked_tab_returns_423() {
+        let (port, state, token) = spawn_server();
+        let cwd = tempfile::tempdir().unwrap();
+        {
+            let mut s = state.lock().unwrap();
+            s.tabs[0].cwd = Some(cwd.path().to_string_lossy().into_owned());
+            s.tabs[0].locked = true;
+            s.cached_response = None;
+        }
+        let body = b"blocked";
+        let raw = request_bytes(
+            port,
+            &format!(
+                "POST /tabs/0/files?name=blocked.txt HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                std::str::from_utf8(body).unwrap()
+            ),
+        );
+        let (h, _) = split_response(&raw);
+        assert!(h.starts_with("HTTP/1.1 423"), "expected 423 Locked, got: {h}");
+        // File must NOT have landed.
+        assert!(
+            !cwd.path().join("inbox").join("blocked.txt").exists(),
+            "locked tab must refuse the upload before write"
+        );
     }
 
     #[test]
