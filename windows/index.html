@@ -1,7 +1,15 @@
 <!DOCTYPE html><meta charset=utf-8><title>tab-atelier Windows builds</title>
-<style>body{font-family:system-ui;max-width:42em;margin:3em auto;padding:0 1em}
-code{background:#f4f4f4;padding:.1em .3em;border-radius:3px}</style>
+<style>body{font-family:system-ui;max-width:48em;margin:3em auto;padding:0 1em}
+code{background:#f4f4f4;padding:.1em .3em;border-radius:3px}
+pre{background:#f4f4f4;padding:.6em .8em;border-radius:4px;overflow-x:auto}
+.note{background:#fff8d6;border-left:3px solid #d9a900;padding:.6em .9em;margin:1em 0;font-size:.95em}</style>
 <h1>tab-atelier Windows builds</h1>
 <p>Headless daemon MSI installers (<code>tab-atelier-headless</code>), newest first. Each filename carries the commit short SHA.</p>
 <ul>
-</ul><p><a href="../">&larr; back to the apt repo</a></p>
+</ul>
+<h2>Installing</h2>
+<p>From an elevated <code>cmd.exe</code> or PowerShell (run as Administrator), in the folder where you downloaded the MSI:</p>
+<pre>msiexec /i tab-atelier-headless-XXXXXXXX-0.4.0-x86_64.msi /qb</pre>
+<p><code>/qb</code> shows a basic progress bar without TaskDialog; <code>/qn</code> is fully silent. Both bypass the legacy Windows installer chrome.</p>
+<div class="note"><strong>If double-click install fails with “entrypoint TaskDialogIndirect can not be found in dynamic link library”:</strong> your shell is loading the legacy comctl32 v5 instead of v6. Use the <code>/qb</code> or <code>/qn</code> command-line install above &mdash; it does not invoke TaskDialog at all.</div>
+<p><a href="../">&larr; back to the apt repo</a></p>
