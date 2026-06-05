@@ -2,33 +2,54 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Captures the git commit hash at build time and exposes it as
-//! `BUILD_HASH` via `env!`. The headless API embeds it into the
+//! Captures a build-identity string at compile time and exposes it
+//! as `BUILD_HASH` via `env!`. The headless API embeds it into the
 //! share-link viewer HTML + the `X-Build-Hash` response header so
 //! the viewer can show an "↻ update available" chip when the binary
 //! it's been served by changes — without false-positives on plain
-//! daemon restarts (which would have flipped a random boot id).
+//! daemon restarts.
 //!
-//! Falls back to `"unknown"` when git isn't available or when we're
-//! building from a source tarball outside a repo. The viewer treats
-//! `"unknown"` the same way it treats empty — comparison is skipped.
+//! Identity is picked in this order:
+//!   1. `git rev-parse --short=12 HEAD` — 12-char hex, e.g. `07c49210abcd`
+//!   2. UNIX timestamp at compile time, formatted as `t<secs>`,
+//!      e.g. `t1717590000`. Used when no `.git/` is present (source
+//!      tarball builds).
+//!   3. The literal `"unknown"`, only if even `SystemTime::now()` fails
+//!      (genuinely bizarre clock state). Viewer short-circuits the
+//!      comparison so we don't false-positive into a chip.
+//!
+//! Why a timestamp fallback rather than a constant string: a tarball
+//! user who unpacks a new release will see fresh mtimes → cargo
+//! re-runs build.rs → new timestamp → viewer detects the upgrade.
+//! Without it, every tarball build would identify as `unknown` and
+//! the chip would never fire.
 
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn main() {
-    // `git rev-parse --short=12 HEAD` is enough entropy to disambiguate
-    // any two distinct builds in this repo's lifetime and short enough
-    // to read at a glance in logs / Vary headers.
-    let hash = Command::new("git")
+    // `git rev-parse --short=12 HEAD` is enough entropy to
+    // disambiguate any two distinct builds in this repo's lifetime
+    // and short enough to read at a glance in logs / Vary headers.
+    let identity = Command::new("git")
         .args(["rev-parse", "--short=12", "HEAD"])
         .output()
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .filter(|s| !s.is_empty())
+        .or_else(|| {
+            // Tarball fallback. The `t` prefix distinguishes
+            // timestamps from git hashes at a glance so logs aren't
+            // ambiguous.
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .map(|d| format!("t{}", d.as_secs()))
+        })
         .unwrap_or_else(|| "unknown".to_string());
 
-    println!("cargo:rustc-env=BUILD_HASH={hash}");
+    println!("cargo:rustc-env=BUILD_HASH={identity}");
 
     // Re-run the script when HEAD moves (commits on the current
     // branch OR a checkout to a different branch). `.git/logs/HEAD`
@@ -36,8 +57,12 @@ fn main() {
     // every branch switch appends a line. Watching `.git/HEAD`
     // alone misses regular commits because the file just contains
     // `ref: refs/heads/main`, which doesn't change.
+    //
+    // For the tarball/no-git path, this directive is harmless (the
+    // file doesn't exist, so it never fires) — the timestamp stays
+    // pinned at unpack time, which is exactly what we want: a
+    // rebuild of the same tarball produces the same identity, but a
+    // fresh tarball unpack refreshes mtimes and the timestamp.
     println!("cargo:rerun-if-changed=.git/logs/HEAD");
-    // Also rerun if cargo invokes us with a different `git` on PATH,
-    // or if these env vars change (e.g. CI override).
     println!("cargo:rerun-if-env-changed=BUILD_HASH");
 }
