@@ -3,11 +3,10 @@
   WiX 3 source for the tab-atelier-headless MSI.
 
   Built on a Windows runner by .github/workflows/windows-msi.yml, which
-  pre-builds tab-atelier-headless and happier-relay (the headless plus
-  happier-bridge feature set only; catbus and energy are Linux-only,
-  being /proc plus AF_UNIX and /sys powercap respectively), then
-  packages them with cargo-wix in no-build mode so this MSI ships just
-  the two cross-platform binaries.
+  pre-builds tab-atelier-headless (headless feature only; catbus and
+  energy are Linux-only, being /proc plus AF_UNIX and /sys powercap
+  respectively) then packages it with cargo-wix in no-build mode so
+  this MSI ships just the one cross-platform binary.
 
   This v1 installs the binaries to Program Files and puts the folder on
   the system PATH. Running the daemon as a Windows Service (the analogue
@@ -71,7 +70,7 @@
               Id="HeadlessServiceInstall"
               Name="tab-atelier-headless"
               DisplayName="tab-atelier headless tab daemon"
-              Description="Restores tabs and serves the local HTTP/TLS API plus happier-bridge."
+              Description="Restores tabs and serves the local HTTP/TLS API."
               Type="ownProcess"
               Start="auto"
               ErrorControl="normal"
@@ -85,17 +84,10 @@
               Remove="uninstall"
               Wait="yes" />
           </Component>
-          <Component Id="RelayExe" Guid="*">
-            <File
-              Id="HappierRelayExe"
-              Name="happier-relay.exe"
-              Source="$(var.CargoTargetBinDir)\happier-relay.exe"
-              KeyPath="yes" />
-          </Component>
-          <!-- Put the install dir on the system PATH so both binaries
-               are runnable from any terminal. Needs an explicit GUID:
-               it has no File keypath (Environment + CreateFolder only),
-               so WiX cannot auto-generate one. -->
+          <!-- Put the install dir on the system PATH so the binary
+               is runnable from any terminal. Needs an explicit GUID:
+               this component has no File keypath (Environment +
+               CreateFolder only), so WiX cannot auto-generate one. -->
           <Component Id="PathEntry" Guid="eccf247c-a6cd-4fbb-9c34-6dc02c56863f">
             <CreateFolder />
             <Environment
@@ -141,7 +133,6 @@
 
     <Feature Id="MainFeature" Title="tab-atelier-headless" Level="1">
       <ComponentRef Id="HeadlessExe" />
-      <ComponentRef Id="RelayExe" />
       <ComponentRef Id="PathEntry" />
       <ComponentRef Id="StartMenuShortcut" />
     </Feature>
