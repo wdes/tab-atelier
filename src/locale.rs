@@ -100,7 +100,6 @@ pub struct Strings {
     pub code_editor_placeholder: &'static str,
     pub api_addr: &'static str,
     pub api_tls_addr: &'static str,
-    pub happier_relay_addr: &'static str,
     pub share_url_base: &'static str,
     pub save: &'static str,
 
@@ -189,7 +188,6 @@ pub static EN: Strings = Strings {
     code_editor_placeholder: "xdg-open (system default)",
     api_addr: "Remote API bind (addr:port, restart required)",
     api_tls_addr: "Remote API TLS bind (addr:port, restart required)",
-    happier_relay_addr: "Happier relay bind (addr:port, restart required)",
     share_url_base: "Share URL base (public URL of a reverse proxy, optional)",
     save: "Save",
 
@@ -277,7 +275,6 @@ pub static FR: Strings = Strings {
     code_editor_placeholder: "xdg-open (par défaut)",
     api_addr: "API distante (adresse:port, redémarrage requis)",
     api_tls_addr: "API distante TLS (adresse:port, redémarrage requis)",
-    happier_relay_addr: "Relais happier (adresse:port, redémarrage requis)",
     share_url_base: "URL de base pour le partage (URL publique d'un proxy inverse, optionnel)",
     save: "Enregistrer",
 

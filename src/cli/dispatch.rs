@@ -142,9 +142,6 @@ pub enum Commands {
         /// `addr:port` for the TLS API listener.
         #[arg(long)]
         api_tls_addr: Option<String>,
-        /// `addr:port` for the bundled happier-relay.
-        #[arg(long)]
-        happier_relay_addr: Option<String>,
         /// Public base URL for share links (empty string clears).
         #[arg(long)]
         share_url_base: Option<String>,
@@ -246,7 +243,6 @@ pub fn dispatch(cli: Cli) -> bool {
         Commands::Settings {
             api_addr,
             api_tls_addr,
-            happier_relay_addr,
             share_url_base,
             pty_cols,
             pty_rows,
@@ -259,10 +255,6 @@ pub fn dispatch(cli: Cli) -> bool {
             }
             if let Some(v) = api_tls_addr {
                 args.push("--api-tls-addr".into());
-                args.push(v);
-            }
-            if let Some(v) = happier_relay_addr {
-                args.push("--happier-relay-addr".into());
                 args.push(v);
             }
             if let Some(v) = share_url_base {

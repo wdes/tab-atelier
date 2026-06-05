@@ -48,7 +48,7 @@ jobs:
                   RUSTFLAGS: "-Cinstrument-coverage"
                   RUSTDOCFLAGS: "-Cinstrument-coverage"
             - name: Build headless
-              run: cargo build --locked --no-default-features --features headless,happier-bridge,energy
+              run: cargo build --locked --no-default-features --features headless,energy
             - name: Run tests
               run: cargo test --locked --all-targets --no-fail-fast
               env:
@@ -62,7 +62,7 @@ jobs:
             - name: Clippy (GUI)
               run: cargo clippy --all-targets --locked -- -D warnings
             - name: Clippy (headless)
-              run: cargo clippy --no-default-features --features headless,happier-bridge,energy --all-targets --locked -- -D warnings
+              run: cargo clippy --no-default-features --features headless,energy --all-targets --locked -- -D warnings
             - name: Install grcov
               run: |
                   mkdir -p "${HOME}/.local/bin"

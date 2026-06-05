@@ -5,8 +5,6 @@
 #![cfg(feature = "gui")]
 
 use crate::api;
-#[cfg(feature = "happier-bridge")]
-use crate::happier_relay_url_from_args;
 use crate::locale::{self, Lang, Strings};
 use crate::platform;
 #[cfg(feature = "energy")]
@@ -36,8 +34,6 @@ use gpui::{
     Point, Render, Rgba, SharedString, Stateful, StatefulInteractiveElement, Styled, WeakEntity, Window,
     WindowBackgroundAppearance, WindowHandle, WindowOptions, div, px, rgba,
 };
-#[cfg(feature = "happier-bridge")]
-use log::warn;
 use log::{debug, info};
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -232,7 +228,6 @@ struct AppState {
     /// since the `TcpListener`s are bound in spawned threads.
     api_addr: String,
     api_tls_addr: String,
-    happier_relay_addr: String,
     /// Public base URL for share links (e.g.
     /// `https://example.com/~user/tab-atelier`). Read at "Copy share
     /// link" menu time. Empty → use the LAN URL.
@@ -271,20 +266,12 @@ struct AppState {
     pref_api_addr_focus: FocusHandle,
     pref_api_tls_addr_text: String,
     pref_api_tls_addr_focus: FocusHandle,
-    pref_happier_relay_addr_text: String,
-    pref_happier_relay_addr_focus: FocusHandle,
     pref_share_url_base_text: String,
     pref_share_url_base_focus: FocusHandle,
     /// Saved remote `tab-atelier-headless` endpoints. Loaded from
     /// `preferences.json` at startup, edited via the "Remote endpoints"
     /// section of the Preferences modal, and persisted back on Save.
     remote_endpoints: Vec<crate::RemoteEndpoint>,
-    /// Owns the spawned happier-relay child. Dropping this struct
-    /// SIGTERMs the relay; storing it here ties the relay's lifetime
-    /// to the running app.
-    #[cfg(feature = "happier-bridge")]
-    #[allow(dead_code)]
-    relay_handle: Option<crate::happier_bridge::RelayHandle>,
     hotkey_handle: Option<platform::HotkeyHandle>,
     /// When the per-tab uptime files were last written. Persisting uptime
     /// every 2s would burn through disk writes for a value that only
@@ -311,7 +298,6 @@ impl AppState {
         let pref_editor_focus = cx.focus_handle();
         let pref_api_addr_focus = cx.focus_handle();
         let pref_api_tls_addr_focus = cx.focus_handle();
-        let pref_happier_relay_addr_focus = cx.focus_handle();
         let pref_share_url_base_focus = cx.focus_handle();
         let font_config = load_font_config(&platform::config_dir());
         let prefs = load_preferences(&platform::config_dir());
@@ -574,9 +560,6 @@ impl AppState {
         // exported into each PTY's env; reuse them here.
         let api_addr = api_addr_resolved;
         let api_tls_addr = prefs.api_tls_addr.unwrap_or_else(|| crate::DEFAULT_API_TLS_ADDR.into());
-        let happier_relay_addr = prefs
-            .happier_relay_addr
-            .unwrap_or_else(|| crate::DEFAULT_HAPPIER_RELAY_ADDR.into());
         let share_url_base = prefs.share_url_base.unwrap_or_default();
         let tab_bg_global = prefs.tab_bg_color;
         let remote_endpoints = prefs.remote_endpoints;
@@ -608,41 +591,6 @@ impl AppState {
             api_tls_addr.clone(),
         );
 
-        // Auto-spawn the bundled happier-relay so mobile + web clients
-        // always have something to connect to. Best-effort: if the
-        // binary isn't on PATH (someone running a custom build) or it
-        // fails to bind, log and continue — the GUI still works.
-        #[cfg(feature = "happier-bridge")]
-        let relay_handle: Option<crate::happier_bridge::RelayHandle> =
-            match crate::happier_bridge::spawn_relay(&happier_relay_addr) {
-                Ok(handle) => {
-                    info!(
-                        "happier-relay spawned at https://{happier_relay_addr} (pid {})",
-                        handle.pid()
-                    );
-                    Some(handle)
-                }
-                Err(e) => {
-                    warn!("happier-relay not spawned: {e}");
-                    None
-                }
-            };
-
-        // Opt-in publish bridge: when the user passes `--happier-relay-url <url>`,
-        // spawn a background thread that publishes each tab as a happier
-        // artifact against the configured relay. Off by default; the
-        // module isn't even compiled unless built with `--features happier-bridge`.
-        #[cfg(feature = "happier-bridge")]
-        if let Some(url) = happier_relay_url_from_args() {
-            crate::happier_bridge::spawn(url, api_state.clone());
-        } else {
-            // Default to the auto-spawned relay so the bridge has a
-            // place to publish to without the user needing the CLI
-            // flag. The relay serves TLS (cert reused from
-            // start_api_server_tls), so the bridge needs `https://`.
-            crate::happier_bridge::spawn(format!("https://{happier_relay_addr}"), api_state.clone());
-        }
-
         #[cfg(feature = "energy")]
         let power_pids: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
         #[cfg(feature = "energy")]
@@ -669,7 +617,6 @@ impl AppState {
             api_token,
             api_addr,
             api_tls_addr,
-            happier_relay_addr,
             share_url_base,
             tab_bg_global,
             api_state,
@@ -699,13 +646,9 @@ impl AppState {
             pref_api_addr_focus,
             pref_api_tls_addr_text: String::new(),
             pref_api_tls_addr_focus,
-            pref_happier_relay_addr_text: String::new(),
-            pref_happier_relay_addr_focus,
             pref_share_url_base_text: String::new(),
             pref_share_url_base_focus,
             remote_endpoints,
-            #[cfg(feature = "happier-bridge")]
-            relay_handle,
             hotkey_handle: None,
             last_uptime_save: std::cell::Cell::new(None),
             last_state_hash: std::cell::Cell::new(0),
@@ -2293,7 +2236,6 @@ impl AppState {
                             this.pref_editor_text = this.code_editor.borrow().clone().unwrap_or_default();
                             this.pref_api_addr_text = this.api_addr.clone();
                             this.pref_api_tls_addr_text = this.api_tls_addr.clone();
-                            this.pref_happier_relay_addr_text = this.happier_relay_addr.clone();
                             this.pref_share_url_base_text = this.share_url_base.clone();
                             this.show_preferences = true;
                             this.context_menu = None;
@@ -3106,60 +3048,6 @@ impl AppState {
                     .child(div().w(px(1.0)).h(px(16.0)).bg(cursor_color))
             });
 
-        let happier_relay_addr_text = self.pref_happier_relay_addr_text.clone();
-        let happier_relay_addr_input = div()
-            .id("pref-happier-relay-addr-input")
-            .key_context("pref-happier-relay-addr")
-            .track_focus(&self.pref_happier_relay_addr_focus)
-            .mt(px(8.0))
-            .w_full()
-            .flex()
-            .flex_row()
-            .items_center()
-            .bg(th.bg_hsla())
-            .border_1()
-            .border_color(input_border)
-            .rounded(px(3.0))
-            .px(px(8.0))
-            .py(px(4.0))
-            .min_h(px(28.0))
-            .cursor_text()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _ev: &MouseDownEvent, window, cx| {
-                    this.pref_happier_relay_addr_focus.focus(window);
-                    cx.notify();
-                }),
-            )
-            .on_key_down(
-                cx.listener(|this, ev: &KeyDownEvent, _window, cx| match ev.keystroke.key.as_str() {
-                    "backspace" => {
-                        this.pref_happier_relay_addr_text.pop();
-                        cx.notify();
-                    }
-                    _ => {
-                        if let Some(ref ch) = ev.keystroke.key_char
-                            && ch.chars().all(is_addr_port_char)
-                            && this.pref_happier_relay_addr_text.len() + ch.len() <= MAX_ADDR_LEN
-                        {
-                            this.pref_happier_relay_addr_text.push_str(ch);
-                            cx.notify();
-                        }
-                    }
-                }),
-            )
-            .when(happier_relay_addr_text.is_empty(), |el| {
-                el.child(
-                    div()
-                        .text_color(placeholder_fg)
-                        .child(crate::DEFAULT_HAPPIER_RELAY_ADDR),
-                )
-            })
-            .when(!happier_relay_addr_text.is_empty(), |el| {
-                el.child(happier_relay_addr_text)
-                    .child(div().w(px(1.0)).h(px(16.0)).bg(cursor_color))
-            });
-
         // Free-form URL field — share-link base for reverse-proxied
         // setups (Caddy at https://example.com/~user/path). Permissive
         // char filter (letters, digits, URL-safe punctuation) and a
@@ -3298,12 +3186,6 @@ impl AppState {
                         .child(div().mt(px(16.0)).child(t.code_editor).child(editor_input))
                         .child(div().mt(px(16.0)).child(t.api_addr).child(api_addr_input))
                         .child(div().mt(px(16.0)).child(t.api_tls_addr).child(api_tls_addr_input))
-                        .child(
-                            div()
-                                .mt(px(16.0))
-                                .child(t.happier_relay_addr)
-                                .child(happier_relay_addr_input),
-                        )
                         .child(div().mt(px(16.0)).child(t.share_url_base).child(share_url_base_input))
                         .child(
                             div()
@@ -3382,14 +3264,6 @@ impl AppState {
                                                 if parsed_tls.is_some() {
                                                     this.api_tls_addr.clone_from(&this.pref_api_tls_addr_text);
                                                 }
-                                                let parsed_relay = this
-                                                    .pref_happier_relay_addr_text
-                                                    .parse::<std::net::SocketAddr>()
-                                                    .ok();
-                                                if parsed_relay.is_some() {
-                                                    this.happier_relay_addr
-                                                        .clone_from(&this.pref_happier_relay_addr_text);
-                                                }
                                                 // share_url_base is a free-form URL; accept whatever
                                                 // the user typed (trimmed), empty means "use LAN URL".
                                                 this.share_url_base = this.pref_share_url_base_text.trim().to_string();
@@ -3409,7 +3283,6 @@ impl AppState {
                                                         code_editor: editor,
                                                         api_addr: Some(this.api_addr.clone()),
                                                         api_tls_addr: Some(this.api_tls_addr.clone()),
-                                                        happier_relay_addr: Some(this.happier_relay_addr.clone()),
                                                         share_url_base,
                                                         remote_endpoints: this.remote_endpoints.clone(),
                                                         // Headless-only fields the GUI never edits;
@@ -3760,8 +3633,8 @@ impl Render for AppState {
 }
 
 // Shared with the headless binary — see `crate::tab_env_extras`,
-// `crate::api_url_for_local_clients`, `crate::build_agent_resume_command`,
-// and `crate::happier_relay_url_from_args` in lib.rs.
+// `crate::api_url_for_local_clients`, and
+// `crate::build_agent_resume_command` in lib.rs.
 
 /// Pull the port out of an `addr:port` bind string. Falls back to
 /// `fallback` when the string is malformed (covers IPv4, IPv6 like

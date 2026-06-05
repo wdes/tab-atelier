@@ -146,7 +146,7 @@ jobs:
                       echo '<style>body{font-family:system-ui;max-width:42em;margin:3em auto;padding:0 1em}'
                       echo 'code{background:#f4f4f4;padding:.1em .3em;border-radius:3px}</style>'
                       echo '<h1>tab-atelier Windows builds</h1>'
-                      echo '<p>Headless daemon MSI installers (<code>tab-atelier-headless</code> + <code>happier-relay</code>), newest first. Each filename carries the commit short SHA.</p>'
+                      echo '<p>Headless daemon MSI installers (<code>tab-atelier-headless</code>), newest first. Each filename carries the commit short SHA.</p>'
                       echo '<ul>'
                       for f in $(ls -1t windows/*.msi 2>/dev/null); do
                           bn=$(basename "$f")

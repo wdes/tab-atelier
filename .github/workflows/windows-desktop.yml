@@ -10,8 +10,7 @@ name: windows-desktop
 #
 # energy is off (power.rs reads /sys, Linux-only); catbus is off (the
 # default feature on Linux only — Cargo.toml puts it in `default`, not
-# `gui`). happier-bridge is also off for this first cut — easy to add
-# once the GUI MSI itself is verified working end-to-end.
+# `gui`).
 
 on:
   workflow_dispatch:

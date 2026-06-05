@@ -1,6 +1,5 @@
 {
     "_comment": "System-wide defaults for tab-atelier. Read by both the desktop and headless variants as a fallback when no per-user preferences.json exists at $HOME/.local/tab-atelier/preferences.json (the GUI Preferences dialog writes there). Per-user settings always win. Edit this file and restart (systemctl restart tab-atelier-headless, or relog for the GUI) to apply. Unknown keys are ignored.",
     "api_addr": "0.0.0.0:7890",
-    "api_tls_addr": "0.0.0.0:7891",
-    "happier_relay_addr": "127.0.0.1:7892"
+    "api_tls_addr": "0.0.0.0:7891"
 }

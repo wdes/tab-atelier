@@ -51,7 +51,6 @@ A Guake-style drop-down terminal emulator for Linux (X11), built with Rust using
 - `tab-atelier tabs` — ratatui live-table viewer of every running tab (mirror of the desktop's bottom bar; works from any SSH shell). `tab-atelier tabs --once` for scriptable output
 - `tab-atelier remote …` — mirror tabs from another instance, attach a sidecar terminal, transfer files (sandboxed). See [Remote tabs](#remote-tabs)
 - **Headless variant** ships as a separate `tab-atelier-headless.deb` (no gpui / x11rb / qrcode deps, 7.9 MB vs 12 MB) for servers — same HTTP API, no display required
-- Optional `happier-bridge` (off by default) republishes tab state into a bundled `happier-relay` so the [happier](https://github.com/maximegris/happier) mobile companion can view sessions, send keystrokes, and see per-tab agent state
 - Wakatime time tracking (reads API key from Zed settings)
 - Screenshots (per-tab or full app) saved as BMP
 
@@ -72,7 +71,7 @@ sudo apt install tab-atelier-headless   # display-less server variant
 
 Replace `stable` with `nightly` to track `main` (versions look like `0.4.0~nightly20260527.123000-1` — the `~` makes them sort strictly **before** the next stable release per [Debian Versioning](https://wiki.debian.org/Versioning), so apt auto-downgrades-then-upgrades on the next stable bump).
 
-The two packages **conflict by design** (they both ship `/usr/bin/catbus-agent` + `happier-relay`). `apt install tab-atelier-headless` after `tab-atelier` swaps cleanly; `dpkg -i …` on both at once is what produced the file-collision error you saw on early `.deb` builds.
+The two packages **conflict by design** (they both ship `/usr/bin/catbus-agent`). `apt install tab-atelier-headless` after `tab-atelier` swaps cleanly; `dpkg -i …` on both at once is what produced the file-collision error you saw on early `.deb` builds.
 
 ### Setting up the apt repo (maintainer)
 
@@ -375,14 +374,6 @@ When a tab carries both `agent_kind` and `agent_session_id` in `tabs.json`, the 
 | anything else | no-op |
 
 If the agent CLI is no longer on `PATH`, the shell prints `command not found` and the tab is otherwise unaffected.
-
-## Mobile companion (happier-bridge)
-
-The `happier-bridge` feature (off by default — enabled in the bundled `.deb`) republishes each tab as an artifact in a local **happier-relay** instance, so the [happier](https://github.com/maximegris/happier) mobile/web client can browse sessions, view scrollback, type into the PTY, and see per-tab agent state. The relay binds on port 7892 with TLS, sharing the same self-signed cert as the API TLS listener.
-
-```sh
-cargo build --release --features happier-bridge
-```
 
 ## Wakatime
 

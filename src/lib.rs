@@ -14,8 +14,6 @@ pub mod app;
 #[cfg(feature = "catbus")]
 pub(crate) mod catbus_agent;
 pub mod cli;
-#[cfg(feature = "happier-bridge")]
-pub(crate) mod happier_bridge;
 #[cfg(not(feature = "gui"))]
 pub mod headless;
 pub(crate) mod locale;
@@ -106,36 +104,11 @@ pub fn build_agent_resume_command(kind: &str, session_id: &str, plan: Option<boo
     }
 }
 
-/// Read the optional `--happier-relay-url <url>` (or `=`) flag.
-///
-/// No clap dep — returns `None` if the flag isn't present, the
-/// value is empty, or the feature is disabled (in which case this
-/// fn isn't even compiled).
-#[cfg(feature = "happier-bridge")]
-#[must_use]
-pub fn happier_relay_url_from_args() -> Option<String> {
-    let mut args = std::env::args().skip(1);
-    while let Some(a) = args.next() {
-        if let Some(rest) = a.strip_prefix("--happier-relay-url=")
-            && !rest.is_empty()
-        {
-            return Some(rest.to_string());
-        }
-        if a == "--happier-relay-url"
-            && let Some(v) = args.next()
-            && !v.is_empty()
-        {
-            return Some(v);
-        }
-    }
-    None
-}
-
 /// Pin the rustls `CryptoProvider` to `ring` at process start.
 ///
 /// Workspace feature unification compiles `rustls` with both `ring`
-/// and `aws_lc_rs` enabled (axum-server / reqwest pull the latter in
-/// via happier-relay + catbus-agent). Without an explicit install,
+/// and `aws_lc_rs` enabled (catbus-agent pulls the latter in via
+/// reqwest). Without an explicit install,
 /// `ServerConfig::builder()` panics: "Could not automatically
 /// determine the process-level `CryptoProvider`". Calling
 /// `install_default()` here makes TLS startup deterministic.
@@ -302,7 +275,7 @@ impl Default for TabState {
 
 /// Discrete agent runtime states a tool inside a tab can publish via
 /// `POST /tabs/by-id/{id}/status`. Drives the desktop LED colour and
-/// the happier mobile session badge.
+/// the share-link viewer's tab-title badge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentState {
@@ -723,13 +696,6 @@ pub struct Preferences {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub share_url_base: Option<String>,
 
-    /// `addr:port` of the embedded happier-relay (when enabled).
-    /// Defaults to `127.0.0.1:7892` — kept adjacent to the HTTP /
-    /// TLS API ports (7890 / 7891). Loopback by default because the
-    /// relay isn't hardened against LAN attackers.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub happier_relay_addr: Option<String>,
-
     /// Saved remote `tab-atelier-headless` endpoints the GUI can
     /// mirror tabs from. Each entry carries its own bearer token +
     /// TOFU-pinned cert fingerprint. The list is allowed to be empty
@@ -770,7 +736,6 @@ pub struct RemoteEndpoint {
 pub const DEFAULT_API_PORT: u16 = 7890;
 pub const DEFAULT_API_ADDR: &str = "0.0.0.0:7890";
 pub const DEFAULT_API_TLS_ADDR: &str = "0.0.0.0:7891";
-pub const DEFAULT_HAPPIER_RELAY_ADDR: &str = "127.0.0.1:7892";
 
 /// System-wide preferences file shipped by the .deb as a dpkg conffile.
 ///

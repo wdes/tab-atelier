@@ -4,15 +4,14 @@
 
 //! PTY scrollback → ANSI-encoded text serialization.
 //!
-//! The HTTP API (`GET /tabs/{idx}/output`) and the happier-bridge
-//! publisher both want a recent slice of the alacritty grid rendered
-//! out as a normal terminal byte stream — SGR-escaped colours and
-//! attributes intact — so a downstream client can pipe it straight
-//! into another terminal and see what the user sees. Both the GUI's
-//! `TerminalView` and the headless `HeadlessTab` keep an
-//! `Arc<FairMutex<Term<E>>>` and produce these strings the same way;
-//! this module hosts that one implementation, generic over the
-//! `EventListener` `E` so the two callers don't drift.
+//! The HTTP API (`GET /tabs/{idx}/output`) wants a recent slice of
+//! the alacritty grid rendered out as a normal terminal byte stream —
+//! SGR-escaped colours and attributes intact — so a downstream client
+//! can pipe it straight into another terminal and see what the user
+//! sees. Both the GUI's `TerminalView` and the headless `HeadlessTab`
+//! keep an `Arc<FairMutex<Term<E>>>` and produce these strings the
+//! same way; this module hosts that one implementation, generic over
+//! the `EventListener` `E` so the two callers don't drift.
 
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::Dimensions;
@@ -333,8 +332,7 @@ pub fn term_to_ansi_rows<E: EventListener>(
 
 /// `term_to_ansi_lines` then trim leading / trailing empty rows and
 /// re-anchor the cursor, finally joining with `\n`. Matches the
-/// shape the API (`GET /tabs/{idx}/output`) and the happier-bridge
-/// publisher expect.
+/// shape the API (`GET /tabs/{idx}/output`) expects.
 pub fn term_to_ansi_text_with_cursor<E: EventListener>(
     term: &FairMutex<Term<E>>,
     max_lines: Option<usize>,

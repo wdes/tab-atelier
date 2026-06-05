@@ -61,7 +61,7 @@ pub fn config_base_dir() -> PathBuf {
     roaming_app_data()
 }
 
-/// Where persistent identity material (happier-bridge key, relay secret)
+/// Where persistent identity material (auth tokens, TLS cert + key)
 /// is written. On Linux this is the bare `~/.config`; on Windows we
 /// namespace under the app folder so we don't litter `%APPDATA%` root.
 pub fn config_dir() -> PathBuf {

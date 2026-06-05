@@ -184,12 +184,15 @@ pub struct SnapshotTab {
     pub shell_pid: u32,
     /// Transient agent state, mirrored from the in-RAM Tab. Surfaced
     /// in the `/tabs` response (so the CLI viewer can render the LED
-    /// without a per-tab probe) and in the happier-bridge artifact
-    /// header.
+    /// without a per-tab probe) and as the `X-Agent-State` header
+    /// on `/stream` for the share-link viewer's title badge.
     pub agent_state: Option<crate::AgentStateSnapshot>,
     /// Durable agent session UUID, mirrored from the in-RAM Tab.
-    /// Only read by the happier-bridge publisher today.
-    #[cfg_attr(not(feature = "happier-bridge"), allow(dead_code))]
+    /// Populated by `set-status --session …`; today no API consumer
+    /// reads it, but the field is persisted into tabs.json so
+    /// auto-resume after a daemon restart can reconstruct the
+    /// agent's session.
+    #[allow(dead_code)]
     pub agent_session_id: Option<String>,
     /// Durable agent CLI kind (`catbus` / `claude` / …). Same
     /// "session attached" semantic the desktop LED uses to render a
