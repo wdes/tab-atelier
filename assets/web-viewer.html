@@ -137,10 +137,14 @@
     // __TAB_NAME_JS__ is JSON-encoded server-side (handles quotes,
     // backslashes, newlines), so wrapping it in quotes here is safe.
     const TAB_NAME = "__TAB_NAME_JS__";
-    // Daemon-start identity. Compared to every `/stream` response's
-    // X-Boot-Id; mismatch means the daemon restarted (likely with a
-    // new binary) and this page is running stale JS.
-    const BOOT_ID = "__BOOT_ID__";
+    // Short git commit hash of the binary that served this HTML.
+    // Compared to every /stream response's X-Build-Hash; a mismatch
+    // means the binary was upgraded since this page loaded (i.e. a
+    // new deb was installed) and this page is running stale JS.
+    // Literal value "unknown" appears for builds outside a git repo
+    // (source tarball etc.); the comparison short-circuits for that
+    // case so we don't false-positive into the chip.
+    const BUILD_HASH = "__BUILD_HASH__";
     const PARAMS = new URLSearchParams(location.search);
     const TOKEN = PARAMS.get("token") || "";
     const READ_ONLY = PARAMS.get("ro") === "1";
@@ -400,13 +404,18 @@
           document.body.style.background = bgNow;
           term.options.theme = { ...term.options.theme, background: bgNow };
         }
-        // Stale-viewer detection. X-Boot-Id changes on every daemon
-        // start; if it stops matching the value baked into this
-        // page, the user is running yesterday's JS. Show the chip,
-        // don't force a reload (mid-share interruption would be
-        // worse than a stale UI).
-        const serverBoot = r.headers.get("X-Boot-Id") || "";
-        if (BOOT_ID && serverBoot && serverBoot !== BOOT_ID) {
+        // Stale-viewer detection. X-Build-Hash carries the binary's
+        // compile-time git hash; mismatch means the binary was
+        // upgraded since this page loaded. Plain daemon restarts
+        // (same binary, same hash) are a silent no-op. Skip when
+        // either side is empty or literally "unknown" — that's the
+        // non-git-repo fallback and we don't want false positives.
+        const serverHash = r.headers.get("X-Build-Hash") || "";
+        if (
+          BUILD_HASH && BUILD_HASH !== "unknown" &&
+          serverHash && serverHash !== "unknown" &&
+          serverHash !== BUILD_HASH
+        ) {
           document.body.classList.add("update-available");
         }
         // Outbox count — surfaces the ⬇ button when there's anything
