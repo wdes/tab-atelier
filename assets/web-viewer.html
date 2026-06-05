@@ -3,6 +3,12 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- Share links must not be indexed: leaked URL → indexed URL ==
+       leaked terminal. The HTTP `X-Robots-Tag` header (set server
+       side on every route) is the load-bearing guard; this meta tag
+       is the belt to that suspenders so a saved-page or proxy that
+       strips headers still tells crawlers to back off. -->
+  <meta name="robots" content="noindex, nofollow, noarchive">
   <title>__TAB_NAME_HTML__ · tab-atelier</title>
   <link rel="stylesheet" href="https://unpkg.com/xterm@5.3.0/css/xterm.css">
   <style>
@@ -29,6 +35,8 @@
     body.locked #locked-banner { display: block; }
     body.locked { padding-top: 32px; box-sizing: border-box; }
     body.locked #term { outline: 1px solid #cc1f1a; }
+    /* Hide the inbox button when the viewer was loaded with a
+       read-only share token. Selector wired up by JS on boot. */
     /* Update-available chip. Surfaces when the server's X-Boot-Id
        no longer matches the value baked into this page (typically
        after a `apt upgrade tab-atelier-headless` on the host).
@@ -60,47 +68,83 @@
     }
     body.drag-over #drop-overlay { display: flex; }
     #drop-overlay .inner { padding: 24px 36px; border: 2px dashed #ffd764; border-radius: 16px; }
-    /* Outbox panel — slides in from the right when the
-       ⬇ outbox button is clicked. */
-    #outbox-btn {
-      position: fixed; bottom: 4px; left: 8px; font-size: 11px;
+    /* Files panel — slides in from the right when ⬇ outbox or
+       ⬆ inbox is clicked. The two panels reuse the same DOM
+       container; the JS swaps the content (#files-list + the
+       directory-path header) when the user toggles. */
+    .files-btn {
+      position: fixed; bottom: 4px; font-size: 11px;
       padding: 3px 8px; border-radius: 10px;
-      background: rgba(120, 200, 255, 0.15); color: #aad8ff;
-      border: 1px solid rgba(120, 200, 255, 0.3);
       cursor: pointer; pointer-events: auto; z-index: 11;
       font-family: ui-monospace, monospace;
-      display: none;
+      display: inline-block;
     }
-    body.has-outbox #outbox-btn { display: inline-block; }
-    body.update-available #outbox-btn { bottom: 28px; }
+    /* Outbox = blue, inbox = green. Two-color cue is faster than
+       reading the label at a glance. */
+    #outbox-btn {
+      left: 8px;
+      background: rgba(120, 200, 255, 0.15); color: #aad8ff;
+      border: 1px solid rgba(120, 200, 255, 0.3);
+    }
     #outbox-btn:hover { background: rgba(120, 200, 255, 0.28); }
-    #outbox-btn .badge {
+    #inbox-btn {
+      left: 96px;
+      background: rgba(140, 220, 140, 0.15); color: #b6e6b6;
+      border: 1px solid rgba(140, 220, 140, 0.3);
+    }
+    #inbox-btn:hover { background: rgba(140, 220, 140, 0.28); }
+    body.read-only #inbox-btn { display: none; }
+    body.update-available .files-btn { bottom: 28px; }
+    .files-btn .badge {
       display: inline-block; min-width: 14px; padding: 0 4px;
       margin-left: 4px; border-radius: 8px;
-      background: #ffd764; color: #002451; font-weight: bold; font-size: 10px;
+      background: rgba(255, 255, 255, 0.18); color: #fff;
+      font-weight: bold; font-size: 10px;
     }
-    #outbox-panel {
+    .files-btn.has-files .badge {
+      background: #ffd764; color: #002451;
+    }
+    #files-panel {
       display: none;
-      position: fixed; top: 8px; right: 8px; bottom: 8px; width: 320px;
-      background: rgba(0, 0, 0, 0.78); color: #ddd; z-index: 13;
+      position: fixed; top: 8px; right: 8px; bottom: 8px; width: 360px;
+      background: rgba(0, 0, 0, 0.82); color: #ddd; z-index: 13;
       border: 1px solid #444; border-radius: 8px; padding: 12px;
       font-family: ui-monospace, monospace; font-size: 12px;
       overflow-y: auto; box-shadow: -4px 0 12px rgba(0, 0, 0, 0.5);
     }
-    body.outbox-open #outbox-panel { display: block; }
-    #outbox-panel h3 { margin: 0 0 8px; font-size: 13px; color: #aad8ff; }
-    #outbox-panel a {
+    body.files-open #files-panel { display: block; }
+    #files-panel h3 { margin: 0 0 4px; font-size: 13px; color: #aad8ff; }
+    #files-panel .dir {
+      color: #888; font-size: 10px; word-break: break-all; margin-bottom: 10px;
+      cursor: pointer;
+    }
+    #files-panel .dir:hover { color: #fff; }
+    #files-panel a {
       display: block; color: #fff; text-decoration: none;
       padding: 6px 8px; border-radius: 4px; margin: 2px -8px;
       word-break: break-all;
     }
-    #outbox-panel a:hover { background: rgba(255, 255, 255, 0.08); }
-    #outbox-panel .meta { color: #888; font-size: 10px; }
-    #outbox-panel .close {
+    #files-panel a:hover { background: rgba(255, 255, 255, 0.08); }
+    #files-panel .row {
+      display: flex; gap: 4px; align-items: baseline; flex-wrap: wrap;
+    }
+    #files-panel .copy-relpath {
+      flex: 1; color: #fff; cursor: copy;
+      padding: 6px 8px; border-radius: 4px; margin: 2px -8px;
+      word-break: break-all;
+    }
+    #files-panel .copy-relpath:hover { background: rgba(255, 255, 255, 0.08); }
+    #files-panel .meta { color: #888; font-size: 10px; }
+    #files-panel .close {
       float: right; cursor: pointer; color: #888;
       font-size: 18px; line-height: 14px; padding: 0 4px;
     }
-    #outbox-panel .close:hover { color: #fff; }
+    #files-panel .close:hover { color: #fff; }
+    #files-panel .empty { color: #888; font-style: italic; }
+    #files-panel .hint {
+      color: #888; font-size: 10px; margin-top: 12px;
+      padding-top: 12px; border-top: 1px solid #333;
+    }
     /* Toast for transient notifications (upload progress, new file
        in outbox, errors). Sits centred at the top, auto-hides after
        4 seconds via setTimeout in JS. */
@@ -120,12 +164,15 @@
   <div id="term"></div>
   <div id="status">connecting…</div>
   <div id="update-chip" title="The server was upgraded — click to reload this viewer">↻ update available</div>
-  <button id="outbox-btn" title="Show files available for download from outbox/">⬇ outbox<span class="badge" id="outbox-badge">0</span></button>
+  <button id="outbox-btn" class="files-btn" title="Files agent has placed in outbox/ for download">⬇ outbox<span class="badge" id="outbox-badge">0</span></button>
+  <button id="inbox-btn" class="files-btn" title="Files you've uploaded to inbox/ — drag the path into Claude">⬆ inbox<span class="badge" id="inbox-badge">0</span></button>
   <div id="drop-overlay"><div class="inner">drop file to upload to <code>inbox/</code></div></div>
-  <div id="outbox-panel">
-    <span class="close" id="outbox-close" title="Close">×</span>
-    <h3>outbox/</h3>
-    <div id="outbox-list">loading…</div>
+  <div id="files-panel">
+    <span class="close" id="files-close" title="Close">×</span>
+    <h3 id="files-title">outbox/</h3>
+    <div class="dir" id="files-dir" title="Click to copy the absolute path"></div>
+    <div id="files-list">loading…</div>
+    <div class="hint" id="files-hint"></div>
   </div>
   <div id="toast"></div>
   <script src="https://unpkg.com/xterm@5.3.0/lib/xterm.js"></script>
@@ -253,7 +300,17 @@
         });
         xhr.addEventListener("load", () => {
           if (xhr.status === 201 || xhr.status === 200) {
-            toast(`uploaded ${file.name} → inbox/`);
+            // Parse the server's response for the relative path
+            // ("inbox/<name>") and offer it as a click-to-copy
+            // toast so the user can paste straight into Claude.
+            let rel = `inbox/${file.name}`;
+            try {
+              const j = JSON.parse(xhr.responseText);
+              if (j.relpath) rel = j.relpath;
+            } catch {}
+            toast(`uploaded → ${rel} · click to copy`, 6000);
+            const onClick = () => { copyText(rel, "copied: " + rel); toastEl.removeEventListener("click", onClick); };
+            toastEl.addEventListener("click", onClick, { once: true });
             resolve(true);
           } else {
             toast(`upload failed (${xhr.status}): ${xhr.responseText.slice(0, 120)}`);
@@ -302,21 +359,53 @@
         refreshOutbox();
       });
     }
-    // Outbox panel — list outbox/ contents, render download links.
+    // Files panel — single slide-in container, two buttons. The
+    // "kind" state is whichever of outbox/inbox is currently open.
     let lastOutboxCount = 0;
-    let bootstrappedOutbox = false;
+    let lastInboxCount = 0;
+    let bootstrappedFiles = false;
+    let panelKind = null; // "outbox" or "inbox" while the panel is open
+    let cachedDir = { outbox: "", inbox: "" };
+    if (READ_ONLY) document.body.classList.add("read-only");
     const outboxBtn = document.getElementById("outbox-btn");
+    const inboxBtn = document.getElementById("inbox-btn");
     const outboxBadge = document.getElementById("outbox-badge");
-    const outboxPanel = document.getElementById("outbox-panel");
-    const outboxList = document.getElementById("outbox-list");
+    const inboxBadge = document.getElementById("inbox-badge");
+    const filesTitle = document.getElementById("files-title");
+    const filesDir = document.getElementById("files-dir");
+    const filesList = document.getElementById("files-list");
+    const filesHint = document.getElementById("files-hint");
     outboxBtn.addEventListener("click", (e) => {
       e.stopPropagation();
-      const open = document.body.classList.toggle("outbox-open");
-      if (open) refreshOutbox();
+      if (panelKind === "outbox" && document.body.classList.contains("files-open")) {
+        document.body.classList.remove("files-open");
+        panelKind = null;
+      } else {
+        panelKind = "outbox";
+        document.body.classList.add("files-open");
+        refreshFiles("outbox");
+      }
     });
-    document.getElementById("outbox-close").addEventListener("click", (e) => {
+    inboxBtn.addEventListener("click", (e) => {
       e.stopPropagation();
-      document.body.classList.remove("outbox-open");
+      if (panelKind === "inbox" && document.body.classList.contains("files-open")) {
+        document.body.classList.remove("files-open");
+        panelKind = null;
+      } else {
+        panelKind = "inbox";
+        document.body.classList.add("files-open");
+        refreshFiles("inbox");
+      }
+    });
+    document.getElementById("files-close").addEventListener("click", (e) => {
+      e.stopPropagation();
+      document.body.classList.remove("files-open");
+      panelKind = null;
+    });
+    filesDir.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const path = cachedDir[panelKind] || "";
+      if (path) copyText(path, "copied: " + path);
     });
     function humanSize(n) {
       if (n < 1024) return `${n} B`;
@@ -324,27 +413,88 @@
       if (n < 1024 * 1024 * 1024) return `${(n / 1048576).toFixed(1)} MiB`;
       return `${(n / 1073741824).toFixed(1)} GiB`;
     }
-    async function refreshOutbox() {
+    function htmlEscape(s) {
+      return String(s).replace(/[<>&"']/g, c => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;", '"': "&quot;", "'": "&#39;" }[c]));
+    }
+    async function copyText(text, toastMsg) {
       try {
-        const r = await fetch(`${BASE}outbox`, { headers });
-        if (!r.ok) { outboxList.textContent = `error: ${r.status}`; return; }
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(text);
+        } else {
+          // Insecure-context fallback (HTTP, file://, older browsers).
+          const ta = document.createElement("textarea");
+          ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+          document.body.appendChild(ta); ta.select(); document.execCommand("copy");
+          document.body.removeChild(ta);
+        }
+        if (toastMsg) toast(toastMsg);
+      } catch {
+        toast("copy failed — select & ⌘C manually");
+      }
+    }
+    // Render either the inbox or outbox listing. Inbox rows are
+    // draggable: dragstart populates text/plain + text/uri-list with
+    // the file's absolute path so the user can drop it straight into
+    // Claude, a code editor, or any other text target. Outbox rows
+    // are `<a download>` so left-click downloads, drag drags the
+    // file URL.
+    async function refreshFiles(kind) {
+      filesTitle.textContent = `${kind}/`;
+      filesList.textContent = "loading…";
+      filesDir.textContent = "";
+      try {
+        const r = await fetch(`${BASE}${kind}`, { headers });
+        if (!r.ok) { filesList.textContent = `error: ${r.status}`; return; }
         const j = await r.json();
         const files = j.files || [];
+        cachedDir[kind] = j.dir || "";
+        filesDir.textContent = j.dir ? `📁 ${j.dir} (click to copy)` : "";
+        filesHint.textContent = kind === "inbox"
+          ? "drag a file from this list to drop its full path into Claude or another tool · click to copy the path"
+          : "click a file to download · drag to drop the URL elsewhere";
         if (!files.length) {
-          outboxList.innerHTML = '<div class="meta">empty</div>';
+          filesList.innerHTML = `<div class="empty">${kind} is empty</div>`;
           return;
         }
-        outboxList.innerHTML = "";
+        filesList.innerHTML = "";
         for (const f of files) {
-          const a = document.createElement("a");
-          const path = encodeURIComponent(`outbox/${f.name}`);
-          a.href = `${BASE}files?path=${path}${TOKEN ? "&token=" + encodeURIComponent(TOKEN) : ""}`;
-          a.download = f.name;
-          a.innerHTML = `${f.name.replace(/[<>&]/g, c => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" }[c]))}<div class="meta">${humanSize(f.size)} · ${new Date(f.mtime * 1000).toISOString().slice(0, 16).replace("T", " ")}</div>`;
-          outboxList.appendChild(a);
+          const absPath = j.dir ? `${j.dir.replace(/\/+$/, "")}/${f.name}` : `${kind}/${f.name}`;
+          const meta = `${humanSize(f.size)} · ${new Date(f.mtime * 1000).toISOString().slice(0, 16).replace("T", " ")}`;
+          if (kind === "outbox") {
+            const a = document.createElement("a");
+            const qpath = encodeURIComponent(`outbox/${f.name}`);
+            a.href = `${BASE}files?path=${qpath}${TOKEN ? "&token=" + encodeURIComponent(TOKEN) : ""}`;
+            a.download = f.name;
+            a.draggable = true;
+            a.addEventListener("dragstart", (ev) => {
+              ev.dataTransfer.setData("text/plain", absPath);
+              ev.dataTransfer.setData("text/uri-list", `file://${absPath}`);
+              ev.dataTransfer.effectAllowed = "copyLink";
+            });
+            a.innerHTML = `${htmlEscape(f.name)}<div class="meta">${meta}</div>`;
+            filesList.appendChild(a);
+          } else {
+            // Inbox row: draggable absolute path, click-to-copy.
+            // Not a download link — the agent is what consumes these.
+            const div = document.createElement("div");
+            div.className = "copy-relpath";
+            div.draggable = true;
+            div.title = absPath + "\n(drag to Claude or click to copy)";
+            div.addEventListener("dragstart", (ev) => {
+              ev.dataTransfer.setData("text/plain", absPath);
+              ev.dataTransfer.setData("text/uri-list", `file://${absPath}`);
+              ev.dataTransfer.effectAllowed = "copyLink";
+            });
+            div.addEventListener("click", (ev) => {
+              ev.stopPropagation();
+              copyText(absPath, "copied: " + absPath);
+            });
+            div.innerHTML = `${htmlEscape(f.name)}<div class="meta">${meta}</div>`;
+            filesList.appendChild(div);
+          }
         }
       } catch (e) {
-        outboxList.textContent = `offline: ${e.message || e}`;
+        filesList.textContent = `offline: ${e.message || e}`;
       }
     }
 
@@ -418,23 +568,26 @@
         ) {
           document.body.classList.add("update-available");
         }
-        // Outbox count — surfaces the ⬇ button when there's anything
-        // to download and toasts on growth so the user notices a
-        // newly-arrived file without polling /outbox themselves.
+        // File counts — buttons are always visible (discoverability),
+        // badges show the live count, and a count INCREASE pops a
+        // toast so the user notices new files without polling.
         const outboxCount = parseInt(r.headers.get("X-Outbox-Count") || "0", 10);
-        if (outboxCount > 0) {
-          document.body.classList.add("has-outbox");
-          outboxBadge.textContent = String(outboxCount);
-        } else {
-          document.body.classList.remove("has-outbox");
-        }
-        if (bootstrappedOutbox && outboxCount > lastOutboxCount) {
+        const inboxCount = parseInt(r.headers.get("X-Inbox-Count") || "0", 10);
+        outboxBadge.textContent = String(outboxCount);
+        inboxBadge.textContent = String(inboxCount);
+        outboxBtn.classList.toggle("has-files", outboxCount > 0);
+        inboxBtn.classList.toggle("has-files", inboxCount > 0);
+        if (bootstrappedFiles && outboxCount > lastOutboxCount) {
           const delta = outboxCount - lastOutboxCount;
           toast(`📥 ${delta} new file${delta > 1 ? "s" : ""} in outbox/`);
-          if (document.body.classList.contains("outbox-open")) refreshOutbox();
+          if (panelKind === "outbox" && document.body.classList.contains("files-open")) refreshFiles("outbox");
         }
-        bootstrappedOutbox = true;
+        if (bootstrappedFiles && inboxCount > lastInboxCount && panelKind === "inbox" && document.body.classList.contains("files-open")) {
+          refreshFiles("inbox");
+        }
+        bootstrappedFiles = true;
         lastOutboxCount = outboxCount;
+        lastInboxCount = inboxCount;
         const lockedNow = r.headers.get("X-Tab-Locked") === "1";
         if (lockedNow !== serverLocked) {
           serverLocked = lockedNow;
