@@ -157,15 +157,45 @@ jobs:
                       # see comment on the previous step). Each
                       # artifact's `name` is already the destination
                       # filename, including the .msi extension.
+                      # The artifact zip endpoint returns a 302 to a
+                      # presigned S3 URL. `gh api` doesn't follow
+                      # redirects (exits 1 instead) — use curl -fL
+                      # with the same token. `set -o pipefail` further
+                      # up would otherwise nuke the whole step on a
+                      # single failed fetch; loop with explicit
+                      # || true so one transient hiccup doesn't lose
+                      # the rest of the artifacts. Each MSI is
+                      # validated post-download against the MSI OLE2
+                      # magic to catch silent half-writes.
                       gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts" \
                           --jq '.artifacts[] | "\(.id)\t\(.name)"' \
                       | while IFS=$'\t' read -r ID NAME; do
                           case "$NAME" in
                               *.msi)
+                                  TMP="windows/$NAME.partial"
                                   echo "→ fetching artifact $ID → windows/$NAME"
-                                  gh api -H "Accept: application/octet-stream" \
-                                      "repos/$GITHUB_REPOSITORY/actions/artifacts/$ID/zip" \
-                                      > "windows/$NAME"
+                                  if curl -fSL \
+                                      -H "Authorization: Bearer $GH_TOKEN" \
+                                      -H "Accept: application/octet-stream" \
+                                      -o "$TMP" \
+                                      "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/artifacts/$ID/zip" \
+                                  ; then
+                                      # MSIs start with the OLE2 CFB
+                                      # magic D0 CF 11 E0. Anything
+                                      # else (404 HTML, an actual
+                                      # zip, …) gets rejected so the
+                                      # site never serves a broken
+                                      # download.
+                                      if head -c 4 "$TMP" | od -An -tx1 | tr -d ' \n' | grep -q '^d0cf11e0$'; then
+                                          mv "$TMP" "windows/$NAME"
+                                      else
+                                          echo "  ✗ wrong magic on $NAME — discarding"
+                                          rm -f "$TMP"
+                                      fi
+                                  else
+                                      echo "  ✗ curl failed for artifact $ID — skipping"
+                                      rm -f "$TMP"
+                                  fi
                                   ;;
                               *) echo "→ skipping non-MSI artifact: $NAME" ;;
                           esac
