@@ -191,6 +191,18 @@ pub enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+
+    /// `⛑ brain` — watch every tab for known agent-failure signatures
+    /// (Anthropic API unreachable, 5xx, etc.) and auto-send `continue`
+    /// to stuck agents. Best run as its own tab.
+    Brain {
+        /// Scan once and exit (instead of looping forever).
+        #[arg(long)]
+        once: bool,
+        /// Seconds between scans. Default 5.
+        #[arg(long)]
+        interval: Option<u64>,
+    },
 }
 
 /// Returns true iff a subcommand was dispatched (caller should not
@@ -306,6 +318,17 @@ pub fn dispatch(cli: Cli) -> bool {
         }
         Commands::ClaudeHook { event } => crate::cli::claude_hook::run(&[event]),
         Commands::Remote { args } => crate::cli::remote::run(&args),
+        Commands::Brain { once, interval } => {
+            let mut args: Vec<String> = Vec::new();
+            if once {
+                args.push("--once".into());
+            }
+            if let Some(s) = interval {
+                args.push("--interval".into());
+                args.push(s.to_string());
+            }
+            crate::cli::brain::run(&args)
+        }
     };
     std::process::exit(code);
 }
