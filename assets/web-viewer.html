@@ -73,12 +73,10 @@
     }
     body.drag-over #drop-overlay { display: flex; }
     #drop-overlay .inner { padding: 24px 36px; border: 2px dashed #ffd764; border-radius: 16px; }
-    /* Files panel — slides in from the right when ⬇ outbox or
-       ⬆ inbox is clicked. The two panels reuse the same DOM
-       container; the JS swaps the content (#files-list + the
-       directory-path header) when the user toggles. */
+    /* Files buttons — top-right corner. The slide-in panel still
+       enters from the right edge below them. */
     .files-btn {
-      position: fixed; bottom: 4px; font-size: 11px;
+      position: fixed; top: 6px; font-size: 11px;
       padding: 3px 8px; border-radius: 10px;
       cursor: pointer; pointer-events: auto; z-index: 11;
       font-family: ui-monospace, monospace;
@@ -87,19 +85,21 @@
     /* Outbox = blue, inbox = green. Two-color cue is faster than
        reading the label at a glance. */
     #outbox-btn {
-      left: 8px;
+      right: 8px;
       background: rgba(120, 200, 255, 0.15); color: #aad8ff;
       border: 1px solid rgba(120, 200, 255, 0.3);
     }
     #outbox-btn:hover { background: rgba(120, 200, 255, 0.28); }
     #inbox-btn {
-      left: 96px;
+      right: 96px;
       background: rgba(140, 220, 140, 0.15); color: #b6e6b6;
       border: 1px solid rgba(140, 220, 140, 0.3);
     }
     #inbox-btn:hover { background: rgba(140, 220, 140, 0.28); }
     body.read-only #inbox-btn { display: none; }
-    body.update-available .files-btn { bottom: 28px; }
+    /* The locked banner takes the top 32 px when active; nudge the
+       buttons down so they don't collide. */
+    body.locked .files-btn { top: 38px; }
     .files-btn .badge {
       display: inline-block; min-width: 14px; padding: 0 4px;
       margin-left: 4px; border-radius: 8px;
@@ -111,7 +111,10 @@
     }
     #files-panel {
       display: none;
-      position: fixed; top: 8px; right: 8px; bottom: 8px; width: 360px;
+      /* Sit just below the top-right buttons so they remain
+         clickable while the panel is open (acts as a "close"
+         click target). */
+      position: fixed; top: 36px; right: 8px; bottom: 8px; width: 360px;
       background: rgba(0, 0, 0, 0.82); color: #ddd; z-index: 13;
       border: 1px solid #444; border-radius: 8px; padding: 12px;
       font-family: ui-monospace, monospace; font-size: 12px;
