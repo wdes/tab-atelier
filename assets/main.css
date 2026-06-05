@@ -1,0 +1,148 @@
+    html, body { margin: 0; padding: 0; height: 100%; background: var(--tab-bg); color: #ccc; font-family: monospace; }
+    /* Centre the terminal so the server-sized grid stays aligned in
+       the middle of a wider browser window. Vertical anchor at top
+       (alignItems: start) so the scrollback grows downward, not from
+       the centre. */
+    body { display: flex; align-items: flex-start; justify-content: center; overflow-x: hidden; }
+    #term { width: max-content; max-width: 100vw; }
+    #status { position: fixed; bottom: 4px; right: 8px; font-size: 11px; opacity: 0.5; pointer-events: none; }
+    /* Locked banner — solid red strip across the top of the page
+       so a recipient cannot miss that this tab refuses input. The
+       JS toggles `.locked` on <body> when X-Tab-Locked is set. */
+    #locked-banner {
+      display: none;
+      position: fixed; top: 0; left: 0; right: 0;
+      background: #cc1f1a; color: #fff;
+      text-align: center; font-weight: bold; font-size: 13px;
+      padding: 6px 8px; letter-spacing: 1px;
+      box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+      z-index: 10;
+    }
+    body.locked #locked-banner { display: block; }
+    body.locked { padding-top: 32px; box-sizing: border-box; }
+    body.locked #term { outline: 1px solid #cc1f1a; }
+    /* Hide the inbox button when the viewer was loaded with a
+       read-only share token. Selector wired up by JS on boot. */
+    /* Update-available chip. Surfaces when the server's X-Boot-Id
+       no longer matches the value baked into this page (typically
+       after a `apt upgrade tab-atelier-headless` on the host).
+       Intentionally quiet — a banner reload prompt would clobber a
+       user's mid-thought share session. */
+    #update-chip {
+      display: none;
+      position: fixed; bottom: 4px; left: 8px; font-size: 11px;
+      padding: 3px 8px; border-radius: 10px;
+      background: rgba(255, 215, 100, 0.18); color: #ffd764;
+      border: 1px solid rgba(255, 215, 100, 0.35);
+      cursor: pointer; pointer-events: auto; z-index: 11;
+      font-family: ui-monospace, monospace;
+    }
+    body.update-available #update-chip { display: inline-block; }
+    #update-chip:hover { background: rgba(255, 215, 100, 0.3); }
+    /* Drag-and-drop overlay — translucent layer that appears when
+       the user drags a file over the page. RO viewers skip the
+       handler attachment entirely so the overlay never appears
+       for them. */
+    #drop-overlay {
+      display: none;
+      position: fixed; inset: 0;
+      background: rgba(0, 36, 81, 0.72);
+      color: #ffd764; font-size: 18px; font-family: ui-monospace, monospace;
+      align-items: center; justify-content: center; text-align: center;
+      z-index: 12; pointer-events: none;
+      backdrop-filter: blur(2px);
+    }
+    body.drag-over #drop-overlay { display: flex; }
+    #drop-overlay .inner { padding: 24px 36px; border: 2px dashed #ffd764; border-radius: 16px; }
+    /* Files buttons — top-right corner. The slide-in panel still
+       enters from the right edge below them. */
+    .files-btn {
+      position: fixed; top: 6px; font-size: 11px;
+      padding: 3px 8px; border-radius: 10px;
+      cursor: pointer; pointer-events: auto; z-index: 11;
+      font-family: ui-monospace, monospace;
+      display: inline-block;
+    }
+    /* Outbox = blue, inbox = green. Two-color cue is faster than
+       reading the label at a glance. */
+    #outbox-btn {
+      right: 8px;
+      background: rgba(120, 200, 255, 0.15); color: #aad8ff;
+      border: 1px solid rgba(120, 200, 255, 0.3);
+    }
+    #outbox-btn:hover { background: rgba(120, 200, 255, 0.28); }
+    #inbox-btn {
+      right: 96px;
+      background: rgba(140, 220, 140, 0.15); color: #b6e6b6;
+      border: 1px solid rgba(140, 220, 140, 0.3);
+    }
+    #inbox-btn:hover { background: rgba(140, 220, 140, 0.28); }
+    body.read-only #inbox-btn { display: none; }
+    /* The locked banner takes the top 32 px when active; nudge the
+       buttons down so they don't collide. */
+    body.locked .files-btn { top: 38px; }
+    .files-btn .badge {
+      display: inline-block; min-width: 14px; padding: 0 4px;
+      margin-left: 4px; border-radius: 8px;
+      background: rgba(255, 255, 255, 0.18); color: #fff;
+      font-weight: bold; font-size: 10px;
+    }
+    .files-btn.has-files .badge {
+      background: #ffd764; color: #002451;
+    }
+    #files-panel {
+      display: none;
+      /* Sit just below the top-right buttons so they remain
+         clickable while the panel is open (acts as a "close"
+         click target). */
+      position: fixed; top: 36px; right: 8px; bottom: 8px; width: 360px;
+      background: rgba(0, 0, 0, 0.82); color: #ddd; z-index: 13;
+      border: 1px solid #444; border-radius: 8px; padding: 12px;
+      font-family: ui-monospace, monospace; font-size: 12px;
+      overflow-y: auto; box-shadow: -4px 0 12px rgba(0, 0, 0, 0.5);
+    }
+    body.files-open #files-panel { display: block; }
+    #files-panel h3 { margin: 0 0 4px; font-size: 13px; color: #aad8ff; }
+    #files-panel .dir {
+      color: #888; font-size: 10px; word-break: break-all; margin-bottom: 10px;
+      cursor: pointer;
+    }
+    #files-panel .dir:hover { color: #fff; }
+    #files-panel a {
+      display: block; color: #fff; text-decoration: none;
+      padding: 6px 8px; border-radius: 4px; margin: 2px -8px;
+      word-break: break-all;
+    }
+    #files-panel a:hover { background: rgba(255, 255, 255, 0.08); }
+    #files-panel .row {
+      display: flex; gap: 4px; align-items: baseline; flex-wrap: wrap;
+    }
+    #files-panel .copy-relpath {
+      flex: 1; color: #fff; cursor: copy;
+      padding: 6px 8px; border-radius: 4px; margin: 2px -8px;
+      word-break: break-all;
+    }
+    #files-panel .copy-relpath:hover { background: rgba(255, 255, 255, 0.08); }
+    #files-panel .meta { color: #888; font-size: 10px; }
+    #files-panel .close {
+      float: right; cursor: pointer; color: #888;
+      font-size: 18px; line-height: 14px; padding: 0 4px;
+    }
+    #files-panel .close:hover { color: #fff; }
+    #files-panel .empty { color: #888; font-style: italic; }
+    #files-panel .hint {
+      color: #888; font-size: 10px; margin-top: 12px;
+      padding-top: 12px; border-top: 1px solid #333;
+    }
+    /* Toast for transient notifications (upload progress, new file
+       in outbox, errors). Sits centred at the top, auto-hides after
+       4 seconds via setTimeout in JS. */
+    #toast {
+      display: none;
+      position: fixed; top: 8px; left: 50%; transform: translateX(-50%);
+      background: rgba(0, 0, 0, 0.82); color: #fff;
+      padding: 8px 16px; border-radius: 6px; font-size: 12px;
+      font-family: ui-monospace, monospace; z-index: 14;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+    }
+    body.toasting #toast { display: block; }

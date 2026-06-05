@@ -22,6 +22,15 @@ const VIEWER_HTML: &str = include_str!("../assets/web-viewer.html");
 const VENDOR_XTERM_JS: &str = include_str!("../assets/vendor/xterm-6.0.0/xterm.js");
 const VENDOR_XTERM_CSS: &str = include_str!("../assets/vendor/xterm-6.0.0/xterm.css");
 
+/// Our own viewer CSS + JS, extracted from web-viewer.html so they
+/// can be cached aggressively by the browser. The HTML references
+/// them as `/assets/main.{css,js}?version=<BUILD_HASH>`; the query
+/// string acts as the cache buster — a new deb publishes new
+/// content under a new URL, and the browser fetches it on the very
+/// next page load with no user intervention.
+const MAIN_CSS: &str = include_str!("../assets/main.css");
+const MAIN_JS: &str = include_str!("../assets/main.js");
+
 /// Short git commit hash baked in at build time by `build.rs`.
 /// Embedded into the `/view` HTML as `__BUILD_HASH__` and echoed on
 /// every `/stream` response as `X-Build-Hash`. The viewer compares
@@ -714,14 +723,20 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
     // browser (without the token in their session cookies) can
     // still load the JS that fetches /stream with the token from
     // the URL.
-    if let ("GET", "/assets/xterm-6.0.0.js" | "/assets/xterm-6.0.0.css") = (method.as_str(), path.as_str()) {
-        let (body, ctype): (&[u8], &str) = if path == "/assets/xterm-6.0.0.js" {
-            (VENDOR_XTERM_JS.as_bytes(), "application/javascript; charset=utf-8")
-        } else {
-            (VENDOR_XTERM_CSS.as_bytes(), "text/css; charset=utf-8")
+    if let ("GET", "/assets/xterm-6.0.0.js" | "/assets/xterm-6.0.0.css" | "/assets/main.js" | "/assets/main.css") =
+        (method.as_str(), path.as_str())
+    {
+        let (body, ctype): (&[u8], &str) = match path.as_str() {
+            "/assets/xterm-6.0.0.js" => (VENDOR_XTERM_JS.as_bytes(), "application/javascript; charset=utf-8"),
+            "/assets/xterm-6.0.0.css" => (VENDOR_XTERM_CSS.as_bytes(), "text/css; charset=utf-8"),
+            "/assets/main.js" => (MAIN_JS.as_bytes(), "application/javascript; charset=utf-8"),
+            _ => (MAIN_CSS.as_bytes(), "text/css; charset=utf-8"),
         };
-        // Cache aggressively: the URL is version-pinned, so any
-        // content change ships under a different filename.
+        // Cache aggressively. xterm-*.{js,css} are version-pinned
+        // in the URL path; main.{js,css} get a `?version=<hash>`
+        // query string from the viewer HTML. Either way, a new
+        // deb publishes new content under a new effective cache
+        // key — `immutable` is safe.
         respond_with_etag(
             stream,
             200,
@@ -3335,13 +3350,58 @@ mod tests {
         let body = String::from_utf8_lossy(&b);
         assert!(
             !body.contains("__BUILD_HASH__"),
-            "template placeholder must be substituted, not left raw"
+            "template placeholder must be substituted everywhere, not left raw"
         );
-        let expected = format!(r#"const BUILD_HASH = "{}";"#, crate::api::BUILD_HASH);
+        let hash = crate::api::BUILD_HASH;
+        let bootstrap = format!(r#"buildHash: "{hash}""#);
         assert!(
-            body.contains(&expected),
-            "viewer JS must embed the live BUILD_HASH — looked for {expected:?}"
+            body.contains(&bootstrap),
+            "bootstrap missing buildHash — looked for {bootstrap:?}"
         );
+        // The cache-buster `?version=<hash>` lives in the <link> /
+        // <script> tags pointing at /assets/main.{css,js}. Without
+        // it a stale cached main.js would survive a deb upgrade.
+        let css_url = format!("/assets/main.css?version={hash}");
+        let js_url = format!("/assets/main.js?version={hash}");
+        assert!(
+            body.contains(&css_url),
+            "main.css cache-buster missing — looked for {css_url:?}"
+        );
+        assert!(
+            body.contains(&js_url),
+            "main.js cache-buster missing — looked for {js_url:?}"
+        );
+    }
+
+    #[test]
+    fn main_assets_serve_unauthenticated_with_immutable_cache() {
+        let (port, _state, _token) = spawn_server();
+        // Both /assets/main.js and /assets/main.css must serve
+        // without an Authorization header (the share viewer needs
+        // them BEFORE the JS reads the URL token), and both must
+        // carry the immutable cache header because the cache key
+        // is invalidated via ?version=<hash>.
+        for (req_path, want_ctype, expected_substr) in [
+            ("/assets/main.js", "application/javascript; charset=utf-8", "TAB.key"),
+            ("/assets/main.css", "text/css; charset=utf-8", "var(--tab-bg)"),
+        ] {
+            let raw = request_bytes(port, &format!("GET {req_path} HTTP/1.1\r\n\r\n"));
+            let (h, b) = split_response(&raw);
+            assert!(h.starts_with("HTTP/1.1 200"), "{req_path} got: {h}");
+            assert_eq!(
+                header_value(&h, "content-type"),
+                Some(want_ctype),
+                "wrong type for {req_path}"
+            );
+            assert!(
+                header_value(&h, "cache-control").unwrap_or("").contains("immutable"),
+                "{req_path} expected immutable cache, got: {h}"
+            );
+            assert!(
+                std::str::from_utf8(&b).unwrap_or("").contains(expected_substr),
+                "{req_path} body should contain {expected_substr:?}"
+            );
+        }
     }
 
     #[test]
