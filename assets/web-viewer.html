@@ -10,7 +10,12 @@
        strips headers still tells crawlers to back off. -->
   <meta name="robots" content="noindex, nofollow, noarchive">
   <title>__TAB_NAME_HTML__ · tab-atelier</title>
-  <link rel="stylesheet" href="https://unpkg.com/xterm@5.3.0/css/xterm.css">
+  <!-- xterm.js + .css are embedded in the daemon binary and served
+       from a version-pinned `/assets/` route that bypasses token
+       auth. Local-first: no CDN fetch, works on air-gapped /
+       sandboxed hosts. Absolute path — viewers behind a
+       sub-path reverse proxy will need to rewrite this. -->
+  <link rel="stylesheet" href="/assets/xterm-5.3.0.css">
   <style>
     html, body { margin: 0; padding: 0; height: 100%; background: __TAB_BG__; color: #ccc; font-family: monospace; }
     /* Centre the terminal so the server-sized grid stays aligned in
@@ -175,7 +180,7 @@
     <div class="hint" id="files-hint"></div>
   </div>
   <div id="toast"></div>
-  <script src="https://unpkg.com/xterm@5.3.0/lib/xterm.js"></script>
+  <script src="/assets/xterm-5.3.0.js"></script>
   <script>
     // __TAB_KEY__ is the route segment after `/tabs/` (numeric idx or
     // `by-id/<uuid>` form). The same value is what every subrequest

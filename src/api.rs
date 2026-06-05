@@ -14,6 +14,14 @@ use crate::tracking::USER_AGENT;
 
 const VIEWER_HTML: &str = include_str!("../assets/web-viewer.html");
 
+/// Vendored xterm.js + xterm.css at a pinned version. Embedded into
+/// the binary so the share viewer renders in fully offline
+/// deployments (firecracker VMs, air-gapped hosts, anywhere CDN
+/// fetches to `unpkg.com` would fail). Served at version-pinned
+/// `/assets/xterm-X.Y.Z.{js,css}` URLs that bypass token auth.
+const VENDOR_XTERM_JS: &str = include_str!("../assets/vendor/xterm-5.3.0/xterm.js");
+const VENDOR_XTERM_CSS: &str = include_str!("../assets/vendor/xterm-5.3.0/xterm.css");
+
 /// Short git commit hash baked in at build time by `build.rs`.
 /// Embedded into the `/view` HTML as `__BUILD_HASH__` and echoed on
 /// every `/stream` response as `X-Build-Hash`. The viewer compares
@@ -698,6 +706,33 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
         Vec::new()
     };
     drop(reader);
+
+    // Public vendor-asset routes bypass auth entirely. They serve
+    // a fixed pinned copy of xterm.js + xterm.css that the share
+    // viewer needs to render — no secrets in either file. Bypass
+    // here so a recipient who opens the share link in a fresh
+    // browser (without the token in their session cookies) can
+    // still load the JS that fetches /stream with the token from
+    // the URL.
+    if let ("GET", "/assets/xterm-5.3.0.js" | "/assets/xterm-5.3.0.css") = (method.as_str(), path.as_str()) {
+        let (body, ctype): (&[u8], &str) = if path == "/assets/xterm-5.3.0.js" {
+            (VENDOR_XTERM_JS.as_bytes(), "application/javascript; charset=utf-8")
+        } else {
+            (VENDOR_XTERM_CSS.as_bytes(), "text/css; charset=utf-8")
+        };
+        // Cache aggressively: the URL is version-pinned, so any
+        // content change ships under a different filename.
+        respond_with_etag(
+            stream,
+            200,
+            ctype,
+            body,
+            accept_gzip,
+            if_none_match.as_deref(),
+            "Cache-Control: public, max-age=31536000, immutable\r\n",
+        );
+        return;
+    }
 
     let provided_token = auth_token.or(query_token);
     // Permission gate, in order:
@@ -3348,6 +3383,35 @@ mod tests {
             std::fs::write(outbox.join(name), content).unwrap();
         }
         dir
+    }
+
+    #[test]
+    fn vendor_xterm_assets_serve_unauthenticated_with_immutable_cache() {
+        let (port, _state, _token) = spawn_server();
+        // No Authorization header at all — must still get 200.
+        let raw = request_bytes(port, "GET /assets/xterm-5.3.0.js HTTP/1.1\r\n\r\n");
+        let (h, b) = split_response(&raw);
+        assert!(h.starts_with("HTTP/1.1 200"), "got: {h}");
+        assert_eq!(
+            header_value(&h, "content-type"),
+            Some("application/javascript; charset=utf-8"),
+        );
+        assert!(
+            header_value(&h, "cache-control").unwrap_or("").contains("immutable"),
+            "expected immutable cache, got: {h}"
+        );
+        // Body sanity — first byte of the UMD wrapper xterm.js ships with.
+        assert!(b.starts_with(b"!function"), "first bytes: {:?}", &b[..b.len().min(40)]);
+
+        let raw = request_bytes(port, "GET /assets/xterm-5.3.0.css HTTP/1.1\r\n\r\n");
+        let (h, b) = split_response(&raw);
+        assert!(h.starts_with("HTTP/1.1 200"), "got: {h}");
+        assert_eq!(header_value(&h, "content-type"), Some("text/css; charset=utf-8"));
+        // CSS opens with the copyright banner.
+        assert!(
+            std::str::from_utf8(&b).unwrap_or("").contains("xterm.js"),
+            "css body must reference xterm.js in its banner"
+        );
     }
 
     #[test]
