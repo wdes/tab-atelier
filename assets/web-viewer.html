@@ -45,6 +45,74 @@
     }
     body.update-available #update-chip { display: inline-block; }
     #update-chip:hover { background: rgba(255, 215, 100, 0.3); }
+    /* Drag-and-drop overlay — translucent layer that appears when
+       the user drags a file over the page. RO viewers skip the
+       handler attachment entirely so the overlay never appears
+       for them. */
+    #drop-overlay {
+      display: none;
+      position: fixed; inset: 0;
+      background: rgba(0, 36, 81, 0.72);
+      color: #ffd764; font-size: 18px; font-family: ui-monospace, monospace;
+      align-items: center; justify-content: center; text-align: center;
+      z-index: 12; pointer-events: none;
+      backdrop-filter: blur(2px);
+    }
+    body.drag-over #drop-overlay { display: flex; }
+    #drop-overlay .inner { padding: 24px 36px; border: 2px dashed #ffd764; border-radius: 16px; }
+    /* Outbox panel — slides in from the right when the
+       ⬇ outbox button is clicked. */
+    #outbox-btn {
+      position: fixed; bottom: 4px; left: 8px; font-size: 11px;
+      padding: 3px 8px; border-radius: 10px;
+      background: rgba(120, 200, 255, 0.15); color: #aad8ff;
+      border: 1px solid rgba(120, 200, 255, 0.3);
+      cursor: pointer; pointer-events: auto; z-index: 11;
+      font-family: ui-monospace, monospace;
+      display: none;
+    }
+    body.has-outbox #outbox-btn { display: inline-block; }
+    body.update-available #outbox-btn { bottom: 28px; }
+    #outbox-btn:hover { background: rgba(120, 200, 255, 0.28); }
+    #outbox-btn .badge {
+      display: inline-block; min-width: 14px; padding: 0 4px;
+      margin-left: 4px; border-radius: 8px;
+      background: #ffd764; color: #002451; font-weight: bold; font-size: 10px;
+    }
+    #outbox-panel {
+      display: none;
+      position: fixed; top: 8px; right: 8px; bottom: 8px; width: 320px;
+      background: rgba(0, 0, 0, 0.78); color: #ddd; z-index: 13;
+      border: 1px solid #444; border-radius: 8px; padding: 12px;
+      font-family: ui-monospace, monospace; font-size: 12px;
+      overflow-y: auto; box-shadow: -4px 0 12px rgba(0, 0, 0, 0.5);
+    }
+    body.outbox-open #outbox-panel { display: block; }
+    #outbox-panel h3 { margin: 0 0 8px; font-size: 13px; color: #aad8ff; }
+    #outbox-panel a {
+      display: block; color: #fff; text-decoration: none;
+      padding: 6px 8px; border-radius: 4px; margin: 2px -8px;
+      word-break: break-all;
+    }
+    #outbox-panel a:hover { background: rgba(255, 255, 255, 0.08); }
+    #outbox-panel .meta { color: #888; font-size: 10px; }
+    #outbox-panel .close {
+      float: right; cursor: pointer; color: #888;
+      font-size: 18px; line-height: 14px; padding: 0 4px;
+    }
+    #outbox-panel .close:hover { color: #fff; }
+    /* Toast for transient notifications (upload progress, new file
+       in outbox, errors). Sits centred at the top, auto-hides after
+       4 seconds via setTimeout in JS. */
+    #toast {
+      display: none;
+      position: fixed; top: 8px; left: 50%; transform: translateX(-50%);
+      background: rgba(0, 0, 0, 0.82); color: #fff;
+      padding: 8px 16px; border-radius: 6px; font-size: 12px;
+      font-family: ui-monospace, monospace; z-index: 14;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+    }
+    body.toasting #toast { display: block; }
   </style>
 </head>
 <body>
@@ -52,6 +120,14 @@
   <div id="term"></div>
   <div id="status">connecting…</div>
   <div id="update-chip" title="The server was upgraded — click to reload this viewer">↻ update available</div>
+  <button id="outbox-btn" title="Show files available for download from outbox/">⬇ outbox<span class="badge" id="outbox-badge">0</span></button>
+  <div id="drop-overlay"><div class="inner">drop file to upload to <code>inbox/</code></div></div>
+  <div id="outbox-panel">
+    <span class="close" id="outbox-close" title="Close">×</span>
+    <h3>outbox/</h3>
+    <div id="outbox-list">loading…</div>
+  </div>
+  <div id="toast"></div>
   <script src="https://unpkg.com/xterm@5.3.0/lib/xterm.js"></script>
   <script>
     // __TAB_KEY__ is the route segment after `/tabs/` (numeric idx or
@@ -132,6 +208,142 @@
       location.reload();
     });
 
+    // ── File transfer (inbox/ uploads + outbox/ downloads) ──────────
+    // Drag-drop is gated on RW (the POST /files endpoint is rejected
+    // for read-only share tokens). Download is available for both
+    // RW and RO viewers.
+    const UPLOAD_MAX_BYTES = 100 * 1024 * 1024;
+    const toastEl = document.getElementById("toast");
+    let toastTimer = null;
+    function toast(msg, ms = 4000) {
+      toastEl.textContent = msg;
+      document.body.classList.add("toasting");
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => document.body.classList.remove("toasting"), ms);
+    }
+    // Suffix the auth token so `<a download>` clicks work — browsers
+    // don't send the Authorization header for navigations.
+    function tokenSuffix(initial = "?") {
+      return TOKEN ? `${initial}token=${encodeURIComponent(TOKEN)}` : "";
+    }
+    // Upload a single File via XMLHttpRequest (fetch can't surface
+    // upload-progress events). Reports percentage in the status bar,
+    // pops a toast on success / error.
+    function uploadFile(file) {
+      return new Promise((resolve) => {
+        if (file.size > UPLOAD_MAX_BYTES) {
+          toast(`${file.name}: too large (${Math.round(file.size / 1048576)} MiB > 100 MiB limit)`);
+          resolve(false);
+          return;
+        }
+        const xhr = new XMLHttpRequest();
+        const url = `${BASE}files?name=${encodeURIComponent(file.name)}${TOKEN ? "&token=" + encodeURIComponent(TOKEN) : ""}`;
+        xhr.open("POST", url);
+        if (TOKEN) xhr.setRequestHeader("Authorization", "Bearer " + TOKEN);
+        xhr.setRequestHeader("Content-Type", "application/octet-stream");
+        xhr.upload.addEventListener("progress", (e) => {
+          if (e.lengthComputable) {
+            const pct = Math.round((e.loaded / e.total) * 100);
+            status.textContent = `uploading ${file.name} · ${pct}%`;
+          }
+        });
+        xhr.addEventListener("load", () => {
+          if (xhr.status === 201 || xhr.status === 200) {
+            toast(`uploaded ${file.name} → inbox/`);
+            resolve(true);
+          } else {
+            toast(`upload failed (${xhr.status}): ${xhr.responseText.slice(0, 120)}`);
+            resolve(false);
+          }
+        });
+        xhr.addEventListener("error", () => {
+          toast(`upload failed: network error`);
+          resolve(false);
+        });
+        xhr.send(file);
+      });
+    }
+    // Drag-drop wiring. dragover/leave maintain the overlay; drop
+    // fires the upload. Multiple files are uploaded sequentially so
+    // the status bar stays a single "uploading X" string instead of
+    // racing N progress values.
+    if (!READ_ONLY) {
+      let dragDepth = 0;  // counter — dragenter/leave fire on every
+                          // child element, so we need to balance them
+      document.body.addEventListener("dragenter", (e) => {
+        e.preventDefault();
+        dragDepth++;
+        document.body.classList.add("drag-over");
+      });
+      document.body.addEventListener("dragover", (e) => {
+        e.preventDefault();
+        e.dataTransfer.dropEffect = "copy";
+      });
+      document.body.addEventListener("dragleave", (e) => {
+        e.preventDefault();
+        dragDepth = Math.max(0, dragDepth - 1);
+        if (dragDepth === 0) document.body.classList.remove("drag-over");
+      });
+      document.body.addEventListener("drop", async (e) => {
+        e.preventDefault();
+        dragDepth = 0;
+        document.body.classList.remove("drag-over");
+        const files = Array.from(e.dataTransfer?.files || []);
+        if (!files.length) return;
+        for (const f of files) {
+          await uploadFile(f);
+        }
+        // Refresh the outbox panel in case a server-side script
+        // moves uploads into outbox/ on receipt.
+        refreshOutbox();
+      });
+    }
+    // Outbox panel — list outbox/ contents, render download links.
+    let lastOutboxCount = 0;
+    let bootstrappedOutbox = false;
+    const outboxBtn = document.getElementById("outbox-btn");
+    const outboxBadge = document.getElementById("outbox-badge");
+    const outboxPanel = document.getElementById("outbox-panel");
+    const outboxList = document.getElementById("outbox-list");
+    outboxBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const open = document.body.classList.toggle("outbox-open");
+      if (open) refreshOutbox();
+    });
+    document.getElementById("outbox-close").addEventListener("click", (e) => {
+      e.stopPropagation();
+      document.body.classList.remove("outbox-open");
+    });
+    function humanSize(n) {
+      if (n < 1024) return `${n} B`;
+      if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KiB`;
+      if (n < 1024 * 1024 * 1024) return `${(n / 1048576).toFixed(1)} MiB`;
+      return `${(n / 1073741824).toFixed(1)} GiB`;
+    }
+    async function refreshOutbox() {
+      try {
+        const r = await fetch(`${BASE}outbox`, { headers });
+        if (!r.ok) { outboxList.textContent = `error: ${r.status}`; return; }
+        const j = await r.json();
+        const files = j.files || [];
+        if (!files.length) {
+          outboxList.innerHTML = '<div class="meta">empty</div>';
+          return;
+        }
+        outboxList.innerHTML = "";
+        for (const f of files) {
+          const a = document.createElement("a");
+          const path = encodeURIComponent(`outbox/${f.name}`);
+          a.href = `${BASE}files?path=${path}${TOKEN ? "&token=" + encodeURIComponent(TOKEN) : ""}`;
+          a.download = f.name;
+          a.innerHTML = `${f.name.replace(/[<>&]/g, c => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" }[c]))}<div class="meta">${humanSize(f.size)} · ${new Date(f.mtime * 1000).toISOString().slice(0, 16).replace("T", " ")}</div>`;
+          outboxList.appendChild(a);
+        }
+      } catch (e) {
+        outboxList.textContent = `offline: ${e.message || e}`;
+      }
+    }
+
     // Monotonic PTY-byte offset we've fed into xterm.js. The server's
     // /stream endpoint hands us `[since, X-Stream-Length)` on each
     // poll — the ring captures every byte the PTY emitted, BEFORE
@@ -197,6 +409,23 @@
         if (BOOT_ID && serverBoot && serverBoot !== BOOT_ID) {
           document.body.classList.add("update-available");
         }
+        // Outbox count — surfaces the ⬇ button when there's anything
+        // to download and toasts on growth so the user notices a
+        // newly-arrived file without polling /outbox themselves.
+        const outboxCount = parseInt(r.headers.get("X-Outbox-Count") || "0", 10);
+        if (outboxCount > 0) {
+          document.body.classList.add("has-outbox");
+          outboxBadge.textContent = String(outboxCount);
+        } else {
+          document.body.classList.remove("has-outbox");
+        }
+        if (bootstrappedOutbox && outboxCount > lastOutboxCount) {
+          const delta = outboxCount - lastOutboxCount;
+          toast(`📥 ${delta} new file${delta > 1 ? "s" : ""} in outbox/`);
+          if (document.body.classList.contains("outbox-open")) refreshOutbox();
+        }
+        bootstrappedOutbox = true;
+        lastOutboxCount = outboxCount;
         const lockedNow = r.headers.get("X-Tab-Locked") === "1";
         if (lockedNow !== serverLocked) {
           serverLocked = lockedNow;

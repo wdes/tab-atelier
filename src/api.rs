@@ -400,6 +400,12 @@ fn sanitize_basename(raw: &str) -> Option<String> {
 /// with its own consent model.
 const FILE_SANDBOX_DIRS: &[&str] = &["inbox", "outbox"];
 
+/// Hard cap on `POST /files` body size. Mostly a foot-gun guard —
+/// the viewer's drag-drop is meant for documents and config files,
+/// not multi-GB tarballs.
+const UPLOAD_MAX_BYTES_MIB: usize = 100;
+const UPLOAD_MAX_BYTES: usize = UPLOAD_MAX_BYTES_MIB * 1024 * 1024;
+
 /// Resolve a relative path against `cwd` and confirm it lands inside
 /// one of `FILE_SANDBOX_DIRS`. Performs syntactic rejection (`..`,
 /// absolute paths, NUL bytes) BEFORE touching the filesystem, then a
@@ -656,6 +662,16 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
         path
     };
 
+    // Reject oversized uploads BEFORE allocating / reading the
+    // body — refuses with 413 on the headers alone. Limits memory
+    // amplification from a hostile client lying about size or
+    // streaming a TB.
+    if content_length > UPLOAD_MAX_BYTES {
+        drop(reader);
+        error_json(stream, 413, &format!("upload exceeds {UPLOAD_MAX_BYTES_MIB} MiB limit"));
+        return;
+    }
+
     // Read the body (if any) before dropping the reader so we can write the
     // response back through `stream` without a borrow conflict.
     let body_bytes: Vec<u8> = if content_length > 0 {
@@ -691,14 +707,18 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
         let allowed = if let Some(p) = provided_token.as_deref()
             && let Some(rest) = path.strip_prefix("/tabs/by-id/")
             && let Some((uuid, action)) = rest.split_once('/')
-            && matches!(action, "view" | "output" | "stream" | "input")
+            && matches!(action, "view" | "output" | "stream" | "input" | "files" | "outbox")
         {
             let state_g = state.lock().unwrap();
             state_g.tabs.iter().find(|t| t.id == uuid).and_then(|t| {
                 let rw_match = !t.share_token_rw.is_empty() && t.share_token_rw == p;
                 let ro_match = !t.share_token_ro.is_empty() && t.share_token_ro == p;
-                if action == "input" {
-                    // RO tokens can never write input. RW tokens can.
+                // Mutating share-token actions: only RW. The RO link
+                // is read-only by construction so attempting to
+                // upload a file (POST /files) must fail with 403,
+                // same as /input.
+                let needs_rw = matches!(action, "input") || (action == "files" && method.as_str() == "POST");
+                if needs_rw {
                     if rw_match {
                         Some(true)
                     } else if ro_match {
@@ -1214,6 +1234,19 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             let pty_rows = t.rows;
             let bg_color = t.bg_color.clone();
             let locked = t.locked;
+            // Count downloadable outbox/ entries so the viewer can
+            // toast "new file available" without a separate poll.
+            // Cheap stat — directory traversal only, no reads.
+            let outbox_count = t.cwd.as_deref().map_or(0, |cwd| {
+                std::fs::read_dir(std::path::Path::new(cwd).join("outbox")).map_or(0, |rd| {
+                    rd.flatten()
+                        .filter(|e| {
+                            e.file_name().to_str().and_then(sanitize_basename).is_some()
+                                && e.metadata().is_ok_and(|m| m.is_file())
+                        })
+                        .count()
+                })
+            });
             let (agent_state_str, agent_label) = t.agent_state.as_ref().map_or((None, None), |s| {
                 let key = match s.state {
                     crate::AgentState::Thinking => "thinking",
@@ -1237,7 +1270,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             // base_offset when `since` aged out.
             let body_start = since.max(base_offset);
             let mut extra = format!(
-                "X-Stream-Length: {total_len}\r\nX-Stream-Start: {body_start}\r\nX-Stream-Cap: {cap}\r\nX-Output-Cols: {pty_cols}\r\nX-Output-Rows: {pty_rows}\r\nX-Boot-Id: {boot}\r\n",
+                "X-Stream-Length: {total_len}\r\nX-Stream-Start: {body_start}\r\nX-Stream-Cap: {cap}\r\nX-Output-Cols: {pty_cols}\r\nX-Output-Rows: {pty_rows}\r\nX-Boot-Id: {boot}\r\nX-Outbox-Count: {outbox_count}\r\n",
                 boot = &*BOOT_ID,
             );
             if !bg_color.is_empty() {
@@ -1455,13 +1488,19 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             // Upload file body into the tab's `cwd/inbox/<name>`.
             // `?name=<basename>` is required and is sanitised to a
             // path-component (no `..`, no separators) so a malicious
-            // remote can't write outside `inbox/`.
-            let idx_str = &p["/tabs/".len()..p.len() - "/files".len()];
-            let Ok(idx) = idx_str.parse::<usize>() else {
-                error_json(stream, 404, "invalid tab index");
+            // remote can't write outside `inbox/`. Accepts both
+            // `/tabs/<idx>/files` and `/tabs/by-id/<uuid>/files`
+            // forms; share-token auth (rw only) was vetted upstream.
+            let Some((key_raw, is_uuid)) = parse_tab_key(p, "/files") else {
+                error_json(stream, 404, "invalid tab key");
                 return;
             };
             let snap = state.lock().unwrap();
+            let Some(idx) = resolve_tab_idx(&snap, key_raw, is_uuid) else {
+                drop(snap);
+                error_json(stream, 404, "tab not found");
+                return;
+            };
             let Some(t) = snap.tabs.get(idx) else {
                 drop(snap);
                 error_json(stream, 404, "tab index out of range");
@@ -1477,14 +1516,30 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 error_json(stream, 400, "missing or invalid ?name=<basename>");
                 return;
             };
+            // Hard cap. The Content-Length pre-check already 413'd
+            // anything bigger (see UPLOAD_MAX_BYTES below), so this
+            // is the post-read safety net for `Transfer-Encoding:
+            // chunked` requests we can't size in advance.
+            if body_bytes.len() > UPLOAD_MAX_BYTES {
+                error_json(stream, 413, &format!("upload exceeds {UPLOAD_MAX_BYTES_MIB} MiB limit"));
+                return;
+            }
             let inbox = std::path::Path::new(&cwd).join("inbox");
             if let Err(e) = std::fs::create_dir_all(&inbox) {
                 error_json(stream, 500, &format!("mkdir inbox: {e}"));
                 return;
             }
+            // Atomic write: stage to <name>.tmp then rename. A reader
+            // walking inbox/ never sees a half-written file.
             let dest = inbox.join(&name);
-            if let Err(e) = std::fs::write(&dest, &body_bytes) {
-                error_json(stream, 500, &format!("write {}: {e}", dest.display()));
+            let staging = inbox.join(format!(".{name}.tmp"));
+            if let Err(e) = std::fs::write(&staging, &body_bytes) {
+                error_json(stream, 500, &format!("write {}: {e}", staging.display()));
+                return;
+            }
+            if let Err(e) = std::fs::rename(&staging, &dest) {
+                let _ = std::fs::remove_file(&staging);
+                error_json(stream, 500, &format!("rename {}: {e}", dest.display()));
                 return;
             }
             info!("API: stored {} bytes in {}", body_bytes.len(), dest.display());
@@ -1493,7 +1548,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 "bytes": body_bytes.len(),
             }))
             .unwrap_or_default();
-            respond_json(stream, 200, &body);
+            respond_json(stream, 201, &body);
         }
         ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/files") => {
             // Download a file from the tab's sandbox. `?path=…` must
@@ -1501,12 +1556,16 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             // `inbox/` + `outbox/`) of the tab's cwd — anything
             // else is rejected before any filesystem access. See
             // `resolve_sandbox_path` for the full check.
-            let idx_str = &p["/tabs/".len()..p.len() - "/files".len()];
-            let Ok(idx) = idx_str.parse::<usize>() else {
-                error_json(stream, 404, "invalid tab index");
+            let Some((key_raw, is_uuid)) = parse_tab_key(p, "/files") else {
+                error_json(stream, 404, "invalid tab key");
                 return;
             };
             let snap = state.lock().unwrap();
+            let Some(idx) = resolve_tab_idx(&snap, key_raw, is_uuid) else {
+                drop(snap);
+                error_json(stream, 404, "tab not found");
+                return;
+            };
             let Some(t) = snap.tabs.get(idx) else {
                 drop(snap);
                 error_json(stream, 404, "tab index out of range");
@@ -1536,7 +1595,28 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                     return;
                 }
             };
+            let display_name = canonical.file_name().and_then(|s| s.to_str()).unwrap_or("download");
             info!("API: served {} bytes from {}", bytes.len(), canonical.display());
+            // RFC 5987 `filename*=UTF-8''…` so accented / non-ASCII
+            // names ("Frédéric.txt") survive transit; the ASCII
+            // fallback `filename="…"` is also included for legacy
+            // user-agents.
+            let mut percent: String = String::with_capacity(display_name.len());
+            for byte in display_name.bytes() {
+                if matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~') {
+                    percent.push(byte as char);
+                } else {
+                    use std::fmt::Write as _;
+                    let _ = write!(&mut percent, "%{byte:02X}");
+                }
+            }
+            let ascii_fallback: String = display_name
+                .chars()
+                .filter(|c| c.is_ascii() && *c != '"' && *c != '\\')
+                .collect();
+            let disposition = format!(
+                "Content-Disposition: attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{percent}\r\nX-Content-Type-Options: nosniff\r\n"
+            );
             respond_with_etag(
                 stream,
                 200,
@@ -1544,15 +1624,65 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 &bytes,
                 accept_gzip,
                 if_none_match.as_deref(),
-                &format!(
-                    "Content-Disposition: attachment; filename=\"{}\"\r\n",
-                    canonical
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("download")
-                        .replace('"', "")
-                ),
+                &disposition,
             );
+        }
+        // List `outbox/` contents so the viewer can render a
+        // download panel. RO + RW share-tokens both allowed (it's a
+        // read), master token always allowed.
+        ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/outbox") => {
+            let Some((key_raw, is_uuid)) = parse_tab_key(p, "/outbox") else {
+                error_json(stream, 404, "invalid tab key");
+                return;
+            };
+            let snap = state.lock().unwrap();
+            let Some(idx) = resolve_tab_idx(&snap, key_raw, is_uuid) else {
+                drop(snap);
+                error_json(stream, 404, "tab not found");
+                return;
+            };
+            let Some(t) = snap.tabs.get(idx) else {
+                drop(snap);
+                error_json(stream, 404, "tab index out of range");
+                return;
+            };
+            let cwd = t.cwd.clone();
+            drop(snap);
+            let Some(cwd) = cwd else {
+                respond_json(stream, 200, r#"{"files":[]}"#);
+                return;
+            };
+            let outbox = std::path::Path::new(&cwd).join("outbox");
+            let mut files: Vec<serde_json::Value> = Vec::new();
+            if let Ok(rd) = std::fs::read_dir(&outbox) {
+                for entry in rd.flatten() {
+                    let Some(name) = entry.file_name().to_str().and_then(sanitize_basename) else {
+                        // Skip anything that wouldn't be downloadable
+                        // anyway (sandbox_basename rejects `..`,
+                        // dotfiles, weird chars).
+                        continue;
+                    };
+                    let Ok(meta) = entry.metadata() else { continue };
+                    if !meta.is_file() {
+                        continue;
+                    }
+                    let mtime = meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map_or(0u64, |d| d.as_secs());
+                    files.push(serde_json::json!({
+                        "name": name,
+                        "size": meta.len(),
+                        "mtime": mtime,
+                    }));
+                }
+            }
+            // Stable order so the viewer's diff (new-file toast) is
+            // predictable across polls.
+            files.sort_by(|a, b| a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or("")));
+            let body = serde_json::to_string(&serde_json::json!({ "files": files })).unwrap_or_default();
+            respond_json(stream, 200, &body);
         }
         ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/lock") => {
             // Flip the per-tab lock from the CLI / API. Master token
@@ -3174,6 +3304,188 @@ mod tests {
         assert_eq!(header_value(&h, "x-agent-state"), Some("thinking"));
         assert!(header_value(&h, "x-output-cols").is_some());
         assert!(header_value(&h, "x-output-rows").is_some());
+    }
+
+    fn make_cwd_with_outbox(files: &[(&str, &[u8])]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = dir.path().join("outbox");
+        std::fs::create_dir_all(&outbox).unwrap();
+        for (name, content) in files {
+            std::fs::write(outbox.join(name), content).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn outbox_endpoint_lists_real_files_alphabetically_and_skips_subdirs() {
+        let (port, state, token) = spawn_server();
+        let cwd = make_cwd_with_outbox(&[("zulu.bin", b"zz"), ("alpha.txt", b"a")]);
+        // Subdir must not appear in the listing — we only surface
+        // downloadable files.
+        std::fs::create_dir_all(cwd.path().join("outbox").join("subdir")).unwrap();
+        {
+            let mut s = state.lock().unwrap();
+            s.tabs[0].cwd = Some(cwd.path().to_string_lossy().into_owned());
+            s.cached_response = None;
+        }
+        let raw = request_bytes(
+            port,
+            &format!("GET /tabs/0/outbox HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        let (h, b) = split_response(&raw);
+        assert!(h.starts_with("HTTP/1.1 200"), "got: {h}");
+        let parsed: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        let files = parsed["files"].as_array().expect("files array");
+        let names: Vec<&str> = files.iter().filter_map(|f| f["name"].as_str()).collect();
+        assert_eq!(names, vec!["alpha.txt", "zulu.bin"], "alphabetical + subdirs skipped");
+        let size_for = |n: &str| {
+            files
+                .iter()
+                .find(|f| f["name"].as_str() == Some(n))
+                .and_then(|f| f["size"].as_u64())
+        };
+        assert_eq!(size_for("alpha.txt"), Some(1));
+        assert_eq!(size_for("zulu.bin"), Some(2));
+    }
+
+    #[test]
+    fn stream_emits_x_outbox_count() {
+        let (port, state, token) = spawn_server();
+        let cwd = make_cwd_with_outbox(&[("a", b"1"), ("b", b"2"), ("c", b"3")]);
+        let ring = Arc::new(Mutex::new(crate::pty_ring::PtyRing::default()));
+        ring.lock().unwrap().push(b"x");
+        {
+            let mut s = state.lock().unwrap();
+            s.tabs[0].pty_ring = Some(ring);
+            s.tabs[0].cwd = Some(cwd.path().to_string_lossy().into_owned());
+            s.cached_response = None;
+        }
+        let raw = request_bytes(
+            port,
+            &format!("GET /tabs/0/stream HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        let (h, _) = split_response(&raw);
+        assert_eq!(header_value(&h, "x-outbox-count"), Some("3"));
+    }
+
+    #[test]
+    fn upload_atomic_write_and_returns_201() {
+        let (port, state, token) = spawn_server();
+        let cwd = tempfile::tempdir().unwrap();
+        {
+            let mut s = state.lock().unwrap();
+            s.tabs[0].cwd = Some(cwd.path().to_string_lossy().into_owned());
+            s.cached_response = None;
+        }
+        let body = b"hello upload";
+        let raw = request_bytes(
+            port,
+            &format!(
+                "POST /tabs/0/files?name=hello.txt HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                std::str::from_utf8(body).unwrap()
+            ),
+        );
+        let (h, b) = split_response(&raw);
+        assert!(h.starts_with("HTTP/1.1 201"), "expected 201 Created, got: {h}");
+        let parsed: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!(parsed["bytes"].as_u64(), Some(body.len() as u64));
+        let dest = cwd.path().join("inbox").join("hello.txt");
+        let got = std::fs::read(&dest).unwrap();
+        assert_eq!(got, body);
+        // The staging file MUST be cleaned up by the atomic rename.
+        let staging = cwd.path().join("inbox").join(".hello.txt.tmp");
+        assert!(!staging.exists(), "staging .tmp file should be gone after rename");
+    }
+
+    #[test]
+    fn download_emits_rfc5987_filename_and_nosniff() {
+        let (port, state, token) = spawn_server();
+        let cwd = make_cwd_with_outbox(&[("Frédéric report.txt", b"hi")]);
+        {
+            let mut s = state.lock().unwrap();
+            s.tabs[0].cwd = Some(cwd.path().to_string_lossy().into_owned());
+            s.cached_response = None;
+        }
+        let raw = request_bytes(
+            port,
+            &format!(
+                "GET /tabs/0/files?path=outbox/Fr%C3%A9d%C3%A9ric%20report.txt HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"
+            ),
+        );
+        let (h, b) = split_response(&raw);
+        assert!(h.starts_with("HTTP/1.1 200"), "got: {h}");
+        assert_eq!(b, b"hi");
+        let disp = header_value(&h, "content-disposition").expect("content-disposition");
+        assert!(
+            disp.contains("filename*=UTF-8''Fr%C3%A9d%C3%A9ric%20report.txt"),
+            "RFC 5987 filename* present, got: {disp}"
+        );
+        assert!(disp.contains("filename=\""), "ASCII fallback also present, got: {disp}");
+        assert_eq!(
+            header_value(&h, "x-content-type-options"),
+            Some("nosniff"),
+            "nosniff guards against in-browser rendering of uploaded HTML"
+        );
+    }
+
+    #[test]
+    fn upload_ro_share_token_returns_403() {
+        // Read-only share-token tries to POST a file → must 403.
+        let (port, state, _master_token) = spawn_server();
+        {
+            let mut s = state.lock().unwrap();
+            s.tabs[0].share_token_ro = "ro-token".into();
+            s.tabs[0].cwd = Some("/tmp".into());
+            s.cached_response = None;
+        }
+        // Use by-id form (share-token auth path requires it).
+        let raw = request_bytes(
+            port,
+            "POST /tabs/by-id/tab-a/files?name=x.txt HTTP/1.1\r\nAuthorization: Bearer ro-token\r\nContent-Length: 0\r\n\r\n",
+        );
+        let (h, _) = split_response(&raw);
+        assert!(h.starts_with("HTTP/1.1 403"), "expected 403, got: {h}");
+    }
+
+    #[test]
+    fn download_ro_share_token_allowed() {
+        // Read-only share-token can GET files (download is a read).
+        let (port, state, _master_token) = spawn_server();
+        let cwd = make_cwd_with_outbox(&[("doc.txt", b"hello ro")]);
+        {
+            let mut s = state.lock().unwrap();
+            s.tabs[0].share_token_ro = "ro-token-2".into();
+            s.tabs[0].cwd = Some(cwd.path().to_string_lossy().into_owned());
+            s.cached_response = None;
+        }
+        let raw = request_bytes(
+            port,
+            "GET /tabs/by-id/tab-a/files?path=outbox/doc.txt HTTP/1.1\r\nAuthorization: Bearer ro-token-2\r\n\r\n",
+        );
+        let (h, b) = split_response(&raw);
+        assert!(h.starts_with("HTTP/1.1 200"), "got: {h}");
+        assert_eq!(b, b"hello ro");
+    }
+
+    #[test]
+    fn outbox_list_works_with_by_id_form_and_ro_share_token() {
+        let (port, state, _master_token) = spawn_server();
+        let cwd = make_cwd_with_outbox(&[("a.txt", b"a")]);
+        {
+            let mut s = state.lock().unwrap();
+            s.tabs[0].share_token_ro = "ro-token-3".into();
+            s.tabs[0].cwd = Some(cwd.path().to_string_lossy().into_owned());
+            s.cached_response = None;
+        }
+        let raw = request_bytes(
+            port,
+            "GET /tabs/by-id/tab-a/outbox HTTP/1.1\r\nAuthorization: Bearer ro-token-3\r\n\r\n",
+        );
+        let (h, b) = split_response(&raw);
+        assert!(h.starts_with("HTTP/1.1 200"), "got: {h}");
+        let parsed: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!(parsed["files"][0]["name"].as_str(), Some("a.txt"));
     }
 
     #[test]
