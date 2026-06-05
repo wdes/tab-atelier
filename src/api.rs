@@ -503,6 +503,15 @@ fn maybe_gzip(bytes: &[u8], accept_gzip: bool) -> Option<Vec<u8>> {
 /// `extra_headers` is appended verbatim (each line should end with `\r\n`);
 /// callers pass per-endpoint metadata there (e.g. X-Output-* on
 /// `/tabs/{idx}/output`). Cursor / cwd headers etc.
+/// Anti-indexing header emitted on every response. Share-link URLs
+/// embed an unguessable token, but if one leaks (a screenshot, a
+/// chat-history index, a paste in a public ticket) the worst case
+/// today is a crawler discovering it and surfacing it in search
+/// results. `X-Robots-Tag` is the HTTP equivalent of the
+/// `<meta name="robots">` we already set in the viewer HTML — it
+/// covers the JSON / binary routes the meta tag can't reach.
+const ROBOTS_TAG: &str = "X-Robots-Tag: noindex, nofollow, noarchive\r\n";
+
 fn respond_with_etag<W: Write>(
     stream: &mut W,
     status: u16,
@@ -517,7 +526,7 @@ fn respond_with_etag<W: Write>(
         // Content is byte-identical to what the client already has.
         let _ = write!(
             stream,
-            "HTTP/1.1 304 Not Modified\r\nETag: \"{etag}\"\r\n{extra_headers}\r\n"
+            "HTTP/1.1 304 Not Modified\r\nETag: \"{etag}\"\r\n{ROBOTS_TAG}{extra_headers}\r\n"
         );
         return;
     }
@@ -534,14 +543,14 @@ fn respond_with_etag<W: Write>(
     if let Some(gz) = maybe_gzip(body, accept_gzip) {
         let _ = write!(
             stream,
-            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Encoding: gzip\r\nETag: \"{etag}\"\r\n{extra_headers}Content-Length: {}\r\n\r\n",
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Encoding: gzip\r\nETag: \"{etag}\"\r\n{ROBOTS_TAG}{extra_headers}Content-Length: {}\r\n\r\n",
             gz.len()
         );
         let _ = stream.write_all(&gz);
     } else {
         let _ = write!(
             stream,
-            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nETag: \"{etag}\"\r\n{extra_headers}Content-Length: {}\r\n\r\n",
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nETag: \"{etag}\"\r\n{ROBOTS_TAG}{extra_headers}Content-Length: {}\r\n\r\n",
             body.len()
         );
         let _ = stream.write_all(body);
@@ -560,7 +569,7 @@ fn respond_json<W: Write>(stream: &mut W, status: u16, body: &str) {
     };
     let _ = write!(
         stream,
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n{ROBOTS_TAG}Content-Length: {}\r\n\r\n{}",
         body.len(),
         body
     );
@@ -1237,19 +1246,23 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             let pty_rows = t.rows;
             let bg_color = t.bg_color.clone();
             let locked = t.locked;
-            // Count downloadable outbox/ entries so the viewer can
-            // toast "new file available" without a separate poll.
-            // Cheap stat — directory traversal only, no reads.
-            let outbox_count = t.cwd.as_deref().map_or(0, |cwd| {
-                std::fs::read_dir(std::path::Path::new(cwd).join("outbox")).map_or(0, |rd| {
-                    rd.flatten()
-                        .filter(|e| {
-                            e.file_name().to_str().and_then(sanitize_basename).is_some()
-                                && e.metadata().is_ok_and(|m| m.is_file())
-                        })
-                        .count()
+            // Count downloadable / uploaded files so the viewer can
+            // toast and badge without an extra poll. Cheap stat —
+            // directory traversal only, no reads.
+            let dir_count = |dirname: &str| -> usize {
+                t.cwd.as_deref().map_or(0, |cwd| {
+                    std::fs::read_dir(std::path::Path::new(cwd).join(dirname)).map_or(0, |rd| {
+                        rd.flatten()
+                            .filter(|e| {
+                                e.file_name().to_str().and_then(sanitize_basename).is_some()
+                                    && e.metadata().is_ok_and(|m| m.is_file())
+                            })
+                            .count()
+                    })
                 })
-            });
+            };
+            let outbox_count = dir_count("outbox");
+            let inbox_count = dir_count("inbox");
             let (agent_state_str, agent_label) = t.agent_state.as_ref().map_or((None, None), |s| {
                 let key = match s.state {
                     crate::AgentState::Thinking => "thinking",
@@ -1273,7 +1286,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             // base_offset when `since` aged out.
             let body_start = since.max(base_offset);
             let mut extra = format!(
-                "X-Stream-Length: {total_len}\r\nX-Stream-Start: {body_start}\r\nX-Stream-Cap: {cap}\r\nX-Output-Cols: {pty_cols}\r\nX-Output-Rows: {pty_rows}\r\nX-Build-Hash: {BUILD_HASH}\r\nX-Outbox-Count: {outbox_count}\r\n",
+                "X-Stream-Length: {total_len}\r\nX-Stream-Start: {body_start}\r\nX-Stream-Cap: {cap}\r\nX-Output-Cols: {pty_cols}\r\nX-Output-Rows: {pty_rows}\r\nX-Build-Hash: {BUILD_HASH}\r\nX-Outbox-Count: {outbox_count}\r\nX-Inbox-Count: {inbox_count}\r\n",
             );
             if !bg_color.is_empty() {
                 let _ = write!(extra, "X-Tab-Bg: {bg_color}\r\n");
@@ -1547,6 +1560,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             info!("API: stored {} bytes in {}", body_bytes.len(), dest.display());
             let body = serde_json::to_string(&serde_json::json!({
                 "path": dest.to_string_lossy(),
+                "relpath": format!("inbox/{name}"),
                 "bytes": body_bytes.len(),
             }))
             .unwrap_or_default();
@@ -1629,11 +1643,15 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 &disposition,
             );
         }
-        // List `outbox/` contents so the viewer can render a
-        // download panel. RO + RW share-tokens both allowed (it's a
-        // read), master token always allowed.
-        ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/outbox") => {
-            let Some((key_raw, is_uuid)) = parse_tab_key(p, "/outbox") else {
+        // List `outbox/` or `inbox/` contents so the viewer can
+        // render the download / sent-files panels. The panel header
+        // shows `dir` (absolute path) so the user can paste it into
+        // Claude / their agent ("read inbox/foo.txt"). RO + RW
+        // share-tokens both allowed, master token always allowed.
+        ("GET", p) if p.starts_with("/tabs/") && (p.ends_with("/outbox") || p.ends_with("/inbox")) => {
+            let dirname = if p.ends_with("/outbox") { "outbox" } else { "inbox" };
+            let suffix = if dirname == "outbox" { "/outbox" } else { "/inbox" };
+            let Some((key_raw, is_uuid)) = parse_tab_key(p, suffix) else {
                 error_json(stream, 404, "invalid tab key");
                 return;
             };
@@ -1651,12 +1669,12 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             let cwd = t.cwd.clone();
             drop(snap);
             let Some(cwd) = cwd else {
-                respond_json(stream, 200, r#"{"files":[]}"#);
+                respond_json(stream, 200, r#"{"files":[],"dir":""}"#);
                 return;
             };
-            let outbox = std::path::Path::new(&cwd).join("outbox");
+            let dir_path = std::path::Path::new(&cwd).join(dirname);
             let mut files: Vec<serde_json::Value> = Vec::new();
-            if let Ok(rd) = std::fs::read_dir(&outbox) {
+            if let Ok(rd) = std::fs::read_dir(&dir_path) {
                 for entry in rd.flatten() {
                     let Some(name) = entry.file_name().to_str().and_then(sanitize_basename) else {
                         // Skip anything that wouldn't be downloadable
@@ -1683,7 +1701,11 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             // Stable order so the viewer's diff (new-file toast) is
             // predictable across polls.
             files.sort_by(|a, b| a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or("")));
-            let body = serde_json::to_string(&serde_json::json!({ "files": files })).unwrap_or_default();
+            let body = serde_json::to_string(&serde_json::json!({
+                "files": files,
+                "dir": dir_path.to_string_lossy(),
+            }))
+            .unwrap_or_default();
             respond_json(stream, 200, &body);
         }
         ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/lock") => {
@@ -3326,6 +3348,40 @@ mod tests {
             std::fs::write(outbox.join(name), content).unwrap();
         }
         dir
+    }
+
+    #[test]
+    fn every_response_carries_x_robots_tag_noindex() {
+        // Crawler-resistance guard: every route must surface
+        // `X-Robots-Tag: noindex, ...` so a leaked share URL can't
+        // get scraped into search results. Touch one route of each
+        // shape — etag (output), JSON (tabs), error (401) — to
+        // cover the three response-helper code paths.
+        let (port, _state, token) = spawn_server();
+
+        for (req, label) in [
+            (
+                format!("GET /tabs/0/output HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+                "output (respond_with_etag)",
+            ),
+            (
+                format!("GET /tabs HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+                "tabs (respond_json)",
+            ),
+            (
+                "GET /tabs/0/output HTTP/1.1\r\nAuthorization: Bearer wrong-token\r\n\r\n".to_string(),
+                "error 401 (error_json)",
+            ),
+        ] {
+            let raw = request_bytes(port, &req);
+            let (h, _) = split_response(&raw);
+            let val = header_value(&h, "x-robots-tag")
+                .unwrap_or_else(|| panic!("X-Robots-Tag missing on: {label} headers={h:?}"));
+            assert!(
+                val.contains("noindex"),
+                "X-Robots-Tag must contain `noindex` on {label}, got: {val:?}"
+            );
+        }
     }
 
     #[test]
