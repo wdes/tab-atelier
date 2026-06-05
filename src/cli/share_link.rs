@@ -457,7 +457,6 @@ pub fn output(args: &[String]) -> i32 {
 pub fn ports(args: &[String]) -> i32 {
     let mut new_api: Option<String> = None;
     let mut new_tls: Option<String> = None;
-    let mut new_relay: Option<String> = None;
     let mut new_share_url: Option<String> = None;
     let mut new_bg: Option<String> = None;
     let mut new_bg_clear = false;
@@ -474,10 +473,6 @@ pub fn ports(args: &[String]) -> i32 {
             "--api-tls-addr" => {
                 i += 1;
                 new_tls = args.get(i).cloned();
-            }
-            "--happier-relay-addr" => {
-                i += 1;
-                new_relay = args.get(i).cloned();
             }
             "--share-url-base" => {
                 i += 1;
@@ -523,7 +518,7 @@ pub fn ports(args: &[String]) -> i32 {
             "--help" | "-h" => {
                 eprintln!(
                     "usage: tab-atelier-headless settings [--api-addr ADDR] [--api-tls-addr ADDR] \
-                     [--happier-relay-addr ADDR] [--share-url-base URL]\n\
+                     [--share-url-base URL]\n\
                      \x20            [--pty-cols N] [--pty-rows N]\n\
                      With no args, prints the current values.\n\
                      Set --share-url-base \"\" to clear.\n\
@@ -572,7 +567,6 @@ pub fn ports(args: &[String]) -> i32 {
 
     if new_api.is_none()
         && new_tls.is_none()
-        && new_relay.is_none()
         && new_share_url.is_none()
         && !clear_share_url
         && new_cols.is_none()
@@ -589,10 +583,6 @@ pub fn ports(args: &[String]) -> i32 {
             .get("api_tls_addr")
             .and_then(serde_json::Value::as_str)
             .unwrap_or(crate::DEFAULT_API_TLS_ADDR);
-        let relay = doc
-            .get("happier_relay_addr")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or(crate::DEFAULT_HAPPIER_RELAY_ADDR);
         let share = doc
             .get("share_url_base")
             .and_then(serde_json::Value::as_str)
@@ -609,10 +599,9 @@ pub fn ports(args: &[String]) -> i32 {
             .get("tab_bg_color")
             .and_then(serde_json::Value::as_str)
             .map_or_else(|| format!("{} (default)", crate::DEFAULT_TAB_BG_COLOR), str::to_owned);
-        println!("api_addr           = {api}");
-        println!("api_tls_addr       = {tls}");
-        println!("happier_relay_addr = {relay}");
-        println!("share_url_base     = {share}");
+        println!("api_addr       = {api}");
+        println!("api_tls_addr   = {tls}");
+        println!("share_url_base = {share}");
         println!("pty_cols           = {cols}");
         println!("pty_rows           = {rows}");
         println!("tab_bg_color       = {bg}");
@@ -626,9 +615,6 @@ pub fn ports(args: &[String]) -> i32 {
     }
     if let Some(v) = new_tls {
         obj.insert("api_tls_addr".into(), serde_json::Value::String(v));
-    }
-    if let Some(v) = new_relay {
-        obj.insert("happier_relay_addr".into(), serde_json::Value::String(v));
     }
     if let Some(v) = new_share_url {
         obj.insert("share_url_base".into(), serde_json::Value::String(v));

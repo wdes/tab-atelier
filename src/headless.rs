@@ -5,10 +5,10 @@
 //! Headless tab-atelier entry point.
 //!
 //! Restores every tab from `tabs.json`, spawns its PTY through
-//! `alacritty_terminal::tty`, runs the same local HTTP / TLS API and
-//! happier-bridge spawn the desktop GUI uses, and persists output /
-//! uptime / energy / token state on a 2 Hz tick. No display server, no
-//! gpui, no x11rb — just libc + alacritty + rustls.
+//! `alacritty_terminal::tty`, runs the same local HTTP / TLS API
+//! the desktop GUI uses, and persists output / uptime / energy /
+//! token state on a 2 Hz tick. No display server, no gpui, no
+//! x11rb — just libc + alacritty + rustls.
 //!
 //! Drains the same pending-action queues the GUI's `persist()` does
 //! (closes / activate / input / rename / status updates / new-tab
@@ -17,8 +17,6 @@
 
 #![cfg(not(feature = "gui"))]
 
-#[cfg(feature = "happier-bridge")]
-use crate::happier_relay_url_from_args;
 use crate::{api_url_for_local_clients, build_agent_resume_command, tab_env_extras};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -39,17 +37,16 @@ use crate::platform;
 #[cfg(feature = "energy")]
 use crate::save_tab_energy;
 use crate::{
-    AgentStateSnapshot, DEFAULT_API_ADDR, DEFAULT_API_TLS_ADDR, DEFAULT_HAPPIER_RELAY_ADDR, SHUTDOWN_REQUESTED,
-    SavedState, TabState, crc32, default_tab_id, load_preferences, load_state_with_outputs, save_state,
-    save_tab_output, save_tab_uptime,
+    AgentStateSnapshot, DEFAULT_API_ADDR, DEFAULT_API_TLS_ADDR, SHUTDOWN_REQUESTED, SavedState, TabState, crc32,
+    default_tab_id, load_preferences, load_state_with_outputs, save_state, save_tab_output, save_tab_uptime,
 };
 
 const INITIAL_COLS: usize = 80;
 const INITIAL_LINES: usize = 24;
 
 // Shared with the GUI — see `crate::tab_env_extras`,
-// `crate::api_url_for_local_clients`, `crate::build_agent_resume_command`,
-// and `crate::happier_relay_url_from_args` in lib.rs.
+// `crate::api_url_for_local_clients`, and
+// `crate::build_agent_resume_command` in lib.rs.
 
 /// Tiny `EventListener` that just keeps the PTY-reply channel hooked
 /// up. Same shape as `terminal.rs::EventProxy` minus the gpui-side
@@ -381,10 +378,6 @@ pub fn run() -> std::io::Result<()> {
     let pty_cols = prefs.pty_cols.map_or(INITIAL_COLS, |v| (v as usize).max(4));
     let pty_rows = prefs.pty_rows.map_or(INITIAL_LINES, |v| (v as usize).max(4));
     let global_bg = prefs.tab_bg_color.unwrap_or_else(|| crate::DEFAULT_TAB_BG_COLOR.into());
-    #[cfg_attr(not(feature = "happier-bridge"), allow(unused_variables))]
-    let happier_relay_addr = prefs
-        .happier_relay_addr
-        .unwrap_or_else(|| DEFAULT_HAPPIER_RELAY_ADDR.into());
 
     let api_url_for_pty = api_url_for_local_clients(&api_addr);
 
@@ -508,31 +501,6 @@ pub fn run() -> std::io::Result<()> {
     let battery_percent: Arc<Mutex<Option<u8>>> = Arc::new(Mutex::new(None));
     #[cfg(feature = "energy")]
     crate::power::start_power_monitor(power_pids.clone(), power_watts.clone(), battery_percent.clone());
-
-    // --- happier-bridge spawn (auto-relay + optional publisher) ---
-    #[cfg(feature = "happier-bridge")]
-    let _relay_handle = match crate::happier_bridge::spawn_relay(&happier_relay_addr) {
-        Ok(handle) => {
-            info!(
-                "happier-relay spawned at https://{happier_relay_addr} (pid {})",
-                handle.pid()
-            );
-            Some(handle)
-        }
-        Err(e) => {
-            warn!("happier-relay not spawned: {e}");
-            None
-        }
-    };
-
-    #[cfg(feature = "happier-bridge")]
-    {
-        if let Some(url) = happier_relay_url_from_args() {
-            crate::happier_bridge::spawn(url, api_state.clone());
-        } else {
-            crate::happier_bridge::spawn(format!("https://{happier_relay_addr}"), api_state.clone());
-        }
-    }
 
     let _ = windowed; // headless doesn't have a window — kept for parity with saved-state shape
 

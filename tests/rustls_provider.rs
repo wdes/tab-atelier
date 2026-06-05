@@ -5,10 +5,10 @@
 //! Regression test for the rustls `CryptoProvider` panic.
 //!
 //! Workspace feature unification compiles `rustls` with both the
-//! `ring` and `aws_lc_rs` features enabled (axum-server + reqwest
-//! pull `aws_lc_rs` in via happier-relay and catbus-agent, while
-//! tab-atelier explicitly enables `ring`). With both providers in
-//! play, `rustls::ServerConfig::builder()` panics:
+//! `ring` and `aws_lc_rs` features enabled (catbus-agent pulls
+//! `aws_lc_rs` in via reqwest, while tab-atelier explicitly enables
+//! `ring`). With both providers in play, `rustls::ServerConfig::builder()`
+//! panics:
 //!
 //! ```text
 //! Could not automatically determine the process-level CryptoProvider

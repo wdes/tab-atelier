@@ -42,16 +42,15 @@ jobs:
           # ~nightly<timestamp> suffix the .debs carry.
           echo "SHORT_SHA=${GITHUB_SHA::8}" >> "$GITHUB_ENV"
 
-      - name: Build headless binaries
+      - name: Build headless binary
         shell: bash
         run: |
           # Explicit -p so the Linux-only catbus-agent workspace member
           # (in default-members) is NOT built. catbus + energy features
           # are off: both are Linux-only (/proc + AF_UNIX, /sys powercap).
           cargo build --release -p tab-atelier \
-            --no-default-features --features headless,happier-bridge \
+            --no-default-features --features headless \
             --bin tab-atelier-headless
-          cargo build --release -p happier-relay
 
       - name: Install WiX 3 toolset
         shell: pwsh

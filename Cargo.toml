@@ -1,10 +1,6 @@
 [workspace]
-members = ["crates/catbus-agent", "crates/happier-relay"]
-# happier-relay is an opt-in experimental sub-binary; keep it out of
-# the default workspace build so `cargo build` / `cargo check` from the
-# root stays lean. Build it explicitly with
-# `cargo build -p happier-relay --features happier-dev`.
-default-members = [".", "crates/catbus-agent", "crates/happier-relay"]
+members = ["crates/catbus-agent"]
+default-members = [".", "crates/catbus-agent"]
 
 [package]
 name = "tab-atelier"
@@ -43,9 +39,8 @@ default = ["gui", "energy", "catbus"]
 # `catbus` is in the `default` feature instead, so Linux builds keep it
 # while `--no-default-features --features gui` on Windows omits it.
 gui = ["dep:gpui", "dep:x11rb", "dep:qrcode"]
-# Display-less variant: only the API server + PTY-driven tab restore
-# + happier-bridge spawn. Selected with `--no-default-features
-# --features headless[,...]`.
+# Display-less variant: only the API server + PTY-driven tab restore.
+# Selected with `--no-default-features --features headless[,...]`.
 headless = []
 energy = ["dep:wattaouille"]
 # catbus-agent integration: per-tab Claude session detection (walks
@@ -54,11 +49,6 @@ energy = ["dep:wattaouille"]
 # (/proc + AF_UNIX), so it's a separate feature that the Windows build
 # leaves off. Implied by `gui`; included in the Linux headless .deb.
 catbus = []
-# Opt-in bridge that publishes every tab as a happier artifact against a
-# user-provided relay (`--happier-relay-url`). Off by default to keep
-# the regular build slim — when enabled, pulls in ed25519 / base64 /
-# happier-style wire types via the `happier-relay` workspace member.
-happier-bridge = ["dep:ed25519-dalek", "dep:base64", "dep:rand"]
 
 [lints.rust]
 unsafe_code = "deny"
@@ -130,10 +120,6 @@ sha2 = { version = "0.10", default-features = false }
 # default is `1975-01-01 → 4096-01-01`, which strict mobile TLS
 # stacks (Android) reject.
 time = "0.3"
-# Optional happier-bridge deps (only compiled with `--features happier-bridge`).
-ed25519-dalek = { version = "2", optional = true }
-base64 = { version = "0.22", optional = true }
-rand = { version = "0.8", optional = true }
 # gzip for the mobile-remote HTTP responses (3–4× smaller for terminal
 # scrollback). Already in the transitive tree; pulling it in directly
 # so we can wrap our own write path.
@@ -179,18 +165,14 @@ gpui = { version = "0.2", default-features = false, optional = true }
 [package.metadata.deb]
 section = "x11"
 priority = "optional"
-# The bundled happier-relay auto-spawn lives behind the
-# `happier-bridge` feature. `cargo build` keeps it off for fast dev
-# rebuilds; the deb always wants it.
-features = ["happier-bridge"]
 depends = "libc6, libgcc-s1, libfreetype6, libxkbcommon0, libxkbcommon-x11-0, libxcb1, libxcb-xkb1"
-# Desktop and headless ship the same `catbus-agent` and
-# `happier-relay` helper binaries in `/usr/bin/`, so they can't both
-# be installed at once. `Conflicts:` makes apt refuse the second
-# install with a clean message instead of letting dpkg unpack-then-
-# crash on a colliding path. `Replaces:` is the matching half so a
-# user who installed one and wants to switch can `apt install
-# tab-atelier-headless` and apt does the swap.
+# Desktop and headless ship the same `catbus-agent` helper binary in
+# `/usr/bin/`, so they can't both be installed at once.
+# `Conflicts:` makes apt refuse the second install with a clean
+# message instead of letting dpkg unpack-then-crash on a colliding
+# path. `Replaces:` is the matching half so a user who installed
+# one and wants to switch can `apt install tab-atelier-headless`
+# and apt does the swap.
 conflicts = "tab-atelier-headless"
 replaces = "tab-atelier-headless"
 maintainer = "William Desportes <williamdes@wdes.fr>"
@@ -200,10 +182,6 @@ assets = [
     # Bundled so the "Switch to catbus" tab menu entry resolves the
     # binary against the user's PATH without extra config.
     ["target/release/catbus-agent", "/usr/bin/", "755"],
-    # tab-atelier spawns this on startup (when `happier-bridge` is
-    # built in) so the mobile/web clients have a relay to talk to
-    # without the user managing a separate process.
-    ["target/release/happier-relay", "/usr/bin/", "755"],
     ["assets/tab-atelier.desktop", "/usr/share/applications/", "644"],
     # Drops a system-wide autostart entry so the app appears in
     # session-manager autostart lists (XFCE: Session and Startup →
@@ -229,24 +207,23 @@ conf-files = ["/etc/tab-atelier/preferences.json"]
 
 # Headless variant — produces tab-atelier-headless_<version>.deb.
 # Built with `cargo deb -p tab-atelier --variant headless`. Uses
-# `--no-default-features --features headless,happier-bridge,energy,catbus`
-# under the hood so the binary depends only on libc / libgcc and
-# never pulls in libfreetype / libxkbcommon / libxcb / libqrcode.
-# `catbus` stays on for the Linux .deb; a future Windows headless build
-# is the only configuration that drops it.
+# `--no-default-features --features headless,energy,catbus` under the
+# hood so the binary depends only on libc / libgcc and never pulls in
+# libfreetype / libxkbcommon / libxcb / libqrcode. `catbus` stays on
+# for the Linux .deb; a future Windows headless build is the only
+# configuration that drops it.
 [package.metadata.deb.variants.headless]
 name = "tab-atelier-headless"
-features = ["headless", "happier-bridge", "energy", "catbus"]
+features = ["headless", "energy", "catbus"]
 default-features = false
 # Mirror of the default variant — see the comment on
 # `[package.metadata.deb].conflicts`. apt picks one or the other.
 conflicts = "tab-atelier"
 replaces = "tab-atelier"
-extended-description = "Display-less companion to tab-atelier. Restores tabs from tabs.json, spawns their PTYs, and runs the same local HTTP/TLS API + happier-bridge as the desktop GUI — without any X11 / gpui dependency. Designed for servers, CI runners, and remote shells where the mobile/web remote should still see the same set of named tabs."
+extended-description = "Display-less companion to tab-atelier. Restores tabs from tabs.json, spawns their PTYs, and runs the same local HTTP/TLS API as the desktop GUI — without any X11 / gpui dependency. Designed for servers, CI runners, and remote shells where the web viewer should still see the same set of named tabs."
 assets = [
     ["target/release/tab-atelier-headless", "/usr/bin/", "755"],
     ["target/release/catbus-agent", "/usr/bin/", "755"],
-    ["target/release/happier-relay", "/usr/bin/", "755"],
     # Systemd *system* unit — runs as the unprivileged `tab-atelier`
     # service account (created by the postinst). State lives under
     # /var/lib/tab-atelier via the unit's StateDirectory=. Designed for

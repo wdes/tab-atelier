@@ -84,7 +84,7 @@ ProtectHostname=true
 ProtectProc=invisible
 ProcSubset=pid
 
-# Network — TCP only (happier-relay is loopback, API binds INADDR_ANY).
+# Network — TCP only (API binds INADDR_ANY by default).
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
 # Namespaces / IPC / keyring
