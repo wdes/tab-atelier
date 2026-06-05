@@ -19,8 +19,8 @@ const VIEWER_HTML: &str = include_str!("../assets/web-viewer.html");
 /// deployments (firecracker VMs, air-gapped hosts, anywhere CDN
 /// fetches to `unpkg.com` would fail). Served at version-pinned
 /// `/assets/xterm-X.Y.Z.{js,css}` URLs that bypass token auth.
-const VENDOR_XTERM_JS: &str = include_str!("../assets/vendor/xterm-5.3.0/xterm.js");
-const VENDOR_XTERM_CSS: &str = include_str!("../assets/vendor/xterm-5.3.0/xterm.css");
+const VENDOR_XTERM_JS: &str = include_str!("../assets/vendor/xterm-6.0.0/xterm.js");
+const VENDOR_XTERM_CSS: &str = include_str!("../assets/vendor/xterm-6.0.0/xterm.css");
 
 /// Short git commit hash baked in at build time by `build.rs`.
 /// Embedded into the `/view` HTML as `__BUILD_HASH__` and echoed on
@@ -714,8 +714,8 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
     // browser (without the token in their session cookies) can
     // still load the JS that fetches /stream with the token from
     // the URL.
-    if let ("GET", "/assets/xterm-5.3.0.js" | "/assets/xterm-5.3.0.css") = (method.as_str(), path.as_str()) {
-        let (body, ctype): (&[u8], &str) = if path == "/assets/xterm-5.3.0.js" {
+    if let ("GET", "/assets/xterm-6.0.0.js" | "/assets/xterm-6.0.0.css") = (method.as_str(), path.as_str()) {
+        let (body, ctype): (&[u8], &str) = if path == "/assets/xterm-6.0.0.js" {
             (VENDOR_XTERM_JS.as_bytes(), "application/javascript; charset=utf-8")
         } else {
             (VENDOR_XTERM_CSS.as_bytes(), "text/css; charset=utf-8")
@@ -3389,7 +3389,7 @@ mod tests {
     fn vendor_xterm_assets_serve_unauthenticated_with_immutable_cache() {
         let (port, _state, _token) = spawn_server();
         // No Authorization header at all — must still get 200.
-        let raw = request_bytes(port, "GET /assets/xterm-5.3.0.js HTTP/1.1\r\n\r\n");
+        let raw = request_bytes(port, "GET /assets/xterm-6.0.0.js HTTP/1.1\r\n\r\n");
         let (h, b) = split_response(&raw);
         assert!(h.starts_with("HTTP/1.1 200"), "got: {h}");
         assert_eq!(
@@ -3403,7 +3403,7 @@ mod tests {
         // Body sanity — first byte of the UMD wrapper xterm.js ships with.
         assert!(b.starts_with(b"!function"), "first bytes: {:?}", &b[..b.len().min(40)]);
 
-        let raw = request_bytes(port, "GET /assets/xterm-5.3.0.css HTTP/1.1\r\n\r\n");
+        let raw = request_bytes(port, "GET /assets/xterm-6.0.0.css HTTP/1.1\r\n\r\n");
         let (h, b) = split_response(&raw);
         assert!(h.starts_with("HTTP/1.1 200"), "got: {h}");
         assert_eq!(header_value(&h, "content-type"), Some("text/css; charset=utf-8"));

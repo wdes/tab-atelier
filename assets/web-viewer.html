@@ -15,7 +15,7 @@
        auth. Local-first: no CDN fetch, works on air-gapped /
        sandboxed hosts. Absolute path — viewers behind a
        sub-path reverse proxy will need to rewrite this. -->
-  <link rel="stylesheet" href="/assets/xterm-5.3.0.css">
+  <link rel="stylesheet" href="/assets/xterm-6.0.0.css">
   <style>
     html, body { margin: 0; padding: 0; height: 100%; background: __TAB_BG__; color: #ccc; font-family: monospace; }
     /* Centre the terminal so the server-sized grid stays aligned in
@@ -180,7 +180,7 @@
     <div class="hint" id="files-hint"></div>
   </div>
   <div id="toast"></div>
-  <script src="/assets/xterm-5.3.0.js"></script>
+  <script src="/assets/xterm-6.0.0.js"></script>
   <script>
     // __TAB_KEY__ is the route segment after `/tabs/` (numeric idx or
     // `by-id/<uuid>` form). The same value is what every subrequest
@@ -225,6 +225,15 @@
       rows: 24,
       scrollback: 5000,
       theme: { background: "__TAB_BG__", foreground: "#cccccc" },
+      // xterm.js 6.0+: push the erased viewport into scrollback when
+      // an ESC[2J (Erase in Display All) sequence fires. Claude Code's
+      // TUI redraws on every turn via ESC[2J\ESC[H — without this
+      // option those rows are lost forever. With it on, every redraw
+      // preserves the previous frame in scrollback. This is THE fix
+      // for the missing scrollbar bug. (Combined with stripping the
+      // alt-screen toggle in the byte stream so Claude stays in main
+      // buffer where scrollback exists at all.)
+      scrollOnEraseInDisplay: true,
     });
     const termEl = document.getElementById("term");
     term.open(termEl);
