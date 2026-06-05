@@ -62,19 +62,25 @@ jobs:
           Expand-Archive "$env:RUNNER_TEMP\wix.zip" -DestinationPath "$env:RUNNER_TEMP\wix"
           "$env:RUNNER_TEMP\wix" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
 
-      - name: Install cargo-wix
-        run: cargo install cargo-wix --version "^0.3" --locked
-
       - name: Build MSI
         shell: bash
         run: |
-          # --no-build: reuse the binaries compiled above (so the feature
-          #   flags stick); cargo-wix would otherwise rebuild with default
-          #   features and pull in the GUI/gpui stack.
-          cargo wix --no-build --nocapture \
-            --package tab-atelier \
-            --install-version "${MSI_VERSION}" \
-            --output "target/wix/tab-atelier-headless-${SHORT_SHA}-${MSI_VERSION}-x86_64.msi"
+          # Invoke candle/light directly, the same way windows-desktop.yml
+          # does. cargo-wix 0.3 auto-harvests every wix/*.wxs in the
+          # workspace, which collides with desktop.wxs (LGHT0089 multiple
+          # entry sections); a direct candle invocation picks exactly one
+          # source file and never sees its sibling.
+          mkdir -p target/wix
+          OUT="target/wix/tab-atelier-headless-${SHORT_SHA}-${MSI_VERSION}-x86_64.msi"
+          candle.exe wix/main.wxs \
+              -ext WixUtilExtension \
+              -arch x64 \
+              -dVersion="${MSI_VERSION}" \
+              -dCargoTargetBinDir="target/release" \
+              -out target/wix/main.wixobj
+          light.exe target/wix/main.wixobj \
+              -ext WixUtilExtension \
+              -out "${OUT}"
 
       # End-to-end smoke test: install the MSI silently, then run the
       # installed binary with --check-crypto and --version. Catches
