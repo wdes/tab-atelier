@@ -3241,13 +3241,19 @@ mod tests {
         );
         let (h, _) = split_response(&raw);
         let server_hash = header_value(&h, "x-build-hash").expect("X-Build-Hash header present");
-        // Must match the compile-time BUILD_HASH. Either a 12-char
-        // hex string (normal build) or the literal "unknown" (built
-        // outside a git repo, e.g. from a tarball).
+        // Must match the compile-time BUILD_HASH and conform to one
+        // of the three forms `build.rs` emits:
+        //   - 12-char hex   git rev-parse fallback
+        //   - "t<digits>"   tarball / no-git fallback (unix secs)
+        //   - "unknown"     last-resort, when even SystemTime fails
         assert_eq!(server_hash, crate::api::BUILD_HASH);
+        let is_git_hash = server_hash.len() == 12 && server_hash.chars().all(|c| c.is_ascii_hexdigit());
+        let is_timestamp = server_hash
+            .strip_prefix('t')
+            .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()));
         assert!(
-            server_hash == "unknown" || (server_hash.len() == 12 && server_hash.chars().all(|c| c.is_ascii_hexdigit())),
-            "build hash should be 12 hex chars or `unknown`, got {server_hash:?}"
+            is_git_hash || is_timestamp || server_hash == "unknown",
+            "build hash must be 12 hex / t<digits> / `unknown`, got {server_hash:?}"
         );
     }
 
