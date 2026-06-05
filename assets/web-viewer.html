@@ -29,8 +29,10 @@
   <div id="term"></div>
   <div id="status">connecting…</div>
   <div id="update-chip" title="The server was upgraded — click to reload this viewer">↻ update available</div>
-  <button id="outbox-btn" class="files-btn" title="Files agent has placed in outbox/ for download">⬇ outbox<span class="badge" id="outbox-badge">0</span></button>
-  <button id="inbox-btn" class="files-btn" title="Files you've uploaded to inbox/ — drag the path into Claude">⬆ inbox<span class="badge" id="inbox-badge">0</span></button>
+  <div id="files-controls">
+    <button id="outbox-btn" class="files-btn" title="Files agent has placed in outbox/ for download">⬇ outbox<span class="badge" id="outbox-badge">0</span></button>
+    <button id="inbox-btn" class="files-btn" title="Files you've uploaded to inbox/ — drag the path into Claude">⬆ inbox<span class="badge" id="inbox-badge">0</span></button>
+  </div>
   <div id="drop-overlay"><div class="inner">drop file to upload to <code>inbox/</code></div></div>
   <div id="files-panel">
     <span class="close" id="files-close" title="Close">×</span>
