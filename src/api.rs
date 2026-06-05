@@ -4,7 +4,7 @@
 
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use serde::Serialize;
 
@@ -429,6 +429,61 @@ const FILE_SANDBOX_DIRS: &[&str] = &["inbox", "outbox"];
 const UPLOAD_MAX_BYTES_MIB: usize = 100;
 const UPLOAD_MAX_BYTES: usize = UPLOAD_MAX_BYTES_MIB * 1024 * 1024;
 
+/// Max concurrent in-flight uploads per share token. A coordinated
+/// attacker holding an RW share token could otherwise queue dozens
+/// of 100 MiB uploads in parallel and amplify memory pressure /
+/// disk churn well past what one user should be able to do.
+/// Tracked process-wide via [`UPLOAD_INFLIGHT`]; counter is
+/// incremented on POST entry and decremented when the route arm
+/// returns (success or error).
+const UPLOAD_MAX_INFLIGHT_PER_TOKEN: usize = 3;
+
+/// Token → in-flight upload count. Bare `Mutex<HashMap>` is fine —
+/// the critical section is two integer ops per request, dwarfed by
+/// the actual file I/O the upload does.
+static UPLOAD_INFLIGHT: LazyLock<Mutex<std::collections::HashMap<String, usize>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// RAII guard. Increments on `try_acquire`, decrements in `Drop`.
+/// The decrement happens automatically even on panics / early
+/// returns, so we can't leak slots.
+struct UploadSlot {
+    token: String,
+}
+
+impl UploadSlot {
+    /// Returns `Ok(slot)` when there was room under the per-token
+    /// cap; `Err(in_flight)` otherwise (caller turns it into 429).
+    fn try_acquire(token: &str) -> Result<Self, usize> {
+        let mut map = UPLOAD_INFLIGHT.lock().unwrap();
+        let entry = map.entry(token.to_string()).or_insert(0);
+        if *entry >= UPLOAD_MAX_INFLIGHT_PER_TOKEN {
+            let n = *entry;
+            drop(map);
+            return Err(n);
+        }
+        *entry += 1;
+        let slot = Self {
+            token: token.to_string(),
+        };
+        drop(map);
+        Ok(slot)
+    }
+}
+
+impl Drop for UploadSlot {
+    fn drop(&mut self) {
+        if let Ok(mut map) = UPLOAD_INFLIGHT.lock()
+            && let Some(n) = map.get_mut(&self.token)
+        {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                map.remove(&self.token);
+            }
+        }
+    }
+}
+
 /// Resolve a relative path against `cwd` and confirm it lands inside
 /// one of `FILE_SANDBOX_DIRS`. Performs syntactic rejection (`..`,
 /// absolute paths, NUL bytes) BEFORE touching the filesystem, then a
@@ -523,6 +578,34 @@ fn maybe_gzip(bytes: &[u8], accept_gzip: bool) -> Option<Vec<u8>> {
 /// `extra_headers` is appended verbatim (each line should end with `\r\n`);
 /// callers pass per-endpoint metadata there (e.g. X-Output-* on
 /// `/tabs/{idx}/output`). Cursor / cwd headers etc.
+/// `#RRGGBB` validator — refuses anything that would break the
+/// surrounding HTTP header line or CSS context if echoed back. Used
+/// both at the POST/preferences-write path (validation-on-input) and
+/// before emitting `X-Tab-Bg` on every `/output` and `/stream`
+/// response (validation-on-output, defense in depth: if a future bug
+/// ever bypasses the input validator, the header line still can't be
+/// corrupted).
+fn is_safe_hex_color(s: &str) -> bool {
+    s.len() == 7 && s.starts_with('#') && s[1..].chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Constant-time byte-slice equality. Returns false on length mismatch
+/// without leaking length differences via early exit; on equal lengths
+/// folds every byte difference into a single accumulator before
+/// reducing to a bool. Used for every token comparison so a remote
+/// attacker can't shave bits off a 128-bit token by timing how
+/// quickly different guesses get rejected.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// Anti-indexing header emitted on every response. Share-link URLs
 /// embed an unguessable token, but if one leaks (a screenshot, a
 /// chat-history index, a paste in a public ticket) the worst case
@@ -585,6 +668,8 @@ fn respond_json<W: Write>(stream: &mut W, status: u16, body: &str) {
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        413 => "Payload Too Large",
+        429 => "Too Many Requests",
         _ => "Error",
     };
     let _ = write!(
@@ -768,21 +853,32 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
     // don't need to re-check; if execution reaches them, this gate
     // has already accepted the request at the right level.
     let mut share_token_authorised = false;
-    if provided_token.as_deref() != Some(token) {
+    if !constant_time_eq(provided_token.as_deref().unwrap_or("").as_bytes(), token.as_bytes()) {
         let allowed = if let Some(p) = provided_token.as_deref()
             && let Some(rest) = path.strip_prefix("/tabs/by-id/")
             && let Some((uuid, action)) = rest.split_once('/')
-            && matches!(action, "view" | "output" | "stream" | "input" | "files" | "outbox")
-        {
+            && matches!(
+                action,
+                "view" | "output" | "stream" | "input" | "files" | "outbox" | "inbox"
+            ) {
             let state_g = state.lock().unwrap();
             state_g.tabs.iter().find(|t| t.id == uuid).and_then(|t| {
-                let rw_match = !t.share_token_rw.is_empty() && t.share_token_rw == p;
-                let ro_match = !t.share_token_ro.is_empty() && t.share_token_ro == p;
-                // Mutating share-token actions: only RW. The RO link
-                // is read-only by construction so attempting to
-                // upload a file (POST /files) must fail with 403,
-                // same as /input.
-                let needs_rw = matches!(action, "input") || (action == "files" && method.as_str() == "POST");
+                // Constant-time per-byte comparison so a brute-force
+                // probe can't shave bits off the search space by
+                // timing how long the reject takes (audit #2).
+                let rw_match =
+                    !t.share_token_rw.is_empty() && constant_time_eq(t.share_token_rw.as_bytes(), p.as_bytes());
+                let ro_match =
+                    !t.share_token_ro.is_empty() && constant_time_eq(t.share_token_ro.as_bytes(), p.as_bytes());
+                // Mutating + privileged-read share-token actions
+                // require RW. The RO link is read-only by construction
+                // so:
+                //   - POST /files (upload): RW only — already enforced
+                //   - GET  /inbox        : RW only — RO recipients
+                //                          shouldn't enumerate what
+                //                          other RW users uploaded
+                //   - POST /input        : RW only
+                let needs_rw = matches!(action, "input" | "inbox") || (action == "files" && method.as_str() == "POST");
                 if needs_rw {
                     if rw_match {
                         Some(true)
@@ -1069,12 +1165,11 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             // value in tabs.json or someone POSTing junk into the
             // bg-color endpoint). Fall back to the default on
             // anything sketchy.
-            let safe_bg: &str =
-                if tab_bg.len() == 7 && tab_bg.starts_with('#') && tab_bg[1..].chars().all(|c| c.is_ascii_hexdigit()) {
-                    &tab_bg
-                } else {
-                    crate::DEFAULT_TAB_BG_COLOR
-                };
+            let safe_bg: &str = if is_safe_hex_color(&tab_bg) {
+                &tab_bg
+            } else {
+                crate::DEFAULT_TAB_BG_COLOR
+            };
             let html = VIEWER_HTML
                 .replace("__TAB_KEY__", &key_for_html)
                 .replace("__TAB_NAME_HTML__", &html_name)
@@ -1092,7 +1187,19 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 html.as_bytes(),
                 accept_gzip,
                 if_none_match.as_deref(),
-                "Cache-Control: no-store, no-cache, must-revalidate\r\nPragma: no-cache\r\n",
+                // Cache headers + clickjacking guards. CSP locks the
+                // page to its own origin for everything (no inline
+                // scripts despite the template subs — they live in a
+                // pinned `<script>` set up to read `window.TAB`, no
+                // user-controlled JS). X-Frame-Options blocks iframe
+                // embedding of share links into phishing pages.
+                "Cache-Control: no-store, no-cache, must-revalidate\r\n\
+                 Pragma: no-cache\r\n\
+                 X-Frame-Options: DENY\r\n\
+                 Content-Security-Policy: default-src 'none'; script-src 'self' 'unsafe-inline'; \
+                 style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; \
+                 base-uri 'none'; form-action 'none'; frame-ancestors 'none'\r\n\
+                 Referrer-Policy: no-referrer\r\n",
             );
         }
         ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/output") => {
@@ -1217,7 +1324,12 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             // Effective background color (per-tab override OR global
             // default, resolved server-side). The JS reads this on
             // every poll and updates theme.background mid-session.
-            if !bg_color.is_empty() {
+            // Re-validate before echoing into a header line — input
+            // validation should already have rejected anything weird,
+            // but the round-trip through TabSnapshot is enough of a
+            // surface that we don't want a hypothetical bypass to
+            // turn into a header-injection vector.
+            if is_safe_hex_color(&bg_color) {
                 let _ = write!(extra, "X-Tab-Bg: {bg_color}\r\n");
             }
             if locked {
@@ -1341,7 +1453,12 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             let mut extra = format!(
                 "X-Stream-Length: {total_len}\r\nX-Stream-Start: {body_start}\r\nX-Stream-Cap: {cap}\r\nX-Output-Cols: {pty_cols}\r\nX-Output-Rows: {pty_rows}\r\nX-Build-Hash: {BUILD_HASH}\r\nX-Outbox-Count: {outbox_count}\r\nX-Inbox-Count: {inbox_count}\r\n",
             );
-            if !bg_color.is_empty() {
+            // Re-validate before echoing into a header line — input
+            // validation should already have rejected anything weird,
+            // but the round-trip through TabSnapshot is enough of a
+            // surface that we don't want a hypothetical bypass to
+            // turn into a header-injection vector.
+            if is_safe_hex_color(&bg_color) {
                 let _ = write!(extra, "X-Tab-Bg: {bg_color}\r\n");
             }
             if locked {
@@ -1559,6 +1676,24 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             // remote can't write outside `inbox/`. Accepts both
             // `/tabs/<idx>/files` and `/tabs/by-id/<uuid>/files`
             // forms; share-token auth (rw only) was vetted upstream.
+            // Per-token concurrency cap: refuse with 429 when N
+            // uploads are already in flight from this same token, so
+            // one share recipient can't queue dozens of concurrent
+            // 100 MiB POSTs and amplify memory pressure (audit #3).
+            let upload_token = provided_token.as_deref().unwrap_or("");
+            let _slot = match UploadSlot::try_acquire(upload_token) {
+                Ok(s) => s,
+                Err(n) => {
+                    error_json(
+                        stream,
+                        429,
+                        &format!(
+                            "too many concurrent uploads from this token ({n} already in flight; cap {UPLOAD_MAX_INFLIGHT_PER_TOKEN})"
+                        ),
+                    );
+                    return;
+                }
+            };
             let Some((key_raw, is_uuid)) = parse_tab_key(p, "/files") else {
                 error_json(stream, 404, "invalid tab key");
                 return;
@@ -3622,6 +3757,108 @@ mod tests {
             Some("nosniff"),
             "nosniff guards against in-browser rendering of uploaded HTML"
         );
+    }
+
+    #[test]
+    fn constant_time_eq_matches_native_equality_on_known_inputs() {
+        // Pin the property — equal slices return true, any length
+        // mismatch returns false, content mismatch returns false.
+        // Doesn't try to measure timing (that's not test-able here);
+        // just guards against the function ever being replaced with
+        // something that returns the wrong boolean.
+        assert!(constant_time_eq(b"", b""));
+        assert!(constant_time_eq(b"a", b"a"));
+        assert!(constant_time_eq(b"abcdefgh", b"abcdefgh"));
+        assert!(!constant_time_eq(b"a", b""));
+        assert!(!constant_time_eq(b"", b"a"));
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+    }
+
+    #[test]
+    fn is_safe_hex_color_only_passes_hash_six_hex_digits() {
+        assert!(is_safe_hex_color("#002451"));
+        assert!(is_safe_hex_color("#ABCDEF"));
+        assert!(is_safe_hex_color("#abc123"));
+        assert!(!is_safe_hex_color(""));
+        assert!(!is_safe_hex_color("#"));
+        assert!(!is_safe_hex_color("#12345"));
+        assert!(!is_safe_hex_color("#1234567"));
+        assert!(!is_safe_hex_color("002451"));
+        assert!(!is_safe_hex_color("#xyzxyz"));
+        // Critical: must reject content that would break the header
+        // line if echoed back into one.
+        assert!(!is_safe_hex_color("#ff\r\nX-Inj: 1"));
+    }
+
+    #[test]
+    fn inbox_listing_with_rw_share_token_returns_200() {
+        // Regression: pre-fix, /inbox was not in the share-token
+        // action gate and required the master token. Even an RW
+        // recipient got 401, which broke the inbox panel for share
+        // viewers.
+        let (port, state, _master_token) = spawn_server();
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cwd.path().join("inbox")).unwrap();
+        std::fs::write(cwd.path().join("inbox").join("uploaded.txt"), b"hi").unwrap();
+        {
+            let mut s = state.lock().unwrap();
+            s.tabs[0].share_token_rw = "rw-inbox-tok".into();
+            s.tabs[0].cwd = Some(cwd.path().to_string_lossy().into_owned());
+            s.cached_response = None;
+        }
+        let raw = request_bytes(
+            port,
+            "GET /tabs/by-id/tab-a/inbox HTTP/1.1\r\nAuthorization: Bearer rw-inbox-tok\r\n\r\n",
+        );
+        let (h, b) = split_response(&raw);
+        assert!(h.starts_with("HTTP/1.1 200"), "got: {h}");
+        let parsed: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!(parsed["files"][0]["name"].as_str(), Some("uploaded.txt"));
+    }
+
+    #[test]
+    fn inbox_listing_with_ro_share_token_returns_403() {
+        // Policy: RO recipients can watch the screen but shouldn't
+        // see what RW collaborators have uploaded to inbox/.
+        let (port, state, _master_token) = spawn_server();
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cwd.path().join("inbox")).unwrap();
+        {
+            let mut s = state.lock().unwrap();
+            s.tabs[0].share_token_ro = "ro-inbox-tok".into();
+            s.tabs[0].cwd = Some(cwd.path().to_string_lossy().into_owned());
+            s.cached_response = None;
+        }
+        let raw = request_bytes(
+            port,
+            "GET /tabs/by-id/tab-a/inbox HTTP/1.1\r\nAuthorization: Bearer ro-inbox-tok\r\n\r\n",
+        );
+        let (h, _) = split_response(&raw);
+        assert!(h.starts_with("HTTP/1.1 403"), "expected 403, got: {h}");
+    }
+
+    #[test]
+    fn view_response_carries_csp_and_frame_options() {
+        // Defense-in-depth: every /view response should refuse
+        // iframe-embedding and constrain script/style/connect to
+        // the same origin so a future XSS bug can't reach external
+        // hosts.
+        let (port, state, token) = spawn_server();
+        {
+            let mut s = state.lock().unwrap();
+            s.tabs[0].share_token_rw = "view-csp-tok".into();
+        }
+        let raw = request_bytes(
+            port,
+            &format!("GET /tabs/by-id/tab-a/view HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        let (h, _) = split_response(&raw);
+        assert_eq!(header_value(&h, "x-frame-options"), Some("DENY"));
+        let csp = header_value(&h, "content-security-policy").unwrap_or("");
+        assert!(csp.contains("default-src 'none'"), "CSP must start strict: {csp}");
+        assert!(csp.contains("frame-ancestors 'none'"), "frame-ancestors locked: {csp}");
+        assert_eq!(header_value(&h, "referrer-policy"), Some("no-referrer"));
     }
 
     #[test]
