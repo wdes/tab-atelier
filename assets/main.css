@@ -54,33 +54,42 @@
     }
     body.drag-over #drop-overlay { display: flex; }
     #drop-overlay .inner { padding: 24px 36px; border: 2px dashed #ffd764; border-radius: 16px; }
-    /* Files buttons — top-right corner. The slide-in panel still
+    /* Files buttons — top-right corner. Wrapped in a flex container
+       so the gap between buttons is content-width-independent (right:
+       offsets alone produced a ~5 px overlap when the button labels
+       rendered slightly wider than expected). The slide-in panel
        enters from the right edge below them. */
+    #files-controls {
+      position: fixed; top: 6px; right: 8px; z-index: 11;
+      display: flex; gap: 10px; pointer-events: none;
+    }
     .files-btn {
-      position: fixed; top: 6px; font-size: 11px;
+      font-size: 11px;
       padding: 3px 8px; border-radius: 10px;
-      cursor: pointer; pointer-events: auto; z-index: 11;
+      cursor: pointer; pointer-events: auto;
       font-family: ui-monospace, monospace;
-      display: inline-block;
+      display: inline-block; white-space: nowrap;
     }
     /* Outbox = blue, inbox = green. Two-color cue is faster than
-       reading the label at a glance. */
+       reading the label at a glance. Inbox rendered FIRST in the flex
+       row so the more-frequent download target (outbox) sits at the
+       far right where the cursor naturally rests. */
     #outbox-btn {
-      right: 8px;
       background: rgba(120, 200, 255, 0.15); color: #aad8ff;
       border: 1px solid rgba(120, 200, 255, 0.3);
+      order: 2;
     }
     #outbox-btn:hover { background: rgba(120, 200, 255, 0.28); }
     #inbox-btn {
-      right: 96px;
       background: rgba(140, 220, 140, 0.15); color: #b6e6b6;
       border: 1px solid rgba(140, 220, 140, 0.3);
+      order: 1;
     }
     #inbox-btn:hover { background: rgba(140, 220, 140, 0.28); }
     body.read-only #inbox-btn { display: none; }
     /* The locked banner takes the top 32 px when active; nudge the
-       buttons down so they don't collide. */
-    body.locked .files-btn { top: 38px; }
+       container down so the buttons don't collide with it. */
+    body.locked #files-controls { top: 38px; }
     .files-btn .badge {
       display: inline-block; min-width: 14px; padding: 0 4px;
       margin-left: 4px; border-radius: 8px;
