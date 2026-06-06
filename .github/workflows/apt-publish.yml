@@ -21,6 +21,10 @@ on:
     push:
         branches: [main]
         tags: ['v*']
+    # Manual trigger so the windows-msi.yml workflow can chain into a
+    # republish after it finishes (push-driven apt-publish often races
+    # the parallel windows-msi build and picks the previous MSI run).
+    workflow_dispatch:
 
 permissions:
     contents: write
@@ -174,9 +178,16 @@ jobs:
                               *.msi)
                                   TMP="windows/$NAME.partial"
                                   echo "→ fetching artifact $ID → windows/$NAME"
-                                  if curl -fSL \
+                                  # Capture curl's stderr so a silent
+                                  # failure leaves a breadcrumb in the
+                                  # job log; the previous "✗ curl
+                                  # failed" line gave no detail. -w
+                                  # echoes status + size so an HTTP
+                                  # 401/404 is obvious.
+                                  if curl -fSL --write-out 'http=%{http_code} bytes=%{size_download}\n' \
                                       -H "Authorization: Bearer $GH_TOKEN" \
                                       -H "Accept: application/octet-stream" \
+                                      -H "X-GitHub-Api-Version: 2022-11-28" \
                                       -o "$TMP" \
                                       "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/artifacts/$ID/zip" \
                                   ; then
