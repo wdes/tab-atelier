@@ -1840,6 +1840,33 @@ impl AppState {
                     .child("\u{1f408}\u{fe0f}\u{1f68c}\u{fe0f} Catbus"),
             );
 
+            // ⛑ Brain — same pattern as Catbus: Ctrl-U + the command +
+            // newline, takes over the current tab. Inside the brain
+            // tab the user sees the rescue log; the brain watches
+            // every OTHER tab via the local HTTP API and POSTs
+            // `continue` to any whose scrollback matches a known
+            // agent-failure signature OR whose agent_state == "error".
+            container = container.child(
+                div()
+                    .id("menu-brain")
+                    .px(px(12.0))
+                    .py(px(4.0))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(menu_hover))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                            this.tabs[idx]
+                                .view
+                                .read(cx)
+                                .send_input_bytes(b"\x15tab-atelier brain\n".to_vec());
+                            this.context_menu = None;
+                            cx.notify();
+                        }),
+                    )
+                    .child("\u{26d1}\u{fe0f} Brain"),
+            );
+
             let colors_enabled = self.tabs[idx].view.read(cx).colors_enabled();
             let toggle_label = if colors_enabled {
                 self.t().disable_colors
