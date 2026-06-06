@@ -31,6 +31,15 @@ fn main() {
                 let rest: Vec<String> = std::env::args().skip(2).collect();
                 std::process::exit(cli::remote::run(&rest));
             }
+            "brain" => {
+                // ⛑ brain — watches every tab for known agent-failure
+                // patterns and auto-sends `continue`. Routed here so the
+                // GUI deb's tab menu's "Brain" entry can fire
+                // `tab-atelier brain` directly without the user needing
+                // the headless deb installed (the two debs conflict).
+                let rest: Vec<String> = std::env::args().skip(2).collect();
+                std::process::exit(cli::brain::run(&rest));
+            }
             _ => {}
         }
     }
