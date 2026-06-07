@@ -227,19 +227,16 @@ jobs:
           Write-Host "→ TCP 127.0.0.1:7890 — accepting connections"
 
           # 4. Unauthenticated request must return 401, NOT a connection
-          # error. Proves the daemon's HTTP server is actually
-          # parsing requests, not just listening.
-          try {
-              $r = Invoke-WebRequest -Uri 'http://127.0.0.1:7890/tabs' `
-                  -UseBasicParsing -ErrorAction Stop -TimeoutSec 5
+          # error. Proves the daemon's HTTP server is actually parsing
+          # requests, not just listening. -SkipHttpErrorCheck (pwsh 7+)
+          # makes Invoke-WebRequest hand back the response on non-2xx
+          # instead of throwing a hard-to-catch HttpResponseException.
+          $r = Invoke-WebRequest -Uri 'http://127.0.0.1:7890/tabs' `
+              -UseBasicParsing -SkipHttpErrorCheck -ErrorAction Stop -TimeoutSec 5
+          if ($r.StatusCode -ne 401) {
               throw "GET /tabs unauthenticated returned $($r.StatusCode), expected 401"
-          } catch [System.Net.WebException] {
-              $code = [int]$_.Exception.Response.StatusCode
-              if ($code -ne 401) {
-                  throw "GET /tabs unauthenticated returned $code, expected 401"
-              }
-              Write-Host "→ GET /tabs unauthenticated → 401 (expected)"
           }
+          Write-Host "→ GET /tabs unauthenticated → 401 (expected)"
 
       # archive: false emits the .msi as-is (single raw file), not wrapped
       # in the usual artifact .zip. Requires exactly one matched file.
