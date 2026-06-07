@@ -119,6 +119,73 @@ jobs:
           & $exe --check-crypto
           if ($LASTEXITCODE -ne 0) { throw "--check-crypto exited $LASTEXITCODE" }
 
+      # Windows-specific behaviour checks. The MSI doesn't just unpack
+      # files: it registers a Windows service (LocalService account),
+      # extends the system PATH, and the service's `Start="install"`
+      # attribute means the daemon should be running by the time
+      # msiexec returns. Each assertion below catches a real
+      # post-install failure mode end users would hit before us.
+      - name: Verify Windows service + PATH + HTTP API
+        shell: pwsh
+        run: |
+          # 1. Service exists AND is in the Running state.
+          $svc = Get-Service -Name 'tab-atelier-headless' -ErrorAction Stop
+          Write-Host "→ Get-Service tab-atelier-headless → $($svc.Status)"
+          if ($svc.Status -ne 'Running') {
+              # Surface the Application event log entries the service
+              # would have written — far more useful than just a status
+              # name. Filter to the last 10 minutes to stay focused.
+              Write-Host "── recent Application event log ─────────────"
+              Get-EventLog -LogName Application -After (Get-Date).AddMinutes(-10) `
+                  -ErrorAction SilentlyContinue `
+                | Where-Object { $_.Source -like '*tab-atelier*' -or $_.Message -like '*tab-atelier*' } `
+                | Select-Object -First 20 TimeGenerated, EntryType, Source, Message `
+                | Format-List
+              throw "service status was '$($svc.Status)', expected 'Running'"
+          }
+
+          # 2. PATH was updated and a fresh process can resolve the
+          # binary by name (not just by absolute path). The system
+          # PATH change took effect immediately for new processes;
+          # use [System.Environment]::GetEnvironmentVariable to read
+          # the up-to-date machine value rather than this shell's
+          # frozen-at-launch copy.
+          $machinePath = [System.Environment]::GetEnvironmentVariable('Path', 'Machine')
+          $env:Path = "$machinePath;$env:Path"
+          $resolved = Get-Command 'tab-atelier-headless.exe' -ErrorAction Stop
+          Write-Host "→ Get-Command tab-atelier-headless.exe → $($resolved.Source)"
+          if ($resolved.Source -notlike '*Program Files\tab-atelier*') {
+              throw "binary resolved off PATH but from unexpected location: $($resolved.Source)"
+          }
+
+          # 3. HTTP API is accepting TCP connections on 7890. Up to 6
+          # one-second polls so a slow service start doesn't flake.
+          $apiUp = $false
+          for ($i = 0; $i -lt 6; $i++) {
+              $t = Test-NetConnection -ComputerName 127.0.0.1 -Port 7890 -WarningAction SilentlyContinue
+              if ($t.TcpTestSucceeded) { $apiUp = $true; break }
+              Start-Sleep -Seconds 1
+          }
+          if (-not $apiUp) {
+              throw "HTTP API not accepting connections on 127.0.0.1:7890 after 6s"
+          }
+          Write-Host "→ TCP 127.0.0.1:7890 — accepting connections"
+
+          # 4. Unauthenticated request must return 401, NOT a connection
+          # error. Proves the daemon's HTTP server is actually
+          # parsing requests, not just listening.
+          try {
+              $r = Invoke-WebRequest -Uri 'http://127.0.0.1:7890/tabs' `
+                  -UseBasicParsing -ErrorAction Stop -TimeoutSec 5
+              throw "GET /tabs unauthenticated returned $($r.StatusCode), expected 401"
+          } catch [System.Net.WebException] {
+              $code = [int]$_.Exception.Response.StatusCode
+              if ($code -ne 401) {
+                  throw "GET /tabs unauthenticated returned $code, expected 401"
+              }
+              Write-Host "→ GET /tabs unauthenticated → 401 (expected)"
+          }
+
       # archive: false emits the .msi as-is (single raw file), not wrapped
       # in the usual artifact .zip. Requires exactly one matched file.
       - name: Upload MSI artifact (raw)
@@ -128,3 +195,40 @@ jobs:
           path: target/wix/tab-atelier-headless-${{ env.SHORT_SHA }}-${{ env.MSI_VERSION }}-x86_64.msi
           archive: false
           if-no-files-found: error
+
+      # Final exit gate: the uninstall flow must also work. A future
+      # GUID drift / orphaned-component bug would only surface here.
+      - name: Uninstall MSI + verify cleanup
+        shell: pwsh
+        run: |
+          $msi = (Resolve-Path "target/wix/tab-atelier-headless-${env:SHORT_SHA}-${env:MSI_VERSION}-x86_64.msi").Path
+          $log = "${env:RUNNER_TEMP}\msi-uninstall.log"
+          Write-Host "→ msiexec /x $msi /qn /L*v $log"
+          $p = Start-Process msiexec -ArgumentList '/x', $msi, '/qn', '/L*v', $log -Wait -PassThru
+          if ($p.ExitCode -ne 0) {
+              Write-Host "── uninstall log tail ──────────────────────"
+              Get-Content $log -Tail 60
+              throw "msiexec /x exited $($p.ExitCode)"
+          }
+
+          # Service gone.
+          $svc = Get-Service -Name 'tab-atelier-headless' -ErrorAction SilentlyContinue
+          if ($null -ne $svc) {
+              throw "service still registered after uninstall: $($svc.Status)"
+          }
+          Write-Host "→ service unregistered"
+
+          # Binary gone.
+          $exe = "C:\Program Files\tab-atelier\tab-atelier-headless.exe"
+          if (Test-Path $exe) {
+              throw "binary still present after uninstall: $exe"
+          }
+          Write-Host "→ binary removed"
+
+          # Port no longer listening — proves the service stopped
+          # cleanly during uninstall, not just got force-killed.
+          $t = Test-NetConnection -ComputerName 127.0.0.1 -Port 7890 -WarningAction SilentlyContinue
+          if ($t.TcpTestSucceeded) {
+              throw "port 7890 still listening after uninstall — daemon process leaked"
+          }
+          Write-Host "→ port 7890 no longer listening"
