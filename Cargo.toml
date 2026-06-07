@@ -165,7 +165,22 @@ gpui = { version = "0.2", default-features = false, optional = true }
 [package.metadata.deb]
 section = "x11"
 priority = "optional"
-depends = "libc6, libgcc-s1, libfreetype6, libxkbcommon0, libxkbcommon-x11-0, libxcb1, libxcb-xkb1"
+# Font Depends rationale: the GUI defaults to font-family "monospace"
+# (src/lib.rs::FontConfig::default), a Fontconfig generic alias. With
+# NO monospace font installed, Fontconfig may resolve to a fallback
+# missing Latin Extended (no precomposed é/è/à/ç glyphs), and the
+# fallback's per-glyph advance metrics don't match the host font —
+# producing the visible horizontal gaps around accented chars we
+# saw in the wild.
+#
+# Per Debian Fonts Task Force convention we don't ship our own font
+# subpackage (we're not the upstream); we Depends on existing
+# `fonts-*` packages with `|` alternatives so any of these satisfies.
+# Order from most-likely-already-installed to least: dejavu-core is
+# pulled in by task-desktop / gnome / kde metapackages, so most
+# desktops add zero bytes. The other two are common Liberation /
+# Noto fallbacks shipped with many distros.
+depends = "libc6, libgcc-s1, libfreetype6, libxkbcommon0, libxkbcommon-x11-0, libxcb1, libxcb-xkb1, fonts-dejavu-core | fonts-liberation | fonts-noto-mono"
 # Desktop and headless ship the same `catbus-agent` helper binary in
 # `/usr/bin/`, so they can't both be installed at once.
 # `Conflicts:` makes apt refuse the second install with a clean
