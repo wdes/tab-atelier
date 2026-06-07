@@ -1186,6 +1186,22 @@ impl Element for TerminalElement {
                     }
                     let ch = if cell_data.c == '\0' { ' ' } else { cell_data.c };
                     full_text.push(ch);
+                    // Wide chars (CJK ideographs, hiragana, katakana, hangul,
+                    // most emoji) occupy 2 grid columns: the char itself in
+                    // cell N + a WIDE_CHAR_SPACER in cell N+1. The text-shape
+                    // engine renders them at ~2× cell_width advance. If a
+                    // wide char is merged into a regular ASCII segment, the
+                    // segment's apparent advance grows past
+                    // col_start * cell_width + len * cell_width and every
+                    // char that follows it inside the same shape drifts one
+                    // cell right (visually overlapping with the next
+                    // segment). Emit wide chars as standalone segments —
+                    // shaped once, painted at exactly col_start * cell_width,
+                    // and the next regular segment starts cleanly at the
+                    // grid-aligned column after the SPACER. Narrow non-ASCII
+                    // (é, è, ┌, ├) is unaffected — those stay merged so
+                    // gpui's shape_line handles font fallback in one pass.
+                    let is_wide = cell_data.flags.contains(CellFlags::WIDE_CHAR);
 
                     let mut fg = if is_default_fg(cell_data.fg) {
                         fg_default
@@ -1267,15 +1283,38 @@ impl Element for TerminalElement {
                     cell_font.weight = font_weight;
                     cell_font.style = font_style;
 
-                    // Append every cell — ASCII and non-ASCII alike — to the
-                    // running segment. The previous "split non-ASCII into its
-                    // own segment" logic produced bizarre horizontal gaps
-                    // around accented chars (é, è, à, ç, ê, etc.) because each
-                    // standalone segment was shaped independently and laid out
-                    // at `col_start * cell.width`, but the shaped width of the
-                    // fallback glyph didn't match the cell grid. gpui's
-                    // shape_line handles mixed scripts + font fallback within
-                    // a single segment correctly — let it.
+                    // Wide chars get their own segment — see the long
+                    // comment over `is_wide` above. Done BEFORE the
+                    // get_or_insert_with that follows so the running
+                    // segment is flushed at the wide-char boundary.
+                    if is_wide {
+                        if let Some(seg) = cur_seg.take() {
+                            segments.push(seg);
+                        }
+                        segments.push(RawSegment {
+                            col_start: c,
+                            text: ch.to_string(),
+                            runs: vec![TextRun {
+                                len: ch.len_utf8(),
+                                font: cell_font,
+                                color: fg,
+                                background_color: None,
+                                underline,
+                                strikethrough,
+                            }],
+                        });
+                        continue;
+                    }
+
+                    // Narrow cells — ASCII and narrow non-ASCII alike — flow
+                    // into the running segment. The previous "split non-ASCII
+                    // into its own segment" logic produced bizarre horizontal
+                    // gaps around accented chars (é, è, à, ç, ê, etc.) because
+                    // each standalone segment was shaped independently and
+                    // laid out at `col_start * cell.width`, but the shaped
+                    // width of the fallback glyph didn't match the cell grid.
+                    // gpui's shape_line handles mixed scripts + font fallback
+                    // within a single segment correctly — let it.
                     let seg = cur_seg.get_or_insert_with(|| RawSegment {
                         col_start: c,
                         text: String::new(),
