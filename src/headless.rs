@@ -250,16 +250,28 @@ fn spawn_pty_tab(
     // daemon's account), so without overriding here, every spawned
     // PTY would print "this account is currently not available"
     // and exit. Prefer /bin/bash, fall back to /bin/sh.
-    let shell_program = if std::path::Path::new("/bin/bash").exists() {
-        "/bin/bash"
+    #[cfg(unix)]
+    let shell_program: String = if std::path::Path::new("/bin/bash").exists() {
+        "/bin/bash".to_string()
     } else {
-        "/bin/sh"
+        "/bin/sh".to_string()
     };
+    // On Windows there is no equivalent of the passwd shell — alacritty's
+    // ConPTY backend just calls CreateProcess on whatever we hand it. Use
+    // %COMSPEC% (the canonical env-pointer at cmd.exe) when set, fall
+    // back to the well-known path. Without this override the Linux-style
+    // `/bin/sh` reaches alacritty and CreateProcess returns ERROR_FILE_NOT_FOUND
+    // (os error 2) — the bug the CI Windows self-test caught.
+    #[cfg(windows)]
+    let shell_program: String = std::env::var("COMSPEC")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| r"C:\Windows\System32\cmd.exe".to_string());
     let opts = tty::Options {
         // No `-l`: a login shell would source /etc/profile +
         // ~/.profile, which under ProtectHome=true can fail noisily
         // for the service account that has no profile files.
-        shell: Some(tty::Shell::new(shell_program.into(), vec![])),
+        shell: Some(tty::Shell::new(shell_program, vec![])),
         working_directory: cwd.clone(),
         env,
         ..Default::default()
