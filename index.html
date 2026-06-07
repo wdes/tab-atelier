@@ -1,22 +1,59 @@
 <!DOCTYPE html><meta charset=utf-8><title>tab-atelier apt repo</title>
-<style>body{font-family:system-ui;max-width:48em;margin:3em auto;padding:0 1em}
+<style>
+body{font-family:system-ui;max-width:48em;margin:3em auto;padding:0 1em}
 /* pre-wrap + overflow-wrap means long single-line commands
    wrap visually in the browser but stay ONE logical line
    when copy-pasted — terminals never see a literal \
    continuation that they might mishandle. */
 pre{background:#f4f4f4;padding:1em;border-radius:4px;white-space:pre-wrap;overflow-wrap:anywhere}
 code{background:#f4f4f4;padding:.1em .3em;border-radius:3px}
-.note{background:#fff8d6;border-left:3px solid #d9a900;padding:.6em .9em;margin:1em 0;font-size:.95em}</style>
+.note{background:#fff8d6;border-left:3px solid #d9a900;padding:.6em .9em;margin:1em 0;font-size:.95em}
+.channel{margin:1em 0;padding:.8em 1em;background:#eef3fb;border-radius:4px;display:flex;gap:1.2em;align-items:center;flex-wrap:wrap}
+.channel label{cursor:pointer;font-weight:500}
+[data-channel].hidden{display:none}
+</style>
 <h1>tab-atelier apt repo</h1>
-<p>Debian / Ubuntu install — paste each line into a terminal:</p>
-<pre>curl -fsSL https://deb.tab-atelier.wdes.eu/tab-atelier.gpg | sudo gpg --dearmor -o /usr/share/keyrings/tab-atelier.gpg
+
+<div class="channel" role="radiogroup" aria-label="channel">
+  Channel:
+  <label><input type="radio" name="channel" value="stable" checked> stable (release builds)</label>
+  <label><input type="radio" name="channel" value="nightly"> nightly (every push to <code>main</code>)</label>
+</div>
+
+<h2>First-time install</h2>
+<p>Debian / Ubuntu — paste each line into a terminal:</p>
+<pre data-channel="stable">curl -fsSL https://deb.tab-atelier.wdes.eu/tab-atelier.gpg | sudo gpg --dearmor -o /usr/share/keyrings/tab-atelier.gpg
 echo "deb [signed-by=/usr/share/keyrings/tab-atelier.gpg] https://deb.tab-atelier.wdes.eu stable main" | sudo tee /etc/apt/sources.list.d/tab-atelier.list > /dev/null
 sudo apt update
 sudo apt install tab-atelier</pre>
-<p>For the headless variant, swap <code>tab-atelier</code> for <code>tab-atelier-headless</code> in the last line. Replace <code>stable</code> with <code>nightly</code> to track <code>main</code>.</p>
+<pre data-channel="nightly" class="hidden">curl -fsSL https://deb.tab-atelier.wdes.eu/tab-atelier.gpg | sudo gpg --dearmor -o /usr/share/keyrings/tab-atelier.gpg
+echo "deb [signed-by=/usr/share/keyrings/tab-atelier.gpg] https://deb.tab-atelier.wdes.eu nightly main" | sudo tee /etc/apt/sources.list.d/tab-atelier.list > /dev/null
+sudo apt update
+sudo apt install tab-atelier</pre>
+
+<h2>Upgrade an existing install</h2>
+<pre>sudo apt update &amp;&amp; sudo apt install --only-upgrade tab-atelier</pre>
+<p>Works on both channels — apt re-reads <code>/etc/apt/sources.list.d/tab-atelier.list</code> on every <code>apt update</code>. To swap channels on an existing install, re-run the first-time-install block with the channel you want; it overwrites the same file.</p>
+
+<p>For the headless variant, swap <code>tab-atelier</code> for <code>tab-atelier-headless</code> in the install or upgrade command.</p>
 <div class="note">
 <strong><code>gpg --dearmor</code> handles older apt:</strong> the published key is ASCII-armored. <code>apt 2.4+</code> accepts both armored and binary keyrings in <code>/usr/share/keyrings/</code>; <code>apt &lt; 2.4</code> (Debian 11 buster &amp; older, Ubuntu 20.04 focal) requires binary. The <code>gpg --dearmor</code> step converts to binary in place, so the same one-liner works on every supported release.
 </div>
 <h2>Windows</h2>
 <p>Headless MSI installers for Windows are at <a href="/windows/">/windows/</a>.</p>
 <p>Source: <a href="https://github.com/wdes/tab-atelier">github.com/wdes/tab-atelier</a>.</p>
+
+<script>
+// Channel picker — toggles which `<pre data-channel="…">`
+// block is visible. Each pre carries the same body modulo
+// "stable" → "nightly", so selecting a channel swaps the
+// visible snippet without touching the copy text.
+document.querySelectorAll('input[name="channel"]').forEach(function (r) {
+  r.addEventListener('change', function (e) {
+    var ch = e.target.value;
+    document.querySelectorAll('[data-channel]').forEach(function (el) {
+      el.classList.toggle('hidden', el.dataset.channel !== ch);
+    });
+  });
+});
+</script>
