@@ -174,6 +174,28 @@ jobs:
               & $exe --check-crypto
               Write-Host "  --check-crypto exit: $LASTEXITCODE"
 
+              # Full daemon run for 6 seconds with RUST_LOG=debug so
+              # we capture whatever headless::run() prints before
+              # giving up. Stderr is /dev/null under SCM but works
+              # fine from a console.
+              Write-Host "── console daemon launch (6 s, RUST_LOG=debug) ─"
+              $env:RUST_LOG = 'debug'
+              $proc = Start-Process -FilePath $exe `
+                  -RedirectStandardOutput "${env:RUNNER_TEMP}\daemon-stdout.log" `
+                  -RedirectStandardError "${env:RUNNER_TEMP}\daemon-stderr.log" `
+                  -PassThru -NoNewWindow
+              Start-Sleep -Seconds 6
+              if (!$proc.HasExited) {
+                  Write-Host "  daemon still running after 6s; killing"
+                  Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+              } else {
+                  Write-Host "  daemon EXITED early with code $($proc.ExitCode)"
+              }
+              Write-Host "── stderr tail ─"
+              Get-Content "${env:RUNNER_TEMP}\daemon-stderr.log" -Tail 40 -ErrorAction SilentlyContinue
+              Write-Host "── stdout tail ─"
+              Get-Content "${env:RUNNER_TEMP}\daemon-stdout.log" -Tail 40 -ErrorAction SilentlyContinue
+
               throw "service status was '$($svc.Status)', expected 'Running'"
           }
 
