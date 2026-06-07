@@ -11,7 +11,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use log::info;
+use log::{info, trace};
 
 use alacritty_terminal::event::{Event as AlacrittyEvent, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
@@ -412,6 +412,17 @@ impl TerminalView {
             return;
         }
         self.last_input.set(Some(std::time::Instant::now()));
+        // T1 — instrumentation: bytes are about to leave our process
+        // toward the PTY notifier. Together with T0 (keystroke entry)
+        // this isolates time spent in our pre-send logic
+        // (scroll-to-bottom, mode lookup, etc).
+        let preview_len = bytes.len().min(16);
+        trace!(
+            target: "tab_atelier::input_lag",
+            "T1 send_input bytes={} preview={:?}",
+            bytes.len(),
+            std::str::from_utf8(&bytes[..preview_len]).unwrap_or("<non-utf8>"),
+        );
         self.term.lock().grid_mut().scroll_display(Scroll::Bottom);
         let _ = self.notifier.send(Msg::Input(bytes.into()));
     }
@@ -712,6 +723,17 @@ impl Render for TerminalView {
             .track_focus(&focus)
             .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, _window, cx| {
                 let ks = &ev.keystroke;
+                // T0 — instrumentation: keystroke entered the gpui
+                // listener. Enable with RUST_LOG=tab_atelier::input_lag=trace.
+                // Compile to a no-op in release when trace isn't enabled.
+                trace!(
+                    target: "tab_atelier::input_lag",
+                    "T0 keystroke key={:?} ctrl={} shift={} alt={}",
+                    ks.key,
+                    ks.modifiers.control,
+                    ks.modifiers.shift,
+                    ks.modifiers.alt
+                );
                 if ks.modifiers.control && ks.modifiers.shift {
                     match ks.key.as_str() {
                         "c" => {
@@ -1416,6 +1438,14 @@ impl Element for TerminalElement {
         window: &mut Window,
         cx: &mut App,
     ) {
+        // T3 — instrumentation: wrap paint with a wall-clock measurement.
+        // The trace at the end shows BOTH the paint duration and a clear
+        // marker for "frame committed", letting us compute T2 → T3
+        // (echo bytes parsed → grid painted) — typically the segment
+        // where lock contention with alacritty's EventLoop would show.
+        // Enable with RUST_LOG=tab_atelier::input_lag=trace.
+        let paint_started = std::time::Instant::now();
+
         let Some(state) = prepaint.take() else {
             return;
         };
@@ -1580,6 +1610,12 @@ impl Element for TerminalElement {
                 });
             }
         });
+
+        trace!(
+            target: "tab_atelier::input_lag",
+            "T3 paint done in {:?}",
+            paint_started.elapsed(),
+        );
     }
 }
 

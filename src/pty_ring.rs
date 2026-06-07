@@ -183,10 +183,22 @@ impl<P: EventedPty> PtyTap<P> {
 impl<P: EventedPty> io::Read for PtyTap<P> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let n = self.inner.reader().read(buf)?;
-        if n > 0
-            && let Ok(mut ring) = self.ring.lock()
-        {
-            ring.push(&buf[..n]);
+        if n > 0 {
+            // T2 — instrumentation: bytes arrived from the PTY (about
+            // to be parsed by alacritty). For typing-lag analysis,
+            // this is "echo received" — the delta from T1 measures
+            // shell round-trip latency, which is mostly kernel +
+            // shell scheduling. Enable with
+            // RUST_LOG=tab_atelier::input_lag=trace.
+            log::trace!(
+                target: "tab_atelier::input_lag",
+                "T2 pty_read bytes={} preview={:?}",
+                n,
+                std::str::from_utf8(&buf[..n.min(32)]).unwrap_or("<non-utf8>"),
+            );
+            if let Ok(mut ring) = self.ring.lock() {
+                ring.push(&buf[..n]);
+            }
         }
         Ok(n)
     }
