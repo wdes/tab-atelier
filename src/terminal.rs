@@ -1267,28 +1267,15 @@ impl Element for TerminalElement {
                     cell_font.weight = font_weight;
                     cell_font.style = font_style;
 
-                    let is_ascii_printable = ch.is_ascii_graphic() || ch == ' ';
-
-                    if !is_ascii_printable {
-                        if let Some(seg) = cur_seg.take() {
-                            segments.push(seg);
-                        }
-                        let char_len = ch.len_utf8();
-                        segments.push(RawSegment {
-                            col_start: c,
-                            text: ch.to_string(),
-                            runs: vec![TextRun {
-                                len: char_len,
-                                font: cell_font,
-                                color: fg,
-                                background_color: None,
-                                underline,
-                                strikethrough,
-                            }],
-                        });
-                        continue;
-                    }
-
+                    // Append every cell — ASCII and non-ASCII alike — to the
+                    // running segment. The previous "split non-ASCII into its
+                    // own segment" logic produced bizarre horizontal gaps
+                    // around accented chars (é, è, à, ç, ê, etc.) because each
+                    // standalone segment was shaped independently and laid out
+                    // at `col_start * cell.width`, but the shaped width of the
+                    // fallback glyph didn't match the cell grid. gpui's
+                    // shape_line handles mixed scripts + font fallback within
+                    // a single segment correctly — let it.
                     let seg = cur_seg.get_or_insert_with(|| RawSegment {
                         col_start: c,
                         text: String::new(),
