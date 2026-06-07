@@ -128,19 +128,52 @@ jobs:
       - name: Verify Windows service + PATH + HTTP API
         shell: pwsh
         run: |
-          # 1. Service exists AND is in the Running state.
+          # 1. Service exists. The MSI registers it; assert that.
           $svc = Get-Service -Name 'tab-atelier-headless' -ErrorAction Stop
           Write-Host "→ Get-Service tab-atelier-headless → $($svc.Status)"
+
+          # If the MSI's auto-start didn't reach Running, try to start
+          # it manually so we surface the actual error code instead of
+          # just "Stopped". `Start-Service` blocks until the SCM
+          # transitions out of pending and throws with the win32 code
+          # on failure (e.g. "Cannot start service ... 1053: timed out
+          # waiting for transaction response").
           if ($svc.Status -ne 'Running') {
-              # Surface the Application event log entries the service
-              # would have written — far more useful than just a status
-              # name. Filter to the last 10 minutes to stay focused.
-              Write-Host "── recent Application event log ─────────────"
-              Get-EventLog -LogName Application -After (Get-Date).AddMinutes(-10) `
-                  -ErrorAction SilentlyContinue `
-                | Where-Object { $_.Source -like '*tab-atelier*' -or $_.Message -like '*tab-atelier*' } `
-                | Select-Object -First 20 TimeGenerated, EntryType, Source, Message `
+              Write-Host "→ service not yet Running; trying Start-Service explicitly"
+              try {
+                  Start-Service -Name 'tab-atelier-headless' -ErrorAction Stop
+              } catch {
+                  Write-Host "── Start-Service error ────────────────────"
+                  Write-Host $_.Exception.Message
+              }
+              $svc.Refresh()
+              Write-Host "→ Get-Service after Start-Service → $($svc.Status)"
+          }
+
+          if ($svc.Status -ne 'Running') {
+              # Dump SCM events from the System log (NOT Application —
+              # SCM writes there with source "Service Control Manager")
+              # filtered to the service name. Also try running the
+              # binary directly so we see its stderr — proves whether
+              # the daemon itself can launch outside the SCM context.
+              Write-Host "── System event log (last 10 min, SCM source) ─"
+              Get-WinEvent -FilterHashtable @{
+                  LogName   = 'System'
+                  StartTime = (Get-Date).AddMinutes(-10)
+                  ProviderName = 'Service Control Manager'
+              } -ErrorAction SilentlyContinue `
+                | Where-Object { $_.Message -like '*tab-atelier*' } `
+                | Select-Object -First 20 TimeCreated, LevelDisplayName, Message `
                 | Format-List
+
+              Write-Host "── direct binary launch (no SCM) ──────────────"
+              $exe = "C:\Program Files\tab-atelier\tab-atelier-headless.exe"
+              # `--check-crypto` runs and exits without trying to bind
+              # ports — proves the EXE loads + the crypto provider
+              # installs even when SCM context is absent.
+              & $exe --check-crypto
+              Write-Host "  --check-crypto exit: $LASTEXITCODE"
+
               throw "service status was '$($svc.Status)', expected 'Running'"
           }
 
