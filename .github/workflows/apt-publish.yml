@@ -184,9 +184,13 @@ jobs:
                                   # failed" line gave no detail. -w
                                   # echoes status + size so an HTTP
                                   # 401/404 is obvious.
+                                  # No `Accept: application/octet-stream` —
+                                  # the artifact API replies 415 to that. The
+                                  # endpoint returns a 302 to a presigned S3
+                                  # URL regardless of Accept; curl -L follows
+                                  # it and S3 sends the raw bytes.
                                   if curl -fSL --write-out 'http=%{http_code} bytes=%{size_download}\n' \
                                       -H "Authorization: Bearer $GH_TOKEN" \
-                                      -H "Accept: application/octet-stream" \
                                       -H "X-GitHub-Api-Version: 2022-11-28" \
                                       -o "$TMP" \
                                       "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/artifacts/$ID/zip" \
