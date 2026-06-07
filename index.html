@@ -1,16 +1,22 @@
 <!DOCTYPE html><meta charset=utf-8><title>tab-atelier apt repo</title>
-<style>body{font-family:system-ui;max-width:42em;margin:3em auto;padding:0 1em}
-pre{background:#f4f4f4;padding:1em;border-radius:4px;overflow-x:auto}
-code{background:#f4f4f4;padding:.1em .3em;border-radius:3px}</style>
+<style>body{font-family:system-ui;max-width:48em;margin:3em auto;padding:0 1em}
+/* pre-wrap + overflow-wrap means long single-line commands
+   wrap visually in the browser but stay ONE logical line
+   when copy-pasted — terminals never see a literal \
+   continuation that they might mishandle. */
+pre{background:#f4f4f4;padding:1em;border-radius:4px;white-space:pre-wrap;overflow-wrap:anywhere}
+code{background:#f4f4f4;padding:.1em .3em;border-radius:3px}
+.note{background:#fff8d6;border-left:3px solid #d9a900;padding:.6em .9em;margin:1em 0;font-size:.95em}</style>
 <h1>tab-atelier apt repo</h1>
-<p>Debian / Ubuntu install:</p>
-<pre>curl -fsSL https://deb.tab-atelier.wdes.eu/tab-atelier.gpg \
-    | sudo tee /usr/share/keyrings/tab-atelier.gpg > /dev/null
-echo "deb [signed-by=/usr/share/keyrings/tab-atelier.gpg] https://deb.tab-atelier.wdes.eu stable main" \
-    | sudo tee /etc/apt/sources.list.d/tab-atelier.list > /dev/null
+<p>Debian / Ubuntu install — paste each line into a terminal:</p>
+<pre>curl -fsSL https://deb.tab-atelier.wdes.eu/tab-atelier.gpg | sudo gpg --dearmor -o /usr/share/keyrings/tab-atelier.gpg
+echo "deb [signed-by=/usr/share/keyrings/tab-atelier.gpg] https://deb.tab-atelier.wdes.eu stable main" | sudo tee /etc/apt/sources.list.d/tab-atelier.list > /dev/null
 sudo apt update
-sudo apt install tab-atelier            # or tab-atelier-headless</pre>
-<p>Replace <code>stable</code> with <code>nightly</code> to track <code>main</code>.</p>
+sudo apt install tab-atelier</pre>
+<p>For the headless variant, swap <code>tab-atelier</code> for <code>tab-atelier-headless</code> in the last line. Replace <code>stable</code> with <code>nightly</code> to track <code>main</code>.</p>
+<div class="note">
+<strong><code>gpg --dearmor</code> handles older apt:</strong> the published key is ASCII-armored. <code>apt 2.4+</code> accepts both armored and binary keyrings in <code>/usr/share/keyrings/</code>; <code>apt &lt; 2.4</code> (Debian 11 buster &amp; older, Ubuntu 20.04 focal) requires binary. The <code>gpg --dearmor</code> step converts to binary in place, so the same one-liner works on every supported release.
+</div>
 <h2>Windows</h2>
 <p>Headless MSI installers for Windows are at <a href="/windows/">/windows/</a>.</p>
 <p>Source: <a href="https://github.com/wdes/tab-atelier">github.com/wdes/tab-atelier</a>.</p>
