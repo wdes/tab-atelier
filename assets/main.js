@@ -524,6 +524,30 @@
     }
 
     if (!READ_ONLY) {
+      // Mobile IME composition dedup. Soft keyboards (Android
+      // Gboard, iOS) fire xterm.js's onData both for each
+      // compositionupdate (cumulative text as the user types) and
+      // for the final compositionend (the committed word). Without
+      // dedup the user sees:
+      //
+      //   typed "6h"           → onData("6h")          → sent "6h"
+      //   IME commit "6h"      → onData("6h")          → sent "6h" again
+      //   typed "auj"          → onData("auj")         → sent "auj"
+      //   IME commit "aujourd'hui" → onData("aujourd'hui") → sent full
+      //
+      // Result: "6h6h aujaujourd'hui" — exactly the bug reported.
+      //
+      // Detection rules, applied only within a 200 ms window of the
+      // prior send (longer windows would dedup legitimate repeat
+      // paste actions):
+      //   * single-char `data` → never deduped (fast typing must
+      //     work, "aaa" is three onData calls with "a" each).
+      //   * exact match of the prior multi-char send → drop entirely.
+      //   * proper-prefix extension of the prior multi-char send →
+      //     send only the new suffix.
+      let lastSent = "";
+      let lastSentAt = 0;
+      const DEDUP_WINDOW_MS = 200;
       term.onData(data => {
         // Server-enforced lock is the source of truth — but we
         // also short-circuit here so we don't fire pointless POSTs
@@ -531,10 +555,27 @@
         // suppress these, but a tab that locks mid-session may
         // have keypresses already in flight.
         if (serverLocked) return;
+        const now = performance.now();
+        let toSend = data;
+        if (data.length > 1 && now - lastSentAt < DEDUP_WINDOW_MS) {
+          if (data === lastSent) {
+            // IME committed the same text it had pre-published as
+            // a composition update.
+            return;
+          }
+          if (data.startsWith(lastSent) && lastSent.length > 0) {
+            // IME extended the prior composition; only ship the new
+            // suffix so we don't repeat the prefix.
+            toSend = data.slice(lastSent.length);
+          }
+        }
+        lastSent = data;
+        lastSentAt = now;
+        if (!toSend) return;
         fetch(`${BASE}input`, {
           method: "POST",
           headers: { ...headers, "Content-Type": "application/octet-stream" },
-          body: new TextEncoder().encode(data),
+          body: new TextEncoder().encode(toSend),
         }).catch(() => {});
       });
     }
