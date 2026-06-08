@@ -143,10 +143,6 @@ http = "1"
 # Paired with `chrono-tz` so the schedule's tz is explicit per tab
 # (no machine-local drift when running headless on a server in a
 # different region than the user).
-# opening-hours 0.10 transitively pulls `sunrise-next 1.2` — every
-# version of which is yanked from crates.io, so a fresh cargo check
-# can't resolve it. Pinning to the 1.x line dodges the dead dep
-# (1.4 depends on `sunrise ^3.0`, a maintained replacement).
 opening-hours = { version = "1.4", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
 chrono-tz = { version = "0.10", default-features = false, features = ["std"] }
