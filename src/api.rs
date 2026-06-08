@@ -1316,9 +1316,8 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             let raw_cursor = t.raw_cursor;
             let bg_color = t.bg_color.clone();
             let schedule = t.schedule.clone();
-            use crate::schedule::LockState as _;
-            let lock_reason = t.lock_reason();
-            let locked = t.effective_locked();
+            let lock_reason = crate::schedule::LockState::lock_reason(t);
+            let locked = crate::schedule::LockState::effective_locked(t);
             // Agent indicator surfaced to the share-link viewer so the
             // browser tab title can mirror what the desktop GUI shows
             // (\u{1f9e0} Thinking / ⌛ Waiting / ❗ Error). Strictly
@@ -1500,9 +1499,8 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             let pty_rows = t.rows;
             let bg_color = t.bg_color.clone();
             let schedule = t.schedule.clone();
-            use crate::schedule::LockState as _;
-            let stream_lock_reason = t.lock_reason();
-            let locked = t.effective_locked();
+            let stream_lock_reason = crate::schedule::LockState::lock_reason(t);
+            let locked = crate::schedule::LockState::effective_locked(t);
             // Count downloadable / uploaded files so the viewer can
             // toast and badge without an extra poll. Cheap stat —
             // directory traversal only, no reads.
@@ -1819,8 +1817,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             // into the agent's inbox while the operator has paused
             // the session. `effective_locked()` covers BOTH the
             // manual flag and the off-hours schedule.
-            use crate::schedule::LockState as _;
-            if t.effective_locked() {
+            if crate::schedule::LockState::effective_locked(t) {
                 drop(snap);
                 error_json(stream, 423, "tab is locked");
                 return;
@@ -2092,7 +2089,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 return;
             };
             let schedule_opt: Option<crate::schedule::TabSchedule> = match (body.rule.as_deref(), body.tz.as_deref()) {
-                (None, _) | (Some(""), _) => None,
+                (None | Some(""), _) => None,
                 (Some(rule), Some(tz)) => match crate::schedule::TabSchedule::new(rule, tz) {
                     Ok(s) => Some(s),
                     Err(e) => {
@@ -2116,13 +2113,13 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             // poll already returns the new locked state via
             // `effective_locked`; persist tick mirrors onto the runtime
             // Tab on the next 100 ms tick.
-            state.tabs[idx].schedule = schedule_opt.clone();
+            state.tabs[idx].schedule.clone_from(&schedule_opt);
             state.pending_schedule_changes.push((tab_id, schedule_opt.clone()));
             drop(state);
-            let body = match &schedule_opt {
-                Some(s) => serde_json::json!({"rule": s.rule, "tz": s.tz}),
-                None => serde_json::json!({"rule": serde_json::Value::Null}),
-            };
+            let body = schedule_opt.as_ref().map_or_else(
+                || serde_json::json!({"rule": serde_json::Value::Null}),
+                |s| serde_json::json!({"rule": s.rule, "tz": s.tz}),
+            );
             respond_json(stream, 200, &body.to_string());
         }
         ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/bg-color") => {
@@ -2187,8 +2184,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 // is the single source of truth: it covers BOTH the
                 // user-toggled manual lock AND the off-hours schedule,
                 // so a new gate can't accidentally honour only one.
-                use crate::schedule::LockState as _;
-                if state.tabs[idx].effective_locked() {
+                if crate::schedule::LockState::effective_locked(&state.tabs[idx]) {
                     drop(state);
                     error_json(stream, 403, "tab is locked");
                     return;

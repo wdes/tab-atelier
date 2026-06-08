@@ -203,14 +203,14 @@ enum Trigger {
 }
 
 impl Trigger {
-    const fn label(&self) -> &'static str {
+    const fn label(self) -> &'static str {
         match self {
             Self::Pattern(p) => p.label,
             Self::AgentError => "agent-state-error",
         }
     }
 
-    const fn action(&self) -> &'static str {
+    const fn action(self) -> &'static str {
         match self {
             Self::Pattern(p) => p.action,
             Self::AgentError => "continue\n",

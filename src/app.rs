@@ -387,8 +387,7 @@ impl AppState {
                     // tab restored OUTSIDE its schedule's open hours
                     // also boots locked, not just manually-locked
                     // tabs.
-                    use crate::schedule::LockState as _;
-                    if ts.effective_locked() {
+                    if crate::schedule::LockState::effective_locked(ts) {
                         view.read(cx).set_locked(true);
                     }
                     // Auto-resume: if this tab had an agent session
@@ -1050,9 +1049,8 @@ impl AppState {
             // when unchanged so an idle tab's per-tick recompute is
             // a single bool compare (no gpui notify, no schedule
             // re-eval cost beyond the one in effective_locked()).
-            use crate::schedule::LockState as _;
             for tab in &mut self.tabs {
-                let want = tab.effective_locked();
+                let want = crate::schedule::LockState::effective_locked(tab);
                 if tab.last_pushed_locked != Some(want) {
                     tab.view.read(cx).set_locked(want);
                     tab.last_pushed_locked = Some(want);
