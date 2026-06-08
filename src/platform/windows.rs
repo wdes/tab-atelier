@@ -99,7 +99,9 @@ pub fn process_alive(_pid: u32) -> bool {
 
 pub fn random_bytes(buf: &mut [u8]) {
     // getrandom wraps BCryptGenRandom (system-preferred RNG) on Windows.
-    if getrandom::getrandom(buf).is_err() {
+    // 0.4 API: `fill(buf) -> Result<(), Error>`; the older `getrandom`
+    // free-fn was removed at 0.3.
+    if getrandom::fill(buf).is_err() {
         // Mirror linux.rs's degraded fallback so we never hard-fail.
         // Essentially unreachable on a healthy system; NOT crypto-grade.
         let seed = std::time::SystemTime::now()
