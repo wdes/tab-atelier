@@ -4,31 +4,31 @@ Hash: SHA512
 Architectures: amd64
 Codename: nightly
 Components: main
-Date: Mon, 08 Jun 2026 12:16:59 +0000
+Date: Mon, 08 Jun 2026 12:23:20 +0000
 Description: tab-atelier nightly channel
 Label: tab-atelier
 Origin: tab-atelier
 Suite: nightly
 MD5Sum:
- cd7cb9f448de3135c0e5ebda0ff81e04              189 Release
- 8e174e7339ea7be0cdd7a69ea04429fc            22696 main/binary-amd64/Packages
- 25cb3f41f995ac70f40347b7c340446f             4680 main/binary-amd64/Packages.gz
+ 35742bb171dd05df50a2c8555fdd4d32              189 Release
+ 18edbb3949252c3df0c70808cb0fa73b            22752 main/binary-amd64/Packages
+ 23b230a62688908637303c4277430464             4688 main/binary-amd64/Packages.gz
 SHA1:
- 2d96d08e53c7db2d15b8cb4e9903dc668d66da45              189 Release
- 67c928ca416d2cff2667fbb071601282ce6d0936            22696 main/binary-amd64/Packages
- 13dd072f46678b4881b2dafe432b5d0632290f93             4680 main/binary-amd64/Packages.gz
+ ea9714c34a633e6cc0a6a33ac03e337bbd6b157d              189 Release
+ e8720c8e7dc7ec8d31024ddb3ec5a9376d671d74            22752 main/binary-amd64/Packages
+ ef3af9699e7f709def492454900b2c223c5880c2             4688 main/binary-amd64/Packages.gz
 SHA256:
- 1bb388760eb825ef22745dc9377619f4613ccfe66db4d75f9383ec828bd65502              189 Release
- 993d818cead7491081a520ab39ef3ca014f4d72f42d4ae72ddb69f94c5544745            22696 main/binary-amd64/Packages
- c05da3b4b6a54eb75f8550de6577b9e3f78a5a057b69d099535db638add83b1a             4680 main/binary-amd64/Packages.gz
+ ae193dfcb5b5b33e5b29f18c31f2cf92c4f4a540783ab5b1ada9278b38fb2ccf              189 Release
+ 2229b6cc969ee46785310bb4a7f1d1296dfe0a00681fef94637f676f8c08068f            22752 main/binary-amd64/Packages
+ 6a081cc4f6317269c395c6af7ab8e265ccd6748bcb552f2c9a0179f1baf07dc0             4688 main/binary-amd64/Packages.gz
 SHA512:
- 8436e971e44be9e94d6838cbcb99239f8c26150c9c19d6321230ef2570bd589f4ee4ffe1ecb796e34c7995afd93a5009fc03d0a514398a773a92936b758f0b94              189 Release
- 57194cfa517581f5cdeb5313ca730fc1d3c6d69072b42f61719826662c8b6f91f24cd93ba912b0ac1d8bc5cdc53cf2cc39030cd3d540b03563d6b55be64e1953            22696 main/binary-amd64/Packages
- 62e234bc83750e40c2a22d1f5b883ee5c8f953924b61a1b6aaed70761aaf0a05ab9dc15725a6695dcaf5efc84af3b1334b6f38293c1d03c9a54596f344f199da             4680 main/binary-amd64/Packages.gz
+ 21b2c0150911ca9884f7791bdfdd36a56de4cb464f9b3d6353b63c195c48c6ae9148fa8801e404d629e71b86d3d4305e95a221913c186f82615214cb42ec34a0              189 Release
+ f9514e6bff48014c3f1cdfe227e7dcd31356806e11636390f0923be25df31df43a6d4dab9cfeb3e344f226feeb74d4c7b58d982a7bb8eacae3be1581b1b327e3            22752 main/binary-amd64/Packages
+ bdbc3ba057a3fa2a6f1cacd65a1a6d8e456df588f0b5abd0e857f9e4933621ff41c0c73de132532df84c6634a316f7d70675e63a56c3afe47ce6bf354a0f2afd             4688 main/binary-amd64/Packages.gz
 -----BEGIN PGP SIGNATURE-----
 
-iHUEARYKAB0WIQSPsuszZUSCzHA3AUn+9Q7Wwd5HEQUCaiayuwAKCRD+9Q7Wwd5H
-EWW8AQDKuXmolkvqJu+5LCOMe52/L9B8DV0gTBtoIB/LQabtBAD/dpc/1PYfkvKV
-rlnxELYnyUiydAYqQPbg+OGqL9c7VwI=
-=K400
+iHUEARYKAB0WIQSPsuszZUSCzHA3AUn+9Q7Wwd5HEQUCaia0OAAKCRD+9Q7Wwd5H
+ER3SAPsE45x3uOet8eF2EJHdBozBF/kgqOEOOr7TjWkGqD353wD+KKny/BGV3lGY
+09K9aG34lDUxJeN3KePjJQt7+Jgn2gI=
+=NknS
 -----END PGP SIGNATURE-----
