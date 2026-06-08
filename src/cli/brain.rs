@@ -413,8 +413,8 @@ pub fn run(args: &[String]) -> i32 {
         i += 1;
     }
 
-    // Name the tab so `tab-atelier-headless tabs` and the share-link
-    // viewer's <title> see the right label. OSC 2 = window title.
+    // Name the tab so the share-link viewer's <title> and any /tabs
+    // consumer see the right label. OSC 2 = window title.
     print!("\x1b]2;\u{26d1} brain\x07");
     println!(
         "\u{26d1} brain — watching every {interval}s · {n} patterns · cooldown {COOLDOWN_SECS}s",

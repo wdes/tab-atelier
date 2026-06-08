@@ -4,10 +4,10 @@
 
 //! Top-level clap dispatcher for `tab-atelier-headless`.
 //!
-//! Every subcommand the binary surfaces (`tabs`, `add`, `close`,
-//! `rename`, `lock`, `unlock`, `input`, `output`, `share-link`,
-//! `settings`, `bg-color`, `set-status`, `claude-hook`, `remote`)
-//! becomes a typed variant on the `Commands` enum. The match arm
+//! Every subcommand the binary surfaces (`add`, `close`, `rename`,
+//! `lock`, `unlock`, `input`, `output`, `share-link`, `settings`,
+//! `bg-color`, `set-status`, `claude-hook`, `remote`, `brain`,
+//! `schedule`) becomes a typed variant on the `Commands` enum. The match arm
 //! in `dispatch()` reconstructs the legacy `Vec<String>` form each
 //! inner CLI module already accepts, so this is a thin top-level
 //! layer — the actual argument validation / HTTP calls live in
@@ -54,13 +54,6 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Live tab listing — ratatui-rendered like the desktop's bottom bar.
-    Tabs {
-        /// Print a single snapshot then exit (script-friendly).
-        #[arg(long)]
-        once: bool,
-    },
-
     /// Create a new tab rooted at `<path>`, optionally renamed.
     Add {
         /// Working directory for the new tab.
@@ -238,13 +231,6 @@ pub fn dispatch(cli: Cli) -> bool {
         return false;
     };
     let code = match cmd {
-        Commands::Tabs { once } => {
-            let mut args: Vec<String> = Vec::new();
-            if once {
-                args.push("--once".into());
-            }
-            crate::cli::tabs::run(&args)
-        }
         Commands::Add { path, name } => {
             let mut args = vec![path.to_string_lossy().into_owned()];
             if let Some(n) = name {
@@ -381,8 +367,6 @@ mod tests {
     fn each_subcommand_round_trips_through_parse_from() {
         let cases: Vec<(&[&str], &str)> = vec![
             (&["tab-atelier-headless"], "no subcommand"),
-            (&["tab-atelier-headless", "tabs"], "tabs"),
-            (&["tab-atelier-headless", "tabs", "--once"], "tabs --once"),
             (&["tab-atelier-headless", "add", "/tmp"], "add path"),
             (&["tab-atelier-headless", "add", "/tmp", "name"], "add path name"),
             (&["tab-atelier-headless", "close", "0"], "close idx"),
@@ -507,9 +491,9 @@ mod tests {
         assert!(pre.read_only);
         assert!(pre.command.is_none());
 
-        let mid = Cli::try_parse_from(["tab-atelier-headless", "tabs", "--read-only"]).unwrap();
+        let mid = Cli::try_parse_from(["tab-atelier-headless", "lock", "0", "--read-only"]).unwrap();
         assert!(mid.read_only);
-        assert!(matches!(mid.command, Some(Commands::Tabs { once: false })));
+        assert!(matches!(mid.command, Some(Commands::Lock { .. })));
     }
 
     /// The clap `Command` builds without panicking — catches mistakes
@@ -520,7 +504,6 @@ mod tests {
         let cmd = Cli::command();
         let names: Vec<&str> = cmd.get_subcommands().map(clap::Command::get_name).collect();
         for expected in [
-            "tabs",
             "add",
             "close",
             "rename",

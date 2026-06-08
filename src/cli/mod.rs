@@ -12,4 +12,3 @@ pub mod set_status;
 /// share-link, add, close, rename, lock, unlock, input, output. Named
 /// after the first one added; see the module docstring for details.
 pub mod share_link;
-pub mod tabs;

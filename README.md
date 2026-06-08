@@ -48,7 +48,6 @@ A Guake-style drop-down terminal emulator for Linux (X11), built with Rust using
 **Integration**
 - HTTP API (port 7890) + TLS variant (port 7891) with token auth and QR code for remote tab management from a phone
 - `tab-atelier set-status` CLI for in-tab tools (agents, hooks, scripts) to publish thinking/waiting/error state to the desktop LED
-- `tab-atelier tabs` — ratatui live-table viewer of every running tab (mirror of the desktop's bottom bar; works from any SSH shell). `tab-atelier tabs --once` for scriptable output
 - `tab-atelier remote …` — mirror tabs from another instance, attach a sidecar terminal, transfer files (sandboxed). See [Remote tabs](#remote-tabs)
 - **Headless variant** ships as a separate `tab-atelier-headless.deb` (no gpui / x11rb / qrcode deps, 7.9 MB vs 12 MB) for servers — same HTTP API, no display required
 - Wakatime time tracking (reads API key from Zed settings)

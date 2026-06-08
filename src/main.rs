@@ -23,10 +23,6 @@ fn main() {
                 let rest: Vec<String> = std::env::args().skip(2).collect();
                 std::process::exit(cli::set_status::run(&rest));
             }
-            "tabs" => {
-                let rest: Vec<String> = std::env::args().skip(2).collect();
-                std::process::exit(cli::tabs::run(&rest));
-            }
             "remote" => {
                 let rest: Vec<String> = std::env::args().skip(2).collect();
                 std::process::exit(cli::remote::run(&rest));
