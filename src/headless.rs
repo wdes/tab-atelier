@@ -160,8 +160,7 @@ impl HeadlessTab {
         // the API gate (a new endpoint, a direct test fixture, …).
         // Refuse rather than silently dropping so the call site
         // surfaces the misuse during development.
-        use crate::schedule::LockState as _;
-        if self.effective_locked() {
+        if crate::schedule::LockState::effective_locked(self) {
             log::warn!(
                 "send_input_bytes called on locked tab {} — dropping {} bytes",
                 self.id,

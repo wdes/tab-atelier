@@ -49,7 +49,7 @@ pub struct TabSchedule {
 /// CLI / GUI so the user sees which half failed.
 #[derive(Debug)]
 pub enum ScheduleError {
-    /// `rule` failed to parse against the OSM opening_hours grammar.
+    /// `rule` failed to parse against the OSM `opening_hours` grammar.
     BadRule(String),
     /// `tz` is not a known IANA name.
     BadTimezone(String),
@@ -70,12 +70,12 @@ impl std::fmt::Display for ScheduleError {
 impl std::error::Error for ScheduleError {}
 
 impl TabSchedule {
-    /// Validate `(rule, tz)` and bundle into a TabSchedule.
+    /// Validate `(rule, tz)` and bundle into a `TabSchedule`.
     ///
     /// # Errors
     /// - `Empty` if either field is empty.
     /// - `BadTimezone` if `tz` does not match a known IANA name.
-    /// - `BadRule` if `rule` fails the OSM opening_hours parse.
+    /// - `BadRule` if `rule` fails the OSM `opening_hours` parse.
     pub fn new(rule: impl Into<String>, tz: impl Into<String>) -> Result<Self, ScheduleError> {
         let rule = rule.into();
         let tz = tz.into();
@@ -164,11 +164,11 @@ impl TabSchedule {
     }
 }
 
-/// Helper for the API headers / 423 error body — returns a short
-/// reason key the viewer can localise: `"manual"` for an explicit
-/// lock, `"schedule"` for an off-hours auto-lock, `None` if the tab
-/// is open. Computed against the same logical "effective locked"
-/// state every API gate uses.
+/// Short reason key the viewer can localise.
+///
+/// `"manual"` for an explicit lock, `"schedule"` for an off-hours
+/// auto-lock, `None` if the tab is open. Computed against the same
+/// logical "effective locked" state every API gate uses.
 #[must_use]
 pub fn lock_reason(manual_locked: bool, schedule: Option<&TabSchedule>) -> Option<&'static str> {
     if manual_locked {
@@ -187,12 +187,13 @@ pub fn effective_locked(manual_locked: bool, schedule: Option<&TabSchedule>) -> 
     lock_reason(manual_locked, schedule).is_some()
 }
 
-/// Uniform lock-state view across every tab representation in the
-/// crate — `TabState` (persisted), `SnapshotTab` (API snapshot), the
-/// gpui `Tab` runtime, and `HeadlessTab` runtime. By routing every
-/// write gate through `effective_locked()` instead of reading the raw
-/// `locked` field, a new gate can't accidentally honour only the
-/// manual flag and ignore the schedule.
+/// Uniform lock-state view across every tab representation.
+///
+/// Implemented for `TabState` (persisted), `SnapshotTab` (API
+/// snapshot), the gpui `Tab` runtime, and `HeadlessTab` runtime. By
+/// routing every write gate through `effective_locked()` instead of
+/// reading the raw `locked` field, a new gate can't accidentally
+/// honour only the manual flag and ignore the schedule.
 ///
 /// Adding a new tab-like type? Implement `manual_locked` + `schedule`
 /// and the provided methods do the rest. Adding a new gate? Call
