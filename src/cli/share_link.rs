@@ -786,6 +786,119 @@ fn write_global_bg(color: &str) -> i32 {
     0
 }
 
+/// `tab-atelier schedule <tab> "<rule>" --tz <iana>` — set the
+/// off-hours auto-lock schedule. With `--clear`, drop the schedule
+/// (tab returns to always-open unless still manually locked).
+///
+/// Rule grammar is OSM `opening_hours` (`Mo-Fr 09:00-18:00`,
+/// `Mo-Fr 09:00-12:30,13:30-18:00; PH off`, `24/7`, …). Tz is an
+/// IANA name (`Europe/Paris`, `America/New_York`, `UTC`).
+///
+/// Validation runs on the server via `TabSchedule::new` — the
+/// parser's error is surfaced to stderr so the user sees exactly
+/// what failed.
+#[must_use]
+pub fn schedule(args: &[String]) -> i32 {
+    let mut key: Option<String> = None;
+    let mut rule: Option<String> = None;
+    let mut tz: Option<String> = None;
+    let mut clear = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--tz" => {
+                i += 1;
+                tz = args.get(i).cloned();
+            }
+            "--clear" => clear = true,
+            "--help" | "-h" => {
+                eprintln!(
+                    "usage:\n  \
+                     tab-atelier schedule <tab-idx-or-uuid> \"<opening_hours>\" --tz <iana>\n  \
+                     tab-atelier schedule <tab-idx-or-uuid> --clear\n\
+                     \n\
+                     examples:\n  \
+                     schedule 0 \"Mo-Fr 09:00-18:00\" --tz Europe/Paris\n  \
+                     schedule 0 \"Mo-Fr 09:00-12:30,13:30-18:00; PH off\" --tz Europe/Paris\n  \
+                     schedule 0 --clear"
+                );
+                return 0;
+            }
+            other if key.is_none() => key = Some(other.to_string()),
+            other if rule.is_none() && !clear => rule = Some(other.to_string()),
+            other => {
+                eprintln!("schedule: unexpected argument: {other}");
+                return 2;
+            }
+        }
+        i += 1;
+    }
+    let Some(key) = key else {
+        eprintln!("usage: tab-atelier schedule <tab-idx-or-uuid> \"<rule>\" --tz <iana> | --clear");
+        return 2;
+    };
+    if !clear && rule.is_none() {
+        eprintln!("schedule: pass either a rule + --tz, or --clear");
+        return 2;
+    }
+    if !clear && tz.is_none() {
+        eprintln!("schedule: --tz is required when setting a rule");
+        return 2;
+    }
+    let ep = match discover_endpoint() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("schedule: {e}");
+            return 1;
+        }
+    };
+    let (_, uuid) = match resolve(&ep, &key) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("schedule: {e}");
+            return 1;
+        }
+    };
+    let body = if clear {
+        serde_json::json!({"rule": serde_json::Value::Null}).to_string()
+    } else {
+        serde_json::json!({
+            "rule": rule.as_deref().unwrap_or(""),
+            "tz": tz.as_deref().unwrap_or(""),
+        })
+        .to_string()
+    };
+    let mut resp = match agent()
+        .post(format!("{}/tabs/by-id/{uuid}/schedule", ep.url))
+        .header("Authorization", format!("Bearer {}", ep.token))
+        .header("Content-Type", "application/json")
+        .send(body.as_bytes())
+    {
+        Ok(r) => r,
+        Err(e) => {
+            // Surface the server's error body (the parser's own message)
+            // so the user sees what was rejected.
+            eprintln!("schedule: {e}");
+            return 1;
+        }
+    };
+    let body_text = resp.body_mut().read_to_string().unwrap_or_default();
+    if clear {
+        println!("cleared schedule on tab {uuid}");
+    } else {
+        println!(
+            "set schedule on tab {uuid}: {} ({})",
+            rule.as_deref().unwrap_or(""),
+            tz.as_deref().unwrap_or("")
+        );
+        // Echo the server's JSON for scripting consumers.
+        if !body_text.is_empty() {
+            println!("{body_text}");
+        }
+    }
+    0
+}
+
 fn unescape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();

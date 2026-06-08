@@ -22,6 +22,7 @@ pub(crate) mod platform;
 pub(crate) mod power;
 pub(crate) mod pty_ring;
 pub mod remote;
+pub mod schedule;
 #[cfg(feature = "gui")]
 pub(crate) mod screenshot;
 pub(crate) mod term_export;
@@ -218,6 +219,17 @@ pub struct TabState {
     /// <hex>` (CLI). Skipped from JSON when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bg_color: Option<String>,
+
+    /// Off-hours auto-lock. When set, the schedule's `(rule, tz)`
+    /// pair feeds [`crate::schedule::effective_locked`] alongside the
+    /// manual [`Self::locked`] flag. Outside the rule's open windows
+    /// every write is refused with 423 and `X-Tab-Locked-Reason:
+    /// schedule`. Set via `tab-atelier schedule <tab> "<rule>" --tz
+    /// <iana>` (CLI) or the Schedule field in the right-click menu
+    /// (GUI). Skipped from JSON when unset so old tabs.json files
+    /// stay byte-clean.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<crate::schedule::TabSchedule>,
 }
 
 /// Default viewer background — Tomorrow Night Blue. Softer than pitch
@@ -269,6 +281,7 @@ impl Default for TabState {
             share_token_ro: String::new(),
             locked: false,
             bg_color: None,
+            schedule: None,
         }
     }
 }

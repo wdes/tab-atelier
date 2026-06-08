@@ -40,6 +40,15 @@ fn main() {
                 let rest: Vec<String> = std::env::args().skip(2).collect();
                 std::process::exit(cli::brain::run(&rest));
             }
+            "schedule" => {
+                // Off-hours auto-lock setter — exposes the same
+                // headless CLI surface in the GUI binary so a user
+                // who only installed `tab-atelier` (not the headless
+                // deb — the two conflict) can still configure the
+                // schedule from a shell.
+                let rest: Vec<String> = std::env::args().skip(2).collect();
+                std::process::exit(cli::share_link::schedule(&rest));
+            }
             _ => {}
         }
     }

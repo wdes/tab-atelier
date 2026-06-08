@@ -440,6 +440,12 @@ impl TerminalView {
         self.locked.get()
     }
 
+    /// Internal lock gate for local typing + paste. Driven by the
+    /// per-tick mirror in `AppState::persist()`, which pushes
+    /// `Tab::effective_locked()` here on every tick. Do not call
+    /// directly from gate sites — the mirror is the single funnel
+    /// so manual lock toggles AND off-hours schedule transitions
+    /// both reach the view without a dedicated push for each.
     pub fn set_locked(&self, value: bool) {
         self.locked.set(value);
     }

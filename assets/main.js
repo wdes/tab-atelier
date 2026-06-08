@@ -347,6 +347,16 @@
     let bootstrapped = false;
     let serverCols = 0;
     let serverRows = 0;
+    // Lock-reason + schedule fields. Populated on every /stream poll
+    // from the X-Tab-Locked-Reason / X-Tab-Schedule-Tz /
+    // X-Tab-Schedule-Next / X-Tab-Schedule-Rule headers so the locked
+    // banner can show "locked until Mo 09:00 Europe/Paris" instead
+    // of a generic "LOCKED" string.
+    let lockReason = "";
+    let scheduleTz = "";
+    let scheduleNext = "";
+    let scheduleRule = "";
+
     // Live mirror of the server's X-Tab-Locked header. Toggling this
     // disables stdin on xterm.js, hides the cursor blink, drops the
     // input POST wiring, and reveals the red banner. The lock state
@@ -432,6 +442,19 @@
           term.options.disableStdin = serverLocked || READ_ONLY;
           term.options.cursorBlink = !(serverLocked || READ_ONLY);
         }
+        // Schedule-driven lock — surface why the tab is locked AND
+        // when it'll be open again. Header set is emitted only when
+        // a schedule is configured; absent on always-open tabs.
+        lockReason = r.headers.get("X-Tab-Locked-Reason") || "";
+        scheduleTz = r.headers.get("X-Tab-Schedule-Tz") || "";
+        scheduleNext = r.headers.get("X-Tab-Schedule-Next") || "";
+        const ruleRaw = r.headers.get("X-Tab-Schedule-Rule") || "";
+        if (ruleRaw) {
+          try { scheduleRule = decodeURIComponent(ruleRaw); }
+          catch { scheduleRule = ruleRaw; }
+        } else {
+          scheduleRule = "";
+        }
         // Agent state badge in the browser tab title, mirroring the
         // desktop GUI's per-tab indicator. Server omits the header
         // when no agent is attached, in which case we reset to plain
@@ -516,7 +539,27 @@
         }
         streamOffset = len;
         bootstrapped = true;
-        const lockTag = serverLocked ? " · LOCKED" : "";
+        let lockTag = "";
+        if (serverLocked) {
+          if (lockReason === "schedule" && scheduleNext) {
+            // ISO-8601 in UTC → format in the schedule's tz so the
+            // user sees their local time, not the browser's.
+            let formattedNext = scheduleNext;
+            try {
+              const d = new Date(scheduleNext);
+              const fmt = new Intl.DateTimeFormat(undefined, {
+                weekday: "short", hour: "2-digit", minute: "2-digit",
+                timeZone: scheduleTz || undefined,
+              });
+              formattedNext = fmt.format(d);
+            } catch { /* fall through with raw string */ }
+            lockTag = ` · LOCKED until ${formattedNext}${scheduleTz ? ` ${scheduleTz}` : ""}`;
+          } else if (lockReason === "schedule") {
+            lockTag = " · LOCKED (schedule)";
+          } else {
+            lockTag = " · LOCKED";
+          }
+        }
         status.textContent = `${TAB_NAME} · ${serverCols}x${serverRows} · ${len}B${lockTag}`;
       } catch (e) {
         status.textContent = `offline · ${e.message || e}`;
