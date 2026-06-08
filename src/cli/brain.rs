@@ -29,6 +29,76 @@ const DEFAULT_INTERVAL_SECS: u64 = 5;
 const COOLDOWN_SECS: u64 = 60;
 const SCOPE_TAIL_BYTES: usize = 4096;
 
+/// Captive-portal-style connectivity probe.
+///
+/// Before sending `continue\n` we make sure the box can actually
+/// reach the open internet — otherwise Claude / catbus-agent will
+/// just re-fail on the next API call, the brain will see the same
+/// error needle, hit cooldown, and we waste a tick every minute
+/// for the duration of the outage.
+///
+/// Endpoints are the same ones Android / Chrome / GNOME use for
+/// captive-portal detection:
+/// - `connectivitycheck.gstatic.com/generate_204` — Google
+/// - `1.1.1.1/cdn-cgi/trace` — Cloudflare, hits the IP directly so
+///   the probe also works when DNS itself is broken
+///
+/// Plain HTTP on purpose — the probe answer is a static empty 204
+/// (or a 1-line text response from CF). No TLS handshake to fail
+/// independently of the connectivity it's supposed to measure.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a probe result stays cached. Reuse for multiple tabs
+/// in a single tick + survive a quick subsequent tick. Shorter than
+/// `COOLDOWN_SECS` so a brief outage releases quickly once the
+/// network's back.
+const PROBE_TTL: Duration = Duration::from_secs(10);
+const PROBE_ENDPOINTS: &[&str] = &[
+    "http://connectivitycheck.gstatic.com/generate_204",
+    "http://1.1.1.1/cdn-cgi/trace",
+];
+
+/// Cached connectivity verdict. `is_online()` returns the cached
+/// value if it's still fresh, otherwise re-probes.
+#[derive(Debug, Default)]
+struct ConnectivityProbe {
+    last_check: Option<Instant>,
+    last_online: bool,
+}
+
+impl ConnectivityProbe {
+    fn is_online(&mut self) -> bool {
+        let now = Instant::now();
+        if let Some(at) = self.last_check
+            && now.duration_since(at) < PROBE_TTL
+        {
+            return self.last_online;
+        }
+        let online = probe_once();
+        self.last_check = Some(now);
+        self.last_online = online;
+        online
+    }
+}
+
+/// One pass through the probe endpoints. Returns true on the first
+/// 2xx (anything in `[200, 300)`) — Google's CPD returns 204, CF's
+/// returns 200 with a tiny text body.
+fn probe_once() -> bool {
+    let ag = ureq::Agent::config_builder()
+        .timeout_global(Some(PROBE_TIMEOUT))
+        .build();
+    let ag: ureq::Agent = ag.into();
+    for url in PROBE_ENDPOINTS {
+        if let Ok(resp) = ag.get(*url).call() {
+            let code = resp.status().as_u16();
+            if (200..300).contains(&code) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// A single trigger → action mapping. Substring match by design —
 /// regex would buy precision we don't need (Anthropic's error
 /// strings are stable) at the cost of pulling in `regex`.
@@ -151,7 +221,7 @@ impl Trigger {
 /// Polled at every interval. Re-derives the endpoint each tick so
 /// a daemon restart (different token, same URL) just resumes
 /// silently on the next loop.
-fn tick(cooldowns: &mut HashMap<(String, &'static str), Instant>) -> Result<(), String> {
+fn tick(cooldowns: &mut HashMap<(String, &'static str), Instant>, probe: &mut ConnectivityProbe) -> Result<(), String> {
     let ep: Endpoint = discover_endpoint()?;
     let ag = agent();
     let auth = format!("Bearer {}", ep.token);
@@ -201,6 +271,24 @@ fn tick(cooldowns: &mut HashMap<(String, &'static str), Instant>) -> Result<(), 
             // after our injected `continue`.
             continue;
         }
+
+        // Connectivity gate. If the box can't reach the open
+        // internet, sending `continue` would just trigger the same
+        // error again and burn a cooldown for nothing. Skip the send
+        // AND skip updating the cooldown so the next tick (~5s)
+        // re-checks and fires as soon as the network's back.
+        //
+        // Cached for `PROBE_TTL` so multiple erroring tabs in a
+        // single tick share one probe.
+        if !probe.is_online() {
+            println!(
+                "⛑ brain: {name:<24} [{label}] → suppressed (no internet — probe failed)",
+                name = tab.name,
+                label = trigger.label(),
+            );
+            continue;
+        }
+
         cooldowns.insert(key, now);
 
         let _ = ag
@@ -244,7 +332,9 @@ pub fn run(args: &[String]) -> i32 {
                      Watches every tab for known agent-failure signatures and sends\n\
                      `continue\\n` to the matching tab. Cooldown {COOLDOWN_SECS}s per (tab,pattern)\n\
                      to prevent re-fire loops.\n\
-                     Patterns: {n} known signatures (Anthropic API connectivity).",
+                     Patterns: {n} known signatures (Anthropic API connectivity).\n\
+                     Connectivity probe (Google generate_204 + Cloudflare 1.1.1.1) gates\n\
+                     every send; offline → suppress, retry on next tick when back online.",
                     n = PATTERNS.len(),
                 );
                 return 0;
@@ -266,8 +356,9 @@ pub fn run(args: &[String]) -> i32 {
     );
 
     let mut cooldowns: HashMap<(String, &'static str), Instant> = HashMap::new();
+    let mut probe = ConnectivityProbe::default();
     loop {
-        if let Err(e) = tick(&mut cooldowns) {
+        if let Err(e) = tick(&mut cooldowns, &mut probe) {
             // Log + keep going. The most likely error is a transient
             // daemon-restart window; the next tick will succeed.
             eprintln!("⛑ brain: tick failed: {e}");
@@ -339,5 +430,24 @@ mod tests {
             assert!(!p.label.is_empty(), "label empty for {p:?}");
             assert!(!p.action.is_empty(), "action empty for {p:?}");
         }
+    }
+
+    #[test]
+    fn connectivity_probe_caches_within_ttl() {
+        // First call populates the cache by hitting the real probe
+        // endpoints — skip the network round-trip by pre-seeding the
+        // cache to a known value and asserting the next call reuses
+        // it without re-probing.
+        let mut p = ConnectivityProbe {
+            last_check: Some(Instant::now()),
+            last_online: false,
+        };
+        // Fresh — must return cached false WITHOUT a real probe
+        // call. If it re-probed, this test would flake on machines
+        // with intermittent gstatic / cloudflare reachability.
+        assert!(!p.is_online());
+        // Pre-seed online: same logic, stays cached.
+        p.last_online = true;
+        assert!(p.is_online());
     }
 }
