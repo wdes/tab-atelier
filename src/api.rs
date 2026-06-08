@@ -2073,12 +2073,12 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             // rejects empty fields, unknown tzs, and unparseable
             // rules. We surface the parser's own error string so the
             // CLI / GUI can show the user exactly what failed.
-            let inner = &p["/tabs/by-id/".len()..p.len() - "/schedule".len()];
             #[derive(serde::Deserialize)]
             struct Body {
                 rule: Option<String>,
                 tz: Option<String>,
             }
+            let inner = &p["/tabs/by-id/".len()..p.len() - "/schedule".len()];
             let parsed: Option<Body> = if body_bytes.is_empty() {
                 Some(Body { rule: None, tz: None })
             } else {
