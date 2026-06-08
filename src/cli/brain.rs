@@ -196,7 +196,7 @@ struct TabsResponse {
 /// scrollback or just an `agent_state == "error"` flag. Both map to
 /// the same default action (`continue\n`) today; the variant exists
 /// so the log + cooldown key distinguishes them.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum Trigger {
     Pattern(&'static Pattern),
     AgentError,
@@ -218,10 +218,48 @@ impl Trigger {
     }
 }
 
+/// A tab that's flagged and past its cooldown — a candidate for the
+/// round-robin picker.
+#[derive(Debug, Clone)]
+struct Eligible {
+    tab_id: String,
+    tab_name: String,
+    trigger: Trigger,
+}
+
+/// Round-robin pick from a slice. Advances `cursor` mod `len()` and
+/// returns the chosen element (a reference into the slice, since the
+/// caller still owns the Vec). `None` on empty input — caller treats
+/// that as "nothing to do this tick" without advancing the cursor.
+///
+/// Extracted as a pure fn so tests can exercise the wrap-around +
+/// monotonic-advance behaviour without mocking HTTP.
+fn pick_round_robin<'a, T>(items: &'a [T], cursor: &mut usize) -> Option<&'a T> {
+    if items.is_empty() {
+        return None;
+    }
+    let idx = *cursor % items.len();
+    *cursor = cursor.wrapping_add(1);
+    items.get(idx)
+}
+
 /// Polled at every interval. Re-derives the endpoint each tick so
 /// a daemon restart (different token, same URL) just resumes
 /// silently on the next loop.
-fn tick(cooldowns: &mut HashMap<(String, &'static str), Instant>, probe: &mut ConnectivityProbe) -> Result<(), String> {
+///
+/// Round-robin send model — at most ONE `continue` per tick. If
+/// five tabs are all stuck on the same connectivity error, sending
+/// to all five simultaneously dogpiles whatever was wrong (rate
+/// limit, transient 5xx) and we'd just collect five fresh failures.
+/// Instead: collect all eligible tabs, pick one via the cursor,
+/// fire only that one. The next tick (~5 s later) picks the next
+/// one, and so on. Cooldown per (tab, pattern) still applies; the
+/// round-robin just spaces out which one fires when.
+fn tick(
+    cooldowns: &mut HashMap<(String, &'static str), Instant>,
+    probe: &mut ConnectivityProbe,
+    cursor: &mut usize,
+) -> Result<(), String> {
     let ep: Endpoint = discover_endpoint()?;
     let ag = agent();
     let auth = format!("Bearer {}", ep.token);
@@ -236,6 +274,7 @@ fn tick(cooldowns: &mut HashMap<(String, &'static str), Instant>, probe: &mut Co
         .map_err(|e| format!("parse /tabs: {e}"))?;
 
     let now = Instant::now();
+    let mut eligible: Vec<Eligible> = Vec::new();
     for tab in tabs.tabs {
         if tab.id.is_empty() {
             continue;
@@ -271,38 +310,63 @@ fn tick(cooldowns: &mut HashMap<(String, &'static str), Instant>, probe: &mut Co
             // after our injected `continue`.
             continue;
         }
+        eligible.push(Eligible {
+            tab_id: tab.id,
+            tab_name: tab.name,
+            trigger,
+        });
+    }
 
-        // Connectivity gate. If the box can't reach the open
-        // internet, sending `continue` would just trigger the same
-        // error again and burn a cooldown for nothing. Skip the send
-        // AND skip updating the cooldown so the next tick (~5s)
-        // re-checks and fires as soon as the network's back.
-        //
-        // Cached for `PROBE_TTL` so multiple erroring tabs in a
-        // single tick share one probe.
-        if !probe.is_online() {
-            println!(
-                "⛑ brain: {name:<24} [{label}] → suppressed (no internet — probe failed)",
-                name = tab.name,
-                label = trigger.label(),
-            );
-            continue;
-        }
+    if eligible.is_empty() {
+        return Ok(());
+    }
 
-        cooldowns.insert(key, now);
+    // Connectivity gate. If the box can't reach the open internet,
+    // sending `continue` would just trigger the same error again and
+    // burn a cooldown for nothing. Skip the send AND skip updating
+    // the cooldown / round-robin cursor so the next tick (~5 s)
+    // re-probes and fires as soon as the network's back. One probe
+    // covers the whole eligible set; the result is cached for
+    // `PROBE_TTL` so tabs share it.
+    if !probe.is_online() {
+        println!(
+            "⛑ brain: {n} tab(s) flagged but suppressed (no internet — probe failed)",
+            n = eligible.len(),
+        );
+        return Ok(());
+    }
 
-        let _ = ag
-            .post(format!("{}/tabs/by-id/{}/input", ep.url, tab.id))
-            .header("Authorization", &auth)
-            .header("Content-Type", "application/octet-stream")
-            .send(trigger.action().as_bytes())
-            .map_err(|e| format!("POST input for {}: {e}", tab.id))?;
+    // Round-robin: pick one from the eligible set. Cursor advances
+    // on every successful tick (online + at least one eligible), so
+    // the next tick walks past this tab to its neighbours. Single
+    // stuck tab → it always wins; multiple → rotation.
+    let Some(pick) = pick_round_robin(&eligible, cursor) else {
+        return Ok(());
+    };
+    let deferred = eligible.len() - 1;
+    let key = (pick.tab_id.clone(), pick.trigger.label());
+    cooldowns.insert(key, now);
 
+    let _ = ag
+        .post(format!("{}/tabs/by-id/{}/input", ep.url, pick.tab_id))
+        .header("Authorization", &auth)
+        .header("Content-Type", "application/octet-stream")
+        .send(pick.trigger.action().as_bytes())
+        .map_err(|e| format!("POST input for {}: {e}", pick.tab_id))?;
+
+    if deferred > 0 {
+        println!(
+            "⛑ brain: {name:<24} [{label}] → sent {action:?} ({deferred} other tab(s) deferred — round-robin)",
+            name = pick.tab_name,
+            label = pick.trigger.label(),
+            action = pick.trigger.action(),
+        );
+    } else {
         println!(
             "⛑ brain: {name:<24} [{label}] → sent {action:?}",
-            name = tab.name,
-            label = trigger.label(),
-            action = trigger.action()
+            name = pick.tab_name,
+            label = pick.trigger.label(),
+            action = pick.trigger.action(),
         );
     }
     Ok(())
@@ -334,7 +398,9 @@ pub fn run(args: &[String]) -> i32 {
                      to prevent re-fire loops.\n\
                      Patterns: {n} known signatures (Anthropic API connectivity).\n\
                      Connectivity probe (Google generate_204 + Cloudflare 1.1.1.1) gates\n\
-                     every send; offline → suppress, retry on next tick when back online.",
+                     every send; offline → suppress, retry on next tick when back online.\n\
+                     Round-robin: at most one send per tick across all eligible tabs.\n\
+                     Five stuck tabs ⇒ they fire 5s apart, not all at once.",
                     n = PATTERNS.len(),
                 );
                 return 0;
@@ -357,8 +423,9 @@ pub fn run(args: &[String]) -> i32 {
 
     let mut cooldowns: HashMap<(String, &'static str), Instant> = HashMap::new();
     let mut probe = ConnectivityProbe::default();
+    let mut rr_cursor: usize = 0;
     loop {
-        if let Err(e) = tick(&mut cooldowns, &mut probe) {
+        if let Err(e) = tick(&mut cooldowns, &mut probe, &mut rr_cursor) {
             // Log + keep going. The most likely error is a transient
             // daemon-restart window; the next tick will succeed.
             eprintln!("⛑ brain: tick failed: {e}");
@@ -449,5 +516,93 @@ mod tests {
         // Pre-seed online: same logic, stays cached.
         p.last_online = true;
         assert!(p.is_online());
+    }
+
+    #[test]
+    fn round_robin_empty_returns_none_without_advancing_cursor() {
+        // No work this tick → cursor must NOT advance, otherwise a
+        // long quiet period would slide the start index past every
+        // possible "first" of the next non-empty eligible set and
+        // we'd skip tabs unfairly.
+        let items: [&str; 0] = [];
+        let mut cursor = 7;
+        assert!(pick_round_robin(&items, &mut cursor).is_none());
+        assert_eq!(cursor, 7);
+    }
+
+    #[test]
+    fn round_robin_single_item_always_picks_it() {
+        let items = ["only-tab"];
+        let mut cursor = 0;
+        assert_eq!(pick_round_robin(&items, &mut cursor), Some(&"only-tab"));
+        assert_eq!(pick_round_robin(&items, &mut cursor), Some(&"only-tab"));
+        assert_eq!(pick_round_robin(&items, &mut cursor), Some(&"only-tab"));
+    }
+
+    #[test]
+    fn round_robin_rotates_through_set() {
+        // The shape of the actual behaviour the user asked for: 3
+        // stuck tabs fire in order A, B, C, A, B, C, …
+        let items = ["A", "B", "C"];
+        let mut cursor = 0;
+        let picks: Vec<&str> = (0..7)
+            .map(|_| *pick_round_robin(&items, &mut cursor).unwrap())
+            .collect();
+        assert_eq!(picks, vec!["A", "B", "C", "A", "B", "C", "A"]);
+    }
+
+    #[test]
+    fn round_robin_starting_cursor_offsets_the_first_pick() {
+        // Cursor 4 in a 3-item set hits idx 4 % 3 = 1 = "B".
+        let items = ["A", "B", "C"];
+        let mut cursor = 4;
+        assert_eq!(pick_round_robin(&items, &mut cursor), Some(&"B"));
+        assert_eq!(cursor, 5);
+        assert_eq!(pick_round_robin(&items, &mut cursor), Some(&"C"));
+    }
+
+    #[test]
+    fn round_robin_survives_wrap_around() {
+        // wrapping_add at usize::MAX shouldn't panic. The cursor
+        // wraps to 0 and the next pick goes to idx 0.
+        let items = ["A", "B", "C"];
+        let mut cursor = usize::MAX;
+        // (usize::MAX) % 3 = 0 → "A". Then cursor wraps to 0.
+        assert_eq!(pick_round_robin(&items, &mut cursor), Some(&"A"));
+        assert_eq!(cursor, 0);
+    }
+
+    #[test]
+    fn round_robin_set_shrinks_between_ticks() {
+        // Realistic shape: this tick sees 3 eligible tabs, next tick
+        // only 1 (the other 2 are now in cooldown). Cursor advanced
+        // to 1 last tick; the new set's len is 1 so idx = 1 % 1 = 0
+        // — we pick the lone remaining tab without panic.
+        let mut cursor = 1;
+        let three = ["A", "B", "C"];
+        assert_eq!(pick_round_robin(&three, &mut cursor), Some(&"B"));
+        // Now only one eligible left.
+        let one = ["Z"];
+        assert_eq!(pick_round_robin(&one, &mut cursor), Some(&"Z"));
+        assert_eq!(cursor, 3);
+    }
+
+    #[test]
+    fn eligible_label_distinguishes_pattern_from_agent_error() {
+        // Cooldown key uses (tab_id, label) — pattern hits and
+        // agent_state-driven hits MUST have distinct labels or one
+        // would cooldown-suppress the other.
+        let pattern = &PATTERNS[0];
+        let p = Eligible {
+            tab_id: "tab-1".into(),
+            tab_name: "shell".into(),
+            trigger: Trigger::Pattern(pattern),
+        };
+        let a = Eligible {
+            tab_id: "tab-1".into(),
+            tab_name: "shell".into(),
+            trigger: Trigger::AgentError,
+        };
+        assert_ne!(p.trigger.label(), a.trigger.label());
     }
 }
