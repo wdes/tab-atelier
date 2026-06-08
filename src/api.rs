@@ -69,9 +69,9 @@ fn resolve_tab_idx(state: &TabSnapshot, key_raw: &str, is_uuid: bool) -> Option<
 #[derive(Serialize)]
 struct TabInfo {
     index: usize,
-    /// Stable per-tab UUID. Exposed so the `tab-atelier tabs` viewer
-    /// (and any other client polling /tabs) can correlate the row
-    /// with `_TAB_ID` shells / set-status calls / auto-resume state.
+    /// Stable per-tab UUID. Exposed so any client polling /tabs can
+    /// correlate the row with `_TAB_ID` shells / set-status calls /
+    /// auto-resume state.
     id: String,
     name: String,
     cwd: Option<String>,
