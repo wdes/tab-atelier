@@ -133,11 +133,8 @@ flate2 = "1"
 # Stable per-tab IDs persisted into tabs.json — used by the
 # `POST /tabs/by-id/{id}/status` API + the auto-resume path.
 uuid = { version = "1", features = ["v4"] }
-# Live `tab-atelier tabs` viewer: ratatui draws the per-row table
-# with the LED + watts/CPU mirror of the desktop's bottom bar, and
-# crossterm flips the terminal into the alt-screen + raw mode while
-# the viewer is up.
-ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+# Used by `tab-atelier remote attach` for raw-mode + alt-screen on
+# the local terminal while the remote PTY is mirrored to it.
 crossterm = { version = "0.29", default-features = false, features = ["events"] }
 # Transitive of ureq today but the remote-tab client reads response
 # headers directly, so import it explicitly to insulate against ureq
