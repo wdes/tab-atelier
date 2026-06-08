@@ -203,6 +203,30 @@ pub enum Commands {
         #[arg(long)]
         interval: Option<u64>,
     },
+
+    /// Off-hours auto-lock — OSM `opening_hours` rule + IANA timezone.
+    ///
+    /// Set: `schedule <tab> "Mo-Fr 09:00-18:00" --tz Europe/Paris`.
+    /// Clear: `schedule <tab> --clear`. Outside the rule's open windows
+    /// every write (input, inbox upload, manual unlock) is refused
+    /// with 423; viewers see the lock reason in the `X-Tab-Locked-
+    /// Reason: schedule` header.
+    Schedule {
+        /// Tab index or UUID.
+        tab: String,
+        /// OSM `opening_hours` rule (e.g. `Mo-Fr 09:00-18:00`,
+        /// `Mo-Fr 09:00-12:30,13:30-18:00; PH off`, `24/7`).
+        /// Required unless `--clear`.
+        rule: Option<String>,
+        /// IANA timezone name (e.g. `Europe/Paris`, `America/New_York`,
+        /// `Asia/Tokyo`, `UTC`). Required unless `--clear`.
+        #[arg(long, conflicts_with = "clear")]
+        tz: Option<String>,
+        /// Drop the schedule on this tab — tab returns to always-open
+        /// (unless still manually locked).
+        #[arg(long, conflicts_with = "rule")]
+        clear: bool,
+    },
 }
 
 /// Returns true iff a subcommand was dispatched (caller should not
@@ -329,6 +353,19 @@ pub fn dispatch(cli: Cli) -> bool {
             }
             crate::cli::brain::run(&args)
         }
+        Commands::Schedule { tab, rule, tz, clear } => {
+            let mut args: Vec<String> = vec![tab];
+            if clear {
+                args.push("--clear".into());
+            } else if let Some(r) = rule {
+                args.push(r);
+                if let Some(z) = tz {
+                    args.push("--tz".into());
+                    args.push(z);
+                }
+            }
+            crate::cli::share_link::schedule(&args)
+        }
     };
     std::process::exit(code);
 }
@@ -403,6 +440,18 @@ mod tests {
                 ],
                 "remote pass-through",
             ),
+            (
+                &[
+                    "tab-atelier-headless",
+                    "schedule",
+                    "0",
+                    "Mo-Fr 09:00-18:00",
+                    "--tz",
+                    "Europe/Paris",
+                ],
+                "schedule set",
+            ),
+            (&["tab-atelier-headless", "schedule", "0", "--clear"], "schedule clear"),
         ];
         for (argv, label) in cases {
             let _ = Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("parse failed for {label}: {e}"));
@@ -485,6 +534,7 @@ mod tests {
             "set-status",
             "claude-hook",
             "remote",
+            "schedule",
         ] {
             assert!(
                 names.contains(&expected),

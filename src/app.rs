@@ -103,10 +103,24 @@ struct Tab {
     /// restarts. Empty until first share.
     share_token_rw: String,
     share_token_ro: String,
-    /// Lock state — when true, every input source is refused:
-    /// local typing, paste, hotkeys, remote API, share links.
-    /// Toggled by the right-click menu; persisted to tabs.json.
+    /// Manual lock — user-toggled via right-click / `POST /lock`.
+    ///
+    /// **Gate authors:** call `tab.effective_locked()` (via
+    /// [`crate::schedule::LockState`]) instead of reading this raw
+    /// field. The effective state factors in the off-hours
+    /// [`Self::schedule`] auto-lock so a new gate can't accidentally
+    /// honour only the manual flag.
     locked: bool,
+    /// Off-hours auto-lock (Settings → Schedule). When the rule's
+    /// current state is closed,
+    /// [`crate::schedule::LockState::effective_locked`] reports
+    /// `true` even if [`Self::locked`] is false. None ⇒ no schedule,
+    /// tab is always-open from the schedule's perspective.
+    schedule: Option<crate::schedule::TabSchedule>,
+    /// Last value pushed to `view.set_locked()` — the per-tick
+    /// mirror in `persist()` compares against this so an idle tab's
+    /// effective-lock recompute is a no-op (skip `cx.notify`).
+    last_pushed_locked: Option<bool>,
     /// Per-tab background color override (`#RRGGBB`). `None` ⇒ use
     /// the global `Preferences::tab_bg_color`, which itself falls
     /// back to Tomorrow Night Blue.
@@ -116,6 +130,15 @@ struct Tab {
     /// PTY, then clears this. Set in `insert_tab` from the
     /// restored `agent_kind` / `agent_session_id` pair.
     pending_agent_resume: Option<String>,
+}
+
+impl crate::schedule::LockState for Tab {
+    fn manual_locked(&self) -> bool {
+        self.locked
+    }
+    fn schedule(&self) -> Option<&crate::schedule::TabSchedule> {
+        self.schedule.as_ref()
+    }
 }
 
 impl Tab {
@@ -357,10 +380,15 @@ impl AppState {
                             Some(output)
                         }
                     });
-                    // Push the persisted lock state onto the view so
-                    // input is blocked from the moment the tab loads,
-                    // not just after the menu is opened.
-                    if ts.locked {
+                    // Push the persisted effective-lock state onto
+                    // the view so input is blocked from the moment
+                    // the tab loads, not just after the first
+                    // persist tick. Routes through `LockState` so a
+                    // tab restored OUTSIDE its schedule's open hours
+                    // also boots locked, not just manually-locked
+                    // tabs.
+                    use crate::schedule::LockState as _;
+                    if ts.effective_locked() {
                         view.read(cx).set_locked(true);
                     }
                     // Auto-resume: if this tab had an agent session
@@ -399,7 +427,9 @@ impl AppState {
                         share_token_rw: ts.share_token_rw.clone(),
                         share_token_ro: ts.share_token_ro.clone(),
                         locked: ts.locked,
+                        schedule: ts.schedule.clone(),
                         bg_color: ts.bg_color.clone(),
+                        last_pushed_locked: None,
                         pending_agent_resume,
                     });
                 }
@@ -437,7 +467,9 @@ impl AppState {
                         share_token_rw: String::new(),
                         share_token_ro: String::new(),
                         locked: false,
+                        schedule: None,
                         bg_color: None,
+                        last_pushed_locked: None,
                         pending_agent_resume: None,
                     });
                 }
@@ -479,7 +511,9 @@ impl AppState {
                         share_token_rw: String::new(),
                         share_token_ro: String::new(),
                         locked: false,
+                        schedule: None,
                         bg_color: None,
+                        last_pushed_locked: None,
                         pending_agent_resume: None,
                     }],
                     0,
@@ -576,6 +610,7 @@ impl AppState {
             pending_input: Vec::new(),
             pending_lock_changes: Vec::new(),
             pending_bg_color_changes: Vec::new(),
+            pending_schedule_changes: Vec::new(),
             pending_new_tabs: 0,
             pending_new_tab_cwds: std::collections::VecDeque::new(),
             pending_renames: Vec::new(),
@@ -713,7 +748,9 @@ impl AppState {
                 share_token_rw: String::new(),
                 share_token_ro: String::new(),
                 locked: false,
+                schedule: None,
                 bg_color: None,
+                last_pushed_locked: None,
                 pending_agent_resume: None,
             },
         );
@@ -820,6 +857,7 @@ impl AppState {
                     share_token_rw: tab.share_token_rw.clone(),
                     share_token_ro: tab.share_token_ro.clone(),
                     locked: tab.locked,
+                    schedule: tab.schedule.clone(),
                     bg_color: tab.bg_color.clone(),
                     ..TabState::default()
                 }
@@ -856,6 +894,7 @@ impl AppState {
                     share_token_rw: ts.share_token_rw.clone(),
                     share_token_ro: ts.share_token_ro.clone(),
                     locked: ts.locked,
+                    schedule: ts.schedule.clone(),
                     bg_color: crate::effective_tab_bg(tab.bg_color.as_deref(), self.tab_bg_global.as_deref())
                         .to_string(),
                     shell_pid: view.pid(),
@@ -970,20 +1009,53 @@ impl AppState {
             let status_updates: Vec<api::PendingStatusUpdate> = snapshot.pending_status_updates.drain(..).collect();
             let lock_changes: Vec<(String, bool)> = snapshot.pending_lock_changes.drain(..).collect();
             let bg_color_changes: Vec<(String, Option<String>)> = snapshot.pending_bg_color_changes.drain(..).collect();
+            let schedule_changes: Vec<(String, Option<crate::schedule::TabSchedule>)> =
+                snapshot.pending_schedule_changes.drain(..).collect();
             drop(snapshot);
-            // Apply lock toggles from the API/CLI onto the runtime Tab
-            // + its view, mirroring the right-click menu path. Both
-            // sites must update — the view gate is what makes typing
-            // stop, the Tab field is what persists into tabs.json.
+            // Apply lock toggles from the API/CLI onto the runtime
+            // Tab's manual flag. The view's set_locked() push happens
+            // in the per-tick mirror below — that's the single site
+            // that funnels `effective_locked()` into the gpui view,
+            // so a future caller can't accidentally toggle the view
+            // without also covering schedule-driven locks.
             for (tab_id, locked) in lock_changes {
                 if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
                     tab.locked = locked;
-                    tab.view.read(cx).set_locked(locked);
                 }
             }
             for (tab_id, color) in bg_color_changes {
                 if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
                     tab.bg_color = color;
+                }
+            }
+            // Schedule changes — None clears, Some sets. Mirrors the
+            // `locked` / `bg_color` drain above: mutate the runtime
+            // `Tab` so the next persist tick rebuilds `tabs.json` +
+            // `api_tabs` with the new value.
+            for (tab_id, sched) in schedule_changes {
+                if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+                    tab.schedule = sched;
+                }
+            }
+            // Per-tick effective-lock mirror.
+            //
+            // The view's `set_locked()` gate is what stops LOCAL
+            // typing in the desktop GUI. We want it driven by the
+            // same `effective_locked()` that every API gate uses, so
+            // off-hours schedule transitions pause local input the
+            // same way a manual lock does — without a dedicated
+            // schedule-only push path that future code might miss.
+            //
+            // Compares against `tab.last_pushed_locked` and skips
+            // when unchanged so an idle tab's per-tick recompute is
+            // a single bool compare (no gpui notify, no schedule
+            // re-eval cost beyond the one in effective_locked()).
+            use crate::schedule::LockState as _;
+            for tab in &mut self.tabs {
+                let want = tab.effective_locked();
+                if tab.last_pushed_locked != Some(want) {
+                    tab.view.read(cx).set_locked(want);
+                    tab.last_pushed_locked = Some(want);
                 }
             }
             for upd in status_updates {
@@ -1990,6 +2062,87 @@ impl AppState {
                         }),
                     )
                     .child("Background: use global"),
+            );
+
+            // Schedule — five preset rules (matching the docs)
+            // bound to the system tz, plus a "clear" entry. Full
+            // custom rule + tz pairing lives in the CLI
+            // (`tab-atelier schedule <tab> "<rule>" --tz <iana>`).
+            // Listed under bg-color because both are tab-scoped
+            // settings the user toggles infrequently.
+            //
+            // `iana_default()` reads /etc/timezone (Linux) so the
+            // presets land on the user's local zone, not the
+            // process's TZ env. Falls back to "UTC".
+            let sched_tz_default = iana_default_tz();
+            let sched_presets: &[(&str, &str)] = &[
+                ("Workdays 9-18", "Mo-Fr 09:00-18:00"),
+                ("Workdays 9-18 + lunch", "Mo-Fr 09:00-12:30,13:30-18:00"),
+                ("Workdays 9-18 (no holidays)", "Mo-Fr 09:00-18:00; PH off"),
+                ("Always open", "24/7"),
+                ("Night shift 22-06", "Mo-Fr 22:00-06:00"),
+            ];
+            for (preset_label, preset_rule) in sched_presets {
+                let tab_id_for_sched = self.tabs[idx].id.clone();
+                let rule = (*preset_rule).to_string();
+                let tz_str = sched_tz_default.clone();
+                let label = format!("Schedule: {preset_label} ({tz_str})");
+                container = container.child(
+                    div()
+                        .id(SharedString::from(format!("menu-sched-{preset_label}")))
+                        .px(px(12.0))
+                        .py(px(4.0))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(menu_hover))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                                // Validate before applying — same
+                                // surface the CLI uses. A panic-free
+                                // path: bad presets fall through with
+                                // no UI feedback today (the menu
+                                // entries are all known-good).
+                                if let Ok(sched) = crate::schedule::TabSchedule::new(rule.clone(), tz_str.clone()) {
+                                    this.tabs[idx].schedule = Some(sched.clone());
+                                    let mut snap = this.api_state.lock().unwrap();
+                                    if let Some(t) = snap.tabs.iter_mut().find(|t| t.id == tab_id_for_sched) {
+                                        t.schedule = Some(sched.clone());
+                                    }
+                                    snap.pending_schedule_changes
+                                        .push((tab_id_for_sched.clone(), Some(sched)));
+                                    drop(snap);
+                                }
+                                this.context_menu = None;
+                                cx.notify();
+                            }),
+                        )
+                        .child(label),
+                );
+            }
+            let tab_id_for_sched_clear = self.tabs[idx].id.clone();
+            container = container.child(
+                div()
+                    .id("menu-sched-clear")
+                    .px(px(12.0))
+                    .py(px(4.0))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(menu_hover))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                            this.tabs[idx].schedule = None;
+                            let mut snap = this.api_state.lock().unwrap();
+                            if let Some(t) = snap.tabs.iter_mut().find(|t| t.id == tab_id_for_sched_clear) {
+                                t.schedule = None;
+                            }
+                            snap.pending_schedule_changes
+                                .push((tab_id_for_sched_clear.clone(), None));
+                            drop(snap);
+                            this.context_menu = None;
+                            cx.notify();
+                        }),
+                    )
+                    .child("Schedule: always open (clear)"),
             );
         }
 
@@ -3724,6 +3877,20 @@ fn format_duration(d: std::time::Duration) -> String {
         let m = (secs % 3600) / 60;
         format!("{h}h {m}m")
     }
+}
+
+/// Best-effort guess at the user's IANA timezone for the
+/// Schedule context-menu presets. Reads `/etc/timezone` (Debian /
+/// Ubuntu standard) and falls back to `UTC` when missing. The user
+/// can always override via the CLI (`tab-atelier schedule <tab>
+/// "<rule>" --tz <iana>`); the menu only ever pre-fills the obvious
+/// default.
+fn iana_default_tz() -> String {
+    std::fs::read_to_string("/etc/timezone")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "UTC".to_string())
 }
 
 fn run_check() {

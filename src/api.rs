@@ -167,11 +167,21 @@ pub struct SnapshotTab {
     /// the GUI menu mints them on first share.
     pub share_token_rw: String,
     pub share_token_ro: String,
-    /// When true, every input source (master token, share tokens,
-    /// local typing in the GUI) is refused on this tab. Surfaced
-    /// as `X-Tab-Locked: 1` on /output so the xterm.js viewer can
-    /// render a locked banner.
+    /// Manual lock — user-toggled via right-click / `POST /lock`.
+    ///
+    /// **Gate authors:** read [`crate::schedule::LockState::effective_locked`]
+    /// instead of this raw field. The effective state factors in the
+    /// off-hours [`Self::schedule`] auto-lock so a new gate can't
+    /// accidentally honour only the manual flag.
     pub locked: bool,
+    /// Off-hours auto-lock. Mirrored from `TabState.schedule`. When
+    /// the rule's current state is closed,
+    /// [`crate::schedule::LockState::effective_locked`] reports
+    /// `true` even if [`Self::locked`] is false. Carries the tz so
+    /// the viewer can show "locked until Mo 09:00 Europe/Paris" in
+    /// headers (`X-Tab-Schedule-Tz`, `X-Tab-Schedule-Next`) without
+    /// parsing the rule.
+    pub schedule: Option<crate::schedule::TabSchedule>,
     /// Effective background color for this tab's viewer (per-tab
     /// override or global default; never `None`). Shipped to the
     /// viewer via `X-Tab-Bg` on /output + `__TAB_BG__` template
@@ -206,6 +216,15 @@ pub struct SnapshotTab {
     /// `None` for tabs that pre-date PTY-tap wiring — endpoint
     /// responds 404 in that case.
     pub pty_ring: Option<std::sync::Arc<std::sync::Mutex<crate::pty_ring::PtyRing>>>,
+}
+
+impl crate::schedule::LockState for SnapshotTab {
+    fn manual_locked(&self) -> bool {
+        self.locked
+    }
+    fn schedule(&self) -> Option<&crate::schedule::TabSchedule> {
+        self.schedule.as_ref()
+    }
 }
 
 /// A status update queued by `POST /tabs/by-id/{id}/status` — drained
@@ -245,6 +264,11 @@ pub struct TabSnapshot {
     /// `None` clears the per-tab override → tab falls back to the
     /// global default. Same drain shape as `pending_lock_changes`.
     pub pending_bg_color_changes: Vec<(String, Option<String>)>,
+    /// (`tab_id`, schedule-or-None) queued by
+    /// `POST /tabs/by-id/{id}/schedule`. `None` clears the schedule
+    /// (tab returns to 24/7 unless still manually locked). Same drain
+    /// shape as `pending_bg_color_changes`.
+    pub pending_schedule_changes: Vec<(String, Option<crate::schedule::TabSchedule>)>,
     pub pending_new_tabs: usize,
     /// Optional explicit cwd hints for the next `pending_new_tabs`
     /// creations, in FIFO order. Populated by `POST /tabs` with a
@@ -587,6 +611,50 @@ fn maybe_gzip(bytes: &[u8], accept_gzip: bool) -> Option<Vec<u8>> {
 /// corrupted).
 fn is_safe_hex_color(s: &str) -> bool {
     s.len() == 7 && s.starts_with('#') && s[1..].chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Emit `X-Tab-Schedule-Tz` + (when computable) `X-Tab-Schedule-Next`
+/// onto the response's extra-headers buffer. Called from /output and
+/// /stream so the viewer can render "locked until Mo 09:00
+/// Europe/Paris" without parsing the rule itself.
+///
+/// `X-Tab-Schedule-Next` is RFC 3339 in UTC. The viewer applies the tz
+/// header to format it back to the schedule's local time.
+///
+/// Re-validates the tz before echoing — input validation already
+/// rejected unknown zones at `TabSchedule::new`, but a defense-in-
+/// depth check keeps a hypothetical bypass from turning into a
+/// header-injection vector.
+fn write_schedule_headers(extra: &mut String, schedule: &crate::schedule::TabSchedule) {
+    // tz is restricted to the chrono-tz table (ASCII letters, digits,
+    // `/`, `_`, `-`). No CRLF or other unsafe bytes can appear.
+    let tz_safe = schedule
+        .tz
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '+'));
+    if tz_safe {
+        let _ = write!(extra, "X-Tab-Schedule-Tz: {}\r\n", schedule.tz);
+    }
+    if let Some(next_utc) = schedule.next_change_from_now() {
+        // RFC 3339 in UTC — strict ASCII, no CRLF.
+        let _ = write!(extra, "X-Tab-Schedule-Next: {}\r\n", next_utc.to_rfc3339());
+    }
+    // Echo the rule too — let the viewer show what the schedule says
+    // without an extra round-trip. Rule is OSM grammar (`Mo-Fr
+    // 09:00-18:00`, `; PH off`, etc.); the parser accepts non-ASCII
+    // in some comment forms, so percent-encode anything outside the
+    // safe printable set.
+    let mut encoded = String::with_capacity(schedule.rule.len());
+    for byte in schedule.rule.bytes() {
+        if matches!(byte, 0x20..=0x7e) && byte != b'%' && byte != b'\r' && byte != b'\n' {
+            encoded.push(byte as char);
+        } else {
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    if !encoded.is_empty() {
+        let _ = write!(extra, "X-Tab-Schedule-Rule: {encoded}\r\n");
+    }
 }
 
 /// Constant-time byte-slice equality. Returns false on length mismatch
@@ -1247,7 +1315,10 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             let pty_rows = t.rows;
             let raw_cursor = t.raw_cursor;
             let bg_color = t.bg_color.clone();
-            let locked = t.locked;
+            let schedule = t.schedule.clone();
+            use crate::schedule::LockState as _;
+            let lock_reason = t.lock_reason();
+            let locked = t.effective_locked();
             // Agent indicator surfaced to the share-link viewer so the
             // browser tab title can mirror what the desktop GUI shows
             // (\u{1f9e0} Thinking / ⌛ Waiting / ❗ Error). Strictly
@@ -1335,6 +1406,12 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             }
             if locked {
                 let _ = write!(extra, "X-Tab-Locked: 1\r\n");
+                if let Some(r) = lock_reason {
+                    let _ = write!(extra, "X-Tab-Locked-Reason: {r}\r\n");
+                }
+            }
+            if let Some(s) = schedule.as_ref() {
+                write_schedule_headers(&mut extra, s);
             }
             if let Some(state_str) = agent_state_str {
                 let _ = write!(extra, "X-Agent-State: {state_str}\r\n");
@@ -1422,7 +1499,10 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             let pty_cols = t.cols;
             let pty_rows = t.rows;
             let bg_color = t.bg_color.clone();
-            let locked = t.locked;
+            let schedule = t.schedule.clone();
+            use crate::schedule::LockState as _;
+            let stream_lock_reason = t.lock_reason();
+            let locked = t.effective_locked();
             // Count downloadable / uploaded files so the viewer can
             // toast and badge without an extra poll. Cheap stat —
             // directory traversal only, no reads.
@@ -1475,6 +1555,12 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             }
             if locked {
                 let _ = write!(extra, "X-Tab-Locked: 1\r\n");
+                if let Some(r) = stream_lock_reason {
+                    let _ = write!(extra, "X-Tab-Locked-Reason: {r}\r\n");
+                }
+            }
+            if let Some(s) = schedule.as_ref() {
+                write_schedule_headers(&mut extra, s);
             }
             if let Some(state_str) = agent_state_str {
                 let _ = write!(extra, "X-Agent-State: {state_str}\r\n");
@@ -1731,8 +1817,10 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             // /input. Lock means "this tab is read-only right now";
             // a share recipient shouldn't be able to drop files
             // into the agent's inbox while the operator has paused
-            // the session.
-            if t.locked {
+            // the session. `effective_locked()` covers BOTH the
+            // manual flag and the off-hours schedule.
+            use crate::schedule::LockState as _;
+            if t.effective_locked() {
                 drop(snap);
                 error_json(stream, 423, "tab is locked");
                 return;
@@ -1949,12 +2037,93 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 return;
             };
             let tab_id = state.tabs[idx].id.clone();
-            let new_val = on_body.unwrap_or(!state.tabs[idx].locked);
+            let current_locked = state.tabs[idx].locked;
+            let new_val = on_body.unwrap_or(!current_locked);
+            // Manual unlock OUTSIDE the schedule's open windows is
+            // refused — the schedule is the boundary, not a polite
+            // suggestion. The user can still lock during open hours
+            // (manual lock beats schedule open). If they want to
+            // unlock outside hours, they remove the schedule first.
+            //
+            // Probe the post-unlock state — pass `false` to the
+            // helper to simulate "what would the lock_reason be
+            // after the unlock?" If the answer is still
+            // schedule-driven, refuse. Routes through the same
+            // `lock_reason` helper as every other gate so a future
+            // change to the rule is automatically picked up here.
+            if !new_val && crate::schedule::lock_reason(false, state.tabs[idx].schedule.as_ref()) == Some("schedule") {
+                drop(state);
+                error_json(stream, 423, "schedule is closed");
+                return;
+            }
             state.tabs[idx].locked = new_val;
             state.pending_lock_changes.push((tab_id, new_val));
             drop(state);
             let body = serde_json::to_string(&serde_json::json!({"locked": new_val})).unwrap_or_default();
             respond_json(stream, 200, &body);
+        }
+        ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/schedule") => {
+            // Set or clear the off-hours auto-lock schedule. Master
+            // token only — same gate as /lock and /bg-color (the
+            // share-token route table refuses everything past
+            // /output|/stream|/input|/files).
+            //
+            // Body: `{"rule": "Mo-Fr 09:00-18:00", "tz": "Europe/Paris"}`
+            // to set; `{"rule": null}` or `{}` to clear (tab goes
+            // back to 24/7 unless still manually locked).
+            //
+            // Validation runs through `TabSchedule::new`, which
+            // rejects empty fields, unknown tzs, and unparseable
+            // rules. We surface the parser's own error string so the
+            // CLI / GUI can show the user exactly what failed.
+            let inner = &p["/tabs/by-id/".len()..p.len() - "/schedule".len()];
+            #[derive(serde::Deserialize)]
+            struct Body {
+                rule: Option<String>,
+                tz: Option<String>,
+            }
+            let parsed: Option<Body> = if body_bytes.is_empty() {
+                Some(Body { rule: None, tz: None })
+            } else {
+                serde_json::from_slice::<Body>(&body_bytes).ok()
+            };
+            let Some(body) = parsed else {
+                error_json(stream, 400, "invalid JSON body");
+                return;
+            };
+            let schedule_opt: Option<crate::schedule::TabSchedule> = match (body.rule.as_deref(), body.tz.as_deref()) {
+                (None, _) | (Some(""), _) => None,
+                (Some(rule), Some(tz)) => match crate::schedule::TabSchedule::new(rule, tz) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        error_json(stream, 400, &format!("{e}"));
+                        return;
+                    }
+                },
+                (Some(_), None) => {
+                    error_json(stream, 400, "tz is required when rule is set");
+                    return;
+                }
+            };
+            let mut state = state.lock().unwrap();
+            let Some(idx) = state.tabs.iter().position(|t| t.id == inner) else {
+                drop(state);
+                error_json(stream, 404, "tab not found");
+                return;
+            };
+            let tab_id = state.tabs[idx].id.clone();
+            // Mirror immediately in the snapshot so the next /output
+            // poll already returns the new locked state via
+            // `effective_locked`; persist tick mirrors onto the runtime
+            // Tab on the next 100 ms tick.
+            state.tabs[idx].schedule = schedule_opt.clone();
+            state.pending_schedule_changes.push((tab_id, schedule_opt.clone()));
+            drop(state);
+            let body = match &schedule_opt {
+                Some(s) => serde_json::json!({"rule": s.rule, "tz": s.tz}),
+                None => serde_json::json!({"rule": serde_json::Value::Null}),
+            };
+            respond_json(stream, 200, &body.to_string());
         }
         ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/bg-color") => {
             // Set or clear the per-tab background color override.
@@ -2014,9 +2183,12 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             let mut state = state.lock().unwrap();
             if let Some(idx) = resolve_tab_idx(&state, key_raw, is_uuid) {
                 // Refuse every write source — master token, share tokens, all
-                // routes — when the tab is locked. The lock is set per-tab
-                // via the right-click menu and persisted in tabs.json.
-                if state.tabs[idx].locked {
+                // routes — when the tab is locked. `effective_locked()`
+                // is the single source of truth: it covers BOTH the
+                // user-toggled manual lock AND the off-hours schedule,
+                // so a new gate can't accidentally honour only one.
+                use crate::schedule::LockState as _;
+                if state.tabs[idx].effective_locked() {
                     drop(state);
                     error_json(stream, 403, "tab is locked");
                     return;
@@ -2564,6 +2736,7 @@ mod tests {
                     share_token_rw: String::new(),
                     share_token_ro: String::new(),
                     locked: false,
+                    schedule: None,
                     bg_color: String::new(),
                     shell_pid: 0,
                     agent_state: None,
@@ -2585,6 +2758,7 @@ mod tests {
                     share_token_rw: String::new(),
                     share_token_ro: String::new(),
                     locked: false,
+                    schedule: None,
                     bg_color: String::new(),
                     shell_pid: 0,
                     agent_state: None,
@@ -2603,6 +2777,7 @@ mod tests {
             pending_input: vec![],
             pending_lock_changes: vec![],
             pending_bg_color_changes: vec![],
+            pending_schedule_changes: vec![],
             pending_new_tabs: 0,
             pending_new_tab_cwds: std::collections::VecDeque::new(),
             pending_renames: vec![],

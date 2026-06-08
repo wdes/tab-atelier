@@ -111,7 +111,11 @@ struct HeadlessTab {
     agent_plan_mode: Option<bool>,
     share_token_rw: String,
     share_token_ro: String,
+    /// Manual lock — user-toggled via right-click / `POST /lock`.
+    /// **Gate authors:** read [`crate::schedule::LockState::effective_locked`]
+    /// (via `tab.effective_locked()`) instead of this raw field.
     locked: bool,
+    schedule: Option<crate::schedule::TabSchedule>,
     bg_color: Option<String>,
     pending_agent_resume: Option<String>,
     colors_enabled: bool,
@@ -120,6 +124,15 @@ struct HeadlessTab {
     /// — alacritty's grid history is wiped by `\x1b[3J` and never
     /// grows when the TUI redraws in-place (Claude Code, htop, …).
     pty_ring: Arc<Mutex<crate::pty_ring::PtyRing>>,
+}
+
+impl crate::schedule::LockState for HeadlessTab {
+    fn manual_locked(&self) -> bool {
+        self.locked
+    }
+    fn schedule(&self) -> Option<&crate::schedule::TabSchedule> {
+        self.schedule.as_ref()
+    }
 }
 
 impl HeadlessTab {
@@ -141,6 +154,21 @@ impl HeadlessTab {
     }
 
     fn send_input_bytes(&mut self, bytes: Vec<u8>) {
+        // Defense in depth: the /input HTTP endpoint already calls
+        // `effective_locked()` before pushing into pending_input, so
+        // this branch only fires if some future code path bypasses
+        // the API gate (a new endpoint, a direct test fixture, …).
+        // Refuse rather than silently dropping so the call site
+        // surfaces the misuse during development.
+        use crate::schedule::LockState as _;
+        if self.effective_locked() {
+            log::warn!(
+                "send_input_bytes called on locked tab {} — dropping {} bytes",
+                self.id,
+                bytes.len()
+            );
+            return;
+        }
         self.last_input = Some(Instant::now());
         let _ = self.notifier.send(Msg::Input(bytes.into()));
     }
@@ -231,6 +259,7 @@ fn spawn_pty_tab(
     share_token_rw: String,
     share_token_ro: String,
     locked: bool,
+    schedule: Option<crate::schedule::TabSchedule>,
     bg_color: Option<String>,
     pty_cols: usize,
     pty_rows: usize,
@@ -353,6 +382,7 @@ fn spawn_pty_tab(
         share_token_rw,
         share_token_ro,
         locked,
+        schedule,
         bg_color,
         pending_agent_resume,
         colors_enabled,
@@ -433,6 +463,7 @@ pub fn run() -> std::io::Result<()> {
                 ts.share_token_rw.clone(),
                 ts.share_token_ro.clone(),
                 ts.locked,
+                ts.schedule.clone(),
                 ts.bg_color.clone(),
                 pty_cols,
                 pty_rows,
@@ -470,6 +501,7 @@ pub fn run() -> std::io::Result<()> {
             String::new(),
             false,
             None,
+            None,
             pty_cols,
             pty_rows,
         ) {
@@ -495,6 +527,7 @@ pub fn run() -> std::io::Result<()> {
         pending_input: Vec::new(),
         pending_lock_changes: Vec::new(),
         pending_bg_color_changes: Vec::new(),
+        pending_schedule_changes: Vec::new(),
         pending_new_tabs: 0,
         pending_new_tab_cwds: std::collections::VecDeque::new(),
         pending_renames: Vec::new(),
@@ -645,6 +678,7 @@ fn refresh_snapshot(
                 share_token_rw: tab.share_token_rw.clone(),
                 share_token_ro: tab.share_token_ro.clone(),
                 locked: tab.locked,
+                schedule: tab.schedule.clone(),
                 bg_color: crate::effective_tab_bg(tab.bg_color.as_deref(), Some(global_bg)).to_string(),
                 shell_pid: tab.pid,
                 agent_state: tab.agent_state.clone(),
@@ -732,6 +766,7 @@ fn persist(
             share_token_rw: tab.share_token_rw.clone(),
             share_token_ro: tab.share_token_ro.clone(),
             locked: tab.locked,
+            schedule: tab.schedule.clone(),
             bg_color: tab.bg_color.clone(),
             ..TabState::default()
         })
@@ -821,6 +856,8 @@ fn drain_pending(
     let status_updates: Vec<api::PendingStatusUpdate> = s.pending_status_updates.drain(..).collect();
     let lock_changes: Vec<(String, bool)> = s.pending_lock_changes.drain(..).collect();
     let bg_color_changes: Vec<(String, Option<String>)> = s.pending_bg_color_changes.drain(..).collect();
+    let schedule_changes: Vec<(String, Option<crate::schedule::TabSchedule>)> =
+        s.pending_schedule_changes.drain(..).collect();
     let new_tabs = std::mem::take(&mut s.pending_new_tabs);
     let new_tab_cwds: std::collections::VecDeque<std::path::PathBuf> = std::mem::take(&mut s.pending_new_tab_cwds);
     drop(s);
@@ -829,6 +866,12 @@ fn drain_pending(
     for (tab_id, locked) in lock_changes {
         if let Some(t) = tabs.iter_mut().find(|t| t.id == tab_id) {
             t.locked = locked;
+        }
+    }
+    // Schedule changes — None clears, Some sets.
+    for (tab_id, sched) in schedule_changes {
+        if let Some(t) = tabs.iter_mut().find(|t| t.id == tab_id) {
+            t.schedule = sched;
         }
     }
     // Same path for the bg-color override.
@@ -1006,6 +1049,7 @@ fn drain_pending(
             String::new(),
             String::new(),
             false,
+            None,
             None,
             pty_cols,
             pty_rows,

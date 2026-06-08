@@ -137,6 +137,15 @@ crossterm = { version = "0.28", default-features = false, features = ["events"] 
 # headers directly, so import it explicitly to insulate against ureq
 # bumps.
 http = "1"
+# Per-tab off-hours auto-lock (Settings → Schedule). Rule grammar is
+# OSM `opening_hours` (e.g. `Mo-Fr 09:00-18:00; PH off`) so a single
+# string covers weekly patterns + public holidays + lunch breaks.
+# Paired with `chrono-tz` so the schedule's tz is explicit per tab
+# (no machine-local drift when running headless on a server in a
+# different region than the user).
+opening-hours = { version = "0.10", default-features = false }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+chrono-tz = { version = "0.10", default-features = false, features = ["std"] }
 
 
 [dev-dependencies]
