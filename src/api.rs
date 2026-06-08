@@ -663,7 +663,7 @@ fn write_schedule_headers(extra: &mut String, schedule: &crate::schedule::TabSch
 /// reducing to a bool. Used for every token comparison so a remote
 /// attacker can't shave bits off a 128-bit token by timing how
 /// quickly different guesses get rejected.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -2327,6 +2327,14 @@ async fn handle_hyper_request(
     token: String,
     read_only: bool,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
+    let path = req.uri().path().to_string();
+    // Intercept WS upgrade BEFORE we collect the body into the sync
+    // adapter — the WS handshake needs the original Request so it
+    // can return a 101 Switching Protocols + park the connection.
+    if let Some(uuid) = crate::api_ws::parse_ws_path(&path) {
+        let uuid = uuid.to_string();
+        return Ok(crate::api_ws::handle_upgrade(req, state, token, read_only, uuid));
+    }
     let method = req.method().to_string();
     let uri = req
         .uri()
