@@ -111,7 +111,13 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 bytes = "1"
-rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "x509-parser"] }
+# Held at 0.13 — 0.14 removed `CertificateParams::from_ca_cert_pem`
+# (the entry point we use to parse a persisted CA cert from PEM)
+# without an obvious replacement on the same type. Bumping needs a
+# read of the 0.14 migration notes + a sweep of src/api.rs. Until
+# then we stay on the last working API; 0.13.x picks up patches
+# automatically.
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem", "x509-parser"] }
 # Used to hex-encode the TOFU SHA-256 fingerprint of a remote
 # `tab-atelier-headless`'s self-signed TLS cert (Preferences > Remote
 # endpoints > Pin certificate).
