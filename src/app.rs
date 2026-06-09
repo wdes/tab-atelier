@@ -3655,6 +3655,24 @@ impl Render for AppState {
         if self.show_hotkey_picker {
             self.hotkey_picker_focus.focus(window);
         }
+        // When the prefs modal is open, force focus onto one of its
+        // inputs every render. Without this, the terminal's focus
+        // handle (or whatever held focus before the modal opened)
+        // keeps receiving KeyDownEvents and typing leaks into the
+        // PTY behind the modal. The per-input on_mouse_down handlers
+        // still cover switching between inputs — if focus is already
+        // on a prefs input, we leave it; we only redirect to
+        // api_addr when focus drifted outside the modal entirely.
+        if self.show_preferences {
+            let already_in_prefs = self.pref_api_addr_focus.is_focused(window)
+                || self.pref_api_tls_addr_focus.is_focused(window)
+                || self.pref_share_url_base_focus.is_focused(window)
+                || self.pref_browser_focus.is_focused(window)
+                || self.pref_editor_focus.is_focused(window);
+            if !already_in_prefs {
+                self.pref_api_addr_focus.focus(window);
+            }
+        }
 
         let alpha = self.opacity as u32;
         let bg_color = if battery.is_some_and(|b| b < 10) {
