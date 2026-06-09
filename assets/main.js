@@ -402,255 +402,284 @@
     }
 
     // Monotonic PTY-byte offset we've fed into xterm.js. The server's
-    // /stream endpoint hands us `[since, X-Stream-Length)` on each
-    // poll — the ring captures every byte the PTY emitted, BEFORE
-    // alacritty's parser saw it, so it survives Claude's `\x1b[3J`
-    // wipes and contains content from in-place TUI redraws that
-    // alacritty's grid history never accumulates. xterm.js's own
-    // terminal emulation runs over those bytes here and produces a
-    // matching scrollback as a side effect.
-    let streamOffset = 0;
+    // WebSocket transport. Replaces the previous /stream HTTP polling
+    // model: the server PUSHES PTY bytes as soon as they arrive,
+    // STATE deltas (lock, schedule, agent, file counts, bg) ride a
+    // typed `meta` frame, and there's no 80 ms poll waste at idle.
+    //
+    // Wire format (mirrors src/api_ws.rs):
+    //   tag 0x01 in       C→S  raw bytes typed by the user
+    //   tag 0x02 out      S→C  raw PTY bytes
+    //   tag 0x03 meta     S→C  JSON state delta
+    //   tag 0x04 resize   C→S  JSON {cols, rows}
+    //
+    // Reconnect: the client tracks `ringOffset` (= total bytes
+    // received since session start) and on disconnect reconnects with
+    // ?since=<ringOffset> so the server resumes from where we left
+    // off. The initial connect uses ?since=0 to replay the full PTY
+    // ring on bootstrap (alacritty's grid history is wiped by
+    // \x1b[3J and never grows when TUIs redraw in-place; the ring is
+    // the only source of historical bytes).
+
+    let ringOffset = 0;
     let bootstrapped = false;
     let serverCols = 0;
     let serverRows = 0;
-    // Lock-reason + schedule fields. Populated on every /stream poll
-    // from the X-Tab-Locked-Reason / X-Tab-Schedule-Tz /
-    // X-Tab-Schedule-Next / X-Tab-Schedule-Rule headers so the locked
-    // banner can show "locked until Mo 09:00 Europe/Paris" instead
-    // of a generic "LOCKED" string.
     let lockReason = "";
     let scheduleTz = "";
     let scheduleNext = "";
     let scheduleRule = "";
-
-    // Live mirror of the server's X-Tab-Locked header. Toggling this
-    // disables stdin on xterm.js, hides the cursor blink, drops the
-    // input POST wiring, and reveals the red banner. The lock state
-    // can change at any poll — the user may flip it from the GUI
-    // right-click menu mid-session.
     let serverLocked = false;
     let serverBg = TAB.bg;
-    // True while the user has scrolled up into xterm.js's scrollback.
-    // While in this state we drop ALL writes — Claude's spinner or
-    // any TUI redrawing would otherwise twitch the viewport and we
-    // already have everything we need in xterm.js's local buffer to
-    // browse history undisturbed. On return-to-bottom we reset the
-    // delta cursor so the next poll triggers a full repaint and the
-    // user catches up to whatever happened while they were reading.
     let inScrollback = false;
-    let wasInScrollback = false;
+    let ws = null;
+    let reconnectAttempt = 0;
+    let reconnectTimer = null;
+    let pendingBytesWhileSelecting = "";
+
     term.onScroll(() => {
       const buf = term.buffer.active;
       inScrollback = buf.viewportY < buf.baseY;
-      // Returning to bottom no longer needs a resync — /stream is
-      // append-only, so xterm.js's scrollback is already coherent
-      // with whatever the server thinks the current state is.
-      wasInScrollback = inScrollback;
     });
 
-    async function poll() {
-      const url = `${BASE}stream?since=${streamOffset}`;
-      try {
-        const r = await fetch(url, { headers });
-        if (!r.ok) { status.textContent = `http ${r.status}`; return; }
-        const len = parseInt(r.headers.get("X-Stream-Length") || "0", 10);
-        const start = parseInt(r.headers.get("X-Stream-Start") || "0", 10);
-        const cols = parseInt(r.headers.get("X-Output-Cols") || "0", 10);
-        const rows = parseInt(r.headers.get("X-Output-Rows") || "0", 10);
-        // Background color can change mid-session via the daemon's
-        // /bg-color endpoint or a Preferences write. Validate the
-        // hex and apply to both <body> and xterm.js theme so the
-        // gutter matches the terminal.
-        const bgNow = r.headers.get("X-Tab-Bg") || "";
-        if (/^#[0-9a-fA-F]{6}$/.test(bgNow) && bgNow !== serverBg) {
-          serverBg = bgNow;
-          document.body.style.background = bgNow;
-          term.options.theme = { ...term.options.theme, background: bgNow };
-        }
-        // Stale-viewer detection. X-Build-Hash carries the binary's
-        // compile-time git hash; mismatch means the binary was
-        // upgraded since this page loaded. Plain daemon restarts
-        // (same binary, same hash) are a silent no-op. Skip when
-        // either side is empty or literally "unknown" — that's the
-        // non-git-repo fallback and we don't want false positives.
-        const serverHash = r.headers.get("X-Build-Hash") || "";
-        if (
-          BUILD_HASH && BUILD_HASH !== "unknown" &&
-          serverHash && serverHash !== "unknown" &&
-          serverHash !== BUILD_HASH
-        ) {
-          document.body.classList.add("update-available");
-        }
-        // File counts — buttons are always visible (discoverability),
-        // badges show the live count, and a count INCREASE pops a
-        // toast so the user notices new files without polling.
-        const outboxCount = parseInt(r.headers.get("X-Outbox-Count") || "0", 10);
-        const inboxCount = parseInt(r.headers.get("X-Inbox-Count") || "0", 10);
-        outboxBadge.textContent = String(outboxCount);
-        inboxBadge.textContent = String(inboxCount);
-        outboxBtn.classList.toggle("has-files", outboxCount > 0);
-        inboxBtn.classList.toggle("has-files", inboxCount > 0);
-        if (bootstrappedFiles && outboxCount > lastOutboxCount) {
-          const delta = outboxCount - lastOutboxCount;
-          toast(`📥 ${delta} new file${delta > 1 ? "s" : ""} in outbox/`);
-          if (panelKind === "outbox" && document.body.classList.contains("files-open")) refreshFiles("outbox");
-        }
-        if (bootstrappedFiles && inboxCount > lastInboxCount && panelKind === "inbox" && document.body.classList.contains("files-open")) {
-          refreshFiles("inbox");
-        }
-        bootstrappedFiles = true;
-        lastOutboxCount = outboxCount;
-        lastInboxCount = inboxCount;
-        const lockedNow = r.headers.get("X-Tab-Locked") === "1";
-        if (lockedNow !== serverLocked) {
-          serverLocked = lockedNow;
-          document.body.classList.toggle("locked", serverLocked);
-          term.options.disableStdin = serverLocked || READ_ONLY;
-          term.options.cursorBlink = !(serverLocked || READ_ONLY);
-        }
-        // Schedule-driven lock — surface why the tab is locked AND
-        // when it'll be open again. Header set is emitted only when
-        // a schedule is configured; absent on always-open tabs.
-        lockReason = r.headers.get("X-Tab-Locked-Reason") || "";
-        scheduleTz = r.headers.get("X-Tab-Schedule-Tz") || "";
-        scheduleNext = r.headers.get("X-Tab-Schedule-Next") || "";
-        const ruleRaw = r.headers.get("X-Tab-Schedule-Rule") || "";
-        if (ruleRaw) {
-          try { scheduleRule = decodeURIComponent(ruleRaw); }
-          catch { scheduleRule = ruleRaw; }
+    function wsUrl() {
+      const proto = location.protocol === "https:" ? "wss:" : "ws:";
+      const params = new URLSearchParams();
+      if (TOKEN) params.set("token", TOKEN);
+      params.set("since", String(ringOffset));
+      return `${proto}//${location.host}${BASE}ws?${params.toString()}`;
+    }
+
+    function renderStatus() {
+      let lockTag = "";
+      if (serverLocked) {
+        if (lockReason === "schedule" && scheduleNext) {
+          let formattedNext = scheduleNext;
+          try {
+            const d = new Date(scheduleNext);
+            const fmt = new Intl.DateTimeFormat(undefined, {
+              weekday: "short", hour: "2-digit", minute: "2-digit",
+              timeZone: scheduleTz || undefined,
+            });
+            formattedNext = fmt.format(d);
+          } catch { /* fall through */ }
+          lockTag = ` · LOCKED until ${formattedNext}${scheduleTz ? ` ${scheduleTz}` : ""}`;
+        } else if (lockReason === "schedule") {
+          lockTag = " · LOCKED (schedule)";
         } else {
-          scheduleRule = "";
+          lockTag = " · LOCKED";
         }
-        // Agent state badge in the browser tab title, mirroring the
-        // desktop GUI's per-tab indicator. Server omits the header
-        // when no agent is attached, in which case we reset to plain
-        // TAB_NAME.
-        const agentState = r.headers.get("X-Agent-State") || "";
-        const agentLabelRaw = r.headers.get("X-Agent-Label") || "";
-        let agentLabel = "";
-        if (agentLabelRaw) {
-          try { agentLabel = decodeURIComponent(agentLabelRaw); }
-          catch { agentLabel = agentLabelRaw; }
-        }
-        const STATE_ICON = { thinking: "\u{1f9e0}", waiting: "⏳", error: "❗" };
-        const nextTitleTag = agentState && STATE_ICON[agentState]
-          ? ` ${STATE_ICON[agentState]}${agentLabel ? " " + agentLabel : ""}`
-          : "";
-        const nextTitle = `${nextTitleTag ? nextTitleTag.trim() + " · " : ""}${TAB_NAME} · tab-atelier`;
-        if (document.title !== nextTitle) document.title = nextTitle;
-        // Resize xterm.js to match the server's PTY grid. Without
-        // this the browser's wider grid breaks the server's wrapping
-        // (long lines stay short, prompt header floats over empty
-        // space on the right).
-        if (cols > 0 && rows > 0 && (cols !== serverCols || rows !== serverRows)) {
-          term.resize(cols, rows);
-          serverCols = cols;
-          serverRows = rows;
-          fitFontToViewport();
-        }
-        // Drop the playback while the user is reading history. Claude
-        // and other TUIs would otherwise jerk the viewport — xterm.js
-        // already has every byte it needs to browse history
-        // undisturbed. `streamOffset` is still advanced from the
-        // header so the catch-up write on return-to-bottom only
-        // contains bytes that arrived during the pause.
-        if (inScrollback) {
-          streamOffset = len;
-          status.textContent = `${TAB_NAME} · paused (scrolled up) · ${len}B`;
-          return;
-        }
-        // Pause writes while the user is selecting OR has an active
-        // selection. Any term.write() clears the selection on most
-        // xterm.js versions, so a poll landing between mousedown and
-        // mouseup would race the in-progress drag away. We do NOT
-        // advance streamOffset, so when the selection clears the
-        // next poll plays the queued bytes in one go.
-        if (isSelecting || term.hasSelection()) {
-          status.textContent = `${TAB_NAME} · selection · click 📋 to copy · ${len - streamOffset}B queued`;
-          return;
-        }
-        const rawBody = await r.text();
-        // Strip alt-screen toggles from the byte stream. Claude Code's
-        // TUI (and vim/less/htop/…) emits `\x1b[?1049h` to enter the
-        // scratch alt-buffer; xterm.js correctly honors it, and the
-        // alt-buffer has no scrollback by spec. With our byte-stream
-        // replay model that means EVERY post-toggle byte writes into
-        // a buffer the user can never scroll into — the scrollbar
-        // visually disappears. Keep xterm.js in the main buffer so
-        // scrollback accumulates for all session content. Side effect:
-        // alt-screen TUIs render inline rather than in a scratch
-        // overlay — desirable for a read-only viewer (the user wants
-        // history, not isolation). Also strip the older 1047 / 47
-        // variants for the same reason.
-        // eslint-disable-next-line no-control-regex
-        const body = rawBody.replace(/\x1b\[\?(?:1049|1047|47)[hl]/g, "");
-        // /stream is append-only by construction: each response is
-        // exactly the bytes the PTY emitted since our `since` offset.
-        // xterm.js's terminal emulator runs over them and reproduces
-        // the server's grid (including in-place redraws that
-        // alacritty's history can never accumulate) and naturally
-        // builds up scrollback as old rows are pushed off the top.
-        // No `\x1b[2J\x1b[H` resync — that would obliterate xterm.js's
-        // local scrollback, defeating the whole point of the ring.
-        if (body.length > 0) {
-          if (start > streamOffset) {
-            // Ring's `base_offset` raced ahead of our `since` —
-            // we lost bytes. Best we can do is play the available
-            // suffix; the missing prefix would have to come from a
-            // ring with bigger capacity. log() to surface in the
-            // browser console so users can size up the ring.
-            console.warn(`stream gap: requested since=${streamOffset}, got start=${start} (${start - streamOffset} bytes aged out)`);
-          }
-          term.write(body);
-        }
-        streamOffset = len;
-        bootstrapped = true;
-        let lockTag = "";
-        if (serverLocked) {
-          if (lockReason === "schedule" && scheduleNext) {
-            // ISO-8601 in UTC → format in the schedule's tz so the
-            // user sees their local time, not the browser's.
-            let formattedNext = scheduleNext;
-            try {
-              const d = new Date(scheduleNext);
-              const fmt = new Intl.DateTimeFormat(undefined, {
-                weekday: "short", hour: "2-digit", minute: "2-digit",
-                timeZone: scheduleTz || undefined,
-              });
-              formattedNext = fmt.format(d);
-            } catch { /* fall through with raw string */ }
-            lockTag = ` · LOCKED until ${formattedNext}${scheduleTz ? ` ${scheduleTz}` : ""}`;
-          } else if (lockReason === "schedule") {
-            lockTag = " · LOCKED (schedule)";
-          } else {
-            lockTag = " · LOCKED";
-          }
-        }
-        status.textContent = `${TAB_NAME} · ${serverCols}x${serverRows} · ${len}B${lockTag}`;
-      } catch (e) {
-        status.textContent = `offline · ${e.message || e}`;
       }
+      status.textContent = `${TAB_NAME} · ${serverCols}x${serverRows} · ${ringOffset}B${lockTag}`;
+    }
+
+    function handleMeta(meta) {
+      // Lock state
+      const lockedNow = !!meta.locked;
+      if (lockedNow !== serverLocked) {
+        serverLocked = lockedNow;
+        document.body.classList.toggle("locked", serverLocked);
+        term.options.disableStdin = serverLocked || READ_ONLY;
+        term.options.cursorBlink = !(serverLocked || READ_ONLY);
+      }
+      lockReason = meta.lock_reason || "";
+      scheduleTz = meta.schedule_tz || "";
+      scheduleNext = meta.schedule_next || "";
+      scheduleRule = meta.schedule_rule || "";
+
+      // Background color
+      const bgNow = meta.bg_color || "";
+      if (/^#[0-9a-fA-F]{6}$/.test(bgNow) && bgNow !== serverBg) {
+        serverBg = bgNow;
+        document.body.style.background = bgNow;
+        term.options.theme = { ...term.options.theme, background: bgNow };
+      }
+
+      // Build hash → update-available chip
+      const serverHash = meta.build_hash || "";
+      if (
+        BUILD_HASH && BUILD_HASH !== "unknown" &&
+        serverHash && serverHash !== "unknown" &&
+        serverHash !== BUILD_HASH
+      ) {
+        document.body.classList.add("update-available");
+      }
+
+      // File counts. RO viewers receive inbox_count=0 (server zeroes
+      // it for Authz::Ro); the inbox button is also hidden by CSS
+      // in the body.read-only class. Outbox is allowed for both.
+      const outboxCount = Number(meta.outbox_count || 0);
+      const inboxCount = Number(meta.inbox_count || 0);
+      outboxBadge.textContent = String(outboxCount);
+      inboxBadge.textContent = String(inboxCount);
+      outboxBtn.classList.toggle("has-files", outboxCount > 0);
+      inboxBtn.classList.toggle("has-files", inboxCount > 0);
+      if (bootstrappedFiles && outboxCount > lastOutboxCount) {
+        const delta = outboxCount - lastOutboxCount;
+        toast(`📥 ${delta} new file${delta > 1 ? "s" : ""} in outbox/`);
+        if (panelKind === "outbox" && document.body.classList.contains("files-open")) refreshFiles("outbox");
+      }
+      if (bootstrappedFiles && inboxCount > lastInboxCount && panelKind === "inbox" && document.body.classList.contains("files-open")) {
+        refreshFiles("inbox");
+      }
+      bootstrappedFiles = true;
+      lastOutboxCount = outboxCount;
+      lastInboxCount = inboxCount;
+
+      // Agent state → browser tab title badge
+      const agentState = meta.agent_state || "";
+      const agentLabel = meta.agent_label || "";
+      const STATE_ICON = { thinking: "\u{1f9e0}", waiting: "⏳", error: "❗" };
+      const nextTitleTag = agentState && STATE_ICON[agentState]
+        ? ` ${STATE_ICON[agentState]}${agentLabel ? " " + agentLabel : ""}`
+        : "";
+      const nextTitle = `${nextTitleTag ? nextTitleTag.trim() + " · " : ""}${TAB_NAME} · tab-atelier`;
+      if (document.title !== nextTitle) document.title = nextTitle;
+
+      // Server-side PTY dims → resize xterm.js to match.
+      const cols = Number(meta.cols || 0);
+      const rows = Number(meta.rows || 0);
+      if (cols > 0 && rows > 0 && (cols !== serverCols || rows !== serverRows)) {
+        term.resize(cols, rows);
+        serverCols = cols;
+        serverRows = rows;
+        fitFontToViewport();
+      }
+      renderStatus();
+    }
+
+    // The PTY stream may contain alt-screen toggles (\x1b[?1049h)
+    // from less / vim / htop / Claude Code. xterm.js correctly honors
+    // them, but the alt-buffer has no scrollback by spec — so every
+    // post-toggle byte ends up in a buffer the user can never scroll
+    // back into. Strip those before writing so all content lands in
+    // the main buffer where scrollback accumulates.
+    function stripAltScreen(s) {
+      // eslint-disable-next-line no-control-regex
+      return s.replace(/\x1b\[\?(?:1049|1047|47)[hl]/g, "");
+    }
+
+    function handleOut(bytes) {
+      // Always advance the offset — even while paused — so reconnect
+      // can resume from the right place. Defer the actual write to
+      // xterm.js if the user is selecting / scrolled up, then flush
+      // the buffered bytes once the gate opens.
+      ringOffset += bytes.length;
+      const text = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+      const stripped = stripAltScreen(text);
+      if (inScrollback || isSelecting || term.hasSelection()) {
+        pendingBytesWhileSelecting += stripped;
+        const queued = pendingBytesWhileSelecting.length;
+        if (inScrollback) {
+          status.textContent = `${TAB_NAME} · paused (scrolled up) · ${queued}B queued`;
+        } else {
+          status.textContent = `${TAB_NAME} · selection · click 📋 to copy · ${queued}B queued`;
+        }
+        return;
+      }
+      if (pendingBytesWhileSelecting) {
+        term.write(pendingBytesWhileSelecting);
+        pendingBytesWhileSelecting = "";
+      }
+      if (stripped.length > 0) term.write(stripped);
+      bootstrapped = true;
+      renderStatus();
+    }
+
+    function encodeFrame(tag, payload) {
+      const out = new Uint8Array(1 + payload.length);
+      out[0] = tag;
+      out.set(payload, 1);
+      return out;
+    }
+
+    function connect() {
+      // Clear any pending reconnect timer — we're connecting now.
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+      let url;
+      try { url = wsUrl(); }
+      catch (e) { status.textContent = `bad url · ${e.message || e}`; return; }
+      try {
+        ws = new WebSocket(url);
+      } catch (e) {
+        status.textContent = `ws · ${e.message || e}`;
+        scheduleReconnect();
+        return;
+      }
+      ws.binaryType = "arraybuffer";
+      ws.onopen = () => {
+        reconnectAttempt = 0;
+        status.textContent = `${TAB_NAME} · connected`;
+      };
+      ws.onmessage = (ev) => {
+        if (!(ev.data instanceof ArrayBuffer)) return; // ignore text frames
+        const view = new Uint8Array(ev.data);
+        if (view.length === 0) return;
+        const tag = view[0];
+        const payload = view.subarray(1);
+        if (tag === 0x02) { // out
+          handleOut(payload);
+        } else if (tag === 0x03) { // meta
+          try {
+            const json = JSON.parse(new TextDecoder("utf-8").decode(payload));
+            handleMeta(json);
+          } catch (e) {
+            console.warn("bad meta frame:", e);
+          }
+        }
+        // 0x01 in / 0x04 resize / 0x07-0x09 are C→S only — ignore.
+      };
+      ws.onerror = () => {
+        // Defer the user-visible "offline" until onclose so we don't
+        // race onclose's reconnect scheduling.
+      };
+      ws.onclose = (ev) => {
+        ws = null;
+        if (ev.code === 1008) {
+          // Policy violation — RO sent a write, or tab locked, or
+          // process is --read-only. Don't auto-reconnect into the
+          // same wall, surface the reason instead.
+          status.textContent = `closed · ${ev.reason || "policy violation"}`;
+          return;
+        }
+        status.textContent = `offline · reconnecting…`;
+        scheduleReconnect();
+      };
+    }
+
+    function scheduleReconnect() {
+      reconnectAttempt = Math.min(reconnectAttempt + 1, 6);
+      const delayMs = Math.min(1000 * 2 ** (reconnectAttempt - 1), 30000);
+      reconnectTimer = setTimeout(connect, delayMs);
     }
 
     if (!READ_ONLY) {
       term.onData(data => {
-        // Server-enforced lock is the source of truth — but we
-        // also short-circuit here so we don't fire pointless POSTs
-        // that will 403. xterm.js's disableStdin should already
-        // suppress these, but a tab that locks mid-session may
-        // have keypresses already in flight.
+        // xterm.js's disableStdin should already suppress these, but
+        // a tab that locks mid-session may have keypresses already
+        // in flight. Also short-circuit if the socket isn't open.
         if (serverLocked) return;
-        fetch(`${BASE}input`, {
-          method: "POST",
-          headers: { ...headers, "Content-Type": "application/octet-stream" },
-          body: new TextEncoder().encode(data),
-        }).catch(() => {});
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        const payload = new TextEncoder().encode(data);
+        try { ws.send(encodeFrame(0x01, payload)); } catch { /* swallow */ }
       });
     }
 
-    // 80 ms is a good balance — fast enough that typed-then-echoed
-    // chars render in ~one frame on a LAN, slow enough that 12 polls
-    // per second don't saturate the server. CRC delta keeps each
-    // request tiny (a few bytes when only the cursor moves).
-    setInterval(poll, 80);
-    poll();
+    // Flush pending bytes on selection clear / scroll-back-to-bottom.
+    document.addEventListener("mouseup", () => {
+      // term.hasSelection() reflects post-mouseup state; the next
+      // tick after selection clears, pending bytes flow into the
+      // terminal via the next out frame's `handleOut` gate. No
+      // explicit flush needed here — but if the user deselects WITH
+      // NO new bytes arriving, the queued text would sit forever.
+      // Force a flush on the next animation frame.
+      requestAnimationFrame(() => {
+        if (pendingBytesWhileSelecting && !inScrollback && !isSelecting && !term.hasSelection()) {
+          term.write(pendingBytesWhileSelecting);
+          pendingBytesWhileSelecting = "";
+          renderStatus();
+        }
+      });
+    });
+
+    connect();

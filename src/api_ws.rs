@@ -174,6 +174,20 @@ fn extract_token<B>(req: &Request<B>) -> Option<String> {
     s.strip_prefix("Bearer ").map(str::to_string)
 }
 
+/// Pull `?since=N` off the URL — the viewer's bootstrap or resume
+/// offset. Missing / unparseable → 0 (= replay the entire ring).
+fn extract_since<B>(req: &Request<B>) -> u64 {
+    let Some(q) = req.uri().query() else { return 0 };
+    for pair in q.split('&') {
+        if let Some(v) = pair.strip_prefix("since=")
+            && let Ok(n) = v.parse::<u64>()
+        {
+            return n;
+        }
+    }
+    0
+}
+
 /// Minimal percent-decode for the `?token=` query value. Tokens
 /// today are hex (no encoding) but bearer-token rotators may
 /// emit `+` / `%2B` etc.
@@ -299,6 +313,11 @@ pub fn handle_upgrade(
         // probe can't distinguish; mirrors the HTTP gate.
         return text_response(401, "invalid or missing token");
     };
+    // `?since=N` on the URL — start streaming from offset N. The
+    // viewer passes 0 on initial connect to bootstrap full history;
+    // on reconnect it passes the last byte it received. Missing /
+    // junk → 0.
+    let since = extract_since(&req);
     // Bound inbound message size so a single rogue frame can't
     // RAM-exhaust the daemon under the snapshot lock. See
     // WS_MAX_MESSAGE_BYTES / WS_MAX_FRAME_BYTES docstrings.
@@ -311,7 +330,7 @@ pub fn handle_upgrade(
     };
     tokio::spawn(async move {
         if let Ok(ws) = ws_future.await {
-            run_pump(ws, state, uuid, authz, ring, read_only_process).await;
+            run_pump(ws, state, uuid, authz, ring, read_only_process, since).await;
         }
     });
     response
@@ -336,13 +355,14 @@ async fn run_pump(
     authz: Authz,
     ring: Arc<Mutex<PtyRing>>,
     read_only_process: bool,
+    since: u64,
 ) {
     let (mut sink, mut stream) = ws.split();
-    // Start from the current high-water mark — the viewer just
-    // bootstrapped from `output` (joined-line snapshot) for its
-    // initial paint and only needs bytes from here on. Future:
-    // accept `?since=N` in the upgrade URL for resume.
-    let mut ring_offset: u64 = ring.lock().map_or(0, |r| r.total_len());
+    // Start streaming from `since`. The first tick will read this
+    // offset to total_len, ship the bytes in one `out` frame, and
+    // advance. since=0 ⇒ replay the entire ring on connect (viewer
+    // bootstrap). since=N ⇒ resume from N (reconnect after a drop).
+    let mut ring_offset: u64 = since;
 
     // Send the initial meta on connect and seed the hash so the
     // first tick after this doesn't re-emit the same payload.
