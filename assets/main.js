@@ -116,6 +116,52 @@
       term.parser.registerDcsHandler({ final: "q" }, () => true);
     }
 
+    // Touch-scroll the terminal. xterm.js v6 doesn't ship native
+    // touch-scroll for mobile — finger drags fall through, the
+    // scrollback is unreachable, and the only way to see history is
+    // a hardware keyboard's Shift+PgUp (which mobile doesn't have).
+    //
+    // Map a single-finger vertical drag to `term.scrollLines(N)`:
+    // finger DOWN ⇒ OLDER content (scrollLines negative, matches
+    // the iOS/Android natural-scroll convention every other app
+    // uses), finger UP ⇒ NEWER. Two-finger gestures bypass us so
+    // pinch-zoom + page scroll still work.
+    //
+    // Cell height comes from the rendered viewport (adapts to
+    // fitFontToViewport's dynamic sizing); fall back to 18 px if
+    // the .xterm-viewport child isn't laid out yet.
+    {
+      let lastTouchY = null;
+      let accumPx = 0;
+      const cellHeightPx = () => {
+        const v = termEl.querySelector(".xterm-viewport") || termEl;
+        const rows = serverRows || term.rows || 24;
+        const h = v.getBoundingClientRect().height;
+        return h > 0 ? h / rows : 18;
+      };
+      termEl.addEventListener("touchstart", (e) => {
+        if (e.touches.length !== 1) { lastTouchY = null; return; }
+        lastTouchY = e.touches[0].clientY;
+        accumPx = 0;
+      }, { passive: true });
+      termEl.addEventListener("touchmove", (e) => {
+        if (lastTouchY === null || e.touches.length !== 1) return;
+        const y = e.touches[0].clientY;
+        accumPx += y - lastTouchY;
+        lastTouchY = y;
+        const ch = cellHeightPx();
+        if (Math.abs(accumPx) >= ch) {
+          const lines = Math.trunc(accumPx / ch);
+          // finger down (accumPx > 0) ⇒ older content ⇒ negative
+          term.scrollLines(-lines);
+          accumPx -= lines * ch;
+        }
+      }, { passive: true });
+      const endTouch = () => { lastTouchY = null; accumPx = 0; };
+      termEl.addEventListener("touchend", endTouch, { passive: true });
+      termEl.addEventListener("touchcancel", endTouch, { passive: true });
+    }
+
     // Copy-selection UX. The /stream poll already pauses term.write()
     // while term.hasSelection() is true (see the gate further down),
     // but xterm.js only flags a selection as "live" on mouseup —
