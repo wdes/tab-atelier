@@ -133,13 +133,17 @@ impl PtyRing {
 
     /// Lowest offset still retained. When a caller's `since` is below
     /// this, some bytes have aged out — caller should know to
-    /// resync.
+    /// resync. Currently used only by tests; kept for future WS
+    /// reconnect gap detection.
+    #[allow(dead_code)]
     #[must_use]
     pub const fn base_offset(&self) -> u64 {
         self.base_offset
     }
 
     /// Capacity in bytes — does not change after construction.
+    /// Same story as `base_offset` — currently unused outside tests.
+    #[allow(dead_code)]
     #[must_use]
     pub const fn capacity(&self) -> usize {
         self.cap
