@@ -202,18 +202,28 @@
       });
     }
     const copyBtn = document.getElementById("copy-btn");
+    function copySelectionAndClear() {
+      const sel = term.getSelection();
+      if (!sel) {
+        toast("nothing selected");
+        return;
+      }
+      copyText(sel, `copied ${sel.length} char${sel.length === 1 ? "" : "s"}`);
+      // Clear xterm.js's selection so the chip disappears via
+      // onSelectionChange. Pre-WS reasoning kept the selection alive
+      // "until the next term.write()" so the user could verify; with
+      // alt-screen TUIs (Claude Code) the next write can be minutes
+      // away, leaving a dangling chip floating over the terminal
+      // content. The copy already succeeded — clearing the selection
+      // is the natural next state.
+      if (term.clearSelection) {
+        term.clearSelection();
+      }
+    }
     if (copyBtn) {
       copyBtn.addEventListener("click", (e) => {
         e.stopPropagation();
-        const sel = term.getSelection();
-        if (!sel) {
-          toast("nothing selected");
-          return;
-        }
-        copyText(sel, `copied ${sel.length} char${sel.length === 1 ? "" : "s"}`);
-        // Don't auto-clear the selection — user might want to verify
-        // what they copied. xterm.js will clear on next text input or
-        // term.write() resumption.
+        copySelectionAndClear();
       });
     }
 
@@ -233,12 +243,7 @@
         if (ev.ctrlKey && ev.shiftKey && (ev.code === "KeyC" || ev.key === "C" || ev.key === "c")) {
           ev.preventDefault();
           ev.stopPropagation();
-          const sel = term.getSelection();
-          if (sel) {
-            copyText(sel, `copied ${sel.length} char${sel.length === 1 ? "" : "s"}`);
-          } else {
-            toast("nothing selected — ⌘/Ctrl+drag first");
-          }
+          copySelectionAndClear();
           return false;
         }
         return true;
