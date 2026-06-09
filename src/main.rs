@@ -56,8 +56,7 @@ fn main() {
     // `tab-atelier --version` from a different shell while the
     // primary instance is up gets the version string, not the
     // "another instance is already running" error.
-    let mut iter = std::env::args().skip(1);
-    while let Some(a) = iter.next() {
+    for a in std::env::args().skip(1) {
         match a.as_str() {
             "-V" | "--version" => {
                 println!("tab-atelier v{}", env!("CARGO_PKG_VERSION"));
