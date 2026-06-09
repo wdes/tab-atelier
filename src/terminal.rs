@@ -868,7 +868,11 @@ impl Render for TerminalView {
                         if lines == 0 {
                             return;
                         }
-                        let mode = this.term.lock().mode();
+                        // `Term::mode()` returns `&TermMode` (a borrow
+                        // into the FairMutex guard). Copy out before
+                        // the guard drops — TermMode is bitflags-derived
+                        // and so is Copy.
+                        let mode = *this.term.lock().mode();
                         let alt_scroll =
                             mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL) && !ev.modifiers.shift;
                         if alt_scroll {
