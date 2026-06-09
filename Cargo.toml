@@ -4,7 +4,7 @@ default-members = [".", "crates/catbus-agent"]
 
 [package]
 name = "tab-atelier"
-version = "0.4.0-dev"
+version = "0.5.0-dev"
 edition = "2024"
 rust-version = "1.92"
 authors = ["William Desportes <williamdes@wdes.fr>"]
