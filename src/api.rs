@@ -2485,18 +2485,23 @@ fn ensure_writable(path: &std::path::Path) -> std::io::Result<()> {
 /// so a malformed cert gets replaced rather than silently kept.
 fn cert_needs_renewal(crt_path: &std::path::Path) -> bool {
     let renewal_window = time::Duration::days(CERT_RENEW_BEFORE_EXPIRY_DAYS);
-    let Ok(pem) = std::fs::read_to_string(crt_path) else {
+    let Ok(pem_bytes) = std::fs::read(crt_path) else {
         return true;
     };
-    let Ok(parsed) = rcgen::CertificateParams::from_ca_cert_pem(&pem) else {
-        // `from_ca_cert_pem` parses any X.509 cert (despite the
-        // name — the `is_ca` flag is read back from the cert's
-        // BasicConstraints, not enforced as an input). Any failure
-        // here means the file isn't a valid cert we can use.
+    // rcgen 0.14 dropped `CertificateParams::from_ca_cert_pem`; use
+    // x509-parser directly. Any failure to parse → renew (the file
+    // is broken, regen will replace it).
+    let Ok((_, pem)) = x509_parser::pem::parse_x509_pem(&pem_bytes) else {
+        return true;
+    };
+    let Ok(cert) = pem.parse_x509() else {
+        return true;
+    };
+    let Ok(not_after) = time::OffsetDateTime::from_unix_timestamp(cert.validity().not_after.timestamp()) else {
         return true;
     };
     let now = time::OffsetDateTime::now_utc();
-    parsed.not_after - now < renewal_window
+    not_after - now < renewal_window
 }
 
 fn load_or_generate_cert() -> std::io::Result<(Vec<u8>, Vec<u8>)> {
