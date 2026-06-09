@@ -117,12 +117,16 @@ futures-util = { version = "0.3", default-features = false }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 bytes = "1"
 # Held at 0.13 — 0.14 removed `CertificateParams::from_ca_cert_pem`
-# (the entry point we use to parse a persisted CA cert from PEM)
-# without an obvious replacement on the same type. Bumping needs a
-# read of the 0.14 migration notes + a sweep of src/api.rs. Until
-# then we stay on the last working API; 0.13.x picks up patches
-# automatically.
-rcgen = { version = "0.13", default-features = false, features = ["ring", "pem", "x509-parser"] }
+# rcgen 0.14 dropped `CertificateParams::from_ca_cert_pem` (the
+# entry point we used to read not_after off a persisted cert).
+# Migration: use x509-parser directly for the parse — see
+# `cert_needs_renewal` in src/api.rs. Generation API (`new` +
+# `self_signed` + `KeyPair::generate`) is unchanged.
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+# Direct dep for our self-signed cert's renewal-window check.
+# Already in our tree via rcgen 0.13's optional feature; now a
+# first-class dep, no extra disk weight.
+x509-parser = { version = "0.16", default-features = false }
 # Used to hex-encode the TOFU SHA-256 fingerprint of a remote
 # `tab-atelier-headless`'s self-signed TLS cert (Preferences > Remote
 # endpoints > Pin certificate).
