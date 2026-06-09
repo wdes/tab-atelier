@@ -176,7 +176,16 @@ pub const PATTERNS: &[Pattern] = &[
 #[must_use]
 pub fn scan_output(text: &str) -> Option<&'static Pattern> {
     let scope = if text.len() > SCOPE_TAIL_BYTES {
-        &text[text.len() - SCOPE_TAIL_BYTES..]
+        // `&text[text.len() - SCOPE_TAIL_BYTES..]` panics when the
+        // byte offset lands mid-character (multi-byte UTF-8 — em
+        // dashes, accents, emoji). Walk back to the nearest valid
+        // char boundary; UTF-8 chars are at most 4 bytes so at most
+        // 3 iterations.
+        let mut start = text.len() - SCOPE_TAIL_BYTES;
+        while start > 0 && !text.is_char_boundary(start) {
+            start -= 1;
+        }
+        &text[start..]
     } else {
         text
     };
@@ -470,6 +479,24 @@ mod tests {
         // Looser match — any subprocess connection refused.
         let log = "[error] foo bar\nConnectionRefused\nbaz";
         assert!(scan_output(log).is_some());
+    }
+
+    #[test]
+    fn scan_handles_multibyte_char_at_window_boundary() {
+        // Regression: panicked when the trailing-window cutoff fell
+        // mid-UTF-8. Repro pattern: an em dash (3-byte E2 80 94)
+        // straddles the SCOPE_TAIL_BYTES boundary from the tail end,
+        // and the slice operation panics on the start of the next
+        // byte instead of finding a char boundary.
+        let mut log = String::new();
+        // Pad to push the em dash so part of it falls right on the
+        // cutoff. With SCOPE_TAIL_BYTES = 4096, putting "—" at
+        // position (total - 4097) puts byte 4096 (= cut) inside it.
+        log.push_str(&"x".repeat(SCOPE_TAIL_BYTES - 1));
+        log.push('—');
+        log.push_str(&"y".repeat(SCOPE_TAIL_BYTES));
+        // Must NOT panic.
+        let _ = scan_output(&log);
     }
 
     #[test]
