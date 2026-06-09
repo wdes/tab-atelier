@@ -315,13 +315,15 @@ fn extract_since<B>(req: &Request<B>) -> u64 {
 /// any code point ≥ 0x80 into a 2-byte sequence and silently
 /// corrupts the wire input:
 ///
-///     %FF  →  '\u{00FF}'  →  String.push  →  "\xC3\xBF"
-///                                            (2 bytes, wrong)
+/// ```text
+/// %FF  →  '\u{00FF}'  →  String.push  →  "\xC3\xBF"  (2 bytes, WRONG)
+/// ```
 ///
 /// vs. what the wire actually sent:
 ///
-///     %FF  →  byte 0xFF   →  Vec<u8>.push →  "\xFF"
-///                                            (1 byte, correct)
+/// ```text
+/// %FF  →  byte 0xFF   →  Vec<u8>.push →  "\xFF"      (1 byte, correct)
+/// ```
 ///
 /// Tokens today are 32 hex chars (every byte ≤ 0x66) so this never
 /// fires in practice, but it's a latent corruption waiting for the
