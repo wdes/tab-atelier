@@ -35,7 +35,12 @@
       convertEol: true,
       cursorBlink: !READ_ONLY,
       disableStdin: READ_ONLY,
-      fontFamily: 'ui-monospace, "JetBrains Mono", "Fira Code", Menlo, monospace',
+      // 'TermSymbols' is the bundled WOFF2 with media-control +
+      // dingbat + box-drawing coverage. Listed FIRST so the browser
+      // consults it before the system mono — for codepoints in the
+      // font's unicode-range (see main.css @font-face), it wins; for
+      // everything else the next font in the stack takes over.
+      fontFamily: '"TermSymbols", ui-monospace, "JetBrains Mono", "Fira Code", Menlo, monospace',
       fontSize: 13,
       cols: 80,
       rows: 24,
@@ -193,6 +198,34 @@
         // Don't auto-clear the selection — user might want to verify
         // what they copied. xterm.js will clear on next text input or
         // term.write() resumption.
+      });
+    }
+
+    // Catch Ctrl+Shift+C (Linux/Windows terminal copy) BEFORE the
+    // browser sees it — otherwise Chrome interprets that combo as
+    // "Inspect Element" and DevTools springs open. xterm.js's
+    // attachCustomKeyEventHandler runs first; returning false from
+    // it prevents both xterm.js's own handling and the browser
+    // default action.
+    //
+    // Cmd+C on macOS works without us intervening — Safari/Chrome
+    // copy the live browser selection (which xterm.js maintains as
+    // a real DOM selection on the off-screen helper renderer).
+    if (term.attachCustomKeyEventHandler) {
+      term.attachCustomKeyEventHandler((ev) => {
+        if (ev.type !== "keydown") return true;
+        if (ev.ctrlKey && ev.shiftKey && (ev.code === "KeyC" || ev.key === "C" || ev.key === "c")) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          const sel = term.getSelection();
+          if (sel) {
+            copyText(sel, `copied ${sel.length} char${sel.length === 1 ? "" : "s"}`);
+          } else {
+            toast("nothing selected — ⌘/Ctrl+drag first");
+          }
+          return false;
+        }
+        return true;
       });
     }
 
@@ -624,6 +657,27 @@
       renderStatus();
     }
 
+    // Strip terminal-private mode toggles that hurt the viewer UX:
+    //
+    //   ?1000 / ?1002 / ?1003   X10 / VT200 / any-motion mouse reports
+    //   ?1006 / ?1005 / ?1015   SGR / UTF-8 / urxvt mouse encodings
+    //   ?9                      X10 button-only mouse
+    //   ?1004                   focus in/out reports
+    //
+    // Apps inside the PTY (Claude Code, vim, tmux) enable these to
+    // grab mouse + focus events. In a SHARE VIEWER we want the
+    // opposite: the user must be free to SELECT text with the
+    // mouse / touch, and the WS shouldn't be flooded with
+    // `\x1b[I` / `\x1b[O` every time the browser tab loses focus.
+    // The TUI degrades to keyboard-only input — acceptable for a
+    // viewer surface.
+    //
+    // Alt-screen (?1049 etc.) is NOT in this list — it's restored.
+    function stripUIModes(s) {
+      // eslint-disable-next-line no-control-regex
+      return s.replace(/\x1b\[\?(?:9|1000|1001|1002|1003|1004|1005|1006|1015)[hl]/g, "");
+    }
+
     function handleOut(bytes) {
       // Always advance the offset — even while paused — so reconnect
       // can resume from the right place. Defer the actual write to
@@ -647,7 +701,7 @@
       // with its full scrollback intact.
       ringOffset += bytes.length;
       const text = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
-      const stripped = text;
+      const stripped = stripUIModes(text);
       if (inScrollback || isSelecting || term.hasSelection()) {
         pendingBytesWhileSelecting += stripped;
         const queued = pendingBytesWhileSelecting.length;
