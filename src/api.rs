@@ -2243,7 +2243,18 @@ where
             .serve_connection(io, svc)
             .await;
     } else {
-        let _ = h1_conn::Builder::new().keep_alive(true).serve_connection(io, svc).await;
+        // `.with_upgrades()` is what makes hyper relinquish the
+        // socket to whatever awaits `hyper::upgrade::on(req)` (us,
+        // for the WS handshake in api_ws). Without it, hyper closes
+        // the connection the instant the 101 response is written
+        // — handshake succeeds at the HTTP layer, then the socket
+        // dies before the WS frame loop can take over. The client
+        // sees `close 1006 <empty>` right after `open`.
+        let _ = h1_conn::Builder::new()
+            .keep_alive(true)
+            .serve_connection(io, svc)
+            .with_upgrades()
+            .await;
     }
 }
 
