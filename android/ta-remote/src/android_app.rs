@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 
 use jni::JavaVM;
-use jni::objects::{JObject, JString};
+use jni::objects::{JObject, JString, JValue};
 use serde::{Deserialize, Serialize};
 use slint::{ComponentHandle, Model, SharedString, VecModel, Weak};
 
@@ -76,6 +76,75 @@ fn read_clipboard(app: &slint::android::AndroidApp) -> Option<String> {
         .ok()?;
     let jstr: JString = s.into();
     env.get_string(&jstr).ok().map(Into::into)
+}
+
+/// Launch the system browser pointed at `url`. Used by the tab list
+/// to delegate per-tab terminal rendering to the same xterm.js
+/// share-viewer the desktop browser uses — Phase 2a of the Android
+/// app's "stop maintaining two terminal renderers" plan. The
+/// rendered share link is just `<host>/tabs/<idx>/view?token=<t>`;
+/// every page asset is vendored by tab-atelier-headless so this
+/// works offline once the share host is reachable on the LAN.
+///
+/// Returns Ok(()) when the Intent.ACTION_VIEW dispatch completed
+/// (the browser pops up). On failure the caller should fall back
+/// to the in-app native renderer so the tab tap doesn't appear
+/// dead.
+fn launch_browser(app: &slint::android::AndroidApp, url: &str) -> Result<(), String> {
+    let vm_ptr = app.vm_as_ptr();
+    let activity_ptr = app.activity_as_ptr();
+    if vm_ptr.is_null() || activity_ptr.is_null() {
+        return Err("null vm/activity pointer".into());
+    }
+    let vm = unsafe { JavaVM::from_raw(vm_ptr.cast()) }.map_err(|e| e.to_string())?;
+    let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
+    let activity = unsafe { JObject::from_raw(activity_ptr.cast()) };
+
+    let url_jstr = env.new_string(url).map_err(|e| e.to_string())?;
+    let uri_cls = env.find_class("android/net/Uri").map_err(|e| e.to_string())?;
+    let uri = env
+        .call_static_method(
+            &uri_cls,
+            "parse",
+            "(Ljava/lang/String;)Landroid/net/Uri;",
+            &[JValue::Object(&JObject::from(url_jstr))],
+        )
+        .map_err(|e| format!("Uri.parse: {e}"))?
+        .l()
+        .map_err(|e| format!("Uri.parse result: {e}"))?;
+
+    let intent_cls = env.find_class("android/content/Intent").map_err(|e| e.to_string())?;
+    let action_view = env
+        .new_string("android.intent.action.VIEW")
+        .map_err(|e| e.to_string())?;
+    let intent = env
+        .new_object(
+            &intent_cls,
+            "(Ljava/lang/String;Landroid/net/Uri;)V",
+            &[JValue::Object(&JObject::from(action_view)), JValue::Object(&uri)],
+        )
+        .map_err(|e| format!("new Intent: {e}"))?;
+
+    // FLAG_ACTIVITY_NEW_TASK = 0x10000000 — required when launching
+    // from a non-Activity context. Without it Android throws
+    // AndroidRuntimeException: Calling startActivity() from outside
+    // of an Activity context requires the FLAG_ACTIVITY_NEW_TASK flag.
+    env.call_method(
+        &intent,
+        "setFlags",
+        "(I)Landroid/content/Intent;",
+        &[JValue::Int(0x1000_0000)],
+    )
+    .map_err(|e| format!("intent.setFlags: {e}"))?;
+
+    env.call_method(
+        &activity,
+        "startActivity",
+        "(Landroid/content/Intent;)V",
+        &[JValue::Object(&intent)],
+    )
+    .map_err(|e| format!("startActivity: {e}"))?;
+    Ok(())
 }
 
 fn launch_intent_uri(app: &slint::android::AndroidApp) -> Option<String> {
@@ -1080,6 +1149,58 @@ pub fn android_main(app: slint::android::AndroidApp) {
                     push_output(&weak, text);
                 }
             });
+        }
+    });
+
+    // Phase 2a: tab tap → share-viewer in system browser. Build the
+    // URL from the active host + idx + token, fire Intent.ACTION_VIEW
+    // via JNI. On failure (no browser installed, malformed URL,
+    // restricted profile), fall back to the in-app native renderer
+    // by routing the tap back through open-tab-changed.
+    let browser_data = data.clone();
+    let browser_weak = ui_weak.clone();
+    let browser_app = app_for_callbacks.clone();
+    ui.on_open_tab_in_browser(move |idx| {
+        if idx < 0 {
+            return;
+        }
+        let host = browser_data.lock().unwrap().active_host();
+        let Some(host) = host else {
+            log::warn!("open-tab-in-browser fired with no active host");
+            return;
+        };
+        // Prefer the LAN URL (faster, no NAT traversal); fall back to
+        // remote-url if LAN is empty. base_url() chooses based on
+        // last-poll reach but here we're DISPATCHING, so any reachable
+        // URL is fine — the browser will retry against the user's
+        // network state.
+        let base = if host.url.is_empty() {
+            &host.remote_url
+        } else {
+            &host.url
+        };
+        if base.is_empty() {
+            log::warn!("open-tab-in-browser: host has no URL");
+            return;
+        }
+        // Strip trailing slash so we don't emit `//tabs/…`.
+        let base = base.trim_end_matches('/');
+        // Token is opaque (hex today), but `ureq::url::form_urlencoded`
+        // is overkill for a single value. Validate that there's no
+        // bare `&` or `#` that would split the query.
+        if host.token.contains('&') || host.token.contains('#') || host.token.contains(' ') {
+            log::warn!("open-tab-in-browser: token contains unsafe chars, refusing");
+            return;
+        }
+        let url = format!("{base}/tabs/{idx}/view?token={}", host.token);
+        match launch_browser(&browser_app, &url) {
+            Ok(()) => log::info!("opened tab {idx} in system browser"),
+            Err(e) => {
+                log::warn!("launch_browser failed: {e}; falling back to in-app native view");
+                if let Some(ui) = browser_weak.upgrade() {
+                    ui.set_open_tab(idx);
+                }
+            }
         }
     });
 

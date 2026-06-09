@@ -1139,6 +1139,13 @@ export component AppWindow inherits Window {
     callback request-set-active-host(int);
     callback request-remove-host(int);
     callback open-tab-changed(int);
+    // Phase 2a: tapping a tab dispatches to the desktop's xterm.js
+    // viewer in the system browser instead of the Slint TerminalView.
+    // Rust handler builds the share-link URL and fires Intent.ACTION_VIEW;
+    // falls back to `open-tab = idx` (the Slint TerminalView path) if
+    // the browser launch errors, so a phone with no browser still
+    // surfaces something.
+    callback open-tab-in-browser(int);
 
     changed open-tab => { root.open-tab-changed(root.open-tab) }
 
@@ -1264,12 +1271,12 @@ export component AppWindow inherits Window {
                 spacing: 8px;
                 for tab[i] in root.tabs : TabCard {
                     tab: tab;
-                    // Tap = open the tab's output on the phone only.
-                    // Switching the *desktop's* active tab is a separate
-                    // explicit action (long-press / menu) so glancing
-                    // through tabs on the phone doesn't yank the user's
-                    // focus around on the workstation.
-                    tapped => { root.open-tab = i; }
+                    // Tap = open the tab in the system browser via the
+                    // xterm.js share-viewer. Phase 2a — the in-app
+                    // native TerminalView is reachable as the failure
+                    // fallback in the Rust handler. Long-press still
+                    // surfaces the per-tab action sheet.
+                    tapped => { root.open-tab-in-browser(i); }
                     actions-requested => { root.actions-idx = i; }
                 }
 
