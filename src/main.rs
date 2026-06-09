@@ -49,6 +49,42 @@ fn main() {
         }
     }
 
+    // Pre-lock metadata flags. `--version` / `--help` ask the binary
+    // to print a static string and exit; they don't touch disk state
+    // and shouldn't be blocked by the single-instance lock check
+    // below. Handle them here so a user running a second
+    // `tab-atelier --version` from a different shell while the
+    // primary instance is up gets the version string, not the
+    // "another instance is already running" error.
+    let mut iter = std::env::args().skip(1);
+    while let Some(a) = iter.next() {
+        match a.as_str() {
+            "-V" | "--version" => {
+                println!("tab-atelier v{}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
+            "-h" | "--help" => {
+                println!(
+                    "tab-atelier v{ver}\n\
+                     A Guake-style drop-down terminal emulator with HTTP API + share-link viewer.\n\
+                     \n\
+                     usage:\n  \
+                     tab-atelier                  start the desktop GUI (default)\n  \
+                     tab-atelier set-status …     publish agent state (Claude Code hook target)\n  \
+                     tab-atelier remote …         attach to a remote tab-atelier-headless\n  \
+                     tab-atelier brain [--once]   watchdog tab that auto-recovers stuck agents\n  \
+                     tab-atelier schedule …       off-hours auto-lock per tab (OSM opening_hours)\n  \
+                     tab-atelier --read-only      start inspect-only (no disk writes, no lock)\n  \
+                     tab-atelier --version        print version and exit\n  \
+                     tab-atelier --help           print this help and exit\n",
+                    ver = env!("CARGO_PKG_VERSION"),
+                );
+                std::process::exit(0);
+            }
+            _ => {}
+        }
+    }
+
     // Smoke check used by tests/rustls_provider.rs to guard against
     // future regressions of the install_default() call above OR any
     // change to the workspace feature graph that re-introduces the
