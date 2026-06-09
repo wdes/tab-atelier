@@ -3707,7 +3707,15 @@ impl Render for AppState {
         // still cover switching between inputs — if focus is already
         // on a prefs input, we leave it; we only redirect to
         // api_addr when focus drifted outside the modal entirely.
-        if self.show_preferences {
+        //
+        // EXCEPTION: when the hotkey picker is layered on top of the
+        // prefs modal, the picker has its own focus handle (anchored
+        // at line ~3700 above). Forcing api_addr focus here would
+        // yank focus back from the picker every frame and the user
+        // could never bind a key combo — keystrokes would just hop
+        // between the picker's window and api_addr at 60 Hz.
+        // Anchoring is the picker's job while it's open.
+        if self.show_preferences && !self.show_hotkey_picker {
             let already_in_prefs = self.pref_api_addr_focus.is_focused(window)
                 || self.pref_api_tls_addr_focus.is_focused(window)
                 || self.pref_share_url_base_focus.is_focused(window)
