@@ -1188,6 +1188,11 @@ impl Element for TerminalElement {
             col_start: usize,
             text: String,
             runs: Vec<TextRun>,
+            /// Cells this segment spans. Always 1 for normal runs;
+            /// 2 for a wide-char segment (CJK / 2-cell emoji like ✅).
+            /// Passed to `shape_line` as `force_width = cell.width *
+            /// cell_span` so the clamp matches the actual grid span.
+            cell_span: usize,
         }
 
         struct RawLine {
@@ -1373,6 +1378,7 @@ impl Element for TerminalElement {
                                 underline,
                                 strikethrough,
                             }],
+                            cell_span: 2,
                         });
                         continue;
                     }
@@ -1391,6 +1397,7 @@ impl Element for TerminalElement {
                         col_start: c,
                         text: String::new(),
                         runs: Vec::new(),
+                        cell_span: 1,
                     });
                     seg.text.push(ch);
                     let char_len = ch.len_utf8();
@@ -1493,7 +1500,15 @@ impl Element for TerminalElement {
                     // dancing up and down" + "ratatui bar columns
                     // misaligned" bugs. Same call shape Zed uses in
                     // `crates/terminal_view/src/terminal_element.rs`.
-                    let shaped = text_sys.shape_line(seg.text.into(), font_size, &seg.runs, Some(cell.width));
+                    //
+                    // Wide-char segments (CJK / 2-cell emoji ✅) span
+                    // TWO grid cells, so the clamp must be 2 × the
+                    // cell width — otherwise the emoji gets squashed
+                    // into half its natural width and the spacer
+                    // column next to it stays empty (the "split-
+                    // rendered emoji" bug).
+                    let force_w = cell.width * seg.cell_span as f32;
+                    let shaped = text_sys.shape_line(seg.text.into(), font_size, &seg.runs, Some(force_w));
                     TermSegment {
                         col_start: seg.col_start,
                         shaped,
