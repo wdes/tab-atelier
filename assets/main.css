@@ -1,4 +1,16 @@
-    html, body { margin: 0; padding: 0; height: 100%; background: var(--tab-bg); color: #ccc; font-family: monospace; }
+    /* Bundled symbol fallback. Loaded only when the browser needs a
+       glyph in the listed unicode-range and the primary mono font
+       doesn't have it. Fixes the blurry play triangle ⏵⏵ (U+23F5)
+       Claude Code puts in its footer — Android's system "monospace"
+       falls back to Noto Sans Symbols 2 for that codepoint, which
+       has different metrics, so the glyph anti-aliases oddly. */
+    @font-face {
+      font-family: 'TermSymbols';
+      src: url('/assets/term-symbols.woff2') format('woff2');
+      font-display: swap;
+      unicode-range: U+2300-23FF, U+2500-25FF, U+2600-26FF, U+2700-27BF, U+2B00-2BFF;
+    }
+    html, body { margin: 0; padding: 0; height: 100%; background: var(--tab-bg); color: #ccc; font-family: 'TermSymbols', monospace; }
     /* Centre the terminal so the server-sized grid stays aligned in
        the middle of a wider browser window. Vertical anchor at top
        (alignItems: start) so the scrollback grows downward, not from

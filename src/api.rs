@@ -22,6 +22,18 @@ const VIEWER_HTML: &str = include_str!("../assets/web-viewer.html");
 const VENDOR_XTERM_JS: &str = include_str!("../assets/vendor/xterm-6.0.0/xterm.js");
 const VENDOR_XTERM_CSS: &str = include_str!("../assets/vendor/xterm-6.0.0/xterm.css");
 
+/// Subset of `FreeMono` (GNU `FreeFont`) carrying just the Misc-
+/// Technical, Box-Drawing, Block Elements, Geometric Shapes, Misc
+/// Symbols, Dingbats and Misc Symbols and Arrows ranges. ~50 KB
+/// WOFF2.
+///
+/// Linked via `unicode-range` in main.css so the browser only loads
+/// it when rendering a glyph that the system mono doesn't have.
+/// User-visible fix: the `⏵⏵` play triangle (U+23F5) Claude Code
+/// puts in its mode footer renders as a clean mono glyph instead of
+/// the blurry symbols-font fallback Android picks for that codepoint.
+const VENDOR_TERM_SYMBOLS_WOFF2: &[u8] = include_bytes!("../assets/vendor/term-symbols.woff2");
+
 /// Our own viewer CSS + JS, extracted from web-viewer.html so they
 /// can be cached aggressively by the browser. The HTML references
 /// them as `/assets/main.{css,js}?version=<BUILD_HASH>`; the query
@@ -884,13 +896,20 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
     // browser (without the token in their session cookies) can
     // still load the JS that fetches /stream with the token from
     // the URL.
-    if let ("GET", "/assets/xterm-6.0.0.js" | "/assets/xterm-6.0.0.css" | "/assets/main.js" | "/assets/main.css") =
-        (method.as_str(), path.as_str())
+    if let (
+        "GET",
+        "/assets/xterm-6.0.0.js"
+        | "/assets/xterm-6.0.0.css"
+        | "/assets/main.js"
+        | "/assets/main.css"
+        | "/assets/term-symbols.woff2",
+    ) = (method.as_str(), path.as_str())
     {
         let (body, ctype): (&[u8], &str) = match path.as_str() {
             "/assets/xterm-6.0.0.js" => (VENDOR_XTERM_JS.as_bytes(), "application/javascript; charset=utf-8"),
             "/assets/xterm-6.0.0.css" => (VENDOR_XTERM_CSS.as_bytes(), "text/css; charset=utf-8"),
             "/assets/main.js" => (MAIN_JS.as_bytes(), "application/javascript; charset=utf-8"),
+            "/assets/term-symbols.woff2" => (VENDOR_TERM_SYMBOLS_WOFF2, "font/woff2"),
             _ => (MAIN_CSS.as_bytes(), "text/css; charset=utf-8"),
         };
         // Cache aggressively. xterm-*.{js,css} are version-pinned
