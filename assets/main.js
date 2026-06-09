@@ -624,25 +624,30 @@
       renderStatus();
     }
 
-    // The PTY stream may contain alt-screen toggles (\x1b[?1049h)
-    // from less / vim / htop / Claude Code. xterm.js correctly honors
-    // them, but the alt-buffer has no scrollback by spec — so every
-    // post-toggle byte ends up in a buffer the user can never scroll
-    // back into. Strip those before writing so all content lands in
-    // the main buffer where scrollback accumulates.
-    function stripAltScreen(s) {
-      // eslint-disable-next-line no-control-regex
-      return s.replace(/\x1b\[\?(?:1049|1047|47)[hl]/g, "");
-    }
-
     function handleOut(bytes) {
       // Always advance the offset — even while paused — so reconnect
       // can resume from the right place. Defer the actual write to
       // xterm.js if the user is selecting / scrolled up, then flush
       // the buffered bytes once the gate opens.
+      //
+      // We used to strip the alt-screen toggle (\x1b[?1049h/l) so
+      // TUIs would paint into the main buffer where xterm.js's
+      // scrollback could accumulate. Cost: TUIs that paint full
+      // screens (Claude Code, vim, htop, less) only land 3-4 rows
+      // because each repaint cycle uses cursor-positioning over a
+      // fixed grid — the rest of the viewport stays the bg colour.
+      // Visible on mobile as "Cooked for 10m" + 2 lines on an
+      // otherwise empty screen.
+      //
+      // Re-instated: alt-buffer is the right destination for TUI
+      // output. Same model the desktop's local tab uses. While
+      // inside the TUI, no scrollback (alt-buffer doesn't have
+      // one — terminal spec). When the user exits the TUI,
+      // xterm.js drops alt-buffer and restores the main buffer
+      // with its full scrollback intact.
       ringOffset += bytes.length;
       const text = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
-      const stripped = stripAltScreen(text);
+      const stripped = text;
       if (inScrollback || isSelecting || term.hasSelection()) {
         pendingBytesWhileSelecting += stripped;
         const queued = pendingBytesWhileSelecting.length;
