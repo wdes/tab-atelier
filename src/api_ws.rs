@@ -249,6 +249,50 @@ fn extract_token<B>(req: &Request<B>) -> Option<Vec<u8>> {
     s.strip_prefix("Bearer ").map(|t| t.as_bytes().to_vec())
 }
 
+/// Origin / CSRF defense-in-depth on the WS upgrade.
+///
+/// Browsers do NOT apply same-origin policy to WebSocket handshakes
+/// the way they do to `fetch()` — any page can open
+/// `new WebSocket("ws://victim/...")` from any origin and the
+/// browser will send the upgrade. The token (128-bit, constant-time)
+/// is the real auth gate, but tokens leak (referer headers, browser
+/// history, screenshares, `ps` listings, …) and a leaked token
+/// without an Origin check means any malicious tab in the user's
+/// browser can attach to their terminal.
+///
+/// Check: Origin's host:port must match the Host header (or the
+/// X-Forwarded-Host of a proxy). Missing Origin → accept (CLI
+/// clients, server-to-server, file://). "null" Origin → accept
+/// (sandbox iframes, file://).
+fn origin_ok<B>(req: &Request<B>) -> bool {
+    let Some(origin) = req.headers().get("origin") else {
+        return true; // no Origin = not a browser request
+    };
+    let Ok(origin_str) = origin.to_str() else {
+        return false;
+    };
+    if origin_str == "null" {
+        return true;
+    }
+    let origin_host = origin_str
+        .strip_prefix("https://")
+        .or_else(|| origin_str.strip_prefix("http://"))
+        .unwrap_or(origin_str)
+        .split('/')
+        .next()
+        .unwrap_or("");
+    // Compare against X-Forwarded-Host first (proxy-aware), then Host.
+    for hdr in ["x-forwarded-host", "host"] {
+        if let Some(v) = req.headers().get(hdr)
+            && let Ok(s) = v.to_str()
+            && s == origin_host
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Pull `?since=N` off the URL — the viewer's bootstrap or resume
 /// offset. Missing / unparseable → 0 (= replay the entire ring).
 fn extract_since<B>(req: &Request<B>) -> u64 {
@@ -399,11 +443,16 @@ pub fn handle_upgrade(
     if !hyper_tungstenite::is_upgrade_request(&req) {
         return text_response(400, "expected websocket upgrade");
     }
+    // Defense-in-depth Origin check before any auth lookup. See
+    // `origin_ok` docstring — token is the real gate, this just
+    // makes a malicious-page-with-leaked-token harder to land.
+    if !origin_ok(&req) {
+        return text_response(403, "origin mismatch");
+    }
     let Some(provided) = extract_token(&req) else {
         return text_response(401, "missing token");
     };
     let Some((authz, ring)) = authorise_and_ring(&state, master_token, &uuid, &provided) else {
-        // intentional: same shape as before, provided is now &[u8].
         // Same response for "no such tab" + "bad token" so a
         // probe can't distinguish; mirrors the HTTP gate.
         return text_response(401, "invalid or missing token");
@@ -689,6 +738,58 @@ mod tests {
         assert_eq!(percent_decode("plain"), b"plain");
         // Malformed escape is passed through.
         assert_eq!(percent_decode("a%ZZ"), b"a%ZZ");
+    }
+
+    fn req_with_headers(headers: &[(&str, &str)]) -> hyper::Request<()> {
+        let mut b = hyper::Request::builder().uri("/").method("GET");
+        for (k, v) in headers {
+            b = b.header(*k, *v);
+        }
+        b.body(()).unwrap()
+    }
+
+    #[test]
+    fn origin_ok_no_origin_accepted() {
+        // CLI / server-to-server requests: no Origin → allow.
+        assert!(origin_ok(&req_with_headers(&[])));
+    }
+
+    #[test]
+    fn origin_ok_null_origin_accepted() {
+        // file:// pages and sandboxed iframes get Origin: null.
+        assert!(origin_ok(&req_with_headers(&[
+            ("origin", "null"),
+            ("host", "x.example")
+        ])));
+    }
+
+    #[test]
+    fn origin_ok_matching_host_accepted() {
+        assert!(origin_ok(&req_with_headers(&[
+            ("origin", "https://amaury.wdes.eu"),
+            ("host", "amaury.wdes.eu"),
+        ])));
+        assert!(origin_ok(&req_with_headers(&[
+            ("origin", "http://192.168.27.77:7890"),
+            ("host", "192.168.27.77:7890"),
+        ])));
+    }
+
+    #[test]
+    fn origin_ok_mismatched_host_rejected() {
+        assert!(!origin_ok(&req_with_headers(&[
+            ("origin", "https://attacker.evil"),
+            ("host", "amaury.wdes.eu"),
+        ])));
+    }
+
+    #[test]
+    fn origin_ok_falls_back_to_forwarded_host_for_proxies() {
+        assert!(origin_ok(&req_with_headers(&[
+            ("origin", "https://amaury.wdes.eu"),
+            ("host", "127.0.0.1:7890"),
+            ("x-forwarded-host", "amaury.wdes.eu"),
+        ])));
     }
 
     #[test]
