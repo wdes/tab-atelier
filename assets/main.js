@@ -54,6 +54,36 @@
     const termEl = document.getElementById("term");
     term.open(termEl);
 
+    // Mobile-keyboard incognito hints. xterm.js renders its input
+    // path through a hidden helper textarea (.xterm-helper-textarea
+    // — created by term.open above). Mobile soft keyboards (Gboard,
+    // iOS) honour these attributes to disable user-dictionary
+    // learning, autocorrect, autocapitalization, and inline word
+    // suggestions. Without them the OS treats a terminal as a
+    // normal text input and offers wrong "corrections" on shell
+    // commands (`ls`→`is`, `cd`→`cs`) AND adds whatever the user
+    // types into the system's predictive-text history.
+    //
+    // The Grammarly attributes (data-gramm*) are an out-of-band
+    // convention the Grammarly browser extension reads to skip the
+    // field — its inline UI corrupts the terminal grid otherwise.
+    //
+    // aria-autocomplete="none" is the accessibility/IME hint that
+    // some Android keyboards respect even when autocomplete="off"
+    // alone doesn't reach the IME layer.
+    const helperTextarea = termEl.querySelector(".xterm-helper-textarea");
+    if (helperTextarea) {
+      helperTextarea.setAttribute("autocomplete", "off");
+      helperTextarea.setAttribute("autocorrect", "off");
+      helperTextarea.setAttribute("autocapitalize", "off");
+      helperTextarea.setAttribute("spellcheck", "false");
+      helperTextarea.setAttribute("inputmode", "text");
+      helperTextarea.setAttribute("aria-autocomplete", "none");
+      helperTextarea.setAttribute("data-gramm", "false");
+      helperTextarea.setAttribute("data-gramm_editor", "false");
+      helperTextarea.setAttribute("data-enable-grammarly", "false");
+    }
+
     // Silence xterm.js's terminal-query auto-responses.
     //
     // The viewer is a passive renderer of a byte stream that ALREADY
