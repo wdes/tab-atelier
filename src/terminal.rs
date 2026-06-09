@@ -1351,10 +1351,13 @@ impl Element for TerminalElement {
                     cell_font.weight = font_weight;
                     cell_font.style = font_style;
 
-                    // Wide chars get their own segment — see the long
-                    // comment over `is_wide` above. Done BEFORE the
-                    // get_or_insert_with that follows so the running
-                    // segment is flushed at the wide-char boundary.
+                    // Wide chars (CJK, hiragana, katakana, hangul,
+                    // most emoji) still get their own segment so the
+                    // shape_line call below can return a 2× advance
+                    // glyph; mixing them with neighbour cells would
+                    // confuse the `force_width` hint we pass to
+                    // shape_line later (it forces every glyph to ONE
+                    // cell width; a wide char needs two).
                     if is_wide {
                         if let Some(seg) = cur_seg.take() {
                             segments.push(seg);
@@ -1374,15 +1377,16 @@ impl Element for TerminalElement {
                         continue;
                     }
 
-                    // Narrow cells — ASCII and narrow non-ASCII alike — flow
-                    // into the running segment. The previous "split non-ASCII
-                    // into its own segment" logic produced bizarre horizontal
-                    // gaps around accented chars (é, è, à, ç, ê, etc.) because
-                    // each standalone segment was shaped independently and
-                    // laid out at `col_start * cell.width`, but the shaped
-                    // width of the fallback glyph didn't match the cell grid.
-                    // gpui's shape_line handles mixed scripts + font fallback
-                    // within a single segment correctly — let it.
+                    // Narrow cells flow into the running segment. The
+                    // accent / CJK / block-element / dingbat drift
+                    // (✽, ❯, ▏▎▌, é, è, …) is fixed at the
+                    // shape_line call site below: gpui's 4th param
+                    // `force_width: Option<Pixels>` clamps every
+                    // glyph's advance to the supplied cell width, so
+                    // regardless of what the fallback font reports
+                    // for any individual glyph the run stays
+                    // cell-aligned. Same pattern Zed's terminal_view
+                    // uses (see crates/terminal_view/src/terminal_element.rs).
                     let seg = cur_seg.get_or_insert_with(|| RawSegment {
                         col_start: c,
                         text: String::new(),
@@ -1477,7 +1481,19 @@ impl Element for TerminalElement {
                 .segments
                 .into_iter()
                 .map(|seg| {
-                    let shaped = text_sys.shape_line(seg.text.into(), font_size, &seg.runs, None);
+                    // 4th arg `force_width: Option<Pixels>` is gpui's
+                    // terminal-cell-alignment hook: it clamps every
+                    // glyph's advance to the supplied width regardless
+                    // of what the font reports. Without it, a fallback
+                    // glyph (✽ from Dingbats, é from Latin-Extended,
+                    // ▏▎▌ from Block Elements, anything CJK before
+                    // the WIDE_CHAR split kicks in) advances by its
+                    // native width and every later cell in the segment
+                    // drifts horizontally — visible as the "✽ spinner
+                    // dancing up and down" + "ratatui bar columns
+                    // misaligned" bugs. Same call shape Zed uses in
+                    // `crates/terminal_view/src/terminal_element.rs`.
+                    let shaped = text_sys.shape_line(seg.text.into(), font_size, &seg.runs, Some(cell.width));
                     TermSegment {
                         col_start: seg.col_start,
                         shaped,
