@@ -60,8 +60,8 @@ use futures_util::{SinkExt, StreamExt};
 use http_body_util::Full;
 use hyper::{Request, Response};
 use hyper_tungstenite::tungstenite::Message;
-use hyper_tungstenite::tungstenite::protocol::CloseFrame;
 use hyper_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use hyper_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
 
 use crate::api::{SnapshotTab, TabSnapshot};
 use crate::pty_ring::PtyRing;
@@ -85,6 +85,21 @@ const TAG_CLOSE: u8 = 0x09;
 /// the Notify migration.
 const TICK_MS: u64 = 30;
 
+/// Per-message cap on inbound WS frames. Tungstenite's defaults
+/// (16 MiB frame, 64 MiB message) are generous to a fault — an
+/// authenticated RW client could send a 64 MiB `TAG_RENAME` and
+/// stall every other tab while `serde_json::from_slice::<R>` parses
+/// the giant payload under the snapshot lock.
+///
+/// 2 MiB max message + 1 MiB max frame is plenty for our use case:
+/// `TAG_IN` keystrokes are a few bytes, `TAG_RESIZE` is ~16 bytes,
+/// `TAG_RENAME` is a short string. A genuine paste of 2 MiB into a
+/// PTY is already 1000× more text than any real-world workflow,
+/// and tungstenite responds with a 1009 Message Too Big close so
+/// the client surfaces the problem instead of silently truncating.
+const WS_MAX_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
+const WS_MAX_FRAME_BYTES: usize = 1024 * 1024;
+
 /// Identify whether the path is a WS upgrade endpoint we handle.
 /// Returns the tab UUID if so.
 #[must_use]
@@ -104,32 +119,44 @@ enum Authz {
     Ro,
 }
 
-/// Resolve `(token, uuid)` to `(tab_index, authorisation level)`.
-/// Master token always wins (RW). Share tokens are matched in
-/// constant time, same as the HTTP gate. None on any failure
-/// (unknown tab, bad token, missing token).
-fn authorise(state: &Arc<Mutex<TabSnapshot>>, master: &str, uuid: &str, provided: &str) -> Option<(usize, Authz)> {
-    // Compute the result inside a scoped block so the MutexGuard
-    // drops before we return — `significant_drop_tightening`
-    // otherwise complains about holding the snapshot lock past the
-    // last actual use.
-    let snap = state.lock().ok()?;
-    let idx = snap.tabs.iter().position(|t| t.id == uuid)?;
-    let t = &snap.tabs[idx];
+/// Resolve `(token, uuid)` to `(authorisation, ring)` in a SINGLE
+/// snapshot lock. Master token wins (RW); per-tab share tokens are
+/// matched in constant time, same as the HTTP gate.
+///
+/// Previously this function returned only `(idx, Authz)` and the
+/// caller re-locked to clone the `pty_ring`. Between those two
+/// locks a tab close on a different connection could shift the
+/// vector and the second lookup would attach to the wrong tab's
+/// ring — a S→C mis-routing race. By doing both lookups under one
+/// guard we close that window. None on any failure (unknown tab,
+/// bad token, missing token, no ring).
+// The `?` early-returns inside the scoped block hold the snapshot
+// guard until the borrowed `t` releases at the close brace; that's
+// the tightest possible window. `significant_drop_tightening` flags
+// it anyway because it can't model the dependency.
+#[allow(clippy::significant_drop_tightening)]
+fn authorise_and_ring(
+    state: &Arc<Mutex<TabSnapshot>>,
+    master: &str,
+    uuid: &str,
+    provided: &str,
+) -> Option<(Authz, Arc<Mutex<PtyRing>>)> {
+    let (rw_tok, ro_tok, ring) = {
+        let snap = state.lock().ok()?;
+        let t = snap.tabs.iter().find(|t| t.id == uuid)?;
+        let ring = t.pty_ring.clone()?;
+        (t.share_token_rw.clone(), t.share_token_ro.clone(), ring)
+    };
     let master_match = crate::api::constant_time_eq(provided.as_bytes(), master.as_bytes());
-    let rw_match =
-        !t.share_token_rw.is_empty() && crate::api::constant_time_eq(t.share_token_rw.as_bytes(), provided.as_bytes());
-    let ro_match =
-        !t.share_token_ro.is_empty() && crate::api::constant_time_eq(t.share_token_ro.as_bytes(), provided.as_bytes());
-    let authz = if master_match || rw_match {
-        Some(Authz::Rw)
+    let rw_match = !rw_tok.is_empty() && crate::api::constant_time_eq(rw_tok.as_bytes(), provided.as_bytes());
+    let ro_match = !ro_tok.is_empty() && crate::api::constant_time_eq(ro_tok.as_bytes(), provided.as_bytes());
+    if master_match || rw_match {
+        Some((Authz::Rw, ring))
     } else if ro_match {
-        Some(Authz::Ro)
+        Some((Authz::Ro, ring))
     } else {
         None
-    };
-    drop(snap);
-    authz.map(|a| (idx, a))
+    }
 }
 
 /// Pull the token off the request — query `?token=...` first (the
@@ -198,7 +225,7 @@ struct MetaSnapshot {
     uptime_secs: f64,
 }
 
-fn snapshot_meta(t: &SnapshotTab) -> MetaSnapshot {
+fn snapshot_meta(t: &SnapshotTab, authz: Authz) -> MetaSnapshot {
     let lock_reason = t.lock_reason();
     let dir_count = |dirname: &str| -> usize {
         t.cwd.as_deref().map_or(0, |cwd| {
@@ -206,6 +233,16 @@ fn snapshot_meta(t: &SnapshotTab) -> MetaSnapshot {
                 rd.flatten().filter(|e| e.metadata().is_ok_and(|m| m.is_file())).count()
             })
         })
+    };
+    // RO viewers don't see `inbox_count`. The HTTP `/inbox` listing
+    // endpoint is RW-only specifically so RO recipients can't
+    // enumerate uploads (`src/api.rs` needs_rw includes "inbox"); a
+    // count here would be a milder version of the same info leak.
+    // `outbox_count` is fine for RO — downloads are allowed.
+    let inbox_count = if matches!(authz, Authz::Ro) {
+        0
+    } else {
+        dir_count("inbox")
     };
     let (agent_state, agent_label) = t.agent_state.as_ref().map_or((None, None), |s| {
         let key = match s.state {
@@ -232,7 +269,7 @@ fn snapshot_meta(t: &SnapshotTab) -> MetaSnapshot {
         agent_state,
         agent_label,
         outbox_count: dir_count("outbox"),
-        inbox_count: dir_count("inbox"),
+        inbox_count,
         build_hash: crate::api::BUILD_HASH,
         cwd: t.cwd.clone(),
         uptime_secs: t.uptime_secs,
@@ -257,17 +294,18 @@ pub fn handle_upgrade(
     let Some(provided) = extract_token(&req) else {
         return text_response(401, "missing token");
     };
-    let Some((idx, authz)) = authorise(&state, master_token, &uuid, &provided) else {
+    let Some((authz, ring)) = authorise_and_ring(&state, master_token, &uuid, &provided) else {
+        // Same response for "no such tab" + "bad token" so a
+        // probe can't distinguish; mirrors the HTTP gate.
         return text_response(401, "invalid or missing token");
     };
-    let Some(ring) = state
-        .lock()
-        .ok()
-        .and_then(|s| s.tabs.get(idx).and_then(|t| t.pty_ring.clone()))
-    else {
-        return text_response(404, "stream unavailable for this tab");
-    };
-    let (response, ws_future) = match hyper_tungstenite::upgrade(&mut req, None) {
+    // Bound inbound message size so a single rogue frame can't
+    // RAM-exhaust the daemon under the snapshot lock. See
+    // WS_MAX_MESSAGE_BYTES / WS_MAX_FRAME_BYTES docstrings.
+    let ws_config = WebSocketConfig::default()
+        .max_message_size(Some(WS_MAX_MESSAGE_BYTES))
+        .max_frame_size(Some(WS_MAX_FRAME_BYTES));
+    let (response, ws_future) = match hyper_tungstenite::upgrade(&mut req, Some(ws_config)) {
         Ok(p) => p,
         Err(e) => return text_response(400, &format!("ws upgrade: {e}")),
     };
@@ -308,7 +346,7 @@ async fn run_pump(
 
     // Send the initial meta on connect and seed the hash so the
     // first tick after this doesn't re-emit the same payload.
-    let mut last_meta_hash: u64 = if let Some(meta) = current_meta(&state, &uuid) {
+    let mut last_meta_hash: u64 = if let Some(meta) = current_meta(&state, &uuid, authz) {
         let bytes = encode_frame(TAG_META, serde_json::to_vec(&meta).unwrap_or_default());
         if sink.send(Message::Binary(bytes.into())).await.is_err() {
             return;
@@ -347,7 +385,7 @@ async fn run_pump(
                     }
                 }
                 // meta frame — only when something actually changed.
-                if let Some(meta) = current_meta(&state, &uuid) {
+                if let Some(meta) = current_meta(&state, &uuid, authz) {
                     let h = meta_hash(&meta);
                     if h != last_meta_hash {
                         let bytes = encode_frame(TAG_META, serde_json::to_vec(&meta).unwrap_or_default());
@@ -481,9 +519,9 @@ fn handle_inbound(
     Ok(())
 }
 
-fn current_meta(state: &Arc<Mutex<TabSnapshot>>, uuid: &str) -> Option<MetaSnapshot> {
+fn current_meta(state: &Arc<Mutex<TabSnapshot>>, uuid: &str, authz: Authz) -> Option<MetaSnapshot> {
     let snap = state.lock().ok()?;
-    let meta = snap.tabs.iter().find(|t| t.id == uuid).map(snapshot_meta);
+    let meta = snap.tabs.iter().find(|t| t.id == uuid).map(|t| snapshot_meta(t, authz));
     drop(snap);
     meta
 }
