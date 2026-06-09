@@ -86,6 +86,40 @@
       term.parser.registerDcsHandler({ final: "q" }, () => true);
     }
 
+    // Copy-selection UX. The /stream poll already pauses term.write()
+    // while term.hasSelection() is true (see the gate further down),
+    // but xterm.js only flags a selection as "live" on mouseup —
+    // during the drag itself, hasSelection() is false. A poll landing
+    // mid-drag would still wipe the gesture. Track mousedown/mouseup
+    // explicitly so the gate covers both phases.
+    //
+    // The button uses term.getSelection() (a string snapshot) so the
+    // copy works even if a stray write between user click and clipboard
+    // write would have cleared xterm.js's internal selection.
+    let isSelecting = false;
+    termEl.addEventListener("mousedown", () => { isSelecting = true; });
+    document.addEventListener("mouseup", () => { isSelecting = false; });
+    if (term.onSelectionChange) {
+      term.onSelectionChange(() => {
+        document.body.classList.toggle("has-selection", term.hasSelection());
+      });
+    }
+    const copyBtn = document.getElementById("copy-btn");
+    if (copyBtn) {
+      copyBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const sel = term.getSelection();
+        if (!sel) {
+          toast("nothing selected");
+          return;
+        }
+        copyText(sel, `copied ${sel.length} char${sel.length === 1 ? "" : "s"}`);
+        // Don't auto-clear the selection — user might want to verify
+        // what they copied. xterm.js will clear on next text input or
+        // term.write() resumption.
+      });
+    }
+
     // Pick an xterm.js font size so the server's full PTY grid fits
     // the browser viewport width. Monospace char width on the JBM /
     // Fira stack is ~0.6 × fontSize; subtract a small gutter so the
@@ -525,14 +559,14 @@
           status.textContent = `${TAB_NAME} · paused (scrolled up) · ${len}B`;
           return;
         }
-        // Pause writes while there's an active selection. Any
-        // term.write() clears the selection on most xterm.js versions,
-        // making text impossible to copy when the stream is busy
-        // (Claude polling at 80 ms ≈ a new write every poll). We do
-        // NOT advance streamOffset, so when the selection clears the
-        // very next poll plays the queued bytes in one go.
-        if (term.hasSelection()) {
-          status.textContent = `${TAB_NAME} · selection — Cmd/Ctrl+C to copy (${len - streamOffset}B queued)`;
+        // Pause writes while the user is selecting OR has an active
+        // selection. Any term.write() clears the selection on most
+        // xterm.js versions, so a poll landing between mousedown and
+        // mouseup would race the in-progress drag away. We do NOT
+        // advance streamOffset, so when the selection clears the
+        // next poll plays the queued bytes in one go.
+        if (isSelecting || term.hasSelection()) {
+          status.textContent = `${TAB_NAME} · selection · click 📋 to copy · ${len - streamOffset}B queued`;
           return;
         }
         const rawBody = await r.text();
