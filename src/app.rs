@@ -535,6 +535,30 @@ impl AppState {
         })
         .detach();
 
+        // Fast input-drain — the persist tick above runs every 2 s
+        // (disk writes, scrollback CRC, …) which means a keystroke
+        // POSTed via /input OR pushed via the WS `in` frame can sit
+        // in `pending_input` for up to two whole seconds before
+        // hitting the PTY. That's the "typing is very slow" report.
+        //
+        // Separate 50 ms tick that does ONLY the input drain. Other
+        // pending queues (lock toggles, schedule changes, status
+        // updates, renames, closes) stay on the slow persist path
+        // — they're not latency-critical.
+        cx.spawn(async |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(50))
+                    .await;
+                let Ok(()) = this.update(cx, |app, cx| {
+                    app.drain_inputs(cx);
+                }) else {
+                    break;
+                };
+            }
+        })
+        .detach();
+
         cx.spawn(async |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             loop {
                 cx.background_executor()
@@ -800,6 +824,26 @@ impl AppState {
         }
         self.context_menu = None;
         cx.notify();
+    }
+
+    /// Drain `pending_input` from the API snapshot and ship the bytes
+    /// to each tab's PTY. Called on a fast 50 ms tick by the spawn in
+    /// `init`, so WS / HTTP keystrokes don't wait up to 2 s for the
+    /// next `persist` tick. The slow persist still drains every
+    /// pending queue (a no-op for input once we've cleared it here).
+    fn drain_inputs(&mut self, cx: &mut Context<Self>) {
+        let inputs: Vec<(usize, Vec<u8>)> = {
+            let mut snapshot = self.api_state.lock().unwrap();
+            if snapshot.pending_input.is_empty() {
+                return;
+            }
+            snapshot.pending_input.drain(..).collect()
+        };
+        for (idx, bytes) in inputs {
+            if idx < self.tabs.len() {
+                self.tabs[idx].view.read(cx).send_input_bytes(bytes);
+            }
+        }
     }
 
     fn persist(&mut self, cx: &mut Context<Self>) {
