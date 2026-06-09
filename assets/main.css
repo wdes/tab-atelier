@@ -46,9 +46,17 @@
        button lifts the selection out via term.getSelection() at
        click time, so the buffer survives even if a poll lands
        between mousedown and the user's ⌘C. */
+    /* Center-top so the button doesn't collide with the inbox/outbox
+       buttons in the top-right on narrow screens (mobile portrait
+       especially). The vertical offset clears the files-btn row
+       (top: 6 + ~22 button height ≈ 32 px); the locked banner shifts
+       both down together so they stay stacked. */
     #copy-btn {
       display: none;
-      position: fixed; top: 8px; right: 8px;
+      position: fixed;
+      top: 36px;
+      left: 50%;
+      transform: translateX(-50%);
       padding: 6px 12px; border-radius: 6px;
       font: 12px ui-monospace, monospace;
       background: rgba(80, 200, 120, 0.18); color: #84d196;
@@ -57,9 +65,9 @@
     }
     body.has-selection #copy-btn { display: inline-block; }
     #copy-btn:hover { background: rgba(80, 200, 120, 0.32); }
-    /* Bump it down when the locked banner is showing so the two
-       don't visually overlap. */
-    body.locked #copy-btn { top: 40px; }
+    /* Locked banner takes the top 32 px AND #files-controls moves
+       from 6 → 38 — so copy-btn goes 36 → 68 to clear them both. */
+    body.locked #copy-btn { top: 68px; }
     /* Drag-and-drop overlay — translucent layer that appears when
        the user drags a file over the page. RO viewers skip the
        handler attachment entirely so the overlay never appears
