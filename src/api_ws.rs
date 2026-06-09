@@ -211,7 +211,7 @@ fn authorise_and_ring(
     state: &Arc<Mutex<TabSnapshot>>,
     master: &str,
     uuid: &str,
-    provided: &str,
+    provided: &[u8],
 ) -> Option<(Authz, Arc<Mutex<PtyRing>>)> {
     let (rw_tok, ro_tok, ring) = {
         let snap = state.lock().ok()?;
@@ -219,9 +219,9 @@ fn authorise_and_ring(
         let ring = t.pty_ring.clone()?;
         (t.share_token_rw.clone(), t.share_token_ro.clone(), ring)
     };
-    let master_match = crate::api::constant_time_eq(provided.as_bytes(), master.as_bytes());
-    let rw_match = !rw_tok.is_empty() && crate::api::constant_time_eq(rw_tok.as_bytes(), provided.as_bytes());
-    let ro_match = !ro_tok.is_empty() && crate::api::constant_time_eq(ro_tok.as_bytes(), provided.as_bytes());
+    let master_match = crate::api::constant_time_eq(provided, master.as_bytes());
+    let rw_match = !rw_tok.is_empty() && crate::api::constant_time_eq(rw_tok.as_bytes(), provided);
+    let ro_match = !ro_tok.is_empty() && crate::api::constant_time_eq(ro_tok.as_bytes(), provided);
     if master_match || rw_match {
         Some((Authz::Rw, ring))
     } else if ro_match {
@@ -234,7 +234,10 @@ fn authorise_and_ring(
 /// Pull the token off the request — query `?token=...` first (the
 /// browser-friendly form, since JS can't set Authorization on a WS
 /// upgrade), then `Authorization: Bearer ...` as a fallback.
-fn extract_token<B>(req: &Request<B>) -> Option<String> {
+/// Returns the raw decoded bytes so the caller's constant-time
+/// comparison runs on the exact wire input — see `percent_decode`'s
+/// docstring for the reason this is `Vec<u8>` and not `String`.
+fn extract_token<B>(req: &Request<B>) -> Option<Vec<u8>> {
     let q = req.uri().query()?;
     for pair in q.split('&') {
         if let Some(v) = pair.strip_prefix("token=") {
@@ -243,7 +246,7 @@ fn extract_token<B>(req: &Request<B>) -> Option<String> {
     }
     let h = req.headers().get(hyper::header::AUTHORIZATION)?;
     let s = h.to_str().ok()?;
-    s.strip_prefix("Bearer ").map(str::to_string)
+    s.strip_prefix("Bearer ").map(|t| t.as_bytes().to_vec())
 }
 
 /// Pull `?since=N` off the URL — the viewer's bootstrap or resume
@@ -260,11 +263,27 @@ fn extract_since<B>(req: &Request<B>) -> u64 {
     0
 }
 
-/// Minimal percent-decode for the `?token=` query value. Tokens
-/// today are hex (no encoding) but bearer-token rotators may
-/// emit `+` / `%2B` etc.
-fn percent_decode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+/// Minimal percent-decode for the `?token=` query value.
+///
+/// Returns `Vec<u8>` (NOT `String`) because tokens are byte strings,
+/// not text. The previous `String`-based version round-tripped each
+/// byte through `u8 as char` + `String::push`, which UTF-8-encodes
+/// any code point ≥ 0x80 into a 2-byte sequence and silently
+/// corrupts the wire input:
+///
+///     %FF  →  '\u{00FF}'  →  String.push  →  "\xC3\xBF"
+///                                            (2 bytes, wrong)
+///
+/// vs. what the wire actually sent:
+///
+///     %FF  →  byte 0xFF   →  Vec<u8>.push →  "\xFF"
+///                                            (1 byte, correct)
+///
+/// Tokens today are 32 hex chars (every byte ≤ 0x66) so this never
+/// fires in practice, but it's a latent corruption waiting for the
+/// first non-ASCII byte routed through the decoder.
+fn percent_decode(s: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -272,15 +291,15 @@ fn percent_decode(s: &str) -> String {
             let hi = (bytes[i + 1] as char).to_digit(16);
             let lo = (bytes[i + 2] as char).to_digit(16);
             if let (Some(h), Some(l)) = (hi, lo) {
-                out.push(((h * 16 + l) as u8) as char);
+                out.push((h * 16 + l) as u8);
                 i += 3;
                 continue;
             }
         }
         if bytes[i] == b'+' {
-            out.push(' ');
+            out.push(b' ');
         } else {
-            out.push(bytes[i] as char);
+            out.push(bytes[i]);
         }
         i += 1;
     }
@@ -384,6 +403,7 @@ pub fn handle_upgrade(
         return text_response(401, "missing token");
     };
     let Some((authz, ring)) = authorise_and_ring(&state, master_token, &uuid, &provided) else {
+        // intentional: same shape as before, provided is now &[u8].
         // Same response for "no such tab" + "bad token" so a
         // probe can't distinguish; mirrors the HTTP gate.
         return text_response(401, "invalid or missing token");
@@ -664,11 +684,20 @@ mod tests {
 
     #[test]
     fn percent_decode_handles_plus_and_hex() {
-        assert_eq!(percent_decode("a+b"), "a b");
-        assert_eq!(percent_decode("a%2Bb"), "a+b");
-        assert_eq!(percent_decode("plain"), "plain");
+        assert_eq!(percent_decode("a+b"), b"a b");
+        assert_eq!(percent_decode("a%2Bb"), b"a+b");
+        assert_eq!(percent_decode("plain"), b"plain");
         // Malformed escape is passed through.
-        assert_eq!(percent_decode("a%ZZ"), "a%ZZ");
+        assert_eq!(percent_decode("a%ZZ"), b"a%ZZ");
+    }
+
+    #[test]
+    fn percent_decode_preserves_high_bytes_one_for_one() {
+        // The regression: %FF was being re-encoded as 0xC3 0xBF
+        // (UTF-8 of U+00FF) via the now-removed u8-as-char round-trip.
+        assert_eq!(percent_decode("%FF"), vec![0xFF]);
+        assert_eq!(percent_decode("%80"), vec![0x80]);
+        assert_eq!(percent_decode("%C3%BF"), vec![0xC3, 0xBF]);
     }
 
     #[test]
