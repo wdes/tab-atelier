@@ -54,6 +54,38 @@
     const termEl = document.getElementById("term");
     term.open(termEl);
 
+    // Silence xterm.js's terminal-query auto-responses.
+    //
+    // The viewer is a passive renderer of a byte stream that ALREADY
+    // includes the responses the real terminal (server-side alacritty)
+    // generated for any queries running programs emitted. xterm.js
+    // doesn't know that — when it parses `\x1b[c` (DA), `\x1b[6n`
+    // (cursor position), `\x1b]10;?`/`\x1b]11;?` (color queries),
+    // `\x1bP+q...\x1b\\` (termcap), etc. in the replay stream, it
+    // generates its OWN reply and ships it through `term.onData()` to
+    // our /input POST → the shell echoes it → next refresh re-replays
+    // the original query and the cycle adds another copy of the reply
+    // to the prompt line. Visible bug: `1;2c1;2c1;2c1;...` accumulating
+    // every page refresh (that's the printable suffix of `\x1b[?1;2c`).
+    //
+    // Returning `true` from a parser handler tells xterm.js "I
+    // handled it" and skips its default reply. No app-level state —
+    // we just drop the response on the floor.
+    if (term.parser) {
+      // CSI queries with final byte 'c' (DA1/DA2/DA3) and 'n' (DSR/CPR).
+      for (const final of ["c", "n"]) {
+        term.parser.registerCsiHandler({ final }, () => true);
+      }
+      // OSC color & hyperlink queries — 10/11/12 are fg/bg/cursor color,
+      // 4/104/105 are palette, 8 is hyperlink. The viewer doesn't own
+      // any of these — the live terminal does.
+      for (const osc of [4, 8, 10, 11, 12, 104, 105]) {
+        term.parser.registerOscHandler(osc, () => true);
+      }
+      // DCS termcap/terminfo query (`\x1bP+q...\x1b\\`).
+      term.parser.registerDcsHandler({ final: "q" }, () => true);
+    }
+
     // Pick an xterm.js font size so the server's full PTY grid fits
     // the browser viewport width. Monospace char width on the JBM /
     // Fira stack is ~0.6 × fontSize; subtract a small gutter so the
