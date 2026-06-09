@@ -104,24 +104,32 @@ enum Authz {
     Ro,
 }
 
-/// Resolve `(token, uuid)` to (tab_index, authorisation level).
+/// Resolve `(token, uuid)` to `(tab_index, authorisation level)`.
 /// Master token always wins (RW). Share tokens are matched in
 /// constant time, same as the HTTP gate. None on any failure
 /// (unknown tab, bad token, missing token).
 fn authorise(state: &Arc<Mutex<TabSnapshot>>, master: &str, uuid: &str, provided: &str) -> Option<(usize, Authz)> {
+    // Compute the result inside a scoped block so the MutexGuard
+    // drops before we return — `significant_drop_tightening`
+    // otherwise complains about holding the snapshot lock past the
+    // last actual use.
     let snap = state.lock().ok()?;
     let idx = snap.tabs.iter().position(|t| t.id == uuid)?;
     let t = &snap.tabs[idx];
-    if crate::api::constant_time_eq(provided.as_bytes(), master.as_bytes()) {
-        return Some((idx, Authz::Rw));
-    }
-    if !t.share_token_rw.is_empty() && crate::api::constant_time_eq(t.share_token_rw.as_bytes(), provided.as_bytes()) {
-        return Some((idx, Authz::Rw));
-    }
-    if !t.share_token_ro.is_empty() && crate::api::constant_time_eq(t.share_token_ro.as_bytes(), provided.as_bytes()) {
-        return Some((idx, Authz::Ro));
-    }
-    None
+    let master_match = crate::api::constant_time_eq(provided.as_bytes(), master.as_bytes());
+    let rw_match =
+        !t.share_token_rw.is_empty() && crate::api::constant_time_eq(t.share_token_rw.as_bytes(), provided.as_bytes());
+    let ro_match =
+        !t.share_token_ro.is_empty() && crate::api::constant_time_eq(t.share_token_ro.as_bytes(), provided.as_bytes());
+    let authz = if master_match || rw_match {
+        Some(Authz::Rw)
+    } else if ro_match {
+        Some(Authz::Ro)
+    } else {
+        None
+    };
+    drop(snap);
+    authz.map(|a| (idx, a))
 }
 
 /// Pull the token off the request — query `?token=...` first (the
@@ -220,11 +228,7 @@ fn snapshot_meta(t: &SnapshotTab) -> MetaSnapshot {
         schedule_tz,
         schedule_rule,
         schedule_next,
-        bg_color: if t.bg_color.is_empty() {
-            None
-        } else {
-            Some(t.bg_color.clone())
-        },
+        bg_color: (!t.bg_color.is_empty()).then(|| t.bg_color.clone()),
         agent_state,
         agent_label,
         outbox_count: dir_count("outbox"),
@@ -243,28 +247,25 @@ fn snapshot_meta(t: &SnapshotTab) -> MetaSnapshot {
 pub fn handle_upgrade(
     mut req: Request<hyper::body::Incoming>,
     state: Arc<Mutex<TabSnapshot>>,
-    master_token: String,
+    master_token: &str,
     read_only_process: bool,
     uuid: String,
 ) -> Response<Full<Bytes>> {
     if !hyper_tungstenite::is_upgrade_request(&req) {
         return text_response(400, "expected websocket upgrade");
     }
-    let provided = match extract_token(&req) {
-        Some(t) => t,
-        None => return text_response(401, "missing token"),
+    let Some(provided) = extract_token(&req) else {
+        return text_response(401, "missing token");
     };
-    let (idx, authz) = match authorise(&state, &master_token, &uuid, &provided) {
-        Some(p) => p,
-        None => return text_response(401, "invalid or missing token"),
+    let Some((idx, authz)) = authorise(&state, master_token, &uuid, &provided) else {
+        return text_response(401, "invalid or missing token");
     };
-    let ring = match state
+    let Some(ring) = state
         .lock()
         .ok()
         .and_then(|s| s.tabs.get(idx).and_then(|t| t.pty_ring.clone()))
-    {
-        Some(r) => r,
-        None => return text_response(404, "stream unavailable for this tab"),
+    else {
+        return text_response(404, "stream unavailable for this tab");
     };
     let (response, ws_future) = match hyper_tungstenite::upgrade(&mut req, None) {
         Ok(p) => p,
@@ -299,23 +300,23 @@ async fn run_pump(
     read_only_process: bool,
 ) {
     let (mut sink, mut stream) = ws.split();
-    let mut ring_offset: u64 = {
-        // Start from the current high-water mark — the viewer just
-        // bootstrapped from `output` (joined-line snapshot) for its
-        // initial paint and only needs bytes from here on. Future:
-        // accept `?since=N` in the upgrade URL for resume.
-        ring.lock().map(|r| r.total_len()).unwrap_or(0)
-    };
-    let mut last_meta_hash: u64 = 0;
+    // Start from the current high-water mark — the viewer just
+    // bootstrapped from `output` (joined-line snapshot) for its
+    // initial paint and only needs bytes from here on. Future:
+    // accept `?since=N` in the upgrade URL for resume.
+    let mut ring_offset: u64 = ring.lock().map_or(0, |r| r.total_len());
 
-    // Send the initial meta on connect.
-    if let Some(meta) = current_meta(&state, &uuid) {
+    // Send the initial meta on connect and seed the hash so the
+    // first tick after this doesn't re-emit the same payload.
+    let mut last_meta_hash: u64 = if let Some(meta) = current_meta(&state, &uuid) {
         let bytes = encode_frame(TAG_META, serde_json::to_vec(&meta).unwrap_or_default());
         if sink.send(Message::Binary(bytes.into())).await.is_err() {
             return;
         }
-        last_meta_hash = meta_hash(&meta);
-    }
+        meta_hash(&meta)
+    } else {
+        0
+    };
 
     let mut tick = tokio::time::interval(Duration::from_millis(TICK_MS));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -324,9 +325,12 @@ async fn run_pump(
         tokio::select! {
             // Periodic push: new PTY bytes + state changes.
             _ = tick.tick() => {
-                // out frames
+                // out frames — drop the ring lock immediately after
+                // copying the new suffix into a Vec so the PTY-read
+                // side (in pty_ring.rs) isn't blocked while we're
+                // talking to the WS sink.
                 let chunk = {
-                    let r = match ring.lock() { Ok(r) => r, Err(_) => return };
+                    let Ok(r) = ring.lock() else { return; };
                     let new_total = r.total_len();
                     if new_total == ring_offset {
                         Vec::new()
@@ -359,7 +363,7 @@ async fn run_pump(
                 let Some(Ok(msg)) = msg else { return; };
                 match msg {
                     Message::Binary(b) => {
-                        if let Err(close) = handle_inbound(&b, authz, read_only_process, &state, &uuid).await {
+                        if let Err(close) = handle_inbound(&b, authz, read_only_process, &state, &uuid) {
                             let _ = sink.send(Message::Close(Some(close))).await;
                             return;
                         }
@@ -386,7 +390,7 @@ fn encode_frame(tag: u8, mut payload: Vec<u8>) -> Vec<u8> {
 /// Returns `Err(CloseFrame)` when the client violated the protocol
 /// (RO trying to write, unknown tag, malformed JSON) and the
 /// connection should close.
-async fn handle_inbound(
+fn handle_inbound(
     bytes: &[u8],
     authz: Authz,
     read_only_process: bool,
@@ -407,14 +411,18 @@ async fn handle_inbound(
             reason: "read-only".into(),
         });
     }
-    let mut snap = state.lock().map_err(|_| CloseFrame {
-        code: CloseCode::Error,
-        reason: "snapshot poisoned".into(),
-    })?;
-    let idx = snap.tabs.iter().position(|t| t.id == uuid).ok_or(CloseFrame {
-        code: CloseCode::Away,
-        reason: "tab vanished".into(),
-    })?;
+    let Ok(mut snap) = state.lock() else {
+        return Err(CloseFrame {
+            code: CloseCode::Error,
+            reason: "snapshot poisoned".into(),
+        });
+    };
+    let Some(idx) = snap.tabs.iter().position(|t| t.id == uuid) else {
+        return Err(CloseFrame {
+            code: CloseCode::Away,
+            reason: "tab vanished".into(),
+        });
+    };
     match tag {
         TAG_IN => {
             // Refuse input if the tab is effective-locked (manual or
@@ -475,13 +483,14 @@ async fn handle_inbound(
 
 fn current_meta(state: &Arc<Mutex<TabSnapshot>>, uuid: &str) -> Option<MetaSnapshot> {
     let snap = state.lock().ok()?;
-    let t = snap.tabs.iter().find(|t| t.id == uuid)?;
-    Some(snapshot_meta(t))
+    let meta = snap.tabs.iter().find(|t| t.id == uuid).map(snapshot_meta);
+    drop(snap);
+    meta
 }
 
 /// Cheap fingerprint so we only emit a `meta` frame when something
 /// actually changed. Serialise + hash; not perfect (re-orders aren't
-/// detected, but serde_json is order-stable on a struct) and the
+/// detected, but `serde_json` is order-stable on a struct) and the
 /// cost is bounded by the meta payload size.
 fn meta_hash(m: &MetaSnapshot) -> u64 {
     use std::hash::Hasher;

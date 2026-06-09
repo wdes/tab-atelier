@@ -137,7 +137,7 @@ pub struct TerminalView {
 }
 
 /// Encode a scroll-wheel gesture as the byte sequence a TUI listening
-/// in ALTERNATE_SCROLL mode (vim/less/htop on alt-screen) wants to see.
+/// in `ALTERNATE_SCROLL` mode (vim/less/htop on alt-screen) wants to see.
 /// One `\x1bOA` per line for scroll-back, one `\x1bOB` per line for
 /// scroll-forward — matches Zed's `alt_scroll()`.
 ///

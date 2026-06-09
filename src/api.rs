@@ -663,7 +663,11 @@ fn write_schedule_headers(extra: &mut String, schedule: &crate::schedule::TabSch
 /// reducing to a bool. Used for every token comparison so a remote
 /// attacker can't shave bits off a 128-bit token by timing how
 /// quickly different guesses get rejected.
-pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+// `pub` here is restricted by the surrounding `pub(crate) mod api;`
+// in lib.rs, so this is effectively crate-visible only. Clippy's
+// `pub_with_shorthand` lint complained about `pub(crate)` inside a
+// non-public module, hence the relaxation.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -2333,7 +2337,7 @@ async fn handle_hyper_request(
     // can return a 101 Switching Protocols + park the connection.
     if let Some(uuid) = crate::api_ws::parse_ws_path(&path) {
         let uuid = uuid.to_string();
-        return Ok(crate::api_ws::handle_upgrade(req, state, token, read_only, uuid));
+        return Ok(crate::api_ws::handle_upgrade(req, state, &token, read_only, uuid));
     }
     let method = req.method().to_string();
     let uri = req

@@ -2409,7 +2409,7 @@ impl AppState {
                     .hover(|s| s.bg(menu_hover))
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                        cx.listener(|this, _ev: &MouseDownEvent, window, cx| {
                             this.pref_browser_text = this.browser.borrow().clone().unwrap_or_default();
                             this.pref_editor_text = this.code_editor.borrow().clone().unwrap_or_default();
                             this.pref_api_addr_text = this.api_addr.clone();
@@ -2417,6 +2417,16 @@ impl AppState {
                             this.pref_share_url_base_text = this.share_url_base.clone();
                             this.show_preferences = true;
                             this.context_menu = None;
+                            // Move focus into the first prefs input on
+                            // open so the user can type immediately
+                            // without clicking. Without this, the
+                            // terminal still has focus and the inputs
+                            // *appear* unfocusable because their
+                            // on_mouse_down focus call fires AFTER
+                            // gpui dispatches the first click's keys
+                            // — by which point the keys are already
+                            // queued at the terminal.
+                            this.pref_api_addr_focus.focus(window);
                             cx.notify();
                         }),
                     )
