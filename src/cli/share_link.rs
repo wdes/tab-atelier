@@ -920,3 +920,87 @@ fn unescape(s: &str) -> String {
     }
     out
 }
+
+/// `tab-atelier-headless tabs` — list tabs with lock status.
+///
+/// Output columns:
+///   #idx  id(8 chars)  lock-state  name
+///
+/// Lock state is one of:
+///   open               — no lock
+///   locked (manual)    — user toggled the padlock; unlock via
+///                        `tab-atelier-headless unlock <id>`
+///   locked (schedule)  — outside the OSM opening-hours window;
+///                        the schedule line shows the rule + tz
+///
+/// Reads /tabs over the local API. Any tab that doesn't expose a
+/// `lock_reason` but has `locked: true` is shown as "locked" with no
+/// reason; that shouldn't happen with current server code but the
+/// fallback survives a future field rename.
+#[must_use]
+pub fn tabs(args: &[String]) -> i32 {
+    let json = args.iter().any(|a| a == "--json");
+    let ep = match discover_endpoint() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("tabs: {e}");
+            return 1;
+        }
+    };
+    let raw = match fetch_tabs(&ep) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("tabs: {e}");
+            return 1;
+        }
+    };
+    if json {
+        // For scripts: dump the raw /tabs payload pretty-printed.
+        let pretty = serde_json::to_string_pretty(&raw).unwrap_or_else(|_| "[]".into());
+        println!("{pretty}");
+        return 0;
+    }
+    if raw.is_empty() {
+        println!("no tabs");
+        return 0;
+    }
+    let header_idx = "IDX";
+    let header_id = "ID";
+    let header_status = "STATUS";
+    let header_name = "NAME";
+    println!("{header_idx:>3}  {header_id:<8}  {header_status:<22}  {header_name}");
+    for t in &raw {
+        let idx = t.get("index").and_then(serde_json::Value::as_u64).unwrap_or(0);
+        let id_short = t
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+            .chars()
+            .take(8)
+            .collect::<String>();
+        let name = t.get("name").and_then(serde_json::Value::as_str).unwrap_or("?");
+        let active = t.get("active").and_then(serde_json::Value::as_bool).unwrap_or(false);
+        let locked = t.get("locked").and_then(serde_json::Value::as_bool).unwrap_or(false);
+        let reason = t.get("lock_reason").and_then(serde_json::Value::as_str);
+        let status = if !locked {
+            "open".to_string()
+        } else if reason == Some("manual") {
+            "locked (manual)".to_string()
+        } else if reason == Some("schedule") {
+            "locked (schedule)".to_string()
+        } else {
+            "locked".to_string()
+        };
+        let marker = if active { "*" } else { " " };
+        println!("{marker}{idx:>2}  {id_short:<8}  {status:<22}  {name}");
+        if locked && reason == Some("schedule") {
+            let rule = t
+                .get("schedule_rule")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?");
+            let tz = t.get("schedule_tz").and_then(serde_json::Value::as_str).unwrap_or("?");
+            println!("       └─ {rule}  [{tz}]");
+        }
+    }
+    0
+}
