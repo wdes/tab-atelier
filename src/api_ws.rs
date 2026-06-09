@@ -218,6 +218,13 @@ fn percent_decode(s: &str) -> String {
 /// JSON snapshot of the per-tab state the client cares about.
 /// Re-emitted as a `meta` frame whenever anything in here changes
 /// (or on first connect).
+///
+/// Deliberately excludes anything that mutates every tick — the
+/// frame goes out via the change-detection hash in `run_pump`, so
+/// including a monotonic counter (uptime, sequence id) would force
+/// a meta frame every 30 ms forever, defeating the
+/// only-on-change push model. If a future viewer needs uptime,
+/// expose it on a separate per-second tick channel.
 #[derive(serde::Serialize)]
 struct MetaSnapshot {
     name: String,
@@ -235,8 +242,6 @@ struct MetaSnapshot {
     outbox_count: usize,
     inbox_count: usize,
     build_hash: &'static str,
-    cwd: Option<String>,
-    uptime_secs: f64,
 }
 
 fn snapshot_meta(t: &SnapshotTab, authz: Authz) -> MetaSnapshot {
@@ -285,8 +290,6 @@ fn snapshot_meta(t: &SnapshotTab, authz: Authz) -> MetaSnapshot {
         outbox_count: dir_count("outbox"),
         inbox_count,
         build_hash: crate::api::BUILD_HASH,
-        cwd: t.cwd.clone(),
-        uptime_secs: t.uptime_secs,
     }
 }
 
