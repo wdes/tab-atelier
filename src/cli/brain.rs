@@ -157,6 +157,15 @@ pub const PATTERNS: &[Pattern] = &[
         label: "anthropic-529",
         action: "continue\n",
     },
+    // Anthropic-side rate limit ("not your usage limit" — server
+    // capacity throttling). Same shape as 529: retryable, the
+    // 60 s cooldown gives Anthropic time to recover before the
+    // next attempt.
+    Pattern {
+        needle: "Server is temporarily limiting requests",
+        label: "anthropic-rate-limited",
+        action: "continue\n",
+    },
 ];
 
 /// Searches the trailing window of `text` for a known failure pattern.
@@ -461,6 +470,20 @@ mod tests {
         // Looser match — any subprocess connection refused.
         let log = "[error] foo bar\nConnectionRefused\nbaz";
         assert!(scan_output(log).is_some());
+    }
+
+    #[test]
+    fn scan_matches_anthropic_rate_limited() {
+        // Canonical Claude Code output for Anthropic-side capacity
+        // throttling — distinct from per-user usage limits, which
+        // the user must fix themselves, hence the "(not your usage
+        // limit)" parenthetical the brain SHOULDN'T retry around.
+        // The needle matches only the server-side phrasing.
+        let log = "● API Error: Server is temporarily limiting requests \
+                   (not your usage limit) · Rate limited\n\
+                   ❯ continue";
+        let p = scan_output(log).expect("must match");
+        assert_eq!(p.label, "anthropic-rate-limited");
     }
 
     #[test]
