@@ -178,8 +178,24 @@
     // copy works even if a stray write between user click and clipboard
     // write would have cleared xterm.js's internal selection.
     let isSelecting = false;
-    termEl.addEventListener("mousedown", () => { isSelecting = true; });
-    document.addEventListener("mouseup", () => { isSelecting = false; });
+    termEl.addEventListener("mousedown", () => {
+      isSelecting = true;
+      document.body.classList.add("selecting");
+    });
+    document.addEventListener("mouseup", () => {
+      isSelecting = false;
+      document.body.classList.remove("selecting");
+    });
+    // Touch-driven selection on mobile uses long-press → drag in
+    // xterm.js. The browser fires touchstart immediately; we treat
+    // any touch ON the terminal as a potential selection so the
+    // overlay buttons stop overlapping the user's gesture.
+    termEl.addEventListener("touchstart", () => {
+      document.body.classList.add("selecting");
+    }, { passive: true });
+    const clearSelectingClass = () => document.body.classList.remove("selecting");
+    termEl.addEventListener("touchend", clearSelectingClass, { passive: true });
+    termEl.addEventListener("touchcancel", clearSelectingClass, { passive: true });
     if (term.onSelectionChange) {
       term.onSelectionChange(() => {
         document.body.classList.toggle("has-selection", term.hasSelection());
@@ -227,6 +243,157 @@
         }
         return true;
       });
+    }
+
+    // Persistent top-left keyboard toggle. The Android share-viewer
+    // and mobile web both need a deterministic way to bring the soft
+    // keyboard back after focus drifts (toolbar tap, drag, screen
+    // rotation, scroll). Focusing the term programmatically asks the
+    // browser to surface its IME.
+    const kbdToggle = document.getElementById("kbd-toggle");
+    if (kbdToggle) {
+      kbdToggle.addEventListener("click", (e) => {
+        e.stopPropagation();
+        term.focus();
+      });
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Mobile keyboard header — port of the Slint KeyboardHeader from
+    // android/ta-remote/ui/app.slint. Two rows of buttons (escape +
+    // arrows + nav) with an FN mode for F1-F12, plus sticky
+    // CTRL/ALT. Each press emits a `TAG_IN` WS frame via the same
+    // sendInputBytes path that `term.onData` uses.
+    //
+    // Only shows on touch devices AND only when the soft keyboard is
+    // up (Visual Viewport API tells us). On desktop the toolbar is
+    // never useful — Ctrl, ESC, arrows are on the real keyboard.
+    // ─────────────────────────────────────────────────────────────
+    const kbdHeader = document.getElementById("mobile-kbd-header");
+    const isTouchDevice = "ontouchstart" in window || (navigator.maxTouchPoints || 0) > 0;
+    if (kbdHeader && isTouchDevice) {
+      let ctrlSticky = false;
+      let altSticky = false;
+      let fnMode = false;
+
+      function sendKeyBytes(bytes) {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        // CTRL+printable maps to control codes (A→\x01, …, _→\x1f).
+        // Only honoured when bytes is a single printable char; ESC
+        // sequences / arrows already carry their own semantics.
+        let payload = bytes;
+        if (ctrlSticky && bytes.length === 1) {
+          const code = bytes.charCodeAt(0);
+          if (code >= 0x40 && code <= 0x7f) {
+            payload = String.fromCharCode(code & 0x1f);
+          }
+        }
+        if (altSticky && payload.length >= 1 && payload.charCodeAt(0) !== 0x1b) {
+          payload = "\x1b" + payload;
+        }
+        const enc = new TextEncoder().encode(payload);
+        try { ws.send(encodeFrame(0x01, enc)); } catch {}
+        if (ctrlSticky) { ctrlSticky = false; }
+        if (altSticky) { altSticky = false; }
+        renderKbdHeader();
+      }
+
+      // Each row entry: { label?, icon?, bytes?, type?, action? }
+      //   - bytes: send a raw byte string straight to the PTY
+      //   - type: "ctrl"/"alt"/"fn"/"kbd" — special sticky toggles
+      //   - label: text label (used if no icon)
+      //   - icon: emoji-ish glyph (used in priority over label)
+      const ROW_NORMAL_1 = [
+        { label: "ESC", bytes: "\x1b" },
+        { label: "/", bytes: "/" },
+        { label: "|", bytes: "|" },
+        { label: "-", bytes: "-" },
+        { label: "HOME", bytes: "\x1b[H" },
+        { icon: "↑", bytes: "\x1b[A" },
+        { label: "END", bytes: "\x1b[F" },
+        { label: "PG↑", bytes: "\x1b[5~" },
+        { label: "FN", type: "fn" },
+      ];
+      const ROW_NORMAL_2 = [
+        { label: "TAB", bytes: "\t" },
+        { label: "CTRL", type: "ctrl" },
+        { label: "ALT", type: "alt" },
+        { icon: "←", bytes: "\x1b[D" },
+        { icon: "↓", bytes: "\x1b[B" },
+        { icon: "→", bytes: "\x1b[C" },
+        { label: "PG↓", bytes: "\x1b[6~" },
+        { icon: "⌨", type: "kbd" },
+      ];
+      const ROW_FN_1 = [
+        { label: "F1", bytes: "\x1bOP", afterFnOff: true },
+        { label: "F2", bytes: "\x1bOQ", afterFnOff: true },
+        { label: "F3", bytes: "\x1bOR", afterFnOff: true },
+        { label: "F4", bytes: "\x1bOS", afterFnOff: true },
+        { label: "F5", bytes: "\x1b[15~", afterFnOff: true },
+        { label: "F6", bytes: "\x1b[17~", afterFnOff: true },
+        { label: "F7", bytes: "\x1b[18~", afterFnOff: true },
+      ];
+      const ROW_FN_2 = [
+        { label: "F8", bytes: "\x1b[19~", afterFnOff: true },
+        { label: "F9", bytes: "\x1b[20~", afterFnOff: true },
+        { label: "F10", bytes: "\x1b[21~", afterFnOff: true },
+        { label: "F11", bytes: "\x1b[23~", afterFnOff: true },
+        { label: "F12", bytes: "\x1b[24~", afterFnOff: true },
+        { icon: "←", type: "fn-exit" },
+      ];
+
+      function renderKbdHeader() {
+        const rows = fnMode ? [ROW_FN_1, ROW_FN_2] : [ROW_NORMAL_1, ROW_NORMAL_2];
+        kbdHeader.innerHTML = "";
+        for (const row of rows) {
+          const rowEl = document.createElement("div");
+          rowEl.className = "kbd-row";
+          for (const key of row) {
+            const btn = document.createElement("button");
+            btn.className = "kbd-key";
+            btn.type = "button";
+            btn.textContent = key.icon || key.label || "";
+            if (key.type === "ctrl" && ctrlSticky) btn.classList.add("sticky-on");
+            if (key.type === "alt" && altSticky) btn.classList.add("sticky-on");
+            if (key.type === "fn" && fnMode) btn.classList.add("sticky-on");
+            btn.addEventListener("touchstart", (e) => { e.preventDefault(); handleKey(key); }, { passive: false });
+            btn.addEventListener("click", (e) => { e.preventDefault(); handleKey(key); });
+            rowEl.appendChild(btn);
+          }
+          kbdHeader.appendChild(rowEl);
+        }
+      }
+
+      function handleKey(key) {
+        if (key.type === "ctrl") { ctrlSticky = !ctrlSticky; renderKbdHeader(); return; }
+        if (key.type === "alt") { altSticky = !altSticky; renderKbdHeader(); return; }
+        if (key.type === "fn") { fnMode = true; renderKbdHeader(); return; }
+        if (key.type === "fn-exit") { fnMode = false; renderKbdHeader(); return; }
+        if (key.type === "kbd") { term.focus(); return; }
+        if (typeof key.bytes === "string") {
+          sendKeyBytes(key.bytes);
+          if (key.afterFnOff) { fnMode = false; renderKbdHeader(); }
+        }
+      }
+
+      renderKbdHeader();
+
+      // Visual-viewport-driven soft-keyboard detection. When the IME
+      // opens, visualViewport.height shrinks below window.innerHeight.
+      // Threshold 150 px catches Android's split-keyboard mode too.
+      function updateKbdUp() {
+        if (!window.visualViewport) {
+          document.body.classList.add("kbd-up"); // fall back to always-show
+          return;
+        }
+        const collapsed = window.innerHeight - window.visualViewport.height;
+        document.body.classList.toggle("kbd-up", collapsed > 150);
+      }
+      updateKbdUp();
+      if (window.visualViewport) {
+        window.visualViewport.addEventListener("resize", updateKbdUp);
+        window.visualViewport.addEventListener("scroll", updateKbdUp);
+      }
     }
 
     // Pick an xterm.js font size so the server's full PTY grid fits

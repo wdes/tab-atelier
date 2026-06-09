@@ -77,6 +77,74 @@
     }
     body.has-selection #copy-btn { display: inline-block; }
     #copy-btn:hover { background: rgba(80, 200, 120, 0.32); }
+    /* Persistent keyboard toggle, top-left. Same visual weight as the
+       files-btn chips so the corner UI reads as a single set. */
+    #kbd-toggle {
+      position: fixed; top: 6px; left: 8px; z-index: 11;
+      font-size: 16px; line-height: 1;
+      padding: 4px 10px; border-radius: 10px;
+      background: rgba(120, 200, 255, 0.15); color: #aad8ff;
+      border: 1px solid rgba(120, 200, 255, 0.3);
+      cursor: pointer; pointer-events: auto;
+      font-family: ui-monospace, monospace;
+    }
+    #kbd-toggle:hover { background: rgba(120, 200, 255, 0.28); }
+    body.locked #kbd-toggle { top: 38px; }
+    /* Mobile keyboard toolbar. Pinned bottom; only rendered when
+       JS sets `body.kbd-up` (visual-viewport-detected IME). Sits ABOVE
+       the IME via env(safe-area-inset-bottom). */
+    #mobile-kbd-header {
+      display: none;
+      position: fixed; left: 0; right: 0;
+      bottom: 0;
+      background: #122b48;
+      padding: 4px;
+      padding-bottom: calc(4px + env(safe-area-inset-bottom));
+      z-index: 13;
+      box-shadow: 0 -2px 8px rgba(0, 0, 0, 0.4);
+      font-family: ui-monospace, monospace;
+    }
+    body.kbd-up #mobile-kbd-header { display: block; }
+    #mobile-kbd-header .kbd-row {
+      display: flex; gap: 4px;
+      margin: 2px 0;
+    }
+    #mobile-kbd-header .kbd-key {
+      flex: 1;
+      min-width: 0;
+      padding: 8px 2px;
+      border-radius: 6px;
+      background: #20364f;
+      color: #e0eaff;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      font: 12px ui-monospace, monospace;
+      text-align: center;
+      cursor: pointer;
+      user-select: none;
+      -webkit-user-select: none;
+      -webkit-tap-highlight-color: transparent;
+    }
+    #mobile-kbd-header .kbd-key:active { background: #2f4d72; }
+    #mobile-kbd-header .kbd-key.sticky-on {
+      background: #ffd764; color: #002451;
+      border-color: rgba(0, 0, 0, 0.25);
+    }
+    /* During a selection drag, hide EVERY floating button so the
+       user's gesture doesn't collide with a chip. Hide-everything;
+       once the gesture ends, has-selection takes over and only the
+       copy button comes back. */
+    body.selecting #copy-btn,
+    body.selecting #kbd-toggle,
+    body.selecting #files-controls,
+    body.selecting #update-chip,
+    body.selecting #mobile-kbd-header { display: none !important; }
+    /* Selection complete: keep the OTHER buttons hidden, only the
+       copy chip surfaces. That's the moment the user is about to
+       reach for one — don't crowd the screen. */
+    body.has-selection #kbd-toggle,
+    body.has-selection #files-controls,
+    body.has-selection #update-chip,
+    body.has-selection #mobile-kbd-header { display: none !important; }
     /* Locked banner takes the top 32 px AND #files-controls moves
        from 6 → 38 — so copy-btn goes 36 → 68 to clear them both. */
     body.locked #copy-btn { top: 68px; }

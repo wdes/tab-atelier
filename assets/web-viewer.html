@@ -34,6 +34,16 @@
        without depending on xterm.js's selection surviving the next
        term.write(), which the polling refresh otherwise nukes. -->
   <button id="copy-btn" title="Copy the highlighted text to clipboard">📋 Copy selection</button>
+  <!-- Persistent top-left keyboard toggle. On touch devices the soft
+       keyboard disappears whenever focus leaves the xterm.js helper
+       textarea (tap on the toolbar, swipe, screen rotation, …). This
+       button is the always-available way to ask for it back. On
+       desktop it's a hint to the user that the textarea is focusable. -->
+  <button id="kbd-toggle" title="Show / focus keyboard">⌨</button>
+  <!-- Mobile keyboard toolbar (rendered only when ontouchstart and an
+       IME is up). Ported from the Slint KeyboardHeader on the Android
+       ta-remote app so mobile web viewers get the same toolbar. -->
+  <div id="mobile-kbd-header" aria-hidden="true"></div>
   <div id="files-controls">
     <button id="outbox-btn" class="files-btn" title="Files agent has placed in outbox/ for download">⬇ outbox<span class="badge" id="outbox-badge">0</span></button>
     <button id="inbox-btn" class="files-btn" title="Files you've uploaded to inbox/ — drag the path into Claude">⬆ inbox<span class="badge" id="inbox-badge">0</span></button>
