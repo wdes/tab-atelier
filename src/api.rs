@@ -88,6 +88,22 @@ struct TabInfo {
     name: String,
     cwd: Option<String>,
     active: bool,
+    /// Effective lock state — true if either the user toggled the
+    /// padlock OR the schedule's current window is closed. Mirrors
+    /// `LockState::effective_locked`; CLI listers should source
+    /// from this field, not from the raw `locked` bit which only
+    /// reflects the manual toggle.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    locked: bool,
+    /// "manual" / "schedule" / null. Only populated when locked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lock_reason: Option<&'static str>,
+    /// OSM `opening_hours` rule on the tab, if a schedule is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    schedule_rule: Option<String>,
+    /// IANA timezone of the schedule rule.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    schedule_tz: Option<String>,
     /// Last non-empty line of the cached output buffer — used by remote clients
     /// to preview what's happening without fetching the full output.
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -1060,6 +1076,10 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                         crate::AgentState::Error => "error",
                     }),
                     agent_kind: t.agent_kind.clone(),
+                    locked: crate::schedule::LockState::effective_locked(t),
+                    lock_reason: crate::schedule::LockState::lock_reason(t),
+                    schedule_rule: t.schedule.as_ref().map(|s| s.rule.clone()),
+                    schedule_tz: t.schedule.as_ref().map(|s| s.tz.clone()),
                 })
                 .collect();
             #[cfg(feature = "energy")]

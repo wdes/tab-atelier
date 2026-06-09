@@ -220,6 +220,16 @@ pub enum Commands {
         #[arg(long, conflicts_with = "rule")]
         clear: bool,
     },
+
+    /// List tabs with their lock status (`open`, `locked (manual)`,
+    /// `locked (schedule)`) — quick read of the running headless's
+    /// state without poking through the JSON API by hand.
+    Tabs {
+        /// Dump the raw `/tabs` JSON instead of the formatted table —
+        /// for scripts that want to consume the full payload.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Returns true iff a subcommand was dispatched (caller should not
@@ -351,6 +361,10 @@ pub fn dispatch(cli: Cli) -> bool {
                 }
             }
             crate::cli::share_link::schedule(&args)
+        }
+        Commands::Tabs { json } => {
+            let args = if json { vec!["--json".to_string()] } else { vec![] };
+            crate::cli::share_link::tabs(&args)
         }
     };
     std::process::exit(code);
