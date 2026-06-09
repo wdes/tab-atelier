@@ -53,7 +53,7 @@
 //! frame so a misbehaving client surfaces the problem fast.
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
@@ -100,6 +100,19 @@ const TICK_MS: u64 = 30;
 const WS_MAX_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
 const WS_MAX_FRAME_BYTES: usize = 1024 * 1024;
 
+/// Dedup window for mobile-IME `compositionupdate` + `compositionend`
+/// duplicates. Android Gboard / iOS soft keyboards fire xterm.js's
+/// `onData` cumulatively as the user types (`"h"`, `"he"`,
+/// `"hel"`, …) then again on commit (`"hello"`) — every fire is a
+/// separate WS frame, so the server receives a prefix chain and
+/// the shell ends up with `"hhehelhellohello"` for one typed word.
+///
+/// WS itself orders frames correctly (TCP guarantee); the issue is
+/// semantic, not ordering — the IME genuinely emits redundant
+/// events that look identical-or-prefix to the previous send. We
+/// recognise the pattern in a 200 ms window per WS connection.
+const IME_DEDUP_WINDOW: Duration = Duration::from_millis(200);
+
 /// Identify whether the path is a WS upgrade endpoint we handle.
 /// Returns the tab UUID if so.
 #[must_use]
@@ -117,6 +130,65 @@ pub fn parse_ws_path(path: &str) -> Option<&str> {
 enum Authz {
     Rw,
     Ro,
+}
+
+/// Per-WS-connection state that recognises the mobile-IME
+/// compositionupdate + compositionend cumulative-prefix pattern.
+/// Compares each new `TAG_IN` payload against the previous one,
+/// within [`IME_DEDUP_WINDOW`]:
+///
+/// - single byte → always send (so fast desktop typing of `"aaa"`
+///   is three deliberate `a`s, not one)
+/// - exact match → drop (compositionend repeating what
+///   compositionupdate just sent)
+/// - proper prefix extension → send only the suffix (the IME
+///   extended the in-progress composition; we already typed the
+///   prefix into the PTY on the previous frame)
+/// - anything else → send as-is
+///
+/// Outside the window every frame goes through unchanged. The
+/// state lives on the `run_pump` stack so it's per-WS-connection,
+/// matching the per-tab-per-viewer scope of IME composition.
+struct ImeDedup {
+    last_bytes: Vec<u8>,
+    last_at: Option<Instant>,
+}
+
+impl ImeDedup {
+    const fn new() -> Self {
+        Self {
+            last_bytes: Vec::new(),
+            last_at: None,
+        }
+    }
+
+    /// Returns the bytes to actually inject into `pending_input`,
+    /// or `None` to drop the frame entirely.
+    fn classify(&mut self, bytes: &[u8]) -> Option<Vec<u8>> {
+        let now = Instant::now();
+        let fresh = self.last_at.is_none_or(|t| now.duration_since(t) >= IME_DEDUP_WINDOW);
+        if bytes.len() <= 1 || fresh {
+            self.last_bytes.clear();
+            self.last_bytes.extend_from_slice(bytes);
+            self.last_at = Some(now);
+            return Some(bytes.to_vec());
+        }
+        if !self.last_bytes.is_empty() && self.last_bytes.as_slice() == bytes {
+            self.last_at = Some(now);
+            return None;
+        }
+        if !self.last_bytes.is_empty() && bytes.starts_with(&self.last_bytes) {
+            let suffix = bytes[self.last_bytes.len()..].to_vec();
+            self.last_bytes.clear();
+            self.last_bytes.extend_from_slice(bytes);
+            self.last_at = Some(now);
+            return Some(suffix);
+        }
+        self.last_bytes.clear();
+        self.last_bytes.extend_from_slice(bytes);
+        self.last_at = Some(now);
+        Some(bytes.to_vec())
+    }
 }
 
 /// Resolve `(token, uuid)` to `(authorisation, ring)` in a SINGLE
@@ -366,6 +438,7 @@ async fn run_pump(
     // advance. since=0 ⇒ replay the entire ring on connect (viewer
     // bootstrap). since=N ⇒ resume from N (reconnect after a drop).
     let mut ring_offset: u64 = since;
+    let mut ime_dedup = ImeDedup::new();
 
     // Send the initial meta on connect and seed the hash so the
     // first tick after this doesn't re-emit the same payload.
@@ -424,7 +497,7 @@ async fn run_pump(
                 let Some(Ok(msg)) = msg else { return; };
                 match msg {
                     Message::Binary(b) => {
-                        if let Err(close) = handle_inbound(&b, authz, read_only_process, &state, &uuid) {
+                        if let Err(close) = handle_inbound(&b, authz, read_only_process, &state, &uuid, &mut ime_dedup) {
                             let _ = sink.send(Message::Close(Some(close))).await;
                             return;
                         }
@@ -457,6 +530,7 @@ fn handle_inbound(
     read_only_process: bool,
     state: &Arc<Mutex<TabSnapshot>>,
     uuid: &str,
+    ime_dedup: &mut ImeDedup,
 ) -> Result<(), CloseFrame> {
     let Some((&tag, payload)) = bytes.split_first() else {
         return Err(CloseFrame {
@@ -495,7 +569,16 @@ fn handle_inbound(
                     reason: "tab locked".into(),
                 });
             }
-            snap.pending_input.push((idx, payload.to_vec()));
+            // Recognise mobile-IME compositionupdate + commit
+            // duplicates BEFORE queueing into pending_input. None
+            // ⇒ the IME re-sent a payload we already injected;
+            // drop silently so the shell doesn't see the
+            // accumulated `"hhehelhellohello"` mess.
+            if let Some(effective) = ime_dedup.classify(payload)
+                && !effective.is_empty()
+            {
+                snap.pending_input.push((idx, effective));
+            }
         }
         TAG_RESIZE => {
             // {"cols":N,"rows":M} — the snapshot itself doesn't carry
@@ -592,5 +675,54 @@ mod tests {
     fn encode_frame_prepends_tag_byte() {
         let f = encode_frame(0x02, b"hello".to_vec());
         assert_eq!(f, b"\x02hello");
+    }
+
+    #[test]
+    fn ime_dedup_passes_single_byte_keystrokes() {
+        // Desktop fast typing of "aaa" must NOT get deduped — even
+        // though the bytes match, single-byte input is whitelisted.
+        let mut d = ImeDedup::new();
+        assert_eq!(d.classify(b"a"), Some(b"a".to_vec()));
+        assert_eq!(d.classify(b"a"), Some(b"a".to_vec()));
+        assert_eq!(d.classify(b"a"), Some(b"a".to_vec()));
+    }
+
+    #[test]
+    fn ime_dedup_drops_exact_multibyte_repeat() {
+        // compositionupdate("hello") + compositionend("hello") =
+        // two identical multi-byte frames within the window.
+        let mut d = ImeDedup::new();
+        assert_eq!(d.classify(b"hello"), Some(b"hello".to_vec()));
+        assert_eq!(d.classify(b"hello"), None);
+    }
+
+    #[test]
+    fn ime_dedup_extracts_suffix_on_prefix_extension() {
+        // The Android compose cascade — each frame is the cumulative
+        // composition. We already typed "he"; the next frame "hel"
+        // should only inject "l", not "hel".
+        let mut d = ImeDedup::new();
+        assert_eq!(d.classify(b"he"), Some(b"he".to_vec()));
+        assert_eq!(d.classify(b"hel"), Some(b"l".to_vec()));
+        assert_eq!(d.classify(b"hello"), Some(b"lo".to_vec()));
+    }
+
+    #[test]
+    fn ime_dedup_window_expires() {
+        // After the dedup window, even an exact match flows through —
+        // the user genuinely typed the same word twice.
+        let mut d = ImeDedup::new();
+        assert_eq!(d.classify(b"hello"), Some(b"hello".to_vec()));
+        // Force the timestamp to look stale.
+        d.last_at = Some(Instant::now() - Duration::from_millis(500));
+        assert_eq!(d.classify(b"hello"), Some(b"hello".to_vec()));
+    }
+
+    #[test]
+    fn ime_dedup_unrelated_multibyte_flows_through() {
+        // Two different words within the window — both must be sent.
+        let mut d = ImeDedup::new();
+        assert_eq!(d.classify(b"hello"), Some(b"hello".to_vec()));
+        assert_eq!(d.classify(b"world"), Some(b"world".to_vec()));
     }
 }
