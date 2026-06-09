@@ -30,7 +30,7 @@ use gpui::{
     App, AsyncApp, Bounds, ClipboardItem, ContentMask, Context, Corners, Edges, Element, ElementId, FocusHandle,
     Focusable, FontStyle, FontWeight, GlobalElementId, Hsla, InspectorElementId, InteractiveElement, IntoElement,
     KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement,
-    Pixels, Render, Rgba, ScrollWheelEvent, ShapedLine, Size, StrikethroughStyle, Style, Styled, TextRun,
+    Pixels, Render, Rgba, ScrollWheelEvent, ShapedLine, Size, StrikethroughStyle, Style, Styled, TextRun, TouchPhase,
     UnderlineStyle, WeakEntity, Window, div, fill, font, point, px, relative, size,
 };
 // Color / NamedColor are no longer referenced directly — the SGR emit
@@ -134,6 +134,22 @@ pub struct TerminalView {
     /// Survives PTY respawn — the same Arc threads into the next
     /// `PtyTap` so the user can scroll past the restart boundary.
     pty_ring: Arc<std::sync::Mutex<crate::pty_ring::PtyRing>>,
+}
+
+/// Encode a scroll-wheel gesture as the byte sequence a TUI listening
+/// in ALTERNATE_SCROLL mode (vim/less/htop on alt-screen) wants to see.
+/// One `\x1bOA` per line for scroll-back, one `\x1bOB` per line for
+/// scroll-forward — matches Zed's `alt_scroll()`.
+///
+/// Positive `lines` ⇒ user wants OLDER content ⇒ up-arrow.
+fn alt_scroll_bytes(lines: i32) -> Vec<u8> {
+    let cmd = if lines > 0 { b'A' } else { b'B' };
+    let n = lines.unsigned_abs() as usize;
+    let mut out = Vec::with_capacity(n * 3);
+    for _ in 0..n {
+        out.extend_from_slice(&[0x1b, b'O', cmd]);
+    }
+    out
 }
 
 fn pty_env(colors_enabled: bool) -> HashMap<String, String> {
@@ -766,11 +782,16 @@ impl Render for TerminalView {
                 if ks.modifiers.shift && !ks.modifiers.control {
                     match ks.key.as_str() {
                         "pageup" => {
-                            this.scroll(-(this.visible_lines() as i32));
+                            // Shift+PgUp ⇒ scroll back into history.
+                            // alacritty's `Scroll::Delta(+N)` increases
+                            // display_offset (= older content visible);
+                            // see the on_scroll_wheel port above.
+                            this.scroll(this.visible_lines() as i32);
                             return;
                         }
                         "pagedown" => {
-                            this.scroll(this.visible_lines() as i32);
+                            // Shift+PgDn ⇒ scroll toward newest content.
+                            this.scroll(-(this.visible_lines() as i32));
                             return;
                         }
                         "home" => {
@@ -809,18 +830,55 @@ impl Render for TerminalView {
                 }
             }))
             .on_scroll_wheel(cx.listener(move |this, ev: &ScrollWheelEvent, _window, cx| {
-                let line_h = this.cell_size.map_or(px(19.6), |c| c.height);
-                let multiplier = this.font_config.scroll_sensitivity;
-                let delta_px = ev.delta.pixel_delta(line_h);
-                let old_offset = (this.scroll_acc.get() / f32::from(line_h)) as i32;
-                let acc = this.scroll_acc.get() + f32::from(delta_px.y) * multiplier;
-                let new_offset = (acc / f32::from(line_h)) as i32;
-                let total_h = f32::from(line_h) * 100.0;
-                this.scroll_acc.set(acc % total_h);
-                let lines = new_offset - old_offset;
-                if lines != 0 {
-                    this.scroll(-lines);
-                    cx.notify();
+                // Ported from Zed's `terminal::scroll_wheel` +
+                // `determine_scroll_lines`. Three things our previous
+                // implementation got wrong:
+                //
+                // 1. We negated `lines` before calling `Scroll::Delta`,
+                //    so the sign convention was inverted relative to
+                //    alacritty's (positive = scroll back into history).
+                //    Dropped — pass the raw delta through, same as Zed.
+                //
+                // 2. We never reset `scroll_acc` on TouchPhase::Started,
+                //    so the float carried over between gestures and the
+                //    first scroll after a direction change felt sticky.
+                //    Now: reset on Started, ignore Ended, work on Moved.
+                //
+                // 3. We always scrolled the LOCAL viewport. When a TUI
+                //    (less, vim, htop) opted into alt-screen with
+                //    ALTERNATE_SCROLL set, the user expected wheel
+                //    events to scroll the TUI's own buffer — Zed
+                //    translates the wheel into `\x1bOA` / `\x1bOB`
+                //    (up / down arrows) and ships them to the PTY so
+                //    the TUI reacts. Now we do the same.
+                match ev.touch_phase {
+                    TouchPhase::Started => {
+                        this.scroll_acc.set(0.0);
+                    }
+                    TouchPhase::Moved => {
+                        let line_h = this.cell_size.map_or(px(19.6), |c| c.height);
+                        let multiplier = this.font_config.scroll_sensitivity;
+                        let delta_px = ev.delta.pixel_delta(line_h);
+                        let old_offset = (this.scroll_acc.get() / f32::from(line_h)) as i32;
+                        let acc = this.scroll_acc.get() + f32::from(delta_px.y) * multiplier;
+                        let new_offset = (acc / f32::from(line_h)) as i32;
+                        let total_h = f32::from(line_h) * 100.0;
+                        this.scroll_acc.set(acc % total_h);
+                        let lines = new_offset - old_offset;
+                        if lines == 0 {
+                            return;
+                        }
+                        let mode = this.term.lock().mode();
+                        let alt_scroll =
+                            mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL) && !ev.modifiers.shift;
+                        if alt_scroll {
+                            this.send_input(alt_scroll_bytes(lines));
+                        } else {
+                            this.scroll(lines);
+                        }
+                        cx.notify();
+                    }
+                    TouchPhase::Ended => {}
                 }
             }))
             .on_mouse_down(
