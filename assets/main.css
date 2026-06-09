@@ -39,6 +39,27 @@
     }
     body.update-available #update-chip { display: inline-block; }
     #update-chip:hover { background: rgba(255, 215, 100, 0.3); }
+    /* Copy-selection button — surfaces while the user has text
+       highlighted in the terminal. xterm.js clears its selection on
+       term.write(), and the 80 ms /stream poll calls term.write()
+       constantly, so the native Ctrl+C window is unreliable. This
+       button lifts the selection out via term.getSelection() at
+       click time, so the buffer survives even if a poll lands
+       between mousedown and the user's ⌘C. */
+    #copy-btn {
+      display: none;
+      position: fixed; top: 8px; right: 8px;
+      padding: 6px 12px; border-radius: 6px;
+      font: 12px ui-monospace, monospace;
+      background: rgba(80, 200, 120, 0.18); color: #84d196;
+      border: 1px solid rgba(132, 209, 150, 0.5);
+      cursor: pointer; z-index: 12;
+    }
+    body.has-selection #copy-btn { display: inline-block; }
+    #copy-btn:hover { background: rgba(80, 200, 120, 0.32); }
+    /* Bump it down when the locked banner is showing so the two
+       don't visually overlap. */
+    body.locked #copy-btn { top: 40px; }
     /* Drag-and-drop overlay — translucent layer that appears when
        the user drags a file over the page. RO viewers skip the
        handler attachment entirely so the overlay never appears
