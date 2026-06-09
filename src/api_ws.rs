@@ -714,7 +714,11 @@ mod tests {
         let mut d = ImeDedup::new();
         assert_eq!(d.classify(b"hello"), Some(b"hello".to_vec()));
         // Force the timestamp to look stale.
-        d.last_at = Some(Instant::now() - Duration::from_millis(500));
+        d.last_at = Some(
+            Instant::now()
+                .checked_sub(Duration::from_millis(500))
+                .expect("monotonic clock just stepped backwards 500 ms during a test"),
+        );
         assert_eq!(d.classify(b"hello"), Some(b"hello".to_vec()));
     }
 
