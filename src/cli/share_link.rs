@@ -463,6 +463,11 @@ pub fn ports(args: &[String]) -> i32 {
     let mut clear_share_url = false;
     let mut new_cols: Option<u16> = None;
     let mut new_rows: Option<u16> = None;
+    let mut new_tls_cert: Option<String> = None;
+    let mut new_tls_key: Option<String> = None;
+    let mut new_tls_client_ca: Option<String> = None;
+    let mut clear_tls_cert = false;
+    let mut clear_tls_client_ca = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -515,15 +520,54 @@ pub fn ports(args: &[String]) -> i32 {
                     return 2;
                 }
             }
+            // User-supplied TLS cert + key. Use the empty string (or
+            // `clear` keyword) to remove both at once and fall back to
+            // the self-signed cert.
+            "--tls-cert" => {
+                i += 1;
+                let v = args.get(i).cloned().unwrap_or_default();
+                if v.is_empty() || v.eq_ignore_ascii_case("clear") {
+                    clear_tls_cert = true;
+                } else {
+                    new_tls_cert = Some(v);
+                }
+            }
+            "--tls-key" => {
+                i += 1;
+                let v = args.get(i).cloned().unwrap_or_default();
+                if v.is_empty() || v.eq_ignore_ascii_case("clear") {
+                    clear_tls_cert = true;
+                } else {
+                    new_tls_key = Some(v);
+                }
+            }
+            // Cloudflare Authenticated Origin Pulls: require clients
+            // to present a cert signed by this CA bundle (typically
+            // `https://developers.cloudflare.com/ssl/static/authenticated_origin_pull_ca.pem`).
+            "--tls-client-ca" => {
+                i += 1;
+                let v = args.get(i).cloned().unwrap_or_default();
+                if v.is_empty() || v.eq_ignore_ascii_case("clear") {
+                    clear_tls_client_ca = true;
+                } else {
+                    new_tls_client_ca = Some(v);
+                }
+            }
             "--help" | "-h" => {
                 eprintln!(
                     "usage: tab-atelier-headless settings [--api-addr ADDR] [--api-tls-addr ADDR] \
                      [--share-url-base URL]\n\
-                     \x20            [--pty-cols N] [--pty-rows N]\n\
+                     \x20            [--pty-cols N] [--pty-rows N] [--bg-color #RRGGBB]\n\
+                     \x20            [--tls-cert PATH] [--tls-key PATH] [--tls-client-ca PATH]\n\
                      With no args, prints the current values.\n\
-                     Set --share-url-base \"\" to clear.\n\
+                     Set --share-url-base / --tls-cert / --tls-key / --tls-client-ca to \
+                     \"\" (or `clear`) to remove.\n\
                      PTY dims apply on next spawn (restart the daemon \
-                     to resize existing tabs)."
+                     to resize existing tabs).\n\
+                     TLS cert + key paths must both be set together; the daemon falls \
+                     back to the self-signed cert otherwise.\n\
+                     --tls-client-ca enables Cloudflare Authenticated Origin Pulls: \
+                     every request must present a client cert signed by that CA."
                 );
                 return 0;
             }
@@ -573,6 +617,11 @@ pub fn ports(args: &[String]) -> i32 {
         && new_rows.is_none()
         && new_bg.is_none()
         && !new_bg_clear
+        && new_tls_cert.is_none()
+        && new_tls_key.is_none()
+        && new_tls_client_ca.is_none()
+        && !clear_tls_cert
+        && !clear_tls_client_ca
     {
         // Read-only mode — print whatever's in the file (or defaults).
         let api = doc
@@ -599,12 +648,27 @@ pub fn ports(args: &[String]) -> i32 {
             .get("tab_bg_color")
             .and_then(serde_json::Value::as_str)
             .map_or_else(|| format!("{} (default)", crate::DEFAULT_TAB_BG_COLOR), str::to_owned);
-        println!("api_addr       = {api}");
-        println!("api_tls_addr   = {tls}");
-        println!("share_url_base = {share}");
-        println!("pty_cols           = {cols}");
-        println!("pty_rows           = {rows}");
-        println!("tab_bg_color       = {bg}");
+        let tls_cert = doc
+            .get("api_tls_cert_path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("(self-signed)");
+        let tls_key = doc
+            .get("api_tls_key_path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("(self-signed)");
+        let tls_client_ca = doc
+            .get("api_tls_client_ca_path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("(none — mTLS off)");
+        println!("api_addr            = {api}");
+        println!("api_tls_addr        = {tls}");
+        println!("share_url_base      = {share}");
+        println!("pty_cols            = {cols}");
+        println!("pty_rows            = {rows}");
+        println!("tab_bg_color        = {bg}");
+        println!("api_tls_cert_path   = {tls_cert}");
+        println!("api_tls_key_path    = {tls_key}");
+        println!("api_tls_client_ca   = {tls_client_ca}");
         println!("(preferences file: {})", path.display());
         return 0;
     }
@@ -633,6 +697,22 @@ pub fn ports(args: &[String]) -> i32 {
     }
     if new_bg_clear {
         obj.remove("tab_bg_color");
+    }
+    if let Some(p) = new_tls_cert {
+        obj.insert("api_tls_cert_path".into(), serde_json::Value::String(p));
+    }
+    if let Some(p) = new_tls_key {
+        obj.insert("api_tls_key_path".into(), serde_json::Value::String(p));
+    }
+    if let Some(p) = new_tls_client_ca {
+        obj.insert("api_tls_client_ca_path".into(), serde_json::Value::String(p));
+    }
+    if clear_tls_cert {
+        obj.remove("api_tls_cert_path");
+        obj.remove("api_tls_key_path");
+    }
+    if clear_tls_client_ca {
+        obj.remove("api_tls_client_ca_path");
     }
 
     if let Some(parent) = path.parent()

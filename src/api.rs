@@ -2509,11 +2509,31 @@ pub fn start_api_server(state: Arc<Mutex<TabSnapshot>>, token: String, read_only
 /// TLS listener — ALPN advertises `h2` and `http/1.1`, so modern
 /// browsers negotiate HTTP/2 and we get multiplexing + persistent
 /// connection for free over the share-link viewer.
-pub fn start_api_server_tls(state: Arc<Mutex<TabSnapshot>>, token: String, read_only: bool, bind: String) {
+///
+/// `external_cert` is `Some((cert_path, key_path))` to serve a user-
+/// supplied PEM cert + key (Cloudflare Origin, Let's Encrypt copy,
+/// etc.) instead of the self-signed `tls.crt` in the state dir. Both
+/// paths must be set; a half-configured pair is rejected at the call
+/// site (in headless.rs / app.rs).
+// `external_cert` + `client_ca` take owned `PathBuf`s rather than refs
+// so the caller can fire-and-forget (this function spawns its own
+// thread).
+#[allow(clippy::needless_pass_by_value)]
+pub fn start_api_server_tls(
+    state: Arc<Mutex<TabSnapshot>>,
+    token: String,
+    read_only: bool,
+    bind: String,
+    external_cert: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    client_ca: Option<std::path::PathBuf>,
+) {
     use rustls::ServerConfig;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use rustls::server::WebPkiClientVerifier;
 
-    let (cert_der, key_der) = match load_or_generate_cert() {
+    let ext_refs: Option<(&std::path::Path, &std::path::Path)> =
+        external_cert.as_ref().map(|(c, k)| (c.as_path(), k.as_path()));
+    let (cert_chain_der, key_der) = match load_or_generate_cert(ext_refs) {
         Ok(pair) => pair,
         Err(e) => {
             error!("API/TLS: cert provisioning failed: {e}");
@@ -2521,8 +2541,36 @@ pub fn start_api_server_tls(state: Arc<Mutex<TabSnapshot>>, token: String, read_
         }
     };
 
-    let mut cfg = match ServerConfig::builder().with_no_client_auth().with_single_cert(
-        vec![CertificateDer::from(cert_der)],
+    let cert_chain: Vec<CertificateDer<'static>> = cert_chain_der.into_iter().map(CertificateDer::from).collect();
+
+    // Optional mutual-TLS: require a client cert chained to a PEM
+    // bundle of trusted CAs. Used to lock the TLS endpoint behind
+    // Cloudflare's Authenticated Origin Pull cert, so the origin
+    // only accepts traffic that arrived via CF.
+    let client_verifier = match &client_ca {
+        Some(path) => match load_client_ca(path) {
+            Ok(roots) => match WebPkiClientVerifier::builder(Arc::new(roots)).build() {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    error!("API/TLS: client-CA verifier build failed: {e}");
+                    return;
+                }
+            },
+            Err(e) => {
+                error!("API/TLS: load client CA {}: {e}", path.display());
+                return;
+            }
+        },
+        None => None,
+    };
+    let builder = ServerConfig::builder();
+    let builder = if let Some(v) = client_verifier {
+        builder.with_client_cert_verifier(v)
+    } else {
+        builder.with_no_client_auth()
+    };
+    let mut cfg = match builder.with_single_cert(
+        cert_chain,
         PrivateKeyDer::try_from(key_der)
             .map_err(std::string::ToString::to_string)
             .unwrap(),
@@ -2650,7 +2698,73 @@ fn cert_needs_renewal(crt_path: &std::path::Path) -> bool {
     not_after - now < renewal_window
 }
 
-fn load_or_generate_cert() -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+/// Parse a PEM bundle of CA certificates into a `RootCertStore` for
+/// client-cert verification (mTLS / Cloudflare Authenticated Origin
+/// Pulls). Each `-----BEGIN CERTIFICATE-----` block in the file is
+/// added as a trust anchor.
+fn load_client_ca(path: &std::path::Path) -> std::io::Result<rustls::RootCertStore> {
+    let bytes = std::fs::read(path)?;
+    let mut roots = rustls::RootCertStore::empty();
+    let mut added = 0usize;
+    for der in rustls_pemfile::certs(&mut bytes.as_slice()).filter_map(Result::ok) {
+        if roots.add(der).is_ok() {
+            added += 1;
+        }
+    }
+    if added == 0 {
+        return Err(std::io::Error::other(format!(
+            "no CA cert added from {} (file empty or all certs rejected)",
+            path.display()
+        )));
+    }
+    info!("API/TLS: loaded {added} client-CA root(s) from {}", path.display());
+    Ok(roots)
+}
+
+/// Load a user-supplied PEM cert + key pair (e.g. a Cloudflare
+/// Origin certificate). Multi-cert PEM files are loaded as a chain
+/// (leaf first, then intermediate(s)) so clients without the issuing
+/// CA in their trust store can still build a path. Renewal is the
+/// operator's responsibility — we never modify these files.
+fn load_external_cert(
+    crt_path: &std::path::Path,
+    key_path: &std::path::Path,
+) -> std::io::Result<(Vec<Vec<u8>>, Vec<u8>)> {
+    let crt_pem = std::fs::read(crt_path)
+        .map_err(|e| std::io::Error::other(format!("read TLS cert {}: {e}", crt_path.display())))?;
+    let key_pem = std::fs::read(key_path)
+        .map_err(|e| std::io::Error::other(format!("read TLS key {}: {e}", key_path.display())))?;
+    let chain: Vec<Vec<u8>> = rustls_pemfile::certs(&mut crt_pem.as_slice())
+        .filter_map(Result::ok)
+        .map(|c| c.to_vec())
+        .collect();
+    if chain.is_empty() {
+        return Err(std::io::Error::other(format!(
+            "no PEM CERTIFICATE block in {}",
+            crt_path.display()
+        )));
+    }
+    let key_der = rustls_pemfile::private_key(&mut key_pem.as_slice())
+        .map_err(|e| std::io::Error::other(format!("parse TLS key {}: {e}", key_path.display())))?
+        .ok_or_else(|| std::io::Error::other(format!("no PEM PRIVATE KEY block in {}", key_path.display())))?
+        .secret_der()
+        .to_vec();
+    Ok((chain, key_der))
+}
+
+/// Returns the chain (leaf first) + key. Falls back to a self-signed
+/// cert in the state dir when `external` is `None`.
+fn load_or_generate_cert(
+    external: Option<(&std::path::Path, &std::path::Path)>,
+) -> std::io::Result<(Vec<Vec<u8>>, Vec<u8>)> {
+    if let Some((crt, key)) = external {
+        info!(
+            "API/TLS: loading user-supplied cert {} + key {}",
+            crt.display(),
+            key.display()
+        );
+        return load_external_cert(crt, key);
+    }
     let dir = crate::platform::state_base_dir().join(crate::APP_DIR);
     std::fs::create_dir_all(&dir)?;
     let crt_path = dir.join("tls.crt");
@@ -2668,7 +2782,7 @@ fn load_or_generate_cert() -> std::io::Result<(Vec<u8>, Vec<u8>)> {
             .ok_or_else(|| std::io::Error::other("no key in tls.key"))?
             .secret_der()
             .to_vec();
-        return Ok((cert_der, key_der));
+        return Ok((vec![cert_der], key_der));
     }
     if crt_path.exists() {
         info!(
@@ -2714,7 +2828,7 @@ fn load_or_generate_cert() -> std::io::Result<(Vec<u8>, Vec<u8>)> {
     write_private_file(&key_path, key_pem.as_bytes())?;
     let cert_der = cert.der().to_vec();
     let key_der = key_pair.serialize_der();
-    Ok((cert_der, key_der))
+    Ok((vec![cert_der], key_der))
 }
 
 #[cfg(test)]

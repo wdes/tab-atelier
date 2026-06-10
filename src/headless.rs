@@ -493,6 +493,18 @@ pub fn run() -> std::io::Result<()> {
     let api_token = api::load_or_generate_token();
     let api_addr = prefs.api_addr.unwrap_or_else(|| DEFAULT_API_ADDR.into());
     let api_tls_addr = prefs.api_tls_addr.unwrap_or_else(|| DEFAULT_API_TLS_ADDR.into());
+    // User-supplied TLS cert + key (Cloudflare Origin etc). Both
+    // must be set; a half-configured pair falls back to self-signed
+    // with a startup warning so the operator notices the misconfig.
+    let api_tls_external = match (prefs.api_tls_cert_path, prefs.api_tls_key_path) {
+        (Some(c), Some(k)) => Some((std::path::PathBuf::from(c), std::path::PathBuf::from(k))),
+        (Some(_), None) | (None, Some(_)) => {
+            log::warn!("API/TLS: api_tls_cert_path and api_tls_key_path must both be set; using self-signed");
+            None
+        }
+        (None, None) => None,
+    };
+    let api_tls_client_ca: Option<std::path::PathBuf> = prefs.api_tls_client_ca_path.map(std::path::PathBuf::from);
     // PTY dims used by every spawn_pty_tab call below. Headless has
     // no display so the dims stay constant for the process lifetime;
     // override via `tab-atelier-headless ports --pty-cols N
@@ -640,7 +652,14 @@ pub fn run() -> std::io::Result<()> {
     }));
     info!("API server starting on {api_addr} (TLS {api_tls_addr})");
     api::start_api_server(api_state.clone(), api_token.clone(), read_only, api_addr);
-    api::start_api_server_tls(api_state.clone(), api_token.clone(), read_only, api_tls_addr);
+    api::start_api_server_tls(
+        api_state.clone(),
+        api_token.clone(),
+        read_only,
+        api_tls_addr,
+        api_tls_external,
+        api_tls_client_ca,
+    );
 
     #[cfg(feature = "energy")]
     let power_pids: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));

@@ -646,6 +646,19 @@ impl AppState {
         // exported into each PTY's env; reuse them here.
         let api_addr = api_addr_resolved;
         let api_tls_addr = prefs.api_tls_addr.unwrap_or_else(|| crate::DEFAULT_API_TLS_ADDR.into());
+        // User-supplied TLS cert + key (Cloudflare Origin etc.). Both
+        // paths must be present; a half-configured pair falls back to
+        // self-signed with a warning so the operator notices.
+        let api_tls_external = match (prefs.api_tls_cert_path.clone(), prefs.api_tls_key_path.clone()) {
+            (Some(c), Some(k)) => Some((std::path::PathBuf::from(c), std::path::PathBuf::from(k))),
+            (Some(_), None) | (None, Some(_)) => {
+                log::warn!("API/TLS: api_tls_cert_path and api_tls_key_path must both be set; using self-signed");
+                None
+            }
+            (None, None) => None,
+        };
+        let api_tls_client_ca: Option<std::path::PathBuf> =
+            prefs.api_tls_client_ca_path.clone().map(std::path::PathBuf::from);
         let share_url_base = prefs.share_url_base.unwrap_or_default();
         let tab_bg_global = prefs.tab_bg_color;
         let remote_endpoints = prefs.remote_endpoints;
@@ -676,6 +689,8 @@ impl AppState {
             api_token.clone(),
             api_read_only,
             api_tls_addr.clone(),
+            api_tls_external,
+            api_tls_client_ca,
         );
 
         #[cfg(feature = "energy")]
@@ -3434,6 +3449,15 @@ impl AppState {
                                                         code_editor: editor,
                                                         api_addr: Some(this.api_addr.clone()),
                                                         api_tls_addr: Some(this.api_tls_addr.clone()),
+                                                        // Same "advanced field, not in the GUI dialog"
+                                                        // treatment as pty_cols / clear_env: the dialog
+                                                        // doesn't surface a cert/key picker, so leaving
+                                                        // these at None on save would silently wipe the
+                                                        // operator's Cloudflare Origin cert path. The
+                                                        // GUI never edits them.
+                                                        api_tls_cert_path: None,
+                                                        api_tls_key_path: None,
+                                                        api_tls_client_ca_path: None,
                                                         share_url_base,
                                                         remote_endpoints: this.remote_endpoints.clone(),
                                                         // Headless-only fields the GUI never edits;
