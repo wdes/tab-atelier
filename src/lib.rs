@@ -648,16 +648,38 @@ pub fn config_state_path(config_base: &std::path::Path) -> PathBuf {
 /// CRC32 (IEEE) — small inline implementation; used to disambiguate tab
 /// names whose sanitized form would otherwise collide (e.g. `foo/bar` and
 /// `foo_bar` both sanitize to `foo_bar`).
+/// CRC32 lookup table (IEEE polynomial, reflected). Built once on
+/// first use. A table-driven CRC is ~8x fewer inner operations than
+/// the bit-by-bit form and this runs on every API response `ETag`,
+/// every `/output` poll, and every persist tick.
+static CRC32_TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
+
+fn crc32_table() -> &'static [u32; 256] {
+    CRC32_TABLE.get_or_init(|| {
+        const POLY: u32 = 0xEDB8_8320;
+        let mut table = [0u32; 256];
+        let mut n = 0usize;
+        while n < 256 {
+            let mut c = n as u32;
+            let mut k = 0;
+            while k < 8 {
+                let mask = (c & 1).wrapping_neg();
+                c = (c >> 1) ^ (POLY & mask);
+                k += 1;
+            }
+            table[n] = c;
+            n += 1;
+        }
+        table
+    })
+}
+
 #[must_use]
 pub fn crc32(data: &[u8]) -> u32 {
-    const POLY: u32 = 0xEDB8_8320;
+    let table = crc32_table();
     let mut crc: u32 = !0;
     for &b in data {
-        crc ^= u32::from(b);
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (POLY & mask);
-        }
+        crc = (crc >> 8) ^ table[((crc ^ u32::from(b)) & 0xff) as usize];
     }
     !crc
 }
@@ -782,9 +804,31 @@ pub fn load_state_from(base: &std::path::Path) -> Option<SavedState> {
     load_state_at(&state_path(base))
 }
 
+/// Hard cap on the size of a state JSON file we'll read into memory.
+/// `tabs.json` is metadata for a handful of tabs — a few KB in
+/// practice. A multi-GB file (corruption, or a hostile local write)
+/// must not be slurped whole and OOM the daemon at startup.
+const MAX_STATE_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Read a state file, refusing anything larger than
+/// [`MAX_STATE_FILE_BYTES`] without reading it into memory.
+fn read_state_file_capped(path: &std::path::Path) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    if meta.len() > MAX_STATE_FILE_BYTES {
+        log::warn!(
+            "state file {} is {} bytes (> {} cap) — refusing to load",
+            path.display(),
+            meta.len(),
+            MAX_STATE_FILE_BYTES
+        );
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
+}
+
 #[must_use]
 pub fn load_state_at(path: &std::path::Path) -> Option<SavedState> {
-    if let Ok(data) = std::fs::read_to_string(path)
+    if let Some(data) = read_state_file_capped(path)
         && let Ok(state) = serde_json::from_str::<SavedState>(&data)
     {
         return Some(state);
@@ -792,7 +836,7 @@ pub fn load_state_at(path: &std::path::Path) -> Option<SavedState> {
     // Primary file missing or corrupt — try rotated backups, newest first.
     for ext in ["bak", "bak.1", "bak.2"] {
         let alt = path.with_extension(format!("json.{ext}"));
-        if let Ok(data) = std::fs::read_to_string(&alt)
+        if let Some(data) = read_state_file_capped(&alt)
             && let Ok(state) = serde_json::from_str::<SavedState>(&data)
         {
             log::warn!("loaded state from backup {}", alt.display());
@@ -1068,7 +1112,18 @@ pub struct RemoteEndpoint {
 }
 
 pub const DEFAULT_API_PORT: u16 = 7890;
-pub const DEFAULT_API_ADDR: &str = "0.0.0.0:7890";
+/// Plaintext HTTP API bind — loopback-only by default.
+///
+/// It carries the master bearer token in clear and is what in-tab
+/// tools reach via `http://127.0.0.1:7890`. Binding it to `0.0.0.0`
+/// would let anyone on the LAN sniff/replay the token, so LAN exposure
+/// must be an explicit opt-in via preferences. The TLS listener below
+/// is the supported way to reach the API from another host (e.g. the
+/// mobile remote).
+pub const DEFAULT_API_ADDR: &str = "127.0.0.1:7890";
+/// TLS API bind. Stays on all interfaces so the mobile remote / share
+/// links keep working over the LAN, but the traffic is encrypted and
+/// the token never crosses the wire in clear.
 pub const DEFAULT_API_TLS_ADDR: &str = "0.0.0.0:7891";
 
 /// System-wide preferences file shipped by the .deb as a dpkg conffile.
@@ -1757,6 +1812,17 @@ fn write_atomic_with_rotation<T: serde::Serialize>(
 
     let tmp = path.with_extension("json.tmp");
     let Ok(mut f) = std::fs::File::create(&tmp) else { return };
+    // State files (tabs.json, preferences.json) carry bearer secrets
+    // (per-tab share tokens, relay tokens). Restrict to owner-only
+    // BEFORE writing the body so the secrets never exist on disk
+    // world-readable, even briefly. The final file inherits these
+    // perms through the rename, and each `.bak*` rotation is a rename
+    // of an already-0600 file, so the backups are protected too.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
     if f.write_all(data.as_bytes()).is_err() || f.sync_all().is_err() {
         let _ = std::fs::remove_file(&tmp);
         return;
@@ -2040,6 +2106,33 @@ mod tests {
         }
     }
 
+    /// Reference reflected bit-by-bit CRC32 used to cross-check the
+    /// table path in `crc32_matches_known_vector_and_is_stable`. Hoisted
+    /// out of the test body so clippy's `items_after_statements` lint
+    /// stays clean.
+    fn bitwise_crc32(data: &[u8]) -> u32 {
+        const POLY: u32 = 0xEDB8_8320;
+        let mut crc: u32 = !0;
+        for &b in data {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (POLY & mask);
+            }
+        }
+        !crc
+    }
+
+    #[test]
+    fn crc32_matches_known_vector_and_is_stable() {
+        // IEEE CRC32 of "123456789" is the canonical check value.
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+        assert_eq!(crc32(b""), 0);
+        for sample in [b"".as_slice(), b"a", b"hello world", b"\x00\xff\x10tab", &[0u8; 257]] {
+            assert_eq!(crc32(sample), bitwise_crc32(sample), "mismatch for {sample:?}");
+        }
+    }
+
     #[test]
     fn minimal_pty_env_uses_dumb_term_without_colors() {
         let env = minimal_pty_env(
@@ -2121,6 +2214,26 @@ mod tests {
         );
         // We must NOT re-enable the survey for OTEL collectors.
         assert!(!env.contains_key("CLAUDE_CODE_ENABLE_FEEDBACK_SURVEY_FOR_OTEL"));
+    }
+
+    #[test]
+    fn load_state_at_rejects_oversized_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tabs.json");
+        let big = vec![b' '; (MAX_STATE_FILE_BYTES + 1) as usize];
+        std::fs::write(&path, &big).unwrap();
+        assert!(load_state_at(&path).is_none(), "oversized state file must be refused");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_with_rotation_sets_owner_only_perms() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.json");
+        write_atomic_with_rotation(dir.path(), &path, &serde_json::json!({"token": "abc"}), false);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "state file must be owner-only, got {mode:o}");
     }
 
     #[test]

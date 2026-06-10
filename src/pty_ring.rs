@@ -160,7 +160,21 @@ impl PtyRing {
         }
         let start = offset.max(self.base_offset);
         let skip = (start - self.base_offset) as usize;
-        self.bytes.iter().copied().skip(skip).collect()
+        // Seek directly to `skip` via the deque's two contiguous
+        // slices instead of `iter().skip(skip)`, which walks every
+        // skipped byte one at a time. In steady state the WS pump polls
+        // ~33x/s with `skip` near the end of a multi-MB ring, so the
+        // old form re-scanned the whole buffer on every tick. This is
+        // O(result) rather than O(buffer).
+        let (head, tail) = self.bytes.as_slices();
+        let mut out = Vec::with_capacity(self.bytes.len() - skip);
+        if skip < head.len() {
+            out.extend_from_slice(&head[skip..]);
+            out.extend_from_slice(tail);
+        } else {
+            out.extend_from_slice(&tail[skip - head.len()..]);
+        }
+        out
     }
 }
 

@@ -76,19 +76,19 @@ pub fn process_alive(pid: u32) -> bool {
 
 // --- Random ---
 
+/// Fill `buf` with cryptographically-secure random bytes from the OS.
+///
+/// This backs the API master token and per-tab share tokens, so a
+/// failure to obtain real randomness MUST be fatal — the previous
+/// behaviour silently fell back to a `SystemTime`-nanos seed tiled
+/// across the buffer, which an attacker who can estimate the host
+/// clock could brute-force. A predictable token is worse than a crash:
+/// crash loudly instead of minting a guessable secret.
 pub fn random_bytes(buf: &mut [u8]) {
     use std::io::Read;
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        let _ = f.read_exact(buf);
-    } else {
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        for (i, b) in seed.to_le_bytes().iter().cycle().take(buf.len()).enumerate() {
-            buf[i] = *b;
-        }
-    }
+    let mut f = std::fs::File::open("/dev/urandom").expect("open /dev/urandom for secure token generation");
+    f.read_exact(buf)
+        .expect("read /dev/urandom for secure token generation");
 }
 
 // --- Screenshot (X11) ---
