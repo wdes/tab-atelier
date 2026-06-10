@@ -22,6 +22,27 @@ use alacritty_terminal::term::cell::Flags as CellFlags;
 use std::fmt::Write;
 use vte::ansi::{Color, NamedColor};
 
+/// Grid-derived snapshot fields, memoised between API-snapshot
+/// refreshes and keyed by the PTY ring's monotonic `total_len`.
+///
+/// Both the GUI (`app.rs`) and headless (`headless.rs`) persist paths
+/// scanned the alacritty grid (`ansi_text_with_cursor(200)` +
+/// 2000-row `raw_screen_text`) for every tab on every tick. Because
+/// every byte that can change the grid flows through the PTY ring
+/// first, a `ring_len` equal to the cached one means the grid is
+/// byte-for-byte unchanged and the prior scan can be reused, so idle
+/// tabs stop paying for the full-grid walk each tick.
+#[derive(Clone)]
+pub struct GridSnapshotCache {
+    pub ring_len: u64,
+    pub output: String,
+    pub cursor: Option<(usize, usize)>,
+    pub raw_output: String,
+    pub raw_cursor: Option<(usize, usize)>,
+    pub cols: u16,
+    pub rows: u16,
+}
+
 /// Minimal `Dimensions` impl for constructing a `Term`.
 ///
 /// Both the GUI and headless tab spawners use the same

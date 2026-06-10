@@ -130,6 +130,14 @@ struct Tab {
     /// PTY, then clears this. Set in `insert_tab` from the
     /// restored `agent_kind` / `agent_session_id` pair.
     pending_agent_resume: Option<String>,
+    /// Memoised grid-derived snapshot fields, keyed by the PTY ring's
+    /// `total_len`. `persist()` rebuilt the API snapshot for every tab
+    /// every 2 s, and the grid scans (`ansi_text_with_cursor(200)` +
+    /// 2000-row `raw_screen_text`) dominate that cost. Since all grid
+    /// changes arrive as PTY bytes through the ring, an unchanged
+    /// `total_len` means the previous scan is still valid. `None` until
+    /// the first scan.
+    snap_cache: Option<crate::term_export::GridSnapshotCache>,
 }
 
 impl crate::schedule::LockState for Tab {
@@ -164,6 +172,10 @@ impl Tab {
     fn flush_pending_restore(&mut self, cx: &mut gpui::App) {
         if let Some(out) = self.pending_restore.take() {
             self.view.read(cx).restore_output(&out);
+            // restore_output feeds the parser directly (not through the
+            // PTY ring), so the ring's total_len doesn't move — drop the
+            // snapshot cache so the next persist re-scans the restored grid.
+            self.snap_cache = None;
         }
     }
 
@@ -470,6 +482,7 @@ impl AppState {
                         bg_color: None,
                         last_pushed_locked: None,
                         pending_agent_resume: None,
+                        snap_cache: None,
                     });
                 }
                 let active = saved.active.min(tabs.len() - 1);
@@ -514,6 +527,7 @@ impl AppState {
                         bg_color: None,
                         last_pushed_locked: None,
                         pending_agent_resume: None,
+                        snap_cache: None,
                     }],
                     0,
                     false,
@@ -775,6 +789,7 @@ impl AppState {
                 bg_color: None,
                 last_pushed_locked: None,
                 pending_agent_resume: None,
+                snap_cache: None,
             },
         );
         self.active = idx;
@@ -906,48 +921,66 @@ impl AppState {
                 }
             })
             .collect();
-        let api_tabs: Vec<api::SnapshotTab> = self
-            .tabs
-            .iter()
-            .zip(tabs.iter())
-            .map(|(tab, ts)| {
-                let view = tab.view.read(cx);
-                // 200 lines for the joined `output` (logical lines —
-                // the mobile remote word-wraps them, more is wasted
-                // bandwidth on a phone screen). 2000 for `raw_output`
-                // so xterm.js's scrollback has actual history to
-                // browse through instead of just the visible viewport.
+        let mut api_tabs: Vec<api::SnapshotTab> = Vec::with_capacity(self.tabs.len());
+        for (tab, ts) in self.tabs.iter_mut().zip(tabs.iter()) {
+            let view = tab.view.read(cx);
+            let shell_pid = view.pid();
+            let pty_ring = view.pty_ring();
+            // Dirtiness key: bytes ever written through the PTY ring.
+            // Unchanged ⇒ the grid is byte-identical, so skip the scans.
+            let ring_len = pty_ring.lock().map(|r| r.total_len()).unwrap_or(0);
+            // 200 lines for the joined `output` (logical lines — the
+            // mobile remote word-wraps them, more is wasted bandwidth on
+            // a phone screen). 2000 for `raw_output` so xterm.js's
+            // scrollback has actual history to browse through.
+            let fresh = if tab.snap_cache.as_ref().is_none_or(|c| c.ring_len != ring_len) {
                 let (output, cursor) = view.ansi_text_with_cursor(Some(200));
                 let (raw_output, raw_cursor) = view.raw_screen_text(Some(2000));
                 let (cols, rows) = view.dims();
-                api::SnapshotTab {
-                    id: tab.id.clone(),
-                    name: ts.name.clone(),
-                    cwd: ts.cwd.clone(),
-                    // Cache 200 lines so remote clients can request scrollback.
-                    // ANSI escapes are kept so the mobile remote can render
-                    // colours instead of the previous flat-grey text.
+                Some(crate::term_export::GridSnapshotCache {
+                    ring_len,
                     output,
+                    cursor,
                     raw_output,
                     raw_cursor,
-                    uptime_secs: tab.uptime().as_secs_f64(),
-                    cursor,
                     cols,
                     rows,
-                    share_token_rw: ts.share_token_rw.clone(),
-                    share_token_ro: ts.share_token_ro.clone(),
-                    locked: ts.locked,
-                    schedule: ts.schedule.clone(),
-                    bg_color: crate::effective_tab_bg(tab.bg_color.as_deref(), self.tab_bg_global.as_deref())
-                        .to_string(),
-                    shell_pid: view.pid(),
-                    agent_state: tab.agent_state.clone(),
-                    agent_session_id: tab.agent_session_id.clone(),
-                    agent_kind: tab.agent_kind.clone(),
-                    pty_ring: Some(view.pty_ring()),
-                }
-            })
-            .collect();
+                })
+            } else {
+                None
+            };
+            // No further use of `view` past here, so the borrow of
+            // `tab.view` ends and we can mutate `tab.snap_cache`.
+            if let Some(c) = fresh {
+                tab.snap_cache = Some(c);
+            }
+            let grid = tab.snap_cache.as_ref().expect("snap_cache populated above").clone();
+            let bg_color = crate::effective_tab_bg(tab.bg_color.as_deref(), self.tab_bg_global.as_deref()).to_string();
+            api_tabs.push(api::SnapshotTab {
+                id: tab.id.clone(),
+                name: ts.name.clone(),
+                cwd: ts.cwd.clone(),
+                // ANSI escapes are kept so the mobile remote can render
+                // colours instead of the previous flat-grey text.
+                output: grid.output,
+                raw_output: grid.raw_output,
+                raw_cursor: grid.raw_cursor,
+                uptime_secs: tab.uptime().as_secs_f64(),
+                cursor: grid.cursor,
+                cols: grid.cols,
+                rows: grid.rows,
+                share_token_rw: ts.share_token_rw.clone(),
+                share_token_ro: ts.share_token_ro.clone(),
+                locked: ts.locked,
+                schedule: ts.schedule.clone(),
+                bg_color,
+                shell_pid,
+                agent_state: tab.agent_state.clone(),
+                agent_session_id: tab.agent_session_id.clone(),
+                agent_kind: tab.agent_kind.clone(),
+                pty_ring: Some(pty_ring),
+            });
+        }
 
         let read_only = crate::read_only();
         let saved = SavedState {
