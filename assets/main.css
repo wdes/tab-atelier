@@ -33,6 +33,26 @@
     body.locked #locked-banner { display: block; }
     body.locked { padding-top: 32px; box-sizing: border-box; }
     body.locked #term { outline: 1px solid #cc1f1a; }
+    /* WS-closed banner — same prominence as the locked banner so the
+       user immediately sees "your typing isn't reaching the server"
+       instead of squinting at the bottom-right status text. The same
+       hide rule that the locked-banner uses applies here. */
+    #ws-state-banner {
+      display: none;
+      position: fixed; top: 0; left: 0; right: 0;
+      background: #b8860b; color: #fff;
+      text-align: center; font-weight: bold; font-size: 13px;
+      padding: 6px 8px; letter-spacing: 1px;
+      box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+      z-index: 10;
+    }
+    body.ws-down #ws-state-banner { display: block; }
+    body.ws-down { padding-top: 32px; box-sizing: border-box; }
+    body.ws-down #term { outline: 1px solid #b8860b; }
+    /* If both banners apply (locked AND ws closed), stack them. The
+       locked banner takes priority visually (already at top). */
+    body.locked.ws-down #ws-state-banner { top: 32px; }
+    body.locked.ws-down { padding-top: 64px; }
     /* Hide the inbox button when the viewer was loaded with a
        read-only share token. Selector wired up by JS on boot. */
     /* Update-available chip. Surfaces when the server's X-Boot-Id

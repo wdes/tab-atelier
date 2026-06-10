@@ -917,6 +917,7 @@
       ws.onopen = () => {
         reconnectAttempt = 0;
         status.textContent = `${TAB_NAME} · connected`;
+        document.body.classList.remove("ws-down");
       };
       ws.onmessage = (ev) => {
         if (!(ev.data instanceof ArrayBuffer)) return; // ignore text frames
@@ -942,14 +943,28 @@
       };
       ws.onclose = (ev) => {
         ws = null;
+        document.body.classList.add("ws-down");
+        const banner = document.getElementById("ws-state-banner");
         if (ev.code === 1008) {
-          // Policy violation — RO sent a write, or tab locked, or
-          // process is --read-only. Don't auto-reconnect into the
-          // same wall, surface the reason instead.
-          status.textContent = `closed · ${ev.reason || "policy violation"}`;
+          // Policy violation — RO sent a write, the tab was locked
+          // mid-session, or the process is --read-only. The lock
+          // could be transient (a schedule transition), so we retry
+          // with capped backoff instead of giving up entirely. The
+          // server will simply close us again every reconnect while
+          // the policy holds — that's cheap, and it means a tab
+          // that unlocks (schedule reopens, user toggled padlock
+          // off) recovers automatically without a page refresh.
+          const reason = ev.reason || "policy violation";
+          status.textContent = `closed · ${reason} · retrying`;
+          if (banner) banner.textContent = `🔒 ${reason.toUpperCase()} — retrying every 30 s`;
+          // Retry every 30 s — slow because the most common cause
+          // is a still-active lock, and we don't want to flood the
+          // server.
+          reconnectTimer = setTimeout(connect, 30000);
           return;
         }
         status.textContent = `offline · reconnecting…`;
+        if (banner) banner.textContent = "⚠ DISCONNECTED — INPUT NOT REACHING SERVER";
         scheduleReconnect();
       };
     }
