@@ -3591,10 +3591,7 @@ mod tests {
         // so `../../` climbs to `<prefix>/`; `/tabs/by-id/<uuid>/view`
         // needs one more hop (`../../../`).
         let (port, _state, token) = spawn_server();
-        for (req_path, want_prefix) in [
-            ("/tabs/0/view", "../../"),
-            ("/tabs/by-id/tab-a/view", "../../../"),
-        ] {
+        for (req_path, want_prefix) in [("/tabs/0/view", "../../"), ("/tabs/by-id/tab-a/view", "../../../")] {
             let raw = request_bytes(
                 port,
                 &format!("GET {req_path} HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
