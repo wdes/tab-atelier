@@ -26,6 +26,11 @@
      without needing template substitution at request time. -->
 <body style="--tab-bg: __TAB_BG__">
   <div id="locked-banner">🔒 TAB LOCKED — INPUT DISABLED</div>
+  <!-- Shown when the WS connection is closed (server-side policy
+       refusal OR network drop). Without it the only signal that
+       typing is going nowhere is a small bottom-right "offline"
+       status text, which is easy to miss. -->
+  <div id="ws-state-banner">⚠ DISCONNECTED — INPUT NOT REACHING SERVER</div>
   <div id="term"></div>
   <div id="status">connecting…</div>
   <div id="update-chip" title="The server was upgraded — click to reload this viewer">↻ update available</div>
