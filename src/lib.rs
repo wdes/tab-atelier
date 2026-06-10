@@ -58,6 +58,38 @@ pub fn read_only() -> bool {
     READ_ONLY.load(Ordering::SeqCst)
 }
 
+/// When set, every tab's PTY is spawned in a *cleared* environment.
+///
+/// PHP-FPM `clear_env = yes` style: the shell carries only the curated
+/// minimal allowlist — see [`minimal_pty_env`]. Off by default, because
+/// clearing drops `DISPLAY` / `DBUS_SESSION_BUS_ADDRESS` /
+/// `SSH_AUTH_SOCK` / … which GUI apps and ssh-agent need, so it's opt-in
+/// via the `clear_env` preference. Set once at startup, like [`READ_ONLY`].
+pub static CLEAR_ENV: AtomicBool = AtomicBool::new(false);
+
+#[must_use]
+pub fn clear_env() -> bool {
+    CLEAR_ENV.load(Ordering::SeqCst)
+}
+
+/// User-defined `key=value` pairs from the `clear_env_vars` preference,
+/// layered into every cleared-env tab (see [`minimal_pty_env`]). Set
+/// once at startup; reads after that are lock-free. Empty until set.
+static CLEAR_ENV_USER_VARS: OnceLock<std::collections::BTreeMap<String, String>> = OnceLock::new();
+
+/// Install the user's `clear_env_vars` for this process. No-op if called
+/// twice (first set wins) — startup is the only caller.
+pub fn set_clear_env_user_vars(vars: std::collections::BTreeMap<String, String>) {
+    let _ = CLEAR_ENV_USER_VARS.set(vars);
+}
+
+/// The user's `clear_env_vars`, or an empty map if none were set.
+#[must_use]
+pub fn clear_env_user_vars() -> &'static std::collections::BTreeMap<String, String> {
+    static EMPTY: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    CLEAR_ENV_USER_VARS.get().unwrap_or(&EMPTY)
+}
+
 /// Kept alive for the lifetime of the process so the file lock isn't
 /// released until the process exits.
 static INSTANCE_LOCK: OnceLock<std::fs::File> = OnceLock::new();
@@ -108,6 +140,132 @@ pub fn apply_telemetry_disable_env<S: std::hash::BuildHasher>(env: &mut std::col
     for (k, v) in TELEMETRY_DISABLE_ENV {
         env.insert((*k).to_string(), (*v).to_string());
     }
+}
+
+/// Parent-environment variables carried over into a cleared-env tab.
+///
+/// Everything NOT on this list is dropped (the `clear_env` opt-in,
+/// modelled on PHP-FPM's `clear_env = yes`). Categories:
+///
+/// - **Path:** `PATH` — without it the shell can't find any command.
+/// - **Identity / username:** `HOME`, `USER`, `LOGNAME`.
+/// - **Shell:** `SHELL`.
+/// - **Locale (UTF-8 rendering / sorting):** `LANG`, `LANGUAGE`,
+///   `LC_ALL`, `LC_CTYPE`.
+/// - **Timezone:** `TZ`.
+///
+/// Colours (`TERM` / `COLORTERM`) are NOT sourced from the parent —
+/// they're set from the tab's own colours flag in [`minimal_pty_env`],
+/// same as the normal (non-cleared) spawn path. Sensitive / session
+/// vars (`DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`, `SSH_AUTH_SOCK`,
+/// `XAUTHORITY`, `AWS_*`, `*_TOKEN`, …) are deliberately absent — that
+/// omission is the whole point of the feature.
+pub const CLEAR_ENV_KEEP: &[&str] = &[
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "TZ",
+];
+
+/// Fallback `PATH` when the parent process has none — an empty `PATH`
+/// in a cleared environment leaves the shell unable to resolve even
+/// `ls`, so seed a conventional system default.
+pub const CLEAR_ENV_DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// Build the *complete* minimal environment for a cleared-env tab.
+///
+/// Layers, lowest priority first: the [`CLEAR_ENV_KEEP`] allowlist
+/// sourced from the current process, colour vars (from `colors_enabled`),
+/// then the user's settings-file `clear_env_vars` (which win over those
+/// basics), then the telemetry opt-out, then `extra_env` (the per-tab
+/// API vars). This is the only environment the shell will see —
+/// nothing is inherited.
+#[must_use]
+pub fn minimal_pty_env<S: std::hash::BuildHasher>(
+    colors_enabled: bool,
+    user_env: &std::collections::BTreeMap<String, String>,
+    extra_env: &std::collections::HashMap<String, String, S>,
+) -> std::collections::HashMap<String, String> {
+    let mut env = std::collections::HashMap::new();
+    // 1. Kept system basics from the parent process.
+    for &key in CLEAR_ENV_KEEP {
+        if let Ok(val) = std::env::var(key)
+            && !val.is_empty()
+        {
+            env.insert(key.to_string(), val);
+        }
+    }
+    env.entry("PATH".to_string())
+        .or_insert_with(|| CLEAR_ENV_DEFAULT_PATH.to_string());
+    // 2. Colours: identical policy to the inheriting `pty_env` path.
+    if colors_enabled {
+        env.insert("TERM".to_string(), "xterm-256color".to_string());
+        env.insert("COLORTERM".to_string(), "truecolor".to_string());
+    } else {
+        env.insert("TERM".to_string(), "dumb".to_string());
+    }
+    // 3. Telemetry opt-out (tab-atelier privacy default).
+    apply_telemetry_disable_env(&mut env);
+    // 4. User-defined vars from the settings file — these WIN over the
+    //    kept basics, colours and telemetry above ("if user has the same
+    //    key, user wins").
+    for (k, v) in user_env {
+        env.insert(k.clone(), v.clone());
+    }
+    // 5. Per-tab API vars (`_TAB_ID`, `TAB_ATELIER_API_*`). Applied last
+    //    so the in-tab tooling keeps working — these are functional, not
+    //    a user preference, and aren't meant to be overridden.
+    for (k, v) in extra_env {
+        env.insert(k.clone(), v.clone());
+    }
+    env
+}
+
+/// Absolute path to `env(1)` used to launch a cleared-env shell. Fixed
+/// absolute path (not PATH-resolved) so spawning doesn't depend on the
+/// parent `PATH` and can't be shadowed.
+pub const ENV_BIN: &str = "/usr/bin/env";
+
+/// Build the `(program, args)` to spawn `shell` in a *cleared*
+/// environment containing only `env`.
+///
+/// alacritty's `tty` always inherits the parent environment and only
+/// overlays `Options.env` (it exposes no env-clear), so the portable
+/// way to truly start from empty is to exec `env -i K=V … <shell>`:
+/// `env -i` ignores its own inherited environment and runs the shell
+/// with exactly the listed variables. The caller sets this as
+/// `Options.shell` and leaves `Options.env` empty.
+///
+/// `login` appends `-l` so the shell sources the profile files (the GUI
+/// wants this); the headless daemon passes `false` because a login
+/// shell sources `/etc/profile` / `~/.profile` which fail noisily for
+/// the service account that has no profile under `ProtectHome=true`.
+#[must_use]
+pub fn clear_env_shell_command<S: std::hash::BuildHasher>(
+    shell: &str,
+    login: bool,
+    env: &std::collections::HashMap<String, String, S>,
+) -> (String, Vec<String>) {
+    let mut args: Vec<String> = Vec::with_capacity(env.len() + 3);
+    args.push("-i".to_string());
+    for (k, v) in env {
+        args.push(format!("{k}={v}"));
+    }
+    args.push(shell.to_string());
+    if login {
+        args.push("-l".to_string());
+    }
+    (ENV_BIN.to_string(), args)
+}
+
+/// The login shell to run inside a cleared-env tab.
+///
+/// Read from `$SHELL` (the only place the parent's choice survives once
+/// we clear), falling back to `/bin/bash`. Returned as an absolute path
+/// candidate so `env -i` can exec it without a `PATH` lookup.
+#[must_use]
+pub fn clear_env_shell_path() -> String {
+    std::env::var("SHELL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/bin/bash".to_string())
 }
 
 /// Build the value handed to in-tab tools as `TAB_ATELIER_API_URL`.
@@ -856,6 +1014,28 @@ pub struct Preferences {
     /// `"default_tab_limits": {"memory_max": "1G", "tasks_max": 512}`.
     #[serde(default, skip_serializing_if = "TabResourceLimits::is_empty")]
     pub default_tab_limits: TabResourceLimits,
+
+    /// Spawn every tab's shell in a cleared environment (PHP-FPM
+    /// `clear_env = yes` style): only the curated [`minimal_pty_env`]
+    /// allowlist (PATH, HOME, USER/LOGNAME, SHELL, locale, TZ, colours,
+    /// the tab API vars and the telemetry opt-out) reaches the shell;
+    /// everything else from the desktop session — `DISPLAY`,
+    /// `DBUS_SESSION_BUS_ADDRESS`, `SSH_AUTH_SOCK`, `*_TOKEN`, … — is
+    /// dropped. Off by default; opt in when you want tabs isolated from
+    /// the launching environment. `None`/absent ⇒ `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clear_env: Option<bool>,
+
+    /// User-defined `key=value` pairs injected into every tab when
+    /// `clear_env` is on. Layered on top of the kept system basics and
+    /// colours, and **win on key conflicts** (set `PATH`, `EDITOR`,
+    /// `LANG`, … to your own values here). The per-tab API vars and the
+    /// telemetry opt-out are applied after these and stay fixed. Ignored
+    /// when `clear_env` is off (the tab inherits the full parent env
+    /// then). Example in `preferences.json`:
+    /// `"clear_env_vars": {"EDITOR": "vim", "PATH": "/opt/bin:/usr/bin"}`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub clear_env_vars: std::collections::BTreeMap<String, String>,
 }
 
 /// One persisted remote `tab-atelier-headless` instance the desktop
@@ -1815,6 +1995,96 @@ mod tests {
             .cpu_max_line()
             .is_none()
         );
+    }
+
+    #[test]
+    fn minimal_pty_env_keeps_essentials_and_drops_session_vars() {
+        // `std::env::set_var` is unsafe (denied), so this reads the
+        // ambient env and asserts on the curated allowlist instead.
+        let mut extra = std::collections::HashMap::new();
+        extra.insert("_TAB_ID".to_string(), "abc-123".to_string());
+        let env = minimal_pty_env(true, &std::collections::BTreeMap::new(), &extra);
+
+        // PATH is always present (allowlisted, or the default fallback).
+        assert!(env.get("PATH").is_some_and(|p| !p.is_empty()), "PATH must be set");
+        // Colours come from the flag, not the parent.
+        assert_eq!(env.get("TERM").map(String::as_str), Some("xterm-256color"));
+        assert_eq!(env.get("COLORTERM").map(String::as_str), Some("truecolor"));
+        // Telemetry opt-out is folded in.
+        assert_eq!(env.get("DO_NOT_TRACK").map(String::as_str), Some("1"));
+        // Per-tab extras pass through.
+        assert_eq!(env.get("_TAB_ID").map(String::as_str), Some("abc-123"));
+        // Session / sensitive vars are NEVER carried over (the point of
+        // the feature) — they're not on CLEAR_ENV_KEEP, so even if the
+        // test host has them set they must be absent here.
+        for leaky in [
+            "DISPLAY",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "SSH_AUTH_SOCK",
+            "XAUTHORITY",
+            "AWS_SECRET_ACCESS_KEY",
+        ] {
+            assert!(!env.contains_key(leaky), "{leaky} must not leak into a cleared-env tab");
+        }
+    }
+
+    #[test]
+    fn minimal_pty_env_uses_dumb_term_without_colors() {
+        let env = minimal_pty_env(
+            false,
+            &std::collections::BTreeMap::new(),
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(env.get("TERM").map(String::as_str), Some("dumb"));
+        assert!(
+            !env.contains_key("COLORTERM"),
+            "no truecolor advertised when colours are off"
+        );
+    }
+
+    #[test]
+    fn minimal_pty_env_user_vars_win_over_basics() {
+        // User settings override the kept basics and colours, but NOT
+        // the per-tab API extras (those are applied last, functional).
+        let mut user = std::collections::BTreeMap::new();
+        user.insert("PATH".to_string(), "/opt/custom/bin".to_string());
+        user.insert("TERM".to_string(), "screen-256color".to_string());
+        user.insert("EDITOR".to_string(), "hx".to_string());
+        let mut extra = std::collections::HashMap::new();
+        extra.insert("_TAB_ID".to_string(), "tab-9".to_string());
+        let env = minimal_pty_env(true, &user, &extra);
+        // User wins over the basics/colours.
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/opt/custom/bin"));
+        assert_eq!(env.get("TERM").map(String::as_str), Some("screen-256color"));
+        // Brand-new user var lands.
+        assert_eq!(env.get("EDITOR").map(String::as_str), Some("hx"));
+        // Functional per-tab var is not clobbered by user settings.
+        assert_eq!(env.get("_TAB_ID").map(String::as_str), Some("tab-9"));
+    }
+
+    #[test]
+    fn clear_env_shell_command_is_env_dash_i_login_shell() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("PATH".to_string(), "/usr/bin".to_string());
+        env.insert("HOME".to_string(), "/home/u".to_string());
+        let (prog, args) = clear_env_shell_command("/bin/zsh", true, &env);
+        assert_eq!(prog, "/usr/bin/env");
+        assert_eq!(
+            args.first().map(String::as_str),
+            Some("-i"),
+            "must clear the environment"
+        );
+        assert!(args.iter().any(|a| a == "PATH=/usr/bin"));
+        assert!(args.iter().any(|a| a == "HOME=/home/u"));
+        // login=true ⇒ shell + `-l` are the final two args, so `env`
+        // execs `/bin/zsh -l`.
+        let n = args.len();
+        assert_eq!(args[n - 2], "/bin/zsh");
+        assert_eq!(args[n - 1], "-l");
+        // login=false ⇒ the shell is the last arg, no `-l`.
+        let (_, args_no_login) = clear_env_shell_command("/bin/sh", false, &env);
+        assert_eq!(args_no_login.last().map(String::as_str), Some("/bin/sh"));
+        assert!(!args_no_login.iter().any(|a| a == "-l"));
     }
 
     #[test]
