@@ -442,6 +442,7 @@ impl AppState {
                         bg_color: ts.bg_color.clone(),
                         last_pushed_locked: None,
                         pending_agent_resume,
+                        snap_cache: None,
                     });
                 }
                 if tabs.is_empty() {
