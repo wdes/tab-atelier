@@ -1015,6 +1015,37 @@ pub struct Preferences {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_tls_addr: Option<String>,
 
+    /// Path to a user-supplied TLS certificate (PEM). When set
+    /// **with** `api_tls_key_path` the daemon serves this cert
+    /// instead of generating a self-signed one — the typical case
+    /// is a Cloudflare Origin certificate (`origin.pem`) put behind
+    /// a Cloudflare Tunnel / Origin Pull. Multi-cert PEMs (leaf +
+    /// intermediate) are loaded as a chain so clients that don't
+    /// trust the issuing CA can still build a path. Renewal is the
+    /// operator's responsibility — we never touch a file we don't
+    /// own. Leave unset (or unpaired with the key) to fall back to
+    /// the self-signed `tls.crt` in the state dir.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_tls_cert_path: Option<String>,
+
+    /// Path to the matching PEM private key for `api_tls_cert_path`.
+    /// Either both keys are set or neither — a half-configured pair
+    /// is treated as "not configured" and the daemon falls back to
+    /// the self-signed cert with a startup warning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_tls_key_path: Option<String>,
+
+    /// Path to a PEM bundle of CA certs to authenticate INCOMING
+    /// client certificates against (mutual TLS). When set, every TLS
+    /// request must present a client cert that chains to one of
+    /// these CAs — typically the Cloudflare Authenticated Origin Pull
+    /// root from
+    /// `https://developers.cloudflare.com/ssl/static/authenticated_origin_pull_ca.pem`,
+    /// so the origin only accepts traffic that came through CF.
+    /// Unset ⇒ no client-cert check (the default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_tls_client_ca_path: Option<String>,
+
     /// Default terminal background color (hex `#RRGGBB`). Applied
     /// in the share-link xterm.js viewer; per-tab override lives on
     /// `TabState::bg_color` and wins when set. None ⇒ falls back to
