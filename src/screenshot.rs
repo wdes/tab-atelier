@@ -31,7 +31,18 @@ fn write_bmp(path: &std::path::Path, width: u16, height: u16, bgra: &[u8]) -> Re
     let pixel_data_size = row_padded * h;
     let file_size = 54 + pixel_data_size;
 
-    let mut f = std::fs::File::create(path).map_err(|e| format!("create {}: {e}", path.display()))?;
+    // The screenshot path is predictable (`tab-atelier-<name>-<unix
+    // secs>.bmp`), so a local attacker could pre-plant a symlink there
+    // pointing at a victim-writable file and have the next capture
+    // truncate it. Drop any pre-existing entry (incl. a symlink) and
+    // create exclusively (`O_EXCL`), which refuses to create through a
+    // symlink — so the write can't be redirected.
+    let _ = std::fs::remove_file(path);
+    let mut f = std::fs::File::options()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| format!("create {}: {e}", path.display()))?;
 
     // BMP header
     f.write_all(b"BM").map_err(|e| e.to_string())?;
