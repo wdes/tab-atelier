@@ -1257,6 +1257,18 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             } else {
                 key_raw.to_string()
             };
+            // Relative hop from the viewer document back to the mount
+            // root so `<prefix>/assets/...` references resolve under any
+            // reverse-proxy prefix (the proxy strips the prefix before
+            // the request reaches us, so absolute `/assets/...` URLs
+            // bypass it and 404). The document lives at
+            // `<prefix>/tabs/{key}/view`; its directory is
+            // `<prefix>/tabs/{key}/`, so one `../` per path segment in
+            // `tabs/{key}` climbs back to `<prefix>/`:
+            //   - `/tabs/0/view`            → `../../`
+            //   - `/tabs/by-id/<uuid>/view` → `../../../`
+            let asset_depth = 1 + key_for_html.split('/').filter(|s| !s.is_empty()).count();
+            let asset_prefix = "../".repeat(asset_depth);
             // The tab name lands in two distinct contexts: inside
             // <title> (HTML-escape) and inside a JS string literal
             // (JSON-encode — handles quotes, backslashes, newlines,
@@ -1283,6 +1295,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 crate::DEFAULT_TAB_BG_COLOR
             };
             let html = VIEWER_HTML
+                .replace("__ASSET_PREFIX__", &asset_prefix)
                 .replace("__TAB_KEY__", &key_for_html)
                 .replace("__TAB_NAME_HTML__", &html_name)
                 .replace("__TAB_NAME_JS__", js_name)
@@ -3563,6 +3576,69 @@ mod tests {
         assert!(
             body.contains(&js_url),
             "main.js cache-buster missing — looked for {js_url:?}"
+        );
+    }
+
+    #[test]
+    fn view_asset_refs_are_relative_to_mount_prefix() {
+        // Regression: assets were referenced with absolute `/assets/...`
+        // URLs, which bypass any reverse-proxy mount prefix (the proxy
+        // strips the prefix before the request reaches us) and 404 the
+        // viewer's CSS/JS. They must be server-rendered as a relative
+        // hop back to the mount root instead.
+        //
+        // Document `/tabs/0/view` lives in directory `<prefix>/tabs/0/`,
+        // so `../../` climbs to `<prefix>/`; `/tabs/by-id/<uuid>/view`
+        // needs one more hop (`../../../`).
+        let (port, _state, token) = spawn_server();
+        for (req_path, want_prefix) in [
+            ("/tabs/0/view", "../../"),
+            ("/tabs/by-id/tab-a/view", "../../../"),
+        ] {
+            let raw = request_bytes(
+                port,
+                &format!("GET {req_path} HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+            );
+            let (h, b) = split_response(&raw);
+            assert!(h.starts_with("HTTP/1.1 200"), "{req_path} got: {h}");
+            let body = String::from_utf8_lossy(&b);
+            assert!(
+                !body.contains("__ASSET_PREFIX__"),
+                "{req_path}: asset-prefix placeholder left unsubstituted"
+            );
+            // Every asset reference must carry the relative prefix.
+            for asset in [
+                "assets/xterm-6.0.0.css",
+                "assets/main.css?version=",
+                "assets/xterm-6.0.0.js",
+                "assets/main.js?version=",
+            ] {
+                let want = format!("{want_prefix}{asset}");
+                assert!(body.contains(&want), "{req_path}: missing relative asset ref {want:?}");
+            }
+            // No absolute `/assets/...` references survive in the markup —
+            // those are exactly what breaks behind a prefix.
+            assert!(
+                !body.contains("href=\"/assets/") && !body.contains("src=\"/assets/"),
+                "{req_path}: absolute /assets/ reference would bypass the mount prefix"
+            );
+        }
+    }
+
+    #[test]
+    fn main_css_font_url_is_relative() {
+        // The bundled symbol font is fetched from inside main.css, which
+        // the browser resolves against the stylesheet's own URL
+        // (`<prefix>/assets/main.css`). An absolute `url('/assets/...')`
+        // would bypass the mount prefix exactly like the share-link bug,
+        // so it must stay a bare relative sibling reference.
+        assert!(
+            MAIN_CSS.contains("url('term-symbols.woff2')"),
+            "main.css must reference the font relatively"
+        );
+        assert!(
+            !MAIN_CSS.contains("url('/assets/"),
+            "main.css must not reference the font with an absolute /assets/ URL"
         );
     }
 
