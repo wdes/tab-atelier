@@ -929,7 +929,7 @@ impl AppState {
             let pty_ring = view.pty_ring();
             // Dirtiness key: bytes ever written through the PTY ring.
             // Unchanged ⇒ the grid is byte-identical, so skip the scans.
-            let ring_len = pty_ring.lock().map(|r| r.total_len()).unwrap_or(0);
+            let ring_len = pty_ring.lock().map_or(0, |r| r.total_len());
             // 200 lines for the joined `output` (logical lines — the
             // mobile remote word-wraps them, more is wasted bandwidth on
             // a phone screen). 2000 for `raw_output` so xterm.js's
