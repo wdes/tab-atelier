@@ -12,14 +12,22 @@
   <title>__TAB_NAME_HTML__ · tab-atelier</title>
   <!-- xterm.js + .css are version-pinned and served by the daemon.
        Cache-Control on those routes is `immutable` since the URL
-       has the version in it. -->
-  <link rel="stylesheet" href="/assets/xterm-6.0.0.css">
+       has the version in it.
+
+       `__ASSET_PREFIX__` is a server-rendered relative hop back to
+       the mount root (`../../` for `/tabs/<idx>/view`, `../../../`
+       for `/tabs/by-id/<uuid>/view`). It MUST stay relative: a
+       reverse proxy (Caddy, nginx, Cloudflare Tunnel) that mounts us
+       under any prefix strips that prefix before the request reaches
+       us, so an absolute `/assets/...` URL would resolve against the
+       proxy's origin root and 404. Relative keeps the prefix. -->
+  <link rel="stylesheet" href="__ASSET_PREFIX__assets/xterm-6.0.0.css">
   <!-- Our own CSS + JS are served with `?version=<BUILD_HASH>` so
        a deb upgrade invalidates the cache atomically — browsers
        fetch the new content on the very next view load, no manual
        refresh dance. Server treats the query string as a cache
        buster only; the route itself ignores it. -->
-  <link rel="stylesheet" href="/assets/main.css?version=__BUILD_HASH__">
+  <link rel="stylesheet" href="__ASSET_PREFIX__assets/main.css?version=__BUILD_HASH__">
 </head>
 <!-- The per-tab background colour is injected as a CSS custom
      property so main.css can reference it via `var(--tab-bg)`
@@ -62,7 +70,7 @@
     <div class="hint" id="files-hint"></div>
   </div>
   <div id="toast"></div>
-  <script src="/assets/xterm-6.0.0.js"></script>
+  <script src="__ASSET_PREFIX__assets/xterm-6.0.0.js"></script>
   <!-- Bootstrap: only thing in /view that's tab-specific. main.js
        reads window.TAB and is otherwise identical across every
        tab + every browser load (= cacheable behind ?version=). -->
@@ -74,6 +82,6 @@
       buildHash: "__BUILD_HASH__",
     };
   </script>
-  <script src="/assets/main.js?version=__BUILD_HASH__"></script>
+  <script src="__ASSET_PREFIX__assets/main.js?version=__BUILD_HASH__"></script>
 </body>
 </html>

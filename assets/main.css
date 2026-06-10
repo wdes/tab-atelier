@@ -6,7 +6,11 @@
        has different metrics, so the glyph anti-aliases oddly. */
     @font-face {
       font-family: 'TermSymbols';
-      src: url('/assets/term-symbols.woff2') format('woff2');
+      /* Relative to this stylesheet's own URL (`<prefix>/assets/main.css`),
+         so the font resolves to `<prefix>/assets/term-symbols.woff2` under
+         any reverse-proxy mount prefix. An absolute `/assets/...` URL would
+         bypass the prefix and 404 — same bug class as the share-link bug. */
+      src: url('term-symbols.woff2') format('woff2');
       font-display: swap;
       unicode-range: U+2300-23FF, U+2500-25FF, U+2600-26FF, U+2700-27BF, U+2B00-2BFF;
     }
