@@ -238,6 +238,8 @@ fn pty_env(colors_enabled: bool) -> HashMap<String, String> {
     } else {
         env.insert("TERM".into(), "dumb".into());
     }
+    // Force the telemetry / feedback-survey opt-out onto every tab.
+    crate::apply_telemetry_disable_env(&mut env);
     env
 }
 
