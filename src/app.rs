@@ -2091,152 +2091,13 @@ impl AppState {
                     .child(lock_label),
             );
 
-            // Background color submenu — five preset swatches +
-            // "clear override". Custom hex still available via the
-            // headless CLI (`bg-color <tab> #RRGGBB`); a full color
-            // picker is more chrome than this app currently has.
-            let bg_presets: &[(&str, &str)] = &[
-                ("Tomorrow Night Blue", "#002451"),
-                ("Catppuccin Mocha", "#1e1e2e"),
-                ("Nord", "#2e3440"),
-                ("Solarized Dark", "#002b36"),
-                ("Pitch black", "#000000"),
-            ];
-            for (preset_label, preset_hex) in bg_presets {
-                let tab_id_for_bg = self.tabs[idx].id.clone();
-                let hex = (*preset_hex).to_string();
-                let label = format!("Background: {preset_label} ({preset_hex})");
-                container = container.child(
-                    div()
-                        .id(SharedString::from(format!(
-                            "menu-bg-{}",
-                            preset_hex.trim_start_matches('#')
-                        )))
-                        .px(px(12.0))
-                        .py(px(4.0))
-                        .cursor_pointer()
-                        .hover(|s| s.bg(menu_hover))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
-                                this.tabs[idx].bg_color = Some(hex.clone());
-                                let mut snap = this.api_state.lock().unwrap();
-                                if let Some(t) = snap.tabs.iter_mut().find(|t| t.id == tab_id_for_bg) {
-                                    t.bg_color.clone_from(&hex);
-                                }
-                                drop(snap);
-                                this.context_menu = None;
-                                cx.notify();
-                            }),
-                        )
-                        .child(label),
-                );
-            }
-            // Clear per-tab override → tab inherits global.
-            let tab_id_for_bg_clear = self.tabs[idx].id.clone();
-            container = container.child(
-                div()
-                    .id("menu-bg-clear")
-                    .px(px(12.0))
-                    .py(px(4.0))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(menu_hover))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
-                            this.tabs[idx].bg_color = None;
-                            let mut snap = this.api_state.lock().unwrap();
-                            if let Some(t) = snap.tabs.iter_mut().find(|t| t.id == tab_id_for_bg_clear) {
-                                t.bg_color = String::new();
-                            }
-                            drop(snap);
-                            this.context_menu = None;
-                            cx.notify();
-                        }),
-                    )
-                    .child("Background: use global"),
-            );
-
-            // Schedule — five preset rules (matching the docs)
-            // bound to the system tz, plus a "clear" entry. Full
-            // custom rule + tz pairing lives in the CLI
-            // (`tab-atelier schedule <tab> "<rule>" --tz <iana>`).
-            // Listed under bg-color because both are tab-scoped
-            // settings the user toggles infrequently.
-            //
-            // `iana_default()` reads /etc/timezone (Linux) so the
-            // presets land on the user's local zone, not the
-            // process's TZ env. Falls back to "UTC".
-            let sched_tz_default = iana_default_tz();
-            let sched_presets: &[(&str, &str)] = &[
-                ("Workdays 9-18", "Mo-Fr 09:00-18:00"),
-                ("Workdays 9-18 + lunch", "Mo-Fr 09:00-12:30,13:30-18:00"),
-                ("Workdays 9-18 (no holidays)", "Mo-Fr 09:00-18:00; PH off"),
-                ("Always open", "24/7"),
-                ("Night shift 22-06", "Mo-Fr 22:00-06:00"),
-            ];
-            for (preset_label, preset_rule) in sched_presets {
-                let tab_id_for_sched = self.tabs[idx].id.clone();
-                let rule = (*preset_rule).to_string();
-                let tz_str = sched_tz_default.clone();
-                let label = format!("Schedule: {preset_label} ({tz_str})");
-                container = container.child(
-                    div()
-                        .id(SharedString::from(format!("menu-sched-{preset_label}")))
-                        .px(px(12.0))
-                        .py(px(4.0))
-                        .cursor_pointer()
-                        .hover(|s| s.bg(menu_hover))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
-                                // Validate before applying — same
-                                // surface the CLI uses. A panic-free
-                                // path: bad presets fall through with
-                                // no UI feedback today (the menu
-                                // entries are all known-good).
-                                if let Ok(sched) = crate::schedule::TabSchedule::new(rule.clone(), tz_str.clone()) {
-                                    this.tabs[idx].schedule = Some(sched.clone());
-                                    let mut snap = this.api_state.lock().unwrap();
-                                    if let Some(t) = snap.tabs.iter_mut().find(|t| t.id == tab_id_for_sched) {
-                                        t.schedule = Some(sched.clone());
-                                    }
-                                    snap.pending_schedule_changes
-                                        .push((tab_id_for_sched.clone(), Some(sched)));
-                                    drop(snap);
-                                }
-                                this.context_menu = None;
-                                cx.notify();
-                            }),
-                        )
-                        .child(label),
-                );
-            }
-            let tab_id_for_sched_clear = self.tabs[idx].id.clone();
-            container = container.child(
-                div()
-                    .id("menu-sched-clear")
-                    .px(px(12.0))
-                    .py(px(4.0))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(menu_hover))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
-                            this.tabs[idx].schedule = None;
-                            let mut snap = this.api_state.lock().unwrap();
-                            if let Some(t) = snap.tabs.iter_mut().find(|t| t.id == tab_id_for_sched_clear) {
-                                t.schedule = None;
-                            }
-                            snap.pending_schedule_changes
-                                .push((tab_id_for_sched_clear.clone(), None));
-                            drop(snap);
-                            this.context_menu = None;
-                            cx.notify();
-                        }),
-                    )
-                    .child("Schedule: always open (clear)"),
-            );
+            // (Background-color + Schedule preset rows used to live
+            // here but pushed the context menu taller than a small-
+            // laptop viewport. Both settings have CLI entry points
+            // that scale better:
+            //   tab-atelier-headless bg-color <tab> #RRGGBB
+            //   tab-atelier-headless schedule <tab> "Mo-Fr 9-18" --tz …
+            // The global Theme picker stays in the Preferences modal.)
         }
 
         {
@@ -2358,13 +2219,18 @@ impl AppState {
                         }),
                     )
                     .child(self.t().paste),
-            )
-            // "Paste selection" — send the current visual selection
-            // straight into the PTY without touching the system
-            // clipboard. Useful for one-off "select-then-paste"
-            // workflows that don't want to clobber whatever's in the
-            // clipboard.
-            .child(
+            );
+
+        // "Paste selection" — send the current visual selection
+        // straight into the PTY without touching the system
+        // clipboard. Useful for one-off "select-then-paste" flows
+        // that don't want to clobber the clipboard. Only rendered
+        // when the active tab HAS a selection; without one the menu
+        // entry would silently no-op (copy_selection() returns None)
+        // and the row reads as broken to the user.
+        let has_active_selection = self.tabs[self.active].view.read(cx).copy_selection().is_some();
+        if has_active_selection {
+            container = container.child(
                 div()
                     .id("menu-paste-selection")
                     .px(px(12.0))
@@ -2383,7 +2249,9 @@ impl AppState {
                         }),
                     )
                     .child(self.t().paste_selection),
-            )
+            );
+        }
+        container = container
             // Terminal section
             .child(sep())
             .child(
@@ -4012,20 +3880,6 @@ fn format_duration(d: std::time::Duration) -> String {
         let m = (secs % 3600) / 60;
         format!("{h}h {m}m")
     }
-}
-
-/// Best-effort guess at the user's IANA timezone for the
-/// Schedule context-menu presets. Reads `/etc/timezone` (Debian /
-/// Ubuntu standard) and falls back to `UTC` when missing. The user
-/// can always override via the CLI (`tab-atelier schedule <tab>
-/// "<rule>" --tz <iana>`); the menu only ever pre-fills the obvious
-/// default.
-fn iana_default_tz() -> String {
-    std::fs::read_to_string("/etc/timezone")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "UTC".to_string())
 }
 
 fn run_check() {
