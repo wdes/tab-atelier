@@ -138,6 +138,11 @@ struct Tab {
     /// `total_len` means the previous scan is still valid. `None` until
     /// the first scan.
     snap_cache: Option<crate::term_export::GridSnapshotCache>,
+    /// Per-tab resource-limit overrides. The GUI doesn't *apply* these
+    /// (cgroup limits are headless-only), but it round-trips them
+    /// through tabs.json so a desktop session doesn't wipe limits a
+    /// headless run set on the same machine.
+    limits: crate::TabResourceLimits,
 }
 
 impl crate::schedule::LockState for Tab {
@@ -443,6 +448,7 @@ impl AppState {
                         last_pushed_locked: None,
                         pending_agent_resume,
                         snap_cache: None,
+                        limits: ts.limits.clone(),
                     });
                 }
                 if tabs.is_empty() {
@@ -484,6 +490,7 @@ impl AppState {
                         last_pushed_locked: None,
                         pending_agent_resume: None,
                         snap_cache: None,
+                        limits: crate::TabResourceLimits::default(),
                     });
                 }
                 let active = saved.active.min(tabs.len() - 1);
@@ -529,6 +536,7 @@ impl AppState {
                         last_pushed_locked: None,
                         pending_agent_resume: None,
                         snap_cache: None,
+                        limits: crate::TabResourceLimits::default(),
                     }],
                     0,
                     false,
@@ -791,6 +799,7 @@ impl AppState {
                 last_pushed_locked: None,
                 pending_agent_resume: None,
                 snap_cache: None,
+                limits: crate::TabResourceLimits::default(),
             },
         );
         self.active = idx;
@@ -918,6 +927,7 @@ impl AppState {
                     locked: tab.locked,
                     schedule: tab.schedule.clone(),
                     bg_color: tab.bg_color.clone(),
+                    limits: tab.limits.clone(),
                     ..TabState::default()
                 }
             })
@@ -1404,6 +1414,7 @@ impl AppState {
                     share_token_ro: tab.share_token_ro.clone(),
                     locked: tab.locked,
                     bg_color: tab.bg_color.clone(),
+                    limits: tab.limits.clone(),
                     ..TabState::default()
                 }
             })
@@ -3559,6 +3570,9 @@ impl AppState {
                                                         pty_cols: None,
                                                         pty_rows: None,
                                                         tab_bg_color: this.tab_bg_global.clone(),
+                                                        // Headless-only advanced field; not edited
+                                                        // by the GUI dialog, same as pty_cols.
+                                                        default_tab_limits: crate::TabResourceLimits::default(),
                                                     },
                                                 );
                                                 if let Some(ref handle) = this.hotkey_handle {

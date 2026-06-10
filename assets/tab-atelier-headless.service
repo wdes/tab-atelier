@@ -87,6 +87,16 @@ ProcSubset=pid
 # Network — TCP only (API binds INADDR_ANY by default).
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
+# Per-tab resource limits (cgroup v2). Delegate the service's own
+# cgroup subtree so the daemon can create one child cgroup per tab and
+# write memory.max / cpu.max / pids.max into it (see src/cgroup.rs).
+# Delegation grants write access to *only* this unit's subtree and
+# coexists with ProtectControlGroups= above (systemd keeps the rest of
+# /sys/fs/cgroup read-only). Without this the per-tab limit settings are
+# silently inert — the daemon detects the non-writable subtree and skips
+# limiting, so the unit still works if you remove this line.
+Delegate=yes
+
 # Namespaces / IPC / keyring
 RestrictNamespaces=true
 RestrictRealtime=true

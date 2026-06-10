@@ -14,6 +14,8 @@ pub(crate) mod api_ws;
 pub mod app;
 #[cfg(feature = "catbus")]
 pub(crate) mod catbus_agent;
+#[cfg(all(target_os = "linux", not(feature = "gui")))]
+pub(crate) mod cgroup;
 pub mod cli;
 #[cfg(not(feature = "gui"))]
 pub mod headless;
@@ -263,6 +265,102 @@ pub struct TabState {
     /// stay byte-clean.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule: Option<crate::schedule::TabSchedule>,
+
+    /// Per-tab resource ceilings (memory / CPU / task count). Each
+    /// field is optional and, when set, overrides the global
+    /// [`Preferences::default_tab_limits`] default for that one axis.
+    /// Applied via cgroup v2 on the headless daemon (see
+    /// [`crate::cgroup`]); a no-op on platforms / setups without a
+    /// delegated cgroup. Skipped from JSON when fully unset.
+    #[serde(default, skip_serializing_if = "TabResourceLimits::is_empty")]
+    pub limits: TabResourceLimits,
+}
+
+/// Optional resource ceilings for a tab's process tree.
+///
+/// Used both as a per-tab override ([`TabState::limits`]) and as the
+/// global default ([`Preferences::default_tab_limits`]);
+/// [`TabResourceLimits::resolve`] layers the two. Every field is `None`
+/// = "no limit on this axis", so the default (all `None`) preserves
+/// today's unlimited behaviour.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct TabResourceLimits {
+    /// Memory high-water mark, e.g. `"512M"`, `"2G"`, or a bare byte
+    /// count. Maps to cgroup `memory.max`. `K`/`M`/`G`/`T` are
+    /// 1024-based.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_max: Option<String>,
+    /// CPU ceiling as a percentage of a single core: `50` = half a
+    /// core, `200` = two full cores. Maps to cgroup `cpu.max`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_quota_percent: Option<u32>,
+    /// Maximum number of tasks (processes + threads) in the tab's
+    /// tree. Maps to cgroup `pids.max`. Caps fork bombs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tasks_max: Option<u64>,
+}
+
+impl TabResourceLimits {
+    /// True when no axis is constrained (the serialised-as-absent case).
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.memory_max.is_none() && self.cpu_quota_percent.is_none() && self.tasks_max.is_none()
+    }
+
+    /// Resolve effective limits: each axis takes the per-tab value when
+    /// set, else falls back to the global default. Mirrors
+    /// [`effective_tab_bg`]'s per-tab-over-global policy.
+    #[must_use]
+    pub fn resolve(per_tab: &Self, global: &Self) -> Self {
+        Self {
+            memory_max: per_tab.memory_max.clone().or_else(|| global.memory_max.clone()),
+            cpu_quota_percent: per_tab.cpu_quota_percent.or(global.cpu_quota_percent),
+            tasks_max: per_tab.tasks_max.or(global.tasks_max),
+        }
+    }
+
+    /// `memory.max` value in bytes, parsed from [`Self::memory_max`].
+    /// `K`/`M`/`G`/`T` suffixes are 1024-based; a bare number is bytes.
+    /// `None` when unset or unparseable.
+    #[must_use]
+    pub fn memory_max_bytes(&self) -> Option<u64> {
+        parse_memory_bytes(self.memory_max.as_deref()?)
+    }
+
+    /// cgroup v2 `cpu.max` line (`"<quota_us> <period_us>"`) for
+    /// [`Self::cpu_quota_percent`], using the conventional 100 ms
+    /// period. `None` when unset or zero.
+    #[must_use]
+    pub fn cpu_max_line(&self) -> Option<String> {
+        let pct = self.cpu_quota_percent?;
+        if pct == 0 {
+            return None;
+        }
+        // period = 100_000 µs; quota = pct% of one core within that.
+        Some(format!("{} 100000", u64::from(pct) * 1000))
+    }
+}
+
+/// Parse a memory size like `"512M"` / `"2G"` / `"1048576"` into bytes.
+/// Suffixes `K`/`M`/`G`/`T` (case-insensitive) are 1024-based. Returns
+/// `None` for empty or malformed input.
+#[must_use]
+fn parse_memory_bytes(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let last = s.chars().last()?;
+    let (digits, mult) = match last {
+        'K' | 'k' => (&s[..s.len() - 1], 1024u64),
+        'M' | 'm' => (&s[..s.len() - 1], 1024 * 1024),
+        'G' | 'g' => (&s[..s.len() - 1], 1024 * 1024 * 1024),
+        'T' | 't' => (&s[..s.len() - 1], 1024u64 * 1024 * 1024 * 1024),
+        '0'..='9' => (s, 1),
+        _ => return None,
+    };
+    let n: u64 = digits.trim().parse().ok()?;
+    Some(n.saturating_mul(mult))
 }
 
 /// Default viewer background — Tomorrow Night Blue. Softer than pitch
@@ -315,6 +413,7 @@ impl Default for TabState {
             locked: false,
             bg_color: None,
             schedule: None,
+            limits: TabResourceLimits::default(),
         }
     }
 }
@@ -748,6 +847,15 @@ pub struct Preferences {
     /// (the common case for users who only run the local instance).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub remote_endpoints: Vec<RemoteEndpoint>,
+
+    /// Global default per-tab resource ceilings, applied to every tab
+    /// whose own [`TabState::limits`] leaves an axis unset. Each axis is
+    /// optional; all unset (the default) keeps tabs unlimited as before.
+    /// Headless-only (needs a delegated cgroup); set in
+    /// `preferences.json`, e.g.
+    /// `"default_tab_limits": {"memory_max": "1G", "tasks_max": 512}`.
+    #[serde(default, skip_serializing_if = "TabResourceLimits::is_empty")]
+    pub default_tab_limits: TabResourceLimits,
 }
 
 /// One persisted remote `tab-atelier-headless` instance the desktop
@@ -1645,6 +1753,69 @@ pub fn file_path_for_open(path: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_memory_bytes_handles_suffixes_and_junk() {
+        assert_eq!(parse_memory_bytes("512M"), Some(512 * 1024 * 1024));
+        assert_eq!(parse_memory_bytes("2G"), Some(2 * 1024 * 1024 * 1024));
+        assert_eq!(parse_memory_bytes("1k"), Some(1024));
+        assert_eq!(parse_memory_bytes("1048576"), Some(1_048_576));
+        assert_eq!(parse_memory_bytes("  4M "), Some(4 * 1024 * 1024));
+        assert_eq!(parse_memory_bytes(""), None);
+        assert_eq!(parse_memory_bytes("abc"), None);
+        assert_eq!(parse_memory_bytes("12X"), None);
+    }
+
+    #[test]
+    fn tab_limits_resolve_per_tab_over_global() {
+        let global = TabResourceLimits {
+            memory_max: Some("1G".into()),
+            cpu_quota_percent: Some(100),
+            tasks_max: Some(512),
+        };
+        let per_tab = TabResourceLimits {
+            memory_max: Some("256M".into()),
+            cpu_quota_percent: None,
+            tasks_max: None,
+        };
+        let eff = TabResourceLimits::resolve(&per_tab, &global);
+        assert_eq!(eff.memory_max.as_deref(), Some("256M"), "per-tab memory wins");
+        assert_eq!(eff.cpu_quota_percent, Some(100), "cpu falls back to global");
+        assert_eq!(eff.tasks_max, Some(512), "tasks falls back to global");
+        assert_eq!(eff.memory_max_bytes(), Some(256 * 1024 * 1024));
+    }
+
+    #[test]
+    fn tab_limits_cpu_max_line_and_emptiness() {
+        let half = TabResourceLimits {
+            cpu_quota_percent: Some(50),
+            ..Default::default()
+        };
+        assert_eq!(half.cpu_max_line().as_deref(), Some("50000 100000"), "half a core");
+        let multi = TabResourceLimits {
+            cpu_quota_percent: Some(250),
+            ..Default::default()
+        };
+        assert_eq!(multi.cpu_max_line().as_deref(), Some("250000 100000"), "2.5 cores");
+        assert!(TabResourceLimits::default().is_empty());
+        assert!(
+            !TabResourceLimits {
+                tasks_max: Some(10),
+                ..Default::default()
+            }
+            .is_empty()
+        );
+        // Zero percent = no CPU cap line (avoids writing a 0-quota
+        // cgroup that would freeze the tab).
+        assert!(
+            TabResourceLimits {
+                cpu_quota_percent: Some(0),
+                ..Default::default()
+            }
+            .cpu_max_line()
+            .is_none()
+        );
+    }
 
     #[test]
     fn telemetry_disable_env_forces_all_optouts() {
