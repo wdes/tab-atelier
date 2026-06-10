@@ -124,6 +124,14 @@ struct HeadlessTab {
     /// — alacritty's grid history is wiped by `\x1b[3J` and never
     /// grows when the TUI redraws in-place (Claude Code, htop, …).
     pty_ring: Arc<Mutex<crate::pty_ring::PtyRing>>,
+    /// Memoised grid-derived snapshot fields, keyed by the PTY ring's
+    /// monotonic `total_len`. `refresh_snapshot` runs every tick and
+    /// the grid scans (`ansi_text_with_cursor(200)` + 2000-row
+    /// `raw_screen_text`) are the bulk of its cost; since every byte
+    /// that can change the grid flows through the ring, a `total_len`
+    /// that hasn't advanced means the grid is byte-for-byte identical
+    /// and the previous scan can be reused. `None` until the first scan.
+    snap_cache: Option<crate::term_export::GridSnapshotCache>,
 }
 
 impl crate::schedule::LockState for HeadlessTab {
@@ -187,6 +195,10 @@ impl HeadlessTab {
     fn flush_pending_restore(&mut self) {
         if let Some(out) = self.pending_restore.take() {
             self.restore_output(&out);
+            // restore_output feeds the parser directly (not through the
+            // PTY ring), so the ring's total_len doesn't move — drop the
+            // snapshot cache so the next refresh re-scans the restored grid.
+            self.snap_cache = None;
         }
     }
 
@@ -223,6 +235,36 @@ impl HeadlessTab {
         let rows = g.screen_lines() as u16;
         drop(t);
         (cols, rows)
+    }
+
+    /// Current PTY-ring high-water mark — the dirtiness key for the
+    /// snapshot cache. A value equal to the last cached one means no
+    /// new bytes reached alacritty, so the grid is unchanged.
+    fn ring_total_len(&self) -> u64 {
+        self.pty_ring.lock().map(|r| r.total_len()).unwrap_or(0)
+    }
+
+    /// Return the grid-derived snapshot fields, scanning the terminal
+    /// only when the PTY ring advanced since the last call. Otherwise
+    /// the previous scan is reused, avoiding the per-tick full-grid
+    /// walk on idle tabs.
+    fn cached_grid(&mut self) -> &crate::term_export::GridSnapshotCache {
+        let ring_len = self.ring_total_len();
+        if self.snap_cache.as_ref().is_none_or(|c| c.ring_len != ring_len) {
+            let (output, cursor) = self.ansi_text_with_cursor(Some(200));
+            let (raw_output, raw_cursor) = self.raw_screen_text(Some(2000));
+            let (cols, rows) = self.dims();
+            self.snap_cache = Some(crate::term_export::GridSnapshotCache {
+                ring_len,
+                output,
+                cursor,
+                raw_output,
+                raw_cursor,
+                cols,
+                rows,
+            });
+        }
+        self.snap_cache.as_ref().expect("snap_cache populated above")
     }
 
     fn copy_all_history(&self) -> String {
@@ -386,6 +428,7 @@ fn spawn_pty_tab(
         pending_agent_resume,
         colors_enabled,
         pty_ring,
+        snap_cache: None,
     })
 }
 
@@ -605,7 +648,7 @@ pub fn run() -> std::io::Result<()> {
         // shell echo within one tick (~500 ms) instead of waiting up
         // to 2 s for the next disk-persist. Cheap — just grid reads.
         refresh_snapshot(
-            &tabs,
+            &mut tabs,
             active,
             &global_bg,
             &api_state,
@@ -650,43 +693,43 @@ pub fn run() -> std::io::Result<()> {
 /// duration instead of waiting for the next disk-persist cycle.
 #[allow(clippy::too_many_arguments)]
 fn refresh_snapshot(
-    tabs: &[HeadlessTab],
+    tabs: &mut [HeadlessTab],
     active: usize,
     global_bg: &str,
     api_state: &Arc<Mutex<api::TabSnapshot>>,
     #[cfg(feature = "energy")] power_watts: &Arc<Mutex<Vec<crate::power::TabPower>>>,
     #[cfg(feature = "energy")] battery_percent: &Arc<Mutex<Option<u8>>>,
 ) {
-    let api_tabs: Vec<api::SnapshotTab> = tabs
-        .iter()
-        .map(|tab| {
-            let (output, cursor) = tab.ansi_text_with_cursor(Some(200));
-            let (raw_output, raw_cursor) = tab.raw_screen_text(Some(2000));
-            let (cols, rows) = tab.dims();
-            api::SnapshotTab {
-                id: tab.id.clone(),
-                name: tab.name.clone(),
-                cwd: tab.last_known_cwd_string.clone(),
-                output,
-                raw_output,
-                raw_cursor,
-                uptime_secs: tab.uptime().as_secs_f64(),
-                cursor,
-                cols,
-                rows,
-                share_token_rw: tab.share_token_rw.clone(),
-                share_token_ro: tab.share_token_ro.clone(),
-                locked: tab.locked,
-                schedule: tab.schedule.clone(),
-                bg_color: crate::effective_tab_bg(tab.bg_color.as_deref(), Some(global_bg)).to_string(),
-                shell_pid: tab.pid,
-                agent_state: tab.agent_state.clone(),
-                agent_session_id: tab.agent_session_id.clone(),
-                agent_kind: tab.agent_kind.clone(),
-                pty_ring: Some(tab.pty_ring.clone()),
-            }
-        })
-        .collect();
+    let mut api_tabs: Vec<api::SnapshotTab> = Vec::with_capacity(tabs.len());
+    for tab in tabs.iter_mut() {
+        // Grid-derived fields come from the per-tab cache, which only
+        // re-scans the terminal when the PTY ring advanced. The other
+        // fields (uptime, lock, agent state, …) are cheap and rebuilt
+        // every tick so changes there still surface immediately.
+        let grid = tab.cached_grid().clone();
+        api_tabs.push(api::SnapshotTab {
+            id: tab.id.clone(),
+            name: tab.name.clone(),
+            cwd: tab.last_known_cwd_string.clone(),
+            output: grid.output,
+            raw_output: grid.raw_output,
+            raw_cursor: grid.raw_cursor,
+            uptime_secs: tab.uptime().as_secs_f64(),
+            cursor: grid.cursor,
+            cols: grid.cols,
+            rows: grid.rows,
+            share_token_rw: tab.share_token_rw.clone(),
+            share_token_ro: tab.share_token_ro.clone(),
+            locked: tab.locked,
+            schedule: tab.schedule.clone(),
+            bg_color: crate::effective_tab_bg(tab.bg_color.as_deref(), Some(global_bg)).to_string(),
+            shell_pid: tab.pid,
+            agent_state: tab.agent_state.clone(),
+            agent_session_id: tab.agent_session_id.clone(),
+            agent_kind: tab.agent_kind.clone(),
+            pty_ring: Some(tab.pty_ring.clone()),
+        });
+    }
     let mut snapshot = api_state.lock().unwrap();
     snapshot.tabs = api_tabs;
     snapshot.active = active;
