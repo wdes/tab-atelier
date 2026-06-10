@@ -76,6 +76,38 @@ pub fn tab_env_extras(tab_id: &str, api_url: &str, api_token: &str) -> std::coll
     m
 }
 
+/// Env vars forced into **every** tab's PTY to disable Claude Code's
+/// telemetry, feedback surveys, and other nonessential traffic.
+///
+/// Set on all tabs unconditionally so no agent session running inside a
+/// tab phones home or prompts for the feedback survey.
+///
+/// - `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` is the strongest
+///   switch: it disables the rating/feedback survey, the transcript-
+///   share follow-up, and all other Anthropic-bound feedback traffic.
+/// - `DISABLE_TELEMETRY=1` and `DO_NOT_TRACK=1` are the widely-honoured
+///   opt-out signals (they also independently disable the survey).
+/// - `CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1` is the explicit survey
+///   kill-switch, set as belt-and-suspenders.
+///
+/// We deliberately do NOT set `CLAUDE_CODE_ENABLE_FEEDBACK_SURVEY_FOR_OTEL`
+/// (which would opt the survey back in for an org's OTEL collector).
+pub const TELEMETRY_DISABLE_ENV: &[(&str, &str)] = &[
+    ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
+    ("DISABLE_TELEMETRY", "1"),
+    ("DO_NOT_TRACK", "1"),
+    ("CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY", "1"),
+];
+
+/// Insert [`TELEMETRY_DISABLE_ENV`] into a PTY env map. Called by both
+/// the GUI and headless spawn paths so the opt-out applies to every
+/// tab on every spawn (initial spawn and respawn).
+pub fn apply_telemetry_disable_env<S: std::hash::BuildHasher>(env: &mut std::collections::HashMap<String, String, S>) {
+    for (k, v) in TELEMETRY_DISABLE_ENV {
+        env.insert((*k).to_string(), (*v).to_string());
+    }
+}
+
 /// Build the value handed to in-tab tools as `TAB_ATELIER_API_URL`.
 ///
 /// The stored `api_addr` is a bind spec (`0.0.0.0:7890`, `:7890`,
@@ -1613,6 +1645,30 @@ pub fn file_path_for_open(path: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn telemetry_disable_env_forces_all_optouts() {
+        let mut env = std::collections::HashMap::new();
+        // A pre-existing conflicting value must be FORCED to the opt-out.
+        env.insert("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".to_string(), "0".to_string());
+        apply_telemetry_disable_env(&mut env);
+        for (k, v) in TELEMETRY_DISABLE_ENV {
+            assert_eq!(env.get(*k).map(String::as_str), Some(*v), "{k} must be forced to {v}");
+        }
+        // The four expected opt-out switches are all present.
+        assert_eq!(
+            env.get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(env.get("DISABLE_TELEMETRY").map(String::as_str), Some("1"));
+        assert_eq!(env.get("DO_NOT_TRACK").map(String::as_str), Some("1"));
+        assert_eq!(
+            env.get("CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY").map(String::as_str),
+            Some("1")
+        );
+        // We must NOT re-enable the survey for OTEL collectors.
+        assert!(!env.contains_key("CLAUDE_CODE_ENABLE_FEEDBACK_SURVEY_FOR_OTEL"));
+    }
 
     #[test]
     fn strip_ansi_removes_sgr_and_keeps_text() {
