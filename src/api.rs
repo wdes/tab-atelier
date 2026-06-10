@@ -329,6 +329,46 @@ pub fn generate_token() -> String {
     s
 }
 
+/// Write `bytes` to `path` as an owner-only (0600) file so secrets
+/// (TLS private key, tokens) never sit on disk world-readable.
+///
+/// On unix the create goes through `O_EXCL` + mode 0600, after first
+/// unlinking any pre-existing file — that both guarantees the fresh
+/// file's perms and drops a pre-planted symlink/file at the path
+/// (anti-symlink-overwrite). On non-unix it degrades to a plain write.
+fn write_private_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let _ = std::fs::remove_file(path);
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)
+    }
+}
+
+/// Write `bytes` to `path`, creating a fresh file and refusing to
+/// follow a symlink at the final component. Any pre-existing entry
+/// (including a planted symlink) is unlinked first so the `create_new`
+/// (`O_EXCL`) open lands on a brand-new inode — `O_CREAT | O_EXCL`
+/// fails rather than following a symlink, closing the
+/// write-through-symlink hole on the file-upload path.
+fn write_new_file_no_symlink(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let _ = std::fs::remove_file(path);
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+    f.write_all(bytes)
+}
+
 /// Load the API token from disk, generating + persisting a fresh one
 /// when none exists yet. Stored next to the TLS cert under
 /// `{state_base}/tab-atelier/api.token` with mode 600. Persisting the
@@ -481,6 +521,19 @@ const FILE_SANDBOX_DIRS: &[&str] = &["inbox", "outbox"];
 const UPLOAD_MAX_BYTES_MIB: usize = 100;
 const UPLOAD_MAX_BYTES: usize = UPLOAD_MAX_BYTES_MIB * 1024 * 1024;
 
+/// Body cap for every non-upload route. Status updates, keystrokes,
+/// prompts, lock/schedule/bg-color POSTs all carry tiny JSON bodies, so
+/// 4 MiB is generous headroom. Keeping the cap low here stops a client
+/// from forcing a 100 MiB `vec![0u8; content_length]` pre-allocation on
+/// a route that the per-token upload-slot limiter doesn't cover.
+const NON_UPLOAD_MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+
+/// How long a client may take to send its complete request headers
+/// before hyper drops the connection. Slow-loris mitigation; generous
+/// enough for any legitimate client (including the WS upgrade) on a
+/// slow LAN/VPN link.
+const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Max concurrent in-flight uploads per share token. A coordinated
 /// attacker holding an RW share token could otherwise queue dozens
 /// of 100 MiB uploads in parallel and amplify memory pressure /
@@ -587,9 +640,12 @@ fn resolve_sandbox_path(cwd: &str, raw: &str) -> Result<std::path::PathBuf, (u16
     // or the candidate doesn't exist on disk yet, canonicalise the
     // parent we know exists and accept the relative remainder.
     let candidate = PathBuf::from(cwd).join(p);
+    // Generic messages — never echo the server's absolute paths or OS
+    // error strings to a remote share-link holder (they'd disclose the
+    // directory layout / usernames).
     let cwd_canonical = Path::new(cwd)
         .canonicalize()
-        .map_err(|e| (404, format!("cwd unreadable: {e}")))?;
+        .map_err(|_| (404, "cwd unreadable".into()))?;
     match candidate.canonicalize() {
         Ok(canonical) => {
             if !canonical.starts_with(&cwd_canonical) {
@@ -612,7 +668,7 @@ fn resolve_sandbox_path(cwd: &str, raw: &str) -> Result<std::path::PathBuf, (u16
             }
             Ok(canonical)
         }
-        Err(e) => Err((404, format!("read {}: {e}", candidate.display()))),
+        Err(_) => Err((404, "file not found".into())),
     }
 }
 
@@ -880,13 +936,25 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
         path
     };
 
-    // Reject oversized uploads BEFORE allocating / reading the
-    // body — refuses with 413 on the headers alone. Limits memory
-    // amplification from a hostile client lying about size or
-    // streaming a TB.
-    if content_length > UPLOAD_MAX_BYTES {
+    // Reject oversized bodies BEFORE allocating / reading the body —
+    // refuses with 413 on the headers alone, so a hostile client can't
+    // force a large `vec![0u8; content_length]` allocation by lying
+    // about size or streaming a TB. Only the file-upload route is
+    // allowed the full `UPLOAD_MAX_BYTES`; every other route (status
+    // updates, input, prompts, …) has tiny bodies, so they're capped
+    // far lower to stop body pre-allocation from being a memory-
+    // amplification lever on routes the per-token upload-slot cap
+    // doesn't gate.
+    let is_upload_route = method == "POST" && path.ends_with("/files");
+    let body_cap = if is_upload_route {
+        UPLOAD_MAX_BYTES
+    } else {
+        NON_UPLOAD_MAX_BODY_BYTES
+    };
+    if content_length > body_cap {
         drop(reader);
-        error_json(stream, 413, &format!("upload exceeds {UPLOAD_MAX_BYTES_MIB} MiB limit"));
+        let limit_mib = body_cap / (1024 * 1024);
+        error_json(stream, 413, &format!("request body exceeds {limit_mib} MiB limit"));
         return;
     }
 
@@ -1282,8 +1350,23 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             // serde_json::to_string yields a quoted JS-safe string
             // literal; strip the surrounding quotes so the template
             // can wrap it in its own quotes.
-            let js_name_quoted = serde_json::to_string(&tab_name).unwrap_or_else(|_| "\"\"".into());
-            let js_name = js_name_quoted.trim_matches('"');
+            //
+            // serde_json escapes quotes/backslashes/control chars but
+            // NOT `<`, `>`, or `&` — and the HTML parser ends the
+            // inline <script> element on the literal byte sequence
+            // `</script>` regardless of JS string context. Since the
+            // viewer's CSP allows 'unsafe-inline', an unescaped
+            // `</script><script>…` tab name would break out and run.
+            // Re-escape those three as JS `\uXXXX` so the value stays a
+            // valid string literal that can never terminate the script
+            // element. (`__TAB_NAME_HTML__` above is separately escaped
+            // for its <title> context.)
+            let js_name = serde_json::to_string(&tab_name)
+                .unwrap_or_else(|_| "\"\"".into())
+                .trim_matches('"')
+                .replace('<', "\\u003c")
+                .replace('>', "\\u003e")
+                .replace('&', "\\u0026");
             // Validate that bg_color looks like #RRGGBB before
             // inlining into HTML / CSS (defense against a malformed
             // value in tabs.json or someone POSTing junk into the
@@ -1298,7 +1381,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 .replace("__ASSET_PREFIX__", &asset_prefix)
                 .replace("__TAB_KEY__", &key_for_html)
                 .replace("__TAB_NAME_HTML__", &html_name)
-                .replace("__TAB_NAME_JS__", js_name)
+                .replace("__TAB_NAME_JS__", &js_name)
                 .replace("__TAB_BG__", safe_bg)
                 .replace("__BUILD_HASH__", BUILD_HASH);
             // Tell browsers (and any intervening CDN) not to cache
@@ -1763,17 +1846,44 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 error_json(stream, 500, &format!("mkdir inbox: {e}"));
                 return;
             }
-            // Atomic write: stage to <name>.tmp then rename. A reader
-            // walking inbox/ never sees a half-written file.
-            let dest = inbox.join(&name);
-            let staging = inbox.join(format!(".{name}.tmp"));
-            if let Err(e) = std::fs::write(&staging, &body_bytes) {
-                error_json(stream, 500, &format!("write {}: {e}", staging.display()));
+            // Sandbox guard (parity with the GET /files download path,
+            // which funnels through resolve_sandbox_path). The upload
+            // path used to `std::fs::write` straight into `cwd/inbox`
+            // with no symlink check, so a symlinked `inbox` (or a
+            // symlink planted at the destination) could redirect the
+            // write to an arbitrary file. Canonicalise and confirm the
+            // resolved inbox is a real directory *inside* the tab's cwd
+            // whose final component is still `inbox`.
+            let resolved = std::path::Path::new(&cwd)
+                .canonicalize()
+                .ok()
+                .zip(inbox.canonicalize().ok());
+            let Some((cwd_canon, inbox_canon)) = resolved else {
+                error_json(stream, 404, "inbox path unreadable");
+                return;
+            };
+            if !inbox_canon.starts_with(&cwd_canon) || inbox_canon.file_name() != Some(std::ffi::OsStr::new("inbox")) {
+                error_json(stream, 403, "inbox escapes the tab's cwd");
                 return;
             }
+            // Atomic write: stage to <name>.tmp then rename. A reader
+            // walking inbox/ never sees a half-written file. `create_new`
+            // (O_EXCL) refuses to create *through* a symlink, so a
+            // pre-planted symlink at the staging name can't redirect the
+            // write — we drop any stale entry (incl. a symlink) first so
+            // the exclusive create lands fresh.
+            let dest = inbox_canon.join(&name);
+            let staging = inbox_canon.join(format!(".{name}.tmp"));
+            if let Err(e) = write_new_file_no_symlink(&staging, &body_bytes) {
+                error_json(stream, 500, &format!("write inbox/.{name}.tmp: {e}"));
+                return;
+            }
+            // rename() replaces the destination entry itself (it does
+            // not follow a symlink at `dest`), so the rename can't be
+            // redirected either.
             if let Err(e) = std::fs::rename(&staging, &dest) {
                 let _ = std::fs::remove_file(&staging);
-                error_json(stream, 500, &format!("rename {}: {e}", dest.display()));
+                error_json(stream, 500, &format!("rename into inbox/{name}: {e}"));
                 return;
             }
             info!("API: stored {} bytes in {}", body_bytes.len(), dest.display());
@@ -1823,12 +1933,25 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                     return;
                 }
             };
-            let bytes = match std::fs::read(&canonical) {
-                Ok(b) => b,
-                Err(e) => {
-                    error_json(stream, 404, &format!("read {}: {e}", canonical.display()));
-                    return;
-                }
+            // Defense in depth against a component being swapped for a
+            // symlink in the window between resolve_sandbox_path's
+            // canonicalize and the read below: confirm the final entry
+            // is still a regular file (not a symlink/dir/fifo) via an
+            // lstat that does NOT follow links. Narrows the TOCTOU and
+            // avoids reading through a freshly-planted symlink.
+            let Ok(meta) = std::fs::symlink_metadata(&canonical) else {
+                error_json(stream, 404, "file not found");
+                return;
+            };
+            if !meta.file_type().is_file() {
+                error_json(stream, 403, "not a regular file");
+                return;
+            }
+            // Generic message — do not echo the absolute server path /
+            // OS error back to a remote share-link holder.
+            let Ok(bytes) = std::fs::read(&canonical) else {
+                error_json(stream, 404, "file not found");
+                return;
             };
             let display_name = canonical.file_name().and_then(|s| s.to_str()).unwrap_or("download");
             info!("API: served {} bytes from {}", bytes.len(), canonical.display());
@@ -2144,7 +2267,7 @@ use hyper::server::conn::http1 as h1_conn;
 use hyper::server::conn::http2 as h2_conn;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use std::convert::Infallible;
 use tokio::net::TcpListener as TokioListener;
 
@@ -2304,6 +2427,16 @@ where
         // sees `close 1006 <empty>` right after `open`.
         let _ = h1_conn::Builder::new()
             .keep_alive(true)
+            // Slow-loris guard: bound how long a client may take to
+            // dribble in its request headers. Without it a connection
+            // that sends one byte every few seconds ties up a task
+            // indefinitely, and the accept loop spawns an unbounded
+            // task per connection. WS upgrades complete their headers
+            // well within this window before handing off the socket.
+            // `header_read_timeout` requires a timer to be installed,
+            // else hyper panics when it arms the deadline.
+            .timer(TokioTimer::new())
+            .header_read_timeout(HEADER_READ_TIMEOUT)
             .serve_connection(io, svc)
             .with_upgrades()
             .await;
@@ -2573,7 +2706,12 @@ fn load_or_generate_cert() -> std::io::Result<(Vec<u8>, Vec<u8>)> {
     let crt_pem = cert.pem();
     let key_pem = key_pair.serialize_pem();
     std::fs::write(&crt_path, &crt_pem)?;
-    std::fs::write(&key_path, &key_pem)?;
+    // The TLS private key must never be world-readable — a local user
+    // who reads it can impersonate / MITM the API's TLS listener. Match
+    // the 0600 handling used for api.token. Create with O_EXCL + mode so
+    // the key never exists on disk with looser perms, even briefly;
+    // fall back to write+chmod if the file already exists.
+    write_private_file(&key_path, key_pem.as_bytes())?;
     let cert_der = cert.der().to_vec();
     let key_der = key_pair.serialize_der();
     Ok((cert_der, key_der))
@@ -3533,6 +3671,36 @@ mod tests {
         assert!(label.contains("%C3%A9"), "accent encoded: {label}");
         assert!(label.contains("%25"), "% encoded: {label}");
         assert!(label.contains("%0A"), "newline encoded: {label}");
+    }
+
+    #[test]
+    fn view_escapes_script_breakout_in_tab_name() {
+        // Regression: a tab name containing `</script>` must not break
+        // out of the inline <script> bootstrap in /view (the viewer's
+        // CSP allows 'unsafe-inline', so an injected script would run).
+        // serde_json alone does not escape `<`/`>`, so we re-escape.
+        let (port, state, token) = spawn_server();
+        {
+            let mut s = state.lock().unwrap();
+            s.tabs[0].name = "</script><script>alert(1)</script>".into();
+        }
+        let raw = request_bytes(
+            port,
+            &format!("GET /tabs/0/view HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        let (h, b) = split_response(&raw);
+        assert!(h.starts_with("HTTP/1.1 200"), "got: {h}");
+        let body = String::from_utf8_lossy(&b);
+        // The attacker's raw breakout sequence must not survive verbatim.
+        assert!(
+            !body.contains("</script><script>alert(1)</script>"),
+            "tab name broke out of the script context"
+        );
+        // It must appear unicode-escaped inside the JS string literal.
+        assert!(
+            body.contains("\\u003c/script\\u003e\\u003cscript\\u003ealert(1)\\u003c/script\\u003e"),
+            "tab name was not JS-unicode-escaped in the bootstrap"
+        );
     }
 
     #[test]

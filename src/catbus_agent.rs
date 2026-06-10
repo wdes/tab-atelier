@@ -106,6 +106,14 @@ pub fn agent_has_active_subprocess(shell_pid: u32) -> bool {
         .is_some_and(|s| s.split_ascii_whitespace().any(|tok| tok.parse::<u32>().is_ok()))
 }
 
+/// Owner UID of a `/proc/<pid>` entry (the process's real UID), or
+/// `None` if the entry is gone. Safe-Rust via `MetadataExt::uid` — no
+/// `geteuid` FFI needed (the crate denies `unsafe`).
+fn proc_uid(pid: &str) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(format!("/proc/{pid}")).ok().map(|m| m.uid())
+}
+
 /// BFS over `/proc/{pid}/task/{pid}/children`. Match `catbus-agent`
 /// or the legacy `claude` TUI by `comm`. We don't recurse into
 /// kernel threads or pids in different namespaces — sticking to
@@ -113,6 +121,13 @@ pub fn agent_has_active_subprocess(shell_pid: u32) -> bool {
 fn find_agent_descendant(root_pid: u32) -> Option<u32> {
     use std::fmt::Write as _;
     const AGENT_COMMS: &[&str] = &["catbus-agent", "claude"];
+    // Only trust processes owned by the same UID as this daemon. A
+    // descendant can freely rename its own `comm` to "claude" /
+    // "catbus-agent"; without this check, on a shared host another
+    // user's process matching by name could steer transcript/socket
+    // resolution to a path of its choosing. `/proc/self` ownership is
+    // the daemon's real UID; compare each candidate against it.
+    let self_uid = proc_uid("self");
     // Reused across both /proc reads per BFS step so neither
     // `read_comm` nor `read_children` allocates a fresh path String.
     let mut path = String::with_capacity(48);
@@ -124,7 +139,7 @@ fn find_agent_descendant(root_pid: u32) -> Option<u32> {
             if comm.ends_with('\n') {
                 comm.pop();
             }
-            if AGENT_COMMS.contains(&comm.as_str()) {
+            if AGENT_COMMS.contains(&comm.as_str()) && proc_uid(&pid.to_string()) == self_uid && self_uid.is_some() {
                 return Some(pid);
             }
         }

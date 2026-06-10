@@ -262,8 +262,14 @@ fn extract_token<B>(req: &Request<B>) -> Option<Vec<u8>> {
 ///
 /// Check: Origin's host:port must match the Host header (or the
 /// X-Forwarded-Host of a proxy). Missing Origin → accept (CLI
-/// clients, server-to-server, file://). "null" Origin → accept
-/// (sandbox iframes, file://).
+/// clients, server-to-server, file://).
+///
+/// A `null` Origin is REJECTED: it's what sandboxed iframes
+/// (`sandbox="allow-scripts"`), `data:`/`file:` documents, and some
+/// privacy proxies send, and accepting it would let such a context
+/// (holding a leaked token) open the input WS. Non-browser clients
+/// that legitimately need access simply omit Origin entirely, which is
+/// still accepted above.
 fn origin_ok<B>(req: &Request<B>) -> bool {
     let Some(origin) = req.headers().get("origin") else {
         return true; // no Origin = not a browser request
@@ -272,7 +278,7 @@ fn origin_ok<B>(req: &Request<B>) -> bool {
         return false;
     };
     if origin_str == "null" {
-        return true;
+        return false;
     }
     let origin_host = origin_str
         .strip_prefix("https://")
@@ -782,9 +788,12 @@ mod tests {
     }
 
     #[test]
-    fn origin_ok_null_origin_accepted() {
-        // file:// pages and sandboxed iframes get Origin: null.
-        assert!(origin_ok(&req_with_headers(&[
+    fn origin_ok_null_origin_rejected() {
+        // `null` Origin (sandboxed iframes, file://, data:) must be
+        // refused — a leaked token in such a context shouldn't be able
+        // to open the input WS. Legit non-browser clients omit Origin
+        // entirely (covered by origin_ok_no_origin_accepted).
+        assert!(!origin_ok(&req_with_headers(&[
             ("origin", "null"),
             ("host", "x.example")
         ])));
