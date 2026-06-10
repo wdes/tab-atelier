@@ -1818,7 +1818,13 @@ pub fn detect_urls(text: &str) -> Vec<(usize, usize, String, bool)> {
                 {
                     i += 1;
                 }
-                while i > start + prefix_len && matches!(chars[i - 1], '.' | ',' | ';') {
+                // Trailing punctuation that's almost never part of the
+                // URL itself — sentence terminators (`.` `,` `;`) and
+                // the line/byte-offset separator (`:`) that compilers,
+                // grep, tracebacks etc. append to a path or URL
+                // (`https://example.com/x:` from a log message, or
+                // `/mnt/foo.pdf:` from an `ls -la` style line).
+                while i > start + prefix_len && matches!(chars[i - 1], '.' | ',' | ';' | ':') {
                     i -= 1;
                 }
                 let url: String = chars[start..i].iter().collect();
@@ -1845,7 +1851,10 @@ pub fn detect_urls(text: &str) -> Vec<(usize, usize, String, bool)> {
             {
                 j += 1;
             }
-            while j > start + 1 && matches!(chars[j - 1], '.' | ',' | ';') {
+            // Same trailing-punctuation strip as the URL branch above.
+            // `:` covers grep / compiler / traceback suffixes
+            // (`/mnt/Dev/questionnaire.pdf:` in `ls -la`-style output).
+            while j > start + 1 && matches!(chars[j - 1], '.' | ',' | ';' | ':') {
                 j -= 1;
             }
             let path: String = chars[start..j].iter().collect();
@@ -1863,7 +1872,10 @@ pub fn detect_urls(text: &str) -> Vec<(usize, usize, String, bool)> {
             {
                 j += 1;
             }
-            while j > start + 1 && matches!(chars[j - 1], '.' | ',' | ';') {
+            // Same trailing-punctuation strip as the URL branch above.
+            // `:` covers grep / compiler / traceback suffixes
+            // (`/mnt/Dev/questionnaire.pdf:` in `ls -la`-style output).
+            while j > start + 1 && matches!(chars[j - 1], '.' | ',' | ';' | ':') {
                 j -= 1;
             }
             let candidate: String = chars[start..j].iter().collect();
@@ -2629,6 +2641,20 @@ mod tests {
         let urls = detect_urls("deb at /tmp/pkg/app_0.1-1_amd64.deb.");
         assert_eq!(urls.len(), 1);
         assert_eq!(urls[0].2, "/tmp/pkg/app_0.1-1_amd64.deb");
+    }
+
+    #[test]
+    fn detect_file_path_trims_trailing_colon() {
+        // grep / compiler / `ls -la` / traceback lines end paths with
+        // `:` to delimit a line number or extra info. The colon isn't
+        // part of the path itself — strip it.
+        let urls = detect_urls("see /mnt/Dev/questionnaire.pdf: header missing");
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0].2, "/mnt/Dev/questionnaire.pdf");
+        // Middle-of-path colons (line numbers) MUST survive — that's
+        // the existing `detect_file_path` invariant.
+        let urls = detect_urls("see /mnt/Dev/main.rs:42:5 column");
+        assert_eq!(urls[0].2, "/mnt/Dev/main.rs:42:5");
     }
 
     #[test]

@@ -257,9 +257,23 @@
     // browser to surface its IME.
     const kbdToggle = document.getElementById("kbd-toggle");
     if (kbdToggle) {
+      // Focus the underlying helper textarea DIRECTLY rather than
+      // calling term.focus() — on mobile, the IME only surfaces when
+      // a real form element receives focus from a user gesture, and
+      // xterm.js's helper-textarea may have `display:none` /
+      // `width:0` styling that the browser uses as a heuristic to
+      // refuse the IME. Calling .focus() on the textarea itself
+      // (inside the click handler = a fresh user gesture) is the
+      // most reliable cross-browser way to ask for the keyboard.
       kbdToggle.addEventListener("click", (e) => {
+        e.preventDefault();
         e.stopPropagation();
-        term.focus();
+        const helper = termEl.querySelector(".xterm-helper-textarea");
+        if (helper) {
+          helper.focus({ preventScroll: true });
+        } else {
+          term.focus();
+        }
       });
     }
 
