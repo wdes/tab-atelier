@@ -316,8 +316,6 @@ fn spawn_pty_tab(
         cell_width: 9,
         cell_height: 18,
     };
-    let mut env = pty_env(colors_enabled);
-    env.extend(extra_env);
     // Pick the shell explicitly. Alacritty defaults to the user's
     // login shell from /etc/passwd. The headless deb creates
     // `tab-atelier` as a system user with `nologin` as its login
@@ -342,14 +340,35 @@ fn spawn_pty_tab(
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| r"C:\Windows\System32\cmd.exe".to_string());
-    let opts = tty::Options {
-        // No `-l`: a login shell would source /etc/profile +
-        // ~/.profile, which under ProtectHome=true can fail noisily
-        // for the service account that has no profile files.
-        shell: Some(tty::Shell::new(shell_program, vec![])),
-        working_directory: cwd.clone(),
-        env,
-        ..Default::default()
+    let opts = if crate::clear_env() {
+        // Cleared-env mode: spawn the shell through `env -i` so it
+        // inherits NOTHING from the daemon — only the curated minimal
+        // allowlist (PATH/HOME/USER/locale + colours + telemetry opt-out
+        // + the per-tab API vars). `login = false` matches the no-`-l`
+        // choice below for the service account. `Options.env` stays
+        // empty because `env -i` discards alacritty's overlaid vars.
+        let min_env = crate::minimal_pty_env(colors_enabled, crate::clear_env_user_vars(), &extra_env);
+        let (prog, args) = crate::clear_env_shell_command(&shell_program, false, &min_env);
+        tty::Options {
+            shell: Some(tty::Shell::new(prog, args)),
+            working_directory: cwd.clone(),
+            env: HashMap::new(),
+            ..Default::default()
+        }
+    } else {
+        // Inherit the daemon environment, then overlay colours +
+        // telemetry opt-out (pty_env) and the per-tab API vars.
+        let mut env = pty_env(colors_enabled);
+        env.extend(extra_env);
+        tty::Options {
+            // No `-l`: a login shell would source /etc/profile +
+            // ~/.profile, which under ProtectHome=true can fail noisily
+            // for the service account that has no profile files.
+            shell: Some(tty::Shell::new(shell_program, vec![])),
+            working_directory: cwd.clone(),
+            env,
+            ..Default::default()
+        }
     };
     let pty = match tty::new(&opts, ws, 0) {
         Ok(p) => p,
@@ -460,6 +479,16 @@ pub fn run() -> std::io::Result<()> {
     // `limits` overrides per axis. Cloned out before `prefs` is picked
     // apart by the `unwrap_or_else` extractions below.
     let default_limits = prefs.default_tab_limits.clone();
+
+    // Latch the cleared-env opt-in for every tab spawn this process does.
+    if prefs.clear_env.unwrap_or(false) {
+        crate::CLEAR_ENV.store(true, Ordering::SeqCst);
+        crate::set_clear_env_user_vars(prefs.clear_env_vars.clone());
+        info!(
+            "clear_env: tabs spawn with a cleared environment (minimal allowlist + {} user var(s))",
+            prefs.clear_env_vars.len()
+        );
+    }
 
     let api_token = api::load_or_generate_token();
     let api_addr = prefs.api_addr.unwrap_or_else(|| DEFAULT_API_ADDR.into());

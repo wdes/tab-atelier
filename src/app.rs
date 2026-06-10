@@ -341,6 +341,12 @@ impl AppState {
         let pref_share_url_base_focus = cx.focus_handle();
         let font_config = load_font_config(&platform::config_dir());
         let prefs = load_preferences(&platform::config_dir());
+        // Latch the cleared-env opt-in (+ user vars) before any tab
+        // spawns below, so every PTY this process creates honours it.
+        if prefs.clear_env.unwrap_or(false) {
+            crate::CLEAR_ENV.store(true, std::sync::atomic::Ordering::SeqCst);
+            crate::set_clear_env_user_vars(prefs.clear_env_vars.clone());
+        }
         let browser: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(prefs.browser.clone()));
         let code_editor: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(prefs.code_editor.clone()));
         let lang = match prefs.lang.as_deref() {
@@ -3570,9 +3576,12 @@ impl AppState {
                                                         pty_cols: None,
                                                         pty_rows: None,
                                                         tab_bg_color: this.tab_bg_global.clone(),
-                                                        // Headless-only advanced field; not edited
-                                                        // by the GUI dialog, same as pty_cols.
+                                                        // Headless-only advanced fields set directly
+                                                        // in preferences.json; not exposed in the GUI
+                                                        // dialog, same treatment as pty_cols above.
                                                         default_tab_limits: crate::TabResourceLimits::default(),
+                                                        clear_env: None,
+                                                        clear_env_vars: std::collections::BTreeMap::new(),
                                                     },
                                                 );
                                                 if let Some(ref handle) = this.hotkey_handle {

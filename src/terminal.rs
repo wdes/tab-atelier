@@ -201,12 +201,28 @@ impl TerminalView {
             cell_width: 9,
             cell_height: 18,
         };
-        let mut env = pty_env(initial_colors_enabled);
-        env.extend(extra_env);
-        let opts = tty::Options {
-            working_directory: cwd.map(std::path::Path::to_path_buf),
-            env,
-            ..Default::default()
+        let opts = if crate::clear_env() {
+            // Cleared-env mode: exec the shell via `env -i` so it
+            // inherits nothing from the GUI process — only the curated
+            // minimal allowlist (PATH/HOME/USER/locale + colours +
+            // telemetry opt-out + the per-tab API vars). `login = true`
+            // so the shell still sources the user's profile files.
+            let min_env = crate::minimal_pty_env(initial_colors_enabled, crate::clear_env_user_vars(), &extra_env);
+            let (prog, args) = crate::clear_env_shell_command(&crate::clear_env_shell_path(), true, &min_env);
+            tty::Options {
+                shell: Some(tty::Shell::new(prog, args)),
+                working_directory: cwd.map(std::path::Path::to_path_buf),
+                env: HashMap::new(),
+                ..Default::default()
+            }
+        } else {
+            let mut env = pty_env(initial_colors_enabled);
+            env.extend(extra_env);
+            tty::Options {
+                working_directory: cwd.map(std::path::Path::to_path_buf),
+                env,
+                ..Default::default()
+            }
         };
         let pty = tty::new(&opts, ws, 0).expect("failed to create pty");
         // ConPTY's Pty doesn't expose the child the way the Unix one does.
@@ -371,10 +387,25 @@ impl TerminalView {
             cell_height: f32::from(cell.height) as u16,
         };
 
-        let opts = tty::Options {
-            working_directory: cwd.map(std::path::Path::to_path_buf),
-            env: pty_env(self.colors_enabled.get()),
-            ..Default::default()
+        let opts = if crate::clear_env() {
+            // Respawn carries no per-tab API extras (same as the
+            // inheriting branch below), so the cleared env is just the
+            // minimal allowlist + colours + telemetry opt-out.
+            let min_env =
+                crate::minimal_pty_env(self.colors_enabled.get(), crate::clear_env_user_vars(), &HashMap::new());
+            let (prog, args) = crate::clear_env_shell_command(&crate::clear_env_shell_path(), true, &min_env);
+            tty::Options {
+                shell: Some(tty::Shell::new(prog, args)),
+                working_directory: cwd.map(std::path::Path::to_path_buf),
+                env: HashMap::new(),
+                ..Default::default()
+            }
+        } else {
+            tty::Options {
+                working_directory: cwd.map(std::path::Path::to_path_buf),
+                env: pty_env(self.colors_enabled.get()),
+                ..Default::default()
+            }
         };
         let pty = tty::new(&opts, ws, 0).expect("failed to create pty");
         // ConPTY's Pty doesn't expose the child the way the Unix one does.
