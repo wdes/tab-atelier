@@ -132,6 +132,9 @@ struct HeadlessTab {
     /// that hasn't advanced means the grid is byte-for-byte identical
     /// and the previous scan can be reused. `None` until the first scan.
     snap_cache: Option<crate::term_export::GridSnapshotCache>,
+    /// Per-tab resource-limit overrides, carried so `persist()` writes
+    /// them back to `tabs.json` instead of wiping them each tick.
+    limits: crate::TabResourceLimits,
 }
 
 impl crate::schedule::LockState for HeadlessTab {
@@ -431,6 +434,7 @@ fn spawn_pty_tab(
         colors_enabled,
         pty_ring,
         snap_cache: None,
+        limits: crate::TabResourceLimits::default(),
     })
 }
 
@@ -452,6 +456,10 @@ pub fn run() -> std::io::Result<()> {
     info!("starting tab-atelier-headless v{}", env!("CARGO_PKG_VERSION"));
 
     let prefs = load_preferences(&platform::config_dir());
+    // Global default per-tab resource ceilings; each tab's own
+    // `limits` overrides per axis. Cloned out before `prefs` is picked
+    // apart by the `unwrap_or_else` extractions below.
+    let default_limits = prefs.default_tab_limits.clone();
 
     let api_token = api::load_or_generate_token();
     let api_addr = prefs.api_addr.unwrap_or_else(|| DEFAULT_API_ADDR.into());
@@ -474,7 +482,19 @@ pub fn run() -> std::io::Result<()> {
     let mut active: usize = 0;
     let mut windowed = false;
 
-    if let Some(saved) = load_state_with_outputs(&platform::config_base_dir(), &platform::state_base_dir()) {
+    let saved_state = load_state_with_outputs(&platform::config_base_dir(), &platform::state_base_dir());
+    // Set up cgroup delegation once, before any tab spawns, but only
+    // when a limit could actually apply (global default set, or some
+    // restored tab carries its own) — an unconfigured daemon never
+    // touches cgroups. Linux + `Delegate=yes` only; no-op otherwise.
+    #[cfg(target_os = "linux")]
+    {
+        let any_tab_limit = saved_state
+            .as_ref()
+            .is_some_and(|s| s.tabs.iter().any(|t| !t.limits.is_empty()));
+        crate::cgroup::init(!default_limits.is_empty() || any_tab_limit);
+    }
+    if let Some(saved) = saved_state {
         info!("restoring {} tab(s) from saved state", saved.tabs.len());
         windowed = saved.windowed;
         for ts in &saved.tabs {
@@ -491,7 +511,7 @@ pub fn run() -> std::io::Result<()> {
                     (None, Some(out))
                 }
             });
-            if let Some(t) = spawn_pty_tab(
+            if let Some(mut t) = spawn_pty_tab(
                 ts.id.clone(),
                 ts.name.clone(),
                 cwd,
@@ -512,6 +532,13 @@ pub fn run() -> std::io::Result<()> {
                 pty_cols,
                 pty_rows,
             ) {
+                t.limits = ts.limits.clone();
+                #[cfg(target_os = "linux")]
+                crate::cgroup::apply(
+                    &t.id,
+                    t.pid,
+                    &crate::TabResourceLimits::resolve(&t.limits, &default_limits),
+                );
                 if let Some(out) = eager {
                     debug!("restoring {} chars of output for '{}'", out.len(), ts.name);
                     t.restore_output(&out);
@@ -549,6 +576,10 @@ pub fn run() -> std::io::Result<()> {
             pty_cols,
             pty_rows,
         ) {
+            // Fresh default tab — no per-tab overrides, so just the
+            // global default ceilings.
+            #[cfg(target_os = "linux")]
+            crate::cgroup::apply(&t.id, t.pid, &default_limits);
             t.activate();
             tabs.push(t);
         }
@@ -645,6 +676,7 @@ pub fn run() -> std::io::Result<()> {
             &api_url_for_pty,
             pty_cols,
             pty_rows,
+            &default_limits,
         );
         // Refresh the API snapshot on every tick so /output reflects
         // shell echo within one tick (~500 ms) instead of waiting up
@@ -812,6 +844,7 @@ fn persist(
             locked: tab.locked,
             schedule: tab.schedule.clone(),
             bg_color: tab.bg_color.clone(),
+            limits: tab.limits.clone(),
             ..TabState::default()
         })
         .collect();
@@ -883,6 +916,7 @@ fn persist(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drain_pending(
     tabs: &mut Vec<HeadlessTab>,
     active: &mut usize,
@@ -891,6 +925,7 @@ fn drain_pending(
     api_url_for_pty: &str,
     pty_cols: usize,
     pty_rows: usize,
+    default_limits: &crate::TabResourceLimits,
 ) {
     let mut s = api_state.lock().unwrap();
     let mut closes: Vec<usize> = s.pending_closes.drain(..).collect();
@@ -1098,6 +1133,12 @@ fn drain_pending(
             pty_cols,
             pty_rows,
         ) {
+            // API-created tab — global default ceilings (no per-tab
+            // overrides exist until one is set).
+            #[cfg(target_os = "linux")]
+            crate::cgroup::apply(&t.id, t.pid, default_limits);
+            #[cfg(not(target_os = "linux"))]
+            let _ = default_limits;
             if *active < tabs.len() {
                 tabs[*active].deactivate();
             }
