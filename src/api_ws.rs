@@ -362,7 +362,7 @@ fn percent_decode(s: &str) -> Vec<u8> {
 /// a meta frame every 30 ms forever, defeating the
 /// only-on-change push model. If a future viewer needs uptime,
 /// expose it on a separate per-second tick channel.
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, PartialEq)]
 struct MetaSnapshot {
     name: String,
     cols: u16,
@@ -511,16 +511,20 @@ async fn run_pump(
     let mut ring_offset: u64 = since;
     let mut ime_dedup = ImeDedup::new();
 
-    // Send the initial meta on connect and seed the hash so the
-    // first tick after this doesn't re-emit the same payload.
-    let mut last_meta_hash: u64 = if let Some(meta) = current_meta(&state, &uuid, authz) {
+    // Send the initial meta on connect and keep the last one so the
+    // first tick after this doesn't re-emit the same payload. We hold
+    // the whole `MetaSnapshot` and compare structurally rather than
+    // re-serialising + hashing it on every 30 ms tick — the meta only
+    // changes on a lock/agent/schedule/file-count event, so the common
+    // case is an allocation-free `==` against the cached value.
+    let mut last_meta: Option<MetaSnapshot> = if let Some(meta) = current_meta(&state, &uuid, authz) {
         let bytes = encode_frame(TAG_META, serde_json::to_vec(&meta).unwrap_or_default());
         if sink.send(Message::Binary(bytes.into())).await.is_err() {
             return;
         }
-        meta_hash(&meta)
+        Some(meta)
     } else {
-        0
+        None
     };
 
     let mut tick = tokio::time::interval(Duration::from_millis(TICK_MS));
@@ -552,15 +556,16 @@ async fn run_pump(
                     }
                 }
                 // meta frame — only when something actually changed.
-                if let Some(meta) = current_meta(&state, &uuid, authz) {
-                    let h = meta_hash(&meta);
-                    if h != last_meta_hash {
-                        let bytes = encode_frame(TAG_META, serde_json::to_vec(&meta).unwrap_or_default());
-                        if sink.send(Message::Binary(bytes.into())).await.is_err() {
-                            return;
-                        }
-                        last_meta_hash = h;
+                // Structural compare against the last sent snapshot; we
+                // only serialise (allocating a Vec) when it differs.
+                if let Some(meta) = current_meta(&state, &uuid, authz)
+                    && last_meta.as_ref() != Some(&meta)
+                {
+                    let bytes = encode_frame(TAG_META, serde_json::to_vec(&meta).unwrap_or_default());
+                    if sink.send(Message::Binary(bytes.into())).await.is_err() {
+                        return;
                     }
+                    last_meta = Some(meta);
                 }
             }
             // Inbound frames.
@@ -703,21 +708,41 @@ fn current_meta(state: &Arc<Mutex<TabSnapshot>>, uuid: &str, authz: Authz) -> Op
     meta
 }
 
-/// Cheap fingerprint so we only emit a `meta` frame when something
-/// actually changed. Serialise + hash; not perfect (re-orders aren't
-/// detected, but `serde_json` is order-stable on a struct) and the
-/// cost is bounded by the meta payload size.
-fn meta_hash(m: &MetaSnapshot) -> u64 {
-    use std::hash::Hasher;
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    let bytes = serde_json::to_vec(m).unwrap_or_default();
-    h.write(&bytes);
-    h.finish()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn meta_snapshot_structural_eq_detects_change() {
+        // The WS pump emits a meta frame only when the snapshot differs
+        // from the last one sent. This replaced a serialize+hash; verify
+        // the derived `PartialEq` distinguishes the fields that matter.
+        let mk = |name: &str, locked: bool| MetaSnapshot {
+            name: name.into(),
+            cols: 80,
+            rows: 24,
+            locked,
+            lock_reason: if locked { Some("manual") } else { None },
+            schedule_tz: None,
+            schedule_rule: None,
+            schedule_next: None,
+            bg_color: None,
+            agent_state: None,
+            agent_label: None,
+            outbox_count: 0,
+            inbox_count: 0,
+            build_hash: crate::api::BUILD_HASH,
+        };
+        assert!(
+            mk("shell", false) == mk("shell", false),
+            "identical snapshots must compare equal"
+        );
+        assert!(
+            mk("shell", false) != mk("shell", true),
+            "a lock change must be detected"
+        );
+        assert!(mk("shell", false) != mk("build", false), "a rename must be detected");
+    }
 
     #[test]
     fn parse_ws_path_accepts_canonical_form() {
