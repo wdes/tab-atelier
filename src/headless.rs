@@ -241,7 +241,7 @@ impl HeadlessTab {
     /// snapshot cache. A value equal to the last cached one means no
     /// new bytes reached alacritty, so the grid is unchanged.
     fn ring_total_len(&self) -> u64 {
-        self.pty_ring.lock().map(|r| r.total_len()).unwrap_or(0)
+        self.pty_ring.lock().map_or(0, |r| r.total_len())
     }
 
     /// Return the grid-derived snapshot fields, scanning the terminal
