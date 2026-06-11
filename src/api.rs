@@ -126,6 +126,14 @@ struct TabInfo {
     /// is attached, even if no transient state is current.
     #[serde(skip_serializing_if = "Option::is_none")]
     agent_kind: Option<String>,
+    /// Durable agent session UUID — set by `set-status --session
+    /// <id>` from inside the agent's PTY. The brain uses this to
+    /// confirm a Claude (or other agent) is actually mid-task before
+    /// auto-injecting `continue`; a tab whose `agent_kind` happens to
+    /// be `claude` but with no live session attached is not a brain
+    /// target.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_session_id: Option<String>,
 }
 
 /// Host-wide stats reported alongside the per-tab list. Keeps the
@@ -1144,6 +1152,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                         crate::AgentState::Error => "error",
                     }),
                     agent_kind: t.agent_kind.clone(),
+                    agent_session_id: t.agent_session_id.clone(),
                     locked: crate::schedule::LockState::effective_locked(t),
                     lock_reason: crate::schedule::LockState::lock_reason(t),
                     schedule_rule: t.schedule.as_ref().map(|s| s.rule.clone()),
