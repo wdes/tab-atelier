@@ -166,6 +166,17 @@ pub const PATTERNS: &[Pattern] = &[
         label: "anthropic-rate-limited",
         action: "continue\n",
     },
+    // Network-layer abort mid-request. Claude Code prints this
+    // when fetch()'s underlying TLS socket dies before the response
+    // is fully received (mobile network handoff, ISP NAT timeout,
+    // a transient Cloudflare 525, …). Same recovery as the other
+    // network patterns: wait the cooldown, then `continue` on a
+    // fresh connection.
+    Pattern {
+        needle: "The socket connection was closed unexpectedly",
+        label: "socket-closed-unexpectedly",
+        action: "continue\n",
+    },
 ];
 
 /// Searches the trailing window of `text` for a known failure pattern.
