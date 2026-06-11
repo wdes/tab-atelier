@@ -1,53 +1,70 @@
-// Embedded WebView for the tab-atelier share-viewer. Replaces the old
-// Intent.ACTION_VIEW launch — the share-viewer now lives INSIDE the
-// app instead of bouncing to the system browser.
+// Embedded WebView for the tab-atelier share-viewer. Replaces the
+// old Intent.ACTION_VIEW launch — the share-viewer now lives INSIDE
+// the app, hosted in a fullscreen Dialog so it composites ABOVE the
+// NativeActivity window surface that Slint owns.
 //
-// Why this is a Java helper and not pure Rust+JNI:
-//   * subclassing `WebViewClient` to override `onReceivedSslError`
-//     (the SSL bypass for the headless's self-signed cert) requires
-//     a concrete Java class, not a JNI Proxy — WebViewClient is a
-//     class with stub default impls, not an interface.
-//   * `WebView` MUST be touched only on the activity's UI thread.
-//     The `runOnUiThread` hop guarantees that regardless of which
-//     thread Rust calls in from.
+// Why a Dialog and not addContentView:
+//   NativeActivity hands its entire window surface to Slint's GL
+//   renderer. The View hierarchy inside R.id.content does still
+//   exist but never gets composited on top — the native surface IS
+//   the visible output. Adding a WebView via addContentView yields a
+//   View that's technically attached and laid out (`uiautomator dump`
+//   shows it) but never drawn on screen.
 //
-// All state lives in static fields on this class. We never serve
-// more than one WebView at a time (the user picked ONE tab to
-// open), so a single static slot is enough.
+//   A Dialog opens a SECOND WindowManager.LayoutParams window that
+//   the system compositor stacks above the activity window, so the
+//   WebView can sit there and we don't fight Slint's render path.
 
 package fr.wdes.tab_atelier;
 
 import android.app.Activity;
+import android.app.Dialog;
+import android.graphics.Color;
+import android.graphics.drawable.ColorDrawable;
 import android.net.http.SslError;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.Window;
+import android.view.WindowManager;
 import android.webkit.SslErrorHandler;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
-import android.widget.FrameLayout;
 
 public final class WebViewHost {
-    private static volatile WebView current;
+    private static volatile Dialog currentDialog;
+    private static volatile WebView currentWebView;
 
-    /** Mount a fullscreen WebView pointed at `url`. Idempotent —
-     *  replaces any currently-mounted view. */
+    /** Mount a fullscreen WebView pointed at `url` in a Dialog above
+     *  the activity. Idempotent — replaces any currently-mounted
+     *  Dialog. */
     public static void show(final Activity activity, final String url) {
         if (activity == null || url == null) return;
         activity.runOnUiThread(new Runnable() {
             @Override public void run() {
                 dismissLocked();
+                // No-title-bar but NOT fullscreen: keep the system
+                // status-bar / notification area visible above the
+                // dialog. Theme_Black_NoTitleBar_Fullscreen took the
+                // notification area too and the WebView overran into
+                // it, leaving the wifi / battery icons sitting on top
+                // of page content.
+                Dialog dialog = new Dialog(activity, android.R.style.Theme_Black_NoTitleBar);
+                Window w = dialog.getWindow();
+                if (w != null) {
+                    w.setBackgroundDrawable(new ColorDrawable(Color.BLACK));
+                    w.setLayout(
+                            WindowManager.LayoutParams.MATCH_PARENT,
+                            WindowManager.LayoutParams.MATCH_PARENT);
+                }
                 WebView wv = new WebView(activity);
                 WebSettings s = wv.getSettings();
                 s.setJavaScriptEnabled(true);
                 s.setDomStorageEnabled(true);
-                // The headless's TLS endpoint serves a self-signed cert
-                // (or a CF Origin cert that Android doesn't trust by
-                // default). The user explicitly asked for the TLS URL
-                // to be reachable from the WebView without manual cert
-                // pinning, so we accept any cert here. The bearer
-                // token in the URL is the actual authn material — TLS
-                // here is a confidentiality channel, not an authn one.
+                // Self-signed origin certs (or CF Origin certs Android
+                // doesn't trust by default) — the bearer token in the
+                // URL is the authn material; TLS here is just for
+                // confidentiality.
                 wv.setWebViewClient(new WebViewClient() {
                     @Override
                     public void onReceivedSslError(WebView view,
@@ -56,21 +73,23 @@ public final class WebViewHost {
                         handler.proceed();
                     }
                 });
-                FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                dialog.setContentView(wv, new ViewGroup.LayoutParams(
                         ViewGroup.LayoutParams.MATCH_PARENT,
-                        ViewGroup.LayoutParams.MATCH_PARENT);
-                activity.addContentView(wv, lp);
+                        ViewGroup.LayoutParams.MATCH_PARENT));
+                dialog.show();
                 wv.loadUrl(url);
-                current = wv;
+                currentDialog = dialog;
+                currentWebView = wv;
             }
         });
     }
 
-    /** Remove + destroy the currently-mounted WebView. Returns true
-     *  if there was one to dismiss (caller uses this from the Back
-     *  key handler to know whether to consume the press). */
+    /** Dismiss the currently-mounted Dialog (if any). Returns true
+     *  if one was up — caller wires this to the Back-key handler so
+     *  the press is consumed instead of falling through to the
+     *  activity (which would close the app). */
     public static boolean dismiss(final Activity activity) {
-        if (current == null || activity == null) return false;
+        if (currentDialog == null || activity == null) return false;
         activity.runOnUiThread(new Runnable() {
             @Override public void run() { dismissLocked(); }
         });
@@ -79,11 +98,19 @@ public final class WebViewHost {
 
     /** Internal. Must run on the UI thread. */
     private static void dismissLocked() {
-        WebView wv = current;
-        if (wv == null) return;
-        current = null;
-        ViewGroup parent = (ViewGroup) wv.getParent();
-        if (parent != null) parent.removeView(wv);
-        wv.destroy();
+        Dialog d = currentDialog;
+        WebView wv = currentWebView;
+        currentDialog = null;
+        currentWebView = null;
+        if (wv != null) {
+            wv.stopLoading();
+            wv.loadUrl("about:blank");
+        }
+        if (d != null) {
+            try { d.dismiss(); } catch (IllegalArgumentException ignored) {}
+        }
+        if (wv != null) {
+            wv.destroy();
+        }
     }
 }

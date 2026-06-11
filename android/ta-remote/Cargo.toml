@@ -82,6 +82,11 @@ name = "android.permission.INTERNET"
 [package.metadata.android.application]
 label = "Tab Atelier Remote"
 icon = "@mipmap/ic_launcher"
+# Allow plain HTTP loads from WebView (LAN share-viewer) and trust
+# user-installed CA certs so WSS to the headless's self-signed origin
+# cert works once the operator imports it via Settings → Security.
+uses_cleartext_traffic = true
+network_security_config = "@xml/network_security_config"
 
 [[package.metadata.android.application.activity]]
 name = "android.app.NativeActivity"

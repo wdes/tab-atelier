@@ -114,14 +114,30 @@ const WS_MAX_FRAME_BYTES: usize = 1024 * 1024;
 const IME_DEDUP_WINDOW: Duration = Duration::from_millis(200);
 
 /// Identify whether the path is a WS upgrade endpoint we handle.
-/// Returns the tab UUID if so.
+/// Returns the tab KEY (UUID or index, as it appeared in the URL)
+/// when so — the caller resolves it to an index against the live
+/// snapshot the same way the HTTP routes do.
+///
+/// Accepts BOTH forms so the embedded Android `WebView`, which loads
+/// `/tabs/<idx>/view` (index-based) and lets the share viewer's
+/// `main.js` derive `/tabs/<idx>/ws` from `location.pathname`, can
+/// upgrade without a server-side detour through `/tabs/by-id/...`.
 #[must_use]
-pub fn parse_ws_path(path: &str) -> Option<&str> {
-    let rest = path.strip_prefix("/tabs/by-id/")?;
-    let (uuid, suffix) = rest.split_once('/')?;
-    // Strip query string from the suffix before comparing.
-    let action = suffix.split('?').next().unwrap_or(suffix);
-    if action == "ws" { Some(uuid) } else { None }
+pub fn parse_ws_path(path: &str) -> Option<(&str, bool)> {
+    let rest = path.strip_prefix("/tabs/")?;
+    if let Some(rest) = rest.strip_prefix("by-id/") {
+        let (uuid, suffix) = rest.split_once('/')?;
+        let action = suffix.split('?').next().unwrap_or(suffix);
+        if action == "ws" { Some((uuid, true)) } else { None }
+    } else {
+        let (idx_str, suffix) = rest.split_once('/')?;
+        let action = suffix.split('?').next().unwrap_or(suffix);
+        if action == "ws" && idx_str.parse::<usize>().is_ok() {
+            Some((idx_str, false))
+        } else {
+            None
+        }
+    }
 }
 
 /// Outcome of the auth + lookup phase. RW gives full duplex; RO
@@ -210,22 +226,28 @@ impl ImeDedup {
 fn authorise_and_ring(
     state: &Arc<Mutex<TabSnapshot>>,
     master: &str,
-    uuid: &str,
+    key: &str,
+    is_uuid: bool,
     provided: &[u8],
-) -> Option<(Authz, Arc<Mutex<PtyRing>>)> {
-    let (rw_tok, ro_tok, ring) = {
+) -> Option<(Authz, Arc<Mutex<PtyRing>>, String)> {
+    let (rw_tok, ro_tok, ring, uuid) = {
         let snap = state.lock().ok()?;
-        let t = snap.tabs.iter().find(|t| t.id == uuid)?;
+        let t = if is_uuid {
+            snap.tabs.iter().find(|t| t.id == key)?
+        } else {
+            let idx: usize = key.parse().ok()?;
+            snap.tabs.get(idx)?
+        };
         let ring = t.pty_ring.clone()?;
-        (t.share_token_rw.clone(), t.share_token_ro.clone(), ring)
+        (t.share_token_rw.clone(), t.share_token_ro.clone(), ring, t.id.clone())
     };
     let master_match = crate::api::constant_time_eq(provided, master.as_bytes());
     let rw_match = !rw_tok.is_empty() && crate::api::constant_time_eq(rw_tok.as_bytes(), provided);
     let ro_match = !ro_tok.is_empty() && crate::api::constant_time_eq(ro_tok.as_bytes(), provided);
     if master_match || rw_match {
-        Some((Authz::Rw, ring))
+        Some((Authz::Rw, ring, uuid))
     } else if ro_match {
-        Some((Authz::Ro, ring))
+        Some((Authz::Ro, ring, uuid))
     } else {
         None
     }
@@ -437,16 +459,18 @@ fn snapshot_meta(t: &SnapshotTab, authz: Authz) -> MetaSnapshot {
 }
 
 /// Entry point — called from `handle_hyper_request` in api.rs after
-/// it has matched `/tabs/by-id/{uuid}/ws` via `parse_ws_path`. If
-/// the upgrade is accepted, returns the 101 response immediately
-/// and spawns the WS pump in the background; if auth fails, returns
-/// a 401 / 404 without upgrading.
+/// it has matched `/tabs/<key>/ws` (UUID or index) via
+/// `parse_ws_path`. If the upgrade is accepted, returns the 101
+/// response immediately and spawns the WS pump in the background;
+/// if auth fails, returns a 401 / 404 without upgrading.
+#[allow(clippy::needless_pass_by_value)]
 pub fn handle_upgrade(
     mut req: Request<hyper::body::Incoming>,
     state: Arc<Mutex<TabSnapshot>>,
     master_token: &str,
     read_only_process: bool,
-    uuid: String,
+    key: String,
+    is_uuid: bool,
 ) -> Response<Full<Bytes>> {
     if !hyper_tungstenite::is_upgrade_request(&req) {
         return text_response(400, "expected websocket upgrade");
@@ -460,7 +484,7 @@ pub fn handle_upgrade(
     let Some(provided) = extract_token(&req) else {
         return text_response(401, "missing token");
     };
-    let Some((authz, ring)) = authorise_and_ring(&state, master_token, &uuid, &provided) else {
+    let Some((authz, ring, uuid)) = authorise_and_ring(&state, master_token, &key, is_uuid, &provided) else {
         // Same response for "no such tab" + "bad token" so a
         // probe can't distinguish; mirrors the HTTP gate.
         return text_response(401, "invalid or missing token");
@@ -751,16 +775,22 @@ mod tests {
     }
 
     #[test]
-    fn parse_ws_path_accepts_canonical_form() {
-        assert_eq!(parse_ws_path("/tabs/by-id/abc-123/ws"), Some("abc-123"));
-        assert_eq!(parse_ws_path("/tabs/by-id/abc-123/ws?token=x"), Some("abc-123"));
+    fn parse_ws_path_accepts_uuid_and_index_forms() {
+        assert_eq!(parse_ws_path("/tabs/by-id/abc-123/ws"), Some(("abc-123", true)));
+        assert_eq!(parse_ws_path("/tabs/by-id/abc-123/ws?token=x"), Some(("abc-123", true)));
+        // Index form — used by the Android WebView whose share-viewer
+        // URL is `/tabs/<idx>/view` and whose main.js derives the WS
+        // path from `location.pathname`.
+        assert_eq!(parse_ws_path("/tabs/0/ws"), Some(("0", false)));
+        assert_eq!(parse_ws_path("/tabs/12/ws?token=x"), Some(("12", false)));
     }
 
     #[test]
     fn parse_ws_path_rejects_other_endpoints() {
         assert_eq!(parse_ws_path("/tabs/by-id/abc/output"), None);
         assert_eq!(parse_ws_path("/tabs/by-id/abc"), None);
-        assert_eq!(parse_ws_path("/tabs/0/ws"), None);
+        // Non-numeric index isn't a tab.
+        assert_eq!(parse_ws_path("/tabs/foo/ws"), None);
         assert_eq!(parse_ws_path("/"), None);
     }
 

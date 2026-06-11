@@ -2360,9 +2360,11 @@ async fn handle_hyper_request(
     // Intercept WS upgrade BEFORE we collect the body into the sync
     // adapter — the WS handshake needs the original Request so it
     // can return a 101 Switching Protocols + park the connection.
-    if let Some(uuid) = crate::api_ws::parse_ws_path(&path) {
-        let uuid = uuid.to_string();
-        return Ok(crate::api_ws::handle_upgrade(req, state, &token, read_only, uuid));
+    if let Some((key, is_uuid)) = crate::api_ws::parse_ws_path(&path) {
+        let key = key.to_string();
+        return Ok(crate::api_ws::handle_upgrade(
+            req, state, &token, read_only, key, is_uuid,
+        ));
     }
     let method = req.method().to_string();
     let uri = req

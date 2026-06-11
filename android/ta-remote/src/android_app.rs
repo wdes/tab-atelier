@@ -87,20 +87,31 @@ fn load_app_class<'local>(
     activity: &JObject<'local>,
     name: &str,
 ) -> Result<jni::objects::JClass<'local>, String> {
-    let activity_cls = env.get_object_class(activity).map_err(|e| format!("get_object_class: {e}"))?;
-    let loader = env
-        .call_method(&activity_cls, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
+    // Activity inherits `getClassLoader()` from Context — call it on
+    // the activity INSTANCE, not its Class object. `Class.getClassLoader`
+    // exists too but returns the loader of `Class` itself (the boot
+    // loader), which doesn't have our app's dex on its path.
+    let loader_result = env.call_method(activity, "getClassLoader", "()Ljava/lang/ClassLoader;", &[]);
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_describe();
+        let _ = env.exception_clear();
+    }
+    let loader = loader_result
         .map_err(|e| format!("activity.getClassLoader: {e}"))?
         .l()
         .map_err(|e| format!("getClassLoader result: {e}"))?;
     let name_jstr = env.new_string(name).map_err(|e| format!("new_string class name: {e}"))?;
-    let cls_obj = env
-        .call_method(
-            &loader,
-            "loadClass",
-            "(Ljava/lang/String;)Ljava/lang/Class;",
-            &[JValue::Object(&JObject::from(name_jstr))],
-        )
+    let load_result = env.call_method(
+        &loader,
+        "loadClass",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+        &[JValue::Object(&JObject::from(name_jstr))],
+    );
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_describe();
+        let _ = env.exception_clear();
+    }
+    let cls_obj = load_result
         .map_err(|e| format!("ClassLoader.loadClass({name}): {e}"))?
         .l()
         .map_err(|e| format!("loadClass result: {e}"))?;
@@ -885,13 +896,13 @@ pub fn android_main(app: slint::android::AndroidApp) {
             log::warn!("open-tab-in-browser: token contains unsafe chars, refusing");
             return;
         }
-        // Switch from the HTTP base to the TLS base — Cloudflare AOP
-        // / Origin Pull setups, plus straightforward "encrypt this LAN
-        // link", both want HTTPS over the share-link. The WebViewHost
-        // bypasses cert validation on the WebViewClient so a self-
-        // signed origin cert doesn't block the load.
-        let tls_base = to_tls_url(base);
-        let url = format!("{tls_base}/tabs/{idx}/view?token={}", host.token);
+        // Use the HTTP base, NOT TLS. We tried HTTPS first but Chromium
+        // WebView refuses self-signed WSS handshakes (net_error -202,
+        // CERT_AUTHORITY_INVALID) and there's no WebViewClient hook to
+        // override the WS path the way onReceivedSslError covers the
+        // HTTPS page load. Until the device trusts the headless's cert
+        // (Settings → Security → Install certificate) we use plain HTTP.
+        let url = format!("{base}/tabs/{idx}/view?token={}", host.token);
         match show_webview(&browser_app, &url) {
             Ok(()) => log::info!("mounted WebView for tab {idx} at {url}"),
             Err(e) => log::warn!("show_webview failed: {e}"),
