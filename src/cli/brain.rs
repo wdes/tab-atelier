@@ -214,6 +214,17 @@ struct TabInfo {
     /// match any of our hard-coded patterns).
     #[serde(default)]
     agent_state: Option<String>,
+    /// Durable agent CLI kind ("claude" / "catbus" / …). None when
+    /// no agent has ever attached to this tab; the brain only
+    /// monitors tabs whose kind is `"claude"`.
+    #[serde(default)]
+    agent_kind: Option<String>,
+    /// Durable agent session UUID set by the Claude Code hook. The
+    /// brain requires this in addition to `agent_kind == "claude"`
+    /// so a tab that briefly ran Claude in the past but isn't
+    /// currently in a session doesn't get auto-`continue`ed.
+    #[serde(default)]
+    agent_session_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -306,6 +317,16 @@ fn tick(
     let mut eligible: Vec<Eligible> = Vec::new();
     for tab in tabs.tabs {
         if tab.id.is_empty() {
+            continue;
+        }
+        // Gate the entire per-tab scan on "Claude is mid-session
+        // here". Without it, brain was polling /output on every tab
+        // — including shell tabs, log tailers, vim sessions — and
+        // anything whose scrollback happened to contain a needle
+        // (e.g. `git log` showing "ECONNRESET" in a commit message)
+        // would get an injected `continue\n`. Only tabs whose hook
+        // has reported a Claude session are legitimate targets.
+        if tab.agent_kind.as_deref() != Some("claude") || tab.agent_session_id.as_deref().unwrap_or("").is_empty() {
             continue;
         }
         let output = ag
