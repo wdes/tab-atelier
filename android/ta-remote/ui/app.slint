@@ -706,367 +706,7 @@ component KeyButton inherits Rectangle {
     }
 }
 
-component KeyboardHeader inherits Rectangle {
-    // Direct-send keys (ESC, arrows, function keys, TAB) emit byte
-    // sequences over `send-bytes`; printable shortcuts (/, |, -) emit
-    // `type-text` so the host integrates them into the input field
-    // rather than dispatching to the terminal. KBD toggles the IME via
-    // its own callback because that's a UI concern, not an input one.
-    callback send-bytes(string);
-    callback type-text(string);
-    callback toggle-kbd();
-    // FN flips the two-row layout to F1–F12, mirroring the Termux
-    // pattern the user requested.
-    in-out property <bool> fn-mode: false;
-    // Sticky CTRL/ALT for future modifier work — visible state only,
-    // dispatch isn't combined with the on-screen keyboard yet.
-    in-out property <bool> ctrl-sticky: false;
-    in-out property <bool> alt-sticky: false;
 
-    height: 84px;
-    background: #122b48;
-    VerticalLayout {
-        padding: 4px;
-        spacing: 4px;
-
-        // ── normal mode ─────────────────────────────────────────────
-        if !root.fn-mode : HorizontalLayout {
-            spacing: 4px;
-            KeyButton { label: "ESC";     tapped => { root.send-bytes("\u{001b}") } }
-            KeyButton { label: "/";       tapped => { root.type-text("/") } }
-            KeyButton { label: "|";       tapped => { root.type-text("|") } }
-            KeyButton { label: "-";       tapped => { root.type-text("-") } }
-            KeyButton { label: "HOME";    tapped => { root.send-bytes("\u{001b}[H") } }
-            KeyButton {
-                icon-commands: "M 12 4 L 6 10 L 7.41 11.41 L 11 7.83 L 11 20 L 13 20 L 13 7.83 L 16.59 11.41 L 18 10 Z";
-                tapped => { root.send-bytes("\u{001b}[A") }
-            }
-            KeyButton { label: "END";     tapped => { root.send-bytes("\u{001b}[F") } }
-            KeyButton { label: "PGPRÉC";  tapped => { root.send-bytes("\u{001b}[5~") } }
-            KeyButton { label: "FN";      active: root.fn-mode; tapped => { root.fn-mode = true; } }
-        }
-        if !root.fn-mode : HorizontalLayout {
-            spacing: 4px;
-            KeyButton { label: "TAB";     tapped => { root.send-bytes("\u{0009}") } }
-            KeyButton { label: "CTRL";    active: root.ctrl-sticky; tapped => { root.ctrl-sticky = !root.ctrl-sticky; } }
-            KeyButton { label: "ALT";     active: root.alt-sticky;  tapped => { root.alt-sticky  = !root.alt-sticky;  } }
-            KeyButton {
-                icon-commands: "M 20 11 L 7.83 11 L 13.42 5.41 L 12 4 L 4 12 L 12 20 L 13.41 18.59 L 7.83 13 L 20 13 Z";
-                tapped => { root.send-bytes("\u{001b}[D") }
-            }
-            KeyButton {
-                icon-commands: "M 12 20 L 18 14 L 16.59 12.59 L 13 16.17 L 13 4 L 11 4 L 11 16.17 L 7.41 12.59 L 6 14 Z";
-                tapped => { root.send-bytes("\u{001b}[B") }
-            }
-            KeyButton {
-                icon-commands: "M 4 13 L 16.17 13 L 10.58 18.59 L 12 20 L 20 12 L 12 4 L 10.59 5.41 L 16.17 11 L 4 11 Z";
-                tapped => { root.send-bytes("\u{001b}[C") }
-            }
-            KeyButton { label: "PGSUIV";  tapped => { root.send-bytes("\u{001b}[6~") } }
-            KeyButton {
-                icon-commands: "M 20 5 L 4 5 C 2.89 5 2 5.89 2 7 L 2 17 C 2 18.11 2.89 19 4 19 L 20 19 C 21.11 19 22 18.11 22 17 L 22 7 C 22 5.89 21.11 5 20 5 Z M 11 8 L 13 8 L 13 10 L 11 10 Z M 11 11 L 13 11 L 13 13 L 11 13 Z M 8 8 L 10 8 L 10 10 L 8 10 Z M 8 11 L 10 11 L 10 13 L 8 13 Z M 7 13 L 5 13 L 5 11 L 7 11 Z M 7 10 L 5 10 L 5 8 L 7 8 Z M 16 17 L 8 17 L 8 15 L 16 15 Z M 16 13 L 14 13 L 14 11 L 16 11 Z M 16 10 L 14 10 L 14 8 L 16 8 Z M 19 13 L 17 13 L 17 11 L 19 11 Z M 19 10 L 17 10 L 17 8 L 19 8 Z";
-                tapped => { root.toggle-kbd() }
-            }
-        }
-
-        // ── FN mode (F1–F12) ─────────────────────────────────────────
-        // Sequences match the standard xterm/VT220 mapping used by
-        // most TUIs: F1–F4 as SS3 P/Q/R/S and F5+ as CSI ~ codes.
-        if root.fn-mode : HorizontalLayout {
-            spacing: 4px;
-            KeyButton { label: "F1"; tapped => { root.send-bytes("\u{001b}OP");   root.fn-mode = false; } }
-            KeyButton { label: "F2"; tapped => { root.send-bytes("\u{001b}OQ");   root.fn-mode = false; } }
-            KeyButton { label: "F3"; tapped => { root.send-bytes("\u{001b}OR");   root.fn-mode = false; } }
-            KeyButton { label: "F4"; tapped => { root.send-bytes("\u{001b}OS");   root.fn-mode = false; } }
-            KeyButton { label: "F5"; tapped => { root.send-bytes("\u{001b}[15~"); root.fn-mode = false; } }
-            KeyButton { label: "F6"; tapped => { root.send-bytes("\u{001b}[17~"); root.fn-mode = false; } }
-            KeyButton { label: "F7"; tapped => { root.send-bytes("\u{001b}[18~"); root.fn-mode = false; } }
-        }
-        if root.fn-mode : HorizontalLayout {
-            spacing: 4px;
-            KeyButton { label: "F8";  tapped => { root.send-bytes("\u{001b}[19~"); root.fn-mode = false; } }
-            KeyButton { label: "F9";  tapped => { root.send-bytes("\u{001b}[20~"); root.fn-mode = false; } }
-            KeyButton { label: "F10"; tapped => { root.send-bytes("\u{001b}[21~"); root.fn-mode = false; } }
-            KeyButton { label: "F11"; tapped => { root.send-bytes("\u{001b}[23~"); root.fn-mode = false; } }
-            KeyButton { label: "F12"; tapped => { root.send-bytes("\u{001b}[24~"); root.fn-mode = false; } }
-            // Explicit back-out — without this the only way to leave
-            // FN-mode is to commit an F-key press.
-            KeyButton {
-                icon-commands: "M 20 11 L 7.83 11 L 13.42 5.41 L 12 4 L 4 12 L 12 20 L 13.41 18.59 L 7.83 13 L 20 13 Z";
-                tapped => { root.fn-mode = false; }
-            }
-        }
-    }
-}
-
-component TerminalView inherits Rectangle {
-    in property <TabRow> tab;
-    in property <[ColorLine]> output-lines;
-    in property <length> safe-top;
-    in property <length> safe-bottom;
-    in property <length> safe-left;
-    in property <length> safe-right;
-    in property <length> ime-height;
-    in-out property <length> font-size: 13px;
-    // Host-reported cursor position (logical row + column). -1 hides
-    // the cursor; otherwise it's drawn at that exact spot.
-    in property <int> cursor-row: -1;
-    in property <int> cursor-col: -1;
-    // Transient buffer fed by the hidden TextInput. Always empty
-    // outside of an in-flight `edited` flush.
-    in-out property <string> capture-buffer: "";
-    callback back();
-    /// Raw byte sequence to feed straight to the terminal — used by
-    /// shortcut keys (ESC, arrows, function keys, …).
-    callback key-tapped(string);
-    /// User-typed characters that should be transformed by sticky
-    /// modifiers before reaching the host. The bool args are the
-    /// CTRL/ALT sticky states at flush time; they're cleared by the
-    /// caller after this fires.
-    callback typed(string, bool, bool);
-
-    // Auto-scroll to bottom whenever new output arrives. Setting
-    // viewport-y to a negative value scrolls the content upwards — the
-    // bottom of output-content lines up with the bottom of the flickable.
-    // A subsequent user scroll-up briefly moves away from the bottom; the
-    // next 2 s poll re-anchors.
-    changed output-lines => {
-        flick.viewport-y = min(0px, flick.height - flick.viewport-height);
-    }
-    // Re-anchor when the IME opens or closes. Slint propagates
-    // `ime-height` synchronously but only re-lays out (and thus updates
-    // `flick.height`) on the next frame, and IME-show animations on
-    // Android can take 200–300 ms to settle. Fire the anchor twice
-    // (early + late) via a counter-driven Timer so we catch both the
-    // pre- and post-animation geometry.
-    in-out property <int> _reanchor_ticks: 0;
-    changed ime-height => { root._reanchor_ticks = 4; }
-    Timer {
-        interval: 100ms;
-        running: root._reanchor_ticks > 0;
-        triggered => {
-            flick.viewport-y = min(0px, flick.height - flick.viewport-height);
-            root._reanchor_ticks = root._reanchor_ticks - 1;
-        }
-    }
-
-    // Cursor blink driver — matches the standard ~530 ms console
-    // cadence. Property is overlayed onto the last logical line.
-    in-out property <bool> _cursor_blink: true;
-    Timer {
-        interval: 530ms;
-        running: root.output-lines.length > 0;
-        triggered => { root._cursor_blink = !root._cursor_blink; }
-    }
-
-    background: #0e0e0e;
-
-    VerticalLayout {
-        spacing: 0;
-        padding-top: root.safe-top;
-        // When the IME is up, sit just above it with a small gap.
-        // When it isn't, reserve at least 48 px — `safe-area-insets`
-        // only reports the system-bars inset; phones running gesture
-        // nav report 0 there but still draw a handle the user
-        // shouldn't tap through, so a hard floor keeps the shortcut
-        // row from being borked into that area.
-        padding-bottom: root.ime-height > 0px
-            ? root.ime-height + 12px
-            : max(root.safe-bottom + 12px, 48px);
-        padding-left: root.safe-left;
-        padding-right: root.safe-right;
-
-        // Top bar
-        Rectangle {
-            height: 52px;
-            background: #181818;
-            HorizontalLayout {
-                padding-left: 8px;
-                padding-right: 12px;
-                spacing: 8px;
-                alignment: stretch;
-                TouchArea {
-                    width: 44px;
-                    clicked => { root.back() }
-                    Rectangle {
-                        background: parent.has-hover ? #2a2a2a : transparent;
-                        border-radius: 6px;
-                        Path {
-                            width: 24px;
-                            height: 24px;
-                            x: parent.width / 2 - 12px;
-                            y: parent.height / 2 - 12px;
-                            viewbox-width: 24;
-                            viewbox-height: 24;
-                            fill: #e0e0e0;
-                            commands: "M 20 11 L 7.83 11 L 13.42 5.41 L 12 4 L 4 12 L 12 20 L 13.41 18.59 L 7.83 13 L 20 13 Z";
-                        }
-                    }
-                }
-                VerticalLayout {
-                    horizontal-stretch: 1;
-                    alignment: center;
-                    spacing: 2px;
-                    Text {
-                        text: tab.name;
-                        color: #f0f0f0;
-                        font-size: 16px;
-                        font-weight: 600;
-                        overflow: elide;
-                    }
-                    Text {
-                        text: tab.cwd;
-                        color: #888;
-                        font-size: 11px;
-                        overflow: elide;
-                    }
-                }
-                Text {
-                    text: tab.cpu;
-                    color: #aaa;
-                    font-size: 12px;
-                    vertical-alignment: center;
-                }
-                TouchArea {
-                    width: 34px;
-                    clicked => {
-                        if (root.font-size > 9px) { root.font-size -= 1px; }
-                    }
-                    Rectangle {
-                        background: parent.has-hover ? #2a2a2a : transparent;
-                        border-radius: 6px;
-                        Text {
-                            text: "A−";
-                            color: #aaa;
-                            font-size: 14px;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
-                        }
-                    }
-                }
-                TouchArea {
-                    width: 34px;
-                    clicked => {
-                        if (root.font-size < 26px) { root.font-size += 1px; }
-                    }
-                    Rectangle {
-                        background: parent.has-hover ? #2a2a2a : transparent;
-                        border-radius: 6px;
-                        Text {
-                            text: "A+";
-                            color: #e0e0e0;
-                            font-size: 16px;
-                            font-weight: 700;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
-                        }
-                    }
-                }
-            }
-        }
-
-        Rectangle {
-            height: 1px;
-            background: #2a2a2a;
-        }
-
-        flick := Flickable {
-            vertical-stretch: 1;
-            interactive: true;
-            viewport-width: output-content.preferred-width;
-            viewport-height: output-content.preferred-height;
-            output-content := VerticalLayout {
-                padding: 10px;
-                spacing: 0;
-                if root.output-lines.length == 0 : Text {
-                    text: "Waiting for output…";
-                    color: #666;
-                    font-family: "FreeMono";
-                    font-size: root.font-size;
-                }
-                // One HorizontalLayout per terminal row, one Text per
-                // contiguous same-colour run. FreeMono is monospace, so
-                // spans line up without explicit cell widths.
-                for line[i] in root.output-lines : HorizontalLayout {
-                    spacing: 0px;
-                    alignment: start;
-                    for span[j] in line.spans : Text {
-                        text: span.text;
-                        color: span.color;
-                        font-family: "FreeMono";
-                        font-size: root.font-size;
-                        font-weight: span.bold ? 700 : 400;
-                        wrap: no-wrap;
-                    }
-                }
-            }
-            // Cursor overlay — positioned at the host-reported
-            // (cursor-row, cursor-col) in logical-line coordinates.
-            // FreeMono is monospace so glyph advance ≈ font-size×0.6;
-            // line height ≈ font-size×1.2. Sits inside the Flickable
-            // so it scrolls with the content.
-            if root.cursor-row >= 0 : Rectangle {
-                x: 10px + root.cursor-col * (root.font-size * 0.6);
-                y: 10px + root.cursor-row * (root.font-size * 1.2);
-                width: root.font-size * 0.6;
-                height: root.font-size * 1.1;
-                background: root._cursor_blink ? #d0d0d0 : transparent;
-            }
-        }
-
-        // Sink FocusScope used to dismiss the IME — focusing a non-text
-        // item makes Slint drop TextInputInterface.text-input-focused
-        // which the Android backend wires to InputMethodManager.hide(...).
-        hide-focus := FocusScope { width: 0; height: 0; }
-
-        // Hidden capture buffer — sized 1×1 px (not 0×0) so Android
-        // IMEs actually deliver key events to it; some IMEs drop
-        // anything aimed at a zero-area field. Multi-line so Enter
-        // arrives in the text stream as `\n` and goes through the
-        // same `typed` path as every other character — the previous
-        // `single-line: true` + `accepted` fallback only worked when
-        // the IME's action-button was wired (which Android IMEs
-        // mostly aren't, for terminal-style fields).
-        Rectangle {
-            height: 1px;
-            width: 1px;
-            opacity: 0;
-            clip: true;
-            input-field := TextInput {
-                text <=> root.capture-buffer;
-                color: transparent;
-                font-size: 1px;
-                edited => {
-                    if (root.capture-buffer != "") {
-                        root.typed(
-                            root.capture-buffer,
-                            kh.ctrl-sticky,
-                            kh.alt-sticky,
-                        );
-                        root.capture-buffer = "";
-                        kh.ctrl-sticky = false;
-                        kh.alt-sticky = false;
-                    }
-                }
-            }
-        }
-
-        kh := KeyboardHeader {
-            // Bytes route straight to the host's tab-input callback.
-            send-bytes(b) => { root.key-tapped(b); }
-            // `/`, `|`, `-` no longer have an input field to land in;
-            // dispatch them directly to the terminal too.
-            type-text(t) => { root.key-tapped(t); }
-            toggle-kbd => {
-                if (root.ime-height > 0px) {
-                    hide-focus.focus();
-                } else {
-                    input-field.focus();
-                }
-            }
-        }
-    }
-}
 
 export component AppWindow inherits Window {
     title: "Tab Atelier Remote";
@@ -1077,7 +717,6 @@ export component AppWindow inherits Window {
     in-out property <[Host]> hosts: [];
 
     in-out property <int> active-host: 0;
-    in-out property <int> open-tab: -1;
     in-out property <bool> picker-open: false;
     in-out property <bool> editor-open: false;
     /// -1 means "add new host"; >= 0 means "edit host at that index".
@@ -1087,11 +726,6 @@ export component AppWindow inherits Window {
     in-out property <string> editor-remote-url: "";
     in-out property <string> editor-token: "";
     in-out property <string> editor-error: "";
-    in-out property <[ColorLine]> open-tab-output-lines: [];
-    /// Cursor position the host reports for the currently-open tab,
-    /// in logical-line coordinates (row, col). -1 = unknown / hide.
-    in-out property <int> cursor-row: -1;
-    in-out property <int> cursor-col: -1;
     /// -1 = no close confirmation dialog open; >= 0 = index of the tab the
     /// user just hit the X on.
     in-out property <int> close-confirm-idx: -1;
@@ -1117,13 +751,11 @@ export component AppWindow inherits Window {
     in-out property <string> toast-text: "";
     in-out property <bool> toast-visible: false;
 
-    callback request-activate(int);
     callback request-send-input(int, string);
     /// Free-typed characters that should be transformed by sticky
     /// CTRL/ALT before being sent to the active tab. Implemented on
     /// the Rust side so the ASCII→Ctrl-byte mapping doesn't have to
     /// live in Slint.
-    callback request-typed-text(int, string, bool, bool);
     callback request-add-host(string, string, string, string);
     callback request-update-host(int, string, string, string, string);
     callback request-close-tab(int);
@@ -1138,16 +770,12 @@ export component AppWindow inherits Window {
     callback request-add-host-prefill();
     callback request-set-active-host(int);
     callback request-remove-host(int);
-    callback open-tab-changed(int);
-    // Phase 2a: tapping a tab dispatches to the desktop's xterm.js
-    // viewer in the system browser instead of the Slint TerminalView.
-    // Rust handler builds the share-link URL and fires Intent.ACTION_VIEW;
-    // falls back to `open-tab = idx` (the Slint TerminalView path) if
-    // the browser launch errors, so a phone with no browser still
-    // surfaces something.
+    // Tapping a tab dispatches to the desktop's xterm.js share-viewer
+    // in the system browser. The Slint TerminalView used to render
+    // the cell grid in-app; it's gone now, the WS-based web viewer
+    // (loaded in the system browser, or via WebView in a follow-up)
+    // is the one rendering pipeline.
     callback open-tab-in-browser(int);
-
-    changed open-tab => { root.open-tab-changed(root.open-tab) }
 
     // Wrap every visible child in a FocusScope so the Android Back key —
     // dispatched by Slint as Key.Back — bubbles from any focused widget
@@ -1176,10 +804,6 @@ export component AppWindow inherits Window {
                 }
                 if root.picker-open {
                     root.picker-open = false;
-                    return accept;
-                }
-                if root.open-tab >= 0 {
-                    root.open-tab = -1;
                     return accept;
                 }
             }
@@ -1320,28 +944,11 @@ export component AppWindow inherits Window {
         }
     }
 
-    if root.open-tab >= 0 : TerminalView {
-        width: 100%;
-        height: 100%;
-        tab: root.tabs[root.open-tab];
-        output-lines: root.open-tab-output-lines;
-        cursor-row: root.cursor-row;
-        cursor-col: root.cursor-col;
-        safe-top: root.safe-area-insets.top;
-        safe-bottom: root.safe-area-insets.bottom;
-        safe-left: root.safe-area-insets.left;
-        safe-right: root.safe-area-insets.right;
-        ime-height: root.virtual-keyboard-size.height;
-        back => { root.open-tab = -1; }
-        // Shortcut keys produce ready-to-send byte sequences.
-        key-tapped(bytes) => { root.request-send-input(root.open-tab, bytes); }
-        // Free-typed characters go through `request-typed-text` so the
-        // host-side handler can fold sticky CTRL / ALT into them
-        // (Ctrl-A → 0x01, Alt-X → "\x1bx", etc.).
-        typed(text, ctrl, alt) => {
-            root.request-typed-text(root.open-tab, text, ctrl, alt);
-        }
-    }
+    // (Old TerminalView render removed — tab tap now opens the
+    // xterm.js share-viewer in the system browser via the
+    // open-tab-in-browser callback. The native cell-grid renderer +
+    // its KeyboardHeader were a second copy of UI that the WS-based
+    // web viewer covers without us re-implementing it.)
 
     if root.picker-open : HostPicker {
         width: 100%;
