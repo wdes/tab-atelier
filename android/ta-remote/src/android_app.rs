@@ -77,6 +77,36 @@ fn read_clipboard(app: &slint::android::AndroidApp) -> Option<String> {
     env.get_string(&jstr).ok().map(Into::into)
 }
 
+/// Load `name` (Java FQCN, dotted: `fr.wdes.tab_atelier.WebViewHost`)
+/// via the *activity's* `ClassLoader` rather than `JNIEnv::find_class`.
+/// `find_class` uses the system class loader from a Rust-spawned thread
+/// and ART aborts the process with `ClassNotFoundException` for any
+/// non-system class — including ours in classes.dex.
+fn load_app_class<'local>(
+    env: &mut jni::JNIEnv<'local>,
+    activity: &JObject<'local>,
+    name: &str,
+) -> Result<jni::objects::JClass<'local>, String> {
+    let activity_cls = env.get_object_class(activity).map_err(|e| format!("get_object_class: {e}"))?;
+    let loader = env
+        .call_method(&activity_cls, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
+        .map_err(|e| format!("activity.getClassLoader: {e}"))?
+        .l()
+        .map_err(|e| format!("getClassLoader result: {e}"))?;
+    let name_jstr = env.new_string(name).map_err(|e| format!("new_string class name: {e}"))?;
+    let cls_obj = env
+        .call_method(
+            &loader,
+            "loadClass",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+            &[JValue::Object(&JObject::from(name_jstr))],
+        )
+        .map_err(|e| format!("ClassLoader.loadClass({name}): {e}"))?
+        .l()
+        .map_err(|e| format!("loadClass result: {e}"))?;
+    Ok(cls_obj.into())
+}
+
 /// Mount the in-app `WebViewHost` (a static Java helper compiled
 /// into classes.dex via cargo-apk2's `java_sources`) at the activity
 /// root, pointed at the xterm.js share-viewer URL. Bypasses TLS
@@ -92,9 +122,7 @@ fn show_webview(app: &slint::android::AndroidApp, url: &str) -> Result<(), Strin
     let vm = unsafe { JavaVM::from_raw(vm_ptr.cast()) }.map_err(|e| e.to_string())?;
     let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
     let activity = unsafe { JObject::from_raw(activity_ptr.cast()) };
-    let host_cls = env
-        .find_class("fr/wdes/tab_atelier/WebViewHost")
-        .map_err(|e| format!("find_class WebViewHost: {e}"))?;
+    let host_cls = load_app_class(&mut env, &activity, "fr.wdes.tab_atelier.WebViewHost")?;
     let url_jstr = env.new_string(url).map_err(|e| e.to_string())?;
     env.call_static_method(
         &host_cls,
@@ -122,7 +150,7 @@ fn dismiss_webview(app: &slint::android::AndroidApp) -> bool {
         return false;
     };
     let activity = unsafe { JObject::from_raw(activity_ptr.cast()) };
-    let Ok(host_cls) = env.find_class("fr/wdes/tab_atelier/WebViewHost") else {
+    let Ok(host_cls) = load_app_class(&mut env, &activity, "fr.wdes.tab_atelier.WebViewHost") else {
         return false;
     };
     env.call_static_method(
