@@ -776,6 +776,11 @@ export component AppWindow inherits Window {
     // (loaded in the system browser, or via WebView in a follow-up)
     // is the one rendering pipeline.
     callback open-tab-in-browser(int);
+    // Back-press while a WebView is mounted on top of the Slint
+    // surface. Rust side checks the WebViewHost state and
+    // returns true if it dismissed a view (in which case Slint
+    // consumes the Back key).
+    callback request-dismiss-webview() -> bool;
 
     // Wrap every visible child in a FocusScope so the Android Back key —
     // dispatched by Slint as Key.Back — bubbles from any focused widget
@@ -786,6 +791,13 @@ export component AppWindow inherits Window {
         init => { fs.focus() }
         key-pressed(event) => {
             if event.text == Key.Escape || event.text == Key.Back {
+                // The WebView sits ABOVE the Slint surface in the
+                // activity's content view — ask Rust first whether a
+                // view is mounted so Back closes it instead of bubbling
+                // up to the activity (which would kill the app).
+                if root.request-dismiss-webview() {
+                    return accept;
+                }
                 if root.actions-idx >= 0 {
                     root.actions-idx = -1;
                     return accept;

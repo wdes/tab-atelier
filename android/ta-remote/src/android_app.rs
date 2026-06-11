@@ -77,19 +77,13 @@ fn read_clipboard(app: &slint::android::AndroidApp) -> Option<String> {
     env.get_string(&jstr).ok().map(Into::into)
 }
 
-/// Launch the system browser pointed at `url`. Used by the tab list
-/// to delegate per-tab terminal rendering to the same xterm.js
-/// share-viewer the desktop browser uses — Phase 2a of the Android
-/// app's "stop maintaining two terminal renderers" plan. The
-/// rendered share link is just `<host>/tabs/<idx>/view?token=<t>`;
-/// every page asset is vendored by tab-atelier-headless so this
-/// works offline once the share host is reachable on the LAN.
-///
-/// Returns Ok(()) when the Intent.ACTION_VIEW dispatch completed
-/// (the browser pops up). On failure the caller should fall back
-/// to the in-app native renderer so the tab tap doesn't appear
-/// dead.
-fn launch_browser(app: &slint::android::AndroidApp, url: &str) -> Result<(), String> {
+/// Mount the in-app `WebViewHost` (a static Java helper compiled
+/// into classes.dex via cargo-apk2's `java_sources`) at the activity
+/// root, pointed at the xterm.js share-viewer URL. Bypasses TLS
+/// validation on the WebViewClient — the bearer token in the URL is
+/// the authn material, and the share host's TLS cert is typically
+/// self-signed.
+fn show_webview(app: &slint::android::AndroidApp, url: &str) -> Result<(), String> {
     let vm_ptr = app.vm_as_ptr();
     let activity_ptr = app.activity_as_ptr();
     if vm_ptr.is_null() || activity_ptr.is_null() {
@@ -98,52 +92,63 @@ fn launch_browser(app: &slint::android::AndroidApp, url: &str) -> Result<(), Str
     let vm = unsafe { JavaVM::from_raw(vm_ptr.cast()) }.map_err(|e| e.to_string())?;
     let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
     let activity = unsafe { JObject::from_raw(activity_ptr.cast()) };
-
+    let host_cls = env
+        .find_class("fr/wdes/tab_atelier/WebViewHost")
+        .map_err(|e| format!("find_class WebViewHost: {e}"))?;
     let url_jstr = env.new_string(url).map_err(|e| e.to_string())?;
-    let uri_cls = env.find_class("android/net/Uri").map_err(|e| e.to_string())?;
-    let uri = env
-        .call_static_method(
-            &uri_cls,
-            "parse",
-            "(Ljava/lang/String;)Landroid/net/Uri;",
-            &[JValue::Object(&JObject::from(url_jstr))],
-        )
-        .map_err(|e| format!("Uri.parse: {e}"))?
-        .l()
-        .map_err(|e| format!("Uri.parse result: {e}"))?;
-
-    let intent_cls = env.find_class("android/content/Intent").map_err(|e| e.to_string())?;
-    let action_view = env
-        .new_string("android.intent.action.VIEW")
-        .map_err(|e| e.to_string())?;
-    let intent = env
-        .new_object(
-            &intent_cls,
-            "(Ljava/lang/String;Landroid/net/Uri;)V",
-            &[JValue::Object(&JObject::from(action_view)), JValue::Object(&uri)],
-        )
-        .map_err(|e| format!("new Intent: {e}"))?;
-
-    // FLAG_ACTIVITY_NEW_TASK = 0x10000000 — required when launching
-    // from a non-Activity context. Without it Android throws
-    // AndroidRuntimeException: Calling startActivity() from outside
-    // of an Activity context requires the FLAG_ACTIVITY_NEW_TASK flag.
-    env.call_method(
-        &intent,
-        "setFlags",
-        "(I)Landroid/content/Intent;",
-        &[JValue::Int(0x1000_0000)],
+    env.call_static_method(
+        &host_cls,
+        "show",
+        "(Landroid/app/Activity;Ljava/lang/String;)V",
+        &[JValue::Object(&activity), JValue::Object(&JObject::from(url_jstr))],
     )
-    .map_err(|e| format!("intent.setFlags: {e}"))?;
-
-    env.call_method(
-        &activity,
-        "startActivity",
-        "(Landroid/content/Intent;)V",
-        &[JValue::Object(&intent)],
-    )
-    .map_err(|e| format!("startActivity: {e}"))?;
+    .map_err(|e| format!("WebViewHost.show: {e}"))?;
     Ok(())
+}
+
+/// Dismiss the currently-mounted WebView, if any. Returns true if a
+/// WebView was active (caller uses this from the Back-key handler
+/// to know whether to consume the press).
+fn dismiss_webview(app: &slint::android::AndroidApp) -> bool {
+    let vm_ptr = app.vm_as_ptr();
+    let activity_ptr = app.activity_as_ptr();
+    if vm_ptr.is_null() || activity_ptr.is_null() {
+        return false;
+    }
+    let Ok(vm) = (unsafe { JavaVM::from_raw(vm_ptr.cast()) }) else {
+        return false;
+    };
+    let Ok(mut env) = vm.attach_current_thread() else {
+        return false;
+    };
+    let activity = unsafe { JObject::from_raw(activity_ptr.cast()) };
+    let Ok(host_cls) = env.find_class("fr/wdes/tab_atelier/WebViewHost") else {
+        return false;
+    };
+    env.call_static_method(
+        &host_cls,
+        "dismiss",
+        "(Landroid/app/Activity;)Z",
+        &[JValue::Object(&activity)],
+    )
+    .and_then(|v| v.z())
+    .unwrap_or(false)
+}
+
+/// Swap `http://host:7890` into `https://host:7891` so the WebView
+/// loads the TLS endpoint instead of the cleartext one. The TLS
+/// endpoint serves the same `/tabs/.../view` route + WS upgrade —
+/// the only difference is the channel encryption. If the URL is
+/// already `https://`, leave it untouched.
+fn to_tls_url(http_url: &str) -> String {
+    let mut s = http_url.to_string();
+    if let Some(rest) = s.strip_prefix("http://") {
+        s = format!("https://{rest}");
+    }
+    if let Some(idx) = s.rfind(":7890") {
+        s = format!("{}:7891{}", &s[..idx], &s[idx + 5..]);
+    }
+    s
 }
 
 fn launch_intent_uri(app: &slint::android::AndroidApp) -> Option<String> {
@@ -811,6 +816,13 @@ pub fn android_main(app: slint::android::AndroidApp) {
     // the active host + idx + token, fire Intent.ACTION_VIEW via
     // JNI. Failures log + drop the tap — there's no in-app fallback
     // anymore (the Slint TerminalView is gone).
+    // Back-key handler bridge: Slint's FocusScope asks Rust whether
+    // there's a mounted WebView to dismiss. If yes, Slint consumes
+    // the Back press; if no, the press falls through to the in-app
+    // dialog handlers below.
+    let dismiss_app = app_for_callbacks.clone();
+    ui.on_request_dismiss_webview(move || dismiss_webview(&dismiss_app));
+
     let browser_data = data.clone();
     let browser_app = app_for_callbacks.clone();
     ui.on_open_tab_in_browser(move |idx| {
@@ -845,14 +857,16 @@ pub fn android_main(app: slint::android::AndroidApp) {
             log::warn!("open-tab-in-browser: token contains unsafe chars, refusing");
             return;
         }
-        let url = format!("{base}/tabs/{idx}/view?token={}", host.token);
-        match launch_browser(&browser_app, &url) {
-            Ok(()) => log::info!("opened tab {idx} in system browser"),
-            // No fallback — the in-app native TerminalView was deleted
-            // along with the old mobile rendering stack. A browser
-            // that can't be reached is just a hard error here; the
-            // tap stays inert until the user installs a browser.
-            Err(e) => log::warn!("launch_browser failed: {e}"),
+        // Switch from the HTTP base to the TLS base — Cloudflare AOP
+        // / Origin Pull setups, plus straightforward "encrypt this LAN
+        // link", both want HTTPS over the share-link. The WebViewHost
+        // bypasses cert validation on the WebViewClient so a self-
+        // signed origin cert doesn't block the load.
+        let tls_base = to_tls_url(base);
+        let url = format!("{tls_base}/tabs/{idx}/view?token={}", host.token);
+        match show_webview(&browser_app, &url) {
+            Ok(()) => log::info!("mounted WebView for tab {idx} at {url}"),
+            Err(e) => log::warn!("show_webview failed: {e}"),
         }
     });
 
