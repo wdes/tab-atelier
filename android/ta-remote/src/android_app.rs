@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 
 use jni::JavaVM;
@@ -306,216 +305,6 @@ impl AppData {
 /// Output payload + cursor logical position, as returned by the host's
 /// `/tabs/N/output` endpoint. The cursor headers are optional; absent
 /// → `cursor = (-1, -1)` which the Slint side renders as "no cursor".
-struct OutputResult {
-    text: String,
-    cursor_row: i32,
-    cursor_col: i32,
-}
-
-fn fetch_output(agent: &ureq::Agent, host: &HostConfig, reach: Reach, idx: i32) -> Option<OutputResult> {
-    let base = base_url(host, reach);
-    if base.is_empty() {
-        return None;
-    }
-    let resp = agent
-        .get(&format!("{base}/tabs/{idx}/output"))
-        .set("Authorization", &format!("Bearer {}", host.token))
-        .timeout(Duration::from_millis(1500))
-        .call()
-        .ok()?;
-    let cursor_row = resp
-        .header("X-Cursor-Row")
-        .and_then(|v| v.parse::<i32>().ok())
-        .unwrap_or(-1);
-    let cursor_col = resp
-        .header("X-Cursor-Col")
-        .and_then(|v| v.parse::<i32>().ok())
-        .unwrap_or(-1);
-    let text = resp.into_string().ok()?;
-    Some(OutputResult {
-        text,
-        cursor_row,
-        cursor_col,
-    })
-}
-
-fn push_output(ui_weak: &Weak<AppWindow>, output: OutputResult) {
-    // Parsing runs on whatever thread called us, but the Slint structs
-    // (`ColorLine` carries a `ModelRc` which is `!Send`) must be built
-    // on the UI thread.
-    let lines = parse_ansi(&output.text);
-    let cursor_row = output.cursor_row;
-    let cursor_col = output.cursor_col;
-    let weak = ui_weak.clone();
-    let _ = slint::invoke_from_event_loop(move || {
-        let Some(ui) = weak.upgrade() else { return };
-        let model: Vec<ColorLine> = lines
-            .into_iter()
-            .map(|spans| {
-                let span_models: Vec<ColorSpan> = spans
-                    .into_iter()
-                    .map(|s| ColorSpan {
-                        text: SharedString::from(s.text),
-                        color: slint::Color::from_rgb_u8(s.rgb[0], s.rgb[1], s.rgb[2]),
-                        bold: s.bold,
-                    })
-                    .collect();
-                ColorLine {
-                    spans: std::rc::Rc::new(slint::VecModel::from(span_models)).into(),
-                }
-            })
-            .collect();
-        ui.set_open_tab_output_lines(VecModel::from_slice(&model));
-        ui.set_cursor_row(cursor_row);
-        ui.set_cursor_col(cursor_col);
-    });
-}
-
-struct ParsedSpan {
-    text: String,
-    rgb: [u8; 3],
-    bold: bool,
-}
-
-/// Default foreground colour for the terminal view — keep in sync with
-/// the old `#d0d0d0` used by the plain-text Text element.
-const DEFAULT_FG: [u8; 3] = [0xd0, 0xd0, 0xd0];
-
-/// Parse `text` (lines separated by '\n') as a sequence of rows where each
-/// row is a vector of single-colour runs. Recognises CSI SGR sequences
-/// (reset, bold, 8 fg, bright fg, 256 fg, 24-bit fg); other CSI sequences
-/// are silently consumed so they don't appear as garbage in the output.
-fn parse_ansi(text: &str) -> Vec<Vec<ParsedSpan>> {
-    let mut lines = Vec::new();
-    let mut cur_color = DEFAULT_FG;
-    let mut cur_bold = false;
-
-    for raw_line in text.split('\n') {
-        let mut spans: Vec<ParsedSpan> = Vec::new();
-        let mut buf = String::new();
-        let mut chars = raw_line.chars().peekable();
-
-        while let Some(c) = chars.next() {
-            if c == '\x1b' && chars.peek() == Some(&'[') {
-                chars.next();
-                let mut params = String::new();
-                let mut final_byte = 0u8;
-                for nc in chars.by_ref() {
-                    if ('\x40'..='\x7e').contains(&nc) {
-                        final_byte = nc as u8;
-                        break;
-                    }
-                    params.push(nc);
-                }
-                if final_byte == b'm' {
-                    if !buf.is_empty() {
-                        spans.push(ParsedSpan {
-                            text: std::mem::take(&mut buf),
-                            rgb: cur_color,
-                            bold: cur_bold,
-                        });
-                    }
-                    apply_sgr(&params, &mut cur_color, &mut cur_bold);
-                }
-            } else {
-                buf.push(c);
-            }
-        }
-        if !buf.is_empty() {
-            spans.push(ParsedSpan {
-                text: buf,
-                rgb: cur_color,
-                bold: cur_bold,
-            });
-        }
-        // Empty rows still need a placeholder span so the VerticalLayout
-        // reserves a row of vertical space — otherwise blank shell lines
-        // would collapse the gap above/below them.
-        if spans.is_empty() {
-            spans.push(ParsedSpan {
-                text: " ".to_string(),
-                rgb: cur_color,
-                bold: cur_bold,
-            });
-        }
-        lines.push(spans);
-    }
-    lines
-}
-
-fn apply_sgr(params: &str, cur: &mut [u8; 3], bold: &mut bool) {
-    if params.is_empty() {
-        *cur = DEFAULT_FG;
-        *bold = false;
-        return;
-    }
-    let parts: Vec<u32> = params.split(';').filter_map(|s| s.parse().ok()).collect();
-    let mut i = 0;
-    while i < parts.len() {
-        let code = parts[i];
-        match code {
-            0 => {
-                *cur = DEFAULT_FG;
-                *bold = false;
-            }
-            1 => *bold = true,
-            22 => *bold = false,
-            30..=37 => *cur = ansi16((code - 30) as u8),
-            38 => {
-                if i + 1 < parts.len() && parts[i + 1] == 5 && i + 2 < parts.len() {
-                    *cur = ansi256(parts[i + 2] as u8);
-                    i += 2;
-                } else if i + 4 < parts.len() && parts[i + 1] == 2 {
-                    *cur = [parts[i + 2] as u8, parts[i + 3] as u8, parts[i + 4] as u8];
-                    i += 4;
-                }
-            }
-            39 => *cur = DEFAULT_FG,
-            90..=97 => *cur = ansi16((code - 90 + 8) as u8),
-            _ => {}
-        }
-        i += 1;
-    }
-}
-
-const ANSI_PALETTE: [[u8; 3]; 16] = [
-    [0x00, 0x00, 0x00],
-    [0xcd, 0x00, 0x00],
-    [0x00, 0xcd, 0x00],
-    [0xcd, 0xcd, 0x00],
-    [0x40, 0x80, 0xff], // blue — brightened from #0000ee for readability on dark bg
-    [0xcd, 0x00, 0xcd],
-    [0x00, 0xcd, 0xcd],
-    [0xe5, 0xe5, 0xe5],
-    [0x7f, 0x7f, 0x7f],
-    [0xff, 0x40, 0x40],
-    [0x40, 0xff, 0x40],
-    [0xff, 0xff, 0x40],
-    [0x80, 0xa0, 0xff],
-    [0xff, 0x40, 0xff],
-    [0x40, 0xff, 0xff],
-    [0xff, 0xff, 0xff],
-];
-
-const fn ansi16(idx: u8) -> [u8; 3] {
-    ANSI_PALETTE[(idx as usize) % 16]
-}
-
-fn ansi256(idx: u8) -> [u8; 3] {
-    if idx < 16 {
-        ansi16(idx)
-    } else if idx < 232 {
-        let i = idx - 16;
-        let r = i / 36;
-        let g = (i % 36) / 6;
-        let b = i % 6;
-        let to_val = |v: u8| if v == 0 { 0u8 } else { 55 + v * 40 };
-        [to_val(r), to_val(g), to_val(b)]
-    } else {
-        let v = 8u8.saturating_add((idx - 232).saturating_mul(10));
-        [v, v, v]
-    }
-}
 
 /// Outcome of one `GET /tabs` attempt — needed because we want to
 /// distinguish "no answer at all" (try the next URL) from "answered
@@ -662,21 +451,6 @@ fn delete_tab(agent: &ureq::Agent, host: &HostConfig, reach: Reach, idx: i32) {
     }
 }
 
-fn post_activate(agent: &ureq::Agent, host: &HostConfig, reach: Reach, idx: i32) {
-    let base = base_url(host, reach);
-    if base.is_empty() {
-        return;
-    }
-    let url = format!("{base}/tabs/{idx}/activate");
-    if let Err(e) = agent
-        .post(&url)
-        .set("Authorization", &format!("Bearer {}", host.token))
-        .timeout(Duration::from_secs(2))
-        .send_string("")
-    {
-        log::warn!("post_activate failed: {e}");
-    }
-}
 
 /// Fold sticky CTRL / ALT into a typed UTF-8 string.
 ///
@@ -685,37 +459,6 @@ fn post_activate(agent: &ureq::Agent, host: &HostConfig, reach: Reach, idx: i32)
 /// remaining bytes are appended verbatim. ALT prepends an ESC byte
 /// (the standard meta-encoding) to the *first* code point and leaves
 /// the rest untouched. If both are set, ALT wraps CTRL.
-fn apply_modifiers(text: &str, ctrl: bool, alt: bool) -> Vec<u8> {
-    if text.is_empty() {
-        return Vec::new();
-    }
-    let mut iter = text.chars();
-    let Some(first) = iter.next() else { return Vec::new() };
-    let rest: String = iter.collect();
-
-    let first_bytes: Vec<u8> = if ctrl {
-        match first {
-            'a'..='z' => vec![(first as u8) - b'a' + 1],
-            'A'..='Z' => vec![(first as u8) - b'A' + 1],
-            // Ctrl-? / Ctrl-/ → DEL (0x7f), Ctrl-Space → NUL,
-            // anything else falls through as-is so the user still sees
-            // their key arrive at the terminal.
-            '?' | '/' => vec![0x7f],
-            ' ' => vec![0x00],
-            other => other.to_string().into_bytes(),
-        }
-    } else {
-        first.to_string().into_bytes()
-    };
-
-    let mut out = Vec::with_capacity(first_bytes.len() + rest.len() + 1);
-    if alt {
-        out.push(0x1b);
-    }
-    out.extend_from_slice(&first_bytes);
-    out.extend_from_slice(rest.as_bytes());
-    out
-}
 
 /// Compact "Xh Ym" / "Xm Ys" / "Xs" uptime string — matches the visual
 /// vocabulary the desktop uses in its tab headers so the phone counter
@@ -822,16 +565,6 @@ fn refresh_soon(
 /// the screen sits stale for almost half a second on average. Schedule
 /// two follow-up fetches at 120 ms and 380 ms so the terminal output
 /// catches up to the keystroke well before the next poll tick.
-fn nudge_output_refresh(ui_weak: Weak<AppWindow>, agent: Arc<ureq::Agent>, host: HostConfig, reach: Reach, idx: i32) {
-    std::thread::spawn(move || {
-        for delay in [Duration::from_millis(120), Duration::from_millis(380)] {
-            std::thread::sleep(delay);
-            if let Some(text) = fetch_output(&agent, &host, reach, idx) {
-                push_output(&ui_weak, text);
-            }
-        }
-    });
-}
 
 /// Forward the API's `host` block to the Slint side. The UI shows the
 /// workstation's battery and total power draw in the header — these
@@ -957,14 +690,14 @@ pub fn android_main(app: slint::android::AndroidApp) {
 
     let last_reach: Arc<Mutex<Reach>> = Arc::new(Mutex::new(Reach::Offline));
     let seen_previews: SeenPreviews = Arc::new(Mutex::new(HashMap::new()));
-    let open_tab: Arc<AtomicI32> = Arc::new(AtomicI32::new(-1));
-
-    // Background poller
+    // Background poller — fetches the tab list + host stats. The old
+    // per-tab /output poll (driven by `open_tab` when the user opened
+    // a tab in the in-app TerminalView) is gone; the tap-to-browser
+    // flow hands rendering to the web viewer, which runs its own WS.
     let poll_weak = ui_weak.clone();
     let poll_agent = agent.clone();
     let poll_data = data.clone();
     let poll_reach = last_reach.clone();
-    let poll_open = open_tab.clone();
     let poll_seen = seen_previews.clone();
     std::thread::spawn(move || {
         loop {
@@ -1005,34 +738,19 @@ pub fn android_main(app: slint::android::AndroidApp) {
                     *last = reach;
                 }
                 push_reachability(&poll_weak, active_idx, reach);
-
-                let idx = poll_open.load(Ordering::Relaxed);
-                if idx >= 0
-                    && let Some(text) = fetch_output(&poll_agent, &host, reach, idx)
-                {
-                    push_output(&poll_weak, text);
-                }
             }
             std::thread::sleep(Duration::from_secs(2));
         }
     });
 
-    let act_agent = agent.clone();
-    let act_data = data.clone();
-    let act_reach = last_reach.clone();
-    ui.on_request_activate(move |idx| {
-        let Some(host) = act_data.lock().unwrap().active_host() else {
-            return;
-        };
-        let reach = *act_reach.lock().unwrap();
-        let agent = act_agent.clone();
-        std::thread::spawn(move || post_activate(&agent, &host, reach, idx));
-    });
-
+    // request-send-input is still fired by the action-sheet's
+    // "restart catbus-agent" entry (it types `clear && exec
+    // catbus-agent\n` into the chosen tab). The TerminalView keyboard
+    // and tap-to-activate pieces are gone with the in-app renderer,
+    // so the activate / typed-text handlers don't exist anymore.
     let send_agent = agent.clone();
     let send_data = data.clone();
     let send_reach = last_reach.clone();
-    let send_weak = ui_weak.clone();
     ui.on_request_send_input(move |idx, text| {
         let Some(host) = send_data.lock().unwrap().active_host() else {
             return;
@@ -1040,29 +758,7 @@ pub fn android_main(app: slint::android::AndroidApp) {
         let reach = *send_reach.lock().unwrap();
         let agent = send_agent.clone();
         let bytes = text.as_bytes().to_vec();
-        let nudge_agent = send_agent.clone();
-        let nudge_host = host.clone();
-        let nudge_weak = send_weak.clone();
         std::thread::spawn(move || post_input(&agent, &host, reach, idx, &bytes));
-        nudge_output_refresh(nudge_weak, nudge_agent, nudge_host, reach, idx);
-    });
-
-    let typed_agent = agent.clone();
-    let typed_data = data.clone();
-    let typed_reach = last_reach.clone();
-    let typed_weak = ui_weak.clone();
-    ui.on_request_typed_text(move |idx, text, ctrl, alt| {
-        let Some(host) = typed_data.lock().unwrap().active_host() else {
-            return;
-        };
-        let reach = *typed_reach.lock().unwrap();
-        let agent = typed_agent.clone();
-        let bytes = apply_modifiers(text.as_str(), ctrl, alt);
-        let nudge_agent = typed_agent.clone();
-        let nudge_host = host.clone();
-        let nudge_weak = typed_weak.clone();
-        std::thread::spawn(move || post_input(&agent, &host, reach, idx, &bytes));
-        nudge_output_refresh(nudge_weak, nudge_agent, nudge_host, reach, idx);
     });
 
     let close_agent = agent.clone();
@@ -1111,54 +807,11 @@ pub fn android_main(app: slint::android::AndroidApp) {
         refresh_soon(&rename_weak, &rename_agent, &rename_data, &rename_reach, &rename_seen);
     });
 
-    // Last use of these process-wide handles — move instead of clone.
-    let open_tab_for_cb = open_tab;
-    let open_weak = ui_weak.clone();
-    let open_data = data.clone();
-    let open_reach = last_reach;
-    let open_agent = agent;
-    let open_seen = seen_previews;
-    ui.on_open_tab_changed(move |idx| {
-        open_tab_for_cb.store(idx, Ordering::Relaxed);
-        if idx < 0 {
-            push_output(
-                &open_weak,
-                OutputResult {
-                    text: String::new(),
-                    cursor_row: -1,
-                    cursor_col: -1,
-                },
-            );
-            return;
-        }
-        // Mark this tab's current preview as seen so the green "new
-        // output" dot clears on the next poll's tabs refresh.
-        if let Some(ui) = open_weak.upgrade()
-            && let Some(row) = ui.get_tabs().row_data(idx as usize)
-        {
-            mark_seen(&open_seen, &row.name, &row.preview);
-        }
-        // Fire an immediate fetch so the view isn't blank for up to 2s.
-        let host = open_data.lock().unwrap().active_host();
-        let reach = *open_reach.lock().unwrap();
-        if let Some(host) = host {
-            let agent = open_agent.clone();
-            let weak = open_weak.clone();
-            std::thread::spawn(move || {
-                if let Some(text) = fetch_output(&agent, &host, reach, idx) {
-                    push_output(&weak, text);
-                }
-            });
-        }
-    });
-
-    // Phase 2a: tab tap → share-viewer in system browser. Build the
-    // URL from the active host + idx + token, fire Intent.ACTION_VIEW
-    // via JNI. On failure (no browser installed, malformed URL,
-    // restricted profile), fall back to the in-app native renderer
-    // by routing the tap back through open-tab-changed.
+    // Tab tap → share-viewer in system browser. Build the URL from
+    // the active host + idx + token, fire Intent.ACTION_VIEW via
+    // JNI. Failures log + drop the tap — there's no in-app fallback
+    // anymore (the Slint TerminalView is gone).
     let browser_data = data.clone();
-    let browser_weak = ui_weak.clone();
     let browser_app = app_for_callbacks.clone();
     ui.on_open_tab_in_browser(move |idx| {
         if idx < 0 {
@@ -1195,12 +848,11 @@ pub fn android_main(app: slint::android::AndroidApp) {
         let url = format!("{base}/tabs/{idx}/view?token={}", host.token);
         match launch_browser(&browser_app, &url) {
             Ok(()) => log::info!("opened tab {idx} in system browser"),
-            Err(e) => {
-                log::warn!("launch_browser failed: {e}; falling back to in-app native view");
-                if let Some(ui) = browser_weak.upgrade() {
-                    ui.set_open_tab(idx);
-                }
-            }
+            // No fallback — the in-app native TerminalView was deleted
+            // along with the old mobile rendering stack. A browser
+            // that can't be reached is just a hard error here; the
+            // tap stays inert until the user installs a browser.
+            Err(e) => log::warn!("launch_browser failed: {e}"),
         }
     });
 

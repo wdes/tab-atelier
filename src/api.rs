@@ -1667,23 +1667,11 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 error_json(stream, 404, "invalid tab index");
             }
         }
-        ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/activate") => {
-            let idx_str = &p["/tabs/".len()..p.len() - "/activate".len()];
-            if let Ok(idx) = idx_str.parse::<usize>() {
-                let mut state = state.lock().unwrap();
-                if idx < state.tabs.len() {
-                    info!("API: activating tab {idx}");
-                    state.pending_activate = Some(idx);
-                    drop(state);
-                    let body = serde_json::to_string(&serde_json::json!({"activated": idx})).unwrap_or_default();
-                    respond_json(stream, 200, &body);
-                } else {
-                    error_json(stream, 404, "tab index out of range");
-                }
-            } else {
-                error_json(stream, 404, "invalid tab index");
-            }
-        }
+        // (Old `POST /tabs/<idx>/activate` route removed — that was
+        // the Android ta-remote app's "tap a tab in the list to make
+        // it the desktop's active one" gesture. The WS frame
+        // `TAG_ACTIVATE` covers the same intent for the web viewer
+        // and no CLI subcommand depends on it.)
         ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/status") => {
             // Per-tab agent state hook. Looked up by stable UUID
             // (`_TAB_ID` env var) rather than position, so a rename
@@ -3347,40 +3335,6 @@ mod tests {
         let (port, _, token) = spawn_server();
         let resp = request(port, &format!("GET /tabs?foo=bar&token={token}&baz=1 HTTP/1.1\r\n\r\n"));
         assert_eq!(status_code(&resp), 200);
-    }
-
-    #[test]
-    fn activate_tab_success() {
-        let (port, state, token) = spawn_server();
-        let resp = request(
-            port,
-            &format!("POST /tabs/1/activate HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
-        );
-        assert_eq!(status_code(&resp), 200);
-        let json: serde_json::Value = serde_json::from_str(body(&resp)).unwrap();
-        assert_eq!(json["activated"], 1);
-        assert_eq!(state.lock().unwrap().pending_activate, Some(1));
-    }
-
-    #[test]
-    fn activate_tab_out_of_range() {
-        let (port, _, token) = spawn_server();
-        let resp = request(
-            port,
-            &format!("POST /tabs/99/activate HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
-        );
-        assert_eq!(status_code(&resp), 404);
-        assert!(body(&resp).contains("out of range"));
-    }
-
-    #[test]
-    fn activate_tab_invalid_index() {
-        let (port, _, token) = spawn_server();
-        let resp = request(
-            port,
-            &format!("POST /tabs/abc/activate HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
-        );
-        assert_eq!(status_code(&resp), 404);
     }
 
     #[test]
