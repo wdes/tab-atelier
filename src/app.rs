@@ -2212,37 +2212,20 @@ impl AppState {
                         }),
                     )
                     .child(self.t().copy_all),
-            )
-            .child(
-                div()
-                    .id("menu-paste")
-                    .px(px(12.0))
-                    .py(px(4.0))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(menu_hover))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
-                            if let Some(item) = cx.read_from_clipboard()
-                                && let Some(text) = TerminalView::clipboard_to_paste_text(&item)
-                            {
-                                let view = &this.tabs[this.active].view;
-                                view.read(cx).send_clipboard(&text);
-                            }
-                            this.context_menu = None;
-                            cx.notify();
-                        }),
-                    )
-                    .child(self.t().paste),
             );
 
-        // "Paste selection" — send the current visual selection
-        // straight into the PTY without touching the system
-        // clipboard. Useful for one-off "select-then-paste" flows
-        // that don't want to clobber the clipboard. Only rendered
-        // when the active tab HAS a selection; without one the menu
-        // entry would silently no-op (copy_selection() returns None)
-        // and the row reads as broken to the user.
+        // Paste row — XOR'd by whether the active tab has a live
+        // selection.
+        //
+        // No selection ⇒ surface "Paste" (system clipboard). Useful
+        // for piping commands back in from a separate editor.
+        //
+        // Selection present ⇒ surface "Paste selection" instead and
+        // suppress plain "Paste". The user just highlighted something
+        // they want to act on — offering both reads as a near-miss
+        // (one wrong click and you've overwritten the clipboard with
+        // an unrelated paste), so we collapse to the single
+        // contextually-correct action.
         let has_active_selection = self.tabs[self.active].view.read(cx).copy_selection().is_some();
         if has_active_selection {
             container = container.child(
@@ -2264,6 +2247,29 @@ impl AppState {
                         }),
                     )
                     .child(self.t().paste_selection),
+            );
+        } else {
+            container = container.child(
+                div()
+                    .id("menu-paste")
+                    .px(px(12.0))
+                    .py(px(4.0))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(menu_hover))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                            if let Some(item) = cx.read_from_clipboard()
+                                && let Some(text) = TerminalView::clipboard_to_paste_text(&item)
+                            {
+                                let view = &this.tabs[this.active].view;
+                                view.read(cx).send_clipboard(&text);
+                            }
+                            this.context_menu = None;
+                            cx.notify();
+                        }),
+                    )
+                    .child(self.t().paste),
             );
         }
         container = container
