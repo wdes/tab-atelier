@@ -4,7 +4,7 @@
 
 //! ⛑ brain — a "rescue tab" that watches every running tab for
 //! known agent-failure signatures and auto-sends remediation
-//! input (typically `continue\n`) when it spots one.
+//! input (typically `continue\r`) when it spots one.
 //!
 //! Designed to be run AS a tab itself: the user spawns a tab whose
 //! command is `tab-atelier-headless brain`, and the brain's log
@@ -31,7 +31,7 @@ const SCOPE_TAIL_BYTES: usize = 4096;
 
 /// Captive-portal-style connectivity probe.
 ///
-/// Before sending `continue\n` we make sure the box can actually
+/// Before sending `continue\r` we make sure the box can actually
 /// reach the open internet — otherwise Claude / catbus-agent will
 /// just re-fail on the next API call, the brain will see the same
 /// error needle, hit cooldown, and we waste a tick every minute
@@ -114,48 +114,48 @@ pub struct Pattern {
 }
 
 /// Order matters only weakly — we return the first match in the
-/// scope. All current entries map to `continue\n`, but the type
+/// scope. All current entries map to `continue\r`, but the type
 /// leaves room for per-pattern recovery actions.
 pub const PATTERNS: &[Pattern] = &[
     Pattern {
         needle: "API Error: Unable to connect to API",
         label: "anthropic-unreachable",
-        action: "continue\n",
+        action: "continue\r",
     },
     Pattern {
         needle: "ConnectionRefused",
         label: "connection-refused",
-        action: "continue\n",
+        action: "continue\r",
     },
     Pattern {
         needle: "Connection refused",
         label: "connection-refused",
-        action: "continue\n",
+        action: "continue\r",
     },
     Pattern {
         needle: "ECONNRESET",
         label: "tcp-reset",
-        action: "continue\n",
+        action: "continue\r",
     },
     Pattern {
         needle: "ETIMEDOUT",
         label: "tcp-timeout",
-        action: "continue\n",
+        action: "continue\r",
     },
     Pattern {
         needle: "503 Service Unavailable",
         label: "anthropic-503",
-        action: "continue\n",
+        action: "continue\r",
     },
     Pattern {
         needle: "Internal server error",
         label: "anthropic-5xx",
-        action: "continue\n",
+        action: "continue\r",
     },
     Pattern {
         needle: "Overloaded (529)",
         label: "anthropic-529",
-        action: "continue\n",
+        action: "continue\r",
     },
     // Anthropic-side rate limit ("not your usage limit" — server
     // capacity throttling). Same shape as 529: retryable, the
@@ -164,7 +164,7 @@ pub const PATTERNS: &[Pattern] = &[
     Pattern {
         needle: "Server is temporarily limiting requests",
         label: "anthropic-rate-limited",
-        action: "continue\n",
+        action: "continue\r",
     },
     // Network-layer abort mid-request. Claude Code prints this
     // when fetch()'s underlying TLS socket dies before the response
@@ -175,7 +175,7 @@ pub const PATTERNS: &[Pattern] = &[
     Pattern {
         needle: "The socket connection was closed unexpectedly",
         label: "socket-closed-unexpectedly",
-        action: "continue\n",
+        action: "continue\r",
     },
 ];
 
@@ -234,7 +234,7 @@ struct TabsResponse {
 
 /// Signal that fired for a tab: either a pattern needle in the
 /// scrollback or just an `agent_state == "error"` flag. Both map to
-/// the same default action (`continue\n`) today; the variant exists
+/// the same default action (`continue\r`) today; the variant exists
 /// so the log + cooldown key distinguishes them.
 #[derive(Debug, Clone, Copy)]
 enum Trigger {
@@ -253,7 +253,7 @@ impl Trigger {
     const fn action(self) -> &'static str {
         match self {
             Self::Pattern(p) => p.action,
-            Self::AgentError => "continue\n",
+            Self::AgentError => "continue\r",
         }
     }
 }
@@ -324,7 +324,7 @@ fn tick(
         // — including shell tabs, log tailers, vim sessions — and
         // anything whose scrollback happened to contain a needle
         // (e.g. `git log` showing "ECONNRESET" in a commit message)
-        // would get an injected `continue\n`. Only tabs whose hook
+        // would get an injected `continue\r`. Only tabs whose hook
         // has reported a Claude session are legitimate targets.
         if tab.agent_kind.as_deref() != Some("claude") || tab.agent_session_id.as_deref().unwrap_or("").is_empty() {
             continue;
@@ -444,7 +444,7 @@ pub fn run(args: &[String]) -> i32 {
                 eprintln!(
                     "usage: tab-atelier-headless brain [--once] [--interval SECS]\n\
                      Watches every tab for known agent-failure signatures and sends\n\
-                     `continue\\n` to the matching tab. Cooldown {COOLDOWN_SECS}s per (tab,pattern)\n\
+                     `continue\\r` to the matching tab. Cooldown {COOLDOWN_SECS}s per (tab,pattern)\n\
                      to prevent re-fire loops.\n\
                      Patterns: {n} known signatures (Anthropic API connectivity).\n\
                      Connectivity probe (Google generate_204 + Cloudflare 1.1.1.1) gates\n\
@@ -503,7 +503,7 @@ mod tests {
                    ❯ continue";
         let p = scan_output(log).expect("must match");
         assert_eq!(p.label, "anthropic-unreachable");
-        assert_eq!(p.action, "continue\n");
+        assert_eq!(p.action, "continue\r");
     }
 
     #[test]
