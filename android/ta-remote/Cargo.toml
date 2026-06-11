@@ -63,6 +63,10 @@ package = "fr.wdes.tab_atelier"
 build_targets = ["aarch64-linux-android"]
 apk_name = "ta-remote"
 resources = "res"
+# Sources for the in-app WebView host (fullscreen WebView with the
+# SSL bypass that lets us reach a self-signed origin cert). cargo-apk2
+# compiles every *.java under this tree into classes.dex.
+java_sources = "java"
 
 [package.metadata.android.sdk]
 min_sdk_version = 23
