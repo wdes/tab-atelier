@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Permit cleartext HTTP for LAN-local share-viewer use AND trust certs
+  the user installed into the device's USER CA store (so once the
+  operator imports the tab-atelier-headless self-signed cert via
+  Settings → Security → Encryption & credentials → Install a
+  certificate, WebView accepts WSS to the TLS endpoint and we can stop
+  falling back to HTTP).
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="user" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>
