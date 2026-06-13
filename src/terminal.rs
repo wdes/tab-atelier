@@ -255,16 +255,47 @@ impl TerminalView {
 
         let focus = cx.focus_handle();
 
+        // Repaint pump.
+        //
+        // Alacritty's PTY reader doesn't notify the gpui view when it
+        // writes a byte into the grid, so we poll. Up to one poll
+        // interval of latency stacks on top of every keystroke before
+        // the echo paints. 16 ms = a single 60 Hz frame; the previous
+        // 33 ms was a perceptible "typing feels sluggish" delay.
+        //
+        // Idle tabs no longer pay for the polling: we read the PTY
+        // ring's monotonic byte counter and skip `cx.notify()` when
+        // it hasn't moved. The ring counter is updated under a small
+        // dedicated mutex (Mutex<PtyRing>) that the alacritty reader
+        // holds for microseconds, so the check is cheap and lock-
+        // contention-free.
+        //
+        // The scrolled-up throttle (every 6th tick when the user is
+        // browsing scrollback) stays in place — even when the grid
+        // hasn't changed, the cursor blink + selection-highlight need
+        // periodic redraws so the user can SEE they're paused.
         let tick = Rc::new(Cell::new(0u32));
         let tick_clone = tick;
+        let last_ring_len = Rc::new(Cell::new(0u64));
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             loop {
-                cx.background_executor().timer(Duration::from_millis(33)).await;
+                cx.background_executor().timer(Duration::from_millis(16)).await;
                 let Ok(()) = this.update(cx, |view, cx: &mut Context<Self>| {
                     let n = tick_clone.get().wrapping_add(1);
                     tick_clone.set(n);
+                    let ring_len = view.pty_ring.lock().map_or(0, |r| r.total_len());
+                    let grid_dirty = ring_len != last_ring_len.get();
+                    last_ring_len.set(ring_len);
                     let scrolled = view.term.lock().grid().display_offset() > 0;
-                    if !scrolled || n.is_multiple_of(6) {
+                    if grid_dirty {
+                        cx.notify();
+                    } else if scrolled && n.is_multiple_of(12) {
+                        // Scrolled-up: paint twice a second so the
+                        // cursor blink stays alive without burning CPU.
+                        cx.notify();
+                    } else if !scrolled && n.is_multiple_of(30) {
+                        // Idle attached: ~once every 500 ms for the
+                        // cursor blink at the bottom.
                         cx.notify();
                     }
                 }) else {
