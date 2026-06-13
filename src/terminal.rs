@@ -1288,6 +1288,40 @@ impl Element for TerminalElement {
                     let cell_data = &grid[GridPoint::new(Line(grid_line), Column(c))];
                     if cell_data.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
                         full_text.push(' ');
+                        // Extend (or open) the trailing bg run so it
+                        // covers BOTH halves of the wide glyph. The
+                        // spacer carries alacritty's "this is the
+                        // right half of a 2-cell char" semantics —
+                        // its bg field equals the wide char's, so a
+                        // 1-cell run on the wide char alone (the old
+                        // code's behaviour) left the right half of
+                        // every coloured emoji / CJK glyph painted in
+                        // the tab's default bg. Visible on the
+                        // Claude Code "auto mode" footer:
+                        //   ⏵⏵ ← yellow bg only on the LEFT half of
+                        //        each triangle, blue (tab bg) on the
+                        //        right half.
+                        if cell_data.flags.contains(CellFlags::INVERSE) {
+                            let prev_fg = if is_default_fg(cell_data.fg) {
+                                fg_default
+                            } else {
+                                t.color_to_hsla(cell_data.fg)
+                            };
+                            if let Some(last) = bg_runs.last_mut()
+                                && last.col + last.len == c
+                                && hsla_eq(last.color, prev_fg)
+                            {
+                                last.len += 1;
+                            }
+                        } else if !is_default_bg(cell_data.bg) {
+                            let bg_c = t.color_to_hsla(cell_data.bg);
+                            if let Some(last) = bg_runs.last_mut()
+                                && last.col + last.len == c
+                                && hsla_eq(last.color, bg_c)
+                            {
+                                last.len += 1;
+                            }
+                        }
                         continue;
                     }
                     let ch = if cell_data.c == '\0' { ' ' } else { cell_data.c };
