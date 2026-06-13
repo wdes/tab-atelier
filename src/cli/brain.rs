@@ -177,6 +177,17 @@ pub const PATTERNS: &[Pattern] = &[
         label: "socket-closed-unexpectedly",
         action: "continue\r",
     },
+    // Auto-mode model-routing classifier briefly unavailable
+    // (Anthropic-side dependency that decides which model to use
+    // for the next turn). Shape Claude Code prints:
+    //   "<model> is temporarily unavailable, so auto mode cannot
+    //    determine the safety of Bash right now. Wait briefly …"
+    // Recovery is identical to the other transient outages.
+    Pattern {
+        needle: "auto mode cannot determine the safety",
+        label: "auto-mode-classifier-down",
+        action: "continue\r",
+    },
 ];
 
 /// Searches the trailing window of `text` for a known failure pattern.
