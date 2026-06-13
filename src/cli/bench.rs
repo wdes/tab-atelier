@@ -110,6 +110,41 @@ fn payload_cursor_motion(target: usize) -> Vec<u8> {
     out
 }
 
+/// Big paste of random printable characters — the worst-case "user
+/// pasted a huge blob" ingest, the heaviest stress on the parser's
+/// plain-print path plus the scrollback churn.
+///
+/// **Bash-safe by construction**: every line is prefixed with `# ` so
+/// that if this payload is ever pasted into a real shell (rather than
+/// fed to a Term as it is here) the shell treats each line as a
+/// comment and runs nothing. Lines are ~200 chars to mirror a wide
+/// terminal wrapping a pasted blob.
+///
+/// The randomness is a deterministic xorshift (fixed seed) so runs are
+/// comparable — only printable ASCII 0x21..0x7e is emitted, never a
+/// control byte, so the parser stays on its plain-print fast path and
+/// the number reflects raw print throughput rather than escape parsing.
+fn payload_paste_random(target: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(target + 256);
+    let mut state: u64 = 0x9e37_79b9_7f4a_7c15; // fixed seed → deterministic
+    let mut next = || {
+        // xorshift64
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        // map to printable ASCII excluding space (0x21..=0x7e)
+        0x21 + (state % (0x7e - 0x21 + 1)) as u8
+    };
+    while out.len() < target {
+        out.extend_from_slice(b"# ");
+        for _ in 0..200 {
+            out.push(next());
+        }
+        out.extend_from_slice(b"\r\n");
+    }
+    out
+}
+
 const CASES: &[Case] = &[
     Case {
         name: "scrolling",
@@ -126,6 +161,10 @@ const CASES: &[Case] = &[
     Case {
         name: "cursor_motion",
         build: payload_cursor_motion,
+    },
+    Case {
+        name: "paste_random",
+        build: payload_paste_random,
     },
 ];
 
@@ -277,6 +316,29 @@ mod tests {
                 p.len()
             );
         }
+    }
+
+    #[test]
+    fn paste_payload_is_bash_safe() {
+        // Every non-empty line must start with '#' so a stray paste
+        // into a real shell is inert. Split on \n; lines end with \r
+        // (CRLF) so trim it before the check.
+        let p = payload_paste_random(64 * 1024);
+        let text = String::from_utf8(p).expect("printable ASCII only");
+        for line in text.split('\n') {
+            let line = line.trim_end_matches('\r');
+            if line.is_empty() {
+                continue;
+            }
+            assert!(line.starts_with('#'), "non-comment line would hit bash: {line:?}");
+        }
+    }
+
+    #[test]
+    fn paste_payload_is_deterministic() {
+        // Fixed seed → identical bytes across runs, so the bench
+        // number is comparable build-to-build.
+        assert_eq!(payload_paste_random(8 * 1024), payload_paste_random(8 * 1024));
     }
 
     #[test]
