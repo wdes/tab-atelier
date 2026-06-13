@@ -147,11 +147,19 @@ pub struct TerminalView {
 }
 
 /// Cached Phase 1 output from the previous paint. See [`TerminalView::prev_frame`].
+///
+/// `lines` is stored as `Vec<Option<RawLine>>` (not `Vec<RawLine>`) so
+/// the per-frame `working` Vec can be moved in / out without
+/// allocating a fresh Vec each paint to wrap entries in `Some`. The
+/// Vec's capacity is reused across frames — only damaged-row slots
+/// are taken + replaced, the rest stay put. Ghostty's
+/// `Contents::clearRetainingCapacity` zero-alloc pattern, mapped to
+/// Rust's `Vec` storage reuse.
 struct CachedFrame {
     display_offset: i32,
     visible_cols: usize,
     visible_lines: usize,
-    lines: Vec<RawLine>,
+    lines: Vec<Option<RawLine>>,
 }
 
 /// Encode a scroll-wheel gesture as the byte sequence a TUI listening
@@ -1385,8 +1393,10 @@ impl Element for TerminalElement {
                 damaged_rows.fill(false);
             }
 
-            // Take prev frame; reuse Vec storage when the geometry
-            // matches, marking damaged rows as None to force rebuild.
+            // Take prev frame's `Vec<Option<RawLine>>` verbatim (no
+            // intermediate alloc). Mark damaged rows as None so the
+            // build loop below rebuilds them; un-damaged slots stay
+            // populated and skip the rebuild entirely.
             let prev = self.prev_frame.borrow_mut().take();
             let mut working: Vec<Option<RawLine>> = match prev {
                 Some(p)
@@ -1394,7 +1404,7 @@ impl Element for TerminalElement {
                         && p.visible_cols == visible_cols
                         && p.visible_lines == visible_lines =>
                 {
-                    let mut v: Vec<Option<RawLine>> = p.lines.into_iter().map(Some).collect();
+                    let mut v = p.lines;
                     if force_full {
                         v.fill_with(|| None);
                     } else {
@@ -1636,14 +1646,17 @@ impl Element for TerminalElement {
                 });
             }
 
-            // unwrap all slots (every visible row is either reused or
-            // freshly built above) and stash a copy for next frame.
+            // Save the working Vec for next frame BEFORE Phase 2
+            // consumes it. Clone the inner RawLines into a fresh Vec
+            // for Phase 2 so we keep `working`'s allocation intact;
+            // the RawLine itself is the only thing that gets cloned
+            // (not the outer Vec).
             let raw_lines: Vec<RawLine> = working.iter().map(|x| x.clone().unwrap()).collect();
             *self.prev_frame.borrow_mut() = Some(CachedFrame {
                 display_offset,
                 visible_cols,
                 visible_lines,
-                lines: raw_lines.clone(),
+                lines: working,
             });
 
             let cursor = if display_offset == 0
