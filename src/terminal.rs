@@ -13,6 +13,75 @@ use std::time::Duration;
 
 use log::{info, trace};
 
+/// Opt-in paint-loop instrument. Set `TAB_ATELIER_PAINT_LOG=1` and the
+/// terminal prepaint (Phase 1 cell scan + Phase 2 shaping) wall-time is
+/// sampled; every 120 frames an aggregate (mean / p50 / p99 / max +
+/// a prepaint-only FPS ceiling) is logged to stderr.
+///
+/// This is the only way to measure the gpui paint loop — it can't run
+/// in the headless `bench` subcommand because the whole loop (`TextRun`,
+/// `shape_line`, GPU paint) is gui-feature-only and needs a display. To
+/// read real numbers: launch the GUI with the env var set and stress a
+/// tab (e.g. `tab-atelier-headless bench`'s paste payload piped in, or
+/// `cat` a large file), then watch stderr.
+///
+/// Note: this times PREPAINT (CPU: cell scan + shaping), not the GPU
+/// submit/present that follows. A low prepaint time means the CPU half
+/// of the frame isn't the bottleneck; it does not by itself prove the
+/// displayed frame rate (the compositor caps that).
+mod paint_log {
+    use std::cell::RefCell;
+    use std::sync::OnceLock;
+    use std::time::Duration;
+
+    fn enabled() -> bool {
+        static EN: OnceLock<bool> = OnceLock::new();
+        *EN.get_or_init(|| std::env::var_os("TAB_ATELIER_PAINT_LOG").is_some())
+    }
+
+    thread_local! {
+        static SAMPLES: RefCell<Vec<Duration>> = const { RefCell::new(Vec::new()) };
+    }
+
+    const FLUSH_EVERY: usize = 120;
+
+    /// Record one prepaint's wall-time; flush aggregate stats every
+    /// [`FLUSH_EVERY`] samples. No-op (one atomic load) when the env
+    /// var is unset, so leaving the call in the hot path is free.
+    pub fn record(d: Duration) {
+        if !enabled() {
+            return;
+        }
+        SAMPLES.with(|s| {
+            let mut v = s.borrow_mut();
+            v.push(d);
+            if v.len() < FLUSH_EVERY {
+                return;
+            }
+            v.sort_unstable();
+            let n = v.len();
+            let p50 = v[n / 2];
+            let p99 = v[(n * 99 / 100).min(n - 1)];
+            let max = v[n - 1];
+            let mean = v.iter().sum::<Duration>() / n as u32;
+            let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+            let ceiling = if mean.as_secs_f64() > 0.0 {
+                1.0 / mean.as_secs_f64()
+            } else {
+                f64::INFINITY
+            };
+            eprintln!(
+                "paint: {n} prepaints · mean {:.2}ms p50 {:.2}ms p99 {:.2}ms max {:.2}ms · prepaint-ceiling {ceiling:.0} fps",
+                ms(mean),
+                ms(p50),
+                ms(p99),
+                ms(max),
+            );
+            v.clear();
+        });
+    }
+}
+
 use alacritty_terminal::event::{Event as AlacrittyEvent, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
 use alacritty_terminal::grid::{Dimensions, Scroll};
@@ -1302,6 +1371,7 @@ impl Element for TerminalElement {
         window: &mut Window,
         _cx: &mut App,
     ) -> Self::PrepaintState {
+        let paint_t0 = std::time::Instant::now();
         let cell = self.cell_size;
         let cols = ((bounds.size.width / cell.width) as usize).max(2);
         let lines = ((bounds.size.height / cell.height) as usize).max(1);
@@ -1770,6 +1840,7 @@ impl Element for TerminalElement {
         *cache = new_cache;
         *self.detected_urls.borrow_mut() = detected;
 
+        paint_log::record(paint_t0.elapsed());
         Some(TermPrepaint {
             lines: result_lines,
             cursor,
