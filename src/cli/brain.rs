@@ -26,7 +26,14 @@ use serde::Deserialize;
 use crate::cli::share_link::{Endpoint, agent, discover_endpoint};
 
 const DEFAULT_INTERVAL_SECS: u64 = 5;
-const COOLDOWN_SECS: u64 = 60;
+/// A tab's `/output` must be byte-for-byte UNCHANGED for at least this
+/// long before brain will nudge it. This is the "is the agent actually
+/// working?" gate: any output activity — a spinner frame, a rate-limit
+/// "retrying in 38s" countdown, real tool output scrolling — resets the
+/// stability clock, so brain only ever nudges a tab whose screen has
+/// been genuinely frozen. At the default 5 s poll that's ~4 ticks of
+/// no movement.
+const STABLE_SECS: u64 = 20;
 const SCOPE_TAIL_BYTES: usize = 4096;
 
 /// Captive-portal-style connectivity probe.
@@ -276,6 +283,48 @@ struct Eligible {
     tab_id: String,
     tab_name: String,
     trigger: Trigger,
+    /// Hash of the frozen `/output` that made this tab eligible.
+    /// Recorded into the tab's [`TabWatch::nudged_hash`] on send so
+    /// brain won't re-nudge the SAME frozen screen — only once the
+    /// output changes (agent reacted, or re-stuck on something new)
+    /// does the tab become eligible again.
+    output_hash: u64,
+}
+
+/// Per-tab watch state, keyed by tab id. Tracks output stability so
+/// brain can tell "frozen and stuck" from "actively working".
+struct TabWatch {
+    /// Hash of the last `/output` we saw for this tab.
+    last_hash: u64,
+    /// When the output first reached `last_hash`. `now - stable_since`
+    /// is how long the screen has been frozen.
+    stable_since: Instant,
+    /// Output hash at the moment we last sent `continue` to this tab,
+    /// or `None` if we've never nudged it (or its output changed since).
+    /// Guards against re-nudging an unchanged frozen screen.
+    nudged_hash: Option<u64>,
+}
+
+/// FNV-1a hash of a tab's `/output`. Process-local only (never
+/// persisted) so any stable hash function works; FNV is allocation-
+/// free and fast enough for a few-KB string per tick.
+fn hash_output(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Pure eligibility decision for a single tab, given its frozen-output
+/// duration and nudge history. Extracted so the "don't nudge a working
+/// or already-nudged tab" rule is unit-testable without HTTP.
+///
+/// Returns true only when the screen has been frozen ≥ [`STABLE_SECS`]
+/// AND we haven't already nudged this exact frozen screen.
+fn should_nudge(stable_for: Duration, nudged_hash: Option<u64>, current_hash: u64) -> bool {
+    stable_for >= Duration::from_secs(STABLE_SECS) && nudged_hash != Some(current_hash)
 }
 
 /// Round-robin pick from a slice. Advances `cursor` mod `len()` and
@@ -307,7 +356,7 @@ fn pick_round_robin<'a, T>(items: &'a [T], cursor: &mut usize) -> Option<&'a T> 
 /// one, and so on. Cooldown per (tab, pattern) still applies; the
 /// round-robin just spaces out which one fires when.
 fn tick(
-    cooldowns: &mut HashMap<(String, &'static str), Instant>,
+    watches: &mut HashMap<String, TabWatch>,
     probe: &mut ConnectivityProbe,
     cursor: &mut usize,
 ) -> Result<(), String> {
@@ -326,6 +375,7 @@ fn tick(
 
     let now = Instant::now();
     let mut eligible: Vec<Eligible> = Vec::new();
+    let mut seen_ids: Vec<String> = Vec::new();
     for tab in tabs.tabs {
         if tab.id.is_empty() {
             continue;
@@ -340,6 +390,7 @@ fn tick(
         if tab.agent_kind.as_deref() != Some("claude") || tab.agent_session_id.as_deref().unwrap_or("").is_empty() {
             continue;
         }
+        seen_ids.push(tab.id.clone());
         let output = ag
             .get(format!("{}/tabs/by-id/{}/output", ep.url, tab.id))
             .header("Authorization", &auth)
@@ -348,6 +399,35 @@ fn tick(
             .body_mut()
             .read_to_string()
             .map_err(|e| format!("read output for {}: {e}", tab.id))?;
+
+        // Output-stability tracking — the core "is the agent working?"
+        // gate. Update the per-tab watch: if the screen changed since
+        // last tick, reset the stability clock (the agent is producing
+        // output → it's alive → leave it alone). If it's the same,
+        // accumulate frozen time.
+        let h = hash_output(&output);
+        let watch = watches.entry(tab.id.clone()).or_insert(TabWatch {
+            last_hash: h,
+            stable_since: now,
+            nudged_hash: None,
+        });
+        if watch.last_hash != h {
+            watch.last_hash = h;
+            watch.stable_since = now;
+        }
+        let stable_for = now.duration_since(watch.stable_since);
+        let nudged_hash = watch.nudged_hash;
+
+        // Only consider tabs whose screen has been frozen long enough
+        // AND that we haven't already nudged at this exact frozen
+        // screen. Auto-retrying rate-limits show a live countdown →
+        // never freeze STABLE_SECS → never reach here. A genuinely
+        // hung agent freezes → gets ONE nudge → won't be nudged again
+        // until its output changes (proof the nudge did something, or
+        // it re-stuck on a different error).
+        if !should_nudge(stable_for, nudged_hash, h) {
+            continue;
+        }
 
         // Two parallel signals — a literal needle match in the
         // scrollback OR an `agent_state: "error"` flag set via
@@ -360,23 +440,17 @@ fn tick(
         } else {
             continue;
         };
-        let key = (tab.id.clone(), trigger.label());
-        if cooldowns
-            .get(&key)
-            .is_some_and(|t| now.duration_since(*t) < Duration::from_secs(COOLDOWN_SECS))
-        {
-            // Already fired recently for this tab+trigger — stay
-            // quiet until the cooldown expires. Prevents tight
-            // re-fire loops when the agent immediately re-errors
-            // after our injected `continue`.
-            continue;
-        }
         eligible.push(Eligible {
             tab_id: tab.id,
             tab_name: tab.name,
             trigger,
+            output_hash: h,
         });
     }
+
+    // Drop watch state for tabs that vanished (closed / no longer a
+    // Claude session) so the map stays bounded.
+    watches.retain(|id, _| seen_ids.iter().any(|s| s == id));
 
     if eligible.is_empty() {
         return Ok(());
@@ -405,8 +479,13 @@ fn tick(
         return Ok(());
     };
     let deferred = eligible.len() - 1;
-    let key = (pick.tab_id.clone(), pick.trigger.label());
-    cooldowns.insert(key, now);
+    // Record the frozen-output hash so this exact screen won't be
+    // nudged again until the agent's output changes (work resumed,
+    // or it re-stuck on something new). Replaces the old time-based
+    // cooldown — a state guard, not a clock.
+    if let Some(w) = watches.get_mut(&pick.tab_id) {
+        w.nudged_hash = Some(pick.output_hash);
+    }
 
     let _ = ag
         .post(format!("{}/tabs/by-id/{}/input", ep.url, pick.tab_id))
@@ -454,14 +533,16 @@ pub fn run(args: &[String]) -> i32 {
             "-h" | "--help" => {
                 eprintln!(
                     "usage: tab-atelier-headless brain [--once] [--interval SECS]\n\
-                     Watches every tab for known agent-failure signatures and sends\n\
-                     `continue\\r` to the matching tab. Cooldown {COOLDOWN_SECS}s per (tab,pattern)\n\
-                     to prevent re-fire loops.\n\
+                     Watches every Claude tab for known agent-failure signatures and\n\
+                     sends `continue\\r` to the matching tab. A tab is nudged only when\n\
+                     its screen has been FROZEN for {STABLE_SECS}s (so an actively-working\n\
+                     or auto-retrying agent — whose output is still moving — is never\n\
+                     interrupted), and only ONCE per frozen screen (re-nudges wait for\n\
+                     the output to change first).\n\
                      Patterns: {n} known signatures (Anthropic API connectivity).\n\
                      Connectivity probe (Google generate_204 + Cloudflare 1.1.1.1) gates\n\
                      every send; offline → suppress, retry on next tick when back online.\n\
-                     Round-robin: at most one send per tick across all eligible tabs.\n\
-                     Five stuck tabs ⇒ they fire 5s apart, not all at once.",
+                     Round-robin: at most one send per tick across all eligible tabs.",
                     n = PATTERNS.len(),
                 );
                 return 0;
@@ -478,15 +559,15 @@ pub fn run(args: &[String]) -> i32 {
     // consumer see the right label. OSC 2 = window title.
     print!("\x1b]2;\u{26d1} brain\x07");
     println!(
-        "\u{26d1} brain — watching every {interval}s · {n} patterns · cooldown {COOLDOWN_SECS}s",
+        "\u{26d1} brain — watching every {interval}s · {n} patterns · nudge after {STABLE_SECS}s frozen",
         n = PATTERNS.len()
     );
 
-    let mut cooldowns: HashMap<(String, &'static str), Instant> = HashMap::new();
+    let mut watches: HashMap<String, TabWatch> = HashMap::new();
     let mut probe = ConnectivityProbe::default();
     let mut rr_cursor: usize = 0;
     loop {
-        if let Err(e) = tick(&mut cooldowns, &mut probe, &mut rr_cursor) {
+        if let Err(e) = tick(&mut watches, &mut probe, &mut rr_cursor) {
             // Log + keep going. The most likely error is a transient
             // daemon-restart window; the next tick will succeed.
             eprintln!("⛑ brain: tick failed: {e}");
@@ -682,20 +763,53 @@ mod tests {
 
     #[test]
     fn eligible_label_distinguishes_pattern_from_agent_error() {
-        // Cooldown key uses (tab_id, label) — pattern hits and
-        // agent_state-driven hits MUST have distinct labels or one
-        // would cooldown-suppress the other.
+        // Pattern hits and agent_state-driven hits MUST have distinct
+        // labels so logs + any future per-label bookkeeping don't
+        // conflate them.
         let pattern = &PATTERNS[0];
         let p = Eligible {
             tab_id: "tab-1".into(),
             tab_name: "shell".into(),
             trigger: Trigger::Pattern(pattern),
+            output_hash: 0,
         };
         let a = Eligible {
             tab_id: "tab-1".into(),
             tab_name: "shell".into(),
             trigger: Trigger::AgentError,
+            output_hash: 0,
         };
         assert_ne!(p.trigger.label(), a.trigger.label());
+    }
+
+    #[test]
+    fn should_nudge_requires_frozen_long_enough() {
+        // Output frozen for less than STABLE_SECS — the agent might
+        // still be producing; never nudge.
+        assert!(!should_nudge(Duration::from_secs(STABLE_SECS - 1), None, 42));
+        // Frozen long enough, never nudged → eligible.
+        assert!(should_nudge(Duration::from_secs(STABLE_SECS), None, 42));
+        assert!(should_nudge(Duration::from_secs(STABLE_SECS + 100), None, 42));
+    }
+
+    #[test]
+    fn should_nudge_suppresses_same_frozen_screen() {
+        // Already nudged at this exact frozen output → don't spam,
+        // even though it's been frozen well past the threshold. This
+        // is the fix for the "continue\r sent every 60s into a stuck
+        // rate-limit" report.
+        assert!(!should_nudge(Duration::from_secs(STABLE_SECS + 600), Some(42), 42));
+        // Output changed since the nudge (different hash) → the agent
+        // reacted / re-stuck on something new → eligible again.
+        assert!(should_nudge(Duration::from_secs(STABLE_SECS), Some(42), 99));
+    }
+
+    #[test]
+    fn hash_output_is_stable_and_sensitive() {
+        // Same input → same hash (stability across ticks).
+        assert_eq!(hash_output("retrying in 38s"), hash_output("retrying in 38s"));
+        // A one-second countdown tick changes the hash → resets the
+        // stability clock → an auto-retrying agent is never nudged.
+        assert_ne!(hash_output("retrying in 38s"), hash_output("retrying in 37s"));
     }
 }
