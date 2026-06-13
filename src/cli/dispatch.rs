@@ -230,6 +230,25 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Terminal throughput self-test — drains vtebench-style payloads
+    /// through the `PtyRing` + alacritty parser and reports MiB/s.
+    /// Measures PTY-read/parse only (not paint or typing latency).
+    /// No display or running daemon required.
+    Bench {
+        /// Payload size per case in MiB (default 64).
+        #[arg(long)]
+        mb: Option<usize>,
+        /// Repeat each case N times, report the best (default 3).
+        #[arg(long)]
+        iterations: Option<usize>,
+        /// Grid columns (default 200).
+        #[arg(long)]
+        cols: Option<usize>,
+        /// Grid rows (default 50).
+        #[arg(long)]
+        rows: Option<usize>,
+    },
 }
 
 /// Returns true iff a subcommand was dispatched (caller should not
@@ -365,6 +384,31 @@ pub fn dispatch(cli: Cli) -> bool {
         Commands::Tabs { json } => {
             let args = if json { vec!["--json".to_string()] } else { vec![] };
             crate::cli::share_link::tabs(&args)
+        }
+        Commands::Bench {
+            mb,
+            iterations,
+            cols,
+            rows,
+        } => {
+            let mut args: Vec<String> = Vec::new();
+            if let Some(n) = mb {
+                args.push("--mb".into());
+                args.push(n.to_string());
+            }
+            if let Some(n) = iterations {
+                args.push("--iterations".into());
+                args.push(n.to_string());
+            }
+            if let Some(n) = cols {
+                args.push("--cols".into());
+                args.push(n.to_string());
+            }
+            if let Some(n) = rows {
+                args.push("--rows".into());
+                args.push(n.to_string());
+            }
+            crate::cli::bench::run(&args)
         }
     };
     std::process::exit(code);
