@@ -134,6 +134,24 @@ pub struct TerminalView {
     /// Survives PTY respawn — the same Arc threads into the next
     /// `PtyTap` so the user can scroll past the restart boundary.
     pty_ring: Arc<std::sync::Mutex<crate::pty_ring::PtyRing>>,
+    /// Previous frame's per-row `RawLine`s, reused for un-damaged rows
+    /// (Ghostty `rebuildCells` pattern). Alacritty's `Term::damage()`
+    /// exposes which screen rows changed since the last call; rows
+    /// outside that set keep their cached `RawLine` and the Phase 1
+    /// cell-scan is skipped entirely for them.
+    ///
+    /// Cache validity is keyed by `(display_offset, visible_cols,
+    /// visible_lines)` — any scroll / resize discards the whole cache
+    /// since the row-row mapping changes.
+    prev_frame: Rc<RefCell<Option<CachedFrame>>>,
+}
+
+/// Cached Phase 1 output from the previous paint. See [`TerminalView::prev_frame`].
+struct CachedFrame {
+    display_offset: i32,
+    visible_cols: usize,
+    visible_lines: usize,
+    lines: Vec<RawLine>,
 }
 
 /// Encode a scroll-wheel gesture as the byte sequence a TUI listening
@@ -350,6 +368,7 @@ impl TerminalView {
             colors_enabled: Cell::new(initial_colors_enabled),
             locked: Rc::new(Cell::new(false)),
             pty_ring,
+            prev_frame: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -1139,6 +1158,7 @@ impl Render for TerminalView {
                 font_config: self.font_config.clone(),
                 detected_urls: self.detected_urls.clone(),
                 hover_grid: self.hover_grid.clone(),
+                prev_frame: self.prev_frame.clone(),
             })
     }
 }
@@ -1161,6 +1181,7 @@ struct TerminalElement {
     font_config: FontConfig,
     detected_urls: Rc<RefCell<Vec<DetectedUrl>>>,
     hover_grid: Rc<Cell<Option<(usize, usize)>>>,
+    prev_frame: Rc<RefCell<Option<CachedFrame>>>,
 }
 
 impl IntoElement for TerminalElement {
@@ -1200,10 +1221,35 @@ struct TermLine {
     bg_runs: Vec<BgRun>,
 }
 
+#[derive(Clone)]
 struct BgRun {
     col: usize,
     len: usize,
     color: Hsla,
+}
+
+/// One same-style run of glyphs inside a [`RawLine`]. Output of
+/// Phase 1 (cell scan) and input to Phase 2 (`shape_line`).
+#[derive(Clone)]
+struct RawSegment {
+    col_start: usize,
+    text: String,
+    runs: Vec<TextRun>,
+    /// Cells this segment spans. 1 for normal runs; 2 for a wide-char
+    /// segment (CJK / 2-cell emoji like ✅). Passed to `shape_line` as
+    /// `force_width = cell.width * cell_span` so the clamp matches the
+    /// actual grid span.
+    cell_span: usize,
+}
+
+/// One screen row's worth of Phase 1 output — cached in
+/// [`TerminalView::prev_frame`] for damage-driven re-use.
+#[derive(Clone)]
+struct RawLine {
+    grid_line: i32,
+    text: String,
+    segments: Vec<RawSegment>,
+    bg_runs: Vec<BgRun>,
 }
 
 impl Element for TerminalElement {
@@ -1248,24 +1294,6 @@ impl Element for TerminalElement {
         window: &mut Window,
         _cx: &mut App,
     ) -> Self::PrepaintState {
-        struct RawSegment {
-            col_start: usize,
-            text: String,
-            runs: Vec<TextRun>,
-            /// Cells this segment spans. Always 1 for normal runs;
-            /// 2 for a wide-char segment (CJK / 2-cell emoji like ✅).
-            /// Passed to `shape_line` as `force_width = cell.width *
-            /// cell_span` so the clamp matches the actual grid span.
-            cell_span: usize,
-        }
-
-        struct RawLine {
-            grid_line: i32,
-            text: String,
-            segments: Vec<RawSegment>,
-            bg_runs: Vec<BgRun>,
-        }
-
         let cell = self.cell_size;
         let cols = ((bounds.size.width / cell.width) as usize).max(2);
         let lines = ((bounds.size.height / cell.height) as usize).max(1);
@@ -1297,18 +1325,96 @@ impl Element for TerminalElement {
         let fg_default = t.term_fg_hsla();
 
         // Phase 1: read cell data under the lock — no shaping here.
+        //
+        // Damage-driven row reuse (Ghostty `rebuildCells` pattern):
+        // pull `Term::damage()`, keep last frame's per-row `RawLine`s
+        // for rows that weren't touched, only walk the cells of rows
+        // alacritty marked dirty since the last paint. Typing one
+        // character usually damages 1-2 rows (the cursor row, plus
+        // the previous-prompt row when the shell scrolls), so the
+        // per-frame cell-scan cost drops from O(rows × cols) to
+        // O(damaged_rows × cols).
+        //
+        // Cache compatibility key: (display_offset, visible_cols,
+        // visible_lines). Scroll changes display_offset → invalidate
+        // since visible viewport-row N maps to a different grid-line;
+        // a resize changes visible_cols/lines → invalidate since the
+        // per-row `RawLine`s no longer match the new layout.
 
         let (raw_lines, cursor, selection, visible_cols, display_offset_val, history_size) = {
-            let term = self.term.lock();
+            let mut term = self.term.lock();
+            let display_offset = term.grid().display_offset() as i32;
+            let visible_lines = term.grid().screen_lines().min(lines);
+            let visible_cols = term.grid().columns().min(cols);
+            let cursor_point = term.grid().cursor.point;
+
+            // Collect damage BEFORE we re-borrow the grid immutably
+            // for the cell scan. `Term::damage()` returns either Full
+            // (entire screen) or Partial (iter of damaged-row indices
+            // in viewport coords). After consuming, `reset_damage`
+            // clears so next paint sees only NEW changes.
+            let (force_full, mut damaged_rows) = {
+                use alacritty_terminal::term::TermDamage;
+                let mut rows = vec![false; visible_lines];
+                let mut force = false;
+                match term.damage() {
+                    TermDamage::Full => force = true,
+                    TermDamage::Partial(iter) => {
+                        for d in iter {
+                            // `d.line` is already viewport-row +
+                            // display_offset (see TermDamageIterator);
+                            // subtract back so we index into our
+                            // 0..visible_lines vec.
+                            let viewport_row = d.line.wrapping_sub(display_offset as usize);
+                            if viewport_row < rows.len() {
+                                rows[viewport_row] = true;
+                            }
+                        }
+                    }
+                }
+                term.reset_damage();
+                (force, rows)
+            };
+
+            // If the user is scrolled into history, the damage tracker
+            // reflects edits to the *live screen* but our visible rows
+            // are showing scrollback. Skip the optimisation in that
+            // case — the cache compatibility check below still lets us
+            // reuse if scroll position is unchanged.
+            if display_offset > 0 {
+                damaged_rows.fill(false);
+            }
+
+            // Take prev frame; reuse Vec storage when the geometry
+            // matches, marking damaged rows as None to force rebuild.
+            let prev = self.prev_frame.borrow_mut().take();
+            let mut working: Vec<Option<RawLine>> = match prev {
+                Some(p)
+                    if p.display_offset == display_offset
+                        && p.visible_cols == visible_cols
+                        && p.visible_lines == visible_lines =>
+                {
+                    let mut v: Vec<Option<RawLine>> = p.lines.into_iter().map(Some).collect();
+                    if force_full {
+                        v.fill_with(|| None);
+                    } else {
+                        for (i, dmg) in damaged_rows.iter().enumerate() {
+                            if *dmg && i < v.len() {
+                                v[i] = None;
+                            }
+                        }
+                    }
+                    v.resize_with(visible_lines, || None);
+                    v
+                }
+                _ => vec![None; visible_lines],
+            };
+
             let grid = term.grid();
-            let cursor_point = grid.cursor.point;
-            let display_offset = grid.display_offset() as i32;
-            let visible_lines = grid.screen_lines().min(lines);
-            let visible_cols = grid.columns().min(cols);
-
-            let mut raw_lines = Vec::with_capacity(visible_lines);
-
-            for l in 0..visible_lines {
+            for (l, slot) in working.iter_mut().enumerate().take(visible_lines) {
+                if slot.is_some() {
+                    continue;
+                }
                 let grid_line = l as i32 - display_offset;
                 let mut full_text = String::with_capacity(visible_cols);
                 let mut segments: Vec<RawSegment> = Vec::new();
@@ -1522,13 +1628,23 @@ impl Element for TerminalElement {
                     segments.push(seg);
                 }
 
-                raw_lines.push(RawLine {
+                *slot = Some(RawLine {
                     grid_line,
                     text: full_text,
                     segments,
                     bg_runs,
                 });
             }
+
+            // unwrap all slots (every visible row is either reused or
+            // freshly built above) and stash a copy for next frame.
+            let raw_lines: Vec<RawLine> = working.iter().map(|x| x.clone().unwrap()).collect();
+            *self.prev_frame.borrow_mut() = Some(CachedFrame {
+                display_offset,
+                visible_cols,
+                visible_lines,
+                lines: raw_lines.clone(),
+            });
 
             let cursor = if display_offset == 0
                 && (cursor_point.line.0 as usize) < visible_lines
