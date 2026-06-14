@@ -39,43 +39,62 @@ mod paint_log {
         *EN.get_or_init(|| std::env::var_os("TAB_ATELIER_PAINT_LOG").is_some())
     }
 
+    /// One frame's timing breakdown.
+    #[derive(Clone, Copy)]
+    pub struct Sample {
+        /// Total prepaint wall-time.
+        pub total: Duration,
+        /// Phase 1: Term-lock acquisition + cell scan (under the lock).
+        /// High here ⇒ lock contention with the parser or a big scan.
+        pub phase1: Duration,
+        /// Phase 2: `shape_line` over the segments (outside the lock).
+        /// High here ⇒ shaping is the bottleneck (cache misses).
+        pub phase2: Duration,
+    }
+
     thread_local! {
-        static SAMPLES: RefCell<Vec<Duration>> = const { RefCell::new(Vec::new()) };
+        static SAMPLES: RefCell<Vec<Sample>> = const { RefCell::new(Vec::new()) };
     }
 
     const FLUSH_EVERY: usize = 120;
 
-    /// Record one prepaint's wall-time; flush aggregate stats every
+    /// Record one frame's breakdown; flush aggregate stats every
     /// [`FLUSH_EVERY`] samples. No-op (one atomic load) when the env
-    /// var is unset, so leaving the call in the hot path is free.
-    pub fn record(d: Duration) {
+    /// var is unset, so leaving the calls in the hot path is free.
+    pub fn record(s: Sample) {
         if !enabled() {
             return;
         }
-        SAMPLES.with(|s| {
-            let mut v = s.borrow_mut();
-            v.push(d);
+        SAMPLES.with(|cell| {
+            let mut v = cell.borrow_mut();
+            v.push(s);
             if v.len() < FLUSH_EVERY {
                 return;
             }
-            v.sort_unstable();
             let n = v.len();
-            let p50 = v[n / 2];
-            let p99 = v[(n * 99 / 100).min(n - 1)];
-            let max = v[n - 1];
-            let mean = v.iter().sum::<Duration>() / n as u32;
             let ms = |d: Duration| d.as_secs_f64() * 1000.0;
-            let ceiling = if mean.as_secs_f64() > 0.0 {
-                1.0 / mean.as_secs_f64()
+            let pct = |sel: &dyn Fn(&Sample) -> Duration, q: usize| {
+                let mut xs: Vec<Duration> = v.iter().map(sel).collect();
+                xs.sort_unstable();
+                ms(xs[(n * q / 100).min(n - 1)])
+            };
+            let mean = |sel: &dyn Fn(&Sample) -> Duration| ms(v.iter().map(sel).sum::<Duration>() / n as u32);
+            let mean_total = v.iter().map(|s| s.total).sum::<Duration>() / n as u32;
+            let ceiling = if mean_total.as_secs_f64() > 0.0 {
+                1.0 / mean_total.as_secs_f64()
             } else {
                 f64::INFINITY
             };
             eprintln!(
-                "paint: {n} prepaints · mean {:.2}ms p50 {:.2}ms p99 {:.2}ms max {:.2}ms · prepaint-ceiling {ceiling:.0} fps",
-                ms(mean),
-                ms(p50),
-                ms(p99),
-                ms(max),
+                "paint: {n} frames · total mean {:.2} p50 {:.2} p99 {:.2}ms · \
+                 lock+scan mean {:.2} p99 {:.2}ms · shape mean {:.2} p99 {:.2}ms · ceiling {ceiling:.0} fps",
+                mean(&|s| s.total),
+                pct(&|s| s.total, 50),
+                pct(&|s| s.total, 99),
+                mean(&|s| s.phase1),
+                pct(&|s| s.phase1, 99),
+                mean(&|s| s.phase2),
+                pct(&|s| s.phase2, 99),
             );
             v.clear();
         });
@@ -1434,8 +1453,13 @@ impl Element for TerminalElement {
         // thread never blocks on the parser. `_unfair` skips the
         // fairness lease, which is correct for a transient read that
         // gives up immediately on contention.
+        let phase1_t0 = std::time::Instant::now();
         let Some(mut term) = self.term.try_lock_unfair() else {
-            paint_log::record(paint_t0.elapsed());
+            paint_log::record(paint_log::Sample {
+                total: paint_t0.elapsed(),
+                phase1: phase1_t0.elapsed(),
+                phase2: Duration::ZERO,
+            });
             return self.last_prepaint.borrow().clone();
         };
         let (raw_lines, cursor, selection, visible_cols, display_offset_val, history_size) = {
@@ -1770,6 +1794,8 @@ impl Element for TerminalElement {
             )
         };
         // Lock released — event loop can proceed while we shape text.
+        let phase1 = phase1_t0.elapsed();
+        let phase2_t0 = std::time::Instant::now();
 
         // Phase 2: shape line segments (with cache) without holding the lock.
         let text_sys = window.text_system();
@@ -1869,7 +1895,11 @@ impl Element for TerminalElement {
         // Stash for the try-lock reuse path (cheap — TermLine is
         // Rc-backed, so the clone is refcount bumps, not glyph copies).
         *self.last_prepaint.borrow_mut() = Some(built.clone());
-        paint_log::record(paint_t0.elapsed());
+        paint_log::record(paint_log::Sample {
+            total: paint_t0.elapsed(),
+            phase1,
+            phase2: phase2_t0.elapsed(),
+        });
         Some(built)
     }
 
