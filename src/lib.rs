@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 
+pub mod alloc_count;
 pub(crate) mod api;
 pub(crate) mod api_ws;
 #[cfg(feature = "gui")]

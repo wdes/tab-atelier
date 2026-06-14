@@ -261,16 +261,23 @@ pub fn run(args: &[String]) -> i32 {
     let target = mb * 1024 * 1024;
     println!(
         "⏱ tab-atelier bench · {mb} MiB/case · {iterations} iter · grid {cols}×{rows}\n\
-         (PTY-read + parse + ring throughput; not paint/latency)\n"
+         (PTY-read + parse + ring throughput + allocations; not paint/latency)\n"
     );
-    println!("{:<16} {:>12} {:>14}", "case", "best (ms)", "throughput");
+    println!(
+        "{:<16} {:>10} {:>12} {:>12} {:>12}",
+        "case", "best (ms)", "throughput", "allocs", "alloc/MiB"
+    );
 
     let mut all_mb_s: Vec<f64> = Vec::new();
     for case in CASES {
         let payload = (case.build)(target);
         let actual = payload.len();
         let mut best = Duration::from_secs(u64::MAX);
-        for _ in 0..iterations {
+        // Count allocations of ONE representative drain (not all
+        // iterations — they'd multiply). Snapshot straddles only the
+        // drain so payload-build allocs aren't counted.
+        let mut drain_allocs: u64 = 0;
+        for iter in 0..iterations {
             // Fresh Term + ring each iteration so scrollback / grid
             // state from the prior run can't skew the next.
             let config = Config {
@@ -286,17 +293,34 @@ pub fn run(args: &[String]) -> i32 {
                 BenchListener,
             )));
             let mut ring = PtyRing::default();
+            let a0 = crate::alloc_count::snapshot();
             let elapsed = drain(&term, &mut ring, &payload);
+            let a1 = crate::alloc_count::snapshot();
+            if iter == 0 {
+                drain_allocs = a1.since(a0).allocations;
+            }
             best = best.min(elapsed);
         }
         let secs = best.as_secs_f64();
         let mb_s = (actual as f64 / (1024.0 * 1024.0)) / secs;
         all_mb_s.push(mb_s);
-        println!("{:<16} {:>12.1} {:>11.0} MiB/s", case.name, secs * 1000.0, mb_s);
+        let per_mib = drain_allocs as f64 / (actual as f64 / (1024.0 * 1024.0));
+        println!(
+            "{:<16} {:>10.1} {:>7.0} MiB/s {:>12} {:>12.0}",
+            case.name,
+            secs * 1000.0,
+            mb_s,
+            drain_allocs,
+            per_mib,
+        );
     }
 
     let mean = all_mb_s.iter().sum::<f64>() / all_mb_s.len() as f64;
-    println!("\nmean: {mean:.0} MiB/s");
+    let total = crate::alloc_count::snapshot();
+    println!(
+        "\nmean: {mean:.0} MiB/s · process allocations so far: {}",
+        total.allocations
+    );
     0
 }
 
