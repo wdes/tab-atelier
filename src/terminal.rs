@@ -393,9 +393,22 @@ impl TerminalView {
         // browsing scrollback) stays in place — even when the grid
         // hasn't changed, the cursor blink + selection-highlight need
         // periodic redraws so the user can SEE they're paused.
+        //
+        // Sustained-output frame cap. A single change (a keystroke's
+        // echo) repaints on the very next 16 ms tick — full
+        // responsiveness. But when output keeps arriving every tick
+        // (an animated TUI's redraw loop, a flood, the piu-piu menu's
+        // twinkling starfield), painting all 60 fps is pure power
+        // burn — the eye can't tell 30 from 60 fps of terminal
+        // content, and each present wakes the GPU. So under sustained
+        // dirtiness we paint every OTHER dirty tick (~30 fps). The
+        // FIRST dirty tick of a burst still paints immediately (odd
+        // count), and the settle-frame (dirty → clean transition) is
+        // always painted so the final state isn't a tick stale.
         let tick = Rc::new(Cell::new(0u32));
         let tick_clone = tick;
         let last_ring_len = Rc::new(Cell::new(0u64));
+        let dirty_streak = Rc::new(Cell::new(0u32));
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             loop {
                 cx.background_executor().timer(Duration::from_millis(16)).await;
@@ -407,15 +420,31 @@ impl TerminalView {
                     last_ring_len.set(ring_len);
                     let scrolled = view.term.lock().grid().display_offset() > 0;
                     if grid_dirty {
-                        cx.notify();
-                    } else if scrolled && n.is_multiple_of(12) {
-                        // Scrolled-up: paint twice a second so the
-                        // cursor blink stays alive without burning CPU.
-                        cx.notify();
-                    } else if !scrolled && n.is_multiple_of(30) {
-                        // Idle attached: ~once every 500 ms for the
-                        // cursor blink at the bottom.
-                        cx.notify();
+                        let streak = dirty_streak.get().wrapping_add(1);
+                        dirty_streak.set(streak);
+                        // Paint on odd ticks of a sustained streak →
+                        // 30 fps cap; the first tick (streak 1) is odd
+                        // so a lone keystroke paints immediately.
+                        if streak % 2 == 1 {
+                            cx.notify();
+                        }
+                    } else {
+                        // Output just settled — paint the final frame
+                        // once if we were mid-streak (so a skipped even
+                        // tick doesn't leave the screen a frame behind).
+                        if dirty_streak.get() > 0 {
+                            cx.notify();
+                        }
+                        dirty_streak.set(0);
+                        if scrolled && n.is_multiple_of(12) {
+                            // Scrolled-up: paint twice a second so the
+                            // cursor blink stays alive without burning CPU.
+                            cx.notify();
+                        } else if n.is_multiple_of(30) {
+                            // Idle attached: ~once every 500 ms for the
+                            // cursor blink at the bottom.
+                            cx.notify();
+                        }
                     }
                 }) else {
                     break;
@@ -1467,6 +1496,14 @@ impl Element for TerminalElement {
             let visible_lines = term.grid().screen_lines().min(lines);
             let visible_cols = term.grid().columns().min(cols);
             let cursor_point = term.grid().cursor.point;
+            // Honour the app's cursor-visibility mode. Every TUI hides
+            // the cursor with `\x1b[?25l` while it redraws (piu-piu,
+            // vim, htop, less, …); without this check we painted the
+            // cursor block anyway, wherever the app last left it —
+            // visible as a cursor "bouncing around" the screen during
+            // an animated redraw. SHOW_CURSOR is set by default and
+            // cleared by `?25l`, restored by `?25h`.
+            let cursor_visible = term.mode().contains(TermMode::SHOW_CURSOR);
 
             // Collect damage BEFORE we re-borrow the grid immutably
             // for the cell scan. `Term::damage()` returns either Full
@@ -1771,7 +1808,8 @@ impl Element for TerminalElement {
                 lines: working,
             });
 
-            let cursor = if display_offset == 0
+            let cursor = if cursor_visible
+                && display_offset == 0
                 && (cursor_point.line.0 as usize) < visible_lines
                 && cursor_point.column.0 < visible_cols
             {
