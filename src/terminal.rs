@@ -213,6 +213,11 @@ pub struct TerminalView {
     /// visible_lines)` — any scroll / resize discards the whole cache
     /// since the row-row mapping changes.
     prev_frame: Rc<RefCell<Option<CachedFrame>>>,
+    /// Last fully-built prepaint output. When the parser thread holds
+    /// the `Term` lock at prepaint time, the UI thread reuses this
+    /// instead of blocking — see the `try_lock_unfair` path in
+    /// `prepaint`. The next 16 ms tick retries with fresh grid data.
+    last_prepaint: Rc<RefCell<Option<TermPrepaint>>>,
 }
 
 /// Cached Phase 1 output from the previous paint. See [`TerminalView::prev_frame`].
@@ -446,6 +451,7 @@ impl TerminalView {
             locked: Rc::new(Cell::new(false)),
             pty_ring,
             prev_frame: Rc::new(RefCell::new(None)),
+            last_prepaint: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -1236,6 +1242,7 @@ impl Render for TerminalView {
                 detected_urls: self.detected_urls.clone(),
                 hover_grid: self.hover_grid.clone(),
                 prev_frame: self.prev_frame.clone(),
+                last_prepaint: self.last_prepaint.clone(),
             })
     }
 }
@@ -1259,6 +1266,7 @@ struct TerminalElement {
     detected_urls: Rc<RefCell<Vec<DetectedUrl>>>,
     hover_grid: Rc<Cell<Option<(usize, usize)>>>,
     prev_frame: Rc<RefCell<Option<CachedFrame>>>,
+    last_prepaint: Rc<RefCell<Option<TermPrepaint>>>,
 }
 
 impl IntoElement for TerminalElement {
@@ -1268,6 +1276,7 @@ impl IntoElement for TerminalElement {
     }
 }
 
+#[derive(Clone)]
 struct TermPrepaint {
     lines: Vec<TermLine>,
     cursor: Option<(usize, usize)>,
@@ -1279,21 +1288,17 @@ struct TermPrepaint {
 
 use alacritty_terminal::selection::SelectionRange;
 
+#[derive(Clone)]
 struct TermSegment {
     col_start: usize,
     shaped: ShapedLine,
 }
 
-impl Clone for TermSegment {
-    fn clone(&self) -> Self {
-        Self {
-            col_start: self.col_start,
-            shaped: self.shaped.clone(),
-        }
-    }
-}
-
+#[derive(Clone)]
 struct TermLine {
+    /// Shaped glyphs for this row. `Rc` so cloning a `TermPrepaint`
+    /// (the try-lock reuse path + the prev-frame cache) is a cheap
+    /// refcount bump, not a deep `ShapedLine` copy.
     segments: std::rc::Rc<Vec<TermSegment>>,
     bg_runs: Vec<BgRun>,
 }
@@ -1419,8 +1424,21 @@ impl Element for TerminalElement {
         // a resize changes visible_cols/lines → invalidate since the
         // per-row `RawLine`s no longer match the new layout.
 
+        // Non-blocking lock acquisition. During a heavy flood the
+        // alacritty PTY-reader thread holds the Term lock for the
+        // duration of a large parse batch; a blocking `lock()` here
+        // made the UI thread wait out that whole batch (measured
+        // p99 ≈ 540 ms prepaint spikes during a `seq 1 2000000`
+        // scroll). Instead, if the parser holds it we reuse the last
+        // built frame and let the next 16 ms tick try again — the UI
+        // thread never blocks on the parser. `_unfair` skips the
+        // fairness lease, which is correct for a transient read that
+        // gives up immediately on contention.
+        let Some(mut term) = self.term.try_lock_unfair() else {
+            paint_log::record(paint_t0.elapsed());
+            return self.last_prepaint.borrow().clone();
+        };
         let (raw_lines, cursor, selection, visible_cols, display_offset_val, history_size) = {
-            let mut term = self.term.lock();
             let display_offset = term.grid().display_offset() as i32;
             let visible_lines = term.grid().screen_lines().min(lines);
             let visible_cols = term.grid().columns().min(cols);
@@ -1840,15 +1858,19 @@ impl Element for TerminalElement {
         *cache = new_cache;
         *self.detected_urls.borrow_mut() = detected;
 
-        paint_log::record(paint_t0.elapsed());
-        Some(TermPrepaint {
+        let built = TermPrepaint {
             lines: result_lines,
             cursor,
             selection,
             visible_cols,
             display_offset: display_offset_val,
             history_size,
-        })
+        };
+        // Stash for the try-lock reuse path (cheap — TermLine is
+        // Rc-backed, so the clone is refcount bumps, not glyph copies).
+        *self.last_prepaint.borrow_mut() = Some(built.clone());
+        paint_log::record(paint_t0.elapsed());
+        Some(built)
     }
 
     fn paint(
