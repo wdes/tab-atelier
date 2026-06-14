@@ -54,9 +54,33 @@ mod paint_log {
 
     thread_local! {
         static SAMPLES: RefCell<Vec<Sample>> = const { RefCell::new(Vec::new()) };
+        /// GPU paint() phase durations since the last flush.
+        static PRESENTS: RefCell<Vec<Duration>> = const { RefCell::new(Vec::new()) };
+        /// Wall-clock of the first present in the current window, to
+        /// compute the actual presents-per-second (proves the 30 fps
+        /// sustained-output cap during real play).
+        static WINDOW_START: RefCell<Option<std::time::Instant>> = const { RefCell::new(None) };
     }
 
     const FLUSH_EVERY: usize = 120;
+
+    /// Record one GPU paint()/present wall-time. Separate from the
+    /// prepaint sample because the present is where the watts go —
+    /// the count over a window gives the real frame rate.
+    pub fn record_present(d: Duration) {
+        if !enabled() {
+            return;
+        }
+        PRESENTS.with(|p| {
+            let mut v = p.borrow_mut();
+            WINDOW_START.with(|w| {
+                if w.borrow().is_none() {
+                    *w.borrow_mut() = Some(std::time::Instant::now());
+                }
+            });
+            v.push(d);
+        });
+    }
 
     /// Record one frame's breakdown; flush aggregate stats every
     /// [`FLUSH_EVERY`] samples. No-op (one atomic load) when the env
@@ -85,9 +109,29 @@ mod paint_log {
             } else {
                 f64::INFINITY
             };
+            // Actual GPU present rate over this window — the number
+            // that tracks watts. With the sustained-output frame cap,
+            // an animated TUI should show ~30 fps here even though the
+            // 16 ms pump ticks at 60.
+            let (present_fps, present_mean_ms, present_n) = PRESENTS.with(|p| {
+                let pv = std::mem::take(&mut *p.borrow_mut());
+                let elapsed = WINDOW_START.with(|w| w.borrow_mut().take().map(|t| t.elapsed()));
+                let cnt = pv.len();
+                let fps = match elapsed {
+                    Some(e) if e.as_secs_f64() > 0.0 => cnt as f64 / e.as_secs_f64(),
+                    _ => 0.0,
+                };
+                let mean = if cnt > 0 {
+                    ms(pv.iter().sum::<Duration>() / cnt as u32)
+                } else {
+                    0.0
+                };
+                (fps, mean, cnt)
+            });
             eprintln!(
-                "paint: {n} frames · total mean {:.2} p50 {:.2} p99 {:.2}ms · \
-                 lock+scan mean {:.2} p99 {:.2}ms · shape mean {:.2} p99 {:.2}ms · ceiling {ceiling:.0} fps",
+                "paint: {n} prepaints · total mean {:.2} p50 {:.2} p99 {:.2}ms · \
+                 lock+scan mean {:.2} p99 {:.2}ms · shape mean {:.2} p99 {:.2}ms · ceiling {ceiling:.0} fps \
+                 || presents {present_n} @ {present_fps:.0} fps (mean {present_mean_ms:.2}ms)",
                 mean(&|s| s.total),
                 pct(&|s| s.total, 50),
                 pct(&|s| s.total, 99),
@@ -2124,10 +2168,11 @@ impl Element for TerminalElement {
             }
         });
 
+        let present = paint_started.elapsed();
+        paint_log::record_present(present);
         trace!(
             target: "tab_atelier::input_lag",
-            "T3 paint done in {:?}",
-            paint_started.elapsed(),
+            "T3 paint done in {present:?}",
         );
     }
 }
