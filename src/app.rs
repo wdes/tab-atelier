@@ -63,6 +63,16 @@ struct Tab {
     /// per-tab `output_tab-...json` write+rotate when nothing changed
     /// (idle tabs, no new output since last persist tick).
     output_hash_last_saved: u32,
+    /// PTY-ring `total_len` at the last output save. The crc32 gate
+    /// above is authoritative for "did the output change", but
+    /// computing the hash needs `copy_all_history()` — a full
+    /// scrollback serialization — which dominated idle CPU with many
+    /// tabs (49 tabs × full-grid scan every 2 s). When the ring's
+    /// monotonic byte counter hasn't moved since the last save, no
+    /// new PTY bytes reached the grid, so the output is byte-identical
+    /// and we skip the serialize+hash entirely. `None` until the
+    /// first save so the very first persist always serializes.
+    output_ring_len_last_saved: Option<u64>,
     /// Saved scrollback that hasn't been fed back into the terminal yet.
     /// Tabs other than the active one defer this work until first focus
     /// so cold-launch with many tabs doesn't block on vte-parsing each
@@ -436,6 +446,7 @@ impl AppState {
                         // first persist tick after launch doesn't rewrite an
                         // identical file.
                         output_hash_last_saved: ts.output.as_deref().map_or(0, |s| crate::crc32(s.as_bytes())),
+                        output_ring_len_last_saved: None,
                         pending_restore,
                         // Seed from saved state so an immediate persist tick
                         // before the new shell has a /proc/PID/cwd readable
@@ -480,6 +491,7 @@ impl AppState {
                         #[cfg(feature = "energy")]
                         energy_wh_last_saved: 0.0,
                         output_hash_last_saved: 0,
+                        output_ring_len_last_saved: None,
                         pending_restore: None,
                         last_known_cwd: None,
                         last_known_cwd_string: None,
@@ -526,6 +538,7 @@ impl AppState {
                         #[cfg(feature = "energy")]
                         energy_wh_last_saved: 0.0,
                         output_hash_last_saved: 0,
+                        output_ring_len_last_saved: None,
                         pending_restore: None,
                         last_known_cwd: None,
                         last_known_cwd_string: None,
@@ -804,6 +817,7 @@ impl AppState {
                 #[cfg(feature = "energy")]
                 energy_wh_last_saved: 0.0,
                 output_hash_last_saved: 0,
+                output_ring_len_last_saved: None,
                 pending_restore: None,
                 last_known_cwd_string: cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
                 last_known_cwd: cwd,
@@ -1030,16 +1044,41 @@ impl AppState {
         }
         if !read_only {
             for tab in &mut self.tabs {
+                // Cheap dirtiness gate BEFORE the expensive
+                // copy_all_history(). The PTY ring's monotonic counter
+                // only advances when new bytes reached the grid; if it
+                // hasn't moved since the last save, the output is
+                // byte-identical and there's nothing to save. This is
+                // what stops idle tabs from each paying a full-grid
+                // serialize every 2 s (the dominant cost at 49 tabs).
+                // crc32 below stays authoritative — we never skip a
+                // real change, we just avoid serializing unchanged
+                // tabs.
+                let ring_len = {
+                    let view = tab.view.read(cx);
+                    view.pty_ring().lock().map_or(0, |r| r.total_len())
+                };
+                if tab.output_ring_len_last_saved == Some(ring_len) {
+                    continue;
+                }
                 let output = tab.view.read(cx).copy_all_history();
                 if output.is_empty() {
+                    // Don't record ring_len: an empty grid that later
+                    // fills must still serialize on the next tick.
                     continue;
                 }
                 let h = crate::crc32(output.as_bytes());
                 if h == tab.output_hash_last_saved {
+                    // Content identical despite a ring advance (e.g.
+                    // bytes that didn't alter the visible/scrollback
+                    // text). Record the ring position so we don't
+                    // re-serialize until genuinely new bytes arrive.
+                    tab.output_ring_len_last_saved = Some(ring_len);
                     continue;
                 }
                 save_tab_output(&state_base, &tab.name, &output);
                 tab.output_hash_last_saved = h;
+                tab.output_ring_len_last_saved = Some(ring_len);
             }
         }
         // Uptime + energy are never written in read-only mode; in normal
