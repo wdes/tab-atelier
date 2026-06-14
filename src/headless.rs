@@ -102,6 +102,10 @@ struct HeadlessTab {
     #[cfg(feature = "energy")]
     energy_wh_last_saved: f64,
     output_hash_last_saved: u32,
+    /// PTY-ring `total_len` at the last output save — same dirtiness
+    /// gate as the GUI's `Tab`: skip the expensive `copy_all_history`
+    /// when no new bytes reached the grid. crc32 stays authoritative.
+    output_ring_len_last_saved: Option<u64>,
     pending_restore: Option<String>,
     last_known_cwd: Option<PathBuf>,
     last_known_cwd_string: Option<String>,
@@ -437,6 +441,7 @@ fn spawn_pty_tab(
         #[cfg(feature = "energy")]
         energy_wh_last_saved: energy_wh,
         output_hash_last_saved: saved_output_hash,
+        output_ring_len_last_saved: None,
         pending_restore,
         last_known_cwd: cwd,
         last_known_cwd_string,
@@ -914,16 +919,28 @@ fn persist(
 
     if !read_only {
         for tab in tabs.iter_mut() {
+            // Dirtiness gate before the expensive copy_all_history():
+            // skip tabs whose PTY ring hasn't advanced since the last
+            // save (no new grid bytes ⇒ identical output). The final
+            // flush ignores the gate so shutdown always persists the
+            // latest. crc32 below stays authoritative on every real
+            // change.
+            let ring_len = tab.ring_total_len();
+            if !final_flush && tab.output_ring_len_last_saved == Some(ring_len) {
+                continue;
+            }
             let output = tab.copy_all_history();
             if output.is_empty() {
                 continue;
             }
             let h = crc32(output.as_bytes());
             if !final_flush && h == tab.output_hash_last_saved {
+                tab.output_ring_len_last_saved = Some(ring_len);
                 continue;
             }
             save_tab_output(&state_base, &tab.name, &output);
             tab.output_hash_last_saved = h;
+            tab.output_ring_len_last_saved = Some(ring_len);
         }
     }
 
