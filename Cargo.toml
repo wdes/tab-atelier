@@ -2,6 +2,18 @@
 members = ["crates/catbus-agent"]
 default-members = [".", "crates/catbus-agent"]
 
+# Release codegen tuned for the hot VT-parse / grid-update loop. Cargo's
+# defaults (lto = false, codegen-units = 16) leave cross-crate inlining
+# on the table — the parser lives in alacritty_terminal/vte while the
+# Term handler and our ring live here, so fat LTO lets LLVM inline across
+# that boundary, and a single codegen unit gives it the whole picture.
+# Biggest near-free win for CPU-bound cases (cursor_motion) and the whole
+# pipeline; panic stays "unwind" because gpui and the test suite rely on
+# it, and target-cpu is left default so the shipped .deb runs everywhere.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
 [package]
 name = "tab-atelier"
 version = "0.5.0-dev"
