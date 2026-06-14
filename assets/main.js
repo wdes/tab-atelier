@@ -990,14 +990,50 @@
     }
 
     if (!READ_ONLY) {
-      term.onData(data => {
-        // xterm.js's disableStdin should already suppress these, but
-        // a tab that locks mid-session may have keypresses already
-        // in flight. Also short-circuit if the socket isn't open.
+      const sendInput = data => {
         if (serverLocked) return;
         if (!ws || ws.readyState !== WebSocket.OPEN) return;
         const payload = new TextEncoder().encode(data);
         try { ws.send(encodeFrame(0x01, payload)); } catch { /* swallow */ }
+      };
+
+      // Mobile IME composition gate. Soft keyboards (Gboard, SwiftKey,
+      // …) made each word arrive twice: once mid-composition and again
+      // on commit, or as an identical commit echoed back-to-back, so
+      // typing landed as "testtest"/"butbut". xterm 6.0.0 already fires
+      // the committed word itself via its async `_finalizeComposition`
+      // (a setTimeout(0) after `compositionend`), so we must NOT re-emit
+      // it here — we only:
+      //   1. swallow `onData` while a composition is active (the stray
+      //      in-progress intermediates), and
+      //   2. drop an identical commit that the IME echoes within a
+      //      short window right after the real one (the exact double).
+      // Both guards engage only around composition events, so desktop
+      // physical-keyboard typing — including deliberate repeats like
+      // "ll" — is never deduped.
+      let composing = false;
+      const recent = { text: "", at: -Infinity };
+      if (helperTextarea) {
+        helperTextarea.addEventListener("compositionstart", () => {
+          composing = true;
+        });
+        helperTextarea.addEventListener("compositionend", () => {
+          composing = false;
+          recent.at = performance.now();
+        });
+      }
+
+      term.onData(data => {
+        // xterm.js's disableStdin should already suppress these, but
+        // a tab that locks mid-session may have keypresses already
+        // in flight. Also short-circuit if the socket isn't open
+        // (handled inside sendInput).
+        if (composing) return;
+        const now = performance.now();
+        if (now - recent.at < 300 && data === recent.text) return;
+        recent.text = data;
+        recent.at = now;
+        sendInput(data);
       });
     }
 
