@@ -13,8 +13,16 @@ use std::sync::atomic::Ordering;
 
 use clap::Parser;
 use tab_atelier::{
-    READ_ONLY, SHUTDOWN_REQUESTED, cli, headless, install_rustls_provider, try_acquire_single_instance_lock,
+    READ_ONLY, SHUTDOWN_REQUESTED, alloc_count, cli, headless, install_rustls_provider,
+    try_acquire_single_instance_lock,
 };
+
+/// Allocation-counting allocator (headless only) so `bench` can report
+/// heap allocations per payload. Two relaxed atomics per alloc —
+/// negligible next to the daemon's syscalls. The gpui binary does not
+/// install this; it keeps the system allocator.
+#[global_allocator]
+static GLOBAL: alloc_count::Counting<std::alloc::System> = alloc_count::Counting(std::alloc::System);
 
 fn main() {
     // Install the rustls crypto provider FIRST. `cli::remote::*` and
