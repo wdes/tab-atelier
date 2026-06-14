@@ -1879,6 +1879,16 @@ fn write_atomic_with_rotation<T: serde::Serialize>(
 
 #[must_use]
 pub fn detect_urls(text: &str) -> Vec<(usize, usize, String, bool)> {
+    // Allocation-free fast path. Every pattern this function detects —
+    // `http://`, `https://`, and `/absolute` or `~/relative` paths —
+    // contains a `/`. A line with no slash can't match, so bail before
+    // the `Vec<char>` allocation + full scan. This runs per cache-
+    // missed row in the paint loop; during a number/paste flood
+    // (`seq`, a pasted blob) almost every row has no slash, so this
+    // turns 50 per-frame allocations into 50 single-byte scans.
+    if !text.as_bytes().contains(&b'/') {
+        return Vec::new();
+    }
     let chars: Vec<char> = text.chars().collect();
     let len = chars.len();
     let mut urls = Vec::new();
@@ -2765,6 +2775,19 @@ mod tests {
         let urls = detect_urls("see https://example.com.");
         assert_eq!(urls.len(), 1);
         assert_eq!(urls[0].2, "https://example.com");
+    }
+
+    #[test]
+    fn detect_urls_no_slash_short_circuits_empty() {
+        // The allocation-free fast path: a line with no '/' cannot
+        // contain any detectable URL or path. These all return empty.
+        assert!(detect_urls("just some prose with no links at all").is_empty());
+        assert!(detect_urls("123456 789012 numbers from seq").is_empty());
+        assert!(detect_urls("# Xq9_-=Zb7A random paste line no slash").is_empty());
+        assert!(detect_urls("https:example.com missing the slashes").is_empty());
+        // And a line WITH a slash still detects normally (fast path
+        // doesn't swallow real matches).
+        assert_eq!(detect_urls("go https://x.io/p now").len(), 1);
     }
 
     #[test]
