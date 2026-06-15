@@ -87,6 +87,12 @@
       helperTextarea.setAttribute("data-gramm", "false");
       helperTextarea.setAttribute("data-gramm_editor", "false");
       helperTextarea.setAttribute("data-enable-grammarly", "false");
+      // Track IME composition ONLY to suppress predictive local echo
+      // (below). It must NOT gate sending — that was the keystroke-
+      // doubling bug. While composing, a per-character mobile IME hasn't
+      // committed yet, so predicting would paint the wrong glyph.
+      helperTextarea.addEventListener("compositionstart", () => { imeComposing = true; });
+      helperTextarea.addEventListener("compositionend", () => { imeComposing = false; });
     }
 
     // Silence xterm.js's terminal-query auto-responses.
@@ -724,6 +730,24 @@
     // strictly in arrival order. `.catch` keeps the tail resolved so a
     // single bad frame can't wedge the whole stream.
     let outChain = Promise.resolve();
+    // Predictive local echo (latency hiding, mosh-style but minimal).
+    // On a high-RTT link we optimistically paint a typed char (dimmed)
+    // immediately, then reconcile when the server's authoritative bytes
+    // arrive: every `out` frame wipes the predicted cells and lets the
+    // real bytes paint, so a wrong guess self-corrects within one RTT
+    // and never persists. Self-gates on measured echo RTT, so LAN/local
+    // viewers (where it'd only add flicker) are untouched. Conservative
+    // by design — predicts only single-byte ASCII at the line end in
+    // the normal buffer, never during IME composition or alt-screen.
+    // Kill switch: append `?nopredict=1` to the viewer URL.
+    const PREDICT_ON_MS = 30; // enable predictions once EMA RTT exceeds this
+    const PREDICT_OFF_MS = 18; // disable below (hysteresis)
+    const PREDICT_DISABLED = new URLSearchParams(location.search).get("nopredict") === "1";
+    let imeComposing = false;
+    let predictActive = false; // currently above the RTT threshold
+    let predRttEma = 0;
+    let predStr = ""; // predicted chars currently shown (dim), at line end
+    let predSentAt = 0; // timestamp of the last keystroke, for the RTT estimate
     let bootstrapped = false;
     let serverCols = 0;
     let serverRows = 0;
@@ -879,7 +903,42 @@
       return new Response(stream).arrayBuffer().then((ab) => new Uint8Array(ab));
     }
 
+    // Optimistically paint the echo of a typed char before the server
+    // confirms it. Strict gating (see the predictor notes above) keeps
+    // it safe: any uncertainty → no prediction, never a wrong glyph.
+    function maybePredict(data) {
+      if (PREDICT_DISABLED || !predictActive || imeComposing) return;
+      if (inScrollback || isSelecting || term.hasSelection()) return;
+      const buf = term.buffer.active;
+      if (buf.type !== "normal") return; // no alt-screen (vim/htop/less)
+      if (data.length !== 1) return; // single keystrokes only
+      const code = data.charCodeAt(0);
+      if (code >= 0x20 && code <= 0x7e) {
+        // Stay clear of the right margin so the reconcile (cursor-left n
+        // on one line) can't have wrapped.
+        if (serverCols <= 0 || buf.cursorX + predStr.length >= serverCols - 1) return;
+        predStr += data;
+        term.write("\x1b[2m" + data + "\x1b[22m"); // dim glyph
+      } else if (code === 0x7f && predStr.length > 0) {
+        // Backspace, but only back over our OWN predicted chars.
+        predStr = predStr.slice(0, -1);
+        term.write("\b \b");
+      }
+      // Any other key (Enter, arrows, control, multi-byte): predict
+      // nothing; pending chars reconcile on the next out frame.
+    }
+
     function handleOut(bytes) {
+      // Predictive-echo RTT estimate: time from the last keystroke to
+      // this (presumed echo) frame. Drives auto-enable/disable so the
+      // feature stays off on fast links where it'd only add flicker.
+      if (predSentAt) {
+        const rtt = performance.now() - predSentAt;
+        predSentAt = 0;
+        predRttEma = predRttEma ? predRttEma * 0.8 + rtt * 0.2 : rtt;
+        if (!predictActive && predRttEma > PREDICT_ON_MS) predictActive = true;
+        else if (predictActive && predRttEma < PREDICT_OFF_MS) predictActive = false;
+      }
       // Always advance the offset — even while paused — so reconnect
       // can resume from the right place. Defer the actual write to
       // xterm.js if the user is selecting / scrolled up, then flush
@@ -912,6 +971,17 @@
           status.textContent = `${TAB_NAME} · selection · click 📋 to copy · ${queued}B queued`;
         }
         return;
+      }
+      // Reconcile predictive local echo: wipe the predicted cells and
+      // return the cursor to the real position before the authoritative
+      // bytes paint. n predicted single-width cells → cursor-left n,
+      // overwrite with spaces, cursor-left n. Correct whether the guess
+      // was right (server bytes repaint the same chars in normal style)
+      // or wrong (server bytes paint over the wiped cells).
+      if (predStr.length > 0) {
+        const rew = `\x1b[${predStr.length}D`;
+        term.write(rew + " ".repeat(predStr.length) + rew);
+        predStr = "";
       }
       if (pendingBytesWhileSelecting) {
         term.write(pendingBytesWhileSelecting);
@@ -1027,6 +1097,10 @@
         if (!ws || ws.readyState !== WebSocket.OPEN) return;
         const payload = new TextEncoder().encode(data);
         try { ws.send(encodeFrame(0x01, payload)); } catch { /* swallow */ }
+        // Timestamp for the RTT estimate (every key), then optimistically
+        // echo it locally if predictions are active.
+        predSentAt = performance.now();
+        maybePredict(data);
       });
     }
 
