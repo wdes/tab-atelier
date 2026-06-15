@@ -125,6 +125,11 @@ http-body-util = "0.1"
 # transport for the xterm.js web viewer + `tab-atelier remote` once
 # both migrate — replaces /stream polling and the X-* header channel.
 hyper-tungstenite = "0.20"
+# Sync WebSocket *client*, used by the `bench-lag` subcommand to time
+# the keystroke→echo round-trip against a running daemon's viewer WS.
+# Already in the tree via hyper-tungstenite/tokio-tungstenite, so this
+# direct dep adds no new compilation. ws:// only (no TLS feature).
+tungstenite = "0.29"
 futures-util = { version = "0.3", default-features = false }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 bytes = "1"

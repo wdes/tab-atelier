@@ -249,6 +249,23 @@ pub enum Commands {
         #[arg(long)]
         rows: Option<usize>,
     },
+
+    /// Input-lag self-test — connects to a running tab's web-viewer
+    /// WebSocket and measures the keystroke→echo round-trip (sends a
+    /// benign `x`, times the echoed output, then erases it). Reports
+    /// min / median / p95 / mean. Needs a running daemon.
+    ///
+    /// Pass the viewer URL you'd open in a browser — the
+    /// `<base>/tabs/by-id/<uuid>/view?token=<tok>` link. Point it at
+    /// `127.0.0.1` to isolate the server-side tick floor, or a remote
+    /// host to include real network latency.
+    BenchLag {
+        /// Viewer URL (`…/view?token=…`) or a direct `ws…/ws?token=…`.
+        url: String,
+        /// Number of keystroke samples to time (default 25).
+        #[arg(long)]
+        samples: Option<usize>,
+    },
 }
 
 /// Returns true iff a subcommand was dispatched (caller should not
@@ -410,6 +427,7 @@ pub fn dispatch(cli: Cli) -> bool {
             }
             crate::cli::bench::run(&args)
         }
+        Commands::BenchLag { url, samples } => crate::cli::bench_lag::run(&url, samples.unwrap_or(25)),
     };
     std::process::exit(code);
 }

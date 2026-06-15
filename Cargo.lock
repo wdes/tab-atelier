@@ -6228,6 +6228,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-rustls",
+ "tungstenite",
  "ureq",
  "uuid",
  "vte 0.15.0",
