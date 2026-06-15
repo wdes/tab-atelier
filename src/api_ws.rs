@@ -75,18 +75,21 @@ const TAG_ACTIVATE: u8 = 0x07;
 const TAG_RENAME: u8 = 0x08;
 const TAG_CLOSE: u8 = 0x09;
 
-/// How often the server-side task wakes to check for new PTY bytes
-/// and state changes. v1 polls the snapshot — a follow-up will
-/// switch to `tokio::sync::Notify` on the ring push site so we
-/// emit bytes within microseconds instead of within this tick.
-///
-/// 10 ms keeps the average output-echo delay to ~5 ms (vs ~15 ms at
-/// the old 30 ms). The pump only runs while a viewer is connected, so
-/// the extra wakeups (100/s per viewer, each a cheap ring lock +
-/// `total_len` compare) cost nothing on idle tabs with no viewer.
-/// Lowering further hits diminishing returns against the per-frame WS
-/// overhead; the real zero-latency fix is the Notify migration above.
-const TICK_MS: u64 = 10;
+/// Output is now event-driven: the pump parks on the `PtyRing`'s
+/// `Notify` and flushes the moment a push lands (sub-millisecond echo),
+/// so there is no output poll tick. This slower tick only drives the
+/// non-latency-critical meta refresh (lock / agent / schedule / file
+/// counts) and doubles as a belt-and-suspenders backstop. 100 ms is
+/// plenty for state that changes on human/event timescales.
+const META_POLL_MS: u64 = 100;
+
+/// After a wake, wait this long before flushing so a burst of PTY
+/// output (a `cat` flood) coalesces into one frame instead of hundreds
+/// of tiny ones. 2 ms is imperceptible for a keystroke echo but caps
+/// the flood frame rate at ~500/s. Inbound keystrokes only queue into
+/// `pending_input` (drained on a separate 16 ms tick), so the brief
+/// debounce never delays input meaningfully.
+const OUTPUT_DEBOUNCE_MS: u64 = 2;
 
 /// Per-message cap on inbound WS frames. Tungstenite's defaults
 /// (16 MiB frame, 64 MiB message) are generous to a fault — an
@@ -560,48 +563,53 @@ async fn run_pump(
         None
     };
 
-    let mut tick = tokio::time::interval(Duration::from_millis(TICK_MS));
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Event-driven output: wake on a `PtyRing` push and flush
+    // immediately. `notify` is cloned from the ring once up front.
+    let notify = {
+        let Ok(r) = ring.lock() else {
+            return;
+        };
+        r.notifier()
+    };
+    let mut meta_tick = tokio::time::interval(Duration::from_millis(META_POLL_MS));
+    meta_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
-        tokio::select! {
-            // Periodic push: new PTY bytes + state changes.
-            _ = tick.tick() => {
-                // out frames — drop the ring lock immediately after
-                // copying the new suffix into a Vec so the PTY-read
-                // side (in pty_ring.rs) isn't blocked while we're
-                // talking to the WS sink.
-                let chunk = {
-                    let Ok(r) = ring.lock() else { return; };
-                    let new_total = r.total_len();
-                    if new_total == ring_offset {
-                        Vec::new()
-                    } else {
-                        let bytes = r.since(ring_offset);
-                        ring_offset = new_total;
-                        bytes
-                    }
-                };
-                if !chunk.is_empty() {
-                    let frame = encode_frame(TAG_OUT, chunk);
-                    if sink.send(Message::Binary(frame.into())).await.is_err() {
-                        return;
-                    }
-                }
-                // meta frame — only when something actually changed.
-                // Structural compare against the last sent snapshot; we
-                // only serialise (allocating a Vec) when it differs.
-                if let Some(meta) = current_meta(&state, &uuid, authz)
-                    && last_meta.as_ref() != Some(&meta)
-                {
-                    let bytes = encode_frame(TAG_META, serde_json::to_vec(&meta).unwrap_or_default());
-                    if sink.send(Message::Binary(bytes.into())).await.is_err() {
-                        return;
-                    }
-                    last_meta = Some(meta);
-                }
+        // Arm the wake BEFORE flushing: `enable()` registers the waiter
+        // now, so a push that lands during the flush below is captured
+        // (the next loop iteration's flush sends it) — no lost wakeup.
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        // Flush any new ring bytes. Idempotent — only the suffix since
+        // `ring_offset` — so a spurious wake is a cheap no-op. The lock
+        // is dropped before we await the sink so the PTY-read side
+        // (pty_ring) is never blocked while we talk to the socket.
+        let chunk = {
+            let Ok(r) = ring.lock() else {
+                return;
+            };
+            let new_total = r.total_len();
+            if new_total == ring_offset {
+                Vec::new()
+            } else {
+                let bytes = r.since(ring_offset);
+                ring_offset = new_total;
+                bytes
             }
-            // Inbound frames.
+        };
+        if !chunk.is_empty() {
+            let frame = encode_frame(TAG_OUT, chunk);
+            if sink.send(Message::Binary(frame.into())).await.is_err() {
+                return;
+            }
+        }
+
+        tokio::select! {
+            biased;
+            // Inbound first — keystrokes are latency-critical (they
+            // just queue into pending_input, so this is quick).
             msg = stream.next() => {
                 let Some(Ok(msg)) = msg else { return; };
                 match msg {
@@ -616,6 +624,24 @@ async fn run_pump(
                     }
                     Message::Close(_) => return,
                     _ => {} // Text / Pong / Frame — ignore.
+                }
+            }
+            // New PTY output: brief debounce to coalesce a burst, then
+            // loop back to flush.
+            () = &mut notified => {
+                tokio::time::sleep(Duration::from_millis(OUTPUT_DEBOUNCE_MS)).await;
+            }
+            // Meta frame — only when something actually changed.
+            // Structural compare; serialise only on a real diff.
+            _ = meta_tick.tick() => {
+                if let Some(meta) = current_meta(&state, &uuid, authz)
+                    && last_meta.as_ref() != Some(&meta)
+                {
+                    let bytes = encode_frame(TAG_META, serde_json::to_vec(&meta).unwrap_or_default());
+                    if sink.send(Message::Binary(bytes.into())).await.is_err() {
+                        return;
+                    }
+                    last_meta = Some(meta);
                 }
             }
         }

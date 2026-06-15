@@ -79,6 +79,12 @@ pub struct PtyRing {
     /// front to make room.
     base_offset: u64,
     cap: usize,
+    /// Fired on every (non-empty) [`Self::push`] so a connected
+    /// web-viewer pump wakes and flushes the new bytes immediately
+    /// instead of waiting out a poll tick — see `api_ws::run_pump`.
+    /// No-op when no pump is registered; lives outside the protocol
+    /// model so it costs a single `notify_waiters` per PTY read.
+    notify: std::sync::Arc<tokio::sync::Notify>,
 }
 
 impl Default for PtyRing {
@@ -94,7 +100,15 @@ impl PtyRing {
             bytes: VecDeque::with_capacity(cap.min(1024 * 1024)),
             base_offset: 0,
             cap: cap.max(1),
+            notify: std::sync::Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// Clone the wake handle for a consumer (the WS pump) to await.
+    /// Each `notified()` waiter is woken on the next non-empty push.
+    #[must_use]
+    pub fn notifier(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        self.notify.clone()
     }
 
     /// Append `data` to the ring, dropping the oldest bytes if the
@@ -102,6 +116,15 @@ impl PtyRing {
     /// number of dropped bytes so the public offset space stays
     /// monotonic.
     pub fn push(&mut self, data: &[u8]) {
+        self.push_inner(data);
+        // Wake the viewer pump so the new bytes flush within
+        // microseconds. Skip on an empty push (nothing to flush).
+        if !data.is_empty() {
+            self.notify.notify_waiters();
+        }
+    }
+
+    fn push_inner(&mut self, data: &[u8]) {
         // Single push larger than capacity: the survivors are the
         // tail of `data`. Drop everything we had AND skip the head of
         // `data` so only the last `cap` bytes remain.
