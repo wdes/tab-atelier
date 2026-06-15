@@ -682,12 +682,16 @@ pub fn run() -> std::io::Result<()> {
     let mut last_state_hash: u32 = 0;
 
     // --- Main tick: 100 ms ---
-    // Drives input drain + snapshot refresh, so a keystroke posted
-    // to /input lands in the PTY within ~100 ms and its echo is in
-    // the snapshot by the next tick. Persist-to-disk runs on its own
-    // 2 s cadence inside the loop, so this faster tick adds no disk
-    // I/O.
-    let tick_interval = Duration::from_millis(100);
+    // Fast 16 ms loop so a keystroke (WS `in` frame or POST /input)
+    // lands in the PTY within ~16 ms instead of ~100 ms — the input
+    // half of the web-viewer latency. The heavier per-tab work
+    // (snapshot rebuild, 2 s disk persist, auto-resume sweep) only
+    // needs ~10 Hz, so it's gated to every 6th tick below; the input
+    // drain runs every tick.
+    let tick_interval = Duration::from_millis(16);
+    // Counts fast ticks; the slow block fires every 6th (~96 ms).
+    // Input drain is NOT gated by it.
+    let mut slow_ctr: u32 = 0;
     // Seed the persist clock 2s in the past so the very first tick
     // forces a flush (state hashing then deduplicates on subsequent
     // ticks). `checked_sub` defensively handles a boot-time clock
@@ -720,7 +724,8 @@ pub fn run() -> std::io::Result<()> {
             return Ok(());
         }
 
-        // Drain pending actions every tick.
+        // Drain pending actions EVERY tick (~16 ms) — this is the
+        // latency-critical input path (WS `in` frames / POST /input).
         drain_pending(
             &mut tabs,
             &mut active,
@@ -731,9 +736,19 @@ pub fn run() -> std::io::Result<()> {
             pty_rows,
             &default_limits,
         );
-        // Refresh the API snapshot on every tick so /output reflects
-        // shell echo within one tick (~500 ms) instead of waiting up
-        // to 2 s for the next disk-persist. Cheap — just grid reads.
+
+        // Everything below is not latency-critical and is gated to
+        // ~10 Hz so the fast input loop doesn't pay for grid scans,
+        // disk writes, and the resume sweep on every 16 ms tick.
+        slow_ctr += 1;
+        if slow_ctr < 6 {
+            continue;
+        }
+        slow_ctr = 0;
+
+        // Refresh the API snapshot so /output (HTTP poll path) and the
+        // WS meta frame reflect shell echo within ~96 ms. Cheap —
+        // grid reads only re-scan a tab whose ring advanced.
         refresh_snapshot(
             &mut tabs,
             active,

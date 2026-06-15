@@ -80,10 +80,13 @@ const TAG_CLOSE: u8 = 0x09;
 /// switch to `tokio::sync::Notify` on the ring push site so we
 /// emit bytes within microseconds instead of within this tick.
 ///
-/// 30 ms is faster than the old 80 ms HTTP poll AND saves the round
-/// trip + header overhead, so end-to-end latency drops even before
-/// the Notify migration.
-const TICK_MS: u64 = 30;
+/// 10 ms keeps the average output-echo delay to ~5 ms (vs ~15 ms at
+/// the old 30 ms). The pump only runs while a viewer is connected, so
+/// the extra wakeups (100/s per viewer, each a cheap ring lock +
+/// `total_len` compare) cost nothing on idle tabs with no viewer.
+/// Lowering further hits diminishing returns against the per-frame WS
+/// overhead; the real zero-latency fix is the Notify migration above.
+const TICK_MS: u64 = 10;
 
 /// Per-message cap on inbound WS frames. Tungstenite's defaults
 /// (16 MiB frame, 64 MiB message) are generous to a fault — an
