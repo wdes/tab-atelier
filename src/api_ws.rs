@@ -884,6 +884,25 @@ mod tests {
     }
 
     #[test]
+    fn ime_dedup_keeps_doubled_letters_and_repeated_backspace() {
+        // Regression: a per-character mobile IME fires a separate
+        // composition for every letter, so typing "William" arrives as
+        // single bytes W i l l i a m — the two 'l's are a real double,
+        // not an echo, and MUST both reach the PTY. Likewise holding
+        // Backspace sends 0x7f repeatedly. A client-side "drop the
+        // identical key within 300 ms" guard broke both; single-byte
+        // whitelisting here is what keeps them working.
+        let mut d = ImeDedup::new();
+        for b in b"William" {
+            assert_eq!(d.classify(&[*b]), Some(vec![*b]), "byte {b:#x} dropped");
+        }
+        // Repeated Backspace (DEL, 0x7f) — every press must pass.
+        assert_eq!(d.classify(b"\x7f"), Some(b"\x7f".to_vec()));
+        assert_eq!(d.classify(b"\x7f"), Some(b"\x7f".to_vec()));
+        assert_eq!(d.classify(b"\x7f"), Some(b"\x7f".to_vec()));
+    }
+
+    #[test]
     fn ime_dedup_drops_exact_multibyte_repeat() {
         // compositionupdate("hello") + compositionend("hello") =
         // two identical multi-byte frames within the window.
