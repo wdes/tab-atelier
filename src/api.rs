@@ -22,6 +22,18 @@ const VIEWER_HTML: &str = include_str!("../assets/web-viewer.html");
 const VENDOR_XTERM_JS: &str = include_str!("../assets/vendor/xterm-6.0.0/xterm.js");
 const VENDOR_XTERM_CSS: &str = include_str!("../assets/vendor/xterm-6.0.0/xterm.css");
 
+/// `xterm.js` ends with a `//# sourceMappingURL=xterm.js.map` pointer,
+/// but we don't ship the `.map` (and it isn't on the no-auth asset
+/// allowlist). Browsers' devtools source-map loader then fetches that
+/// URL and logs a 401 / "request failed" error. Serve the file with
+/// the dead pointer trimmed so devtools stays quiet — done at runtime
+/// so the vendored copy stays byte-identical to upstream.
+static VENDOR_XTERM_JS_SERVED: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    VENDOR_XTERM_JS
+        .rfind("//# sourceMappingURL=")
+        .map_or_else(|| VENDOR_XTERM_JS.to_string(), |idx| VENDOR_XTERM_JS[..idx].to_string())
+});
+
 /// Subset of `FreeMono` (GNU `FreeFont`) carrying just the Misc-
 /// Technical, Box-Drawing, Block Elements, Geometric Shapes, Misc
 /// Symbols, Dingbats and Misc Symbols and Arrows ranges. ~50 KB
@@ -998,7 +1010,10 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
     ) = (method.as_str(), path.as_str())
     {
         let (body, ctype): (&[u8], &str) = match path.as_str() {
-            "/assets/xterm-6.0.0.js" => (VENDOR_XTERM_JS.as_bytes(), "application/javascript; charset=utf-8"),
+            "/assets/xterm-6.0.0.js" => (
+                VENDOR_XTERM_JS_SERVED.as_bytes(),
+                "application/javascript; charset=utf-8",
+            ),
             "/assets/xterm-6.0.0.css" => (VENDOR_XTERM_CSS.as_bytes(), "text/css; charset=utf-8"),
             "/assets/main.js" => (MAIN_JS.as_bytes(), "application/javascript; charset=utf-8"),
             "/assets/term-symbols.woff2" => (VENDOR_TERM_SYMBOLS_WOFF2, "font/woff2"),
@@ -1414,8 +1429,8 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                  Pragma: no-cache\r\n\
                  X-Frame-Options: DENY\r\n\
                  Content-Security-Policy: default-src 'none'; script-src 'self' 'unsafe-inline'; \
-                 style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; \
-                 base-uri 'none'; form-action 'none'; frame-ancestors 'none'\r\n\
+                 style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; \
+                 connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'\r\n\
                  Referrer-Policy: no-referrer\r\n",
             );
         }
@@ -4182,6 +4197,13 @@ mod tests {
         let csp = header_value(&h, "content-security-policy").unwrap_or("");
         assert!(csp.contains("default-src 'none'"), "CSP must start strict: {csp}");
         assert!(csp.contains("frame-ancestors 'none'"), "frame-ancestors locked: {csp}");
+        // The terminal-symbols WOFF2 loads via @font-face; without an
+        // explicit font-src it falls back to default-src 'none' and the
+        // browser blocks it. Guard the directive so it can't regress.
+        assert!(
+            csp.contains("font-src 'self'"),
+            "font-src must allow same-origin woff2: {csp}"
+        );
         assert_eq!(header_value(&h, "referrer-policy"), Some("no-referrer"));
     }
 
