@@ -3,6 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 pub mod bench;
+pub mod bench_lag;
 pub mod brain;
 pub mod claude_hook;
 pub mod dispatch;
