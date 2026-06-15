@@ -717,6 +717,13 @@
     // the only source of historical bytes).
 
     let ringOffset = 0;
+    // Serialises `out` frame handling. A gzip `out-gz` (0x0A) frame
+    // inflates asynchronously; without a queue a following raw `out`
+    // (0x02) frame could overtake the still-inflating one and corrupt
+    // the stream. Every out frame chains off this tail so they apply
+    // strictly in arrival order. `.catch` keeps the tail resolved so a
+    // single bad frame can't wedge the whole stream.
+    let outChain = Promise.resolve();
     let bootstrapped = false;
     let serverCols = 0;
     let serverRows = 0;
@@ -864,6 +871,14 @@
       return s.replace(/\x1b\[\?(?:9|1000|1001|1002|1003|1004|1005|1006|1015)[hl]/g, "");
     }
 
+    // Inflate a gzip `out-gz` (0x0A) payload back to the original PTY
+    // bytes using the browser's native DecompressionStream — no JS
+    // inflate library is shipped. Returns a Promise<Uint8Array>.
+    function inflateGzip(bytes) {
+      const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"));
+      return new Response(stream).arrayBuffer().then((ab) => new Uint8Array(ab));
+    }
+
     function handleOut(bytes) {
       // Always advance the offset — even while paused — so reconnect
       // can resume from the right place. Defer the actual write to
@@ -939,8 +954,13 @@
         if (view.length === 0) return;
         const tag = view[0];
         const payload = view.subarray(1);
-        if (tag === 0x02) { // out
-          handleOut(payload);
+        if (tag === 0x02) { // out — raw PTY bytes
+          outChain = outChain.then(() => handleOut(payload)).catch((e) => console.warn("out:", e));
+        } else if (tag === 0x0a) { // out-gz — gzip-compressed PTY bytes
+          outChain = outChain
+            .then(() => inflateGzip(payload))
+            .then(handleOut)
+            .catch((e) => console.warn("out-gz:", e));
         } else if (tag === 0x03) { // meta
           try {
             const json = JSON.parse(new TextDecoder("utf-8").decode(payload));

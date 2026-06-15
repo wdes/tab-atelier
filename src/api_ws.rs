@@ -31,6 +31,7 @@
 //! |------|----------|-----|----------------------------------------|
 //! | 0x01 | in       | C→S | raw bytes typed by the user            |
 //! | 0x02 | out      | S→C | raw bytes from the PTY (since last)    |
+//! | 0x0A | out-gz   | S→C | gzip of an `out` payload (large frames) |
 //! | 0x03 | meta     | S→C | JSON state delta (locked, schedule, …) |
 //! | 0x04 | resize   | C→S | JSON `{"cols":N,"rows":M}`             |
 //! | 0x07 | activate | C→S | empty — make this tab active           |
@@ -74,6 +75,20 @@ const TAG_RESIZE: u8 = 0x04;
 const TAG_ACTIVATE: u8 = 0x07;
 const TAG_RENAME: u8 = 0x08;
 const TAG_CLOSE: u8 = 0x09;
+/// Same semantics as [`TAG_OUT`] but the payload is gzip-compressed.
+/// The client inflates, then advances its ring offset by the
+/// *decompressed* length (so reconnect `since=` stays correct). Used
+/// only for frames over [`COMPRESS_MIN_BYTES`] where it actually
+/// shrinks them — keystroke echoes stay raw `TAG_OUT`.
+const TAG_OUT_DEFLATE: u8 = 0x0A;
+
+/// Don't bother gzipping `out` frames below this — gzip's ~18-byte
+/// header + deflate framing would erase the win on tiny payloads, and
+/// keystroke echoes must stay on the zero-CPU raw path. The biggest
+/// beneficiary is the `since=0` scrollback replay (often MiB of highly
+/// repetitive VT text → ~10-15× smaller). We also re-check the
+/// compressed size and fall back to raw if it didn't actually shrink.
+const COMPRESS_MIN_BYTES: usize = 256;
 
 /// Output is now event-driven: the pump parks on the `PtyRing`'s
 /// `Notify` and flushes the moment a push lands (sub-millisecond echo),
@@ -600,7 +615,7 @@ async fn run_pump(
             }
         };
         if !chunk.is_empty() {
-            let frame = encode_frame(TAG_OUT, chunk);
+            let frame = encode_out_frame(chunk);
             if sink.send(Message::Binary(frame.into())).await.is_err() {
                 return;
             }
@@ -653,6 +668,30 @@ fn encode_frame(tag: u8, mut payload: Vec<u8>) -> Vec<u8> {
     out.push(tag);
     out.append(&mut payload);
     out
+}
+
+/// Build an `out` frame, gzipping the payload when it's large enough to
+/// benefit ([`COMPRESS_MIN_BYTES`]) AND the gzip actually shrinks it.
+/// Otherwise send raw [`TAG_OUT`]. Keystroke echoes (tiny) always take
+/// the raw, zero-CPU path; the big win is the scrollback replay.
+fn encode_out_frame(chunk: Vec<u8>) -> Vec<u8> {
+    if chunk.len() >= COMPRESS_MIN_BYTES
+        && let Some(gz) = gzip(&chunk)
+        && gz.len() < chunk.len()
+    {
+        return encode_frame(TAG_OUT_DEFLATE, gz);
+    }
+    encode_frame(TAG_OUT, chunk)
+}
+
+/// gzip `data` at a fast level (terminal text compresses well even at
+/// level 1, and this can sit on the output hot path). `None` on the
+/// practically-impossible encoder error so the caller falls back to raw.
+fn gzip(data: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Write;
+    let mut enc = flate2::write::GzEncoder::new(Vec::with_capacity(data.len() / 3 + 32), flate2::Compression::fast());
+    enc.write_all(data).ok()?;
+    enc.finish().ok()
 }
 
 /// Dispatch a single C→S frame into the snapshot's pending queues.
