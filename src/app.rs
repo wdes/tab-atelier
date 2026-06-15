@@ -583,14 +583,19 @@ impl AppState {
         // in `pending_input` for up to two whole seconds before
         // hitting the PTY. That's the "typing is very slow" report.
         //
-        // Separate 50 ms tick that does ONLY the input drain. Other
+        // Separate 16 ms tick that does ONLY the input drain. Other
         // pending queues (lock toggles, schedule changes, status
         // updates, renames, closes) stay on the slow persist path
-        // — they're not latency-critical.
+        // — they're not latency-critical. 16 ms (~one 60 Hz frame)
+        // keeps the average keystroke→PTY delay to ~8 ms; the drain is
+        // a lock + (usually empty) Vec check, so the higher cadence is
+        // negligible. NOTE: this runs on the gpui main thread, so it
+        // is still stalled whenever the 2 s persist blocks that thread
+        // — the periodic ~500 ms latency spike under many active tabs.
         cx.spawn(async |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             loop {
                 cx.background_executor()
-                    .timer(std::time::Duration::from_millis(50))
+                    .timer(std::time::Duration::from_millis(16))
                     .await;
                 let Ok(()) = this.update(cx, |app, cx| {
                     app.drain_inputs(cx);
