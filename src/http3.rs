@@ -217,6 +217,57 @@ async fn handle_session(incoming: wtransport::endpoint::IncomingSession) -> Resu
 mod tests {
     use super::*;
 
+    use wtransport::{ClientConfig, Endpoint};
+
+    /// End-to-end over real QUIC: the self-signed cert is accepted by
+    /// the client purely via its SHA-256 (the WebTransport
+    /// `serverCertificateHashes` flow), then a framed message
+    /// round-trips through a bidi stream. Proves the transport + cert
+    /// pinning + framing all work together.
+    #[tokio::test]
+    async fn webtransport_framed_roundtrip_with_cert_hash() {
+        let identity = self_signed(&["localhost", "127.0.0.1"]).expect("identity");
+        let digest = identity.certificate_chain().as_slice()[0].hash();
+
+        let server = Endpoint::server(
+            ServerConfig::builder()
+                .with_bind_address("127.0.0.1:0".parse().unwrap())
+                .with_identity(identity)
+                .build(),
+        )
+        .expect("server endpoint");
+        let port = server.local_addr().expect("local addr").port();
+
+        // Server: accept one session, echo one framed message.
+        tokio::spawn(async move {
+            let incoming = server.accept().await;
+            let conn = incoming.await.unwrap().accept().await.unwrap();
+            let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+            if let Some((tag, payload)) = read_frame(&mut recv).await.unwrap() {
+                send.write_all(&frame(tag, &payload)).await.unwrap();
+                send.finish().await.unwrap();
+            }
+        });
+
+        // Client: pin the cert by hash, open a bidi stream, round-trip.
+        let client = Endpoint::client(
+            ClientConfig::builder()
+                .with_bind_default()
+                .with_server_certificate_hashes([digest])
+                .build(),
+        )
+        .expect("client endpoint");
+        let conn = client
+            .connect(format!("https://127.0.0.1:{port}"))
+            .await
+            .expect("connect");
+        let (mut send, mut recv) = conn.open_bi().await.expect("open_bi").await.expect("bi");
+        send.write_all(&frame(TAG_IN, b"ping")).await.expect("write");
+        let (tag, payload) = read_frame(&mut recv).await.expect("read").expect("frame");
+        assert_eq!(tag, TAG_IN);
+        assert_eq!(payload, b"ping");
+    }
+
     #[test]
     fn frame_is_length_delimited() {
         // [00 00 00 06][01][h e l l o]
