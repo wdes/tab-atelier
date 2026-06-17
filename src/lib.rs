@@ -20,6 +20,9 @@ pub(crate) mod cgroup;
 pub mod cli;
 #[cfg(not(feature = "gui"))]
 pub mod headless;
+/// Experimental HTTP/3 + WebTransport transport (behind `http3`).
+#[cfg(feature = "http3")]
+pub mod http3;
 pub(crate) mod locale;
 pub(crate) mod platform;
 #[cfg(feature = "energy")]

@@ -61,6 +61,12 @@ energy = ["dep:wattaouille"]
 # (/proc + AF_UNIX), so it's a separate feature that the Windows build
 # leaves off. Implied by `gui`; included in the Linux headless .deb.
 catbus = []
+# EXPERIMENTAL HTTP/3 + WebTransport transport (quinn-based, via
+# wtransport). Default-OFF so the normal build + .deb pull none of the
+# QUIC stack. Uses the `ring` crypto backend (same as our rustls), and
+# self-signed certs verified browser-side via WebTransport's
+# `serverCertificateHashes` — no CA needed for a self-hosted server.
+http3 = ["dep:wtransport"]
 
 [lints.rust]
 unsafe_code = "deny"
@@ -130,6 +136,11 @@ hyper-tungstenite = "0.20"
 # Already in the tree via hyper-tungstenite/tokio-tungstenite, so this
 # direct dep adds no new compilation. ws:// only (no TLS feature).
 tungstenite = "0.29"
+# EXPERIMENTAL HTTP/3 + WebTransport server (behind the `http3` feature).
+# Default features pull the `ring` crypto backend (matches our rustls)
+# and `self-signed` cert generation for the serverCertificateHashes
+# flow. Optional → the QUIC stack (quinn/h3) is absent unless `http3`.
+wtransport = { version = "0.7", optional = true }
 futures-util = { version = "0.3", default-features = false }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 bytes = "1"
