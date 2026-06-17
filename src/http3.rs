@@ -28,11 +28,123 @@
 //! listener + cert plumbing that the rest builds on.
 
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 use wtransport::{Endpoint, Identity, ServerConfig};
+use wtransport::{RecvStream, SendStream};
+
+use crate::pty_ring::PtyRing;
 
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
+
+// Frame tags mirror the WebSocket transport (src/api_ws.rs) so the
+// client uses one wire vocabulary across both. WebSocket gives message
+// boundaries for free; a WebTransport *stream* is a raw byte stream, so
+// every frame here is length-delimited: a 4-byte big-endian length L,
+// then L bytes = tag(1) + payload.
+/// Inbound tag — consumed by the Phase 3 handler that maps `TAG_IN`
+/// onto `pending_input` (kept here so both transports share the table).
+#[allow(dead_code)]
+const TAG_IN: u8 = 0x01;
+const TAG_OUT: u8 = 0x02;
+/// Cap on a single inbound framed message (matches the WS 2 MiB limit)
+/// so a malformed length can't make us allocate unbounded.
+const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
+/// Coalesce a burst of PTY output into one frame (same rationale as the
+/// WS pump's `OUTPUT_DEBOUNCE_MS`).
+const OUTPUT_DEBOUNCE: Duration = Duration::from_millis(2);
+
+/// Length-delimit a `tag`+`payload` frame for a WebTransport stream.
+#[must_use]
+pub fn frame(tag: u8, payload: &[u8]) -> Vec<u8> {
+    let body_len = 1 + payload.len();
+    let mut out = Vec::with_capacity(4 + body_len);
+    out.extend_from_slice(&(body_len as u32).to_be_bytes());
+    out.push(tag);
+    out.extend_from_slice(payload);
+    out
+}
+
+/// Read exactly `buf.len()` bytes from `recv`. `Ok(false)` on a clean
+/// EOF before the buffer is filled (peer finished the stream).
+async fn read_exact(recv: &mut RecvStream, buf: &mut [u8]) -> Result<bool, BoxErr> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match recv.read(&mut buf[filled..]).await? {
+            Some(0) | None => return Ok(false),
+            Some(n) => filled += n,
+        }
+    }
+    Ok(true)
+}
+
+/// Read one length-delimited frame → `(tag, payload)`. `Ok(None)` at
+/// end of stream.
+///
+/// # Errors
+/// On a read error or a length over [`MAX_FRAME_BYTES`].
+pub async fn read_frame(recv: &mut RecvStream) -> Result<Option<(u8, Vec<u8>)>, BoxErr> {
+    let mut len_be = [0u8; 4];
+    if !read_exact(recv, &mut len_be).await? {
+        return Ok(None);
+    }
+    let len = u32::from_be_bytes(len_be) as usize;
+    if len == 0 || len > MAX_FRAME_BYTES {
+        return Err(format!("bad frame length {len}").into());
+    }
+    let mut body = vec![0u8; len];
+    if !read_exact(recv, &mut body).await? {
+        return Ok(None);
+    }
+    let tag = body[0];
+    Ok(Some((tag, body.split_off(1))))
+}
+
+/// Stream new `PtyRing` bytes as length-delimited `TAG_OUT` frames over
+/// a WebTransport send stream, starting at byte offset `since`.
+///
+/// Wakes on the ring's `Notify` (event-driven, like the WS pump) so a
+/// shell echo flushes within microseconds, with a tiny debounce to
+/// coalesce floods. Runs until the stream errors.
+///
+/// # Errors
+/// On a stream write error or a poisoned ring lock.
+// The chunk-copy guard is held across `total_len` + `since` for a
+// consistent read; `significant_drop_tightening` can't model that
+// dependency (same as the WS pump in api_ws.rs).
+#[allow(clippy::significant_drop_tightening)]
+pub async fn pump_output(send: &mut SendStream, ring: &Arc<Mutex<PtyRing>>, since: u64) -> Result<(), BoxErr> {
+    let notify = {
+        let r = ring.lock().map_err(|_| "ring lock poisoned")?;
+        r.notifier()
+    };
+    let mut offset = since;
+    loop {
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        let chunk = {
+            let r = ring.lock().map_err(|_| "ring lock poisoned")?;
+            let total = r.total_len();
+            if total == offset {
+                Vec::new()
+            } else {
+                let bytes = r.since(offset);
+                offset = total;
+                bytes
+            }
+        };
+        if !chunk.is_empty() {
+            send.write_all(&frame(TAG_OUT, &chunk)).await?;
+        }
+
+        notified.await;
+        tokio::time::sleep(OUTPUT_DEBOUNCE).await;
+    }
+}
 
 /// Generate a short-lived self-signed identity covering `sans` (e.g.
 /// `["localhost", "127.0.0.1", "lan.example.com"]`). The browser trusts
@@ -104,6 +216,20 @@ async fn handle_session(incoming: wtransport::endpoint::IncomingSession) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_is_length_delimited() {
+        // [00 00 00 06][01][h e l l o]
+        let f = frame(TAG_IN, b"hello");
+        assert_eq!(&f[..4], &6u32.to_be_bytes(), "4-byte BE length = 1 tag + 5 payload");
+        assert_eq!(f[4], TAG_IN);
+        assert_eq!(&f[5..], b"hello");
+        // Empty payload still carries the tag → body length 1.
+        let e = frame(TAG_OUT, b"");
+        assert_eq!(&e[..4], &1u32.to_be_bytes());
+        assert_eq!(e[4], TAG_OUT);
+        assert_eq!(e.len(), 5);
+    }
 
     #[test]
     fn self_signed_cert_hash_is_64_hex() {
