@@ -699,6 +699,9 @@ pub fn run() -> std::io::Result<()> {
     let mut last_persist = Instant::now()
         .checked_sub(Duration::from_secs(2))
         .unwrap_or_else(Instant::now);
+    // Heavy per-tab output saves run here, off the main loop, so they
+    // can't stall the 16 ms input drain.
+    let output_saver = OutputSaver::spawn(platform::state_base_dir());
     loop {
         std::thread::sleep(tick_interval);
 
@@ -776,6 +779,12 @@ pub fn run() -> std::io::Result<()> {
                 &mut last_state_hash,
                 false,
             );
+            // Hand the heavy per-tab output save to the background
+            // thread (cheap Arc snapshot here); persist() above no
+            // longer does it inline except on shutdown.
+            if !crate::read_only() {
+                output_saver.submit(&tabs);
+            }
             last_persist = Instant::now();
         }
 
@@ -847,6 +856,80 @@ fn refresh_snapshot(
 // Too many parameters because cfg-gated energy features triple the
 // arg count. Easier than packaging them into a Context struct that
 // only adds plumbing.
+/// One tab's output-save job handed to the background saver thread.
+struct SaveJob {
+    name: String,
+    term: Arc<FairMutex<Term<EventProxy>>>,
+    ring_len: u64,
+}
+
+/// Background thread that runs the expensive `copy_all_history`
+/// (scrollback → ANSI string) + atomic disk write OFF the main loop.
+///
+/// The periodic 2 s output-save used to run inline on the single main
+/// thread, so a flood of active tabs froze the input drain that shares
+/// that thread for up to ~1.5 s (the p99 keystroke stall). Now the main
+/// loop only submits cheap `Arc` handles; this thread reconstructs each
+/// tab's scrollback and writes it. `Term`/ring are behind `FairMutex`,
+/// and `save_tab_output` writes atomically (temp + rename), so the only
+/// cross-thread contention is a brief lock while reading the grid.
+struct OutputSaver {
+    tx: std::sync::mpsc::Sender<Vec<SaveJob>>,
+}
+
+impl OutputSaver {
+    fn spawn(state_base: std::path::PathBuf) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<SaveJob>>();
+        std::thread::Builder::new()
+            .name("ta-output-saver".into())
+            .spawn(move || {
+                // Per-tab dirtiness gate (ring_len, output crc) — the
+                // same logic the inline loop used, just kept here now.
+                let mut seen: HashMap<String, (u64, u32)> = HashMap::new();
+                while let Ok(mut batch) = rx.recv() {
+                    // Saves are current-state + idempotent, so if newer
+                    // batches queued while we worked, jump to the latest.
+                    while let Ok(newer) = rx.try_recv() {
+                        batch = newer;
+                    }
+                    for job in batch {
+                        if seen.get(&job.name).is_some_and(|&(rl, _)| rl == job.ring_len) {
+                            continue; // ring unchanged ⇒ identical output
+                        }
+                        let output = crate::term_export::term_to_ansi_text_with_cursor(&job.term, None).0;
+                        if output.is_empty() {
+                            continue;
+                        }
+                        let h = crate::crc32(output.as_bytes());
+                        if seen.get(&job.name).is_some_and(|&(_, hh)| hh == h) {
+                            seen.insert(job.name, (job.ring_len, h));
+                            continue;
+                        }
+                        save_tab_output(&state_base, &job.name, &output);
+                        seen.insert(job.name, (job.ring_len, h));
+                    }
+                }
+            })
+            .expect("spawn output-saver thread");
+        Self { tx }
+    }
+
+    /// Main-thread side: snapshot `Arc` handles + ring lengths and hand
+    /// them off. Cheap (Arc clone + a brief ring lock per tab) — never
+    /// blocks on the scrollback copy or the disk write.
+    fn submit(&self, tabs: &[HeadlessTab]) {
+        let batch: Vec<SaveJob> = tabs
+            .iter()
+            .map(|t| SaveJob {
+                name: t.name.clone(),
+                term: t.term.clone(),
+                ring_len: t.ring_total_len(),
+            })
+            .collect();
+        let _ = self.tx.send(batch); // ignore if the saver has exited
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn persist(
     tabs: &mut [HeadlessTab],
@@ -932,7 +1015,11 @@ fn persist(
         *last_state_hash = new_hash;
     }
 
-    if !read_only {
+    // Periodic output saves run on the background `OutputSaver` thread
+    // (submitted from the main loop) so they never freeze the input
+    // drain. Only the shutdown `final_flush` saves inline here, where a
+    // synchronous write before exit is exactly what we want.
+    if !read_only && final_flush {
         for tab in tabs.iter_mut() {
             // Dirtiness gate before the expensive copy_all_history():
             // skip tabs whose PTY ring hasn't advanced since the last
