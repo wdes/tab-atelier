@@ -90,6 +90,17 @@ const TAG_OUT_DEFLATE: u8 = 0x0A;
 /// compressed size and fall back to raw if it didn't actually shrink.
 const COMPRESS_MIN_BYTES: usize = 256;
 
+/// When `TAB_ATELIER_WS_DEBUG_INPUT` is set in the environment, every
+/// inbound `TAG_IN` frame is logged to stderr (wall-clock ms, raw
+/// bytes, printable repr, and what `ImeDedup` decided). Used to
+/// diagnose the mobile-IME (`SwiftKey` / `GBoard`) duplicate-word
+/// pattern (xterm.js#3600) from REAL device frames rather than guessing
+/// — does `SwiftKey` send `wordswords` as one frame or two, with what gap?
+/// Off by default; reading it once via `LazyLock` keeps the hot path
+/// free when unset.
+static WS_DEBUG_INPUT: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("TAB_ATELIER_WS_DEBUG_INPUT").is_some());
+
 /// Output is now event-driven: the pump parks on the `PtyRing`'s
 /// `Notify` and flushes the moment a push lands (sub-millisecond echo),
 /// so there is no output poll tick. This slower tick only drives the
@@ -698,6 +709,37 @@ fn gzip(data: &[u8]) -> Option<Vec<u8>> {
 /// Returns `Err(CloseFrame)` when the client violated the protocol
 /// (RO trying to write, unknown tag, malformed JSON) and the
 /// connection should close.
+///
+/// Debug dump of one inbound `TAG_IN` frame (gated by [`WS_DEBUG_INPUT`]).
+/// Prints a wall-clock millisecond timestamp so consecutive frames'
+/// inter-arrival gap is visible — the key question for the `SwiftKey`
+/// duplicate-word bug (one doubled frame vs two frames within the
+/// dedup window).
+fn debug_log_input(idx: usize, raw: &[u8], decision: Option<&[u8]>) {
+    use std::fmt::Write as _;
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    let mut hex = String::with_capacity(raw.len() * 3);
+    for b in raw {
+        let _ = write!(hex, "{b:02x} ");
+    }
+    let repr: String = raw
+        .iter()
+        .map(|&b| if (0x20..=0x7e).contains(&b) { b as char } else { '.' })
+        .collect();
+    let act = match decision {
+        None => "DROP".to_owned(),
+        Some(e) if e == raw => "send-as-is".to_owned(),
+        Some(e) => format!("send-suffix({}/{})", e.len(), raw.len()),
+    };
+    eprintln!(
+        "[ws-in tab={idx} t={t}] len={} hex=[{}] repr=\"{repr}\" -> {act}",
+        raw.len(),
+        hex.trim_end(),
+    );
+}
+
 fn handle_inbound(
     bytes: &[u8],
     authz: Authz,
@@ -748,7 +790,11 @@ fn handle_inbound(
             // ⇒ the IME re-sent a payload we already injected;
             // drop silently so the shell doesn't see the
             // accumulated `"hhehelhellohello"` mess.
-            if let Some(effective) = ime_dedup.classify(payload)
+            let decision = ime_dedup.classify(payload);
+            if *WS_DEBUG_INPUT {
+                debug_log_input(idx, payload, decision.as_deref());
+            }
+            if let Some(effective) = decision
                 && !effective.is_empty()
             {
                 snap.pending_input.push((idx, effective));
