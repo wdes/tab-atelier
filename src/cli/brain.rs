@@ -512,6 +512,20 @@ fn tick(
     Ok(())
 }
 
+/// Append a line to `brain-crash.log` in the state dir. Used when a
+/// tick panics, so a brain whose terminal/PTY has gone away still
+/// leaves a trace — the "crashed for no visible reason" case. All
+/// errors swallowed: logging must never be the thing that kills brain.
+fn crash_log(msg: &str) {
+    use std::io::Write as _;
+    let path = crate::platform::state_base_dir()
+        .join("tab-atelier")
+        .join("brain-crash.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "{msg}");
+    }
+}
+
 #[must_use]
 pub fn run(args: &[String]) -> i32 {
     let mut once = false;
@@ -567,10 +581,32 @@ pub fn run(args: &[String]) -> i32 {
     let mut probe = ConnectivityProbe::default();
     let mut rr_cursor: usize = 0;
     loop {
-        if let Err(e) = tick(&mut watches, &mut probe, &mut rr_cursor) {
-            // Log + keep going. The most likely error is a transient
-            // daemon-restart window; the next tick will succeed.
-            eprintln!("⛑ brain: tick failed: {e}");
+        // Run the tick under catch_unwind so a panic anywhere in it (a
+        // dependency edge case, a broken-pipe `println!`, …) is caught
+        // and logged instead of silently killing brain. The &mut state
+        // is AssertUnwindSafe: a panic mid-tick may leave the watch map
+        // slightly stale, which the next tick re-syncs from the daemon.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tick(&mut watches, &mut probe, &mut rr_cursor)
+        }));
+        match outcome {
+            Ok(Ok(())) => {}
+            // Most likely a transient daemon-restart window; next tick succeeds.
+            Ok(Err(e)) => eprintln!("⛑ brain: tick failed: {e}"),
+            Err(panic) => {
+                let msg = panic
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("(non-string panic payload)");
+                // Record to a file (terminal may be gone) + best-effort
+                // stderr, then keep watching rather than die.
+                crash_log(&format!("tick panicked (recovered): {msg}"));
+                let _ = std::io::Write::write_all(
+                    &mut std::io::stderr(),
+                    format!("⛑ brain: tick PANICKED, recovered: {msg}\n").as_bytes(),
+                );
+            }
         }
         if once {
             return 0;
