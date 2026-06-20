@@ -8,6 +8,7 @@ pub mod brain;
 pub mod claude_hook;
 pub mod dispatch;
 pub mod remote;
+pub mod set_font;
 pub mod set_status;
 /// Headless-side basic-action subcommands.
 ///
