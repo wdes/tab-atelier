@@ -23,6 +23,12 @@ fn main() {
                 let rest: Vec<String> = std::env::args().skip(2).collect();
                 std::process::exit(cli::set_status::run(&rest));
             }
+            "set-font" => {
+                // Set the GUI terminal font (family/size) in
+                // preferences.json without opening the GUI dialog.
+                let rest: Vec<String> = std::env::args().skip(2).collect();
+                std::process::exit(cli::set_font::run(&rest));
+            }
             "remote" => {
                 let rest: Vec<String> = std::env::args().skip(2).collect();
                 std::process::exit(cli::remote::run(&rest));
@@ -70,6 +76,7 @@ fn main() {
                      usage:\n  \
                      tab-atelier                  start the desktop GUI (default)\n  \
                      tab-atelier set-status …     publish agent state (Claude Code hook target)\n  \
+                     tab-atelier set-font …       set GUI font (--font NAME --size PX)\n  \
                      tab-atelier remote …         attach to a remote tab-atelier-headless\n  \
                      tab-atelier brain [--once]   watchdog tab that auto-recovers stuck agents\n  \
                      tab-atelier schedule …       off-hours auto-lock per tab (OSM opening_hours)\n  \
