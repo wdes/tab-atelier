@@ -15,7 +15,7 @@ use crate::theme::{self, ThemeName};
 use crate::tracking::WakatimeTracker;
 use crate::{
     DEFAULT_HOTKEYS, FontConfig, Preferences, SavedState, TabState, gpui_key_to_keycode, keycode_label,
-    load_font_config, load_preferences, load_state_with_outputs, load_wakatime_key, save_preferences, save_state,
+    load_preferences, load_state_with_outputs, load_wakatime_key, resolve_font_config, save_preferences, save_state,
     save_tab_output, save_tab_uptime,
 };
 // Feature-gated extras: clippy --features gui flagged these as
@@ -349,8 +349,11 @@ impl AppState {
         let pref_api_addr_focus = cx.focus_handle();
         let pref_api_tls_addr_focus = cx.focus_handle();
         let pref_share_url_base_focus = cx.focus_handle();
-        let font_config = load_font_config(&platform::config_dir());
         let prefs = load_preferences(&platform::config_dir());
+        // Font: preferences.json `font_family`/`font_size` → zed
+        // settings → fontconfig-resolved monospace (the generic
+        // "monospace" can render with a too-wide cell advance).
+        let font_config = resolve_font_config(&platform::config_dir(), &prefs);
         // Latch the cleared-env opt-in (+ user vars) before any tab
         // spawns below, so every PTY this process creates honours it.
         if prefs.clear_env.unwrap_or(false) {
@@ -3488,9 +3491,16 @@ impl AppState {
                                                 } else {
                                                     Some(this.share_url_base.clone())
                                                 };
+                                                let on_disk_prefs = load_preferences(&platform::config_dir());
                                                 save_preferences(
                                                     &platform::config_dir(),
                                                     &Preferences {
+                                                        // Font lives in preferences.json (or zed /
+                                                        // fontconfig); the GUI dialog doesn't edit it,
+                                                        // so carry the on-disk values through rather
+                                                        // than wiping them on save.
+                                                        font_family: on_disk_prefs.font_family,
+                                                        font_size: on_disk_prefs.font_size,
                                                         lang: Some(lang_str.into()),
                                                         theme: Some(this.theme_name.id().into()),
                                                         opacity: Some(this.opacity),

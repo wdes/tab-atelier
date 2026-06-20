@@ -929,6 +929,56 @@ pub fn load_font_config_from(path: &std::path::Path) -> FontConfig {
     config
 }
 
+/// Resolve the GUI terminal font in the priority order the user asked
+/// for: **preferences.json → zed `settings.json` → fontconfig**.
+///
+/// The generic "monospace" string is only a last resort — gpui resolves
+/// it to a font with a too-wide cell advance on some systems (the
+/// "horribly spaced" look), so when nothing more specific is set we ask
+/// `fc-match` for the concrete family it maps to.
+#[must_use]
+pub fn resolve_font_config(config_base: &std::path::Path, prefs: &Preferences) -> FontConfig {
+    // Tier 2: zed/settings.json (falls back to the "monospace" default).
+    let mut config = load_font_config(config_base);
+
+    // Tier 1: preferences.json wins outright when set.
+    if let Some(family) = prefs.font_family.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        config.family = family.to_string();
+    }
+    if let Some(size) = prefs.font_size.filter(|s| *s > 0.0) {
+        config.size = size;
+    }
+
+    // Tier 3: still on the generic alias ⇒ resolve it via fontconfig.
+    if config.family.trim().eq_ignore_ascii_case("monospace")
+        && let Some(concrete) = fc_match_monospace()
+    {
+        config.family = concrete;
+    }
+    config
+}
+
+/// Ask fontconfig which concrete family the generic "monospace" alias
+/// maps to (e.g. `DejaVu Sans Mono`). `None` when `fc-match` is absent
+/// (non-Linux / minimal container) or yields nothing useful.
+fn fc_match_monospace() -> Option<String> {
+    let out = std::process::Command::new("fc-match")
+        .args(["-f", "%{family}", "monospace"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    // fc-match can return a comma list ("Fam A,Fam B") — take the first.
+    let first = raw.split(',').next().unwrap_or("").trim();
+    if first.is_empty() || first.eq_ignore_ascii_case("monospace") {
+        None
+    } else {
+        Some(first.to_string())
+    }
+}
+
 fn strip_json_comments(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
@@ -1068,6 +1118,20 @@ pub struct Preferences {
     pub pty_cols: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pty_rows: Option<u16>,
+
+    /// GUI terminal font family. Highest-priority source for the
+    /// font (over `zed/settings.json`'s `ui_font_family`). Set this to
+    /// a concrete installed monospace (e.g. `JetBrains Mono`, `DejaVu
+    /// Sans Mono`) — the generic "monospace" default can resolve to a
+    /// font with a too-wide advance, giving the "horribly spaced"
+    /// look. Unset ⇒ zed settings ⇒ fontconfig-resolved monospace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_family: Option<String>,
+
+    /// GUI terminal font size in px. Overrides `zed/settings.json`'s
+    /// `ui_font_size` / `buffer_font_size`. Unset ⇒ those ⇒ 16.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_size: Option<f32>,
 
     /// Public base URL for share links — when set, the "Copy share
     /// link" menu emits `<this>/tabs/by-id/<uuid>/view?...` instead
@@ -2612,6 +2676,34 @@ mod tests {
         assert_eq!(fc.weight, 400);
         assert!((fc.size - 16.0).abs() < f32::EPSILON);
         assert!((fc.scroll_sensitivity - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn resolve_font_config_preferences_win_over_zed_and_fontconfig() {
+        // No zed/settings.json at this base ⇒ tier 2 yields the
+        // "monospace" default; preferences.json (tier 1) must override
+        // family + size outright, and because a concrete family is set,
+        // the fontconfig fallback is never consulted.
+        let base = std::path::Path::new("/tmp/ta-nonexistent-cfg-xyz");
+        let prefs = Preferences {
+            font_family: Some("JetBrains Mono".into()),
+            font_size: Some(13.5),
+            ..Default::default()
+        };
+        let fc = resolve_font_config(base, &prefs);
+        assert_eq!(fc.family, "JetBrains Mono");
+        assert!((fc.size - 13.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn resolve_font_config_without_overrides_is_never_the_bare_generic_when_fc_present() {
+        // With no prefs and no zed settings, we must not leave gpui the
+        // bare "monospace" alias *if* fontconfig is available — it gets
+        // resolved to a concrete family. On a box without fc-match it
+        // stays "monospace"; either way the family is non-empty.
+        let base = std::path::Path::new("/tmp/ta-nonexistent-cfg-xyz");
+        let fc = resolve_font_config(base, &Preferences::default());
+        assert!(!fc.family.trim().is_empty());
     }
 
     #[test]
