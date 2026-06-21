@@ -46,9 +46,11 @@ pub fn run(args: &[String]) -> i32 {
                      Sets the GUI terminal font in preferences.json (at least one of\n\
                      --font / --size required). Relog / restart the desktop app to apply.\n\
                      A bare family name may also be given positionally.\n\
+                     `DejaVu Sans Mono` always works — the GUI .deb Depends on it\n\
+                     (or Liberation / Noto Mono), so it's installed on every host.\n\
                      Examples:\n  \
-                     tab-atelier set-font --font \"JetBrains Mono\" --size 16\n  \
-                     tab-atelier set-font \"DejaVu Sans Mono\"\n  \
+                     tab-atelier set-font --font \"DejaVu Sans Mono\" --size 16\n  \
+                     tab-atelier set-font \"Liberation Mono\"\n  \
                      tab-atelier set-font --size 18"
                 );
                 return 0;

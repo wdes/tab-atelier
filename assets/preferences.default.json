@@ -1,6 +1,6 @@
 {
     "_comment": "System-wide defaults for tab-atelier. Read by both the desktop and headless variants as a fallback when no per-user preferences.json exists at $HOME/.local/tab-atelier/preferences.json (the GUI Preferences dialog writes there). Per-user settings always win. Edit this file and restart (systemctl restart tab-atelier-headless, or relog for the GUI) to apply. Unknown keys are ignored.",
-    "_font_comment": "GUI terminal font. Set 'font_family' to a concrete installed monospace (e.g. 'JetBrains Mono', 'DejaVu Sans Mono') and optionally 'font_size' (px) if the default looks badly spaced. Unset -> zed settings.json (ui_font_family) -> fontconfig 'monospace'. Headless ignores this.",
+    "_font_comment": "GUI terminal font. Set 'font_family' to a concrete installed monospace if the default looks badly spaced. 'DejaVu Sans Mono' always works (the GUI .deb Depends on it, or Liberation/Noto Mono). Also set 'font_size' (px) if you like. Or run: tab-atelier set-font --font 'DejaVu Sans Mono' --size 16. Unset -> zed settings.json (ui_font_family) -> fontconfig 'monospace'. Headless ignores this.",
     "api_addr": "0.0.0.0:7890",
     "api_tls_addr": "0.0.0.0:7891"
 }
