@@ -6,6 +6,7 @@ pub mod bench;
 pub mod bench_lag;
 pub mod brain;
 pub mod claude_hook;
+pub mod delegate;
 pub mod dispatch;
 pub mod remote;
 pub mod set_font;

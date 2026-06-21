@@ -185,6 +185,14 @@ pub enum Commands {
         args: Vec<String>,
     },
 
+    /// Hand work to another tab's agent (or a fresh `--new` tab) and
+    /// optionally `--wait` for it to go idle and report back.
+    Dispatch {
+        /// Passed straight through to `cli::delegate::run`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// `⛑ brain` — watch every tab for known agent-failure signatures
     /// (Anthropic API unreachable, 5xx, etc.) and auto-send `continue`
     /// to stuck agents. Best run as its own tab.
@@ -374,6 +382,7 @@ pub fn dispatch(cli: Cli) -> bool {
         }
         Commands::ClaudeHook { event } => crate::cli::claude_hook::run(&[event]),
         Commands::Remote { args } => crate::cli::remote::run(&args),
+        Commands::Dispatch { args } => crate::cli::delegate::run(&args),
         Commands::Brain { once, interval } => {
             let mut args: Vec<String> = Vec::new();
             if once {

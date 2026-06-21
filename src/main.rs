@@ -29,6 +29,12 @@ fn main() {
                 let rest: Vec<String> = std::env::args().skip(2).collect();
                 std::process::exit(cli::set_font::run(&rest));
             }
+            "dispatch" => {
+                // Hand work to another tab's agent (or a fresh one) and
+                // optionally wait for it to finish and report back.
+                let rest: Vec<String> = std::env::args().skip(2).collect();
+                std::process::exit(cli::delegate::run(&rest));
+            }
             "remote" => {
                 let rest: Vec<String> = std::env::args().skip(2).collect();
                 std::process::exit(cli::remote::run(&rest));
@@ -79,6 +85,7 @@ fn main() {
                      tab-atelier set-font …       set GUI font (--font NAME --size PX)\n  \
                      tab-atelier remote …         attach to a remote tab-atelier-headless\n  \
                      tab-atelier brain [--once]   watchdog tab that auto-recovers stuck agents\n  \
+                     tab-atelier dispatch …       hand work to another tab / a new agent\n  \
                      tab-atelier schedule …       off-hours auto-lock per tab (OSM opening_hours)\n  \
                      tab-atelier --read-only      start inspect-only (no disk writes, no lock)\n  \
                      tab-atelier --version        print version and exit\n  \
