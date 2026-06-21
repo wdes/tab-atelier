@@ -67,7 +67,7 @@ pub(crate) fn agent() -> ureq::Agent {
         .into()
 }
 
-fn fetch_tabs(ep: &Endpoint) -> Result<Vec<serde_json::Value>, String> {
+pub(crate) fn fetch_tabs(ep: &Endpoint) -> Result<Vec<serde_json::Value>, String> {
     let mut resp = agent()
         .get(format!("{}/tabs", ep.url))
         .header("Authorization", format!("Bearer {}", ep.token))
@@ -80,7 +80,7 @@ fn fetch_tabs(ep: &Endpoint) -> Result<Vec<serde_json::Value>, String> {
 /// Resolve a CLI key argument ("0", "3", "<uuid>") to (index, uuid).
 /// We need both because some routes are index-based (rename, close)
 /// and some are uuid-based (view/output/input via /by-id/).
-fn resolve(ep: &Endpoint, key: &str) -> Result<(usize, String), String> {
+pub(crate) fn resolve(ep: &Endpoint, key: &str) -> Result<(usize, String), String> {
     let tabs = fetch_tabs(ep)?;
     let pick = key.parse::<usize>().map_or_else(
         |_| {
