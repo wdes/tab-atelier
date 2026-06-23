@@ -135,6 +135,10 @@ struct Tab {
     /// the global `Preferences::tab_bg_color`, which itself falls
     /// back to Tomorrow Night Blue.
     bg_color: Option<String>,
+    /// Free-text context the in-tab agent set via `set-context` (e.g.
+    /// the PR/task it's on). Shown as a hover tooltip on the tab name.
+    /// In-memory; set via the API + drained from the snapshot.
+    context: Option<String>,
     /// One-shot resume command queued on tab restore — when the
     /// shell is up the next tick types `<command>\n` into the
     /// PTY, then clears this. Set in `insert_tab` from the
@@ -251,6 +255,30 @@ impl Render for DraggedTab {
             .rounded(px(4.0))
             .opacity(0.8)
             .child(self.name.clone())
+    }
+}
+
+/// Hover tooltip showing a tab's agent-set context (the PR / task the
+/// in-tab agent declared via `tab-atelier set-context "…"`).
+struct TabContextTooltip {
+    text: String,
+    theme: ThemeName,
+}
+
+impl Render for TabContextTooltip {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let th = theme::theme(self.theme);
+        div()
+            .max_w(px(440.0))
+            .px(px(10.0))
+            .py(px(6.0))
+            .bg(th.elevated_hsla())
+            .text_color(th.fg_hsla())
+            .text_size(px(12.0))
+            .border_1()
+            .border_color(th.border_hsla())
+            .rounded(px(4.0))
+            .child(self.text.clone())
     }
 }
 
@@ -465,6 +493,7 @@ impl AppState {
                         locked: ts.locked,
                         schedule: ts.schedule.clone(),
                         bg_color: ts.bg_color.clone(),
+                        context: None,
                         last_pushed_locked: None,
                         pending_agent_resume,
                         snap_cache: None,
@@ -508,6 +537,7 @@ impl AppState {
                         locked: false,
                         schedule: None,
                         bg_color: None,
+                        context: None,
                         last_pushed_locked: None,
                         pending_agent_resume: None,
                         snap_cache: None,
@@ -555,6 +585,7 @@ impl AppState {
                         locked: false,
                         schedule: None,
                         bg_color: None,
+                        context: None,
                         last_pushed_locked: None,
                         pending_agent_resume: None,
                         snap_cache: None,
@@ -696,6 +727,7 @@ impl AppState {
             pending_input: Vec::new(),
             pending_lock_changes: Vec::new(),
             pending_bg_color_changes: Vec::new(),
+            pending_context_changes: Vec::new(),
             pending_schedule_changes: Vec::new(),
             pending_new_tabs: 0,
             pending_new_tab_cwds: std::collections::VecDeque::new(),
@@ -839,6 +871,7 @@ impl AppState {
                 locked: false,
                 schedule: None,
                 bg_color: None,
+                context: None,
                 last_pushed_locked: None,
                 pending_agent_resume: None,
                 snap_cache: None,
@@ -1028,6 +1061,7 @@ impl AppState {
                 locked: ts.locked,
                 schedule: ts.schedule.clone(),
                 bg_color,
+                context: tab.context.clone(),
                 shell_pid,
                 agent_state: tab.agent_state.clone(),
                 agent_session_id: tab.agent_session_id.clone(),
@@ -1164,6 +1198,7 @@ impl AppState {
             let status_updates: Vec<api::PendingStatusUpdate> = snapshot.pending_status_updates.drain(..).collect();
             let lock_changes: Vec<(String, bool)> = snapshot.pending_lock_changes.drain(..).collect();
             let bg_color_changes: Vec<(String, Option<String>)> = snapshot.pending_bg_color_changes.drain(..).collect();
+            let context_changes: Vec<(String, Option<String>)> = snapshot.pending_context_changes.drain(..).collect();
             let schedule_changes: Vec<(String, Option<crate::schedule::TabSchedule>)> =
                 snapshot.pending_schedule_changes.drain(..).collect();
             drop(snapshot);
@@ -1181,6 +1216,11 @@ impl AppState {
             for (tab_id, color) in bg_color_changes {
                 if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
                     tab.bg_color = color;
+                }
+            }
+            for (tab_id, context) in context_changes {
+                if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+                    tab.context = context;
                 }
             }
             // Schedule changes — None clears, Some sets. Mirrors the
@@ -1624,6 +1664,7 @@ impl AppState {
             );
 
         let blink_on = self.blink_on;
+        let theme_name = self.theme_name;
         for (i, tab) in self.tabs.iter().enumerate() {
             let is_active = i == self.active;
             // Visual lock marker — a 🔒 ahead of the name is enough to
@@ -1723,6 +1764,16 @@ impl AppState {
                 .text_color(tab_fg)
                 .text_size(px(13.0))
                 .cursor_pointer()
+                // Hover tooltip: the agent-set context (PR/task), if any.
+                .when_some(tab.context.clone(), |el, ctx| {
+                    el.tooltip(move |_window, cx| {
+                        cx.new(|_| TabContextTooltip {
+                            text: ctx.clone(),
+                            theme: theme_name,
+                        })
+                        .into()
+                    })
+                })
                 .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
                     if ev.click_count() >= 2 {
                         let name = this.tabs[i].name.clone();

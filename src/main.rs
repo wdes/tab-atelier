@@ -29,6 +29,12 @@ fn main() {
                 let rest: Vec<String> = std::env::args().skip(2).collect();
                 std::process::exit(cli::set_font::run(&rest));
             }
+            "set-context" => {
+                // Let an in-tab agent declare what PR/task it's on; the
+                // text shows as a hover tooltip on the GUI tab name.
+                let rest: Vec<String> = std::env::args().skip(2).collect();
+                std::process::exit(cli::set_context::run(&rest));
+            }
             "dispatch" => {
                 // Hand work to another tab's agent (or a fresh one) and
                 // optionally wait for it to finish and report back.
@@ -83,6 +89,7 @@ fn main() {
                      tab-atelier                  start the desktop GUI (default)\n  \
                      tab-atelier set-status …     publish agent state (Claude Code hook target)\n  \
                      tab-atelier set-font …       set GUI font (--font NAME --size PX)\n  \
+                     tab-atelier set-context …    label this tab with its PR/task (hover tooltip)\n  \
                      tab-atelier remote …         attach to a remote tab-atelier-headless\n  \
                      tab-atelier brain [--once]   watchdog tab that auto-recovers stuck agents\n  \
                      tab-atelier dispatch …       hand work to another tab / a new agent\n  \

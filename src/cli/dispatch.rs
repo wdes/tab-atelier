@@ -6,8 +6,8 @@
 //!
 //! Every subcommand the binary surfaces (`add`, `close`, `rename`,
 //! `lock`, `unlock`, `input`, `output`, `share-link`, `settings`,
-//! `bg-color`, `set-status`, `claude-hook`, `remote`, `brain`,
-//! `schedule`) becomes a typed variant on the `Commands` enum. The match arm
+//! `bg-color`, `set-status`, `set-context`, `claude-hook`, `remote`,
+//! `brain`, `schedule`) becomes a typed variant on the `Commands` enum. The match arm
 //! in `dispatch()` reconstructs the legacy `Vec<String>` form each
 //! inner CLI module already accepts, so this is a thin top-level
 //! layer — the actual argument validation / HTTP calls live in
@@ -170,6 +170,16 @@ pub enum Commands {
         /// Agent is NOT in plan mode (clears the flag).
         #[arg(long)]
         no_plan: bool,
+    },
+
+    /// Label the current tab with what it's working on (PR/issue/task).
+    ///
+    /// Shows as a hover tooltip on the GUI tab name and on `/tabs`.
+    /// `--tab <id>` targets another tab; `--clear` removes the label.
+    SetContext {
+        /// Passed straight through to `cli::set_context::run`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
 
     /// Bridge a Claude Code hook event to set-status. Reads JSON from stdin.
@@ -380,6 +390,7 @@ pub fn dispatch(cli: Cli) -> bool {
             }
             crate::cli::set_status::run(&args)
         }
+        Commands::SetContext { args } => crate::cli::set_context::run(&args),
         Commands::ClaudeHook { event } => crate::cli::claude_hook::run(&[event]),
         Commands::Remote { args } => crate::cli::remote::run(&args),
         Commands::Dispatch { args } => crate::cli::delegate::run(&args),

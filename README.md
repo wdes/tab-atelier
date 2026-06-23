@@ -215,6 +215,7 @@ Selected routes:
 | `POST` | `/tabs/{idx}/activate` | Switch to a tab |
 | `POST` | `/tabs/{idx}/rename` | Rename a tab |
 | `POST` | `/tabs/by-id/{tab_id}/status` | Publish agent state — see [Agent state](#agent-state) |
+| `POST` | `/tabs/by-id/{tab_id}/context` | Set/clear the tab's context label (PR/task) — see [Tab context](#tab-context) |
 | `POST` | `/tabs/{idx}/files?name=…` | Upload bytes into `<cwd>/inbox/<name>` (see [Remote tabs](#remote-tabs)) |
 | `GET` | `/tabs/{idx}/files?path=…` | Download from the tab's `inbox/` or `outbox/` sandbox |
 | `DELETE` | `/tabs/{idx}` | Close a tab |
@@ -361,6 +362,20 @@ The CLI silently exits 0 when `_TAB_ID` is unset (i.e. invoked outside a tab), s
 | `PermissionRequest` | `waiting` (label `permission`) | Claude paused for tool/file approval — needs you |
 | `StopFailure` | `error` | Turn aborted (API error, crash) |
 | `SessionEnd` | `idle` | Session terminated — clear the LED |
+
+## Tab context
+
+Each tab can carry a free-text **context** label — what the agent in it is working on (a PR, an issue, a task). Hover the tab name in the desktop GUI and the label shows as a tooltip; it's also surfaced on `/tabs` (omitted when unset). Handy when several tabs each run their own Claude and the tab names alone don't tell you which is on what.
+
+An in-tab agent sets it from its own shell — no token needed, the endpoint is auto-discovered from the injected `TAB_ATELIER_API_*` env:
+
+```sh
+tab-atelier set-context "PR #3719: dompdf font reproduction"
+tab-atelier set-context --tab <id> "labelling a worker I just spawned"
+tab-atelier set-context --clear
+```
+
+The text is capped at 2000 chars; a whitespace-only value clears it. Like `set-status`, it's safe to call unconditionally — it errors (non-fatally) only when run outside a tab. To have Claude keep it current, point a `UserPromptSubmit` (or `SessionStart`) hook at it, or just ask Claude to run it when it picks up a task.
 
 ### Auto-resume on restart
 

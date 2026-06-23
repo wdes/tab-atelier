@@ -121,6 +121,9 @@ struct HeadlessTab {
     locked: bool,
     schedule: Option<crate::schedule::TabSchedule>,
     bg_color: Option<String>,
+    /// Free-text context the in-tab agent set via `set-context`.
+    /// In-memory only (not persisted); reflected on `/tabs`.
+    context: Option<String>,
     pending_agent_resume: Option<String>,
     colors_enabled: bool,
     /// Raw PTY byte ring captured BEFORE alacritty's parser sees the
@@ -454,6 +457,7 @@ fn spawn_pty_tab(
         locked,
         schedule,
         bg_color,
+        context: None,
         pending_agent_resume,
         colors_enabled,
         pty_ring,
@@ -648,6 +652,7 @@ pub fn run() -> std::io::Result<()> {
         pending_input: Vec::new(),
         pending_lock_changes: Vec::new(),
         pending_bg_color_changes: Vec::new(),
+        pending_context_changes: Vec::new(),
         pending_schedule_changes: Vec::new(),
         pending_new_tabs: 0,
         pending_new_tab_cwds: std::collections::VecDeque::new(),
@@ -834,6 +839,7 @@ fn refresh_snapshot(
             locked: tab.locked,
             schedule: tab.schedule.clone(),
             bg_color: crate::effective_tab_bg(tab.bg_color.as_deref(), Some(global_bg)).to_string(),
+            context: tab.context.clone(),
             shell_pid: tab.pid,
             agent_state: tab.agent_state.clone(),
             agent_session_id: tab.agent_session_id.clone(),
@@ -1102,6 +1108,7 @@ fn drain_pending(
     let status_updates: Vec<api::PendingStatusUpdate> = s.pending_status_updates.drain(..).collect();
     let lock_changes: Vec<(String, bool)> = s.pending_lock_changes.drain(..).collect();
     let bg_color_changes: Vec<(String, Option<String>)> = s.pending_bg_color_changes.drain(..).collect();
+    let context_changes: Vec<(String, Option<String>)> = s.pending_context_changes.drain(..).collect();
     let schedule_changes: Vec<(String, Option<crate::schedule::TabSchedule>)> =
         s.pending_schedule_changes.drain(..).collect();
     let new_tabs = std::mem::take(&mut s.pending_new_tabs);
@@ -1124,6 +1131,12 @@ fn drain_pending(
     for (tab_id, color) in bg_color_changes {
         if let Some(t) = tabs.iter_mut().find(|t| t.id == tab_id) {
             t.bg_color = color;
+        }
+    }
+    // …and the per-tab agent context.
+    for (tab_id, context) in context_changes {
+        if let Some(t) = tabs.iter_mut().find(|t| t.id == tab_id) {
+            t.context = context;
         }
     }
 
