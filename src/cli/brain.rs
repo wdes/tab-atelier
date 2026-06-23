@@ -35,6 +35,13 @@ const DEFAULT_INTERVAL_SECS: u64 = 5;
 /// no movement.
 const STABLE_SECS: u64 = 20;
 const SCOPE_TAIL_BYTES: usize = 4096;
+/// Exponential-backoff base. After the first `continue` for an error
+/// episode, brain waits this long before the next nudge, doubling each
+/// time the SAME error recurs — so it stops hammering a transient outage
+/// (repeated `529 Overloaded`, rate limits). A different error resets it.
+const NUDGE_BACKOFF_BASE_SECS: u64 = 60;
+/// Backoff ceiling — a long outage still gets a retry roughly every 15 min.
+const NUDGE_BACKOFF_MAX_SECS: u64 = 900;
 
 /// Captive-portal-style connectivity probe.
 ///
@@ -161,6 +168,14 @@ pub const PATTERNS: &[Pattern] = &[
     },
     Pattern {
         needle: "Overloaded (529)",
+        label: "anthropic-529",
+        action: "continue\r",
+    },
+    // Current Claude Code wording for the same 529: "API Error: 529
+    // Overloaded. This is a server-side issue, usually temporary …".
+    // The parenthesised form above doesn't match it, so cover both.
+    Pattern {
+        needle: "529 Overloaded",
         label: "anthropic-529",
         action: "continue\r",
     },
@@ -303,6 +318,14 @@ struct TabWatch {
     /// or `None` if we've never nudged it (or its output changed since).
     /// Guards against re-nudging an unchanged frozen screen.
     nudged_hash: Option<u64>,
+    /// Consecutive nudges for the current unresolved error episode —
+    /// drives the exponential backoff. Reset to 0 when the tab recovers
+    /// (no error trigger) or hits a different error.
+    nudge_streak: u32,
+    /// Earliest time the next nudge is allowed (the backoff gate).
+    next_nudge_at: Option<Instant>,
+    /// Error label of the last nudge; a different label resets the streak.
+    last_label: Option<&'static str>,
 }
 
 /// FNV-1a hash of a tab's `/output`. Process-local only (never
@@ -325,6 +348,16 @@ fn hash_output(s: &str) -> u64 {
 /// AND we haven't already nudged this exact frozen screen.
 fn should_nudge(stable_for: Duration, nudged_hash: Option<u64>, current_hash: u64) -> bool {
     stable_for >= Duration::from_secs(STABLE_SECS) && nudged_hash != Some(current_hash)
+}
+
+/// Seconds to wait before the next nudge after `streak` consecutive
+/// nudges for the same error episode: `BASE * 2^(streak-1)`, capped at
+/// [`NUDGE_BACKOFF_MAX_SECS`]. So 60s, 120s, 240s, 480s, 900s, 900s…
+fn backoff_secs(streak: u32) -> u64 {
+    let shift = streak.saturating_sub(1).min(6);
+    NUDGE_BACKOFF_BASE_SECS
+        .saturating_mul(1u64 << shift)
+        .min(NUDGE_BACKOFF_MAX_SECS)
 }
 
 /// Round-robin pick from a slice. Advances `cursor` mod `len()` and
@@ -410,36 +443,62 @@ fn tick(
             last_hash: h,
             stable_since: now,
             nudged_hash: None,
+            nudge_streak: 0,
+            next_nudge_at: None,
+            last_label: None,
         });
         if watch.last_hash != h {
             watch.last_hash = h;
             watch.stable_since = now;
         }
         let stable_for = now.duration_since(watch.stable_since);
-        let nudged_hash = watch.nudged_hash;
 
-        // Only consider tabs whose screen has been frozen long enough
-        // AND that we haven't already nudged at this exact frozen
-        // screen. Auto-retrying rate-limits show a live countdown →
-        // never freeze STABLE_SECS → never reach here. A genuinely
-        // hung agent freezes → gets ONE nudge → won't be nudged again
-        // until its output changes (proof the nudge did something, or
-        // it re-stuck on a different error).
-        if !should_nudge(stable_for, nudged_hash, h) {
+        // Identify the error trigger for EVERY claude tab (not just frozen
+        // ones) so a recovered tab is the reset point for the backoff.
+        // Two parallel signals — a literal needle match in the scrollback
+        // OR an `agent_state: "error"` flag set via set-status. Pattern
+        // wins on tie (its label is more specific).
+        let trigger: Option<Trigger> = if let Some(p) = scan_output(&output) {
+            Some(Trigger::Pattern(p))
+        } else if tab.agent_state.as_deref() == Some("error") {
+            Some(Trigger::AgentError)
+        } else {
+            None
+        };
+        let Some(trigger) = trigger else {
+            // No error on screen → recovered (or never errored). Clear
+            // the backoff so the next episode starts fresh.
+            watch.nudge_streak = 0;
+            watch.next_nudge_at = None;
+            watch.last_label = None;
+            continue;
+        };
+        let label = trigger.label();
+
+        // Frozen long enough AND not already nudged at this exact screen?
+        // (An active auto-retry countdown keeps the screen moving, so it
+        // never freezes STABLE_SECS and never reaches here.)
+        if !should_nudge(stable_for, watch.nudged_hash, h) {
             continue;
         }
 
-        // Two parallel signals — a literal needle match in the
-        // scrollback OR an `agent_state: "error"` flag set via
-        // set-status from inside the agent. Pattern wins on tie
-        // because its label is more specific than "agent-state-error".
-        let trigger: Trigger = if let Some(p) = scan_output(&output) {
-            Trigger::Pattern(p)
-        } else if tab.agent_state.as_deref() == Some("error") {
-            Trigger::AgentError
-        } else {
+        // Exponential backoff: while the SAME error keeps recurring, wait
+        // progressively longer between nudges so brain doesn't hammer a
+        // transient outage (repeated `529 Overloaded`, rate limits). A
+        // different error label resets the streak (applied on send).
+        if watch.last_label == Some(label)
+            && let Some(at) = watch.next_nudge_at
+            && now < at
+        {
+            let wait = at.duration_since(now).as_secs();
+            println!(
+                "⛑ brain: {name:<24} [{label}] backing off — next nudge in ~{wait}s (streak {streak})",
+                name = tab.name,
+                streak = watch.nudge_streak,
+            );
             continue;
-        };
+        }
+
         eligible.push(Eligible {
             tab_id: tab.id,
             tab_name: tab.name,
@@ -485,6 +544,17 @@ fn tick(
     // cooldown — a state guard, not a clock.
     if let Some(w) = watches.get_mut(&pick.tab_id) {
         w.nudged_hash = Some(pick.output_hash);
+        // Advance the exponential backoff for this error episode: same
+        // label → grow the streak (longer wait next time); new label →
+        // restart at 1. The gate above suppresses nudges until then.
+        let label = pick.trigger.label();
+        w.nudge_streak = if w.last_label == Some(label) {
+            w.nudge_streak + 1
+        } else {
+            1
+        };
+        w.last_label = Some(label);
+        w.next_nudge_at = Some(now + Duration::from_secs(backoff_secs(w.nudge_streak)));
     }
 
     let _ = ag
@@ -826,6 +896,29 @@ mod tests {
         // Frozen long enough, never nudged → eligible.
         assert!(should_nudge(Duration::from_secs(STABLE_SECS), None, 42));
         assert!(should_nudge(Duration::from_secs(STABLE_SECS + 100), None, 42));
+    }
+
+    #[test]
+    fn scan_matches_current_529_wording() {
+        // The exact line Claude Code prints today — the parenthesised
+        // "Overloaded (529)" needle wouldn't catch it.
+        let p = scan_output("● API Error: 529 Overloaded. This is a server-side issue, usually temporary")
+            .expect("must match");
+        assert_eq!(p.label, "anthropic-529");
+    }
+
+    #[test]
+    fn backoff_grows_exponentially_then_caps() {
+        // 60s, 120s, 240s, 480s, then capped at 900s — so brain stops
+        // hammering a stuck agent (e.g. repeated 529 Overloaded) and
+        // retries less and less often.
+        assert_eq!(backoff_secs(1), 60);
+        assert_eq!(backoff_secs(2), 120);
+        assert_eq!(backoff_secs(3), 240);
+        assert_eq!(backoff_secs(4), 480);
+        assert_eq!(backoff_secs(5), 900); // 960 → capped
+        assert_eq!(backoff_secs(20), 900); // stays capped, no overflow
+        assert_eq!(backoff_secs(0), 60); // saturating, never panics
     }
 
     #[test]
