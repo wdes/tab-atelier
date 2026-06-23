@@ -9,6 +9,7 @@ pub mod claude_hook;
 pub mod delegate;
 pub mod dispatch;
 pub mod remote;
+pub mod set_context;
 pub mod set_font;
 pub mod set_status;
 /// Headless-side basic-action subcommands.

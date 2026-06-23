@@ -146,6 +146,10 @@ struct TabInfo {
     /// target.
     #[serde(skip_serializing_if = "Option::is_none")]
     agent_session_id: Option<String>,
+    /// Free-text context the in-tab agent set via `set-context` — the
+    /// PR/task it's on. Omitted when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context: Option<String>,
 }
 
 /// Host-wide stats reported alongside the per-tab list. Keeps the
@@ -235,6 +239,11 @@ pub struct SnapshotTab {
     /// viewer via `X-Tab-Bg` on /output + `__TAB_BG__` template
     /// substitution on /view.
     pub bg_color: String,
+    /// Free-text context an in-tab agent set for itself via
+    /// `tab-atelier set-context "…"` — e.g. the PR/issue it's working
+    /// on. Surfaced on `/tabs` and as a hover tooltip on the GUI tab
+    /// name. `None` ⇒ no context set.
+    pub context: Option<String>,
     /// PID of the tab's shell. The /catbus endpoints walk its
     /// descendant processes to find a catbus-agent (or fallback
     /// `claude` TUI) and resolve the session's transcript file.
@@ -312,6 +321,10 @@ pub struct TabSnapshot {
     /// `None` clears the per-tab override → tab falls back to the
     /// global default. Same drain shape as `pending_lock_changes`.
     pub pending_bg_color_changes: Vec<(String, Option<String>)>,
+    /// (`tab_id`, context-or-None) queued by `POST /tabs/by-id/{id}/context`.
+    /// `None` clears the tab's context. Same drain shape as
+    /// `pending_bg_color_changes`.
+    pub pending_context_changes: Vec<(String, Option<String>)>,
     /// (`tab_id`, schedule-or-None) queued by
     /// `POST /tabs/by-id/{id}/schedule`. `None` clears the schedule
     /// (tab returns to 24/7 unless still manually locked). Same drain
@@ -1172,6 +1185,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                     lock_reason: crate::schedule::LockState::lock_reason(t),
                     schedule_rule: t.schedule.as_ref().map(|s| s.rule.clone()),
                     schedule_tz: t.schedule.as_ref().map(|s| s.tz.clone()),
+                    context: t.context.clone(),
                 })
                 .collect();
             #[cfg(feature = "energy")]
@@ -2225,6 +2239,43 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             .unwrap_or_default();
             respond_json(stream, 200, &body);
         }
+        ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/context") => {
+            // Set or clear this tab's free-text context (the PR/task an
+            // in-tab agent is working on). Body: {"context":"…"} to set,
+            // {"context":null} or empty body to clear. RW token only.
+            let inner = &p["/tabs/by-id/".len()..p.len() - "/context".len()];
+            let context_opt: Option<String> = if body_bytes.is_empty() {
+                None
+            } else {
+                serde_json::from_slice::<serde_json::Value>(&body_bytes)
+                    .ok()
+                    .and_then(|v| v.get("context").cloned())
+                    .and_then(|c| {
+                        if c.is_null() {
+                            None
+                        } else {
+                            c.as_str().map(str::to_owned)
+                        }
+                    })
+            };
+            // Cap length so a runaway agent can't bloat the snapshot /
+            // tooltip; trim whitespace-only to a clear.
+            let context_opt = context_opt
+                .map(|s| s.chars().take(2000).collect::<String>())
+                .filter(|s| !s.trim().is_empty());
+            let mut state = state.lock().unwrap();
+            let Some(idx) = state.tabs.iter().position(|t| t.id == inner) else {
+                drop(state);
+                error_json(stream, 404, "tab not found");
+                return;
+            };
+            let tab_id = state.tabs[idx].id.clone();
+            state.tabs[idx].context.clone_from(&context_opt);
+            state.pending_context_changes.push((tab_id, context_opt.clone()));
+            drop(state);
+            let body = serde_json::to_string(&serde_json::json!({ "context": context_opt })).unwrap_or_default();
+            respond_json(stream, 200, &body);
+        }
         ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/input") => {
             let Some((key_raw, is_uuid)) = parse_tab_key(p, "/input") else {
                 error_json(stream, 404, "invalid tab key");
@@ -2942,6 +2993,7 @@ mod tests {
                     locked: false,
                     schedule: None,
                     bg_color: String::new(),
+                    context: None,
                     shell_pid: 0,
                     agent_state: None,
                     agent_session_id: None,
@@ -2964,6 +3016,7 @@ mod tests {
                     locked: false,
                     schedule: None,
                     bg_color: String::new(),
+                    context: None,
                     shell_pid: 0,
                     agent_state: None,
                     agent_session_id: None,
@@ -2981,6 +3034,7 @@ mod tests {
             pending_input: vec![],
             pending_lock_changes: vec![],
             pending_bg_color_changes: vec![],
+            pending_context_changes: vec![],
             pending_schedule_changes: vec![],
             pending_new_tabs: 0,
             pending_new_tab_cwds: std::collections::VecDeque::new(),
@@ -3259,6 +3313,71 @@ mod tests {
         assert_eq!(status_code(&resp), 200);
         let pending = state.lock().unwrap().pending_renames.clone();
         assert_eq!(pending, vec![(0_usize, "renamed".into())]);
+    }
+
+    #[test]
+    fn set_context_sets_and_clears() {
+        let (port, state, token) = spawn_server();
+        // Set.
+        let body = r#"{"context":"PR #42: dompdf fonts"}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/tab-a/context HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 200);
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(s.tabs[0].context.as_deref(), Some("PR #42: dompdf fonts"));
+            assert_eq!(
+                s.pending_context_changes.last().unwrap().1.as_deref(),
+                Some("PR #42: dompdf fonts")
+            );
+        }
+        // Whitespace-only body clears it.
+        let body = r#"{"context":"   "}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/tab-a/context HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 200);
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(s.tabs[0].context, None);
+            assert_eq!(s.pending_context_changes.last().unwrap().1, None);
+        }
+    }
+
+    #[test]
+    fn set_context_caps_length() {
+        let (port, state, token) = spawn_server();
+        let long = "x".repeat(5000);
+        let body = format!(r#"{{"context":"{long}"}}"#);
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/tab-a/context HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 200);
+        let s = state.lock().unwrap();
+        assert_eq!(s.tabs[0].context.as_deref().map(str::len), Some(2000));
+    }
+
+    #[test]
+    fn set_context_requires_auth() {
+        let (port, _, _) = spawn_server();
+        let resp = request(
+            port,
+            "POST /tabs/by-id/tab-a/context HTTP/1.1\r\nContent-Length: 0\r\n\r\n",
+        );
+        assert_eq!(status_code(&resp), 401);
     }
 
     #[test]
