@@ -1944,6 +1944,22 @@ fn write_atomic_with_rotation<T: serde::Serialize>(
     }
 }
 
+/// Does a path's last segment look like a `name.ext` filename? Used to
+/// promote a single-slash token (`build/poc.php`) to a clickable path
+/// while rejecting prose (`and/or`, `TCP/IP`, `24/7`, `2.5`). True when
+/// there's a short (≤8) alphanumeric extension after a dot AND the
+/// segment contains at least one letter (so pure numbers don't qualify).
+#[must_use]
+fn looks_like_filename(seg: &str) -> bool {
+    let Some((_name, ext)) = seg.rsplit_once('.') else {
+        return false;
+    };
+    !ext.is_empty()
+        && ext.len() <= 8
+        && ext.chars().all(|c| c.is_ascii_alphanumeric())
+        && seg.chars().any(|c| c.is_ascii_alphabetic())
+}
+
 #[must_use]
 pub fn detect_urls(text: &str) -> Vec<(usize, usize, String, bool)> {
     // Allocation-free fast path. Every pattern this function detects —
@@ -2033,7 +2049,14 @@ pub fn detect_urls(text: &str) -> Vec<(usize, usize, String, bool)> {
                 j -= 1;
             }
             let path: String = chars[start..j].iter().collect();
-            if path.matches('/').count() >= 2 {
+            // ≥2 slashes ⇒ unambiguous path (`/a/b`, `src/x/y`). A
+            // SINGLE-slash token is a path only when its last segment
+            // looks like a filename (`build/poc.php`, `src/main.rs`) —
+            // that filter rejects prose like `and/or`, `TCP/IP`, `24/7`
+            // while catching relative file paths a tool just printed.
+            let slashes = path.matches('/').count();
+            let single_slash_file = slashes == 1 && looks_like_filename(path.rsplit('/').next().unwrap_or(""));
+            if slashes >= 2 || single_slash_file {
                 urls.push((start, j, path, true));
                 i = j;
                 continue;
@@ -2870,6 +2893,36 @@ mod tests {
         let urls = detect_urls("see https://example.com.");
         assert_eq!(urls.len(), 1);
         assert_eq!(urls[0].2, "https://example.com");
+    }
+
+    #[test]
+    fn detect_single_slash_relative_file_path() {
+        // Regression: a single-slash relative path with a filename
+        // extension must be clickable (was missed — required >=2 slashes).
+        let urls = detect_urls("POC saved at build/mangopay-birthday-poc.php");
+        assert_eq!(urls.len(), 1, "got {urls:?}");
+        assert_eq!(urls[0].2, "build/mangopay-birthday-poc.php");
+        assert!(urls[0].3, "should be flagged as a path");
+
+        let urls = detect_urls("edit src/main.rs now");
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0].2, "src/main.rs");
+    }
+
+    #[test]
+    fn single_slash_prose_is_not_a_path() {
+        // The filename heuristic must reject prose / fractions / ratios.
+        for s in ["choose and/or both", "uses TCP/IP here", "open 24/7", "ratio 1/2.5 ok"] {
+            assert!(
+                detect_urls(s).is_empty(),
+                "false positive in {s:?}: {:?}",
+                detect_urls(s)
+            );
+        }
+        // …but a 2+-slash path is still detected regardless of extension.
+        let urls = detect_urls("cd /usr/local/bin");
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0].2, "/usr/local/bin");
     }
 
     #[test]
