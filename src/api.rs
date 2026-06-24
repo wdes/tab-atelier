@@ -3328,14 +3328,10 @@ mod tests {
             ),
         );
         assert_eq!(status_code(&resp), 200);
-        {
-            let s = state.lock().unwrap();
-            assert_eq!(s.tabs[0].context.as_deref(), Some("PR #42: dompdf fonts"));
-            assert_eq!(
-                s.pending_context_changes.last().unwrap().1.as_deref(),
-                Some("PR #42: dompdf fonts")
-            );
-        }
+        let ctx = state.lock().unwrap().tabs[0].context.clone();
+        assert_eq!(ctx.as_deref(), Some("PR #42: dompdf fonts"));
+        let last = state.lock().unwrap().pending_context_changes.last().cloned();
+        assert_eq!(last.unwrap().1.as_deref(), Some("PR #42: dompdf fonts"));
         // Whitespace-only body clears it.
         let body = r#"{"context":"   "}"#;
         let resp = request(
@@ -3346,11 +3342,10 @@ mod tests {
             ),
         );
         assert_eq!(status_code(&resp), 200);
-        {
-            let s = state.lock().unwrap();
-            assert_eq!(s.tabs[0].context, None);
-            assert_eq!(s.pending_context_changes.last().unwrap().1, None);
-        }
+        let ctx = state.lock().unwrap().tabs[0].context.clone();
+        assert_eq!(ctx, None);
+        let last = state.lock().unwrap().pending_context_changes.last().cloned();
+        assert_eq!(last.unwrap().1, None);
     }
 
     #[test]
@@ -3366,8 +3361,8 @@ mod tests {
             ),
         );
         assert_eq!(status_code(&resp), 200);
-        let s = state.lock().unwrap();
-        assert_eq!(s.tabs[0].context.as_deref().map(str::len), Some(2000));
+        let len = state.lock().unwrap().tabs[0].context.as_deref().map(str::len);
+        assert_eq!(len, Some(2000));
     }
 
     #[test]
