@@ -19,13 +19,17 @@
 //!
 //! Events handled:
 //! - `session-start`  → state=thinking, kind=claude, sessionId=`<id>`
+//! - `user-prompt`    → state=thinking, and sets the tab context label
+//!   to the submitted prompt (the tab name's hover tooltip then shows
+//!   what the agent is working on)
 //! - `pre-tool`       → state=thinking, label=`<tool_name>`
 //! - `post-tool`      → state=thinking (no label — back to base)
 //! - `stop`           → state=waiting (Claude finished a turn)
 //! - `notification`   → state=waiting, label=`<message>`
 //! - `session-end`    → state=idle, label=__clear__ (drops the
 //!   persistent agent attachment so the LED actually goes dark;
-//!   mirrored from set-status idle semantics)
+//!   mirrored from set-status idle semantics) and clears the tab
+//!   context label
 //!
 //! Failures are intentionally swallowed (exit 0) so a misconfigured
 //! hook can never block Claude. Stderr gets a one-line note for
@@ -37,7 +41,7 @@ use std::io::Read;
 pub fn run(args: &[String]) -> i32 {
     let Some(event) = args.first().map(String::as_str) else {
         eprintln!("usage: tab-atelier-headless claude-hook <event>");
-        eprintln!("  events: session-start, pre-tool, post-tool, stop, notification, session-end");
+        eprintln!("  events: session-start, user-prompt, pre-tool, post-tool, stop, notification, session-end");
         return 2;
     };
 
@@ -59,13 +63,36 @@ pub fn run(args: &[String]) -> i32 {
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned);
 
+    // Context side-channel: keep the tab's hover label in sync with the
+    // agent's work. `user-prompt` stamps the submitted prompt;
+    // `session-end` clears it. set_context::run is a silent no-op when
+    // the tab env isn't present, so this never blocks Claude.
+    match event {
+        "user-prompt" => {
+            if let Some(p) = payload.get("prompt").and_then(serde_json::Value::as_str) {
+                // Trim to a tooltip-sized snippet; the API caps at 2000
+                // chars anyway, but a one-line label reads better.
+                let snippet: String = p.trim().chars().take(200).collect();
+                if !snippet.is_empty() {
+                    let _ = crate::cli::set_context::run(&[snippet]);
+                }
+            }
+        }
+        "session-end" => {
+            let _ = crate::cli::set_context::run(&["--clear".to_owned()]);
+        }
+        _ => {}
+    }
+
     // Map event → (state, label override). For SessionStart we also
     // pass `--kind claude --session <id>` so the daemon stamps the
     // durable attachment that drives auto-resume.
     let (state, label, with_attachment) = match event {
         "session-start" => ("thinking", None, true),
         "pre-tool" => ("thinking", tool_name, false),
-        "post-tool" => ("thinking", None, false),
+        // user-prompt and post-tool both return to the base thinking
+        // state with no label (user-prompt's context side-effect ran above).
+        "user-prompt" | "post-tool" => ("thinking", None, false),
         "stop" => ("waiting", None, false),
         "notification" => ("waiting", notification, false),
         "session-end" => ("idle", Some("__clear__".to_owned()), false),

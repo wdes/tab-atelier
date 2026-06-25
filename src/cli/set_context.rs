@@ -57,6 +57,18 @@ pub fn run(args: &[String]) -> i32 {
         i += 1;
     }
 
+    // Outside a tab-atelier tab the API env isn't exported. Treat that
+    // as a silent no-op (exit 0) — exactly like `set-status` — so a
+    // UserPromptSubmit / SessionEnd hook wired to this can never block
+    // prompt submission or spam errors when `claude` runs outside any
+    // tab. Once the env IS present we surface real failures normally.
+    let (Ok(api_url), Ok(api_token)) = (
+        std::env::var("TAB_ATELIER_API_URL"),
+        std::env::var("TAB_ATELIER_API_TOKEN"),
+    ) else {
+        return 0;
+    };
+
     let context: Option<String> = if clear {
         None
     } else {
@@ -71,17 +83,9 @@ pub fn run(args: &[String]) -> i32 {
     let tab_id = match tab_override.or_else(|| std::env::var("_TAB_ID").ok()) {
         Some(id) if !id.is_empty() => id,
         _ => {
-            eprintln!("set-context: not inside a tab (_TAB_ID unset) — pass --tab <id>");
+            eprintln!("set-context: TAB_ATELIER env present but _TAB_ID unset — pass --tab <id>");
             return 1;
         }
-    };
-    let Ok(api_url) = std::env::var("TAB_ATELIER_API_URL") else {
-        eprintln!("set-context: TAB_ATELIER_API_URL unset (not inside a tab?)");
-        return 1;
-    };
-    let Ok(api_token) = std::env::var("TAB_ATELIER_API_TOKEN") else {
-        eprintln!("set-context: TAB_ATELIER_API_TOKEN unset (not inside a tab?)");
-        return 1;
     };
 
     let cleared = context.is_none();
