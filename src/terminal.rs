@@ -273,8 +273,14 @@ pub struct TerminalView {
     /// cell-scan is skipped entirely for them.
     ///
     /// Cache validity is keyed by `(display_offset, visible_cols,
-    /// visible_lines)` — any scroll / resize discards the whole cache
-    /// since the row-row mapping changes.
+    /// visible_lines, history_size)` — any scroll / resize discards the
+    /// whole cache since the row-row mapping changes. `history_size` is
+    /// the crucial one for a *live*-screen scroll: pushing a line into
+    /// scrollback shifts every visible row up by one while
+    /// `display_offset` stays 0, and alacritty only damages the newly
+    /// exposed bottom row — so without this key the shifted rows keep
+    /// their stale cached `RawLine` (e.g. an old inverse-red diff line
+    /// bleeding red under the next thing drawn there).
     prev_frame: Rc<RefCell<Option<CachedFrame>>>,
     /// Last fully-built prepaint output. When the parser thread holds
     /// the `Term` lock at prepaint time, the UI thread reuses this
@@ -296,6 +302,10 @@ struct CachedFrame {
     display_offset: i32,
     visible_cols: usize,
     visible_lines: usize,
+    /// Scrollback length at build time. A change means the live screen
+    /// scrolled (rows shifted up), so the whole index-keyed cache is
+    /// stale even though `display_offset` is still 0.
+    history_size: usize,
     lines: Vec<Option<RawLine>>,
 }
 
@@ -1539,6 +1549,11 @@ impl Element for TerminalElement {
             let display_offset = term.grid().display_offset() as i32;
             let visible_lines = term.grid().screen_lines().min(lines);
             let visible_cols = term.grid().columns().min(cols);
+            // Scrollback length now, used as a cache-validity key below: a
+            // live-screen scroll grows this while display_offset stays 0,
+            // and only the new bottom row is damaged — so the index-keyed
+            // line cache must be discarded or shifted rows bleed stale bg.
+            let history_size = term.grid().history_size();
             let cursor_point = term.grid().cursor.point;
             // Honour the app's cursor-visibility mode. Every TUI hides
             // the cursor with `\x1b[?25l` while it redraws (piu-piu,
@@ -1595,7 +1610,8 @@ impl Element for TerminalElement {
                 Some(p)
                     if p.display_offset == display_offset
                         && p.visible_cols == visible_cols
-                        && p.visible_lines == visible_lines =>
+                        && p.visible_lines == visible_lines
+                        && p.history_size == history_size =>
                 {
                     let mut v = p.lines;
                     if force_full {
@@ -1849,6 +1865,7 @@ impl Element for TerminalElement {
                 display_offset,
                 visible_cols,
                 visible_lines,
+                history_size,
                 lines: working,
             });
 
@@ -1863,7 +1880,6 @@ impl Element for TerminalElement {
             };
 
             let selection = term.selection.as_ref().and_then(|s| s.to_range(&*term));
-            let history_size = grid.history_size();
             drop(term);
 
             (
