@@ -37,6 +37,17 @@
 
 use std::io::Read;
 
+/// True when a `UserPromptSubmit` payload is a system/tool injection
+/// rather than a human-typed prompt — a background `<task-notification>`,
+/// a `<system-reminder>`, a slash-command or `!`-bash expansion, etc.
+/// These fire `UserPromptSubmit` with the wrapped XML block as `.prompt`,
+/// and we don't want them overwriting the tab's context label with noise.
+/// Heuristic: a genuine prompt almost never opens with a literal `<tag>`.
+fn is_synthetic_prompt(prompt: &str) -> bool {
+    let mut chars = prompt.trim_start().chars();
+    chars.next() == Some('<') && chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+}
+
 #[must_use]
 pub fn run(args: &[String]) -> i32 {
     let Some(event) = args.first().map(String::as_str) else {
@@ -70,10 +81,17 @@ pub fn run(args: &[String]) -> i32 {
     match event {
         "user-prompt" => {
             if let Some(p) = payload.get("prompt").and_then(serde_json::Value::as_str) {
-                // Trim to a tooltip-sized snippet; the API caps at 2000
-                // chars anyway, but a one-line label reads better.
-                let snippet: String = p.trim().chars().take(200).collect();
-                if !snippet.is_empty() {
+                let p = p.trim();
+                // Skip system/tool injections (background <task-notification>,
+                // <system-reminder>, slash-command / !-bash expansions) — they
+                // arrive as UserPromptSubmit with the wrapped XML as `.prompt`
+                // and would clobber the label with noise, not the actual task.
+                // Also skip a leading `--` so a prompt isn't mis-parsed as a
+                // set-context flag.
+                if !p.is_empty() && !is_synthetic_prompt(p) && !p.starts_with("--") {
+                    // Trim to a tooltip-sized snippet; the API caps at 2000
+                    // chars anyway, but a one-line label reads better.
+                    let snippet: String = p.chars().take(200).collect();
                     let _ = crate::cli::set_context::run(&[snippet]);
                 }
             }
@@ -124,4 +142,26 @@ pub fn run(args: &[String]) -> i32 {
     // anything useful to stderr inside set_status::run.
     let _ = code;
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_synthetic_prompt;
+
+    #[test]
+    fn synthetic_prompts_are_skipped() {
+        // System / tool injections that arrive as UserPromptSubmit.
+        assert!(is_synthetic_prompt("<task-notification>\n<task-id>b6co42m2k</task-id>"));
+        assert!(is_synthetic_prompt("<system-reminder>do the thing</system-reminder>"));
+        assert!(is_synthetic_prompt("  <command-name>/foo</command-name>"));
+    }
+
+    #[test]
+    fn real_prompts_are_kept() {
+        assert!(!is_synthetic_prompt("PR #3719: dompdf font reproduction"));
+        assert!(!is_synthetic_prompt("continue"));
+        // A bare comparison / math expression isn't a tag.
+        assert!(!is_synthetic_prompt("< 5 items left"));
+        assert!(!is_synthetic_prompt("<"));
+    }
 }
