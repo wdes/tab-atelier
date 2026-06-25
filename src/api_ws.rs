@@ -213,6 +213,18 @@ impl ImeDedup {
     /// Returns the bytes to actually inject into `pending_input`,
     /// or `None` to drop the frame entirely.
     fn classify(&mut self, bytes: &[u8]) -> Option<Vec<u8>> {
+        // Control / cursor-key sequences (arrows `\x1b[D`, Home/End,
+        // F-keys, Delete `\x1b[3~`, PageUp/Down, Alt+<key>) all begin
+        // with ESC. They are deliberate, rapidly-repeatable keystrokes —
+        // never IME composition, which is always printable text. Pass
+        // them straight through WITHOUT touching the dedup state, so a
+        // fast burst of Left presses isn't collapsed to one by the
+        // exact-match drop below (the reported "rapid arrows do nothing;
+        // wait ~half a second and it works"). The IME prefix/exact
+        // window is left intact for the printable text it's meant for.
+        if bytes.first() == Some(&0x1b) {
+            return Some(bytes.to_vec());
+        }
         let now = Instant::now();
         let fresh = self.last_at.is_none_or(|t| now.duration_since(t) >= IME_DEDUP_WINDOW);
         if bytes.len() <= 1 || fresh {
@@ -1023,6 +1035,28 @@ mod tests {
         let mut d = ImeDedup::new();
         assert_eq!(d.classify(b"hello"), Some(b"hello".to_vec()));
         assert_eq!(d.classify(b"hello"), None);
+    }
+
+    #[test]
+    fn ime_dedup_passes_rapid_escape_sequences() {
+        // Cursor / control keys all start with ESC and are deliberate,
+        // rapidly-repeatable keystrokes — they must NEVER be deduped.
+        // Regression: holding/spamming Left (`\x1b[D`) in the xterm.js
+        // viewer dropped every repeat after the first; only a >window
+        // pause let the next one through.
+        let mut d = ImeDedup::new();
+        assert_eq!(d.classify(b"\x1b[D"), Some(b"\x1b[D".to_vec()));
+        assert_eq!(d.classify(b"\x1b[D"), Some(b"\x1b[D".to_vec()));
+        assert_eq!(d.classify(b"\x1b[D"), Some(b"\x1b[D".to_vec()));
+        // Home/End and other CSI keys too.
+        assert_eq!(d.classify(b"\x1b[H"), Some(b"\x1b[H".to_vec()));
+        assert_eq!(d.classify(b"\x1b[H"), Some(b"\x1b[H".to_vec()));
+        // …and an escape key in the middle must not corrupt a real IME
+        // prefix cascade that resumes after it.
+        let mut d2 = ImeDedup::new();
+        assert_eq!(d2.classify(b"he"), Some(b"he".to_vec()));
+        assert_eq!(d2.classify(b"\x1b[D"), Some(b"\x1b[D".to_vec()));
+        assert_eq!(d2.classify(b"hel"), Some(b"l".to_vec()));
     }
 
     #[test]
