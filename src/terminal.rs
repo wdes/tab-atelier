@@ -1018,11 +1018,14 @@ impl Render for TerminalView {
                 // Compile to a no-op in release when trace isn't enabled.
                 trace!(
                     target: "tab_atelier::input_lag",
-                    "T0 keystroke key={:?} ctrl={} shift={} alt={}",
+                    "T0 keystroke key={:?} key_char={:?} held={} ctrl={} shift={} alt={} fn={}",
                     ks.key,
+                    ks.key_char,
+                    ev.is_held,
                     ks.modifiers.control,
                     ks.modifiers.shift,
-                    ks.modifiers.alt
+                    ks.modifiers.alt,
+                    ks.modifiers.function,
                 );
                 if ks.modifiers.control && ks.modifiers.shift {
                     match ks.key.as_str() {
