@@ -239,7 +239,21 @@ priority = "optional"
 # pulled in by task-desktop / gnome / kde metapackages, so most
 # desktops add zero bytes. The other two are common Liberation /
 # Noto fallbacks shipped with many distros.
-depends = "libc6, libgcc-s1, libfreetype6, libxkbcommon0, libxkbcommon-x11-0, libxcb1, libxcb-xkb1, fonts-dejavu-core | fonts-liberation | fonts-noto-mono"
+#
+# `$auto` is cargo-deb's automatic shared-library resolver: it reads the
+# binary's ELF DT_NEEDED entries and emits VERSIONED deps —
+# `libc6 (>= 2.39), libxcb1 (>= 1.12), libxkbcommon0 (>= 0.5.0),
+# libxkbcommon-x11-0 (>= 0.5.0)`. We MUST keep it: a hand-written `libc6`
+# with no version lets dpkg install the package on a too-old glibc, where
+# the binary then crashes at runtime; `$auto` makes the libc6 floor track
+# whatever glibc the release was built on, so apt refuses too-old systems.
+# Appended by hand, because `$auto` does NOT emit them:
+#   * fonts-* `|` alternative — runtime data, not a linked library.
+#   * libgcc-s1 — libgcc_s.so.1 IS DT_NEEDED, but cargo-deb's resolver
+#     omits it; keep it explicit so the dep is correct per Debian policy.
+#   * libfreetype6 — loaded for glyph rasterisation; not a direct
+#     DT_NEEDED link, so $auto can't see it.
+depends = "$auto, libgcc-s1, libfreetype6, fonts-dejavu-core | fonts-liberation | fonts-noto-mono"
 # Desktop and headless ship the same `catbus-agent` helper binary in
 # `/usr/bin/`, so they can't both be installed at once.
 # `Conflicts:` makes apt refuse the second install with a clean
@@ -332,10 +346,13 @@ assets = [
 # are handled by these scripts; cargo-deb installs them as the deb's
 # maintainer scripts with mode 0755.
 maintainer-scripts = "assets/headless-debian/"
-# `adduser` for the `tab-atelier` service account in postinst.
-# `init-system-helpers` is essential but listed explicitly to make
-# the deb-systemd-helper / deb-systemd-invoke dependency obvious.
-depends = "libc6, libgcc-s1, adduser, init-system-helpers"
+# `$auto` auto-detects the versioned `libc6 (>= 2.39)` from the ELF so the
+# package refuses to install on a too-old glibc instead of crashing
+# post-install — see the GUI variant's note above. `libgcc-s1` is appended
+# because libgcc_s.so.1 is DT_NEEDED but cargo-deb's resolver omits it.
+# `adduser` (service account in postinst) and `init-system-helpers`
+# (deb-systemd-helper / deb-systemd-invoke) aren't linked libraries.
+depends = "$auto, libgcc-s1, adduser, init-system-helpers"
 # Mirror the default variant: the shipped preferences.json fallback
 # is a real conffile so admin edits survive `apt upgrade`. The Claude
 # Code system hooks live in a different /etc subdir; making it a
