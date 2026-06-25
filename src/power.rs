@@ -29,7 +29,10 @@ impl TabPower {
             } else if w >= 0.01 {
                 return format!("{:.0}mW", w * 1000.0);
             }
-            return "0W".into();
+            // Below 10 mW (including ~zero): keep the milliwatt unit so a
+            // near-idle tab reads "0mW" in line with its neighbours, not a
+            // jarring "0W" sitting next to "13mW".
+            return "0mW".into();
         }
         if self.cpu_percent >= 0.1 {
             return self.cpu_label();
@@ -217,12 +220,20 @@ mod tests {
     }
 
     #[test]
-    fn label_shows_zero_watts_when_tiny() {
+    fn label_shows_zero_milliwatts_when_tiny() {
+        // Sub-10mW (incl. ~zero) stays in mW so it lines up with
+        // neighbouring tabs' "13mW" rather than showing a stray "0W".
         let tp = TabPower {
             cpu_percent: 0.5,
             watts: Some(0.001),
         };
-        assert_eq!(tp.label(), "0W");
+        assert_eq!(tp.label(), "0mW");
+        // Exactly zero too.
+        let tp_zero = TabPower {
+            cpu_percent: 0.0,
+            watts: Some(0.0),
+        };
+        assert_eq!(tp_zero.label(), "0mW");
     }
 
     #[test]
