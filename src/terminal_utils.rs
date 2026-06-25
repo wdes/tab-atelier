@@ -147,7 +147,16 @@ pub fn keystroke_to_bytes(ks: &Keystroke, mode: TermMode) -> Option<Vec<u8>> {
                 if alt {
                     return Some(vec![0x1b, c]);
                 }
-                return Some(vec![c]);
+                // Reaching here means `key_char` is None (the branch above
+                // returns whenever it's Some). gpui only fills `key_char`
+                // with the text a key actually produced, so an UNMODIFIED
+                // printable key that produced no text is a DEAD / compose
+                // key — e.g. the circumflex that turns `e` into `ê`.
+                // Emitting its base label here is what printed the stray
+                // leading char (the reported `[` before `ê`); the composed
+                // character arrives on the next event with `key_char` set,
+                // so suppress this one.
+                return None;
             }
             return None;
         }
@@ -572,10 +581,23 @@ mod tests {
     }
 
     #[test]
-    fn plain_character_without_key_char() {
+    fn dead_key_without_key_char_is_suppressed() {
+        // An unmodified printable key with no `key_char` is a dead /
+        // compose key (it produced no text). It must emit nothing — the
+        // composed character arrives on the next event with key_char set.
+        // Regression: emitting the base label here printed a stray `[`
+        // before an `ê` typed via the circumflex dead key.
+        assert_eq!(keystroke_to_bytes(&ks("x", None, no_mod()), NORMAL), None);
+        assert_eq!(keystroke_to_bytes(&ks("[", None, no_mod()), NORMAL), None);
+        // …but a real keypress carries its text in key_char and is sent.
         assert_eq!(
-            keystroke_to_bytes(&ks("x", None, no_mod()), NORMAL),
-            Some(b"x".to_vec())
+            keystroke_to_bytes(&ks("[", Some("["), no_mod()), NORMAL),
+            Some(b"[".to_vec())
+        );
+        // ctrl/alt fallbacks are unaffected (they don't rely on key_char).
+        assert_eq!(
+            keystroke_to_bytes(&ks("x", None, alt()), NORMAL),
+            Some(vec![0x1b, b'x'])
         );
     }
 
