@@ -375,7 +375,9 @@ tab-atelier set-context --tab <id> "labelling a worker I just spawned"
 tab-atelier set-context --clear
 ```
 
-The text is capped at 2000 chars; a whitespace-only value clears it. Like `set-status`, it's safe to call unconditionally — it errors (non-fatally) only when run outside a tab. To have Claude keep it current, point a `UserPromptSubmit` (or `SessionStart`) hook at it, or just ask Claude to run it when it picks up a task.
+The text is capped at 2000 chars; a whitespace-only value clears it. Like `set-status`, it's safe to call unconditionally — it's a silent no-op (exit 0) when the `TAB_ATELIER_API_*` env isn't present, so a shell rc file or Claude Code hook calling it outside a tab does nothing.
+
+Both `.deb`s wire this automatically: the shipped `/etc/claude-code/managed-settings.json` routes Claude Code's `UserPromptSubmit` through `tab-atelier claude-hook user-prompt` (desktop) / `tab-atelier-headless claude-hook user-prompt` (headless), which stamps the prompt as the tab context, and `SessionEnd` clears it — so any `claude` running in a tab labels its tab with no per-user setup. To do it yourself instead, point a `UserPromptSubmit` hook in `~/.claude/settings.json` at `set-context`, or just ask Claude to run it when it picks up a task.
 
 ### Auto-resume on restart
 

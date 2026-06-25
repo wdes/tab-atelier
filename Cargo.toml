@@ -268,6 +268,12 @@ assets = [
     # install. Listed in `conf-files` below so dpkg treats local
     # edits the policy-correct way on upgrade.
     ["assets/preferences.default.json", "/etc/tab-atelier/preferences.json", "644"],
+    # System-wide Claude Code hooks — same mechanism as the headless
+    # deb (see its comment), but routed through the desktop `tab-atelier`
+    # binary since the two debs conflict and only one is installed. Lets
+    # `claude` track agent state + set the per-tab hover context out of
+    # the box without each user editing ~/.claude/settings.json.
+    ["assets/claude-code-managed-settings.desktop.json", "/etc/claude-code/managed-settings.json", "644"],
     ["README.md", "/usr/share/doc/tab-atelier/", "644"],
     ["LICENSE", "/usr/share/doc/tab-atelier/", "644"],
 ]
@@ -276,8 +282,12 @@ assets = [
 # both we and they changed the file. The autostart .desktop entry
 # above is deliberately NOT a conffile — admins shouldn't be editing
 # it. `preferences.json` IS, so admins can tune defaults and keep
-# those edits across upgrades.
-conf-files = ["/etc/tab-atelier/preferences.json"]
+# those edits across upgrades. The Claude Code system hooks live in a
+# different /etc subdir; making it a conffile means user edits survive.
+conf-files = [
+    "/etc/tab-atelier/preferences.json",
+    "/etc/claude-code/managed-settings.json",
+]
 
 # Headless variant — produces tab-atelier-headless_<version>.deb.
 # Built with `cargo deb -p tab-atelier --variant headless`. Uses

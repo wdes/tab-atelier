@@ -1,0 +1,61 @@
+{
+  "_comment": "System-wide Claude Code hooks shipped by tab-atelier (desktop). Read by `claude` for every user on this box; tab-atelier's claude-hook subcommand pipes the event through to set-status / set-context (env-driven: needs TAB_ATELIER_API_URL/TOKEN/_TAB_ID exported into the PTY — tab-atelier does this automatically). UserPromptSubmit also labels the tab with the prompt (hover the tab name to see it); session-end clears it. Hooks fail silently if the env isn't set so a `claude` run outside any tab is unaffected. Identical to the headless deb's file except the binary name (the two debs conflict, so only one ships this path).",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "tab-atelier claude-hook session-start" }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "tab-atelier claude-hook user-prompt" }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "tab-atelier claude-hook pre-tool" }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "tab-atelier claude-hook post-tool" }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "tab-atelier claude-hook notification" }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "tab-atelier claude-hook stop" }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "tab-atelier claude-hook session-end" }
+        ]
+      }
+    ]
+  }
+}

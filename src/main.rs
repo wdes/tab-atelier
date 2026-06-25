@@ -35,6 +35,15 @@ fn main() {
                 let rest: Vec<String> = std::env::args().skip(2).collect();
                 std::process::exit(cli::set_context::run(&rest));
             }
+            "claude-hook" => {
+                // Bridge a Claude Code hook event to set-status /
+                // set-context. The desktop deb ships a managed-settings
+                // pointing `claude` at `tab-atelier claude-hook <event>`
+                // so the LED + tab context track agent state out of the
+                // box (the headless deb routes to its own binary).
+                let rest: Vec<String> = std::env::args().skip(2).collect();
+                std::process::exit(cli::claude_hook::run(&rest));
+            }
             "dispatch" => {
                 // Hand work to another tab's agent (or a fresh one) and
                 // optionally wait for it to finish and report back.

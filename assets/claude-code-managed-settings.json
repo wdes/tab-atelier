@@ -1,11 +1,19 @@
 {
-  "_comment": "System-wide Claude Code hooks shipped by tab-atelier-headless. Read by `claude` for every user on this box; tab-atelier-headless's claude-hook subcommand pipes the event through to set-status (env-driven: needs TAB_ATELIER_API_URL/TOKEN/_TAB_ID exported into the PTY — tab-atelier does this automatically). Hooks fail silently if the env isn't set so a `claude` run outside any tab is unaffected.",
+  "_comment": "System-wide Claude Code hooks shipped by tab-atelier-headless. Read by `claude` for every user on this box; tab-atelier-headless's claude-hook subcommand pipes the event through to set-status / set-context (env-driven: needs TAB_ATELIER_API_URL/TOKEN/_TAB_ID exported into the PTY — tab-atelier does this automatically). UserPromptSubmit also labels the tab with the prompt (hover the tab name to see it); session-end clears it. Hooks fail silently if the env isn't set so a `claude` run outside any tab is unaffected.",
   "hooks": {
     "SessionStart": [
       {
         "matcher": "*",
         "hooks": [
           { "type": "command", "command": "tab-atelier-headless claude-hook session-start" }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "tab-atelier-headless claude-hook user-prompt" }
         ]
       }
     ],
