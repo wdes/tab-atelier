@@ -309,6 +309,28 @@ struct CachedFrame {
     lines: Vec<Option<RawLine>>,
 }
 
+impl CachedFrame {
+    /// Whether this cached frame may be reused for the current grid
+    /// state. ALL of the geometry keys must match — and crucially
+    /// `history_size`: a live-screen scroll grows the scrollback while
+    /// `display_offset` stays 0 and only the new bottom row is damaged,
+    /// so reusing the index-keyed cache then serves stale `RawLine`s
+    /// (the inverse-red bg bleeding under later-drawn content). Keep
+    /// every field in this check; dropping one reintroduces that bug.
+    const fn reusable_for(
+        &self,
+        display_offset: i32,
+        visible_cols: usize,
+        visible_lines: usize,
+        history_size: usize,
+    ) -> bool {
+        self.display_offset == display_offset
+            && self.visible_cols == visible_cols
+            && self.visible_lines == visible_lines
+            && self.history_size == history_size
+    }
+}
+
 /// Encode a scroll-wheel gesture as the byte sequence a TUI listening
 /// in `ALTERNATE_SCROLL` mode (vim/less/htop on alt-screen) wants to see.
 /// One `\x1bOA` per line for scroll-back, one `\x1bOB` per line for
@@ -1610,12 +1632,7 @@ impl Element for TerminalElement {
             // populated and skip the rebuild entirely.
             let prev = self.prev_frame.borrow_mut().take();
             let mut working: Vec<Option<RawLine>> = match prev {
-                Some(p)
-                    if p.display_offset == display_offset
-                        && p.visible_cols == visible_cols
-                        && p.visible_lines == visible_lines
-                        && p.history_size == history_size =>
-                {
+                Some(p) if p.reusable_for(display_offset, visible_cols, visible_lines, history_size) => {
                     let mut v = p.lines;
                     if force_full {
                         v.fill_with(|| None);
@@ -2210,6 +2227,32 @@ mod tests {
 
     fn default_editor() -> Rc<RefCell<Option<String>>> {
         Rc::new(RefCell::new(None))
+    }
+
+    /// Guards the stale-bg-bleed fix: the per-line frame cache must be
+    /// reused ONLY when geometry AND scrollback length match. A
+    /// live-screen scroll grows `history_size` while `display_offset`
+    /// stays 0 (alacritty damages only the new bottom row), so omitting
+    /// `history_size` from the key serves stale `RawLine`s and an old
+    /// inverse-red row bleeds under whatever is drawn there next.
+    #[test]
+    fn cached_frame_reuse_requires_history_size_match() {
+        let frame = CachedFrame {
+            display_offset: 0,
+            visible_cols: 80,
+            visible_lines: 24,
+            history_size: 100,
+            lines: Vec::new(),
+        };
+        // Identical state → reusable.
+        assert!(frame.reusable_for(0, 80, 24, 100));
+        // A scroll (history grew, display_offset still 0) → NOT reusable.
+        // This is the exact case the bug missed.
+        assert!(!frame.reusable_for(0, 80, 24, 101));
+        // Each other geometry key still invalidates too.
+        assert!(!frame.reusable_for(1, 80, 24, 100), "display_offset change");
+        assert!(!frame.reusable_for(0, 100, 24, 100), "cols change (resize)");
+        assert!(!frame.reusable_for(0, 80, 50, 100), "lines change (resize)");
     }
 
     #[gpui::test]
