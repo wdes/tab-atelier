@@ -1646,8 +1646,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
         }
         ("DELETE", p)
             if p.starts_with("/tabs/")
-                && (!p[6..].contains('/')
-                    || (p[6..].starts_with("by-id/") && p[6..].matches('/').count() == 1)) =>
+                && (!p[6..].contains('/') || (p[6..].starts_with("by-id/") && p[6..].matches('/').count() == 1)) =>
         {
             // Accepts `/tabs/<idx>` and `/tabs/by-id/<uuid>` — the UUID is
             // the stable handle (index drifts as tabs open/close).
@@ -3275,7 +3274,7 @@ mod tests {
             &format!("DELETE /tabs/99 HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
         );
         assert_eq!(status_code(&resp), 404);
-        assert!(body(&resp).contains("out of range"));
+        assert!(body(&resp).contains("tab not found"));
     }
 
     #[test]
@@ -3286,7 +3285,7 @@ mod tests {
             &format!("DELETE /tabs/abc HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
         );
         assert_eq!(status_code(&resp), 404);
-        assert!(body(&resp).contains("invalid tab index"));
+        assert!(body(&resp).contains("tab not found"));
     }
 
     #[test]
