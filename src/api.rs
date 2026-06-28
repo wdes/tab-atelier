@@ -1225,13 +1225,19 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             // detectable agent session (Claude Code TUI or
             // catbus-agent), and if so, which file is the transcript
             // living in?". 404 when no candidate process is found
-            // under the tab's shell.
-            let idx_str = &p["/tabs/".len()..p.len() - "/catbus".len()];
-            let Ok(idx) = idx_str.parse::<usize>() else {
-                error_json(stream, 404, "invalid tab index");
+            // under the tab's shell. Accepts both `/tabs/<idx>/catbus`
+            // and `/tabs/by-id/<uuid>/catbus` — the UUID is the stable
+            // handle (index drifts as tabs open/close), so API clients
+            // can address a catbus session by its tab UUID directly.
+            let Some((key_raw, is_uuid)) = parse_tab_key(p, "/catbus") else {
+                error_json(stream, 404, "invalid tab key");
                 return;
             };
             let snap = state.lock().unwrap();
+            let Some(idx) = resolve_tab_idx(&snap, key_raw, is_uuid) else {
+                error_json(stream, 404, "tab not found");
+                return;
+            };
             let Some(t) = snap.tabs.get(idx) else {
                 error_json(stream, 404, "tab index out of range");
                 return;
@@ -1259,12 +1265,15 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             // produces a `done` frame or errors out. The mobile
             // client picks up the appended assistant turn via the
             // existing GET messages endpoint on its next poll.
-            let idx_str = &p["/tabs/".len()..p.len() - "/catbus/message".len()];
-            let Ok(idx) = idx_str.parse::<usize>() else {
-                error_json(stream, 404, "invalid tab index");
+            let Some((key_raw, is_uuid)) = parse_tab_key(p, "/catbus/message") else {
+                error_json(stream, 404, "invalid tab key");
                 return;
             };
             let snap = state.lock().unwrap();
+            let Some(idx) = resolve_tab_idx(&snap, key_raw, is_uuid) else {
+                error_json(stream, 404, "tab not found");
+                return;
+            };
             let Some(t) = snap.tabs.get(idx) else {
                 error_json(stream, 404, "tab index out of range");
                 return;
@@ -1308,12 +1317,15 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             // the mobile remote diffs on its end. `?since=N` lets a
             // client skip the first N messages once incremental
             // updates land.
-            let idx_str = &p["/tabs/".len()..p.len() - "/catbus/messages".len()];
-            let Ok(idx) = idx_str.parse::<usize>() else {
-                error_json(stream, 404, "invalid tab index");
+            let Some((key_raw, is_uuid)) = parse_tab_key(p, "/catbus/messages") else {
+                error_json(stream, 404, "invalid tab key");
                 return;
             };
             let snap = state.lock().unwrap();
+            let Some(idx) = resolve_tab_idx(&snap, key_raw, is_uuid) else {
+                error_json(stream, 404, "tab not found");
+                return;
+            };
             let Some(t) = snap.tabs.get(idx) else {
                 error_json(stream, 404, "tab index out of range");
                 return;
@@ -1632,22 +1644,28 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 &extra,
             );
         }
-        ("DELETE", p) if p.starts_with("/tabs/") && !p[6..].contains('/') => {
-            let idx_str = &p[6..];
-            if let Ok(idx) = idx_str.parse::<usize>() {
-                let mut state = state.lock().unwrap();
-                if idx < state.tabs.len() {
-                    info!("API: closing tab {idx}");
-                    state.pending_closes.push(idx);
-                    drop(state);
-                    let body = serde_json::to_string(&serde_json::json!({"closed": idx})).unwrap_or_default();
-                    respond_json(stream, 200, &body);
-                } else {
-                    error_json(stream, 404, "tab index out of range");
-                }
-            } else {
-                error_json(stream, 404, "invalid tab index");
-            }
+        ("DELETE", p)
+            if p.starts_with("/tabs/")
+                && (!p[6..].contains('/')
+                    || (p[6..].starts_with("by-id/") && p[6..].matches('/').count() == 1)) =>
+        {
+            // Accepts `/tabs/<idx>` and `/tabs/by-id/<uuid>` — the UUID is
+            // the stable handle (index drifts as tabs open/close).
+            let Some((key_raw, is_uuid)) = parse_tab_key(p, "") else {
+                error_json(stream, 404, "invalid tab key");
+                return;
+            };
+            let mut state = state.lock().unwrap();
+            let Some(idx) = resolve_tab_idx(&state, key_raw, is_uuid) else {
+                drop(state);
+                error_json(stream, 404, "tab not found");
+                return;
+            };
+            info!("API: closing tab {idx}");
+            state.pending_closes.push(idx);
+            drop(state);
+            let body = serde_json::to_string(&serde_json::json!({"closed": idx})).unwrap_or_default();
+            respond_json(stream, 200, &body);
         }
         ("POST", "/tabs") => {
             // Optional JSON body: `{"cwd": "<path>"}` opens the tab
@@ -4358,6 +4376,38 @@ mod tests {
         let (h, b) = split_response(&raw);
         assert!(h.starts_with("HTTP/1.1 200"), "got: {h}");
         assert_eq!(b, b"hello ro");
+    }
+
+    #[test]
+    fn delete_tab_works_with_by_id_form() {
+        let (port, _state, token) = spawn_server();
+        let raw = request_bytes(
+            port,
+            &format!("DELETE /tabs/by-id/tab-a HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        let (h, b) = split_response(&raw);
+        assert!(h.starts_with("HTTP/1.1 200"), "got: {h}");
+        let parsed: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!(parsed["closed"].as_u64(), Some(0));
+    }
+
+    #[test]
+    fn catbus_metadata_resolves_by_id_form() {
+        // No agent runs under the tab in tests, so the handler reaches
+        // find_session and 404s with "no agent session" — which proves the
+        // by-id form resolved to the tab (a resolution miss says "tab not found").
+        let (port, _state, token) = spawn_server();
+        let raw = request_bytes(
+            port,
+            &format!("GET /tabs/by-id/tab-a/catbus HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        let (h, b) = split_response(&raw);
+        assert!(h.starts_with("HTTP/1.1 404"), "got: {h}");
+        assert!(
+            String::from_utf8_lossy(&b).contains("no agent session"),
+            "body: {}",
+            String::from_utf8_lossy(&b)
+        );
     }
 
     #[test]
