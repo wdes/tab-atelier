@@ -13,6 +13,8 @@ pub(crate) mod api;
 pub(crate) mod api_ws;
 #[cfg(feature = "gui")]
 pub mod app;
+#[cfg(feature = "gui")]
+pub(crate) mod box_drawing;
 #[cfg(feature = "catbus")]
 pub(crate) mod catbus_agent;
 #[cfg(all(target_os = "linux", not(feature = "gui")))]
