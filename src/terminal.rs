@@ -1428,12 +1428,23 @@ struct TermLine {
     /// refcount bump, not a deep `ShapedLine` copy.
     segments: std::rc::Rc<Vec<TermSegment>>,
     bg_runs: Vec<BgRun>,
+    /// Box-drawing cells painted geometrically (see [`crate::box_drawing`]).
+    box_cells: Vec<BoxCell>,
 }
 
 #[derive(Clone)]
 struct BgRun {
     col: usize,
     len: usize,
+    color: Hsla,
+}
+
+/// A box-drawing cell to paint as connecting bars rather than via the
+/// (usually too-narrow, gappy) font glyph. See [`crate::box_drawing`].
+#[derive(Clone)]
+struct BoxCell {
+    col: usize,
+    parts: crate::box_drawing::BoxParts,
     color: Hsla,
 }
 
@@ -1459,6 +1470,7 @@ struct RawLine {
     text: String,
     segments: Vec<RawSegment>,
     bg_runs: Vec<BgRun>,
+    box_cells: Vec<BoxCell>,
 }
 
 impl Element for TerminalElement {
@@ -1659,6 +1671,7 @@ impl Element for TerminalElement {
                 let mut segments: Vec<RawSegment> = Vec::new();
                 let mut cur_seg: Option<RawSegment> = None;
                 let mut bg_runs: Vec<BgRun> = Vec::new();
+                let mut box_cells: Vec<BoxCell> = Vec::new();
 
                 for c in 0..visible_cols {
                     let cell_data = &grid[GridPoint::new(Line(grid_line), Column(c))];
@@ -1836,14 +1849,35 @@ impl Element for TerminalElement {
                     // for any individual glyph the run stays
                     // cell-aligned. Same pattern Zed's terminal_view
                     // uses (see crates/terminal_view/src/terminal_element.rs).
+                    // Box-drawing glyphs from the font are usually narrower
+                    // than the cell, so long `─` runs render dashed and
+                    // column rules drift. Divert the common subset to
+                    // geometric rendering (painted as connecting bars in
+                    // Phase 2) and blank the glyph cell so the gappy font
+                    // glyph isn't drawn underneath. Inverse cells keep the
+                    // glyph (rare, and reverse-video boxes want the swap).
+                    let box_parts = if cell_data.flags.contains(CellFlags::INVERSE) {
+                        None
+                    } else {
+                        crate::box_drawing::parts(ch)
+                    };
+                    if let Some(parts) = box_parts {
+                        box_cells.push(BoxCell {
+                            col: c,
+                            parts,
+                            color: fg,
+                        });
+                    }
+                    let glyph_ch = if box_parts.is_some() { ' ' } else { ch };
+
                     let seg = cur_seg.get_or_insert_with(|| RawSegment {
                         col_start: c,
                         text: String::new(),
                         runs: Vec::new(),
                         cell_span: 1,
                     });
-                    seg.text.push(ch);
-                    let char_len = ch.len_utf8();
+                    seg.text.push(glyph_ch);
+                    let char_len = glyph_ch.len_utf8();
                     let can_merge = seg.runs.last().is_some_and(|last: &TextRun| {
                         last.color == fg
                             && last.font == cell_font
@@ -1872,6 +1906,7 @@ impl Element for TerminalElement {
                     text: full_text,
                     segments,
                     bg_runs,
+                    box_cells,
                 });
             }
 
@@ -1929,6 +1964,7 @@ impl Element for TerminalElement {
                     // Cheap atomic bump — no Vec/ShapedLine deep clone.
                     segments: std::rc::Rc::clone(&cached.segments),
                     bg_runs: raw.bg_runs,
+                    box_cells: raw.box_cells,
                 });
                 // Gather cached URLs without re-running detection.
                 for (start, end, url, is_file) in cached.urls.iter() {
@@ -1996,6 +2032,7 @@ impl Element for TerminalElement {
             result_lines.push(TermLine {
                 segments: shaped_rc,
                 bg_runs: raw.bg_runs,
+                box_cells: raw.box_cells,
             });
         }
 
@@ -2112,6 +2149,24 @@ impl Element for TerminalElement {
                         origin.y + cell.height * line_idx as f32,
                     );
                     let _ = seg.shaped.paint(pos, cell.height, window, cx);
+                }
+            }
+
+            // Paint geometric box-drawing bars. These cells were blanked
+            // in the glyph layer above; drawing them as filled bars that
+            // reach the cell edges makes table rules connect instead of
+            // showing the font's narrower, gappy glyph.
+            let cw = f32::from(cell.width);
+            let chh = f32::from(cell.height);
+            for (line_idx, line) in state.lines.iter().enumerate() {
+                for bc in &line.box_cells {
+                    let cell_x = origin.x + cell.width * bc.col as f32;
+                    let cell_y = origin.y + cell.height * line_idx as f32;
+                    for r in crate::box_drawing::rects(bc.parts, cw, chh) {
+                        let pos = point(cell_x + px(r.x), cell_y + px(r.y));
+                        let sz = size(px(r.w), px(r.h));
+                        window.paint_quad(fill(Bounds::new(pos, sz), bc.color));
+                    }
                 }
             }
 
