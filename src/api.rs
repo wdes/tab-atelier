@@ -314,6 +314,13 @@ pub struct PendingStatusUpdate {
 
 pub struct TabSnapshot {
     pub tabs: Vec<SnapshotTab>,
+    /// The live master API token the auth gate validates against.
+    /// Sourced here (not a per-connection clone) so `POST
+    /// /master-token/reset` can hot-swap it without a daemon restart —
+    /// old links carrying the previous token 401 immediately, the new
+    /// token is persisted to `api.token`, and `tab-atelier token`
+    /// re-reads the file. Initialised at server start.
+    pub master_token: String,
     pub active: usize,
     #[cfg(feature = "energy")]
     pub power: Vec<crate::power::TabPower>,
@@ -973,7 +980,7 @@ fn html_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnapshot>>, token: &str, read_only: bool) {
+fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnapshot>>, _token: &str, read_only: bool) {
     // Owned BufReader around the stream itself — `try_clone` was only used
     // to dodge the read/write borrow on TcpStream, but it doesn't exist on
     // rustls::Stream. Buffering on `&mut S` works for both, and the read
@@ -1171,7 +1178,17 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
     // don't need to re-check; if execution reaches them, this gate
     // has already accepted the request at the right level.
     let mut share_token_authorised = false;
-    if !constant_time_eq(provided_token.as_deref().unwrap_or("").as_bytes(), token.as_bytes()) {
+    // The master token lives on the shared snapshot (not the per-connection
+    // `_token` clone) so `POST /master-token/reset` can hot-swap it. The
+    // non-empty guard means an as-yet-uninitialised master ("") never
+    // authorises a token-less request.
+    let master_token = state.lock().unwrap().master_token.clone();
+    let is_master = !master_token.is_empty()
+        && constant_time_eq(
+            provided_token.as_deref().unwrap_or("").as_bytes(),
+            master_token.as_bytes(),
+        );
+    if !is_master {
         let allowed = if let Some(p) = provided_token.as_deref()
             && let Some(rest) = path.strip_prefix("/tabs/by-id/")
             && let Some((uuid, action)) = rest.split_once('/')
@@ -2337,6 +2354,23 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             drop(state);
             respond_json(stream, 200, &format!(r#"{{"revoked":{revoked}}}"#));
         }
+        ("POST", "/master-token/reset") => {
+            // Hot-swap the master API token: generate a fresh one, persist
+            // it to api.token (so `tab-atelier token` and saved configs
+            // re-read it), and publish it onto the snapshot the auth gate
+            // validates against. Every link / client carrying the OLD
+            // master token 401s on its next request. Master token only
+            // (this path isn't in the share-token allowlist).
+            let new = generate_token();
+            let dir = crate::platform::state_base_dir().join(crate::APP_DIR);
+            let _ = std::fs::create_dir_all(&dir);
+            if let Err(e) = write_private_file(&dir.join("api.token"), new.as_bytes()) {
+                error_json(stream, 500, &format!("could not persist token: {e}"));
+                return;
+            }
+            state.lock().unwrap().master_token.clone_from(&new);
+            respond_json(stream, 200, &format!(r#"{{"token":"{new}"}}"#));
+        }
         ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/bg-color") => {
             // Set or clear the per-tab background color override.
             // Master token only. Body: {"color": "#RRGGBB"} to set,
@@ -2673,6 +2707,12 @@ async fn shutdown_watcher(notify: Arc<tokio::sync::Notify>) {
 }
 
 pub fn start_api_server(state: Arc<Mutex<TabSnapshot>>, token: String, read_only: bool, bind: String) {
+    // Publish the master token onto the shared snapshot the auth gate
+    // reads, BEFORE any connection is served, so it's live-swappable via
+    // POST /master-token/reset without a restart.
+    if let Ok(mut s) = state.lock() {
+        s.master_token.clone_from(&token);
+    }
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
             Ok(rt) => rt,
@@ -2743,6 +2783,12 @@ pub fn start_api_server_tls(
     use rustls::ServerConfig;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     use rustls::server::WebPkiClientVerifier;
+
+    // Same as start_api_server: publish the master token onto the shared
+    // snapshot before serving, so it's live-swappable.
+    if let Ok(mut s) = state.lock() {
+        s.master_token.clone_from(&token);
+    }
 
     let ext_refs: Option<(&std::path::Path, &std::path::Path)> =
         external_cert.as_ref().map(|(c, k)| (c.as_path(), k.as_path()));
@@ -3192,6 +3238,7 @@ mod tests {
             pending_renames: vec![],
             pending_status_updates: vec![],
             cached_response: None,
+            master_token: String::new(),
         }))
     }
 
@@ -3209,6 +3256,8 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let state = test_state();
         let token = "test-secret-token".to_string();
+        // Auth validates against the snapshot's master_token (live-swappable).
+        state.lock().unwrap().master_token = token.clone();
         let s = state.clone();
         let t = token.clone();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
@@ -3591,6 +3640,32 @@ mod tests {
             "GET /tabs/by-id/tab-a/view?token=bad HTTP/1.1\r\nAccept: */*\r\n\r\n",
         );
         assert!(!resp.contains("<!DOCTYPE"), "curl default gets json");
+    }
+
+    #[test]
+    fn master_token_is_hot_swappable() {
+        // The auth gate validates against the snapshot's master_token, so
+        // `POST /master-token/reset` can swap it live. (We mutate the
+        // snapshot directly here instead of hitting the endpoint, which
+        // would write the real api.token file.)
+        let (port, state, master) = spawn_server();
+        let resp = request(
+            port,
+            &format!("GET /tabs HTTP/1.1\r\nAuthorization: Bearer {master}\r\n\r\n"),
+        );
+        assert_eq!(status_code(&resp), 200, "current master works");
+        state.lock().unwrap().master_token = "new-master".into();
+        let resp = request(
+            port,
+            &format!("GET /tabs HTTP/1.1\r\nAuthorization: Bearer {master}\r\n\r\n"),
+        );
+        assert_eq!(status_code(&resp), 401, "old master token revoked after swap");
+        let resp = request(port, "GET /tabs HTTP/1.1\r\nAuthorization: Bearer new-master\r\n\r\n");
+        assert_eq!(status_code(&resp), 200, "new master token works");
+        // An empty master must never authorise a token-less request.
+        state.lock().unwrap().master_token = String::new();
+        let resp = request(port, "GET /tabs HTTP/1.1\r\n\r\n");
+        assert_eq!(status_code(&resp), 401, "empty master rejects token-less request");
     }
 
     #[test]

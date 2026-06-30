@@ -68,3 +68,48 @@ pub fn rotate(_args: &[String]) -> i32 {
         }
     }
 }
+
+/// `tab-atelier reset-master-token` — hot-swap the master API token.
+///
+/// Every client / link carrying the old master token 401s on its next
+/// request; the new token is persisted to `api.token` (so your saved
+/// configs and `tab-atelier token` pick it up). Prints the new token to
+/// stdout. Requires the current master token to authorise the request.
+#[must_use]
+pub fn reset_master(_args: &[String]) -> i32 {
+    let ep = match discover_endpoint() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("reset-master-token: {e}");
+            return 1;
+        }
+    };
+    match agent()
+        .post(format!("{}/master-token/reset", ep.url))
+        .header("Authorization", &format!("Bearer {}", ep.token))
+        .send_empty()
+    {
+        Ok(mut resp) => {
+            let new = resp
+                .body_mut()
+                .read_json::<serde_json::Value>()
+                .ok()
+                .and_then(|v| v.get("token").and_then(serde_json::Value::as_str).map(str::to_owned));
+            new.map_or_else(
+                || {
+                    eprintln!("reset-master-token: unexpected response from daemon");
+                    1
+                },
+                |t| {
+                    println!("{t}");
+                    eprintln!("# master API token reset — old token now 401s, new one written to api.token");
+                    0
+                },
+            )
+        }
+        Err(e) => {
+            eprintln!("reset-master-token: {e}");
+            1
+        }
+    }
+}

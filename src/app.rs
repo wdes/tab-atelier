@@ -741,6 +741,10 @@ impl AppState {
         info!("API server starting on {api_addr} (TLS {api_tls_addr})");
         let api_state = Arc::new(Mutex::new(api::TabSnapshot {
             tabs: Vec::<api::SnapshotTab>::new(),
+            // Set by start_api_server before it serves; an empty master
+            // is rejected by the auth gate's non-empty guard, so the brief
+            // pre-start window can't authorise anyone.
+            master_token: String::new(),
             active: 0,
             #[cfg(feature = "energy")]
             power: Vec::new(),

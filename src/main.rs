@@ -47,6 +47,11 @@ fn main() {
                 let rest: Vec<String> = std::env::args().skip(2).collect();
                 std::process::exit(cli::tokens::rotate(&rest));
             }
+            "reset-master-token" => {
+                // Hot-swap the master API token → old token 401s.
+                let rest: Vec<String> = std::env::args().skip(2).collect();
+                std::process::exit(cli::tokens::reset_master(&rest));
+            }
             "claude-hook" => {
                 // Bridge a Claude Code hook event to set-status /
                 // set-context. The desktop deb ships a managed-settings
@@ -113,6 +118,7 @@ fn main() {
                      tab-atelier set-context …    label this tab with its PR/task (hover tooltip)\n  \
                      tab-atelier token            print the master API token (for API calls)\n  \
                      tab-atelier rotate-tokens    revoke all share tokens (old share links 401)\n  \
+                     tab-atelier reset-master-token  rotate the master API token (old token 401s)\n  \
                      tab-atelier remote …         attach to a remote tab-atelier-headless\n  \
                      tab-atelier brain [--once]   watchdog tab that auto-recovers stuck agents\n  \
                      tab-atelier dispatch …       hand work to another tab / a new agent\n  \
