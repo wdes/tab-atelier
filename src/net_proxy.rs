@@ -59,6 +59,46 @@ impl ProxyHandle {
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
     }
+
+    /// The proxy env vars to inject into an allowlisted tab's shell. See
+    /// [`proxy_env_vars`].
+    #[must_use]
+    pub fn env_vars(&self) -> Vec<(String, String)> {
+        proxy_env_vars(&self.url())
+    }
+}
+
+/// Build the standard proxy environment for a tab routed through `url`
+/// (`http://127.0.0.1:<port>`).
+///
+/// Encodes the proxy-env research:
+/// - both lower- and UPPER-case for `https`/`all`/`http` so Node (undici —
+///   Claude Code), curl, git, requests and Go tools all pick it up;
+/// - `NO_PROXY` whitelists loopback so the in-tab calls to the local
+///   tab-atelier API (`http://127.0.0.1:<api>`) don't get filtered (they'd
+///   otherwise be denied — 127.0.0.1 isn't in any allow-set);
+/// - `http_proxy` points at the CONNECT-only proxy too, so plain-HTTP fails
+///   closed (405) rather than leaking past the allowlist.
+///
+/// Note `curl` ignores UPPER-case `HTTP_PROXY` by design (httpoxy); the
+/// lower-case `http_proxy` is the one it honours. Setting both is harmless
+/// here (we're not a CGI) and maximises coverage.
+#[must_use]
+pub fn proxy_env_vars(url: &str) -> Vec<(String, String)> {
+    const NO_PROXY: &str = "localhost,127.0.0.1,::1";
+    [
+        ("HTTPS_PROXY", url),
+        ("https_proxy", url),
+        ("ALL_PROXY", url),
+        ("all_proxy", url),
+        ("HTTP_PROXY", url),
+        ("http_proxy", url),
+        ("NO_PROXY", NO_PROXY),
+        ("no_proxy", NO_PROXY),
+    ]
+    .iter()
+    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+    .collect()
 }
 
 impl Drop for ProxyHandle {
@@ -284,5 +324,30 @@ mod tests {
     fn url_is_loopback_http() {
         let proxy = spawn(AllowSet::default()).unwrap();
         assert!(proxy.url().starts_with("http://127.0.0.1:"));
+    }
+
+    #[test]
+    fn proxy_env_covers_cases_and_loopback_bypass() {
+        let env = proxy_env_vars("http://127.0.0.1:9");
+        let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        // Both cases present for the proxy vars so every toolchain sees it.
+        for k in [
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+        ] {
+            assert_eq!(get(k), Some("http://127.0.0.1:9"), "missing {k}");
+        }
+        // Loopback bypass is mandatory — the in-tab API lives on 127.0.0.1.
+        for k in ["NO_PROXY", "no_proxy"] {
+            let v = get(k).unwrap();
+            assert!(
+                v.contains("127.0.0.1") && v.contains("localhost") && v.contains("::1"),
+                "{k} = {v}"
+            );
+        }
     }
 }
