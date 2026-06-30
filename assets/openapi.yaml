@@ -178,6 +178,35 @@ paths:
       responses:
         "200": { description: OK }
         "401": { $ref: "#/components/responses/Unauthorized" }
+  /tabs/by-id/{id}/net:
+    post:
+      tags: [tabs]
+      summary: Turn the tab's internet off/on (bubblewrap netns jail)
+      description: >
+        Cut or restore a tab's network. `disabled:true` respawns the tab's
+        shell inside a bubblewrap network namespace (loopback only);
+        `disabled:false` respawns it without the jail. Omitting the body
+        toggles. The shell restarts to apply, so the change is not
+        instantaneous. Turning net off when bubblewrap (`bwrap`) isn't
+        installed on the host is refused with 412.
+      parameters: [ { $ref: "#/components/parameters/id" } ]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: { disabled: { type: boolean } }
+      responses:
+        "200":
+          description: New state
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { net_disabled: { type: boolean } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Tab not found }
+        "412": { description: bubblewrap (bwrap) is not installed }
   /tabs/by-id/{id}/view:
     get:
       tags: [tabs]

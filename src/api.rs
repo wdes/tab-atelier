@@ -177,6 +177,11 @@ struct TabInfo {
     /// currently watching this tab. Omitted when zero.
     #[serde(skip_serializing_if = "is_zero")]
     viewers: usize,
+    /// Whether the tab has no internet (its shell runs inside a
+    /// bubblewrap network-isolated sandbox). Omitted when false so
+    /// existing consumers don't see a new field unless net is off.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    net_disabled: bool,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -310,6 +315,11 @@ pub struct SnapshotTab {
     /// `None` for tabs that pre-date PTY-tap wiring — endpoint
     /// responds 404 in that case.
     pub pty_ring: Option<std::sync::Arc<std::sync::Mutex<crate::pty_ring::PtyRing>>>,
+    /// Whether the tab's shell runs with no internet (bubblewrap
+    /// network-isolated). Mirrored from the runtime tab so `/tabs` and
+    /// the net toggle endpoint can report it. Desktop GUI toggles it via
+    /// the right-click menu; headless via `net-off`/`net-on`.
+    pub net_disabled: bool,
 }
 
 impl crate::schedule::LockState for SnapshotTab {
@@ -361,6 +371,12 @@ pub struct TabSnapshot {
     /// the new lock state too (snapshot mutation alone would be lost
     /// on the next persist tick).
     pub pending_lock_changes: Vec<(String, bool)>,
+    /// (`tab_id`, `net_disabled`) flips queued by
+    /// `POST /tabs/by-id/{id}/net` — drained by the main loop, which sets
+    /// the flag on the runtime tab / `HeadlessTab` and respawns the PTY so
+    /// the bubblewrap netns jail takes effect. Same drain shape as
+    /// `pending_lock_changes`.
+    pub pending_net_changes: Vec<(String, bool)>,
     /// (`tab_id`, color-or-None) queued by `POST /tabs/by-id/{id}/bg-color`.
     /// `None` clears the per-tab override → tab falls back to the
     /// global default. Same drain shape as `pending_lock_changes`.
@@ -1361,6 +1377,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                     schedule_rule: t.schedule.as_ref().map(|s| s.rule.clone()),
                     schedule_tz: t.schedule.as_ref().map(|s| s.tz.clone()),
                     context: t.context.clone(),
+                    net_disabled: t.net_disabled,
                 })
                 .collect();
             #[cfg(feature = "energy")]
@@ -2318,6 +2335,43 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             let body = serde_json::to_string(&serde_json::json!({"locked": new_val})).unwrap_or_default();
             respond_json(stream, 200, &body);
         }
+        ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/net") => {
+            // Turn the tab's internet off / on (bubblewrap net-namespace
+            // jail). Master token only (share-token gate above does not
+            // allow `/net`). Body `{"disabled": true|false}`; absent →
+            // toggle. The shell respawns to apply, so the change isn't
+            // instantaneous — the runtime tab picks it up next tick.
+            let inner = &p["/tabs/by-id/".len()..p.len() - "/net".len()];
+            let disabled_body: Option<bool> = if body_bytes.is_empty() {
+                None
+            } else {
+                serde_json::from_slice::<serde_json::Value>(&body_bytes)
+                    .ok()
+                    .and_then(|v| v.get("disabled").and_then(serde_json::Value::as_bool))
+            };
+            let mut state = state.lock().unwrap();
+            let Some(idx) = state.tabs.iter().position(|t| t.id == inner) else {
+                drop(state);
+                error_json(stream, 404, "tab not found");
+                return;
+            };
+            let tab_id = state.tabs[idx].id.clone();
+            let new_val = disabled_body.unwrap_or(!state.tabs[idx].net_disabled);
+            // Refuse turning net OFF when bubblewrap isn't installed —
+            // there's no way to build the netns jail, and silently
+            // leaving the net on would be a lie. Turning net back ON is
+            // always allowed (no bwrap needed to un-jail).
+            if new_val && !crate::bwrap_available() {
+                drop(state);
+                error_json(stream, 412, "bubblewrap (bwrap) is not installed");
+                return;
+            }
+            state.tabs[idx].net_disabled = new_val;
+            state.pending_net_changes.push((tab_id, new_val));
+            drop(state);
+            let body = serde_json::to_string(&serde_json::json!({"net_disabled": new_val})).unwrap_or_default();
+            respond_json(stream, 200, &body);
+        }
         ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/schedule") => {
             // Set or clear the off-hours auto-lock schedule. Master
             // token only — same gate as /lock and /bg-color (the
@@ -3245,6 +3299,7 @@ mod tests {
                     agent_kind: None,
                     viewers: 0,
                     pty_ring: None,
+                    net_disabled: false,
                 },
                 SnapshotTab {
                     id: "tab-b".into(),
@@ -3269,6 +3324,7 @@ mod tests {
                     agent_kind: None,
                     viewers: 0,
                     pty_ring: None,
+                    net_disabled: false,
                 },
             ],
             active: 0,
@@ -3280,6 +3336,7 @@ mod tests {
             pending_activate: None,
             pending_input: vec![],
             pending_lock_changes: vec![],
+            pending_net_changes: vec![],
             pending_bg_color_changes: vec![],
             pending_context_changes: vec![],
             pending_token_rotations: vec![],
@@ -3823,6 +3880,48 @@ mod tests {
             &format!("GET /tabs HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
         );
         assert_eq!(status_code(&resp), 200);
+    }
+
+    #[test]
+    fn net_endpoint_enable_returns_state_and_queues() {
+        // Turning net back ON ({"disabled": false}) never needs bwrap, so
+        // this path is deterministic regardless of the test host. The
+        // endpoint mirrors into the snapshot and queues a drain entry.
+        let (port, state, token) = spawn_server();
+        let body_in = r#"{"disabled":false}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/tab-a/net HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body_in}",
+                body_in.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 200);
+        assert!(
+            body(&resp).contains("\"net_disabled\":false"),
+            "body was {}",
+            body(&resp)
+        );
+        let (tab0_net, queued) = {
+            let s = state.lock().unwrap();
+            (s.tabs[0].net_disabled, s.pending_net_changes.clone())
+        };
+        assert!(!tab0_net);
+        assert_eq!(queued, vec![("tab-a".to_string(), false)]);
+    }
+
+    #[test]
+    fn net_endpoint_unknown_tab_404() {
+        let (port, _state, token) = spawn_server();
+        let body_in = r#"{"disabled":false}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/does-not-exist/net HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body_in}",
+                body_in.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 404);
     }
 
     #[test]

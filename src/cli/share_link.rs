@@ -359,6 +359,79 @@ pub fn unlock(args: &[String]) -> i32 {
     set_lock(args, false, "unlock")
 }
 
+/// Turn a tab's internet off / on by `POST`ing `{"disabled": <bool>}` to
+/// `/tabs/by-id/<uuid>/net`. The daemon respawns the shell inside (or out
+/// of) a bubblewrap netns on the next drain tick, so the change isn't
+/// instantaneous. Turning net off when bubblewrap isn't installed is
+/// refused by the server (HTTP 412).
+fn set_net(args: &[String], disabled: bool, verb: &str) -> i32 {
+    let Some(key) = args.first() else {
+        eprintln!("usage: tab-atelier-headless {verb} <tab-index-or-uuid>");
+        return 2;
+    };
+    let ep = match discover_endpoint() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("{verb}: {e}");
+            return 1;
+        }
+    };
+    let (idx, uuid) = match resolve(&ep, key) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{verb}: {e}");
+            return 1;
+        }
+    };
+    let body = serde_json::json!({"disabled": disabled}).to_string();
+    let mut resp = match agent()
+        .post(format!("{}/tabs/by-id/{uuid}/net", ep.url))
+        .header("Authorization", format!("Bearer {}", ep.token))
+        .header("Content-Type", "application/json")
+        .send(body.as_bytes())
+    {
+        Ok(r) => r,
+        Err(ureq::Error::StatusCode(412)) => {
+            eprintln!("{verb}: bubblewrap (bwrap) is not installed on the daemon host");
+            return 1;
+        }
+        Err(e) => {
+            eprintln!("{verb}: {e}");
+            return 1;
+        }
+    };
+    let actual: bool = resp
+        .body_mut()
+        .read_json::<serde_json::Value>()
+        .ok()
+        .and_then(|v| v.get("net_disabled").and_then(serde_json::Value::as_bool))
+        .unwrap_or(disabled);
+    if actual == disabled {
+        println!(
+            "internet {} for tab {idx} (shell respawns)",
+            if disabled { "off" } else { "on" }
+        );
+    } else {
+        eprintln!(
+            "{verb}: server reports tab {idx} internet is {} (expected {})",
+            if actual { "off" } else { "on" },
+            if disabled { "off" } else { "on" }
+        );
+        return 1;
+    }
+    0
+}
+
+#[must_use]
+pub fn net_off(args: &[String]) -> i32 {
+    set_net(args, true, "net-off")
+}
+
+#[must_use]
+pub fn net_on(args: &[String]) -> i32 {
+    set_net(args, false, "net-on")
+}
+
 #[must_use]
 pub fn send_input(args: &[String]) -> i32 {
     if args.len() < 2 {
