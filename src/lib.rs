@@ -27,6 +27,7 @@ pub mod headless;
 pub mod http3;
 pub(crate) mod locale;
 pub mod net_policy;
+pub mod net_proxy;
 pub(crate) mod platform;
 #[cfg(feature = "energy")]
 pub(crate) mod power;
