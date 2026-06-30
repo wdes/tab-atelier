@@ -1113,6 +1113,9 @@ impl AppState {
                 viewers: pty_ring.lock().map_or(0, |r| r.viewer_count()),
                 pty_ring: Some(pty_ring),
                 net_disabled: ts.net_disabled,
+                // Connection metering is wired on the headless service;
+                // the desktop GUI reports 0 for now.
+                connections: 0,
             });
         }
 
