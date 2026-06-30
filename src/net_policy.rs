@@ -300,6 +300,31 @@ pub enum NetMode {
     Allowlist,
 }
 
+/// The raw allowlist inputs for a tab (presets + custom entries).
+///
+/// Carried together through the spawn paths so the param lists don't
+/// balloon. Flatten to the resolved [`AllowSet`] with [`Self::to_allow_set`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AllowConfig {
+    pub presets: Vec<Preset>,
+    pub domains: Vec<String>,
+    pub cidrs: Vec<String>,
+}
+
+impl AllowConfig {
+    /// No presets and no custom entries ⇒ the tab is not in allowlist mode.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.presets.is_empty() && self.domains.is_empty() && self.cidrs.is_empty()
+    }
+
+    /// Resolve to the match-set the proxy / nftables consume.
+    #[must_use]
+    pub fn to_allow_set(&self) -> AllowSet {
+        AllowSet::build(&self.presets, &self.domains, &self.cidrs)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

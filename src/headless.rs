@@ -124,6 +124,16 @@ struct HeadlessTab {
     /// When true the shell runs inside a bubblewrap netns (no internet).
     /// Persisted; applied on (re)spawn.
     net_disabled: bool,
+    /// Allowlist-mode config (mutually exclusive with `net_disabled`).
+    /// Persisted; applied on (re)spawn by launching `net_proxy` and
+    /// injecting its env. Empty ⇒ not in allowlist mode.
+    net_allow: crate::net_policy::AllowConfig,
+    /// The per-tab filtering proxy, alive while the tab is in allowlist
+    /// mode. Held purely as a drop-guard: its `Drop` stops the proxy when
+    /// the tab is torn down / respawned (`tabs[idx] = new` drops the old
+    /// `HeadlessTab`). `None` outside allowlist mode.
+    #[allow(dead_code)]
+    net_proxy: Option<crate::net_proxy::ProxyHandle>,
     /// Free-text context the in-tab agent set via `set-context`.
     /// In-memory only (not persisted); reflected on `/tabs`.
     context: Option<String>,
@@ -320,6 +330,7 @@ fn spawn_pty_tab(
     pty_cols: usize,
     pty_rows: usize,
     net_disabled: bool,
+    net_allow: crate::net_policy::AllowConfig,
 ) -> Option<HeadlessTab> {
     let ws = WindowSize {
         num_lines: pty_rows as u16,
@@ -351,6 +362,31 @@ fn spawn_pty_tab(
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| r"C:\Windows\System32\cmd.exe".to_string());
+    // Allowlist mode: launch the per-tab filtering proxy and route the
+    // shell's HTTP(S) traffic through it via proxy env vars (injected for
+    // both the clear-env and inherit-env branches below by extending
+    // `extra_env`). Cooperative on its own; the privileged nftables path
+    // hard-enforces. Skipped when net is fully off — an airgapped tab has
+    // nothing for the proxy to reach. A proxy-spawn failure logs and falls
+    // back to no proxy rather than killing the tab.
+    let mut extra_env = extra_env;
+    let net_proxy = if !net_disabled && !net_allow.is_empty() {
+        match crate::net_proxy::spawn(net_allow.to_allow_set()) {
+            Ok(handle) => {
+                for (k, v) in handle.env_vars() {
+                    extra_env.insert(k, v);
+                }
+                Some(handle)
+            }
+            Err(e) => {
+                warn!("headless: net proxy spawn failed for '{name}': {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let (env_map, prog, args): (HashMap<String, String>, String, Vec<String>) = if crate::clear_env() {
         // Cleared-env mode: spawn the shell through `env -i` so it
         // inherits NOTHING from the daemon — only the curated minimal
@@ -463,6 +499,8 @@ fn spawn_pty_tab(
         schedule,
         bg_color,
         net_disabled,
+        net_allow,
+        net_proxy,
         context: None,
         pending_agent_resume,
         colors_enabled,
@@ -588,6 +626,7 @@ pub fn run() -> std::io::Result<()> {
                 pty_cols,
                 pty_rows,
                 ts.net_disabled,
+                ts.allow_config(),
             ) {
                 t.limits = ts.limits.clone();
                 #[cfg(target_os = "linux")]
@@ -633,6 +672,7 @@ pub fn run() -> std::io::Result<()> {
             pty_cols,
             pty_rows,
             false,
+            crate::net_policy::AllowConfig::default(),
         ) {
             // Fresh default tab — no per-tab overrides, so just the
             // global default ceilings.
@@ -1013,6 +1053,9 @@ fn persist(
             share_token_ro: tab.share_token_ro.clone(),
             locked: tab.locked,
             net_disabled: tab.net_disabled,
+            net_allow_presets: tab.net_allow.presets.clone(),
+            net_allow_domains: tab.net_allow.domains.clone(),
+            net_allow_cidrs: tab.net_allow.cidrs.clone(),
             schedule: tab.schedule.clone(),
             bg_color: tab.bg_color.clone(),
             limits: tab.limits.clone(),
@@ -1174,6 +1217,7 @@ fn drain_pending(
         let locked = tabs[idx].locked;
         let schedule = tabs[idx].schedule.clone();
         let bg = tabs[idx].bg_color.clone();
+        let net_allow = tabs[idx].net_allow.clone();
         tabs[idx].shutdown();
         if let Some(mut t) = spawn_pty_tab(
             id,
@@ -1196,6 +1240,7 @@ fn drain_pending(
             pty_cols,
             pty_rows,
             disabled,
+            net_allow,
         ) {
             #[cfg(target_os = "linux")]
             crate::cgroup::apply(&t.id, t.pid, default_limits);
@@ -1400,6 +1445,7 @@ fn drain_pending(
             pty_cols,
             pty_rows,
             false,
+            crate::net_policy::AllowConfig::default(),
         ) {
             // API-created tab — global default ceilings (no per-tab
             // overrides exist until one is set).
