@@ -226,6 +226,8 @@ Bind addresses for both listeners are configurable in preferences (`api_addr`, `
 
 Auth errors are content-negotiated: a browser (`Accept: text/html`) opening a revoked share link gets a self-contained 401 page (inline CSS + SVG, no external resources); everything else gets `{"error":…}` JSON.
 
+An **OpenAPI 3.1 spec** describes the API: served live (public, no token) at `GET /openapi.yaml` and shipped in the `.deb` at `/usr/share/doc/tab-atelier{,-headless}/openapi.yaml` — point Swagger UI / `openapi-generator` at it.
+
 ### Token CLI
 
 So you can use the API and manage share access without hunting for the `api.token` state file:

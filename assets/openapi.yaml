@@ -1,0 +1,289 @@
+openapi: 3.1.0
+info:
+  title: tab-atelier local API
+  # The `version` line is rewritten to the running build's version when
+  # served from `GET /openapi.yaml`; the shipped file carries 0.0.0.
+  version: 0.0.0
+  description: >
+    Local HTTP API of tab-atelier / tab-atelier-headless. Exposes the tab
+    list, scrollback, input, agent state, share-link management and token
+    rotation. Served on the loopback/LAN bind addresses configured in
+    preferences (`api_addr`, `api_tls_addr`).
+  license:
+    name: MPL-2.0
+    url: https://mozilla.org/MPL/2.0/
+servers:
+  - url: http://127.0.0.1:7890
+    description: HTTP listener (default api_addr)
+  - url: https://127.0.0.1:7891
+    description: TLS listener (self-signed by default; api_tls_addr)
+security:
+  - bearerAuth: []
+  - shareToken: []
+tags:
+  - name: tabs
+    description: Tab list, I/O and per-tab state
+  - name: tokens
+    description: Master token + share-link token management
+paths:
+  /tabs:
+    get:
+      tags: [tabs]
+      summary: List tabs
+      description: cwd, name, output preview, agent state, viewers, watts/cpu/uptime.
+      responses:
+        "200":
+          description: Tab list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tabs:
+                    type: array
+                    items: { $ref: "#/components/schemas/Tab" }
+                  active: { type: integer }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      tags: [tabs]
+      summary: Create a tab
+      responses:
+        "200":
+          description: Creation queued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { queued: { type: string, example: new } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /tabs/{idx}/output:
+    get:
+      tags: [tabs]
+      summary: Tab scrollback
+      parameters:
+        - $ref: "#/components/parameters/idx"
+        - name: since
+          in: query
+          schema: { type: integer }
+          description: Return only bytes after this offset (delta patching).
+        - name: crc
+          in: query
+          schema: { type: string }
+      responses:
+        "200": { description: Scrollback text, content: { text/plain: {} } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /tabs/{idx}/input:
+    post:
+      tags: [tabs]
+      summary: Send raw bytes to the tab's PTY
+      requestBody:
+        required: true
+        content:
+          application/octet-stream: { schema: { type: string, format: binary } }
+      responses:
+        "200": { description: Queued }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "423": { description: Tab is locked }
+  /tabs/{idx}/activate:
+    post:
+      tags: [tabs]
+      summary: Switch to a tab
+      parameters: [ { $ref: "#/components/parameters/idx" } ]
+      responses:
+        "200": { description: OK }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /tabs/{idx}/rename:
+    post:
+      tags: [tabs]
+      summary: Rename a tab
+      parameters: [ { $ref: "#/components/parameters/idx" } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [name], properties: { name: { type: string } } }
+      responses:
+        "200": { description: Renamed }
+        "400": { description: Empty name }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /tabs/{idx}:
+    delete:
+      tags: [tabs]
+      summary: Close a tab
+      parameters: [ { $ref: "#/components/parameters/idx" } ]
+      responses:
+        "200": { description: Closed }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /tabs/by-id/{id}/status:
+    post:
+      tags: [tabs]
+      summary: Publish agent state (drives the desktop LED)
+      parameters: [ { $ref: "#/components/parameters/id" } ]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                state: { type: string, enum: [thinking, waiting, error, idle] }
+                label: { type: string }
+                sessionId: { type: string }
+                agentKind: { type: string }
+                planMode: { type: boolean }
+      responses:
+        "200": { description: OK }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /tabs/by-id/{id}/context:
+    post:
+      tags: [tabs]
+      summary: Set/clear the tab context label (PR/task)
+      parameters: [ { $ref: "#/components/parameters/id" } ]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: { context: { type: [string, "null"], maxLength: 2000 } }
+      responses:
+        "200": { description: OK }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /tabs/by-id/{id}/bg-color:
+    post:
+      tags: [tabs]
+      summary: Set/clear the per-tab background colour
+      parameters: [ { $ref: "#/components/parameters/id" } ]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: { color: { type: [string, "null"], example: "#002451" } }
+      responses:
+        "200": { description: OK }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /tabs/by-id/{id}/schedule:
+    post:
+      tags: [tabs]
+      summary: Off-hours auto-lock (OSM opening_hours rule + IANA tz)
+      parameters: [ { $ref: "#/components/parameters/id" } ]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                rule: { type: [string, "null"], example: "Mo-Fr 09:00-18:00" }
+                tz: { type: string, example: "Europe/Paris" }
+      responses:
+        "200": { description: OK }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /tabs/by-id/{id}/view:
+    get:
+      tags: [tabs]
+      summary: HTML share-link viewer (xterm.js)
+      description: >
+        Browser-facing terminal viewer. Authenticate with `?token=<share or
+        master token>` (add `&ro=1` for a read-only link). A revoked or
+        invalid token returns a 401 — an HTML page for browsers, JSON
+        otherwise (content-negotiated on `Accept`).
+      parameters:
+        - $ref: "#/components/parameters/id"
+        - name: token
+          in: query
+          schema: { type: string }
+        - name: ro
+          in: query
+          schema: { type: integer, enum: [1] }
+      responses:
+        "200": { description: HTML viewer, content: { text/html: {} } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /tabs/rotate-tokens:
+    post:
+      tags: [tokens]
+      summary: Revoke all per-tab share tokens
+      description: >
+        Clears every tab's share_token_rw/ro — all outstanding share links
+        401 immediately; a fresh token is minted on the next share. The
+        master API token is untouched. Master token only.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Revoked
+          content:
+            application/json:
+              schema: { type: object, properties: { revoked: { type: integer } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /master-token/reset:
+    post:
+      tags: [tokens]
+      summary: Hot-swap the master API token
+      description: >
+        Generates a fresh master token, persists it to api.token, and
+        publishes it live — every client/link carrying the OLD master token
+        401s on its next request, no daemon restart. Master token only.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: New token
+          content:
+            application/json:
+              schema: { type: object, properties: { token: { type: string } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "500": { description: Could not persist token }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Master API token (`tab-atelier token`) or, on /tabs/by-id/*, a per-tab share token.
+    shareToken:
+      type: apiKey
+      in: query
+      name: token
+      description: Per-tab share token (or master token) as a query parameter — used by share links.
+  parameters:
+    idx:
+      name: idx
+      in: path
+      required: true
+      schema: { type: integer }
+      description: Tab index. Most by-index routes also accept the UUID form under /tabs/by-id/{id}/…
+    id:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+      description: Stable per-tab UUID.
+  responses:
+    Unauthorized:
+      description: Invalid or missing token. HTML page for browsers (Accept text/html), JSON otherwise.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Forbidden:
+      description: Share token is read-only.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+  schemas:
+    Error:
+      type: object
+      properties: { error: { type: string } }
+    Tab:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        index: { type: integer }
+        name: { type: string }
+        cwd: { type: [string, "null"] }
+        active: { type: boolean }
+        locked: { type: boolean }
+        lock_reason: { type: [string, "null"], enum: [manual, schedule, null] }
+        agent_state: { type: [string, "null"], enum: [thinking, waiting, error, null] }
+        agent_kind: { type: [string, "null"] }
+        context: { type: [string, "null"] }
+        viewers: { type: integer, description: WS viewers currently watching this tab }
+        watts: { type: [number, "null"] }
