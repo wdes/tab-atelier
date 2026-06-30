@@ -219,8 +219,25 @@ Selected routes:
 | `POST` | `/tabs/{idx}/files?name=…` | Upload bytes into `<cwd>/inbox/<name>` (see [Remote tabs](#remote-tabs)) |
 | `GET` | `/tabs/{idx}/files?path=…` | Download from the tab's `inbox/` or `outbox/` sandbox |
 | `DELETE` | `/tabs/{idx}` | Close a tab |
+| `POST` | `/tabs/rotate-tokens` | Revoke all per-tab share tokens (share links 401) — master only |
+| `POST` | `/master-token/reset` | Hot-swap the master API token (old token 401s) — master only |
 
 Bind addresses for both listeners are configurable in preferences (`api_addr`, `api_tls_addr`); pass `--read-only` to launch a second instance that serves the API but refuses every mutating verb.
+
+Auth errors are content-negotiated: a browser (`Accept: text/html`) opening a revoked share link gets a self-contained 401 page (inline CSS + SVG, no external resources); everything else gets `{"error":…}` JSON.
+
+### Token CLI
+
+So you can use the API and manage share access without hunting for the `api.token` state file:
+
+```sh
+tab-atelier token              # print the master API token (stdout) + URL hint (stderr)
+curl -s "$(tab-atelier token | head -1)" ...   # TOKEN=$(tab-atelier token) is scriptable
+tab-atelier rotate-tokens      # revoke every tab's share tokens → existing share links 401
+tab-atelier reset-master-token # rotate the master token live (no restart) → old token 401s
+```
+
+`/tabs` also reports a `viewers` count per tab (how many web/remote viewers are attached); the headless `tabs` listing shows it as `👁 N`, and the desktop dormant-LED treats a watched tab as "tended".
 
 ## Remote tabs
 
