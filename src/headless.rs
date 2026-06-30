@@ -121,6 +121,9 @@ struct HeadlessTab {
     locked: bool,
     schedule: Option<crate::schedule::TabSchedule>,
     bg_color: Option<String>,
+    /// When true the shell runs inside a bubblewrap netns (no internet).
+    /// Persisted; applied on (re)spawn.
+    net_disabled: bool,
     /// Free-text context the in-tab agent set via `set-context`.
     /// In-memory only (not persisted); reflected on `/tabs`.
     context: Option<String>,
@@ -316,6 +319,7 @@ fn spawn_pty_tab(
     bg_color: Option<String>,
     pty_cols: usize,
     pty_rows: usize,
+    net_disabled: bool,
 ) -> Option<HeadlessTab> {
     let ws = WindowSize {
         num_lines: pty_rows as u16,
@@ -347,7 +351,7 @@ fn spawn_pty_tab(
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| r"C:\Windows\System32\cmd.exe".to_string());
-    let opts = if crate::clear_env() {
+    let (env_map, prog, args): (HashMap<String, String>, String, Vec<String>) = if crate::clear_env() {
         // Cleared-env mode: spawn the shell through `env -i` so it
         // inherits NOTHING from the daemon — only the curated minimal
         // allowlist (PATH/HOME/USER/locale + colours + telemetry opt-out
@@ -355,27 +359,28 @@ fn spawn_pty_tab(
         // choice below for the service account. `Options.env` stays
         // empty because `env -i` discards alacritty's overlaid vars.
         let min_env = crate::minimal_pty_env(colors_enabled, crate::clear_env_user_vars(), &extra_env);
-        let (prog, args) = crate::clear_env_shell_command(&shell_program, false, &min_env);
-        tty::Options {
-            shell: Some(tty::Shell::new(prog, args)),
-            working_directory: cwd.clone(),
-            env: HashMap::new(),
-            ..Default::default()
-        }
+        let (p, a) = crate::clear_env_shell_command(&shell_program, false, &min_env);
+        (HashMap::new(), p, a)
     } else {
         // Inherit the daemon environment, then overlay colours +
-        // telemetry opt-out (pty_env) and the per-tab API vars.
+        // telemetry opt-out (pty_env) and the per-tab API vars. No `-l`:
+        // a login shell would source /etc/profile + ~/.profile, which
+        // under ProtectHome=true can fail noisily for the service account.
         let mut env = pty_env(colors_enabled);
         env.extend(extra_env);
-        tty::Options {
-            // No `-l`: a login shell would source /etc/profile +
-            // ~/.profile, which under ProtectHome=true can fail noisily
-            // for the service account that has no profile files.
-            shell: Some(tty::Shell::new(shell_program, vec![])),
-            working_directory: cwd.clone(),
-            env,
-            ..Default::default()
-        }
+        (env, shell_program, vec![])
+    };
+    // Net-off tabs run their shell inside a bubblewrap netns (no internet).
+    let (prog, args) = if net_disabled {
+        crate::no_internet_command(&prog, &args)
+    } else {
+        (prog, args)
+    };
+    let opts = tty::Options {
+        shell: Some(tty::Shell::new(prog, args)),
+        working_directory: cwd.clone(),
+        env: env_map,
+        ..Default::default()
     };
     let pty = match tty::new(&opts, ws, 0) {
         Ok(p) => p,
@@ -457,6 +462,7 @@ fn spawn_pty_tab(
         locked,
         schedule,
         bg_color,
+        net_disabled,
         context: None,
         pending_agent_resume,
         colors_enabled,
@@ -581,6 +587,7 @@ pub fn run() -> std::io::Result<()> {
                 ts.bg_color.clone(),
                 pty_cols,
                 pty_rows,
+                ts.net_disabled,
             ) {
                 t.limits = ts.limits.clone();
                 #[cfg(target_os = "linux")]
@@ -625,6 +632,7 @@ pub fn run() -> std::io::Result<()> {
             None,
             pty_cols,
             pty_rows,
+            false,
         ) {
             // Fresh default tab — no per-tab overrides, so just the
             // global default ceilings.
@@ -1002,6 +1010,7 @@ fn persist(
             share_token_rw: tab.share_token_rw.clone(),
             share_token_ro: tab.share_token_ro.clone(),
             locked: tab.locked,
+            net_disabled: tab.net_disabled,
             schedule: tab.schedule.clone(),
             bg_color: tab.bg_color.clone(),
             limits: tab.limits.clone(),
@@ -1324,6 +1333,7 @@ fn drain_pending(
             None,
             pty_cols,
             pty_rows,
+            false,
         ) {
             // API-created tab — global default ceilings (no per-tab
             // overrides exist until one is set).
