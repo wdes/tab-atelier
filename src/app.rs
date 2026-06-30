@@ -369,6 +369,13 @@ struct AppState {
     /// CRC32 of the last serialized `tabs.json` content. Skips the write+
     /// rotate when nothing in the tab list changed since last tick.
     last_state_hash: std::cell::Cell<u32>,
+    /// Per-tab active connection count (metering), keyed by tab id. Refreshed
+    /// on a timer from `/proc` (the desktop is unprivileged → connections
+    /// only, no nft byte counts). Side map so the `Tab` struct is untouched.
+    tab_connections: std::cell::RefCell<std::collections::HashMap<String, usize>>,
+    /// Last time `tab_connections` was refreshed (throttled — the /proc scan
+    /// is too heavy for every persist tick).
+    last_conn_meter: std::cell::Cell<Option<std::time::Instant>>,
 }
 
 impl AppState {
@@ -849,6 +856,8 @@ impl AppState {
             hotkey_handle: None,
             last_uptime_save: std::cell::Cell::new(None),
             last_state_hash: std::cell::Cell::new(0),
+            tab_connections: std::cell::RefCell::new(std::collections::HashMap::new()),
+            last_conn_meter: std::cell::Cell::new(None),
         }
     }
 
@@ -1028,6 +1037,19 @@ impl AppState {
                 tab.last_known_cwd = Some(p);
             }
         }
+        // Connection metering (throttled ~5 s — the /proc scan is too heavy
+        // for every 2 s persist tick). Desktop is unprivileged, so it's
+        // connections only (no nft byte counters).
+        #[cfg(target_os = "linux")]
+        if self.last_conn_meter.get().is_none_or(|t| t.elapsed().as_secs() >= 5) {
+            self.last_conn_meter.set(Some(std::time::Instant::now()));
+            let roots: Vec<(String, u32)> = self
+                .tabs
+                .iter()
+                .map(|tab| (tab.id.clone(), tab.view.read(cx).pid()))
+                .collect();
+            *self.tab_connections.borrow_mut() = crate::net_meter::connection_counts(&roots);
+        }
         let tabs: Vec<TabState> = self
             .tabs
             .iter()
@@ -1113,9 +1135,8 @@ impl AppState {
                 viewers: pty_ring.lock().map_or(0, |r| r.viewer_count()),
                 pty_ring: Some(pty_ring),
                 net_disabled: ts.net_disabled,
-                // Connection metering is wired on the headless service;
-                // the desktop GUI reports 0 for now.
-                connections: 0,
+                connections: self.tab_connections.borrow().get(&tab.id).copied().unwrap_or(0),
+                // Desktop is unprivileged → no nft byte counters.
                 tx_bytes: 0,
                 tx_denied_bytes: 0,
             });
@@ -2398,6 +2419,15 @@ impl AppState {
                 }
             }
             stats_lines.push(format!("{}: {}", t.uptime, format_duration(elapsed)));
+            let conns = self
+                .tab_connections
+                .borrow()
+                .get(&self.tabs[stats_idx].id)
+                .copied()
+                .unwrap_or(0);
+            if conns > 0 {
+                stats_lines.push(format!("{}: {conns}", t.connections));
+            }
 
             if !stats_lines.is_empty() {
                 if has_tab_section {
