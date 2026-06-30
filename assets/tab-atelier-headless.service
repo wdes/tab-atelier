@@ -120,10 +120,16 @@ SystemCallArchitectures=native
 # openpty / fork / exec / mmap calls this daemon needs.
 SystemCallFilter=@system-service
 SystemCallFilter=~@clock @cpu-emulation @debug @module @mount @obsolete @privileged @raw-io @reboot @resources @swap @keyring @pkey
-# Re-allow capset (it's in @privileged, dropped above): `setpriv` calls it
-# to strip capabilities from each tab's shell. Gated by NoNewPrivileges +
-# an empty cap set on the tab, so re-allowing the syscall grants nothing.
-SystemCallFilter=capset
+# Re-allow capset + the privilege-DROP syscalls (setuid/setgid/...). They're
+# in @privileged (dropped above), but common interactive tools call them at
+# startup just to SHED privileges — `ping` (iputils), `sudo`, `su`, and our
+# own `setpriv` cap-strip — so blocking the syscall makes them error out
+# ("ping: setuid: Operation not permitted") even when they're not trying to
+# gain anything. Re-allowing the syscalls grants nothing: raising to another
+# uid still needs CAP_SETUID (tabs hold none) and NoNewPrivileges blocks
+# setuid-binary escalation. ICMP itself already works via unprivileged ping
+# sockets (net.ipv4.ping_group_range), so this is purely about the drop.
+SystemCallFilter=capset setuid setgid setgroups setresuid setresgid setreuid setregid setfsuid setfsgid
 SystemCallErrorNumber=EPERM
 
 [Install]
