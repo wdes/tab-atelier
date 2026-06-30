@@ -271,6 +271,28 @@ pub fn redirect_ruleset(nat_table: &str, cgroup_rel: &str, resolver_port: u16) -
     s
 }
 
+/// Install the domain-allowlist table (static CIDRs + dynamic sets). The
+/// resolver fills the dynamic sets. Best-effort, idempotent.
+#[must_use]
+pub fn apply_domain(tab_id: &str, cgroup_rel: &str, cidrs: &[Cidr]) -> bool {
+    teardown(tab_id);
+    matches!(
+        run_nft_stdin(&domain_ruleset(&table_name(tab_id), cgroup_rel, cidrs)),
+        Ok(true)
+    )
+}
+
+/// Install the `:53` → resolver redirect (NAT) table for a tab. Best-effort.
+/// Call AFTER [`apply_domain`] (teardown there drops a stale `_nat` table).
+#[must_use]
+pub fn apply_redirect(tab_id: &str, cgroup_rel: &str, resolver_port: u16) -> bool {
+    let nat = format!("{}_nat", table_name(tab_id));
+    matches!(
+        run_nft_stdin(&redirect_ruleset(&nat, cgroup_rel, resolver_port)),
+        Ok(true)
+    )
+}
+
 /// Add a resolved IP to a tab's dynamic allow set with a TTL + domain comment.
 ///
 /// The domain it came from is the element's `comment`, so `nft list ruleset`

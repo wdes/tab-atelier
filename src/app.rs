@@ -1141,6 +1141,7 @@ impl AppState {
                 tx_denied_bytes: 0,
                 // Desktop allowlist isn't wired (headless-only feature).
                 net_allow: crate::net_policy::AllowConfig::default(),
+                dns_entries: Vec::new(),
             });
         }
 
