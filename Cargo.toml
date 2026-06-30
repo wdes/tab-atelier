@@ -361,7 +361,9 @@ maintainer-scripts = "assets/headless-debian/"
 # only — installing the package applies NO host rules, so it can't lock the
 # user out). Rules are programmed at runtime against the host netns by
 # cgroup, so no userspace-NAT (`passt`) dependency.
-depends = "$auto, libgcc-s1, adduser, init-system-helpers, nftables"
+# `bubblewrap` provides `bwrap`, used to give a net-off tab its own empty
+# network namespace (`no_internet_command`); it runs unprivileged.
+depends = "$auto, libgcc-s1, adduser, init-system-helpers, nftables, bubblewrap"
 # Mirror the default variant: the shipped preferences.json fallback
 # is a real conffile so admin edits survive `apt upgrade`. The Claude
 # Code system hooks live in a different /etc subdir; making it a
