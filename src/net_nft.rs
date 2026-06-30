@@ -187,6 +187,112 @@ pub fn apply_block(tab_id: &str, cgroup_rel: &str) -> bool {
     matches!(run_nft_stdin(&block_ruleset(&table_name(tab_id), cgroup_rel)), Ok(true))
 }
 
+/// Build the confine ruleset for a **domain** allowlist tab.
+///
+/// Static CIDRs plus two dynamic sets (`allow_dyn` v4 / `allow_dyn6` v6) the
+/// per-tab DNS resolver fills with the IPs each allowed domain resolved to —
+/// each with a `timeout` (the DNS TTL) so they expire, and a per-domain
+/// `comment`. Same confine/out structure + counters as [`ruleset`].
+#[must_use]
+pub fn domain_ruleset(table: &str, cgroup_rel: &str, cidrs: &[Cidr]) -> String {
+    let cgroup_rel = cgroup_rel.trim_matches('/');
+    let level = cgroup_rel.split('/').filter(|s| !s.is_empty()).count();
+    let (mut v4, mut v6) = (Vec::new(), Vec::new());
+    for c in cidrs {
+        match c {
+            Cidr::V4 { base, prefix } => {
+                let o = base.to_be_bytes();
+                v4.push(format!("{}.{}.{}.{}/{}", o[0], o[1], o[2], o[3], prefix));
+            }
+            Cidr::V6 { base, prefix } => v6.push(format!("{}/{}", fmt_v6(*base), prefix)),
+        }
+    }
+    let mut s = String::new();
+    let _ = writeln!(s, "table inet {table} {{");
+    // Dynamic sets the resolver populates (`flags timeout` ⇒ per-element TTL).
+    s.push_str("  set allow_dyn { type ipv4_addr; flags timeout; }\n");
+    s.push_str("  set allow_dyn6 { type ipv6_addr; flags timeout; }\n");
+    s.push_str("  chain confine {\n");
+    s.push_str("    oifname \"lo\" accept comment \"loopback (local API, resolver)\"\n");
+    s.push_str("    ct state established,related accept comment \"replies\"\n");
+    s.push_str("    ip daddr @allow_dyn accept comment \"resolver-added (domain)\"\n");
+    s.push_str("    ip6 daddr @allow_dyn6 accept comment \"resolver-added (domain)\"\n");
+    if !v4.is_empty() {
+        let _ = writeln!(
+            s,
+            "    ip daddr {{ {} }} accept comment \"allowlist v4\"",
+            v4.join(", ")
+        );
+    }
+    if !v6.is_empty() {
+        let _ = writeln!(
+            s,
+            "    ip6 daddr {{ {} }} accept comment \"allowlist v6\"",
+            v6.join(", ")
+        );
+    }
+    s.push_str("    counter drop comment \"tab-atelier: off-allowlist egress denied\"\n");
+    s.push_str("  }\n");
+    s.push_str("  chain out {\n");
+    s.push_str("    type filter hook output priority 0; policy accept;\n");
+    let _ = writeln!(
+        s,
+        "    socket cgroupv2 level {level} \"{cgroup_rel}\" counter jump confine comment \"tab-atelier egress allowlist\""
+    );
+    s.push_str("  }\n");
+    s.push_str("}\n");
+    s
+}
+
+/// Build the NAT table that redirects the tab's `:53` to its resolver.
+///
+/// Redirects the tab cgroup's `:53` (tcp + udp) to the per-tab resolver on
+/// `127.0.0.1:<resolver_port>`, so the tab is forced through our gating
+/// resolver. Separate table (nat hook) from the filter one; named
+/// `<table>_nat`.
+#[must_use]
+pub fn redirect_ruleset(nat_table: &str, cgroup_rel: &str, resolver_port: u16) -> String {
+    let cgroup_rel = cgroup_rel.trim_matches('/');
+    let level = cgroup_rel.split('/').filter(|s| !s.is_empty()).count();
+    let mut s = String::new();
+    let _ = writeln!(s, "table inet {nat_table} {{");
+    s.push_str("  chain out {\n");
+    s.push_str("    type nat hook output priority -100; policy accept;\n");
+    let _ = writeln!(
+        s,
+        "    socket cgroupv2 level {level} \"{cgroup_rel}\" meta l4proto udp udp dport 53 redirect to :{resolver_port} comment \"tab-atelier dns\""
+    );
+    let _ = writeln!(
+        s,
+        "    socket cgroupv2 level {level} \"{cgroup_rel}\" meta l4proto tcp tcp dport 53 redirect to :{resolver_port} comment \"tab-atelier dns\""
+    );
+    s.push_str("  }\n");
+    s.push_str("}\n");
+    s
+}
+
+/// Add a resolved IP to a tab's dynamic allow set with a TTL + domain comment.
+///
+/// The domain it came from is the element's `comment`, so `nft list ruleset`
+/// shows which domain pulled in each IP. Best-effort. The set name picks
+/// v4/v6 by the address.
+pub fn add_allow_ip(tab_id: &str, ip: std::net::IpAddr, ttl_secs: u32, domain: &str) {
+    let table = table_name(tab_id);
+    let (set, addr) = match ip {
+        std::net::IpAddr::V4(a) => ("allow_dyn", a.to_string()),
+        std::net::IpAddr::V6(a) => ("allow_dyn6", a.to_string()),
+    };
+    // Domain is the resolver's gated query name (already validated against the
+    // allowlist); still strip quotes to keep the nft element syntax clean.
+    let safe_domain: String = domain.chars().filter(|c| *c != '"' && *c != '\\').collect();
+    let element = format!("{{ {addr} timeout {ttl_secs}s comment \"{safe_domain}\" }}");
+    let _ = std::process::Command::new(nft_bin())
+        .args(["add", "element", "inet", &table, set, &element])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
 /// Format a u128 as a fully-expanded IPv6 address (no `::` compression —
 /// nft accepts the long form and it keeps the generator trivial).
 fn fmt_v6(v: u128) -> String {
@@ -303,11 +409,14 @@ fn parse_counters(json: &serde_json::Value) -> (u64, u64) {
 /// applied, or already gone) is not an error.
 pub fn teardown(tab_id: &str) {
     let table = table_name(tab_id);
-    let _ = std::process::Command::new(nft_bin())
-        .args(["delete", "table", "inet", &table])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+    let nat = format!("{table}_nat");
+    for t in [&table, &nat] {
+        let _ = std::process::Command::new(nft_bin())
+            .args(["delete", "table", "inet", t])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
 }
 
 /// Pipe an nft script to `nft -f -`. `Ok(true)` on success, `Ok(false)` on
@@ -395,6 +504,27 @@ mod tests {
     fn parse_counters_empty_is_zero() {
         let json: serde_json::Value = serde_json::from_str(r#"{"nftables":[]}"#).unwrap();
         assert_eq!(parse_counters(&json), (0, 0));
+    }
+
+    #[test]
+    fn domain_ruleset_has_dynamic_sets_and_static_cidrs() {
+        let cidrs = vec![Cidr::parse("104.16.0.0/13").unwrap()];
+        let rs = domain_ruleset("t", "a/b/c", &cidrs);
+        assert!(rs.contains("set allow_dyn { type ipv4_addr; flags timeout; }"));
+        assert!(rs.contains("set allow_dyn6 { type ipv6_addr; flags timeout; }"));
+        assert!(rs.contains("ip daddr @allow_dyn accept"));
+        assert!(rs.contains("ip6 daddr @allow_dyn6 accept"));
+        assert!(rs.contains("ip daddr { 104.16.0.0/13 } accept"), "static cidr too");
+        assert!(rs.contains("counter drop"));
+    }
+
+    #[test]
+    fn redirect_ruleset_dnats_dns_to_resolver() {
+        let rs = redirect_ruleset("t_nat", "a/b/c", 5388);
+        assert!(rs.contains("type nat hook output priority -100"));
+        assert!(rs.contains("udp dport 53 redirect to :5388"));
+        assert!(rs.contains("tcp dport 53 redirect to :5388"));
+        assert!(rs.contains("socket cgroupv2 level 3 \"a/b/c\""));
     }
 
     #[test]
