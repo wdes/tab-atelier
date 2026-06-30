@@ -1286,6 +1286,17 @@ pub struct Preferences {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tab_bg_color: Option<String>,
 
+    /// Default network allowlist applied to **newly created** tabs
+    /// (presets / domains / CIDRs). Empty ⇒ new tabs start unrestricted.
+    /// Existing tabs keep whatever they were configured with. Set via
+    /// `net-default` (CLI) — see [`Self::default_allow_config`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub default_net_allow_presets: Vec<crate::net_policy::Preset>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub default_net_allow_domains: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub default_net_allow_cidrs: Vec<String>,
+
     /// Headless PTY dimensions. The GUI re-sizes its terminals from
     /// the window, but the headless daemon has no display — the
     /// alacritty PTY stays at whatever it spawned with. Default is
@@ -1357,6 +1368,19 @@ pub struct Preferences {
     /// `"clear_env_vars": {"EDITOR": "vim", "PATH": "/opt/bin:/usr/bin"}`.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub clear_env_vars: std::collections::BTreeMap<String, String>,
+}
+
+impl Preferences {
+    /// The default allowlist for new tabs, as an [`crate::net_policy::AllowConfig`].
+    /// Empty when no default is configured.
+    #[must_use]
+    pub fn default_allow_config(&self) -> crate::net_policy::AllowConfig {
+        crate::net_policy::AllowConfig {
+            presets: self.default_net_allow_presets.clone(),
+            domains: self.default_net_allow_domains.clone(),
+            cidrs: self.default_net_allow_cidrs.clone(),
+        }
+    }
 }
 
 /// One persisted remote `tab-atelier-headless` instance the desktop

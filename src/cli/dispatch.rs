@@ -132,6 +132,21 @@ pub enum Commands {
         tab: Option<String>,
     },
 
+    /// Set the default allowlist applied to NEW tabs (written to
+    /// preferences.json; applies to tabs created after the daemon restarts).
+    /// `--clear` removes the default. Same flags as `net-allow`.
+    #[command(name = "net-default")]
+    NetDefault {
+        #[arg(long = "preset")]
+        presets: Vec<String>,
+        #[arg(long = "domain")]
+        domains: Vec<String>,
+        #[arg(long = "cidr")]
+        cidrs: Vec<String>,
+        #[arg(long)]
+        clear: bool,
+    },
+
     /// Send keystrokes to a tab (`\n` / `\r` / `\t` / `\\` escapes interpreted).
     Input {
         /// Tab index or UUID.
@@ -372,6 +387,12 @@ pub fn dispatch(cli: Cli) -> bool {
             clear,
         } => crate::cli::share_link::net_allow(&tab, &presets, &domains, &cidrs, clear),
         Commands::NetStats { tab } => crate::cli::share_link::net_stats(tab.as_deref()),
+        Commands::NetDefault {
+            presets,
+            domains,
+            cidrs,
+            clear,
+        } => crate::cli::share_link::net_default(&presets, &domains, &cidrs, clear),
         Commands::Input { tab, text } => crate::cli::share_link::send_input(&[tab, text]),
         Commands::Output { tab } => crate::cli::share_link::output(&[tab]),
         Commands::ShareLink { tab, ro } => {

@@ -548,6 +548,9 @@ pub fn run() -> std::io::Result<()> {
     info!("starting tab-atelier-headless v{}", env!("CARGO_PKG_VERSION"));
 
     let prefs = load_preferences(&platform::config_dir());
+    // Default allowlist for NEW tabs (the seed tab + API-created ones).
+    // Restored tabs keep their own persisted config.
+    let default_net_allow = prefs.default_allow_config();
     // Global default per-tab resource ceilings; each tab's own
     // `limits` overrides per axis. Cloned out before `prefs` is picked
     // apart by the `unwrap_or_else` extractions below.
@@ -692,7 +695,7 @@ pub fn run() -> std::io::Result<()> {
             pty_cols,
             pty_rows,
             false,
-            crate::net_policy::AllowConfig::default(),
+            default_net_allow.clone(),
         ) {
             // Fresh default tab — no per-tab overrides, so just the
             // global default ceilings.
@@ -815,6 +818,7 @@ pub fn run() -> std::io::Result<()> {
             pty_cols,
             pty_rows,
             &default_limits,
+            &default_net_allow,
         );
 
         // Everything below is not latency-critical and is gated to
@@ -1285,6 +1289,7 @@ fn drain_pending(
     pty_cols: usize,
     pty_rows: usize,
     default_limits: &crate::TabResourceLimits,
+    default_net_allow: &crate::net_policy::AllowConfig,
 ) {
     let mut s = api_state.lock().unwrap();
     let mut closes: Vec<usize> = s.pending_closes.drain(..).collect();
@@ -1562,7 +1567,7 @@ fn drain_pending(
             pty_cols,
             pty_rows,
             false,
-            crate::net_policy::AllowConfig::default(),
+            default_net_allow.clone(),
         ) {
             // API-created tab — global default ceilings (no per-tab
             // overrides exist until one is set).
