@@ -128,6 +128,11 @@ struct HeadlessTab {
     /// Persisted; applied on (re)spawn by installing per-tab nftables rules
     /// (CIDRs) before the shell starts. Empty ⇒ not in allowlist mode.
     net_allow: crate::net_policy::AllowConfig,
+    /// Per-tab gating DNS resolver, alive while a DOMAIN allowlist tab runs.
+    /// Drop-guard (its `Drop` stops the resolver) + source of the
+    /// DNS-entries view. `None` outside domain-allowlist mode.
+    #[cfg(target_os = "linux")]
+    net_resolver: Option<crate::net_resolver::ResolverHandle>,
     /// Active outbound connection count (metering), refreshed on a timer
     /// from `/proc`. In-memory only; reflected on `/tabs`.
     connections: usize,
@@ -169,6 +174,30 @@ impl crate::schedule::LockState for HeadlessTab {
 }
 
 impl HeadlessTab {
+    /// DNS-entries view `(domain, allowed, ips)` from the per-tab resolver
+    /// (domain-allowlist tabs only; empty otherwise).
+    fn dns_entries(&self) -> Vec<(String, bool, Vec<String>)> {
+        #[cfg(target_os = "linux")]
+        {
+            self.net_resolver.as_ref().map_or_else(Vec::new, |r| {
+                r.entries()
+                    .into_iter()
+                    .map(|e| {
+                        (
+                            e.domain,
+                            e.allowed,
+                            e.ips.iter().map(std::string::ToString::to_string).collect(),
+                        )
+                    })
+                    .collect()
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Vec::new()
+        }
+    }
+
     fn uptime(&self) -> Duration {
         let live = self.last_activated.map(|t| t.elapsed()).unwrap_or_default();
         self.prior_uptime + self.active_duration + live
@@ -393,6 +422,11 @@ fn spawn_pty_tab(
     // teardown-first clears stale state. Best-effort.
     #[cfg(target_os = "linux")]
     let privileged = crate::has_ambient_caps();
+    // For a DOMAIN allowlist (privileged): install the dynamic-set table, run
+    // a per-tab gating resolver, and redirect the tab's :53 to it. The
+    // resolver handle is kept on the tab (drop-guard + the DNS-entries view).
+    #[cfg(target_os = "linux")]
+    let mut net_resolver: Option<crate::net_resolver::ResolverHandle> = None;
     #[cfg(target_os = "linux")]
     let nft_cgroup: Option<String> = {
         crate::net_nft::teardown(&id);
@@ -402,11 +436,29 @@ fn spawn_pty_tab(
                 // the unprivileged bwrap path below.
                 privileged && crate::net_nft::apply_block(&id, &rel)
             } else {
-                let cidrs = net_allow.to_allow_set().cidrs;
-                if cidrs.is_empty() {
+                let allow_set = net_allow.to_allow_set();
+                if privileged && !allow_set.domains.is_empty() {
+                    // Domain allowlist: dynamic-set table + resolver + :53 redirect.
+                    crate::net_nft::apply_domain(&id, &rel, &allow_set.cidrs)
+                        && match crate::net_resolver::spawn(
+                            id.clone(),
+                            allow_set,
+                            crate::net_resolver::upstream_resolver(),
+                        ) {
+                            Ok(r) => {
+                                let _ = crate::net_nft::apply_redirect(&id, &rel, r.port());
+                                net_resolver = Some(r);
+                                true
+                            }
+                            Err(e) => {
+                                log::warn!("net_resolver: spawn failed for '{name}': {e}");
+                                true // table is installed; domains just won't resolve
+                            }
+                        }
+                } else if allow_set.cidrs.is_empty() {
                     crate::net_nft::apply_meter(&id, &rel)
                 } else {
-                    crate::net_nft::apply(&id, &rel, &cidrs)
+                    crate::net_nft::apply(&id, &rel, &allow_set.cidrs)
                 }
             };
             ok.then_some(rel)
@@ -524,6 +576,8 @@ fn spawn_pty_tab(
         bg_color,
         net_disabled,
         net_allow,
+        #[cfg(target_os = "linux")]
+        net_resolver,
         connections: 0,
         tx_bytes: 0,
         tx_denied_bytes: 0,
@@ -964,6 +1018,7 @@ fn refresh_snapshot(
             tx_bytes: tab.tx_bytes,
             tx_denied_bytes: tab.tx_denied_bytes,
             net_allow: tab.net_allow.clone(),
+            dns_entries: tab.dns_entries(),
         });
     }
     let mut snapshot = api_state.lock().unwrap();

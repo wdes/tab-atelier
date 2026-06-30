@@ -198,6 +198,18 @@ struct TabInfo {
     net_allow_domains: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     net_allow_cidrs: Vec<String>,
+    /// Per-tab resolver DNS log (domain-allowlist tabs). Omitted when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    dns: Vec<DnsEntryInfo>,
+}
+
+/// One DNS-entries-view row for the `/tabs` response.
+#[derive(Serialize)]
+struct DnsEntryInfo {
+    domain: String,
+    allowed: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    ips: Vec<String>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -352,6 +364,10 @@ pub struct SnapshotTab {
     /// `/tabs` reports it and the `net-allow --add/--remove` CLI can merge
     /// against it. Empty ⇒ not in allowlist mode.
     pub net_allow: crate::net_policy::AllowConfig,
+    /// DNS-entries view for a domain-allowlist tab: `(domain, allowed, ips)`
+    /// from the per-tab resolver — including DENIED queries (what the tab
+    /// tried to reach and couldn't). Empty when no resolver.
+    pub dns_entries: Vec<(String, bool, Vec<String>)>,
 }
 
 impl crate::schedule::LockState for SnapshotTab {
@@ -1422,6 +1438,15 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                     net_allow_presets: t.net_allow.presets.iter().map(|p| p.id().to_string()).collect(),
                     net_allow_domains: t.net_allow.domains.clone(),
                     net_allow_cidrs: t.net_allow.cidrs.clone(),
+                    dns: t
+                        .dns_entries
+                        .iter()
+                        .map(|(domain, allowed, ips)| DnsEntryInfo {
+                            domain: domain.clone(),
+                            allowed: *allowed,
+                            ips: ips.clone(),
+                        })
+                        .collect(),
                 })
                 .collect();
             #[cfg(feature = "energy")]
@@ -3410,6 +3435,7 @@ mod tests {
                     tx_bytes: 0,
                     tx_denied_bytes: 0,
                     net_allow: crate::net_policy::AllowConfig::default(),
+                    dns_entries: Vec::new(),
                 },
                 SnapshotTab {
                     id: "tab-b".into(),
@@ -3439,6 +3465,7 @@ mod tests {
                     tx_bytes: 0,
                     tx_denied_bytes: 0,
                     net_allow: crate::net_policy::AllowConfig::default(),
+                    dns_entries: Vec::new(),
                 },
             ],
             active: 0,

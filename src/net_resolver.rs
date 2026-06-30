@@ -78,6 +78,23 @@ impl Drop for ResolverHandle {
 /// Cap on the kept query log so it can't grow without bound.
 const LOG_CAP: usize = 256;
 
+/// The upstream resolver to forward allowed queries to.
+///
+/// The first `nameserver` in `/etc/resolv.conf`, falling back to Cloudflare
+/// (`1.1.1.1:53`). A loopback nameserver (systemd-resolved at 127.0.0.53) is
+/// fine — the daemon itself isn't egress-restricted.
+#[must_use]
+pub fn upstream_resolver() -> SocketAddr {
+    let fallback = SocketAddr::from(([1, 1, 1, 1], 53));
+    let Ok(conf) = std::fs::read_to_string("/etc/resolv.conf") else {
+        return fallback;
+    };
+    conf.lines()
+        .filter_map(|l| l.strip_prefix("nameserver").map(str::trim))
+        .find_map(|ns| ns.parse::<IpAddr>().ok())
+        .map_or(fallback, |ip| SocketAddr::new(ip, 53))
+}
+
 /// Start a gating resolver for `tab_id` on a random loopback UDP port,
 /// forwarding allowed queries to `upstream`.
 ///
