@@ -191,6 +191,13 @@ struct TabInfo {
     /// Of those, bytes the allowlist dropped. Omitted when 0.
     #[serde(skip_serializing_if = "is_zero_u64")]
     tx_denied_bytes: u64,
+    /// Current allowlist (when in allowlist mode). Omitted when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    net_allow_presets: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    net_allow_domains: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    net_allow_cidrs: Vec<String>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -341,6 +348,10 @@ pub struct SnapshotTab {
     /// tab tried to send, and bytes the allowlist dropped. 0 otherwise.
     pub tx_bytes: u64,
     pub tx_denied_bytes: u64,
+    /// The tab's current allowlist config, mirrored from the runtime tab so
+    /// `/tabs` reports it and the `net-allow --add/--remove` CLI can merge
+    /// against it. Empty ⇒ not in allowlist mode.
+    pub net_allow: crate::net_policy::AllowConfig,
 }
 
 impl crate::schedule::LockState for SnapshotTab {
@@ -1408,6 +1419,9 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                     connections: t.connections,
                     tx_bytes: t.tx_bytes,
                     tx_denied_bytes: t.tx_denied_bytes,
+                    net_allow_presets: t.net_allow.presets.iter().map(|p| p.id().to_string()).collect(),
+                    net_allow_domains: t.net_allow.domains.clone(),
+                    net_allow_cidrs: t.net_allow.cidrs.clone(),
                 })
                 .collect();
             #[cfg(feature = "energy")]
@@ -3395,6 +3409,7 @@ mod tests {
                     connections: 0,
                     tx_bytes: 0,
                     tx_denied_bytes: 0,
+                    net_allow: crate::net_policy::AllowConfig::default(),
                 },
                 SnapshotTab {
                     id: "tab-b".into(),
@@ -3423,6 +3438,7 @@ mod tests {
                     connections: 0,
                     tx_bytes: 0,
                     tx_denied_bytes: 0,
+                    net_allow: crate::net_policy::AllowConfig::default(),
                 },
             ],
             active: 0,

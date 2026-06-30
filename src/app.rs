@@ -1139,6 +1139,8 @@ impl AppState {
                 // Desktop is unprivileged → no nft byte counters.
                 tx_bytes: 0,
                 tx_denied_bytes: 0,
+                // Desktop allowlist isn't wired (headless-only feature).
+                net_allow: crate::net_policy::AllowConfig::default(),
             });
         }
 

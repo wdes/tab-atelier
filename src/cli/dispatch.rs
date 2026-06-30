@@ -119,6 +119,12 @@ pub enum Commands {
         /// CIDR / IP to allow (e.g. `104.16.0.0/13`). Repeatable.
         #[arg(long = "cidr")]
         cidrs: Vec<String>,
+        /// Add the given entries to the tab's CURRENT allowlist (merge).
+        #[arg(long, conflicts_with_all = ["remove", "clear"])]
+        add: bool,
+        /// Remove the given entries from the tab's current allowlist.
+        #[arg(long, conflicts_with_all = ["add", "clear"])]
+        remove: bool,
         /// Clear the allowlist (tab returns to unrestricted internet).
         #[arg(long)]
         clear: bool,
@@ -384,8 +390,10 @@ pub fn dispatch(cli: Cli) -> bool {
             presets,
             domains,
             cidrs,
+            add,
+            remove,
             clear,
-        } => crate::cli::share_link::net_allow(&tab, &presets, &domains, &cidrs, clear),
+        } => crate::cli::share_link::net_allow(&tab, &presets, &domains, &cidrs, clear, add, remove),
         Commands::NetStats { tab } => crate::cli::share_link::net_stats(tab.as_deref()),
         Commands::NetDefault {
             presets,
