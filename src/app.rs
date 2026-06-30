@@ -40,6 +40,12 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
+/// How long an attached-but-quiet tab must go un-focused before its LED
+/// turns blue ("dormant"). The transient state is already swept to None
+/// after 2 min of agent silence, so this is the extra "and you haven't
+/// looked at it" grace on top of that.
+const DORMANT_AFTER_SECS: u64 = 180;
+
 struct Tab {
     view: Entity<TerminalView>,
     name: String,
@@ -53,6 +59,11 @@ struct Tab {
     prior_uptime: std::time::Duration,
     active_duration: std::time::Duration,
     last_activated: Option<std::time::Instant>,
+    /// When this tab was last the foreground (focused) tab. Refreshed
+    /// every persist tick for the active tab; ages for the rest. Drives
+    /// the "dormant" (blue) LED — an attached-but-quiet session you
+    /// haven't opened in a while. `None` = never focused this run.
+    last_focused_at: Option<std::time::Instant>,
     #[cfg(feature = "energy")]
     energy_wh: f64,
     /// Last `energy_wh` value flushed to disk. Used to skip writes when no
@@ -469,6 +480,7 @@ impl AppState {
                         prior_uptime: std::time::Duration::from_secs_f64(ts.uptime_secs.unwrap_or(0.0)),
                         active_duration: std::time::Duration::ZERO,
                         last_activated: None,
+                        last_focused_at: None,
                         #[cfg(feature = "energy")]
                         energy_wh: ts.energy_wh.unwrap_or(0.0),
                         #[cfg(feature = "energy")]
@@ -518,6 +530,7 @@ impl AppState {
                         prior_uptime: std::time::Duration::ZERO,
                         active_duration: std::time::Duration::ZERO,
                         last_activated: None,
+                        last_focused_at: None,
                         #[cfg(feature = "energy")]
                         energy_wh: 0.0,
                         #[cfg(feature = "energy")]
@@ -566,6 +579,7 @@ impl AppState {
                         prior_uptime: std::time::Duration::ZERO,
                         active_duration: std::time::Duration::ZERO,
                         last_activated: Some(std::time::Instant::now()),
+                        last_focused_at: Some(std::time::Instant::now()),
                         #[cfg(feature = "energy")]
                         energy_wh: 0.0,
                         #[cfg(feature = "energy")]
@@ -852,6 +866,7 @@ impl AppState {
                 prior_uptime: std::time::Duration::ZERO,
                 active_duration: std::time::Duration::ZERO,
                 last_activated: Some(std::time::Instant::now()),
+                last_focused_at: Some(std::time::Instant::now()),
                 #[cfg(feature = "energy")]
                 energy_wh: 0.0,
                 #[cfg(feature = "energy")]
@@ -1292,6 +1307,12 @@ impl AppState {
             // `PostToolUse`. Also covers manual subshell commands the
             // user starts inside an active agent tab.
             let now = std::time::Instant::now();
+            // Keep the foreground tab "freshly seen" so it never reads as
+            // dormant; every other tab's last_focused_at ages until you
+            // switch to it. Drives the blue dormant LED below.
+            if let Some(t) = self.tabs.get_mut(self.active) {
+                t.last_focused_at = Some(now);
+            }
             #[cfg(feature = "catbus")]
             for tab in &mut self.tabs {
                 if tab.agent_kind.is_none() {
@@ -1721,10 +1742,28 @@ impl AppState {
                         b: 0.267,
                         a: 1.0,
                     }),
-                    // Session attached but no recent activity — show
-                    // the LED in steady grey so the user still sees a
-                    // claude/catbus is running in this tab.
-                    None => grey,
+                    // Session attached but quiet (state swept to None
+                    // after ≥2 min of agent silence). If you also haven't
+                    // opened this tab in a while it's "dormant" — show
+                    // blue so a long-untended session stands out among
+                    // many tabs; the steady grey is kept for one you've
+                    // looked at recently. Opening the tab refreshes
+                    // last_focused_at (persist tick) → back to grey.
+                    None => {
+                        let dormant = tab
+                            .last_focused_at
+                            .is_none_or(|t| t.elapsed().as_secs() > DORMANT_AFTER_SECS);
+                        if dormant {
+                            Hsla::from(Rgba {
+                                r: 0.36,
+                                g: 0.60,
+                                b: 1.0,
+                                a: 1.0,
+                            })
+                        } else {
+                            grey
+                        }
+                    }
                 };
                 Some(div().w(px(7.0)).h(px(7.0)).mr(px(5.0)).rounded_full().bg(color))
             } else {
