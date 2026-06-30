@@ -1751,6 +1751,18 @@ impl Element for TerminalElement {
                         t.color_to_hsla(cell_data.fg)
                     };
 
+                    // Box-drawing glyphs from the font are usually narrower
+                    // than the cell, so long runs render dashed and column
+                    // rules drift. Divert the common subset to geometric
+                    // rendering (connecting bars painted in Phase 2). This is
+                    // computed before the INVERSE handling below: an inverse
+                    // box cell must NOT take the fg/bg swap — inverting a thin
+                    // rule turns it into a filled block (and falls back to the
+                    // gappy glyph), which is what made reverse-video scrollbar
+                    // rules render dashed. Draw the rule geometrically in the
+                    // normal foreground instead, with no inverse bg fill.
+                    let box_parts = crate::box_drawing::parts(ch);
+
                     let mut font_weight = FontWeight(self.font_config.weight as f32);
                     let mut font_style = FontStyle::Normal;
                     let mut underline = None;
@@ -1775,7 +1787,7 @@ impl Element for TerminalElement {
                             color: Some(fg),
                         });
                     }
-                    if cell_data.flags.contains(CellFlags::INVERSE) {
+                    if cell_data.flags.contains(CellFlags::INVERSE) && box_parts.is_none() {
                         let bg_c = if is_default_bg(cell_data.bg) {
                             t.term_bg_hsla()
                         } else {
@@ -1800,7 +1812,7 @@ impl Element for TerminalElement {
                                 color: old_fg,
                             });
                         }
-                    } else if !is_default_bg(cell_data.bg) {
+                    } else if !cell_data.flags.contains(CellFlags::INVERSE) && !is_default_bg(cell_data.bg) {
                         let bg_c = t.color_to_hsla(cell_data.bg);
                         if let Some(last) = bg_runs.last_mut() {
                             if last.col + last.len == c && hsla_eq(last.color, bg_c) {
@@ -1867,13 +1879,9 @@ impl Element for TerminalElement {
                     // column rules drift. Divert the common subset to
                     // geometric rendering (painted as connecting bars in
                     // Phase 2) and blank the glyph cell so the gappy font
-                    // glyph isn't drawn underneath. Inverse cells keep the
-                    // glyph (rare, and reverse-video boxes want the swap).
-                    let box_parts = if cell_data.flags.contains(CellFlags::INVERSE) {
-                        None
-                    } else {
-                        crate::box_drawing::parts(ch)
-                    };
+                    // glyph isn't drawn underneath. `box_parts` was computed
+                    // above (before the INVERSE swap) so the bar is painted in
+                    // the normal foreground colour even for reverse-video cells.
                     if let Some(parts) = box_parts {
                         box_cells.push(BoxCell {
                             col: c,
