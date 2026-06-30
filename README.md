@@ -27,7 +27,7 @@ A Guake-style drop-down terminal emulator for Linux (X11), built with Rust using
 - **Ctrl+Shift+T** to open a new tab (inherits working directory)
 - **Alt+Tab** to cycle between tabs
 - Shell exit detection with close/respawn confirmation
-- Per-tab **agent state LED** to the left of the tab name (thinking / waiting / error), driven by an in-tab CLI (see [Agent state](#agent-state))
+- Per-tab **agent state LED** to the left of the tab name (thinking / waiting / error / dormant), driven by an in-tab CLI (see [Agent state](#agent-state))
 
 **Session**
 - Tabs, working directories, and full terminal output persisted across restarts
@@ -291,15 +291,16 @@ The connection is allowed through (Phase 2 uses `disable_verification` on the wi
 
 Each tab carries an optional **agent state** rendered as a small colored LED to the left of the tab name:
 
-| State | LED |
-|---|---|
-| `thinking` | steady cyan |
-| `waiting` | amber that alternates with grey every 500 ms (same cadence as the low-battery indicator) — easy to spot from across the room without strobing the eye |
-| `error` | steady red |
-| _none, but a session is attached_ | steady grey — "agent CLI lives here, no recent activity" |
-| _none, no session_ | hidden |
+| LED | State | What it means |
+|---|---|---|
+| ![#4ec9b0](https://placehold.co/13x13/4ec9b0/4ec9b0.png) steady teal | `thinking` | agent is actively working (or a tool subprocess is running) |
+| ![#d97706](https://placehold.co/13x13/d97706/d97706.png) ⇄ ![#737373](https://placehold.co/13x13/737373/737373.png) blinking amber | `waiting` | agent finished its turn — **your move**. Alternates amber↔grey every 500 ms (same cadence as the low-battery indicator) so it catches the eye without strobing |
+| ![#ef4444](https://placehold.co/13x13/ef4444/ef4444.png) steady red | `error` | the last turn errored or was aborted |
+| ![#5c99ff](https://placehold.co/13x13/5c99ff/5c99ff.png) steady blue | _dormant_ | a session is attached but it's been quiet **and** you haven't opened this tab in a while (≈3 min) — so a long-untended agent stands out across dozens of tabs. Opening the tab clears it back to grey |
+| ![#737373](https://placehold.co/13x13/737373/737373.png) steady grey | _attached, quiet_ | agent CLI lives here, no recent activity, but you've looked at it recently |
+| _(hidden)_ | _no session_ | no agent attached to this tab |
 
-The grey-when-idle behaviour means the LED stays visible for the entire life of an attached agent session: once your shell sends a `--session <uuid>` it sticks until the session genuinely ends. Claude Code's `SessionEnd` hook (or a manual `tab-atelier set-status idle`) wipes both the transient state and the durable session attachment so the LED disappears.
+The grey/blue-when-idle behaviour means the LED stays visible for the entire life of an attached agent session: once your shell sends a `--session <uuid>` it sticks until the session genuinely ends. After ~2 min of agent silence the transient `thinking`/`waiting`/`error` state is swept and the LED falls back to grey, then to **blue** once the tab has also gone ~3 min without you opening it. Claude Code's `SessionEnd` hook (or a manual `tab-atelier set-status idle`) wipes both the transient state and the durable session attachment so the LED disappears.
 
 State is stored in RAM only (the durable session id, agent kind, and plan-mode flag are persisted to `tabs.json` for auto-resume).
 
