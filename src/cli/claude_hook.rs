@@ -48,6 +48,15 @@ fn is_synthetic_prompt(prompt: &str) -> bool {
     chars.next() == Some('<') && chars.next().is_some_and(|c| c.is_ascii_alphabetic())
 }
 
+/// True for bare resume/affirmation nudges that shouldn't replace a
+/// tab's context label. "continue" is what the ⛑ brain auto-injects to
+/// unstick an agent; the rest are common one-word "keep going" replies.
+fn is_nudge(prompt: &str) -> bool {
+    const NUDGES: &[&str] = &["continue", "go", "go on", "keep going", "proceed", "resume", "next"];
+    let p = prompt.trim();
+    NUDGES.iter().any(|n| p.eq_ignore_ascii_case(n))
+}
+
 #[must_use]
 pub fn run(args: &[String]) -> i32 {
     let Some(event) = args.first().map(String::as_str) else {
@@ -87,8 +96,10 @@ pub fn run(args: &[String]) -> i32 {
                 // arrive as UserPromptSubmit with the wrapped XML as `.prompt`
                 // and would clobber the label with noise, not the actual task.
                 // Also skip a leading `--` so a prompt isn't mis-parsed as a
-                // set-context flag.
-                if !p.is_empty() && !is_synthetic_prompt(p) && !p.starts_with("--") {
+                // set-context flag, and bare nudges like "continue" (what the
+                // brain auto-sends to a stuck agent, or you type to resume) —
+                // those shouldn't overwrite the real PR/task context.
+                if !p.is_empty() && !is_synthetic_prompt(p) && !p.starts_with("--") && !is_nudge(p) {
                     // Trim to a tooltip-sized snippet; the API caps at 2000
                     // chars anyway, but a one-line label reads better.
                     let snippet: String = p.chars().take(200).collect();
@@ -146,7 +157,22 @@ pub fn run(args: &[String]) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::is_synthetic_prompt;
+    use super::{is_nudge, is_synthetic_prompt};
+
+    #[test]
+    fn nudges_do_not_overwrite_context() {
+        // The brain auto-injects "continue"; these one-word resumes must
+        // NOT replace a tab's real PR/task context.
+        assert!(is_nudge("continue"));
+        assert!(is_nudge("  Continue  "));
+        assert!(is_nudge("CONTINUE"));
+        assert!(is_nudge("go on"));
+        assert!(is_nudge("keep going"));
+        // Real prompts are kept.
+        assert!(!is_nudge("continue the dompdf refactor"));
+        assert!(!is_nudge("PR #42"));
+        assert!(!is_nudge("continuent"));
+    }
 
     #[test]
     fn synthetic_prompts_are_skipped() {
