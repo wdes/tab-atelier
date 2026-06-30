@@ -150,6 +150,15 @@ struct TabInfo {
     /// PR/task it's on. Omitted when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     context: Option<String>,
+    /// Number of WS viewers (browser share-link / `remote attach`)
+    /// currently watching this tab. Omitted when zero.
+    #[serde(skip_serializing_if = "is_zero")]
+    viewers: usize,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// Host-wide stats reported alongside the per-tab list. Keeps the
@@ -265,6 +274,11 @@ pub struct SnapshotTab {
     /// "session attached" semantic the desktop LED uses to render a
     /// steady grey dot when there's no transient state.
     pub agent_kind: Option<String>,
+    /// How many WS viewers (browser share-link / `remote attach`) are
+    /// currently watching this tab. Surfaced on `/tabs` so `tabs`-list
+    /// consumers can see who's being watched; also the GUI's "tab is
+    /// being tended" signal that suppresses the dormant LED.
+    pub viewers: usize,
     /// Per-tab raw PTY byte ring captured BEFORE alacritty's parser.
     /// `GET /tabs/by-id/{id}/stream[?since=N]` reads from this; the
     /// xterm.js share-link viewer uses it to populate scrollback,
@@ -1181,6 +1195,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                     }),
                     agent_kind: t.agent_kind.clone(),
                     agent_session_id: t.agent_session_id.clone(),
+                    viewers: t.viewers,
                     locked: crate::schedule::LockState::effective_locked(t),
                     lock_reason: crate::schedule::LockState::lock_reason(t),
                     schedule_rule: t.schedule.as_ref().map(|s| s.rule.clone()),
@@ -3015,6 +3030,7 @@ mod tests {
                     agent_state: None,
                     agent_session_id: None,
                     agent_kind: None,
+                    viewers: 0,
                     pty_ring: None,
                 },
                 SnapshotTab {
@@ -3038,6 +3054,7 @@ mod tests {
                     agent_state: None,
                     agent_session_id: None,
                     agent_kind: None,
+                    viewers: 0,
                     pty_ring: None,
                 },
             ],
