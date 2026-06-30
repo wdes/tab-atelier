@@ -131,6 +131,11 @@ struct HeadlessTab {
     /// Active outbound connection count (metering), refreshed on a timer
     /// from `/proc`. In-memory only; reflected on `/tabs`.
     connections: usize,
+    /// Egress byte counters from this tab's nftables table (allowlist mode
+    /// only): total bytes the cgroup tried to send, and bytes the allowlist
+    /// dropped. Allowed = total − denied. 0 outside allowlist mode.
+    tx_bytes: u64,
+    tx_denied_bytes: u64,
     /// Free-text context the in-tab agent set via `set-context`.
     /// In-memory only (not persisted); reflected on `/tabs`.
     context: Option<String>,
@@ -517,6 +522,8 @@ fn spawn_pty_tab(
         net_disabled,
         net_allow,
         connections: 0,
+        tx_bytes: 0,
+        tx_denied_bytes: 0,
         context: None,
         pending_agent_resume,
         colors_enabled,
@@ -902,6 +909,15 @@ fn refresh_snapshot(
                 if let Some(&n) = counts.get(&tab.id) {
                     tab.connections = n;
                 }
+                // Byte counters from the tab's nftables table (allowlist
+                // tabs only — plain tabs have no table). total = allowed +
+                // denied; we store total and denied.
+                if !tab.net_allow.is_empty()
+                    && let Some((total, denied)) = crate::net_nft::read_counters(&tab.id)
+                {
+                    tab.tx_bytes = total;
+                    tab.tx_denied_bytes = denied;
+                }
             }
         }
     }
@@ -938,6 +954,8 @@ fn refresh_snapshot(
             pty_ring: Some(tab.pty_ring.clone()),
             net_disabled: tab.net_disabled,
             connections: tab.connections,
+            tx_bytes: tab.tx_bytes,
+            tx_denied_bytes: tab.tx_denied_bytes,
         });
     }
     let mut snapshot = api_state.lock().unwrap();

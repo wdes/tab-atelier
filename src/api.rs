@@ -185,10 +185,21 @@ struct TabInfo {
     /// Active outbound connections (metering). Omitted when zero.
     #[serde(skip_serializing_if = "is_zero")]
     connections: usize,
+    /// Egress bytes a confined (allowlist) tab tried to send. Omitted when 0.
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    tx_bytes: u64,
+    /// Of those, bytes the allowlist dropped. Omitted when 0.
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    tx_denied_bytes: u64,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
 const fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_zero_u64(n: &u64) -> bool {
     *n == 0
 }
 
@@ -326,6 +337,10 @@ pub struct SnapshotTab {
     /// Active outbound connection count (metering), refreshed on a timer
     /// from `/proc` (see `net_meter`). 0 when not yet sampled / none.
     pub connections: usize,
+    /// Egress bytes (allowlist tabs only, from nftables counters): total the
+    /// tab tried to send, and bytes the allowlist dropped. 0 otherwise.
+    pub tx_bytes: u64,
+    pub tx_denied_bytes: u64,
 }
 
 impl crate::schedule::LockState for SnapshotTab {
@@ -1391,6 +1406,8 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                     context: t.context.clone(),
                     net_disabled: t.net_disabled,
                     connections: t.connections,
+                    tx_bytes: t.tx_bytes,
+                    tx_denied_bytes: t.tx_denied_bytes,
                 })
                 .collect();
             #[cfg(feature = "energy")]
@@ -3376,6 +3393,8 @@ mod tests {
                     pty_ring: None,
                     net_disabled: false,
                     connections: 0,
+                    tx_bytes: 0,
+                    tx_denied_bytes: 0,
                 },
                 SnapshotTab {
                     id: "tab-b".into(),
@@ -3402,6 +3421,8 @@ mod tests {
                     pty_ring: None,
                     net_disabled: false,
                     connections: 0,
+                    tx_bytes: 0,
+                    tx_denied_bytes: 0,
                 },
             ],
             active: 0,
