@@ -3761,6 +3761,13 @@ impl AppState {
                                                         pty_cols: None,
                                                         pty_rows: None,
                                                         tab_bg_color: this.tab_bg_global.clone(),
+                                                        // Headless-only: default allowlist for new
+                                                        // tabs, set via the CLI. Preserve on-disk.
+                                                        default_net_allow_presets: on_disk_prefs
+                                                            .default_net_allow_presets,
+                                                        default_net_allow_domains: on_disk_prefs
+                                                            .default_net_allow_domains,
+                                                        default_net_allow_cidrs: on_disk_prefs.default_net_allow_cidrs,
                                                         // Headless-only advanced fields set directly
                                                         // in preferences.json; not exposed in the GUI
                                                         // dialog, same treatment as pty_cols above.

@@ -514,6 +514,47 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// `net-default …` — set (or clear) the allowlist applied to NEW tabs.
+///
+/// Persisted to preferences.json. Unlike the other net commands this edits
+/// config directly (no API); the daemon reads it at startup, so it applies
+/// to tabs created after the next restart.
+#[must_use]
+pub fn net_default(presets: &[String], domains: &[String], cidrs: &[String], clear: bool) -> i32 {
+    let cfg = crate::platform::config_dir();
+    let mut prefs = crate::load_preferences(&cfg);
+    if clear {
+        prefs.default_net_allow_presets.clear();
+        prefs.default_net_allow_domains.clear();
+        prefs.default_net_allow_cidrs.clear();
+    } else {
+        let mut parsed = Vec::new();
+        for id in presets {
+            let Some(p) = crate::net_policy::Preset::from_id(id) else {
+                eprintln!("net-default: unknown preset: {id}");
+                return 1;
+            };
+            parsed.push(p);
+        }
+        for c in cidrs {
+            if crate::net_policy::Cidr::parse(c).is_none() {
+                eprintln!("net-default: invalid CIDR: {c}");
+                return 1;
+            }
+        }
+        prefs.default_net_allow_presets = parsed;
+        prefs.default_net_allow_domains = domains.to_vec();
+        prefs.default_net_allow_cidrs = cidrs.to_vec();
+    }
+    crate::save_preferences(&cfg, &prefs);
+    if prefs.default_allow_config().is_empty() {
+        println!("default allowlist cleared — new tabs start unrestricted");
+    } else {
+        println!("default allowlist saved — applies to NEW tabs (restart the daemon to pick it up)");
+    }
+    0
+}
+
 /// Put a tab into allowlist mode (or clear it) by `POST`ing the config to
 /// `/tabs/by-id/<uuid>/net-allow`. The daemon launches a filtering proxy
 /// for the tab and respawns its shell on the next drain tick.
