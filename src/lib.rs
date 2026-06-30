@@ -261,6 +261,50 @@ pub fn clear_env_shell_command<S: std::hash::BuildHasher>(
     (ENV_BIN.to_string(), args)
 }
 
+/// `bwrap` (bubblewrap) executable name — used to give a tab its own
+/// empty network namespace so it has no internet.
+const BWRAP_BIN: &str = "bwrap";
+
+/// True when `bwrap` is on `PATH`. Net-off tabs need it; if absent, the
+/// toggle is refused with a message rather than silently leaving the net
+/// on. Probes `PATH` entries without executing anything.
+#[must_use]
+pub fn bwrap_available() -> bool {
+    std::env::var_os("PATH").is_some_and(|paths| std::env::split_paths(&paths).any(|d| d.join(BWRAP_BIN).is_file()))
+}
+
+/// Wrap a shell command so the tab has **no internet**: run it inside a
+/// bubblewrap sandbox with an isolated network namespace (loopback only).
+///
+/// - `--dev-bind / /` keeps the whole host filesystem visible (tools,
+///   profiles, the user's `$HOME` all work as normal),
+/// - `--proc /proc` mounts a fresh `/proc` so it reflects the empty netns,
+/// - `--unshare-net` is the actual airgap (only `lo`, no route/DNS),
+/// - `--die-with-parent` ties the sandbox's life to tab-atelier.
+///
+/// bubblewrap runs unprivileged via user namespaces (no `CAP_NET_ADMIN`),
+/// so this works in both the desktop GUI and the headless service.
+/// Returns the `(program, args)` to hand to the PTY.
+#[must_use]
+pub fn no_internet_command(prog: &str, args: &[String]) -> (String, Vec<String>) {
+    let mut out: Vec<String> = [
+        "--dev-bind",
+        "/",
+        "/",
+        "--proc",
+        "/proc",
+        "--unshare-net",
+        "--die-with-parent",
+        "--",
+        prog,
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect();
+    out.extend(args.iter().cloned());
+    (BWRAP_BIN.to_string(), out)
+}
+
 /// The login shell to run inside a cleared-env tab.
 ///
 /// Read from `$SHELL` (the only place the parent's choice survives once
@@ -410,6 +454,14 @@ pub struct TabState {
     /// restarts.
     #[serde(default, skip_serializing_if = "is_false")]
     pub locked: bool,
+
+    /// When true, the tab's shell runs inside a bubblewrap network
+    /// namespace (loopback only → no internet). Toggled by the
+    /// right-click "Disable internet" menu (GUI) / `net-off` (CLI);
+    /// applied on (re)spawn. Persisted so a net-off tab stays off across
+    /// restarts. Skipped from JSON when false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub net_disabled: bool,
 
     /// Per-tab override of the viewer background color (hex
     /// `#RRGGBB`). When `Some`, beats the global
@@ -575,6 +627,7 @@ impl Default for TabState {
             share_token_rw: String::new(),
             share_token_ro: String::new(),
             locked: false,
+            net_disabled: false,
             bg_color: None,
             schedule: None,
             limits: TabResourceLimits::default(),
@@ -2145,6 +2198,24 @@ pub fn file_path_for_open(path: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_internet_command_wraps_in_bwrap_unshare_net() {
+        let (prog, args) = no_internet_command("/bin/bash", &["-l".to_string()]);
+        assert_eq!(prog, "bwrap");
+        // The airgap flag + the real command after the `--` separator.
+        assert!(
+            args.contains(&"--unshare-net".to_string()),
+            "isolates the network namespace"
+        );
+        assert!(args.contains(&"--die-with-parent".to_string()));
+        let sep = args.iter().position(|a| a == "--").expect("has -- separator");
+        assert_eq!(
+            &args[sep + 1..],
+            &["/bin/bash".to_string(), "-l".to_string()],
+            "real cmd after --"
+        );
+    }
 
     #[test]
     fn parse_memory_bytes_handles_suffixes_and_junk() {
