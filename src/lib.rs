@@ -319,6 +319,33 @@ pub fn setpriv_available() -> bool {
     std::env::var_os("PATH").is_some_and(|paths| std::env::split_paths(&paths).any(|d| d.join(SETPRIV_BIN).is_file()))
 }
 
+/// Whether this process holds any **ambient** capabilities.
+///
+/// Ambient caps are the ones a child inherits across `exec`. Tabs only need
+/// stripping (via [`drop_caps_command`]) when there's something to strip: if
+/// the daemon has no ambient caps (the default — `AmbientCapabilities=`
+/// empty), wrapping every shell in `setpriv` is pointless AND dangerous,
+/// because `setpriv` calls `capset`, which a restrictive `SystemCallFilter`
+/// may block — and then the shell never execs (a blank tab). Reads
+/// `/proc/self/status`; `false` on non-Linux or any read/parse failure.
+#[must_use]
+pub fn has_ambient_caps() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/self/status").is_ok_and(|status| {
+            status.lines().any(|line| {
+                line.strip_prefix("CapAmb:")
+                    .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
+                    .is_some_and(|v| v != 0)
+            })
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
 /// Wrap a shell command so the tab's process subtree holds **no Linux
 /// capabilities** and can never regain any.
 ///

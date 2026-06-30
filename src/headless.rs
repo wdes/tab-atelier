@@ -407,12 +407,14 @@ fn spawn_pty_tab(
 
     // Net-off tabs run their shell inside a bubblewrap netns (which also
     // drops all caps). Otherwise strip Linux capabilities from the tab's
-    // subtree via setpriv — the daemon may hold CAP_NET_ADMIN to program
-    // nft, and the agent must NOT inherit it (it could `nft flush` its own
-    // allowlist and escape).
+    // subtree via setpriv — BUT only when the daemon actually holds ambient
+    // caps to leak (it has CAP_NET_ADMIN to program nft). With no ambient
+    // caps there's nothing to strip, and wrapping in setpriv would only risk
+    // breaking the spawn (setpriv calls capset, which a strict
+    // SystemCallFilter blocks → a blank tab).
     let (prog, args) = if net_disabled {
         crate::no_internet_command(&prog, &args)
-    } else if crate::setpriv_available() {
+    } else if crate::has_ambient_caps() && crate::setpriv_available() {
         crate::drop_caps_command(&prog, &args)
     } else {
         (prog, args)
