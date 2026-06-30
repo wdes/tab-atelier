@@ -308,6 +308,45 @@ pub fn no_internet_command(prog: &str, args: &[String]) -> (String, Vec<String>)
     (BWRAP_BIN.to_string(), out)
 }
 
+/// `setpriv` (util-linux) executable name — used to strip Linux
+/// capabilities from a tab's shell subtree.
+const SETPRIV_BIN: &str = "setpriv";
+
+/// True when `setpriv` is on `PATH` (util-linux; essentially always on
+/// Debian). Probed without executing.
+#[must_use]
+pub fn setpriv_available() -> bool {
+    std::env::var_os("PATH").is_some_and(|paths| std::env::split_paths(&paths).any(|d| d.join(SETPRIV_BIN).is_file()))
+}
+
+/// Wrap a shell command so the tab's process subtree holds **no Linux
+/// capabilities** and can never regain any.
+///
+/// The headless service is granted `CAP_NET_ADMIN` (to program the per-tab
+/// nftables egress allowlist), which systemd places in the daemon's
+/// *ambient* set — and ambient caps are inherited across `exec` into every
+/// child. Without stripping them, an agent inside a tab could `nft flush`
+/// its own allowlist and walk straight out. So we drop them:
+///
+/// - `--ambient-caps=-all` clears the ambient set the child would inherit
+///   (this is the one that actually carries `CAP_NET_ADMIN` to the tab),
+/// - `--inh-caps=-all` clears inheritable so nothing re-populates ambient,
+/// - `--no-new-privs` blocks regaining privileges via setuid/`execve`.
+///
+/// Bounding-set drop is intentionally omitted: it needs `CAP_SETPCAP`,
+/// while the three above work for an ordinary (even capability-holding)
+/// user, and clearing ambient is sufficient to deny the cap. Returns the
+/// `(program, args)` to hand to the PTY.
+#[must_use]
+pub fn drop_caps_command(prog: &str, args: &[String]) -> (String, Vec<String>) {
+    let mut out: Vec<String> = ["--ambient-caps=-all", "--inh-caps=-all", "--no-new-privs", "--", prog]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    out.extend(args.iter().cloned());
+    (SETPRIV_BIN.to_string(), out)
+}
+
 /// The login shell to run inside a cleared-env tab.
 ///
 /// Read from `$SHELL` (the only place the parent's choice survives once
@@ -2264,6 +2303,26 @@ mod tests {
             "isolates the network namespace"
         );
         assert!(args.contains(&"--die-with-parent".to_string()));
+        let sep = args.iter().position(|a| a == "--").expect("has -- separator");
+        assert_eq!(
+            &args[sep + 1..],
+            &["/bin/bash".to_string(), "-l".to_string()],
+            "real cmd after --"
+        );
+    }
+
+    #[test]
+    fn drop_caps_command_strips_ambient_and_blocks_regain() {
+        let (prog, args) = drop_caps_command("/bin/bash", &["-l".to_string()]);
+        assert_eq!(prog, "setpriv");
+        // Ambient is the set that would carry CAP_NET_ADMIN into the tab.
+        assert!(args.contains(&"--ambient-caps=-all".to_string()), "clears ambient caps");
+        assert!(args.contains(&"--no-new-privs".to_string()), "blocks regaining privs");
+        // Bounding-set drop is deliberately NOT used (needs CAP_SETPCAP).
+        assert!(
+            !args.iter().any(|a| a.starts_with("--bounding-set")),
+            "no bounding-set drop"
+        );
         let sep = args.iter().position(|a| a == "--").expect("has -- separator");
         assert_eq!(
             &args[sep + 1..],

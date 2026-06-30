@@ -125,8 +125,8 @@ struct HeadlessTab {
     /// Persisted; applied on (re)spawn.
     net_disabled: bool,
     /// Allowlist-mode config (mutually exclusive with `net_disabled`).
-    /// Persisted; applied on (re)spawn by launching `net_proxy` and
-    /// injecting its env. Empty ⇒ not in allowlist mode.
+    /// Persisted; applied on (re)spawn by installing per-tab nftables rules
+    /// (CIDRs) before the shell starts. Empty ⇒ not in allowlist mode.
     net_allow: crate::net_policy::AllowConfig,
     /// Free-text context the in-tab agent set via `set-context`.
     /// In-memory only (not persisted); reflected on `/tabs`.
@@ -375,9 +375,45 @@ fn spawn_pty_tab(
         env.extend(extra_env);
         (env, shell_program, vec![])
     };
-    // Net-off tabs run their shell inside a bubblewrap netns (no internet).
+    // Install the kernel egress allowlist BEFORE the shell exists, so the
+    // tab is confined the instant it's moved into its cgroup (no unconfined
+    // window — the cgroup is created empty + rules applied here; the pid
+    // joins it right after spawn). teardown-first un-confines a tab that
+    // left allowlist mode. CIDR-only — domain allowlists are the resolver's
+    // job (nft can't match a hostname). Best-effort: logs + leaves the tab
+    // unconfined on failure.
+    #[cfg(target_os = "linux")]
+    let nft_cgroup: Option<String> = {
+        crate::net_nft::teardown(&id);
+        if net_disabled || net_allow.is_empty() {
+            None
+        } else {
+            let cidrs = net_allow.to_allow_set().cidrs;
+            if cidrs.is_empty() {
+                log::debug!("net_nft: tab '{name}' allowlist has no CIDRs; nothing for nft to confine yet");
+                None
+            } else if let Some(rel) = crate::cgroup::prepare_tab_cgroup(&id) {
+                if crate::net_nft::apply(&id, &rel, &cidrs) {
+                    Some(rel)
+                } else {
+                    None
+                }
+            } else {
+                log::debug!("net_nft: no per-tab cgroup for '{name}'; kernel enforcement skipped");
+                None
+            }
+        }
+    };
+
+    // Net-off tabs run their shell inside a bubblewrap netns (which also
+    // drops all caps). Otherwise strip Linux capabilities from the tab's
+    // subtree via setpriv — the daemon may hold CAP_NET_ADMIN to program
+    // nft, and the agent must NOT inherit it (it could `nft flush` its own
+    // allowlist and escape).
     let (prog, args) = if net_disabled {
         crate::no_internet_command(&prog, &args)
+    } else if crate::setpriv_available() {
+        crate::drop_caps_command(&prog, &args)
     } else {
         (prog, args)
     };
@@ -402,6 +438,12 @@ fn spawn_pty_tab(
     // child-PID lookup is wired up.
     #[cfg(windows)]
     let pid = 0u32;
+    // Join the (already nft-confined) cgroup immediately so enforcement
+    // begins right away. The rules were installed pre-spawn above.
+    #[cfg(target_os = "linux")]
+    if nft_cgroup.is_some() {
+        crate::cgroup::move_pid_to_tab_cgroup(&id, pid);
+    }
     let config = Config {
         scrolling_history: 10_000,
         ..Config::default()
@@ -436,28 +478,6 @@ fn spawn_pty_tab(
     let last_known_cwd_string = cwd.as_ref().map(|p| p.to_string_lossy().into_owned());
     #[cfg(not(feature = "energy"))]
     let _ = energy_wh;
-
-    // Kernel-level egress allowlist (nftables — required). Clears any stale
-    // table for this id first (so leaving allowlist mode un-confines the
-    // tab), then — when in allowlist mode with CIDRs — puts the tab's shell
-    // in a cgroup and installs nft rules that drop everything off the
-    // allowlist. Best-effort: a no-op without CAP_NET_ADMIN / cgroups (logs;
-    // the tab is then NOT confined). Domain allowlists are enforced by the
-    // DNS resolver (separate) — nftables can't match a hostname.
-    #[cfg(target_os = "linux")]
-    {
-        crate::net_nft::teardown(&id);
-        if !net_disabled && !net_allow.is_empty() {
-            let allow_set = net_allow.to_allow_set();
-            if allow_set.cidrs.is_empty() {
-                log::debug!("net_nft: tab '{name}' allowlist has no CIDRs; nothing for nft to confine yet");
-            } else if let Some(rel) = crate::cgroup::ensure_tab_cgroup(&id, pid) {
-                let _ = crate::net_nft::apply(&id, &rel, &allow_set.cidrs);
-            } else {
-                log::debug!("net_nft: no per-tab cgroup for '{name}'; kernel enforcement skipped");
-            }
-        }
-    }
 
     Some(HeadlessTab {
         id,
