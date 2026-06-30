@@ -158,24 +158,34 @@ pub fn apply(tab_id: &str, pid: u32, limits: &TabResourceLimits) {
     }
 }
 
-/// Ensure a per-tab cgroup exists and `pid` is in it, returning its path
-/// **relative to the cgroup v2 mount** (e.g.
-/// `system.slice/tab-atelier-headless.service/tab-<id>`) for nftables'
-/// `socket cgroupv2` match. Unlike [`apply`], this runs even when the tab
-/// has no resource limits — the kernel egress allowlist
-/// ([`crate::net_nft`]) needs the cgroup regardless. `None` when delegation
+/// Create a tab's cgroup (empty) and return its path **relative to the
+/// cgroup v2 mount** (e.g. `system.slice/tab-atelier-headless.service/tab-<id>`)
+/// for nftables' `socket cgroupv2` match. The path is deterministic and
+/// needs no pid, so the caller can install nft rules against it **before**
+/// the tab's shell is spawned — there is no unconfined window. Pair with
+/// [`move_pid_to_tab_cgroup`] once the pid exists. `None` when delegation
 /// isn't set up. Idempotent.
 #[must_use]
-pub fn ensure_tab_cgroup(tab_id: &str, pid: u32) -> Option<String> {
+pub fn prepare_tab_cgroup(tab_id: &str) -> Option<String> {
     let Some(Some(base)) = DELEGATED_BASE.get() else {
         return None;
     };
     let dir = base.join(format!("tab-{}", sanitize_id(tab_id)));
     std::fs::create_dir_all(&dir).ok()?;
-    write_cgroup(&dir.join("cgroup.procs"), &pid.to_string()).ok()?;
     dir.strip_prefix(CGROUP_ROOT)
         .ok()
         .map(|rel| rel.to_string_lossy().into_owned())
+}
+
+/// Move `pid` into the tab's (already [`prepare_tab_cgroup`]d) cgroup, so
+/// the nft rules keyed on it take effect. Best-effort: `false` if delegation
+/// is off or the write fails.
+pub fn move_pid_to_tab_cgroup(tab_id: &str, pid: u32) -> bool {
+    let Some(Some(base)) = DELEGATED_BASE.get() else {
+        return false;
+    };
+    let dir = base.join(format!("tab-{}", sanitize_id(tab_id)));
+    write_cgroup(&dir.join("cgroup.procs"), &pid.to_string()).is_ok()
 }
 
 /// Sanitise a tab id into a safe single path component.
