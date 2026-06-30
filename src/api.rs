@@ -54,6 +54,11 @@ const VENDOR_TERM_SYMBOLS_WOFF2: &[u8] = include_bytes!("../assets/vendor/term-s
 /// next page load with no user intervention.
 const MAIN_CSS: &str = include_str!("../assets/main.css");
 const MAIN_JS: &str = include_str!("../assets/main.js");
+/// `OpenAPI` 3.1 description of this API. Embedded so the daemon can serve
+/// it at `GET /openapi.yaml` (public, no auth), and shipped in the `.deb`
+/// at `/usr/share/doc/tab-atelier*/openapi.yaml`. The `version: 0.0.0`
+/// placeholder is rewritten to the running build's version when served.
+const OPENAPI_YAML: &str = include_str!("../assets/openapi.yaml");
 
 /// Short git commit hash baked in at build time by `build.rs`.
 /// Embedded into the `/view` HTML as `__BUILD_HASH__` and echoed on
@@ -1126,6 +1131,22 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
     // browser (without the token in their session cookies) can
     // still load the JS that fetches /stream with the token from
     // the URL.
+    // OpenAPI spec — public so tooling (Swagger UI, codegen) can fetch it
+    // without a token. The `version: 0.0.0` placeholder is swapped for the
+    // running build's version so the served spec is always accurate.
+    if (method.as_str(), path.as_str()) == ("GET", "/openapi.yaml") {
+        let spec = OPENAPI_YAML.replacen("version: 0.0.0", &format!("version: {}", env!("CARGO_PKG_VERSION")), 1);
+        respond_with_etag(
+            stream,
+            200,
+            "application/yaml; charset=utf-8",
+            spec.as_bytes(),
+            accept_gzip,
+            if_none_match.as_deref(),
+            "Cache-Control: no-cache\r\n",
+        );
+        return;
+    }
     if let (
         "GET",
         "/assets/xterm-6.0.0.js"
@@ -3666,6 +3687,26 @@ mod tests {
         state.lock().unwrap().master_token = String::new();
         let resp = request(port, "GET /tabs HTTP/1.1\r\n\r\n");
         assert_eq!(status_code(&resp), 401, "empty master rejects token-less request");
+    }
+
+    #[test]
+    fn openapi_spec_served_publicly() {
+        let (port, _, _) = spawn_server();
+        // No token — the spec is public so tooling can fetch it.
+        let resp = request(port, "GET /openapi.yaml HTTP/1.1\r\n\r\n");
+        assert_eq!(status_code(&resp), 200);
+        assert!(resp.contains("openapi: 3.1"), "is an openapi doc");
+        // The 0.0.0 placeholder is rewritten to the running build version.
+        assert!(
+            resp.contains(&format!("version: {}", env!("CARGO_PKG_VERSION"))),
+            "version substituted"
+        );
+        assert!(!resp.contains("version: 0.0.0"), "placeholder gone");
+        // Covers the new token endpoints.
+        assert!(
+            resp.contains("/tabs/rotate-tokens") && resp.contains("/master-token/reset"),
+            "documents token endpoints"
+        );
     }
 
     #[test]

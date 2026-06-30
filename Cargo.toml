@@ -290,6 +290,9 @@ assets = [
     ["assets/claude-code-managed-settings.desktop.json", "/etc/claude-code/managed-settings.json", "644"],
     ["README.md", "/usr/share/doc/tab-atelier/", "644"],
     ["LICENSE", "/usr/share/doc/tab-atelier/", "644"],
+    # OpenAPI 3.1 spec for the local HTTP API (also served live at
+    # GET /openapi.yaml). Point Swagger UI / codegen at it.
+    ["assets/openapi.yaml", "/usr/share/doc/tab-atelier/", "644"],
 ]
 # Per debian-policy §10.7.2, conffiles are files in /etc that dpkg
 # treats as user-modifiable: on upgrade, dpkg prompts the admin if
@@ -341,6 +344,8 @@ assets = [
     ["assets/claude-code-managed-settings.json", "/etc/claude-code/managed-settings.json", "644"],
     ["README.md", "/usr/share/doc/tab-atelier-headless/", "644"],
     ["LICENSE", "/usr/share/doc/tab-atelier-headless/", "644"],
+    # OpenAPI 3.1 spec (also served live at GET /openapi.yaml).
+    ["assets/openapi.yaml", "/usr/share/doc/tab-atelier-headless/", "644"],
 ]
 # Service-account lifecycle (adduser/deluser) and unit enable/start
 # are handled by these scripts; cargo-deb installs them as the deb's
