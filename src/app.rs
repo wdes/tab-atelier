@@ -1816,11 +1816,15 @@ impl AppState {
                 .h(px(32.0))
                 .min_w(px(120.0))
                 .flex_shrink_0()
-                // Left border so the first tab of each wrapped row
-                // shows a separator on its left edge — right-only
-                // borders left the bar looking unbounded at every
-                // row start.
+                // Border on all four sides so every tab is fully framed:
+                // left/right give the column separators, and top/bottom
+                // give each (wrapped) row a horizontal rule — without the
+                // bottom line, rows of tabs blurred together vertically.
+                // The outer edges sit flush with the bar container's own
+                // top/bottom border (same 1px, same colour → one line).
                 .border_l_1()
+                .border_t_1()
+                .border_b_1()
                 .bg(if blink_red {
                     tab_blink_bg
                 } else if is_active {
