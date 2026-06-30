@@ -21,9 +21,17 @@
 //!
 //! ## Scope
 //!
-//! The pure ruleset generator ([`ruleset`]) is unit-tested; [`apply`] /
-//! [`teardown`] shell out to `nft`. CIDR-only — domain allowlists are the
-//! DNS resolver's job (nftables can't match a hostname).
+//! The pure ruleset generators ([`ruleset`] / [`meter_ruleset`]) are
+//! unit-tested; [`apply`] / [`apply_meter`] / [`teardown`] shell out to
+//! `nft`. CIDR-only enforcement — domain allowlists are the DNS resolver's
+//! job (nftables can't match a hostname).
+//!
+//! ## Metering
+//!
+//! Every non-net-off tab gets a per-tab table (allowlist tabs the confining
+//! [`ruleset`], plain tabs the count-only [`meter_ruleset`]), each with a
+//! `counter` on the cgroup match — so [`read_counters`] yields per-tab
+//! egress bytes (total, and denied for allowlist tabs) for *all* tabs.
 
 #![cfg(all(target_os = "linux", not(feature = "gui")))]
 
@@ -111,6 +119,37 @@ pub fn ruleset(table: &str, cgroup_rel: &str, cidrs: &[Cidr]) -> String {
     s.push_str("  }\n");
     s.push_str("}\n");
     s
+}
+
+/// Build a **count-only** ruleset for a tab that is NOT in allowlist mode.
+///
+/// One table whose OUTPUT-hook rule matches the tab's cgroup, bumps an
+/// (anonymous) counter and accepts. No drop — the tab reaches anywhere; we
+/// just meter its egress so *every* tab gets byte counts, not only confined
+/// ones. Same `socket cgroupv2` match as [`ruleset`].
+#[must_use]
+pub fn meter_ruleset(table: &str, cgroup_rel: &str) -> String {
+    let cgroup_rel = cgroup_rel.trim_matches('/');
+    let level = cgroup_rel.split('/').filter(|s| !s.is_empty()).count();
+    let mut s = String::new();
+    let _ = writeln!(s, "table inet {table} {{");
+    s.push_str("  chain out {\n");
+    s.push_str("    type filter hook output priority 0; policy accept;\n");
+    let _ = writeln!(
+        s,
+        "    socket cgroupv2 level {level} \"{cgroup_rel}\" counter accept comment \"tab-atelier metering\""
+    );
+    s.push_str("  }\n");
+    s.push_str("}\n");
+    s
+}
+
+/// Install the count-only metering table for a non-allowlist tab. Like
+/// [`apply`] but no enforcement — best-effort, idempotent (teardown first).
+#[must_use]
+pub fn apply_meter(tab_id: &str, cgroup_rel: &str) -> bool {
+    teardown(tab_id);
+    matches!(run_nft_stdin(&meter_ruleset(&table_name(tab_id), cgroup_rel)), Ok(true))
 }
 
 /// Format a u128 as a fully-expanded IPv6 address (no `::` compression —
@@ -213,7 +252,10 @@ fn parse_counters(json: &serde_json::Value) -> (u64, u64) {
                 .and_then(serde_json::Value::as_u64)
         });
         let Some(bytes) = counter_bytes else { continue };
-        if chain == "out" && exprs.iter().any(|e| e.get("jump").is_some()) {
+        // The single rule in chain `out` carries the TOTAL counter, whether
+        // it jumps into a confine chain (allowlist) or just accepts
+        // (meter-only). The confine chain's drop rule carries DENIED.
+        if chain == "out" {
             total = bytes;
         } else if chain == "confine" && exprs.iter().any(|e| e.get("drop").is_some()) {
             denied = bytes;
@@ -318,6 +360,29 @@ mod tests {
     fn parse_counters_empty_is_zero() {
         let json: serde_json::Value = serde_json::from_str(r#"{"nftables":[]}"#).unwrap();
         assert_eq!(parse_counters(&json), (0, 0));
+    }
+
+    #[test]
+    fn meter_ruleset_counts_and_accepts_no_drop() {
+        let rs = meter_ruleset("t", "/a/b/c/");
+        assert!(
+            rs.contains("socket cgroupv2 level 3 \"a/b/c\" counter accept comment \"tab-atelier metering\""),
+            "{rs}"
+        );
+        assert!(!rs.contains("drop"), "meter-only never drops");
+        assert!(!rs.contains("confine"), "no policing chain");
+    }
+
+    #[test]
+    fn parse_counters_meter_only_has_total_no_denied() {
+        // Meter-only out rule: counter + accept, no jump, no confine chain.
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{"nftables":[{"rule":{"chain":"out","expr":[
+                {"match":{"left":{"socket":{"key":"cgroupv2"}}}},
+                {"counter":{"packets":5,"bytes":2048}},{"accept":null}]}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(parse_counters(&json), (2048, 0));
     }
 
     #[test]
