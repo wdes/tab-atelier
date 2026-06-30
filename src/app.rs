@@ -1116,6 +1116,8 @@ impl AppState {
                 // Connection metering is wired on the headless service;
                 // the desktop GUI reports 0 for now.
                 connections: 0,
+                tx_bytes: 0,
+                tx_denied_bytes: 0,
             });
         }
 

@@ -97,13 +97,16 @@ pub fn ruleset(table: &str, cgroup_rel: &str, cidrs: &[Cidr]) -> String {
             v6.join(", ")
         );
     }
-    s.push_str("    drop comment \"tab-atelier: off-allowlist egress denied\"\n");
+    // `counter drop`: bytes/packets DENIED (tried to leave the allowlist).
+    s.push_str("    counter drop comment \"tab-atelier: off-allowlist egress denied\"\n");
     s.push_str("  }\n");
     s.push_str("  chain out {\n");
     s.push_str("    type filter hook output priority 0; policy accept;\n");
+    // `counter` on the jump: TOTAL egress from this tab's cgroup (allowed +
+    // denied). Allowed = total − denied, read back by `read_counters`.
     let _ = writeln!(
         s,
-        "    socket cgroupv2 level {level} \"{cgroup_rel}\" jump confine comment \"tab-atelier egress allowlist\""
+        "    socket cgroupv2 level {level} \"{cgroup_rel}\" counter jump confine comment \"tab-atelier egress allowlist\""
     );
     s.push_str("  }\n");
     s.push_str("}\n");
@@ -164,6 +167,61 @@ fn nft_bin() -> &'static str {
     "nft"
 }
 
+/// Read a tab's egress byte counters: `(total_bytes, denied_bytes)`.
+///
+/// `total` is everything the tab's cgroup tried to send (the counter on the
+/// jump rule); `denied` is what the allowlist dropped (the counter on the
+/// `drop`). Allowed = total − denied. `None` when the table doesn't exist
+/// (tab not confined) or `nft` can't be read.
+#[must_use]
+pub fn read_counters(tab_id: &str) -> Option<(u64, u64)> {
+    let table = table_name(tab_id);
+    let out = std::process::Command::new(nft_bin())
+        .args(["-j", "list", "table", "inet", &table])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    Some(parse_counters(&json))
+}
+
+/// Pull `(total, denied)` byte counts out of `nft -j list table` JSON. Pure
+/// so it's unit-testable. `total` = the counter on the chain-`out` jump
+/// rule; `denied` = the counter on the chain-`confine` `drop` rule.
+#[must_use]
+fn parse_counters(json: &serde_json::Value) -> (u64, u64) {
+    let mut total = 0;
+    let mut denied = 0;
+    let Some(items) = json.get("nftables").and_then(|n| n.as_array()) else {
+        return (0, 0);
+    };
+    for item in items {
+        let Some(rule) = item.get("rule") else { continue };
+        let chain = rule
+            .get("chain")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let Some(exprs) = rule.get("expr").and_then(|e| e.as_array()) else {
+            continue;
+        };
+        let counter_bytes = exprs.iter().find_map(|e| {
+            e.get("counter")
+                .and_then(|c| c.get("bytes"))
+                .and_then(serde_json::Value::as_u64)
+        });
+        let Some(bytes) = counter_bytes else { continue };
+        if chain == "out" && exprs.iter().any(|e| e.get("jump").is_some()) {
+            total = bytes;
+        } else if chain == "confine" && exprs.iter().any(|e| e.get("drop").is_some()) {
+            denied = bytes;
+        }
+    }
+    (total, denied)
+}
+
 /// Remove a tab's table. Best-effort and silent — a missing table (never
 /// applied, or already gone) is not an error.
 pub fn teardown(tab_id: &str) {
@@ -208,14 +266,14 @@ mod tests {
         let rs = ruleset("t", "system.slice/svc/tab-x", &cidrs);
         // Three path components ⇒ level 3.
         assert!(
-            rs.contains("socket cgroupv2 level 3 \"system.slice/svc/tab-x\" jump confine"),
+            rs.contains("socket cgroupv2 level 3 \"system.slice/svc/tab-x\" counter jump confine"),
             "{rs}"
         );
         // Output hook must stay accept so the daemon isn't policed.
         assert!(rs.contains("hook output priority 0; policy accept;"));
         // The allowlisted v4 net is accepted, then everything else dropped.
         assert!(rs.contains("ip daddr { 104.16.0.0/13 } accept"));
-        assert!(rs.contains("    drop comment "));
+        assert!(rs.contains("    counter drop comment "));
         // Loopback + DNS always allowed (local API, proxy, resolution).
         assert!(rs.contains("oifname \"lo\" accept"));
         assert!(rs.contains("udp dport 53 accept"));
@@ -231,9 +289,35 @@ mod tests {
 
         // Empty allowlist → still valid (loopback + DNS, everything else drop).
         let empty = ruleset("t", "a/b", &[]);
-        assert!(empty.contains("    drop comment "));
+        assert!(empty.contains("    counter drop comment "));
         assert!(!empty.contains("ip daddr"));
         assert!(!empty.contains("ip6 daddr"));
+    }
+
+    #[test]
+    fn parse_counters_extracts_total_and_denied() {
+        // Shape of `nft -j list table inet …`: a jump rule (chain out) with
+        // the total counter, and a drop rule (chain confine) with denied.
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{"nftables":[
+                {"metainfo":{"version":"1.1.3"}},
+                {"table":{"family":"inet","name":"tabatelier_x"}},
+                {"rule":{"chain":"confine","expr":[
+                    {"counter":{"packets":3,"bytes":240}},{"drop":null}]}},
+                {"rule":{"chain":"out","expr":[
+                    {"match":{"left":{"socket":{"key":"cgroupv2"}}}},
+                    {"counter":{"packets":12,"bytes":4096}},
+                    {"jump":{"target":"confine"}}]}}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(parse_counters(&json), (4096, 240)); // (total, denied)
+    }
+
+    #[test]
+    fn parse_counters_empty_is_zero() {
+        let json: serde_json::Value = serde_json::from_str(r#"{"nftables":[]}"#).unwrap();
+        assert_eq!(parse_counters(&json), (0, 0));
     }
 
     #[test]
