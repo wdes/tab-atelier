@@ -1072,7 +1072,16 @@ pub fn tabs(args: &[String]) -> i32 {
             "locked".to_string()
         };
         let marker = if active { "*" } else { " " };
-        println!("{marker}{idx:>2}  {id_short:<8}  {status:<22}  {name}");
+        // Trailing "👁 N" when one or more web/remote viewers are
+        // attached, so you can see at a glance which tabs are being
+        // watched. Omitted when nobody's connected.
+        let viewers = t.get("viewers").and_then(serde_json::Value::as_u64).unwrap_or(0);
+        let watch = if viewers > 0 {
+            format!("  👁 {viewers}")
+        } else {
+            String::new()
+        };
+        println!("{marker}{idx:>2}  {id_short:<8}  {status:<22}  {name}{watch}");
         if locked && reason == Some("schedule") {
             let rule = t
                 .get("schedule_rule")

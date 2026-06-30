@@ -844,6 +844,7 @@ fn refresh_snapshot(
             agent_state: tab.agent_state.clone(),
             agent_session_id: tab.agent_session_id.clone(),
             agent_kind: tab.agent_kind.clone(),
+            viewers: tab.pty_ring.lock().map_or(0, |r| r.viewer_count()),
             pty_ring: Some(tab.pty_ring.clone()),
         });
     }

@@ -85,6 +85,14 @@ pub struct PtyRing {
     /// No-op when no pump is registered; lives outside the protocol
     /// model so it costs a single `notify_waiters` per PTY read.
     notify: std::sync::Arc<tokio::sync::Notify>,
+    /// Number of WS viewers (browser share-link / `remote attach`)
+    /// currently attached to this tab. Bumped by a guard in
+    /// `api_ws::run_pump` for the life of each connection. An
+    /// `Arc<AtomicUsize>` so the guard can inc/dec and the renderer can
+    /// read it without taking the ring lock. Drives "is anyone watching
+    /// this tab" — the GUI's dormant-LED suppressor and the `/tabs`
+    /// `viewers` field.
+    viewers: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Default for PtyRing {
@@ -101,6 +109,7 @@ impl PtyRing {
             base_offset: 0,
             cap: cap.max(1),
             notify: std::sync::Arc::new(tokio::sync::Notify::new()),
+            viewers: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -109,6 +118,19 @@ impl PtyRing {
     #[must_use]
     pub fn notifier(&self) -> std::sync::Arc<tokio::sync::Notify> {
         self.notify.clone()
+    }
+
+    /// Clone the viewer-count handle so a connection guard can inc/dec
+    /// it without holding the ring lock. See [`Self::viewer_count`].
+    #[must_use]
+    pub fn viewers_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+        self.viewers.clone()
+    }
+
+    /// How many WS viewers are currently attached to this tab.
+    #[must_use]
+    pub fn viewer_count(&self) -> usize {
+        self.viewers.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Append `data` to the ring, dropping the oldest bytes if the

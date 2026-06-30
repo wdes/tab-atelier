@@ -480,7 +480,12 @@ impl AppState {
                         prior_uptime: std::time::Duration::from_secs_f64(ts.uptime_secs.unwrap_or(0.0)),
                         active_duration: std::time::Duration::ZERO,
                         last_activated: None,
-                        last_focused_at: None,
+                        // Treat a restored tab as "just seen" at boot so
+                        // it starts grey and only ages into the blue
+                        // dormant state after DORMANT_AFTER_SECS without
+                        // you opening it — otherwise every attached
+                        // session would flash blue on every restart.
+                        last_focused_at: Some(std::time::Instant::now()),
                         #[cfg(feature = "energy")]
                         energy_wh: ts.energy_wh.unwrap_or(0.0),
                         #[cfg(feature = "energy")]
@@ -530,7 +535,12 @@ impl AppState {
                         prior_uptime: std::time::Duration::ZERO,
                         active_duration: std::time::Duration::ZERO,
                         last_activated: None,
-                        last_focused_at: None,
+                        // Treat a restored tab as "just seen" at boot so
+                        // it starts grey and only ages into the blue
+                        // dormant state after DORMANT_AFTER_SECS without
+                        // you opening it — otherwise every attached
+                        // session would flash blue on every restart.
+                        last_focused_at: Some(std::time::Instant::now()),
                         #[cfg(feature = "energy")]
                         energy_wh: 0.0,
                         #[cfg(feature = "energy")]
@@ -1081,6 +1091,7 @@ impl AppState {
                 agent_state: tab.agent_state.clone(),
                 agent_session_id: tab.agent_session_id.clone(),
                 agent_kind: tab.agent_kind.clone(),
+                viewers: pty_ring.lock().map_or(0, |r| r.viewer_count()),
                 pty_ring: Some(pty_ring),
             });
         }
@@ -1750,9 +1761,13 @@ impl AppState {
                     // looked at recently. Opening the tab refreshes
                     // last_focused_at (persist tick) → back to grey.
                     None => {
-                        let dormant = tab
-                            .last_focused_at
-                            .is_none_or(|t| t.elapsed().as_secs() > DORMANT_AFTER_SECS);
+                        // A tab someone is watching over the web/remote
+                        // viewer is being tended too — never dormant.
+                        let watched = tab.view.read(cx).viewer_count() > 0;
+                        let dormant = !watched
+                            && tab
+                                .last_focused_at
+                                .is_none_or(|t| t.elapsed().as_secs() > DORMANT_AFTER_SECS);
                         if dormant {
                             Hsla::from(Rgba {
                                 r: 0.36,

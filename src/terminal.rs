@@ -266,6 +266,10 @@ pub struct TerminalView {
     /// Survives PTY respawn — the same Arc threads into the next
     /// `PtyTap` so the user can scroll past the restart boundary.
     pty_ring: Arc<std::sync::Mutex<crate::pty_ring::PtyRing>>,
+    /// Lock-free copy of the ring's WS-viewer counter, so the renderer
+    /// can ask "is anyone watching this tab over the web/remote?" each
+    /// frame without taking the ring lock. Bumped by `api_ws::run_pump`.
+    viewers: Arc<std::sync::atomic::AtomicUsize>,
     /// Previous frame's per-row `RawLine`s, reused for un-damaged rows
     /// (Ghostty `rebuildCells` pattern). Alacritty's `Term::damage()`
     /// exposes which screen rows changed since the last call; rows
@@ -442,6 +446,7 @@ impl TerminalView {
         );
         let term = Arc::new(FairMutex::new(term));
         let pty_ring = Arc::new(std::sync::Mutex::new(crate::pty_ring::PtyRing::default()));
+        let viewers = pty_ring.lock().expect("fresh ring lock").viewers_handle();
         let pty = crate::pty_ring::PtyTap::new(pty, pty_ring.clone());
         let el = EventLoop::new(term.clone(), proxy.clone(), pty, false, false).expect("failed to create event loop");
         let notifier = el.channel();
@@ -574,6 +579,7 @@ impl TerminalView {
             colors_enabled: Cell::new(initial_colors_enabled),
             locked: Rc::new(Cell::new(false)),
             pty_ring,
+            viewers,
             prev_frame: Rc::new(RefCell::new(None)),
             last_prepaint: Rc::new(RefCell::new(None)),
         }
@@ -585,6 +591,13 @@ impl TerminalView {
     #[must_use]
     pub fn pty_ring(&self) -> Arc<std::sync::Mutex<crate::pty_ring::PtyRing>> {
         self.pty_ring.clone()
+    }
+
+    /// How many WS viewers (browser share-link / `remote attach`) are
+    /// currently watching this tab. Lock-free.
+    #[must_use]
+    pub fn viewer_count(&self) -> usize {
+        self.viewers.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub const fn colors_enabled(&self) -> bool {

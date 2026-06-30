@@ -202,6 +202,25 @@ struct ImeDedup {
     last_at: Option<Instant>,
 }
 
+/// RAII counter for "a viewer is attached to this tab". Increments the
+/// ring's viewer count on construction and decrements on drop, so the
+/// count is correct across every `run_pump` exit path (clean close,
+/// send/recv error, task cancellation).
+struct ViewerGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl ViewerGuard {
+    fn new(counter: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self(counter)
+    }
+}
+
+impl Drop for ViewerGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 impl ImeDedup {
     const fn new() -> Self {
         Self {
@@ -602,13 +621,18 @@ async fn run_pump(
     };
 
     // Event-driven output: wake on a `PtyRing` push and flush
-    // immediately. `notify` is cloned from the ring once up front.
-    let notify = {
+    // immediately. `notify` is cloned from the ring once up front, along
+    // with the viewer-count handle.
+    let (notify, viewers) = {
         let Ok(r) = ring.lock() else {
             return;
         };
-        r.notifier()
+        (r.notifier(), r.viewers_handle())
     };
+    // Count this connection as a viewer for its whole lifetime. The
+    // guard's Drop decrements on every exit path (clean close, error,
+    // task cancel), so a crashed viewer can't leak a phantom count.
+    let _viewer = ViewerGuard::new(viewers);
     let mut meta_tick = tokio::time::interval(Duration::from_millis(META_POLL_MS));
     meta_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -1035,6 +1059,23 @@ mod tests {
         let mut d = ImeDedup::new();
         assert_eq!(d.classify(b"hello"), Some(b"hello".to_vec()));
         assert_eq!(d.classify(b"hello"), None);
+    }
+
+    #[test]
+    fn viewer_guard_counts_connections() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let n = Arc::new(AtomicUsize::new(0));
+        {
+            let _a = ViewerGuard::new(n.clone());
+            assert_eq!(n.load(Ordering::Relaxed), 1);
+            let b = ViewerGuard::new(n.clone());
+            assert_eq!(n.load(Ordering::Relaxed), 2, "two viewers");
+            drop(b);
+            assert_eq!(n.load(Ordering::Relaxed), 1, "one disconnected");
+        }
+        // Both guards dropped (incl. error/cancel paths) → back to zero.
+        assert_eq!(n.load(Ordering::Relaxed), 0, "no phantom viewers leak");
     }
 
     #[test]
