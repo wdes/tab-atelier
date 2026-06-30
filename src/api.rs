@@ -54,11 +54,29 @@ const VENDOR_TERM_SYMBOLS_WOFF2: &[u8] = include_bytes!("../assets/vendor/term-s
 /// next page load with no user intervention.
 const MAIN_CSS: &str = include_str!("../assets/main.css");
 const MAIN_JS: &str = include_str!("../assets/main.js");
-/// `OpenAPI` 3.1 description of this API. Embedded so the daemon can serve
-/// it at `GET /openapi.yaml` (public, no auth), and shipped in the `.deb`
-/// at `/usr/share/doc/tab-atelier*/openapi.yaml`. The `version: 0.0.0`
-/// placeholder is rewritten to the running build's version when served.
+/// `OpenAPI` 3.1 description of this API, embedded as a fallback. The
+/// canonical copy is the `.deb` docs file (see [`openapi_spec`]); this
+/// build-time embed only backs uninstalled (dev / `cargo run`) runs.
 const OPENAPI_YAML: &str = include_str!("../assets/openapi.yaml");
+
+/// The `OpenAPI` spec to serve at `GET /openapi.yaml`, with the
+/// `version: 0.0.0` placeholder rewritten to the running build's version.
+///
+/// Read from the installed Debian docs file so the served copy and the
+/// `/usr/share/doc` copy are one and the same — the systemd unit binds
+/// `/usr` read-only into the sandbox, so the service can read it. Falls
+/// back to the embedded copy when not installed (dev runs, tests).
+fn openapi_spec() -> String {
+    const DOC_PATHS: [&str; 2] = [
+        "/usr/share/doc/tab-atelier/openapi.yaml",
+        "/usr/share/doc/tab-atelier-headless/openapi.yaml",
+    ];
+    let raw = DOC_PATHS
+        .iter()
+        .find_map(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_else(|| OPENAPI_YAML.to_string());
+    raw.replacen("version: 0.0.0", &format!("version: {}", env!("CARGO_PKG_VERSION")), 1)
+}
 
 /// Short git commit hash baked in at build time by `build.rs`.
 /// Embedded into the `/view` HTML as `__BUILD_HASH__` and echoed on
@@ -1132,10 +1150,9 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
     // still load the JS that fetches /stream with the token from
     // the URL.
     // OpenAPI spec — public so tooling (Swagger UI, codegen) can fetch it
-    // without a token. The `version: 0.0.0` placeholder is swapped for the
-    // running build's version so the served spec is always accurate.
+    // without a token. Read from the installed /usr/share/doc copy.
     if (method.as_str(), path.as_str()) == ("GET", "/openapi.yaml") {
-        let spec = OPENAPI_YAML.replacen("version: 0.0.0", &format!("version: {}", env!("CARGO_PKG_VERSION")), 1);
+        let spec = openapi_spec();
         respond_with_etag(
             stream,
             200,
@@ -1144,6 +1161,19 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             accept_gzip,
             if_none_match.as_deref(),
             "Cache-Control: no-cache\r\n",
+        );
+        return;
+    }
+    // RFC 9727 API Catalog at the IANA-registered well-known URI. Returns
+    // an RFC 9264 linkset pointing to the OpenAPI description via the RFC
+    // 8631 `service-desc` relation, so generic API tooling can discover
+    // the spec from the host root. Public (no token).
+    if (method.as_str(), path.as_str()) == ("GET", "/.well-known/api-catalog") {
+        let body = r#"{"linkset":[{"anchor":"/.well-known/api-catalog","service-desc":[{"href":"/openapi.yaml","type":"application/yaml","title":"tab-atelier local API (OpenAPI 3.1)"}]}]}"#;
+        let _ = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/linkset+json\r\n{ROBOTS_TAG}Cache-Control: no-cache\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len(),
         );
         return;
     }
@@ -3706,6 +3736,22 @@ mod tests {
         assert!(
             resp.contains("/tabs/rotate-tokens") && resp.contains("/master-token/reset"),
             "documents token endpoints"
+        );
+    }
+
+    #[test]
+    fn well_known_api_catalog_links_to_spec() {
+        // RFC 9727 well-known API Catalog — public, links to the OpenAPI.
+        let (port, _, _) = spawn_server();
+        let resp = request(port, "GET /.well-known/api-catalog HTTP/1.1\r\n\r\n");
+        assert_eq!(status_code(&resp), 200);
+        assert!(
+            resp.to_ascii_lowercase().contains("application/linkset+json"),
+            "linkset content-type"
+        );
+        assert!(
+            resp.contains("\"service-desc\"") && resp.contains("/openapi.yaml"),
+            "links to the spec"
         );
     }
 
