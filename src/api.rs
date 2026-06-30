@@ -182,6 +182,9 @@ struct TabInfo {
     /// existing consumers don't see a new field unless net is off.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     net_disabled: bool,
+    /// Active outbound connections (metering). Omitted when zero.
+    #[serde(skip_serializing_if = "is_zero")]
+    connections: usize,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -320,6 +323,9 @@ pub struct SnapshotTab {
     /// the net toggle endpoint can report it. Desktop GUI toggles it via
     /// the right-click menu; headless via `net-off`/`net-on`.
     pub net_disabled: bool,
+    /// Active outbound connection count (metering), refreshed on a timer
+    /// from `/proc` (see `net_meter`). 0 when not yet sampled / none.
+    pub connections: usize,
 }
 
 impl crate::schedule::LockState for SnapshotTab {
@@ -1384,6 +1390,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                     schedule_tz: t.schedule.as_ref().map(|s| s.tz.clone()),
                     context: t.context.clone(),
                     net_disabled: t.net_disabled,
+                    connections: t.connections,
                 })
                 .collect();
             #[cfg(feature = "energy")]
@@ -3368,6 +3375,7 @@ mod tests {
                     viewers: 0,
                     pty_ring: None,
                     net_disabled: false,
+                    connections: 0,
                 },
                 SnapshotTab {
                     id: "tab-b".into(),
@@ -3393,6 +3401,7 @@ mod tests {
                     viewers: 0,
                     pty_ring: None,
                     net_disabled: false,
+                    connections: 0,
                 },
             ],
             active: 0,

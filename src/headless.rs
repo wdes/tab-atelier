@@ -128,6 +128,9 @@ struct HeadlessTab {
     /// Persisted; applied on (re)spawn by installing per-tab nftables rules
     /// (CIDRs) before the shell starts. Empty ⇒ not in allowlist mode.
     net_allow: crate::net_policy::AllowConfig,
+    /// Active outbound connection count (metering), refreshed on a timer
+    /// from `/proc`. In-memory only; reflected on `/tabs`.
+    connections: usize,
     /// Free-text context the in-tab agent set via `set-context`.
     /// In-memory only (not persisted); reflected on `/tabs`.
     context: Option<String>,
@@ -513,6 +516,7 @@ fn spawn_pty_tab(
         bg_color,
         net_disabled,
         net_allow,
+        connections: 0,
         context: None,
         pending_agent_resume,
         colors_enabled,
@@ -880,6 +884,28 @@ fn refresh_snapshot(
     #[cfg(feature = "energy")] power_watts: &Arc<Mutex<Vec<crate::power::TabPower>>>,
     #[cfg(feature = "energy")] battery_percent: &Arc<Mutex<Option<u8>>>,
 ) {
+    // Connection metering (unprivileged /proc scan). Throttled to ~5 s —
+    // the process-tree + per-fd scan is far too heavy for the 2 Hz snapshot
+    // tick. The per-tab count persists between refreshes on the tab.
+    #[cfg(target_os = "linux")]
+    {
+        use std::sync::OnceLock;
+        static LAST: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+        let lock = LAST.get_or_init(|| Mutex::new(None));
+        let mut last = lock.lock().unwrap();
+        if last.is_none_or(|t| t.elapsed() >= Duration::from_secs(5)) {
+            *last = Some(Instant::now());
+            drop(last);
+            let roots: Vec<(String, u32)> = tabs.iter().map(|t| (t.id.clone(), t.pid)).collect();
+            let counts = crate::net_meter::connection_counts(&roots);
+            for tab in tabs.iter_mut() {
+                if let Some(&n) = counts.get(&tab.id) {
+                    tab.connections = n;
+                }
+            }
+        }
+    }
+
     let mut api_tabs: Vec<api::SnapshotTab> = Vec::with_capacity(tabs.len());
     for tab in tabs.iter_mut() {
         // Grid-derived fields come from the per-tab cache, which only
@@ -911,6 +937,7 @@ fn refresh_snapshot(
             viewers: tab.pty_ring.lock().map_or(0, |r| r.viewer_count()),
             pty_ring: Some(tab.pty_ring.clone()),
             net_disabled: tab.net_disabled,
+            connections: tab.connections,
         });
     }
     let mut snapshot = api_state.lock().unwrap();
