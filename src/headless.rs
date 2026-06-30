@@ -383,33 +383,30 @@ fn spawn_pty_tab(
         env.extend(extra_env);
         (env, shell_program, vec![])
     };
-    // Install the kernel egress allowlist BEFORE the shell exists, so the
-    // tab is confined the instant it's moved into its cgroup (no unconfined
-    // window — the cgroup is created empty + rules applied here; the pid
-    // joins it right after spawn). teardown-first un-confines a tab that
-    // left allowlist mode. CIDR-only — domain allowlists are the resolver's
-    // job (nft can't match a hostname). Best-effort: logs + leaves the tab
-    // unconfined on failure.
+    // Install the per-tab nftables table BEFORE the shell exists, so it's in
+    // force the instant the pid joins the cgroup (no unconfined window; the
+    // cgroup is created empty + rules applied here). Every non-net-off tab
+    // gets one: an allowlist tab (with CIDRs) gets the confining ruleset,
+    // any other tab gets the count-only metering table — so all tabs are
+    // metered, not just confined ones. teardown-first clears stale state.
+    // net-off tabs are isolated in a bwrap netns, nothing to meter. CIDR
+    // enforcement only (domains are the resolver's job). Best-effort.
     #[cfg(target_os = "linux")]
     let nft_cgroup: Option<String> = {
         crate::net_nft::teardown(&id);
-        if net_disabled || net_allow.is_empty() {
+        if net_disabled {
             None
-        } else {
+        } else if let Some(rel) = crate::cgroup::prepare_tab_cgroup(&id) {
             let cidrs = net_allow.to_allow_set().cidrs;
-            if cidrs.is_empty() {
-                log::debug!("net_nft: tab '{name}' allowlist has no CIDRs; nothing for nft to confine yet");
-                None
-            } else if let Some(rel) = crate::cgroup::prepare_tab_cgroup(&id) {
-                if crate::net_nft::apply(&id, &rel, &cidrs) {
-                    Some(rel)
-                } else {
-                    None
-                }
+            let ok = if cidrs.is_empty() {
+                crate::net_nft::apply_meter(&id, &rel)
             } else {
-                log::debug!("net_nft: no per-tab cgroup for '{name}'; kernel enforcement skipped");
-                None
-            }
+                crate::net_nft::apply(&id, &rel, &cidrs)
+            };
+            ok.then_some(rel)
+        } else {
+            log::debug!("net_nft: no per-tab cgroup for '{name}'; metering/enforcement skipped");
+            None
         }
     };
 
@@ -909,12 +906,12 @@ fn refresh_snapshot(
                 if let Some(&n) = counts.get(&tab.id) {
                     tab.connections = n;
                 }
-                // Byte counters from the tab's nftables table (allowlist
-                // tabs only — plain tabs have no table). total = allowed +
-                // denied; we store total and denied.
-                if !tab.net_allow.is_empty()
-                    && let Some((total, denied)) = crate::net_nft::read_counters(&tab.id)
-                {
+                // Byte counters from the tab's nftables table. Every
+                // non-net-off tab has one (confine or meter-only), so this
+                // meters all tabs; `read_counters` returns None when there's
+                // no table (net-off / nft unavailable). total = allowed +
+                // denied.
+                if let Some((total, denied)) = crate::net_nft::read_counters(&tab.id) {
                     tab.tx_bytes = total;
                     tab.tx_denied_bytes = denied;
                 }
