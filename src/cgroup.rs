@@ -132,17 +132,7 @@ pub fn apply(tab_id: &str, pid: u32, limits: &TabResourceLimits) {
         return;
     };
     // Per-tab cgroup name — sanitise the id to a safe path component.
-    let safe: String = tab_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let dir = base.join(format!("tab-{safe}"));
+    let dir = base.join(format!("tab-{}", sanitize_id(tab_id)));
     if std::fs::create_dir_all(&dir).is_err() {
         debug!("cgroup: could not create {}; tab {tab_id} unlimited", dir.display());
         return;
@@ -166,6 +156,40 @@ pub fn apply(tab_id: &str, pid: u32, limits: &TabResourceLimits) {
             dir.display()
         );
     }
+}
+
+/// Ensure a per-tab cgroup exists and `pid` is in it, returning its path
+/// **relative to the cgroup v2 mount** (e.g.
+/// `system.slice/tab-atelier-headless.service/tab-<id>`) for nftables'
+/// `socket cgroupv2` match. Unlike [`apply`], this runs even when the tab
+/// has no resource limits — the kernel egress allowlist
+/// ([`crate::net_nft`]) needs the cgroup regardless. `None` when delegation
+/// isn't set up. Idempotent.
+#[must_use]
+pub fn ensure_tab_cgroup(tab_id: &str, pid: u32) -> Option<String> {
+    let Some(Some(base)) = DELEGATED_BASE.get() else {
+        return None;
+    };
+    let dir = base.join(format!("tab-{}", sanitize_id(tab_id)));
+    std::fs::create_dir_all(&dir).ok()?;
+    write_cgroup(&dir.join("cgroup.procs"), &pid.to_string()).ok()?;
+    dir.strip_prefix(CGROUP_ROOT)
+        .ok()
+        .map(|rel| rel.to_string_lossy().into_owned())
+}
+
+/// Sanitise a tab id into a safe single path component.
+fn sanitize_id(tab_id: &str) -> String {
+    tab_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// Write a single value to a cgroup control file. cgroup files want the
