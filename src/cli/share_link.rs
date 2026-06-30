@@ -432,6 +432,88 @@ pub fn net_on(args: &[String]) -> i32 {
     set_net(args, false, "net-on")
 }
 
+/// Human-readable byte size (1.5 KB, 3.4 MB, …).
+fn human_bytes(n: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+    if n < 1024 {
+        return format!("{n} B");
+    }
+    let mut v = n as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    format!("{v:.1} {}", UNITS[u])
+}
+
+/// `net-stats [tab]` — print per-tab network metering from `/tabs`
+/// (connections + egress bytes). `tab` filters to one index/UUID.
+#[must_use]
+pub fn net_stats(tab: Option<&str>) -> i32 {
+    let ep = match discover_endpoint() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("net-stats: {e}");
+            return 1;
+        }
+    };
+    let tabs = match fetch_tabs(&ep) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("net-stats: {e}");
+            return 1;
+        }
+    };
+    // Optional filter: match the index or the UUID.
+    let wanted: Option<usize> = match tab {
+        None => None,
+        Some(key) => match resolve(&ep, key) {
+            Ok((idx, _)) => Some(idx),
+            Err(e) => {
+                eprintln!("net-stats: {e}");
+                return 1;
+            }
+        },
+    };
+    let u64f = |t: &serde_json::Value, k: &str| t.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
+    println!(
+        "{:>3}  {:<22} {:>6}  {:>10}  {:>10}  {:<4}",
+        "IDX", "NAME", "CONNS", "TX", "DENIED", "NET"
+    );
+    for t in &tabs {
+        let idx = u64f(t, "index") as usize;
+        if wanted.is_some_and(|w| w != idx) {
+            continue;
+        }
+        let name = t.get("name").and_then(serde_json::Value::as_str).unwrap_or("");
+        let net = if t.get("net_disabled").and_then(serde_json::Value::as_bool) == Some(true) {
+            "off"
+        } else {
+            "on"
+        };
+        println!(
+            "{idx:>3}  {:<22} {:>6}  {:>10}  {:>10}  {net:<4}",
+            truncate(name, 22),
+            u64f(t, "connections"),
+            human_bytes(u64f(t, "tx_bytes")),
+            human_bytes(u64f(t, "tx_denied_bytes")),
+        );
+    }
+    0
+}
+
+/// Clip a name to `max` chars (so the table columns stay aligned).
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max - 1).collect();
+        out.push('…');
+        out
+    }
+}
+
 /// Put a tab into allowlist mode (or clear it) by `POST`ing the config to
 /// `/tabs/by-id/<uuid>/net-allow`. The daemon launches a filtering proxy
 /// for the tab and respawns its shell on the next drain tick.

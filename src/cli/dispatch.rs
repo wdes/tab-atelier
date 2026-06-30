@@ -103,8 +103,8 @@ pub enum Commands {
         tab: String,
     },
 
-    /// Restrict a tab to an allowlist of destinations via a filtering
-    /// proxy. Repeat `--preset`/`--domain`/`--cidr` to add entries;
+    /// Restrict a tab to an allowlist of destinations, enforced by per-tab
+    /// nftables. Repeat `--preset`/`--domain`/`--cidr` to add entries;
     /// `--clear` removes the allowlist (tab returns to unrestricted).
     #[command(name = "net-allow")]
     NetAllow {
@@ -122,6 +122,14 @@ pub enum Commands {
         /// Clear the allowlist (tab returns to unrestricted internet).
         #[arg(long)]
         clear: bool,
+    },
+
+    /// Show per-tab network metering (connections + egress bytes). Optional
+    /// tab index/UUID to show just one.
+    #[command(name = "net-stats")]
+    NetStats {
+        /// Tab index or UUID. Omit for all tabs.
+        tab: Option<String>,
     },
 
     /// Send keystrokes to a tab (`\n` / `\r` / `\t` / `\\` escapes interpreted).
@@ -363,6 +371,7 @@ pub fn dispatch(cli: Cli) -> bool {
             cidrs,
             clear,
         } => crate::cli::share_link::net_allow(&tab, &presets, &domains, &cidrs, clear),
+        Commands::NetStats { tab } => crate::cli::share_link::net_stats(tab.as_deref()),
         Commands::Input { tab, text } => crate::cli::share_link::send_input(&[tab, text]),
         Commands::Output { tab } => crate::cli::share_link::output(&[tab]),
         Commands::ShareLink { tab, ro } => {
