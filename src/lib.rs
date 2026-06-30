@@ -26,6 +26,7 @@ pub mod headless;
 #[cfg(feature = "http3")]
 pub mod http3;
 pub(crate) mod locale;
+pub mod net_policy;
 pub(crate) mod platform;
 #[cfg(feature = "energy")]
 pub(crate) mod power;
