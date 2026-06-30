@@ -677,6 +677,16 @@ impl TabState {
     pub fn allow_set(&self) -> crate::net_policy::AllowSet {
         crate::net_policy::AllowSet::build(&self.net_allow_presets, &self.net_allow_domains, &self.net_allow_cidrs)
     }
+
+    /// The raw allowlist inputs, carried into the spawn paths.
+    #[must_use]
+    pub fn allow_config(&self) -> crate::net_policy::AllowConfig {
+        crate::net_policy::AllowConfig {
+            presets: self.net_allow_presets.clone(),
+            domains: self.net_allow_domains.clone(),
+            cidrs: self.net_allow_cidrs.clone(),
+        }
+    }
 }
 
 /// Discrete agent runtime states a tool inside a tab can publish via
