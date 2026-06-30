@@ -385,39 +385,45 @@ fn spawn_pty_tab(
     };
     // Install the per-tab nftables table BEFORE the shell exists, so it's in
     // force the instant the pid joins the cgroup (no unconfined window; the
-    // cgroup is created empty + rules applied here). Every non-net-off tab
-    // gets one: an allowlist tab (with CIDRs) gets the confining ruleset,
-    // any other tab gets the count-only metering table — so all tabs are
-    // metered, not just confined ones. teardown-first clears stale state.
-    // net-off tabs are isolated in a bwrap netns, nothing to meter. CIDR
-    // enforcement only (domains are the resolver's job). Best-effort.
+    // cgroup is created empty + rules applied here). Every tab gets one when
+    // the daemon is privileged: net-off → drop-all-egress, allowlist (CIDRs)
+    // → confining ruleset, anything else → count-only metering. So all tabs
+    // are metered, not just confined ones, and net-off is enforced WITHOUT
+    // bubblewrap (the hardened unit's /proc restrictions break bwrap).
+    // teardown-first clears stale state. Best-effort.
+    #[cfg(target_os = "linux")]
+    let privileged = crate::has_ambient_caps();
     #[cfg(target_os = "linux")]
     let nft_cgroup: Option<String> = {
         crate::net_nft::teardown(&id);
-        if net_disabled {
-            None
-        } else if let Some(rel) = crate::cgroup::prepare_tab_cgroup(&id) {
-            let cidrs = net_allow.to_allow_set().cidrs;
-            let ok = if cidrs.is_empty() {
-                crate::net_nft::apply_meter(&id, &rel)
+        crate::cgroup::prepare_tab_cgroup(&id).and_then(|rel| {
+            let ok = if net_disabled {
+                // Only nft-block when privileged; otherwise fall through to
+                // the unprivileged bwrap path below.
+                privileged && crate::net_nft::apply_block(&id, &rel)
             } else {
-                crate::net_nft::apply(&id, &rel, &cidrs)
+                let cidrs = net_allow.to_allow_set().cidrs;
+                if cidrs.is_empty() {
+                    crate::net_nft::apply_meter(&id, &rel)
+                } else {
+                    crate::net_nft::apply(&id, &rel, &cidrs)
+                }
             };
             ok.then_some(rel)
-        } else {
-            log::debug!("net_nft: no per-tab cgroup for '{name}'; metering/enforcement skipped");
-            None
-        }
+        })
     };
 
-    // Net-off tabs run their shell inside a bubblewrap netns (which also
-    // drops all caps). Otherwise strip Linux capabilities from the tab's
-    // subtree via setpriv — BUT only when the daemon actually holds ambient
-    // caps to leak (it has CAP_NET_ADMIN to program nft). With no ambient
-    // caps there's nothing to strip, and wrapping in setpriv would only risk
-    // breaking the spawn (setpriv calls capset, which a strict
-    // SystemCallFilter blocks → a blank tab).
-    let (prog, args) = if net_disabled {
+    // net-off WITHOUT CAP_NET_ADMIN (unprivileged headless) falls back to a
+    // bubblewrap netns (which also drops all caps). When privileged, net-off
+    // is done by nft above, so the shell spawns normally and just gets its
+    // caps stripped via setpriv (only when the daemon actually holds ambient
+    // caps to leak — wrapping otherwise risks a blank tab, since setpriv
+    // calls capset which a strict SystemCallFilter blocks).
+    #[cfg(target_os = "linux")]
+    let net_off_via_bwrap = net_disabled && !privileged;
+    #[cfg(not(target_os = "linux"))]
+    let net_off_via_bwrap = net_disabled;
+    let (prog, args) = if net_off_via_bwrap {
         crate::no_internet_command(&prog, &args)
     } else if crate::has_ambient_caps() && crate::setpriv_available() {
         crate::drop_caps_command(&prog, &args)
