@@ -334,18 +334,24 @@ pub fn setpriv_available() -> bool {
 pub fn has_ambient_caps() -> bool {
     #[cfg(target_os = "linux")]
     {
-        std::fs::read_to_string("/proc/self/status").is_ok_and(|status| {
-            status.lines().any(|line| {
-                line.strip_prefix("CapAmb:")
-                    .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
-                    .is_some_and(|v| v != 0)
-            })
-        })
+        std::fs::read_to_string("/proc/self/status").is_ok_and(|status| cap_amb_nonzero(&status))
     }
     #[cfg(not(target_os = "linux"))]
     {
         false
     }
+}
+
+/// Whether the `CapAmb:` line of a `/proc/<pid>/status` blob is non-zero.
+/// Pure so the gating logic is unit-testable. `false` when absent/unparseable.
+#[cfg(target_os = "linux")]
+#[must_use]
+fn cap_amb_nonzero(status: &str) -> bool {
+    status.lines().any(|line| {
+        line.strip_prefix("CapAmb:")
+            .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
+            .is_some_and(|v| v != 0)
+    })
 }
 
 /// Wrap a shell command so the tab's process subtree holds **no Linux
@@ -2382,6 +2388,17 @@ mod tests {
             &["/bin/bash".to_string(), "-l".to_string()],
             "real cmd after --"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cap_amb_nonzero_gates_the_cap_strip() {
+        // The regression: setpriv was applied even with no ambient caps,
+        // breaking tabs. We only strip when CapAmb is non-zero.
+        assert!(!cap_amb_nonzero("Name:\tx\nCapAmb:\t0000000000000000\nNoNewPrivs:\t1"));
+        assert!(cap_amb_nonzero("CapAmb:\t0000000000001000")); // CAP_NET_ADMIN
+        assert!(!cap_amb_nonzero("no cap line here"));
+        assert!(!cap_amb_nonzero("CapAmb:\tnothex"));
     }
 
     #[test]
