@@ -88,6 +88,21 @@ pub enum Commands {
         tab: String,
     },
 
+    /// Cut a tab's internet — respawn its shell inside a bubblewrap
+    /// network namespace (loopback only). Needs `bubblewrap` installed.
+    #[command(name = "net-off")]
+    NetOff {
+        /// Tab index or UUID.
+        tab: String,
+    },
+
+    /// Restore a tab's internet — respawn its shell without the netns jail.
+    #[command(name = "net-on")]
+    NetOn {
+        /// Tab index or UUID.
+        tab: String,
+    },
+
     /// Send keystrokes to a tab (`\n` / `\r` / `\t` / `\\` escapes interpreted).
     Input {
         /// Tab index or UUID.
@@ -318,6 +333,8 @@ pub fn dispatch(cli: Cli) -> bool {
         Commands::Rename { tab, name } => crate::cli::share_link::rename(&[tab, name]),
         Commands::Lock { tab } => crate::cli::share_link::lock(&[tab]),
         Commands::Unlock { tab } => crate::cli::share_link::unlock(&[tab]),
+        Commands::NetOff { tab } => crate::cli::share_link::net_off(&[tab]),
+        Commands::NetOn { tab } => crate::cli::share_link::net_on(&[tab]),
         Commands::Input { tab, text } => crate::cli::share_link::send_input(&[tab, text]),
         Commands::Output { tab } => crate::cli::share_link::output(&[tab]),
         Commands::ShareLink { tab, ro } => {

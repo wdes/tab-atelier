@@ -270,6 +270,14 @@ pub struct TerminalView {
     /// can ask "is anyone watching this tab over the web/remote?" each
     /// frame without taking the ring lock. Bumped by `api_ws::run_pump`.
     viewers: Arc<std::sync::atomic::AtomicUsize>,
+    /// When true the PTY is (re)spawned inside a bubblewrap sandbox with
+    /// its own empty network namespace — the tab has no internet. Set via
+    /// [`Self::set_net_disabled`]; the caller then respawns so the change
+    /// takes effect (the running shell can't be re-jailed in place). The
+    /// fresh-tab spawn always starts net-on; only `respawn` consults this,
+    /// so a restored net-off tab is respawned by `app.rs`. `Cell` so the
+    /// flag flips through a shared `&self` view handle like `colors_enabled`.
+    net_disabled: Cell<bool>,
     /// Previous frame's per-row `RawLine`s, reused for un-damaged rows
     /// (Ghostty `rebuildCells` pattern). Alacritty's `Term::damage()`
     /// exposes which screen rows changed since the last call; rows
@@ -580,6 +588,7 @@ impl TerminalView {
             locked: Rc::new(Cell::new(false)),
             pty_ring,
             viewers,
+            net_disabled: Cell::new(false),
             prev_frame: Rc::new(RefCell::new(None)),
             last_prepaint: Rc::new(RefCell::new(None)),
         }
@@ -641,6 +650,19 @@ impl TerminalView {
             .max(1)
     }
 
+    /// Whether this tab is currently running with no internet (its PTY is
+    /// inside a bubblewrap network-isolated sandbox).
+    pub const fn net_disabled(&self) -> bool {
+        self.net_disabled.get()
+    }
+
+    /// Record the desired internet on/off state. Takes effect on the next
+    /// [`Self::respawn`] — the caller respawns (history-preserving from the
+    /// GUI) so the change applies; the running shell can't be re-jailed.
+    pub fn set_net_disabled(&self, disabled: bool) {
+        self.net_disabled.set(disabled);
+    }
+
     pub fn respawn(&mut self, cwd: Option<&Path>, cx: &mut Context<Self>) {
         let _ = self.notifier.send(Msg::Shutdown);
 
@@ -664,10 +686,27 @@ impl TerminalView {
             let min_env =
                 crate::minimal_pty_env(self.colors_enabled.get(), crate::clear_env_user_vars(), &HashMap::new());
             let (prog, args) = crate::clear_env_shell_command(&crate::clear_env_shell_path(), true, &min_env);
+            let (prog, args) = if self.net_disabled.get() {
+                crate::no_internet_command(&prog, &args)
+            } else {
+                (prog, args)
+            };
             tty::Options {
                 shell: Some(tty::Shell::new(prog, args)),
                 working_directory: cwd.map(std::path::Path::to_path_buf),
                 env: HashMap::new(),
+                ..Default::default()
+            }
+        } else if self.net_disabled.get() {
+            // Inheriting env, but net-off: alacritty's implicit default
+            // shell can't be wrapped, so spawn the login shell explicitly
+            // inside bubblewrap. bwrap inherits `env` and passes it to the
+            // child (no --clearenv), so the colour/telemetry vars survive.
+            let (prog, args) = crate::no_internet_command(&crate::clear_env_shell_path(), &["-l".to_string()]);
+            tty::Options {
+                shell: Some(tty::Shell::new(prog, args)),
+                working_directory: cwd.map(std::path::Path::to_path_buf),
+                env: pty_env(self.colors_enabled.get()),
                 ..Default::default()
             }
         } else {

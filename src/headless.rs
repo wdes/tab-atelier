@@ -660,6 +660,7 @@ pub fn run() -> std::io::Result<()> {
         pending_activate: None,
         pending_input: Vec::new(),
         pending_lock_changes: Vec::new(),
+        pending_net_changes: Vec::new(),
         pending_bg_color_changes: Vec::new(),
         pending_context_changes: Vec::new(),
         pending_token_rotations: Vec::new(),
@@ -856,6 +857,7 @@ fn refresh_snapshot(
             agent_kind: tab.agent_kind.clone(),
             viewers: tab.pty_ring.lock().map_or(0, |r| r.viewer_count()),
             pty_ring: Some(tab.pty_ring.clone()),
+            net_disabled: tab.net_disabled,
         });
     }
     let mut snapshot = api_state.lock().unwrap();
@@ -1119,6 +1121,7 @@ fn drain_pending(
     let renames: Vec<(usize, String)> = s.pending_renames.drain(..).collect();
     let status_updates: Vec<api::PendingStatusUpdate> = s.pending_status_updates.drain(..).collect();
     let lock_changes: Vec<(String, bool)> = s.pending_lock_changes.drain(..).collect();
+    let net_changes: Vec<(String, bool)> = s.pending_net_changes.drain(..).collect();
     let bg_color_changes: Vec<(String, Option<String>)> = s.pending_bg_color_changes.drain(..).collect();
     let context_changes: Vec<(String, Option<String>)> = s.pending_context_changes.drain(..).collect();
     let token_rotations: Vec<String> = s.pending_token_rotations.drain(..).collect();
@@ -1138,6 +1141,69 @@ fn drain_pending(
     for (tab_id, sched) in schedule_changes {
         if let Some(t) = tabs.iter_mut().find(|t| t.id == tab_id) {
             t.schedule = sched;
+        }
+    }
+    // CLI / API net toggles → rebuild the tab's PTY with the new
+    // bubblewrap netns state. There's no in-place re-jail, so the shell
+    // restarts; the current scrollback is fed back via pending_restore so
+    // the screen isn't blanked. Durable fields (id/name/tokens/schedule/
+    // agent/uptime) carry across. The bwrap-availability guard lives at
+    // the endpoint, so a queued change is already known applicable.
+    for (tab_id, disabled) in net_changes {
+        let Some(idx) = tabs.iter().position(|t| t.id == tab_id) else {
+            continue;
+        };
+        let was_active = *active == idx;
+        let cwd = platform::process_cwd(tabs[idx].pid).or_else(|| tabs[idx].last_known_cwd.clone());
+        let history = tabs[idx].copy_all_history();
+        let pending_restore = if history.is_empty() { None } else { Some(history) };
+        let env = tab_env_extras(&tabs[idx].id, api_url_for_pty, api_token);
+        let id = tabs[idx].id.clone();
+        let name = tabs[idx].name.clone();
+        let prior = tabs[idx].uptime().as_secs_f64();
+        #[cfg(feature = "energy")]
+        let energy = tabs[idx].energy_wh;
+        #[cfg(not(feature = "energy"))]
+        let energy = 0.0;
+        let saved_hash = tabs[idx].output_hash_last_saved;
+        let agent_session_id = tabs[idx].agent_session_id.clone();
+        let agent_kind = tabs[idx].agent_kind.clone();
+        let agent_plan_mode = tabs[idx].agent_plan_mode;
+        let rw = tabs[idx].share_token_rw.clone();
+        let ro = tabs[idx].share_token_ro.clone();
+        let locked = tabs[idx].locked;
+        let schedule = tabs[idx].schedule.clone();
+        let bg = tabs[idx].bg_color.clone();
+        tabs[idx].shutdown();
+        if let Some(mut t) = spawn_pty_tab(
+            id,
+            name,
+            cwd,
+            true,
+            env,
+            prior,
+            energy,
+            saved_hash,
+            pending_restore,
+            agent_session_id,
+            agent_kind,
+            agent_plan_mode,
+            rw,
+            ro,
+            locked,
+            schedule,
+            bg,
+            pty_cols,
+            pty_rows,
+            disabled,
+        ) {
+            #[cfg(target_os = "linux")]
+            crate::cgroup::apply(&t.id, t.pid, default_limits);
+            if was_active {
+                t.activate();
+                t.flush_pending_restore();
+            }
+            tabs[idx] = t;
         }
     }
     // Revoke per-tab share tokens (the snapshot was already cleared by

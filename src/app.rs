@@ -465,6 +465,17 @@ impl AppState {
                     if crate::schedule::LockState::effective_locked(ts) {
                         view.read(cx).set_locked(true);
                     }
+                    // Restore the no-internet sandbox: set the flag and
+                    // respawn into bubblewrap so the tab comes back
+                    // airgapped. Skipped (net left on) when bwrap isn't
+                    // installed, so a persisted net-off tab doesn't boot
+                    // into a dead shell on a host without bubblewrap.
+                    if ts.net_disabled && crate::bwrap_available() {
+                        view.update(cx, |v, cx| {
+                            v.set_net_disabled(true);
+                            v.respawn(cwd.as_deref(), cx);
+                        });
+                    }
                     // Auto-resume: if this tab had an agent session
                     // and kind persisted, queue the resume command
                     // to be typed into the freshly-spawned shell.
@@ -754,6 +765,7 @@ impl AppState {
             pending_activate: None,
             pending_input: Vec::new(),
             pending_lock_changes: Vec::new(),
+            pending_net_changes: Vec::new(),
             pending_bg_color_changes: Vec::new(),
             pending_context_changes: Vec::new(),
             pending_token_rotations: Vec::new(),
@@ -1025,6 +1037,7 @@ impl AppState {
                     name: tab.name.clone(),
                     cwd,
                     colors_enabled: tab.view.read(cx).colors_enabled(),
+                    net_disabled: tab.view.read(cx).net_disabled(),
                     agent_session_id: tab.agent_session_id.clone(),
                     agent_kind: tab.agent_kind.clone(),
                     agent_plan_mode: tab.agent_plan_mode,
@@ -1098,6 +1111,7 @@ impl AppState {
                 agent_kind: tab.agent_kind.clone(),
                 viewers: pty_ring.lock().map_or(0, |r| r.viewer_count()),
                 pty_ring: Some(pty_ring),
+                net_disabled: ts.net_disabled,
             });
         }
 
@@ -1228,6 +1242,7 @@ impl AppState {
             let renames: Vec<(usize, String)> = snapshot.pending_renames.drain(..).collect();
             let status_updates: Vec<api::PendingStatusUpdate> = snapshot.pending_status_updates.drain(..).collect();
             let lock_changes: Vec<(String, bool)> = snapshot.pending_lock_changes.drain(..).collect();
+            let net_changes: Vec<(String, bool)> = snapshot.pending_net_changes.drain(..).collect();
             let bg_color_changes: Vec<(String, Option<String>)> = snapshot.pending_bg_color_changes.drain(..).collect();
             let context_changes: Vec<(String, Option<String>)> = snapshot.pending_context_changes.drain(..).collect();
             let token_rotations: Vec<String> = snapshot.pending_token_rotations.drain(..).collect();
@@ -1243,6 +1258,21 @@ impl AppState {
             for (tab_id, locked) in lock_changes {
                 if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
                     tab.locked = locked;
+                }
+            }
+            // Net on/off toggles from the API/CLI. Set the view's flag
+            // and respawn the PTY so the bubblewrap netns jail takes
+            // effect — the shell can't be re-jailed in place. No window
+            // here (persist tick), so use the low-level respawn rather
+            // than `respawn_tab_with_history`; refocus isn't needed for a
+            // background toggle.
+            for (tab_id, disabled) in net_changes {
+                if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+                    let cwd = platform::process_cwd(tab.view.read(cx).pid()).or_else(|| std::env::current_dir().ok());
+                    tab.view.update(cx, |v, cx| {
+                        v.set_net_disabled(disabled);
+                        v.respawn(cwd.as_deref(), cx);
+                    });
                 }
             }
             for (tab_id, color) in bg_color_changes {
@@ -1562,6 +1592,7 @@ impl AppState {
                     name: tab.name.clone(),
                     cwd,
                     colors_enabled: tab.view.read(cx).colors_enabled(),
+                    net_disabled: tab.view.read(cx).net_disabled(),
                     agent_session_id: tab.agent_session_id.clone(),
                     agent_kind: tab.agent_kind.clone(),
                     agent_plan_mode: tab.agent_plan_mode,
@@ -2276,6 +2307,48 @@ impl AppState {
                     )
                     .child(lock_label),
             );
+
+            // Internet on/off — flips the tab's bubblewrap net-namespace
+            // jail. Set the flag on the view, mirror into the API snapshot
+            // (so /tabs and the toggle endpoint agree immediately), then
+            // respawn history-preserving so the new netns takes effect —
+            // the running shell can't be re-jailed in place. Shown only
+            // when bubblewrap is usable, or when the tab is already off
+            // (so it can always be turned back on); on a host without
+            // bubblewrap and a net-on tab there's nothing to toggle to.
+            let net_disabled = self.tabs[idx].view.read(cx).net_disabled();
+            if net_disabled || crate::bwrap_available() {
+                let net_label = if net_disabled {
+                    self.t().enable_internet
+                } else {
+                    self.t().disable_internet
+                };
+                let tab_id_for_net = self.tabs[idx].id.clone();
+                container = container.child(
+                    div()
+                        .id("menu-toggle-net")
+                        .px(px(12.0))
+                        .py(px(4.0))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(menu_hover))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _ev: &MouseDownEvent, window, cx| {
+                                let next = !net_disabled;
+                                this.tabs[idx].view.read(cx).set_net_disabled(next);
+                                {
+                                    let mut snap = this.api_state.lock().unwrap();
+                                    if let Some(t) = snap.tabs.iter_mut().find(|t| t.id == tab_id_for_net) {
+                                        t.net_disabled = next;
+                                    }
+                                }
+                                this.context_menu = None;
+                                this.respawn_tab_with_history(idx, window, cx);
+                            }),
+                        )
+                        .child(net_label),
+                );
+            }
 
             // (Background-color + Schedule preset rows used to live
             // here but pushed the context menu taller than a small-
