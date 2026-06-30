@@ -957,6 +957,7 @@ fn refresh_snapshot(
             connections: tab.connections,
             tx_bytes: tab.tx_bytes,
             tx_denied_bytes: tab.tx_denied_bytes,
+            net_allow: tab.net_allow.clone(),
         });
     }
     let mut snapshot = api_state.lock().unwrap();

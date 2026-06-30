@@ -555,13 +555,32 @@ pub fn net_default(presets: &[String], domains: &[String], cidrs: &[String], cle
     0
 }
 
-/// Put a tab into allowlist mode (or clear it) by `POST`ing the config to
-/// `/tabs/by-id/<uuid>/net-allow`. The daemon launches a filtering proxy
-/// for the tab and respawns its shell on the next drain tick.
+/// Set / add / remove / clear a tab's allowlist.
+///
+/// `POST`s the resolved config to `/tabs/by-id/<uuid>/net-allow`; the daemon
+/// installs per-tab nftables and respawns the shell. `--add`/`--remove`
+/// merge against the tab's current allowlist (read from `/tabs`),
+/// client-side.
 #[must_use]
-pub fn net_allow(tab: &str, presets: &[String], domains: &[String], cidrs: &[String], clear: bool) -> i32 {
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
+pub fn net_allow(
+    tab: &str,
+    presets: &[String],
+    domains: &[String],
+    cidrs: &[String],
+    clear: bool,
+    add: bool,
+    remove: bool,
+) -> i32 {
     let ep = match discover_endpoint() {
         Ok(e) => e,
+        Err(e) => {
+            eprintln!("net-allow: {e}");
+            return 1;
+        }
+    };
+    let tabs = match fetch_tabs(&ep) {
+        Ok(t) => t,
         Err(e) => {
             eprintln!("net-allow: {e}");
             return 1;
@@ -574,12 +593,47 @@ pub fn net_allow(tab: &str, presets: &[String], domains: &[String], cidrs: &[Str
             return 1;
         }
     };
-    // `--clear` (or no entries at all) sends an empty config, which the
-    // server reads as "leave allowlist mode".
-    let (presets, domains, cidrs): (&[String], &[String], &[String]) = if clear {
-        (&[], &[], &[])
+    // Resolve the final (presets, domains, cidrs): clear → empty; add/remove
+    // → merge against the tab's current allowlist from /tabs; else replace.
+    let arr = |t: &serde_json::Value, k: &str| -> Vec<String> {
+        t.get(k)
+            .and_then(serde_json::Value::as_array)
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+            .unwrap_or_default()
+    };
+    let (presets, domains, cidrs): (Vec<String>, Vec<String>, Vec<String>) = if clear {
+        (vec![], vec![], vec![])
+    } else if add || remove {
+        let cur = tabs
+            .iter()
+            .find(|t| t.get("id").and_then(serde_json::Value::as_str) == Some(uuid.as_str()));
+        let (mut cp, mut cd, mut cc) = cur.map_or_else(
+            || (vec![], vec![], vec![]),
+            |t| {
+                (
+                    arr(t, "net_allow_presets"),
+                    arr(t, "net_allow_domains"),
+                    arr(t, "net_allow_cidrs"),
+                )
+            },
+        );
+        let merge = |cur: &mut Vec<String>, given: &[String]| {
+            for g in given {
+                if add {
+                    if !cur.contains(g) {
+                        cur.push(g.clone());
+                    }
+                } else {
+                    cur.retain(|x| x != g);
+                }
+            }
+        };
+        merge(&mut cp, presets);
+        merge(&mut cd, domains);
+        merge(&mut cc, cidrs);
+        (cp, cd, cc)
     } else {
-        (presets, domains, cidrs)
+        (presets.to_vec(), domains.to_vec(), cidrs.to_vec())
     };
     if !clear && presets.is_empty() && domains.is_empty() && cidrs.is_empty() {
         eprintln!("net-allow: nothing to allow — pass --preset/--domain/--cidr, or --clear to remove the allowlist");
