@@ -142,11 +142,23 @@ pub fn apply(tab_id: &str, cgroup_rel: &str, cidrs: &[Cidr]) -> bool {
     }
 }
 
+/// Resolve the `nft` binary. It lives in `/usr/sbin` (or `/sbin`), which a
+/// hardened service's `PATH` may not include — so prefer the absolute paths
+/// and fall back to a bare `nft` (PATH lookup) only if none exist.
+fn nft_bin() -> &'static str {
+    for p in ["/usr/sbin/nft", "/sbin/nft", "/usr/bin/nft"] {
+        if std::path::Path::new(p).is_file() {
+            return p;
+        }
+    }
+    "nft"
+}
+
 /// Remove a tab's table. Best-effort and silent — a missing table (never
 /// applied, or already gone) is not an error.
 pub fn teardown(tab_id: &str) {
     let table = table_name(tab_id);
-    let _ = std::process::Command::new("nft")
+    let _ = std::process::Command::new(nft_bin())
         .args(["delete", "table", "inet", &table])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -158,7 +170,7 @@ pub fn teardown(tab_id: &str) {
 /// spawned at all.
 fn run_nft_stdin(script: &str) -> std::io::Result<bool> {
     use std::io::Write;
-    let mut child = std::process::Command::new("nft")
+    let mut child = std::process::Command::new(nft_bin())
         .args(["-f", "-"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
