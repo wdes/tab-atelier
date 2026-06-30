@@ -207,6 +207,39 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { description: Tab not found }
         "412": { description: bubblewrap (bwrap) is not installed }
+  /tabs/by-id/{id}/net-allow:
+    post:
+      tags: [tabs]
+      summary: Restrict a tab to an allowlist (filtering proxy)
+      description: >
+        Put the tab into allowlist mode — it may reach only the listed
+        presets / domains / CIDRs, enforced by a per-tab filtering CONNECT
+        proxy injected via `HTTPS_PROXY` (and, on the privileged headless
+        service, nftables). A non-empty config also clears net-off (mutually
+        exclusive). An empty/absent body clears allowlist mode (tab returns
+        to unrestricted). The shell respawns to apply. Presets today:
+        `claude-code`, `cloudflare`.
+      parameters: [ { $ref: "#/components/parameters/id" } ]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                presets: { type: array, items: { type: string, enum: [claude-code, cloudflare] } }
+                domains: { type: array, items: { type: string }, example: ["api.anthropic.com", "*.example.com"] }
+                cidrs: { type: array, items: { type: string }, example: ["104.16.0.0/13"] }
+      responses:
+        "200":
+          description: New state
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { allowlist_active: { type: boolean } }
+        "400": { description: Unknown preset or invalid CIDR }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Tab not found }
   /tabs/by-id/{id}/view:
     get:
       tags: [tabs]
