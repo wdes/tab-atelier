@@ -503,6 +503,68 @@ pub fn net_stats(tab: Option<&str>) -> i32 {
     0
 }
 
+/// `net-dns [tab]` — print each domain-allowlist tab's resolver DNS log
+/// (allowed + denied queries with resolved IPs) from `/tabs`.
+#[must_use]
+pub fn net_dns(tab: Option<&str>) -> i32 {
+    let ep = match discover_endpoint() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("net-dns: {e}");
+            return 1;
+        }
+    };
+    let tabs = match fetch_tabs(&ep) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("net-dns: {e}");
+            return 1;
+        }
+    };
+    let wanted: Option<usize> = match tab {
+        None => None,
+        Some(key) => match resolve(&ep, key) {
+            Ok((idx, _)) => Some(idx),
+            Err(e) => {
+                eprintln!("net-dns: {e}");
+                return 1;
+            }
+        },
+    };
+    let mut any = false;
+    for t in &tabs {
+        let idx = t.get("index").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;
+        if wanted.is_some_and(|w| w != idx) {
+            continue;
+        }
+        let Some(dns) = t
+            .get("dns")
+            .and_then(serde_json::Value::as_array)
+            .filter(|a| !a.is_empty())
+        else {
+            continue;
+        };
+        any = true;
+        let name = t.get("name").and_then(serde_json::Value::as_str).unwrap_or("");
+        println!("[{idx}] {name}");
+        for e in dns {
+            let domain = e.get("domain").and_then(serde_json::Value::as_str).unwrap_or("");
+            let allowed = e.get("allowed").and_then(serde_json::Value::as_bool).unwrap_or(false);
+            let ips: Vec<&str> = e
+                .get("ips")
+                .and_then(serde_json::Value::as_array)
+                .map(|a| a.iter().filter_map(serde_json::Value::as_str).collect())
+                .unwrap_or_default();
+            let mark = if allowed { "✓" } else { "✗ DENIED" };
+            println!("   {mark:<9} {domain:<32} {}", ips.join(", "));
+        }
+    }
+    if !any {
+        println!("(no resolver DNS entries — domain-allowlist tabs only)");
+    }
+    0
+}
+
 /// Clip a name to `max` chars (so the table columns stay aligned).
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
