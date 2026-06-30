@@ -26,8 +26,13 @@ UMask=0077
 # --- Hardening ---
 # Privilege containment
 NoNewPrivileges=true
-CapabilityBoundingSet=
-AmbientCapabilities=
+# CAP_NET_ADMIN lets the daemon program the per-tab nftables egress
+# allowlist (see src/net_nft.rs). It's the ONLY capability granted. Tabs do
+# NOT keep it: each tab's shell is spawned through `setpriv --ambient-caps=
+# -all` so an agent can't touch the firewall. Leave both empty to disable
+# egress-allowlist enforcement entirely (tabs still spawn, just unconfined).
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
 RestrictSUIDSGID=true
 
 # Filesystem — explicit bind-mount sandbox.
@@ -84,8 +89,12 @@ ProtectHostname=true
 ProtectProc=invisible
 ProcSubset=pid
 
-# Network — TCP only (API binds INADDR_ANY by default).
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# Network — AF_INET/AF_INET6 for the API, AF_UNIX for IPC, AF_NETLINK so
+# the daemon can program the per-tab nftables egress allowlist (nft talks
+# to the kernel over NETLINK_NETFILTER). The tabs themselves only need
+# INET/UNIX and hold no caps, so they can't do anything privileged over
+# netlink even though the family is permitted service-wide.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 
 # Per-tab resource limits (cgroup v2). Delegate the service's own
 # cgroup subtree so the daemon can create one child cgroup per tab and
@@ -111,6 +120,10 @@ SystemCallArchitectures=native
 # openpty / fork / exec / mmap calls this daemon needs.
 SystemCallFilter=@system-service
 SystemCallFilter=~@clock @cpu-emulation @debug @module @mount @obsolete @privileged @raw-io @reboot @resources @swap @keyring @pkey
+# Re-allow capset (it's in @privileged, dropped above): `setpriv` calls it
+# to strip capabilities from each tab's shell. Gated by NoNewPrivileges +
+# an empty cap set on the tab, so re-allowing the syscall grants nothing.
+SystemCallFilter=capset
 SystemCallErrorNumber=EPERM
 
 [Install]
