@@ -182,6 +182,14 @@ pub enum Commands {
         args: Vec<String>,
     },
 
+    /// Print the master API token, so the local API can be called
+    /// without locating the `api.token` state file.
+    Token,
+
+    /// Revoke every tab's per-tab share tokens — all outstanding share
+    /// links 401; a fresh token is minted on the next share.
+    RotateTokens,
+
     /// Bridge a Claude Code hook event to set-status. Reads JSON from stdin.
     ClaudeHook {
         /// Event name (`session-start`, `pre-tool`, …).
@@ -391,6 +399,8 @@ pub fn dispatch(cli: Cli) -> bool {
             crate::cli::set_status::run(&args)
         }
         Commands::SetContext { args } => crate::cli::set_context::run(&args),
+        Commands::Token => crate::cli::tokens::show(&[]),
+        Commands::RotateTokens => crate::cli::tokens::rotate(&[]),
         Commands::ClaudeHook { event } => crate::cli::claude_hook::run(&[event]),
         Commands::Remote { args } => crate::cli::remote::run(&args),
         Commands::Dispatch { args } => crate::cli::delegate::run(&args),

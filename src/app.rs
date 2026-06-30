@@ -752,6 +752,7 @@ impl AppState {
             pending_lock_changes: Vec::new(),
             pending_bg_color_changes: Vec::new(),
             pending_context_changes: Vec::new(),
+            pending_token_rotations: Vec::new(),
             pending_schedule_changes: Vec::new(),
             pending_new_tabs: 0,
             pending_new_tab_cwds: std::collections::VecDeque::new(),
@@ -1225,6 +1226,7 @@ impl AppState {
             let lock_changes: Vec<(String, bool)> = snapshot.pending_lock_changes.drain(..).collect();
             let bg_color_changes: Vec<(String, Option<String>)> = snapshot.pending_bg_color_changes.drain(..).collect();
             let context_changes: Vec<(String, Option<String>)> = snapshot.pending_context_changes.drain(..).collect();
+            let token_rotations: Vec<String> = snapshot.pending_token_rotations.drain(..).collect();
             let schedule_changes: Vec<(String, Option<crate::schedule::TabSchedule>)> =
                 snapshot.pending_schedule_changes.drain(..).collect();
             drop(snapshot);
@@ -1242,6 +1244,15 @@ impl AppState {
             for (tab_id, color) in bg_color_changes {
                 if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
                     tab.bg_color = color;
+                }
+            }
+            // Revoke per-tab share tokens on the runtime Tab so the
+            // cleared state persists into tabs.json (the snapshot was
+            // already cleared by the endpoint for instant 401s).
+            for tab_id in token_rotations {
+                if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+                    tab.share_token_rw.clear();
+                    tab.share_token_ro.clear();
                 }
             }
             for (tab_id, context) in context_changes {

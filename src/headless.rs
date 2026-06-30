@@ -653,6 +653,7 @@ pub fn run() -> std::io::Result<()> {
         pending_lock_changes: Vec::new(),
         pending_bg_color_changes: Vec::new(),
         pending_context_changes: Vec::new(),
+        pending_token_rotations: Vec::new(),
         pending_schedule_changes: Vec::new(),
         pending_new_tabs: 0,
         pending_new_tab_cwds: std::collections::VecDeque::new(),
@@ -1110,6 +1111,7 @@ fn drain_pending(
     let lock_changes: Vec<(String, bool)> = s.pending_lock_changes.drain(..).collect();
     let bg_color_changes: Vec<(String, Option<String>)> = s.pending_bg_color_changes.drain(..).collect();
     let context_changes: Vec<(String, Option<String>)> = s.pending_context_changes.drain(..).collect();
+    let token_rotations: Vec<String> = s.pending_token_rotations.drain(..).collect();
     let schedule_changes: Vec<(String, Option<crate::schedule::TabSchedule>)> =
         s.pending_schedule_changes.drain(..).collect();
     let new_tabs = std::mem::take(&mut s.pending_new_tabs);
@@ -1126,6 +1128,14 @@ fn drain_pending(
     for (tab_id, sched) in schedule_changes {
         if let Some(t) = tabs.iter_mut().find(|t| t.id == tab_id) {
             t.schedule = sched;
+        }
+    }
+    // Revoke per-tab share tokens (the snapshot was already cleared by
+    // the endpoint); persists the cleared state into tabs.json below.
+    for tab_id in token_rotations {
+        if let Some(t) = tabs.iter_mut().find(|t| t.id == tab_id) {
+            t.share_token_rw.clear();
+            t.share_token_ro.clear();
         }
     }
     // Same path for the bg-color override.

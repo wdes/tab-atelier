@@ -339,6 +339,12 @@ pub struct TabSnapshot {
     /// `None` clears the tab's context. Same drain shape as
     /// `pending_bg_color_changes`.
     pub pending_context_changes: Vec<(String, Option<String>)>,
+    /// Tab ids whose per-tab share tokens (`share_token_rw`/`_ro`) the
+    /// owner loop should clear, queued by `POST /tabs/rotate-tokens`.
+    /// Clearing revokes every outstanding share link for that tab (it
+    /// 401s); a fresh token is minted on the next "Remote control" /
+    /// `share-link`. Drained like `pending_bg_color_changes`.
+    pub pending_token_rotations: Vec<String>,
     /// (`tab_id`, schedule-or-None) queued by
     /// `POST /tabs/by-id/{id}/schedule`. `None` clears the schedule
     /// (tab returns to 24/7 unless still manually locked). Same drain
@@ -891,6 +897,82 @@ fn error_json<W: Write>(stream: &mut W, status: u16, msg: &str) {
     respond_json(stream, status, &body);
 }
 
+/// Send an error as either a self-contained HTML page (browsers — an
+/// `Accept: text/html` request) or JSON (curl / API / xterm.js viewer).
+/// Used for the auth gate so a revoked share link opened in a browser
+/// gets a friendly page instead of a raw `{"error":…}` blob.
+fn error_negotiated<W: Write>(stream: &mut W, status: u16, msg: &str, wants_html: bool) {
+    if wants_html {
+        let reason = match status {
+            401 => "Unauthorized",
+            403 => "Forbidden",
+            404 => "Not Found",
+            _ => "Error",
+        };
+        let page = error_html_page(status, reason, msg);
+        let _ = write!(
+            stream,
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: text/html; charset=utf-8\r\n{ROBOTS_TAG}Content-Length: {}\r\n\r\n{page}",
+            page.len(),
+        );
+    } else {
+        error_json(stream, status, msg);
+    }
+}
+
+/// A self-contained (no external resources, inline CSS + SVG) error
+/// page. Tailored hint for 401 (the revoked / expired share-link case).
+fn error_html_page(status: u16, reason: &str, msg: &str) -> String {
+    let hint = if status == 401 || status == 403 {
+        "This share link may have been revoked or expired. Ask the owner for a fresh link."
+    } else {
+        ""
+    };
+    let hint_html = if hint.is_empty() {
+        String::new()
+    } else {
+        format!(r#"<p class="hint">{hint}</p>"#)
+    };
+    let esc_msg = html_escape(msg);
+    format!(
+        r#"<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{status} {reason} — tab-atelier</title>
+<style>
+:root{{color-scheme:dark}}
+*{{box-sizing:border-box}}
+body{{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+background:#0d1b2e;color:#e6edf3;
+font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}}
+main{{max-width:30rem;padding:2.5rem;text-align:center}}
+.lock{{width:54px;height:54px;margin:0 auto 1rem;color:#5c99ff;opacity:.95}}
+.code{{font-weight:700;letter-spacing:.05em;font-size:.8rem;color:#5c99ff;text-transform:uppercase}}
+h1{{font-size:1.5rem;margin:.25rem 0 .75rem}}
+p{{margin:.5rem 0;color:#9fb0c3}}
+.hint{{margin-top:1.25rem;font-size:.9rem;color:#6b7d92}}
+footer{{margin-top:2rem;font-size:.8rem;color:#46566a}}
+</style></head>
+<body><main>
+<svg class="lock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"
+stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+<rect x="4" y="11" width="16" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>
+<div class="code">{status} · {reason}</div>
+<h1>This link isn’t valid</h1>
+<p>{esc_msg}</p>
+{hint_html}
+<footer>tab-atelier</footer>
+</main></body></html>"#,
+    )
+}
+
+/// Minimal HTML-escape for the error message interpolated into the page.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
 fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnapshot>>, token: &str, read_only: bool) {
     // Owned BufReader around the stream itself — `try_clone` was only used
     // to dodge the read/write borrow on TcpStream, but it doesn't exist on
@@ -905,6 +987,11 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
     let mut auth_token = None;
     let mut content_length: usize = 0;
     let mut accept_gzip = false;
+    // Whether the client prefers an HTML response (a browser opening a
+    // share link) vs JSON (curl / API / xterm.js viewer). Drives the
+    // content-negotiated error pages — a revoked link gets a friendly
+    // 401 page in the browser, machine-readable JSON everywhere else.
+    let mut wants_html = false;
     let mut if_none_match: Option<String> = None;
     let mut line = String::new();
     loop {
@@ -930,6 +1017,11 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
         }
         if let Some(val) = lower.strip_prefix("if-none-match: ") {
             if_none_match = Some(val.trim().trim_matches('"').to_string());
+        }
+        if let Some(val) = lower.strip_prefix("accept: ") {
+            // Browsers lead with `text/html`; treat its presence as
+            // "wants HTML". curl's `*/*` and API clients' JSON stay JSON.
+            wants_html = val.contains("text/html");
         }
     }
 
@@ -1127,12 +1219,12 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 share_token_authorised = true;
             }
             Some(false) => {
-                error_json(stream, 403, "share token is read-only");
+                error_negotiated(stream, 403, "share token is read-only", wants_html);
                 return;
             }
             None => {
                 debug!("API: 401 unauthorized request to {path}");
-                error_json(stream, 401, "invalid or missing token");
+                error_negotiated(stream, 401, "invalid or missing token", wants_html);
                 return;
             }
         }
@@ -2221,6 +2313,30 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             );
             respond_json(stream, 200, &body.to_string());
         }
+        ("POST", "/tabs/rotate-tokens") => {
+            // Revoke every tab's per-tab share tokens so all outstanding
+            // share links 401. Cleared on the snapshot immediately
+            // (instant effect) and queued so the owner loop clears the
+            // runtime Tab + persists; a fresh token is minted on the next
+            // "Remote control" / `share-link`. Master token only — this
+            // path isn't in the share-token allowlist, so a share token
+            // never authorises here.
+            let mut state = state.lock().unwrap();
+            let mut revoked = 0usize;
+            for t in &mut state.tabs {
+                if t.share_token_rw.is_empty() && t.share_token_ro.is_empty() {
+                    continue;
+                }
+                t.share_token_rw.clear();
+                t.share_token_ro.clear();
+                revoked += 1;
+            }
+            let ids: Vec<String> = state.tabs.iter().map(|t| t.id.clone()).collect();
+            state.pending_token_rotations.extend(ids);
+            state.cached_response = None;
+            drop(state);
+            respond_json(stream, 200, &format!(r#"{{"revoked":{revoked}}}"#));
+        }
         ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/bg-color") => {
             // Set or clear the per-tab background color override.
             // Master token only. Body: {"color": "#RRGGBB"} to set,
@@ -3069,6 +3185,7 @@ mod tests {
             pending_lock_changes: vec![],
             pending_bg_color_changes: vec![],
             pending_context_changes: vec![],
+            pending_token_rotations: vec![],
             pending_schedule_changes: vec![],
             pending_new_tabs: 0,
             pending_new_tab_cwds: std::collections::VecDeque::new(),
@@ -3407,6 +3524,83 @@ mod tests {
             "POST /tabs/by-id/tab-a/context HTTP/1.1\r\nContent-Length: 0\r\n\r\n",
         );
         assert_eq!(status_code(&resp), 401);
+    }
+
+    #[test]
+    fn rotate_tokens_revokes_share_links() {
+        let (port, state, master) = spawn_server();
+        // Give tab-a a share token; confirm it authorises a read.
+        state.lock().unwrap().tabs[0].share_token_rw = "sharetok123".into();
+        let resp = request(port, "GET /tabs/by-id/tab-a/output?token=sharetok123 HTTP/1.1\r\n\r\n");
+        assert_eq!(status_code(&resp), 200, "share token works before rotation");
+        // Rotate — master token only.
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/rotate-tokens HTTP/1.1\r\nAuthorization: Bearer {master}\r\nContent-Length: 0\r\n\r\n"
+            ),
+        );
+        assert_eq!(status_code(&resp), 200);
+        // Snapshot token cleared immediately → the old link now 401s.
+        assert!(
+            state.lock().unwrap().tabs[0].share_token_rw.is_empty(),
+            "snapshot share token cleared"
+        );
+        let resp = request(port, "GET /tabs/by-id/tab-a/output?token=sharetok123 HTTP/1.1\r\n\r\n");
+        assert_eq!(status_code(&resp), 401, "old share link now 401");
+        let pending = state.lock().unwrap().pending_token_rotations.clone();
+        assert!(pending.contains(&"tab-a".to_string()), "runtime clear queued");
+    }
+
+    #[test]
+    fn unauthorized_negotiates_html_vs_json() {
+        let (port, _, _) = spawn_server();
+        // Browser (Accept: text/html) → a self-contained HTML 401 page.
+        let resp = request(
+            port,
+            "GET /tabs/by-id/tab-a/view?token=bad HTTP/1.1\r\nAccept: text/html,application/xhtml+xml\r\n\r\n",
+        );
+        assert_eq!(status_code(&resp), 401);
+        // (hyper lowercases response header names — assert case-insensitively.)
+        assert!(
+            resp.to_ascii_lowercase().contains("content-type: text/html"),
+            "html content-type"
+        );
+        assert!(
+            resp.contains("<!DOCTYPE html>") && resp.contains("This link"),
+            "html body"
+        );
+        // Self-contained: inline CSS + inline SVG, no external links/scripts.
+        assert!(
+            !resp.contains("<link") && !resp.contains("src="),
+            "no external resources"
+        );
+        // API (Accept: application/json) → JSON.
+        let resp = request(
+            port,
+            "GET /tabs/by-id/tab-a/view?token=bad HTTP/1.1\r\nAccept: application/json\r\n\r\n",
+        );
+        assert_eq!(status_code(&resp), 401);
+        assert!(
+            resp.contains("invalid or missing token") && !resp.contains("<!DOCTYPE"),
+            "json body"
+        );
+        // curl default (*/*) → JSON, not HTML.
+        let resp = request(
+            port,
+            "GET /tabs/by-id/tab-a/view?token=bad HTTP/1.1\r\nAccept: */*\r\n\r\n",
+        );
+        assert!(!resp.contains("<!DOCTYPE"), "curl default gets json");
+    }
+
+    #[test]
+    fn rotate_tokens_requires_master() {
+        let (port, _, _) = spawn_server();
+        let resp = request(
+            port,
+            "POST /tabs/rotate-tokens HTTP/1.1\r\nAuthorization: Bearer wrong\r\nContent-Length: 0\r\n\r\n",
+        );
+        assert_eq!(status_code(&resp), 401, "rotate is master-only");
     }
 
     #[test]
