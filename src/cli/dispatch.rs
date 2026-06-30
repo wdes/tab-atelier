@@ -103,6 +103,27 @@ pub enum Commands {
         tab: String,
     },
 
+    /// Restrict a tab to an allowlist of destinations via a filtering
+    /// proxy. Repeat `--preset`/`--domain`/`--cidr` to add entries;
+    /// `--clear` removes the allowlist (tab returns to unrestricted).
+    #[command(name = "net-allow")]
+    NetAllow {
+        /// Tab index or UUID.
+        tab: String,
+        /// Preset id (`claude-code`, `cloudflare`). Repeatable.
+        #[arg(long = "preset")]
+        presets: Vec<String>,
+        /// Domain suffix to allow (e.g. `api.anthropic.com`, `*.example.com`). Repeatable.
+        #[arg(long = "domain")]
+        domains: Vec<String>,
+        /// CIDR / IP to allow (e.g. `104.16.0.0/13`). Repeatable.
+        #[arg(long = "cidr")]
+        cidrs: Vec<String>,
+        /// Clear the allowlist (tab returns to unrestricted internet).
+        #[arg(long)]
+        clear: bool,
+    },
+
     /// Send keystrokes to a tab (`\n` / `\r` / `\t` / `\\` escapes interpreted).
     Input {
         /// Tab index or UUID.
@@ -335,6 +356,13 @@ pub fn dispatch(cli: Cli) -> bool {
         Commands::Unlock { tab } => crate::cli::share_link::unlock(&[tab]),
         Commands::NetOff { tab } => crate::cli::share_link::net_off(&[tab]),
         Commands::NetOn { tab } => crate::cli::share_link::net_on(&[tab]),
+        Commands::NetAllow {
+            tab,
+            presets,
+            domains,
+            cidrs,
+            clear,
+        } => crate::cli::share_link::net_allow(&tab, &presets, &domains, &cidrs, clear),
         Commands::Input { tab, text } => crate::cli::share_link::send_input(&[tab, text]),
         Commands::Output { tab } => crate::cli::share_link::output(&[tab]),
         Commands::ShareLink { tab, ro } => {

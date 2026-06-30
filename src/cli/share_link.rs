@@ -432,6 +432,72 @@ pub fn net_on(args: &[String]) -> i32 {
     set_net(args, false, "net-on")
 }
 
+/// Put a tab into allowlist mode (or clear it) by `POST`ing the config to
+/// `/tabs/by-id/<uuid>/net-allow`. The daemon launches a filtering proxy
+/// for the tab and respawns its shell on the next drain tick.
+#[must_use]
+pub fn net_allow(tab: &str, presets: &[String], domains: &[String], cidrs: &[String], clear: bool) -> i32 {
+    let ep = match discover_endpoint() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("net-allow: {e}");
+            return 1;
+        }
+    };
+    let (idx, uuid) = match resolve(&ep, tab) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("net-allow: {e}");
+            return 1;
+        }
+    };
+    // `--clear` (or no entries at all) sends an empty config, which the
+    // server reads as "leave allowlist mode".
+    let (presets, domains, cidrs): (&[String], &[String], &[String]) = if clear {
+        (&[], &[], &[])
+    } else {
+        (presets, domains, cidrs)
+    };
+    if !clear && presets.is_empty() && domains.is_empty() && cidrs.is_empty() {
+        eprintln!("net-allow: nothing to allow — pass --preset/--domain/--cidr, or --clear to remove the allowlist");
+        return 2;
+    }
+    let body = serde_json::json!({
+        "presets": presets,
+        "domains": domains,
+        "cidrs": cidrs,
+    })
+    .to_string();
+    let mut resp = match agent()
+        .post(format!("{}/tabs/by-id/{uuid}/net-allow", ep.url))
+        .header("Authorization", format!("Bearer {}", ep.token))
+        .header("Content-Type", "application/json")
+        .send(body.as_bytes())
+    {
+        Ok(r) => r,
+        Err(ureq::Error::StatusCode(400)) => {
+            eprintln!("net-allow: rejected — unknown preset or invalid CIDR");
+            return 1;
+        }
+        Err(e) => {
+            eprintln!("net-allow: {e}");
+            return 1;
+        }
+    };
+    let active = resp
+        .body_mut()
+        .read_json::<serde_json::Value>()
+        .ok()
+        .and_then(|v| v.get("allowlist_active").and_then(serde_json::Value::as_bool))
+        .unwrap_or(!clear);
+    if active {
+        println!("allowlist applied to tab {idx} (shell respawns)");
+    } else {
+        println!("allowlist cleared for tab {idx} — internet unrestricted (shell respawns)");
+    }
+    0
+}
+
 #[must_use]
 pub fn send_input(args: &[String]) -> i32 {
     if args.len() < 2 {
