@@ -31,6 +31,8 @@ pub mod net_meter;
 #[cfg(all(target_os = "linux", not(feature = "gui")))]
 pub mod net_nft;
 pub mod net_policy;
+#[cfg(all(target_os = "linux", not(feature = "gui")))]
+pub mod net_resolver;
 pub(crate) mod platform;
 #[cfg(feature = "energy")]
 pub(crate) mod power;
