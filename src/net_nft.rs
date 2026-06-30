@@ -77,9 +77,12 @@ pub fn ruleset(table: &str, cgroup_rel: &str, cidrs: &[Cidr]) -> String {
         }
     }
 
+    // The policing chain is named `confine`, NOT `policy` — `policy` is a
+    // reserved nftables keyword (used in `policy accept;`), so a chain by
+    // that name is a syntax error.
     let mut s = String::new();
     let _ = writeln!(s, "table inet {table} {{");
-    s.push_str("  chain policy {\n");
+    s.push_str("  chain confine {\n");
     s.push_str("    oifname \"lo\" accept\n");
     s.push_str("    ct state established,related accept\n");
     s.push_str("    udp dport 53 accept\n");
@@ -94,7 +97,7 @@ pub fn ruleset(table: &str, cgroup_rel: &str, cidrs: &[Cidr]) -> String {
     s.push_str("  }\n");
     s.push_str("  chain out {\n");
     s.push_str("    type filter hook output priority 0; policy accept;\n");
-    let _ = writeln!(s, "    socket cgroupv2 level {level} \"{cgroup_rel}\" jump policy");
+    let _ = writeln!(s, "    socket cgroupv2 level {level} \"{cgroup_rel}\" jump confine");
     s.push_str("  }\n");
     s.push_str("}\n");
     s
@@ -198,7 +201,7 @@ mod tests {
         let rs = ruleset("t", "system.slice/svc/tab-x", &cidrs);
         // Three path components ⇒ level 3.
         assert!(
-            rs.contains("socket cgroupv2 level 3 \"system.slice/svc/tab-x\" jump policy"),
+            rs.contains("socket cgroupv2 level 3 \"system.slice/svc/tab-x\" jump confine"),
             "{rs}"
         );
         // Output hook must stay accept so the daemon isn't policed.
