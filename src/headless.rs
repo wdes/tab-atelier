@@ -642,6 +642,7 @@ pub fn run() -> std::io::Result<()> {
     // --- API servers ---
     let api_state = Arc::new(Mutex::new(api::TabSnapshot {
         tabs: Vec::<api::SnapshotTab>::new(),
+        master_token: String::new(),
         active,
         #[cfg(feature = "energy")]
         power: Vec::new(),

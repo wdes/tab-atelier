@@ -190,6 +190,10 @@ pub enum Commands {
     /// links 401; a fresh token is minted on the next share.
     RotateTokens,
 
+    /// Hot-swap the master API token. Every client/link carrying the old
+    /// token 401s; the new token is written to `api.token`.
+    ResetMasterToken,
+
     /// Bridge a Claude Code hook event to set-status. Reads JSON from stdin.
     ClaudeHook {
         /// Event name (`session-start`, `pre-tool`, …).
@@ -401,6 +405,7 @@ pub fn dispatch(cli: Cli) -> bool {
         Commands::SetContext { args } => crate::cli::set_context::run(&args),
         Commands::Token => crate::cli::tokens::show(&[]),
         Commands::RotateTokens => crate::cli::tokens::rotate(&[]),
+        Commands::ResetMasterToken => crate::cli::tokens::reset_master(&[]),
         Commands::ClaudeHook { event } => crate::cli::claude_hook::run(&[event]),
         Commands::Remote { args } => crate::cli::remote::run(&args),
         Commands::Dispatch { args } => crate::cli::delegate::run(&args),
