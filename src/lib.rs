@@ -465,6 +465,19 @@ pub struct TabState {
     #[serde(default, skip_serializing_if = "is_false")]
     pub net_disabled: bool,
 
+    /// Allowlist-mode config — the tab may reach ONLY these destinations,
+    /// enforced by the filtering proxy (and nftables on the headless
+    /// service). Mutually exclusive with [`Self::net_disabled`] (full
+    /// airgap): when both are set, `net_disabled` wins. All three empty ⇒
+    /// the tab is not in allowlist mode. Set via the `net-allow` CLI /
+    /// API. See [`Self::net_mode`] / [`Self::allow_set`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub net_allow_presets: Vec<crate::net_policy::Preset>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub net_allow_domains: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub net_allow_cidrs: Vec<String>,
+
     /// Per-tab override of the viewer background color (hex
     /// `#RRGGBB`). When `Some`, beats the global
     /// `Preferences::tab_bg_color`. Set via the right-click "Background
@@ -630,10 +643,39 @@ impl Default for TabState {
             share_token_ro: String::new(),
             locked: false,
             net_disabled: false,
+            net_allow_presets: Vec::new(),
+            net_allow_domains: Vec::new(),
+            net_allow_cidrs: Vec::new(),
             bg_color: None,
             schedule: None,
             limits: TabResourceLimits::default(),
         }
+    }
+}
+
+impl TabState {
+    /// Resolve the persisted fields into the three-state network mode.
+    /// `net_disabled` (full airgap) wins over any allowlist config.
+    #[must_use]
+    pub const fn net_mode(&self) -> crate::net_policy::NetMode {
+        use crate::net_policy::NetMode;
+        if self.net_disabled {
+            NetMode::Off
+        } else if self.net_allow_presets.is_empty()
+            && self.net_allow_domains.is_empty()
+            && self.net_allow_cidrs.is_empty()
+        {
+            NetMode::On
+        } else {
+            NetMode::Allowlist
+        }
+    }
+
+    /// Flatten the allowlist config into the resolved match-set the proxy /
+    /// nftables consume. Empty when not in allowlist mode.
+    #[must_use]
+    pub fn allow_set(&self) -> crate::net_policy::AllowSet {
+        crate::net_policy::AllowSet::build(&self.net_allow_presets, &self.net_allow_domains, &self.net_allow_cidrs)
     }
 }
 
