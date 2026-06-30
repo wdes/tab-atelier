@@ -35,12 +35,6 @@ use std::fmt::Write as _;
 
 use crate::net_policy::Cidr;
 
-/// Whether kernel egress enforcement is opted in (`TAB_ATELIER_NFT=1`).
-#[must_use]
-pub fn enforcement_enabled() -> bool {
-    std::env::var("TAB_ATELIER_NFT").is_ok_and(|v| v == "1")
-}
-
 /// nftables table name for a tab. Sanitised so the id is a safe nft
 /// identifier (alnum + `_`); collisions across tabs are impossible because
 /// tab ids are UUIDs.
@@ -118,17 +112,14 @@ fn fmt_v6(v: u128) -> String {
 
 /// Install the ruleset for a tab. Best-effort.
 ///
-/// Returns `false` (and logs at debug) when enforcement is disabled, `nft`
-/// is missing, or the command fails — the caller keeps running with just
-/// the cooperative proxy.
+/// Returns `false` (and logs at debug) when `nft` is missing or the command
+/// fails — a tab is never killed over a firewall-programming failure, but
+/// note that a `false` here means the tab is **not** egress-confined.
 ///
 /// Idempotent: drops any existing table of the same name first, so a
 /// respawn re-applies cleanly.
 #[must_use]
 pub fn apply(tab_id: &str, cgroup_rel: &str, cidrs: &[Cidr]) -> bool {
-    if !enforcement_enabled() {
-        return false;
-    }
     let table = table_name(tab_id);
     teardown(tab_id);
     let script = ruleset(&table, cgroup_rel, cidrs);
@@ -154,9 +145,6 @@ pub fn apply(tab_id: &str, cgroup_rel: &str, cidrs: &[Cidr]) -> bool {
 /// Remove a tab's table. Best-effort and silent — a missing table (never
 /// applied, or already gone) is not an error.
 pub fn teardown(tab_id: &str) {
-    if !enforcement_enabled() {
-        return;
-    }
     let table = table_name(tab_id);
     let _ = std::process::Command::new("nft")
         .args(["delete", "table", "inet", &table])

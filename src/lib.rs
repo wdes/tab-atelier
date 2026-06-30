@@ -29,7 +29,6 @@ pub(crate) mod locale;
 #[cfg(all(target_os = "linux", not(feature = "gui")))]
 pub mod net_nft;
 pub mod net_policy;
-pub mod net_proxy;
 pub(crate) mod platform;
 #[cfg(feature = "energy")]
 pub(crate) mod power;

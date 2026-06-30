@@ -128,12 +128,6 @@ struct HeadlessTab {
     /// Persisted; applied on (re)spawn by launching `net_proxy` and
     /// injecting its env. Empty ⇒ not in allowlist mode.
     net_allow: crate::net_policy::AllowConfig,
-    /// The per-tab filtering proxy, alive while the tab is in allowlist
-    /// mode. Held purely as a drop-guard: its `Drop` stops the proxy when
-    /// the tab is torn down / respawned (`tabs[idx] = new` drops the old
-    /// `HeadlessTab`). `None` outside allowlist mode.
-    #[allow(dead_code)]
-    net_proxy: Option<crate::net_proxy::ProxyHandle>,
     /// Free-text context the in-tab agent set via `set-context`.
     /// In-memory only (not persisted); reflected on `/tabs`.
     context: Option<String>,
@@ -362,31 +356,6 @@ fn spawn_pty_tab(
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| r"C:\Windows\System32\cmd.exe".to_string());
-    // Allowlist mode: launch the per-tab filtering proxy and route the
-    // shell's HTTP(S) traffic through it via proxy env vars (injected for
-    // both the clear-env and inherit-env branches below by extending
-    // `extra_env`). Cooperative on its own; the privileged nftables path
-    // hard-enforces. Skipped when net is fully off — an airgapped tab has
-    // nothing for the proxy to reach. A proxy-spawn failure logs and falls
-    // back to no proxy rather than killing the tab.
-    let mut extra_env = extra_env;
-    let net_proxy = if !net_disabled && !net_allow.is_empty() {
-        match crate::net_proxy::spawn(net_allow.to_allow_set()) {
-            Ok(handle) => {
-                for (k, v) in handle.env_vars() {
-                    extra_env.insert(k, v);
-                }
-                Some(handle)
-            }
-            Err(e) => {
-                warn!("headless: net proxy spawn failed for '{name}': {e}");
-                None
-            }
-        }
-    } else {
-        None
-    };
-
     let (env_map, prog, args): (HashMap<String, String>, String, Vec<String>) = if crate::clear_env() {
         // Cleared-env mode: spawn the shell through `env -i` so it
         // inherits NOTHING from the daemon — only the curated minimal
@@ -468,23 +437,20 @@ fn spawn_pty_tab(
     #[cfg(not(feature = "energy"))]
     let _ = energy_wh;
 
-    // Kernel-level egress allowlist (opt-in, privileged). Clears any stale
+    // Kernel-level egress allowlist (nftables — required). Clears any stale
     // table for this id first (so leaving allowlist mode un-confines the
-    // tab), then — when in allowlist mode with CIDRs and `TAB_ATELIER_NFT=1`
-    // — puts the tab's shell in a cgroup and installs nft rules that drop
-    // everything off the allowlist, even from software that ignores the
-    // proxy. Best-effort: a no-op without CAP_NET_ADMIN / nft / cgroups, in
-    // which case the cooperative proxy is the only control. Domains stay
-    // proxy-only (can't match a hostname in nftables).
+    // tab), then — when in allowlist mode with CIDRs — puts the tab's shell
+    // in a cgroup and installs nft rules that drop everything off the
+    // allowlist. Best-effort: a no-op without CAP_NET_ADMIN / cgroups (logs;
+    // the tab is then NOT confined). Domain allowlists are enforced by the
+    // DNS resolver (separate) — nftables can't match a hostname.
     #[cfg(target_os = "linux")]
     {
         crate::net_nft::teardown(&id);
-        if !net_disabled && !net_allow.is_empty() && crate::net_nft::enforcement_enabled() {
+        if !net_disabled && !net_allow.is_empty() {
             let allow_set = net_allow.to_allow_set();
             if allow_set.cidrs.is_empty() {
-                log::debug!(
-                    "net_nft: tab '{name}' allowlist has no CIDRs; kernel enforcement skipped (proxy still applies)"
-                );
+                log::debug!("net_nft: tab '{name}' allowlist has no CIDRs; nothing for nft to confine yet");
             } else if let Some(rel) = crate::cgroup::ensure_tab_cgroup(&id, pid) {
                 let _ = crate::net_nft::apply(&id, &rel, &allow_set.cidrs);
             } else {
@@ -525,7 +491,6 @@ fn spawn_pty_tab(
         bg_color,
         net_disabled,
         net_allow,
-        net_proxy,
         context: None,
         pending_agent_resume,
         colors_enabled,

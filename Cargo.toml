@@ -357,7 +357,10 @@ maintainer-scripts = "assets/headless-debian/"
 # because libgcc_s.so.1 is DT_NEEDED but cargo-deb's resolver omits it.
 # `adduser` (service account in postinst) and `init-system-helpers`
 # (deb-systemd-helper / deb-systemd-invoke) aren't linked libraries.
-depends = "$auto, libgcc-s1, adduser, init-system-helpers"
+# `nftables` is the egress-allowlist enforcement mechanism (per-tab tables
+# only — installing the package applies NO host rules, so it can't lock the
+# user out). `passt` provides the per-tab netns outbound path.
+depends = "$auto, libgcc-s1, adduser, init-system-helpers, nftables, passt"
 # Mirror the default variant: the shipped preferences.json fallback
 # is a real conffile so admin edits survive `apt upgrade`. The Claude
 # Code system hooks live in a different /etc subdir; making it a
