@@ -195,6 +195,11 @@ pub struct DetectedUrl {
 #[derive(Clone, Default)]
 struct EventProxy {
     notifier: Arc<std::sync::Mutex<Option<EventLoopSender>>>,
+    /// Active theme, so OSC colour queries (see `send_event`) answer with
+    /// the palette the tab is actually painted in. Kept in sync by
+    /// [`TerminalView::set_theme`]. `Arc<Mutex<_>>` because the proxy is
+    /// cloned into the parser thread.
+    theme: Arc<std::sync::Mutex<ThemeName>>,
 }
 
 impl EventProxy {
@@ -203,15 +208,35 @@ impl EventProxy {
             *slot = Some(sender);
         }
     }
+
+    fn set_theme(&self, theme: ThemeName) {
+        if let Ok(mut t) = self.theme.lock() {
+            *t = theme;
+        }
+    }
 }
 
 impl EventListener for EventProxy {
     fn send_event(&self, event: AlacrittyEvent) {
-        if let AlacrittyEvent::PtyWrite(text) = event
-            && let Ok(slot) = self.notifier.lock()
+        let bytes: Vec<u8> = match event {
+            AlacrittyEvent::PtyWrite(text) => text.into_bytes(),
+            // Answer OSC colour queries (OSC 4 palette / 10 fg / 11 bg /
+            // 12 cursor). Without a reply the query times out and the app
+            // assumes a default (near-black) background — Claude Code then
+            // computes its diff highlight colours for that imagined bg, and
+            // those clash with our real navy theme (added lines render a
+            // blue that nearly matches the background). Replying with the
+            // actual palette lets the app blend against the right bg.
+            AlacrittyEvent::ColorRequest(index, formatter) => {
+                let theme = self.theme.lock().map_or_else(|_| ThemeName::default(), |t| *t);
+                formatter(crate::theme::theme(theme).color_index_to_rgb(index)).into_bytes()
+            }
+            _ => return,
+        };
+        if let Ok(slot) = self.notifier.lock()
             && let Some(sender) = slot.as_ref()
         {
-            let _ = sender.send(Msg::Input(text.into_bytes().into()));
+            let _ = sender.send(Msg::Input(bytes.into()));
         }
     }
 }
@@ -616,6 +641,15 @@ impl TerminalView {
     #[allow(clippy::missing_const_for_fn)]
     pub fn set_colors_enabled(&self, enabled: bool) {
         self.colors_enabled.set(enabled);
+    }
+
+    /// Set the active theme. Updates the field the renderer reads AND the
+    /// copy the event proxy uses to answer OSC colour queries, so a TUI
+    /// querying the terminal background always sees the current palette.
+    /// Use this instead of writing `view.theme` directly.
+    pub fn set_theme(&mut self, theme: ThemeName) {
+        self.theme = theme;
+        self.event_proxy.set_theme(theme);
     }
 
     pub fn restore_output(&self, text: &str) {

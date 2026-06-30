@@ -132,6 +132,41 @@ impl Theme {
         }
     }
 
+    /// Resolve an alacritty colour-table index to an RGB triple for OSC
+    /// colour-query replies (OSC 4 palette, 10 fg, 11 bg, 12 cursor).
+    /// Indices 0–255 are the palette (16 ANSI + 6×6×6 cube + grayscale
+    /// ramp, same maths as [`Self::xterm_256_to_hsla`]); 256 = foreground,
+    /// 257 = background, 258 = cursor. Anything else falls back to fg.
+    pub const fn color_index_to_rgb(&self, index: usize) -> Rgb {
+        const fn split(v: u32) -> Rgb {
+            Rgb {
+                r: ((v >> 16) & 0xff) as u8,
+                g: ((v >> 8) & 0xff) as u8,
+                b: (v & 0xff) as u8,
+            }
+        }
+        const fn cube(v: u8) -> u8 {
+            if v == 0 { 0 } else { 55 + v * 40 }
+        }
+        match index {
+            0..=15 => split(self.ansi[index]),
+            16..=231 => {
+                let i = (index - 16) as u8;
+                Rgb {
+                    r: cube(i / 36),
+                    g: cube((i % 36) / 6),
+                    b: cube(i % 6),
+                }
+            }
+            232..=255 => {
+                let s = (8 + 10 * (index as u16 - 232)) as u8;
+                Rgb { r: s, g: s, b: s }
+            }
+            257 => split(self.term_bg),
+            _ => split(self.term_fg),
+        }
+    }
+
     pub fn term_fg_hsla(&self) -> Hsla {
         rgb(self.term_fg).into()
     }
@@ -381,6 +416,42 @@ mod tests {
         let bg = t.color_to_hsla(Color::Named(NamedColor::Background));
         let expected: Hsla = rgb(t.term_bg).into();
         assert!((bg.h - expected.h).abs() < 0.001);
+    }
+
+    #[test]
+    fn color_index_to_rgb_covers_table() {
+        let t = theme(ThemeName::TomorrowNightBlue);
+        // 257 = background → term_bg (0x002451 = navy). This is the value
+        // a TUI reads from an OSC 11 query; it must match the painted bg.
+        let bg = t.color_index_to_rgb(257);
+        assert_eq!((bg.r, bg.g, bg.b), (0x00, 0x24, 0x51));
+        // 256 = foreground.
+        let fg = t.color_index_to_rgb(256);
+        assert_eq!((fg.r, fg.g, fg.b), (0xff, 0xff, 0xff));
+        // 0..16 map to the ANSI palette (index 1 = red).
+        let red = t.color_index_to_rgb(1);
+        let ansi_red = t.ansi[1];
+        assert_eq!(
+            (red.r, red.g, red.b),
+            (
+                ((ansi_red >> 16) & 0xff) as u8,
+                ((ansi_red >> 8) & 0xff) as u8,
+                (ansi_red & 0xff) as u8
+            )
+        );
+        // Cube + grayscale agree with the HSLA path's hue.
+        for i in [16usize, 100, 231, 232, 255] {
+            let rgb_v = t.color_index_to_rgb(i);
+            let via_hsla: Hsla = Rgba {
+                r: f32::from(rgb_v.r) / 255.0,
+                g: f32::from(rgb_v.g) / 255.0,
+                b: f32::from(rgb_v.b) / 255.0,
+                a: 1.0,
+            }
+            .into();
+            let direct = t.xterm_256_to_hsla(i as u8);
+            assert!((via_hsla.l - direct.l).abs() < 0.01, "lightness mismatch at idx {i}");
+        }
     }
 
     #[test]

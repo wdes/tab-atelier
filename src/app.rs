@@ -437,7 +437,7 @@ impl AppState {
                     let view = cx.new(|cx| {
                         let mut tv =
                             TerminalView::new_with_colors_and_env(cwd.as_deref(), fc, br, ce, colors, env, window, cx);
-                        tv.theme = theme_name;
+                        tv.set_theme(theme_name);
                         tv
                     });
                     // Defer restore_output for non-active tabs — feeding the
@@ -536,7 +536,7 @@ impl AppState {
                     let env = tab_env_extras(&new_id, &api_url_for_pty, &api_token);
                     let view = cx.new(|cx| {
                         let mut tv = TerminalView::new_with_colors_and_env(None, fc, br, ce, true, env, window, cx);
-                        tv.theme = theme_name;
+                        tv.set_theme(theme_name);
                         tv
                     });
                     tabs.push(Tab {
@@ -589,7 +589,7 @@ impl AppState {
                 let env = tab_env_extras(&new_id, &api_url_for_pty, &api_token);
                 let view = cx.new(|cx| {
                     let mut tv = TerminalView::new_with_colors_and_env(None, fc, br, ce, true, env, window, cx);
-                    tv.theme = theme_name;
+                    tv.set_theme(theme_name);
                     tv
                 });
                 (
@@ -880,7 +880,7 @@ impl AppState {
         let env = tab_env_extras(&new_id, &api_url_for_local_clients(&self.api_addr), &self.api_token);
         let view = cx.new(|cx| {
             let mut tv = TerminalView::new_with_colors_and_env(cwd.as_deref(), fc, br, ce, true, env, window, cx);
-            tv.theme = tn;
+            tv.set_theme(tn);
             tv
         });
         let idx = at.min(self.tabs.len());
@@ -1493,7 +1493,7 @@ impl AppState {
         );
         let view = cx.new(|cx| {
             let mut tv = TerminalView::new_with_colors_and_env(cwd.as_deref(), fc, br, ce, true, env, window, cx);
-            tv.theme = tn;
+            tv.set_theme(tn);
             tv
         });
         self.tabs[idx].view = view;
@@ -3200,7 +3200,7 @@ impl AppState {
                         cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
                             this.theme_name = tn;
                             for tab in &this.tabs {
-                                tab.view.update(cx, |tv, _cx| tv.theme = tn);
+                                tab.view.update(cx, |tv, _cx| tv.set_theme(tn));
                             }
                             cx.notify();
                         }),
