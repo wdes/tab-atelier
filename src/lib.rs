@@ -26,6 +26,8 @@ pub mod headless;
 #[cfg(feature = "http3")]
 pub mod http3;
 pub(crate) mod locale;
+#[cfg(target_os = "linux")]
+pub mod net_meter;
 #[cfg(all(target_os = "linux", not(feature = "gui")))]
 pub mod net_nft;
 pub mod net_policy;
