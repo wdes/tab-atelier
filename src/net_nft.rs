@@ -152,6 +152,41 @@ pub fn apply_meter(tab_id: &str, cgroup_rel: &str) -> bool {
     matches!(run_nft_stdin(&meter_ruleset(&table_name(tab_id), cgroup_rel)), Ok(true))
 }
 
+/// Build the **net-off** ruleset: drop all egress except loopback.
+///
+/// Drops everything from the tab's cgroup except loopback (so the local API
+/// still works) — no internet, no DNS. The privileged-service alternative to
+/// a bubblewrap netns (which the hardened unit's `/proc` restrictions
+/// break). Counters included.
+#[must_use]
+pub fn block_ruleset(table: &str, cgroup_rel: &str) -> String {
+    let cgroup_rel = cgroup_rel.trim_matches('/');
+    let level = cgroup_rel.split('/').filter(|s| !s.is_empty()).count();
+    let mut s = String::new();
+    let _ = writeln!(s, "table inet {table} {{");
+    s.push_str("  chain confine {\n");
+    s.push_str("    oifname \"lo\" accept comment \"loopback (local API)\"\n");
+    s.push_str("    ct state established,related accept comment \"replies\"\n");
+    s.push_str("    counter drop comment \"tab-atelier: net-off (no internet)\"\n");
+    s.push_str("  }\n");
+    s.push_str("  chain out {\n");
+    s.push_str("    type filter hook output priority 0; policy accept;\n");
+    let _ = writeln!(
+        s,
+        "    socket cgroupv2 level {level} \"{cgroup_rel}\" counter jump confine comment \"tab-atelier net-off\""
+    );
+    s.push_str("  }\n");
+    s.push_str("}\n");
+    s
+}
+
+/// Install the net-off (drop-all-egress) table. Best-effort, idempotent.
+#[must_use]
+pub fn apply_block(tab_id: &str, cgroup_rel: &str) -> bool {
+    teardown(tab_id);
+    matches!(run_nft_stdin(&block_ruleset(&table_name(tab_id), cgroup_rel)), Ok(true))
+}
+
 /// Format a u128 as a fully-expanded IPv6 address (no `::` compression —
 /// nft accepts the long form and it keeps the generator trivial).
 fn fmt_v6(v: u128) -> String {
@@ -360,6 +395,20 @@ mod tests {
     fn parse_counters_empty_is_zero() {
         let json: serde_json::Value = serde_json::from_str(r#"{"nftables":[]}"#).unwrap();
         assert_eq!(parse_counters(&json), (0, 0));
+    }
+
+    #[test]
+    fn block_ruleset_drops_everything_but_loopback() {
+        let rs = block_ruleset("t", "a/b/c");
+        assert!(rs.contains("oifname \"lo\" accept"), "loopback kept");
+        assert!(
+            rs.contains("counter drop comment \"tab-atelier: net-off"),
+            "drops the rest"
+        );
+        // No allow/dns rules — net-off means no internet, no DNS.
+        assert!(!rs.contains("dport 53"));
+        assert!(!rs.contains("daddr"));
+        assert!(rs.contains("socket cgroupv2 level 3 \"a/b/c\" counter jump confine"));
     }
 
     #[test]
