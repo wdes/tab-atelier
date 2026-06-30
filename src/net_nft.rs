@@ -2,32 +2,28 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Privileged, **non-proxy** egress enforcement for allowlist mode.
+//! Privileged, kernel-enforced egress allowlist for allowlist-mode tabs.
 //!
-//! The filtering proxy ([`crate::net_proxy`]) only catches software that
-//! honours `HTTPS_PROXY`. To deny a tab's *non-compliant* traffic too —
-//! "anything not on the allowlist is dropped at the kernel, period" — we
-//! install nftables rules keyed on the tab's cgroup v2 path: traffic from
-//! that cgroup may only reach the allowlisted CIDRs (plus loopback for the
-//! local API + the proxy, plus DNS so names still resolve); everything else
-//! is dropped.
+//! Installs per-tab nftables rules keyed on the tab's cgroup v2 path so that
+//! traffic from that cgroup may only reach the allowlisted CIDRs (plus
+//! loopback for the local API + DNS so names still resolve); everything else
+//! is dropped — including from software that would ignore a proxy. The
+//! daemon holds `CAP_NET_ADMIN` to program this; the tabs do not (their caps
+//! are stripped on spawn), so an agent can't `nft flush` its way out.
 //!
 //! ## Requirements & degradation
 //!
-//! - Linux, headless service, `CAP_NET_ADMIN`, the `nft` binary, AND the
+//! - Linux headless service with `CAP_NET_ADMIN`, the `nft` binary, AND the
 //!   per-tab cgroup ([`crate::cgroup`]). Missing any ⇒ [`apply`] is a
-//!   best-effort no-op (logs at debug); the cooperative proxy still applies.
-//! - **Opt-in.** Even when everything is present, enforcement only runs when
-//!   `TAB_ATELIER_NFT=1`. This is deliberately conservative: a wrong cgroup
-//!   match in the OUTPUT hook could police the daemon's own traffic, so the
-//!   feature ships off until validated on the target host.
+//!   best-effort no-op (logs at debug) and the tab is **not** confined.
+//! - The OUTPUT hook stays `policy accept` and only *jumps* the tab's own
+//!   cgroup into the policing chain, so it can never affect the host/daemon.
 //!
 //! ## Scope
 //!
-//! This module is mostly the **pure ruleset generator** ([`ruleset`]),
-//! which is unit-tested. [`apply`] / [`teardown`] shell out to `nft -f -`
-//! / `nft delete table` and are best-effort. CIDR-only — domain allowlists
-//! stay with the proxy (you can't match a hostname in nftables).
+//! The pure ruleset generator ([`ruleset`]) is unit-tested; [`apply`] /
+//! [`teardown`] shell out to `nft`. CIDR-only — domain allowlists are the
+//! DNS resolver's job (nftables can't match a hostname).
 
 #![cfg(all(target_os = "linux", not(feature = "gui")))]
 
@@ -83,21 +79,32 @@ pub fn ruleset(table: &str, cgroup_rel: &str, cidrs: &[Cidr]) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "table inet {table} {{");
     s.push_str("  chain confine {\n");
-    s.push_str("    oifname \"lo\" accept\n");
-    s.push_str("    ct state established,related accept\n");
-    s.push_str("    udp dport 53 accept\n");
-    s.push_str("    tcp dport 53 accept\n");
+    s.push_str("    oifname \"lo\" accept comment \"loopback (local API, resolver)\"\n");
+    s.push_str("    ct state established,related accept comment \"replies\"\n");
+    s.push_str("    udp dport 53 accept comment \"dns\"\n");
+    s.push_str("    tcp dport 53 accept comment \"dns\"\n");
     if !v4.is_empty() {
-        let _ = writeln!(s, "    ip daddr {{ {} }} accept", v4.join(", "));
+        let _ = writeln!(
+            s,
+            "    ip daddr {{ {} }} accept comment \"allowlist v4\"",
+            v4.join(", ")
+        );
     }
     if !v6.is_empty() {
-        let _ = writeln!(s, "    ip6 daddr {{ {} }} accept", v6.join(", "));
+        let _ = writeln!(
+            s,
+            "    ip6 daddr {{ {} }} accept comment \"allowlist v6\"",
+            v6.join(", ")
+        );
     }
-    s.push_str("    drop\n");
+    s.push_str("    drop comment \"tab-atelier: off-allowlist egress denied\"\n");
     s.push_str("  }\n");
     s.push_str("  chain out {\n");
     s.push_str("    type filter hook output priority 0; policy accept;\n");
-    let _ = writeln!(s, "    socket cgroupv2 level {level} \"{cgroup_rel}\" jump confine");
+    let _ = writeln!(
+        s,
+        "    socket cgroupv2 level {level} \"{cgroup_rel}\" jump confine comment \"tab-atelier egress allowlist\""
+    );
     s.push_str("  }\n");
     s.push_str("}\n");
     s
@@ -208,7 +215,7 @@ mod tests {
         assert!(rs.contains("hook output priority 0; policy accept;"));
         // The allowlisted v4 net is accepted, then everything else dropped.
         assert!(rs.contains("ip daddr { 104.16.0.0/13 } accept"));
-        assert!(rs.contains("    drop\n"));
+        assert!(rs.contains("    drop comment "));
         // Loopback + DNS always allowed (local API, proxy, resolution).
         assert!(rs.contains("oifname \"lo\" accept"));
         assert!(rs.contains("udp dport 53 accept"));
@@ -224,7 +231,7 @@ mod tests {
 
         // Empty allowlist → still valid (loopback + DNS, everything else drop).
         let empty = ruleset("t", "a/b", &[]);
-        assert!(empty.contains("    drop\n"));
+        assert!(empty.contains("    drop comment "));
         assert!(!empty.contains("ip daddr"));
         assert!(!empty.contains("ip6 daddr"));
     }
