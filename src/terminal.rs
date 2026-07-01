@@ -253,6 +253,12 @@ struct CachedLine {
     /// on every subsequent hit so `detect_urls` doesn't re-run every frame.
     /// The tuple shape matches `crate::detect_urls`'s return.
     urls: std::rc::Rc<Vec<(usize, usize, String, bool)>>,
+    /// Fingerprint of the shaping inputs the plain `text` does NOT capture
+    /// (per-run colour + font weight/style + under/strikethrough). The cache
+    /// is keyed on `grid_line`; validating on `text` alone let a line whose
+    /// text was unchanged but whose colour changed reuse stale glyphs shaped
+    /// in the old colour. See [`line_style_sig`].
+    sig: u64,
 }
 
 pub struct TerminalView {
@@ -1559,6 +1565,47 @@ struct RawLine {
     box_cells: Vec<BoxCell>,
 }
 
+#[inline]
+const fn fnv_mix(h: u64, v: u64) -> u64 {
+    (h ^ v).wrapping_mul(0x0000_0100_0000_01b3)
+}
+
+/// FNV-1a fingerprint of a line's *shaping inputs* — the per-run foreground
+/// colour, font weight/style, and under/strikethrough presence. The Phase-2
+/// [`CachedLine`] cache is keyed on `grid_line` and used to be validated on
+/// `text` alone, so a row whose text was unchanged but whose colours changed
+/// reused the previously-shaped glyphs in the stale colour.
+///
+/// That is the "pasted text is invisible until you edit it" bug: readline
+/// wraps a bracketed paste in reverse-video (`\x1b[7m…\x1b[27m`), which this
+/// renderer shapes in the *background* colour (with a matching bg run behind
+/// it). The instant the active region deactivates — any cursor move or
+/// keypress — readline re-emits the SAME characters without the reverse, so
+/// the fresh row has no bg run but the text-only cache hit kept the glyphs
+/// painted in the background colour → invisible. Editing changed the text and
+/// missed the cache, which is why a single keystroke "fixed" it. Folding the
+/// colour into the cache key makes the deactivation redraw a cache miss.
+fn line_style_sig(segments: &[RawSegment]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for seg in segments {
+        h = fnv_mix(h, seg.col_start as u64);
+        h = fnv_mix(h, seg.cell_span as u64);
+        for run in &seg.runs {
+            h = fnv_mix(h, run.len as u64);
+            let c = run.color;
+            h = fnv_mix(h, u64::from(c.h.to_bits()));
+            h = fnv_mix(h, u64::from(c.s.to_bits()));
+            h = fnv_mix(h, u64::from(c.l.to_bits()));
+            h = fnv_mix(h, u64::from(c.a.to_bits()));
+            h = fnv_mix(h, u64::from(run.font.weight.0.to_bits()));
+            h = fnv_mix(h, matches!(run.font.style, FontStyle::Italic) as u64);
+            h = fnv_mix(h, run.underline.is_some() as u64);
+            h = fnv_mix(h, run.strikethrough.is_some() as u64);
+        }
+    }
+    h
+}
+
 impl Element for TerminalElement {
     type RequestLayoutState = ();
     type PrepaintState = Option<TermPrepaint>;
@@ -2051,8 +2098,10 @@ impl Element for TerminalElement {
         let mut result_lines = Vec::with_capacity(raw_lines.len());
         let mut detected: Vec<DetectedUrl> = Vec::new();
         for (line_idx, raw) in raw_lines.into_iter().enumerate() {
+            let sig = line_style_sig(&raw.segments);
             if let Some(cached) = cache.remove(&raw.grid_line)
                 && cached.text == raw.text
+                && cached.sig == sig
             {
                 result_lines.push(TermLine {
                     // Cheap atomic bump — no Vec/ShapedLine deep clone.
@@ -2121,6 +2170,7 @@ impl Element for TerminalElement {
                     text: raw.text,
                     segments: std::rc::Rc::clone(&shaped_rc),
                     urls: urls_rc,
+                    sig,
                 },
             );
             result_lines.push(TermLine {
@@ -2402,6 +2452,48 @@ mod tests {
         assert!(!frame.reusable_for(1, 80, 24, 100), "display_offset change");
         assert!(!frame.reusable_for(0, 100, 24, 100), "cols change (resize)");
         assert!(!frame.reusable_for(0, 80, 50, 100), "lines change (resize)");
+    }
+
+    /// Guards the "pasted text is invisible until you edit it" fix. Readline
+    /// highlights a bracketed paste with reverse-video, then re-emits the SAME
+    /// characters without reverse the moment the region deactivates. The
+    /// Phase-2 glyph cache is keyed on `grid_line` + text; before the fix it
+    /// reused the reverse-shaped (background-coloured) glyphs on that
+    /// identical-text redraw. `line_style_sig` must differ when only the
+    /// colour changes so the redraw misses the cache and re-shapes.
+    #[test]
+    fn line_style_sig_tracks_colour_not_just_text() {
+        let mk = |color: Hsla| {
+            vec![RawSegment {
+                col_start: 0,
+                text: "/mnt/Dev".to_string(),
+                runs: vec![TextRun {
+                    len: 8,
+                    font: font("monospace"),
+                    color,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                }],
+                cell_span: 1,
+            }]
+        };
+        let white = Hsla::from(Rgba {
+            r: 1.0,
+            g: 1.0,
+            b: 1.0,
+            a: 1.0,
+        });
+        let navy = Hsla::from(Rgba {
+            r: 0.0,
+            g: 0.14,
+            b: 0.32,
+            a: 1.0,
+        });
+        // Same text, different foreground → different signature (cache miss).
+        assert_ne!(line_style_sig(&mk(white)), line_style_sig(&mk(navy)));
+        // Identical inputs → identical signature (cache hit, no re-shape).
+        assert_eq!(line_style_sig(&mk(white)), line_style_sig(&mk(white)));
     }
 
     #[gpui::test]
