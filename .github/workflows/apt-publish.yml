@@ -64,6 +64,7 @@ jobs:
               run: |
                   sudo apt-get update
                   sudo apt-get install -y --no-install-recommends \
+                      build-essential \
                       libvulkan-dev libwayland-dev libxkbcommon-dev \
                       libxkbcommon-x11-dev libx11-dev libxcb1-dev \
                       libxcb-render0-dev libxcb-shm0-dev libxcb-xkb-dev \

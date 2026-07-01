@@ -37,4 +37,10 @@ Tab Atelier is a Guake-style drop-down terminal emulator for Linux (X11), built 
 
 ## Build dependencies
 
-System packages needed (Ubuntu/Debian): libvulkan-dev, libwayland-dev, libxkbcommon-dev, libxkbcommon-x11-dev, libx11-dev, libxcb1-dev, libxcb-render0-dev, libxcb-shm0-dev, libxcb-xkb-dev, libfontconfig-dev, libfreetype-dev.
+A **C compiler** (`build-essential` / `gcc`, or `clang`) — required by
+`libmimalloc-sys`, which compiles the mimalloc C source via the `cc` crate.
+mimalloc is our global allocator on both binaries (replaces glibc malloc; see
+`src/main.rs` / `src/bin/tab-atelier-headless.rs`). It's **statically linked**,
+so this is a build-time requirement only — no new runtime/`.deb` dependency.
+
+System packages needed for the GUI (Ubuntu/Debian): libvulkan-dev, libwayland-dev, libxkbcommon-dev, libxkbcommon-x11-dev, libx11-dev, libxcb1-dev, libxcb-render0-dev, libxcb-shm0-dev, libxcb-xkb-dev, libfontconfig-dev, libfreetype-dev.
