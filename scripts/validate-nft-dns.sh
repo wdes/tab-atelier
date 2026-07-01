@@ -57,8 +57,10 @@ then echo "!! nft rejected the dynamic-set ruleset (see above)"; exit 2; fi
   && echo "   element add (1.1.1.1 timeout 30s comment) OK" || echo "   !! element add FAILED"
 
 echo "=> [2/3] cgroup-scoped :53 redirect to 127.0.0.1:$RPORT"
-# tiny UDP listener as the stand-in resolver
-( timeout 20 python3 - "$RPORT" <<'PY' &
+# tiny UDP listener as the stand-in resolver. Background it in THIS shell (no
+# `( … & )` subshell) so `$!` is bound to the listener's PID — inside a subshell
+# the `&` PID never reaches the parent and `LPID=$!` trips `set -u`.
+timeout 20 python3 - "$RPORT" <<'PY' &
 import socket,sys
 s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.bind(("127.0.0.1",int(sys.argv[1])))
 s.settimeout(15)
@@ -66,7 +68,7 @@ try:
     d,a=s.recvfrom(2048); open("/tmp/.nftdns_hit","w").write("HIT from %s"%(a,))
 except Exception: pass
 PY
-) ; LPID=$!
+LPID=$!
 rm -f /tmp/.nftdns_hit
 if ! "$NFT" -f - <<EOF
 table inet $NAT {
