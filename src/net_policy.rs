@@ -282,6 +282,21 @@ impl AllowSet {
         self.cidrs.iter().any(|c| c.contains(ip))
     }
 
+    /// Concrete domains the daemon can pre-resolve (plain entries — the apex is
+    /// itself a name). `*.` wildcards are excluded: they match arbitrary
+    /// subdomains that can't be enumerated, so the pre-resolve model can't
+    /// populate IPs for them (a connection to such a subdomain is dropped
+    /// unless its IP arrived via another allowed name/CIDR).
+    #[must_use]
+    pub fn resolvable_domains(&self) -> Vec<String> {
+        self.domains
+            .iter()
+            .zip(&self.apex_ok)
+            .filter(|(_, apex)| **apex)
+            .map(|(d, _)| d.clone())
+            .collect()
+    }
+
     /// Is the allow-set empty (no presets matched, no custom entries)? An
     /// empty allowlist would block everything, so the UI/CLI warns.
     #[must_use]
@@ -391,6 +406,17 @@ mod tests {
         assert!(set.host_allowed("a.example.com"));
         assert!(set.host_allowed("deep.a.example.com"));
         assert!(!set.host_allowed("example.com"), "wildcard should not match the apex");
+    }
+
+    #[test]
+    fn resolvable_domains_are_concrete_only() {
+        // Plain entries are pre-resolvable; `*.` wildcards can't be enumerated.
+        let set = AllowSet::build(
+            &[],
+            &["api.anthropic.com".to_string(), "*.example.com".to_string()],
+            &[],
+        );
+        assert_eq!(set.resolvable_domains(), vec!["api.anthropic.com".to_string()]);
     }
 
     #[test]

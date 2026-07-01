@@ -438,21 +438,25 @@ fn spawn_pty_tab(
             } else {
                 let allow_set = net_allow.to_allow_set();
                 if privileged && !allow_set.domains.is_empty() {
-                    // Domain allowlist: dynamic-set table + resolver + :53 redirect.
-                    crate::net_nft::apply_domain(&id, &rel, &allow_set.cidrs)
+                    // Domain allowlist: confine table (dynamic sets + scoped DNS
+                    // hole to the host's nameservers) + a daemon-side
+                    // pre-resolver that keeps @allow_dyn filled from the
+                    // allowlisted domains. No redirect / mount-ns — the tab
+                    // resolves via the host DNS and we gate at the IP layer.
+                    let dns = crate::net_resolver::nameservers();
+                    crate::net_nft::apply_domain(&id, &rel, &allow_set.cidrs, &dns)
                         && match crate::net_resolver::spawn(
                             id.clone(),
                             allow_set,
                             crate::net_resolver::upstream_resolver(),
                         ) {
                             Ok(r) => {
-                                let _ = crate::net_nft::apply_redirect(&id, &rel, r.port());
                                 net_resolver = Some(r);
                                 true
                             }
                             Err(e) => {
                                 log::warn!("net_resolver: spawn failed for '{name}': {e}");
-                                true // table is installed; domains just won't resolve
+                                true // table is installed; domains just won't pre-resolve
                             }
                         }
                 } else if allow_set.cidrs.is_empty() {
