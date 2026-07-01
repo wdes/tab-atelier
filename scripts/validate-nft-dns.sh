@@ -24,7 +24,11 @@ RPORT=5388                                   # stand-in resolver port
 cleanup() {
   "$NFT" delete table inet "$T" 2>/dev/null
   "$NFT" delete table inet "$NAT" 2>/dev/null
-  kill "${LPID:-0}" 2>/dev/null
+  # NB: guard the kill — `kill "${LPID:-0}"` becomes `kill 0` on the pre-flight
+  # cleanup (LPID isn't set until [2/3]), and `kill 0` SIGTERMs the whole
+  # process group, silently killing this script (exit 143) before it prints a
+  # line. Only fires as root, since non-root exits at the id check first.
+  [ -n "${LPID:-}" ] && kill "$LPID" 2>/dev/null
   [ -d "$TESTCG" ] && { while read -r p; do echo "$p" > "$CG/cgroup.procs" 2>/dev/null; done < "$TESTCG/cgroup.procs" 2>/dev/null; rmdir "$TESTCG" 2>/dev/null; }
   rmdir "$CG/tabatelier-dns" 2>/dev/null
 }
