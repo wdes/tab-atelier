@@ -452,6 +452,28 @@ pub fn build_agent_resume_command(kind: &str, session_id: &str, plan: Option<boo
     }
 }
 
+/// Extra shell args that make a restored agent tab **launch the agent
+/// directly** instead of dropping to a shell and typing the resume command.
+///
+/// Appended to the tab's shell invocation, they become e.g.
+/// `bash [-l] -i -c 'exec claude --resume <id>'`:
+/// - `-i` so the shell still sources the user's rc (nvm / PATH where `claude`
+///   and `node` live) — same PATH the interactive tab had, so the binary
+///   resolves;
+/// - `exec` so the shell process is **replaced by** the agent: the tab's
+///   foreground process *is* `claude`, so PTY-close / cgroup.kill / pgroup-kill
+///   hit it directly (no bash middleman to orphan it), and there's no
+///   type-into-shell race that can double-launch a `--resume`.
+///
+/// Returns None for an unknown `agent_kind` (the caller then spawns a plain
+/// shell). The tab dies when the agent exits — the GUI already shows an
+/// exited tab (`has_exited`) and can respawn it.
+#[must_use]
+pub fn agent_launch_shell_suffix(kind: &str, session_id: &str, plan: Option<bool>) -> Option<Vec<String>> {
+    let cmd = build_agent_resume_command(kind, session_id, plan)?;
+    Some(vec!["-i".to_string(), "-c".to_string(), format!("exec {cmd}")])
+}
+
 /// Pin the rustls `CryptoProvider` to `ring` at process start.
 ///
 /// Workspace feature unification compiles `rustls` with both `ring`
@@ -2378,6 +2400,18 @@ pub fn file_path_for_open(path: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_launch_suffix_execs_the_resume_command() {
+        let s = agent_launch_shell_suffix("claude", "abc-123", None).unwrap();
+        // Interactive shell (sources rc for PATH), then exec the agent.
+        assert_eq!(s, vec!["-i", "-c", "exec claude --resume abc-123"]);
+        // catbus + plan flag flows through build_agent_resume_command.
+        let c = agent_launch_shell_suffix("catbus", "s1", Some(true)).unwrap();
+        assert_eq!(c.last().unwrap(), "exec catbus-agent --resume s1 --plan");
+        // Unknown kind → no direct launch (caller keeps the plain shell).
+        assert!(agent_launch_shell_suffix("bash", "x", None).is_none());
+    }
 
     #[test]
     fn no_internet_command_wraps_in_bwrap_unshare_net() {

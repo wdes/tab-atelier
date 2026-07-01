@@ -393,7 +393,7 @@ fn spawn_pty_tab(
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| r"C:\Windows\System32\cmd.exe".to_string());
-    let (env_map, prog, args): (HashMap<String, String>, String, Vec<String>) = if crate::clear_env() {
+    let (env_map, prog, mut args): (HashMap<String, String>, String, Vec<String>) = if crate::clear_env() {
         // Cleared-env mode: spawn the shell through `env -i` so it
         // inherits NOTHING from the daemon — only the curated minimal
         // allowlist (PATH/HOME/USER/locale + colours + telemetry opt-out
@@ -412,6 +412,17 @@ fn spawn_pty_tab(
         env.extend(extra_env);
         (env, shell_program, vec![])
     };
+    // Restored agent tab → launch the agent DIRECTLY (`exec claude --resume …`)
+    // instead of spawning a shell and typing the resume in later: the tab's
+    // foreground process is claude itself (clean kill/detect, no double-launch
+    // race). `pending_agent_resume` is then left None so nothing is typed.
+    let agent_direct: Option<Vec<String>> = match (&agent_kind, &agent_session_id) {
+        (Some(k), Some(s)) => crate::agent_launch_shell_suffix(k, s, agent_plan_mode),
+        _ => None,
+    };
+    if let Some(suffix) = &agent_direct {
+        args.extend(suffix.iter().cloned());
+    }
     // Install the per-tab nftables table BEFORE the shell exists, so it's in
     // force the instant the pid joins the cgroup (no unconfined window; the
     // cgroup is created empty + rules applied here). Every tab gets one when
@@ -542,7 +553,11 @@ fn spawn_pty_tab(
     proxy.set_notifier(notifier.clone());
     el.spawn();
 
+    // Only queue a type-in resume when we did NOT launch the agent directly
+    // above (agent_direct) — otherwise the exec'd agent + a typed `--resume`
+    // would double-launch.
     let pending_agent_resume = match (&agent_kind, &agent_session_id) {
+        _ if agent_direct.is_some() => None,
         (Some(kind), Some(sid)) => build_agent_resume_command(kind, sid, agent_plan_mode),
         _ => None,
     };

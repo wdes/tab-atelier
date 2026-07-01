@@ -416,7 +416,17 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::new_with_colors_and_env(cwd, font_config, browser, code_editor, true, HashMap::new(), window, cx)
+        Self::new_with_colors_and_env(
+            cwd,
+            font_config,
+            browser,
+            code_editor,
+            true,
+            HashMap::new(),
+            None,
+            window,
+            cx,
+        )
     }
 
     /// `new` plus per-tab env-var injection (`_TAB_ID`,
@@ -430,6 +440,10 @@ impl TerminalView {
         code_editor: Rc<RefCell<Option<String>>>,
         initial_colors_enabled: bool,
         extra_env: HashMap<String, String>,
+        // Restored agent tab → extra shell args to launch the agent directly
+        // (`… -i -c 'exec claude --resume <id>'`, see `agent_launch_shell_suffix`)
+        // so the tab's process IS claude. Only honoured in cleared-env mode.
+        agent_launch: Option<Vec<String>>,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -446,7 +460,10 @@ impl TerminalView {
             // telemetry opt-out + the per-tab API vars). `login = true`
             // so the shell still sources the user's profile files.
             let min_env = crate::minimal_pty_env(initial_colors_enabled, crate::clear_env_user_vars(), &extra_env);
-            let (prog, args) = crate::clear_env_shell_command(&crate::clear_env_shell_path(), true, &min_env);
+            let (prog, mut args) = crate::clear_env_shell_command(&crate::clear_env_shell_path(), true, &min_env);
+            if let Some(suffix) = agent_launch {
+                args.extend(suffix);
+            }
             tty::Options {
                 shell: Some(tty::Shell::new(prog, args)),
                 working_directory: cwd.map(std::path::Path::to_path_buf),
