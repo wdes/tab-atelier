@@ -92,6 +92,13 @@ struct_excessive_bools = "allow"
 needless_pass_by_ref_mut = "allow"
 
 [dependencies]
+# Global allocator (both binaries). Replaces glibc malloc, whose per-thread
+# arenas (up to 8×ncpu) fragment badly and hoard freed memory under our
+# many-threaded workload (one PTY-reader thread per tab) — the dominant cause of
+# the desktop's ~560 MB RSS. mimalloc returns memory to the OS promptly. No
+# `unsafe` in our code (the impl lives in the crate); edition-2024-clean (no
+# `malloc_conf` export needed, unlike jemalloc).
+mimalloc = { version = "0.1", default-features = false }
 alacritty_terminal = "0.26"
 # Same `polling` alacritty pulls in transitively; promoted to a direct
 # dep so we can implement `EventedReadWrite` on our PTY tap wrapper

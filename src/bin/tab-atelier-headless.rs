@@ -18,11 +18,12 @@ use tab_atelier::{
 };
 
 /// Allocation-counting allocator (headless only) so `bench` can report
-/// heap allocations per payload. Two relaxed atomics per alloc —
-/// negligible next to the daemon's syscalls. The gpui binary does not
-/// install this; it keeps the system allocator.
+/// heap allocations per payload — now wrapping **mimalloc** instead of the
+/// system (glibc) allocator, so the daemon gets the same arena-free, prompt-
+/// return memory behaviour as the GUI while keeping the two relaxed-atomic
+/// counters `bench` reports.
 #[global_allocator]
-static GLOBAL: alloc_count::Counting<std::alloc::System> = alloc_count::Counting(std::alloc::System);
+static GLOBAL: alloc_count::Counting<mimalloc::MiMalloc> = alloc_count::Counting(mimalloc::MiMalloc);
 
 fn main() {
     // Install the rustls crypto provider FIRST. `cli::remote::*` and
