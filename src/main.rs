@@ -6,6 +6,13 @@ use std::sync::atomic::Ordering;
 
 use tab_atelier::{READ_ONLY, SHUTDOWN_REQUESTED, app, cli, install_rustls_provider, try_acquire_single_instance_lock};
 
+// Use mimalloc instead of glibc malloc: with one PTY-reader thread per tab
+// (~85 threads at 57 tabs) glibc spins up dozens of arenas that fragment and
+// hoard freed memory — the bulk of the desktop's RSS. mimalloc returns pages to
+// the OS promptly. Safe wrapper (the `unsafe impl` is inside the crate).
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() {
     // Install the rustls crypto provider BEFORE any subcommand can run.
     // `cli::remote::*` makes HTTPS calls (TOFU cert fetch on `remote add`,
