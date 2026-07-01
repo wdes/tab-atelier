@@ -80,8 +80,8 @@ if ! "$NFT" -f - <<EOF
 table inet $NAT {
   chain out {
     type nat hook output priority -100; policy accept;
-    socket cgroupv2 level $LEVEL "$REL" meta l4proto udp udp dport 53 redirect to :$RPORT
-    socket cgroupv2 level $LEVEL "$REL" meta l4proto tcp tcp dport 53 redirect to :$RPORT
+    socket cgroupv2 level $LEVEL "$REL" meta l4proto udp udp dport 53 counter redirect to :$RPORT
+    socket cgroupv2 level $LEVEL "$REL" meta l4proto tcp tcp dport 53 counter redirect to :$RPORT
   }
 }
 EOF
@@ -96,8 +96,14 @@ echo 1 > "$RLN"
 in_cg() { sh -c 'echo $$ > "'"$TESTCG"'/cgroup.procs"; exec "$@"' _ "$@"; }
 in_cg sh -c 'dig +time=2 +tries=1 @9.9.9.9 example.com >/dev/null 2>&1 || nslookup -timeout=2 example.com 9.9.9.9 >/dev/null 2>&1 || true'
 sleep 1
-if [ -f /tmp/.nftdns_hit ]; then echo "   redirect WORKS: $(cat /tmp/.nftdns_hit)"; else echo "   !! redirect: listener got nothing (redirect may be unsupported here)"; fi
+if [ -f /tmp/.nftdns_hit ]; then echo "   redirect WORKS: $(cat /tmp/.nftdns_hit)"; else echo "   !! redirect: listener got nothing"; fi
 rm -f /tmp/.nftdns_hit
+# Diagnostics to localize a redirect miss: did the NAT rule match at all?
+echo "   -- redirect diagnostics --"
+echo "   route_localnet all/lo = $(cat /proc/sys/net/ipv4/conf/all/route_localnet 2>/dev/null)/$(cat /proc/sys/net/ipv4/conf/lo/route_localnet 2>/dev/null)"
+echo "   listener bound: $(ss -lunp 2>/dev/null | grep ":$RPORT " || echo "NOT LISTENING")"
+echo "   nat rule counters (nonzero packets => rule matched, delivery is the problem):"
+"$NFT" list table inet "$NAT" 2>/dev/null | grep -E "counter|redirect" | sed 's/^/     /'
 
 echo "=> [3/3] enforcement: cgroup reaches the set-allowed IP, others dropped"
 # Raw TCP connect, no TLS: an ALLOWED dest completes the handshake fast, a
