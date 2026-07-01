@@ -16,7 +16,7 @@ jobs:
         outputs:
             deb-artifact-id: ${{ steps.upload-deb.outputs.artifact-id }}
         steps:
-            - uses: actions/checkout@v6
+            - uses: actions/checkout@v7
             # ubuntu-latest ships with ~14 GB free; the instrumented
             # cargo build + cargo test (coverage) + headless build +
             # `cargo deb` (which re-runs cargo build --release for two
@@ -26,7 +26,7 @@ jobs:
             # run died with `IOException: No space left on device`
             # mid-clippy.
             - name: Free disk space
-              uses: jlumbroso/free-disk-space@main
+              uses: jlumbroso/free-disk-space@v1.3.1
               with:
                   tool-cache: false
                   android: true
@@ -89,7 +89,7 @@ jobs:
                   echo "$HOME/.local/bin" >> $GITHUB_PATH
             - name: Run grcov
               run: grcov . --binary-path target/debug/deps/ -s . -t lcov --branch --ignore-not-existing --ignore '../**' --ignore '/*' -o coverage.lcov
-            - uses: codecov/codecov-action@v5
+            - uses: codecov/codecov-action@v7
               # fail_ci_if_error stayed false after Codecov's GPG
               # verification step started failing intermittently on
               # fresh runners ("Can't check signature: No public key"
