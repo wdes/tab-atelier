@@ -41,7 +41,7 @@ jobs:
         # tweaks from the release workflow itself).
         if: ${{ !contains(github.event.head_commit.message, '[skip apt]') }}
         steps:
-            - uses: actions/checkout@v6
+            - uses: actions/checkout@v7
               with:
                   fetch-depth: 0
             - name: Decide channel + version
