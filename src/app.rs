@@ -964,7 +964,12 @@ impl AppState {
         }
         let was_active = self.active == idx;
         self.tabs[idx].deactivate();
+        let pid = self.tabs[idx].view.read(cx).pid();
         self.tabs[idx].view.read(cx).shutdown();
+        // Hard-kill the tab's process group — shutdown() only drops the PTY
+        // (SIGHUP), which `claude` can survive and orphan (the ghost sessions).
+        #[cfg(unix)]
+        crate::kill_tab_pgroup(pid);
         self.tabs.remove(idx);
         if self.active >= self.tabs.len() {
             self.active = self.tabs.len() - 1;
@@ -1512,6 +1517,11 @@ impl AppState {
         let old_pid = self.tabs[idx].view.read(cx).pid();
         let cwd = platform::process_cwd(old_pid).or_else(|| Some(std::env::current_dir().unwrap_or_default()));
         self.tabs[idx].view.read(cx).shutdown();
+        // Kill the old process group before respawning — otherwise a claude
+        // that survived the PTY-close SIGHUP orphans and the fresh spawn's
+        // `--resume` loads a duplicate of the same session.
+        #[cfg(unix)]
+        crate::kill_tab_pgroup(old_pid);
         let fc = self.font_config.clone();
         let br = self.browser.clone();
         let ce = self.code_editor.clone();
@@ -1666,7 +1676,12 @@ impl AppState {
             tracker.shutdown();
         }
         for tab in &self.tabs {
+            let pid = tab.view.read(cx).pid();
             tab.view.read(cx).shutdown();
+            // Kill each tab's process group on app quit — a bare SIGHUP lets
+            // claude survive and orphan, and the next launch resumes duplicates.
+            #[cfg(unix)]
+            crate::kill_tab_pgroup(pid);
         }
         cx.quit();
     }

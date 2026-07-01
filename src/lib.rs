@@ -397,6 +397,31 @@ pub fn clear_env_shell_path() -> String {
         .unwrap_or_else(|| "/bin/bash".to_string())
 }
 
+/// Best-effort SIGTERM→SIGKILL of a tab's process **group**.
+///
+/// The PTY child is a session/group leader (alacritty's `tty::new` calls
+/// `setsid`), so `pid == pgid`; killing the group `-pid` takes down the shell
+/// and its foreground job (e.g. `claude`), which a bare PTY-close SIGHUP can
+/// survive and orphan. Used on the desktop, which has no cgroups — the headless
+/// daemon prefers [`crate::cgroup::kill_tab`] (kills the *whole* subtree).
+///
+/// `unsafe`-free: shells to `kill(1)` with the `-s SIG -- -PGID` form
+/// (util-linux needs the `--` before the negative pgid).
+#[cfg(unix)]
+pub fn kill_tab_pgroup(pid: u32) {
+    if pid <= 1 {
+        return; // never signal pid 0 (our group) or init
+    }
+    let target = format!("-{pid}");
+    for sig in ["TERM", "KILL"] {
+        let _ = std::process::Command::new("kill")
+            .args(["-s", sig, "--", &target])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
 /// Build the value handed to in-tab tools as `TAB_ATELIER_API_URL`.
 ///
 /// The stored `api_addr` is a bind spec (`0.0.0.0:7890`, `:7890`,
