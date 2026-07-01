@@ -144,6 +144,9 @@ pub enum Commands {
     NetDns {
         /// Tab index or UUID. Omit for all tabs.
         tab: Option<String>,
+        /// Show only DENIED queries (what a tab tried to reach and couldn't).
+        #[arg(long)]
+        denied: bool,
     },
 
     /// Set the default allowlist applied to NEW tabs (written to
@@ -403,7 +406,7 @@ pub fn dispatch(cli: Cli) -> bool {
             clear,
         } => crate::cli::share_link::net_allow(&tab, &presets, &domains, &cidrs, clear, add, remove),
         Commands::NetStats { tab } => crate::cli::share_link::net_stats(tab.as_deref()),
-        Commands::NetDns { tab } => crate::cli::share_link::net_dns(tab.as_deref()),
+        Commands::NetDns { tab, denied } => crate::cli::share_link::net_dns(tab.as_deref(), denied),
         Commands::NetDefault {
             presets,
             domains,

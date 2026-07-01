@@ -503,10 +503,10 @@ pub fn net_stats(tab: Option<&str>) -> i32 {
     0
 }
 
-/// `net-dns [tab]` — print each domain-allowlist tab's resolver DNS log
-/// (allowed + denied queries with resolved IPs) from `/tabs`.
+/// `net-dns [tab] [--denied]` — print each domain-allowlist tab's resolver
+/// DNS log from `/tabs`. `denied` filters to just the blocked queries.
 #[must_use]
-pub fn net_dns(tab: Option<&str>) -> i32 {
+pub fn net_dns(tab: Option<&str>, denied: bool) -> i32 {
     let ep = match discover_endpoint() {
         Ok(e) => e,
         Err(e) => {
@@ -537,17 +537,21 @@ pub fn net_dns(tab: Option<&str>) -> i32 {
         if wanted.is_some_and(|w| w != idx) {
             continue;
         }
-        let Some(dns) = t
-            .get("dns")
-            .and_then(serde_json::Value::as_array)
-            .filter(|a| !a.is_empty())
-        else {
+        let Some(dns) = t.get("dns").and_then(serde_json::Value::as_array) else {
             continue;
         };
+        // With --denied, keep only the blocked queries.
+        let rows: Vec<&serde_json::Value> = dns
+            .iter()
+            .filter(|e| !denied || e.get("allowed").and_then(serde_json::Value::as_bool) != Some(true))
+            .collect();
+        if rows.is_empty() {
+            continue;
+        }
         any = true;
         let name = t.get("name").and_then(serde_json::Value::as_str).unwrap_or("");
         println!("[{idx}] {name}");
-        for e in dns {
+        for e in rows {
             let domain = e.get("domain").and_then(serde_json::Value::as_str).unwrap_or("");
             let allowed = e.get("allowed").and_then(serde_json::Value::as_bool).unwrap_or(false);
             let ips: Vec<&str> = e
@@ -560,7 +564,8 @@ pub fn net_dns(tab: Option<&str>) -> i32 {
         }
     }
     if !any {
-        println!("(no resolver DNS entries — domain-allowlist tabs only)");
+        let what = if denied { "denied " } else { "" };
+        println!("(no {what}resolver DNS entries — domain-allowlist tabs only)");
     }
     0
 }
