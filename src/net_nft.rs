@@ -36,6 +36,7 @@
 #![cfg(all(target_os = "linux", not(feature = "gui")))]
 
 use std::fmt::Write as _;
+use std::net::IpAddr;
 
 use crate::net_policy::Cidr;
 
@@ -190,11 +191,15 @@ pub fn apply_block(tab_id: &str, cgroup_rel: &str) -> bool {
 /// Build the confine ruleset for a **domain** allowlist tab.
 ///
 /// Static CIDRs plus two dynamic sets (`allow_dyn` v4 / `allow_dyn6` v6) the
-/// per-tab DNS resolver fills with the IPs each allowed domain resolved to —
-/// each with a `timeout` (the DNS TTL) so they expire, and a per-domain
-/// `comment`. Same confine/out structure + counters as [`ruleset`].
+/// daemon's pre-resolver fills with the IPs each allowed domain resolved to —
+/// each with a `timeout` (≈ the DNS TTL) so they expire, and a per-domain
+/// `comment`. Because the daemon resolves the names (the tab is not routed
+/// through us), the tab must reach a DNS server itself: `dns_servers` opens a
+/// **scoped** `:53` hole to exactly the host's configured nameservers (not any
+/// `:53`), so name resolution works but arbitrary UDP-to-:53 exfil doesn't.
+/// Same confine/out structure + counters as [`ruleset`].
 #[must_use]
-pub fn domain_ruleset(table: &str, cgroup_rel: &str, cidrs: &[Cidr]) -> String {
+pub fn domain_ruleset(table: &str, cgroup_rel: &str, cidrs: &[Cidr], dns_servers: &[IpAddr]) -> String {
     let cgroup_rel = cgroup_rel.trim_matches('/');
     let level = cgroup_rel.split('/').filter(|s| !s.is_empty()).count();
     let (mut v4, mut v6) = (Vec::new(), Vec::new());
@@ -212,11 +217,46 @@ pub fn domain_ruleset(table: &str, cgroup_rel: &str, cidrs: &[Cidr]) -> String {
     // Dynamic sets the resolver populates (`flags timeout` ⇒ per-element TTL).
     s.push_str("  set allow_dyn { type ipv4_addr; flags timeout; }\n");
     s.push_str("  set allow_dyn6 { type ipv6_addr; flags timeout; }\n");
+    // Scope the DNS hole to the host's actual nameservers (v4/v6), split by
+    // family so the `ip`/`ip6` match is valid.
+    let (mut ns4, mut ns6) = (Vec::new(), Vec::new());
+    for ns in dns_servers {
+        match ns {
+            IpAddr::V4(a) => ns4.push(a.to_string()),
+            IpAddr::V6(a) => ns6.push(a.to_string()),
+        }
+    }
     s.push_str("  chain confine {\n");
-    s.push_str("    oifname \"lo\" accept comment \"loopback (local API, resolver)\"\n");
+    s.push_str("    oifname \"lo\" accept comment \"loopback (local API)\"\n");
     s.push_str("    ct state established,related accept comment \"replies\"\n");
-    s.push_str("    ip daddr @allow_dyn accept comment \"resolver-added (domain)\"\n");
-    s.push_str("    ip6 daddr @allow_dyn6 accept comment \"resolver-added (domain)\"\n");
+    // The tab resolves names itself (the daemon pre-resolves the allowlist into
+    // @allow_dyn); allow DNS only to the configured resolvers.
+    if !ns4.is_empty() {
+        let _ = writeln!(
+            s,
+            "    ip daddr {{ {} }} udp dport 53 accept comment \"DNS to host resolver\"",
+            ns4.join(", ")
+        );
+        let _ = writeln!(
+            s,
+            "    ip daddr {{ {} }} tcp dport 53 accept comment \"DNS to host resolver\"",
+            ns4.join(", ")
+        );
+    }
+    if !ns6.is_empty() {
+        let _ = writeln!(
+            s,
+            "    ip6 daddr {{ {} }} udp dport 53 accept comment \"DNS to host resolver\"",
+            ns6.join(", ")
+        );
+        let _ = writeln!(
+            s,
+            "    ip6 daddr {{ {} }} tcp dport 53 accept comment \"DNS to host resolver\"",
+            ns6.join(", ")
+        );
+    }
+    s.push_str("    ip daddr @allow_dyn accept comment \"pre-resolved (domain)\"\n");
+    s.push_str("    ip6 daddr @allow_dyn6 accept comment \"pre-resolved (domain)\"\n");
     if !v4.is_empty() {
         let _ = writeln!(
             s,
@@ -244,51 +284,14 @@ pub fn domain_ruleset(table: &str, cgroup_rel: &str, cidrs: &[Cidr]) -> String {
     s
 }
 
-/// Build the NAT table that redirects the tab's `:53` to its resolver.
-///
-/// Redirects the tab cgroup's `:53` (tcp + udp) to the per-tab resolver on
-/// `127.0.0.1:<resolver_port>`, so the tab is forced through our gating
-/// resolver. Separate table (nat hook) from the filter one; named
-/// `<table>_nat`.
+/// Install the domain-allowlist table (static CIDRs + dynamic sets + a scoped
+/// DNS hole to `dns_servers`). The daemon's pre-resolver fills the dynamic
+/// sets. Best-effort, idempotent.
 #[must_use]
-pub fn redirect_ruleset(nat_table: &str, cgroup_rel: &str, resolver_port: u16) -> String {
-    let cgroup_rel = cgroup_rel.trim_matches('/');
-    let level = cgroup_rel.split('/').filter(|s| !s.is_empty()).count();
-    let mut s = String::new();
-    let _ = writeln!(s, "table inet {nat_table} {{");
-    s.push_str("  chain out {\n");
-    s.push_str("    type nat hook output priority -100; policy accept;\n");
-    let _ = writeln!(
-        s,
-        "    socket cgroupv2 level {level} \"{cgroup_rel}\" meta l4proto udp udp dport 53 redirect to :{resolver_port} comment \"tab-atelier dns\""
-    );
-    let _ = writeln!(
-        s,
-        "    socket cgroupv2 level {level} \"{cgroup_rel}\" meta l4proto tcp tcp dport 53 redirect to :{resolver_port} comment \"tab-atelier dns\""
-    );
-    s.push_str("  }\n");
-    s.push_str("}\n");
-    s
-}
-
-/// Install the domain-allowlist table (static CIDRs + dynamic sets). The
-/// resolver fills the dynamic sets. Best-effort, idempotent.
-#[must_use]
-pub fn apply_domain(tab_id: &str, cgroup_rel: &str, cidrs: &[Cidr]) -> bool {
+pub fn apply_domain(tab_id: &str, cgroup_rel: &str, cidrs: &[Cidr], dns_servers: &[IpAddr]) -> bool {
     teardown(tab_id);
     matches!(
-        run_nft_stdin(&domain_ruleset(&table_name(tab_id), cgroup_rel, cidrs)),
-        Ok(true)
-    )
-}
-
-/// Install the `:53` → resolver redirect (NAT) table for a tab. Best-effort.
-/// Call AFTER [`apply_domain`] (teardown there drops a stale `_nat` table).
-#[must_use]
-pub fn apply_redirect(tab_id: &str, cgroup_rel: &str, resolver_port: u16) -> bool {
-    let nat = format!("{}_nat", table_name(tab_id));
-    matches!(
-        run_nft_stdin(&redirect_ruleset(&nat, cgroup_rel, resolver_port)),
+        run_nft_stdin(&domain_ruleset(&table_name(tab_id), cgroup_rel, cidrs, dns_servers)),
         Ok(true)
     )
 }
@@ -529,24 +532,29 @@ mod tests {
     }
 
     #[test]
-    fn domain_ruleset_has_dynamic_sets_and_static_cidrs() {
+    fn domain_ruleset_has_dynamic_sets_static_cidrs_and_scoped_dns() {
         let cidrs = vec![Cidr::parse("104.16.0.0/13").unwrap()];
-        let rs = domain_ruleset("t", "a/b/c", &cidrs);
+        let dns = vec![
+            IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 1)),
+            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        ];
+        let rs = domain_ruleset("t", "a/b/c", &cidrs, &dns);
         assert!(rs.contains("set allow_dyn { type ipv4_addr; flags timeout; }"));
         assert!(rs.contains("set allow_dyn6 { type ipv6_addr; flags timeout; }"));
         assert!(rs.contains("ip daddr @allow_dyn accept"));
         assert!(rs.contains("ip6 daddr @allow_dyn6 accept"));
         assert!(rs.contains("ip daddr { 104.16.0.0/13 } accept"), "static cidr too");
+        // Scoped DNS hole: only the configured nameservers, on :53.
+        assert!(rs.contains("ip daddr { 192.168.1.1 } udp dport 53 accept"));
+        assert!(rs.contains("ip daddr { 192.168.1.1 } tcp dport 53 accept"));
+        assert!(rs.contains("ip6 daddr { ::1 } udp dport 53 accept"));
         assert!(rs.contains("counter drop"));
     }
 
     #[test]
-    fn redirect_ruleset_dnats_dns_to_resolver() {
-        let rs = redirect_ruleset("t_nat", "a/b/c", 5388);
-        assert!(rs.contains("type nat hook output priority -100"));
-        assert!(rs.contains("udp dport 53 redirect to :5388"));
-        assert!(rs.contains("tcp dport 53 redirect to :5388"));
-        assert!(rs.contains("socket cgroupv2 level 3 \"a/b/c\""));
+    fn domain_ruleset_without_dns_servers_has_no_dns_hole() {
+        let rs = domain_ruleset("t", "a/b/c", &[], &[]);
+        assert!(!rs.contains("dport 53"), "no nameservers => no DNS hole");
     }
 
     #[test]

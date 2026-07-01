@@ -2,25 +2,28 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Per-tab gating DNS resolver — the domain half of allowlist mode.
+//! Per-tab allowlist pre-resolver — the domain half of allowlist mode.
 //!
-//! A tiny blocking UDP forwarder bound on a loopback port. The tab's `:53`
-//! is redirected to it by nftables ([`crate::net_nft::redirect_ruleset`]),
-//! so every name the tab resolves passes through here. For each query:
+//! It does **not** sit in the tab's DNS path (that would need a mount
+//! namespace to point the tab's `resolv.conf` at us, which the hardened
+//! service unit forbids). Instead it runs beside the path: a daemon-side
+//! thread that, on a timer, resolves each concrete allowlisted domain via the
+//! upstream resolver and programs the answer IPs into the tab's nftables
+//! dynamic set with `timeout = TTL` and the domain as a comment
+//! ([`crate::net_nft::add_allow_ip`]). The tab resolves the same names through
+//! the host resolver (allowed by a scoped `:53` hole) and connects to the IPs,
+//! which the confine chain gates against `@allow_dyn`.
 //!
-//! - **allowed** (the QNAME matches the tab's [`AllowSet`]): forward to the
-//!   upstream resolver, return the answer, and add each resolved A/AAAA IP
-//!   to the tab's nftables dynamic set with `timeout = TTL` and the domain
-//!   as a comment ([`crate::net_nft::add_allow_ip`]) — so the tab can then
-//!   reach exactly those IPs, and only while the TTL is live;
-//! - **denied**: return `REFUSED` without forwarding, so a disallowed name
-//!   never even resolves.
+//! Trade-off vs a true interceptor: enforcement is at the IP layer, so a
+//! per-query CDN (short TTL, rotating IPs) can hand the tab an IP we didn't
+//! pre-load — that connection drops even though the domain is allowed. A short
+//! refresh interval + a TTL grace window narrow the gap. Wildcard (`*.`)
+//! entries can't be enumerated and so can't be pre-resolved. And because we no
+//! longer see the tab's queries, denied names aren't observed per-domain (only
+//! the confine `drop` counter remains).
 //!
-//! It runs **in the daemon** (host loopback, no namespace), so its query log
-//! (allowed + denied, for the DNS-entries view) is read directly — no
-//! bind-mount. UDP only for now (the common path); TCP DNS (large answers)
-//! would need a second listener. No external DNS library — the wire parsing
-//! is small and unit-tested. Dependency-free, blocking `std::net`.
+//! No external DNS library — the wire format is small and unit-tested.
+//! Dependency-free, blocking `std::net`.
 
 #![cfg(all(target_os = "linux", not(feature = "gui")))]
 
@@ -32,38 +35,32 @@ use std::time::Duration;
 
 use crate::net_policy::AllowSet;
 
-/// A single observed DNS query, kept for the DNS-entries view.
+/// A pre-resolved allowlist domain, kept for the DNS-entries view.
 #[derive(Clone, Debug)]
 pub struct DnsEntry {
     pub domain: String,
+    /// Always `true` in the pre-resolve model — the daemon only looks up names
+    /// that are on the allowlist. Kept for API compatibility with the view.
     pub allowed: bool,
-    /// Resolved IPs (allowed queries only).
+    /// The IPs the domain last resolved to (and were programmed into nft).
     pub ips: Vec<IpAddr>,
 }
 
-/// Handle to a running per-tab resolver. Holds the loopback port (to feed the
-/// nft `:53` redirect) and the query log. Dropping it stops the resolver.
+/// Handle to a running per-tab pre-resolver. Holds the resolved-domain log;
+/// dropping it stops the refresh thread.
 pub struct ResolverHandle {
-    port: u16,
     shutdown: Arc<AtomicBool>,
     log: Arc<Mutex<Vec<DnsEntry>>>,
 }
 
 impl ResolverHandle {
-    /// The loopback port the resolver listens on — feed to
-    /// [`crate::net_nft::redirect_ruleset`].
-    #[must_use]
-    pub const fn port(&self) -> u16 {
-        self.port
-    }
-
-    /// Snapshot of the recent query log (allowed + denied).
+    /// Snapshot of the last resolved IPs per allowlist domain.
     #[must_use]
     pub fn entries(&self) -> Vec<DnsEntry> {
         self.log.lock().map(|l| l.clone()).unwrap_or_default()
     }
 
-    /// Stop the resolver (also runs on drop).
+    /// Stop the refresh thread (also runs on drop).
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
     }
@@ -75,80 +72,136 @@ impl Drop for ResolverHandle {
     }
 }
 
-/// Cap on the kept query log so it can't grow without bound.
+/// Cap on the kept log so it can't grow without bound.
 const LOG_CAP: usize = 256;
+/// Refresh cadence bounds (seconds): re-resolve at least this often and at
+/// most this rarely, regardless of the domains' TTLs.
+const REFRESH_MIN_S: u32 = 20;
+const REFRESH_MAX_S: u32 = 120;
+/// Grace added to an element's nft timeout beyond the refresh interval, so an
+/// IP survives until the next refresh reprograms it (avoids a blackout gap).
+const TTL_GRACE_S: u32 = 60;
 
-/// The upstream resolver to forward allowed queries to.
+/// The upstream resolver the daemon forwards its own lookups to.
 ///
 /// The first `nameserver` in `/etc/resolv.conf`, falling back to Cloudflare
-/// (`1.1.1.1:53`). A loopback nameserver (systemd-resolved at 127.0.0.53) is
-/// fine — the daemon itself isn't egress-restricted.
+/// (`1.1.1.1:53`). Matches what the tab's resolver uses, so the daemon and the
+/// tab tend to see the same answer.
 #[must_use]
 pub fn upstream_resolver() -> SocketAddr {
-    let fallback = SocketAddr::from(([1, 1, 1, 1], 53));
-    let Ok(conf) = std::fs::read_to_string("/etc/resolv.conf") else {
-        return fallback;
-    };
-    conf.lines()
-        .filter_map(|l| l.strip_prefix("nameserver").map(str::trim))
-        .find_map(|ns| ns.parse::<IpAddr>().ok())
-        .map_or(fallback, |ip| SocketAddr::new(ip, 53))
+    nameservers()
+        .into_iter()
+        .next()
+        .map_or_else(|| SocketAddr::from(([1, 1, 1, 1], 53)), |ip| SocketAddr::new(ip, 53))
 }
 
-/// Start a gating resolver for `tab_id` on a random loopback UDP port,
-/// forwarding allowed queries to `upstream`.
+/// Every `nameserver` in `/etc/resolv.conf`.
+///
+/// These are the DNS servers the tab will use, so they scope the confine
+/// chain's `:53` hole to just those hosts. Falls back to `1.1.1.1` when the
+/// file is missing or lists none.
+#[must_use]
+pub fn nameservers() -> Vec<IpAddr> {
+    let servers: Vec<IpAddr> = std::fs::read_to_string("/etc/resolv.conf")
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.strip_prefix("nameserver").map(str::trim))
+        // Strip a `%zone` scope id (link-local IPv6) before parsing.
+        .filter_map(|ns| ns.split('%').next().unwrap_or(ns).parse::<IpAddr>().ok())
+        .collect();
+    if servers.is_empty() {
+        vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))]
+    } else {
+        servers
+    }
+}
+
+/// Start the pre-resolve loop for `tab_id`, refreshing the tab's nft allow-set
+/// from `allow`'s concrete domains, forwarding lookups to `upstream`.
 ///
 /// # Errors
-/// Returns the `io::Error` if the loopback socket can't be bound or the
-/// worker thread can't be spawned.
+/// Returns the `io::Error` if the worker thread can't be spawned.
 pub fn spawn(tab_id: String, allow: AllowSet, upstream: SocketAddr) -> std::io::Result<ResolverHandle> {
-    let sock = UdpSocket::bind(("127.0.0.1", 0))?;
-    sock.set_read_timeout(Some(Duration::from_millis(200)))?;
-    let port = sock.local_addr()?.port();
     let shutdown = Arc::new(AtomicBool::new(false));
     let log = Arc::new(Mutex::new(Vec::new()));
     let (sd, lg) = (shutdown.clone(), log.clone());
     std::thread::Builder::new()
         .name("net-resolver".to_string())
-        .spawn(move || serve(&sock, &tab_id, &allow, upstream, &sd, &lg))?;
-    Ok(ResolverHandle { port, shutdown, log })
+        .spawn(move || refresh_loop(&tab_id, &allow, upstream, &sd, &lg))?;
+    Ok(ResolverHandle { shutdown, log })
 }
 
-fn serve(
-    sock: &UdpSocket,
+fn refresh_loop(
     tab_id: &str,
     allow: &AllowSet,
     upstream: SocketAddr,
     shutdown: &Arc<AtomicBool>,
     log: &Arc<Mutex<Vec<DnsEntry>>>,
 ) {
-    let mut buf = [0u8; 1500];
+    let domains = allow.resolvable_domains();
     while !shutdown.load(Ordering::Relaxed) {
-        let (n, client) = match sock.recv_from(&mut buf) {
-            Ok(v) => v,
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
-                continue;
+        let mut min_ttl = REFRESH_MAX_S;
+        let mut resolved: Vec<(String, Vec<(IpAddr, u32)>)> = Vec::with_capacity(domains.len());
+        for domain in &domains {
+            let ips = resolve(domain, upstream);
+            for &(_, ttl) in &ips {
+                min_ttl = min_ttl.min(ttl.max(1));
             }
-            Err(_) => break,
-        };
-        let query = &buf[..n];
-        let Some(name) = extract_qname(query) else { continue };
-        if allow.host_allowed(&name) {
-            // Forward to upstream and relay the answer; program nft with the
-            // resolved IPs so the tab can reach them.
-            if let Some(resp) = forward(query, upstream) {
-                let ips: Vec<(IpAddr, u32)> = extract_answer_ips(&resp);
-                for &(ip, ttl) in &ips {
-                    crate::net_nft::add_allow_ip(tab_id, ip, ttl.max(30), &name);
-                }
-                record(log, &name, true, ips.iter().map(|(ip, _)| *ip).collect());
-                let _ = sock.send_to(&resp, client);
+            resolved.push((domain.clone(), ips));
+        }
+        let sleep_s = min_ttl.clamp(REFRESH_MIN_S, REFRESH_MAX_S);
+        let elem_timeout = sleep_s + TTL_GRACE_S;
+        for (domain, ips) in &resolved {
+            for &(ip, ttl) in ips {
+                // Live at least until the next refresh reprograms it.
+                crate::net_nft::add_allow_ip(tab_id, ip, ttl.max(elem_timeout), domain);
             }
-        } else {
-            record(log, &name, false, Vec::new());
-            let _ = sock.send_to(&refused_response(query), client);
+            record(log, domain, ips.iter().map(|(ip, _)| *ip).collect());
+        }
+        sleep_with_shutdown(sleep_s, shutdown);
+    }
+}
+
+/// Sleep `secs` seconds in 1-second steps, waking early if shutdown is set.
+fn sleep_with_shutdown(secs: u32, shutdown: &Arc<AtomicBool>) {
+    for _ in 0..secs {
+        if shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// Resolve `domain` to its A and AAAA IPs (with TTLs) via `upstream`.
+fn resolve(domain: &str, upstream: SocketAddr) -> Vec<(IpAddr, u32)> {
+    let mut ips = Vec::new();
+    for qtype in [1u16 /* A */, 28u16 /* AAAA */] {
+        if let Some(q) = build_query(domain, qtype)
+            && let Some(resp) = forward(&q, upstream)
+        {
+            ips.extend(extract_answer_ips(&resp));
         }
     }
+    ips
+}
+
+/// Build a minimal DNS query packet (RD=1, one question) for `name`/`qtype`.
+/// `None` if a label is empty or over 63 bytes.
+#[must_use]
+pub fn build_query(name: &str, qtype: u16) -> Option<Vec<u8>> {
+    // id=1, flags RD=1, qd=1, an/ns/ar=0.
+    let mut q = vec![0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+    for label in name.trim_end_matches('.').split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return None;
+        }
+        q.push(label.len() as u8);
+        q.extend_from_slice(label.as_bytes());
+    }
+    q.push(0); // root label
+    q.extend_from_slice(&qtype.to_be_bytes());
+    q.extend_from_slice(&[0x00, 0x01]); // class IN
+    Some(q)
 }
 
 /// Forward a raw query to `upstream` and return the raw response (best-effort).
@@ -161,10 +214,9 @@ fn forward(query: &[u8], upstream: SocketAddr) -> Option<Vec<u8>> {
     Some(buf[..n].to_vec())
 }
 
-fn record(log: &Arc<Mutex<Vec<DnsEntry>>>, domain: &str, allowed: bool, ips: Vec<IpAddr>) {
+fn record(log: &Arc<Mutex<Vec<DnsEntry>>>, domain: &str, ips: Vec<IpAddr>) {
     if let Ok(mut l) = log.lock() {
-        // De-dup by (domain, allowed): refresh the existing entry's IPs.
-        if let Some(e) = l.iter_mut().find(|e| e.domain == domain && e.allowed == allowed) {
+        if let Some(e) = l.iter_mut().find(|e| e.domain == domain) {
             if !ips.is_empty() {
                 e.ips = ips;
             }
@@ -174,43 +226,11 @@ fn record(log: &Arc<Mutex<Vec<DnsEntry>>>, domain: &str, allowed: bool, ips: Vec
             }
             l.push(DnsEntry {
                 domain: domain.to_string(),
-                allowed,
+                allowed: true,
                 ips,
             });
         }
     }
-}
-
-/// Extract the queried name (QNAME) from a DNS query packet. Queries don't
-/// use name compression, so this is a straight label walk. `None` on a
-/// malformed/short packet.
-#[must_use]
-pub fn extract_qname(q: &[u8]) -> Option<String> {
-    if q.len() < 12 {
-        return None;
-    }
-    let mut i = 12;
-    let mut labels: Vec<String> = Vec::new();
-    loop {
-        let len = *q.get(i)? as usize;
-        if len == 0 {
-            break;
-        }
-        if len & 0xC0 != 0 {
-            return None; // compression pointer — not valid in a query QNAME
-        }
-        i += 1;
-        let label = q.get(i..i + len)?;
-        labels.push(std::str::from_utf8(label).ok()?.to_ascii_lowercase());
-        i += len;
-        if labels.len() > 127 {
-            return None;
-        }
-    }
-    if labels.is_empty() {
-        return None;
-    }
-    Some(labels.join("."))
 }
 
 /// Advance past a DNS name at offset `i`, returning the index just after it.
@@ -263,44 +283,28 @@ pub fn extract_answer_ips(r: &[u8]) -> Vec<(IpAddr, u32)> {
     out
 }
 
-/// Craft a `REFUSED` reply to `query`: same header/question, QR=1, RCODE=5,
-/// no answers.
-#[must_use]
-pub fn refused_response(query: &[u8]) -> Vec<u8> {
-    let mut r = query.to_vec();
-    if r.len() >= 12 {
-        r[2] = (r[2] & 0x01) | 0x80; // QR=1, preserve RD, opcode 0
-        r[3] = 0x05; // RCODE=REFUSED, RA=0
-        // Zero AN/NS/AR counts (keep QDCOUNT).
-        r[6..12].fill(0);
-    }
-    r
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // A DNS query for "api.anthropic.com" A: header (id, flags, qd=1) + qname.
-    fn query_for(name: &str) -> Vec<u8> {
-        let mut q = vec![0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
-        for label in name.split('.') {
-            q.push(label.len() as u8);
-            q.extend_from_slice(label.as_bytes());
-        }
-        q.push(0); // root
-        q.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // A IN
-        q
+    #[test]
+    fn build_query_encodes_name_and_type() {
+        let q = build_query("api.anthropic.com", 1).unwrap();
+        // header: id=1, RD, qd=1
+        assert_eq!(&q[0..6], &[0x00, 0x01, 0x01, 0x00, 0x00, 0x01]);
+        // labels: 3"api" …
+        assert_eq!(&q[12..16], &[0x03, b'a', b'p', b'i']);
+        // trailing: root(0) + qtype A(1) + class IN(1)
+        assert_eq!(&q[q.len() - 5..], &[0x00, 0x00, 0x01, 0x00, 0x01]);
+        // AAAA type (28 = 0x1C) is encoded in the trailing qtype.
+        let q6 = build_query("a", 28).unwrap();
+        assert_eq!(&q6[q6.len() - 4..], &[0x00, 0x1C, 0x00, 0x01]);
     }
 
     #[test]
-    fn extract_qname_reads_the_name() {
-        assert_eq!(
-            extract_qname(&query_for("api.anthropic.com")).as_deref(),
-            Some("api.anthropic.com")
-        );
-        assert_eq!(extract_qname(&query_for("EXAMPLE.com")).as_deref(), Some("example.com")); // lowercased
-        assert_eq!(extract_qname(b"\x00\x01"), None); // too short
+    fn build_query_rejects_bad_labels() {
+        assert!(build_query("a..b", 1).is_none()); // empty label
+        assert!(build_query(&"x".repeat(64), 1).is_none()); // label too long
     }
 
     #[test]
@@ -327,20 +331,13 @@ mod tests {
     }
 
     #[test]
-    fn refused_sets_qr_and_rcode() {
-        let q = query_for("blocked.test");
-        let r = refused_response(&q);
-        assert_eq!(r[2] & 0x80, 0x80, "QR set");
-        assert_eq!(r[3] & 0x0F, 0x05, "RCODE = REFUSED");
-        assert_eq!(&r[6..12], &[0, 0, 0, 0, 0, 0], "no answer/auth/additional");
-        // header id preserved
-        assert_eq!(&r[0..2], &q[0..2]);
-    }
-
-    #[test]
-    fn gate_allows_subdomain_refuses_other() {
-        let allow = AllowSet::build(&[], &["example.com".to_string()], &[]);
-        assert!(allow.host_allowed(&extract_qname(&query_for("a.example.com")).unwrap()));
-        assert!(!allow.host_allowed(&extract_qname(&query_for("evil.test")).unwrap()));
+    fn record_dedups_by_domain_and_refreshes_ips() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        record(&log, "api.x.com", vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]);
+        record(&log, "api.x.com", vec![IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8))]);
+        let e = log.lock().unwrap().clone();
+        assert_eq!(e.len(), 1);
+        assert!(e[0].allowed);
+        assert_eq!(e[0].ips, vec![IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8))]);
     }
 }
