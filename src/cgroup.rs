@@ -188,6 +188,71 @@ pub fn move_pid_to_tab_cgroup(tab_id: &str, pid: u32) -> bool {
     write_cgroup(&dir.join("cgroup.procs"), &pid.to_string()).is_ok()
 }
 
+/// Ensure `tab_id` has its own cgroup and `pid` is in it. Idempotent.
+///
+/// EVERY tab gets its own cgroup — even one with no resource limits — so its
+/// whole process subtree can be reliably torn down via [`kill_tab`] and reaped
+/// on the next startup ([`reap_stale_tabs`]). Without this a limit-less tab's
+/// shell stays in the daemon's `supervisor` leaf, so its orphaned children
+/// (a `claude --resume …` that ignored SIGHUP) couldn't be killed by cgroup
+/// without also killing the daemon. Best-effort no-op when delegation is off.
+pub fn ensure_tab(tab_id: &str, pid: u32) {
+    if prepare_tab_cgroup(tab_id).is_some() {
+        move_pid_to_tab_cgroup(tab_id, pid);
+    }
+}
+
+/// Kill a tab's ENTIRE process subtree and remove its cgroup. Best-effort.
+///
+/// Writes `1` to the tab cgroup's `cgroup.kill` — a cgroup-v2 atomic SIGKILL
+/// of every process in the subtree, immune to the SIGHUP-survival that lets
+/// `claude` (Node) and its detached tool/MCP subprocesses orphan. Then removes
+/// the (now-empty) cgroup dir. No-op when delegation is off or the cgroup is
+/// already gone. Returns `true` if the kill was issued.
+pub fn kill_tab(tab_id: &str) -> bool {
+    let Some(Some(base)) = DELEGATED_BASE.get() else {
+        return false;
+    };
+    let dir = base.join(format!("tab-{}", sanitize_id(tab_id)));
+    let killed = write_cgroup(&dir.join("cgroup.kill"), "1").is_ok();
+    // rmdir can lose the race with the kernel reaping the killed procs; if so
+    // the next spawn reuses the dir and reap_stale_tabs cleans it eventually.
+    let _ = std::fs::remove_dir(&dir);
+    killed
+}
+
+/// On startup, kill + remove any `tab-*` cgroups left over from a PRIOR run.
+///
+/// An unclean stop (crash, SIGKILL, or a `claude` that survived SIGHUP) leaves
+/// orphaned process trees sitting in their old per-tab cgroups (reparented to
+/// pid 1 but still cgroup members). Call this after [`init`] and BEFORE
+/// respawning tabs, so a fresh `claude --resume <id>` can't run alongside a
+/// still-live copy of the same session — the root cause of the duplicate
+/// ghost sessions. Skips the `supervisor` leaf (that's us). Best-effort.
+pub fn reap_stale_tabs() {
+    let Some(Some(base)) = DELEGATED_BASE.get() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return;
+    };
+    let mut n = 0u32;
+    for e in entries.flatten() {
+        let name = e.file_name();
+        // Only our per-tab cgroups; never the `supervisor` leaf (the daemon).
+        if !name.to_string_lossy().starts_with("tab-") {
+            continue;
+        }
+        let dir = e.path();
+        let _ = write_cgroup(&dir.join("cgroup.kill"), "1");
+        let _ = std::fs::remove_dir(&dir);
+        n += 1;
+    }
+    if n > 0 {
+        info!("cgroup: reaped {n} stale tab cgroup(s) (orphans from a prior run)");
+    }
+}
+
 /// Sanitise a tab id into a safe single path component.
 fn sanitize_id(tab_id: &str) -> String {
     tab_id

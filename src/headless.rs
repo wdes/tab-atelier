@@ -427,8 +427,11 @@ fn spawn_pty_tab(
     // resolver handle is kept on the tab (drop-guard + the DNS-entries view).
     #[cfg(target_os = "linux")]
     let mut net_resolver: Option<crate::net_resolver::ResolverHandle> = None;
+    // Run the pre-spawn net setup for its side effects (nft rules + resolver).
+    // The returned cgroup path is unused now — every tab is put in its cgroup
+    // unconditionally below (`ensure_tab`) for teardown, not just net ones.
     #[cfg(target_os = "linux")]
-    let nft_cgroup: Option<String> = {
+    let _net_setup: Option<String> = {
         crate::net_nft::teardown(&id);
         crate::cgroup::prepare_tab_cgroup(&id).and_then(|rel| {
             let ok = if net_disabled {
@@ -507,12 +510,12 @@ fn spawn_pty_tab(
     // child-PID lookup is wired up.
     #[cfg(windows)]
     let pid = 0u32;
-    // Join the (already nft-confined) cgroup immediately so enforcement
-    // begins right away. The rules were installed pre-spawn above.
+    // Put every tab in its OWN cgroup immediately: nft egress enforcement
+    // (when opted in) keys on it AND it makes the tab's whole process tree
+    // reliably killable/reapable (cgroup.kill) so a `claude --resume` can't
+    // orphan across restarts. Idempotent; also covers limit-less/plain tabs.
     #[cfg(target_os = "linux")]
-    if nft_cgroup.is_some() {
-        crate::cgroup::move_pid_to_tab_cgroup(&id, pid);
-    }
+    crate::cgroup::ensure_tab(&id, pid);
     let config = Config {
         scrolling_history: 10_000,
         ..Config::default()
@@ -664,16 +667,18 @@ pub fn run() -> std::io::Result<()> {
     let mut windowed = false;
 
     let saved_state = load_state_with_outputs(&platform::config_base_dir(), &platform::state_base_dir());
-    // Set up cgroup delegation once, before any tab spawns, but only
-    // when a limit could actually apply (global default set, or some
-    // restored tab carries its own) — an unconfigured daemon never
-    // touches cgroups. Linux + `Delegate=yes` only; no-op otherwise.
+    // Set up cgroup delegation once, before any tab spawns. Always attempted
+    // now (not just when a resource limit is configured): every tab needs its
+    // own cgroup so its process tree can be reliably killed (cgroup.kill) on
+    // close/shutdown and reaped on startup — the fix for orphaned
+    // `claude --resume` trees accumulating across restarts. Linux +
+    // `Delegate=yes` only; a clean no-op otherwise. Then reap any tab cgroups
+    // a prior (crashed / unclean) run left behind, BEFORE respawning tabs, so
+    // a fresh resume can't run beside a still-live copy of the same session.
     #[cfg(target_os = "linux")]
     {
-        let any_tab_limit = saved_state
-            .as_ref()
-            .is_some_and(|s| s.tabs.iter().any(|t| !t.limits.is_empty()));
-        crate::cgroup::init(!default_limits.is_empty() || any_tab_limit);
+        crate::cgroup::init(true);
+        crate::cgroup::reap_stale_tabs();
     }
     if let Some(saved) = saved_state {
         info!("restoring {} tab(s) from saved state", saved.tabs.len());
@@ -867,6 +872,12 @@ pub fn run() -> std::io::Result<()> {
             );
             for tab in &tabs {
                 tab.shutdown();
+                // Kill the whole tree, not just SIGHUP the PTY — otherwise a
+                // claude that ignores SIGHUP orphans and the NEXT start
+                // resumes a duplicate. (systemd's cgroup kill covers a clean
+                // stop; this covers non-systemd runs + belt-and-suspenders.)
+                #[cfg(target_os = "linux")]
+                crate::cgroup::kill_tab(&tab.id);
             }
             return Ok(());
         }
@@ -1564,10 +1575,14 @@ fn drain_pending(
             let was_active = *active == idx;
             tabs[idx].deactivate();
             tabs[idx].shutdown();
-            // Drop any kernel egress allowlist for the closed tab (no-op
-            // unless enforcement was opted in and applied).
+            // Hard-kill the tab's whole process subtree (claude + subprocesses)
+            // via cgroup.kill — shutdown() only drops the PTY (SIGHUP), which
+            // claude can survive and orphan. Then drop the egress allowlist.
             #[cfg(target_os = "linux")]
-            crate::net_nft::teardown(&tabs[idx].id);
+            {
+                crate::cgroup::kill_tab(&tabs[idx].id);
+                crate::net_nft::teardown(&tabs[idx].id);
+            }
             tabs.remove(idx);
             if *active >= tabs.len() {
                 *active = tabs.len() - 1;
