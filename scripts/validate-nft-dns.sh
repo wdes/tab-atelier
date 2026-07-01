@@ -20,8 +20,14 @@ NAT=tabatelier_dns_nat
 REL="tabatelier-dns/tab-x"; TESTCG="$CG/$REL"
 LEVEL=$(awk -F/ '{print NF}' <<<"$REL")
 RPORT=5388                                   # stand-in resolver port
+# REDIRECT to a loopback port only routes when route_localnet=1 on the egress
+# iface; with the default 0 the kernel silently drops the DNAT'd DNS packet and
+# the resolver never sees it. Save the old value so cleanup can restore it.
+RLN=/proc/sys/net/ipv4/conf/all/route_localnet
+RLN_OLD=$(cat "$RLN" 2>/dev/null || echo 0)
 
 cleanup() {
+  echo "${RLN_OLD:-0}" > "$RLN" 2>/dev/null
   "$NFT" delete table inet "$T" 2>/dev/null
   "$NFT" delete table inet "$NAT" 2>/dev/null
   # NB: guard the kill — `kill "${LPID:-0}"` becomes `kill 0` on the pre-flight
@@ -81,6 +87,10 @@ table inet $NAT {
 EOF
 then echo "!! nft rejected the nat/redirect ruleset (see above)"; exit 3; fi
 
+# Without this the REDIRECT->127.0.0.1:$RPORT is silently dropped (see RLN note
+# at the top). The real daemon must do the same when it installs apply_redirect.
+echo 1 > "$RLN"
+
 # From the cgroup, fire a DNS query at some resolver; the redirect should
 # divert it to our local listener.
 in_cg() { sh -c 'echo $$ > "'"$TESTCG"'/cgroup.procs"; exec "$@"' _ "$@"; }
@@ -90,10 +100,14 @@ if [ -f /tmp/.nftdns_hit ]; then echo "   redirect WORKS: $(cat /tmp/.nftdns_hit
 rm -f /tmp/.nftdns_hit
 
 echo "=> [3/3] enforcement: cgroup reaches the set-allowed IP, others dropped"
-hit(){ curl -sS -o /dev/null -w "%{http_code}" --max-time 6 "https://$1/" 2>/dev/null; }
-printf "   cg -> 1.1.1.1 (in @allow_dyn) : %s\n" "$(in_cg sh -c "$(declare -f hit); hit 1.1.1.1" || echo BLOCKED)"
-printf "   cg -> 8.8.8.8 (not in set)    : %s\n" "$( (timeout 8 sh -c "$(declare -f in_cg hit); CG=$CG; in_cg sh -c 'hit 8.8.8.8'") >/dev/null 2>&1 && echo 'REACHED (BAD)' || echo 'blocked (good)')"
+# Raw TCP connect, no TLS: an ALLOWED dest completes the handshake fast, a
+# DROPPED dest gets no SYN-ACK and hits the timeout. (The old https-to-bare-IP
+# probe returned curl 000 for BOTH cases — a cert-name mismatch on the allowed
+# path is indistinguishable from a drop — so it proved nothing.)
+probe(){ in_cg timeout 5 bash -c "exec 3<>/dev/tcp/$1/443" 2>/dev/null && echo "REACHED" || echo "blocked/timeout"; }
+printf "   cg -> 1.1.1.1:443 (in @allow_dyn) : %s\n" "$(probe 1.1.1.1)"
+printf "   cg -> 8.8.8.8:443 (not in set)    : %s\n" "$(probe 8.8.8.8)"
 
 echo
-echo "PASS: [1] ruleset+element accepted; [2] 'redirect WORKS'; [3] 1.1.1.1 reachable, 8.8.8.8 blocked."
+echo "Expected PASS: [1] ruleset+element accepted; [2] 'redirect WORKS'; [3] 1.1.1.1:443 REACHED, 8.8.8.8:443 blocked."
 echo "live filter table:"; "$NFT" list table inet "$T" | sed 's/^/   /'
