@@ -10,6 +10,15 @@
        strips headers still tells crawlers to back off. -->
   <meta name="robots" content="noindex, nofollow, noarchive">
   <title>__TAB_NAME_HTML__ · tab-atelier</title>
+  <!-- Icons. Declared relative to the mount root (`__ASSET_PREFIX__`) so they
+       resolve under a sub-path reverse-proxy; the daemon also serves them at
+       the origin root for the browser's automatic `/favicon.ico` fetch. -->
+  <link rel="icon" href="__ASSET_PREFIX__favicon.svg" type="image/svg+xml">
+  <link rel="icon" href="__ASSET_PREFIX__favicon-32x32.png" sizes="32x32" type="image/png">
+  <link rel="icon" href="__ASSET_PREFIX__favicon-16x16.png" sizes="16x16" type="image/png">
+  <link rel="apple-touch-icon" href="__ASSET_PREFIX__apple-touch-icon.png">
+  <link rel="manifest" href="__ASSET_PREFIX__site.webmanifest">
+  <meta name="theme-color" content="#1e1e1e">
   <!-- xterm.js + .css are version-pinned and served by the daemon.
        Cache-Control on those routes is `immutable` since the URL
        has the version in it.

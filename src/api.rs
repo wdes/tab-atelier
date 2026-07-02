@@ -54,6 +54,18 @@ const VENDOR_TERM_SYMBOLS_WOFF2: &[u8] = include_bytes!("../assets/vendor/term-s
 /// next page load with no user intervention.
 const MAIN_CSS: &str = include_str!("../assets/main.css");
 const MAIN_JS: &str = include_str!("../assets/main.js");
+// Site icons + metadata served at the origin root (`/favicon.ico`, …). The
+// `.svg` reuses the app icon; the raster set is rendered from it. `robots.txt`
+// mirrors the `X-Robots-Tag: noindex` stance for crawlers that check it first.
+const FAVICON_ICO: &[u8] = include_bytes!("../assets/icons/favicon.ico");
+const FAVICON_PNG_16: &[u8] = include_bytes!("../assets/icons/favicon-16x16.png");
+const FAVICON_PNG_32: &[u8] = include_bytes!("../assets/icons/favicon-32x32.png");
+const APPLE_TOUCH_ICON: &[u8] = include_bytes!("../assets/icons/apple-touch-icon.png");
+const ICON_PNG_192: &[u8] = include_bytes!("../assets/icons/icon-192.png");
+const ICON_PNG_512: &[u8] = include_bytes!("../assets/icons/icon-512.png");
+const FAVICON_SVG: &str = include_str!("../assets/tab-atelier.svg");
+const SITE_WEBMANIFEST: &str = include_str!("../assets/site.webmanifest");
+const ROBOTS_TXT: &str = include_str!("../assets/robots.txt");
 /// `OpenAPI` 3.1 description of this API, embedded as a fallback. The
 /// canonical copy is the `.deb` docs file (see [`openapi_spec`]); this
 /// build-time embed only backs uninstalled (dev / `cargo run`) runs.
@@ -1281,6 +1293,52 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             "Cache-Control: public, max-age=31536000, immutable\r\n",
         );
         return;
+    }
+
+    // Site icons + web metadata. Public (no token) — a favicon/robots request
+    // must never 401. Served at the origin root so the browser's automatic
+    // `/favicon.ico` / `/apple-touch-icon.png` / `/robots.txt` fetches hit us;
+    // the viewer HTML also declares them via `__ASSET_PREFIX__` for sub-path
+    // reverse-proxy mounts.
+    if method.as_str() == "GET" {
+        let icon: Option<(&[u8], &str, &str)> = match path.as_str() {
+            "/favicon.ico" => Some((FAVICON_ICO, "image/x-icon", "public, max-age=604800")),
+            "/favicon.svg" => Some((
+                FAVICON_SVG.as_bytes(),
+                "image/svg+xml; charset=utf-8",
+                "public, max-age=604800",
+            )),
+            "/favicon-16x16.png" => Some((FAVICON_PNG_16, "image/png", "public, max-age=604800")),
+            "/favicon-32x32.png" => Some((FAVICON_PNG_32, "image/png", "public, max-age=604800")),
+            "/apple-touch-icon.png" | "/apple-touch-icon-precomposed.png" => {
+                Some((APPLE_TOUCH_ICON, "image/png", "public, max-age=604800"))
+            }
+            "/icon-192.png" => Some((ICON_PNG_192, "image/png", "public, max-age=604800")),
+            "/icon-512.png" => Some((ICON_PNG_512, "image/png", "public, max-age=604800")),
+            "/site.webmanifest" => Some((
+                SITE_WEBMANIFEST.as_bytes(),
+                "application/manifest+json; charset=utf-8",
+                "public, max-age=86400",
+            )),
+            "/robots.txt" => Some((
+                ROBOTS_TXT.as_bytes(),
+                "text/plain; charset=utf-8",
+                "public, max-age=86400",
+            )),
+            _ => None,
+        };
+        if let Some((body, ctype, cache)) = icon {
+            respond_with_etag(
+                stream,
+                200,
+                ctype,
+                body,
+                accept_gzip,
+                if_none_match.as_deref(),
+                &format!("Cache-Control: {cache}\r\n"),
+            );
+            return;
+        }
     }
 
     let provided_token = auth_token.or(query_token);
@@ -4805,6 +4863,44 @@ mod tests {
                 val.contains("noindex"),
                 "X-Robots-Tag must contain `noindex` on {label}, got: {val:?}"
             );
+        }
+    }
+
+    #[test]
+    fn favicon_and_site_metadata_served_publicly() {
+        // Icons / robots.txt / manifest must be served WITHOUT a token (a
+        // browser fetching /favicon.ico must never get a 401) and with the
+        // right content-type.
+        let (port, _state, _token) = spawn_server();
+        for (req, want_ctype, want_in_body) in [
+            ("GET /favicon.ico HTTP/1.1\r\n\r\n", "image/x-icon", None),
+            ("GET /favicon.svg HTTP/1.1\r\n\r\n", "image/svg+xml", Some("<svg")),
+            ("GET /favicon-32x32.png HTTP/1.1\r\n\r\n", "image/png", Some("PNG")),
+            ("GET /apple-touch-icon.png HTTP/1.1\r\n\r\n", "image/png", Some("PNG")),
+            ("GET /icon-512.png HTTP/1.1\r\n\r\n", "image/png", None),
+            (
+                "GET /site.webmanifest HTTP/1.1\r\n\r\n",
+                "application/manifest+json",
+                Some("icon-512.png"),
+            ),
+            ("GET /robots.txt HTTP/1.1\r\n\r\n", "text/plain", Some("Disallow: /")),
+        ] {
+            let raw = request_bytes(port, req);
+            let (h, body) = split_response(&raw);
+            assert!(
+                h.lines().next().is_some_and(|l| l.contains("200")),
+                "want 200 for {req:?}, got: {}",
+                h.lines().next().unwrap_or("")
+            );
+            let ctype = header_value(&h, "content-type").unwrap_or_default();
+            assert!(ctype.contains(want_ctype), "content-type for {req:?}: {ctype:?}");
+            assert!(!body.is_empty(), "empty body for {req:?}");
+            if let Some(needle) = want_in_body {
+                assert!(
+                    String::from_utf8_lossy(&body).contains(needle),
+                    "body of {req:?} missing {needle:?}"
+                );
+            }
         }
     }
 
