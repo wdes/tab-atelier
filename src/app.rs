@@ -308,6 +308,22 @@ struct AppState {
     tabs: Vec<Tab>,
     active: usize,
     context_menu: Option<ContextMenu>,
+    /// The desktop screen-mate pet (Mini Owl), `Some` while it's on screen.
+    /// Summoned/dismissed from the background right-click menu.
+    #[cfg(feature = "pets")]
+    pet: Option<crate::pet::Pet>,
+    #[cfg(feature = "pets")]
+    pet_sheet: Option<std::sync::Arc<gpui::Image>>,
+    #[cfg(feature = "pets")]
+    pet_sheet_wh: (f32, f32),
+    #[cfg(feature = "pets")]
+    pet_tile_wh: (f32, f32),
+    #[cfg(feature = "pets")]
+    pet_last: std::time::Instant,
+    /// While dragging the pet: the grab offset `(mouse - pet_top_left)` so the
+    /// sprite stays under the cursor at the point it was picked up.
+    #[cfg(feature = "pets")]
+    pet_drag: Option<(f32, f32)>,
     renaming: Option<(usize, String)>,
     rename_select_all: bool,
     rename_focus: FocusHandle,
@@ -718,6 +734,25 @@ impl AppState {
         })
         .detach();
 
+        // Screen-mate pet animation clock: while the pet is on screen, notify
+        // ~20 fps so render() advances the walk. Cheap no-op while dismissed.
+        #[cfg(feature = "pets")]
+        cx.spawn(async |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(50))
+                    .await;
+                let Ok(()) = this.update(cx, |app, cx| {
+                    if app.pet.is_some() {
+                        cx.notify();
+                    }
+                }) else {
+                    break;
+                };
+            }
+        })
+        .detach();
+
         cx.spawn(async |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             loop {
                 cx.background_executor()
@@ -844,6 +879,18 @@ impl AppState {
             tabs,
             active,
             context_menu: None,
+            #[cfg(feature = "pets")]
+            pet: None,
+            #[cfg(feature = "pets")]
+            pet_sheet: None,
+            #[cfg(feature = "pets")]
+            pet_sheet_wh: (0.0, 0.0),
+            #[cfg(feature = "pets")]
+            pet_tile_wh: (49.0, 49.0),
+            #[cfg(feature = "pets")]
+            pet_last: std::time::Instant::now(),
+            #[cfg(feature = "pets")]
+            pet_drag: None,
             renaming: None,
             rename_select_all: false,
             rename_focus,
@@ -2097,6 +2144,47 @@ impl AppState {
         bar.child(plus_btn)
     }
 
+    /// Summon a random pet if none is on screen, or dismiss the current one.
+    /// Loads a baked sprite sheet + animation XML from `/usr/share/tab-atelier/pets/`
+    /// (dev: `./assets/pets/`). No-op if no pets are installed.
+    #[cfg(feature = "pets")]
+    fn toggle_pet(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
+        if self.pet.take().is_some() {
+            self.pet_sheet = None;
+            return; // was on screen → now dismissed
+        }
+        let pets = crate::pet::list_pets();
+        if pets.is_empty() {
+            return;
+        }
+        // Pick one at random so each summon is a surprise. A time-seeded index is
+        // plenty for "which sheep today?" — no need to pull in an rng dep.
+        let idx = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos() as usize)
+            % pets.len();
+        let Some(loaded) = crate::pet::load_pet(&pets[idx].0) else {
+            return;
+        };
+        let (sw, sh) = (loaded.sheet_w, loaded.sheet_h);
+        let (tw, th) = (sw / loaded.def.tilesx as f32, sh / loaded.def.tilesy as f32);
+        self.pet_sheet = Some(std::sync::Arc::new(gpui::Image::from_bytes(
+            gpui::ImageFormat::Png,
+            loaded.png,
+        )));
+        self.pet_sheet_wh = (sw, sh);
+        self.pet_tile_wh = (tw, th);
+        let vp = window.viewport_size();
+        self.pet = Some(crate::pet::Pet::new(
+            loaded.def,
+            f32::from(vp.width),
+            f32::from(vp.height),
+            tw,
+            th,
+        ));
+        self.pet_last = std::time::Instant::now();
+    }
+
     fn render_context_menu(&self, window: &Window, cx: &Context<Self>) -> Option<Stateful<Div>> {
         let menu = self.context_menu.as_ref()?;
         let th = self.th();
@@ -2775,6 +2863,33 @@ impl AppState {
                     )
                     .child(self.t().preferences),
             );
+
+        // Screen-mate pet toggle (background menu).
+        #[cfg(feature = "pets")]
+        {
+            let label = if self.pet.is_some() {
+                "🐾 Dismiss pet"
+            } else {
+                "🐾 Summon a pet"
+            };
+            container = container.child(sep()).child(
+                div()
+                    .id("menu-pet")
+                    .px(px(12.0))
+                    .py(px(4.0))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(menu_hover))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _ev: &MouseDownEvent, window, cx| {
+                            this.toggle_pet(window, cx);
+                            this.context_menu = None;
+                            cx.notify();
+                        }),
+                    )
+                    .child(label),
+            );
+        }
 
         Some(container)
     }
@@ -4212,6 +4327,112 @@ impl Render for AppState {
                 stack = stack.child(el);
             }
             root = root.child(stack);
+        }
+
+        // Advance + draw the screen-mate pet on top of everything. Frame timing
+        // comes from a ~50 ms notify loop (see `new`); we compute the real dt
+        // here so the walk speed is display-rate independent. Frozen while the
+        // window is hidden (Guake-style drop-down) — no point animating off-screen.
+        #[cfg(feature = "pets")]
+        if self.pet.is_some() {
+            let now = std::time::Instant::now();
+            let dt_ms = (now.saturating_duration_since(self.pet_last).as_secs_f32() * 1000.0).min(200.0);
+            self.pet_last = now;
+            let vp = window.viewport_size();
+            let (vw, vh) = (f32::from(vp.width), f32::from(vp.height));
+            let (tw, th) = self.pet_tile_wh;
+            if self.visible
+                && let Some(pet) = self.pet.as_mut()
+            {
+                // Ledges the pet can perch on. The screen floor/walls/ceiling are
+                // implicit; extra UI lines (tab bar, …) go here — TODO.
+                let world = crate::pet::World {
+                    w: vw,
+                    h: vh,
+                    tile_w: tw,
+                    tile_h: th,
+                    surfaces: &[],
+                };
+                pet.tick(dt_ms, &world);
+            }
+            if let (Some(pet), Some(sheet)) = (self.pet.as_ref(), self.pet_sheet.as_ref()) {
+                let (col, row) = pet.current_tile();
+                let (x, y) = pet.pos();
+                let (sw, sh) = self.pet_sheet_wh;
+                let dragging = pet.is_dragging();
+                // Sprite tile: a tile-sized window clipping the sheet. `.occlude()`
+                // so a click on the pet grabs it (drag) instead of leaking into a
+                // terminal text selection; the tiny footprint leaves the rest of
+                // the screen selectable.
+                root = root.child(
+                    div()
+                        .absolute()
+                        .left(px(x))
+                        .top(px(y))
+                        .w(px(tw))
+                        .h(px(th))
+                        .overflow_hidden()
+                        .occlude()
+                        .cursor(if dragging {
+                            gpui::CursorStyle::ClosedHand
+                        } else {
+                            gpui::CursorStyle::OpenHand
+                        })
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, ev: &MouseDownEvent, _window, cx| {
+                                if let Some(pet) = this.pet.as_mut() {
+                                    let (px_, py_) = pet.pos();
+                                    this.pet_drag =
+                                        Some((f32::from(ev.position.x) - px_, f32::from(ev.position.y) - py_));
+                                    pet.grab();
+                                    cx.notify();
+                                }
+                            }),
+                        )
+                        .child(
+                            gpui::img(gpui::ImageSource::Image(sheet.clone()))
+                                .absolute()
+                                .left(px(-(col as f32) * tw))
+                                .top(px(-(row as f32) * th))
+                                .w(px(sw))
+                                .h(px(sh)),
+                        ),
+                );
+                // While a drag is live, track the mouse across the whole window
+                // and release on mouse-up — a full-window transparent catcher so
+                // the pointer needn't stay inside the tiny sprite box.
+                if dragging {
+                    root = root.child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .w(px(vw))
+                            .h(px(vh))
+                            .occlude()
+                            .cursor(gpui::CursorStyle::ClosedHand)
+                            .on_mouse_move(cx.listener(move |this, ev: &gpui::MouseMoveEvent, _window, cx| {
+                                if let (Some(off), Some(pet)) = (this.pet_drag, this.pet.as_mut()) {
+                                    let nx = (f32::from(ev.position.x) - off.0).clamp(0.0, (vw - tw).max(0.0));
+                                    let ny = (f32::from(ev.position.y) - off.1).clamp(0.0, (vh - th).max(0.0));
+                                    pet.set_pos(nx, ny);
+                                    cx.notify();
+                                }
+                            }))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, _ev: &gpui::MouseUpEvent, _window, cx| {
+                                    if let Some(pet) = this.pet.as_mut() {
+                                        pet.drop();
+                                    }
+                                    this.pet_drag = None;
+                                    cx.notify();
+                                }),
+                            ),
+                    );
+                }
+            }
         }
 
         root
