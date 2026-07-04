@@ -1510,29 +1510,24 @@ fn drain_pending(
         }
     }
 
-    // Working-subprocess sweep — same logic as the GUI tick.
+    // Working-subprocess sweep — same logic as the GUI tick. Keep an in-progress
+    // "thinking" LED (set by the PreToolUse hook) fresh through a long tool call
+    // where no hook fires between Pre and Post — but only REFRESH an existing
+    // thinking state while real work is on-CPU. Never fabricate one from a stray
+    // short-lived subprocess (the agent's own status hooks flit through `R`),
+    // which used to paint idle tabs green.
     let now = Instant::now();
     #[cfg(feature = "catbus")]
     for tab in tabs.iter_mut() {
         if tab.agent_kind.is_none() {
             continue;
         }
-        if !crate::catbus_agent::agent_has_active_subprocess(tab.pid) {
-            continue;
+        if crate::catbus_agent::agent_activity(tab.pid) == crate::catbus_agent::AgentActivity::Working
+            && let Some(snap) = &mut tab.agent_state
+            && snap.state == crate::AgentState::Thinking
+        {
+            snap.updated_at = now;
         }
-        tab.agent_state = Some(match tab.agent_state.take() {
-            Some(mut snap) if snap.state != crate::AgentState::Error => {
-                snap.state = crate::AgentState::Thinking;
-                snap.updated_at = now;
-                snap
-            }
-            Some(snap) => snap,
-            None => AgentStateSnapshot {
-                state: crate::AgentState::Thinking,
-                label: Some("subproc".into()),
-                updated_at: now,
-            },
-        });
     }
 
     // Staleness sweep: drop transient state older than 2 min.

@@ -1518,22 +1518,32 @@ impl AppState {
                     continue;
                 }
                 let pid = tab.view.read(cx).pid();
-                if !crate::catbus_agent::agent_has_active_subprocess(pid) {
-                    continue;
-                }
-                tab.agent_state = Some(match tab.agent_state.take() {
-                    Some(mut snap) if snap.state != crate::AgentState::Error => {
-                        snap.state = crate::AgentState::Thinking;
-                        snap.updated_at = now;
-                        snap
+                match crate::catbus_agent::agent_activity(pid) {
+                    // The agent process is gone but no `idle` status POST cleared
+                    // the session (killed / crashed / plain exit). Drop the stale
+                    // session so the tab stops showing a phantom dormant-blue LED
+                    // for an agent that isn't there anymore.
+                    crate::catbus_agent::AgentActivity::Gone => {
+                        tab.agent_kind = None;
+                        tab.agent_session_id = None;
+                        tab.agent_plan_mode = None;
+                        tab.agent_state = None;
                     }
-                    Some(snap) => snap, // keep Error sticky
-                    None => crate::AgentStateSnapshot {
-                        state: crate::AgentState::Thinking,
-                        label: Some("subproc".into()),
-                        updated_at: now,
-                    },
-                });
+                    // A real tool call is on-CPU. Keep an in-progress "thinking"
+                    // LED (set by the PreToolUse hook) fresh through a long tool
+                    // call, where no hook fires between Pre and Post. We only
+                    // REFRESH an existing thinking state — never fabricate one
+                    // from a stray short-lived subprocess (the agent's own status
+                    // hooks flit through `R`), which used to paint idle tabs green.
+                    crate::catbus_agent::AgentActivity::Working => {
+                        if let Some(snap) = &mut tab.agent_state
+                            && snap.state == crate::AgentState::Thinking
+                        {
+                            snap.updated_at = now;
+                        }
+                    }
+                    crate::catbus_agent::AgentActivity::Idle => {}
+                }
             }
             // Staleness sweep: drop transient LED state when the last
             // update is older than 2 min. Real Claude turns are

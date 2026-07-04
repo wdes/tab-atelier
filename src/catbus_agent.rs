@@ -94,23 +94,38 @@ pub fn has_agent_descendant(shell_pid: u32) -> bool {
 /// longer than the 2-min staleness sweep (long `cargo build`, sleep,
 /// pytest run, …).
 #[must_use]
-pub fn agent_has_active_subprocess(shell_pid: u32) -> bool {
+/// Liveness + work state of a tab's agent session, from a single `/proc` walk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentActivity {
+    /// No `catbus-agent` / `claude` process under the shell — the session ended.
+    Gone,
+    /// Agent alive but no subprocess is on-CPU: idle, waiting for input, or
+    /// thinking over the network — not running local work.
+    Idle,
+    /// A descendant is actually running (`R`) or blocked in uninterruptible I/O
+    /// (`D`) — a real tool call (cargo build, pytest, …) is underway.
+    Working,
+}
+
+/// Classify a tab's agent session in one BFS over the agent's descendants.
+///
+/// `Working` requires a descendant genuinely on-CPU (`R`) or in uninterruptible
+/// I/O (`D`); merely-existing children don't count. An idle agent keeps
+/// persistent helpers alive (MCP servers, a language server, a paused shell)
+/// that sit in `S` (interruptible sleep), and its own status hooks flit through
+/// `R` — treating either as work is what pinned idle tabs to the green
+/// "thinking" LED with nothing running.
+pub fn agent_activity(shell_pid: u32) -> AgentActivity {
     use std::fmt::Write as _;
     let Some(agent_pid) = find_agent_descendant(shell_pid) else {
-        return false;
+        return AgentActivity::Gone;
     };
-    // BFS the agent's descendants and count it "working" only if at least one is
-    // actually on-CPU (state `R`) or blocked in uninterruptible I/O (`D`). Merely
-    // *existing* children don't count: an idle agent keeps persistent helpers
-    // alive (MCP servers, a language server, a paused shell) that sit in `S`
-    // (interruptible sleep) — treating those as work is what pinned idle tabs to
-    // the green "thinking" LED with nothing running.
     let mut path = String::with_capacity(48);
     let mut queue = vec![agent_pid];
     while let Some(pid) = queue.pop() {
         // Skip the agent process itself; we're judging its subprocesses.
         if pid != agent_pid && matches!(proc_state(pid), Some('R' | 'D')) {
-            return true;
+            return AgentActivity::Working;
         }
         path.clear();
         let _ = write!(path, "/proc/{pid}/task/{pid}/children");
@@ -118,7 +133,7 @@ pub fn agent_has_active_subprocess(shell_pid: u32) -> bool {
             queue.extend(raw.split_ascii_whitespace().filter_map(|s| s.parse::<u32>().ok()));
         }
     }
-    false
+    AgentActivity::Idle
 }
 
 /// The scheduler state character (`R`/`S`/`D`/`Z`/`T`/…) from `/proc/<pid>/stat`,
