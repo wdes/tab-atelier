@@ -99,11 +99,40 @@ pub fn agent_has_active_subprocess(shell_pid: u32) -> bool {
     let Some(agent_pid) = find_agent_descendant(shell_pid) else {
         return false;
     };
+    // BFS the agent's descendants and count it "working" only if at least one is
+    // actually on-CPU (state `R`) or blocked in uninterruptible I/O (`D`). Merely
+    // *existing* children don't count: an idle agent keeps persistent helpers
+    // alive (MCP servers, a language server, a paused shell) that sit in `S`
+    // (interruptible sleep) — treating those as work is what pinned idle tabs to
+    // the green "thinking" LED with nothing running.
     let mut path = String::with_capacity(48);
-    let _ = write!(path, "/proc/{agent_pid}/task/{agent_pid}/children");
-    fs::read_to_string(&path)
-        .ok()
-        .is_some_and(|s| s.split_ascii_whitespace().any(|tok| tok.parse::<u32>().is_ok()))
+    let mut queue = vec![agent_pid];
+    while let Some(pid) = queue.pop() {
+        // Skip the agent process itself; we're judging its subprocesses.
+        if pid != agent_pid && matches!(proc_state(pid), Some('R' | 'D')) {
+            return true;
+        }
+        path.clear();
+        let _ = write!(path, "/proc/{pid}/task/{pid}/children");
+        if let Ok(raw) = fs::read_to_string(&path) {
+            queue.extend(raw.split_ascii_whitespace().filter_map(|s| s.parse::<u32>().ok()));
+        }
+    }
+    false
+}
+
+/// The scheduler state character (`R`/`S`/`D`/`Z`/`T`/…) from `/proc/<pid>/stat`,
+/// or `None` if the process is gone.
+fn proc_state(pid: u32) -> Option<char> {
+    parse_proc_state(&fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
+/// Pull the state char out of a `/proc/<pid>/stat` line. The format is
+/// `pid (comm) STATE …`, and `comm` may itself contain spaces and parens, so we
+/// key off the *last* `)` rather than splitting on whitespace.
+fn parse_proc_state(stat: &str) -> Option<char> {
+    let after_comm = stat.rfind(')')? + 2; // skip ") "
+    stat.get(after_comm..)?.chars().next()
 }
 
 /// Owner UID of a `/proc/<pid>` entry (the process's real UID), or
@@ -400,6 +429,19 @@ mod tests {
     fn escape_cwd_replaces_every_non_alpha_with_dash() {
         let p = Path::new("/mnt/Dev/@wdes");
         assert_eq!(escape_cwd(p), "-mnt-Dev--wdes");
+    }
+
+    #[test]
+    fn parse_proc_state_keys_off_the_last_paren() {
+        // Normal case.
+        assert_eq!(parse_proc_state("1234 (bash) S 1 1234 …"), Some('S'));
+        assert_eq!(parse_proc_state("42 (cargo) R 1 …"), Some('R'));
+        // comm containing spaces AND parens — must use the LAST ')'.
+        assert_eq!(parse_proc_state("77 (weird )( name) D 1 …"), Some('D'));
+        assert_eq!(parse_proc_state("88 (a) b) c) Z 1 …"), Some('Z'));
+        // Malformed / empty.
+        assert_eq!(parse_proc_state("no parens here"), None);
+        assert_eq!(parse_proc_state("5 (x)"), None);
     }
 
     #[test]
