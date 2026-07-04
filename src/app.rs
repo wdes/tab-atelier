@@ -64,6 +64,13 @@ struct Tab {
     /// the "dormant" (blue) LED — an attached-but-quiet session you
     /// haven't opened in a while. `None` = never focused this run.
     last_focused_at: Option<std::time::Instant>,
+    /// When this tab last produced terminal output (PTY ring grew). A tab that
+    /// is actively streaming/redrawing — e.g. an agent thinking, its spinner
+    /// animating, or a `cargo build` printing — is NOT dormant even if you
+    /// haven't clicked it, so the blue "dormant" LED reflects genuine silence
+    /// rather than "un-focused for 180 s while claude works." `None` = no
+    /// output observed yet this run.
+    last_output_at: Option<std::time::Instant>,
     #[cfg(feature = "energy")]
     energy_wh: f64,
     /// Last `energy_wh` value flushed to disk. Used to skip writes when no
@@ -530,6 +537,7 @@ impl AppState {
                     // you opening it — otherwise every attached
                     // session would flash blue on every restart.
                     last_focused_at: Some(std::time::Instant::now()),
+                    last_output_at: None,
                     #[cfg(feature = "energy")]
                     energy_wh: ts.energy_wh.unwrap_or(0.0),
                     #[cfg(feature = "energy")]
@@ -585,6 +593,7 @@ impl AppState {
                     // you opening it — otherwise every attached
                     // session would flash blue on every restart.
                     last_focused_at: Some(std::time::Instant::now()),
+                    last_output_at: None,
                     #[cfg(feature = "energy")]
                     energy_wh: 0.0,
                     #[cfg(feature = "energy")]
@@ -634,6 +643,7 @@ impl AppState {
                     active_duration: std::time::Duration::ZERO,
                     last_activated: Some(std::time::Instant::now()),
                     last_focused_at: Some(std::time::Instant::now()),
+                    last_output_at: None,
                     #[cfg(feature = "energy")]
                     energy_wh: 0.0,
                     #[cfg(feature = "energy")]
@@ -931,6 +941,7 @@ impl AppState {
                 active_duration: std::time::Duration::ZERO,
                 last_activated: Some(std::time::Instant::now()),
                 last_focused_at: Some(std::time::Instant::now()),
+                last_output_at: None,
                 #[cfg(feature = "energy")]
                 energy_wh: 0.0,
                 #[cfg(feature = "energy")]
@@ -1138,6 +1149,10 @@ impl AppState {
             // `tab.view` ends and we can mutate `tab.snap_cache`.
             if let Some(c) = fresh {
                 tab.snap_cache = Some(c);
+                // The ring grew ⇒ the tab produced output (claude streaming /
+                // its spinner animating / a build printing). Mark it so the
+                // dormant-blue LED reflects real silence, not just un-focus.
+                tab.last_output_at = Some(std::time::Instant::now());
             }
             let grid = tab.snap_cache.as_ref().expect("snap_cache populated above").clone();
             let bg_color = crate::effective_tab_bg(tab.bg_color.as_deref(), self.tab_bg_global.as_deref()).to_string();
@@ -1893,7 +1908,15 @@ impl AppState {
                         // A tab someone is watching over the web/remote
                         // viewer is being tended too — never dormant.
                         let watched = tab.view.read(cx).viewer_count() > 0;
+                        // Recent terminal output (claude streaming a reply /
+                        // its spinner animating / a build printing) also means
+                        // "not dormant" — otherwise an actively-working session
+                        // reads blue just because you haven't clicked it.
+                        let quiet_output = tab
+                            .last_output_at
+                            .is_none_or(|t| t.elapsed().as_secs() > DORMANT_AFTER_SECS);
                         let dormant = !watched
+                            && quiet_output
                             && tab
                                 .last_focused_at
                                 .is_none_or(|t| t.elapsed().as_secs() > DORMANT_AFTER_SECS);
