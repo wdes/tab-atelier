@@ -326,6 +326,18 @@ impl Pet {
         // actually descended onto the floor this step.
         let was_airborne = self.airborne(world);
 
+        // A downward-moving (fall/`fall_face`) animation that's resting on the
+        // ground has, by definition, landed — its motion can't descend further.
+        // The fall graph can wander back into a fall state on the floor (e.g.
+        // after a throw), where no bottom-hit fires because we're already down;
+        // snap it back to walking so it doesn't get stuck face-down. Airborne
+        // falls are untouched — those land via the bottom border below.
+        if !was_airborne && dy > 0.0 {
+            self.anim = self.def.start;
+            self.frame_i = 0;
+            return;
+        }
+
         let old_feet = self.y + th;
         let mut nx = self.x + dx;
         let mut ny = self.y + dy;
@@ -797,6 +809,47 @@ mod tests {
                 pet.pos().1
             );
         }
+    }
+
+    #[test]
+    fn thrown_pet_recovers_to_walking() {
+        // Regression: throwing a pet up must not leave it stuck in a fall pose
+        // (the sheep's `fall_face`) on the ground. After it settles it should be
+        // back in its start (walk) animation, on the floor.
+        let lp = load_pet("blue_sheep").expect("sheep assets");
+        let (w, h) = (1000.0f32, 700.0f32);
+        let (tw, th) = (lp.sheet_w / lp.def.tilesx as f32, lp.sheet_h / lp.def.tilesy as f32);
+        let start = lp.def.start;
+        let mut pet = Pet::new(lp.def, w, h, tw, th);
+        pet.grab();
+        pet.set_pos(w * 0.5, 40.0);
+        pet.drop();
+        let mut saw_start_after_settling = false;
+        for i in 0..900 {
+            pet.tick(
+                30.0,
+                &World {
+                    w,
+                    h,
+                    tile_w: tw,
+                    tile_h: th,
+                    surfaces: &[],
+                },
+            );
+            if i >= 700 && pet.anim == start {
+                saw_start_after_settling = true;
+            }
+        }
+        let floor = h - th;
+        assert!(
+            (pet.pos().1 - floor).abs() < 2.0,
+            "settled on the floor (y={})",
+            pet.pos().1
+        );
+        assert!(
+            saw_start_after_settling,
+            "recovered to the walk animation (not stuck face-down)"
+        );
     }
 
     #[test]
