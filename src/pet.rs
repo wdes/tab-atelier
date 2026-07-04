@@ -16,6 +16,10 @@
 //! `app.rs` reads [`Pet::current_tile`] / [`Pet::pos`] each frame, clips the sheet
 //! to the active tile, and can [`Pet::grab`]/[`Pet::release`] it for drag-and-drop.
 //!
+//! [`PetOverlay`] runs a whole herd: summon adds pets (no cap), grass sprouts on
+//! the tab-line ledges, sheep stop to graze it down ([`Pet::start_grazing`]), and
+//! while grass is around new grazers wander in on their own.
+//!
 //! Dead-end animations (empty `<next>`) are desktopPet's death/kill/effect
 //! sequences (`alien_kill`, `blank_die`, …) that end the pet's life via a
 //! spawn/child system we don't model. Upstream respawns the pet there
@@ -83,6 +87,9 @@ pub struct PetDef {
     /// Astonished/held animation played while grabbed — desktopPet's `drag` key,
     /// or `scream` as a stand-in. `None` ⇒ the pet just freezes its current frame.
     grabbed: Option<u32>,
+    /// The `eat` animation, if the pet grazes (the sheep). `None` ⇒ it ignores
+    /// grass. Played in place while nibbling a grass tuft.
+    eat: Option<u32>,
     /// Whether any animation has a `<gravity>` fall. Pets without one (the owl)
     /// get a synthetic downward drift when airborne so a dropped pet doesn't
     /// hover; pets with one are left to their own aerial animations.
@@ -119,7 +126,7 @@ impl PetDef {
         let mut start = u32::MAX;
         let mut walk_id = None;
         let mut fall_id = None;
-        let (mut drag_id, mut scream_id) = (None, None);
+        let (mut drag_id, mut scream_id, mut eat_id) = (None, None, None);
         for a in anims_node.children().filter(|n| n.has_tag_name("animation")) {
             let Some(id) = a.attribute("id").and_then(|s| s.parse::<u32>().ok()) else {
                 continue;
@@ -129,6 +136,7 @@ impl PetDef {
                 Some("fall") => fall_id = Some(id),
                 Some("drag") => drag_id = Some(id),
                 Some("scream") => scream_id = Some(id),
+                Some("eat") => eat_id = Some(id),
                 _ => {}
             }
             let seq = a.children().find(|n| n.has_tag_name("sequence"));
@@ -221,6 +229,7 @@ impl PetDef {
             start: walk_id.unwrap_or(start),
             fall: fall_id,
             grabbed: drag_id.or(scream_id),
+            eat: eat_id,
             anims,
             has_gravity,
         })
@@ -281,6 +290,9 @@ pub struct Pet {
     /// While held by the mouse, physics is frozen and position is driven by the
     /// drag handler; releasing drops the pet (gravity takes over).
     dragging: bool,
+    /// Grazing: the pet chews a grass tuft in place (the `eat` animation loops,
+    /// no movement or transitions) until the overlay tells it to stop.
+    eating: bool,
 }
 
 impl Pet {
@@ -298,6 +310,7 @@ impl Pet {
             accum_ms: 0.0,
             rng: 0x2545_F491,
             dragging: false,
+            eating: false,
         }
     }
 
@@ -311,6 +324,7 @@ impl Pet {
         self.anim = self.def.start;
         self.frame_i = 0;
         self.accum_ms = 0.0;
+        self.eating = false;
     }
 
     /// Cheap LCG so `next`-probability picks don't need the `rand` crate.
@@ -323,6 +337,19 @@ impl Pet {
     /// and applying gravity. No-op while the pet is being dragged.
     pub fn tick(&mut self, dt_ms: f32, world: &World) {
         if self.dragging {
+            return;
+        }
+        // Grazing: chew in place — cycle the eat frames, no movement/transitions.
+        if self.eating {
+            if let Some(cur) = self.def.anims.get(&self.anim) {
+                self.accum_ms += dt_ms;
+                let mut steps = 0;
+                while self.accum_ms >= cur.interval_ms && steps < 8 {
+                    self.accum_ms -= cur.interval_ms;
+                    steps += 1;
+                    self.frame_i = (self.frame_i + 1) % cur.frames.len().max(1);
+                }
+            }
             return;
         }
         let Some(mut cur) = self.def.anims.get(&self.anim).cloned() else {
@@ -526,12 +553,53 @@ impl Pet {
     /// Begin a drag: freeze physics until [`Pet::release`].
     pub const fn grab(&mut self) {
         self.dragging = true;
+        self.eating = false;
         // Look astonished while held (desktopPet's `drag`, or `scream`). Physics
         // is frozen during the drag, so this just shows the surprised frame.
         if let Some(g) = self.def.grabbed {
             self.anim = g;
             self.frame_i = 0;
         }
+    }
+
+    /// Whether this pet grazes (has an `eat` animation — the sheep).
+    #[must_use]
+    pub const fn can_graze(&self) -> bool {
+        self.def.eat.is_some()
+    }
+
+    /// Whether it's currently walking (its start animation) and free to react —
+    /// so grazing only kicks in from a normal stroll, not mid-climb/fall/drag.
+    #[must_use]
+    pub const fn is_walking(&self) -> bool {
+        self.anim == self.def.start && !self.eating && !self.dragging
+    }
+
+    #[must_use]
+    pub const fn is_grazing(&self) -> bool {
+        self.eating
+    }
+
+    /// The pet's feet: sprite-centre x and bottom y — where it stands on a ledge.
+    #[must_use]
+    pub fn feet(&self, tile_w: f32, tile_h: f32) -> (f32, f32) {
+        (tile_w.mul_add(0.5, self.x), self.y + tile_h)
+    }
+
+    /// Start nibbling a grass tuft in place (plays the `eat` animation on loop).
+    pub const fn start_grazing(&mut self) {
+        if let Some(e) = self.def.eat {
+            self.eating = true;
+            self.anim = e;
+            self.frame_i = 0;
+        }
+    }
+
+    /// Stop grazing and walk on.
+    pub const fn stop_grazing(&mut self) {
+        self.eating = false;
+        self.anim = self.def.start;
+        self.frame_i = 0;
     }
 
     /// Move the pet to a top-left position (used while dragging).
@@ -547,6 +615,7 @@ impl Pet {
     /// straight back to walking (see the grounded-fall check in `step`).
     pub fn release(&mut self) {
         self.dragging = false;
+        self.eating = false;
         self.anim = self.def.fall.unwrap_or(self.def.start);
         self.frame_i = 0;
     }
@@ -687,79 +756,125 @@ fn png_dims(bytes: &[u8]) -> Option<(f32, f32)> {
     (w > 0 && h > 0).then_some((w as f32, h as f32))
 }
 
-/// The desktop screen-mate: all the pet's UI state and gpui glue.
-///
-/// Holds the live [`Pet`], its two sprite sheets, drag state, and the per-tab
-/// ledge list, and knows how to summon, animate, draw, and drag it. Lives here
-/// so `app.rs` keeps a single `PetOverlay` field and a few delegating calls
-/// instead of the whole feature.
-pub struct PetOverlay {
-    pet: Option<Pet>,
-    sheet: Option<Arc<gpui::Image>>,
-    sheet_flip: Option<Arc<gpui::Image>>,
+/// One live pet: its movement state plus its two sprite sheets and geometry.
+struct LivePet {
+    pet: Pet,
+    sheet: Arc<gpui::Image>,
+    sheet_flip: Arc<gpui::Image>,
     sheet_wh: (f32, f32),
     tile_wh: (f32, f32),
+}
+
+/// A tuft of grass on a ledge that grazing sheep eat down. `amount` is fullness
+/// in `0..1`; it shrinks as eaten and the tuft is removed at 0.
+#[derive(Clone, Copy, Debug)]
+struct Grass {
+    x: f32,
+    y: f32,
+    amount: f32,
+}
+
+/// The desktop screen-mates: a herd of pets and the grass they graze.
+///
+/// Owns the pets, the grass tufts on the tab lines, and the gpui glue to summon,
+/// animate, draw, drag, grow, and auto-spawn them. `app.rs` keeps a single
+/// `PetOverlay` field and a few delegating calls.
+pub struct PetOverlay {
+    pets: Vec<LivePet>,
     last: Instant,
-    /// While dragging: the grab offset `(mouse - pet_top_left)`.
-    drag: Option<(f32, f32)>,
-    /// Ledges the pet can walk on (one per tab, its top edge), collected each
-    /// paint by the per-tab measuring canvases ([`PetOverlay::tab_ledge_canvas`]).
+    /// While dragging: `(pet index, grab offset mouse - top_left)`.
+    drag: Option<(usize, (f32, f32))>,
+    /// Ledges (one per tab, its top edge) collected each paint by the measuring
+    /// canvases — the pets walk them and grass grows on them.
     ledges: Rc<RefCell<Vec<Surface>>>,
+    /// Grass tufts on the ledges; grow over time, eaten by grazing sheep.
+    grass: Vec<Grass>,
+    grow_accum: f32,
+    spawn_accum: f32,
+    rng: u32,
 }
 
 impl Default for PetOverlay {
     fn default() -> Self {
         Self {
-            pet: None,
-            sheet: None,
-            sheet_flip: None,
-            sheet_wh: (0.0, 0.0),
-            tile_wh: (49.0, 49.0),
+            pets: Vec::new(),
             last: Instant::now(),
             drag: None,
             ledges: Rc::new(RefCell::new(Vec::new())),
+            grass: Vec::new(),
+            grow_accum: 0.0,
+            spawn_accum: 0.0,
+            rng: 0x9E37_79B9,
         }
     }
 }
 
 impl PetOverlay {
-    /// Whether a pet is currently on screen.
+    /// Whether any pet is currently on screen.
     #[must_use]
     pub const fn is_active(&self) -> bool {
-        self.pet.is_some()
+        !self.pets.is_empty()
     }
 
-    /// Summon a random installed pet, or dismiss the current one.
-    pub fn toggle(&mut self, screen_w: f32, screen_h: f32) {
-        if self.pet.take().is_some() {
-            self.sheet = None;
-            self.sheet_flip = None;
-            return; // was on screen → now dismissed
-        }
-        let pets = list_pets();
-        if pets.is_empty() {
-            return;
-        }
-        // Pick one at random so each summon is a surprise. A time-seeded index is
-        // plenty for "which sheep today?" — no need to pull in an rng dep.
-        let idx = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.subsec_nanos() as usize)
-            % pets.len();
-        let Some(loaded) = load_pet(&pets[idx].0) else {
-            return;
-        };
+    /// How many pets are on screen — drives the "dismiss all" menu entry.
+    #[must_use]
+    pub const fn count(&self) -> usize {
+        self.pets.len()
+    }
+
+    /// Cheap LCG for random species / grass positions.
+    const fn rand_u32(&mut self) -> u32 {
+        self.rng = self.rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        self.rng
+    }
+
+    /// Load a pet by id and build a `LivePet` at the spawn point.
+    fn build(id: &str, screen_w: f32, screen_h: f32) -> Option<LivePet> {
+        let loaded = load_pet(id)?;
         let (sw, sh) = (loaded.sheet_w, loaded.sheet_h);
         let (tw, th) = (sw / loaded.def.tilesx as f32, sh / loaded.def.tilesy as f32);
-        self.sheet = Some(Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, loaded.png)));
-        self.sheet_flip = Some(Arc::new(gpui::Image::from_bytes(
-            gpui::ImageFormat::Png,
-            loaded.png_flip,
-        )));
-        self.sheet_wh = (sw, sh);
-        self.tile_wh = (tw, th);
-        self.pet = Some(Pet::new(loaded.def, screen_w, screen_h, tw, th));
-        self.last = Instant::now();
+        Some(LivePet {
+            pet: Pet::new(loaded.def, screen_w, screen_h, tw, th),
+            sheet: Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, loaded.png)),
+            sheet_flip: Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, loaded.png_flip)),
+            sheet_wh: (sw, sh),
+            tile_wh: (tw, th),
+        })
+    }
+
+    /// Summon one more random pet — repeated calls grow the herd (no cap).
+    pub fn summon(&mut self, screen_w: f32, screen_h: f32) {
+        let choices = list_pets();
+        if choices.is_empty() {
+            return;
+        }
+        let idx = self.rand_u32() as usize % choices.len();
+        if let Some(lp) = Self::build(&choices[idx].0, screen_w, screen_h) {
+            self.pets.push(lp);
+        }
+    }
+
+    /// Auto-spawn a grazing sheep (only species that eat) to graze the grass.
+    fn spawn_grazer(&mut self, screen_w: f32, screen_h: f32) {
+        let sheep: Vec<String> = list_pets()
+            .into_iter()
+            .map(|(id, _)| id)
+            .filter(|id| id.contains("sheep"))
+            .collect();
+        if sheep.is_empty() {
+            return;
+        }
+        let idx = self.rand_u32() as usize % sheep.len();
+        if let Some(lp) = Self::build(&sheep[idx], screen_w, screen_h) {
+            self.pets.push(lp);
+        }
+    }
+
+    /// Remove every pet and all grass (a clean "dismiss all").
+    pub fn dismiss_all(&mut self) {
+        self.pets.clear();
+        self.grass.clear();
+        self.drag = None;
     }
 
     /// A measuring canvas for tab `index`'s top edge, appended to the ledge list.
@@ -790,54 +905,115 @@ impl PetOverlay {
         .size_full()
     }
 
-    /// Advance the pet by real elapsed time and build its sprite (+ a drag catcher
-    /// while held). `visible` freezes it when the window is hidden. `access` maps
-    /// the render entity back to this overlay so the drag listeners can reach it.
-    /// `None` when no pet is summoned.
-    pub fn render<V: 'static>(
-        &mut self,
-        visible: bool,
-        screen_w: f32,
-        screen_h: f32,
-        cx: &mut Context<V>,
-        access: fn(&mut V) -> &mut Self,
-    ) -> Option<gpui::AnyElement> {
-        self.pet.as_ref()?;
-        // Frame timing: real dt so walk speed is display-rate independent. Frozen
-        // while hidden — no point animating off-screen.
-        let now = Instant::now();
-        let dt_ms = (now.saturating_duration_since(self.last).as_secs_f32() * 1000.0).min(200.0);
-        self.last = now;
-        let (tw, th) = self.tile_wh;
-        if visible && let Some(pet) = self.pet.as_mut() {
-            let surfaces = self.ledges.borrow();
+    /// Grow grass on the tab-line ledges, auto-spawn grazers while there's grass,
+    /// run grazing, and tick every pet. One real-time frame of the ecosystem.
+    fn advance(&mut self, dt_ms: f32, screen_w: f32, screen_h: f32) {
+        const GROW_MS: f32 = 3500.0; // a new grass tuft this often
+        const GRASS_MAX: usize = 60; // soft cap on tufts (not pets)
+        const SPAWN_MS: f32 = 6000.0; // a new grazing sheep this often, while grass lasts
+        const EAT_RATE: f32 = 0.4; // fullness eaten per second
+
+        // Snapshot the ledges (Copy) so we can borrow `self` mutably below.
+        let ledges: Vec<Surface> = self.ledges.borrow().clone();
+
+        // 1. Sprout a grass tuft now and then at a random spot on a random ledge.
+        self.grow_accum += dt_ms;
+        if self.grow_accum >= GROW_MS {
+            self.grow_accum = 0.0;
+            if !ledges.is_empty() && self.grass.len() < GRASS_MAX {
+                let s = ledges[self.rand_u32() as usize % ledges.len()];
+                // Random fraction in 0..1 from the top 24 bits (exact in f32).
+                let f = f64::from(self.rand_u32() >> 8) as f32 / 16_777_216.0;
+                let x = (s.x1 - s.x0).max(1.0).mul_add(f, s.x0);
+                self.grass.push(Grass { x, y: s.y, amount: 1.0 });
+            }
+        }
+
+        // 2. While there's grass, a new sheep wanders in every so often (no cap;
+        //    self-limited by grass + rate). No grass ⇒ the herd stops growing.
+        if self.grass.is_empty() {
+            self.spawn_accum = 0.0;
+        } else {
+            self.spawn_accum += dt_ms;
+            if self.spawn_accum >= SPAWN_MS {
+                self.spawn_accum = 0.0;
+                self.spawn_grazer(screen_w, screen_h);
+            }
+        }
+
+        // 3. Grazing + movement per pet.
+        for i in 0..self.pets.len() {
+            let (tw, th) = self.pets[i].tile_wh;
+            if self.pets[i].pet.can_graze() {
+                let (cx, feet) = self.pets[i].pet.feet(tw, th);
+                let over = self
+                    .grass
+                    .iter()
+                    .position(|g| g.amount > 0.0 && (g.y - feet).abs() < 3.0 && (g.x - cx).abs() < tw * 0.5);
+                match (self.pets[i].pet.is_grazing(), over) {
+                    (false, Some(_)) if self.pets[i].pet.is_walking() => self.pets[i].pet.start_grazing(),
+                    (true, Some(gi)) => {
+                        self.grass[gi].amount -= dt_ms / 1000.0 * EAT_RATE;
+                        if self.grass[gi].amount <= 0.0 {
+                            self.grass.remove(gi);
+                            self.pets[i].pet.stop_grazing();
+                        }
+                    }
+                    (true, None) => self.pets[i].pet.stop_grazing(),
+                    _ => {}
+                }
+            }
             let world = World {
                 w: screen_w,
                 h: screen_h,
                 tile_w: tw,
                 tile_h: th,
-                surfaces: &surfaces,
+                surfaces: &ledges,
             };
-            pet.tick(dt_ms, &world);
+            self.pets[i].pet.tick(dt_ms, &world);
         }
-        // Face the way it's moving: the mirrored sheet when flipped (facing right),
-        // the normal one otherwise. Both are tile-aligned, so the `(col, row)`
-        // offsets are unchanged.
-        let pet = self.pet.as_ref()?;
-        let sheet = if pet.flipped() {
-            self.sheet_flip.as_ref()
-        } else {
-            self.sheet.as_ref()
-        }?;
-        let (col, row) = pet.current_tile();
-        let (x, y) = pet.pos();
-        let (sw, sh) = self.sheet_wh;
-        let dragging = pet.is_dragging();
+    }
 
-        // Sprite tile: a tile-sized window clipping the sheet. `.occlude()` so a
-        // click on the pet grabs it (drag) instead of leaking into a terminal text
-        // selection; the tiny footprint leaves the rest of the screen selectable.
-        let sprite = div()
+    /// A little green tuft drawn on a ledge; its height tracks how much is left.
+    fn grass_tuft(g: Grass) -> gpui::AnyElement {
+        let h = (g.amount * 9.0).clamp(2.0, 9.0);
+        let green = gpui::rgb(0x4f_9d_3a);
+        let blade = move |dx: f32, bh: f32| {
+            div()
+                .absolute()
+                .left(px(dx))
+                .bottom(px(0.0))
+                .w(px(2.0))
+                .h(px(bh))
+                .rounded_full()
+                .bg(green)
+        };
+        div()
+            .absolute()
+            .left(px(g.x - 5.0))
+            .top(px(g.y - h))
+            .w(px(10.0))
+            .h(px(h))
+            .child(blade(1.0, h * 0.75))
+            .child(blade(4.0, h))
+            .child(blade(7.0, h * 0.65))
+            .into_any_element()
+    }
+
+    /// The clickable sprite for one pet (index `i`), facing the way it moves.
+    fn pet_sprite<V: 'static>(
+        i: usize,
+        lp: &LivePet,
+        cx: &mut Context<V>,
+        access: fn(&mut V) -> &mut Self,
+    ) -> gpui::AnyElement {
+        let (tw, th) = lp.tile_wh;
+        let (sw, sh) = lp.sheet_wh;
+        let (col, row) = lp.pet.current_tile();
+        let (x, y) = lp.pet.pos();
+        let dragging = lp.pet.is_dragging();
+        let sheet = if lp.pet.flipped() { &lp.sheet_flip } else { &lp.sheet };
+        div()
             .absolute()
             .left(px(x))
             .top(px(y))
@@ -854,10 +1030,10 @@ impl PetOverlay {
                 gpui::MouseButton::Left,
                 cx.listener(move |this, ev: &gpui::MouseDownEvent, _window, cx| {
                     let o = access(this);
-                    if let Some(pet) = o.pet.as_mut() {
-                        let (px_, py_) = pet.pos();
-                        pet.grab();
-                        o.drag = Some((f32::from(ev.position.x) - px_, f32::from(ev.position.y) - py_));
+                    if let Some(lp) = o.pets.get_mut(i) {
+                        let (px_, py_) = lp.pet.pos();
+                        lp.pet.grab();
+                        o.drag = Some((i, (f32::from(ev.position.x) - px_, f32::from(ev.position.y) - py_)));
                         cx.notify();
                     }
                 }),
@@ -869,20 +1045,45 @@ impl PetOverlay {
                     .top(px(-(row as f32) * th))
                     .w(px(sw))
                     .h(px(sh)),
-            );
+            )
+            .into_any_element()
+    }
 
-        let mut wrap = div()
-            .absolute()
-            .top_0()
-            .left_0()
-            .w(px(screen_w))
-            .h(px(screen_h))
-            .child(sprite);
+    /// Advance the herd + grass and build the overlay: grass tufts, every pet's
+    /// sprite, and a full-window drag catcher for whichever pet is held. `visible`
+    /// freezes it when the window is hidden; `access` maps the render entity back
+    /// to this overlay for the drag listeners. `None` when nothing is on screen.
+    pub fn render<V: 'static>(
+        &mut self,
+        visible: bool,
+        screen_w: f32,
+        screen_h: f32,
+        cx: &mut Context<V>,
+        access: fn(&mut V) -> &mut Self,
+    ) -> Option<gpui::AnyElement> {
+        if self.pets.is_empty() && self.grass.is_empty() {
+            return None;
+        }
+        // Frame timing: real dt so speeds are display-rate independent. Frozen
+        // while hidden — no point animating off-screen.
+        let now = Instant::now();
+        let dt_ms = (now.saturating_duration_since(self.last).as_secs_f32() * 1000.0).min(200.0);
+        self.last = now;
+        if visible {
+            self.advance(dt_ms, screen_w, screen_h);
+        }
 
-        // While a drag is live, track the mouse across the whole window and release
-        // on mouse-up — a full-window transparent catcher so the pointer needn't
-        // stay inside the tiny sprite box.
-        if dragging {
+        let mut wrap = div().absolute().top_0().left_0().w(px(screen_w)).h(px(screen_h));
+        for g in &self.grass {
+            wrap = wrap.child(Self::grass_tuft(*g));
+        }
+        for (i, lp) in self.pets.iter().enumerate() {
+            wrap = wrap.child(Self::pet_sprite(i, lp, cx, access));
+        }
+
+        // Full-window catcher for the held pet, so the pointer needn't stay inside
+        // the tiny sprite box while dragging.
+        if let Some((di, _)) = self.drag {
             wrap = wrap.child(
                 div()
                     .absolute()
@@ -894,10 +1095,12 @@ impl PetOverlay {
                     .cursor(gpui::CursorStyle::ClosedHand)
                     .on_mouse_move(cx.listener(move |this, ev: &gpui::MouseMoveEvent, _window, cx| {
                         let o = access(this);
-                        if let (Some(off), Some(pet)) = (o.drag, o.pet.as_mut()) {
+                        if let (Some((idx, off)), Some(lp)) = (o.drag, o.pets.get_mut(di)) {
+                            let (tw, th) = lp.tile_wh;
                             let nx = (f32::from(ev.position.x) - off.0).clamp(0.0, (screen_w - tw).max(0.0));
                             let ny = (f32::from(ev.position.y) - off.1).clamp(0.0, (screen_h - th).max(0.0));
-                            pet.set_pos(nx, ny);
+                            debug_assert_eq!(idx, di);
+                            lp.pet.set_pos(nx, ny);
                             cx.notify();
                         }
                     }))
@@ -905,8 +1108,8 @@ impl PetOverlay {
                         gpui::MouseButton::Left,
                         cx.listener(move |this, _ev: &gpui::MouseUpEvent, _window, cx| {
                             let o = access(this);
-                            if let Some(pet) = o.pet.as_mut() {
-                                pet.release();
+                            if let Some(lp) = o.pets.get_mut(di) {
+                                lp.pet.release();
                             }
                             o.drag = None;
                             cx.notify();
@@ -1470,6 +1673,110 @@ mod tests {
             (pet.pos().1 + th - h).abs() < 2.0,
             "dropped pet fell to the floor (y={})",
             pet.pos().1
+        );
+    }
+
+    #[test]
+    fn sheep_grazes_owl_does_not() {
+        let sheep = load_pet("blue_sheep").expect("sheep");
+        assert!(
+            Pet::new(sheep.def, 800.0, 600.0, 40.0, 40.0).can_graze(),
+            "sheep grazes"
+        );
+        let owl = load_pet("owl").expect("owl");
+        assert!(
+            !Pet::new(owl.def, 800.0, 600.0, 49.0, 49.0).can_graze(),
+            "owl doesn't graze"
+        );
+    }
+
+    #[test]
+    fn grazing_holds_the_pet_in_place() {
+        let lp = load_pet("blue_sheep").expect("sheep");
+        let (tw, th) = (lp.sheet_w / lp.def.tilesx as f32, lp.sheet_h / lp.def.tilesy as f32);
+        let mut pet = Pet::new(lp.def, 800.0, 600.0, tw, th);
+        pet.set_pos(300.0, 200.0);
+        pet.start_grazing();
+        assert!(pet.is_grazing() && !pet.is_walking());
+        let before = pet.pos();
+        for _ in 0..80 {
+            pet.tick(30.0, &bare_world(800.0, 600.0, tw));
+        }
+        assert_eq!(pet.pos(), before, "grazes in place — no movement or transitions");
+        assert!(pet.is_grazing(), "keeps grazing until told to stop");
+        pet.stop_grazing();
+        assert!(!pet.is_grazing() && pet.is_walking());
+    }
+
+    #[test]
+    fn summon_grows_the_herd_dismiss_clears_it() {
+        let mut ov = PetOverlay::default();
+        assert!(!ov.is_active() && ov.count() == 0);
+        ov.summon(1000.0, 700.0);
+        ov.summon(1000.0, 700.0);
+        ov.summon(1000.0, 700.0);
+        assert_eq!(ov.count(), 3, "each summon adds one (no cap)");
+        assert!(ov.is_active());
+        ov.dismiss_all();
+        assert_eq!(ov.count(), 0);
+        assert!(ov.grass.is_empty(), "dismiss-all clears the grass too");
+    }
+
+    #[test]
+    fn grass_grows_on_the_tab_ledges() {
+        let mut ov = PetOverlay::default();
+        ov.ledges.borrow_mut().push(Surface {
+            y: 120.0,
+            x0: 0.0,
+            x1: 500.0,
+        });
+        // ~4.8 s of sim: past the grow interval, so at least one tuft sprouts.
+        for _ in 0..300 {
+            ov.advance(16.0, 1000.0, 700.0);
+        }
+        assert!(!ov.grass.is_empty(), "grass sprouted on the ledge");
+        assert!(
+            ov.grass
+                .iter()
+                .all(|g| (g.y - 120.0).abs() < 0.1 && (0.0..=500.0).contains(&g.x)),
+            "every tuft sits on the ledge line"
+        );
+    }
+
+    #[test]
+    fn a_sheep_eats_a_grass_tuft() {
+        let mut ov = PetOverlay::default();
+        let (w, h) = (1000.0f32, 700.0f32);
+        ov.ledges.borrow_mut().push(Surface {
+            y: 120.0,
+            x0: 0.0,
+            x1: 500.0,
+        });
+        let mut lp = PetOverlay::build("blue_sheep", w, h).expect("sheep");
+        let (tw, th) = lp.tile_wh;
+        lp.pet.set_pos(tw.mul_add(-0.5, 200.0), 120.0 - th); // feet at (200, 120), on the ledge
+        ov.pets.push(lp);
+        ov.grass.push(Grass {
+            x: 200.0,
+            y: 120.0,
+            amount: 1.0,
+        }); // right under its mouth
+
+        let mut grazed = false;
+        for _ in 0..220 {
+            // ~3.5 s — long enough to eat one tuft, short of a second sprout
+            ov.advance(16.0, w, h);
+            if ov.pets[0].pet.is_grazing() {
+                grazed = true;
+            }
+            if ov.grass.is_empty() {
+                break;
+            }
+        }
+        assert!(grazed, "the sheep stopped to graze");
+        assert!(
+            ov.grass.iter().all(|g| (g.x - 200.0).abs() > 1.0),
+            "the tuft it was eating is gone"
         );
     }
 }
