@@ -341,6 +341,12 @@ struct AppState {
     /// sprite stays under the cursor at the point it was picked up.
     #[cfg(feature = "pets")]
     pet_drag: Option<(f32, f32)>,
+    /// Top-y of the (bottom-anchored, wrapping) tab bar, captured each paint by a
+    /// measuring canvas and read one frame later so the pet can walk along that
+    /// line as a ledge. `f32::MAX` until first measured. `Rc<Cell>` because the
+    /// canvas paint closure is `'static` and can't borrow `self`.
+    #[cfg(feature = "pets")]
+    tab_bar_top: Rc<std::cell::Cell<f32>>,
     /// When set, tab names render as solid redaction bars instead of text.
     /// Flipped on only for the duration of a "Screenshot (redacted)" capture so
     /// the real names never reach the pixel buffer — nothing to reverse.
@@ -918,6 +924,8 @@ impl AppState {
             pet_last: std::time::Instant::now(),
             #[cfg(feature = "pets")]
             pet_drag: None,
+            #[cfg(feature = "pets")]
+            tab_bar_top: Rc::new(std::cell::Cell::new(f32::MAX)),
             screenshot_censor: false,
             renaming: None,
             rename_select_all: false,
@@ -4201,6 +4209,24 @@ impl Render for AppState {
         #[cfg(not(feature = "energy"))]
         let battery: Option<u8> = None;
         let tab_bar = self.render_tab_bar(battery, window, cx);
+        // Measure the tab bar's top edge each paint so the pet can walk along it
+        // as a ledge (the "multi-level garden"). An absolute, full-size canvas
+        // reports the bar's laid-out bounds without disturbing the tab layout;
+        // its origin.y is read one frame later in the pet tick.
+        #[cfg(feature = "pets")]
+        let tab_bar = {
+            let top = self.tab_bar_top.clone();
+            tab_bar.relative().child(
+                gpui::canvas(
+                    move |bounds, _, _| top.set(f32::from(bounds.origin.y)),
+                    |_, (), _, _| {},
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full(),
+            )
+        };
         let context_menu = if self.renaming.is_none()
             && self.exit_confirm.is_none()
             && self.close_confirm.is_none()
@@ -4419,17 +4445,30 @@ impl Render for AppState {
             let vp = window.viewport_size();
             let (vw, vh) = (f32::from(vp.width), f32::from(vp.height));
             let (tw, th) = self.pet_tile_wh;
+            // Ledges the pet can perch on, beyond the implicit floor/walls/ceiling:
+            // the top edge of the (bottom-anchored) tab bar, measured last paint.
+            // The pet lands on it from above and walks it as a second level.
+            let tab_top = self.tab_bar_top.get();
+            let ledge;
+            let surfaces: &[crate::pet::Surface] = if tab_top.is_finite() && tab_top > th && tab_top < vh {
+                ledge = [crate::pet::Surface {
+                    y: tab_top,
+                    x0: 0.0,
+                    x1: vw,
+                }];
+                &ledge
+            } else {
+                &[]
+            };
             if self.visible
                 && let Some(pet) = self.pet.as_mut()
             {
-                // Ledges the pet can perch on. The screen floor/walls/ceiling are
-                // implicit; extra UI lines (tab bar, …) go here — TODO.
                 let world = crate::pet::World {
                     w: vw,
                     h: vh,
                     tile_w: tw,
                     tile_h: th,
-                    surfaces: &[],
+                    surfaces,
                 };
                 pet.tick(dt_ms, &world);
             }
