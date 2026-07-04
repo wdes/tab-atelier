@@ -35,6 +35,20 @@ use gpui::{
     WindowBackgroundAppearance, WindowHandle, WindowOptions, div, px, rgba,
 };
 use log::{debug, info};
+
+/// Which capture the screenshot menu requested.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScreenshotMode {
+    /// The terminal only (tab bar cropped off).
+    Tab,
+    /// The whole window.
+    App,
+    /// The whole window, but with every tab name painted over by a solid
+    /// redaction bar *before* the frame is captured — so the real names never
+    /// reach the image and can't be recovered.
+    Redacted,
+}
+
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -324,6 +338,10 @@ struct AppState {
     /// sprite stays under the cursor at the point it was picked up.
     #[cfg(feature = "pets")]
     pet_drag: Option<(f32, f32)>,
+    /// When set, tab names render as solid redaction bars instead of text.
+    /// Flipped on only for the duration of a "Screenshot (redacted)" capture so
+    /// the real names never reach the pixel buffer — nothing to reverse.
+    screenshot_censor: bool,
     renaming: Option<(usize, String)>,
     rename_select_all: bool,
     rename_focus: FocusHandle,
@@ -891,6 +909,7 @@ impl AppState {
             pet_last: std::time::Instant::now(),
             #[cfg(feature = "pets")]
             pet_drag: None,
+            screenshot_censor: false,
             renaming: None,
             rename_select_all: false,
             rename_focus,
@@ -1786,8 +1805,18 @@ impl AppState {
         cx.quit();
     }
 
-    fn do_screenshot(&mut self, full: bool, cx: &mut Context<Self>) {
-        let tab_name = self.tabs[self.active].name.clone();
+    fn do_screenshot(&mut self, mode: ScreenshotMode, cx: &mut Context<Self>) {
+        // Redacted shots must not leak the name via the filename either.
+        let tab_name = if mode == ScreenshotMode::Redacted {
+            "redacted".to_string()
+        } else {
+            self.tabs[self.active].name.clone()
+        };
+        // Turn tab names into redaction bars for this capture. The frame renders
+        // censored (below, via `cx.notify()`), we wait, capture, then clear it.
+        if mode == ScreenshotMode::Redacted {
+            self.screenshot_censor = true;
+        }
         let progress_time = std::time::Instant::now();
         self.toasts.push(Toast {
             message: self.t().taking_screenshot.into(),
@@ -1807,15 +1836,16 @@ impl AppState {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    if full {
-                        screenshot::take_screenshot_full(&tab_name)
-                    } else {
-                        screenshot::take_screenshot_tab(&tab_name, 32)
+                    match mode {
+                        ScreenshotMode::Tab => screenshot::take_screenshot_tab(&tab_name, 32),
+                        ScreenshotMode::App | ScreenshotMode::Redacted => screenshot::take_screenshot_full(&tab_name),
                     }
                 })
                 .await;
             let toast_time = std::time::Instant::now();
             let _ = this.update(cx, |state, cx| {
+                // Names back to normal now that the frame's been captured.
+                state.screenshot_censor = false;
                 let t = state.t();
                 let (msg, path) = match result {
                     Ok(path) => (t.saved.to_string(), Some(path)),
@@ -2098,7 +2128,13 @@ impl AppState {
                     this.move_tab(dragged.idx, i, window, cx);
                 }))
                 .when_some(agent_led, ParentElement::child)
-                .child(name);
+                .child(if self.screenshot_censor {
+                    // Solid opaque bar over the name — an irreversible redaction
+                    // (the text is never drawn), not a reversible blur.
+                    div().w(px(72.0)).h(px(14.0)).rounded_sm().bg(tab_fg).into_any_element()
+                } else {
+                    name.into_any_element()
+                });
 
             #[cfg(feature = "energy")]
             let tab_el = tab_el.child(
@@ -2752,7 +2788,7 @@ impl AppState {
                         MouseButton::Left,
                         cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
                             this.context_menu = None;
-                            this.do_screenshot(false, cx);
+                            this.do_screenshot(ScreenshotMode::Tab, cx);
                         }),
                     )
                     .child(self.t().screenshot_tab),
@@ -2768,10 +2804,26 @@ impl AppState {
                         MouseButton::Left,
                         cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
                             this.context_menu = None;
-                            this.do_screenshot(true, cx);
+                            this.do_screenshot(ScreenshotMode::App, cx);
                         }),
                     )
                     .child(self.t().screenshot_app),
+            )
+            .child(
+                div()
+                    .id("menu-screenshot-redacted")
+                    .px(px(12.0))
+                    .py(px(4.0))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(menu_hover))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                            this.context_menu = None;
+                            this.do_screenshot(ScreenshotMode::Redacted, cx);
+                        }),
+                    )
+                    .child(self.t().screenshot_redacted),
             )
             // Window section
             .child(sep())
