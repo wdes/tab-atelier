@@ -499,8 +499,20 @@ pub fn agent_launch_shell_suffix(kind: &str, session_id: &str, plan: Option<bool
 /// without `strace` still launches agents normally. Call sites use this
 /// in place of the plain builder; the plain one stays pure for the unit
 /// tests and any caller that must never be traced.
+///
+/// `proctitle` sets the launched process's `argv[0]` (via bash/zsh
+/// `exec -a`), which the agent runtime turns into its `comm` — so
+/// `top -H` / `ps` show the tab name instead of a wall of identical
+/// `claude`s. Pass `None` (or a shell that lacks `exec -a`, see
+/// [`shell_supports_exec_a`]) to skip it. Names the outermost program:
+/// `claude` normally, or the `strace` wrapper when tracing is on.
 #[must_use]
-pub fn agent_launch_shell_suffix_instrumented(kind: &str, session_id: &str, plan: Option<bool>) -> Option<Vec<String>> {
+pub fn agent_launch_shell_suffix_instrumented(
+    kind: &str,
+    session_id: &str,
+    plan: Option<bool>,
+    proctitle: Option<&str>,
+) -> Option<Vec<String>> {
     let cmd = build_agent_resume_command(kind, session_id, plan)?;
     let trace = agent_probe::resolve_tracer().map(|tracer| {
         let base = agent_probe::state_base();
@@ -513,25 +525,42 @@ pub fn agent_launch_shell_suffix_instrumented(kind: &str, session_id: &str, plan
     Some(vec![
         "-i".to_string(),
         "-c".to_string(),
-        wrap_exec_command(&cmd, trace.as_ref()),
+        wrap_exec_command(&cmd, trace.as_ref(), proctitle),
     ])
 }
 
-/// Build the `exec …` string handed to `sh -c`, optionally prefixing a
-/// `(tracer, log_path)` so the agent runs under `strace -f -c -o <log>`.
-/// Pure — the unit-testable core of the tracer wrap.
+/// True when `shell_path`'s `exec` builtin accepts `-a argv0`.
+///
+/// bash and zsh do; dash/POSIX `sh` and fish don't, so callers skip the
+/// proctitle and launch with a plain `exec` there (a bad `-a` would fail
+/// the launch).
 #[must_use]
-fn wrap_exec_command(cmd: &str, trace: Option<&(String, String)>) -> String {
-    match trace {
+pub fn shell_supports_exec_a(shell_path: &str) -> bool {
+    matches!(
+        std::path::Path::new(shell_path).file_name().and_then(|s| s.to_str()),
+        Some("bash" | "zsh")
+    )
+}
+
+/// Build the `exec …` string handed to `sh -c`. Optionally runs the agent
+/// under `strace -f -c -o <log>` (`trace`) and/or sets its `argv[0]` via
+/// `exec -a <title>` (`proctitle`). Pure — the unit-testable core.
+#[must_use]
+fn wrap_exec_command(cmd: &str, trace: Option<&(String, String)>, proctitle: Option<&str>) -> String {
+    let program = match trace {
         Some((tracer, log)) => {
             format!(
-                "exec {} -f -c -o {} {cmd}",
+                "{} -f -c -o {} {cmd}",
                 agent_probe::sh_squote(tracer),
                 agent_probe::sh_squote(log)
             )
         }
-        None => format!("exec {cmd}"),
-    }
+        None => cmd.to_string(),
+    };
+    proctitle.map_or_else(
+        || format!("exec {program}"),
+        |title| format!("exec -a {} {program}", agent_probe::sh_squote(title)),
+    )
 }
 
 /// Install a file-backed logger for the windowed GUI.
@@ -2559,14 +2588,41 @@ mod tests {
 
     #[test]
     fn wrap_exec_command_prefixes_tracer_when_present() {
-        // No tracer → identical to the plain suffix's exec line.
-        assert_eq!(wrap_exec_command("claude --resume x", None), "exec claude --resume x");
+        // No tracer, no title → identical to the plain suffix's exec line.
+        assert_eq!(
+            wrap_exec_command("claude --resume x", None, None),
+            "exec claude --resume x"
+        );
         // With a tracer → strace counts syscalls, output to the quoted log.
         let trace = ("/usr/bin/strace".to_string(), "/var/lib/tab-atelier/t.txt".to_string());
         assert_eq!(
-            wrap_exec_command("claude --resume x", Some(&trace)),
+            wrap_exec_command("claude --resume x", Some(&trace), None),
             "exec '/usr/bin/strace' -f -c -o '/var/lib/tab-atelier/t.txt' claude --resume x"
         );
+    }
+
+    #[test]
+    fn wrap_exec_command_sets_proctitle_via_exec_a() {
+        // proctitle → argv[0] override so the process shows the tab name.
+        assert_eq!(
+            wrap_exec_command("claude --resume x", None, Some("my tab")),
+            "exec -a 'my tab' claude --resume x"
+        );
+        // Combined with the tracer, the title names the outermost program.
+        let trace = ("/usr/bin/strace".to_string(), "/s/t.txt".to_string());
+        assert_eq!(
+            wrap_exec_command("claude --resume x", Some(&trace), Some("oa3")),
+            "exec -a 'oa3' '/usr/bin/strace' -f -c -o '/s/t.txt' claude --resume x"
+        );
+    }
+
+    #[test]
+    fn shell_exec_a_support() {
+        assert!(shell_supports_exec_a("/bin/bash"));
+        assert!(shell_supports_exec_a("/usr/bin/zsh"));
+        assert!(!shell_supports_exec_a("/bin/dash"));
+        assert!(!shell_supports_exec_a("/usr/bin/fish"));
+        assert!(!shell_supports_exec_a("/bin/sh"));
     }
 
     #[test]
