@@ -6314,6 +6314,7 @@ dependencies = [
  "polling",
  "qrcode",
  "rcgen",
+ "roxmltree",
  "rustls",
  "rustls-pemfile",
  "serde",

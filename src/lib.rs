@@ -33,6 +33,8 @@ pub mod net_nft;
 pub mod net_policy;
 #[cfg(all(target_os = "linux", not(feature = "gui")))]
 pub mod net_resolver;
+#[cfg(feature = "pets")]
+pub mod pet;
 pub(crate) mod platform;
 #[cfg(feature = "energy")]
 pub(crate) mod power;

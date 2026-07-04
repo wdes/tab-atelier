@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""Bake eSheep pet assets for the `pets` feature.
+
+The upstream desktopPet / eSheep pets ship a single self-contained XML with the
+sprite sheet embedded as base64 inside `<png>…</png>` and (for the sheep) a
+Magenta colour-key instead of an alpha channel. Shipping those verbatim is huge
+(~318 KB/sheep) and forces the runtime to base64-decode, PNG-decode, colour-key
+and re-encode on every summon.
+
+This one-shot pass moves all of that offline:
+
+  * extract the embedded sprite,
+  * key the `<transparency>` colour (Magenta/Black/White) to alpha — unless the
+    sheet already has an alpha channel (the owl), in which case it's left as-is,
+  * palette-quantize (pixel art uses a tiny palette — the sheep need ~36 colours,
+    so this is lossless in practice) and write a binary `assets/pets/<id>.png`,
+  * strip the base64 blob out of the XML and minify inter-tag whitespace.
+
+Result: ~144 KB/sheep (was 318), and the runtime just reads a plain PNG + XML —
+no image/base64 crates in the shipped binary.
+
+Idempotent: once an XML has an empty `<png></png>` it's skipped. To re-bake from
+scratch, restore the original embedded-sprite XMLs first (from the desktopPet
+repo, or the owl the maintainer provided). Requires Pillow.
+
+    python3 tools/bake-pets
+"""
+
+import base64
+import glob
+import io
+import os
+import re
+import sys
+
+try:
+    from PIL import Image
+except ImportError:
+    sys.exit("this script needs Pillow: pip install Pillow")
+
+KEYS = {"magenta": (255, 0, 255), "black": (0, 0, 0), "white": (255, 255, 255)}
+ROOT = os.path.join(os.path.dirname(__file__), "..", "assets", "pets")
+
+
+def bake(xml_path):
+    stem = os.path.splitext(os.path.basename(xml_path))[0]
+    xml = open(xml_path).read()
+    m = re.search(r"<png>(.*?)</png>", xml, re.S)
+    if not m:
+        return None
+    blob = "".join(m.group(1).split())
+    if not blob:
+        return None  # already baked
+
+    im = Image.open(io.BytesIO(base64.b64decode(blob))).convert("RGBA")
+    t = re.search(r"<transparency>(.*?)</transparency>", xml, re.S)
+    key = KEYS.get((t.group(1).strip().lower() if t else ""))
+    px = im.load()
+    w, h = im.size
+    has_alpha = any(px[x, y][3] < 255 for y in range(0, h, 7) for x in range(0, w, 7))
+    if key and not has_alpha:
+        for y in range(h):
+            for x in range(w):
+                r, g, b, _ = px[x, y]
+                if abs(r - key[0]) < 40 and abs(g - key[1]) < 40 and abs(b - key[2]) < 40:
+                    px[x, y] = (0, 0, 0, 0)
+
+    quant = im.quantize(colors=64, method=Image.FASTOCTREE, dither=Image.NONE)
+    qbuf = io.BytesIO()
+    quant.save(qbuf, "PNG", optimize=True)
+    obuf = io.BytesIO()
+    im.save(obuf, "PNG", optimize=True)  # fallback if quantize regresses
+    best = qbuf.getvalue() if len(qbuf.getvalue()) <= len(obuf.getvalue()) else obuf.getvalue()
+    open(os.path.join(ROOT, f"{stem}.png"), "wb").write(best)
+
+    stripped = xml[: m.start()] + "<png></png>" + xml[m.end():]
+    stripped = re.sub(r">\s+<", "><", stripped).strip()
+    open(xml_path, "w").write(stripped)
+    return stem, len(best), len(stripped)
+
+
+def main():
+    total = 0
+    for xml_path in sorted(glob.glob(os.path.join(ROOT, "*.xml"))):
+        r = bake(xml_path)
+        if r is None:
+            print(f"{os.path.basename(xml_path):16} already baked / no sprite")
+            continue
+        stem, png, xml = r
+        total += png + xml
+        print(f"{stem:16} png {png // 1024:3} KB   xml {xml // 1024:3} KB")
+    print(f"\ntotal assets/pets: {total // 1024} KB")
+
+
+if __name__ == "__main__":
+    main()

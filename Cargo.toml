@@ -44,13 +44,19 @@ path = "src/bin/tab-atelier-headless.rs"
 required-features = ["headless"]
 
 [features]
-default = ["gui", "energy", "catbus"]
+default = ["gui", "energy", "catbus", "pets"]
 # Desktop GUI build: gpui + x11rb (hotkeys + screenshot) + qrcode.
 # Does NOT pull `catbus` — the GUI uses catbus on Linux, but a Windows
 # desktop build must drop it (catbus_agent uses AF_UNIX + /proc).
 # `catbus` is in the `default` feature instead, so Linux builds keep it
 # while `--no-default-features --features gui` on Windows omits it.
 gui = ["dep:gpui", "dep:x11rb", "dep:qrcode"]
+# Desktop-only "screen mate" — eSheep-compatible pets (the Mini Owl, rainbow
+# sheep, Blue Ham Ham) whose sprite sheets + animation XML are shipped in the
+# repo, installed under /usr/share/tab-atelier/pets/, and animated in a gpui
+# overlay. Sprites are baked (alpha-keyed + palette-quantized) at build time by
+# tools/bake-pets, so the runtime only needs the roxmltree XML parser.
+pets = ["gui", "dep:roxmltree"]
 # Display-less variant: only the API server + PTY-driven tab restore.
 # Selected with `--no-default-features --features headless[,...]`.
 headless = []
@@ -99,6 +105,11 @@ needless_pass_by_ref_mut = "allow"
 # `unsafe` in our code (the impl lives in the crate); edition-2024-clean (no
 # `malloc_conf` export needed, unlike jemalloc).
 mimalloc = { version = "0.1", default-features = false }
+# eSheep pet (the `pets` feature only) — pinned to a copy already in the tree
+# (via resvg / gpui) so it adds no extra download. roxmltree parses the animation
+# XML. Sprite decode/alpha-keying/quantization all happen offline in
+# tools/bake-pets, so no image/base64 dep leaks into the shipped binary.
+roxmltree = { version = "0.20", optional = true }
 alacritty_terminal = "0.26"
 # Same `polling` alacritty pulls in transitively; promoted to a direct
 # dep so we can implement `EventedReadWrite` on our PTY tap wrapper
@@ -300,6 +311,11 @@ assets = [
     # OpenAPI 3.1 spec for the local HTTP API (also served live at
     # GET /openapi.yaml). Point Swagger UI / codegen at it.
     ["assets/openapi.yaml", "/usr/share/doc/tab-atelier/", "644"],
+    # eSheep pets (the `pets` feature): a baked sprite sheet (<id>.png, alpha-keyed
+    # + palette-quantized) beside its animation XML (<id>.xml), loaded at runtime
+    # from here (dev falls back to ./assets/pets/).
+    ["assets/pets/*.xml", "/usr/share/tab-atelier/pets/", "644"],
+    ["assets/pets/*.png", "/usr/share/tab-atelier/pets/", "644"],
 ]
 # Per debian-policy §10.7.2, conffiles are files in /etc that dpkg
 # treats as user-modifiable: on upgrade, dpkg prompts the admin if
