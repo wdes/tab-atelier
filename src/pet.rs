@@ -1134,6 +1134,55 @@ mod tests {
     }
 
     #[test]
+    fn ascii_pet_at_every_screen_position() {
+        // Drive the pet to each canonical spot — corners, walls, ceiling, floor,
+        // centre — and confirm its `pos()` renders into the right ASCII cell.
+        // `grab()` freezes physics so `set_pos` sticks and the frame is exactly
+        // where we put it. Prints an ASCII graph per position (🐑 = pet).
+        use std::fmt::Write as _;
+        let lp = load_pet("owl").expect("owl assets");
+        let (w, h) = (200.0f32, 120.0f32);
+        let (tw, th) = (40.0f32, 40.0f32);
+        let (cols, rows) = ((w / tw) as usize, (h / th) as usize); // 5 × 3
+        let mut pet = Pet::new(lp.def, w, h, tw, th);
+        pet.grab();
+
+        let spots = [
+            ("top-left corner", 0.0, 0.0),
+            ("ceiling middle", (w - tw) / 2.0, 0.0),
+            ("top-right corner", w - tw, 0.0),
+            ("left wall middle", 0.0, (h - th) / 2.0),
+            ("dead centre", (w - tw) / 2.0, (h - th) / 2.0),
+            ("right wall middle", w - tw, (h - th) / 2.0),
+            ("bottom-left corner", 0.0, h - th),
+            ("floor middle", (w - tw) / 2.0, h - th),
+            ("bottom-right corner", w - tw, h - th),
+        ];
+
+        let mut out = String::new();
+        for (label, x, y) in spots {
+            pet.set_pos(x, y);
+            let (px_, py_) = pet.pos();
+            assert!(
+                (px_ - x).abs() < 0.01 && (py_ - y).abs() < 0.01,
+                "{label}: position round-trips"
+            );
+            let pc = ((tw.mul_add(0.5, px_) / tw) as usize).min(cols - 1);
+            let pr = ((py_ / th) as usize).min(rows - 1);
+            let grid: Vec<String> = (0..rows)
+                .map(|r| (0..cols).map(|c| if r == pr && c == pc { '🐑' } else { '·' }).collect())
+                .collect();
+            let _ = writeln!(out, "{label} ({x},{y}):\n{}\n", grid.join("\n"));
+            let n = grid.iter().flat_map(|s| s.chars()).filter(|&ch| ch == '🐑').count();
+            assert_eq!(n, 1, "{label}: pet renders in exactly one cell");
+            let ecol = ((tw.mul_add(0.5, x) / tw) as usize).min(cols - 1);
+            let erow = ((y / th) as usize).min(rows - 1);
+            assert_eq!((pr, pc), (erow, ecol), "{label}: rendered at the expected cell");
+        }
+        eprintln!("\n{out}");
+    }
+
+    #[test]
     fn thrown_pet_recovers_to_walking() {
         // Regression: throwing a pet up must not leave it stuck in a fall pose
         // (the sheep's `fall_face`) on the ground. After it settles it should be
