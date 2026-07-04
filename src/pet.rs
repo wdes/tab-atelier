@@ -14,7 +14,7 @@
 //! animation's per-step motion and its edge/gravity transitions. Extra [`Surface`]
 //! ledges (the tab bar, …) let it hop between levels. The gpui overlay in
 //! `app.rs` reads [`Pet::current_tile`] / [`Pet::pos`] each frame, clips the sheet
-//! to the active tile, and can [`Pet::grab`]/[`Pet::drop`] it for drag-and-drop.
+//! to the active tile, and can [`Pet::grab`]/[`Pet::release`] it for drag-and-drop.
 //!
 //! Dead-end animations (empty `<next>`) are desktopPet's death/kill/effect
 //! sequences (`alien_kill`, `blank_die`, …) that end the pet's life via a
@@ -76,6 +76,13 @@ pub struct PetDef {
     anims: HashMap<u32, Anim>,
     /// Animation to start in (the `walk` id, or the lowest id as a fallback).
     start: u32,
+    /// The `fall` named animation, if any — desktopPet's `Fall` key, played when
+    /// the pet is released from a drag so it drops instead of resuming whatever
+    /// (e.g. wall-climbing) animation it was grabbed in.
+    fall: Option<u32>,
+    /// Astonished/held animation played while grabbed — desktopPet's `drag` key,
+    /// or `scream` as a stand-in. `None` ⇒ the pet just freezes its current frame.
+    grabbed: Option<u32>,
     /// Whether any animation has a `<gravity>` fall. Pets without one (the owl)
     /// get a synthetic downward drift when airborne so a dropped pet doesn't
     /// hover; pets with one are left to their own aerial animations.
@@ -111,12 +118,18 @@ impl PetDef {
         let mut anims: HashMap<u32, Anim> = HashMap::new();
         let mut start = u32::MAX;
         let mut walk_id = None;
+        let mut fall_id = None;
+        let (mut drag_id, mut scream_id) = (None, None);
         for a in anims_node.children().filter(|n| n.has_tag_name("animation")) {
             let Some(id) = a.attribute("id").and_then(|s| s.parse::<u32>().ok()) else {
                 continue;
             };
-            if child(a, "name").as_deref() == Some("walk") {
-                walk_id = Some(id);
+            match child(a, "name").as_deref() {
+                Some("walk") => walk_id = Some(id),
+                Some("fall") => fall_id = Some(id),
+                Some("drag") => drag_id = Some(id),
+                Some("scream") => scream_id = Some(id),
+                _ => {}
             }
             let seq = a.children().find(|n| n.has_tag_name("sequence"));
             let frames: Vec<u32> = seq.map_or_else(Vec::new, |s| {
@@ -206,6 +219,8 @@ impl PetDef {
             tilesx,
             tilesy,
             start: walk_id.unwrap_or(start),
+            fall: fall_id,
+            grabbed: drag_id.or(scream_id),
             anims,
             has_gravity,
         })
@@ -508,9 +523,15 @@ impl Pet {
         cur.next.first().map(|&(_, id)| id)
     }
 
-    /// Begin a drag: freeze physics until [`Pet::drop`].
+    /// Begin a drag: freeze physics until [`Pet::release`].
     pub const fn grab(&mut self) {
         self.dragging = true;
+        // Look astonished while held (desktopPet's `drag`, or `scream`). Physics
+        // is frozen during the drag, so this just shows the surprised frame.
+        if let Some(g) = self.def.grabbed {
+            self.anim = g;
+            self.frame_i = 0;
+        }
     }
 
     /// Move the pet to a top-left position (used while dragging).
@@ -519,9 +540,15 @@ impl Pet {
         self.y = y;
     }
 
-    /// Release a drag: gravity takes over on the next tick.
-    pub const fn drop(&mut self) {
+    /// Release a drag. Switch into the `fall` animation (or the start animation
+    /// for pets without one) so the pet drops under gravity from wherever it was
+    /// let go — instead of resuming the (e.g. wall-climbing) animation it was
+    /// grabbed in and "walking a wall" in mid-air. On the floor, the fall resolves
+    /// straight back to walking (see the grounded-fall check in `step`).
+    pub fn release(&mut self) {
         self.dragging = false;
+        self.anim = self.def.fall.unwrap_or(self.def.start);
+        self.frame_i = 0;
     }
 
     #[must_use]
@@ -879,7 +906,7 @@ impl PetOverlay {
                         cx.listener(move |this, _ev: &gpui::MouseUpEvent, _window, cx| {
                             let o = access(this);
                             if let Some(pet) = o.pet.as_mut() {
-                                pet.drop();
+                                pet.release();
                             }
                             o.drag = None;
                             cx.notify();
@@ -1051,7 +1078,7 @@ mod tests {
             let mut pet = Pet::new(lp.def, w, h, tw, th);
             pet.grab();
             pet.set_pos(w * 0.5, 30.0);
-            pet.drop();
+            pet.release();
             for _ in 0..800 {
                 pet.tick(
                     30.0,
@@ -1122,7 +1149,7 @@ mod tests {
         let mut pet = Pet::new(lp.def, w, h, tw, th);
         pet.grab();
         pet.set_pos(84.0, 0.0); // released above the ledge
-        pet.drop();
+        pet.release();
 
         let mut on_ledge = false;
         let mut movie = String::new();
@@ -1360,7 +1387,7 @@ mod tests {
         let mut pet = Pet::new(lp.def, w, h, tw, th);
         pet.grab();
         pet.set_pos(w * 0.5, 40.0);
-        pet.drop();
+        pet.release();
         let mut saw_start_after_settling = false;
         for i in 0..900 {
             pet.tick(
@@ -1399,7 +1426,50 @@ mod tests {
         let before = pet.pos();
         pet.tick(1000.0, &bare_world(400.0, 300.0, 49.0));
         assert_eq!(pet.pos(), before, "frozen while dragged");
-        pet.drop();
+        pet.release();
         assert!(!pet.is_dragging());
+    }
+
+    #[test]
+    fn grabbing_plays_the_astonished_animation() {
+        // Held ⇒ astonished. The sheep's `scream` (id 14) is its `drag`/surprised
+        // pose; grabbing swaps to it.
+        let lp = load_pet("blue_sheep").expect("sheep assets");
+        let mut pet = Pet::new(lp.def, 800.0, 600.0, 40.0, 40.0);
+        pet.grab();
+        assert!(pet.is_dragging());
+        assert_eq!(pet.anim, 14, "grabbed pet shows the scream/astonished animation");
+    }
+
+    #[test]
+    fn dropped_pet_falls_instead_of_walking_a_wall() {
+        // Grab the sheep mid-air while it's in a wall-climbing animation, drop it,
+        // and confirm it falls to the floor instead of resuming the climb in place.
+        let lp = load_pet("blue_sheep").expect("sheep assets");
+        let (w, h) = (1000.0f32, 700.0f32);
+        let (tw, th) = (lp.sheet_w / lp.def.tilesx as f32, lp.sheet_h / lp.def.tilesy as f32);
+        let mut pet = Pet::new(lp.def, w, h, tw, th);
+        pet.grab();
+        pet.set_pos(500.0, 100.0); // mid-air
+        pet.anim = 37; // walk_up — a wall climb with no gravity of its own
+        pet.release();
+        assert_ne!(pet.anim, 37, "release leaves the wall-climbing animation");
+        for _ in 0..600 {
+            pet.tick(
+                16.0,
+                &World {
+                    w,
+                    h,
+                    tile_w: tw,
+                    tile_h: th,
+                    surfaces: &[],
+                },
+            );
+        }
+        assert!(
+            (pet.pos().1 + th - h).abs() < 2.0,
+            "dropped pet fell to the floor (y={})",
+            pet.pos().1
+        );
     }
 }
