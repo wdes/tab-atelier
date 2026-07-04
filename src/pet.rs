@@ -1183,6 +1183,74 @@ mod tests {
     }
 
     #[test]
+    fn ascii_pet_flips_facing_at_the_wall() {
+        // The mirror: the owl spawns facing left (◀); when it walks into the left
+        // wall the XML `<action>flip>` toggles `facing`, and the app then draws
+        // the mirrored sheet so it faces right (▶). Assert the flip sheet is a
+        // real, distinct mirror and that `flipped()` toggles, shown with chars.
+        let lp = load_pet("owl").expect("owl assets");
+        assert_ne!(
+            lp.png, lp.png_flip,
+            "the flip sheet is a distinct mirrored image, not a copy"
+        );
+        assert_eq!(
+            png_dims(&lp.png),
+            png_dims(&lp.png_flip),
+            "same geometry as the normal sheet"
+        );
+
+        let (w, h) = (200.0f32, 80.0f32);
+        let (tw, th) = (40.0f32, 40.0f32);
+        let (cols, rows) = ((w / tw) as usize, (h / th) as usize);
+        let render = |p: &Pet| -> String {
+            let (x, y) = p.pos();
+            let pc = ((tw.mul_add(0.5, x) / tw) as usize).min(cols - 1);
+            let pr = ((y / th) as usize).min(rows - 1);
+            let glyph = if p.flipped() { '▶' } else { '◀' }; // ▶ = mirrored sheet
+            (0..rows)
+                .map(|r| {
+                    (0..cols)
+                        .map(|c| if r == pr && c == pc { glyph } else { '·' })
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let mut pet = Pet::new(lp.def, w, h, tw, th);
+        assert!(!pet.flipped(), "spawns facing left (◀ → normal sheet)");
+        let spawn_art = render(&pet);
+
+        let mut turned_art = None;
+        for _ in 0..200 {
+            pet.tick(
+                100.0,
+                &World {
+                    w,
+                    h,
+                    tile_w: tw,
+                    tile_h: th,
+                    surfaces: &[],
+                },
+            );
+            if pet.pos().0 <= 1.0 && pet.flipped() {
+                turned_art = Some(render(&pet));
+                break;
+            }
+        }
+        let turned_art = turned_art.expect("pet turned at the wall to face right");
+        eprintln!("spawn (facing left):\n{spawn_art}\n\nafter wall-turn (facing right):\n{turned_art}\n");
+        assert!(
+            spawn_art.contains('◀'),
+            "spawn frame draws the left-facing (normal) sprite"
+        );
+        assert!(
+            turned_art.contains('▶'),
+            "post-turn frame draws the right-facing (mirrored) sprite"
+        );
+    }
+
+    #[test]
     fn thrown_pet_recovers_to_walking() {
         // Regression: throwing a pet up must not leave it stuck in a fall pose
         // (the sheep's `fall_face`) on the ground. After it settles it should be
