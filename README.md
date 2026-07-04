@@ -10,49 +10,6 @@ A Guake-style drop-down terminal emulator for Linux (X11), built with Rust using
 
 ![Low battery warning](.github/docs/screenshot-low-battery.webp)
 
-## Features
-
-**Terminal**
-- Drop-down terminal toggled with global hotkeys (default: **`** and **XF86Calculator**, customizable in preferences)
-- Full terminal emulation via alacritty_terminal (colors, scrollback, bracketed paste, ...)
-- GPU-accelerated rendering via gpui
-- Text selection with mouse, copy/paste from context menu
-- Clickable URLs and file paths detected in terminal output
-- Reset input & color for misbehaving programs
-
-**Tabs**
-- Multiple tabs with drag-and-drop reordering
-- Double-click to rename, right-click context menu
-- "Copy path" right-click entry copies the tab's working directory to the clipboard
-- **Ctrl+Shift+T** to open a new tab (inherits working directory)
-- **Alt+Tab** to cycle between tabs
-- Shell exit detection with close/respawn confirmation
-- Per-tab **agent state LED** to the left of the tab name (thinking / waiting / error / dormant), driven by an in-tab CLI (see [Agent state](#agent-state))
-
-**Session**
-- Tabs, working directories, and full terminal output persisted across restarts
-- Active tab selection restored on startup
-- **Agent auto-resume**: tabs that were running `catbus-agent` or `claude` at last save reopen with `catbus-agent --resume <uuid>` / `claude --resume <uuid>` typed into the freshly-spawned shell
-
-**Preferences**
-- Theme selection (Dark, Tomorrow Night Blue)
-- Window opacity (1%-100% slider)
-- Language (English, French)
-- Configurable toggle hotkeys (press any key to register, applied immediately)
-- Configurable browser and code editor for opening links
-
-**Monitoring**
-- Per-tab CPU usage, power draw (watts), energy consumption (Wh), and uptime
-- Low battery warning with visual indicator
-
-**Integration**
-- HTTP API (port 7890) + TLS variant (port 7891) with token auth and QR code for remote tab management from a phone
-- `tab-atelier set-status` CLI for in-tab tools (agents, hooks, scripts) to publish thinking/waiting/error state to the desktop LED
-- `tab-atelier remote …` — mirror tabs from another instance, attach a sidecar terminal, transfer files (sandboxed). See [Remote tabs](#remote-tabs)
-- **Headless variant** ships as a separate `tab-atelier-headless.deb` (no gpui / x11rb / qrcode deps, 7.9 MB vs 12 MB) for servers — same HTTP API, no display required
-- Wakatime time tracking (reads API key from Zed settings)
-- Screenshots (per-tab or full app) saved as BMP
-
 ## Installation
 
 ### Debian / Ubuntu — apt repo (recommended)
@@ -110,11 +67,59 @@ The `.deb` lays out the following under FHS-standard paths:
 | `/usr/bin/tab-atelier` | `0755` | The binary |
 | `/usr/share/applications/tab-atelier.desktop` | `0644` | Desktop entry (registers Tab Atelier in app launchers) |
 | `/usr/share/icons/hicolor/scalable/apps/tab-atelier.svg` | `0644` | App icon (scalable SVG, picked up by the desktop environment via the `Icon=tab-atelier` line in the .desktop) |
+| `/usr/share/tab-atelier/pets/` | `0644` | Screen-mate pet sprite sheets (`*.png`) + animations (`*.xml`) |
 | `/usr/share/doc/tab-atelier/` | `0644` | `README.md`, `LICENSE`, `copyright` |
 
 **`conffiles` (per [debian-policy §10.7.2](https://www.debian.org/doc/debian-policy/ch-files.html#behavior)):** none. tab-atelier ships no system-wide configuration in `/etc`, so dpkg has no files to track between upgrades. All user-modifiable state — preferences, tab list, scrollback, uptime, energy, single-instance lock — lives under the user's `$XDG_CONFIG_HOME` and `$XDG_STATE_HOME` (see [State](#state) below). The package's `conf-files = []` in `Cargo.toml` records this intentionally.
 
 **`dirs` (per [debian-policy §10.5](https://www.debian.org/doc/debian-policy/ch-files.html#permissions-and-owners)):** the package creates only what it installs (under `/usr/bin`, `/usr/share/applications`, `/usr/share/icons/hicolor/scalable/apps`, `/usr/share/doc/tab-atelier`). It does **not** pre-create any directory under `/etc` or `/var`. The per-user `~/.config/tab-atelier/` and `~/.local/{,state/}tab-atelier/` directories are created lazily by the running application on first save — dpkg never touches them, so a `dpkg --purge` leaves them in place for the user to remove manually if desired.
+
+## Features
+
+**Terminal**
+- Drop-down terminal toggled with global hotkeys (default: **`** and **XF86Calculator**, customizable in preferences)
+- Full terminal emulation via alacritty_terminal (colors, scrollback, bracketed paste, ...)
+- GPU-accelerated rendering via gpui
+- Text selection with mouse, copy/paste from context menu
+- Clickable URLs and file paths detected in terminal output
+- Reset input & color for misbehaving programs
+
+**Tabs**
+- Multiple tabs with drag-and-drop reordering
+- Double-click to rename, right-click context menu
+- "Copy path" right-click entry copies the tab's working directory to the clipboard
+- **Ctrl+Shift+T** to open a new tab (inherits working directory)
+- **Alt+Tab** to cycle between tabs
+- Shell exit detection with close/respawn confirmation
+- Per-tab **agent state LED** to the left of the tab name (thinking / waiting / error / dormant), driven by an in-tab CLI (see [Agent state](#agent-state))
+
+**Session**
+- Tabs, working directories, and full terminal output persisted across restarts
+- Active tab selection restored on startup
+- **Agent auto-resume**: tabs that were running `catbus-agent` or `claude` at last save reopen with `catbus-agent --resume <uuid>` / `claude --resume <uuid>` typed into the freshly-spawned shell
+
+**Preferences**
+- Theme selection (Dark, Tomorrow Night Blue)
+- Window opacity (1%-100% slider)
+- Language (English, French)
+- Configurable toggle hotkeys (press any key to register, applied immediately)
+- Configurable browser and code editor for opening links
+
+**Monitoring**
+- Per-tab CPU usage, power draw (watts), energy consumption (Wh), and uptime
+- Low battery warning with visual indicator
+
+**Desktop**
+- **Screen-mate pets** — [eSheep](https://adrianotiger.github.io/desktopPet/)-compatible sprites (a Mini Owl, seven rainbow sheep, Blue Ham Ham) that roam the screen: walk the floor, climb the walls, cross the ceiling, fall under gravity. Right-click the background → **🐾 Summon a pet** for a random one; **drag-and-drop** to pick one up and toss it. Frozen while the window is hidden. Desktop-only, feature-gated behind `pets`
+- Screenshots (per-tab or full app) saved as BMP, plus a **redacted** mode that irreversibly blanks tab names before capture for safe sharing
+
+**Integration**
+- HTTP API (port 7890) + TLS variant (port 7891) with token auth and QR code for remote tab management from a phone
+- **Browser viewer** — the daemon serves a per-tab [xterm.js](https://xtermjs.org/) terminal view (share-link URLs, `noindex`/`X-Robots-Tag` so a leaked link can't be crawled), with file up/download to each tab's sandboxed `inbox/` / `outbox/`
+- `tab-atelier set-status` CLI for in-tab tools (agents, hooks, scripts) to publish thinking/waiting/error state to the desktop LED
+- `tab-atelier remote …` — mirror tabs from another instance, attach a sidecar terminal, transfer files (sandboxed). See [Remote tabs](#remote-tabs)
+- **Headless variant** ships as a separate `tab-atelier-headless.deb` (no gpui / x11rb / qrcode deps, 7.9 MB vs 12 MB) for servers — same HTTP API, no display required
+- Wakatime time tracking (reads API key from Zed settings)
 
 ## Running
 
