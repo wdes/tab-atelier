@@ -419,7 +419,9 @@ fn spawn_pty_tab(
     // Never in read-only mode: resuming a live session rotates/strips the
     // session ids in the user's JSON — a read-only instance stays inert.
     let agent_direct: Option<Vec<String>> = match (&agent_kind, &agent_session_id) {
-        (Some(k), Some(s)) if !crate::read_only() => crate::agent_launch_shell_suffix(k, s, agent_plan_mode),
+        (Some(k), Some(s)) if !crate::read_only() => {
+            crate::agent_launch_shell_suffix_instrumented(k, s, agent_plan_mode)
+        }
         _ => None,
     };
     if let Some(suffix) = &agent_direct {
@@ -622,7 +624,15 @@ fn spawn_pty_tab(
 /// the seed tab — all subsequent failures are logged and the loop
 /// keeps running. Returns `Ok(())` on a clean shutdown via SIGTERM.
 pub fn run() -> std::io::Result<()> {
-    env_logger::init();
+    // Honour the persisted `tab-atelier log …` filter as a fallback to
+    // the env vars, so the CLI toggle works for the daemon too (records
+    // still go to stderr/journald here, not a file). Env still wins.
+    match crate::resolve_log_filter() {
+        Some(filter) => {
+            let _ = env_logger::Builder::new().parse_filters(&filter).try_init();
+        }
+        None => env_logger::init(),
+    }
 
     if std::env::args().any(|a| a == "-V" || a == "--version") {
         println!("tab-atelier-headless v{}", env!("CARGO_PKG_VERSION"));

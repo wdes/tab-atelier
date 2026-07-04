@@ -254,7 +254,7 @@ impl<P: EventedPty> io::Read for PtyTap<P> {
             // shell scheduling. Enable with
             // RUST_LOG=tab_atelier::input_lag=trace.
             log::trace!(
-                target: "tab_atelier::input_lag",
+                target: crate::INPUT_TRACE_TARGET,
                 "T2 pty_read bytes={} preview={:?}",
                 n,
                 std::str::from_utf8(&buf[..n.min(32)]).unwrap_or("<non-utf8>"),

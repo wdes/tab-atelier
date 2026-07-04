@@ -833,7 +833,7 @@ impl TerminalView {
         // (scroll-to-bottom, mode lookup, etc).
         let preview_len = bytes.len().min(16);
         trace!(
-            target: "tab_atelier::input_lag",
+            target: crate::INPUT_TRACE_TARGET,
             "T1 send_input bytes={} preview={:?}",
             bytes.len(),
             std::str::from_utf8(&bytes[..preview_len]).unwrap_or("<non-utf8>"),
@@ -1148,7 +1148,7 @@ impl Render for TerminalView {
                 // listener. Enable with RUST_LOG=tab_atelier::input_lag=trace.
                 // Compile to a no-op in release when trace isn't enabled.
                 trace!(
-                    target: "tab_atelier::input_lag",
+                    target: crate::INPUT_TRACE_TARGET,
                     "T0 keystroke key={:?} key_char={:?} held={} ctrl={} shift={} alt={} fn={}",
                     ks.key,
                     ks.key_char,
@@ -2423,7 +2423,7 @@ impl Element for TerminalElement {
         let present = paint_started.elapsed();
         paint_log::record_present(present);
         trace!(
-            target: "tab_atelier::input_lag",
+            target: crate::INPUT_TRACE_TARGET,
             "T3 paint done in {present:?}",
         );
     }
