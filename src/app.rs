@@ -322,32 +322,10 @@ struct AppState {
     tabs: Vec<Tab>,
     active: usize,
     context_menu: Option<ContextMenu>,
-    /// The desktop screen-mate pet (Mini Owl), `Some` while it's on screen.
-    /// Summoned/dismissed from the background right-click menu.
+    /// The desktop screen-mate pet — all its state + rendering lives in
+    /// [`crate::pet::PetOverlay`]; summoned/dismissed from the background menu.
     #[cfg(feature = "pets")]
-    pet: Option<crate::pet::Pet>,
-    #[cfg(feature = "pets")]
-    pet_sheet: Option<std::sync::Arc<gpui::Image>>,
-    /// The mirrored sprite sheet, drawn when the pet faces the other way.
-    #[cfg(feature = "pets")]
-    pet_sheet_flip: Option<std::sync::Arc<gpui::Image>>,
-    #[cfg(feature = "pets")]
-    pet_sheet_wh: (f32, f32),
-    #[cfg(feature = "pets")]
-    pet_tile_wh: (f32, f32),
-    #[cfg(feature = "pets")]
-    pet_last: std::time::Instant,
-    /// While dragging the pet: the grab offset `(mouse - pet_top_left)` so the
-    /// sprite stays under the cursor at the point it was picked up.
-    #[cfg(feature = "pets")]
-    pet_drag: Option<(f32, f32)>,
-    /// Ledges the pet can walk on, one per tab (its top edge), collected each
-    /// paint by per-tab measuring canvases and read one frame later. Adjacent
-    /// tabs form continuous rows; row ends / the `+` button leave gaps the pet
-    /// walks off and drops through — the "multi-level garden". `Rc<RefCell>`
-    /// because the canvas paint closures are `'static` and can't borrow `self`.
-    #[cfg(feature = "pets")]
-    pet_ledges: Rc<std::cell::RefCell<Vec<crate::pet::Surface>>>,
+    pet: crate::pet::PetOverlay,
     /// When set, tab names render as solid redaction bars instead of text.
     /// Flipped on only for the duration of a "Screenshot (redacted)" capture so
     /// the real names never reach the pixel buffer — nothing to reverse.
@@ -780,7 +758,7 @@ impl AppState {
                     .timer(std::time::Duration::from_millis(50))
                     .await;
                 let Ok(()) = this.update(cx, |app, cx| {
-                    if app.pet.is_some() {
+                    if app.pet.is_active() {
                         cx.notify();
                     }
                 }) else {
@@ -917,21 +895,7 @@ impl AppState {
             active,
             context_menu: None,
             #[cfg(feature = "pets")]
-            pet: None,
-            #[cfg(feature = "pets")]
-            pet_sheet: None,
-            #[cfg(feature = "pets")]
-            pet_sheet_flip: None,
-            #[cfg(feature = "pets")]
-            pet_sheet_wh: (0.0, 0.0),
-            #[cfg(feature = "pets")]
-            pet_tile_wh: (49.0, 49.0),
-            #[cfg(feature = "pets")]
-            pet_last: std::time::Instant::now(),
-            #[cfg(feature = "pets")]
-            pet_drag: None,
-            #[cfg(feature = "pets")]
-            pet_ledges: Rc::new(std::cell::RefCell::new(Vec::new())),
+            pet: crate::pet::PetOverlay::default(),
             screenshot_censor: false,
             renaming: None,
             rename_select_all: false,
@@ -2201,37 +2165,9 @@ impl AppState {
                     .child(power_label),
             );
 
-            // Measuring canvas: report this tab's top edge as a pet ledge. The
-            // first tab clears last frame's collection before anyone appends
-            // (canvases paint in child order: tab 0 first). Absolute + full-size
-            // so it measures the tab without disturbing layout or stealing mouse
-            // events (it has no hitbox).
+            // Measure this tab's top edge as a pet ledge (see PetOverlay).
             #[cfg(feature = "pets")]
-            let tab_el = {
-                let ledges = self.pet_ledges.clone();
-                let is_first = i == 0;
-                tab_el.relative().child(
-                    gpui::canvas(
-                        move |bounds, _, _| {
-                            let mut v = ledges.borrow_mut();
-                            if is_first {
-                                v.clear();
-                            }
-                            let x0 = f32::from(bounds.origin.x);
-                            v.push(crate::pet::Surface {
-                                y: f32::from(bounds.origin.y),
-                                x0,
-                                x1: x0 + f32::from(bounds.size.width),
-                            });
-                        },
-                        |_, (), _, _| {},
-                    )
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .size_full(),
-                )
-            };
+            let tab_el = tab_el.relative().child(self.pet.tab_ledge_canvas(i));
 
             bar = bar.child(tab_el);
         }
@@ -2272,45 +2208,8 @@ impl AppState {
     /// (dev: `./assets/pets/`). No-op if no pets are installed.
     #[cfg(feature = "pets")]
     fn toggle_pet(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
-        if self.pet.take().is_some() {
-            self.pet_sheet = None;
-            self.pet_sheet_flip = None;
-            return; // was on screen → now dismissed
-        }
-        let pets = crate::pet::list_pets();
-        if pets.is_empty() {
-            return;
-        }
-        // Pick one at random so each summon is a surprise. A time-seeded index is
-        // plenty for "which sheep today?" — no need to pull in an rng dep.
-        let idx = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.subsec_nanos() as usize)
-            % pets.len();
-        let Some(loaded) = crate::pet::load_pet(&pets[idx].0) else {
-            return;
-        };
-        let (sw, sh) = (loaded.sheet_w, loaded.sheet_h);
-        let (tw, th) = (sw / loaded.def.tilesx as f32, sh / loaded.def.tilesy as f32);
-        self.pet_sheet = Some(std::sync::Arc::new(gpui::Image::from_bytes(
-            gpui::ImageFormat::Png,
-            loaded.png,
-        )));
-        self.pet_sheet_flip = Some(std::sync::Arc::new(gpui::Image::from_bytes(
-            gpui::ImageFormat::Png,
-            loaded.png_flip,
-        )));
-        self.pet_sheet_wh = (sw, sh);
-        self.pet_tile_wh = (tw, th);
         let vp = window.viewport_size();
-        self.pet = Some(crate::pet::Pet::new(
-            loaded.def,
-            f32::from(vp.width),
-            f32::from(vp.height),
-            tw,
-            th,
-        ));
-        self.pet_last = std::time::Instant::now();
+        self.pet.toggle(f32::from(vp.width), f32::from(vp.height));
     }
 
     fn render_context_menu(&self, window: &Window, cx: &Context<Self>) -> Option<Stateful<Div>> {
@@ -3011,7 +2910,7 @@ impl AppState {
         // Screen-mate pet toggle (background menu).
         #[cfg(feature = "pets")]
         {
-            let label = if self.pet.is_some() {
+            let label = if self.pet.is_active() {
                 "🐾 Dismiss pet"
             } else {
                 "🐾 Summon a pet"
@@ -4475,123 +4374,16 @@ impl Render for AppState {
             root = root.child(stack);
         }
 
-        // Advance + draw the screen-mate pet on top of everything. Frame timing
-        // comes from a ~50 ms notify loop (see `new`); we compute the real dt
-        // here so the walk speed is display-rate independent. Frozen while the
-        // window is hidden (Guake-style drop-down) — no point animating off-screen.
+        // Advance + draw the screen-mate pet on top of everything (all the logic
+        // lives in PetOverlay). The ~50 ms notify loop drives the frames; it's
+        // frozen while the window is hidden.
         #[cfg(feature = "pets")]
-        if self.pet.is_some() {
-            let now = std::time::Instant::now();
-            let dt_ms = (now.saturating_duration_since(self.pet_last).as_secs_f32() * 1000.0).min(200.0);
-            self.pet_last = now;
+        {
             let vp = window.viewport_size();
             let (vw, vh) = (f32::from(vp.width), f32::from(vp.height));
-            let (tw, th) = self.pet_tile_wh;
-            // Ledges the pet can perch on, beyond the implicit floor/walls/ceiling:
-            // one per tab (its top edge), collected last paint by the tab-bar's
-            // measuring canvases. The pet lands on them from above and walks the
-            // rows, dropping off row ends / gaps. Clone the Rc so the borrow
-            // doesn't tie up `self` while `self.pet` is borrowed mutably.
-            let ledges = self.pet_ledges.clone();
-            if self.visible
-                && let Some(pet) = self.pet.as_mut()
-            {
-                let surfaces = ledges.borrow();
-                let world = crate::pet::World {
-                    w: vw,
-                    h: vh,
-                    tile_w: tw,
-                    tile_h: th,
-                    surfaces: &surfaces,
-                };
-                pet.tick(dt_ms, &world);
-            }
-            // Face the way it's moving: the mirrored sheet when flipped (facing
-            // right), the normal one otherwise. Both are tile-aligned, so the
-            // `(col, row)` offsets below are unchanged.
-            if let Some(pet) = self.pet.as_ref()
-                && let Some(sheet) = if pet.flipped() {
-                    self.pet_sheet_flip.as_ref()
-                } else {
-                    self.pet_sheet.as_ref()
-                }
-            {
-                let (col, row) = pet.current_tile();
-                let (x, y) = pet.pos();
-                let (sw, sh) = self.pet_sheet_wh;
-                let dragging = pet.is_dragging();
-                // Sprite tile: a tile-sized window clipping the sheet. `.occlude()`
-                // so a click on the pet grabs it (drag) instead of leaking into a
-                // terminal text selection; the tiny footprint leaves the rest of
-                // the screen selectable.
-                root = root.child(
-                    div()
-                        .absolute()
-                        .left(px(x))
-                        .top(px(y))
-                        .w(px(tw))
-                        .h(px(th))
-                        .overflow_hidden()
-                        .occlude()
-                        .cursor(if dragging {
-                            gpui::CursorStyle::ClosedHand
-                        } else {
-                            gpui::CursorStyle::OpenHand
-                        })
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, ev: &MouseDownEvent, _window, cx| {
-                                if let Some(pet) = this.pet.as_mut() {
-                                    let (px_, py_) = pet.pos();
-                                    this.pet_drag =
-                                        Some((f32::from(ev.position.x) - px_, f32::from(ev.position.y) - py_));
-                                    pet.grab();
-                                    cx.notify();
-                                }
-                            }),
-                        )
-                        .child(
-                            gpui::img(gpui::ImageSource::Image(sheet.clone()))
-                                .absolute()
-                                .left(px(-(col as f32) * tw))
-                                .top(px(-(row as f32) * th))
-                                .w(px(sw))
-                                .h(px(sh)),
-                        ),
-                );
-                // While a drag is live, track the mouse across the whole window
-                // and release on mouse-up — a full-window transparent catcher so
-                // the pointer needn't stay inside the tiny sprite box.
-                if dragging {
-                    root = root.child(
-                        div()
-                            .absolute()
-                            .top_0()
-                            .left_0()
-                            .w(px(vw))
-                            .h(px(vh))
-                            .occlude()
-                            .cursor(gpui::CursorStyle::ClosedHand)
-                            .on_mouse_move(cx.listener(move |this, ev: &gpui::MouseMoveEvent, _window, cx| {
-                                if let (Some(off), Some(pet)) = (this.pet_drag, this.pet.as_mut()) {
-                                    let nx = (f32::from(ev.position.x) - off.0).clamp(0.0, (vw - tw).max(0.0));
-                                    let ny = (f32::from(ev.position.y) - off.1).clamp(0.0, (vh - th).max(0.0));
-                                    pet.set_pos(nx, ny);
-                                    cx.notify();
-                                }
-                            }))
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(move |this, _ev: &gpui::MouseUpEvent, _window, cx| {
-                                    if let Some(pet) = this.pet.as_mut() {
-                                        pet.drop();
-                                    }
-                                    this.pet_drag = None;
-                                    cx.notify();
-                                }),
-                            ),
-                    );
-                }
+            let visible = self.visible;
+            if let Some(el) = self.pet.render(visible, vw, vh, cx, |this| &mut this.pet) {
+                root = root.child(el);
             }
         }
 
