@@ -416,8 +416,10 @@ fn spawn_pty_tab(
     // instead of spawning a shell and typing the resume in later: the tab's
     // foreground process is claude itself (clean kill/detect, no double-launch
     // race). `pending_agent_resume` is then left None so nothing is typed.
+    // Never in read-only mode: resuming a live session rotates/strips the
+    // session ids in the user's JSON — a read-only instance stays inert.
     let agent_direct: Option<Vec<String>> = match (&agent_kind, &agent_session_id) {
-        (Some(k), Some(s)) => crate::agent_launch_shell_suffix(k, s, agent_plan_mode),
+        (Some(k), Some(s)) if !crate::read_only() => crate::agent_launch_shell_suffix(k, s, agent_plan_mode),
         _ => None,
     };
     if let Some(suffix) = &agent_direct {
@@ -557,7 +559,7 @@ fn spawn_pty_tab(
     // above (agent_direct) — otherwise the exec'd agent + a typed `--resume`
     // would double-launch.
     let pending_agent_resume = match (&agent_kind, &agent_session_id) {
-        _ if agent_direct.is_some() => None,
+        _ if agent_direct.is_some() || crate::read_only() => None,
         (Some(kind), Some(sid)) => build_agent_resume_command(kind, sid, agent_plan_mode),
         _ => None,
     };

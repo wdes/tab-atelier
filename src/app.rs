@@ -489,7 +489,11 @@ impl AppState {
                 // Launch the agent directly (exec) when we can drive the
                 // shell command (cleared-env mode); otherwise fall back to
                 // typing the resume in (`pending_agent_resume` below).
-                let agent_launch = if crate::clear_env() {
+                // NEVER in read-only mode: `claude --resume <uuid>` spawns a
+                // duplicate agent against a live session, which rotates/strips
+                // the session ids in the user's JSON. A read-only instance must
+                // stay inert, so it restores tabs as plain shells.
+                let agent_launch = if crate::clear_env() && !crate::read_only() {
                     match (&ts.agent_kind, &ts.agent_session_id) {
                         (Some(k), Some(s)) => crate::agent_launch_shell_suffix(k, s, ts.agent_plan_mode),
                         _ => None,
@@ -552,7 +556,7 @@ impl AppState {
                 // persisted, queue the resume command to be typed into the
                 // freshly-spawned shell — UNLESS we already launched the
                 // agent directly above (then typing it would double-launch).
-                let pending_agent_resume = if agent_launch.is_some() {
+                let pending_agent_resume = if agent_launch.is_some() || crate::read_only() {
                     None
                 } else {
                     match (&ts.agent_kind, &ts.agent_session_id) {
@@ -1655,8 +1659,10 @@ impl AppState {
             &self.api_token,
         );
         // Respawning an agent tab → relaunch the agent directly (exec), same as
-        // a restore, so it comes back as claude rather than a bare shell.
-        let agent_launch = if crate::clear_env() {
+        // a restore, so it comes back as claude rather than a bare shell. Never
+        // in read-only mode — see the restore path: resuming a live session
+        // corrupts the user's session ids.
+        let agent_launch = if crate::clear_env() && !crate::read_only() {
             match (&self.tabs[idx].agent_kind, &self.tabs[idx].agent_session_id) {
                 (Some(k), Some(s)) => crate::agent_launch_shell_suffix(k, s, self.tabs[idx].agent_plan_mode),
                 _ => None,
