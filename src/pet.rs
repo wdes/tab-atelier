@@ -812,6 +812,91 @@ mod tests {
     }
 
     #[test]
+    fn ascii_pet_moves_through_a_graph() {
+        // A little ASCII movie: the pet (🐑) is dropped above a mid-air ledge,
+        // lands on it, walks along it, then walks off the end and drops to the
+        // floor. Printed as frames so a human can watch it move; asserts it
+        // actually visits the ledge and ends up on the floor. Uses the owl (no
+        // fall animation ⇒ a deterministic gravity drift), so it's stable.
+        use std::fmt::Write as _;
+        let lp = load_pet("owl").expect("owl assets");
+        let (w, h) = (240.0f32, 140.0f32);
+        let (tw, th) = (24.0f32, 28.0f32);
+        let ledge = [Surface {
+            y: 84.0,
+            x0: 48.0,
+            x1: 168.0,
+        }];
+        let (cols, rows) = ((w / tw) as usize, (h / th) as usize);
+        let ledge_row = (ledge[0].y / th) as usize;
+        let render = |pet: &Pet| -> String {
+            let (x, y) = pet.pos();
+            let pc = ((tw.mul_add(0.5, x) / tw) as usize).min(cols - 1);
+            let pr = ((y / th) as usize).min(rows - 1);
+            (0..rows)
+                .map(|r| {
+                    (0..cols)
+                        .map(|c| {
+                            if r == pr && c == pc {
+                                '🐑'
+                            } else if r == rows - 1 {
+                                '━' // floor
+                            } else if r == ledge_row {
+                                let cx = (c as f32).mul_add(tw, tw * 0.5);
+                                if cx >= ledge[0].x0 && cx <= ledge[0].x1 {
+                                    '━'
+                                } else {
+                                    '·'
+                                }
+                            } else {
+                                '·'
+                            }
+                        })
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let mut pet = Pet::new(lp.def, w, h, tw, th);
+        pet.grab();
+        pet.set_pos(84.0, 0.0); // released above the ledge
+        pet.drop();
+
+        let mut on_ledge = false;
+        let mut movie = String::new();
+        for i in 0..260 {
+            pet.tick(
+                16.0,
+                &World {
+                    w,
+                    h,
+                    tile_w: tw,
+                    tile_h: th,
+                    surfaces: &ledge,
+                },
+            );
+            let feet = pet.pos().1 + th;
+            let cx = tw.mul_add(0.5, pet.pos().0);
+            if (feet - ledge[0].y).abs() < 2.0 && cx >= ledge[0].x0 && cx <= ledge[0].x1 {
+                on_ledge = true;
+            }
+            if i % 40 == 0 {
+                let _ = write!(movie, "t={i}:\n{}\n\n", render(&pet));
+            }
+        }
+        let _ = write!(movie, "final:\n{}\n", render(&pet));
+        eprintln!("\n{movie}");
+
+        assert!(on_ledge, "the pet landed on the mid-air ledge");
+        assert!(
+            (pet.pos().1 + th - h).abs() < 2.0,
+            "the pet ended on the floor after walking off the ledge (feet={})",
+            pet.pos().1 + th
+        );
+    }
+
+    #[test]
     fn thrown_pet_recovers_to_walking() {
         // Regression: throwing a pet up must not leave it stuck in a fall pose
         // (the sheep's `fall_face`) on the ground. After it settles it should be
