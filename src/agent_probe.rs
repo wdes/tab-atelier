@@ -19,10 +19,11 @@
 //!   session accumulates a syscall histogram, flushed to a per-session
 //!   file when the agent finally exits.
 //!
-//! Both are on by default and gated by env kill-switches
-//! (`TAB_ATELIER_AGENT_PROBE`, `TAB_ATELIER_AGENT_TRACE`) so a normal
-//! run can opt out. The JSONL schema is the stable tap contract — see
-//! [`ProbeLine`] and `docs/agent-probe.md`.
+//! All instrumentation is **opt-in (default off)**, toggled per-flag via
+//! `tab-atelier flags <name> on` (persisted) or the `TAB_ATELIER_*` env
+//! vars — see [`INSTRUMENTATION_FLAGS`]. A normal run does nothing extra.
+//! The JSONL schema is the stable tap contract — see [`ProbeLine`] and
+//! `docs/agent-probe.md`.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -260,46 +261,139 @@ fn first_u64(s: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// `false` only when `TAB_ATELIER_AGENT_PROBE` is an explicit off value
-/// (`0`/`false`/`off`/`no`); default-on, matching "automatic for all
-/// agent tabs".
+/// The instrumentation toggles surfaced by `tab-atelier flags`:
+/// `(cli-name, env-var, default, one-line help)`.
+///
+/// All are resolved via [`flag_enabled`] — the env var wins at runtime,
+/// else the persisted `<state>/flags.json` (so a systemd daemon that
+/// can't easily set env can still be toggled with `flags <name> on`),
+/// else the default here. All default **off** — the instrumentation is
+/// fully opt-in; a normal run does nothing extra.
+pub const INSTRUMENTATION_FLAGS: &[(&str, &str, bool, &str)] = &[
+    (
+        "frame-timing",
+        "TAB_ATELIER_FRAME_TIMING",
+        false,
+        "per-render-frame JSONL (idle-repaint debug); heavy",
+    ),
+    (
+        "trace",
+        "TAB_ATELIER_AGENT_TRACE",
+        false,
+        "strace -f -c syscall histogram per agent session",
+    ),
+    (
+        "probe",
+        "TAB_ATELIER_AGENT_PROBE",
+        false,
+        "per-tick CPU/RSS/ctxsw sampler",
+    ),
+    (
+        "reap",
+        "TAB_ATELIER_AGENT_REAP",
+        false,
+        "kill leaked agent ghosts on desktop startup",
+    ),
+];
+
+/// Resolve `cli-name` (e.g. `frame-timing`) to its env-var key.
+#[must_use]
+pub fn flag_env_var(cli_name: &str) -> Option<&'static str> {
+    INSTRUMENTATION_FLAGS
+        .iter()
+        .find(|(n, ..)| *n == cli_name)
+        .map(|(_, env, ..)| *env)
+}
+
+/// `true` only when the `probe` flag resolves on. Default OFF (opt-in).
 #[must_use]
 pub fn probe_enabled() -> bool {
-    !env_disabled("TAB_ATELIER_AGENT_PROBE")
+    flag_enabled("TAB_ATELIER_AGENT_PROBE", false)
 }
 
-/// `false` only when `TAB_ATELIER_AGENT_TRACE` is an explicit off value.
-/// Default-on; the tracer additionally needs `strace` on `PATH`.
+/// `true` only when the `trace` flag resolves on. Default OFF (opt-in);
+/// the tracer additionally needs `strace` on `PATH`.
 #[must_use]
 pub fn trace_enabled() -> bool {
-    !env_disabled("TAB_ATELIER_AGENT_TRACE")
+    flag_enabled("TAB_ATELIER_AGENT_TRACE", false)
 }
 
-#[must_use]
-fn env_disabled(var: &str) -> bool {
-    std::env::var(var)
-        .ok()
-        .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"))
-}
-
-/// `true` only when `var` is an explicit on value (`1`/`true`/`on`/`yes`).
-/// Default-OFF — the inverse of [`env_disabled`], for opt-in features.
-#[must_use]
-fn env_on(var: &str) -> bool {
-    std::env::var(var)
-        .ok()
-        .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"))
-}
-
-/// `true` only when `TAB_ATELIER_FRAME_TIMING` is explicitly on.
-///
-/// Default OFF: unlike the tracer, this makes the agent append a JSONL
-/// record on *every* render frame (via `CLAUDE_CODE_FRAME_TIMING_LOG`),
-/// so it stays opt-in — flip it on to debug idle-CPU/repaint burn, off
-/// for normal use.
+/// `true` only when the `frame-timing` flag resolves on. Default OFF: it
+/// makes the agent append a JSONL record on *every* render frame (via
+/// `CLAUDE_CODE_FRAME_TIMING_LOG`), so it stays opt-in.
 #[must_use]
 pub fn frame_timing_enabled() -> bool {
-    env_on("TAB_ATELIER_FRAME_TIMING")
+    flag_enabled("TAB_ATELIER_FRAME_TIMING", false)
+}
+
+/// Parse a bool-ish string: `Some(true)` for on-values, `Some(false)`
+/// for off-values, `None` if unset/unrecognised.
+#[must_use]
+pub fn parse_bool(s: &str) -> Option<bool> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" => Some(true),
+        "0" | "false" | "off" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+/// The persisted instrumentation-flags file: `<state>/flags.json`.
+#[must_use]
+pub fn flags_path(base: &Path) -> PathBuf {
+    crate::state_dir(base).join("flags.json")
+}
+
+/// Read the persisted flag map (env-var key → bool). Empty on any miss.
+#[must_use]
+pub fn read_flags(base: &Path) -> std::collections::BTreeMap<String, bool> {
+    std::fs::read_to_string(flags_path(base))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Resolve a flag: env var wins, then persisted `flags.json`, then default.
+#[must_use]
+pub fn flag_enabled(env_var: &str, default: bool) -> bool {
+    resolve_flag(
+        std::env::var(env_var).ok().and_then(|v| parse_bool(&v)),
+        read_flags(&state_base()).get(env_var).copied(),
+        default,
+    )
+}
+
+/// Pure precedence: env → persisted → default.
+#[must_use]
+fn resolve_flag(env: Option<bool>, persisted: Option<bool>, default: bool) -> bool {
+    env.or(persisted).unwrap_or(default)
+}
+
+/// Persist a flag (`Some`) or clear it back to env/default (`None`).
+/// Takes effect on the next agent launch / daemon restart.
+///
+/// # Errors
+/// Propagates create-dir / write / remove failures.
+pub fn set_persisted_flag(base: &Path, env_var: &str, value: Option<bool>) -> std::io::Result<()> {
+    let mut flags = read_flags(base);
+    match value {
+        Some(b) => {
+            flags.insert(env_var.to_string(), b);
+        }
+        None => {
+            flags.remove(env_var);
+        }
+    }
+    let path = flags_path(base);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    if flags.is_empty() {
+        return match std::fs::remove_file(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        };
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(&flags).unwrap_or_default())
 }
 
 /// The per-tab probe log path: `<state>/agent_probe_tab-<name>.jsonl`.
@@ -415,16 +509,18 @@ pub fn state_base() -> PathBuf {
 /// wrapped `exec` line doesn't depend on the agent shell's `PATH`.
 #[must_use]
 pub fn resolve_tracer() -> Option<String> {
-    if !trace_enabled() {
+    // A non-bool env value names a tracer command and implies enabled
+    // (else, since tracing is off by default, the override would be
+    // silently ignored). Otherwise honour the on/off flag.
+    let env = std::env::var("TAB_ATELIER_AGENT_TRACE").ok();
+    let path_override = env
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty() && parse_bool(v).is_none());
+    if path_override.is_none() && !trace_enabled() {
         return None;
     }
-    // An explicit non-toggle value is treated as the tracer command.
-    let requested = std::env::var("TAB_ATELIER_AGENT_TRACE").ok();
-    let name = requested
-        .as_deref()
-        .filter(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "" | "1" | "true" | "on" | "yes"))
-        .unwrap_or("strace");
-    which(name)
+    which(path_override.unwrap_or("strace"))
 }
 
 /// Minimal `PATH` lookup — absolute/relative names are returned as-is if
@@ -509,10 +605,41 @@ mod tests {
     }
 
     #[test]
-    fn probe_default_on_trace_default_on() {
-        // No env set in the test process ⇒ both default enabled.
-        assert!(probe_enabled());
-        assert!(trace_enabled());
+    fn instrumentation_is_off_by_default() {
+        // No env / no persisted flag in the test process ⇒ all opt-in
+        // flags resolve off. (frame-timing too; reap lives in agent_reaper.)
+        assert!(!probe_enabled());
+        assert!(!trace_enabled());
+        assert!(!frame_timing_enabled());
+        // Every declared flag defaults off.
+        assert!(INSTRUMENTATION_FLAGS.iter().all(|(_, _, default, _)| !*default));
+    }
+
+    #[test]
+    fn flag_precedence_env_then_persisted_then_default() {
+        // env wins over persisted, persisted over default.
+        assert!(resolve_flag(Some(true), Some(false), false));
+        assert!(!resolve_flag(Some(false), Some(true), true));
+        assert!(resolve_flag(None, Some(true), false));
+        assert!(!resolve_flag(None, Some(false), true));
+        assert!(resolve_flag(None, None, true));
+        assert!(!resolve_flag(None, None, false));
+    }
+
+    #[test]
+    fn parse_bool_recognises_on_off() {
+        assert_eq!(parse_bool("on"), Some(true));
+        assert_eq!(parse_bool(" TRUE "), Some(true));
+        assert_eq!(parse_bool("0"), Some(false));
+        assert_eq!(parse_bool("no"), Some(false));
+        assert_eq!(parse_bool("maybe"), None);
+    }
+
+    #[test]
+    fn flag_env_var_maps_cli_names() {
+        assert_eq!(flag_env_var("frame-timing"), Some("TAB_ATELIER_FRAME_TIMING"));
+        assert_eq!(flag_env_var("reap"), Some("TAB_ATELIER_AGENT_REAP"));
+        assert_eq!(flag_env_var("nope"), None);
     }
 
     #[test]

@@ -104,6 +104,13 @@ fn main() {
                 let rest: Vec<String> = std::env::args().skip(2).collect();
                 std::process::exit(cli::logging::run(&rest));
             }
+            "flags" => {
+                // Toggle agent-instrumentation flags (frame-timing, trace,
+                // probe, reap) without env edits — persisted, applied on
+                // next launch. Same store the headless daemon reads.
+                let rest: Vec<String> = std::env::args().skip(2).collect();
+                std::process::exit(cli::flags::run(&rest));
+            }
             _ => {}
         }
     }
@@ -139,6 +146,7 @@ fn main() {
                      tab-atelier dispatch …       hand work to another tab / a new agent\n  \
                      tab-atelier schedule …       off-hours auto-lock per tab (OSM opening_hours)\n  \
                      tab-atelier log [input|off|…] enable/disable the GUI file logger (applies next launch)\n  \
+                     tab-atelier flags [name on|off] toggle agent instrumentation (frame-timing/trace/probe/reap)\n  \
                      tab-atelier --read-only      start inspect-only (no disk writes, no lock)\n  \
                      tab-atelier --version        print version and exit\n  \
                      tab-atelier --help           print this help and exit\n",

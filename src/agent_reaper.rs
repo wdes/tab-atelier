@@ -61,13 +61,11 @@ pub fn record_path(base: &Path) -> PathBuf {
     crate::state_dir(base).join("agent_procs.json")
 }
 
-/// `false` only when `TAB_ATELIER_AGENT_REAP` is an explicit off value —
-/// the kill-switch. Default-on.
+/// `true` only when the `reap` flag resolves on (env `TAB_ATELIER_AGENT_
+/// REAP`, then persisted `flags.json`). Default OFF — opt-in.
 #[must_use]
 pub fn reap_enabled() -> bool {
-    !std::env::var("TAB_ATELIER_AGENT_REAP")
-        .ok()
-        .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"))
+    crate::agent_probe::flag_enabled("TAB_ATELIER_AGENT_REAP", false)
 }
 
 /// Overwrite the provenance record with the agents alive right now.

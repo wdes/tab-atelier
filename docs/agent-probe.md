@@ -5,8 +5,21 @@ answer **"why does an idle agent keep eating CPU/RAM while it's meant to
 be sleeping?"** — and to give a future `tab-atelier` binary a stable,
 on-disk hook it can read to understand a tab and poke at it.
 
-Two probes, both **on by default** (they activate the next time the app
-is started), both with an env kill-switch.
+All instrumentation is **opt-in (off by default)** — a normal run does
+nothing extra. Toggle each flag with `tab-atelier flags <name> on`
+(persisted to `<state>/flags.json`, applied on next launch) or the
+matching `TAB_ATELIER_*` env var:
+
+| flag | env var | what |
+|---|---|---|
+| `frame-timing` | `TAB_ATELIER_FRAME_TIMING` | per-render-frame JSONL (idle-repaint debug) |
+| `trace` | `TAB_ATELIER_AGENT_TRACE` | `strace -f -c` syscall histogram |
+| `probe` | `TAB_ATELIER_AGENT_PROBE` | per-tick CPU/RSS/ctxsw sampler |
+| `reap` | `TAB_ATELIER_AGENT_REAP` | kill leaked agent ghosts on desktop startup |
+
+Resolution: env var wins, then persisted flag, then off. Run the CLI as
+the daemon's user so it lands in the daemon's state dir, e.g.
+`sudo -u tab-atelier tab-atelier-headless flags probe on`.
 
 ## 1. Sampler (`src/agent_probe.rs`)
 
@@ -57,9 +70,9 @@ for tab in agent_probe::list_logs(&base) {
 
 Or from a shell: `tail -f ~/.local/state/tab-atelier/agent_probe_tab-*.jsonl | jq .`
 
-### Kill-switch
+### Enable
 
-`TAB_ATELIER_AGENT_PROBE=0` (also `false`/`off`/`no`) disables sampling.
+Off by default; `tab-atelier flags probe on` (or `TAB_ATELIER_AGENT_PROBE=1`).
 
 ## 2. Tracer (launch wrap)
 
@@ -76,11 +89,11 @@ overhead vs. full tracing). The summary flushes **when the agent exits**
 (e.g. you close the tab), so it captures the cumulative cost of a mostly
 idle session — the syscalls a sleeping agent spins on.
 
-### Kill-switch / override
+### Enable / override
 
-- `TAB_ATELIER_AGENT_TRACE=0` disables the wrap (launch bare).
+- Off by default; `tab-atelier flags trace on` (or `TAB_ATELIER_AGENT_TRACE=1`).
 - `TAB_ATELIER_AGENT_TRACE=/path/to/tracer` uses a different tracer
-  command instead of `strace`.
+  command instead of `strace` (and enables it).
 - If no tracer is found on `PATH`, the agent launches bare (no failure).
 
 ## Related: GUI log access

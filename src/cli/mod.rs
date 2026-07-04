@@ -8,6 +8,8 @@ pub mod brain;
 pub mod claude_hook;
 pub mod delegate;
 pub mod dispatch;
+/// `tab-atelier flags …` — toggle agent-instrumentation flags.
+pub mod flags;
 /// `tab-atelier log …` — enable/disable the GUI file logger (persisted,
 /// applied on next launch) without wrangling env vars.
 pub mod logging;
