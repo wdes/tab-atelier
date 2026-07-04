@@ -1505,6 +1505,11 @@ impl AppState {
             let probe_base = platform::state_base_dir();
             #[cfg(feature = "catbus")]
             let probe_now = std::time::SystemTime::now();
+            // (pid, session) of every live agent this tick — persisted as the
+            // reaper's provenance record so a crash-leaked ghost can be killed
+            // (and only it) on the next startup. See `agent_reaper`.
+            #[cfg(feature = "catbus")]
+            let mut live_agents: Vec<(u32, String)> = Vec::new();
             #[cfg(feature = "catbus")]
             for tab in &mut self.tabs {
                 if tab.agent_kind.is_none() {
@@ -1512,6 +1517,9 @@ impl AppState {
                 }
                 let pid = tab.view.read(cx).pid();
                 let activity = crate::catbus_agent::agent_activity(pid);
+                if activity != crate::catbus_agent::AgentActivity::Gone {
+                    live_agents.push((pid, tab.agent_session_id.clone().unwrap_or_default()));
+                }
                 // Resource sampler: append this tick's CPU/RSS/ctxsw line for
                 // live agents (Gone has no process to sample). The PTY child
                 // *is* claude (agent tabs `exec claude`), so `pid` roots the
@@ -1549,6 +1557,13 @@ impl AppState {
                     }
                     crate::catbus_agent::AgentActivity::Idle => {}
                 }
+            }
+            // Not in read-only: an inspect-only instance must not overwrite
+            // the record with processes it didn't launch (it shares the state
+            // dir and skips the single-instance lock).
+            #[cfg(feature = "catbus")]
+            if !crate::read_only() {
+                crate::agent_reaper::record_live_agents(&probe_base, &live_agents);
             }
             // Staleness sweep: drop transient LED state when the last
             // update is older than 2 min. Real Claude turns are
@@ -4528,7 +4543,13 @@ fn run_check() {
 /// # Panics
 /// Panics if gpui fails to open its initial window (e.g. no X server).
 pub fn run() {
-    env_logger::init();
+    // Single logger init for the GUI. Routes to <state>/tab-atelier.log
+    // when a filter is set (`tab-atelier log …` / TAB_ATELIER_LOG /
+    // RUST_LOG), else installs nothing — the desktop has no terminal, so
+    // stderr logging is pointless. Must be the ONLY init: it uses
+    // try_init, so a second env_logger::init() here would panic once a
+    // file logger is installed.
+    crate::init_gui_file_logging();
 
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--check") {
@@ -4541,6 +4562,23 @@ pub fn run() {
     }
 
     info!("starting Tab Atelier v{}", env!("CARGO_PKG_VERSION"));
+
+    // Reap agent processes leaked by a prior (unclean) run before we
+    // restore any tab — reclaims the stopped `claude` ghosts that
+    // reparented to init. Provenance-based (only kills processes this GUI
+    // recorded launching, identity-pinned by start-time), so it can never
+    // touch a `claude` running elsewhere. Never in read-only mode — an
+    // inspect-only instance must not kill anything.
+    if !crate::read_only() {
+        let report = crate::agent_reaper::reap_orphans(&platform::state_base_dir());
+        if report.killed > 0 {
+            info!(
+                "reaped {} orphan agent process(es) (~{} MB) leaked by a prior run",
+                report.killed, report.freed_mb
+            );
+        }
+    }
+
     Application::new().run(|cx: &mut App| {
         let prefs = load_preferences(&platform::config_dir());
         let keycodes: Vec<u8> = if prefs.hotkeys.is_empty() {
