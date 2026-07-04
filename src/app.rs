@@ -341,12 +341,13 @@ struct AppState {
     /// sprite stays under the cursor at the point it was picked up.
     #[cfg(feature = "pets")]
     pet_drag: Option<(f32, f32)>,
-    /// Top-y of the (bottom-anchored, wrapping) tab bar, captured each paint by a
-    /// measuring canvas and read one frame later so the pet can walk along that
-    /// line as a ledge. `f32::MAX` until first measured. `Rc<Cell>` because the
-    /// canvas paint closure is `'static` and can't borrow `self`.
+    /// Ledges the pet can walk on, one per tab (its top edge), collected each
+    /// paint by per-tab measuring canvases and read one frame later. Adjacent
+    /// tabs form continuous rows; row ends / the `+` button leave gaps the pet
+    /// walks off and drops through — the "multi-level garden". `Rc<RefCell>`
+    /// because the canvas paint closures are `'static` and can't borrow `self`.
     #[cfg(feature = "pets")]
-    tab_bar_top: Rc<std::cell::Cell<f32>>,
+    pet_ledges: Rc<std::cell::RefCell<Vec<crate::pet::Surface>>>,
     /// When set, tab names render as solid redaction bars instead of text.
     /// Flipped on only for the duration of a "Screenshot (redacted)" capture so
     /// the real names never reach the pixel buffer — nothing to reverse.
@@ -930,7 +931,7 @@ impl AppState {
             #[cfg(feature = "pets")]
             pet_drag: None,
             #[cfg(feature = "pets")]
-            tab_bar_top: Rc::new(std::cell::Cell::new(f32::MAX)),
+            pet_ledges: Rc::new(std::cell::RefCell::new(Vec::new())),
             screenshot_censor: false,
             renaming: None,
             rename_select_all: false,
@@ -2199,6 +2200,38 @@ impl AppState {
                     .text_align(gpui::TextAlign::Right)
                     .child(power_label),
             );
+
+            // Measuring canvas: report this tab's top edge as a pet ledge. The
+            // first tab clears last frame's collection before anyone appends
+            // (canvases paint in child order: tab 0 first). Absolute + full-size
+            // so it measures the tab without disturbing layout or stealing mouse
+            // events (it has no hitbox).
+            #[cfg(feature = "pets")]
+            let tab_el = {
+                let ledges = self.pet_ledges.clone();
+                let is_first = i == 0;
+                tab_el.relative().child(
+                    gpui::canvas(
+                        move |bounds, _, _| {
+                            let mut v = ledges.borrow_mut();
+                            if is_first {
+                                v.clear();
+                            }
+                            let x0 = f32::from(bounds.origin.x);
+                            v.push(crate::pet::Surface {
+                                y: f32::from(bounds.origin.y),
+                                x0,
+                                x1: x0 + f32::from(bounds.size.width),
+                            });
+                        },
+                        |_, (), _, _| {},
+                    )
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full(),
+                )
+            };
 
             bar = bar.child(tab_el);
         }
@@ -4233,25 +4266,9 @@ impl Render for AppState {
         let battery = *self.battery_percent.lock().unwrap();
         #[cfg(not(feature = "energy"))]
         let battery: Option<u8> = None;
+        // Per-tab ledges for the pet are collected inside `render_tab_bar` by
+        // measuring canvases (see `pet_ledges`).
         let tab_bar = self.render_tab_bar(battery, window, cx);
-        // Measure the tab bar's top edge each paint so the pet can walk along it
-        // as a ledge (the "multi-level garden"). An absolute, full-size canvas
-        // reports the bar's laid-out bounds without disturbing the tab layout;
-        // its origin.y is read one frame later in the pet tick.
-        #[cfg(feature = "pets")]
-        let tab_bar = {
-            let top = self.tab_bar_top.clone();
-            tab_bar.relative().child(
-                gpui::canvas(
-                    move |bounds, _, _| top.set(f32::from(bounds.origin.y)),
-                    |_, (), _, _| {},
-                )
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full(),
-            )
-        };
         let context_menu = if self.renaming.is_none()
             && self.exit_confirm.is_none()
             && self.close_confirm.is_none()
@@ -4471,29 +4488,21 @@ impl Render for AppState {
             let (vw, vh) = (f32::from(vp.width), f32::from(vp.height));
             let (tw, th) = self.pet_tile_wh;
             // Ledges the pet can perch on, beyond the implicit floor/walls/ceiling:
-            // the top edge of the (bottom-anchored) tab bar, measured last paint.
-            // The pet lands on it from above and walks it as a second level.
-            let tab_top = self.tab_bar_top.get();
-            let ledge;
-            let surfaces: &[crate::pet::Surface] = if tab_top.is_finite() && tab_top > th && tab_top < vh {
-                ledge = [crate::pet::Surface {
-                    y: tab_top,
-                    x0: 0.0,
-                    x1: vw,
-                }];
-                &ledge
-            } else {
-                &[]
-            };
+            // one per tab (its top edge), collected last paint by the tab-bar's
+            // measuring canvases. The pet lands on them from above and walks the
+            // rows, dropping off row ends / gaps. Clone the Rc so the borrow
+            // doesn't tie up `self` while `self.pet` is borrowed mutably.
+            let ledges = self.pet_ledges.clone();
             if self.visible
                 && let Some(pet) = self.pet.as_mut()
             {
+                let surfaces = ledges.borrow();
                 let world = crate::pet::World {
                     w: vw,
                     h: vh,
                     tile_w: tw,
                     tile_h: th,
-                    surfaces,
+                    surfaces: &surfaces,
                 };
                 pet.tick(dt_ms, &world);
             }
