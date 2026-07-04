@@ -337,6 +337,17 @@ pub enum Commands {
         json: bool,
     },
 
+    /// Toggle agent-instrumentation flags (persisted to flags.json,
+    /// applied on next agent launch / daemon restart) — so a systemd
+    /// daemon needn't have env vars edited. `flags` shows all;
+    /// `flags frame-timing on`, `flags trace off`, `flags probe default`.
+    /// Env vars still win when set.
+    Flags {
+        /// `<name> <on|off|default>`, or empty to show all flags.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Enable/disable the file logger from the shell (persisted, applied
     /// on next start). `log input` traces every keystroke (IME included),
     /// `log off` disables, `log <filter>` sets any `env_logger` filter.
@@ -539,6 +550,7 @@ pub fn dispatch(cli: Cli) -> bool {
             }
             crate::cli::share_link::schedule(&args)
         }
+        Commands::Flags { args } => crate::cli::flags::run(&args),
         Commands::Log { args } => crate::cli::logging::run(&args),
         Commands::Tabs { json } => {
             let args = if json { vec!["--json".to_string()] } else { vec![] };

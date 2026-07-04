@@ -494,11 +494,11 @@ pub fn agent_launch_shell_suffix(kind: &str, session_id: &str, plan: Option<bool
 /// `agent_trace_<kind>_<session>.txt` under the state dir and flushes
 /// when the agent exits.
 ///
-/// Falls back to the plain suffix when tracing is disabled
-/// (`TAB_ATELIER_AGENT_TRACE=0`) or no tracer is on `PATH`, so a build
-/// without `strace` still launches agents normally. Call sites use this
-/// in place of the plain builder; the plain one stays pure for the unit
-/// tests and any caller that must never be traced.
+/// Tracing is opt-in (off by default; enable with `flags trace on` or
+/// `TAB_ATELIER_AGENT_TRACE=1`). Falls back to the plain suffix when it's
+/// off or no tracer is on `PATH`, so a build without `strace` still
+/// launches agents normally. Call sites use this in place of the plain
+/// builder; the plain one stays pure for the unit tests.
 ///
 /// `proctitle` sets the launched process's `argv[0]` (via bash/zsh
 /// `exec -a`), which the agent runtime turns into its `comm` — so
