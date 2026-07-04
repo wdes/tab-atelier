@@ -66,6 +66,10 @@ pub struct PetDef {
     anims: HashMap<u32, Anim>,
     /// Animation to start in (the `walk` id, or the lowest id as a fallback).
     start: u32,
+    /// Whether any animation has a `<gravity>` fall. Pets without one (the owl)
+    /// get a synthetic downward drift when airborne so a dropped pet doesn't
+    /// hover; pets with one are left to their own aerial animations.
+    has_gravity: bool,
 }
 
 impl PetDef {
@@ -187,11 +191,13 @@ impl PetDef {
         if anims.is_empty() {
             return None;
         }
+        let has_gravity = anims.values().any(|a| a.gravity_next.is_some());
         Some(Self {
             tilesx,
             tilesy,
             start: walk_id.unwrap_or(start),
             anims,
+            has_gravity,
         })
     }
 }
@@ -313,6 +319,13 @@ impl Pet {
         let dx = lerp(cur.start.0, cur.end.0, t) * mult;
         let dy = lerp(cur.start.1, cur.end.1, t);
 
+        // Was the pet already resting on the floor/a ledge before this step? A
+        // falling animation keeps dy > 0 after touching down, so without this the
+        // floor would re-fire a "landing" every step and the pet would loop the
+        // fall sequence forever (stuck upright). Only count a bottom hit when it
+        // actually descended onto the floor this step.
+        let was_airborne = self.airborne(world);
+
         let old_feet = self.y + th;
         let mut nx = self.x + dx;
         let mut ny = self.y + dy;
@@ -324,14 +337,14 @@ impl Pet {
             left: dx < 0.0 && nx <= 0.0,
             right: dx > 0.0 && nx + tw >= world.w,
             top: dy < 0.0 && ny <= 0.0,
-            bottom: dy > 0.0 && ny + th >= world.h,
+            bottom: was_airborne && dy > 0.0 && ny + th >= world.h,
         };
         nx = nx.clamp(0.0, (world.w - tw).max(0.0));
         ny = ny.clamp(0.0, (world.h - th).max(0.0));
 
         // Landing on a mid-screen ledge: while descending, the feet cross a
         // surface top within its span. Snap onto the highest such ledge.
-        if dy > 0.0 {
+        if was_airborne && dy > 0.0 {
             let cx = tw.mul_add(0.5, nx);
             let new_feet = ny + th;
             let landed = world
@@ -363,14 +376,37 @@ impl Pet {
             return;
         }
 
-        // Gravity: a ground animation running in mid-air (walked off a ledge, or
-        // was dropped) falls.
-        if let Some(g) = cur.gravity_next
-            && self.airborne(world)
-        {
-            self.anim = g;
-            self.frame_i = 0;
-            return;
+        // Gravity, for a pet caught in mid-air (walked off a ledge, or dropped).
+        if self.airborne(world) {
+            if let Some(g) = cur.gravity_next {
+                // The pet has its own fall animation — play it.
+                self.anim = g;
+                self.frame_i = 0;
+                return;
+            }
+            if !self.def.has_gravity {
+                // A pet with no fall animation at all (the owl). Drift straight
+                // down to the nearest surface below so a dropped pet doesn't
+                // hover, then resume walking on landing.
+                const FALL: f32 = 9.0;
+                let feet = self.y + th;
+                let cx = tw.mul_add(0.5, self.x);
+                let target = world
+                    .surfaces
+                    .iter()
+                    .filter(|s| cx >= s.x0 && cx <= s.x1 && s.y >= feet - 0.5)
+                    .map(|s| s.y)
+                    .fold(world.h, f32::min);
+                let new_feet = (feet + FALL).min(target);
+                self.y = new_feet - th;
+                if (new_feet - target).abs() < 0.5 {
+                    self.anim = self.def.start;
+                    self.frame_i = 0;
+                }
+                return;
+            }
+            // Otherwise it's an intentionally-aerial animation (climb/ceiling/
+            // jump) on a gravity-capable pet — leave it be.
         }
 
         // Advance the frame; at the end, apply flip + pick the next animation.
@@ -719,6 +755,40 @@ mod tests {
         }
         assert!(minx <= 1.0, "reaches the left wall (minx={minx})");
         assert!(maxx >= w - tw - 1.0, "reaches the right wall (maxx={maxx})");
+    }
+
+    #[test]
+    fn dropped_pet_lands_on_the_floor() {
+        // Regression: a fall must resolve to the floor (not loop the fall
+        // sequence "stuck upright"), and a pet with no fall animation (the owl)
+        // must still drop instead of hovering. Both must settle on the floor.
+        for id in ["owl", "blue_sheep"] {
+            let lp = load_pet(id).unwrap_or_else(|| panic!("{id} assets"));
+            let (w, h) = (1000.0f32, 700.0f32);
+            let (tw, th) = (lp.sheet_w / lp.def.tilesx as f32, lp.sheet_h / lp.def.tilesy as f32);
+            let floor = h - th;
+            let mut pet = Pet::new(lp.def, w, h, tw, th);
+            pet.grab();
+            pet.set_pos(w * 0.5, 30.0);
+            pet.drop();
+            for _ in 0..800 {
+                pet.tick(
+                    30.0,
+                    &World {
+                        w,
+                        h,
+                        tile_w: tw,
+                        tile_h: th,
+                        surfaces: &[],
+                    },
+                );
+            }
+            assert!(
+                (pet.pos().1 - floor).abs() < 2.0,
+                "{id} settled on the floor (y={})",
+                pet.pos().1
+            );
+        }
     }
 
     #[test]
