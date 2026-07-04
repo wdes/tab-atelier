@@ -282,6 +282,26 @@ fn env_disabled(var: &str) -> bool {
         .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"))
 }
 
+/// `true` only when `var` is an explicit on value (`1`/`true`/`on`/`yes`).
+/// Default-OFF — the inverse of [`env_disabled`], for opt-in features.
+#[must_use]
+fn env_on(var: &str) -> bool {
+    std::env::var(var)
+        .ok()
+        .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"))
+}
+
+/// `true` only when `TAB_ATELIER_FRAME_TIMING` is explicitly on.
+///
+/// Default OFF: unlike the tracer, this makes the agent append a JSONL
+/// record on *every* render frame (via `CLAUDE_CODE_FRAME_TIMING_LOG`),
+/// so it stays opt-in — flip it on to debug idle-CPU/repaint burn, off
+/// for normal use.
+#[must_use]
+pub fn frame_timing_enabled() -> bool {
+    env_on("TAB_ATELIER_FRAME_TIMING")
+}
+
 /// The per-tab probe log path: `<state>/agent_probe_tab-<name>.jsonl`.
 #[must_use]
 pub fn log_path(base: &Path, tab: &str) -> PathBuf {
@@ -293,6 +313,21 @@ pub fn log_path(base: &Path, tab: &str) -> PathBuf {
 pub fn trace_log_path(base: &Path, kind: &str, session: &str) -> PathBuf {
     crate::state_dir(base).join(format!(
         "agent_trace_{}_{}.txt",
+        crate::sanitize_tab_filename(kind),
+        crate::sanitize_tab_filename(session)
+    ))
+}
+
+/// The per-session render frame-timing log: `<state>/agent_frames_<kind>_<session>.jsonl`.
+///
+/// One JSON object per rendered frame (`total`/`renderer`/`diff`/`yoga`/
+/// `patches`/…), written by the agent when `CLAUDE_CODE_FRAME_TIMING_LOG`
+/// points here. A healthy idle tab writes ~nothing after settling; a tab
+/// stuck repainting fills this continuously — the idle-CPU smoking gun.
+#[must_use]
+pub fn frame_log_path(base: &Path, kind: &str, session: &str) -> PathBuf {
+    crate::state_dir(base).join(format!(
+        "agent_frames_{}_{}.jsonl",
         crate::sanitize_tab_filename(kind),
         crate::sanitize_tab_filename(session)
     ))
