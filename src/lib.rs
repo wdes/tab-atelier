@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 
+pub mod agent_probe;
 pub mod alloc_count;
 pub(crate) mod api;
 pub(crate) mod api_ws;
@@ -54,6 +55,14 @@ pub(crate) mod tracking;
 pub mod win_service;
 
 pub const APP_DIR: &str = "tab-atelier";
+
+/// `log` target for the keystroke/input-latency trace.
+///
+/// The trace logs `key` / `key_char` per key event — the data the IME
+/// bug needs. Single source of truth: the `trace!` call sites and the
+/// `tab-atelier log input` preset both reference this, so a rename can't
+/// leave them out of sync.
+pub const INPUT_TRACE_TARGET: &str = "tab_atelier::input_lag";
 
 /// Set by the SIGINT/SIGTERM handler. The persist tick checks it and runs
 /// `close_all_tabs` (which does an unconditional flush of every tab's
@@ -474,6 +483,138 @@ pub fn build_agent_resume_command(kind: &str, session_id: &str, plan: Option<boo
 pub fn agent_launch_shell_suffix(kind: &str, session_id: &str, plan: Option<bool>) -> Option<Vec<String>> {
     let cmd = build_agent_resume_command(kind, session_id, plan)?;
     Some(vec!["-i".to_string(), "-c".to_string(), format!("exec {cmd}")])
+}
+
+/// Tracer-wrapping variant of [`agent_launch_shell_suffix`].
+///
+/// Wraps the agent under a syscall-counting tracer (`strace -f -c`) when
+/// instrumentation is on — the launch half of the resource-probe feature
+/// (see [`crate::agent_probe`]). The per-session histogram lands in
+/// `agent_trace_<kind>_<session>.txt` under the state dir and flushes
+/// when the agent exits.
+///
+/// Falls back to the plain suffix when tracing is disabled
+/// (`TAB_ATELIER_AGENT_TRACE=0`) or no tracer is on `PATH`, so a build
+/// without `strace` still launches agents normally. Call sites use this
+/// in place of the plain builder; the plain one stays pure for the unit
+/// tests and any caller that must never be traced.
+#[must_use]
+pub fn agent_launch_shell_suffix_instrumented(kind: &str, session_id: &str, plan: Option<bool>) -> Option<Vec<String>> {
+    let cmd = build_agent_resume_command(kind, session_id, plan)?;
+    let trace = agent_probe::resolve_tracer().map(|tracer| {
+        let base = agent_probe::state_base();
+        let log = agent_probe::trace_log_path(&base, kind, session_id);
+        if let Some(dir) = log.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        (tracer, log.to_string_lossy().into_owned())
+    });
+    Some(vec![
+        "-i".to_string(),
+        "-c".to_string(),
+        wrap_exec_command(&cmd, trace.as_ref()),
+    ])
+}
+
+/// Build the `exec …` string handed to `sh -c`, optionally prefixing a
+/// `(tracer, log_path)` so the agent runs under `strace -f -c -o <log>`.
+/// Pure — the unit-testable core of the tracer wrap.
+#[must_use]
+fn wrap_exec_command(cmd: &str, trace: Option<&(String, String)>) -> String {
+    match trace {
+        Some((tracer, log)) => {
+            format!(
+                "exec {} -f -c -o {} {cmd}",
+                agent_probe::sh_squote(tracer),
+                agent_probe::sh_squote(log)
+            )
+        }
+        None => format!("exec {cmd}"),
+    }
+}
+
+/// Install a file-backed logger for the windowed GUI.
+///
+/// The desktop app launches from a hotkey / `.desktop` entry with no
+/// controlling terminal, so `log` records and `eprintln!` are lost —
+/// this is why the IME bug "has no log access": the keystroke trace at
+/// `terminal.rs` (target `tab_atelier::input_lag`, carrying the IME
+/// `key`/`key_char`) is emitted but dropped. Route `log` to
+/// `<state>/tab-atelier.log` (append, size-capped, one `.1` rotation)
+/// so those records survive a reboot and can be read/tapped like the
+/// agent probe — no terminal required.
+///
+/// No-op unless a filter is configured, so a normal run writes nothing.
+/// The filter is resolved in precedence order — `TAB_ATELIER_LOG` env,
+/// `RUST_LOG` env, then the persisted [`log_filter_path`] file written by
+/// `tab-atelier log …`. The value is a standard `env_logger` filter, e.g.
+/// `tab_atelier::input_lag=trace` to capture IME input.
+pub fn init_gui_file_logging() {
+    let Some(filter) = resolve_log_filter() else {
+        return;
+    };
+    let dir = state_dir(&agent_probe::state_base());
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("tab-atelier.log");
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 8 * 1024 * 1024) {
+        let _ = std::fs::rename(&path, path.with_extension("log.1"));
+    }
+    let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) else {
+        return;
+    };
+    let _ = env_logger::Builder::new()
+        .parse_filters(&filter)
+        .format_timestamp_millis()
+        .target(env_logger::Target::Pipe(Box::new(file)))
+        .try_init();
+}
+
+/// The effective GUI log filter: `TAB_ATELIER_LOG` env, then `RUST_LOG`
+/// env, then the persisted [`log_filter_path`] file. `None` (logging
+/// off) when none is set or the persisted value is blank.
+#[must_use]
+pub fn resolve_log_filter() -> Option<String> {
+    std::env::var("TAB_ATELIER_LOG")
+        .ok()
+        .or_else(|| std::env::var("RUST_LOG").ok())
+        .or_else(|| std::fs::read_to_string(log_filter_path()).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Where `tab-atelier log …` persists the log filter, read at GUI
+/// startup: `<state>/log.filter`.
+#[must_use]
+pub fn log_filter_path() -> PathBuf {
+    state_dir(&agent_probe::state_base()).join("log.filter")
+}
+
+/// Full path of the GUI log file records are routed to.
+#[must_use]
+pub fn gui_log_path() -> PathBuf {
+    state_dir(&agent_probe::state_base()).join("tab-atelier.log")
+}
+
+/// Persist the GUI log filter (`Some(filter)`) or clear it (`None`).
+/// Takes effect on the next GUI launch. Returns an `io::Error` only on a
+/// real filesystem failure (a missing file on clear is success).
+///
+/// # Errors
+/// Propagates create-dir / write / remove failures.
+pub fn set_persisted_log_filter(filter: Option<&str>) -> std::io::Result<()> {
+    let path = log_filter_path();
+    match filter {
+        Some(f) => {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::write(&path, f.trim())
+        }
+        None => match std::fs::remove_file(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        },
+    }
 }
 
 /// Pin the rustls `CryptoProvider` to `ring` at process start.
@@ -2413,6 +2554,18 @@ mod tests {
         assert_eq!(c.last().unwrap(), "exec catbus-agent --resume s1 --plan");
         // Unknown kind → no direct launch (caller keeps the plain shell).
         assert!(agent_launch_shell_suffix("bash", "x", None).is_none());
+    }
+
+    #[test]
+    fn wrap_exec_command_prefixes_tracer_when_present() {
+        // No tracer → identical to the plain suffix's exec line.
+        assert_eq!(wrap_exec_command("claude --resume x", None), "exec claude --resume x");
+        // With a tracer → strace counts syscalls, output to the quoted log.
+        let trace = ("/usr/bin/strace".to_string(), "/var/lib/tab-atelier/t.txt".to_string());
+        assert_eq!(
+            wrap_exec_command("claude --resume x", Some(&trace)),
+            "exec '/usr/bin/strace' -f -c -o '/var/lib/tab-atelier/t.txt' claude --resume x"
+        );
     }
 
     #[test]

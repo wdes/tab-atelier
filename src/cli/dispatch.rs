@@ -337,6 +337,17 @@ pub enum Commands {
         json: bool,
     },
 
+    /// Enable/disable the file logger from the shell (persisted, applied
+    /// on next start). `log input` traces every keystroke (IME included),
+    /// `log off` disables, `log <filter>` sets any `env_logger` filter.
+    /// Env vars (`TAB_ATELIER_LOG` / `RUST_LOG`) still win when set.
+    Log {
+        /// `input` | `on` | `off` | a raw `env_logger` filter (may be
+        /// several words). Omit to print the current filter + log paths.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Terminal throughput self-test — drains vtebench-style payloads
     /// through the `PtyRing` + alacritty parser and reports MiB/s.
     /// Measures PTY-read/parse only (not paint or typing latency).
@@ -528,6 +539,7 @@ pub fn dispatch(cli: Cli) -> bool {
             }
             crate::cli::share_link::schedule(&args)
         }
+        Commands::Log { args } => crate::cli::logging::run(&args),
         Commands::Tabs { json } => {
             let args = if json { vec!["--json".to_string()] } else { vec![] };
             crate::cli::share_link::tabs(&args)

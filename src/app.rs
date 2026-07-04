@@ -426,6 +426,11 @@ struct AppState {
     /// Last time `tab_connections` was refreshed (throttled — the /proc scan
     /// is too heavy for every persist tick).
     last_conn_meter: std::cell::Cell<Option<std::time::Instant>>,
+    /// Per-tab agent resource sampler. Every persist tick, each agent
+    /// tab's `/proc` subtree is sampled and a JSONL line appended to
+    /// `agent_probe_tab-<name>.jsonl` — the "why is idle claude busy"
+    /// timeline a future binary taps into. See [`crate::agent_probe`].
+    agent_probe: crate::agent_probe::AgentProbe,
 }
 
 impl AppState {
@@ -501,7 +506,7 @@ impl AppState {
                 // stay inert, so it restores tabs as plain shells.
                 let agent_launch = if crate::clear_env() && !crate::read_only() {
                     match (&ts.agent_kind, &ts.agent_session_id) {
-                        (Some(k), Some(s)) => crate::agent_launch_shell_suffix(k, s, ts.agent_plan_mode),
+                        (Some(k), Some(s)) => crate::agent_launch_shell_suffix_instrumented(k, s, ts.agent_plan_mode),
                         _ => None,
                     }
                 } else {
@@ -977,6 +982,7 @@ impl AppState {
             last_state_hash: std::cell::Cell::new(0),
             tab_connections: std::cell::RefCell::new(std::collections::HashMap::new()),
             last_conn_meter: std::cell::Cell::new(None),
+            agent_probe: crate::agent_probe::AgentProbe::default(),
         }
     }
 
@@ -1091,6 +1097,7 @@ impl AppState {
         // (SIGHUP), which `claude` can survive and orphan (the ghost sessions).
         #[cfg(unix)]
         crate::kill_tab_pgroup(pid);
+        self.agent_probe.forget(&self.tabs[idx].name);
         self.tabs.remove(idx);
         if self.active >= self.tabs.len() {
             self.active = self.tabs.len() - 1;
@@ -1530,12 +1537,28 @@ impl AppState {
                 t.last_focused_at = Some(now);
             }
             #[cfg(feature = "catbus")]
+            let probe_base = platform::state_base_dir();
+            #[cfg(feature = "catbus")]
+            let probe_now = std::time::SystemTime::now();
+            #[cfg(feature = "catbus")]
             for tab in &mut self.tabs {
                 if tab.agent_kind.is_none() {
                     continue;
                 }
                 let pid = tab.view.read(cx).pid();
-                match crate::catbus_agent::agent_activity(pid) {
+                let activity = crate::catbus_agent::agent_activity(pid);
+                // Resource sampler: append this tick's CPU/RSS/ctxsw line for
+                // live agents (Gone has no process to sample). The PTY child
+                // *is* claude (agent tabs `exec claude`), so `pid` roots the
+                // agent subtree directly.
+                if let Some(state) = match activity {
+                    crate::catbus_agent::AgentActivity::Idle => Some("idle"),
+                    crate::catbus_agent::AgentActivity::Working => Some("working"),
+                    crate::catbus_agent::AgentActivity::Gone => None,
+                } {
+                    self.agent_probe.observe(&probe_base, &tab.name, pid, state, probe_now);
+                }
+                match activity {
                     // The agent process is gone but no `idle` status POST cleared
                     // the session (killed / crashed / plain exit). Drop the stale
                     // session so the tab stops showing a phantom dormant-blue LED
@@ -1672,7 +1695,9 @@ impl AppState {
         // corrupts the user's session ids.
         let agent_launch = if crate::clear_env() && !crate::read_only() {
             match (&self.tabs[idx].agent_kind, &self.tabs[idx].agent_session_id) {
-                (Some(k), Some(s)) => crate::agent_launch_shell_suffix(k, s, self.tabs[idx].agent_plan_mode),
+                (Some(k), Some(s)) => {
+                    crate::agent_launch_shell_suffix_instrumented(k, s, self.tabs[idx].agent_plan_mode)
+                }
                 _ => None,
             }
         } else {

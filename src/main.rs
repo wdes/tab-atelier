@@ -96,6 +96,14 @@ fn main() {
                 let rest: Vec<String> = std::env::args().skip(2).collect();
                 std::process::exit(cli::share_link::schedule(&rest));
             }
+            "log" => {
+                // Enable/disable the GUI file logger without env vars.
+                // Persists a filter the GUI reads at startup — e.g.
+                // `tab-atelier log input` to capture the keystroke trace
+                // for diagnosing input/IME bugs. Applies on next launch.
+                let rest: Vec<String> = std::env::args().skip(2).collect();
+                std::process::exit(cli::logging::run(&rest));
+            }
             _ => {}
         }
     }
@@ -130,6 +138,7 @@ fn main() {
                      tab-atelier brain [--once]   watchdog tab that auto-recovers stuck agents\n  \
                      tab-atelier dispatch …       hand work to another tab / a new agent\n  \
                      tab-atelier schedule …       off-hours auto-lock per tab (OSM opening_hours)\n  \
+                     tab-atelier log [input|off|…] enable/disable the GUI file logger (applies next launch)\n  \
                      tab-atelier --read-only      start inspect-only (no disk writes, no lock)\n  \
                      tab-atelier --version        print version and exit\n  \
                      tab-atelier --help           print this help and exit\n",
@@ -168,6 +177,12 @@ fn main() {
     let _ = ctrlc::set_handler(|| {
         SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
     });
+
+    // Route GUI `log` records to <state>/tab-atelier.log when
+    // TAB_ATELIER_LOG / RUST_LOG is set. The desktop has no terminal, so
+    // without this the keystroke/IME trace (target tab_atelier::input_lag)
+    // is emitted but discarded — see init_gui_file_logging.
+    tab_atelier::init_gui_file_logging();
 
     app::run();
 }
