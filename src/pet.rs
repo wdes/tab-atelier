@@ -21,8 +21,14 @@
 
 #![cfg(feature = "pets")]
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Instant;
+
+use gpui::{Context, InteractiveElement as _, IntoElement, ParentElement as _, Styled as _, canvas, div, img, px};
 
 /// Which screen edge a border transition applies to. eSheep tags each border
 /// `<next>` with `only=`: `vertical` = the side walls, `horizontal+` = the top,
@@ -628,6 +634,237 @@ fn png_dims(bytes: &[u8]) -> Option<(f32, f32)> {
     let w = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
     let h = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
     (w > 0 && h > 0).then_some((w as f32, h as f32))
+}
+
+/// The desktop screen-mate: all the pet's UI state and gpui glue.
+///
+/// Holds the live [`Pet`], its two sprite sheets, drag state, and the per-tab
+/// ledge list, and knows how to summon, animate, draw, and drag it. Lives here
+/// so `app.rs` keeps a single `PetOverlay` field and a few delegating calls
+/// instead of the whole feature.
+pub struct PetOverlay {
+    pet: Option<Pet>,
+    sheet: Option<Arc<gpui::Image>>,
+    sheet_flip: Option<Arc<gpui::Image>>,
+    sheet_wh: (f32, f32),
+    tile_wh: (f32, f32),
+    last: Instant,
+    /// While dragging: the grab offset `(mouse - pet_top_left)`.
+    drag: Option<(f32, f32)>,
+    /// Ledges the pet can walk on (one per tab, its top edge), collected each
+    /// paint by the per-tab measuring canvases ([`PetOverlay::tab_ledge_canvas`]).
+    ledges: Rc<RefCell<Vec<Surface>>>,
+}
+
+impl Default for PetOverlay {
+    fn default() -> Self {
+        Self {
+            pet: None,
+            sheet: None,
+            sheet_flip: None,
+            sheet_wh: (0.0, 0.0),
+            tile_wh: (49.0, 49.0),
+            last: Instant::now(),
+            drag: None,
+            ledges: Rc::new(RefCell::new(Vec::new())),
+        }
+    }
+}
+
+impl PetOverlay {
+    /// Whether a pet is currently on screen.
+    #[must_use]
+    pub const fn is_active(&self) -> bool {
+        self.pet.is_some()
+    }
+
+    /// Summon a random installed pet, or dismiss the current one.
+    pub fn toggle(&mut self, screen_w: f32, screen_h: f32) {
+        if self.pet.take().is_some() {
+            self.sheet = None;
+            self.sheet_flip = None;
+            return; // was on screen → now dismissed
+        }
+        let pets = list_pets();
+        if pets.is_empty() {
+            return;
+        }
+        // Pick one at random so each summon is a surprise. A time-seeded index is
+        // plenty for "which sheep today?" — no need to pull in an rng dep.
+        let idx = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos() as usize)
+            % pets.len();
+        let Some(loaded) = load_pet(&pets[idx].0) else {
+            return;
+        };
+        let (sw, sh) = (loaded.sheet_w, loaded.sheet_h);
+        let (tw, th) = (sw / loaded.def.tilesx as f32, sh / loaded.def.tilesy as f32);
+        self.sheet = Some(Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, loaded.png)));
+        self.sheet_flip = Some(Arc::new(gpui::Image::from_bytes(
+            gpui::ImageFormat::Png,
+            loaded.png_flip,
+        )));
+        self.sheet_wh = (sw, sh);
+        self.tile_wh = (tw, th);
+        self.pet = Some(Pet::new(loaded.def, screen_w, screen_h, tw, th));
+        self.last = Instant::now();
+    }
+
+    /// A measuring canvas for tab `index`'s top edge, appended to the ledge list.
+    /// The first tab clears last frame's list before anyone appends (canvases
+    /// paint in child order). Absolute + full-size so it measures the tab without
+    /// disturbing layout or stealing mouse events (it has no hitbox).
+    #[must_use]
+    pub fn tab_ledge_canvas(&self, index: usize) -> impl IntoElement {
+        let ledges = self.ledges.clone();
+        canvas(
+            move |bounds, _, _| {
+                let mut v = ledges.borrow_mut();
+                if index == 0 {
+                    v.clear();
+                }
+                let x0 = f32::from(bounds.origin.x);
+                v.push(Surface {
+                    y: f32::from(bounds.origin.y),
+                    x0,
+                    x1: x0 + f32::from(bounds.size.width),
+                });
+            },
+            |_, (), _, _| {},
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+    }
+
+    /// Advance the pet by real elapsed time and build its sprite (+ a drag catcher
+    /// while held). `visible` freezes it when the window is hidden. `access` maps
+    /// the render entity back to this overlay so the drag listeners can reach it.
+    /// `None` when no pet is summoned.
+    pub fn render<V: 'static>(
+        &mut self,
+        visible: bool,
+        screen_w: f32,
+        screen_h: f32,
+        cx: &mut Context<V>,
+        access: fn(&mut V) -> &mut Self,
+    ) -> Option<gpui::AnyElement> {
+        self.pet.as_ref()?;
+        // Frame timing: real dt so walk speed is display-rate independent. Frozen
+        // while hidden — no point animating off-screen.
+        let now = Instant::now();
+        let dt_ms = (now.saturating_duration_since(self.last).as_secs_f32() * 1000.0).min(200.0);
+        self.last = now;
+        let (tw, th) = self.tile_wh;
+        if visible && let Some(pet) = self.pet.as_mut() {
+            let surfaces = self.ledges.borrow();
+            let world = World {
+                w: screen_w,
+                h: screen_h,
+                tile_w: tw,
+                tile_h: th,
+                surfaces: &surfaces,
+            };
+            pet.tick(dt_ms, &world);
+        }
+        // Face the way it's moving: the mirrored sheet when flipped (facing right),
+        // the normal one otherwise. Both are tile-aligned, so the `(col, row)`
+        // offsets are unchanged.
+        let pet = self.pet.as_ref()?;
+        let sheet = if pet.flipped() {
+            self.sheet_flip.as_ref()
+        } else {
+            self.sheet.as_ref()
+        }?;
+        let (col, row) = pet.current_tile();
+        let (x, y) = pet.pos();
+        let (sw, sh) = self.sheet_wh;
+        let dragging = pet.is_dragging();
+
+        // Sprite tile: a tile-sized window clipping the sheet. `.occlude()` so a
+        // click on the pet grabs it (drag) instead of leaking into a terminal text
+        // selection; the tiny footprint leaves the rest of the screen selectable.
+        let sprite = div()
+            .absolute()
+            .left(px(x))
+            .top(px(y))
+            .w(px(tw))
+            .h(px(th))
+            .overflow_hidden()
+            .occlude()
+            .cursor(if dragging {
+                gpui::CursorStyle::ClosedHand
+            } else {
+                gpui::CursorStyle::OpenHand
+            })
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(move |this, ev: &gpui::MouseDownEvent, _window, cx| {
+                    let o = access(this);
+                    if let Some(pet) = o.pet.as_mut() {
+                        let (px_, py_) = pet.pos();
+                        pet.grab();
+                        o.drag = Some((f32::from(ev.position.x) - px_, f32::from(ev.position.y) - py_));
+                        cx.notify();
+                    }
+                }),
+            )
+            .child(
+                img(gpui::ImageSource::Image(sheet.clone()))
+                    .absolute()
+                    .left(px(-(col as f32) * tw))
+                    .top(px(-(row as f32) * th))
+                    .w(px(sw))
+                    .h(px(sh)),
+            );
+
+        let mut wrap = div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .w(px(screen_w))
+            .h(px(screen_h))
+            .child(sprite);
+
+        // While a drag is live, track the mouse across the whole window and release
+        // on mouse-up — a full-window transparent catcher so the pointer needn't
+        // stay inside the tiny sprite box.
+        if dragging {
+            wrap = wrap.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .w(px(screen_w))
+                    .h(px(screen_h))
+                    .occlude()
+                    .cursor(gpui::CursorStyle::ClosedHand)
+                    .on_mouse_move(cx.listener(move |this, ev: &gpui::MouseMoveEvent, _window, cx| {
+                        let o = access(this);
+                        if let (Some(off), Some(pet)) = (o.drag, o.pet.as_mut()) {
+                            let nx = (f32::from(ev.position.x) - off.0).clamp(0.0, (screen_w - tw).max(0.0));
+                            let ny = (f32::from(ev.position.y) - off.1).clamp(0.0, (screen_h - th).max(0.0));
+                            pet.set_pos(nx, ny);
+                            cx.notify();
+                        }
+                    }))
+                    .on_mouse_up(
+                        gpui::MouseButton::Left,
+                        cx.listener(move |this, _ev: &gpui::MouseUpEvent, _window, cx| {
+                            let o = access(this);
+                            if let Some(pet) = o.pet.as_mut() {
+                                pet.drop();
+                            }
+                            o.drag = None;
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+        Some(wrap.into_any_element())
+    }
 }
 
 #[cfg(test)]
