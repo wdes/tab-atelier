@@ -485,7 +485,14 @@ impl AppState {
                 // stay inert, so it restores tabs as plain shells.
                 let agent_launch = if crate::clear_env() && !crate::read_only() {
                     match (&ts.agent_kind, &ts.agent_session_id) {
-                        (Some(k), Some(s)) => crate::agent_launch_shell_suffix_instrumented(k, s, ts.agent_plan_mode),
+                        (Some(k), Some(s)) => {
+                            // Name the agent process after the tab so `top -H`/`ps`
+                            // can tell 20 claudes apart. Only when the launch shell
+                            // supports `exec -a`.
+                            let title = crate::shell_supports_exec_a(&crate::clear_env_shell_path())
+                                .then_some(ts.name.as_str());
+                            crate::agent_launch_shell_suffix_instrumented(k, s, ts.agent_plan_mode, title)
+                        }
                         _ => None,
                     }
                 } else {
@@ -1676,7 +1683,10 @@ impl AppState {
         let agent_launch = if crate::clear_env() && !crate::read_only() {
             match (&self.tabs[idx].agent_kind, &self.tabs[idx].agent_session_id) {
                 (Some(k), Some(s)) => {
-                    crate::agent_launch_shell_suffix_instrumented(k, s, self.tabs[idx].agent_plan_mode)
+                    // Name the agent process after the tab (see the restore path).
+                    let title = crate::shell_supports_exec_a(&crate::clear_env_shell_path())
+                        .then_some(self.tabs[idx].name.as_str());
+                    crate::agent_launch_shell_suffix_instrumented(k, s, self.tabs[idx].agent_plan_mode, title)
                 }
                 _ => None,
             }

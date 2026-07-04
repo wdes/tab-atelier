@@ -393,6 +393,9 @@ fn spawn_pty_tab(
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| r"C:\Windows\System32\cmd.exe".to_string());
+    // Whether the launch shell supports `exec -a` (for the agent proctitle
+    // below) — captured before `shell_program` is moved into the tuple.
+    let shell_titleable = crate::shell_supports_exec_a(&shell_program);
     let (env_map, prog, mut args): (HashMap<String, String>, String, Vec<String>) = if crate::clear_env() {
         // Cleared-env mode: spawn the shell through `env -i` so it
         // inherits NOTHING from the daemon — only the curated minimal
@@ -420,7 +423,10 @@ fn spawn_pty_tab(
     // session ids in the user's JSON — a read-only instance stays inert.
     let agent_direct: Option<Vec<String>> = match (&agent_kind, &agent_session_id) {
         (Some(k), Some(s)) if !crate::read_only() => {
-            crate::agent_launch_shell_suffix_instrumented(k, s, agent_plan_mode)
+            // Name the agent process after the tab so `top -H`/`ps` can tell
+            // instances apart. Only when the launch shell supports `exec -a`.
+            let title = shell_titleable.then_some(name.as_str());
+            crate::agent_launch_shell_suffix_instrumented(k, s, agent_plan_mode, title)
         }
         _ => None,
     };
