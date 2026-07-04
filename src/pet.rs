@@ -512,13 +512,17 @@ impl Pet {
     }
 }
 
-/// A pet loaded and ready to render: animation model + its sprite sheet.
+/// A pet loaded and ready to render: animation model + its sprite sheets.
 pub struct LoadedPet {
     pub def: PetDef,
     /// The sprite-sheet PNG bytes — an alpha-keyed, palette-quantized sheet baked
     /// at build time (see `tools/bake-pets`), so feed straight to
     /// `gpui::Image::from_bytes` with no runtime decode/keying.
     pub png: Vec<u8>,
+    /// The same sheet with every tile mirrored horizontally in place, drawn when
+    /// the pet faces the other way ([`Pet::flipped`]) — gpui can't mirror a raster
+    /// element, so we ship both orientations.
+    pub png_flip: Vec<u8>,
     pub sheet_w: f32,
     pub sheet_h: f32,
 }
@@ -580,9 +584,13 @@ pub fn load_pet(id: &str) -> Option<LoadedPet> {
     let def = PetDef::parse(&xml)?;
     let png = std::fs::read(dir.join(format!("{id}.png"))).ok()?;
     let (sheet_w, sheet_h) = png_dims(&png)?;
+    // The mirrored sheet is optional — fall back to the normal one so a pet with
+    // no baked flip still renders (just un-mirrored when facing the other way).
+    let png_flip = std::fs::read(dir.join(format!("{id}.flip.png"))).unwrap_or_else(|_| png.clone());
     Some(LoadedPet {
         def,
         png,
+        png_flip,
         sheet_w,
         sheet_h,
     })

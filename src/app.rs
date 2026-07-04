@@ -328,6 +328,9 @@ struct AppState {
     pet: Option<crate::pet::Pet>,
     #[cfg(feature = "pets")]
     pet_sheet: Option<std::sync::Arc<gpui::Image>>,
+    /// The mirrored sprite sheet, drawn when the pet faces the other way.
+    #[cfg(feature = "pets")]
+    pet_sheet_flip: Option<std::sync::Arc<gpui::Image>>,
     #[cfg(feature = "pets")]
     pet_sheet_wh: (f32, f32),
     #[cfg(feature = "pets")]
@@ -901,6 +904,8 @@ impl AppState {
             pet: None,
             #[cfg(feature = "pets")]
             pet_sheet: None,
+            #[cfg(feature = "pets")]
+            pet_sheet_flip: None,
             #[cfg(feature = "pets")]
             pet_sheet_wh: (0.0, 0.0),
             #[cfg(feature = "pets")]
@@ -2197,6 +2202,7 @@ impl AppState {
     fn toggle_pet(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
         if self.pet.take().is_some() {
             self.pet_sheet = None;
+            self.pet_sheet_flip = None;
             return; // was on screen → now dismissed
         }
         let pets = crate::pet::list_pets();
@@ -2217,6 +2223,10 @@ impl AppState {
         self.pet_sheet = Some(std::sync::Arc::new(gpui::Image::from_bytes(
             gpui::ImageFormat::Png,
             loaded.png,
+        )));
+        self.pet_sheet_flip = Some(std::sync::Arc::new(gpui::Image::from_bytes(
+            gpui::ImageFormat::Png,
+            loaded.png_flip,
         )));
         self.pet_sheet_wh = (sw, sh);
         self.pet_tile_wh = (tw, th);
@@ -4417,7 +4427,16 @@ impl Render for AppState {
                 };
                 pet.tick(dt_ms, &world);
             }
-            if let (Some(pet), Some(sheet)) = (self.pet.as_ref(), self.pet_sheet.as_ref()) {
+            // Face the way it's moving: the mirrored sheet when flipped (facing
+            // right), the normal one otherwise. Both are tile-aligned, so the
+            // `(col, row)` offsets below are unchanged.
+            if let Some(pet) = self.pet.as_ref()
+                && let Some(sheet) = if pet.flipped() {
+                    self.pet_sheet_flip.as_ref()
+                } else {
+                    self.pet_sheet.as_ref()
+                }
+            {
                 let (col, row) = pet.current_tile();
                 let (x, y) = pet.pos();
                 let (sw, sh) = self.pet_sheet_wh;

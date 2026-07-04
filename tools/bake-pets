@@ -79,16 +79,49 @@ def bake(xml_path):
     return stem, len(best), len(stripped)
 
 
+def write_flip(stem, xml):
+    """Write `<stem>.flip.png`: each sprite tile mirrored horizontally *in place*.
+
+    gpui can't mirror a raster element, so we ship a pre-flipped sheet the app
+    swaps to when the pet faces the other way. Mirroring per-tile (not the whole
+    sheet) keeps every tile at the same grid cell, so the renderer reuses the
+    exact same `(col, row)` offsets — it only picks a different image.
+    """
+    png = os.path.join(ROOT, f"{stem}.png")
+    if not os.path.exists(png):
+        return 0
+    tx = int(re.search(r"<tilesx>(\d+)</tilesx>", xml).group(1))
+    ty = int(re.search(r"<tilesy>(\d+)</tilesy>", xml).group(1))
+    im = Image.open(png).convert("RGBA")
+    w, h = im.size
+    tw, th = w // tx, h // ty
+    flip = Image.new("RGBA", (w, h))
+    for gy in range(ty):
+        for gx in range(tx):
+            box = (gx * tw, gy * th, gx * tw + tw, gy * th + th)
+            flip.paste(im.crop(box).transpose(Image.FLIP_LEFT_RIGHT), box)
+    q = flip.quantize(colors=64, method=Image.FASTOCTREE, dither=Image.NONE)
+    buf = io.BytesIO()
+    q.save(buf, "PNG", optimize=True)
+    open(os.path.join(ROOT, f"{stem}.flip.png"), "wb").write(buf.getvalue())
+    return len(buf.getvalue())
+
+
 def main():
     total = 0
     for xml_path in sorted(glob.glob(os.path.join(ROOT, "*.xml"))):
+        stem = os.path.splitext(os.path.basename(xml_path))[0]
         r = bake(xml_path)
         if r is None:
             print(f"{os.path.basename(xml_path):16} already baked / no sprite")
-            continue
-        stem, png, xml = r
-        total += png + xml
-        print(f"{stem:16} png {png // 1024:3} KB   xml {xml // 1024:3} KB")
+        else:
+            stem, png, xml = r
+            total += png + xml
+            print(f"{stem:16} png {png // 1024:3} KB   xml {xml // 1024:3} KB")
+        # Always (re)derive the mirrored sheet from the baked <stem>.png so this
+        # runs on already-baked assets too.
+        flip = write_flip(stem, open(xml_path).read())
+        total += flip
     print(f"\ntotal assets/pets: {total // 1024} KB")
 
 
