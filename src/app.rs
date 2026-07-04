@@ -2203,13 +2203,13 @@ impl AppState {
         bar.child(plus_btn)
     }
 
-    /// Summon a random pet if none is on screen, or dismiss the current one.
+    /// Summon one more random pet onto the screen (repeated calls grow the herd).
     /// Loads a baked sprite sheet + animation XML from `/usr/share/tab-atelier/pets/`
     /// (dev: `./assets/pets/`). No-op if no pets are installed.
     #[cfg(feature = "pets")]
-    fn toggle_pet(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
+    fn summon_pet(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
         let vp = window.viewport_size();
-        self.pet.toggle(f32::from(vp.width), f32::from(vp.height));
+        self.pet.summon(f32::from(vp.width), f32::from(vp.height));
     }
 
     fn render_context_menu(&self, window: &Window, cx: &Context<Self>) -> Option<Stateful<Div>> {
@@ -2907,17 +2907,13 @@ impl AppState {
                     .child(self.t().preferences),
             );
 
-        // Screen-mate pet toggle (background menu).
+        // Screen-mate pets (background menu): "Summon" adds one more to the herd;
+        // "Dismiss all" appears only when at least one pet is on screen.
         #[cfg(feature = "pets")]
         {
-            let label = if self.pet.is_active() {
-                "🐾 Dismiss pet"
-            } else {
-                "🐾 Summon a pet"
-            };
             container = container.child(sep()).child(
                 div()
-                    .id("menu-pet")
+                    .id("menu-pet-summon")
                     .px(px(12.0))
                     .py(px(4.0))
                     .cursor_pointer()
@@ -2925,13 +2921,32 @@ impl AppState {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _ev: &MouseDownEvent, window, cx| {
-                            this.toggle_pet(window, cx);
+                            this.summon_pet(window, cx);
                             this.context_menu = None;
                             cx.notify();
                         }),
                     )
-                    .child(label),
+                    .child("🐾 Summon a pet"),
             );
+            if self.pet.count() > 0 {
+                container = container.child(
+                    div()
+                        .id("menu-pet-dismiss")
+                        .px(px(12.0))
+                        .py(px(4.0))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(menu_hover))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                                this.pet.dismiss_all();
+                                this.context_menu = None;
+                                cx.notify();
+                            }),
+                        )
+                        .child("🐾 Dismiss all pets"),
+                );
+            }
         }
 
         Some(container)
