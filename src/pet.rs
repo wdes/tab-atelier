@@ -16,8 +16,12 @@
 //! `app.rs` reads [`Pet::current_tile`] / [`Pet::pos`] each frame, clips the sheet
 //! to the active tile, and can [`Pet::grab`]/[`Pet::drop`] it for drag-and-drop.
 //!
-//! Unknown animation ids are tolerated (they fall back to the start animation),
-//! so a pet referencing an effect we don't model simply keeps walking.
+//! Dead-end animations (empty `<next>`) are desktopPet's death/kill/effect
+//! sequences (`alien_kill`, `blank_die`, …) that end the pet's life via a
+//! spawn/child system we don't model. Upstream respawns the pet there
+//! (`FormPet.SetNewAnimation`: `if (id < 0) … spawn!`), and so do we — a
+//! [`Pet::respawn`] to the start point — so a pet can never freeze (e.g. stuck
+//! forever at the top of the screen). Unknown animation ids fall back the same.
 
 #![cfg(feature = "pets")]
 
@@ -282,6 +286,18 @@ impl Pet {
         }
     }
 
+    /// Reset to the spawn state — bottom, facing left, walking. Upstream's
+    /// `id < 0 → spawn` fallback (`FormPet.SetNewAnimation`) when an animation
+    /// dead-ends; mirrors [`Pet::new`]'s spawn using the live screen size.
+    fn respawn(&mut self, world: &World) {
+        self.x = (world.w - world.tile_w).max(0.0);
+        self.y = (world.h - world.tile_h).max(0.0);
+        self.facing = -1;
+        self.anim = self.def.start;
+        self.frame_i = 0;
+        self.accum_ms = 0.0;
+    }
+
     /// Cheap LCG so `next`-probability picks don't need the `rand` crate.
     const fn rand_100(&mut self) -> u32 {
         self.rng = self.rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
@@ -434,8 +450,16 @@ impl Pet {
             if cur.flip {
                 self.facing = -self.facing;
             }
+            // A sequence with no `<next>` is a dead end — desktopPet's death /
+            // kill / effect animations (alien_kill, blank_die, …) whose empty next
+            // means "end of life". Upstream never freezes on these: FormPet.cs
+            // `SetNewAnimation` does `if (id < 0) // no animation found, spawn!` —
+            // it respawns the pet. We match that: respawn at the start point so a
+            // sheep can never get stuck (e.g. frozen forever at the top of screen).
             if let Some(next) = self.pick_next(cur) {
                 self.anim = next;
+            } else {
+                self.respawn(world);
             }
         }
     }
@@ -1248,6 +1272,80 @@ mod tests {
             turned_art.contains('▶'),
             "post-turn frame draws the right-facing (mirrored) sprite"
         );
+    }
+
+    #[test]
+    fn pets_never_freeze_in_a_dead_end() {
+        // Regression: a sheep used to get stuck FOREVER at the top of the screen
+        // in `alien_kill` (a death animation with an empty `<next>`). No pet may
+        // stay frozen — same anim id AND position — for long. Walking keeps the
+        // anim but moves; idle changes anim or animates in place and wakes up. The
+        // pre-fix freeze was 174_304 ticks; legit idle tops out around 2_775.
+        const MAX_FROZEN: u32 = 10_000; // ≈2.7 min of sim
+        for id in ["owl", "blue_sheep", "blue_ham_ham"] {
+            let Some(lp) = load_pet(id) else { continue };
+            let (w, h) = (1200.0f32, 700.0f32);
+            let (tw, th) = (lp.sheet_w / lp.def.tilesx as f32, lp.sheet_h / lp.def.tilesy as f32);
+            let mut pet = Pet::new(lp.def, w, h, tw, th);
+            let (mut ka, mut kx, mut ky, mut run, mut worst) = (u32::MAX, 0.0f32, 0.0f32, 0u32, 0u32);
+            for _ in 0..150_000 {
+                pet.tick(
+                    16.0,
+                    &World {
+                        w,
+                        h,
+                        tile_w: tw,
+                        tile_h: th,
+                        surfaces: &[],
+                    },
+                );
+                let (x, y) = pet.pos();
+                if pet.anim == ka && (x - kx).abs() < 1.0 && (y - ky).abs() < 1.0 {
+                    run += 1;
+                } else {
+                    (ka, kx, ky, run) = (pet.anim, x, y, 1);
+                }
+                worst = worst.max(run);
+            }
+            assert!(
+                worst < MAX_FROZEN,
+                "{id}: frozen for {worst} ticks — stuck in a dead-end animation"
+            );
+        }
+    }
+
+    #[test]
+    fn dead_end_animation_respawns_the_pet() {
+        // Upstream (`FormPet.SetNewAnimation`: `if (id < 0) ... spawn!`) respawns
+        // the pet when an animation dead-ends. Shove the sheep into `alien_kill`
+        // (id 62 — empty `<next>`) at the top of the screen and confirm it
+        // respawns at the bottom instead of freezing there.
+        let lp = load_pet("blue_sheep").expect("sheep assets");
+        let (w, h) = (1000.0f32, 700.0f32);
+        let (tw, th) = (lp.sheet_w / lp.def.tilesx as f32, lp.sheet_h / lp.def.tilesy as f32);
+        let mut pet = Pet::new(lp.def, w, h, tw, th);
+        pet.set_pos(400.0, 0.0); // top of the screen
+        pet.anim = 62; // alien_kill — a dead end
+        pet.frame_i = 0;
+        let spawn_y = h - th;
+        let mut respawned = false;
+        for _ in 0..300 {
+            pet.tick(
+                60.0,
+                &World {
+                    w,
+                    h,
+                    tile_w: tw,
+                    tile_h: th,
+                    surfaces: &[],
+                },
+            );
+            if pet.anim != 62 && (pet.pos().1 - spawn_y).abs() < 2.0 {
+                respawned = true;
+                break;
+            }
+        }
+        assert!(respawned, "the dead-end animation respawned the pet at the bottom");
     }
 
     #[test]
