@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::{Deserialize, Serialize};
 
 pub mod agent_probe;
+pub mod agent_reaper;
 pub mod alloc_count;
 pub(crate) mod api;
 pub(crate) mod api_ws;

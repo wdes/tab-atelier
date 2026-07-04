@@ -178,11 +178,5 @@ fn main() {
         SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
     });
 
-    // Route GUI `log` records to <state>/tab-atelier.log when
-    // TAB_ATELIER_LOG / RUST_LOG is set. The desktop has no terminal, so
-    // without this the keystroke/IME trace (target tab_atelier::input_lag)
-    // is emitted but discarded — see init_gui_file_logging.
-    tab_atelier::init_gui_file_logging();
-
     app::run();
 }
