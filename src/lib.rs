@@ -522,10 +522,20 @@ pub fn agent_launch_shell_suffix_instrumented(
         }
         (tracer, log.to_string_lossy().into_owned())
     });
+    // Opt-in (`TAB_ATELIER_FRAME_TIMING`): make the agent log per-frame
+    // render timings to a per-session JSONL, for idle-CPU/repaint debugging.
+    let frames = agent_probe::frame_timing_enabled().then(|| {
+        let base = agent_probe::state_base();
+        let log = agent_probe::frame_log_path(&base, kind, session_id);
+        if let Some(dir) = log.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        log.to_string_lossy().into_owned()
+    });
     Some(vec![
         "-i".to_string(),
         "-c".to_string(),
-        wrap_exec_command(&cmd, trace.as_ref(), proctitle),
+        wrap_exec_command(&cmd, trace.as_ref(), frames.as_deref(), proctitle),
     ])
 }
 
@@ -546,7 +556,12 @@ pub fn shell_supports_exec_a(shell_path: &str) -> bool {
 /// under `strace -f -c -o <log>` (`trace`) and/or sets its `argv[0]` via
 /// `exec -a <title>` (`proctitle`). Pure — the unit-testable core.
 #[must_use]
-fn wrap_exec_command(cmd: &str, trace: Option<&(String, String)>, proctitle: Option<&str>) -> String {
+fn wrap_exec_command(
+    cmd: &str,
+    trace: Option<&(String, String)>,
+    frames: Option<&str>,
+    proctitle: Option<&str>,
+) -> String {
     let program = match trace {
         Some((tracer, log)) => {
             format!(
@@ -557,10 +572,21 @@ fn wrap_exec_command(cmd: &str, trace: Option<&(String, String)>, proctitle: Opt
         }
         None => cmd.to_string(),
     };
-    proctitle.map_or_else(
+    let exec = proctitle.map_or_else(
         || format!("exec {program}"),
         |title| format!("exec -a {} {program}", agent_probe::sh_squote(title)),
-    )
+    );
+    // Frame-timing env is set as a prefix assignment on `exec` (not via an
+    // `env` wrapper), so `exec -a <title>` still renames the agent itself
+    // and bash exports the vars into the exec'd process. `DEBUG_REPAINTS`
+    // rides along so the frame log carries repaint counts.
+    match frames {
+        None => exec,
+        Some(log) => format!(
+            "CLAUDE_CODE_FRAME_TIMING_LOG={} CLAUDE_CODE_DEBUG_REPAINTS=1 {exec}",
+            agent_probe::sh_squote(log)
+        ),
+    }
 }
 
 /// Install a file-backed logger for the windowed GUI.
@@ -2588,15 +2614,15 @@ mod tests {
 
     #[test]
     fn wrap_exec_command_prefixes_tracer_when_present() {
-        // No tracer, no title → identical to the plain suffix's exec line.
+        // No tracer, no frames, no title → the plain suffix's exec line.
         assert_eq!(
-            wrap_exec_command("claude --resume x", None, None),
+            wrap_exec_command("claude --resume x", None, None, None),
             "exec claude --resume x"
         );
         // With a tracer → strace counts syscalls, output to the quoted log.
         let trace = ("/usr/bin/strace".to_string(), "/var/lib/tab-atelier/t.txt".to_string());
         assert_eq!(
-            wrap_exec_command("claude --resume x", Some(&trace), None),
+            wrap_exec_command("claude --resume x", Some(&trace), None, None),
             "exec '/usr/bin/strace' -f -c -o '/var/lib/tab-atelier/t.txt' claude --resume x"
         );
     }
@@ -2605,14 +2631,34 @@ mod tests {
     fn wrap_exec_command_sets_proctitle_via_exec_a() {
         // proctitle → argv[0] override so the process shows the tab name.
         assert_eq!(
-            wrap_exec_command("claude --resume x", None, Some("my tab")),
+            wrap_exec_command("claude --resume x", None, None, Some("my tab")),
             "exec -a 'my tab' claude --resume x"
         );
         // Combined with the tracer, the title names the outermost program.
         let trace = ("/usr/bin/strace".to_string(), "/s/t.txt".to_string());
         assert_eq!(
-            wrap_exec_command("claude --resume x", Some(&trace), Some("oa3")),
+            wrap_exec_command("claude --resume x", Some(&trace), None, Some("oa3")),
             "exec -a 'oa3' '/usr/bin/strace' -f -c -o '/s/t.txt' claude --resume x"
+        );
+    }
+
+    #[test]
+    fn wrap_exec_command_prefixes_frame_timing_env() {
+        // frames → env-var prefix on `exec`; `exec -a <title>` still renames
+        // the agent (not an `env` wrapper), and the quoted log path survives.
+        assert_eq!(
+            wrap_exec_command("claude --resume x", None, Some("/s/frames.jsonl"), None),
+            "CLAUDE_CODE_FRAME_TIMING_LOG='/s/frames.jsonl' CLAUDE_CODE_DEBUG_REPAINTS=1 exec claude --resume x"
+        );
+        assert_eq!(
+            wrap_exec_command("claude --resume x", None, Some("/s/f.jsonl"), Some("t2")),
+            "CLAUDE_CODE_FRAME_TIMING_LOG='/s/f.jsonl' CLAUDE_CODE_DEBUG_REPAINTS=1 exec -a 't2' claude --resume x"
+        );
+        // Tracer + frames compose: env prefix, then exec, then strace, then agent.
+        let trace = ("/usr/bin/strace".to_string(), "/s/t.txt".to_string());
+        assert_eq!(
+            wrap_exec_command("claude --resume x", Some(&trace), Some("/s/f.jsonl"), Some("oa3")),
+            "CLAUDE_CODE_FRAME_TIMING_LOG='/s/f.jsonl' CLAUDE_CODE_DEBUG_REPAINTS=1 exec -a 'oa3' '/usr/bin/strace' -f -c -o '/s/t.txt' claude --resume x"
         );
     }
 
