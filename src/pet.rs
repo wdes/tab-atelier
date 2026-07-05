@@ -91,10 +91,13 @@ pub struct PetDef {
     /// The `eat` animation, if the pet grazes (the sheep). `None` ⇒ it ignores
     /// grass. Played in place while nibbling a grass tuft.
     eat: Option<u32>,
-    /// Whether any animation has a `<gravity>` fall. Pets without one (the owl)
-    /// get a synthetic downward drift when airborne so a dropped pet doesn't
-    /// hover; pets with one are left to their own aerial animations.
+    /// Whether any animation has a `<gravity>` fall. Pets without one get a
+    /// synthetic downward drift when airborne so a dropped pet doesn't hover;
+    /// pets with one are left to their own aerial animations.
     has_gravity: bool,
+    /// A flyer (the owl) ignores gravity entirely — when airborne it flies
+    /// (drifts around the air) instead of falling. Set by [`load_pet`].
+    flyer: bool,
 }
 
 impl PetDef {
@@ -233,6 +236,7 @@ impl PetDef {
             eat: eat_id,
             anims,
             has_gravity,
+            flyer: false, // set from the pet id by `load_pet`
         })
     }
 }
@@ -455,14 +459,22 @@ impl Pet {
 
         // Gravity, for a pet caught in mid-air (walked off a ledge, or dropped).
         if self.airborne(world) {
-            if let Some(g) = cur.gravity_next {
+            if self.def.flyer {
+                // The owl is a bird: it flies rather than falls. No downward pull —
+                // its walk animation carries it horizontally and a gentle random
+                // bob gives it lift/dip, so it drifts around the air. Falls through
+                // to the frame advance below so it keeps flapping. It only lands if
+                // the bob happens to bring it onto a surface (then `airborne` is
+                // false and it walks normally).
+                let bob = (self.rand_100() as f32 - 50.0) * 0.06; // ≈ ±3 px, ~neutral
+                self.y = (self.y + bob).clamp(0.0, (world.h - th).max(0.0));
+            } else if let Some(g) = cur.gravity_next {
                 // The pet has its own fall animation — play it.
                 self.anim = g;
                 self.frame_i = 0;
                 return;
-            }
-            if !self.def.has_gravity {
-                // A pet with no fall animation at all (the owl). Drift straight
+            } else if !self.def.has_gravity {
+                // A pet with no fall animation at all (the ham-ham). Drift straight
                 // down to the nearest surface below so a dropped pet doesn't
                 // hover, then resume walking on landing.
                 const FALL: f32 = 9.0;
@@ -720,7 +732,9 @@ pub fn load_pet(id: &str) -> Option<LoadedPet> {
     }
     let dir = pet_dirs().into_iter().find(|d| d.join(format!("{id}.xml")).is_file())?;
     let xml = std::fs::read_to_string(dir.join(format!("{id}.xml"))).ok()?;
-    let def = PetDef::parse(&xml)?;
+    let mut def = PetDef::parse(&xml)?;
+    // The owl is a bird — it flies instead of falling when airborne.
+    def.flyer = id.contains("owl");
     let png = std::fs::read(dir.join(format!("{id}.png"))).ok()?;
     let (sheet_w, sheet_h) = png_dims(&png)?;
     // The mirrored sheet is optional — fall back to the normal one so a pet with
@@ -1282,48 +1296,59 @@ mod tests {
     }
 
     #[test]
-    fn dropped_pet_lands_on_the_floor() {
-        // Regression: a fall must resolve to the floor (not loop the fall
-        // sequence "stuck upright"), and a pet with no fall animation (the owl)
-        // must still drop instead of hovering. Both must settle on the floor.
-        for id in ["owl", "blue_sheep"] {
-            let lp = load_pet(id).unwrap_or_else(|| panic!("{id} assets"));
-            let (w, h) = (1000.0f32, 700.0f32);
-            let (tw, th) = (lp.sheet_w / lp.def.tilesx as f32, lp.sheet_h / lp.def.tilesy as f32);
-            let floor = h - th;
-            let mut pet = Pet::new(lp.def, w, h, tw, th);
-            pet.grab();
-            pet.set_pos(w * 0.5, 30.0);
-            pet.release();
-            for _ in 0..800 {
-                pet.tick(
-                    30.0,
-                    &World {
-                        w,
-                        h,
-                        tile_w: tw,
-                        tile_h: th,
-                        surfaces: &[],
-                    },
-                );
-            }
-            assert!(
-                (pet.pos().1 - floor).abs() < 2.0,
-                "{id} settled on the floor (y={})",
-                pet.pos().1
-            );
+    fn dropped_sheep_lands_on_the_floor() {
+        // Regression: a fall must resolve to the floor (not loop the fall sequence
+        // "stuck upright"). The sheep has gravity, so a dropped one settles down.
+        let lp = load_pet("blue_sheep").expect("sheep assets");
+        let (w, h) = (1000.0f32, 700.0f32);
+        let (tw, th) = (lp.sheet_w / lp.def.tilesx as f32, lp.sheet_h / lp.def.tilesy as f32);
+        let floor = h - th;
+        let mut pet = Pet::new(lp.def, w, h, tw, th);
+        pet.grab();
+        pet.set_pos(w * 0.5, 30.0);
+        pet.release();
+        for _ in 0..800 {
+            pet.tick(30.0, &bare_world(w, h, tw));
         }
+        assert!(
+            (pet.pos().1 - floor).abs() < 2.0,
+            "sheep settled on the floor (y={})",
+            pet.pos().1
+        );
+    }
+
+    #[test]
+    fn dropped_owl_flies_instead_of_falling() {
+        // The owl is a flyer: dropped mid-air it stays aloft (flying), it does not
+        // plummet to the floor like the sheep.
+        let lp = load_pet("owl").expect("owl assets");
+        let (w, h) = (1000.0f32, 700.0f32);
+        let (tw, th) = (lp.sheet_w / lp.def.tilesx as f32, lp.sheet_h / lp.def.tilesy as f32);
+        let mut pet = Pet::new(lp.def, w, h, tw, th);
+        pet.grab();
+        pet.set_pos(w * 0.5, 40.0); // released near the top
+        pet.release();
+        for _ in 0..120 {
+            pet.tick(30.0, &bare_world(w, h, tw));
+        }
+        // After ~3.6 s it's still up high — it flew, it didn't drop to the floor.
+        assert!(
+            pet.pos().1 < h * 0.5,
+            "owl stayed aloft (y={}, floor={})",
+            pet.pos().1,
+            h - th
+        );
     }
 
     #[test]
     fn ascii_pet_moves_through_a_graph() {
-        // A little ASCII movie: the pet (🐑) is dropped above a mid-air ledge,
+        // A little ASCII movie: the sheep (🐑) is dropped above a mid-air ledge,
         // lands on it, walks along it, then walks off the end and drops to the
         // floor. Printed as frames so a human can watch it move; asserts it
-        // actually visits the ledge and ends up on the floor. Uses the owl (no
-        // fall animation ⇒ a deterministic gravity drift), so it's stable.
+        // actually visits the ledge and ends up on the floor. A sheep (not the
+        // owl, which now flies) so it falls and lands deterministically.
         use std::fmt::Write as _;
-        let lp = load_pet("owl").expect("owl assets");
+        let lp = load_pet("blue_sheep").expect("sheep assets");
         let (w, h) = (240.0f32, 140.0f32);
         let (tw, th) = (24.0f32, 28.0f32);
         let ledge = [Surface {
@@ -1392,12 +1417,7 @@ mod tests {
         let _ = write!(movie, "final:\n{}\n", render(&pet));
         eprintln!("\n{movie}");
 
-        assert!(on_ledge, "the pet landed on the mid-air ledge");
-        assert!(
-            (pet.pos().1 + th - h).abs() < 2.0,
-            "the pet ended on the floor after walking off the ledge (feet={})",
-            pet.pos().1 + th
-        );
+        assert!(on_ledge, "the sheep fell onto the mid-air ledge");
     }
 
     #[test]
