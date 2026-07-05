@@ -511,7 +511,8 @@ impl Pet {
             // `SetNewAnimation` does `if (id < 0) // no animation found, spawn!` —
             // it respawns the pet. We match that: respawn at the start point so a
             // sheep can never get stuck (e.g. frozen forever at the top of screen).
-            if let Some(next) = self.pick_next(cur) {
+            let grounded = !self.airborne(world);
+            if let Some(next) = self.pick_next(cur, grounded) {
                 self.anim = next;
             } else {
                 self.respawn(world);
@@ -554,7 +555,22 @@ impl Pet {
         first
     }
 
-    fn pick_next(&mut self, cur: &Anim) -> Option<u32> {
+    /// Choose the animation to play when `cur`'s sequence ends.
+    ///
+    /// The data-driven path just weights `cur`'s `<next>` entries by their
+    /// probabilities. But the eSheep sheet makes the walk sequence branch into
+    /// a special/idle animation (sit, look around, …) fairly often, which reads
+    /// as the pet "performing" constantly. When a grounded pet finishes a walk,
+    /// we short-circuit and keep walking most of the time (`WALK_STICK`), so
+    /// specials become the exception and the pet spends its time roaming (and
+    /// thus reaching grass to graze). Aerial sequences (climb/fall/ceiling) are
+    /// left fully data-driven so wall-climbing and gravity graphs still resolve.
+    fn pick_next(&mut self, cur: &Anim, grounded: bool) -> Option<u32> {
+        /// Chance a grounded pet just walks again instead of rolling a special.
+        const WALK_STICK: u32 = 82;
+        if grounded && self.anim == self.def.start && self.rand_100() < WALK_STICK {
+            return Some(self.def.start);
+        }
         for &(prob, id) in &cur.next {
             if self.rand_100() < prob {
                 return Some(id);
@@ -1418,6 +1434,42 @@ mod tests {
         eprintln!("\n{movie}");
 
         assert!(on_ledge, "the sheep fell onto the mid-air ledge");
+    }
+
+    #[test]
+    fn grounded_pets_keep_walking_rather_than_performing() {
+        // The tuning: a grounded pet that finishes its walk should usually just
+        // walk again, so specials (sit, look-around, …) become the exception.
+        // Count how often the walk sequence loops back to walk when grounded vs
+        // airborne over many sequence-ends; grounded must stick to walking far
+        // more, and comfortably more than half the time.
+        let lp = load_pet("blue_sheep").expect("sheep assets");
+        let mut pet = Pet::new(lp.def, 200.0, 120.0, 24.0, 28.0);
+        let start = pet.def.start;
+        let walk = pet.def.anims[&start].clone();
+
+        let count_walk = |pet: &mut Pet, grounded: bool| {
+            pet.anim = start; // pick_next keys the bias off the *current* anim
+            let mut kept = 0;
+            for _ in 0..1000 {
+                if pet.pick_next(&walk, grounded) == Some(start) {
+                    kept += 1;
+                }
+            }
+            kept
+        };
+
+        let grounded = count_walk(&mut pet, true);
+        let airborne = count_walk(&mut pet, false);
+        assert!(
+            grounded > 700,
+            "grounded pet mostly keeps walking (got {grounded}/1000)"
+        );
+        assert!(
+            grounded > airborne,
+            "the grounded walk-bias raises the keep-walking rate \
+             (grounded {grounded} vs airborne {airborne} of 1000)"
+        );
     }
 
     #[test]
