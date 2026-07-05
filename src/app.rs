@@ -4602,6 +4602,13 @@ pub fn run() {
                 WindowOptions {
                     titlebar: None,
                     window_background: WindowBackgroundAppearance::Transparent,
+                    // Sets the X11 `WM_CLASS` (and Wayland app-id) to match the
+                    // `.desktop` file's `StartupWMClass=tab-atelier`, so the
+                    // running window is tied to `tab-atelier.desktop` and the
+                    // taskbar/dock shows its `Icon=tab-atelier`. Without this
+                    // gpui leaves the class unset and the window gets a generic
+                    // fallback icon.
+                    app_id: Some("tab-atelier".to_owned()),
                     ..Default::default()
                 },
                 |window, cx| {
