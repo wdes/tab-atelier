@@ -16,9 +16,10 @@
 //! `app.rs` reads [`Pet::current_tile`] / [`Pet::pos`] each frame, clips the sheet
 //! to the active tile, and can [`Pet::grab`]/[`Pet::release`] it for drag-and-drop.
 //!
-//! [`PetOverlay`] runs a whole herd: summon adds pets (no cap), grass sprouts on
-//! the tab-line ledges, sheep stop to graze it down ([`Pet::start_grazing`]), and
-//! while grass is around new grazers wander in on their own.
+//! [`PetOverlay`] runs a whole herd: each summon click raises the herd's target
+//! size and adds a pet, grass sprouts on the tab-line ledges, sheep stop to graze
+//! it down ([`Pet::start_grazing`]), and grazers wander in on their own — but
+//! never past the asked-for count, so the herd can't run away.
 //!
 //! Dead-end animations (empty `<next>`) are desktopPet's death/kill/effect
 //! sequences (`alien_kill`, `blank_die`, …) that end the pet's life via a
@@ -791,6 +792,10 @@ pub struct PetOverlay {
     grass: Vec<Grass>,
     grow_accum: f32,
     spawn_accum: f32,
+    /// How many pets the user asked for (summon clicks). The auto-spawning
+    /// grazers top the herd up toward this but never past it — so the herd can't
+    /// run away on its own.
+    asked: usize,
     rng: u32,
 }
 
@@ -804,6 +809,7 @@ impl Default for PetOverlay {
             grass: Vec::new(),
             grow_accum: 0.0,
             spawn_accum: 0.0,
+            asked: 0,
             rng: 0x9E37_79B9,
         }
     }
@@ -842,7 +848,8 @@ impl PetOverlay {
         })
     }
 
-    /// Summon one more random pet — repeated calls grow the herd (no cap).
+    /// Summon one more random pet — each click raises the herd's target size and
+    /// adds a pet. Auto-spawning never pushes the total past this.
     pub fn summon(&mut self, screen_w: f32, screen_h: f32) {
         let choices = list_pets();
         if choices.is_empty() {
@@ -851,11 +858,16 @@ impl PetOverlay {
         let idx = self.rand_u32() as usize % choices.len();
         if let Some(lp) = Self::build(&choices[idx].0, screen_w, screen_h) {
             self.pets.push(lp);
+            self.asked += 1;
         }
     }
 
-    /// Auto-spawn a grazing sheep (only species that eat) to graze the grass.
+    /// Auto-spawn a grazing sheep to top the herd up toward the asked count. Hard
+    /// cap: never spawn past `asked`, so the grazing herd can't run away.
     fn spawn_grazer(&mut self, screen_w: f32, screen_h: f32) {
+        if self.pets.len() >= self.asked {
+            return;
+        }
         let sheep: Vec<String> = list_pets()
             .into_iter()
             .map(|(id, _)| id)
@@ -870,10 +882,11 @@ impl PetOverlay {
         }
     }
 
-    /// Remove every pet and all grass (a clean "dismiss all").
+    /// Remove every pet and all grass, and reset the asked count.
     pub fn dismiss_all(&mut self) {
         self.pets.clear();
         self.grass.clear();
+        self.asked = 0;
         self.drag = None;
     }
 
@@ -1741,6 +1754,27 @@ mod tests {
                 .all(|g| (g.y - 120.0).abs() < 0.1 && (0.0..=500.0).contains(&g.x)),
             "every tuft sits on the ledge line"
         );
+    }
+
+    #[test]
+    fn auto_spawn_never_exceeds_the_asked_count() {
+        // The grazing herd may top up toward the summoned count but must never
+        // overflow it — even with grass sitting around for a long time.
+        let mut ov = PetOverlay::default();
+        let (w, h) = (1200.0f32, 700.0f32);
+        ov.ledges.borrow_mut().push(Surface {
+            y: 120.0,
+            x0: 0.0,
+            x1: 900.0,
+        });
+        ov.summon(w, h);
+        ov.summon(w, h);
+        assert_eq!(ov.count(), 2, "asked for two");
+        // ~40 s of sim with grass present — many spawn intervals would have fired.
+        for _ in 0..2500 {
+            ov.advance(16.0, w, h);
+        }
+        assert_eq!(ov.count(), 2, "auto-spawn stayed within the asked count");
     }
 
     #[test]
