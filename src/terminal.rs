@@ -330,6 +330,16 @@ pub struct TerminalView {
     /// instead of blocking — see the `try_lock_unfair` path in
     /// `prepaint`. The next 16 ms tick retries with fresh grid data.
     last_prepaint: Rc<RefCell<Option<TermPrepaint>>>,
+    /// Wall-clock of the last time this view was actually rendered (i.e.
+    /// mounted as the visible/active tab). `render` stamps it; the repaint
+    /// pump reads it to decide whether it's the foreground view. Only the
+    /// active tab is put in the element tree, so a background tab's stamp
+    /// goes stale and its pump stops scheduling frames — without this, every
+    /// one of N background tabs streaming agent output would `notify()` at
+    /// ~30 fps and each schedules a full window repaint of the *active*
+    /// terminal, starving keystroke handling (the "typing is laggy" bug).
+    /// `None` until first paint, so restored-but-unopened tabs never pump.
+    last_render: Rc<Cell<Option<std::time::Instant>>>,
 }
 
 /// Cached Phase 1 output from the previous paint. See [`TerminalView::prev_frame`].
@@ -546,15 +556,32 @@ impl TerminalView {
         let tick_clone = tick;
         let last_ring_len = Rc::new(Cell::new(0u64));
         let dirty_streak = Rc::new(Cell::new(0u32));
+        let last_render = Rc::new(Cell::new(None::<std::time::Instant>));
+        let last_render_pump = last_render.clone();
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             loop {
                 cx.background_executor().timer(Duration::from_millis(16)).await;
                 let Ok(()) = this.update(cx, |view, cx: &mut Context<Self>| {
+                    // How long after its last paint a view still counts as the
+                    // foreground tab (a few cursor-blink heartbeats of slack).
+                    const FRESH: Duration = Duration::from_secs(2);
                     let n = tick_clone.get().wrapping_add(1);
                     tick_clone.set(n);
                     let ring_len = view.pty_ring.lock().map_or(0, |r| r.total_len());
                     let grid_dirty = ring_len != last_ring_len.get();
                     last_ring_len.set(ring_len);
+                    // Foreground gate: only the visible/active tab is mounted,
+                    // so only it is ever painted (`render` stamps `last_render`).
+                    // A background tab's stamp goes stale within FRESH; suppress
+                    // its `notify()`s entirely so N streaming agents can't drive
+                    // N full-window repaints per frame. The active tab keeps
+                    // itself fresh via its own repaints (keystroke echo + the
+                    // 500 ms cursor-blink heartbeat below), and a tab switch
+                    // re-renders the new active view, re-stamping it at once.
+                    let painting = last_render_pump.get().is_some_and(|t| t.elapsed() < FRESH);
+                    if !painting {
+                        return;
+                    }
                     let scrolled = view.term.lock().grid().display_offset() > 0;
                     if grid_dirty {
                         let streak = dirty_streak.get().wrapping_add(1);
@@ -639,6 +666,7 @@ impl TerminalView {
             net_disabled: Cell::new(false),
             prev_frame: Rc::new(RefCell::new(None)),
             last_prepaint: Rc::new(RefCell::new(None)),
+            last_render,
         }
     }
 
@@ -1098,6 +1126,10 @@ impl TerminalView {
 
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Mark this view as the foreground one this frame. Only the active
+        // tab is mounted, so this stamp only advances for the visible tab;
+        // the repaint pump uses its staleness to mute background tabs.
+        self.last_render.set(Some(std::time::Instant::now()));
         let focus = self.focus.clone();
         let term = self.term.clone();
 
