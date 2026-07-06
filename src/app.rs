@@ -911,7 +911,12 @@ impl AppState {
                     .await;
                 let Ok(()) = this.update(cx, |app, cx| {
                     app.blink_on = !app.blink_on;
-                    if app.battery_percent.lock().unwrap().is_some_and(|b| b < 10) {
+                    if app
+                        .battery_percent
+                        .lock()
+                        .expect("lock poisoned")
+                        .is_some_and(|b| b < 10)
+                    {
                         cx.notify();
                     }
                 }) else {
@@ -1292,7 +1297,7 @@ impl AppState {
     /// pending queue (a no-op for input once we've cleared it here).
     fn drain_inputs(&mut self, cx: &mut Context<Self>) {
         let inputs: Vec<(usize, Vec<u8>)> = {
-            let mut snapshot = self.api_state.lock().unwrap();
+            let mut snapshot = self.api_state.lock().expect("lock poisoned");
             if snapshot.pending_input.is_empty() {
                 return;
             }
@@ -1321,7 +1326,7 @@ impl AppState {
         }
         #[cfg(feature = "energy")]
         {
-            let watts = self.power_watts.lock().unwrap();
+            let watts = self.power_watts.lock().expect("lock poisoned");
             for (i, tab) in self.tabs.iter_mut().enumerate() {
                 if let Some(w) = watts.get(i).and_then(|p| p.watts) {
                     tab.energy_wh += w * 2.0 / 3600.0;
@@ -1555,27 +1560,29 @@ impl AppState {
         }
 
         {
-            let mut snapshot = self.api_state.lock().unwrap();
+            let mut snapshot = self.api_state.lock().expect("lock poisoned");
             snapshot.tabs = api_tabs;
             snapshot.active = self.active;
             // Invalidate the /tabs cache; next GET rebuilds it once.
             snapshot.cached_response = None;
             #[cfg(feature = "energy")]
-            snapshot.power.clone_from(&self.power_watts.lock().unwrap());
+            snapshot
+                .power
+                .clone_from(&self.power_watts.lock().expect("lock poisoned"));
             #[cfg(feature = "energy")]
             {
-                snapshot.battery_percent = *self.battery_percent.lock().unwrap();
+                snapshot.battery_percent = *self.battery_percent.lock().expect("lock poisoned");
             }
         }
 
         #[cfg(feature = "energy")]
         {
             let pids: Vec<u32> = self.tabs.iter().map(|tab| tab.view.read(cx).pid()).collect();
-            *self.power_pids.lock().unwrap() = pids;
+            *self.power_pids.lock().expect("lock poisoned") = pids;
         }
 
         {
-            let mut snapshot = self.api_state.lock().unwrap();
+            let mut snapshot = self.api_state.lock().expect("lock poisoned");
             let mut closes: Vec<usize> = snapshot.pending_closes.drain(..).collect();
             let activate = snapshot.pending_activate.take();
             let inputs: Vec<(usize, Vec<u8>)> = snapshot.pending_input.drain(..).collect();
@@ -2138,7 +2145,7 @@ impl AppState {
         let watts_fg = th.fg_muted_hsla();
 
         #[cfg(feature = "energy")]
-        let watts = self.power_watts.lock().unwrap().clone();
+        let watts = self.power_watts.lock().expect("lock poisoned").clone();
 
         let mut bar = div()
             .id("tab-bar")
@@ -2590,7 +2597,7 @@ impl AppState {
                                 }
                                 let token = slot_ref.clone();
                                 {
-                                    let mut snap = this.api_state.lock().unwrap();
+                                    let mut snap = this.api_state.lock().expect("lock poisoned");
                                     if let Some(t) = snap.tabs.iter_mut().find(|t| t.id == tab_id) {
                                         if ro {
                                             t.share_token_ro.clone_from(&token);
@@ -2755,7 +2762,7 @@ impl AppState {
                             this.tabs[idx].locked = next;
                             this.tabs[idx].view.read(cx).set_locked(next);
                             {
-                                let mut snap = this.api_state.lock().unwrap();
+                                let mut snap = this.api_state.lock().expect("lock poisoned");
                                 if let Some(t) = snap.tabs.iter_mut().find(|t| t.id == tab_id_for_lock) {
                                     t.locked = next;
                                 }
@@ -2796,7 +2803,7 @@ impl AppState {
                                 let next = !net_disabled;
                                 this.tabs[idx].view.read(cx).set_net_disabled(next);
                                 {
-                                    let mut snap = this.api_state.lock().unwrap();
+                                    let mut snap = this.api_state.lock().expect("lock poisoned");
                                     if let Some(t) = snap.tabs.iter_mut().find(|t| t.id == tab_id_for_net) {
                                         t.net_disabled = next;
                                     }
@@ -2831,7 +2838,7 @@ impl AppState {
 
             #[cfg(feature = "energy")]
             {
-                let power_info = self.power_watts.lock().unwrap().get(stats_idx).cloned();
+                let power_info = self.power_watts.lock().expect("lock poisoned").get(stats_idx).cloned();
                 if let Some(ref p) = power_info {
                     if p.cpu_percent >= 0.1 {
                         stats_lines.push(format!("{}: {}", t.cpu, p.cpu_label()));
@@ -4399,7 +4406,7 @@ impl Render for AppState {
         // Window handle; piggy-backing on render() is the simplest place
         // to react to remote POST /tabs requests.
         let (new_tab_count, new_tab_cwds): (usize, Vec<PathBuf>) = {
-            let mut snap = self.api_state.lock().unwrap();
+            let mut snap = self.api_state.lock().expect("lock poisoned");
             let n = std::mem::take(&mut snap.pending_new_tabs);
             let cwds: Vec<PathBuf> = std::mem::take(&mut snap.pending_new_tab_cwds).into_iter().collect();
             drop(snap);
@@ -4424,7 +4431,7 @@ impl Render for AppState {
         window.set_window_title(&format!("{}{}", self.tabs[self.active].name, self.t().title_suffix));
         let active_terminal = self.tabs[self.active].view.clone();
         #[cfg(feature = "energy")]
-        let battery = *self.battery_percent.lock().unwrap();
+        let battery = *self.battery_percent.lock().expect("lock poisoned");
         #[cfg(not(feature = "energy"))]
         let battery: Option<u8> = None;
         // Per-tab ledges for the pet are collected inside `render_tab_bar` by
@@ -4838,7 +4845,7 @@ pub fn run() {
                     cx.new(|cx| AppState::new(window, cx))
                 },
             )
-            .unwrap();
+            .expect("failed to open the main window");
 
         spawn_hotkey_listener(&keycodes, window_handle, cx);
     });
