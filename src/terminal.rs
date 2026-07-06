@@ -547,9 +547,17 @@ impl TerminalView {
         let last_render = Rc::new(Cell::new(None::<std::time::Instant>));
         let last_render_pump = last_render.clone();
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            // Poll fast (one 60 Hz frame) only while this tab is the foreground
+            // one; a background/asleep tab backs off to `IDLE` so N tabs don't
+            // each wake the main thread 60×/s just to read a ring counter they
+            // won't paint. A tab switch re-stamps `last_render`, so a resumed
+            // tab is back to `FAST` within one idle poll.
+            const FAST: Duration = Duration::from_millis(16);
+            const IDLE: Duration = Duration::from_millis(250);
+            let mut interval = FAST;
             loop {
-                cx.background_executor().timer(Duration::from_millis(16)).await;
-                let Ok(()) = this.update(cx, |view, cx: &mut Context<Self>| {
+                cx.background_executor().timer(interval).await;
+                let Ok(painting) = this.update(cx, |view, cx: &mut Context<Self>| {
                     // How long after its last paint a view still counts as the
                     // foreground tab (a few cursor-blink heartbeats of slack).
                     const FRESH: Duration = Duration::from_secs(2);
@@ -568,7 +576,7 @@ impl TerminalView {
                     // re-renders the new active view, re-stamping it at once.
                     let painting = last_render_pump.get().is_some_and(|t| t.elapsed() < FRESH);
                     if !painting {
-                        return;
+                        return false;
                     }
                     let scrolled = view.term.lock().grid().display_offset() > 0;
                     if grid_dirty {
@@ -598,9 +606,11 @@ impl TerminalView {
                             cx.notify();
                         }
                     }
+                    true
                 }) else {
                     break;
                 };
+                interval = if painting { FAST } else { IDLE };
             }
         })
         .detach();
