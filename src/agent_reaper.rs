@@ -132,12 +132,14 @@ pub fn reap_orphans(base: &Path) -> ReapReport {
     report
 }
 
-/// `starttime` (field 22) from `/proc/<pid>/stat`, or `None` if the
-/// process is gone. Keyed off the last `)` because `comm` may hold spaces
-/// and parens; fields after it start at field 3 (`state`), so field 22 is
-/// index 19.
+/// `starttime` (field 22) from `/proc/<pid>/stat`, or `None` if gone.
+///
+/// The identity pin: `(pid, start_time)` uniquely names a process for its
+/// lifetime, defeating PID reuse. Keyed off the last `)` because `comm`
+/// may hold spaces and parens; fields after it start at field 3
+/// (`state`), so field 22 is index 19.
 #[must_use]
-fn proc_start_time(pid: u32) -> Option<u64> {
+pub fn proc_start_time(pid: u32) -> Option<u64> {
     parse_start_time(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
 }
 
