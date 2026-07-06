@@ -1008,7 +1008,7 @@ fn refresh_snapshot(
         use std::sync::OnceLock;
         static LAST: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
         let lock = LAST.get_or_init(|| Mutex::new(None));
-        let mut last = lock.lock().unwrap();
+        let mut last = lock.lock().expect("lock poisoned");
         if last.is_none_or(|t| t.elapsed() >= Duration::from_secs(5)) {
             *last = Some(Instant::now());
             drop(last);
@@ -1069,15 +1069,15 @@ fn refresh_snapshot(
             dns_entries: tab.dns_entries(),
         });
     }
-    let mut snapshot = api_state.lock().unwrap();
+    let mut snapshot = api_state.lock().expect("lock poisoned");
     snapshot.tabs = api_tabs;
     snapshot.active = active;
     snapshot.cached_response = None;
     #[cfg(feature = "energy")]
-    snapshot.power.clone_from(&power_watts.lock().unwrap());
+    snapshot.power.clone_from(&power_watts.lock().expect("lock poisoned"));
     #[cfg(feature = "energy")]
     {
-        snapshot.battery_percent = *battery_percent.lock().unwrap();
+        snapshot.battery_percent = *battery_percent.lock().expect("lock poisoned");
     }
 }
 
@@ -1190,7 +1190,7 @@ fn persist(
 
     #[cfg(feature = "energy")]
     {
-        let watts = power_watts.lock().unwrap();
+        let watts = power_watts.lock().expect("lock poisoned");
         for (i, tab) in tabs.iter_mut().enumerate() {
             if let Some(w) = watts.get(i).and_then(|p| p.watts) {
                 tab.energy_wh += w * 2.0 / 3600.0;
@@ -1311,7 +1311,7 @@ fn persist(
     #[cfg(feature = "energy")]
     {
         let pids: Vec<u32> = tabs.iter().map(|tab| tab.pid).collect();
-        *power_pids.lock().unwrap() = pids;
+        *power_pids.lock().expect("lock poisoned") = pids;
     }
 }
 
@@ -1401,7 +1401,7 @@ fn drain_pending(
     default_limits: &crate::TabResourceLimits,
     default_net_allow: &crate::net_policy::AllowConfig,
 ) {
-    let mut s = api_state.lock().unwrap();
+    let mut s = api_state.lock().expect("lock poisoned");
     let mut closes: Vec<usize> = s.pending_closes.drain(..).collect();
     let activate = s.pending_activate.take();
     let inputs: Vec<(usize, Vec<u8>)> = s.pending_input.drain(..).collect();

@@ -725,7 +725,7 @@ impl UploadSlot {
     /// Returns `Ok(slot)` when there was room under the per-token
     /// cap; `Err(in_flight)` otherwise (caller turns it into 429).
     fn try_acquire(token: &str) -> Result<Self, usize> {
-        let mut map = UPLOAD_INFLIGHT.lock().unwrap();
+        let mut map = UPLOAD_INFLIGHT.lock().expect("lock poisoned");
         let entry = map.entry(token.to_string()).or_insert(0);
         if *entry >= UPLOAD_MAX_INFLIGHT_PER_TOKEN {
             let n = *entry;
@@ -1361,7 +1361,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
     // `_token` clone) so `POST /master-token/reset` can hot-swap it. The
     // non-empty guard means an as-yet-uninitialised master ("") never
     // authorises a token-less request.
-    let master_token = state.lock().unwrap().master_token.clone();
+    let master_token = state.lock().expect("lock poisoned").master_token.clone();
     let is_master = !master_token.is_empty()
         && constant_time_eq(
             provided_token.as_deref().unwrap_or("").as_bytes(),
@@ -1375,7 +1375,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 action,
                 "view" | "output" | "stream" | "input" | "files" | "outbox" | "inbox"
             ) {
-            let state_g = state.lock().unwrap();
+            let state_g = state.lock().expect("lock poisoned");
             state_g.tabs.iter().find(|t| t.id == uuid).and_then(|t| {
                 // Constant-time per-byte comparison so a brute-force
                 // probe can't shave bits off the search space by
@@ -1441,7 +1441,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
 
     match (method.as_str(), path.as_str()) {
         ("GET", "/" | "/tabs") => {
-            let mut state = state.lock().unwrap();
+            let mut state = state.lock().expect("lock poisoned");
             if let Some(cached) = state.cached_response.as_deref() {
                 let body = cached.to_owned();
                 drop(state);
@@ -1552,7 +1552,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 error_json(stream, 404, "invalid tab key");
                 return;
             };
-            let snap = state.lock().unwrap();
+            let snap = state.lock().expect("lock poisoned");
             let Some(idx) = resolve_tab_idx(&snap, key_raw, is_uuid) else {
                 error_json(stream, 404, "tab not found");
                 return;
@@ -1588,7 +1588,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 error_json(stream, 404, "invalid tab key");
                 return;
             };
-            let snap = state.lock().unwrap();
+            let snap = state.lock().expect("lock poisoned");
             let Some(idx) = resolve_tab_idx(&snap, key_raw, is_uuid) else {
                 error_json(stream, 404, "tab not found");
                 return;
@@ -1640,7 +1640,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 error_json(stream, 404, "invalid tab key");
                 return;
             };
-            let snap = state.lock().unwrap();
+            let snap = state.lock().expect("lock poisoned");
             let Some(idx) = resolve_tab_idx(&snap, key_raw, is_uuid) else {
                 error_json(stream, 404, "tab not found");
                 return;
@@ -1675,7 +1675,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 error_json(stream, 404, "invalid tab key");
                 return;
             };
-            let state_g = state.lock().unwrap();
+            let state_g = state.lock().expect("lock poisoned");
             let Some(idx) = resolve_tab_idx(&state_g, key_raw, is_uuid) else {
                 drop(state_g);
                 error_json(stream, 404, "tab not found");
@@ -1784,7 +1784,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 error_json(stream, 404, "invalid tab key");
                 return;
             };
-            let state = state.lock().unwrap();
+            let state = state.lock().expect("lock poisoned");
             let Some(idx) = resolve_tab_idx(&state, key_raw, is_uuid) else {
                 drop(state);
                 error_json(stream, 404, "tab not found");
@@ -1973,7 +1973,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 error_json(stream, 404, "invalid tab key");
                 return;
             };
-            let mut state = state.lock().unwrap();
+            let mut state = state.lock().expect("lock poisoned");
             let Some(idx) = resolve_tab_idx(&state, key_raw, is_uuid) else {
                 drop(state);
                 error_json(stream, 404, "tab not found");
@@ -2001,7 +2001,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                             .map(std::path::PathBuf::from)
                     })
             };
-            let mut state = state.lock().unwrap();
+            let mut state = state.lock().expect("lock poisoned");
             info!(
                 "API: queueing new tab creation (cwd: {})",
                 cwd_hint.as_ref().map_or("inherit", |p| p.to_str().unwrap_or("?"))
@@ -2026,7 +2026,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                     error_json(stream, 400, "missing or empty name");
                     return;
                 }
-                let mut state = state.lock().unwrap();
+                let mut state = state.lock().expect("lock poisoned");
                 if idx < state.tabs.len() {
                     info!("API: renaming tab {idx} to {new_name}");
                     state.pending_renames.push((idx, new_name.clone()));
@@ -2074,7 +2074,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                     // "idle" = clear the indicator. Queue an Error-shaped
                     // marker the loop interprets as "wipe"; simpler than
                     // adding a fourth enum variant just for the wire.
-                    let mut snap = state.lock().unwrap();
+                    let mut snap = state.lock().expect("lock poisoned");
                     let Some(t) = snap.tabs.iter().find(|t| t.id == tab_id) else {
                         drop(snap);
                         error_json(stream, 404, "tab not found");
@@ -2111,7 +2111,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 .and_then(|v| v.as_str())
                 .map(std::string::ToString::to_string);
             let plan_mode = parsed.get("planMode").and_then(serde_json::Value::as_bool);
-            let mut snap = state.lock().unwrap();
+            let mut snap = state.lock().expect("lock poisoned");
             let Some(t) = snap.tabs.iter().find(|t| t.id == tab_id) else {
                 drop(snap);
                 error_json(stream, 404, "tab not found");
@@ -2163,7 +2163,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 error_json(stream, 404, "invalid tab key");
                 return;
             };
-            let snap = state.lock().unwrap();
+            let snap = state.lock().expect("lock poisoned");
             let Some(idx) = resolve_tab_idx(&snap, key_raw, is_uuid) else {
                 drop(snap);
                 error_json(stream, 404, "tab not found");
@@ -2267,7 +2267,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 error_json(stream, 404, "invalid tab key");
                 return;
             };
-            let snap = state.lock().unwrap();
+            let snap = state.lock().expect("lock poisoned");
             let Some(idx) = resolve_tab_idx(&snap, key_raw, is_uuid) else {
                 drop(snap);
                 error_json(stream, 404, "tab not found");
@@ -2359,7 +2359,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 error_json(stream, 404, "invalid tab key");
                 return;
             };
-            let snap = state.lock().unwrap();
+            let snap = state.lock().expect("lock poisoned");
             let Some(idx) = resolve_tab_idx(&snap, key_raw, is_uuid) else {
                 drop(snap);
                 error_json(stream, 404, "tab not found");
@@ -2430,7 +2430,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                     .ok()
                     .and_then(|v| v.get("on").and_then(serde_json::Value::as_bool))
             };
-            let mut state = state.lock().unwrap();
+            let mut state = state.lock().expect("lock poisoned");
             let Some(idx) = state.tabs.iter().position(|t| t.id == inner) else {
                 drop(state);
                 error_json(stream, 404, "tab not found");
@@ -2476,7 +2476,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                     .ok()
                     .and_then(|v| v.get("disabled").and_then(serde_json::Value::as_bool))
             };
-            let mut state = state.lock().unwrap();
+            let mut state = state.lock().expect("lock poisoned");
             let Some(idx) = state.tabs.iter().position(|t| t.id == inner) else {
                 drop(state);
                 error_json(stream, 404, "tab not found");
@@ -2544,7 +2544,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 domains,
                 cidrs,
             };
-            let mut state = state.lock().unwrap();
+            let mut state = state.lock().expect("lock poisoned");
             let Some(idx) = state.tabs.iter().position(|t| t.id == inner) else {
                 drop(state);
                 error_json(stream, 404, "tab not found");
@@ -2604,7 +2604,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                     return;
                 }
             };
-            let mut state = state.lock().unwrap();
+            let mut state = state.lock().expect("lock poisoned");
             let Some(idx) = state.tabs.iter().position(|t| t.id == inner) else {
                 drop(state);
                 error_json(stream, 404, "tab not found");
@@ -2632,7 +2632,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             // "Remote control" / `share-link`. Master token only — this
             // path isn't in the share-token allowlist, so a share token
             // never authorises here.
-            let mut state = state.lock().unwrap();
+            let mut state = state.lock().expect("lock poisoned");
             let mut revoked = 0usize;
             for t in &mut state.tabs {
                 if t.share_token_rw.is_empty() && t.share_token_ro.is_empty() {
@@ -2662,7 +2662,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 error_json(stream, 500, &format!("could not persist token: {e}"));
                 return;
             }
-            state.lock().unwrap().master_token.clone_from(&new);
+            state.lock().expect("lock poisoned").master_token.clone_from(&new);
             respond_json(stream, 200, &format!(r#"{{"token":"{new}"}}"#));
         }
         ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/bg-color") => {
@@ -2696,7 +2696,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 error_json(stream, 400, "color must be #RRGGBB");
                 return;
             }
-            let mut state = state.lock().unwrap();
+            let mut state = state.lock().expect("lock poisoned");
             let Some(idx) = state.tabs.iter().position(|t| t.id == inner) else {
                 drop(state);
                 error_json(stream, 404, "tab not found");
@@ -2739,7 +2739,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             let context_opt = context_opt
                 .map(|s| s.chars().take(2000).collect::<String>())
                 .filter(|s| !s.trim().is_empty());
-            let mut state = state.lock().unwrap();
+            let mut state = state.lock().expect("lock poisoned");
             let Some(idx) = state.tabs.iter().position(|t| t.id == inner) else {
                 drop(state);
                 error_json(stream, 404, "tab not found");
@@ -2757,7 +2757,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 error_json(stream, 404, "invalid tab key");
                 return;
             };
-            let mut state = state.lock().unwrap();
+            let mut state = state.lock().expect("lock poisoned");
             if let Some(idx) = resolve_tab_idx(&state, key_raw, is_uuid) {
                 // Refuse every write source — master token, share tokens, all
                 // routes — when the tab is locked. `effective_locked()`
@@ -3122,12 +3122,14 @@ pub fn start_api_server_tls(
     } else {
         builder.with_no_client_auth()
     };
-    let mut cfg = match builder.with_single_cert(
-        cert_chain,
-        PrivateKeyDer::try_from(key_der)
-            .map_err(std::string::ToString::to_string)
-            .unwrap(),
-    ) {
+    let key = match PrivateKeyDer::try_from(key_der) {
+        Ok(k) => k,
+        Err(e) => {
+            error!("API/TLS: private key conversion failed: {e}");
+            return;
+        }
+    };
+    let mut cfg = match builder.with_single_cert(cert_chain, key) {
         Ok(c) => c,
         Err(e) => {
             error!("API/TLS: rustls config build failed: {e}");
@@ -3565,7 +3567,7 @@ mod tests {
         let state = test_state();
         let token = "test-secret-token".to_string();
         // Auth validates against the snapshot's master_token (live-swappable).
-        state.lock().unwrap().master_token = token.clone();
+        state.lock().expect("lock poisoned").master_token = token.clone();
         let s = state.clone();
         let t = token.clone();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
@@ -3754,7 +3756,7 @@ mod tests {
         assert_eq!(status_code(&resp), 200);
         let json: serde_json::Value = serde_json::from_str(body(&resp)).unwrap();
         assert_eq!(json["closed"], 1);
-        assert_eq!(state.lock().unwrap().pending_closes, vec![1]);
+        assert_eq!(state.lock().expect("lock poisoned").pending_closes, vec![1]);
     }
 
     #[test]
@@ -3797,7 +3799,7 @@ mod tests {
             &format!("POST /tabs HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\n\r\n"),
         );
         assert_eq!(status_code(&resp), 200);
-        assert_eq!(state.lock().unwrap().pending_new_tabs, 1);
+        assert_eq!(state.lock().expect("lock poisoned").pending_new_tabs, 1);
     }
 
     #[test]
@@ -3819,7 +3821,7 @@ mod tests {
             ),
         );
         assert_eq!(status_code(&resp), 200);
-        let pending = state.lock().unwrap().pending_renames.clone();
+        let pending = state.lock().expect("lock poisoned").pending_renames.clone();
         assert_eq!(pending, vec![(0_usize, "renamed".into())]);
     }
 
@@ -3836,9 +3838,14 @@ mod tests {
             ),
         );
         assert_eq!(status_code(&resp), 200);
-        let ctx = state.lock().unwrap().tabs[0].context.clone();
+        let ctx = state.lock().expect("lock poisoned").tabs[0].context.clone();
         assert_eq!(ctx.as_deref(), Some("PR #42: dompdf fonts"));
-        let last = state.lock().unwrap().pending_context_changes.last().cloned();
+        let last = state
+            .lock()
+            .expect("lock poisoned")
+            .pending_context_changes
+            .last()
+            .cloned();
         assert_eq!(last.unwrap().1.as_deref(), Some("PR #42: dompdf fonts"));
         // Whitespace-only body clears it.
         let body = r#"{"context":"   "}"#;
@@ -3850,9 +3857,14 @@ mod tests {
             ),
         );
         assert_eq!(status_code(&resp), 200);
-        let ctx = state.lock().unwrap().tabs[0].context.clone();
+        let ctx = state.lock().expect("lock poisoned").tabs[0].context.clone();
         assert_eq!(ctx, None);
-        let last = state.lock().unwrap().pending_context_changes.last().cloned();
+        let last = state
+            .lock()
+            .expect("lock poisoned")
+            .pending_context_changes
+            .last()
+            .cloned();
         assert_eq!(last.unwrap().1, None);
     }
 
@@ -3869,7 +3881,10 @@ mod tests {
             ),
         );
         assert_eq!(status_code(&resp), 200);
-        let len = state.lock().unwrap().tabs[0].context.as_deref().map(str::len);
+        let len = state.lock().expect("lock poisoned").tabs[0]
+            .context
+            .as_deref()
+            .map(str::len);
         assert_eq!(len, Some(2000));
     }
 
@@ -3887,7 +3902,7 @@ mod tests {
     fn rotate_tokens_revokes_share_links() {
         let (port, state, master) = spawn_server();
         // Give tab-a a share token; confirm it authorises a read.
-        state.lock().unwrap().tabs[0].share_token_rw = "sharetok123".into();
+        state.lock().expect("lock poisoned").tabs[0].share_token_rw = "sharetok123".into();
         let resp = request(port, "GET /tabs/by-id/tab-a/output?token=sharetok123 HTTP/1.1\r\n\r\n");
         assert_eq!(status_code(&resp), 200, "share token works before rotation");
         // Rotate — master token only.
@@ -3900,12 +3915,12 @@ mod tests {
         assert_eq!(status_code(&resp), 200);
         // Snapshot token cleared immediately → the old link now 401s.
         assert!(
-            state.lock().unwrap().tabs[0].share_token_rw.is_empty(),
+            state.lock().expect("lock poisoned").tabs[0].share_token_rw.is_empty(),
             "snapshot share token cleared"
         );
         let resp = request(port, "GET /tabs/by-id/tab-a/output?token=sharetok123 HTTP/1.1\r\n\r\n");
         assert_eq!(status_code(&resp), 401, "old share link now 401");
-        let pending = state.lock().unwrap().pending_token_rotations.clone();
+        let pending = state.lock().expect("lock poisoned").pending_token_rotations.clone();
         assert!(pending.contains(&"tab-a".to_string()), "runtime clear queued");
     }
 
@@ -3962,7 +3977,7 @@ mod tests {
             &format!("GET /tabs HTTP/1.1\r\nAuthorization: Bearer {master}\r\n\r\n"),
         );
         assert_eq!(status_code(&resp), 200, "current master works");
-        state.lock().unwrap().master_token = "new-master".into();
+        state.lock().expect("lock poisoned").master_token = "new-master".into();
         let resp = request(
             port,
             &format!("GET /tabs HTTP/1.1\r\nAuthorization: Bearer {master}\r\n\r\n"),
@@ -3971,7 +3986,7 @@ mod tests {
         let resp = request(port, "GET /tabs HTTP/1.1\r\nAuthorization: Bearer new-master\r\n\r\n");
         assert_eq!(status_code(&resp), 200, "new master token works");
         // An empty master must never authorise a token-less request.
-        state.lock().unwrap().master_token = String::new();
+        state.lock().expect("lock poisoned").master_token = String::new();
         let resp = request(port, "GET /tabs HTTP/1.1\r\n\r\n");
         assert_eq!(status_code(&resp), 401, "empty master rejects token-less request");
     }
@@ -4103,7 +4118,7 @@ mod tests {
             body(&resp)
         );
         let (tab0_net, queued) = {
-            let s = state.lock().unwrap();
+            let s = state.lock().expect("lock poisoned");
             (s.tabs[0].net_disabled, s.pending_net_changes.clone())
         };
         assert!(!tab0_net);
@@ -4142,7 +4157,7 @@ mod tests {
             body(&resp)
         );
         let queued = {
-            let s = state.lock().unwrap();
+            let s = state.lock().expect("lock poisoned");
             s.pending_net_allow_changes.clone()
         };
         assert_eq!(queued.len(), 1);
@@ -4246,7 +4261,7 @@ mod tests {
         assert_eq!(status_code(&resp), 200);
         let json: serde_json::Value = serde_json::from_str(body(&resp)).unwrap();
         assert_eq!(json["sent"], payload.len());
-        let pending = state.lock().unwrap().pending_input.clone();
+        let pending = state.lock().expect("lock poisoned").pending_input.clone();
         assert_eq!(pending, vec![(0_usize, payload.as_bytes().to_vec())]);
     }
 
@@ -4260,7 +4275,7 @@ mod tests {
         assert_eq!(status_code(&resp), 200);
         let json: serde_json::Value = serde_json::from_str(body(&resp)).unwrap();
         assert_eq!(json["sent"], 0);
-        let pending = state.lock().unwrap().pending_input.clone();
+        let pending = state.lock().expect("lock poisoned").pending_input.clone();
         assert_eq!(pending.len(), 1);
         assert!(pending[0].1.is_empty());
     }
@@ -4318,7 +4333,8 @@ mod tests {
     #[test]
     fn get_tab_output_lines_param_tails() {
         let (port, state, token) = spawn_server();
-        state.lock().unwrap().tabs[0].output = (1..=10).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        state.lock().expect("lock poisoned").tabs[0].output =
+            (1..=10).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
         let resp = request(
             port,
             &format!("GET /tabs/0/output?lines=3&token={token} HTTP/1.1\r\n\r\n"),
@@ -4356,7 +4372,7 @@ mod tests {
         let mut buf = String::new();
         let _ = stream.read_to_string(&mut buf);
         assert_eq!(status_code(&buf), 200);
-        let pending = state.lock().unwrap().pending_input.clone();
+        let pending = state.lock().expect("lock poisoned").pending_input.clone();
         assert_eq!(pending, vec![(1_usize, vec![0x03_u8, 0x0a])]);
     }
 
@@ -4406,7 +4422,7 @@ mod tests {
     /// Helper to populate a tab with a large enough scrollback that the
     /// gzip path kicks in (we threshold at 4 KB).
     fn fill_output(state: &Arc<Mutex<TabSnapshot>>, idx: usize, content: &str) {
-        let mut snap = state.lock().unwrap();
+        let mut snap = state.lock().expect("lock poisoned");
         snap.tabs[idx].output = content.to_string();
         snap.cached_response = None; // invalidate /tabs cache
     }
@@ -4468,7 +4484,7 @@ mod tests {
         let (port, state, token) = spawn_server();
         let cwd = tempfile::tempdir().unwrap();
         {
-            let mut s = state.lock().unwrap();
+            let mut s = state.lock().expect("lock poisoned");
             s.tabs[0].cwd = Some(cwd.path().to_string_lossy().into_owned());
             s.tabs[0].locked = true;
             s.cached_response = None;
@@ -4539,7 +4555,7 @@ mod tests {
     }
 
     fn set_agent_state(state: &Arc<Mutex<TabSnapshot>>, idx: usize, snap: Option<crate::AgentStateSnapshot>) {
-        let mut s = state.lock().unwrap();
+        let mut s = state.lock().expect("lock poisoned");
         s.tabs[idx].agent_state = snap;
         s.cached_response = None;
     }
@@ -4636,7 +4652,7 @@ mod tests {
         // serde_json alone does not escape `<`/`>`, so we re-escape.
         let (port, state, token) = spawn_server();
         {
-            let mut s = state.lock().unwrap();
+            let mut s = state.lock().expect("lock poisoned");
             s.tabs[0].name = "</script><script>alert(1)</script>".into();
         }
         let raw = request_bytes(
@@ -4667,7 +4683,7 @@ mod tests {
         let (port, state, token) = spawn_server();
         // /view needs a share token on the path; mint one for tab 0.
         {
-            let mut s = state.lock().unwrap();
+            let mut s = state.lock().expect("lock poisoned");
             s.tabs[0].share_token_rw = "view-token".into();
         }
         let raw = request_bytes(
@@ -4912,7 +4928,7 @@ mod tests {
         // downloadable files.
         std::fs::create_dir_all(cwd.path().join("outbox").join("subdir")).unwrap();
         {
-            let mut s = state.lock().unwrap();
+            let mut s = state.lock().expect("lock poisoned");
             s.tabs[0].cwd = Some(cwd.path().to_string_lossy().into_owned());
             s.cached_response = None;
         }
@@ -4941,7 +4957,7 @@ mod tests {
         let (port, state, token) = spawn_server();
         let cwd = tempfile::tempdir().unwrap();
         {
-            let mut s = state.lock().unwrap();
+            let mut s = state.lock().expect("lock poisoned");
             s.tabs[0].cwd = Some(cwd.path().to_string_lossy().into_owned());
             s.cached_response = None;
         }
@@ -4971,7 +4987,7 @@ mod tests {
         let (port, state, token) = spawn_server();
         let cwd = make_cwd_with_outbox(&[("Frédéric report.txt", b"hi")]);
         {
-            let mut s = state.lock().unwrap();
+            let mut s = state.lock().expect("lock poisoned");
             s.tabs[0].cwd = Some(cwd.path().to_string_lossy().into_owned());
             s.cached_response = None;
         }
@@ -5040,7 +5056,7 @@ mod tests {
         std::fs::create_dir_all(cwd.path().join("inbox")).unwrap();
         std::fs::write(cwd.path().join("inbox").join("uploaded.txt"), b"hi").unwrap();
         {
-            let mut s = state.lock().unwrap();
+            let mut s = state.lock().expect("lock poisoned");
             s.tabs[0].share_token_rw = "rw-inbox-tok".into();
             s.tabs[0].cwd = Some(cwd.path().to_string_lossy().into_owned());
             s.cached_response = None;
@@ -5063,7 +5079,7 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(cwd.path().join("inbox")).unwrap();
         {
-            let mut s = state.lock().unwrap();
+            let mut s = state.lock().expect("lock poisoned");
             s.tabs[0].share_token_ro = "ro-inbox-tok".into();
             s.tabs[0].cwd = Some(cwd.path().to_string_lossy().into_owned());
             s.cached_response = None;
@@ -5084,7 +5100,7 @@ mod tests {
         // hosts.
         let (port, state, token) = spawn_server();
         {
-            let mut s = state.lock().unwrap();
+            let mut s = state.lock().expect("lock poisoned");
             s.tabs[0].share_token_rw = "view-csp-tok".into();
         }
         let raw = request_bytes(
@@ -5111,7 +5127,7 @@ mod tests {
         // Read-only share-token tries to POST a file → must 403.
         let (port, state, _master_token) = spawn_server();
         {
-            let mut s = state.lock().unwrap();
+            let mut s = state.lock().expect("lock poisoned");
             s.tabs[0].share_token_ro = "ro-token".into();
             s.tabs[0].cwd = Some("/tmp".into());
             s.cached_response = None;
@@ -5131,7 +5147,7 @@ mod tests {
         let (port, state, _master_token) = spawn_server();
         let cwd = make_cwd_with_outbox(&[("doc.txt", b"hello ro")]);
         {
-            let mut s = state.lock().unwrap();
+            let mut s = state.lock().expect("lock poisoned");
             s.tabs[0].share_token_ro = "ro-token-2".into();
             s.tabs[0].cwd = Some(cwd.path().to_string_lossy().into_owned());
             s.cached_response = None;
@@ -5183,7 +5199,7 @@ mod tests {
         let (port, state, _master_token) = spawn_server();
         let cwd = make_cwd_with_outbox(&[("a.txt", b"a")]);
         {
-            let mut s = state.lock().unwrap();
+            let mut s = state.lock().expect("lock poisoned");
             s.tabs[0].share_token_ro = "ro-token-3".into();
             s.tabs[0].cwd = Some(cwd.path().to_string_lossy().into_owned());
             s.cached_response = None;

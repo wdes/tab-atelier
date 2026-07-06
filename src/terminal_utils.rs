@@ -98,7 +98,7 @@ pub fn keystroke_to_bytes(ks: &Keystroke, mode: TermMode) -> Option<Vec<u8>> {
                 if let Some(ref ch_str) = ks.key_char
                     && ch_str.len() == 1
                 {
-                    let c = ch_str.bytes().next().unwrap();
+                    let c = ch_str.as_bytes()[0];
                     if c.is_ascii_alphabetic() {
                         return Some(vec![(c.to_ascii_lowercase() - b'a') + 1]);
                     }
@@ -127,7 +127,7 @@ pub fn keystroke_to_bytes(ks: &Keystroke, mode: TermMode) -> Option<Vec<u8>> {
             }
             if let Some(ref ch_str) = ks.key_char {
                 if ctrl && ch_str.len() == 1 {
-                    let c = ch_str.bytes().next().unwrap();
+                    let c = ch_str.as_bytes()[0];
                     if c.is_ascii_alphabetic() {
                         return Some(vec![(c.to_ascii_lowercase() - b'a') + 1]);
                     }
@@ -140,7 +140,7 @@ pub fn keystroke_to_bytes(ks: &Keystroke, mode: TermMode) -> Option<Vec<u8>> {
                 return Some(ch_str.as_bytes().to_vec());
             }
             if key.len() == 1 {
-                let c = key.bytes().next().unwrap();
+                let c = key.as_bytes()[0];
                 if ctrl && c.is_ascii_alphabetic() {
                     return Some(vec![(c.to_ascii_lowercase() - b'a') + 1]);
                 }

@@ -2214,8 +2214,8 @@ impl Element for TerminalElement {
                             && last.underline == underline
                             && last.strikethrough == strikethrough
                     });
-                    if can_merge {
-                        seg.runs.last_mut().unwrap().len += char_len;
+                    if let Some(last) = seg.runs.last_mut().filter(|_| can_merge) {
+                        last.len += char_len;
                     } else {
                         seg.runs.push(TextRun {
                             len: char_len,
@@ -2245,7 +2245,10 @@ impl Element for TerminalElement {
             // for Phase 2 so we keep `working`'s allocation intact;
             // the RawLine itself is the only thing that gets cloned
             // (not the outer Vec).
-            let raw_lines: Vec<RawLine> = working.iter().map(|x| x.clone().unwrap()).collect();
+            let raw_lines: Vec<RawLine> = working
+                .iter()
+                .map(|x| x.as_ref().expect("phase-1 fills every working slot").clone())
+                .collect();
             *self.prev_frame.borrow_mut() = Some(CachedFrame {
                 display_offset,
                 visible_cols,

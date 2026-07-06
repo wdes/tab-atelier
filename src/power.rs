@@ -164,13 +164,13 @@ pub fn start_power_monitor(
         let interval = std::time::Duration::from_secs(2);
         loop {
             std::thread::sleep(interval);
-            *battery.lock().unwrap() = read_battery_percent();
-            let pids = tab_pids.lock().unwrap().clone();
+            *battery.lock().expect("lock poisoned") = read_battery_percent();
+            let pids = tab_pids.lock().expect("lock poisoned").clone();
             if pids.is_empty() {
                 continue;
             }
             let snapshot = monitor.sample(&pids, interval.as_secs_f64());
-            *results.lock().unwrap() = snapshot;
+            *results.lock().expect("lock poisoned") = snapshot;
         }
     });
 }
