@@ -261,9 +261,22 @@ struct CachedLine {
     sig: u64,
 }
 
+/// Everything [`TerminalView::ensure_spawned`] needs to fork the shell for a
+/// tab whose spawn was deferred at startup (skeleton tab). Mirrors the initial
+/// spawn inputs; the working size comes from `last_size`/`cell_size`, colours
+/// from `colors_enabled`, so only these three per-tab bits are stashed.
+struct SpawnRecipe {
+    cwd: Option<std::path::PathBuf>,
+    extra_env: HashMap<String, String>,
+    agent_launch: Option<Vec<String>>,
+}
+
 pub struct TerminalView {
     term: Arc<FairMutex<Term<EventProxy>>>,
-    notifier: EventLoopSender,
+    /// Channel into the PTY event loop. `None` for a *skeleton* tab whose shell
+    /// hasn't been forked yet (deferred at startup for a fast first paint — see
+    /// [`Self::ensure_spawned`]). Every send guards on it.
+    notifier: Option<EventLoopSender>,
     event_proxy: EventProxy,
     focus: FocusHandle,
     cell_size: Option<Size<Pixels>>,
@@ -271,7 +284,11 @@ pub struct TerminalView {
     content_origin: Rc<Cell<gpui::Point<Pixels>>>,
     bounds_size: Rc<Cell<Size<Pixels>>>,
     line_cache: Rc<RefCell<HashMap<i32, CachedLine>>>,
+    /// PTY child pid, or `0` until the shell is spawned (skeleton tab).
     pid: u32,
+    /// Deferred-spawn inputs. `Some` for a skeleton tab that hasn't forked its
+    /// shell yet; `ensure_spawned` takes it to build the PTY. `None` once spawned.
+    spawn_recipe: Option<SpawnRecipe>,
     exited: Rc<Cell<bool>>,
     scrollbar_dragging: Rc<Cell<bool>>,
     scroll_acc: Rc<Cell<f32>>,
@@ -435,6 +452,7 @@ impl TerminalView {
             HashMap::new(),
             None,
             None,
+            false, // tests want a live shell immediately
             window,
             cx,
         )
@@ -460,51 +478,15 @@ impl TerminalView {
         // the real window-derived size means even a never-shown tab's PTY (and
         // its remote xterm.js viewer) is correctly sized from birth.
         initial_grid: Option<(usize, usize, Size<Pixels>)>,
+        // Skeleton tab: build the view but DON'T fork the shell yet. The active
+        // tab spawns eagerly (fast first paint); background tabs pass `true` and
+        // are forked later by [`Self::ensure_spawned`] (the app's boot loader).
+        defer_spawn: bool,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let (init_cols, init_lines) = initial_grid.map_or((INITIAL_COLS, INITIAL_LINES), |(c, l, _)| (c, l));
         let init_cell = initial_grid.map(|(_, _, cell)| cell);
-        let ws = WindowSize {
-            num_lines: init_lines as u16,
-            num_cols: init_cols as u16,
-            cell_width: init_cell.map_or(9, |c| f32::from(c.width) as u16),
-            cell_height: init_cell.map_or(18, |c| f32::from(c.height) as u16),
-        };
-        let opts = if crate::clear_env() {
-            // Cleared-env mode: exec the shell via `env -i` so it
-            // inherits nothing from the GUI process — only the curated
-            // minimal allowlist (PATH/HOME/USER/locale + colours +
-            // telemetry opt-out + the per-tab API vars). `login = true`
-            // so the shell still sources the user's profile files.
-            let min_env = crate::minimal_pty_env(initial_colors_enabled, crate::clear_env_user_vars(), &extra_env);
-            let (prog, mut args) = crate::clear_env_shell_command(&crate::clear_env_shell_path(), true, &min_env);
-            if let Some(suffix) = agent_launch {
-                args.extend(suffix);
-            }
-            tty::Options {
-                shell: Some(tty::Shell::new(prog, args)),
-                working_directory: cwd.map(std::path::Path::to_path_buf),
-                env: HashMap::new(),
-                ..Default::default()
-            }
-        } else {
-            let mut env = pty_env(initial_colors_enabled);
-            env.extend(extra_env);
-            tty::Options {
-                working_directory: cwd.map(std::path::Path::to_path_buf),
-                env,
-                ..Default::default()
-            }
-        };
-        let pty = tty::new(&opts, ws, 0).expect("failed to create pty");
-        // ConPTY's Pty doesn't expose the child the way the Unix one does.
-        // The PID feeds /proc cwd + catbus detection — both Linux-only, so
-        // a 0 sentinel is fine on Windows.
-        #[cfg(unix)]
-        let pid = pty.child().id();
-        #[cfg(windows)]
-        let pid = 0u32;
         let config = Config {
             scrolling_history: 10_000,
             ..Config::default()
@@ -521,11 +503,6 @@ impl TerminalView {
         let term = Arc::new(FairMutex::new(term));
         let pty_ring = Arc::new(std::sync::Mutex::new(crate::pty_ring::PtyRing::default()));
         let viewers = pty_ring.lock().expect("fresh ring lock").viewers_handle();
-        let pty = crate::pty_ring::PtyTap::new(pty, pty_ring.clone());
-        let el = EventLoop::new(term.clone(), proxy.clone(), pty, false, false).expect("failed to create event loop");
-        let notifier = el.channel();
-        proxy.set_notifier(notifier.clone());
-        el.spawn();
 
         let focus = cx.focus_handle();
 
@@ -625,29 +602,20 @@ impl TerminalView {
         })
         .detach();
 
+        // The exit-watch loop needs a real pid, so it's started by
+        // `ensure_spawned` (not here) — a skeleton has no process to watch yet.
         let exited = Rc::new(Cell::new(false));
-        let exited_clone = exited.clone();
-        let pid_for_check = pid;
-        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            loop {
-                cx.background_executor().timer(Duration::from_millis(500)).await;
-                if !crate::platform::process_alive(pid_for_check) {
-                    let still_current = this
-                        .update(cx, |view: &mut Self, _| view.pid == pid_for_check)
-                        .unwrap_or(false);
-                    if still_current {
-                        exited_clone.set(true);
-                        let _ = this.update(cx, |_, cx: &mut Context<Self>| cx.notify());
-                    }
-                    break;
-                }
-            }
-        })
-        .detach();
 
-        Self {
+        let recipe = SpawnRecipe {
+            cwd: cwd.map(std::path::Path::to_path_buf),
+            extra_env,
+            agent_launch,
+        };
+
+        let mut me = Self {
             term,
-            notifier,
+            // Forked lazily below (or by the boot loader) — see `ensure_spawned`.
+            notifier: None,
             event_proxy: proxy,
             focus,
             // Seed from `initial_grid` so a tab spawned at a known size doesn't
@@ -657,7 +625,8 @@ impl TerminalView {
             content_origin: Rc::new(Cell::new(point(px(0.0), px(0.0)))),
             bounds_size: Rc::new(Cell::new(size(px(0.0), px(0.0)))),
             line_cache: Rc::new(RefCell::new(HashMap::new())),
-            pid,
+            pid: 0,
+            spawn_recipe: Some(recipe),
             exited,
             scrollbar_dragging: Rc::new(Cell::new(false)),
             scroll_acc: Rc::new(Cell::new(0.0)),
@@ -677,7 +646,102 @@ impl TerminalView {
             prev_frame: Rc::new(RefCell::new(None)),
             last_prepaint: Rc::new(RefCell::new(None)),
             last_render,
+        };
+        // The active tab forks its shell now (so the first frame is live); a
+        // deferred skeleton waits for `ensure_spawned` (the app's boot loader
+        // or the switch/render that first shows it).
+        if !defer_spawn {
+            me.ensure_spawned(cx);
         }
+        me
+    }
+
+    /// Fork the shell + start the PTY event loop for a tab whose spawn was
+    /// deferred (skeleton). No-op once spawned. Mirrors the initial-spawn path,
+    /// pulling the working size from `last_size`/`cell_size` and the shell/env
+    /// from the stashed [`SpawnRecipe`]. Called eagerly for the active tab, and
+    /// in the background for the rest so restored agents come back online.
+    pub fn ensure_spawned(&mut self, cx: &mut Context<Self>) {
+        let Some(recipe) = self.spawn_recipe.take() else {
+            return;
+        };
+        let (cols, lines) = self.last_size.get().unwrap_or((INITIAL_COLS, INITIAL_LINES));
+        let cell = self.cell_size.unwrap_or(Size {
+            width: px(8.4),
+            height: px(19.6),
+        });
+        let ws = WindowSize {
+            num_lines: lines as u16,
+            num_cols: cols as u16,
+            cell_width: f32::from(cell.width) as u16,
+            cell_height: f32::from(cell.height) as u16,
+        };
+        let colors = self.colors_enabled.get();
+        let opts = if crate::clear_env() {
+            // Cleared-env mode: exec via `env -i` so the shell inherits only the
+            // curated minimal allowlist. `login = true` sources the profile.
+            let min_env = crate::minimal_pty_env(colors, crate::clear_env_user_vars(), &recipe.extra_env);
+            let (prog, mut args) = crate::clear_env_shell_command(&crate::clear_env_shell_path(), true, &min_env);
+            if let Some(suffix) = recipe.agent_launch {
+                args.extend(suffix);
+            }
+            tty::Options {
+                shell: Some(tty::Shell::new(prog, args)),
+                working_directory: recipe.cwd,
+                env: HashMap::new(),
+                ..Default::default()
+            }
+        } else {
+            let mut env = pty_env(colors);
+            env.extend(recipe.extra_env);
+            tty::Options {
+                working_directory: recipe.cwd,
+                env,
+                ..Default::default()
+            }
+        };
+        let pty = tty::new(&opts, ws, 0).expect("failed to create pty");
+        // ConPTY's Pty doesn't expose the child like the Unix one; pid feeds
+        // /proc cwd + catbus detection (Linux-only), so a 0 sentinel is fine.
+        #[cfg(unix)]
+        let pid = pty.child().id();
+        #[cfg(windows)]
+        let pid = 0u32;
+        let pty = crate::pty_ring::PtyTap::new(pty, self.pty_ring.clone());
+        let el = EventLoop::new(self.term.clone(), self.event_proxy.clone(), pty, false, false)
+            .expect("failed to create event loop");
+        let notifier = el.channel();
+        self.event_proxy.set_notifier(notifier.clone());
+        el.spawn();
+        self.notifier = Some(notifier);
+        self.pid = pid;
+        self.exited.set(false);
+
+        // Now that a real process exists, watch for its exit.
+        let exited = self.exited.clone();
+        let pid_for_check = pid;
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            loop {
+                cx.background_executor().timer(Duration::from_millis(500)).await;
+                if !crate::platform::process_alive(pid_for_check) {
+                    let still_current = this
+                        .update(cx, |view: &mut Self, _| view.pid == pid_for_check)
+                        .unwrap_or(false);
+                    if still_current {
+                        exited.set(true);
+                        let _ = this.update(cx, |_, cx: &mut Context<Self>| cx.notify());
+                    }
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Whether the shell has been forked yet (`false` for a skeleton tab).
+    #[must_use]
+    pub const fn is_spawned(&self) -> bool {
+        self.spawn_recipe.is_none()
     }
 
     /// Clone of the per-tab PTY ring's Arc. Lets the snapshot
@@ -759,7 +823,12 @@ impl TerminalView {
     }
 
     pub fn respawn(&mut self, cwd: Option<&Path>, cx: &mut Context<Self>) {
-        let _ = self.notifier.send(Msg::Shutdown);
+        if let Some(n) = self.notifier.as_ref() {
+            let _ = n.send(Msg::Shutdown);
+        }
+        // A respawn always ends up with a live process, so this view is no
+        // longer a skeleton even if it was one (respawn builds its own opts).
+        self.spawn_recipe = None;
 
         let (cols, lines) = self.last_size.get().unwrap_or((INITIAL_COLS, INITIAL_LINES));
         let cell = self.cell_size.unwrap_or(Size {
@@ -829,9 +898,10 @@ impl TerminalView {
         let pty = crate::pty_ring::PtyTap::new(pty, self.pty_ring.clone());
         let el = EventLoop::new(self.term.clone(), self.event_proxy.clone(), pty, false, false)
             .expect("failed to create event loop");
-        self.notifier = el.channel();
-        self.event_proxy.set_notifier(self.notifier.clone());
+        let notifier = el.channel();
+        self.event_proxy.set_notifier(notifier.clone());
         el.spawn();
+        self.notifier = Some(notifier);
 
         self.pid = pid;
         self.exited.set(false);
@@ -857,7 +927,9 @@ impl TerminalView {
     }
 
     pub fn shutdown(&self) {
-        let _ = self.notifier.send(Msg::Shutdown);
+        if let Some(n) = self.notifier.as_ref() {
+            let _ = n.send(Msg::Shutdown);
+        }
     }
 
     fn send_input(&self, bytes: Vec<u8>) {
@@ -877,7 +949,9 @@ impl TerminalView {
             std::str::from_utf8(&bytes[..preview_len]).unwrap_or("<non-utf8>"),
         );
         self.term.lock().grid_mut().scroll_display(Scroll::Bottom);
-        let _ = self.notifier.send(Msg::Input(bytes.into()));
+        if let Some(n) = self.notifier.as_ref() {
+            let _ = n.send(Msg::Input(bytes.into()));
+        }
     }
 
     pub fn send_input_bytes(&self, bytes: Vec<u8>) {
@@ -974,7 +1048,9 @@ impl TerminalView {
         } else {
             text.replace("\r\n", "\r").replace('\n', "\r")
         };
-        let _ = self.notifier.send(Msg::Input(payload.into_bytes().into()));
+        if let Some(n) = self.notifier.as_ref() {
+            let _ = n.send(Msg::Input(payload.into_bytes().into()));
+        }
     }
 
     fn scroll(&self, delta: i32) {
@@ -1076,12 +1152,14 @@ impl TerminalView {
                 screen_lines: lines,
             });
         }
-        let _ = self.notifier.send(Msg::Resize(WindowSize {
-            num_lines: lines as u16,
-            num_cols: cols as u16,
-            cell_width: f32::from(cell.width) as u16,
-            cell_height: f32::from(cell.height) as u16,
-        }));
+        if let Some(n) = self.notifier.as_ref() {
+            let _ = n.send(Msg::Resize(WindowSize {
+                num_lines: lines as u16,
+                num_cols: cols as u16,
+                cell_width: f32::from(cell.width) as u16,
+                cell_height: f32::from(cell.height) as u16,
+            }));
+        }
     }
 
     /// Row-by-row dump for the xterm.js viewer (no WRAPLINE join).
@@ -1581,7 +1659,9 @@ impl Focusable for TerminalView {
 
 struct TerminalElement {
     term: Arc<FairMutex<Term<EventProxy>>>,
-    notifier: EventLoopSender,
+    /// `None` only for a not-yet-spawned skeleton; the mounted (active) tab is
+    /// always spawned, so in practice the element that paints has `Some`.
+    notifier: Option<EventLoopSender>,
     cell_size: Size<Pixels>,
     last_size: Rc<Cell<Option<(usize, usize)>>>,
     content_origin: Rc<Cell<gpui::Point<Pixels>>>,
@@ -1769,12 +1849,14 @@ impl Element for TerminalElement {
                     screen_lines: lines,
                 });
             }
-            let _ = self.notifier.send(Msg::Resize(WindowSize {
-                num_lines: lines as u16,
-                num_cols: cols as u16,
-                cell_width: f32::from(cell.width) as u16,
-                cell_height: f32::from(cell.height) as u16,
-            }));
+            if let Some(n) = self.notifier.as_ref() {
+                let _ = n.send(Msg::Resize(WindowSize {
+                    num_lines: lines as u16,
+                    num_cols: cols as u16,
+                    cell_width: f32::from(cell.width) as u16,
+                    cell_height: f32::from(cell.height) as u16,
+                }));
+            }
         }
 
         self.content_origin.set(bounds.origin);
@@ -2691,6 +2773,46 @@ mod tests {
                 // Idempotent — re-applying the same size keeps the grid.
                 view.force_resize(120, 40, cell);
                 assert_eq!(view.dims(), (120, 40));
+                view.shutdown();
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn skeleton_tab_defers_shell_until_ensure_spawned(cx: &mut TestAppContext) {
+        // A background tab is built as a skeleton (`defer_spawn = true`): the
+        // view exists and renders, but no shell is forked until `ensure_spawned`
+        // — that's what keeps startup from blocking on ~60 forks.
+        let window = cx.add_window(|window, cx| {
+            TerminalView::new_with_colors_and_env(
+                None,
+                FontConfig::default(),
+                default_browser(),
+                default_editor(),
+                true,
+                std::collections::HashMap::new(),
+                None,
+                None,
+                true, // defer_spawn — skeleton
+                window,
+                cx,
+            )
+        });
+        window
+            .update(cx, |view, _window, _cx| {
+                assert!(!view.is_spawned(), "skeleton hasn't forked a shell");
+                assert_eq!(view.pid(), 0, "no pid before spawn");
+            })
+            .unwrap();
+        window
+            .update(cx, |view, _window, cx| {
+                view.ensure_spawned(cx);
+                assert!(view.is_spawned(), "shell forked after ensure_spawned");
+                assert!(view.pid() > 0, "a real pid now");
+                // Idempotent — a second call is a no-op.
+                let pid = view.pid();
+                view.ensure_spawned(cx);
+                assert_eq!(view.pid(), pid);
                 view.shutdown();
             })
             .unwrap();

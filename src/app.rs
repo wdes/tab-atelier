@@ -517,259 +517,300 @@ impl AppState {
         // never opens (and its remote viewer) is correctly sized from the start.
         let boot_grid = Self::grid_size(window, &font_config);
 
-        let (tabs, active, restored_windowed) = if let Some(saved) =
-            load_state_with_outputs(&platform::config_base_dir(), &platform::state_base_dir())
-        {
-            info!("restoring {} tab(s) from saved state", saved.tabs.len());
-            let mut tabs = Vec::new();
-            for ts in &saved.tabs {
-                let cwd = ts.cwd.as_ref().map(PathBuf::from);
-                let fc = font_config.clone();
-                let br = browser.clone();
-                let ce = code_editor.clone();
-                let colors = ts.colors_enabled;
-                let env = tab_env_extras(&ts.id, &api_url_for_pty, &api_token);
-                // Launch the agent directly (exec) when we can drive the
-                // shell command (cleared-env mode); otherwise fall back to
-                // typing the resume in (`pending_agent_resume` below).
-                // NEVER in read-only mode: `claude --resume <uuid>` spawns a
-                // duplicate agent against a live session, which rotates/strips
-                // the session ids in the user's JSON. A read-only instance must
-                // stay inert, so it restores tabs as plain shells.
-                let agent_launch = if crate::clear_env() && !crate::read_only() {
-                    match (&ts.agent_kind, &ts.agent_session_id) {
-                        (Some(k), Some(s)) => {
-                            // Name the agent process after the tab so `top -H`/`ps`
-                            // can tell 20 claudes apart. Only when the launch shell
-                            // supports `exec -a`.
-                            let title = crate::shell_supports_exec_a(&crate::clear_env_shell_path())
-                                .then_some(ts.name.as_str());
-                            crate::agent_launch_shell_suffix_instrumented(k, s, ts.agent_plan_mode, title)
+        let (tabs, active, restored_windowed) =
+            if let Some(saved) = load_state_with_outputs(&platform::config_base_dir(), &platform::state_base_dir()) {
+                info!("restoring {} tab(s) from saved state", saved.tabs.len());
+                let mut tabs = Vec::new();
+                for ts in &saved.tabs {
+                    // The tab that will be shown first forks its shell now (fast
+                    // first paint + eager scrollback restore). Every other tab is a
+                    // skeleton — its PTY is forked in the background by the boot
+                    // loader below, so startup doesn't block on ~60 shell forks.
+                    // Net-off tabs aren't deferred (they respawn into bubblewrap
+                    // right after creation, which needs a live process).
+                    let is_active = tabs.len() == saved.active;
+                    let defer_spawn = !is_active && !ts.net_disabled;
+                    let cwd = ts.cwd.as_ref().map(PathBuf::from);
+                    let fc = font_config.clone();
+                    let br = browser.clone();
+                    let ce = code_editor.clone();
+                    let colors = ts.colors_enabled;
+                    let env = tab_env_extras(&ts.id, &api_url_for_pty, &api_token);
+                    // Launch the agent directly (exec) when we can drive the
+                    // shell command (cleared-env mode); otherwise fall back to
+                    // typing the resume in (`pending_agent_resume` below).
+                    // NEVER in read-only mode: `claude --resume <uuid>` spawns a
+                    // duplicate agent against a live session, which rotates/strips
+                    // the session ids in the user's JSON. A read-only instance must
+                    // stay inert, so it restores tabs as plain shells.
+                    let agent_launch = if crate::clear_env() && !crate::read_only() {
+                        match (&ts.agent_kind, &ts.agent_session_id) {
+                            (Some(k), Some(s)) => {
+                                // Name the agent process after the tab so `top -H`/`ps`
+                                // can tell 20 claudes apart. Only when the launch shell
+                                // supports `exec -a`.
+                                let title = crate::shell_supports_exec_a(&crate::clear_env_shell_path())
+                                    .then_some(ts.name.as_str());
+                                crate::agent_launch_shell_suffix_instrumented(k, s, ts.agent_plan_mode, title)
+                            }
+                            _ => None,
                         }
-                        _ => None,
+                    } else {
+                        None
+                    };
+                    let view = cx.new(|cx| {
+                        let mut tv = TerminalView::new_with_colors_and_env(
+                            cwd.as_deref(),
+                            fc,
+                            br,
+                            ce,
+                            colors,
+                            env,
+                            agent_launch.clone(),
+                            boot_grid,
+                            defer_spawn,
+                            window,
+                            cx,
+                        );
+                        tv.set_theme(theme_name);
+                        tv
+                    });
+                    // Defer restore_output for non-active tabs — feeding the
+                    // whole scrollback through vte for every tab synchronously
+                    // is what makes cold launch slow when there's a lot of
+                    // history. The active tab is restored eagerly so the user
+                    // sees their last screen the moment the window paints.
+                    let pending_restore = ts.output.clone().and_then(|output| {
+                        if is_active {
+                            debug!("restoring {} chars of output for '{}'", output.len(), ts.name);
+                            view.read(cx).restore_output(&output);
+                            None
+                        } else {
+                            Some(output)
+                        }
+                    });
+                    // Push the persisted effective-lock state onto
+                    // the view so input is blocked from the moment
+                    // the tab loads, not just after the first
+                    // persist tick. Routes through `LockState` so a
+                    // tab restored OUTSIDE its schedule's open hours
+                    // also boots locked, not just manually-locked
+                    // tabs.
+                    if crate::schedule::LockState::effective_locked(ts) {
+                        view.read(cx).set_locked(true);
                     }
-                } else {
-                    None
-                };
-                let view = cx.new(|cx| {
-                    let mut tv = TerminalView::new_with_colors_and_env(
-                        cwd.as_deref(),
-                        fc,
-                        br,
-                        ce,
-                        colors,
-                        env,
-                        agent_launch.clone(),
-                        boot_grid,
-                        window,
-                        cx,
-                    );
-                    tv.set_theme(theme_name);
-                    tv
-                });
-                // Defer restore_output for non-active tabs — feeding the
-                // whole scrollback through vte for every tab synchronously
-                // is what makes cold launch slow when there's a lot of
-                // history. The active tab is restored eagerly so the user
-                // sees their last screen the moment the window paints.
-                let is_active = tabs.len() == saved.active;
-                let pending_restore = ts.output.clone().and_then(|output| {
-                    if is_active {
-                        debug!("restoring {} chars of output for '{}'", output.len(), ts.name);
-                        view.read(cx).restore_output(&output);
+                    // Restore the no-internet sandbox: set the flag and
+                    // respawn into bubblewrap so the tab comes back
+                    // airgapped. Skipped (net left on) when bwrap isn't
+                    // installed, so a persisted net-off tab doesn't boot
+                    // into a dead shell on a host without bubblewrap.
+                    if ts.net_disabled && crate::bwrap_available() {
+                        view.update(cx, |v, cx| {
+                            v.set_net_disabled(true);
+                            v.respawn(cwd.as_deref(), cx);
+                        });
+                    }
+                    // Auto-resume: if this tab had an agent session and kind
+                    // persisted, queue the resume command to be typed into the
+                    // freshly-spawned shell — UNLESS we already launched the
+                    // agent directly above (then typing it would double-launch).
+                    let pending_agent_resume = if agent_launch.is_some() || crate::read_only() {
                         None
                     } else {
-                        Some(output)
-                    }
-                });
-                // Push the persisted effective-lock state onto
-                // the view so input is blocked from the moment
-                // the tab loads, not just after the first
-                // persist tick. Routes through `LockState` so a
-                // tab restored OUTSIDE its schedule's open hours
-                // also boots locked, not just manually-locked
-                // tabs.
-                if crate::schedule::LockState::effective_locked(ts) {
-                    view.read(cx).set_locked(true);
-                }
-                // Restore the no-internet sandbox: set the flag and
-                // respawn into bubblewrap so the tab comes back
-                // airgapped. Skipped (net left on) when bwrap isn't
-                // installed, so a persisted net-off tab doesn't boot
-                // into a dead shell on a host without bubblewrap.
-                if ts.net_disabled && crate::bwrap_available() {
-                    view.update(cx, |v, cx| {
-                        v.set_net_disabled(true);
-                        v.respawn(cwd.as_deref(), cx);
+                        match (&ts.agent_kind, &ts.agent_session_id) {
+                            (Some(kind), Some(sid)) => build_agent_resume_command(kind, sid, ts.agent_plan_mode),
+                            _ => None,
+                        }
+                    };
+                    tabs.push(Tab {
+                        view,
+                        id: ts.id.clone(),
+                        name: ts.name.clone(),
+                        created_at: std::time::Instant::now(),
+                        prior_uptime: std::time::Duration::from_secs_f64(ts.uptime_secs.unwrap_or(0.0)),
+                        active_duration: std::time::Duration::ZERO,
+                        last_activated: None,
+                        // Treat a restored tab as "just seen" at boot so
+                        // it starts grey and only ages into the blue
+                        // dormant state after DORMANT_AFTER_SECS without
+                        // you opening it — otherwise every attached
+                        // session would flash blue on every restart.
+                        last_focused_at: Some(std::time::Instant::now()),
+                        last_output_at: None,
+                        #[cfg(feature = "energy")]
+                        energy_wh: ts.energy_wh.unwrap_or(0.0),
+                        #[cfg(feature = "energy")]
+                        energy_wh_last_saved: ts.energy_wh.unwrap_or(0.0),
+                        // Seed with the hash of the just-restored output so the
+                        // first persist tick after launch doesn't rewrite an
+                        // identical file.
+                        output_hash_last_saved: ts.output.as_deref().map_or(0, |s| crate::crc32(s.as_bytes())),
+                        output_ring_len_last_saved: None,
+                        pending_restore,
+                        // Seed from saved state so an immediate persist tick
+                        // before the new shell has a /proc/PID/cwd readable
+                        // doesn't overwrite the restored value with None.
+                        last_known_cwd_string: cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                        last_known_cwd: cwd.clone(),
+                        agent_state: None,
+                        agent_session_id: ts.agent_session_id.clone(),
+                        agent_kind: ts.agent_kind.clone(),
+                        agent_plan_mode: ts.agent_plan_mode,
+                        share_token_rw: ts.share_token_rw.clone(),
+                        share_token_ro: ts.share_token_ro.clone(),
+                        locked: ts.locked,
+                        schedule: ts.schedule.clone(),
+                        bg_color: ts.bg_color.clone(),
+                        context: None,
+                        last_pushed_locked: None,
+                        pending_agent_resume,
+                        snap_cache: None,
+                        limits: ts.limits.clone(),
                     });
                 }
-                // Auto-resume: if this tab had an agent session and kind
-                // persisted, queue the resume command to be typed into the
-                // freshly-spawned shell — UNLESS we already launched the
-                // agent directly above (then typing it would double-launch).
-                let pending_agent_resume = if agent_launch.is_some() || crate::read_only() {
-                    None
-                } else {
-                    match (&ts.agent_kind, &ts.agent_session_id) {
-                        (Some(kind), Some(sid)) => build_agent_resume_command(kind, sid, ts.agent_plan_mode),
-                        _ => None,
-                    }
-                };
-                tabs.push(Tab {
-                    view,
-                    id: ts.id.clone(),
-                    name: ts.name.clone(),
-                    created_at: std::time::Instant::now(),
-                    prior_uptime: std::time::Duration::from_secs_f64(ts.uptime_secs.unwrap_or(0.0)),
-                    active_duration: std::time::Duration::ZERO,
-                    last_activated: None,
-                    // Treat a restored tab as "just seen" at boot so
-                    // it starts grey and only ages into the blue
-                    // dormant state after DORMANT_AFTER_SECS without
-                    // you opening it — otherwise every attached
-                    // session would flash blue on every restart.
-                    last_focused_at: Some(std::time::Instant::now()),
-                    last_output_at: None,
-                    #[cfg(feature = "energy")]
-                    energy_wh: ts.energy_wh.unwrap_or(0.0),
-                    #[cfg(feature = "energy")]
-                    energy_wh_last_saved: ts.energy_wh.unwrap_or(0.0),
-                    // Seed with the hash of the just-restored output so the
-                    // first persist tick after launch doesn't rewrite an
-                    // identical file.
-                    output_hash_last_saved: ts.output.as_deref().map_or(0, |s| crate::crc32(s.as_bytes())),
-                    output_ring_len_last_saved: None,
-                    pending_restore,
-                    // Seed from saved state so an immediate persist tick
-                    // before the new shell has a /proc/PID/cwd readable
-                    // doesn't overwrite the restored value with None.
-                    last_known_cwd_string: cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
-                    last_known_cwd: cwd.clone(),
-                    agent_state: None,
-                    agent_session_id: ts.agent_session_id.clone(),
-                    agent_kind: ts.agent_kind.clone(),
-                    agent_plan_mode: ts.agent_plan_mode,
-                    share_token_rw: ts.share_token_rw.clone(),
-                    share_token_ro: ts.share_token_ro.clone(),
-                    locked: ts.locked,
-                    schedule: ts.schedule.clone(),
-                    bg_color: ts.bg_color.clone(),
-                    context: None,
-                    last_pushed_locked: None,
-                    pending_agent_resume,
-                    snap_cache: None,
-                    limits: ts.limits.clone(),
-                });
-            }
-            if tabs.is_empty() {
+                if tabs.is_empty() {
+                    let fc = font_config.clone();
+                    let br = browser.clone();
+                    let ce = code_editor.clone();
+                    let new_id = crate::default_tab_id();
+                    let env = tab_env_extras(&new_id, &api_url_for_pty, &api_token);
+                    let view = cx.new(|cx| {
+                        let mut tv = TerminalView::new_with_colors_and_env(
+                            None, fc, br, ce, true, env, None, boot_grid, false, window, cx,
+                        );
+                        tv.set_theme(theme_name);
+                        tv
+                    });
+                    tabs.push(Tab {
+                        view,
+                        name: locale::strings(lang).terminal.into(),
+                        created_at: std::time::Instant::now(),
+                        prior_uptime: std::time::Duration::ZERO,
+                        active_duration: std::time::Duration::ZERO,
+                        last_activated: None,
+                        // Treat a restored tab as "just seen" at boot so
+                        // it starts grey and only ages into the blue
+                        // dormant state after DORMANT_AFTER_SECS without
+                        // you opening it — otherwise every attached
+                        // session would flash blue on every restart.
+                        last_focused_at: Some(std::time::Instant::now()),
+                        last_output_at: None,
+                        #[cfg(feature = "energy")]
+                        energy_wh: 0.0,
+                        #[cfg(feature = "energy")]
+                        energy_wh_last_saved: 0.0,
+                        output_hash_last_saved: 0,
+                        output_ring_len_last_saved: None,
+                        pending_restore: None,
+                        last_known_cwd: None,
+                        last_known_cwd_string: None,
+                        id: new_id,
+                        agent_state: None,
+                        agent_session_id: None,
+                        agent_kind: None,
+                        agent_plan_mode: None,
+                        share_token_rw: String::new(),
+                        share_token_ro: String::new(),
+                        locked: false,
+                        schedule: None,
+                        bg_color: None,
+                        context: None,
+                        last_pushed_locked: None,
+                        pending_agent_resume: None,
+                        snap_cache: None,
+                        limits: crate::TabResourceLimits::default(),
+                    });
+                }
+                let active = saved.active.min(tabs.len() - 1);
+                tabs[active].activate();
+                (tabs, active, saved.windowed)
+            } else {
                 let fc = font_config.clone();
                 let br = browser.clone();
                 let ce = code_editor.clone();
                 let new_id = crate::default_tab_id();
                 let env = tab_env_extras(&new_id, &api_url_for_pty, &api_token);
                 let view = cx.new(|cx| {
-                    let mut tv =
-                        TerminalView::new_with_colors_and_env(None, fc, br, ce, true, env, None, boot_grid, window, cx);
+                    let mut tv = TerminalView::new_with_colors_and_env(
+                        None, fc, br, ce, true, env, None, boot_grid, false, window, cx,
+                    );
                     tv.set_theme(theme_name);
                     tv
                 });
-                tabs.push(Tab {
-                    view,
-                    name: locale::strings(lang).terminal.into(),
-                    created_at: std::time::Instant::now(),
-                    prior_uptime: std::time::Duration::ZERO,
-                    active_duration: std::time::Duration::ZERO,
-                    last_activated: None,
-                    // Treat a restored tab as "just seen" at boot so
-                    // it starts grey and only ages into the blue
-                    // dormant state after DORMANT_AFTER_SECS without
-                    // you opening it — otherwise every attached
-                    // session would flash blue on every restart.
-                    last_focused_at: Some(std::time::Instant::now()),
-                    last_output_at: None,
-                    #[cfg(feature = "energy")]
-                    energy_wh: 0.0,
-                    #[cfg(feature = "energy")]
-                    energy_wh_last_saved: 0.0,
-                    output_hash_last_saved: 0,
-                    output_ring_len_last_saved: None,
-                    pending_restore: None,
-                    last_known_cwd: None,
-                    last_known_cwd_string: None,
-                    id: new_id,
-                    agent_state: None,
-                    agent_session_id: None,
-                    agent_kind: None,
-                    agent_plan_mode: None,
-                    share_token_rw: String::new(),
-                    share_token_ro: String::new(),
-                    locked: false,
-                    schedule: None,
-                    bg_color: None,
-                    context: None,
-                    last_pushed_locked: None,
-                    pending_agent_resume: None,
-                    snap_cache: None,
-                    limits: crate::TabResourceLimits::default(),
-                });
-            }
-            let active = saved.active.min(tabs.len() - 1);
-            tabs[active].activate();
-            (tabs, active, saved.windowed)
-        } else {
-            let fc = font_config.clone();
-            let br = browser.clone();
-            let ce = code_editor.clone();
-            let new_id = crate::default_tab_id();
-            let env = tab_env_extras(&new_id, &api_url_for_pty, &api_token);
-            let view = cx.new(|cx| {
-                let mut tv =
-                    TerminalView::new_with_colors_and_env(None, fc, br, ce, true, env, None, boot_grid, window, cx);
-                tv.set_theme(theme_name);
-                tv
-            });
-            (
-                vec![Tab {
-                    view,
-                    name: locale::strings(lang).terminal.into(),
-                    created_at: std::time::Instant::now(),
-                    prior_uptime: std::time::Duration::ZERO,
-                    active_duration: std::time::Duration::ZERO,
-                    last_activated: Some(std::time::Instant::now()),
-                    last_focused_at: Some(std::time::Instant::now()),
-                    last_output_at: None,
-                    #[cfg(feature = "energy")]
-                    energy_wh: 0.0,
-                    #[cfg(feature = "energy")]
-                    energy_wh_last_saved: 0.0,
-                    output_hash_last_saved: 0,
-                    output_ring_len_last_saved: None,
-                    pending_restore: None,
-                    last_known_cwd: None,
-                    last_known_cwd_string: None,
-                    id: new_id,
-                    agent_state: None,
-                    agent_session_id: None,
-                    agent_kind: None,
-                    agent_plan_mode: None,
-                    share_token_rw: String::new(),
-                    share_token_ro: String::new(),
-                    locked: false,
-                    schedule: None,
-                    bg_color: None,
-                    context: None,
-                    last_pushed_locked: None,
-                    pending_agent_resume: None,
-                    snap_cache: None,
-                    limits: crate::TabResourceLimits::default(),
-                }],
-                0,
-                false,
-            )
-        };
+                (
+                    vec![Tab {
+                        view,
+                        name: locale::strings(lang).terminal.into(),
+                        created_at: std::time::Instant::now(),
+                        prior_uptime: std::time::Duration::ZERO,
+                        active_duration: std::time::Duration::ZERO,
+                        last_activated: Some(std::time::Instant::now()),
+                        last_focused_at: Some(std::time::Instant::now()),
+                        last_output_at: None,
+                        #[cfg(feature = "energy")]
+                        energy_wh: 0.0,
+                        #[cfg(feature = "energy")]
+                        energy_wh_last_saved: 0.0,
+                        output_hash_last_saved: 0,
+                        output_ring_len_last_saved: None,
+                        pending_restore: None,
+                        last_known_cwd: None,
+                        last_known_cwd_string: None,
+                        id: new_id,
+                        agent_state: None,
+                        agent_session_id: None,
+                        agent_kind: None,
+                        agent_plan_mode: None,
+                        share_token_rw: String::new(),
+                        share_token_ro: String::new(),
+                        locked: false,
+                        schedule: None,
+                        bg_color: None,
+                        context: None,
+                        last_pushed_locked: None,
+                        pending_agent_resume: None,
+                        snap_cache: None,
+                        limits: crate::TabResourceLimits::default(),
+                    }],
+                    0,
+                    false,
+                )
+            };
         if restored_windowed {
             window.toggle_fullscreen();
         }
+
+        // Boot loader: only the active tab forked its shell up front. Warm the
+        // rest — skeletons — in the background, a couple per tick, so startup
+        // isn't blocked on ~60 shell forks yet restored agents still come back
+        // online (their `exec claude` is baked into the deferred spawn). Runs
+        // until every tab is spawned, then exits.
+        cx.spawn(async |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(40))
+                    .await;
+                let done = this
+                    .update(cx, |app, cx| {
+                        let mut spawned = 0;
+                        for tab in &app.tabs {
+                            if spawned >= 2 {
+                                break;
+                            }
+                            if !tab.view.read(cx).is_spawned() {
+                                tab.view.update(cx, TerminalView::ensure_spawned);
+                                spawned += 1;
+                            }
+                        }
+                        app.tabs.iter().all(|t| t.view.read(cx).is_spawned())
+                    })
+                    .unwrap_or(true);
+                if done {
+                    break;
+                }
+            }
+        })
+        .detach();
 
         cx.spawn(async |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             loop {
@@ -1135,8 +1176,19 @@ impl AppState {
         let view = cx.new(|cx| {
             // Fresh tab — no agent session yet, so a plain shell (None). Spawn at
             // the live window's grid so the tab is correctly sized immediately.
-            let mut tv =
-                TerminalView::new_with_colors_and_env(cwd.as_deref(), fc, br, ce, true, env, None, grid, window, cx);
+            let mut tv = TerminalView::new_with_colors_and_env(
+                cwd.as_deref(),
+                fc,
+                br,
+                ce,
+                true,
+                env,
+                None,
+                grid,
+                false,
+                window,
+                cx,
+            );
             tv.set_theme(tn);
             tv
         });
@@ -1853,6 +1905,7 @@ impl AppState {
                 env,
                 agent_launch,
                 grid,
+                false,
                 window,
                 cx,
             );
@@ -4364,6 +4417,10 @@ impl Render for AppState {
         if self.tabs.is_empty() {
             return self.render_center_screen("Tab Atelier", self.t().loading, None);
         }
+        // The active tab must be live to display it — fork its shell now if it
+        // was still a skeleton (e.g. the user switched to a not-yet-warmed tab
+        // before the boot loader reached it). No-op once spawned.
+        self.tabs[self.active].view.update(cx, TerminalView::ensure_spawned);
         window.set_window_title(&format!("{}{}", self.tabs[self.active].name, self.t().title_suffix));
         let active_terminal = self.tabs[self.active].view.clone();
         #[cfg(feature = "energy")]
