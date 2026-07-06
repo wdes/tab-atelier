@@ -343,8 +343,9 @@ pub fn term_to_ansi_rows<E: EventListener>(
         // spaces doesn't bloat the transfer. xterm.js advances cursor
         // to col 0 on \n, so the missing trailing spaces don't change
         // the layout when the next row is written.
-        let trimmed = line.trim_end_matches(' ').to_string();
-        out.push_str(&trimmed);
+        // `trim_end_matches` returns a borrowed slice — push it straight into
+        // `out` instead of allocating a fresh `String` per row.
+        out.push_str(line.trim_end_matches(' '));
         out.push('\n');
     }
     drop(t);
