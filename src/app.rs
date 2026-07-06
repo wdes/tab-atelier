@@ -1459,9 +1459,27 @@ impl AppState {
             // mobile remote word-wraps them, more is wasted bandwidth on
             // a phone screen). 2000 for `raw_output` so xterm.js's
             // scrollback has actual history to browse through.
-            let fresh = if tab.snap_cache.as_ref().is_none_or(|c| c.ring_len != ring_len) {
+            // The 2000-line `raw_output` (xterm.js scrollback) is only consumed
+            // when someone is actually web-viewing THIS tab. For an unwatched
+            // tab — the common case, e.g. 20 background agents streaming while
+            // you watch one — skip that scan and keep only the cheap 200-line
+            // `output` the /tabs list needs. When a viewer attaches to a tab
+            // whose cache was built without raw scrollback, refresh once so
+            // xterm.js still gets history (within one persist tick).
+            let want_raw = view.viewer_count() > 0;
+            let stale = tab.snap_cache.as_ref().is_none_or(|c| c.ring_len != ring_len);
+            let needs_raw_backfill = want_raw
+                && tab
+                    .snap_cache
+                    .as_ref()
+                    .is_some_and(|c| c.raw_output.is_empty() && !c.output.is_empty());
+            let fresh = if stale || needs_raw_backfill {
                 let (output, cursor) = view.ansi_text_with_cursor(Some(200));
-                let (raw_output, raw_cursor) = view.raw_screen_text(Some(2000));
+                let (raw_output, raw_cursor) = if want_raw {
+                    view.raw_screen_text(Some(2000))
+                } else {
+                    (String::new(), None)
+                };
                 let (cols, rows) = view.dims();
                 Some(crate::term_export::GridSnapshotCache {
                     ring_len,
