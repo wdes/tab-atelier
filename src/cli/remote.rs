@@ -243,7 +243,10 @@ fn cmd_test(args: &[String], watch: bool) -> i32 {
     };
 
     println!("Connecting to {} ({})…", endpoint.label, endpoint.url);
-    let client = remote::Client::spawn(endpoint);
+    let Some(client) = remote::Client::spawn(endpoint) else {
+        eprintln!("error: could not start the remote client thread");
+        return 1;
+    };
 
     let mut seen_first_tabs = false;
     let deadline = std::time::Instant::now() + Duration::from_secs(if watch { 600 } else { 10 });

@@ -302,23 +302,29 @@ impl HeadlessTab {
     /// only when the PTY ring advanced since the last call. Otherwise
     /// the previous scan is reused, avoiding the per-tick full-grid
     /// walk on idle tabs.
-    fn cached_grid(&mut self) -> &crate::term_export::GridSnapshotCache {
+    fn cached_grid(&mut self) -> crate::term_export::GridSnapshotCache {
         let ring_len = self.ring_total_len();
-        if self.snap_cache.as_ref().is_none_or(|c| c.ring_len != ring_len) {
-            let (output, cursor) = self.ansi_text_with_cursor(Some(200));
-            let (raw_output, raw_cursor) = self.raw_screen_text(Some(2000));
-            let (cols, rows) = self.dims();
-            self.snap_cache = Some(crate::term_export::GridSnapshotCache {
-                ring_len,
-                output,
-                cursor,
-                raw_output,
-                raw_cursor,
-                cols,
-                rows,
-            });
+        // Reuse the cached scan when the ring hasn't advanced; the early return
+        // ends the borrow so the miss path can re-borrow `self` mutably. Returns
+        // owned (the sole caller cloned it anyway), so there's no infallible
+        // `expect` on an always-Some cache.
+        if let Some(c) = self.snap_cache.as_ref().filter(|c| c.ring_len == ring_len) {
+            return c.clone();
         }
-        self.snap_cache.as_ref().expect("snap_cache populated above")
+        let (output, cursor) = self.ansi_text_with_cursor(Some(200));
+        let (raw_output, raw_cursor) = self.raw_screen_text(Some(2000));
+        let (cols, rows) = self.dims();
+        let grid = crate::term_export::GridSnapshotCache {
+            ring_len,
+            output,
+            cursor,
+            raw_output,
+            raw_cursor,
+            cols,
+            rows,
+        };
+        self.snap_cache = Some(grid.clone());
+        grid
     }
 
     fn copy_all_history(&self) -> String {
@@ -1008,7 +1014,7 @@ fn refresh_snapshot(
         use std::sync::OnceLock;
         static LAST: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
         let lock = LAST.get_or_init(|| Mutex::new(None));
-        let mut last = lock.lock().expect("lock poisoned");
+        let mut last = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if last.is_none_or(|t| t.elapsed() >= Duration::from_secs(5)) {
             *last = Some(Instant::now());
             drop(last);
@@ -1037,7 +1043,7 @@ fn refresh_snapshot(
         // re-scans the terminal when the PTY ring advanced. The other
         // fields (uptime, lock, agent state, …) are cheap and rebuilt
         // every tick so changes there still surface immediately.
-        let grid = tab.cached_grid().clone();
+        let grid = tab.cached_grid();
         api_tabs.push(api::SnapshotTab {
             id: tab.id.clone(),
             name: tab.name.clone(),
@@ -1069,15 +1075,19 @@ fn refresh_snapshot(
             dns_entries: tab.dns_entries(),
         });
     }
-    let mut snapshot = api_state.lock().expect("lock poisoned");
+    let mut snapshot = api_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     snapshot.tabs = api_tabs;
     snapshot.active = active;
     snapshot.cached_response = None;
     #[cfg(feature = "energy")]
-    snapshot.power.clone_from(&power_watts.lock().expect("lock poisoned"));
+    snapshot
+        .power
+        .clone_from(&power_watts.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
     #[cfg(feature = "energy")]
     {
-        snapshot.battery_percent = *battery_percent.lock().expect("lock poisoned");
+        snapshot.battery_percent = *battery_percent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
     }
 }
 
@@ -1108,7 +1118,7 @@ struct OutputSaver {
 impl OutputSaver {
     fn spawn(state_base: std::path::PathBuf) -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<Vec<SaveJob>>();
-        std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name("ta-output-saver".into())
             .spawn(move || {
                 // Per-tab dirtiness gate (ring_len, output crc) — the
@@ -1137,8 +1147,13 @@ impl OutputSaver {
                         seen.insert(job.name, (job.ring_len, h));
                     }
                 }
-            })
-            .expect("spawn output-saver thread");
+            });
+        // Degrade rather than crash: if the OS won't give us a thread, the
+        // daemon keeps serving the API — tab output just won't be persisted
+        // (sends on `tx` become no-ops once `rx` is dropped).
+        if let Err(e) = spawned {
+            warn!("output-saver thread failed to spawn; tab output won't be saved: {e}");
+        }
         Self { tx }
     }
 
@@ -1190,7 +1205,7 @@ fn persist(
 
     #[cfg(feature = "energy")]
     {
-        let watts = power_watts.lock().expect("lock poisoned");
+        let watts = power_watts.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         for (i, tab) in tabs.iter_mut().enumerate() {
             if let Some(w) = watts.get(i).and_then(|p| p.watts) {
                 tab.energy_wh += w * 2.0 / 3600.0;
@@ -1311,7 +1326,7 @@ fn persist(
     #[cfg(feature = "energy")]
     {
         let pids: Vec<u32> = tabs.iter().map(|tab| tab.pid).collect();
-        *power_pids.lock().expect("lock poisoned") = pids;
+        *power_pids.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = pids;
     }
 }
 
@@ -1401,7 +1416,7 @@ fn drain_pending(
     default_limits: &crate::TabResourceLimits,
     default_net_allow: &crate::net_policy::AllowConfig,
 ) {
-    let mut s = api_state.lock().expect("lock poisoned");
+    let mut s = api_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut closes: Vec<usize> = s.pending_closes.drain(..).collect();
     let activate = s.pending_activate.take();
     let inputs: Vec<(usize, Vec<u8>)> = s.pending_input.drain(..).collect();

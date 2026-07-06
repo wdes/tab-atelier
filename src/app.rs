@@ -34,7 +34,7 @@ use gpui::{
     Point, Render, Rgba, SharedString, Stateful, StatefulInteractiveElement, Styled, WeakEntity, Window,
     WindowBackgroundAppearance, WindowHandle, WindowOptions, div, px, rgba,
 };
-use log::{debug, info};
+use log::{debug, error, info};
 
 /// Which capture the screenshot menu requested.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -914,7 +914,7 @@ impl AppState {
                     if app
                         .battery_percent
                         .lock()
-                        .expect("lock poisoned")
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .is_some_and(|b| b < 10)
                     {
                         cx.notify();
@@ -1297,7 +1297,7 @@ impl AppState {
     /// pending queue (a no-op for input once we've cleared it here).
     fn drain_inputs(&mut self, cx: &mut Context<Self>) {
         let inputs: Vec<(usize, Vec<u8>)> = {
-            let mut snapshot = self.api_state.lock().expect("lock poisoned");
+            let mut snapshot = self.api_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if snapshot.pending_input.is_empty() {
                 return;
             }
@@ -1326,7 +1326,10 @@ impl AppState {
         }
         #[cfg(feature = "energy")]
         {
-            let watts = self.power_watts.lock().expect("lock poisoned");
+            let watts = self
+                .power_watts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             for (i, tab) in self.tabs.iter_mut().enumerate() {
                 if let Some(w) = watts.get(i).and_then(|p| p.watts) {
                     tab.energy_wh += w * 2.0 / 3600.0;
@@ -1422,7 +1425,11 @@ impl AppState {
                 // dormant-blue LED reflects real silence, not just un-focus.
                 tab.last_output_at = Some(std::time::Instant::now());
             }
-            let grid = tab.snap_cache.as_ref().expect("snap_cache populated above").clone();
+            // Populated just above; if somehow absent, skip this tab in the
+            // snapshot this tick rather than panic (next tick refills it).
+            let Some(grid) = tab.snap_cache.clone() else {
+                continue;
+            };
             let bg_color = crate::effective_tab_bg(tab.bg_color.as_deref(), self.tab_bg_global.as_deref()).to_string();
             api_tabs.push(api::SnapshotTab {
                 id: tab.id.clone(),
@@ -1560,29 +1567,38 @@ impl AppState {
         }
 
         {
-            let mut snapshot = self.api_state.lock().expect("lock poisoned");
+            let mut snapshot = self.api_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             snapshot.tabs = api_tabs;
             snapshot.active = self.active;
             // Invalidate the /tabs cache; next GET rebuilds it once.
             snapshot.cached_response = None;
             #[cfg(feature = "energy")]
-            snapshot
-                .power
-                .clone_from(&self.power_watts.lock().expect("lock poisoned"));
+            snapshot.power.clone_from(
+                &self
+                    .power_watts
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
             #[cfg(feature = "energy")]
             {
-                snapshot.battery_percent = *self.battery_percent.lock().expect("lock poisoned");
+                snapshot.battery_percent = *self
+                    .battery_percent
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
             }
         }
 
         #[cfg(feature = "energy")]
         {
             let pids: Vec<u32> = self.tabs.iter().map(|tab| tab.view.read(cx).pid()).collect();
-            *self.power_pids.lock().expect("lock poisoned") = pids;
+            *self
+                .power_pids
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = pids;
         }
 
         {
-            let mut snapshot = self.api_state.lock().expect("lock poisoned");
+            let mut snapshot = self.api_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut closes: Vec<usize> = snapshot.pending_closes.drain(..).collect();
             let activate = snapshot.pending_activate.take();
             let inputs: Vec<(usize, Vec<u8>)> = snapshot.pending_input.drain(..).collect();
@@ -2145,7 +2161,11 @@ impl AppState {
         let watts_fg = th.fg_muted_hsla();
 
         #[cfg(feature = "energy")]
-        let watts = self.power_watts.lock().expect("lock poisoned").clone();
+        let watts = self
+            .power_watts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
 
         let mut bar = div()
             .id("tab-bar")
@@ -2597,7 +2617,8 @@ impl AppState {
                                 }
                                 let token = slot_ref.clone();
                                 {
-                                    let mut snap = this.api_state.lock().expect("lock poisoned");
+                                    let mut snap =
+                                        this.api_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                     if let Some(t) = snap.tabs.iter_mut().find(|t| t.id == tab_id) {
                                         if ro {
                                             t.share_token_ro.clone_from(&token);
@@ -2762,7 +2783,7 @@ impl AppState {
                             this.tabs[idx].locked = next;
                             this.tabs[idx].view.read(cx).set_locked(next);
                             {
-                                let mut snap = this.api_state.lock().expect("lock poisoned");
+                                let mut snap = this.api_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                 if let Some(t) = snap.tabs.iter_mut().find(|t| t.id == tab_id_for_lock) {
                                     t.locked = next;
                                 }
@@ -2803,7 +2824,8 @@ impl AppState {
                                 let next = !net_disabled;
                                 this.tabs[idx].view.read(cx).set_net_disabled(next);
                                 {
-                                    let mut snap = this.api_state.lock().expect("lock poisoned");
+                                    let mut snap =
+                                        this.api_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                     if let Some(t) = snap.tabs.iter_mut().find(|t| t.id == tab_id_for_net) {
                                         t.net_disabled = next;
                                     }
@@ -2838,7 +2860,12 @@ impl AppState {
 
             #[cfg(feature = "energy")]
             {
-                let power_info = self.power_watts.lock().expect("lock poisoned").get(stats_idx).cloned();
+                let power_info = self
+                    .power_watts
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(stats_idx)
+                    .cloned();
                 if let Some(ref p) = power_info {
                     if p.cpu_percent >= 0.1 {
                         stats_lines.push(format!("{}: {}", t.cpu, p.cpu_label()));
@@ -4406,7 +4433,7 @@ impl Render for AppState {
         // Window handle; piggy-backing on render() is the simplest place
         // to react to remote POST /tabs requests.
         let (new_tab_count, new_tab_cwds): (usize, Vec<PathBuf>) = {
-            let mut snap = self.api_state.lock().expect("lock poisoned");
+            let mut snap = self.api_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let n = std::mem::take(&mut snap.pending_new_tabs);
             let cwds: Vec<PathBuf> = std::mem::take(&mut snap.pending_new_tab_cwds).into_iter().collect();
             drop(snap);
@@ -4431,7 +4458,10 @@ impl Render for AppState {
         window.set_window_title(&format!("{}{}", self.tabs[self.active].name, self.t().title_suffix));
         let active_terminal = self.tabs[self.active].view.clone();
         #[cfg(feature = "energy")]
-        let battery = *self.battery_percent.lock().expect("lock poisoned");
+        let battery = *self
+            .battery_percent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         #[cfg(not(feature = "energy"))]
         let battery: Option<u8> = None;
         // Per-tab ledges for the pet are collected inside `render_tab_bar` by
@@ -4826,26 +4856,33 @@ pub fn run() {
             prefs.hotkeys
         };
 
-        let window_handle = cx
-            .open_window(
-                WindowOptions {
-                    titlebar: None,
-                    window_background: WindowBackgroundAppearance::Transparent,
-                    // Sets the X11 `WM_CLASS` (and Wayland app-id) to match the
-                    // `.desktop` file's `StartupWMClass=tab-atelier`, so the
-                    // running window is tied to `tab-atelier.desktop` and the
-                    // taskbar/dock shows its `Icon=tab-atelier`. Without this
-                    // gpui leaves the class unset and the window gets a generic
-                    // fallback icon.
-                    app_id: Some("tab-atelier".to_owned()),
-                    ..Default::default()
-                },
-                |window, cx| {
-                    window.toggle_fullscreen();
-                    cx.new(|cx| AppState::new(window, cx))
-                },
-            )
-            .expect("failed to open the main window");
+        let window_handle = cx.open_window(
+            WindowOptions {
+                titlebar: None,
+                window_background: WindowBackgroundAppearance::Transparent,
+                // Sets the X11 `WM_CLASS` (and Wayland app-id) to match the
+                // `.desktop` file's `StartupWMClass=tab-atelier`, so the
+                // running window is tied to `tab-atelier.desktop` and the
+                // taskbar/dock shows its `Icon=tab-atelier`. Without this
+                // gpui leaves the class unset and the window gets a generic
+                // fallback icon.
+                app_id: Some("tab-atelier".to_owned()),
+                ..Default::default()
+            },
+            |window, cx| {
+                window.toggle_fullscreen();
+                cx.new(|cx| AppState::new(window, cx))
+            },
+        );
+        // Without a window there's no app; report it and exit cleanly (a normal
+        // exit code, not a panic + backtrace).
+        let window_handle = match window_handle {
+            Ok(h) => h,
+            Err(e) => {
+                error!("cannot open the main window: {e}");
+                std::process::exit(1);
+            }
+        };
 
         spawn_hotkey_listener(&keycodes, window_handle, cx);
     });

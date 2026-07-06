@@ -4,7 +4,7 @@
 
 // Integration test crate — `.unwrap()` is idiomatic here (the crate-wide deny
 // in Cargo.toml also covers `tests/`, which never sets `cfg(test)`).
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 //! Shape tests for `assets/claude-code-managed-settings.json` — the
 //! system-wide Claude Code hooks file we ship at

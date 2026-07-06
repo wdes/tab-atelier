@@ -86,9 +86,19 @@ pub fn process_alive(pid: u32) -> bool {
 /// crash loudly instead of minting a guessable secret.
 pub fn random_bytes(buf: &mut [u8]) {
     use std::io::Read;
-    let mut f = std::fs::File::open("/dev/urandom").expect("open /dev/urandom for secure token generation");
-    f.read_exact(buf)
-        .expect("read /dev/urandom for secure token generation");
+    // A predictable token is worse than stopping — but stop cleanly (log + exit
+    // code 1) rather than panic with a backtrace. Both are fatal by design.
+    let mut f = match std::fs::File::open("/dev/urandom") {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("fatal: cannot open /dev/urandom for secure token generation: {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = f.read_exact(buf) {
+        eprintln!("fatal: cannot read /dev/urandom for secure token generation: {e}");
+        std::process::exit(1);
+    }
 }
 
 // --- Screenshot (X11) ---

@@ -1056,7 +1056,10 @@ pub fn ports(args: &[String]) -> i32 {
         return 0;
     }
 
-    let obj = doc.as_object_mut().expect("doc should be a JSON object");
+    let Some(obj) = doc.as_object_mut() else {
+        eprintln!("error: preferences file is not a JSON object");
+        return 1;
+    };
     if let Some(v) = new_api {
         obj.insert("api_addr".into(), serde_json::Value::String(v));
     }

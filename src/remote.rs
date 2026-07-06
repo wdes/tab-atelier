@@ -135,25 +135,25 @@ impl Client {
     /// only on `RemoteCommand::Shutdown` (or the receiver hanging up,
     /// which the loop also notices).
     ///
-    /// # Panics
-    ///
-    /// Panics if the OS refuses to spawn the polling thread — only
-    /// likely under extreme resource exhaustion.
+    /// Returns `None` if the OS refuses to spawn the polling thread — only
+    /// likely under extreme resource exhaustion. The caller reports and skips
+    /// the endpoint rather than the whole process aborting.
     #[must_use]
-    pub fn spawn(endpoint: RemoteEndpoint) -> Self {
+    pub fn spawn(endpoint: RemoteEndpoint) -> Option<Self> {
         let (cmd_tx, cmd_rx) = mpsc::channel::<RemoteCommand>();
         let (evt_tx, evt_rx) = mpsc::channel::<RemoteEvent>();
         let endpoint_id = endpoint.id.clone();
         let join = std::thread::Builder::new()
             .name(format!("tab-atelier-remote-{}", endpoint.label))
             .spawn(move || run(&endpoint, &cmd_rx, &evt_tx))
-            .expect("spawn remote client thread");
-        Self {
+            .map_err(|e| log::error!("failed to spawn remote client thread: {e}"))
+            .ok()?;
+        Some(Self {
             endpoint_id,
             tx: cmd_tx,
             rx: evt_rx,
             join: Some(join),
-        }
+        })
     }
 
     /// Best-effort `Shutdown` send + join. Idempotent.
