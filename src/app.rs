@@ -34,7 +34,7 @@ use gpui::{
     Point, Render, Rgba, SharedString, Stateful, StatefulInteractiveElement, Styled, WeakEntity, Window,
     WindowBackgroundAppearance, WindowHandle, WindowOptions, div, px, rgba,
 };
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 
 /// Which capture the screenshot menu requested.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -91,20 +91,6 @@ struct Tab {
     /// meaningful additional energy has been consumed since last save.
     #[cfg(feature = "energy")]
     energy_wh_last_saved: f64,
-    /// CRC32 of the last output snapshot written to disk. Skips the
-    /// per-tab `output_tab-...json` write+rotate when nothing changed
-    /// (idle tabs, no new output since last persist tick).
-    output_hash_last_saved: u32,
-    /// PTY-ring `total_len` at the last output save. The crc32 gate
-    /// above is authoritative for "did the output change", but
-    /// computing the hash needs `copy_all_history()` — a full
-    /// scrollback serialization — which dominated idle CPU with many
-    /// tabs (49 tabs × full-grid scan every 2 s). When the ring's
-    /// monotonic byte counter hasn't moved since the last save, no
-    /// new PTY bytes reached the grid, so the output is byte-identical
-    /// and we skip the serialize+hash entirely. `None` until the
-    /// first save so the very first persist always serializes.
-    output_ring_len_last_saved: Option<u64>,
     /// Saved scrollback that hasn't been fed back into the terminal yet.
     /// Tabs other than the active one defer this work until first focus
     /// so cold-launch with many tabs doesn't block on vte-parsing each
@@ -340,6 +326,73 @@ fn grid_dims(vp_w: f32, vp_h: f32, cell_w: f32, cell_h: f32) -> Option<(usize, u
     Some((cols, lines))
 }
 
+/// One tab's output-save request for the [`OutputSaver`] worker: its name, the
+/// ring length (a cheap dirtiness key), and a `Send` closure that serialises the
+/// scrollback. The main thread builds these (an `Arc` clone + a brief ring lock
+/// per tab); the worker runs the expensive serialize + atomic disk write.
+struct SaveJob {
+    name: String,
+    ring_len: u64,
+    serialize: Box<dyn FnOnce() -> String + Send>,
+}
+
+/// Background thread that runs `copy_all_history` (scrollback → ANSI, up to 10k
+/// lines) + the atomic disk write OFF the gpui main thread — the GUI twin of
+/// headless's saver. Before this, the 2 s persist tick serialised every changed
+/// tab inline on the main thread, so a flood of active tabs stalled typing for
+/// up to ~1.5 s (the p99 keystroke spike).
+struct OutputSaver {
+    tx: std::sync::mpsc::Sender<Vec<SaveJob>>,
+}
+
+impl OutputSaver {
+    fn spawn(state_base: PathBuf) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<SaveJob>>();
+        let spawned = std::thread::Builder::new()
+            .name("ta-output-saver".into())
+            .spawn(move || {
+                // Per-tab dirtiness gate (ring_len, then output crc), kept here in
+                // the worker instead of on the `Tab` struct.
+                let mut seen: std::collections::HashMap<String, (u64, u32)> = std::collections::HashMap::new();
+                while let Ok(mut batch) = rx.recv() {
+                    // Saves are current-state + idempotent, so if newer batches
+                    // queued while we worked, jump to the latest.
+                    while let Ok(newer) = rx.try_recv() {
+                        batch = newer;
+                    }
+                    for job in batch {
+                        if seen.get(&job.name).is_some_and(|&(rl, _)| rl == job.ring_len) {
+                            continue; // ring unchanged ⇒ identical output
+                        }
+                        let output = (job.serialize)();
+                        if output.is_empty() {
+                            continue;
+                        }
+                        let h = crate::crc32(output.as_bytes());
+                        if seen.get(&job.name).is_some_and(|&(_, hh)| hh == h) {
+                            seen.insert(job.name, (job.ring_len, h));
+                            continue;
+                        }
+                        save_tab_output(&state_base, &job.name, &output);
+                        seen.insert(job.name, (job.ring_len, h));
+                    }
+                }
+            });
+        // Degrade rather than crash: if the OS won't give us a thread, the app
+        // keeps running — tab output just isn't persisted.
+        if let Err(e) = spawned {
+            warn!("output-saver thread failed to spawn; tab output won't be saved: {e}");
+        }
+        Self { tx }
+    }
+
+    /// Cheap main-thread hand-off (`Arc` clones + a brief ring lock per tab);
+    /// never blocks on the scrollback serialize or the disk write.
+    fn submit(&self, batch: Vec<SaveJob>) {
+        let _ = self.tx.send(batch); // ignore if the saver has exited
+    }
+}
+
 struct AppState {
     tabs: Vec<Tab>,
     active: usize,
@@ -436,6 +489,10 @@ struct AppState {
     /// App icon for [`Self::render_center_screen`], wrapped once so the
     /// loading/lock screen doesn't re-wrap the PNG bytes every frame.
     logo: Arc<gpui::Image>,
+    /// Worker thread the persist tick hands scrollback-save jobs to, so the
+    /// expensive `copy_all_history` + disk write never runs on the gpui main
+    /// thread (was the ~1.5 s periodic typing stall under many active tabs).
+    output_saver: OutputSaver,
     /// Per-tab agent resource sampler. Every persist tick, each agent
     /// tab's `/proc` subtree is sampled and a JSONL line appended to
     /// `agent_probe_tab-<name>.jsonl` — the "why is idle claude busy"
@@ -652,8 +709,6 @@ impl AppState {
                         // Seed with the hash of the just-restored output so the
                         // first persist tick after launch doesn't rewrite an
                         // identical file.
-                        output_hash_last_saved: ts.output.as_deref().map_or(0, |s| crate::crc32(s.as_bytes())),
-                        output_ring_len_last_saved: None,
                         pending_restore,
                         // Seed from saved state so an immediate persist tick
                         // before the new shell has a /proc/PID/cwd readable
@@ -707,8 +762,6 @@ impl AppState {
                         energy_wh: 0.0,
                         #[cfg(feature = "energy")]
                         energy_wh_last_saved: 0.0,
-                        output_hash_last_saved: 0,
-                        output_ring_len_last_saved: None,
                         pending_restore: None,
                         last_known_cwd: None,
                         last_known_cwd_string: None,
@@ -759,8 +812,6 @@ impl AppState {
                         energy_wh: 0.0,
                         #[cfg(feature = "energy")]
                         energy_wh_last_saved: 0.0,
-                        output_hash_last_saved: 0,
-                        output_ring_len_last_saved: None,
                         pending_restore: None,
                         last_known_cwd: None,
                         last_known_cwd_string: None,
@@ -1074,6 +1125,7 @@ impl AppState {
             last_conn_meter: std::cell::Cell::new(None),
             last_broadcast_size: std::cell::Cell::new(None),
             logo: Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, LOGO_PNG.to_vec())),
+            output_saver: OutputSaver::spawn(platform::state_base_dir()),
             agent_probe: crate::agent_probe::AgentProbe::default(),
             launched_agents: std::collections::HashMap::new(),
         }
@@ -1222,8 +1274,6 @@ impl AppState {
                 energy_wh: 0.0,
                 #[cfg(feature = "energy")]
                 energy_wh_last_saved: 0.0,
-                output_hash_last_saved: 0,
-                output_ring_len_last_saved: None,
                 pending_restore: None,
                 last_known_cwd_string: cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
                 last_known_cwd: cwd,
@@ -1491,43 +1541,24 @@ impl AppState {
             self.last_state_hash.set(new_hash);
         }
         if !read_only {
-            for tab in &mut self.tabs {
-                // Cheap dirtiness gate BEFORE the expensive
-                // copy_all_history(). The PTY ring's monotonic counter
-                // only advances when new bytes reached the grid; if it
-                // hasn't moved since the last save, the output is
-                // byte-identical and there's nothing to save. This is
-                // what stops idle tabs from each paying a full-grid
-                // serialize every 2 s (the dominant cost at 49 tabs).
-                // crc32 below stays authoritative — we never skip a
-                // real change, we just avoid serializing unchanged
-                // tabs.
-                let ring_len = {
+            // Hand the scrollback-save off to the worker thread: build a cheap
+            // job per tab (name + ring_len + a `Send` serialize closure) and
+            // submit. The worker does the ring/crc dirtiness gate and the
+            // expensive `copy_all_history` + disk write, so this tick never
+            // stalls typing on a full-grid serialize (the old inline cost).
+            let batch: Vec<SaveJob> = self
+                .tabs
+                .iter()
+                .map(|tab| {
                     let view = tab.view.read(cx);
-                    view.pty_ring().lock().map_or(0, |r| r.total_len())
-                };
-                if tab.output_ring_len_last_saved == Some(ring_len) {
-                    continue;
-                }
-                let output = tab.view.read(cx).copy_all_history();
-                if output.is_empty() {
-                    // Don't record ring_len: an empty grid that later
-                    // fills must still serialize on the next tick.
-                    continue;
-                }
-                let h = crate::crc32(output.as_bytes());
-                if h == tab.output_hash_last_saved {
-                    // Content identical despite a ring advance (e.g.
-                    // bytes that didn't alter the visible/scrollback
-                    // text). Record the ring position so we don't
-                    // re-serialize until genuinely new bytes arrive.
-                    tab.output_ring_len_last_saved = Some(ring_len);
-                    continue;
-                }
-                save_tab_output(&state_base, &tab.name, &output);
-                tab.output_hash_last_saved = h;
-                tab.output_ring_len_last_saved = Some(ring_len);
-            }
+                    SaveJob {
+                        name: tab.name.clone(),
+                        ring_len: view.pty_ring().lock().map_or(0, |r| r.total_len()),
+                        serialize: Box::new(view.history_job()),
+                    }
+                })
+                .collect();
+            self.output_saver.submit(batch);
         }
         // Uptime + energy are never written in read-only mode; in normal
         // mode each has its own throttle (30s for uptime, ≥0.1 Wh delta for
