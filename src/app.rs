@@ -756,8 +756,13 @@ impl AppState {
         })
         .detach();
 
-        // Screen-mate pet animation clock: while the pet is on screen, notify
-        // ~20 fps so render() advances the walk. Cheap no-op while dismissed.
+        // Screen-mate pet animation clock: while the pet is on screen AND the
+        // drop-down is visible, notify ~20 fps so render() advances the walk.
+        // Gated on `visible`: a Guake terminal is hidden most of the time, and
+        // an ungated 20 fps `cx.notify()` repaints the whole window (including
+        // the active terminal) even while hidden — a constant main-thread load
+        // that competes with keystroke handling (contributes to laggy typing).
+        // Hidden ⇒ pets aren't on screen anyway, so freeze them till it's shown.
         #[cfg(feature = "pets")]
         cx.spawn(async |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             loop {
@@ -765,7 +770,7 @@ impl AppState {
                     .timer(std::time::Duration::from_millis(50))
                     .await;
                 let Ok(()) = this.update(cx, |app, cx| {
-                    if app.pet.is_active() {
+                    if app.visible && app.pet.is_active() {
                         cx.notify();
                     }
                 }) else {
