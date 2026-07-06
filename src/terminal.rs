@@ -1213,6 +1213,16 @@ impl TerminalView {
         self.ansi_lines(None).0.join("\n")
     }
 
+    /// A `Send` closure that serialises this tab's full scrollback to the same
+    /// string `copy_all_history` produces. Hands the `Term` `Arc` to a worker
+    /// thread so the expensive walk (up to 10k lines) runs OFF the gpui main
+    /// thread — the persist tick submits these instead of serialising inline,
+    /// which is what used to stall typing every 2 s under many active tabs.
+    pub fn history_job(&self) -> impl FnOnce() -> String + Send + 'static {
+        let term = self.term.clone();
+        move || crate::term_export::term_to_ansi_text_with_cursor(&term, None).0
+    }
+
     /// Same view as `plain_text` but with SGR escape sequences preserved
     /// per fg/bg/flags change, so a remote client can render colours.
     /// `max_lines` caps the result to the last N lines (visible screen
