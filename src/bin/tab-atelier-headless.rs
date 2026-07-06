@@ -2,6 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+// `unwrap_used` is denied crate-wide (Cargo.toml); tests may still unwrap.
+#![cfg_attr(test, allow(clippy::unwrap_used))]
+
 //! Headless binary shim — runs everything except gpui. Built by
 //! `cargo build --no-default-features --features headless`. Same
 //! tab-atelier crate, same persistence files, same local API.
