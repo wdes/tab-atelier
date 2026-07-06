@@ -318,6 +318,28 @@ struct ExitConfirm {
     tab_idx: usize,
 }
 
+/// Height of the tab strip in pixels — matches `render_tab_bar`'s `.h(px(32.0))`.
+/// Subtracted from the viewport height to get the terminal area when computing a
+/// startup grid size for every tab (so unopened tabs' PTYs are sized right).
+const TAB_BAR_HEIGHT: f32 = 32.0;
+
+/// App icon shown on the reusable centered screen (loading / future lock screen).
+/// The same 192px raster the web manifest and favicons are generated from.
+const LOGO_PNG: &[u8] = include_bytes!("../assets/icons/icon-192.png");
+
+/// Cols × lines that fit a viewport, given the cell size — the pure arithmetic
+/// behind [`AppState::grid_size`]. Subtracts the tab strip from the height.
+/// `None` for a not-yet-laid-out (zero) viewport or an unmeasured cell, so the
+/// caller keeps the 80×24 spawn fallback rather than a nonsense 2×1 grid.
+fn grid_dims(vp_w: f32, vp_h: f32, cell_w: f32, cell_h: f32) -> Option<(usize, usize)> {
+    if vp_w < 1.0 || vp_h < 1.0 || cell_w < 1.0 || cell_h < 1.0 {
+        return None;
+    }
+    let cols = ((vp_w / cell_w) as usize).max(2);
+    let lines = (((vp_h - TAB_BAR_HEIGHT).max(cell_h) / cell_h) as usize).max(1);
+    Some((cols, lines))
+}
+
 struct AppState {
     tabs: Vec<Tab>,
     active: usize,
@@ -405,6 +427,15 @@ struct AppState {
     /// Last time `tab_connections` was refreshed (throttled — the /proc scan
     /// is too heavy for every persist tick).
     last_conn_meter: std::cell::Cell<Option<std::time::Instant>>,
+    /// Last `(cols, lines)` broadcast from the active tab to the background
+    /// tabs. The active tab computes the real grid size on its first/every
+    /// paint; a tick pushes it to the (never-painted) background tabs so their
+    /// PTYs + remote viewers match. This skips the O(N) resize loop when the
+    /// size is unchanged (the common case — only launch + window resizes move it).
+    last_broadcast_size: std::cell::Cell<Option<(usize, usize)>>,
+    /// App icon for [`Self::render_center_screen`], wrapped once so the
+    /// loading/lock screen doesn't re-wrap the PNG bytes every frame.
+    logo: Arc<gpui::Image>,
     /// Per-tab agent resource sampler. Every persist tick, each agent
     /// tab's `/proc` subtree is sampled and a JSONL line appended to
     /// `agent_probe_tab-<name>.jsonl` — the "why is idle claude busy"
@@ -419,6 +450,23 @@ impl AppState {
 
     fn th(&self) -> &'static theme::Theme {
         theme::theme(self.theme_name)
+    }
+
+    /// Terminal grid size `(cols, lines, cell)` for the current window, so every
+    /// tab's PTY can be spawned at the right size instead of the 80×24 fallback —
+    /// a never-opened tab (and its remote xterm.js viewer) is then correctly
+    /// sized from birth. `None` before the window has a real size (viewport not
+    /// laid out yet); callers fall back to 80×24 and the first paint corrects it.
+    fn grid_size(window: &mut Window, fc: &crate::FontConfig) -> Option<(usize, usize, gpui::Size<Pixels>)> {
+        let vp = window.viewport_size();
+        let cell = crate::terminal::measure_cell(window, fc);
+        let (cols, lines) = grid_dims(
+            f32::from(vp.width),
+            f32::from(vp.height),
+            f32::from(cell.width),
+            f32::from(cell.height),
+        )?;
+        Some((cols, lines, cell))
     }
 
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -464,6 +512,11 @@ impl AppState {
         let api_addr_resolved = prefs.api_addr.clone().unwrap_or_else(|| crate::DEFAULT_API_ADDR.into());
         let api_url_for_pty = api_url_for_local_clients(&api_addr_resolved);
 
+        // Grid size for the current window, computed once — every tab below
+        // spawns its PTY at this size instead of 80×24, so even a tab the user
+        // never opens (and its remote viewer) is correctly sized from the start.
+        let boot_grid = Self::grid_size(window, &font_config);
+
         let (tabs, active, restored_windowed) = if let Some(saved) =
             load_state_with_outputs(&platform::config_base_dir(), &platform::state_base_dir())
         {
@@ -507,6 +560,7 @@ impl AppState {
                         colors,
                         env,
                         agent_launch.clone(),
+                        boot_grid,
                         window,
                         cx,
                     );
@@ -614,7 +668,8 @@ impl AppState {
                 let new_id = crate::default_tab_id();
                 let env = tab_env_extras(&new_id, &api_url_for_pty, &api_token);
                 let view = cx.new(|cx| {
-                    let mut tv = TerminalView::new_with_colors_and_env(None, fc, br, ce, true, env, None, window, cx);
+                    let mut tv =
+                        TerminalView::new_with_colors_and_env(None, fc, br, ce, true, env, None, boot_grid, window, cx);
                     tv.set_theme(theme_name);
                     tv
                 });
@@ -668,7 +723,8 @@ impl AppState {
             let new_id = crate::default_tab_id();
             let env = tab_env_extras(&new_id, &api_url_for_pty, &api_token);
             let view = cx.new(|cx| {
-                let mut tv = TerminalView::new_with_colors_and_env(None, fc, br, ce, true, env, None, window, cx);
+                let mut tv =
+                    TerminalView::new_with_colors_and_env(None, fc, br, ce, true, env, None, boot_grid, window, cx);
                 tv.set_theme(theme_name);
                 tv
             });
@@ -786,6 +842,9 @@ impl AppState {
                     .timer(std::time::Duration::from_millis(500))
                     .await;
                 let Ok(()) = this.update(cx, |app, cx| {
+                    // Keep background tabs sized to the window (the active tab's
+                    // real paint size) — cheap no-op unless it changed.
+                    app.broadcast_active_size(cx);
                     if app.exit_confirm.is_some() {
                         return;
                     }
@@ -959,8 +1018,90 @@ impl AppState {
             last_state_hash: std::cell::Cell::new(0),
             tab_connections: std::cell::RefCell::new(std::collections::HashMap::new()),
             last_conn_meter: std::cell::Cell::new(None),
+            last_broadcast_size: std::cell::Cell::new(None),
+            logo: Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, LOGO_PNG.to_vec())),
             agent_probe: crate::agent_probe::AgentProbe::default(),
         }
+    }
+
+    /// Push the active tab's real (painted) grid size onto every background tab,
+    /// so tabs the user hasn't opened — and their remote xterm.js viewers — are
+    /// sized to the window instead of stuck at the 80×24 spawn fallback. Cheap:
+    /// a no-op until the active tab's measured size actually changes (launch,
+    /// window resize), then one `force_resize` per other tab.
+    fn broadcast_active_size(&self, cx: &mut Context<Self>) {
+        let Some((cols, lines, cell)) = self.tabs.get(self.active).and_then(|t| t.view.read(cx).measured_grid()) else {
+            return;
+        };
+        if self.last_broadcast_size.get() == Some((cols, lines)) {
+            return;
+        }
+        self.last_broadcast_size.set(Some((cols, lines)));
+        for (i, tab) in self.tabs.iter().enumerate() {
+            if i == self.active {
+                continue;
+            }
+            tab.view.update(cx, |v, _| v.force_resize(cols, lines, cell));
+        }
+    }
+
+    /// A full-window centered screen: app logo, a title, a status subtitle, and
+    /// an optional progress bar. The reusable shell behind the boot loading
+    /// screen (`progress: Some`) and, later, a lock screen (`progress: None` +
+    /// a "Locked" subtitle). Returns `AnyElement` so `render` can early-return
+    /// it in place of the normal tab UI.
+    fn render_center_screen(
+        &self,
+        title: impl Into<SharedString>,
+        subtitle: impl Into<SharedString>,
+        progress: Option<f32>,
+    ) -> gpui::AnyElement {
+        const BAR_W: f32 = 220.0;
+        let t = self.th();
+        let column = div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(14.0))
+            .child(
+                gpui::img(gpui::ImageSource::Image(self.logo.clone()))
+                    .w(px(96.0))
+                    .h(px(96.0)),
+            )
+            .child(div().text_size(px(22.0)).text_color(t.fg_hsla()).child(title.into()))
+            .child(
+                div()
+                    .text_size(px(13.0))
+                    .text_color(t.fg_muted_hsla())
+                    .child(subtitle.into()),
+            )
+            .when_some(progress, |el, p| {
+                el.child(
+                    div()
+                        .w(px(BAR_W))
+                        .h(px(4.0))
+                        .rounded(px(2.0))
+                        .bg(t.surface_hsla())
+                        .child(
+                            div()
+                                .w(px(BAR_W * p.clamp(0.0, 1.0)))
+                                .h(px(4.0))
+                                .rounded(px(2.0))
+                                .bg(t.accent_hsla()),
+                        ),
+                )
+            });
+        div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(t.bg_hsla())
+            .child(column)
+            .into_any_element()
     }
 
     fn add_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -983,6 +1124,7 @@ impl AppState {
             let pid = self.tabs[self.active].view.read(cx).pid();
             platform::process_cwd(pid).or_else(|| self.tabs[self.active].last_known_cwd.clone())
         });
+        let grid = Self::grid_size(window, &self.font_config);
         self.tabs[self.active].deactivate();
         let fc = self.font_config.clone();
         let br = self.browser.clone();
@@ -991,8 +1133,10 @@ impl AppState {
         let new_id = crate::default_tab_id();
         let env = tab_env_extras(&new_id, &api_url_for_local_clients(&self.api_addr), &self.api_token);
         let view = cx.new(|cx| {
-            // Fresh tab — no agent session yet, so a plain shell (None).
-            let mut tv = TerminalView::new_with_colors_and_env(cwd.as_deref(), fc, br, ce, true, env, None, window, cx);
+            // Fresh tab — no agent session yet, so a plain shell (None). Spawn at
+            // the live window's grid so the tab is correctly sized immediately.
+            let mut tv =
+                TerminalView::new_with_colors_and_env(cwd.as_deref(), fc, br, ce, true, env, None, grid, window, cx);
             tv.set_theme(tn);
             tv
         });
@@ -1672,6 +1816,7 @@ impl AppState {
         // `--resume` loads a duplicate of the same session.
         #[cfg(unix)]
         crate::kill_tab_pgroup(old_pid);
+        let grid = Self::grid_size(window, &self.font_config);
         let fc = self.font_config.clone();
         let br = self.browser.clone();
         let ce = self.code_editor.clone();
@@ -1699,8 +1844,18 @@ impl AppState {
             None
         };
         let view = cx.new(|cx| {
-            let mut tv =
-                TerminalView::new_with_colors_and_env(cwd.as_deref(), fc, br, ce, true, env, agent_launch, window, cx);
+            let mut tv = TerminalView::new_with_colors_and_env(
+                cwd.as_deref(),
+                fc,
+                br,
+                ce,
+                true,
+                env,
+                agent_launch,
+                grid,
+                window,
+                cx,
+            );
             tv.set_theme(tn);
             tv
         });
@@ -4204,6 +4359,11 @@ impl Render for AppState {
                 None => self.add_tab(window, cx),
             }
         }
+        // No tab to show yet (transient empty state / future async boot): the
+        // reusable centered screen stands in rather than indexing a missing tab.
+        if self.tabs.is_empty() {
+            return self.render_center_screen("Tab Atelier", self.t().loading, None);
+        }
         window.set_window_title(&format!("{}{}", self.tabs[self.active].name, self.t().title_suffix));
         let active_terminal = self.tabs[self.active].view.clone();
         #[cfg(feature = "energy")]
@@ -4432,7 +4592,7 @@ impl Render for AppState {
             }
         }
 
-        root
+        root.into_any_element()
     }
 }
 
@@ -4665,6 +4825,32 @@ fn spawn_hotkey_listener(keycodes: &[u8], window_handle: WindowHandle<AppState>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grid_dims_fits_viewport_minus_tab_bar() {
+        // 800×600 window, 8×16 px cells → 100 cols; height minus the 32px tab
+        // bar is 568 / 16 = 35 lines (truncated).
+        assert_eq!(grid_dims(800.0, 600.0, 8.0, 16.0), Some((100, 35)));
+        // A wider cell yields fewer columns.
+        assert_eq!(grid_dims(800.0, 600.0, 10.0, 16.0), Some((80, 35)));
+    }
+
+    #[test]
+    fn grid_dims_rejects_unlaid_out_or_unmeasured() {
+        // Zero viewport (window not laid out yet) → fall back to 80×24 spawn.
+        assert_eq!(grid_dims(0.0, 0.0, 8.0, 16.0), None);
+        assert_eq!(grid_dims(800.0, 0.0, 8.0, 16.0), None);
+        // Unmeasured cell.
+        assert_eq!(grid_dims(800.0, 600.0, 0.0, 16.0), None);
+    }
+
+    #[test]
+    fn grid_dims_clamps_to_a_minimum_grid() {
+        // A viewport smaller than the tab bar + one cell still yields a usable
+        // grid rather than 0 lines / <2 cols.
+        let (cols, lines) = grid_dims(5.0, 10.0, 8.0, 16.0).expect("some");
+        assert!(cols >= 2 && lines >= 1);
+    }
 
     #[test]
     fn format_duration_seconds() {

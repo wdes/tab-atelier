@@ -434,6 +434,7 @@ impl TerminalView {
             true,
             HashMap::new(),
             None,
+            None,
             window,
             cx,
         )
@@ -454,14 +455,21 @@ impl TerminalView {
         // (`… -i -c 'exec claude --resume <id>'`, see `agent_launch_shell_suffix`)
         // so the tab's process IS claude. Only honoured in cleared-env mode.
         agent_launch: Option<Vec<String>>,
+        // Grid size to spawn the PTY at (cols, lines, cell). When `None` the
+        // PTY starts at the 80×24 fallback and resizes on first paint. Passing
+        // the real window-derived size means even a never-shown tab's PTY (and
+        // its remote xterm.js viewer) is correctly sized from birth.
+        initial_grid: Option<(usize, usize, Size<Pixels>)>,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let (init_cols, init_lines) = initial_grid.map_or((INITIAL_COLS, INITIAL_LINES), |(c, l, _)| (c, l));
+        let init_cell = initial_grid.map(|(_, _, cell)| cell);
         let ws = WindowSize {
-            num_lines: INITIAL_LINES as u16,
-            num_cols: INITIAL_COLS as u16,
-            cell_width: 9,
-            cell_height: 18,
+            num_lines: init_lines as u16,
+            num_cols: init_cols as u16,
+            cell_width: init_cell.map_or(9, |c| f32::from(c.width) as u16),
+            cell_height: init_cell.map_or(18, |c| f32::from(c.height) as u16),
         };
         let opts = if crate::clear_env() {
             // Cleared-env mode: exec the shell via `env -i` so it
@@ -505,8 +513,8 @@ impl TerminalView {
         let term = Term::new(
             config,
             &TermDims {
-                columns: INITIAL_COLS,
-                screen_lines: INITIAL_LINES,
+                columns: init_cols,
+                screen_lines: init_lines,
             },
             proxy.clone(),
         );
@@ -642,8 +650,10 @@ impl TerminalView {
             notifier,
             event_proxy: proxy,
             focus,
-            cell_size: None,
-            last_size: Rc::new(Cell::new(None)),
+            // Seed from `initial_grid` so a tab spawned at a known size doesn't
+            // re-measure the cell or thrash a resize on its first paint.
+            cell_size: init_cell,
+            last_size: Rc::new(Cell::new(initial_grid.map(|(c, l, _)| (c, l)))),
             content_origin: Rc::new(Cell::new(point(px(0.0), px(0.0)))),
             bounds_size: Rc::new(Cell::new(size(px(0.0), px(0.0)))),
             line_cache: Rc::new(RefCell::new(HashMap::new())),
@@ -1033,6 +1043,47 @@ impl TerminalView {
         (cols, rows)
     }
 
+    /// The grid size this view last laid out at (cols, lines, cell), once it
+    /// has been painted at least once. `None` before the first prepaint. The
+    /// app reads this off the *active* tab and broadcasts it to the others via
+    /// [`Self::force_resize`], so background tabs match the visible one.
+    #[must_use]
+    pub fn measured_grid(&self) -> Option<(usize, usize, Size<Pixels>)> {
+        match (self.last_size.get(), self.cell_size) {
+            (Some((cols, lines)), Some(cell)) => Some((cols, lines, cell)),
+            _ => None,
+        }
+    }
+
+    /// Resize the grid + PTY without going through a paint — for background
+    /// tabs, which are never mounted and so never hit the prepaint resize.
+    /// Mirrors the resize body in [`TerminalElement::prepaint`]; no-op when the
+    /// size is unchanged.
+    pub fn force_resize(&mut self, cols: usize, lines: usize, cell: Size<Pixels>) {
+        let cols = cols.max(2);
+        let lines = lines.max(1);
+        if self.cell_size.is_none() {
+            self.cell_size = Some(cell);
+        }
+        if self.last_size.get() == Some((cols, lines)) {
+            return;
+        }
+        self.last_size.set(Some((cols, lines)));
+        {
+            let mut t = self.term.lock();
+            t.resize(TermDims {
+                columns: cols,
+                screen_lines: lines,
+            });
+        }
+        let _ = self.notifier.send(Msg::Resize(WindowSize {
+            num_lines: lines as u16,
+            num_cols: cols as u16,
+            cell_width: f32::from(cell.width) as u16,
+            cell_height: f32::from(cell.height) as u16,
+        }));
+    }
+
     /// Row-by-row dump for the xterm.js viewer (no WRAPLINE join).
     /// Each server-grid row → one `\n`-terminated line, so the
     /// browser-side terminal at matching cols reproduces the layout
@@ -1124,6 +1175,40 @@ impl TerminalView {
 // GUI render + the headless ANSI dump don't drift. Tests below
 // import the shared one directly.
 
+/// Measure a monospace cell (advance width × line height) for `fc` through the
+/// window's text system — the same shaping pipeline `shape_line` uses, so the
+/// grid maths matches what's painted. Extracted so callers that don't render a
+/// terminal (e.g. the app computing a startup grid size for every tab) can size
+/// the PTY without mounting the view.
+///
+/// Cell width measurement based on Zed's `terminal_element.rs`
+/// Copyright (c) Zed Industries — Apache-2.0 / GPL-3.0
+#[must_use]
+pub fn measure_cell(window: &mut Window, fc: &FontConfig) -> Size<Pixels> {
+    let mut f = font(fc.family.clone());
+    f.weight = FontWeight(fc.weight as f32);
+    let font_size = px(fc.size);
+    let text_sys = window.text_system();
+    // Measure cell width through the shaping pipeline to match shape_line.
+    let layout = text_sys.layout_line(
+        "m",
+        font_size,
+        &[TextRun {
+            len: 1,
+            font: f,
+            color: gpui::black(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        }],
+        None,
+    );
+    Size {
+        width: layout.width,
+        height: font_size * 1.4,
+    }
+}
+
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Mark this view as the foreground one this frame. Only the active
@@ -1134,35 +1219,8 @@ impl Render for TerminalView {
         let term = self.term.clone();
 
         // Measure cell size once we have a text system.
-        // Cell width measurement based on Zed's terminal_element.rs
-        // Copyright (c) Zed Industries — Apache-2.0 / GPL-3.0
         if self.cell_size.is_none() {
-            let mut f = font(self.font_config.family.clone());
-            f.weight = FontWeight(self.font_config.weight as f32);
-            let font_size = px(self.font_config.size);
-            let text_sys = window.text_system();
-            let font_id = text_sys.resolve_font(&f);
-            // Measure cell width through the shaping pipeline to match shape_line
-            let layout = text_sys.layout_line(
-                "m",
-                font_size,
-                &[TextRun {
-                    len: 1,
-                    font: f,
-                    color: gpui::black(),
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                }],
-                None,
-            );
-            let cell_width = layout.width;
-            let _ = font_id;
-            let line_height = font_size * 1.4;
-            self.cell_size = Some(Size {
-                width: cell_width,
-                height: line_height,
-            });
+            self.cell_size = Some(measure_cell(window, &self.font_config));
         }
 
         let cell_size = self.cell_size.unwrap_or(Size {
@@ -2600,6 +2658,39 @@ mod tests {
                 }
                 assert!(found, "restored text should appear in grid");
                 drop(t);
+                view.shutdown();
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn force_resize_sizes_a_background_view(cx: &mut TestAppContext) {
+        // A background tab is never painted, so it relies on `force_resize`
+        // (driven from the app's broadcast tick) to match the active tab —
+        // resizing the grid + PTY and reporting the new size via measured_grid.
+        let window = cx.add_window(|window, cx| {
+            TerminalView::new(
+                None,
+                FontConfig::default(),
+                default_browser(),
+                default_editor(),
+                window,
+                cx,
+            )
+        });
+        window
+            .update(cx, |view, _window, _cx| {
+                let cell = Size {
+                    width: px(8.0),
+                    height: px(16.0),
+                };
+                view.force_resize(120, 40, cell);
+                assert_eq!(view.dims(), (120, 40), "the PTY grid resized");
+                let (mc, ml, _) = view.measured_grid().expect("size reported after resize");
+                assert_eq!((mc, ml), (120, 40), "measured cols/lines match");
+                // Idempotent — re-applying the same size keeps the grid.
+                view.force_resize(120, 40, cell);
+                assert_eq!(view.dims(), (120, 40));
                 view.shutdown();
             })
             .unwrap();

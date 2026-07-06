@@ -29,6 +29,8 @@ pub struct Strings {
     pub terminal_n: &'static str,
     pub tab_atelier: &'static str,
     pub title_suffix: &'static str,
+    /// Subtitle on the boot loading screen.
+    pub loading: &'static str,
 
     // Tab bar
     pub new_tab: &'static str,
@@ -130,6 +132,7 @@ pub static EN: Strings = Strings {
     terminal_n: "Terminal",
     tab_atelier: "Tab Atelier",
     title_suffix: " — Tab Atelier",
+    loading: "Starting…",
 
     new_tab: "+",
 
@@ -221,6 +224,7 @@ pub static FR: Strings = Strings {
     terminal_n: "Terminal",
     tab_atelier: "Tab Atelier",
     title_suffix: " — Tab Atelier",
+    loading: "Démarrage…",
 
     new_tab: "+",
 
