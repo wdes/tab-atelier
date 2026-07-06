@@ -441,6 +441,14 @@ struct AppState {
     /// `agent_probe_tab-<name>.jsonl` — the "why is idle claude busy"
     /// timeline a future binary taps into. See [`crate::agent_probe`].
     agent_probe: crate::agent_probe::AgentProbe,
+    /// Every agent process launched this run, `pid → /proc start_time`.
+    /// On close-all / quit we SIGKILL any still alive so a claude that
+    /// escaped its tab's process group (respawn race, or one that outlived
+    /// its PTY) doesn't leak as a stopped, init-reparented ghost.
+    /// Provenance-based: only pids we launched, start-time-pinned so a
+    /// reused pid is never hit. In-memory (a crash can't consult it — that
+    /// stays the opt-in startup reaper's job).
+    launched_agents: std::collections::HashMap<u32, u64>,
 }
 
 impl AppState {
@@ -1067,6 +1075,7 @@ impl AppState {
             last_broadcast_size: std::cell::Cell::new(None),
             logo: Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, LOGO_PNG.to_vec())),
             agent_probe: crate::agent_probe::AgentProbe::default(),
+            launched_agents: std::collections::HashMap::new(),
         }
     }
 
@@ -1750,6 +1759,11 @@ impl AppState {
                 let activity = crate::catbus_agent::agent_activity(pid);
                 if activity != crate::catbus_agent::AgentActivity::Gone {
                     live_agents.push((pid, tab.agent_session_id.clone().unwrap_or_default()));
+                    // Remember it (start-time-pinned) so close-all / quit can
+                    // kill it even if it later escapes its tab's process group.
+                    if let Some(st) = crate::agent_reaper::proc_start_time(pid) {
+                        self.launched_agents.insert(pid, st);
+                    }
                 }
                 // Resource sampler: append this tick's CPU/RSS/ctxsw line for
                 // live agents (Gone has no process to sample). The PTY child
@@ -2081,6 +2095,17 @@ impl AppState {
             // claude survive and orphan, and the next launch resumes duplicates.
             #[cfg(unix)]
             crate::kill_tab_pgroup(pid);
+        }
+        // Provenance sweep: also kill any agent we launched this run that
+        // escaped its tab's process group (respawn race, or a claude that
+        // outlived its PTY) — otherwise it leaks as a stopped, init-
+        // reparented ghost that no later "close all" can reach. Start-time-
+        // pinned so a reused pid is never hit.
+        #[cfg(unix)]
+        for (&pid, &start) in &self.launched_agents {
+            if crate::agent_reaper::proc_start_time(pid) == Some(start) {
+                crate::kill_tab_pgroup(pid);
+            }
         }
         cx.quit();
     }
