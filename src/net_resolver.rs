@@ -335,7 +335,7 @@ mod tests {
         let log = Arc::new(Mutex::new(Vec::new()));
         record(&log, "api.x.com", vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]);
         record(&log, "api.x.com", vec![IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8))]);
-        let e = log.lock().expect("lock poisoned").clone();
+        let e = log.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
         assert_eq!(e.len(), 1);
         assert!(e[0].allowed);
         assert_eq!(e[0].ips, vec![IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8))]);

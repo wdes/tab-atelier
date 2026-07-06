@@ -54,7 +54,10 @@ pub fn run(args: &[String]) -> i32 {
     resolver::warn_if_cert_drifted(&endpoint);
 
     eprintln!("Connecting to {} ({})…", endpoint.label, endpoint.url);
-    let client = Client::spawn(endpoint);
+    let Some(client) = Client::spawn(endpoint) else {
+        eprintln!("tab-atelier remote attach: could not start the remote client thread");
+        return 1;
+    };
 
     let initial_tabs = match resolver::wait_for_first_tabs(&client, Duration::from_secs(5)) {
         Ok(t) => t,
@@ -147,7 +150,9 @@ fn run_loop(client: &Client, target_id: &str) -> Result<(), String> {
 
     exit_flag.store(true, Ordering::SeqCst);
     drop(guard); // restore terminal mode before joining
-    let _ = stdin_thread.join();
+    if let Some(t) = stdin_thread {
+        let _ = t.join();
+    }
     eprintln!("(detached, last_len={last_seen_len})");
     result
 }
@@ -156,11 +161,14 @@ fn spawn_stdin_forwarder(
     tx: std::sync::mpsc::Sender<RemoteCommand>,
     remote_id: String,
     exit_flag: Arc<AtomicBool>,
-) -> std::thread::JoinHandle<()> {
+) -> Option<std::thread::JoinHandle<()>> {
+    // `None` (degraded: no keystroke forwarding, still watches) rather than
+    // aborting the whole attach if the OS won't give us a thread.
     std::thread::Builder::new()
         .name("tab-atelier-attach-stdin".into())
         .spawn(move || stdin_forwarder_loop(&tx, &remote_id, &exit_flag))
-        .expect("spawn stdin forwarder")
+        .map_err(|e| eprintln!("tab-atelier remote attach: stdin forwarder unavailable: {e}"))
+        .ok()
 }
 
 #[allow(clippy::significant_drop_tightening)]

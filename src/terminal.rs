@@ -11,7 +11,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use log::{info, trace};
+use log::{error, info, trace};
 
 /// Opt-in paint-loop instrument. Set `TAB_ATELIER_PAINT_LOG=1` and the
 /// terminal prepaint (Phase 1 cell scan + Phase 2 shaping) wall-time is
@@ -502,7 +502,10 @@ impl TerminalView {
         );
         let term = Arc::new(FairMutex::new(term));
         let pty_ring = Arc::new(std::sync::Mutex::new(crate::pty_ring::PtyRing::default()));
-        let viewers = pty_ring.lock().expect("fresh ring lock").viewers_handle();
+        let viewers = pty_ring
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .viewers_handle();
 
         let focus = cx.focus_handle();
 
@@ -700,7 +703,16 @@ impl TerminalView {
                 ..Default::default()
             }
         };
-        let pty = tty::new(&opts, ws, 0).expect("failed to create pty");
+        let pty = match tty::new(&opts, ws, 0) {
+            Ok(pty) => pty,
+            Err(e) => {
+                // Can't fork the shell (out of fds/pids, etc.). Don't crash the
+                // whole app — mark this one tab dead so it renders as exited.
+                error!("failed to create PTY: {e}");
+                self.exited.set(true);
+                return;
+            }
+        };
         // ConPTY's Pty doesn't expose the child like the Unix one; pid feeds
         // /proc cwd + catbus detection (Linux-only), so a 0 sentinel is fine.
         #[cfg(unix)]
@@ -708,8 +720,14 @@ impl TerminalView {
         #[cfg(windows)]
         let pid = 0u32;
         let pty = crate::pty_ring::PtyTap::new(pty, self.pty_ring.clone());
-        let el = EventLoop::new(self.term.clone(), self.event_proxy.clone(), pty, false, false)
-            .expect("failed to create event loop");
+        let el = match EventLoop::new(self.term.clone(), self.event_proxy.clone(), pty, false, false) {
+            Ok(el) => el,
+            Err(e) => {
+                error!("failed to create PTY event loop: {e}");
+                self.exited.set(true);
+                return;
+            }
+        };
         let notifier = el.channel();
         self.event_proxy.set_notifier(notifier.clone());
         el.spawn();
@@ -880,7 +898,14 @@ impl TerminalView {
                 ..Default::default()
             }
         };
-        let pty = tty::new(&opts, ws, 0).expect("failed to create pty");
+        let pty = match tty::new(&opts, ws, 0) {
+            Ok(pty) => pty,
+            Err(e) => {
+                error!("failed to re-create PTY on respawn: {e}");
+                self.exited.set(true);
+                return;
+            }
+        };
         // ConPTY's Pty doesn't expose the child the way the Unix one does.
         // The PID feeds /proc cwd + catbus detection — both Linux-only, so
         // a 0 sentinel is fine on Windows.
@@ -896,8 +921,14 @@ impl TerminalView {
         // hit Enter to relaunch). Bytes from the old process stay
         // in the ring; new bytes append.
         let pty = crate::pty_ring::PtyTap::new(pty, self.pty_ring.clone());
-        let el = EventLoop::new(self.term.clone(), self.event_proxy.clone(), pty, false, false)
-            .expect("failed to create event loop");
+        let el = match EventLoop::new(self.term.clone(), self.event_proxy.clone(), pty, false, false) {
+            Ok(el) => el,
+            Err(e) => {
+                error!("failed to create PTY event loop on respawn: {e}");
+                self.exited.set(true);
+                return;
+            }
+        };
         let notifier = el.channel();
         self.event_proxy.set_notifier(notifier.clone());
         el.spawn();
@@ -2245,10 +2276,9 @@ impl Element for TerminalElement {
             // for Phase 2 so we keep `working`'s allocation intact;
             // the RawLine itself is the only thing that gets cloned
             // (not the outer Vec).
-            let raw_lines: Vec<RawLine> = working
-                .iter()
-                .map(|x| x.as_ref().expect("phase-1 fills every working slot").clone())
-                .collect();
+            // Phase 1 fills every slot; `flatten` skips any stray `None` rather
+            // than panicking (a missing row just isn't cached this frame).
+            let raw_lines: Vec<RawLine> = working.iter().flatten().cloned().collect();
             *self.prev_frame.borrow_mut() = Some(CachedFrame {
                 display_offset,
                 visible_cols,

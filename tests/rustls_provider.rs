@@ -2,6 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+// Integration test crate — unwrap/expect are idiomatic here.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 //! Regression test for the rustls `CryptoProvider` panic.
 //!
 //! Workspace feature unification compiles `rustls` with both the

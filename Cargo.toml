@@ -81,12 +81,14 @@ unsafe_code = "deny"
 all = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }
 nursery = { level = "deny", priority = -1 }
-# No bare `.unwrap()` in production. Tests opt out via a crate-root
-# `#![cfg_attr(test, allow(clippy::unwrap_used))]` (a failed unwrap is how a
-# test reports the unexpected). Prefer `.expect("why unreachable")` or real
-# error handling. Under `--all-targets` the lib target compiles without
-# `cfg(test)`, so this still fires on production code.
+# No panics in production: neither `.unwrap()` nor `.expect()`. Production code
+# must recover, degrade, or exit cleanly (a logged `std::process::exit(1)`)
+# instead of panicking with a backtrace. Tests opt back in via a crate-root
+# `#![cfg_attr(test, allow(...))]` (a failed unwrap/expect is how a test reports
+# the unexpected). Under `--all-targets` the lib target compiles without
+# `cfg(test)`, so these still fire on production code.
 unwrap_used = "deny"
+expect_used = "deny"
 
 # Pixel math requires constant casting between f32/i32/usize
 cast_possible_truncation = "allow"

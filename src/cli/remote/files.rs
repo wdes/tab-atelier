@@ -217,7 +217,8 @@ pub fn cmd_get(args: &[String]) -> i32 {
 /// the existing `Client::spawn` plumbing so the index reflects any
 /// recent open/close on the remote.
 fn resolve_tab_index(endpoint: &RemoteEndpoint, tab_arg: Option<&str>) -> Result<usize, String> {
-    let client = crate::remote::Client::spawn(endpoint.clone());
+    let client = crate::remote::Client::spawn(endpoint.clone())
+        .ok_or_else(|| "could not start the remote client thread".to_owned())?;
     let tabs = resolver::wait_for_first_tabs(&client, Duration::from_secs(5))?;
     let tab = if let Some(arg) = tab_arg {
         resolver::pick_tab(&tabs, arg)?

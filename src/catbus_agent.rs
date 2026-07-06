@@ -433,7 +433,9 @@ pub fn send_prompt_to_socket(socket_path: &Path, text: &str) -> Result<String, S
 /// build a full `Value`; the text is the only field that needs
 /// escaping.
 fn json_encode_string(s: &str) -> String {
-    serde_json::to_string(s).expect("string is always serializable")
+    // Serialising a plain string never fails; the fallback (a valid empty JSON
+    // string) is unreachable but keeps this panic-free.
+    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_owned())
 }
 
 #[cfg(test)]

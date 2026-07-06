@@ -112,14 +112,12 @@ impl TabSchedule {
     }
 
     /// Parsed opening-hours rule. Constructed on demand because the
-    /// underlying type isn't Clone-cheap (allocates an AST).
-    ///
-    /// # Panics
-    /// Cannot panic in practice — the rule was validated at
-    /// construction. The `unwrap` is documented as a should-be-Ok.
+    /// underlying type isn't Clone-cheap (allocates an AST). `None` only if the
+    /// rule somehow fails to parse — it was validated at construction, so the
+    /// verdict callers treat `None` as "no restriction" rather than panicking.
     #[must_use]
-    pub fn parsed(&self) -> opening_hours::OpeningHours {
-        opening_hours::OpeningHours::parse(&self.rule).expect("rule validated at construction")
+    pub fn parsed(&self) -> Option<opening_hours::OpeningHours> {
+        opening_hours::OpeningHours::parse(&self.rule).ok()
     }
 
     /// Like [`Self::parsed`] but memoised per-thread, keyed by the rule
@@ -129,14 +127,14 @@ impl TabSchedule {
     /// most installs have a handful of distinct rules at most, so the
     /// cache stays tiny. Thread-local keeps the parsed type free of any
     /// `Send`/`Sync` requirement.
-    fn parsed_cached(&self) -> std::rc::Rc<opening_hours::OpeningHours> {
+    fn parsed_cached(&self) -> Option<std::rc::Rc<opening_hours::OpeningHours>> {
         PARSED_RULE_CACHE.with(|cache| {
             if let Some(oh) = cache.borrow().get(&self.rule) {
-                return oh.clone();
+                return Some(oh.clone());
             }
-            let oh = std::rc::Rc::new(self.parsed());
+            let oh = std::rc::Rc::new(self.parsed()?);
             cache.borrow_mut().insert(self.rule.clone(), oh.clone());
-            oh
+            Some(oh)
         })
     }
 
@@ -145,7 +143,11 @@ impl TabSchedule {
     #[must_use]
     pub fn is_open_at(&self, now_utc: DateTime<Utc>) -> bool {
         let local = self.local_naive(now_utc);
-        let oh = self.parsed_cached();
+        // An unparseable rule (shouldn't happen — validated at construction)
+        // must not lock the user out of their tab: treat it as always open.
+        let Some(oh) = self.parsed_cached() else {
+            return true;
+        };
         // The opening-hours crate's `state(t)` returns Open / Closed /
         // Unknown. Treat anything that isn't an explicit Open as
         // closed — fail closed on ambiguity.
@@ -158,7 +160,7 @@ impl TabSchedule {
     #[must_use]
     pub fn next_change_at(&self, now_utc: DateTime<Utc>) -> Option<DateTime<Utc>> {
         let local = self.local_naive(now_utc);
-        let oh = self.parsed_cached();
+        let oh = self.parsed_cached()?;
         let next_local = oh.next_change(local)?;
         let tz = self.timezone();
         // `from_local_datetime` is ambiguous around DST gaps. Pick the

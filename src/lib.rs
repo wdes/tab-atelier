@@ -2,8 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// `unwrap_used` is denied crate-wide (Cargo.toml); tests may still unwrap.
-#![cfg_attr(test, allow(clippy::unwrap_used))]
+// unwrap_used + expect_used are denied crate-wide (Cargo.toml); tests may panic.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
