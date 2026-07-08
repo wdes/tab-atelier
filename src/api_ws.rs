@@ -198,7 +198,16 @@ enum Authz {
 /// state lives on the `run_pump` stack so it's per-WS-connection,
 /// matching the per-tab-per-viewer scope of IME composition.
 struct ImeDedup {
-    last_bytes: Vec<u8>,
+    /// Printable composition accumulated since the last word boundary. The
+    /// single-char frames a client emits as the user types are appended here,
+    /// so a following whole-word commit frame can be recognised as a duplicate
+    /// (the word-doubling bug). Also holds the last multi-byte frame, for the
+    /// cumulative-prefix pattern.
+    buf: Vec<u8>,
+    /// True while `buf` was built by live single-char typing (an in-progress
+    /// composition); false once a multi-byte frame set it. Gates the
+    /// erase-preedit conversion path so a paste is never mistaken for one.
+    composing: bool,
     last_at: Option<Instant>,
 }
 
@@ -224,48 +233,94 @@ impl Drop for ViewerGuard {
 impl ImeDedup {
     const fn new() -> Self {
         Self {
-            last_bytes: Vec::new(),
+            buf: Vec::new(),
+            composing: false,
             last_at: None,
         }
     }
 
+    fn set_baseline(&mut self, bytes: &[u8], now: Instant) {
+        self.buf.clear();
+        self.buf.extend_from_slice(bytes);
+        self.composing = false;
+        self.last_at = Some(now);
+    }
+
     /// Returns the bytes to actually inject into `pending_input`,
     /// or `None` to drop the frame entirely.
+    ///
+    /// Handles two client shapes that both duplicate a typed word:
+    /// - **cumulative-prefix** IMEs (`"h"`,`"he"`,`"hel"`,`"hello"`) — send only
+    ///   each new suffix; a re-sent identical commit drops;
+    /// - **char-by-char + commit** (`"w"`,`"r"`,…,`"g"`,`"writing"`, the reported
+    ///   web-viewer bug) — the single chars are accumulated in `buf` so the
+    ///   whole-word commit is recognised and dropped.
+    ///
+    /// Plus IME **conversion** (`"8"`,`"0"`,`"€"`; dead-key `"ù"`): the commit
+    /// replaces the live composition, so erase the preedit then send it.
     fn classify(&mut self, bytes: &[u8]) -> Option<Vec<u8>> {
-        // Control / cursor-key sequences (arrows `\x1b[D`, Home/End,
-        // F-keys, Delete `\x1b[3~`, PageUp/Down, Alt+<key>) all begin
-        // with ESC. They are deliberate, rapidly-repeatable keystrokes —
-        // never IME composition, which is always printable text. Pass
-        // them straight through WITHOUT touching the dedup state, so a
-        // fast burst of Left presses isn't collapsed to one by the
-        // exact-match drop below (the reported "rapid arrows do nothing;
-        // wait ~half a second and it works"). The IME prefix/exact
-        // window is left intact for the printable text it's meant for.
+        // Control / cursor-key sequences (arrows `\x1b[D`, Home/End, F-keys,
+        // Delete `\x1b[3~`, PageUp/Down, Alt+<key>) all begin with ESC. They are
+        // deliberate, rapidly-repeatable keystrokes — never IME composition.
+        // Pass them straight through WITHOUT touching the dedup state, so a fast
+        // burst of Left presses isn't collapsed and the composition window
+        // survives an arrow press mid-word.
         if bytes.first() == Some(&0x1b) {
             return Some(bytes.to_vec());
         }
         let now = Instant::now();
-        let fresh = self.last_at.is_none_or(|t| now.duration_since(t) >= IME_DEDUP_WINDOW);
-        if bytes.len() <= 1 || fresh {
-            self.last_bytes.clear();
-            self.last_bytes.extend_from_slice(bytes);
+        let within = self.last_at.is_some_and(|t| now.duration_since(t) < IME_DEDUP_WINDOW);
+
+        // A single-byte frame is one ASCII key. Word boundaries (space, Enter,
+        // other C0 controls, DEL) end the composition; other printable chars
+        // extend it. Single chars ALWAYS pass through unchanged — fast typing of
+        // `"aaa"` is three deliberate `a`s, not a duplicate.
+        if bytes.len() == 1 {
+            let b = bytes[0];
+            if b <= b' ' || b == 0x7f {
+                self.buf.clear();
+                self.composing = false;
+            } else {
+                self.buf.push(b);
+                self.composing = true;
+            }
             self.last_at = Some(now);
             return Some(bytes.to_vec());
         }
-        if !self.last_bytes.is_empty() && self.last_bytes.as_slice() == bytes {
-            self.last_at = Some(now);
-            return None;
+
+        // Multi-byte frame: a commit / cumulative-prefix re-send, or a paste.
+        // Only correlate with the composition when it lands inside the window
+        // (a commit fires within ms of the last char); otherwise it's new.
+        if within && !self.buf.is_empty() {
+            if self.buf.as_slice() == bytes {
+                // Exact re-send of what we already typed → drop. Keep `buf` so a
+                // 2nd/3rd identical commit in the window also drops (emoji `😁`).
+                self.last_at = Some(now);
+                return None;
+            }
+            if bytes.starts_with(&self.buf) {
+                // Cumulative-prefix commit extends the composition → send only
+                // the new suffix.
+                let suffix = bytes[self.buf.len()..].to_vec();
+                self.set_baseline(bytes, now);
+                return Some(suffix);
+            }
+            if self.composing {
+                // The commit REPLACES a live single-char composition (IME
+                // conversion: `"80"`→`"€"`, dead-key `"ù"`). Erase the preedit we
+                // already injected (one DEL per char), then send the commit.
+                // Gated on `composing`, so a paste right after typing — `buf`
+                // set from a prior multi-byte frame — is never erased.
+                let preedit_chars = std::str::from_utf8(&self.buf).map_or(self.buf.len(), |s| s.chars().count());
+                let mut out = vec![0x7f; preedit_chars];
+                out.extend_from_slice(bytes);
+                self.set_baseline(bytes, now);
+                return Some(out);
+            }
         }
-        if !self.last_bytes.is_empty() && bytes.starts_with(&self.last_bytes) {
-            let suffix = bytes[self.last_bytes.len()..].to_vec();
-            self.last_bytes.clear();
-            self.last_bytes.extend_from_slice(bytes);
-            self.last_at = Some(now);
-            return Some(suffix);
-        }
-        self.last_bytes.clear();
-        self.last_bytes.extend_from_slice(bytes);
-        self.last_at = Some(now);
+        // Fresh / paste / two distinct commits → send as-is, becoming the new
+        // baseline for any following cumulative-prefix extension.
+        self.set_baseline(bytes, now);
         Some(bytes.to_vec())
     }
 }
@@ -1132,5 +1187,67 @@ mod tests {
         let mut d = ImeDedup::new();
         assert_eq!(d.classify(b"hello"), Some(b"hello".to_vec()));
         assert_eq!(d.classify(b"world"), Some(b"world".to_vec()));
+    }
+
+    #[test]
+    fn ime_dedup_drops_char_by_char_word_commit() {
+        // The reported web-viewer bug: the client sends each character as its
+        // own frame AS TYPED, then re-sends the whole word on `compositionend`.
+        // The single chars are accumulated so the commit is recognised + dropped
+        // (otherwise the shell gets "writingwriting"). Captured live sequence.
+        let mut d = ImeDedup::new();
+        for c in b"writing" {
+            assert_eq!(d.classify(&[*c]), Some(vec![*c]), "char {c:#x} passes through");
+        }
+        assert_eq!(d.classify(b"writing"), None, "whole-word commit dropped");
+    }
+
+    #[test]
+    fn ime_dedup_word_boundary_resets_composition() {
+        // The commit fires right before the space; the space then resets the
+        // composition so the next word starts clean. Captured "am _ to" shape.
+        let mut d = ImeDedup::new();
+        assert_eq!(d.classify(b"a"), Some(b"a".to_vec()));
+        assert_eq!(d.classify(b"m"), Some(b"m".to_vec()));
+        assert_eq!(d.classify(b"am"), None, "commit of first word dropped");
+        assert_eq!(d.classify(b" "), Some(b" ".to_vec()), "space passes + resets");
+        assert_eq!(d.classify(b"t"), Some(b"t".to_vec()));
+        assert_eq!(d.classify(b"o"), Some(b"o".to_vec()));
+        assert_eq!(d.classify(b"to"), None, "second word commit dropped, not doubled");
+    }
+
+    #[test]
+    fn ime_dedup_erases_preedit_on_ime_conversion() {
+        // IME conversion (captured "80"→"€", and dead-key "ù"): the commit
+        // REPLACES the live single-char composition, so the already-injected
+        // preedit is erased (one DEL per char) and the commit sent.
+        let mut d = ImeDedup::new();
+        assert_eq!(d.classify(b"8"), Some(b"8".to_vec()));
+        assert_eq!(d.classify(b"0"), Some(b"0".to_vec()));
+        let euro = "€".as_bytes();
+        let mut expected = vec![0x7f, 0x7f]; // erase the "80" preedit
+        expected.extend_from_slice(euro);
+        assert_eq!(d.classify(euro), Some(expected), "erase preedit then send €");
+    }
+
+    #[test]
+    fn ime_dedup_paste_after_word_not_erased() {
+        // Safety: a multi-byte frame that follows a COMMITTED word (not a live
+        // single-char composition) must never be treated as a conversion +
+        // erase the previous word. `composing` is false here.
+        let mut d = ImeDedup::new();
+        assert_eq!(d.classify(b"hello"), Some(b"hello".to_vec())); // commit → composing=false
+        assert_eq!(d.classify(b"pasted"), Some(b"pasted".to_vec()), "sent as-is, no erase");
+    }
+
+    #[test]
+    fn ime_dedup_collapses_repeated_emoji_commit() {
+        // Emoji picker double/triple-fires the same multi-byte commit ("😁😁😁"
+        // for one pick). Within the window the repeats drop to a single emoji.
+        let mut d = ImeDedup::new();
+        let e = "😁".as_bytes();
+        assert_eq!(d.classify(e), Some(e.to_vec()), "first emoji sent");
+        assert_eq!(d.classify(e), None, "2nd identical commit dropped");
+        assert_eq!(d.classify(e), None, "3rd identical commit dropped");
     }
 }
