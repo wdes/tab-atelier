@@ -199,6 +199,18 @@ pub const PATTERNS: &[Pattern] = &[
         label: "socket-closed-unexpectedly",
         action: "continue\r",
     },
+    // Streaming response cut off mid-flight — Claude Code prints
+    //   "API Error: Connection closed mid-response. The response
+    //    above may be incomplete."
+    // when the SSE/response stream drops before completion (same
+    // transient network causes as the socket-closed case). The turn
+    // is left half-finished, so recover the same way: cooldown, then
+    // `continue` to re-request on a fresh connection.
+    Pattern {
+        needle: "Connection closed mid-response",
+        label: "connection-closed-mid-response",
+        action: "continue\r",
+    },
     // Auto-mode model-routing classifier briefly unavailable
     // (Anthropic-side dependency that decides which model to use
     // for the next turn). Shape Claude Code prints:
@@ -905,6 +917,16 @@ mod tests {
         let p = scan_output("● API Error: 529 Overloaded. This is a server-side issue, usually temporary")
             .expect("must match");
         assert_eq!(p.label, "anthropic-529");
+    }
+
+    #[test]
+    fn scan_matches_connection_closed_mid_response() {
+        // Streaming response cut off mid-flight — recover like the other
+        // network aborts (cooldown + `continue`).
+        let p = scan_output("● API Error: Connection closed mid-response. The response above may be incomplete.")
+            .expect("must match");
+        assert_eq!(p.label, "connection-closed-mid-response");
+        assert_eq!(p.action, "continue\r");
     }
 
     #[test]
