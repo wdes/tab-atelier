@@ -14,13 +14,20 @@
       font-display: swap;
       unicode-range: U+2300-23FF, U+2500-25FF, U+2600-26FF, U+2700-27BF, U+2B00-2BFF;
     }
-    html, body { margin: 0; padding: 0; height: 100%; background: var(--tab-bg); color: #ccc; font-family: 'TermSymbols', monospace; }
+    /* `overscroll-behavior: none` stops the mobile browser's pull-to-refresh
+       (and rubber-band glow) from firing when you scroll the terminal
+       scrollback past its top — the whole page is the terminal, so a scroll
+       gesture there should never reload the view. */
+    html, body { margin: 0; padding: 0; height: 100%; background: var(--tab-bg); color: #ccc; font-family: 'TermSymbols', monospace; overscroll-behavior: none; }
     /* Centre the terminal so the server-sized grid stays aligned in
        the middle of a wider browser window. Vertical anchor at top
        (alignItems: start) so the scrollback grows downward, not from
        the centre. */
     body { display: flex; align-items: flex-start; justify-content: center; overflow-x: hidden; }
     #term { width: max-content; max-width: 100vw; }
+    /* xterm.js's own scroll container: contain overscroll so scrolling the
+       scrollback never chains up to the page / triggers pull-to-refresh. */
+    .xterm-viewport { overscroll-behavior: contain; }
     #status { position: fixed; bottom: 4px; right: 8px; font-size: 11px; opacity: 0.5; pointer-events: none; }
     /* Locked banner — solid red strip across the top of the page
        so a recipient cannot miss that this tab refuses input. The
