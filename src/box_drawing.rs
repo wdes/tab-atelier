@@ -47,7 +47,7 @@ impl BoxParts {
 }
 
 /// Cell-relative rectangle (origin = cell top-left), in pixels.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub struct Rect {
     pub x: f32,
     pub y: f32,
@@ -101,8 +101,12 @@ pub const fn parts(ch: char) -> Option<BoxParts> {
 /// `─` (left+right) spans the full width and meets its neighbours, and
 /// `┼` is a full cross. Bars overlap at the centre by their own
 /// thickness, which renders the junctions cleanly.
+///
+/// Returns a fixed array + count (a glyph has at most 4 bars): the
+/// only production caller runs this per box cell per painted frame —
+/// a table border row of 200 `─` cells was 200 Vec mallocs per frame.
 #[must_use]
-pub fn rects(parts: BoxParts, cell_w: f32, cell_h: f32) -> Vec<Rect> {
+pub fn rects(parts: BoxParts, cell_w: f32, cell_h: f32) -> ([Rect; 4], usize) {
     // Light stroke ≈ 1/12 of the cell height, heavy ≈ double, each at
     // least 1px / 2px so they never vanish on small cells.
     let light = (cell_h / 12.0).round().max(1.0);
@@ -114,12 +118,17 @@ pub fn rects(parts: BoxParts, cell_w: f32, cell_h: f32) -> Vec<Rect> {
     };
     let cx = cell_w / 2.0;
     let cy = cell_h / 2.0;
-    let mut out = Vec::new();
+    let mut out = [Rect::default(); 4];
+    let mut n = 0;
+    let mut push = |r: Rect| {
+        out[n] = r;
+        n += 1;
+    };
 
     // Horizontal bars: thickness centred on cy, spanning centre→edge.
     let h_left = weight_px(parts.left);
     if h_left > 0.0 {
-        out.push(Rect {
+        push(Rect {
             x: 0.0,
             y: cy - h_left / 2.0,
             w: cx + h_left / 2.0,
@@ -128,7 +137,7 @@ pub fn rects(parts: BoxParts, cell_w: f32, cell_h: f32) -> Vec<Rect> {
     }
     let h_right = weight_px(parts.right);
     if h_right > 0.0 {
-        out.push(Rect {
+        push(Rect {
             x: cx - h_right / 2.0,
             y: cy - h_right / 2.0,
             w: cell_w - (cx - h_right / 2.0),
@@ -138,7 +147,7 @@ pub fn rects(parts: BoxParts, cell_w: f32, cell_h: f32) -> Vec<Rect> {
     // Vertical bars: thickness centred on cx, spanning centre→edge.
     let v_up = weight_px(parts.up);
     if v_up > 0.0 {
-        out.push(Rect {
+        push(Rect {
             x: cx - v_up / 2.0,
             y: 0.0,
             w: v_up,
@@ -147,14 +156,14 @@ pub fn rects(parts: BoxParts, cell_w: f32, cell_h: f32) -> Vec<Rect> {
     }
     let v_down = weight_px(parts.down);
     if v_down > 0.0 {
-        out.push(Rect {
+        push(Rect {
             x: cx - v_down / 2.0,
             y: cy - v_down / 2.0,
             w: v_down,
             h: cell_h - (cy - v_down / 2.0),
         });
     }
-    out
+    (out, n)
 }
 
 #[cfg(test)]
@@ -191,11 +200,17 @@ mod tests {
         assert_eq!(parts('x'), None);
     }
 
+    /// Test-side view of [`rects`]'s fixed-array return as a slice.
+    fn bars(ch: char, w: f32, h: f32) -> Vec<Rect> {
+        let (arr, n) = rects(parts(ch).unwrap(), w, h);
+        arr[..n].to_vec()
+    }
+
     #[test]
     fn horizontal_bar_spans_full_cell_width() {
         // The actual fix: a `─` must reach both cell edges so adjacent
         // `─` cells join into a continuous line (no dashed gaps).
-        let r = rects(parts('─').unwrap(), 10.0, 20.0);
+        let r = bars('─', 10.0, 20.0);
         let min_x = r.iter().map(|q| q.x).fold(f32::INFINITY, f32::min);
         let max_x = r.iter().map(|q| q.x + q.w).fold(f32::NEG_INFINITY, f32::max);
         assert!((min_x - 0.0).abs() < 0.01, "left edge reached, got {min_x}");
@@ -208,7 +223,7 @@ mod tests {
 
     #[test]
     fn vertical_bar_spans_full_cell_height() {
-        let r = rects(parts('│').unwrap(), 10.0, 20.0);
+        let r = bars('│', 10.0, 20.0);
         let min_y = r.iter().map(|q| q.y).fold(f32::INFINITY, f32::min);
         let max_y = r.iter().map(|q| q.y + q.h).fold(f32::NEG_INFINITY, f32::max);
         assert!((min_y - 0.0).abs() < 0.01, "top edge reached, got {min_y}");
@@ -218,7 +233,7 @@ mod tests {
     #[test]
     fn corner_only_reaches_its_two_edges() {
         // `┌` = right + down only: nothing crosses the left or top edge.
-        let r = rects(parts('┌').unwrap(), 10.0, 20.0);
+        let r = bars('┌', 10.0, 20.0);
         let min_x = r.iter().map(|q| q.x).fold(f32::INFINITY, f32::min);
         let max_x = r.iter().map(|q| q.x + q.w).fold(f32::NEG_INFINITY, f32::max);
         let max_y = r.iter().map(|q| q.y + q.h).fold(f32::NEG_INFINITY, f32::max);
@@ -230,8 +245,8 @@ mod tests {
 
     #[test]
     fn heavy_is_thicker_than_light() {
-        let light = rects(parts('─').unwrap(), 10.0, 24.0)[0].h;
-        let heavy = rects(parts('━').unwrap(), 10.0, 24.0)[0].h;
+        let light = bars('─', 10.0, 24.0)[0].h;
+        let heavy = bars('━', 10.0, 24.0)[0].h;
         assert!(heavy > light, "heavy {heavy} should exceed light {light}");
     }
 }
