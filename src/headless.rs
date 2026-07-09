@@ -901,7 +901,14 @@ pub fn run() -> std::io::Result<()> {
     #[cfg(feature = "energy")]
     let battery_percent: Arc<Mutex<Option<u8>>> = Arc::new(Mutex::new(None));
     #[cfg(feature = "energy")]
-    crate::power::start_power_monitor(power_pids.clone(), power_watts.clone(), battery_percent.clone());
+    let power_hot = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    #[cfg(feature = "energy")]
+    crate::power::start_power_monitor(
+        power_pids.clone(),
+        power_watts.clone(),
+        battery_percent.clone(),
+        power_hot.clone(),
+    );
 
     let _ = windowed; // headless doesn't have a window — kept for parity with saved-state shape
 

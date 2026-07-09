@@ -476,6 +476,11 @@ struct AppState {
     power_watts: Arc<Mutex<Vec<power::TabPower>>>,
     #[cfg(feature = "energy")]
     battery_percent: Arc<Mutex<Option<u8>>>,
+    /// Owner side of the power sampler's hot/cold switch — persist flips
+    /// it from (window visible || API consumer active) so the /proc
+    /// sweep slows 5× when nobody can see the numbers.
+    #[cfg(feature = "energy")]
+    power_hot: Arc<std::sync::atomic::AtomicBool>,
     blink_on: bool,
     toasts: Vec<Toast>,
     lang: Lang,
@@ -1173,7 +1178,14 @@ impl AppState {
         #[cfg(feature = "energy")]
         let battery_percent: Arc<Mutex<Option<u8>>> = Arc::new(Mutex::new(None));
         #[cfg(feature = "energy")]
-        power::start_power_monitor(power_pids.clone(), power_watts.clone(), battery_percent.clone());
+        let power_hot = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        #[cfg(feature = "energy")]
+        power::start_power_monitor(
+            power_pids.clone(),
+            power_watts.clone(),
+            battery_percent.clone(),
+            power_hot.clone(),
+        );
 
         Self {
             tabs,
@@ -1207,6 +1219,8 @@ impl AppState {
             power_watts,
             #[cfg(feature = "energy")]
             battery_percent,
+            #[cfg(feature = "energy")]
+            power_hot,
             blink_on: false,
             toasts: Vec::new(),
             lang,
@@ -1542,6 +1556,11 @@ impl AppState {
             }
         }
         let api_hot = self.activity_last_at.get().is_some_and(|t| t.elapsed().as_secs() < 60);
+        // Keep the power sampler fast only while its numbers are visible
+        // somewhere (tab bar on screen, or an API consumer polling).
+        #[cfg(feature = "energy")]
+        self.power_hot
+            .store(self.visible || api_hot, std::sync::atomic::Ordering::Relaxed);
         // Connection metering (throttled ~5 s — the /proc scan is too heavy
         // for every 2 s persist tick). Desktop is unprivileged, so it's
         // connections only (no nft byte counters). Two more gates:
