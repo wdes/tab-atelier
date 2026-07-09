@@ -84,6 +84,27 @@ impl GridSnapshotCache {
             raw_output_crc,
         }
     }
+
+    /// This cache with the 2000-row `raw_output` dump released. Used when
+    /// the last web viewer detaches from a tab that then goes quiet: the
+    /// rebuild-on-ring-advance path would drop the dump on the next byte
+    /// of output, but a silent tab would otherwise pin megabytes of
+    /// scrollback text nobody can read anymore. Everything else is shared
+    /// (`Arc` bumps), so no grid rescan happens.
+    #[must_use]
+    pub fn without_raw(&self) -> Self {
+        Self {
+            ring_len: self.ring_len,
+            output: std::sync::Arc::clone(&self.output),
+            cursor: self.cursor,
+            raw_output: std::sync::Arc::from(""),
+            raw_cursor: None,
+            cols: self.cols,
+            rows: self.rows,
+            output_crc: self.output_crc,
+            raw_output_crc: crate::crc32(b""),
+        }
+    }
 }
 
 /// Minimal `Dimensions` impl for constructing a `Term`.
@@ -596,5 +617,27 @@ mod cache_tests {
         let c = g.clone();
         assert!(std::sync::Arc::ptr_eq(&g.output, &c.output));
         assert!(std::sync::Arc::ptr_eq(&g.raw_output, &c.raw_output));
+    }
+
+    #[test]
+    fn without_raw_sheds_the_dump_and_keeps_the_rest() {
+        let g = GridSnapshotCache::new(
+            42,
+            "hello".to_string(),
+            Some((1, 2)),
+            "raw rows".to_string(),
+            Some((3, 4)),
+            80,
+            24,
+        );
+        let d = g.without_raw();
+        assert!(d.raw_output.is_empty());
+        assert_eq!(d.raw_cursor, None);
+        assert_eq!(d.raw_output_crc, crate::crc32(b""));
+        // Everything else survives — shared, not copied.
+        assert!(std::sync::Arc::ptr_eq(&g.output, &d.output));
+        assert_eq!(d.ring_len, 42);
+        assert_eq!(d.output_crc, g.output_crc);
+        assert_eq!((d.cols, d.rows, d.cursor), (80, 24, Some((1, 2))));
     }
 }
