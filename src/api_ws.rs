@@ -527,25 +527,58 @@ struct MetaSnapshot {
     build_hash: &'static str,
 }
 
-fn snapshot_meta(t: &SnapshotTab, authz: Authz) -> MetaSnapshot {
-    let lock_reason = t.lock_reason();
-    let dir_count = |dirname: &str| -> usize {
-        t.cwd.as_deref().map_or(0, |cwd| {
-            std::fs::read_dir(std::path::Path::new(cwd).join(dirname)).map_or(0, |rd| {
-                rd.flatten().filter(|e| e.metadata().is_ok_and(|m| m.is_file())).count()
+/// Per-connection cache of the tab's inbox/outbox file counts. Each
+/// count is a `read_dir` + a `stat` per entry on the tab's cwd —
+/// blocking fs I/O that used to run inside [`snapshot_meta`] on every
+/// 100 ms meta tick *while holding the global snapshot mutex*, on the
+/// single-threaded runtime every connection shares. A big inbox (or a
+/// slow/NFS cwd) stalled the whole API surface 10×/s per viewer. The
+/// counts change on human timescales, so re-scan at most once per
+/// second, always outside the lock.
+struct DirCountCache {
+    outbox: usize,
+    inbox: usize,
+    scanned_at: Option<Instant>,
+}
+
+impl DirCountCache {
+    const TTL: Duration = Duration::from_secs(1);
+
+    const fn new() -> Self {
+        Self {
+            outbox: 0,
+            inbox: 0,
+            scanned_at: None,
+        }
+    }
+
+    fn refresh(&mut self, cwd: Option<&str>, authz: Authz) {
+        if self.scanned_at.is_some_and(|t| t.elapsed() < Self::TTL) {
+            return;
+        }
+        self.scanned_at = Some(Instant::now());
+        let dir_count = |dirname: &str| -> usize {
+            cwd.map_or(0, |cwd| {
+                std::fs::read_dir(std::path::Path::new(cwd).join(dirname)).map_or(0, |rd| {
+                    rd.flatten().filter(|e| e.metadata().is_ok_and(|m| m.is_file())).count()
+                })
             })
-        })
-    };
-    // RO viewers don't see `inbox_count`. The HTTP `/inbox` listing
-    // endpoint is RW-only specifically so RO recipients can't
-    // enumerate uploads (`src/api.rs` needs_rw includes "inbox"); a
-    // count here would be a milder version of the same info leak.
-    // `outbox_count` is fine for RO — downloads are allowed.
-    let inbox_count = if matches!(authz, Authz::Ro) {
-        0
-    } else {
-        dir_count("inbox")
-    };
+        };
+        self.outbox = dir_count("outbox");
+        // RO viewers don't see `inbox_count`. The HTTP `/inbox` listing
+        // endpoint is RW-only specifically so RO recipients can't
+        // enumerate uploads (`src/api.rs` needs_rw includes "inbox"); a
+        // count here would be a milder version of the same info leak.
+        // `outbox_count` is fine for RO — downloads are allowed.
+        self.inbox = if matches!(authz, Authz::Ro) { 0 } else { dir_count("inbox") };
+    }
+}
+
+/// Snapshot the lock-guarded meta fields. `outbox_count` / `inbox_count`
+/// are left at 0 — [`current_meta`] fills them from the [`DirCountCache`]
+/// after the snapshot lock is dropped (no fs I/O belongs under it).
+fn snapshot_meta(t: &SnapshotTab) -> MetaSnapshot {
+    let lock_reason = t.lock_reason();
     let (agent_state, agent_label) = t.agent_state.as_ref().map_or((None, None), |s| {
         let key = match s.state {
             crate::AgentState::Thinking => "thinking",
@@ -570,8 +603,8 @@ fn snapshot_meta(t: &SnapshotTab, authz: Authz) -> MetaSnapshot {
         bg_color: (!t.bg_color.is_empty()).then(|| t.bg_color.clone()),
         agent_state,
         agent_label,
-        outbox_count: dir_count("outbox"),
-        inbox_count,
+        outbox_count: 0,
+        inbox_count: 0,
         build_hash: crate::api::BUILD_HASH,
     }
 }
@@ -665,7 +698,8 @@ async fn run_pump(
     // re-serialising + hashing it on every 30 ms tick — the meta only
     // changes on a lock/agent/schedule/file-count event, so the common
     // case is an allocation-free `==` against the cached value.
-    let mut last_meta: Option<MetaSnapshot> = if let Some(meta) = current_meta(&state, &uuid, authz) {
+    let mut dir_counts = DirCountCache::new();
+    let mut last_meta: Option<MetaSnapshot> = if let Some(meta) = current_meta(&state, &uuid, authz, &mut dir_counts) {
         let bytes = encode_frame(TAG_META, serde_json::to_vec(&meta).unwrap_or_default());
         if sink.send(Message::Binary(bytes.into())).await.is_err() {
             return;
@@ -751,7 +785,7 @@ async fn run_pump(
             // Meta frame — only when something actually changed.
             // Structural compare; serialise only on a real diff.
             _ = meta_tick.tick() => {
-                if let Some(meta) = current_meta(&state, &uuid, authz)
+                if let Some(meta) = current_meta(&state, &uuid, authz, &mut dir_counts)
                     && last_meta.as_ref() != Some(&meta)
                 {
                     let bytes = encode_frame(TAG_META, serde_json::to_vec(&meta).unwrap_or_default());
@@ -936,11 +970,22 @@ fn handle_inbound(
     Ok(())
 }
 
-fn current_meta(state: &Arc<Mutex<TabSnapshot>>, uuid: &str, authz: Authz) -> Option<MetaSnapshot> {
+fn current_meta(
+    state: &Arc<Mutex<TabSnapshot>>,
+    uuid: &str,
+    authz: Authz,
+    counts: &mut DirCountCache,
+) -> Option<MetaSnapshot> {
     let snap = state.lock().ok()?;
-    let meta = snap.tabs.iter().find(|t| t.id == uuid).map(|t| snapshot_meta(t, authz));
+    let t = snap.tabs.iter().find(|t| t.id == uuid)?;
+    let mut meta = snapshot_meta(t);
+    let cwd = t.cwd.clone();
     drop(snap);
-    meta
+    // fs work strictly after the snapshot lock is dropped.
+    counts.refresh(cwd.as_deref(), authz);
+    meta.outbox_count = counts.outbox;
+    meta.inbox_count = counts.inbox;
+    Some(meta)
 }
 
 #[cfg(test)]
