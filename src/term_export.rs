@@ -144,6 +144,9 @@ pub fn term_to_ansi_lines<E: EventListener>(
     let mut continues_prev = false;
     let mut prefix_cols: usize = 0;
 
+    // One SGR scratch buffer for the whole walk — a per-cell-coloured
+    // dump used to allocate a fresh String per attribute change.
+    let mut sgr = String::new();
     for row in start_row..screen as i32 {
         let last_cell_wraps = grid[GridPoint::new(Line(row), Column(cols - 1))]
             .flags
@@ -162,7 +165,7 @@ pub fn term_to_ansi_lines<E: EventListener>(
             }
 
             if cell.fg != cur_fg || cell.bg != cur_bg || cell.flags != cur_flags {
-                let mut sgr = String::new();
+                sgr.clear();
                 let push_code = |buf: &mut String, code: &str| {
                     if !buf.is_empty() {
                         buf.push(';');
@@ -235,7 +238,11 @@ pub fn term_to_ansi_lines<E: EventListener>(
         let row_text = if last_cell_wraps {
             line
         } else {
-            line.trim_end().to_string()
+            // Trim in place — `trim_end().to_string()` re-allocated a
+            // second full String per non-wrapped row.
+            let mut line = line;
+            line.truncate(line.trim_end().len());
+            line
         };
         if row == cursor_grid_row {
             let logical_idx = if continues_prev {
@@ -298,10 +305,17 @@ pub fn term_to_ansi_rows<E: EventListener>(
     let mut cur_fg = default_fg;
     let mut cur_bg = default_bg;
     let mut cur_flags = CellFlags::empty();
-    let mut out = String::with_capacity(cols * screen * 2);
+    // Size for the rows we actually emit (`want`), not just the screen —
+    // the 2000-row dump was under-sized ~40x and paid doubling reallocs.
+    let mut out = String::with_capacity(cols * want * 2);
 
+    // Row + SGR scratch buffers hoisted out of the loops: only their
+    // trimmed slice ever reaches `out`, so the whole dump now runs with
+    // zero per-row allocations.
+    let mut line = String::with_capacity(cols * 2);
+    let mut sgr = String::new();
     for row in start_row..screen as i32 {
-        let mut line = String::with_capacity(cols * 2);
+        line.clear();
         for col in 0..cols {
             let cell = &grid[GridPoint::new(Line(row), Column(col))];
             if cell.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
@@ -314,7 +328,7 @@ pub fn term_to_ansi_rows<E: EventListener>(
                 continue;
             }
             if cell.fg != cur_fg || cell.bg != cur_bg || cell.flags != cur_flags {
-                let mut sgr = String::new();
+                sgr.clear();
                 let removed = cur_flags & !cell.flags;
                 if removed.intersects(
                     CellFlags::BOLD
@@ -403,11 +417,10 @@ pub fn term_to_ansi_text_with_cursor<E: EventListener>(
     max_lines: Option<usize>,
 ) -> (String, Option<(usize, usize)>) {
     let (mut lines, mut cursor) = term_to_ansi_lines(term, max_lines);
-    let mut leading_trimmed = 0_usize;
-    while lines.first().is_some_and(std::string::String::is_empty) {
-        lines.remove(0);
-        leading_trimmed += 1;
-    }
+    // Count then drain — `remove(0)` per empty row memmoves the whole
+    // Vec (O(k x n) on a dump of up to ~2000 rows).
+    let leading_trimmed = lines.iter().take_while(|l| l.is_empty()).count();
+    lines.drain(..leading_trimmed);
     if let Some((r, c)) = cursor {
         cursor = if r >= leading_trimmed {
             Some((r - leading_trimmed, c))
