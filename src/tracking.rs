@@ -67,15 +67,27 @@ impl WakatimeTracker {
         std::thread::spawn(move || {
             let mut last_sent: u64 = 0;
             let mut last_project: Option<String> = None;
+            let mut last_cwd: Option<PathBuf> = None;
 
             while let Ok(HeartbeatEvent::Activity { cwd }) = rx.recv() {
                 let now = unix_now();
+                // `detect_project` stats `.git` up the whole ancestor
+                // chain; while typing (events every ~2 s) the result was
+                // computed and then usually thrown away by the debounce.
+                // Only re-walk when the cwd changed or the debounce is
+                // already past.
+                let debounced = now - last_sent < DEBOUNCE_SECS;
+                if debounced && cwd == last_cwd {
+                    continue;
+                }
                 let project = cwd.as_deref().and_then(detect_project);
                 let project_changed = project != last_project;
 
-                if now - last_sent < DEBOUNCE_SECS && !project_changed {
+                if debounced && !project_changed {
+                    last_cwd = cwd;
                     continue;
                 }
+                last_cwd.clone_from(&cwd);
                 last_sent = now;
                 last_project.clone_from(&project);
 
