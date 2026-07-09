@@ -137,6 +137,22 @@ impl PowerMonitor {
     }
 }
 
+/// Whether this 2 s step of the sampler loop should sample: every step
+/// while `hot`, every [`COLD_EVERY`]-th step (10 s) otherwise. Pure —
+/// the cadence contract of the hot/cold gate, unit-tested below.
+const fn sample_due(hot: bool, cold_ctr: &mut u32) -> bool {
+    /// Cold cadence divisor: sample every Nth 2 s step when nobody looks.
+    const COLD_EVERY: u32 = 5;
+    if !hot {
+        *cold_ctr += 1;
+        if *cold_ctr < COLD_EVERY {
+            return false;
+        }
+    }
+    *cold_ctr = 0;
+    true
+}
+
 pub fn read_battery_percent() -> Option<u8> {
     let dir = std::fs::read_dir("/sys/class/power_supply").ok()?;
     for entry in dir.flatten() {
@@ -173,18 +189,13 @@ pub fn start_power_monitor(
         // jiffies/energy counters are cumulative, so a longer window
         // loses no energy, just per-tab display granularity.
         let step = std::time::Duration::from_secs(2);
-        let cold_every = 5u32; // 10 s cadence when nobody is looking
         let mut cold_ctr = 0u32;
         let mut last_sample = std::time::Instant::now();
         loop {
             std::thread::sleep(step);
-            if !hot.load(std::sync::atomic::Ordering::Relaxed) {
-                cold_ctr += 1;
-                if cold_ctr < cold_every {
-                    continue;
-                }
+            if !sample_due(hot.load(std::sync::atomic::Ordering::Relaxed), &mut cold_ctr) {
+                continue;
             }
-            cold_ctr = 0;
             *battery.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = read_battery_percent();
             let pids = tab_pids
                 .lock()
@@ -207,6 +218,23 @@ pub fn start_power_monitor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sample_cadence_hot_every_step_cold_every_fifth() {
+        let mut ctr = 0;
+        // Hot: every step samples and keeps the counter reset.
+        assert!(sample_due(true, &mut ctr));
+        assert!(sample_due(true, &mut ctr));
+        assert_eq!(ctr, 0);
+        // Cold: steps 1-4 skip, the 5th samples (10 s at 2 s steps).
+        let skips = (0..4).filter(|_| !sample_due(false, &mut ctr)).count();
+        assert_eq!(skips, 4);
+        assert!(sample_due(false, &mut ctr));
+        assert_eq!(ctr, 0, "sampling resets the counter");
+        // Going hot mid-cold-stretch samples immediately.
+        assert!(!sample_due(false, &mut ctr));
+        assert!(sample_due(true, &mut ctr));
+    }
 
     #[test]
     fn first_sample_is_zero() {

@@ -502,6 +502,74 @@ pub fn sgr_color(sgr: &mut String, color: Color, foreground: bool) {
 }
 
 #[cfg(test)]
+mod walk_tests {
+    use super::*;
+
+    struct Nop;
+    impl EventListener for Nop {}
+
+    /// A live 20×5 terminal fed through the real vte parser.
+    fn term_with(bytes: &[u8]) -> FairMutex<Term<Nop>> {
+        let term = Term::new(
+            alacritty_terminal::term::Config::default(),
+            &TermDims {
+                columns: 20,
+                screen_lines: 5,
+            },
+            Nop,
+        );
+        let term = FairMutex::new(term);
+        let mut parser: vte::ansi::Processor = vte::ansi::Processor::new();
+        parser.advance(&mut *term.lock(), bytes);
+        term
+    }
+
+    #[test]
+    fn lines_walk_trims_joins_and_emits_sgr() {
+        // Red word, trailing spaces (must trim), and a soft-wrapped long
+        // line (25 chars in a 20-col grid ⇒ WRAPLINE join).
+        let term = term_with(b"\x1b[31mred\x1b[0m   \r\nabcdefghijklmnopqrstuvwxy");
+        let (text, _cursor) = term_to_ansi_text_with_cursor(&term, None);
+        let lines: Vec<&str> = text.split('\n').collect();
+        assert!(lines[0].contains("\x1b[31m"), "SGR preserved: {lines:?}");
+        // A fg-only change back to default resets via SGR 39, and the
+        // trailing default spaces are trimmed away.
+        assert!(lines[0].ends_with("\x1b[39m"), "fg reset closes the row: {lines:?}");
+        assert_eq!(
+            crate::strip_ansi(lines[1]),
+            "abcdefghijklmnopqrstuvwxy",
+            "wrapped rows joined into one logical line: {lines:?}"
+        );
+        assert_eq!(lines.len(), 2, "trailing empty rows trimmed");
+    }
+
+    #[test]
+    fn rows_walk_is_row_per_line_with_no_join() {
+        let term = term_with(b"abcdefghijklmnopqrstuvwxy");
+        let (text, cursor) = term_to_ansi_rows(&term, Some(2000));
+        let rows: Vec<&str> = text.split('\n').collect();
+        // (The soft-wrap flag on the row's last cell emits a trailing
+        // SGR reset — strip escapes and compare the text content.)
+        assert_eq!(
+            crate::strip_ansi(rows[0]),
+            "abcdefghijklmnopqrst",
+            "first grid row verbatim"
+        );
+        assert_eq!(crate::strip_ansi(rows[1]), "uvwxy", "wrap NOT joined in row mode");
+        assert!(cursor.is_some(), "cursor on the visible screen");
+    }
+
+    #[test]
+    fn leading_empty_rows_are_drained() {
+        // Cursor parked mid-screen: rows above stay empty and must be
+        // dropped from the joined dump.
+        let term = term_with(b"\x1b[3;1Hdown here");
+        let (text, _cursor) = term_to_ansi_text_with_cursor(&term, None);
+        assert_eq!(text, "down here");
+    }
+}
+
+#[cfg(test)]
 mod cache_tests {
     use super::GridSnapshotCache;
 
