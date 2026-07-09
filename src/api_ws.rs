@@ -1047,6 +1047,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dir_count_cache_counts_files_and_hides_inbox_from_ro() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        std::fs::create_dir(cwd.join("outbox")).unwrap();
+        std::fs::create_dir(cwd.join("inbox")).unwrap();
+        std::fs::write(cwd.join("outbox/a.txt"), b"x").unwrap();
+        std::fs::write(cwd.join("outbox/b.txt"), b"x").unwrap();
+        std::fs::write(cwd.join("inbox/up.bin"), b"x").unwrap();
+        // Subdirectories are not files — must not count.
+        std::fs::create_dir(cwd.join("outbox/nested")).unwrap();
+
+        let cwd_str = cwd.to_str().unwrap();
+        let mut rw = DirCountCache::new();
+        rw.refresh(Some(cwd_str), Authz::Rw);
+        assert_eq!((rw.outbox, rw.inbox), (2, 1));
+
+        // RO viewers never see the inbox count (info-leak guard).
+        let mut ro = DirCountCache::new();
+        ro.refresh(Some(cwd_str), Authz::Ro);
+        assert_eq!((ro.outbox, ro.inbox), (2, 0));
+
+        // Within the TTL the cache does NOT re-scan (stale counts kept)…
+        std::fs::write(cwd.join("outbox/c.txt"), b"x").unwrap();
+        rw.refresh(Some(cwd_str), Authz::Rw);
+        assert_eq!(rw.outbox, 2, "TTL suppresses the re-scan");
+        // …and once it expires, the new file is picked up.
+        rw.scanned_at = Instant::now().checked_sub(DirCountCache::TTL);
+        rw.refresh(Some(cwd_str), Authz::Rw);
+        assert_eq!(rw.outbox, 3);
+
+        // No cwd / missing dirs ⇒ zero, no error.
+        let mut none = DirCountCache::new();
+        none.refresh(None, Authz::Rw);
+        assert_eq!((none.outbox, none.inbox), (0, 0));
+    }
+
+    #[test]
     fn meta_snapshot_structural_eq_detects_change() {
         // The WS pump emits a meta frame only when the snapshot differs
         // from the last one sent. This replaced a serialize+hash; verify

@@ -202,4 +202,17 @@ mod tests {
         got.sort_unstable();
         assert_eq!(got, vec![1, 2, 3]);
     }
+
+    #[test]
+    fn connection_counts_live_smoke() {
+        // End-to-end over the real /proc of the test process itself:
+        // exercises children_map + descendants + socket_inodes + the
+        // single-parse table path. The count is whatever sockets the
+        // test harness happens to hold — assert shape, not value.
+        let me = std::process::id();
+        let counts = connection_counts(&[("self".to_string(), me)]);
+        assert!(counts.contains_key("self"));
+        // Empty input takes the early return.
+        assert!(connection_counts(&[]).is_empty());
+    }
 }
