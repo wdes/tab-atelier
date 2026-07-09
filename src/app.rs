@@ -436,6 +436,10 @@ struct AppState {
     rename_select_all: bool,
     rename_focus: FocusHandle,
     visible: bool,
+    /// Lock-free mirror of `visible`, updated wherever `visible` is —
+    /// lets the housekeeping loops decide the hidden case (a Guake
+    /// terminal's steady state) without entering the entity.
+    visible_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
     windowed: bool,
     exit_confirm: Option<ExitConfirm>,
     close_confirm: Option<usize>,
@@ -738,9 +742,9 @@ impl AppState {
                 // installed, so a persisted net-off tab doesn't boot
                 // into a dead shell on a host without bubblewrap.
                 if ts.net_disabled && crate::bwrap_available() {
-                    view.update(cx, |v, cx| {
+                    view.update(cx, |v, _| {
                         v.set_net_disabled(true);
-                        v.respawn(cwd.as_deref(), cx);
+                        v.respawn(cwd.as_deref());
                     });
                 }
                 // Auto-resume: if this tab had an agent session and kind
@@ -937,7 +941,7 @@ impl AppState {
                                 break;
                             }
                             if !tab.view.read(cx).is_spawned() {
-                                tab.view.update(cx, TerminalView::ensure_spawned);
+                                tab.view.update(cx, |v, _| v.ensure_spawned());
                                 spawned += 1;
                             }
                         }
@@ -1029,78 +1033,117 @@ impl AppState {
         })
         .detach();
 
+        // Lock-free mirror of `self.visible` for the housekeeping loops
+        // below — the hidden steady state of a Guake terminal is decided
+        // off one atomic instead of a main-thread entity wake per tick.
+        let visible_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        #[cfg(feature = "energy")]
+        let battery_percent_shared: Arc<Mutex<Option<u8>>> = Arc::new(Mutex::new(None));
+
         // Screen-mate pet animation clock: while the pet is on screen AND the
         // drop-down is visible, notify ~20 fps so render() advances the walk.
-        // Gated on `visible`: a Guake terminal is hidden most of the time, and
-        // an ungated 20 fps `cx.notify()` repaints the whole window (including
-        // the active terminal) even while hidden — a constant main-thread load
-        // that competes with keystroke handling (contributes to laggy typing).
-        // Hidden ⇒ pets aren't on screen anyway, so freeze them till it's shown.
+        // The hidden case (a Guake terminal's steady state) is decided on the
+        // lock-free `visible` mirror, so a hidden app doesn't even enter the
+        // entity 20×/s — the loop breathes at 500 ms touching one atomic.
         #[cfg(feature = "pets")]
-        cx.spawn(async |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            loop {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(50))
-                    .await;
-                let Ok(()) = this.update(cx, |app, cx| {
-                    if app.visible && app.pet.is_active() {
-                        cx.notify();
-                    }
-                }) else {
-                    break;
-                };
-            }
-        })
-        .detach();
-
-        cx.spawn(async |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            loop {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(500))
-                    .await;
-                let Ok(()) = this.update(cx, |app, cx| {
-                    // Keep background tabs sized to the window (the active tab's
-                    // real paint size) — cheap no-op unless it changed.
-                    app.broadcast_active_size(cx);
-                    if app.exit_confirm.is_some() {
-                        return;
-                    }
-                    for (i, tab) in app.tabs.iter().enumerate() {
-                        if tab.view.read(cx).has_exited() {
-                            app.exit_confirm = Some(ExitConfirm { tab_idx: i });
-                            cx.notify();
+        {
+            let visible = visible_flag.clone();
+            cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                loop {
+                    let shown = visible.load(std::sync::atomic::Ordering::Relaxed);
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(if shown { 50 } else { 500 }))
+                        .await;
+                    if !shown {
+                        if this.upgrade().is_none() {
                             break;
                         }
+                        continue;
                     }
-                }) else {
-                    break;
-                };
-            }
-        })
-        .detach();
+                    let Ok(()) = this.update(cx, |app, cx| {
+                        if app.visible && app.pet.is_active() {
+                            cx.notify();
+                        }
+                    }) else {
+                        break;
+                    };
+                }
+            })
+            .detach();
+        }
+
+        {
+            let visible = visible_flag.clone();
+            cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                loop {
+                    let shown = visible.load(std::sync::atomic::Ordering::Relaxed);
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(if shown { 500 } else { 1000 }))
+                        .await;
+                    // Hidden: the window can't resize and an exit dialog
+                    // can't be seen — skip the entity entirely; the first
+                    // tick after re-show catches up on both.
+                    if !shown {
+                        if this.upgrade().is_none() {
+                            break;
+                        }
+                        continue;
+                    }
+                    let Ok(()) = this.update(cx, |app, cx| {
+                        // Keep background tabs sized to the window (the active tab's
+                        // real paint size) — cheap no-op unless it changed.
+                        app.broadcast_active_size(cx);
+                        if app.exit_confirm.is_some() {
+                            return;
+                        }
+                        for (i, tab) in app.tabs.iter().enumerate() {
+                            if tab.view.read(cx).has_exited() {
+                                app.exit_confirm = Some(ExitConfirm { tab_idx: i });
+                                cx.notify();
+                                break;
+                            }
+                        }
+                    }) else {
+                        break;
+                    };
+                }
+            })
+            .detach();
+        }
 
         #[cfg(feature = "energy")]
-        cx.spawn(async |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            loop {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(500))
-                    .await;
-                let Ok(()) = this.update(cx, |app, cx| {
-                    app.blink_on = !app.blink_on;
-                    if app
-                        .battery_percent
+        {
+            let visible = visible_flag.clone();
+            let battery = battery_percent_shared.clone();
+            cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(500))
+                        .await;
+                    if this.upgrade().is_none() {
+                        break;
+                    }
+                    // The blink only exists to flash the tab bar red on a
+                    // critical battery — both "hidden" and "battery fine"
+                    // are answered off-thread, so the steady state costs an
+                    // atomic load + a mutex peek, not a main-thread wake.
+                    let critical = battery
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .is_some_and(|b| b < 10)
-                    {
-                        cx.notify();
+                        .is_some_and(|b| b < 10);
+                    if !critical || !visible.load(std::sync::atomic::Ordering::Relaxed) {
+                        continue;
                     }
-                }) else {
-                    break;
-                };
-            }
-        })
-        .detach();
+                    let Ok(()) = this.update(cx, |app, cx| {
+                        app.blink_on = !app.blink_on;
+                        cx.notify();
+                    }) else {
+                        break;
+                    };
+                }
+            })
+            .detach();
+        }
 
         tabs[active].view.read(cx).focus_handle(cx).focus(window);
 
@@ -1181,7 +1224,7 @@ impl AppState {
         #[cfg(feature = "energy")]
         let power_watts: Arc<Mutex<Vec<power::TabPower>>> = Arc::new(Mutex::new(Vec::new()));
         #[cfg(feature = "energy")]
-        let battery_percent: Arc<Mutex<Option<u8>>> = Arc::new(Mutex::new(None));
+        let battery_percent = battery_percent_shared;
         #[cfg(feature = "energy")]
         let power_hot = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         #[cfg(feature = "energy")]
@@ -1203,6 +1246,7 @@ impl AppState {
             rename_select_all: false,
             rename_focus,
             visible: true,
+            visible_flag,
             windowed: restored_windowed,
             exit_confirm: None,
             close_confirm: None,
@@ -1541,8 +1585,15 @@ impl AppState {
         // so a later persist tick after the shell exits still has a value
         // to fall back on instead of blanking the cwd to None. Update the
         // stringified mirror only when the PathBuf actually changed, so
-        // unchanged tabs allocate nothing here.
+        // unchanged tabs allocate nothing here. Gated on ring movement:
+        // the shell's cwd only changes via `cd`, whose prompt redraw emits
+        // bytes — a silent-since-last-tick tab skips the /proc readlink
+        // (which every tab paid every 2 s forever).
         for tab in &mut self.tabs {
+            let ring_len = tab.view.read(cx).ring_len();
+            if tab.snap_cache.as_ref().is_some_and(|c| c.ring_len == ring_len) {
+                continue;
+            }
             let pid = tab.view.read(cx).pid();
             if let Some(p) = platform::process_cwd(pid)
                 && tab.last_known_cwd.as_deref() != Some(p.as_path())
@@ -1623,7 +1674,7 @@ impl AppState {
             let pty_ring = view.pty_ring();
             // Dirtiness key: bytes ever written through the PTY ring.
             // Unchanged ⇒ the grid is byte-identical, so skip the scans.
-            let ring_len = pty_ring.lock().map_or(0, |r| r.total_len());
+            let ring_len = view.ring_len();
             // 200 lines for the joined `output` (logical lines — the
             // mobile remote word-wraps them, more is wasted bandwidth on
             // a phone screen). 2000 for `raw_output` so xterm.js's
@@ -1756,7 +1807,7 @@ impl AppState {
                     let view = tab.view.read(cx);
                     SaveJob {
                         name: tab.name.clone(),
-                        ring_len: view.pty_ring().lock().map_or(0, |r| r.total_len()),
+                        ring_len: view.ring_len(),
                         serialize: Box::new(view.history_job(Some(crate::PERIODIC_OUTPUT_SAVE_LINES))),
                     }
                 })
@@ -1905,9 +1956,9 @@ impl AppState {
             for (tab_id, disabled) in net_changes {
                 if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
                     let cwd = platform::process_cwd(tab.view.read(cx).pid()).or_else(|| std::env::current_dir().ok());
-                    tab.view.update(cx, |v, cx| {
+                    tab.view.update(cx, |v, _| {
                         v.set_net_disabled(disabled);
-                        v.respawn(cwd.as_deref(), cx);
+                        v.respawn(cwd.as_deref());
                     });
                 }
             }
@@ -2228,8 +2279,8 @@ impl AppState {
         }
         let old_pid = self.tabs[idx].view.read(cx).pid();
         let cwd = platform::process_cwd(old_pid).or_else(|| Some(std::env::current_dir().unwrap_or_default()));
-        self.tabs[idx].view.update(cx, |view, cx| {
-            view.respawn(cwd.as_deref(), cx);
+        self.tabs[idx].view.update(cx, |view, _| {
+            view.respawn(cwd.as_deref());
         });
         self.tabs[idx].created_at = std::time::Instant::now();
         self.tabs[idx].prior_uptime = std::time::Duration::ZERO;
@@ -4782,7 +4833,7 @@ impl Render for AppState {
         // The active tab must be live to display it — fork its shell now if it
         // was still a skeleton (e.g. the user switched to a not-yet-warmed tab
         // before the boot loader reached it). No-op once spawned.
-        self.tabs[self.active].view.update(cx, TerminalView::ensure_spawned);
+        self.tabs[self.active].view.update(cx, |v, _| v.ensure_spawned());
         // Only push the title when it changed — gpui does no diffing, so an
         // unconditional call here meant a format! + X11 property write on
         // every frame (30-60 fps while the terminal streams) for a string
@@ -5225,7 +5276,11 @@ pub fn run() {
 }
 
 fn spawn_hotkey_listener(keycodes: &[u8], window_handle: WindowHandle<AppState>, cx: &mut App) {
-    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    // An awaitable channel, not a polled std::mpsc: the old loop woke
+    // 20×/s forever to try_recv a hotkey that fires a few times an hour.
+    // tokio's unbounded channel is runtime-free (no reactor needed), so
+    // gpui's executor can await it and the loop runs ONLY on keypresses.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
     let handle = platform::grab_hotkeys(keycodes, move || {
         let _ = tx.send(());
@@ -5236,24 +5291,22 @@ fn spawn_hotkey_listener(keycodes: &[u8], window_handle: WindowHandle<AppState>,
     });
 
     cx.spawn(async move |cx: &mut AsyncApp| {
-        loop {
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(50))
-                .await;
-            if rx.try_recv().is_ok() {
-                let _ = cx.update(|cx| {
-                    let _ = window_handle.update(cx, |state, window, _cx| {
-                        state.visible = !state.visible;
-                        if state.visible {
-                            state.tabs[state.active].activate();
-                            window.activate_window();
-                        } else {
-                            state.tabs[state.active].deactivate();
-                            window.minimize_window();
-                        }
-                    });
+        while rx.recv().await.is_some() {
+            let _ = cx.update(|cx| {
+                let _ = window_handle.update(cx, |state, window, _cx| {
+                    state.visible = !state.visible;
+                    state
+                        .visible_flag
+                        .store(state.visible, std::sync::atomic::Ordering::Relaxed);
+                    if state.visible {
+                        state.tabs[state.active].activate();
+                        window.activate_window();
+                    } else {
+                        state.tabs[state.active].deactivate();
+                        window.minimize_window();
+                    }
                 });
-            }
+            });
         }
     })
     .detach();

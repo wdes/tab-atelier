@@ -2,8 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-#[cfg(feature = "gui")]
-use std::path::Path;
 use std::path::PathBuf;
 
 #[cfg(feature = "gui")]
@@ -67,11 +65,6 @@ pub fn pictures_dir() -> PathBuf {
 
 pub fn process_cwd(pid: u32) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
-}
-
-#[cfg(feature = "gui")]
-pub fn process_alive(pid: u32) -> bool {
-    Path::new(&format!("/proc/{pid}")).exists()
 }
 
 // --- Random ---
@@ -350,18 +343,6 @@ mod tests {
         let pid = std::process::id();
         let cwd = process_cwd(pid);
         assert!(cwd.is_some());
-    }
-
-    #[cfg(feature = "gui")]
-    #[test]
-    fn process_alive_self() {
-        assert!(process_alive(std::process::id()));
-    }
-
-    #[cfg(feature = "gui")]
-    #[test]
-    fn process_alive_bogus() {
-        assert!(!process_alive(u32::MAX));
     }
 
     #[test]
