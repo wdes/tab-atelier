@@ -927,17 +927,54 @@ impl AppState {
         // Separate 16 ms tick that does ONLY the input drain. Other
         // pending queues (lock toggles, schedule changes, status
         // updates, renames, closes) stay on the slow persist path
-        // — they're not latency-critical. 16 ms (~one 60 Hz frame)
-        // keeps the average keystroke→PTY delay to ~8 ms; the drain is
-        // a lock + (usually empty) Vec check, so the higher cadence is
-        // negligible. NOTE: this runs on the gpui main thread, so it
-        // is still stalled whenever the 2 s persist blocks that thread
-        // — the periodic ~500 ms latency spike under many active tabs.
+        // — they're not latency-critical.
+        //
+        // The tick is signal-driven: producers bump the snapshot's
+        // lock-free `activity` counter, and an idle tick is one atomic
+        // load on the background executor — no snapshot lock and, more
+        // importantly, NO main-thread wake-up. A Guake terminal spends
+        // most of its life hidden with no remote connected; the old
+        // unconditional loop woke the gpui thread 62×/s forever for a
+        // queue that was almost always empty. When the signal has been
+        // quiet for a while the poll itself backs off to 250 ms, so a
+        // fully idle app costs 4 atomic loads a second. The first
+        // remote keystroke after an idle stretch pays ≤250 ms once;
+        // everything after runs on the 16 ms tick again. Missed-bump
+        // safety net: `persist` drains every pending queue every 2 s.
         cx.spawn(async |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            use std::sync::atomic::Ordering;
+            const FAST: std::time::Duration = std::time::Duration::from_millis(16);
+            const IDLE: std::time::Duration = std::time::Duration::from_millis(250);
+            // How long after the last API/WS activity the fast tick is
+            // kept armed (covers think-pauses between keystrokes).
+            const HOT: std::time::Duration = std::time::Duration::from_secs(2);
+            let Ok(activity) = this.update(cx, |app, _| {
+                app.api_state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .activity
+                    .clone()
+            }) else {
+                return;
+            };
+            let mut last_seen = activity.load(Ordering::Relaxed);
+            let mut last_change = std::time::Instant::now();
+            let mut interval = IDLE;
             loop {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(16))
-                    .await;
+                cx.background_executor().timer(interval).await;
+                let seq = activity.load(Ordering::Relaxed);
+                if seq == last_seen {
+                    // Nothing new — don't touch the main thread, just
+                    // decide how soon to look again.
+                    if this.upgrade().is_none() {
+                        break;
+                    }
+                    interval = if last_change.elapsed() < HOT { FAST } else { IDLE };
+                    continue;
+                }
+                last_seen = seq;
+                last_change = std::time::Instant::now();
+                interval = FAST;
                 let Ok(()) = this.update(cx, |app, cx| {
                     app.drain_inputs(cx);
                 }) else {
@@ -1080,6 +1117,7 @@ impl AppState {
             pending_renames: Vec::new(),
             pending_status_updates: Vec::new(),
             cached_response: None,
+            activity: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }));
         let api_read_only = crate::read_only();
         api::start_api_server(api_state.clone(), api_token.clone(), api_read_only, api_addr.clone());

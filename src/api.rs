@@ -485,6 +485,23 @@ pub struct TabSnapshot {
     /// changes. Avoids rebuilding the whole response (`strip_ansi` per tab,
     /// pretty-printed JSON) on every mobile-remote poll.
     pub cached_response: Option<String>,
+    /// Lock-free "someone is talking to the daemon" signal. Bumped (via
+    /// [`Self::touch`]) by every handled HTTP request and every WS `in`
+    /// frame. The GUI's input-drain tick and the headless main loop read
+    /// it WITHOUT taking this snapshot's mutex, so their idle polls cost
+    /// one atomic load — and both back off their wake-up rate when it
+    /// hasn't moved for a while and no WS viewer is attached, instead of
+    /// spinning at 60 Hz forever on a machine where the terminal is
+    /// hidden and nobody remote is connected.
+    pub activity: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl TabSnapshot {
+    /// Record API/WS activity (see the `activity` field). Relaxed is
+    /// enough: consumers only compare against the last value they saw.
+    pub fn touch(&self) {
+        self.activity.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 pub fn generate_token() -> String {
@@ -1436,6 +1453,12 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
         }
     }
     let _ = share_token_authorised;
+
+    // Past the auth gate ⇒ a real client is talking to us. Bump the
+    // lock-free activity signal so the GUI input drain / headless main
+    // loop stay (or return to) their fast tick while traffic flows.
+    // Unauthenticated probes and public asset fetches don't count.
+    state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).touch();
 
     debug!("API: {method} {path}");
 
@@ -3572,6 +3595,7 @@ mod tests {
             pending_renames: vec![],
             pending_status_updates: vec![],
             cached_response: None,
+            activity: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             master_token: String::new(),
         }))
     }

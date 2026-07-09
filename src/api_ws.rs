@@ -903,6 +903,9 @@ fn handle_inbound(
             reason: "tab vanished".into(),
         });
     };
+    // Any C→S frame counts as activity — keeps the input-drain loops
+    // on their fast tick while a viewer is interacting.
+    snap.touch();
     match tag {
         TAG_IN => {
             // Refuse input if the tab is effective-locked (manual or
