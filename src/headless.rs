@@ -316,17 +316,39 @@ impl HeadlessTab {
     /// only when the PTY ring advanced since the last call. Otherwise
     /// the previous scan is reused, avoiding the per-tick full-grid
     /// walk on idle tabs.
+    ///
+    /// The 2000-row `raw_output` (xterm.js scrollback) is only built
+    /// while someone is actually web-viewing THIS tab — same gate the
+    /// GUI's persist snapshot uses. For an unwatched tab (the common
+    /// case on a daemon full of agents) only the cheap 200-line
+    /// `output` the /tabs list needs is scanned; when a viewer attaches
+    /// to a tab whose cache was built without raw scrollback, the next
+    /// refresh backfills it (within one ~96 ms tick).
     fn cached_grid(&mut self) -> crate::term_export::GridSnapshotCache {
         let ring_len = self.ring_total_len();
+        let want_raw = self.pty_ring.lock().map_or(0, |r| r.viewer_count()) > 0;
+        let stale = self.snap_cache.as_ref().is_none_or(|c| c.ring_len != ring_len);
+        let needs_raw_backfill = want_raw
+            && self
+                .snap_cache
+                .as_ref()
+                .is_some_and(|c| c.raw_output.is_empty() && !c.output.is_empty());
         // Reuse the cached scan when the ring hasn't advanced; the early return
         // ends the borrow so the miss path can re-borrow `self` mutably. Returns
         // owned (the sole caller cloned it anyway), so there's no infallible
         // `expect` on an always-Some cache.
-        if let Some(c) = self.snap_cache.as_ref().filter(|c| c.ring_len == ring_len) {
+        if !stale
+            && !needs_raw_backfill
+            && let Some(c) = self.snap_cache.as_ref()
+        {
             return c.clone();
         }
         let (output, cursor) = self.ansi_text_with_cursor(Some(200));
-        let (raw_output, raw_cursor) = self.raw_screen_text(Some(2000));
+        let (raw_output, raw_cursor) = if want_raw {
+            self.raw_screen_text(Some(2000))
+        } else {
+            (String::new(), None)
+        };
         let (cols, rows) = self.dims();
         let grid = crate::term_export::GridSnapshotCache {
             ring_len,
