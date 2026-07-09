@@ -1421,16 +1421,22 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
     // `_token` clone) so `POST /master-token/reset` can hot-swap it. The
     // non-empty guard means an as-yet-uninitialised master ("") never
     // authorises a token-less request.
-    let master_token = state
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .master_token
-        .clone();
-    let is_master = !master_token.is_empty()
-        && constant_time_eq(
-            provided_token.as_deref().unwrap_or("").as_bytes(),
-            master_token.as_bytes(),
-        );
+    // Compare under the lock (no per-request token clone) and bump the
+    // activity signal in the SAME lock scope on success — this gate used
+    // to take the global mutex twice per master-token request (once to
+    // clone the token, once more for `touch()` after the gate).
+    let is_master = {
+        let snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ok = !snap.master_token.is_empty()
+            && constant_time_eq(
+                provided_token.as_deref().unwrap_or("").as_bytes(),
+                snap.master_token.as_bytes(),
+            );
+        if ok {
+            snap.touch();
+        }
+        ok
+    };
     if !is_master {
         let allowed = if let Some(p) = provided_token.as_deref()
             && let Some(rest) = path.strip_prefix("/tabs/by-id/")
@@ -1440,7 +1446,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 "view" | "output" | "stream" | "input" | "files" | "outbox" | "inbox"
             ) {
             let state_g = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            state_g.tabs.iter().find(|t| t.id == uuid).and_then(|t| {
+            let verdict = state_g.tabs.iter().find(|t| t.id == uuid).and_then(|t| {
                 // Constant-time per-byte comparison so a brute-force
                 // probe can't shave bits off the search space by
                 // timing how long the reject takes (audit #2).
@@ -1470,7 +1476,11 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 } else {
                     None
                 }
-            })
+            });
+            if verdict == Some(true) {
+                state_g.touch();
+            }
+            verdict
         } else {
             None
         };
@@ -1491,12 +1501,10 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
     }
     let _ = share_token_authorised;
 
-    // Past the auth gate ⇒ a real client is talking to us. Bump the
-    // lock-free activity signal so the GUI input drain / headless main
-    // loop stay (or return to) their fast tick while traffic flows.
-    // Unauthenticated probes and public asset fetches don't count.
-    state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).touch();
-
+    // The activity-signal bump ("a real client is talking to us" — keeps
+    // the GUI input drain / headless main loop on their fast tick) now
+    // happens inside the auth locks above; unauthenticated probes and
+    // public asset fetches still don't count.
     debug!("API: {method} {path}");
 
     // Block every mutating verb when the process was launched with
@@ -3018,8 +3026,11 @@ async fn handle_hyper_request(
         .uri()
         .path_and_query()
         .map_or_else(|| req.uri().to_string(), std::string::ToString::to_string);
-    let headers = req.headers().clone();
-    let body = match req.into_body().collect().await {
+    // Split the request instead of cloning the whole HeaderMap just
+    // because `into_body()` would consume it.
+    let (parts, body) = req.into_parts();
+    let headers = parts.headers;
+    let body = match body.collect().await {
         Ok(c) => c.to_bytes(),
         Err(_) => {
             return Ok(Response::builder()
