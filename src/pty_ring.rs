@@ -436,4 +436,43 @@ mod tests {
         assert!(r.since(0).is_empty());
         assert_eq!(r.total_len(), 0);
     }
+
+    #[test]
+    fn frame_cache_hits_only_on_exact_range() {
+        let mut r = PtyRing::with_capacity(1024);
+        assert!(r.cached_frame(0, 10).is_none(), "empty cache misses");
+        r.store_frame(0, 10, bytes::Bytes::from_static(b"\x02frame"));
+        assert_eq!(r.cached_frame(0, 10).as_deref(), Some(&b"\x02frame"[..]));
+        // A different range (viewer at another offset) must miss.
+        assert!(r.cached_frame(5, 10).is_none());
+        assert!(r.cached_frame(0, 11).is_none());
+        // A newer store replaces the entry.
+        r.store_frame(10, 12, bytes::Bytes::from_static(b"\x02hi"));
+        assert!(r.cached_frame(0, 10).is_none());
+        assert_eq!(r.cached_frame(10, 12).as_deref(), Some(&b"\x02hi"[..]));
+    }
+
+    #[test]
+    fn frame_cache_skips_oversized_frames() {
+        let mut r = PtyRing::with_capacity(1024);
+        let big = bytes::Bytes::from(vec![0u8; PtyRing::FRAME_CACHE_MAX + 1]);
+        r.store_frame(0, 1, big);
+        assert!(r.cached_frame(0, 1).is_none(), "oversized frame not cached");
+    }
+
+    #[test]
+    fn frame_cache_dropped_when_no_viewer_remains() {
+        let mut r = PtyRing::with_capacity(1024);
+        let viewers = r.viewers_handle();
+        viewers.store(1, std::sync::atomic::Ordering::Relaxed);
+        r.store_frame(0, 3, bytes::Bytes::from_static(b"\x02abc"));
+        // Watched: a push keeps the cache (range no longer matches new
+        // data, but sibling pumps may still be mid-flush on it).
+        r.push(b"abc");
+        assert!(r.cached_frame(0, 3).is_some());
+        // Last viewer left: the next push frees the retained frame.
+        viewers.store(0, std::sync::atomic::Ordering::Relaxed);
+        r.push(b"def");
+        assert!(r.cached_frame(0, 3).is_none());
+    }
 }
