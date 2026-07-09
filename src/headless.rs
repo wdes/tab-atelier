@@ -1258,7 +1258,14 @@ impl OutputSaver {
                         if seen.get(&job.name).is_some_and(|&(rl, _)| rl == job.ring_len) {
                             continue; // ring unchanged ⇒ identical output
                         }
-                        let output = crate::term_export::term_to_ansi_text_with_cursor(&job.term, None).0;
+                        // Capped depth for the periodic save — the walk
+                        // holds the Term lock the parser needs; the
+                        // shutdown flush still writes full history.
+                        let output = crate::term_export::term_to_ansi_text_with_cursor(
+                            &job.term,
+                            Some(crate::PERIODIC_OUTPUT_SAVE_LINES),
+                        )
+                        .0;
                         if output.is_empty() {
                             continue;
                         }
