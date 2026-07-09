@@ -176,6 +176,12 @@ struct HeadlessTab {
     /// two fsyncs every 2 s persist tick for an identical ~40-byte file.
     #[cfg(feature = "catbus")]
     tokens_last_saved: Option<crate::TokenUsage>,
+    /// Agent CLI pid found by the last LED sweep (`None` = no agent / not
+    /// yet swept). Lets the token loop resolve the session without
+    /// re-walking the shell's whole /proc subtree; a stale pid just fails
+    /// the /proc reads until the next sweep.
+    #[cfg(feature = "catbus")]
+    agent_pid: Option<u32>,
 }
 
 impl crate::schedule::LockState for HeadlessTab {
@@ -663,6 +669,8 @@ fn spawn_pty_tab(
         limits: crate::TabResourceLimits::default(),
         #[cfg(feature = "catbus")]
         tokens_last_saved: None,
+        #[cfg(feature = "catbus")]
+        agent_pid: None,
     })
 }
 
@@ -1466,7 +1474,13 @@ fn persist(
             if tab.agent_kind.is_none() && !discover {
                 continue;
             }
-            if let Some(session) = crate::catbus_agent::find_session(tab.pid)
+            // Reuse the LED sweep's subtree walk when it already located
+            // the agent; full walk only for discovery (non-agent tabs).
+            let session = tab.agent_pid.map_or_else(
+                || crate::catbus_agent::find_session(tab.pid),
+                crate::catbus_agent::find_session_for,
+            );
+            if let Some(session) = session
                 && let Some(usage) = crate::catbus_agent::read_session_tokens(&session)
                 // Usage is cumulative and only moves when the agent
                 // finishes a prompt — skip the (double-fsync) rewrite
@@ -1735,7 +1749,11 @@ fn drain_pending(
             if tab.agent_kind.is_none() {
                 continue;
             }
-            match crate::catbus_agent::agent_activity(tab.pid) {
+            let (activity, agent_pid) = crate::catbus_agent::agent_activity_with_pid(tab.pid);
+            // Cache the found agent pid so the persist tick's token loop
+            // can resolve the session without re-walking the subtree.
+            tab.agent_pid = agent_pid;
+            match activity {
                 crate::catbus_agent::AgentActivity::Gone => {
                     tab.agent_state = None;
                     tab.agent_session_id = None;

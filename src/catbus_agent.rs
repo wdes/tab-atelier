@@ -61,7 +61,15 @@ pub enum MessageSegment {
 /// `~/.claude/projects/`, so a single lookup serves the /catbus
 /// endpoints regardless of which one the tab is hosting.
 pub fn find_session(shell_pid: u32) -> Option<AgentSession> {
-    let agent_pid = find_agent_descendant(shell_pid)?;
+    find_session_for(find_agent_descendant(shell_pid)?)
+}
+
+/// [`find_session`] when the agent's pid is already known (e.g. from the
+/// same tick's [`agent_activity_with_pid`] walk) — skips the BFS over the
+/// shell's whole /proc subtree that `find_session` would repeat. A stale
+/// pid (agent restarted since the walk) fails the `/proc` reads and
+/// returns `None`; the caller's next sweep refreshes it.
+pub fn find_session_for(agent_pid: u32) -> Option<AgentSession> {
     let cwd = fs::read_link(format!("/proc/{agent_pid}/cwd")).ok()?;
     let project_dir = home_projects_dir()?.join(escape_cwd(&cwd));
     if !project_dir.is_dir() {
@@ -105,17 +113,20 @@ pub enum AgentActivity {
 /// that sit in `S` (interruptible sleep), and its own status hooks flit through
 /// `R` — treating either as work is what pinned idle tabs to the green
 /// "thinking" LED with nothing running.
-pub fn agent_activity(shell_pid: u32) -> AgentActivity {
+/// Also returns the agent CLI's pid when one was found, so a caller in
+/// the same tick can resolve the session ([`find_session_for`]) without
+/// re-walking the identical subtree.
+pub fn agent_activity_with_pid(shell_pid: u32) -> (AgentActivity, Option<u32>) {
     use std::fmt::Write as _;
     let Some(agent_pid) = find_agent_descendant(shell_pid) else {
-        return AgentActivity::Gone;
+        return (AgentActivity::Gone, None);
     };
     let mut path = String::with_capacity(48);
     let mut queue = vec![agent_pid];
     while let Some(pid) = queue.pop() {
         // Skip the agent process itself; we're judging its subprocesses.
         if pid != agent_pid && matches!(proc_state(pid), Some('R' | 'D')) {
-            return AgentActivity::Working;
+            return (AgentActivity::Working, Some(agent_pid));
         }
         path.clear();
         let _ = write!(path, "/proc/{pid}/task/{pid}/children");
@@ -123,7 +134,7 @@ pub fn agent_activity(shell_pid: u32) -> AgentActivity {
             queue.extend(raw.split_ascii_whitespace().filter_map(|s| s.parse::<u32>().ok()));
         }
     }
-    AgentActivity::Idle
+    (AgentActivity::Idle, Some(agent_pid))
 }
 
 /// The scheduler state character (`R`/`S`/`D`/`Z`/`T`/…) from `/proc/<pid>/stat`,
