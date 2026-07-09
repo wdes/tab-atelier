@@ -4400,8 +4400,11 @@ mod tests {
     #[test]
     fn get_tab_output_lines_param_tails() {
         let (port, state, token) = spawn_server();
-        state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).tabs[0].output =
-            (1..=10).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n").into();
+        state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).tabs[0].output = (1..=10)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into();
         let resp = request(
             port,
             &format!("GET /tabs/0/output?lines=3&token={token} HTTP/1.1\r\n\r\n"),

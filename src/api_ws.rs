@@ -570,7 +570,11 @@ impl DirCountCache {
         // enumerate uploads (`src/api.rs` needs_rw includes "inbox"); a
         // count here would be a milder version of the same info leak.
         // `outbox_count` is fine for RO — downloads are allowed.
-        self.inbox = if matches!(authz, Authz::Ro) { 0 } else { dir_count("inbox") };
+        self.inbox = if matches!(authz, Authz::Ro) {
+            0
+        } else {
+            dir_count("inbox")
+        };
     }
 }
 
