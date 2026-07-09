@@ -2308,6 +2308,17 @@ pub fn save_state(config_base: &std::path::Path, state: &SavedState) {
     write_atomic_with_rotation(&dir, &path, state, true);
 }
 
+/// [`save_state`] for a caller that already holds the pretty-printed JSON.
+///
+/// The persist ticks serialize the state anyway to CRC-hash it for the
+/// dirtiness gate, so re-serializing the identical value inside the
+/// writer was duplicate work on every dirty tick.
+pub fn save_state_serialized(config_base: &std::path::Path, json: &str) {
+    let dir = config_dir(config_base);
+    let path = dir.join("tabs.json");
+    write_atomic_raw_with_rotation(&dir, &path, json);
+}
+
 pub fn save_preferences_at(path: &std::path::Path, prefs: &Preferences) {
     if let Some(parent) = path.parent() {
         write_atomic_with_rotation(parent, path, prefs, true);
@@ -2357,8 +2368,6 @@ fn write_atomic_with_rotation<T: serde::Serialize>(
     value: &T,
     pretty: bool,
 ) {
-    use std::io::Write;
-    let _ = std::fs::create_dir_all(dir);
     let result = if pretty {
         serde_json::to_string_pretty(value)
     } else {
@@ -2367,6 +2376,14 @@ fn write_atomic_with_rotation<T: serde::Serialize>(
     let Ok(data) = result else {
         return;
     };
+    write_atomic_raw_with_rotation(dir, path, &data);
+}
+
+/// The write half of [`write_atomic_with_rotation`] for pre-serialized
+/// content (see [`save_state_serialized`]).
+fn write_atomic_raw_with_rotation(dir: &std::path::Path, path: &std::path::Path, data: &str) {
+    use std::io::Write;
+    let _ = std::fs::create_dir_all(dir);
 
     let tmp = path.with_extension("json.tmp");
     let Ok(mut f) = std::fs::File::create(&tmp) else { return };

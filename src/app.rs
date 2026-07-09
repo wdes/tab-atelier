@@ -1634,10 +1634,12 @@ impl AppState {
         };
         // Skip the write+rotate when the serialized content is identical to
         // last tick — the common case once the user stops poking the UI.
+        // The string serialized for the hash IS what gets written, so the
+        // dirty path doesn't serialize the same value a second time.
         let serialized = serde_json::to_string_pretty(&saved).unwrap_or_default();
         let new_hash = crate::crc32(serialized.as_bytes());
         if !read_only && new_hash != self.last_state_hash.get() {
-            save_state(&platform::config_base_dir(), &saved);
+            crate::save_state_serialized(&platform::config_base_dir(), &serialized);
             self.last_state_hash.set(new_hash);
         }
         if !read_only {
@@ -3138,7 +3140,7 @@ impl AppState {
         // (one wrong click and you've overwritten the clipboard with
         // an unrelated paste), so we collapse to the single
         // contextually-correct action.
-        let has_active_selection = self.tabs[self.active].view.read(cx).copy_selection().is_some();
+        let has_active_selection = self.tabs[self.active].view.read(cx).has_selection();
         if has_active_selection {
             container = container.child(
                 div()
