@@ -349,6 +349,16 @@ impl HeadlessTab {
                 .snap_cache
                 .as_ref()
                 .is_some_and(|c| c.raw_output.is_empty() && !c.output.is_empty());
+        // Last viewer detached and the tab then went quiet: shed the
+        // 2000-row dump without a grid rescan, or a silent tab pins
+        // megabytes of scrollback text nobody can read anymore.
+        if !stale && !want_raw && self.snap_cache.as_ref().is_some_and(|c| !c.raw_output.is_empty()) {
+            let dropped = self
+                .snap_cache
+                .as_ref()
+                .map(crate::term_export::GridSnapshotCache::without_raw);
+            self.snap_cache = dropped;
+        }
         // Reuse the cached scan when the ring hasn't advanced; the early return
         // ends the borrow so the miss path can re-borrow `self` mutably. Returns
         // owned (the sole caller cloned it anyway), so there's no infallible
