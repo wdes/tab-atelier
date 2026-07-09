@@ -58,21 +58,25 @@ fn write_bmp(path: &std::path::Path, width: u16, height: u16, bgra: &[u8]) -> Re
     f.write_all(&24u16.to_le_bytes()).map_err(|e| e.to_string())?;
     f.write_all(&[0u8; 24]).map_err(|e| e.to_string())?;
 
-    let padding = vec![0u8; (row_padded - row_size) as usize];
     let bpp = if bgra.len() >= (w * h * 4) as usize { 4 } else { 3 };
 
+    // Assemble each row in memory and write it with ONE syscall — the
+    // per-pixel `write_all` this replaces issued ~2.1 million 3-byte
+    // `write(2)` calls for a 1920×1080 capture (a seconds-long,
+    // user-visible stall on every screenshot).
+    let mut row_buf: Vec<u8> = Vec::with_capacity(row_padded as usize);
     for y in (0..h).rev() {
+        row_buf.clear();
         for x in 0..w {
             let src = (y * w + x) as usize * bpp;
             if src + 2 < bgra.len() {
-                f.write_all(&bgra[src..src + 3]).map_err(|e| e.to_string())?;
+                row_buf.extend_from_slice(&bgra[src..src + 3]);
             } else {
-                f.write_all(&[0, 0, 0]).map_err(|e| e.to_string())?;
+                row_buf.extend_from_slice(&[0, 0, 0]);
             }
         }
-        if !padding.is_empty() {
-            f.write_all(&padding).map_err(|e| e.to_string())?;
-        }
+        row_buf.resize(row_padded as usize, 0); // row padding
+        f.write_all(&row_buf).map_err(|e| e.to_string())?;
     }
 
     Ok(())

@@ -353,11 +353,30 @@ pub fn read_flags(base: &Path) -> std::collections::BTreeMap<String, bool> {
 }
 
 /// Resolve a flag: env var wins, then persisted `flags.json`, then default.
+///
+/// The persisted map is cached for ~30 s: `flag_enabled` gates the
+/// probe/reaper on the 2 s persist tick — per agent tab — and each call
+/// used to open + JSON-parse `flags.json` (usually just to learn it
+/// doesn't exist). Flag edits already promise "takes effect on the next
+/// agent launch / daemon restart", so a ≤30 s pickup is within contract.
 #[must_use]
 pub fn flag_enabled(env_var: &str, default: bool) -> bool {
+    type FlagCache = Option<(std::time::Instant, std::collections::BTreeMap<String, bool>)>;
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<FlagCache>> = std::sync::OnceLock::new();
+    let persisted = {
+        let lock = CACHE.get_or_init(|| std::sync::Mutex::new(None));
+        let mut slot = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let fresh = slot
+            .as_ref()
+            .is_some_and(|(at, _)| at.elapsed() < std::time::Duration::from_secs(30));
+        if !fresh {
+            *slot = Some((std::time::Instant::now(), read_flags(&state_base())));
+        }
+        slot.as_ref().and_then(|(_, flags)| flags.get(env_var).copied())
+    };
     resolve_flag(
         std::env::var(env_var).ok().and_then(|v| parse_bool(&v)),
-        read_flags(&state_base()).get(env_var).copied(),
+        persisted,
         default,
     )
 }
