@@ -95,6 +95,38 @@ pub const fn parts(ch: char) -> Option<BoxParts> {
     Some(p)
 }
 
+/// Light / heavy stroke thickness for a `cell_h`-tall cell: light ≈ 1/12
+/// of the cell height, heavy ≈ double, each at least 1px / 2px so they
+/// never vanish on small cells.
+fn stroke_px(cell_h: f32) -> (f32, f32) {
+    let light = (cell_h / 12.0).round().max(1.0);
+    (light, (light * 2.0).max(2.0))
+}
+
+/// The single bar a *pure horizontal* stroke (`─`, `━`, dashed variants)
+/// paints: full cell width, thickness centred on the cell mid-height.
+/// `None` for any glyph with vertical ink (corners, tees, crosses) or
+/// mixed left/right weights — those must stay per-cell.
+///
+/// For these glyphs this is exactly the union of [`rects`]'s two
+/// centre-to-edge bars, so the paint loop can coalesce a same-colour run
+/// of them across adjacent columns into ONE quad: a 200-column table
+/// rule was 400 `paint_quad` calls per frame, now it's 1.
+#[must_use]
+pub fn h_bar(parts: BoxParts, cell_w: f32, cell_h: f32) -> Option<Rect> {
+    if parts.up != 0 || parts.down != 0 || parts.left != parts.right || parts.left == 0 {
+        return None;
+    }
+    let (light, heavy) = stroke_px(cell_h);
+    let t = if parts.left == 2 { heavy } else { light };
+    Some(Rect {
+        x: 0.0,
+        y: cell_h / 2.0 - t / 2.0,
+        w: cell_w,
+        h: t,
+    })
+}
+
 /// Build the filled bars for a glyph in a `cell_w` × `cell_h` cell.
 ///
 /// Each present edge is a bar from the cell centre to that edge, so a
@@ -107,10 +139,7 @@ pub const fn parts(ch: char) -> Option<BoxParts> {
 /// a table border row of 200 `─` cells was 200 Vec mallocs per frame.
 #[must_use]
 pub fn rects(parts: BoxParts, cell_w: f32, cell_h: f32) -> ([Rect; 4], usize) {
-    // Light stroke ≈ 1/12 of the cell height, heavy ≈ double, each at
-    // least 1px / 2px so they never vanish on small cells.
-    let light = (cell_h / 12.0).round().max(1.0);
-    let heavy = (light * 2.0).max(2.0);
+    let (light, heavy) = stroke_px(cell_h);
     let weight_px = |w: Weight| match w {
         1 => light,
         2 => heavy,
@@ -248,5 +277,37 @@ mod tests {
         let light = bars('─', 10.0, 24.0)[0].h;
         let heavy = bars('━', 10.0, 24.0)[0].h;
         assert!(heavy > light, "heavy {heavy} should exceed light {light}");
+    }
+
+    #[test]
+    fn h_bar_matches_rects_union_for_horizontals() {
+        // The coalescing fast path must paint the exact same ink as the
+        // per-cell path it replaces: for a pure horizontal, `rects`'s
+        // two centre-to-edge bars union to one full-width bar.
+        for ch in ['─', '━', '┄', '╍'] {
+            let p = parts(ch).unwrap();
+            let bar = h_bar(p, 10.0, 20.0).unwrap_or_else(|| panic!("{ch:?} is a pure horizontal"));
+            let r = bars(ch, 10.0, 20.0);
+            let min_x = r.iter().map(|q| q.x).fold(f32::INFINITY, f32::min);
+            let max_x = r.iter().map(|q| q.x + q.w).fold(f32::NEG_INFINITY, f32::max);
+            assert!((bar.x - min_x).abs() < 0.01, "{ch:?} left edge");
+            assert!((bar.x + bar.w - max_x).abs() < 0.01, "{ch:?} right edge");
+            for q in &r {
+                assert!(
+                    (q.y - bar.y).abs() < 0.01 && (q.h - bar.h).abs() < 0.01,
+                    "{ch:?} thickness/centre"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn h_bar_rejects_vertical_ink() {
+        // Anything with an up/down stroke paints more than one bar and
+        // must stay on the per-cell path — coalescing a corner or tee
+        // into a plain rule would erase its vertical arm.
+        for ch in ['│', '┃', '┌', '┘', '├', '┤', '┬', '┴', '┼', '╋'] {
+            assert_eq!(h_bar(parts(ch).unwrap(), 10.0, 20.0), None, "{ch:?} must not coalesce");
+        }
     }
 }
