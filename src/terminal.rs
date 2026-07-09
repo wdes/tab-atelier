@@ -376,7 +376,10 @@ struct CachedFrame {
     /// scrolled (rows shifted up), so the whole index-keyed cache is
     /// stale even though `display_offset` is still 0.
     history_size: usize,
-    lines: Vec<Option<RawLine>>,
+    /// `Rc` so handing the rows to Phase 2 each frame is a refcount
+    /// bump per row — the old `RawLine` deep clone (text + segments +
+    /// runs for EVERY visible row) ran under the Term lock every paint.
+    lines: Vec<Option<Rc<RawLine>>>,
 }
 
 impl CachedFrame {
@@ -578,7 +581,6 @@ impl TerminalView {
                     if !painting {
                         return false;
                     }
-                    let scrolled = view.term.lock().grid().display_offset() > 0;
                     if grid_dirty {
                         let streak = dirty_streak.get().wrapping_add(1);
                         dirty_streak.set(streak);
@@ -596,6 +598,18 @@ impl TerminalView {
                             cx.notify();
                         }
                         dirty_streak.set(0);
+                        // Read the scroll offset only on this quiet path, and
+                        // without blocking: a plain `lock()` here ran on EVERY
+                        // 16 ms tick, and during a flood the parser thread
+                        // holds the Term lock for whole parse batches — the
+                        // same main-thread stall the prepaint's try-lock path
+                        // exists to avoid. On contention assume "not
+                        // scrolled"; the ring counter is moving then anyway,
+                        // so this branch isn't the one painting.
+                        let scrolled = view
+                            .term
+                            .try_lock_unfair()
+                            .is_some_and(|t| t.grid().display_offset() > 0);
                         if scrolled && n.is_multiple_of(12) {
                             // Scrolled-up: paint twice a second so the
                             // cursor blink stays alive without burning CPU.
@@ -2016,7 +2030,7 @@ impl Element for TerminalElement {
             // build loop below rebuilds them; un-damaged slots stay
             // populated and skip the rebuild entirely.
             let prev = self.prev_frame.borrow_mut().take();
-            let mut working: Vec<Option<RawLine>> = match prev {
+            let mut working: Vec<Option<Rc<RawLine>>> = match prev {
                 Some(p) if p.reusable_for(display_offset, visible_cols, visible_lines, history_size) => {
                     let mut v = p.lines;
                     if force_full {
@@ -2282,23 +2296,22 @@ impl Element for TerminalElement {
                     segments.push(seg);
                 }
 
-                *slot = Some(RawLine {
+                *slot = Some(Rc::new(RawLine {
                     grid_line,
                     text: full_text,
                     segments,
                     bg_runs,
                     box_cells,
-                });
+                }));
             }
 
             // Save the working Vec for next frame BEFORE Phase 2
-            // consumes it. Clone the inner RawLines into a fresh Vec
-            // for Phase 2 so we keep `working`'s allocation intact;
-            // the RawLine itself is the only thing that gets cloned
-            // (not the outer Vec).
+            // consumes it. The rows are `Rc`-shared, so this is one
+            // refcount bump per row — no per-frame deep clone of text/
+            // segments/runs while the Term lock is held.
             // Phase 1 fills every slot; `flatten` skips any stray `None` rather
             // than panicking (a missing row just isn't cached this frame).
-            let raw_lines: Vec<RawLine> = working.iter().flatten().cloned().collect();
+            let raw_lines: Vec<Rc<RawLine>> = working.iter().flatten().cloned().collect();
             *self.prev_frame.borrow_mut() = Some(CachedFrame {
                 display_offset,
                 visible_cols,
@@ -2348,8 +2361,8 @@ impl Element for TerminalElement {
                 result_lines.push(TermLine {
                     // Cheap atomic bump — no Vec/ShapedLine deep clone.
                     segments: std::rc::Rc::clone(&cached.segments),
-                    bg_runs: raw.bg_runs,
-                    box_cells: raw.box_cells,
+                    bg_runs: raw.bg_runs.clone(),
+                    box_cells: raw.box_cells.clone(),
                 });
                 // Gather cached URLs without re-running detection.
                 for (start, end, url, is_file) in cached.urls.iter() {
@@ -2364,9 +2377,11 @@ impl Element for TerminalElement {
                 new_cache.insert(raw.grid_line, cached);
                 continue;
             }
+            // Cache miss (damaged row) — the only path that still copies
+            // the row's text/segments out of the shared `Rc<RawLine>`.
             let shaped_segments: Vec<TermSegment> = raw
                 .segments
-                .into_iter()
+                .iter()
                 .map(|seg| {
                     // 4th arg `force_width: Option<Pixels>` is gpui's
                     // terminal-cell-alignment hook: it clamps every
@@ -2388,7 +2403,7 @@ impl Element for TerminalElement {
                     // column next to it stays empty (the "split-
                     // rendered emoji" bug).
                     let force_w = cell.width * seg.cell_span as f32;
-                    let shaped = text_sys.shape_line(seg.text.into(), font_size, &seg.runs, Some(force_w));
+                    let shaped = text_sys.shape_line(seg.text.clone().into(), font_size, &seg.runs, Some(force_w));
                     TermSegment {
                         col_start: seg.col_start,
                         shaped,
@@ -2409,7 +2424,7 @@ impl Element for TerminalElement {
             new_cache.insert(
                 raw.grid_line,
                 CachedLine {
-                    text: raw.text,
+                    text: raw.text.clone(),
                     segments: std::rc::Rc::clone(&shaped_rc),
                     urls: urls_rc,
                     sig,
@@ -2417,8 +2432,8 @@ impl Element for TerminalElement {
             );
             result_lines.push(TermLine {
                 segments: shaped_rc,
-                bg_runs: raw.bg_runs,
-                box_cells: raw.box_cells,
+                bg_runs: raw.bg_runs.clone(),
+                box_cells: raw.box_cells.clone(),
             });
         }
 
