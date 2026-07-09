@@ -78,7 +78,9 @@ struct Anim {
 pub struct PetDef {
     pub tilesx: u32,
     pub tilesy: u32,
-    anims: HashMap<u32, Anim>,
+    /// `Rc<Anim>` so the 20 fps tick's working copy is a refcount bump —
+    /// the `Anim` deep clone (3 Vecs) ran per pet per step while visible.
+    anims: HashMap<u32, std::rc::Rc<Anim>>,
     /// Animation to start in (the `walk` id, or the lowest id as a fallback).
     start: u32,
     /// The `fall` named animation, if any — desktopPet's `Fall` key, played when
@@ -126,7 +128,7 @@ impl PetDef {
         }
 
         let anims_node = root.children().find(|n| n.has_tag_name("animations"))?;
-        let mut anims: HashMap<u32, Anim> = HashMap::new();
+        let mut anims: HashMap<u32, std::rc::Rc<Anim>> = HashMap::new();
         let mut start = u32::MAX;
         let mut walk_id = None;
         let mut fall_id = None;
@@ -210,7 +212,7 @@ impl PetDef {
                 .and_then(|n| n.text().and_then(|t| t.trim().parse().ok()));
             anims.insert(
                 id,
-                Anim {
+                std::rc::Rc::new(Anim {
                     frames,
                     interval_ms: interval_ms.max(1.0),
                     start: start_v,
@@ -219,7 +221,7 @@ impl PetDef {
                     next,
                     border_next,
                     gravity_next,
-                },
+                }),
             );
             start = start.min(id);
         }
@@ -818,6 +820,11 @@ pub struct PetOverlay {
     /// Ledges (one per tab, its top edge) collected each paint by the measuring
     /// canvases — the pets walk them and grass grows on them.
     ledges: Rc<RefCell<Vec<Surface>>>,
+    /// Reused buffer for `advance`'s per-frame ledge snapshot (the 20 fps
+    /// tick used to clone the Vec every frame).
+    ledges_scratch: Vec<Surface>,
+    /// Cached grazer (sheep) pet ids — see `spawn_grazer`.
+    grazer_ids: Option<Vec<String>>,
     /// Grass tufts on the ledges; grow over time, eaten by grazing sheep.
     grass: Vec<Grass>,
     grow_accum: f32,
@@ -836,6 +843,8 @@ impl Default for PetOverlay {
             last: Instant::now(),
             drag: None,
             ledges: Rc::new(RefCell::new(Vec::new())),
+            ledges_scratch: Vec::new(),
+            grazer_ids: None,
             grass: Vec::new(),
             grow_accum: 0.0,
             spawn_accum: 0.0,
@@ -898,16 +907,27 @@ impl PetOverlay {
         if self.pets.len() >= self.asked {
             return;
         }
-        let sheep: Vec<String> = list_pets()
-            .into_iter()
-            .map(|(id, _)| id)
-            .filter(|id| id.contains("sheep"))
-            .collect();
-        if sheep.is_empty() {
+        // The installed pet set is static for the process lifetime, and
+        // `list_pets` reads every pet XML in full — cache the sheep ids
+        // instead of re-scanning the directory every 6 s spawn tick.
+        if self.grazer_ids.is_none() {
+            self.grazer_ids = Some(
+                list_pets()
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .filter(|id| id.contains("sheep"))
+                    .collect(),
+            );
+        }
+        let len = self.grazer_ids.as_ref().map_or(0, Vec::len);
+        if len == 0 {
             return;
         }
-        let idx = self.rand_u32() as usize % sheep.len();
-        if let Some(lp) = Self::build(&sheep[idx], screen_w, screen_h) {
+        let idx = self.rand_u32() as usize % len;
+        let Some(id) = self.grazer_ids.as_ref().and_then(|v| v.get(idx)).cloned() else {
+            return;
+        };
+        if let Some(lp) = Self::build(&id, screen_w, screen_h) {
             self.pets.push(lp);
         }
     }
@@ -956,8 +976,11 @@ impl PetOverlay {
         const SPAWN_MS: f32 = 6000.0; // a new grazing sheep this often, while grass lasts
         const EAT_RATE: f32 = 0.4; // fullness eaten per second
 
-        // Snapshot the ledges (Copy) so we can borrow `self` mutably below.
-        let ledges: Vec<Surface> = self.ledges.borrow().clone();
+        // Snapshot the ledges (Copy) so we can borrow `self` mutably below,
+        // reusing the scratch buffer instead of a per-frame clone.
+        let mut ledges = std::mem::take(&mut self.ledges_scratch);
+        ledges.clear();
+        ledges.extend_from_slice(&self.ledges.borrow());
 
         // 1. Sprout a grass tuft now and then at a random spot on a random ledge.
         self.grow_accum += dt_ms;
@@ -1015,6 +1038,9 @@ impl PetOverlay {
             };
             self.pets[i].pet.tick(dt_ms, &world);
         }
+
+        // Hand the snapshot buffer back for the next frame.
+        self.ledges_scratch = ledges;
     }
 
     /// A little green tuft drawn on a ledge; its height tracks how much is left.

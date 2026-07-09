@@ -2705,7 +2705,15 @@ impl AppState {
 
             // Measure this tab's top edge as a pet ledge (see PetOverlay).
             #[cfg(feature = "pets")]
-            let tab_el = tab_el.relative().child(self.pet.tab_ledge_canvas(i));
+            // Only measure ledges while pets are actually on screen — this
+            // added a canvas element per tab per frame (30-60 fps during
+            // floods) for a feature that's usually off. Summoning calls
+            // cx.notify(), so ledges appear the same frame the pet does.
+            let tab_el = if self.pet.is_active() {
+                tab_el.relative().child(self.pet.tab_ledge_canvas(i))
+            } else {
+                tab_el
+            };
 
             bar = bar.child(tab_el);
         }
