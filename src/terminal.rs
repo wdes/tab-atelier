@@ -1232,6 +1232,18 @@ impl TerminalView {
         t.selection_to_string()
     }
 
+    /// Whether an active, non-empty selection exists. For render paths
+    /// that only need the yes/no — `copy_selection` builds the whole
+    /// selected TEXT under the Term lock, which the context menu used
+    /// to do once per frame just to pick a menu label. Non-blocking:
+    /// if the parser holds the lock this frame, report "no selection"
+    /// and let the next repaint correct it.
+    pub fn has_selection(&self) -> bool {
+        self.term
+            .try_lock_unfair()
+            .is_some_and(|t| t.selection.as_ref().is_some_and(|s| !s.is_empty()))
+    }
+
     #[allow(clippy::significant_drop_tightening)]
     pub fn copy_all_history(&self) -> String {
         self.ansi_lines(None).0.join("\n")
