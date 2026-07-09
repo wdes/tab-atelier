@@ -3043,15 +3043,18 @@ mod tests {
         window
             .update(cx, |view, _window, _cx| {
                 view.restore_output("select this text");
+                assert!(!view.has_selection(), "no selection yet");
                 let start = GridPoint::new(Line(0), Column(0));
                 let end = GridPoint::new(Line(0), Column(5));
                 view.start_selection(start, Side::Left);
                 view.update_selection(end, Side::Right);
+                assert!(view.has_selection(), "cheap probe sees the selection");
                 let text = view.copy_selection();
                 assert!(text.is_some());
                 assert!(!text.unwrap().is_empty());
                 view.clear_selection();
                 assert!(view.copy_selection().is_none());
+                assert!(!view.has_selection(), "probe clears with the selection");
                 view.shutdown();
             })
             .unwrap();

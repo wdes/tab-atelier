@@ -3260,6 +3260,16 @@ mod tests {
         assert_eq!(loaded.tabs[1].cwd, None);
         assert_eq!(loaded.active, 1);
 
+        // The pre-serialized entry point (what the persist ticks call)
+        // must round-trip identically to `save_state`.
+        let mut renamed = state;
+        renamed.tabs[0].name = "One-renamed".into();
+        let json = serde_json::to_string_pretty(&renamed).unwrap();
+        save_state_serialized(&dir, &json);
+        let loaded = load_state_from(&dir).expect("should load pre-serialized state");
+        assert_eq!(loaded.tabs[0].name, "One-renamed");
+        assert_eq!(loaded.active, 1);
+
         let _ = std::fs::remove_dir_all(dir.join(APP_DIR));
     }
 

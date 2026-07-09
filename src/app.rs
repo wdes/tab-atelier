@@ -509,10 +509,20 @@ struct AppState {
     /// Per-tab active connection count (metering), keyed by tab id. Refreshed
     /// on a timer from `/proc` (the desktop is unprivileged → connections
     /// only, no nft byte counts). Side map so the `Tab` struct is untouched.
-    tab_connections: std::cell::RefCell<std::collections::HashMap<String, usize>>,
+    /// `Arc<Mutex<…>>` (not `RefCell`) so the /proc scan that fills it can
+    /// run on the background executor — it stats every process on the host
+    /// and readlinks every descendant fd, a 10-50 ms stall when it ran
+    /// inline in the 2 s persist tick on the gpui main thread.
+    tab_connections: Arc<Mutex<std::collections::HashMap<String, usize>>>,
     /// Last time `tab_connections` was refreshed (throttled — the /proc scan
     /// is too heavy for every persist tick).
     last_conn_meter: std::cell::Cell<Option<std::time::Instant>>,
+    /// Mirror of the API snapshot's lock-free `activity` counter (see
+    /// `api::TabSnapshot::activity`), so persist-tick work that only serves
+    /// API consumers can be skipped entirely while nobody is connected.
+    activity_signal: Arc<std::sync::atomic::AtomicU64>,
+    activity_last_seen: std::cell::Cell<u64>,
+    activity_last_at: std::cell::Cell<Option<std::time::Instant>>,
     /// Last `(cols, lines)` broadcast from the active tab to the background
     /// tabs. The active tab computes the real grid size on its first/every
     /// paint; a tick pushes it to the (never-painted) background tabs so their
@@ -1095,6 +1105,7 @@ impl AppState {
         let tab_bg_global = prefs.tab_bg_color;
         let remote_endpoints = prefs.remote_endpoints;
         info!("API server starting on {api_addr} (TLS {api_tls_addr})");
+        let activity_signal = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let api_state = Arc::new(Mutex::new(api::TabSnapshot {
             tabs: Vec::<api::SnapshotTab>::new(),
             // Set by start_api_server before it serves; an empty master
@@ -1121,7 +1132,7 @@ impl AppState {
             pending_renames: Vec::new(),
             pending_status_updates: Vec::new(),
             cached_response: None,
-            activity: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            activity: activity_signal.clone(),
         }));
         let api_read_only = crate::read_only();
         api::start_api_server(api_state.clone(), api_token.clone(), api_read_only, api_addr.clone());
@@ -1201,7 +1212,10 @@ impl AppState {
             hotkey_handle: None,
             last_uptime_save: std::cell::Cell::new(None),
             last_state_hash: std::cell::Cell::new(0),
-            tab_connections: std::cell::RefCell::new(std::collections::HashMap::new()),
+            tab_connections: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            activity_signal,
+            activity_last_seen: std::cell::Cell::new(0),
+            activity_last_at: std::cell::Cell::new(None),
             last_conn_meter: std::cell::Cell::new(None),
             last_broadcast_size: std::cell::Cell::new(None),
             logo: Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, LOGO_PNG.to_vec())),
@@ -1492,18 +1506,41 @@ impl AppState {
                 tab.last_known_cwd = Some(p);
             }
         }
+        // Track the API activity signal so persist-tick work that only
+        // serves API consumers can be skipped while nobody is connected.
+        {
+            let seq = self.activity_signal.load(std::sync::atomic::Ordering::Relaxed);
+            if seq != self.activity_last_seen.get() {
+                self.activity_last_seen.set(seq);
+                self.activity_last_at.set(Some(std::time::Instant::now()));
+            }
+        }
+        let api_hot = self.activity_last_at.get().is_some_and(|t| t.elapsed().as_secs() < 60);
         // Connection metering (throttled ~5 s — the /proc scan is too heavy
         // for every 2 s persist tick). Desktop is unprivileged, so it's
-        // connections only (no nft byte counters).
+        // connections only (no nft byte counters). Two more gates:
+        //  - only when the numbers can be SEEN — the context menu's stats
+        //    block or an API consumer that's been active within a minute.
+        //    Idle with nothing open ⇒ zero /proc scans.
+        //  - the scan runs on the background executor; it stats every
+        //    process on the host and used to stall the main thread 10-50 ms.
         #[cfg(target_os = "linux")]
-        if self.last_conn_meter.get().is_none_or(|t| t.elapsed().as_secs() >= 5) {
+        if (api_hot || self.context_menu.is_some())
+            && self.last_conn_meter.get().is_none_or(|t| t.elapsed().as_secs() >= 5)
+        {
             self.last_conn_meter.set(Some(std::time::Instant::now()));
             let roots: Vec<(String, u32)> = self
                 .tabs
                 .iter()
                 .map(|tab| (tab.id.clone(), tab.view.read(cx).pid()))
                 .collect();
-            *self.tab_connections.borrow_mut() = crate::net_meter::connection_counts(&roots);
+            let out = self.tab_connections.clone();
+            cx.background_executor()
+                .spawn(async move {
+                    let counts = crate::net_meter::connection_counts(&roots);
+                    *out.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = counts;
+                })
+                .detach();
         }
         let tabs: Vec<TabState> = self
             .tabs
@@ -1616,7 +1653,13 @@ impl AppState {
                 viewers: pty_ring.lock().map_or(0, |r| r.viewer_count()),
                 pty_ring: Some(pty_ring),
                 net_disabled: ts.net_disabled,
-                connections: self.tab_connections.borrow().get(&tab.id).copied().unwrap_or(0),
+                connections: self
+                    .tab_connections
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&tab.id)
+                    .copied()
+                    .unwrap_or(0),
                 // Desktop is unprivileged → no nft byte counters.
                 tx_bytes: 0,
                 tx_denied_bytes: 0,
@@ -3055,7 +3098,8 @@ impl AppState {
             stats_lines.push(format!("{}: {}", t.uptime, format_duration(elapsed)));
             let conns = self
                 .tab_connections
-                .borrow()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .get(&self.tabs[stats_idx].id)
                 .copied()
                 .unwrap_or(0);

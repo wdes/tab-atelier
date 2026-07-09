@@ -40,6 +40,10 @@ use std::net::IpAddr;
 
 use crate::net_policy::Cidr;
 
+/// Shared prefix of every tab table — the filter [`parse_counters_by_table`]
+/// uses to keep host firewall rules out of the batch counter read.
+const TABLE_PREFIX: &str = "tabatelier_";
+
 /// nftables table name for a tab. Sanitised so the id is a safe nft
 /// identifier (alnum + `_`); collisions across tabs are impossible because
 /// tab ids are UUIDs.
@@ -49,7 +53,7 @@ pub fn table_name(tab_id: &str) -> String {
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect();
-    format!("tabatelier_{safe}")
+    format!("{TABLE_PREFIX}{safe}")
 }
 
 /// Build the `nft -f` ruleset that confines `cgroup_rel` (the tab's cgroup
@@ -393,41 +397,95 @@ pub fn read_counters(tab_id: &str) -> Option<(u64, u64)> {
     Some(parse_counters(&json))
 }
 
+/// Egress byte counters for EVERY tab table in one `nft` invocation,
+/// keyed by tab table name (see [`counters_key`]).
+///
+/// The metering sweep used to fork one `nft -j list table` per tab per
+/// refresh — with a dozen tabs that's a steady stream of subprocess
+/// spawns for data one `list ruleset` dump already contains. `None`
+/// when `nft` is missing or unreadable (unprivileged), same as
+/// [`read_counters`].
+#[must_use]
+pub fn read_counters_all() -> Option<std::collections::HashMap<String, (u64, u64)>> {
+    let out = std::process::Command::new(nft_bin())
+        .args(["-j", "list", "ruleset"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    Some(parse_counters_by_table(&json))
+}
+
+/// The key a tab's counters live under in [`read_counters_all`]'s map.
+#[must_use]
+pub fn counters_key(tab_id: &str) -> String {
+    table_name(tab_id)
+}
+
+/// Fold one rule's counter into a `(total, denied)` pair. The single rule
+/// in chain `out` carries the TOTAL counter, whether it jumps into a
+/// confine chain (allowlist) or just accepts (meter-only); the confine
+/// chain's `drop` rule carries DENIED.
+fn fold_rule_counter(rule: &serde_json::Value, slot: &mut (u64, u64)) {
+    let chain = rule
+        .get("chain")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let Some(exprs) = rule.get("expr").and_then(|e| e.as_array()) else {
+        return;
+    };
+    let counter_bytes = exprs.iter().find_map(|e| {
+        e.get("counter")
+            .and_then(|c| c.get("bytes"))
+            .and_then(serde_json::Value::as_u64)
+    });
+    let Some(bytes) = counter_bytes else { return };
+    if chain == "out" {
+        slot.0 = bytes;
+    } else if chain == "confine" && exprs.iter().any(|e| e.get("drop").is_some()) {
+        slot.1 = bytes;
+    }
+}
+
 /// Pull `(total, denied)` byte counts out of `nft -j list table` JSON. Pure
-/// so it's unit-testable. `total` = the counter on the chain-`out` jump
-/// rule; `denied` = the counter on the chain-`confine` `drop` rule.
+/// so it's unit-testable.
 #[must_use]
 fn parse_counters(json: &serde_json::Value) -> (u64, u64) {
-    let mut total = 0;
-    let mut denied = 0;
+    let mut out = (0, 0);
     let Some(items) = json.get("nftables").and_then(|n| n.as_array()) else {
-        return (0, 0);
+        return out;
+    };
+    for item in items {
+        if let Some(rule) = item.get("rule") {
+            fold_rule_counter(rule, &mut out);
+        }
+    }
+    out
+}
+
+/// [`parse_counters`] over a whole-`ruleset` dump: group rule counters by
+/// their table, keeping only our `tabatelier_*` tables so host firewall
+/// rules never mix in. Pure so it's unit-testable.
+#[must_use]
+fn parse_counters_by_table(json: &serde_json::Value) -> std::collections::HashMap<String, (u64, u64)> {
+    let mut map: std::collections::HashMap<String, (u64, u64)> = std::collections::HashMap::new();
+    let Some(items) = json.get("nftables").and_then(|n| n.as_array()) else {
+        return map;
     };
     for item in items {
         let Some(rule) = item.get("rule") else { continue };
-        let chain = rule
-            .get("chain")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        let Some(exprs) = rule.get("expr").and_then(|e| e.as_array()) else {
+        let Some(table) = rule.get("table").and_then(serde_json::Value::as_str) else {
             continue;
         };
-        let counter_bytes = exprs.iter().find_map(|e| {
-            e.get("counter")
-                .and_then(|c| c.get("bytes"))
-                .and_then(serde_json::Value::as_u64)
-        });
-        let Some(bytes) = counter_bytes else { continue };
-        // The single rule in chain `out` carries the TOTAL counter, whether
-        // it jumps into a confine chain (allowlist) or just accepts
-        // (meter-only). The confine chain's drop rule carries DENIED.
-        if chain == "out" {
-            total = bytes;
-        } else if chain == "confine" && exprs.iter().any(|e| e.get("drop").is_some()) {
-            denied = bytes;
+        if !table.starts_with(TABLE_PREFIX) {
+            continue;
         }
+        fold_rule_counter(rule, map.entry(table.to_string()).or_insert((0, 0)));
     }
-    (total, denied)
+    map
 }
 
 /// Remove a tab's table. Best-effort and silent — a missing table (never
@@ -529,6 +587,34 @@ mod tests {
     fn parse_counters_empty_is_zero() {
         let json: serde_json::Value = serde_json::from_str(r#"{"nftables":[]}"#).unwrap();
         assert_eq!(parse_counters(&json), (0, 0));
+    }
+
+    #[test]
+    fn parse_counters_by_table_groups_and_filters() {
+        // Shape of `nft -j list ruleset`: rules from TWO tab tables plus a
+        // host-firewall rule that must be ignored (not `tabatelier_*`).
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{"nftables":[
+                {"metainfo":{"version":"1.1.3"}},
+                {"table":{"family":"inet","name":"tabatelier_a"}},
+                {"rule":{"table":"tabatelier_a","chain":"out","expr":[
+                    {"counter":{"packets":1,"bytes":100}},{"jump":{"target":"confine"}}]}},
+                {"rule":{"table":"tabatelier_a","chain":"confine","expr":[
+                    {"counter":{"packets":1,"bytes":40}},{"drop":null}]}},
+                {"rule":{"table":"tabatelier_b","chain":"out","expr":[
+                    {"counter":{"packets":2,"bytes":900}},{"accept":null}]}},
+                {"rule":{"table":"filter","chain":"out","expr":[
+                    {"counter":{"packets":9,"bytes":123456}},{"accept":null}]}}
+            ]}"#,
+        )
+        .unwrap();
+        let map = parse_counters_by_table(&json);
+        assert_eq!(map.get("tabatelier_a"), Some(&(100, 40)));
+        // Meter-only table: total counted, no drop rule ⇒ denied 0.
+        assert_eq!(map.get("tabatelier_b"), Some(&(900, 0)));
+        assert!(!map.contains_key("filter"), "host firewall rules excluded");
+        // The lookup key for a tab id is its sanitised table name.
+        assert_eq!(counters_key("a"), "tabatelier_a");
     }
 
     #[test]

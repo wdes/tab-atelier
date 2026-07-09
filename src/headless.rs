@@ -1007,6 +1007,10 @@ pub fn run() -> std::io::Result<()> {
             &power_watts,
             #[cfg(feature = "energy")]
             &battery_percent,
+            // Same "anyone connected?" signal that keeps the loop fast —
+            // gates the metering sweep, whose numbers only exist for API
+            // consumers.
+            tick_interval == TICK_FAST,
         );
 
         // Persist on a 2 Hz tick like the GUI's `cx.spawn(timer(2s))`.
@@ -1056,35 +1060,61 @@ fn refresh_snapshot(
     api_state: &Arc<Mutex<api::TabSnapshot>>,
     #[cfg(feature = "energy")] power_watts: &Arc<Mutex<Vec<crate::power::TabPower>>>,
     #[cfg(feature = "energy")] battery_percent: &Arc<Mutex<Option<u8>>>,
+    client_hot: bool,
 ) {
-    // Connection metering (unprivileged /proc scan). Throttled to ~5 s —
-    // the process-tree + per-fd scan is far too heavy for the 2 Hz snapshot
-    // tick. The per-tab count persists between refreshes on the tab.
+    #[cfg(not(target_os = "linux"))]
+    let _ = client_hot;
+    // Connection metering (unprivileged /proc scan) + nftables byte
+    // counters. Throttled to ~5 s and gated on `client_hot`: the numbers
+    // exist only for API consumers, so with nobody connected the daemon
+    // does zero /proc scans and zero nft forks. The sweep itself runs on
+    // a worker thread — the /proc walk (stat every host process, readlink
+    // every descendant fd) took 10-50 ms on a busy box, stalling the
+    // input drain that shares this loop; results are applied on a later
+    // refresh pass. One `nft -j list ruleset` covers every tab's
+    // counters instead of a subprocess per tab.
     #[cfg(target_os = "linux")]
     {
         use std::sync::OnceLock;
+        type MeterResults = (
+            std::collections::HashMap<String, usize>,
+            Option<std::collections::HashMap<String, (u64, u64)>>,
+        );
+        static RESULTS: OnceLock<Mutex<Option<MeterResults>>> = OnceLock::new();
         static LAST: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
-        let lock = LAST.get_or_init(|| Mutex::new(None));
-        let mut last = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if last.is_none_or(|t| t.elapsed() >= Duration::from_secs(5)) {
-            *last = Some(Instant::now());
-            drop(last);
-            let roots: Vec<(String, u32)> = tabs.iter().map(|t| (t.id.clone(), t.pid)).collect();
-            let counts = crate::net_meter::connection_counts(&roots);
+        let results = RESULTS.get_or_init(|| Mutex::new(None));
+        // Apply whatever the previous sweep's worker left for us. Take
+        // the payload out and release the slot's lock before the apply
+        // loop (clippy: significant_drop_in_scrutinee).
+        let pending = results.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        if let Some((counts, nft)) = pending {
             for tab in tabs.iter_mut() {
                 if let Some(&n) = counts.get(&tab.id) {
                     tab.connections = n;
                 }
                 // Byte counters from the tab's nftables table. Every
-                // non-net-off tab has one (confine or meter-only), so this
-                // meters all tabs; `read_counters` returns None when there's
-                // no table (net-off / nft unavailable). total = allowed +
-                // denied.
-                if let Some((total, denied)) = crate::net_nft::read_counters(&tab.id) {
+                // non-net-off tab has one (confine or meter-only); a tab
+                // with no table (net-off / nft unavailable) keeps its
+                // previous value, same as the old per-tab `read_counters`.
+                if let Some(m) = nft.as_ref()
+                    && let Some(&(total, denied)) = m.get(&crate::net_nft::counters_key(&tab.id))
+                {
                     tab.tx_bytes = total;
                     tab.tx_denied_bytes = denied;
                 }
             }
+        }
+        let lock = LAST.get_or_init(|| Mutex::new(None));
+        let mut last = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if client_hot && last.is_none_or(|t| t.elapsed() >= Duration::from_secs(5)) {
+            *last = Some(Instant::now());
+            drop(last);
+            let roots: Vec<(String, u32)> = tabs.iter().map(|t| (t.id.clone(), t.pid)).collect();
+            let _ = std::thread::Builder::new().name("net-meter".into()).spawn(move || {
+                let counts = crate::net_meter::connection_counts(&roots);
+                let nft = crate::net_nft::read_counters_all();
+                *results.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((counts, nft));
+            });
         }
     }
 
