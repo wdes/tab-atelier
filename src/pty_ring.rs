@@ -180,6 +180,9 @@ impl PtyRing {
     }
 
     /// Clone the lock-free `total_len` mirror. See the `len_mirror` field.
+    /// The production caller is the GUI's repaint pump; headless builds
+    /// compile the method for the shared unit tests only.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
     #[must_use]
     pub fn total_len_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
         self.len_mirror.clone()
