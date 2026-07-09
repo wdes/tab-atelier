@@ -182,6 +182,11 @@ struct HeadlessTab {
     /// the /proc reads until the next sweep.
     #[cfg(feature = "catbus")]
     agent_pid: Option<u32>,
+    /// Cached handle to the ring's WS-viewer counter, so the snapshot
+    /// refresh (3× per tab) and the main loop's tick-rate probe read a
+    /// lock-free atomic instead of taking the ring mutex the PTY reader
+    /// thread contends on.
+    viewers: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl crate::schedule::LockState for HeadlessTab {
@@ -318,6 +323,11 @@ impl HeadlessTab {
         self.pty_ring.lock().map_or(0, |r| r.total_len())
     }
 
+    /// Lock-free WS viewer count (see the `viewers` field).
+    fn viewer_count(&self) -> usize {
+        self.viewers.load(Ordering::Relaxed)
+    }
+
     /// Return the grid-derived snapshot fields, scanning the terminal
     /// only when the PTY ring advanced since the last call. Otherwise
     /// the previous scan is reused, avoiding the per-tick full-grid
@@ -332,7 +342,7 @@ impl HeadlessTab {
     /// refresh backfills it (within one ~96 ms tick).
     fn cached_grid(&mut self) -> crate::term_export::GridSnapshotCache {
         let ring_len = self.ring_total_len();
-        let want_raw = self.pty_ring.lock().map_or(0, |r| r.viewer_count()) > 0;
+        let want_raw = self.viewer_count() > 0;
         let stale = self.snap_cache.as_ref().is_none_or(|c| c.ring_len != ring_len);
         let needs_raw_backfill = want_raw
             && self
@@ -617,6 +627,10 @@ fn spawn_pty_tab(
     #[cfg(not(feature = "energy"))]
     let _ = energy_wh;
 
+    let viewers_handle = pty_ring
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .viewers_handle();
     Some(HeadlessTab {
         id,
         name,
@@ -657,6 +671,7 @@ fn spawn_pty_tab(
         context: None,
         pending_agent_resume,
         colors_enabled,
+        viewers: viewers_handle,
         pty_ring,
         snap_cache: None,
         limits: crate::TabResourceLimits::default(),
@@ -964,15 +979,14 @@ pub fn run() -> std::io::Result<()> {
             activity_last_seen = seq;
             activity_last_change = Instant::now();
         }
-        tick_interval = if activity_last_change.elapsed() < TICK_HOT
-            || tabs
-                .iter()
-                .any(|t| t.pty_ring.lock().is_ok_and(|r| r.viewer_count() > 0))
-        {
+        tick_interval = if activity_last_change.elapsed() < TICK_HOT || tabs.iter().any(|t| t.viewer_count() > 0) {
             TICK_FAST
         } else {
             TICK_IDLE
         };
+        // Same signal drives the power sampler's hot/cold cadence.
+        #[cfg(feature = "energy")]
+        power_hot.store(tick_interval == TICK_FAST, Ordering::Relaxed);
 
         if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
             info!("graceful shutdown requested by signal, flushing state");
@@ -1178,7 +1192,7 @@ fn refresh_snapshot(
             agent_state: tab.agent_state.clone(),
             agent_session_id: tab.agent_session_id.clone(),
             agent_kind: tab.agent_kind.clone(),
-            viewers: tab.pty_ring.lock().map_or(0, |r| r.viewer_count()),
+            viewers: tab.viewer_count(),
             pty_ring: Some(tab.pty_ring.clone()),
             net_disabled: tab.net_disabled,
             connections: tab.connections,
