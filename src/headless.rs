@@ -1159,7 +1159,28 @@ fn refresh_snapshot(
     let mut snapshot = api_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     snapshot.tabs = api_tabs;
     snapshot.active = active;
-    snapshot.cached_response = None;
+    // Invalidate the cached /tabs body at the GUI's persist cadence
+    // (2 s), not on every ~96 ms refresh. Unconditional invalidation
+    // made the cache a no-op — any poller slower than one refresh tick
+    // always missed and paid the full rebuild (strip-ansi per tab +
+    // pretty JSON of every scrollback dump) per poll. /tabs consumers
+    // already tolerate 2 s staleness against the GUI; /output and the
+    // WS meta path read the snapshot fields directly, so their
+    // freshness keeps the fast tick.
+    {
+        use std::sync::OnceLock;
+        static LAST_INVALIDATE: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+        let lock = LAST_INVALIDATE.get_or_init(|| Mutex::new(None));
+        let mut last = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let due = last.is_none_or(|t| t.elapsed() >= Duration::from_secs(2));
+        if due {
+            *last = Some(Instant::now());
+        }
+        drop(last);
+        if due {
+            snapshot.cached_response = None;
+        }
+    }
     #[cfg(feature = "energy")]
     snapshot
         .power
