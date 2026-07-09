@@ -356,15 +356,8 @@ impl HeadlessTab {
             (String::new(), None)
         };
         let (cols, rows) = self.dims();
-        let grid = crate::term_export::GridSnapshotCache {
-            ring_len,
-            output: output.into(),
-            cursor,
-            raw_output: raw_output.into(),
-            raw_cursor,
-            cols,
-            rows,
-        };
+        let grid =
+            crate::term_export::GridSnapshotCache::new(ring_len, output, cursor, raw_output, raw_cursor, cols, rows);
         self.snap_cache = Some(grid.clone());
         grid
     }
@@ -1161,6 +1154,8 @@ fn refresh_snapshot(
             cwd: tab.last_known_cwd_string.clone(),
             output: grid.output,
             raw_output: grid.raw_output,
+            output_crc: grid.output_crc,
+            raw_output_crc: grid.raw_output_crc,
             raw_cursor: grid.raw_cursor,
             uptime_secs: tab.uptime().as_secs_f64(),
             cursor: grid.cursor,
