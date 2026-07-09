@@ -178,7 +178,10 @@ pub struct DetectedUrl {
     pub line: usize,
     pub start_col: usize,
     pub end_col: usize,
-    pub url: String,
+    /// `Rc<str>` — the detected-URL list is rebuilt every painted frame
+    /// from the per-line cache, so the URL text is shared rather than
+    /// re-allocated per frame.
+    pub url: std::rc::Rc<str>,
     pub is_file: bool,
 }
 
@@ -243,6 +246,9 @@ impl EventListener for EventProxy {
 
 use crate::term_export::TermDims;
 
+/// `(start_col, end_col, url, is_file)` — one detected URL in a cached line.
+type CachedUrl = (usize, usize, std::rc::Rc<str>, bool);
+
 struct CachedLine {
     text: String,
     /// Shared with the per-frame `TermLine::segments`. Wrapping in `Rc` so
@@ -251,8 +257,9 @@ struct CachedLine {
     segments: std::rc::Rc<Vec<TermSegment>>,
     /// URLs detected in this line, computed once on cache miss and reused
     /// on every subsequent hit so `detect_urls` doesn't re-run every frame.
-    /// The tuple shape matches `crate::detect_urls`'s return.
-    urls: std::rc::Rc<Vec<(usize, usize, String, bool)>>,
+    /// Like `crate::detect_urls`'s return, with the URL text `Rc`-shared
+    /// so the per-frame `DetectedUrl` rebuild is refcount bumps.
+    urls: std::rc::Rc<Vec<CachedUrl>>,
     /// Fingerprint of the shaping inputs the plain `text` does NOT capture
     /// (per-run colour + font weight/style + under/strikethrough). The cache
     /// is keyed on `grid_line`; validating on `text` alone let a line whose
@@ -284,6 +291,9 @@ pub struct TerminalView {
     content_origin: Rc<Cell<gpui::Point<Pixels>>>,
     bounds_size: Rc<Cell<Size<Pixels>>>,
     line_cache: Rc<RefCell<HashMap<i32, CachedLine>>>,
+    /// Last frame's map, kept as scratch so Phase 2 never allocates a
+    /// fresh `HashMap` per frame — the two maps swap roles each paint.
+    line_cache_scratch: Rc<RefCell<HashMap<i32, CachedLine>>>,
     /// PTY child pid, or `0` until the shell is spawned (skeleton tab).
     pid: u32,
     /// Deferred-spawn inputs. `Some` for a skeleton tab that hasn't forked its
@@ -652,6 +662,7 @@ impl TerminalView {
             content_origin: Rc::new(Cell::new(point(px(0.0), px(0.0)))),
             bounds_size: Rc::new(Cell::new(size(px(0.0), px(0.0)))),
             line_cache: Rc::new(RefCell::new(HashMap::new())),
+            line_cache_scratch: Rc::new(RefCell::new(HashMap::new())),
             pid: 0,
             spawn_recipe: Some(recipe),
             exited,
@@ -1246,7 +1257,7 @@ impl TerminalView {
 
     #[allow(clippy::significant_drop_tightening)]
     pub fn copy_all_history(&self) -> String {
-        self.ansi_lines(None).0.join("\n")
+        self.ansi_text_with_cursor(None).0
     }
 
     /// A `Send` closure that serialises this tab's scrollback (capped at
@@ -1271,18 +1282,13 @@ impl TerminalView {
     /// joined). Returns None when the cursor is in scrollback or
     /// outside the requested window. Used by the mobile remote to
     /// render the cursor at the right (row, col).
+    /// Delegates straight to the shared `term_export` implementation.
+    /// This used to round-trip through a `Vec<String>` — split the
+    /// joined dump into per-line Strings, then join them again — which
+    /// tripled the copies (and added ~10k String allocs for a full
+    /// history dump) for byte-identical output.
     pub fn ansi_text_with_cursor(&self, max_lines: Option<usize>) -> (String, Option<(usize, usize)>) {
-        let (lines, cursor) = self.ansi_lines(max_lines);
-        (lines.join("\n"), cursor)
-    }
-
-    /// Delegates to the shared `term_export` so the GUI and headless
-    /// paths can't drift. Kept private to preserve the existing
-    /// public surface (`plain_text`, `ansi_text_with_cursor`).
-    fn ansi_lines(&self, max_lines: Option<usize>) -> (Vec<String>, Option<(usize, usize)>) {
-        let (text, cursor) = crate::term_export::term_to_ansi_text_with_cursor(&self.term, max_lines);
-        let lines: Vec<String> = text.split('\n').map(str::to_string).collect();
-        (lines, cursor)
+        crate::term_export::term_to_ansi_text_with_cursor(&self.term, max_lines)
     }
 
     fn url_at_grid(&self, line: usize, col: usize) -> Option<DetectedUrl> {
@@ -1721,6 +1727,7 @@ impl Render for TerminalView {
                 content_origin: self.content_origin.clone(),
                 bounds_size: self.bounds_size.clone(),
                 line_cache: self.line_cache.clone(),
+                line_cache_scratch: self.line_cache_scratch.clone(),
                 theme: self.theme,
                 font_config: self.font_config.clone(),
                 detected_urls: self.detected_urls.clone(),
@@ -1747,6 +1754,7 @@ struct TerminalElement {
     content_origin: Rc<Cell<gpui::Point<Pixels>>>,
     bounds_size: Rc<Cell<Size<Pixels>>>,
     line_cache: Rc<RefCell<HashMap<i32, CachedLine>>>,
+    line_cache_scratch: Rc<RefCell<HashMap<i32, CachedLine>>>,
     theme: ThemeName,
     font_config: FontConfig,
     detected_urls: Rc<RefCell<Vec<DetectedUrl>>>,
@@ -1786,9 +1794,12 @@ struct TermLine {
     /// (the try-lock reuse path + the prev-frame cache) is a cheap
     /// refcount bump, not a deep `ShapedLine` copy.
     segments: std::rc::Rc<Vec<TermSegment>>,
-    bg_runs: Vec<BgRun>,
-    /// Box-drawing cells painted geometrically (see [`crate::box_drawing`]).
-    box_cells: Vec<BoxCell>,
+    /// The Phase 1 row this line was built from. `paint` reads
+    /// `bg_runs` / `box_cells` through it — they used to be deep-cloned
+    /// out of the shared row twice per line per frame (once into
+    /// `TermLine`, once more when `TermPrepaint` is cloned for the
+    /// try-lock reuse stash).
+    raw: Rc<RawLine>,
 }
 
 #[derive(Clone)]
@@ -1945,6 +1956,22 @@ impl Element for TerminalElement {
         let mut mono_font = font(self.font_config.family.clone());
         mono_font.weight = FontWeight(self.font_config.weight as f32);
         let font_size = px(self.font_config.size);
+        // Only four Font values can ever come out of the cell scan:
+        // (normal | bold) × (normal | italic). Build them ONCE per frame
+        // and clone per cell — `gpui::font()` default-constructs
+        // `FontFeatures(Arc<Vec<…>>)`, i.e. a heap allocation, and the
+        // old code did that for EVERY non-spacer cell of every damaged
+        // row while holding the Term lock (a full-damage 250×60 frame is
+        // ~15k mallocs; a 30 fps TUI redraw ~450k/s). A Font clone is
+        // refcount bumps only.
+        let font_variants: [gpui::Font; 4] = {
+            let mut v: [gpui::Font; 4] = [mono_font.clone(), mono_font.clone(), mono_font.clone(), mono_font];
+            v[1].weight = FontWeight::BOLD; // bold
+            v[2].style = FontStyle::Italic; // italic
+            v[3].weight = FontWeight::BOLD; // bold italic
+            v[3].style = FontStyle::Italic;
+            v
+        };
         let t = theme::theme(self.theme);
         let fg_default = t.term_fg_hsla();
 
@@ -2152,16 +2179,16 @@ impl Element for TerminalElement {
                     // normal foreground instead, with no inverse bg fill.
                     let box_parts = crate::box_drawing::parts(ch);
 
-                    let mut font_weight = FontWeight(self.font_config.weight as f32);
-                    let mut font_style = FontStyle::Normal;
+                    // Index into `font_variants`: bit 0 = bold, bit 1 = italic.
+                    let mut font_idx = 0usize;
                     let mut underline = None;
                     let mut strikethrough = None;
 
                     if cell_data.flags.contains(CellFlags::BOLD) {
-                        font_weight = FontWeight::BOLD;
+                        font_idx |= 1;
                     }
                     if cell_data.flags.contains(CellFlags::ITALIC) {
-                        font_style = FontStyle::Italic;
+                        font_idx |= 2;
                     }
                     if cell_data.flags.intersects(CellFlags::ALL_UNDERLINES) {
                         underline = Some(UnderlineStyle {
@@ -2222,9 +2249,7 @@ impl Element for TerminalElement {
                         }
                     }
 
-                    let mut cell_font = font(mono_font.family.clone());
-                    cell_font.weight = font_weight;
-                    cell_font.style = font_style;
+                    let cell_font = font_variants[font_idx].clone();
 
                     // Wide chars (CJK, hiragana, katakana, hangul,
                     // most emoji) still get their own segment so the
@@ -2364,7 +2389,10 @@ impl Element for TerminalElement {
         // Phase 2: shape line segments (with cache) without holding the lock.
         let text_sys = window.text_system();
         let mut cache = self.line_cache.borrow_mut();
-        let mut new_cache = HashMap::with_capacity(raw_lines.len());
+        // Build into last frame's (cleared) map and swap at the end —
+        // steady-state zero HashMap allocations per frame.
+        let mut new_cache = self.line_cache_scratch.borrow_mut();
+        new_cache.clear();
         let mut result_lines = Vec::with_capacity(raw_lines.len());
         let mut detected: Vec<DetectedUrl> = Vec::new();
         for (line_idx, raw) in raw_lines.into_iter().enumerate() {
@@ -2373,12 +2401,6 @@ impl Element for TerminalElement {
                 && cached.text == raw.text
                 && cached.sig == sig
             {
-                result_lines.push(TermLine {
-                    // Cheap atomic bump — no Vec/ShapedLine deep clone.
-                    segments: std::rc::Rc::clone(&cached.segments),
-                    bg_runs: raw.bg_runs.clone(),
-                    box_cells: raw.box_cells.clone(),
-                });
                 // Gather cached URLs without re-running detection.
                 for (start, end, url, is_file) in cached.urls.iter() {
                     detected.push(DetectedUrl {
@@ -2389,7 +2411,13 @@ impl Element for TerminalElement {
                         is_file: *is_file,
                     });
                 }
+                let segments = std::rc::Rc::clone(&cached.segments);
                 new_cache.insert(raw.grid_line, cached);
+                result_lines.push(TermLine {
+                    // Cheap atomic bumps — no Vec/ShapedLine deep clone.
+                    segments,
+                    raw,
+                });
                 continue;
             }
             // Cache miss (damaged row) — the only path that still copies
@@ -2426,7 +2454,12 @@ impl Element for TerminalElement {
                 })
                 .collect();
             let shaped_rc = std::rc::Rc::new(shaped_segments);
-            let urls_rc = std::rc::Rc::new(detect_urls(&raw.text));
+            let urls_rc = std::rc::Rc::new(
+                detect_urls(&raw.text)
+                    .into_iter()
+                    .map(|(s, e, url, f)| (s, e, std::rc::Rc::<str>::from(url), f))
+                    .collect::<Vec<_>>(),
+            );
             for (start, end, url, is_file) in urls_rc.iter() {
                 detected.push(DetectedUrl {
                     line: line_idx,
@@ -2447,12 +2480,13 @@ impl Element for TerminalElement {
             );
             result_lines.push(TermLine {
                 segments: shaped_rc,
-                bg_runs: raw.bg_runs.clone(),
-                box_cells: raw.box_cells.clone(),
+                raw,
             });
         }
 
-        *cache = new_cache;
+        // `cache` still holds entries for rows that vanished this frame;
+        // they become next frame's scratch and are cleared on entry.
+        std::mem::swap(&mut *cache, &mut *new_cache);
         *self.detected_urls.borrow_mut() = detected;
 
         let built = TermPrepaint {
@@ -2508,7 +2542,7 @@ impl Element for TerminalElement {
 
             // Paint backgrounds.
             for (line_idx, line) in state.lines.iter().enumerate() {
-                for bg in &line.bg_runs {
+                for bg in &line.raw.bg_runs {
                     let pos = point(
                         origin.x + cell.width * bg.col as f32,
                         origin.y + cell.height * line_idx as f32,
@@ -2575,10 +2609,11 @@ impl Element for TerminalElement {
             let cw = f32::from(cell.width);
             let chh = f32::from(cell.height);
             for (line_idx, line) in state.lines.iter().enumerate() {
-                for bc in &line.box_cells {
+                for bc in &line.raw.box_cells {
                     let cell_x = origin.x + cell.width * bc.col as f32;
                     let cell_y = origin.y + cell.height * line_idx as f32;
-                    for r in crate::box_drawing::rects(bc.parts, cw, chh) {
+                    let (bars, n) = crate::box_drawing::rects(bc.parts, cw, chh);
+                    for r in &bars[..n] {
                         let pos = point(cell_x + px(r.x), cell_y + px(r.y));
                         let sz = size(px(r.w), px(r.h));
                         window.paint_quad(fill(Bounds::new(pos, sz), bc.color));
