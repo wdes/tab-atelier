@@ -1078,7 +1078,11 @@ impl AppState {
                 loop {
                     let shown = visible.load(std::sync::atomic::Ordering::Relaxed);
                     cx.background_executor()
-                        .timer(std::time::Duration::from_millis(if shown { 500 } else { 1000 }))
+                        .timer(if shown {
+                            std::time::Duration::from_millis(500)
+                        } else {
+                            std::time::Duration::from_secs(1)
+                        })
                         .await;
                     // Hidden: the window can't resize and an exit dialog
                     // can't be seen — skip the entity entirely; the first
