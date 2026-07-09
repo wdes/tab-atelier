@@ -3305,6 +3305,36 @@ mod tests {
     }
 
     #[test]
+    fn load_state_with_outputs_hydrates_per_tab_files() {
+        let dir = std::env::temp_dir().join("ta-test-hydrate");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mk = |name: &str| TabState {
+            name: name.into(),
+            colors_enabled: true,
+            ..Default::default()
+        };
+        save_state(
+            &dir,
+            &SavedState {
+                tabs: vec![mk("one"), mk("two"), mk("three")],
+                active: 0,
+                windowed: false,
+            },
+        );
+        save_tab_output(&dir, "one", "hello from one");
+        save_tab_uptime(&dir, "two", 42.5);
+
+        // Multiple tabs ⇒ the threaded fan-out path runs.
+        let loaded = load_state_with_outputs(&dir, &dir).expect("state loads");
+        assert_eq!(loaded.tabs[0].output.as_deref(), Some("hello from one"));
+        assert!(loaded.tabs[0].uptime_secs.is_none(), "no uptime file for 'one'");
+        assert!((loaded.tabs[1].uptime_secs.unwrap() - 42.5).abs() < 0.01);
+        assert!(loaded.tabs[2].output.is_none(), "no files at all for 'three'");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_load_state_malformed_json() {
         let dir = std::env::temp_dir().join("ta-test-malformed");
         let sd = dir.join(APP_DIR);
