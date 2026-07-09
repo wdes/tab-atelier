@@ -1,6 +1,17 @@
 name: Build
 
-on: [push, pull_request]
+# push is main-only: `on: [push, pull_request]` ran everything twice
+# per PR commit (once per event), and tag pushes are already covered by
+# release.yml + apt-publish.
+on:
+    push:
+        branches: [main]
+    pull_request:
+
+# main is never cancelled — its runs publish the codecov base.
+concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
     contents: read
@@ -17,24 +28,14 @@ jobs:
             deb-artifact-id: ${{ steps.upload-deb.outputs.artifact-id }}
         steps:
             - uses: actions/checkout@v7
-            # ubuntu-latest ships with ~14 GB free; the instrumented
-            # cargo build + cargo test (coverage) + headless build +
-            # `cargo deb` (which re-runs cargo build --release for two
-            # variants) easily exhausts that. Frees ~30 GB by removing
-            # the pre-installed Android SDK / .NET / GHC / CodeQL
-            # bundles we don't use. Cheap (a few seconds); the prior
-            # run died with `IOException: No space left on device`
-            # mid-clippy.
-            - name: Free disk space
-              uses: jlumbroso/free-disk-space@v1.3.1
-              with:
-                  tool-cache: false
-                  android: true
-                  dotnet: true
-                  haskell: true
-                  large-packages: false
-                  docker-images: false
-                  swap-storage: false
+            # ubuntu-latest's ~14 GB free isn't enough for the coverage
+            # + headless + release targets (a prior run died with "No
+            # space left on device" mid-clippy). Backgrounded: the space
+            # isn't needed until the first cargo step, minutes away.
+            - name: Free disk space (background)
+              run: |
+                  sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup &
+                  echo "→ freeing ~30 GB in the background (pid $!)"
             - name: Install system dependencies
               run: |
                   sudo apt-get update
@@ -58,6 +59,10 @@ jobs:
                   components: clippy, rustfmt, llvm-tools
             - name: Cache cargo artifacts
               uses: Swatinem/rust-cache@v2
+              with:
+                  # Per-branch multi-GB saves evict main's entry from the
+                  # repo's 10 GB cache budget; PR runs restore main's.
+                  save-if: ${{ github.ref == 'refs/heads/main' }}
             - name: Build without energy feature
               run: cargo check --locked --no-default-features --features gui
             - name: Build
@@ -74,8 +79,11 @@ jobs:
                   CARGO_INCREMENTAL: "0"
                   RUSTFLAGS: "-Cinstrument-coverage"
                   RUSTDOCFLAGS: "-Cinstrument-coverage"
+            # Feature set must match the build/clippy steps above (and
+            # the shipped headless .deb) — a differing set compiles the
+            # whole crate graph once more just for this step.
             - name: Run headless tests
-              run: cargo test --locked --no-default-features --features headless --no-fail-fast
+              run: cargo test --locked --no-default-features --features headless,energy --no-fail-fast
             - name: Check formatting
               run: cargo fmt -- --check
             - name: Clippy (GUI)
@@ -101,9 +109,16 @@ jobs:
                   flags: rust
                   fail_ci_if_error: false
                   token: ${{ secrets.CODECOV_TOKEN }}
-            - name: Build .deb packages
+            - name: Build .deb packages (smoke-test only)
+              # These debs only feed the integration job below; users
+              # install the ones apt-publish.yml / release.yml build
+              # with the real fat-LTO profile. Env (not Cargo.toml) so
+              # the target/release/ asset paths stay valid.
+              env:
+                  CARGO_PROFILE_RELEASE_LTO: "off"
+                  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
               run: |
-                  cargo install cargo-deb
+                  cargo install cargo-deb --locked
                   cargo deb -p tab-atelier --locked
                   cargo deb -p tab-atelier --variant headless --locked
             - name: Upload .deb packages
