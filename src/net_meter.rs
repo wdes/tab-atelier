@@ -27,26 +27,34 @@ use std::collections::{HashMap, HashSet};
 /// Counts entries whose socket inode is in `inodes` **and** that have a real
 /// remote endpoint (a non-zero remote port — so listeners and unconnected
 /// sockets don't inflate the number). Pure over the table text so it's
-/// unit-testable.
+/// unit-testable. Socket inodes are unique across the kernel tables, so the
+/// intersection size equals the row count the old per-row filter produced.
 #[must_use]
 pub fn count_connections<S: std::hash::BuildHasher>(table: &str, inodes: &HashSet<u64, S>) -> usize {
-    table
-        .lines()
-        .skip(1) // header row
-        .filter(|line| {
-            let f: Vec<&str> = line.split_whitespace().collect();
-            // sl(0) local(1) rem(2) st(3) … uid(7) timeout(8) inode(9)
-            if f.len() < 10 {
-                return false;
-            }
-            // Remote endpoint present? `IP:PORT` in hex; "…:0000" ⇒ none.
-            let has_remote = f[2].rsplit(':').next().is_some_and(|port| port != "0000");
-            if !has_remote {
-                return false;
-            }
-            f[9].parse::<u64>().is_ok_and(|inode| inodes.contains(&inode))
-        })
-        .count()
+    let mut connected = HashSet::new();
+    collect_connected_inodes(table, &mut connected);
+    inodes.iter().filter(|i| connected.contains(i)).count()
+}
+
+/// Add the socket inodes of every *connected* entry (non-zero remote port)
+/// in one `/proc/net/{tcp,udp}` table to `out`. Zero-allocation tokenizing
+/// — the old form collected a `Vec<&str>` per socket line, and
+/// [`connection_counts`] used to re-tokenize the whole joined text once
+/// per TAB; the tables are now parsed exactly once per refresh.
+fn collect_connected_inodes(table: &str, out: &mut HashSet<u64>) {
+    for line in table.lines().skip(1) {
+        // sl(0) local(1) rem(2) st(3) … uid(7) timeout(8) inode(9)
+        let mut f = line.split_whitespace();
+        let Some(rem) = f.nth(2) else { continue };
+        // Remote endpoint present? `IP:PORT` in hex; "…:0000" ⇒ none.
+        if rem.rsplit(':').next().is_none_or(|port| port == "0000") {
+            continue;
+        }
+        // After nth(2) the iterator resumes at st(3); inode(9) is 6 on.
+        if let Some(inode) = f.nth(6).and_then(|s| s.parse::<u64>().ok()) {
+            out.insert(inode);
+        }
+    }
 }
 
 /// Socket inodes held by `pid` — reads `/proc/<pid>/fd/*`, whose symlink
@@ -70,10 +78,13 @@ fn parse_socket_link(link: &str) -> Option<u64> {
     link.strip_prefix("socket:[")?.strip_suffix(']')?.parse().ok()
 }
 
-/// Build a `pid -> ppid` map from `/proc/<pid>/stat` for every process. Used
-/// to gather a tab's descendant pids from its shell's root pid.
-fn ppid_map() -> HashMap<u32, u32> {
-    let mut map = HashMap::new();
+/// Build a `ppid -> children` adjacency map from `/proc/<pid>/stat` for
+/// every process. Used to gather a tab's descendant pids from its shell's
+/// root pid with a plain BFS — O(subtree) per tab, where the old
+/// `pid -> ppid` form needed a fixed-point sweep over the WHOLE host
+/// process list per tab.
+fn children_map() -> HashMap<u32, Vec<u32>> {
+    let mut map: HashMap<u32, Vec<u32>> = HashMap::new();
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return map;
     };
@@ -84,7 +95,7 @@ fn ppid_map() -> HashMap<u32, u32> {
         if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat"))
             && let Some(ppid) = parse_ppid(&stat)
         {
-            map.insert(pid, ppid);
+            map.entry(ppid).or_default().push(pid);
         }
     }
     map
@@ -99,51 +110,44 @@ fn parse_ppid(stat: &str) -> Option<u32> {
     after.split_whitespace().nth(1)?.parse().ok()
 }
 
-/// All descendants of `root` (inclusive), per the `pid -> ppid` map.
-fn descendants(root: u32, ppids: &HashMap<u32, u32>) -> Vec<u32> {
-    let mut want = HashSet::from([root]);
-    // Iterate to a fixed point — a child whose parent is already wanted gets
-    // added; repeat until no growth. Process trees are shallow so this
-    // converges in a couple of passes.
-    loop {
-        let before = want.len();
-        for (&pid, &ppid) in ppids {
-            if want.contains(&ppid) {
-                want.insert(pid);
-            }
+/// All descendants of `root` (inclusive), per the `ppid -> children` map.
+/// The ppid relation is a forest, so a plain frontier walk terminates.
+fn descendants(root: u32, children: &HashMap<u32, Vec<u32>>) -> Vec<u32> {
+    let mut out = vec![root];
+    let mut i = 0;
+    while i < out.len() {
+        if let Some(kids) = children.get(&out[i]) {
+            out.extend_from_slice(kids);
         }
-        if want.len() == before {
-            break;
-        }
+        i += 1;
     }
-    want.into_iter().collect()
+    out
 }
 
-/// Active outbound connection count per tab, keyed by tab id. `roots` is
-/// each tab's shell root pid. Reads the four net tables + the process tree
-/// once for the whole batch.
+/// Active outbound connection count per tab, keyed by tab id.
+///
+/// `roots` is each tab's shell root pid. Reads the four net tables + the
+/// process tree once for the whole batch; the per-tab work is one BFS over
+/// the tab's own subtree plus a membership test per tab-owned socket fd.
 #[must_use]
 pub fn connection_counts(roots: &[(String, u32)]) -> HashMap<String, usize> {
     let mut result = HashMap::new();
     if roots.is_empty() {
         return result;
     }
-    let tables: String = ["tcp", "tcp6", "udp", "udp6"]
-        .iter()
-        .filter_map(|t| std::fs::read_to_string(format!("/proc/net/{t}")).ok())
-        .collect::<Vec<_>>()
-        .join("\n");
-    let ppids = ppid_map();
+    let mut connected: HashSet<u64> = HashSet::new();
+    for t in ["tcp", "tcp6", "udp", "udp6"] {
+        if let Ok(text) = std::fs::read_to_string(format!("/proc/net/{t}")) {
+            collect_connected_inodes(&text, &mut connected);
+        }
+    }
+    let children = children_map();
     for (id, root) in roots {
         let mut inodes = HashSet::new();
-        for pid in descendants(*root, &ppids) {
+        for pid in descendants(*root, &children) {
             socket_inodes(pid, &mut inodes);
         }
-        // Each of the four tables has its own header line; `count_connections`
-        // skips one. We joined them, so re-split per original table would be
-        // cleaner — but the joined header lines simply never match an inode,
-        // so they're harmless. Count across the joined text.
-        result.insert(id.clone(), count_connections(&tables, &inodes));
+        result.insert(id.clone(), inodes.iter().filter(|i| connected.contains(i)).count());
     }
     result
 }
@@ -193,8 +197,8 @@ mod tests {
     #[test]
     fn descendants_follows_the_tree() {
         // 1 -> 2 -> 3, plus unrelated 9 -> 8.
-        let ppids = HashMap::from([(2u32, 1u32), (3, 2), (8, 9)]);
-        let mut got = descendants(1, &ppids);
+        let children = HashMap::from([(1u32, vec![2u32]), (2, vec![3]), (9, vec![8])]);
+        let mut got = descendants(1, &children);
         got.sort_unstable();
         assert_eq!(got, vec![1, 2, 3]);
     }
