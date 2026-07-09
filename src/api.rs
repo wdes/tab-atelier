@@ -483,8 +483,10 @@ pub struct TabSnapshot {
     /// Cached serialized `/tabs` JSON body. Built lazily on the first GET
     /// after invalidation; cleared by `persist()` whenever the snapshot
     /// changes. Avoids rebuilding the whole response (`strip_ansi` per tab,
-    /// pretty-printed JSON) on every mobile-remote poll.
-    pub cached_response: Option<String>,
+    /// pretty-printed JSON) on every mobile-remote poll. `Arc<str>` so a
+    /// cache hit hands the body out with a refcount bump — the full-body
+    /// `String` copy used to happen while holding this snapshot's mutex.
+    pub cached_response: Option<std::sync::Arc<str>>,
     /// Lock-free "someone is talking to the daemon" signal. Bumped (via
     /// [`Self::touch`]) by every handled HTTP request and every WS `in`
     /// frame. The GUI's input-drain tick and the headless main loop read
@@ -865,7 +867,11 @@ fn maybe_gzip(bytes: &[u8], accept_gzip: bool) -> Option<Vec<u8>> {
     if !accept_gzip || bytes.len() < MIN_BODY {
         return None;
     }
-    let mut enc = flate2::write::GzEncoder::new(Vec::with_capacity(bytes.len() / 4), flate2::Compression::default());
+    // `fast` (level 1), not `default` (level 6): these are polled live
+    // endpoints (/tabs, /output) re-compressed per response, and
+    // terminal text / JSON compresses nearly as well at level 1 for a
+    // fraction of the CPU. The WS path made the same call (`api_ws::gzip`).
+    let mut enc = flate2::write::GzEncoder::new(Vec::with_capacity(bytes.len() / 4), flate2::Compression::fast());
     Write::write_all(&mut enc, bytes).ok()?;
     enc.finish().ok()
 }
@@ -1475,8 +1481,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
     match (method.as_str(), path.as_str()) {
         ("GET", "/" | "/tabs") => {
             let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(cached) = state.cached_response.as_deref() {
-                let body = cached.to_owned();
+            if let Some(body) = state.cached_response.clone() {
                 drop(state);
                 respond_with_etag(
                     stream,
@@ -1558,7 +1563,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 host,
                 tabs,
             };
-            let body = serde_json::to_string_pretty(&resp).unwrap_or_default();
+            let body: std::sync::Arc<str> = serde_json::to_string_pretty(&resp).unwrap_or_default().into();
             state.cached_response = Some(body.clone());
             drop(state);
             respond_with_etag(
