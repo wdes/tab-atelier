@@ -158,21 +158,47 @@ pub fn start_power_monitor(
     tab_pids: Arc<Mutex<Vec<u32>>>,
     results: Arc<Mutex<Vec<TabPower>>>,
     battery: Arc<Mutex<Option<u8>>>,
+    hot: Arc<std::sync::atomic::AtomicBool>,
 ) {
     std::thread::spawn(move || {
         let mut monitor = PowerMonitor::new();
-        let interval = std::time::Duration::from_secs(2);
+        // Fast cadence while someone can SEE the numbers (window visible /
+        // API consumer active — the owner flips `hot`); 5× slower
+        // otherwise. The sample itself walks every tab's whole /proc
+        // subtree (one stat + children read per descendant — ~hundreds of
+        // opens with a fleet of agent tabs), which is a lot of steady
+        // background syscalls for a hidden display. Sampling never stops
+        // entirely: the energy accounting integrates these watts, and
+        // agents keep drawing power while the window is hidden — the
+        // jiffies/energy counters are cumulative, so a longer window
+        // loses no energy, just per-tab display granularity.
+        let step = std::time::Duration::from_secs(2);
+        let cold_every = 5u32; // 10 s cadence when nobody is looking
+        let mut cold_ctr = 0u32;
+        let mut last_sample = std::time::Instant::now();
         loop {
-            std::thread::sleep(interval);
+            std::thread::sleep(step);
+            if !hot.load(std::sync::atomic::Ordering::Relaxed) {
+                cold_ctr += 1;
+                if cold_ctr < cold_every {
+                    continue;
+                }
+            }
+            cold_ctr = 0;
             *battery.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = read_battery_percent();
             let pids = tab_pids
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
+            let elapsed = last_sample.elapsed().as_secs_f64();
+            last_sample = std::time::Instant::now();
             if pids.is_empty() {
                 continue;
             }
-            let snapshot = monitor.sample(&pids, interval.as_secs_f64());
+            // Real elapsed time, not the nominal interval — the watts
+            // figure would otherwise be 5× off on the first hot sample
+            // after a cold stretch.
+            let snapshot = monitor.sample(&pids, elapsed);
             *results.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = snapshot;
         }
     });
