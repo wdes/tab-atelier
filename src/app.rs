@@ -91,6 +91,14 @@ struct Tab {
     /// meaningful additional energy has been consumed since last save.
     #[cfg(feature = "energy")]
     energy_wh_last_saved: f64,
+    /// Last token usage flushed to `tokens_tab-<name>.json`. Skips the
+    /// write when unchanged — `save_tab_tokens` fsyncs the file AND its
+    /// directory, and without this gate every agent tab paid those two
+    /// fsyncs every 2 s persist tick for an almost-always-identical
+    /// ~40-byte file. `Cell` because the token loop borrows `self.tabs`
+    /// immutably.
+    #[cfg(feature = "catbus")]
+    tokens_last_saved: std::cell::Cell<Option<crate::TokenUsage>>,
     /// Saved scrollback that hasn't been fed back into the terminal yet.
     /// Tabs other than the active one defer this work until first focus
     /// so cold-launch with many tabs doesn't block on vte-parsing each
@@ -706,6 +714,8 @@ impl AppState {
                         energy_wh: ts.energy_wh.unwrap_or(0.0),
                         #[cfg(feature = "energy")]
                         energy_wh_last_saved: ts.energy_wh.unwrap_or(0.0),
+                        #[cfg(feature = "catbus")]
+                        tokens_last_saved: std::cell::Cell::new(None),
                         // Seed with the hash of the just-restored output so the
                         // first persist tick after launch doesn't rewrite an
                         // identical file.
@@ -762,6 +772,8 @@ impl AppState {
                         energy_wh: 0.0,
                         #[cfg(feature = "energy")]
                         energy_wh_last_saved: 0.0,
+                        #[cfg(feature = "catbus")]
+                        tokens_last_saved: std::cell::Cell::new(None),
                         pending_restore: None,
                         last_known_cwd: None,
                         last_known_cwd_string: None,
@@ -812,6 +824,8 @@ impl AppState {
                         energy_wh: 0.0,
                         #[cfg(feature = "energy")]
                         energy_wh_last_saved: 0.0,
+                        #[cfg(feature = "catbus")]
+                        tokens_last_saved: std::cell::Cell::new(None),
                         pending_restore: None,
                         last_known_cwd: None,
                         last_known_cwd_string: None,
@@ -1274,6 +1288,8 @@ impl AppState {
                 energy_wh: 0.0,
                 #[cfg(feature = "energy")]
                 energy_wh_last_saved: 0.0,
+                #[cfg(feature = "catbus")]
+                tokens_last_saved: std::cell::Cell::new(None),
                 pending_restore: None,
                 last_known_cwd_string: cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
                 last_known_cwd: cwd,
@@ -1611,8 +1627,13 @@ impl AppState {
                 let pid = tab.view.read(cx).pid();
                 if let Some(session) = crate::catbus_agent::find_session(pid)
                     && let Some(usage) = crate::catbus_agent::read_session_tokens(&session)
+                    // Usage is cumulative and only moves when the agent
+                    // finishes a prompt — skip the (double-fsync) rewrite
+                    // of an identical ~40-byte file on all other ticks.
+                    && tab.tokens_last_saved.get() != Some(usage)
                 {
                     save_tab_tokens(&state_base, &tab.name, &usage);
+                    tab.tokens_last_saved.set(Some(usage));
                 }
             }
         }
@@ -1827,9 +1848,12 @@ impl AppState {
                 }
                 match activity {
                     // The agent process is gone but no `idle` status POST cleared
-                    // the session (killed / crashed / plain exit). Drop the stale
-                    // session so the tab stops showing a phantom dormant-blue LED
-                    // for an agent that isn't there anymore.
+                    // the session (killed / crashed / Ctrl-D / closed without
+                    // `/exit` — cases where the SessionEnd hook never ran). Drop
+                    // the stale session so the tab stops showing a phantom LED
+                    // for an agent that isn't there anymore. `Gone` is exactly
+                    // `!has_agent_descendant`, so this arm IS the process-
+                    // presence sweep — no separate `/proc` walk needed.
                     crate::catbus_agent::AgentActivity::Gone => {
                         tab.agent_kind = None;
                         tab.agent_session_id = None;
@@ -1873,25 +1897,10 @@ impl AppState {
                     tab.agent_state = None;
                 }
             }
-            // Process-presence sweep: clear the whole agent attachment
-            // (state + session + kind) when the agent CLI is no longer
-            // a descendant of the tab's shell. Catches Ctrl-D / crash
-            // / "closed claude without /exit" cases where the SessionEnd
-            // hook never gets a chance to run — without this the LED
-            // would keep amber-blinking from a stale Stop event until
-            // the 2-min staleness sweep above eventually fires.
-            #[cfg(feature = "catbus")]
-            for tab in &mut self.tabs {
-                if tab.agent_kind.is_some() {
-                    let pid = tab.view.read(cx).pid();
-                    if !crate::catbus_agent::has_agent_descendant(pid) {
-                        tab.agent_state = None;
-                        tab.agent_session_id = None;
-                        tab.agent_kind = None;
-                        tab.agent_plan_mode = None;
-                    }
-                }
-            }
+            // (The process-presence sweep that used to live here re-walked
+            // every agent tab's `/proc` subtree a second time per tick; the
+            // `AgentActivity::Gone` arm above already clears the attachment
+            // from the same walk, so it was pure duplicate syscall traffic.)
             // Auto-resume sweep: type the queued resume command into
             // any tab whose shell has had ~500ms to print its prompt.
             // `flush_pending_agent_resume` takes the queued command,
