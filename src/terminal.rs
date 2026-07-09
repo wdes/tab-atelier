@@ -262,9 +262,9 @@ struct CachedLine {
     urls: std::rc::Rc<Vec<CachedUrl>>,
     /// Fingerprint of the shaping inputs the plain `text` does NOT capture
     /// (per-run colour + font weight/style + under/strikethrough). The cache
-    /// is keyed on `grid_line`; validating on `text` alone let a line whose
-    /// text was unchanged but whose colour changed reuse stale glyphs shaped
-    /// in the old colour. See [`line_style_sig`].
+    /// is keyed on [`RawLine::abs_line`]; validating on `text` alone let a
+    /// line whose text was unchanged but whose colour changed reuse stale
+    /// glyphs shaped in the old colour. See [`line_style_sig`].
     sig: u64,
 }
 
@@ -342,14 +342,15 @@ pub struct TerminalView {
     /// outside that set keep their cached `RawLine` and the Phase 1
     /// cell-scan is skipped entirely for them.
     ///
-    /// Cache validity is keyed by `(display_offset, visible_cols,
-    /// visible_lines, history_size)` — any scroll / resize discards the
-    /// whole cache since the row-row mapping changes. `history_size` is
-    /// the crucial one for a *live*-screen scroll: pushing a line into
-    /// scrollback shifts every visible row up by one while
-    /// `display_offset` stays 0, and alacritty only damages the newly
-    /// exposed bottom row — so without this key the shifted rows keep
-    /// their stale cached `RawLine` (e.g. an old inverse-red diff line
+    /// Cache validity / row realignment is decided by
+    /// [`CachedFrame::shift_for`]: a resize or any output-while-the-
+    /// window-moved discards the rows, a pure user scroll *shifts* them
+    /// (the content is unchanged, only the viewport window moved), and
+    /// a stationary window reuses them index-for-index under damage.
+    /// `history_size` matters for a *live*-screen scroll: pushing a
+    /// line into scrollback shifts every visible row up while
+    /// `display_offset` stays 0, so index-keyed reuse without the shift
+    /// check serves stale rows (e.g. an old inverse-red diff line
     /// bleeding red under the next thing drawn there).
     prev_frame: Rc<RefCell<Option<CachedFrame>>>,
     /// Last fully-built prepaint output. When the parser thread holds
@@ -383,9 +384,15 @@ struct CachedFrame {
     visible_cols: usize,
     visible_lines: usize,
     /// Scrollback length at build time. A change means the live screen
-    /// scrolled (rows shifted up), so the whole index-keyed cache is
-    /// stale even though `display_offset` is still 0.
+    /// scrolled (rows shifted up), so the index-keyed rows only stay
+    /// valid through the shift arithmetic in [`Self::shift_for`].
     history_size: usize,
+    /// PTY ring byte counter at build time. Bytes are counted into the
+    /// ring BEFORE alacritty parses them, so an unchanged counter means
+    /// the grid *content* is unchanged and only the viewport window can
+    /// have moved (a `scroll_display`) — the signal that makes shifted
+    /// reuse safe for user scrolling.
+    ring_len: u64,
     /// `Rc` so handing the rows to Phase 2 each frame is a refcount
     /// bump per row — the old `RawLine` deep clone (text + segments +
     /// runs for EVERY visible row) ran under the Term lock every paint.
@@ -393,24 +400,71 @@ struct CachedFrame {
 }
 
 impl CachedFrame {
-    /// Whether this cached frame may be reused for the current grid
-    /// state. ALL of the geometry keys must match — and crucially
-    /// `history_size`: a live-screen scroll grows the scrollback while
-    /// `display_offset` stays 0 and only the new bottom row is damaged,
-    /// so reusing the index-keyed cache then serves stale `RawLine`s
-    /// (the inverse-red bg bleeding under later-drawn content). Keep
-    /// every field in this check; dropping one reintroduces that bug.
-    const fn reusable_for(
+    /// How the current viewport maps onto this cached frame's rows, or
+    /// `None` when the rows must be rebuilt from scratch.
+    ///
+    /// `Some(0)`: same window (offset AND scrollback length unchanged) —
+    /// rows are index-stable, caller applies damage as usual.
+    ///
+    /// `Some(shift)`: the window moved over UNCHANGED content (the ring
+    /// counter proves no PTY bytes arrived since the build): slot `i`
+    /// now shows what old slot `i + shift` held. This is every wheel /
+    /// scrollbar step — previously a full rescan + reshape of all rows
+    /// per step, because alacritty marks the whole screen damaged on
+    /// any `scroll_display`.
+    ///
+    /// `None`: geometry changed, or output arrived while the window
+    /// moved (streaming, `\x1b[3J`, scroll-during-flood). The old
+    /// stale-bg-bleed guard lives here: a live-screen scroll grows
+    /// `history_size` while `display_offset` stays 0, and index-keyed
+    /// reuse without the shift served stale inverse-video rows.
+    fn shift_for(
         &self,
         display_offset: i32,
         visible_cols: usize,
         visible_lines: usize,
         history_size: usize,
-    ) -> bool {
-        self.display_offset == display_offset
-            && self.visible_cols == visible_cols
-            && self.visible_lines == visible_lines
-            && self.history_size == history_size
+        ring_len: u64,
+    ) -> Option<i32> {
+        if self.visible_cols != visible_cols || self.visible_lines != visible_lines {
+            return None;
+        }
+        if self.display_offset == display_offset && self.history_size == history_size {
+            return Some(0);
+        }
+        if ring_len != self.ring_len {
+            return None;
+        }
+        // Content-stable line coordinate: `history_size - display_offset`
+        // is the scrollback line shown in viewport slot 0. Same content,
+        // different window → the slot delta is the difference of bases.
+        let base = history_size as i64 - i64::from(display_offset);
+        let prev_base = self.history_size as i64 - i64::from(self.display_offset);
+        i32::try_from(base - prev_base).ok()
+    }
+}
+
+/// Realign cached rows after a pure scroll: slot `i` takes the row that
+/// sat at slot `i + shift`; slots whose source falls outside the old
+/// window become `None` (rebuilt by the cell scan). In-place rotation —
+/// no per-scroll-step Vec allocation.
+fn shift_rows<T>(rows: &mut [Option<T>], shift: i32) {
+    let s = rows.len().min(shift.unsigned_abs() as usize);
+    if s == rows.len() {
+        for slot in rows.iter_mut() {
+            *slot = None;
+        }
+    } else if shift > 0 {
+        rows.rotate_left(s);
+        let start = rows.len() - s;
+        for slot in &mut rows[start..] {
+            *slot = None;
+        }
+    } else {
+        rows.rotate_right(s);
+        for slot in &mut rows[..s] {
+            *slot = None;
+        }
     }
 }
 
@@ -1734,6 +1788,7 @@ impl Render for TerminalView {
                 hover_grid: self.hover_grid.clone(),
                 prev_frame: self.prev_frame.clone(),
                 last_prepaint: self.last_prepaint.clone(),
+                pty_ring: self.pty_ring.clone(),
             })
     }
 }
@@ -1761,6 +1816,10 @@ struct TerminalElement {
     hover_grid: Rc<Cell<Option<(usize, usize)>>>,
     prev_frame: Rc<RefCell<Option<CachedFrame>>>,
     last_prepaint: Rc<RefCell<Option<TermPrepaint>>>,
+    /// Same ring as [`TerminalView::pty_ring`]; prepaint reads its byte
+    /// counter as the "did any output arrive since the cached frame was
+    /// built" signal for [`CachedFrame::shift_for`].
+    pty_ring: Arc<std::sync::Mutex<crate::pty_ring::PtyRing>>,
 }
 
 impl IntoElement for TerminalElement {
@@ -1836,7 +1895,17 @@ struct RawSegment {
 /// [`TerminalView::prev_frame`] for damage-driven re-use.
 #[derive(Clone)]
 struct RawLine {
-    grid_line: i32,
+    /// Content-stable line coordinate: `history_size - display_offset +
+    /// viewport_row`, i.e. the row's distance from the top of the
+    /// scrollback. Unlike a viewport index it does NOT change when the
+    /// user scrolls or when streaming pushes lines into history, so the
+    /// Phase-2 shaping cache keyed on it survives both — previously
+    /// every scroll step and every streaming frame re-shaped ALL
+    /// visible rows because the key was viewport-anchored. When the
+    /// scrollback ring is full the coordinate saturates (content
+    /// rotates under a pinned `history_size`); the cache's text +
+    /// style-sig validation turns that into misses, never stale glyphs.
+    abs_line: i32,
     text: String,
     segments: Vec<RawSegment>,
     bg_runs: Vec<BgRun>,
@@ -1850,7 +1919,7 @@ const fn fnv_mix(h: u64, v: u64) -> u64 {
 
 /// FNV-1a fingerprint of a line's *shaping inputs* — the per-run foreground
 /// colour, font weight/style, and under/strikethrough presence. The Phase-2
-/// [`CachedLine`] cache is keyed on `grid_line` and used to be validated on
+/// [`CachedLine`] cache is keyed on `abs_line` and used to be validated on
 /// `text` alone, so a row whose text was unchanged but whose colours changed
 /// reused the previously-shaped glyphs in the stale colour.
 ///
@@ -1986,11 +2055,19 @@ impl Element for TerminalElement {
         // per-frame cell-scan cost drops from O(rows × cols) to
         // O(damaged_rows × cols).
         //
-        // Cache compatibility key: (display_offset, visible_cols,
-        // visible_lines). Scroll changes display_offset → invalidate
-        // since visible viewport-row N maps to a different grid-line;
-        // a resize changes visible_cols/lines → invalidate since the
-        // per-row `RawLine`s no longer match the new layout.
+        // Cache compatibility / row realignment: `CachedFrame::shift_for`.
+        // A resize rebuilds everything; a pure user scroll (no PTY bytes
+        // since the cache was built) SHIFTS the cached rows to their new
+        // slots instead of rescanning them; a stationary window reuses
+        // rows index-for-index under damage.
+
+        // Read the ring byte counter BEFORE taking the Term lock (the
+        // pump and the PTY tap take the ring lock on their own, so
+        // never nest it inside the Term lock). Bytes are counted into
+        // the ring before they are parsed, so a reuse check that sees
+        // an unchanged counter can only be wrong in the safe direction
+        // (spurious rebuild), never by missing arrived output.
+        let ring_len = self.pty_ring.lock().map_or(0, |r| r.total_len());
 
         // Non-blocking lock acquisition. During a heavy flood the
         // alacritty PTY-reader thread holds the Term lock for the
@@ -2015,10 +2092,11 @@ impl Element for TerminalElement {
             let display_offset = term.grid().display_offset() as i32;
             let visible_lines = term.grid().screen_lines().min(lines);
             let visible_cols = term.grid().columns().min(cols);
-            // Scrollback length now, used as a cache-validity key below: a
-            // live-screen scroll grows this while display_offset stays 0,
-            // and only the new bottom row is damaged — so the index-keyed
-            // line cache must be discarded or shifted rows bleed stale bg.
+            // Scrollback length now, one input to `shift_for` below: a
+            // live-screen scroll grows this while display_offset stays 0
+            // (rows shift up), a user scroll changes display_offset while
+            // this stays put — their difference is the content-stable
+            // base the cached rows are realigned against.
             let history_size = term.grid().history_size();
             let cursor_point = term.grid().cursor.point;
             // Honour the app's cursor-visibility mode. Every TUI hides
@@ -2035,7 +2113,7 @@ impl Element for TerminalElement {
             // (entire screen) or Partial (iter of damaged-row indices
             // in viewport coords). After consuming, `reset_damage`
             // clears so next paint sees only NEW changes.
-            let (force_full, mut damaged_rows) = {
+            let (force_full, damaged_rows) = {
                 use alacritty_terminal::term::TermDamage;
                 let mut rows = vec![false; visible_lines];
                 let mut force = false;
@@ -2043,13 +2121,17 @@ impl Element for TerminalElement {
                     TermDamage::Full => force = true,
                     TermDamage::Partial(iter) => {
                         for d in iter {
-                            // `d.line` is already viewport-row +
-                            // display_offset (see TermDamageIterator);
-                            // subtract back so we index into our
-                            // 0..visible_lines vec.
-                            let viewport_row = d.line.wrapping_sub(display_offset as usize);
-                            if viewport_row < rows.len() {
-                                rows[viewport_row] = true;
+                            // `d.line` IS the viewport row: alacritty
+                            // stores damage per screen line, and the
+                            // TermDamageIterator reports it shifted by
+                            // display_offset (screen line r is shown at
+                            // viewport row r + offset), truncating rows
+                            // pushed below the viewport. So this maps
+                            // correctly even while scrolled into
+                            // history — live-screen edits invalidate
+                            // exactly the rows they're visible on.
+                            if d.line < rows.len() {
+                                rows[d.line] = true;
                             }
                         }
                     }
@@ -2058,22 +2140,16 @@ impl Element for TerminalElement {
                 (force, rows)
             };
 
-            // If the user is scrolled into history, the damage tracker
-            // reflects edits to the *live screen* but our visible rows
-            // are showing scrollback. Skip the optimisation in that
-            // case — the cache compatibility check below still lets us
-            // reuse if scroll position is unchanged.
-            if display_offset > 0 {
-                damaged_rows.fill(false);
-            }
-
             // Take prev frame's `Vec<Option<RawLine>>` verbatim (no
             // intermediate alloc). Mark damaged rows as None so the
             // build loop below rebuilds them; un-damaged slots stay
             // populated and skip the rebuild entirely.
             let prev = self.prev_frame.borrow_mut().take();
-            let mut working: Vec<Option<Rc<RawLine>>> = match prev {
-                Some(p) if p.reusable_for(display_offset, visible_cols, visible_lines, history_size) => {
+            let shift = prev
+                .as_ref()
+                .and_then(|p| p.shift_for(display_offset, visible_cols, visible_lines, history_size, ring_len));
+            let mut working: Vec<Option<Rc<RawLine>>> = match (prev, shift) {
+                (Some(p), Some(0)) => {
                     let mut v = p.lines;
                     if force_full {
                         v.fill_with(|| None);
@@ -2087,6 +2163,26 @@ impl Element for TerminalElement {
                     v.resize_with(visible_lines, || None);
                     v
                 }
+                (Some(p), Some(shift)) => {
+                    // Pure scroll: identical content through a moved
+                    // window. Realign the rows; only the newly exposed
+                    // slots (shifted in from outside the old window)
+                    // are rescanned. `force_full` is IGNORED here — it
+                    // is the full damage alacritty marks for every
+                    // `scroll_display`, and the ring counter already
+                    // proved no bytes arrived to change the content —
+                    // but partial damage (a parser flush that raced the
+                    // cache build) still invalidates its rows.
+                    let mut v = p.lines;
+                    v.resize_with(visible_lines, || None);
+                    shift_rows(&mut v, shift);
+                    for (i, dmg) in damaged_rows.iter().enumerate() {
+                        if *dmg && i < v.len() {
+                            v[i] = None;
+                        }
+                    }
+                    v
+                }
                 _ => vec![None; visible_lines],
             };
 
@@ -2096,6 +2192,7 @@ impl Element for TerminalElement {
                     continue;
                 }
                 let grid_line = l as i32 - display_offset;
+                let abs_line = history_size as i32 + grid_line;
                 let mut full_text = String::with_capacity(visible_cols);
                 let mut segments: Vec<RawSegment> = Vec::new();
                 let mut cur_seg: Option<RawSegment> = None;
@@ -2337,7 +2434,7 @@ impl Element for TerminalElement {
                 }
 
                 *slot = Some(Rc::new(RawLine {
-                    grid_line,
+                    abs_line,
                     text: full_text,
                     segments,
                     bg_runs,
@@ -2357,6 +2454,7 @@ impl Element for TerminalElement {
                 visible_cols,
                 visible_lines,
                 history_size,
+                ring_len,
                 lines: working,
             });
 
@@ -2397,7 +2495,7 @@ impl Element for TerminalElement {
         let mut detected: Vec<DetectedUrl> = Vec::new();
         for (line_idx, raw) in raw_lines.into_iter().enumerate() {
             let sig = line_style_sig(&raw.segments);
-            if let Some(cached) = cache.remove(&raw.grid_line)
+            if let Some(cached) = cache.remove(&raw.abs_line)
                 && cached.text == raw.text
                 && cached.sig == sig
             {
@@ -2412,7 +2510,7 @@ impl Element for TerminalElement {
                     });
                 }
                 let segments = std::rc::Rc::clone(&cached.segments);
-                new_cache.insert(raw.grid_line, cached);
+                new_cache.insert(raw.abs_line, cached);
                 result_lines.push(TermLine {
                     // Cheap atomic bumps — no Vec/ShapedLine deep clone.
                     segments,
@@ -2470,7 +2568,7 @@ impl Element for TerminalElement {
                 });
             }
             new_cache.insert(
-                raw.grid_line,
+                raw.abs_line,
                 CachedLine {
                     text: raw.text.clone(),
                     segments: std::rc::Rc::clone(&shaped_rc),
@@ -2735,36 +2833,88 @@ mod tests {
         Rc::new(RefCell::new(None))
     }
 
-    /// Guards the stale-bg-bleed fix: the per-line frame cache must be
-    /// reused ONLY when geometry AND scrollback length match. A
-    /// live-screen scroll grows `history_size` while `display_offset`
-    /// stays 0 (alacritty damages only the new bottom row), so omitting
-    /// `history_size` from the key serves stale `RawLine`s and an old
-    /// inverse-red row bleeds under whatever is drawn there next.
-    #[test]
-    fn cached_frame_reuse_requires_history_size_match() {
-        let frame = CachedFrame {
-            display_offset: 0,
+    fn frame(display_offset: i32, history_size: usize, ring_len: u64) -> CachedFrame {
+        CachedFrame {
+            display_offset,
             visible_cols: 80,
             visible_lines: 24,
-            history_size: 100,
+            history_size,
+            ring_len,
             lines: Vec::new(),
-        };
-        // Identical state → reusable.
-        assert!(frame.reusable_for(0, 80, 24, 100));
-        // A scroll (history grew, display_offset still 0) → NOT reusable.
-        // This is the exact case the bug missed.
-        assert!(!frame.reusable_for(0, 80, 24, 101));
-        // Each other geometry key still invalidates too.
-        assert!(!frame.reusable_for(1, 80, 24, 100), "display_offset change");
-        assert!(!frame.reusable_for(0, 100, 24, 100), "cols change (resize)");
-        assert!(!frame.reusable_for(0, 80, 50, 100), "lines change (resize)");
+        }
+    }
+
+    /// A stationary window (offset AND scrollback length unchanged)
+    /// reuses rows index-for-index — `Some(0)`, damage applied by the
+    /// caller — and any resize rebuilds outright.
+    #[test]
+    fn cached_frame_stationary_and_resize() {
+        let f = frame(0, 100, 7);
+        assert_eq!(f.shift_for(0, 80, 24, 100, 7), Some(0));
+        // Same window, output arrived in place (TUI redraw): still
+        // index-stable; the damage rows handle the changed content.
+        assert_eq!(f.shift_for(0, 80, 24, 100, 9), Some(0));
+        assert_eq!(f.shift_for(0, 100, 24, 100, 7), None, "cols change (resize)");
+        assert_eq!(f.shift_for(0, 80, 50, 100, 7), None, "lines change (resize)");
+    }
+
+    /// Guards the stale-bg-bleed fix, now in shift form: when output
+    /// arrives AND the window moves (streaming grows `history_size`
+    /// while `display_offset` stays 0), the index-keyed rows must not
+    /// be reused as-is — the old bug served a stale inverse-red row
+    /// under whatever was drawn there next. With bytes in flight the
+    /// shift is not trustworthy either (the scrollback ring may be
+    /// saturated and rotating), so the frame rebuilds.
+    #[test]
+    fn cached_frame_stream_scroll_rebuilds() {
+        let f = frame(0, 100, 7);
+        assert_eq!(f.shift_for(0, 80, 24, 101, 8), None, "history grew + output");
+        assert_eq!(f.shift_for(0, 80, 24, 0, 8), None, "\\x1b[3J history clear");
+        assert_eq!(f.shift_for(5, 80, 24, 100, 8), None, "user scroll during flood");
+    }
+
+    /// A pure user scroll — no PTY bytes since the cache was built —
+    /// realigns the cached rows instead of rebuilding them: slot `i`
+    /// takes the row from old slot `i + shift`, where the shift is the
+    /// change of the content-stable base `history_size - display_offset`.
+    #[test]
+    fn cached_frame_pure_scroll_shifts() {
+        let f = frame(0, 100, 7);
+        // Scrolling up 5 lines: content moves DOWN the screen.
+        assert_eq!(f.shift_for(5, 80, 24, 100, 7), Some(-5));
+        // And back toward the bottom from offset 5.
+        assert_eq!(frame(5, 100, 7).shift_for(2, 80, 24, 100, 7), Some(3));
+        // Scrolled all the way with a full 10k scrollback: still a
+        // plain shift — history must never be truncated to avoid this.
+        assert_eq!(frame(0, 10_000, 7).shift_for(10_000, 80, 24, 10_000, 7), Some(-10_000));
+    }
+
+    /// The realignment itself: `None` slots are the rows the cell scan
+    /// rebuilds, everything else is carried over in place.
+    #[test]
+    fn shift_rows_realigns_and_exposes() {
+        let mut v: Vec<Option<u32>> = vec![Some(0), Some(1), Some(2), Some(3)];
+        // Content moved up 2 (scrolled toward the bottom): slot 0 shows
+        // what slot 2 held; the 2 newly exposed bottom slots rebuild.
+        shift_rows(&mut v, 2);
+        assert_eq!(v, vec![Some(2), Some(3), None, None]);
+        let mut v: Vec<Option<u32>> = vec![Some(0), Some(1), Some(2), Some(3)];
+        // Scrolled up 1: content moves down, top slot rebuilds.
+        shift_rows(&mut v, -1);
+        assert_eq!(v, vec![None, Some(0), Some(1), Some(2)]);
+        // A jump past the whole window exposes everything.
+        let mut v: Vec<Option<u32>> = vec![Some(0), Some(1)];
+        shift_rows(&mut v, 40);
+        assert_eq!(v, vec![None, None]);
+        let mut v: Vec<Option<u32>> = vec![Some(0), Some(1)];
+        shift_rows(&mut v, -40);
+        assert_eq!(v, vec![None, None]);
     }
 
     /// Guards the "pasted text is invisible until you edit it" fix. Readline
     /// highlights a bracketed paste with reverse-video, then re-emits the SAME
     /// characters without reverse the moment the region deactivates. The
-    /// Phase-2 glyph cache is keyed on `grid_line` + text; before the fix it
+    /// Phase-2 glyph cache is keyed on `abs_line` + text; before the fix it
     /// reused the reverse-shaped (background-coloured) glyphs on that
     /// identical-text redraw. `line_style_sig` must differ when only the
     /// colour changes so the redraw misses the cache and re-shapes.
