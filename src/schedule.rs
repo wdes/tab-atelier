@@ -40,6 +40,21 @@ thread_local! {
     static PARSED_RULE_CACHE: std::cell::RefCell<
         std::collections::HashMap<String, std::rc::Rc<opening_hours::OpeningHours>>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
+
+    /// Per-thread cache of the *current verdict* per `(rule, tz)` — see
+    /// [`TabSchedule::verdict_now`]. A `Vec` with linear scan, not a map:
+    /// an install has a handful of distinct schedules at most, and `&str`
+    /// comparison needs no per-lookup key allocation.
+    static VERDICT_CACHE: std::cell::RefCell<Vec<(String, String, Verdict)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A schedule's answer at "now", valid until [`Verdict::next_change`]
+/// passes (forever when `None` — the rule has no transitions, e.g. `24/7`).
+#[derive(Clone, Copy)]
+struct Verdict {
+    is_open: bool,
+    next_change: Option<DateTime<Utc>>,
 }
 
 /// Persisted per-tab schedule. Both fields are required; an empty
@@ -173,17 +188,58 @@ impl TabSchedule {
     }
 
     /// Convenience wrapper around [`Self::is_open_at`] using the
-    /// process's current wall-clock.
+    /// process's current wall-clock. Served from the per-thread verdict
+    /// cache — see [`Self::verdict_now`].
     #[must_use]
     pub fn is_open_now(&self) -> bool {
-        self.is_open_at(Utc::now())
+        self.verdict_now().is_open
     }
 
     /// Convenience wrapper around [`Self::next_change_at`] using the
-    /// process's current wall-clock.
+    /// process's current wall-clock. Served from the per-thread verdict
+    /// cache — see [`Self::verdict_now`].
     #[must_use]
     pub fn next_change_from_now(&self) -> Option<DateTime<Utc>> {
-        self.next_change_at(Utc::now())
+        self.verdict_now().next_change
+    }
+
+    /// Current verdict, memoised per `(rule, tz)` until the schedule's
+    /// own next transition instant. `is_open_now` runs on hot paths —
+    /// twice per `GET /output` response, three times per WS meta tick
+    /// per connection, and on every write gate — and each uncached call
+    /// costs a `Tz::from_str`, two chrono tz conversions, and an
+    /// opening-hours interval walk for an answer that can't change
+    /// until `next_change` passes. The cache turns all of that into a
+    /// short linear scan + one `DateTime` comparison.
+    ///
+    /// Explicit-instant callers ([`Self::is_open_at`] /
+    /// [`Self::next_change_at`]) stay uncached, so tests and
+    /// frozen-time callers remain exact.
+    fn verdict_now(&self) -> Verdict {
+        let now = Utc::now();
+        VERDICT_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if let Some((_, _, v)) = cache.iter().find(|(r, t, _)| r == &self.rule && t == &self.tz)
+                && v.next_change.is_none_or(|at| now < at)
+            {
+                return *v;
+            }
+            let v = Verdict {
+                is_open: self.is_open_at(now),
+                next_change: self.next_change_at(now),
+            };
+            if let Some(slot) = cache.iter_mut().find(|(r, t, _)| r == &self.rule && t == &self.tz) {
+                slot.2 = v;
+            } else {
+                // Defensive cap: schedules churned via the API shouldn't
+                // grow the scan list without bound.
+                if cache.len() >= 64 {
+                    cache.clear();
+                }
+                cache.push((self.rule.clone(), self.tz.clone(), v));
+            }
+            v
+        })
     }
 
     fn local_naive(&self, now_utc: DateTime<Utc>) -> NaiveDateTime {
@@ -354,6 +410,28 @@ mod tests {
     #[test]
     fn lock_reason_none_when_no_schedule_no_manual() {
         assert_eq!(lock_reason(false, None), None);
+    }
+
+    #[test]
+    fn cached_verdict_matches_uncached_and_is_stable() {
+        // `24/7` has no transitions ⇒ the cached verdict is valid forever
+        // and must agree with the explicit-instant path.
+        let always = TabSchedule::new("24/7", "UTC").unwrap();
+        assert!(always.is_open_now());
+        assert_eq!(always.next_change_from_now(), None);
+        assert!(always.is_open_now(), "second call served from cache");
+
+        // A rule with transitions: cached now-verdict agrees with the
+        // uncached is_open_at(now) and reports a future transition.
+        let office = TabSchedule::new("Mo-Fr 09:00-18:00", "Europe/Paris").unwrap();
+        let now = Utc::now();
+        assert_eq!(office.is_open_now(), office.is_open_at(now));
+        let next = office
+            .next_change_from_now()
+            .expect("weekday rule always has a next change");
+        assert!(next > now, "transition must be in the future");
+        // Distinct (rule, tz) entries don't clobber each other.
+        assert!(always.is_open_now());
     }
 
     #[test]
