@@ -487,3 +487,33 @@ pub fn sgr_color(sgr: &mut String, color: Color, foreground: bool) {
         }
     }
 }
+
+#[cfg(test)]
+mod cache_tests {
+    use super::GridSnapshotCache;
+
+    #[test]
+    fn new_stamps_crcs_of_both_dumps() {
+        let g = GridSnapshotCache::new(
+            42,
+            "hello".to_string(),
+            Some((1, 2)),
+            "raw rows".to_string(),
+            None,
+            80,
+            24,
+        );
+        assert_eq!(g.ring_len, 42);
+        assert_eq!(&*g.output, "hello");
+        assert_eq!(&*g.raw_output, "raw rows");
+        assert_eq!(g.output_crc, crate::crc32(b"hello"));
+        assert_eq!(g.raw_output_crc, crate::crc32(b"raw rows"));
+        assert_eq!((g.cols, g.rows), (80, 24));
+        assert_eq!(g.cursor, Some((1, 2)));
+        assert_eq!(g.raw_cursor, None);
+        // Clones share the dumps (refcount bump, not memcpy).
+        let c = g.clone();
+        assert!(std::sync::Arc::ptr_eq(&g.output, &c.output));
+        assert!(std::sync::Arc::ptr_eq(&g.raw_output, &c.raw_output));
+    }
+}
