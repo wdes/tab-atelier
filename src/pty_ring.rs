@@ -105,7 +105,11 @@ impl PtyRing {
     #[must_use]
     pub fn with_capacity(cap: usize) -> Self {
         Self {
-            bytes: VecDeque::with_capacity(cap.min(1024 * 1024)),
+            // Start small and let the deque grow toward `cap` on demand:
+            // the old 1 MiB pre-allocation charged every tab ~1 MiB of
+            // RSS at spawn even if it never printed more than a prompt
+            // (60 restored tabs ⇒ ~60 MiB of mostly-untouched buffers).
+            bytes: VecDeque::with_capacity(cap.min(64 * 1024)),
             base_offset: 0,
             cap: cap.max(1),
             notify: std::sync::Arc::new(tokio::sync::Notify::new()),
@@ -140,8 +144,14 @@ impl PtyRing {
     pub fn push(&mut self, data: &[u8]) {
         self.push_inner(data);
         // Wake the viewer pump so the new bytes flush within
-        // microseconds. Skip on an empty push (nothing to flush).
-        if !data.is_empty() {
+        // microseconds. Skip on an empty push (nothing to flush) and
+        // when nobody is attached — `notify_waiters` takes an internal
+        // waiter-list mutex even with zero waiters, and this runs once
+        // per PTY read on every tab (N unwatched flooding tabs would
+        // pay it thousands of times a second for nothing). A viewer
+        // increments the count before it first awaits the notifier, and
+        // the pump's 100 ms meta tick backstops any connect race.
+        if !data.is_empty() && self.viewer_count() > 0 {
             self.notify.notify_waiters();
         }
     }
