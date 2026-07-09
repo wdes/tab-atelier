@@ -44,6 +44,14 @@ use crate::{
 const INITIAL_COLS: usize = 80;
 const INITIAL_LINES: usize = 24;
 
+/// Main-loop tick while a client is active (input drained within one tick).
+const TICK_FAST: Duration = Duration::from_millis(16);
+/// Main-loop tick while nobody is connected — see the loop header in [`run`].
+const TICK_IDLE: Duration = Duration::from_millis(250);
+/// How long after the last API/WS activity the fast tick stays armed
+/// (covers think-pauses between keystrokes).
+const TICK_HOT: Duration = Duration::from_secs(2);
+
 // Shared with the GUI — see `crate::tab_env_extras`,
 // `crate::api_url_for_local_clients`, and
 // `crate::build_agent_resume_command` in lib.rs.
@@ -850,6 +858,7 @@ pub fn run() -> std::io::Result<()> {
         pending_renames: Vec::new(),
         pending_status_updates: Vec::new(),
         cached_response: None,
+        activity: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     }));
     info!("API server starting on {api_addr} (TLS {api_tls_addr})");
     api::start_api_server(api_state.clone(), api_token.clone(), read_only, api_addr);
@@ -877,16 +886,32 @@ pub fn run() -> std::io::Result<()> {
     let mut last_uptime_save: Option<Instant> = None;
     let mut last_state_hash: u32 = 0;
 
-    // --- Main tick: 100 ms ---
+    // --- Main tick ---
     // Fast 16 ms loop so a keystroke (WS `in` frame or POST /input)
     // lands in the PTY within ~16 ms instead of ~100 ms — the input
     // half of the web-viewer latency. The heavier per-tab work
     // (snapshot rebuild, 2 s disk persist, auto-resume sweep) only
     // needs ~10 Hz, so it's gated to every 6th tick below; the input
     // drain runs every tick.
-    let tick_interval = Duration::from_millis(16);
-    // Counts fast ticks; the slow block fires every 6th (~96 ms).
-    // Input drain is NOT gated by it.
+    //
+    // The 16 ms cadence only pays for itself while someone is actually
+    // connected. The daemon idles at 250 ms otherwise, keyed on two
+    // cheap lock-free signals: the snapshot's `activity` counter
+    // (bumped by every authenticated HTTP request and WS `in` frame)
+    // and the per-tab WS viewer counts. A headless box with agents
+    // running but nobody attached stops waking 62×/s; the first
+    // request after an idle stretch pays ≤250 ms once and the loop is
+    // back on the fast tick.
+    let activity = api_state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .activity
+        .clone();
+    let mut activity_last_seen = activity.load(Ordering::Relaxed);
+    let mut activity_last_change = Instant::now();
+    let mut tick_interval = TICK_FAST;
+    // Counts fast ticks; the slow block fires every 6th (~96 ms on the
+    // fast tick). Input drain is NOT gated by it.
     let mut slow_ctr: u32 = 0;
     // Seed the persist clock 2s in the past so the very first tick
     // forces a flush (state hashing then deduplicates on subsequent
@@ -900,6 +925,24 @@ pub fn run() -> std::io::Result<()> {
     let output_saver = OutputSaver::spawn(platform::state_base_dir());
     loop {
         std::thread::sleep(tick_interval);
+
+        // Pick the NEXT sleep's length from the two wake-keeping
+        // signals. Viewer counts are only consulted once the activity
+        // signal has gone cold, so the fast path stays two atomic loads.
+        let seq = activity.load(Ordering::Relaxed);
+        if seq != activity_last_seen {
+            activity_last_seen = seq;
+            activity_last_change = Instant::now();
+        }
+        tick_interval = if activity_last_change.elapsed() < TICK_HOT
+            || tabs
+                .iter()
+                .any(|t| t.pty_ring.lock().is_ok_and(|r| r.viewer_count() > 0))
+        {
+            TICK_FAST
+        } else {
+            TICK_IDLE
+        };
 
         if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
             info!("graceful shutdown requested by signal, flushing state");
