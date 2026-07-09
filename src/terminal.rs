@@ -1249,14 +1249,17 @@ impl TerminalView {
         self.ansi_lines(None).0.join("\n")
     }
 
-    /// A `Send` closure that serialises this tab's full scrollback to the same
-    /// string `copy_all_history` produces. Hands the `Term` `Arc` to a worker
-    /// thread so the expensive walk (up to 10k lines) runs OFF the gpui main
-    /// thread — the persist tick submits these instead of serialising inline,
-    /// which is what used to stall typing every 2 s under many active tabs.
-    pub fn history_job(&self) -> impl FnOnce() -> String + Send + 'static {
+    /// A `Send` closure that serialises this tab's scrollback (capped at
+    /// `max_lines`; `None` = full history) to the same string
+    /// `copy_all_history` produces. Hands the `Term` `Arc` to a worker
+    /// thread so the expensive walk runs OFF the gpui main thread — the
+    /// persist tick submits these instead of serialising inline, which is
+    /// what used to stall typing every 2 s under many active tabs. The
+    /// periodic caller caps the depth (`PERIODIC_OUTPUT_SAVE_LINES`) so
+    /// the walk also stops monopolising the Term lock the PARSER needs.
+    pub fn history_job(&self, max_lines: Option<usize>) -> impl FnOnce() -> String + Send + 'static {
         let term = self.term.clone();
-        move || crate::term_export::term_to_ansi_text_with_cursor(&term, None).0
+        move || crate::term_export::term_to_ansi_text_with_cursor(&term, max_lines).0
     }
 
     /// Same view as `plain_text` but with SGR escape sequences preserved
