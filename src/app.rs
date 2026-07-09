@@ -534,6 +534,10 @@ struct AppState {
     activity_signal: Arc<std::sync::atomic::AtomicU64>,
     activity_last_seen: std::cell::Cell<u64>,
     activity_last_at: std::cell::Cell<Option<std::time::Instant>>,
+    /// `render`'s own last-seen activity value (separate from persist's —
+    /// they consume the same counter independently). Seeded to `u64::MAX`
+    /// so the first frame always checks the pending-new-tab queue.
+    render_activity_seen: std::cell::Cell<u64>,
     /// Last `(cols, lines)` broadcast from the active tab to the background
     /// tabs. The active tab computes the real grid size on its first/every
     /// paint; a tick pushes it to the (never-painted) background tabs so their
@@ -1233,6 +1237,7 @@ impl AppState {
             activity_signal,
             activity_last_seen: std::cell::Cell::new(0),
             activity_last_at: std::cell::Cell::new(None),
+            render_activity_seen: std::cell::Cell::new(u64::MAX),
             last_conn_meter: std::cell::Cell::new(None),
             #[cfg(feature = "catbus")]
             last_token_discovery: std::cell::Cell::new(None),
@@ -4700,7 +4705,18 @@ impl Render for AppState {
         // insert_tab from persist() because that path doesn't have a
         // Window handle; piggy-backing on render() is the simplest place
         // to react to remote POST /tabs requests.
-        let (new_tab_count, new_tab_cwds): (usize, Vec<PathBuf>) = {
+        //
+        // Only touch the global API mutex when the lock-free activity
+        // counter moved since the last frame — POST /tabs, like every
+        // authenticated request, bumps it, so a quiet counter proves
+        // `pending_new_tabs` is 0. The unconditional lock made every
+        // frame contend with whatever an API handler was doing under
+        // the same mutex (e.g. the /tabs body rebuild).
+        let seq = self.activity_signal.load(std::sync::atomic::Ordering::Relaxed);
+        let (new_tab_count, new_tab_cwds): (usize, Vec<PathBuf>) = if seq == self.render_activity_seen.get() {
+            (0, Vec::new())
+        } else {
+            self.render_activity_seen.set(seq);
             let mut snap = self.api_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let n = std::mem::take(&mut snap.pending_new_tabs);
             let cwds: Vec<PathBuf> = std::mem::take(&mut snap.pending_new_tab_cwds).into_iter().collect();
