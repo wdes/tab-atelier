@@ -203,6 +203,11 @@ struct EventProxy {
     /// [`TerminalView::set_theme`]. `Arc<Mutex<_>>` because the proxy is
     /// cloned into the parser thread.
     theme: Arc<std::sync::Mutex<ThemeName>>,
+    /// Flipped by `ChildExit` — alacritty's event loop already watches
+    /// the PTY child, so the shell's death arrives as an event instead
+    /// of the 500 ms `process_alive` `/proc` poll every tab used to run
+    /// for its whole life. Shared with [`TerminalView::exited`].
+    exited: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl EventProxy {
@@ -223,6 +228,10 @@ impl EventListener for EventProxy {
     fn send_event(&self, event: AlacrittyEvent) {
         let bytes: Vec<u8> = match event {
             AlacrittyEvent::PtyWrite(text) => text.into_bytes(),
+            AlacrittyEvent::ChildExit(_) => {
+                self.exited.store(true, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
             // Answer OSC colour queries (OSC 4 palette / 10 fg / 11 bg /
             // 12 cursor). Without a reply the query times out and the app
             // assumes a default (near-black) background — Claude Code then
@@ -299,7 +308,9 @@ pub struct TerminalView {
     /// Deferred-spawn inputs. `Some` for a skeleton tab that hasn't forked its
     /// shell yet; `ensure_spawned` takes it to build the PTY. `None` once spawned.
     spawn_recipe: Option<SpawnRecipe>,
-    exited: Rc<Cell<bool>>,
+    /// Set by the PTY event-loop thread when the shell dies (see
+    /// [`EventProxy::exited`]); read on the UI thread by `has_exited`.
+    exited: Arc<std::sync::atomic::AtomicBool>,
     scrollbar_dragging: Rc<Cell<bool>>,
     scroll_acc: Rc<Cell<f32>>,
     pub theme: ThemeName,
@@ -328,6 +339,11 @@ pub struct TerminalView {
     /// can ask "is anyone watching this tab over the web/remote?" each
     /// frame without taking the ring lock. Bumped by `api_ws::run_pump`.
     viewers: Arc<std::sync::atomic::AtomicUsize>,
+    /// Lock-free mirror of the ring's `total_len` (see
+    /// [`crate::pty_ring::PtyRing::total_len_handle`]) — the repaint pump
+    /// and the persist tick probe "did output arrive" through it without
+    /// touching the ring mutex.
+    ring_len_mirror: Arc<std::sync::atomic::AtomicU64>,
     /// When true the PTY is (re)spawned inside a bubblewrap sandbox with
     /// its own empty network namespace — the tab has no internet. Set via
     /// [`Self::set_net_disabled`]; the caller then respawns so the change
@@ -613,38 +629,70 @@ impl TerminalView {
         let dirty_streak = Rc::new(Cell::new(0u32));
         let last_render = Rc::new(Cell::new(None::<std::time::Instant>));
         let last_render_pump = last_render.clone();
+        let ring_len_mirror = pty_ring.lock().map_or_else(
+            |_| Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            |r| r.total_len_handle(),
+        );
+        let ring_len_mirror_pump = ring_len_mirror.clone();
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             // Poll fast (one 60 Hz frame) only while this tab is the foreground
-            // one; a background/asleep tab backs off to `IDLE` so N tabs don't
-            // each wake the main thread 60×/s just to read a ring counter they
-            // won't paint. A tab switch re-stamps `last_render`, so a resumed
-            // tab is back to `FAST` within one idle poll.
+            // one; a background/asleep tab backs off to `IDLE`, and one nobody
+            // has looked at for a minute parks at `DEEP`, so N tabs don't each
+            // wake the main thread 60×/s just to read a ring counter they
+            // won't paint. A tab switch re-stamps `last_render` and renders
+            // immediately; the pump is back to `FAST` within one parked poll.
             const FAST: Duration = Duration::from_millis(16);
             const IDLE: Duration = Duration::from_millis(250);
+            const DEEP: Duration = Duration::from_secs(1);
+            // How long after its last paint a view still counts as the
+            // foreground tab (a few cursor-blink heartbeats of slack), and
+            // how long until a background tab is considered parked.
+            const FRESH: Duration = Duration::from_secs(2);
+            const PARKED: Duration = Duration::from_secs(60);
+            let ring_len_mirror = ring_len_mirror_pump;
             let mut interval = FAST;
+            let mut parked = false;
             loop {
                 cx.background_executor().timer(interval).await;
-                let Ok(painting) = this.update(cx, |view, cx: &mut Context<Self>| {
-                    // How long after its last paint a view still counts as the
-                    // foreground tab (a few cursor-blink heartbeats of slack).
-                    const FRESH: Duration = Duration::from_secs(2);
-                    let n = tick_clone.get().wrapping_add(1);
-                    tick_clone.set(n);
-                    let ring_len = view.pty_ring.lock().map_or(0, |r| r.total_len());
-                    let grid_dirty = ring_len != last_ring_len.get();
-                    last_ring_len.set(ring_len);
-                    // Foreground gate: only the visible/active tab is mounted,
-                    // so only it is ever painted (`render` stamps `last_render`).
-                    // A background tab's stamp goes stale within FRESH; suppress
-                    // its `notify()`s entirely so N streaming agents can't drive
-                    // N full-window repaints per frame. The active tab keeps
-                    // itself fresh via its own repaints (keystroke echo + the
-                    // 500 ms cursor-blink heartbeat below), and a tab switch
-                    // re-renders the new active view, re-stamping it at once.
-                    let painting = last_render_pump.get().is_some_and(|t| t.elapsed() < FRESH);
-                    if !painting {
-                        return false;
+                if this.upgrade().is_none() {
+                    break;
+                }
+                let n = tick_clone.get().wrapping_add(1);
+                tick_clone.set(n);
+                // Lock-free ring probe — the mutex is contended by the PTY
+                // reader thread during floods, and N background pumps have
+                // no business queueing on it.
+                let ring_len = ring_len_mirror.load(std::sync::atomic::Ordering::Relaxed);
+                let grid_dirty = ring_len != last_ring_len.get();
+                last_ring_len.set(ring_len);
+                // Foreground gate: only the visible/active tab is mounted,
+                // so only it is ever painted (`render` stamps `last_render`).
+                // A background tab's stamp goes stale within FRESH; skip the
+                // entity update entirely so N streaming agents can't drive
+                // N full-window repaints per frame. The active tab keeps
+                // itself fresh via its own repaints (keystroke echo + the
+                // 500 ms cursor-blink heartbeat below), and a tab switch
+                // re-renders the new active view, re-stamping it at once.
+                let render_age = last_render_pump.get().map(|t| t.elapsed());
+                if render_age.is_none_or(|a| a >= FRESH) {
+                    if render_age.is_some_and(|a| a < PARKED) {
+                        interval = IDLE;
+                    } else {
+                        interval = DEEP;
+                        // Park transition: nobody has looked at this tab in
+                        // a minute — free its shaped-glyph / frame caches.
+                        // Rebuilt in one frame when it's next shown, which
+                        // a tab switch pays anyway.
+                        if !parked {
+                            parked = true;
+                            let _ = this.update(cx, |view, _| view.release_render_caches());
+                        }
                     }
+                    continue;
+                }
+                interval = FAST;
+                parked = false;
+                let Ok(()) = this.update(cx, |view, cx: &mut Context<Self>| {
                     if grid_dirty {
                         let streak = dirty_streak.get().wrapping_add(1);
                         dirty_streak.set(streak);
@@ -684,18 +732,16 @@ impl TerminalView {
                             cx.notify();
                         }
                     }
-                    true
                 }) else {
                     break;
                 };
-                interval = if painting { FAST } else { IDLE };
             }
         })
         .detach();
 
-        // The exit-watch loop needs a real pid, so it's started by
-        // `ensure_spawned` (not here) — a skeleton has no process to watch yet.
-        let exited = Rc::new(Cell::new(false));
+        // Shell death arrives as `ChildExit` on this flag (see
+        // `EventProxy::exited`) — no per-tab watcher loop needed.
+        let exited = proxy.exited.clone();
 
         let recipe = SpawnRecipe {
             cwd: cwd.map(std::path::Path::to_path_buf),
@@ -734,6 +780,7 @@ impl TerminalView {
             locked: Rc::new(Cell::new(false)),
             pty_ring,
             viewers,
+            ring_len_mirror,
             net_disabled: Cell::new(false),
             prev_frame: Rc::new(RefCell::new(None)),
             last_prepaint: Rc::new(RefCell::new(None)),
@@ -743,7 +790,7 @@ impl TerminalView {
         // deferred skeleton waits for `ensure_spawned` (the app's boot loader
         // or the switch/render that first shows it).
         if !defer_spawn {
-            me.ensure_spawned(cx);
+            me.ensure_spawned();
         }
         me
     }
@@ -753,7 +800,7 @@ impl TerminalView {
     /// pulling the working size from `last_size`/`cell_size` and the shell/env
     /// from the stashed [`SpawnRecipe`]. Called eagerly for the active tab, and
     /// in the background for the rest so restored agents come back online.
-    pub fn ensure_spawned(&mut self, cx: &mut Context<Self>) {
+    pub fn ensure_spawned(&mut self) {
         let Some(recipe) = self.spawn_recipe.take() else {
             return;
         };
@@ -798,7 +845,7 @@ impl TerminalView {
                 // Can't fork the shell (out of fds/pids, etc.). Don't crash the
                 // whole app — mark this one tab dead so it renders as exited.
                 error!("failed to create PTY: {e}");
-                self.exited.set(true);
+                self.exited.store(true, std::sync::atomic::Ordering::Relaxed);
                 return;
             }
         };
@@ -813,7 +860,7 @@ impl TerminalView {
             Ok(el) => el,
             Err(e) => {
                 error!("failed to create PTY event loop: {e}");
-                self.exited.set(true);
+                self.exited.store(true, std::sync::atomic::Ordering::Relaxed);
                 return;
             }
         };
@@ -822,27 +869,7 @@ impl TerminalView {
         el.spawn();
         self.notifier = Some(notifier);
         self.pid = pid;
-        self.exited.set(false);
-
-        // Now that a real process exists, watch for its exit.
-        let exited = self.exited.clone();
-        let pid_for_check = pid;
-        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            loop {
-                cx.background_executor().timer(Duration::from_millis(500)).await;
-                if !crate::platform::process_alive(pid_for_check) {
-                    let still_current = this
-                        .update(cx, |view: &mut Self, _| view.pid == pid_for_check)
-                        .unwrap_or(false);
-                    if still_current {
-                        exited.set(true);
-                        let _ = this.update(cx, |_, cx: &mut Context<Self>| cx.notify());
-                    }
-                    break;
-                }
-            }
-        })
-        .detach();
+        self.exited.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Whether the shell has been forked yet (`false` for a skeleton tab).
@@ -864,6 +891,13 @@ impl TerminalView {
     #[must_use]
     pub fn viewer_count(&self) -> usize {
         self.viewers.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Total bytes ever written through the tab's PTY ring — the
+    /// universal "did output arrive" dirtiness key. Lock-free.
+    #[must_use]
+    pub fn ring_len(&self) -> u64 {
+        self.ring_len_mirror.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub const fn colors_enabled(&self) -> bool {
@@ -901,7 +935,28 @@ impl TerminalView {
     }
 
     pub fn has_exited(&self) -> bool {
-        self.exited.get()
+        self.exited.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Drop the render caches (previous frame's rows, shaped-glyph cache,
+    /// stashed prepaint, detected URLs). Called when the tab leaves the
+    /// foreground — a parked tab can pin hundreds of KB of shaped glyphs
+    /// it cannot paint; the first frame after re-activation rebuilds them
+    /// from the grid in one pass, which a tab switch pays anyway.
+    pub fn release_render_caches(&self) {
+        self.prev_frame.borrow_mut().take();
+        self.last_prepaint.borrow_mut().take();
+        let mut cache = self.line_cache.borrow_mut();
+        cache.clear();
+        cache.shrink_to_fit();
+        drop(cache);
+        let mut scratch = self.line_cache_scratch.borrow_mut();
+        scratch.clear();
+        scratch.shrink_to_fit();
+        drop(scratch);
+        let mut urls = self.detected_urls.borrow_mut();
+        urls.clear();
+        urls.shrink_to_fit();
     }
 
     pub fn last_input_time(&self) -> Option<std::time::Instant> {
@@ -929,7 +984,7 @@ impl TerminalView {
         self.net_disabled.set(disabled);
     }
 
-    pub fn respawn(&mut self, cwd: Option<&Path>, cx: &mut Context<Self>) {
+    pub fn respawn(&mut self, cwd: Option<&Path>) {
         if let Some(n) = self.notifier.as_ref() {
             let _ = n.send(Msg::Shutdown);
         }
@@ -991,7 +1046,7 @@ impl TerminalView {
             Ok(pty) => pty,
             Err(e) => {
                 error!("failed to re-create PTY on respawn: {e}");
-                self.exited.set(true);
+                self.exited.store(true, std::sync::atomic::Ordering::Relaxed);
                 return;
             }
         };
@@ -1014,7 +1069,7 @@ impl TerminalView {
             Ok(el) => el,
             Err(e) => {
                 error!("failed to create PTY event loop on respawn: {e}");
-                self.exited.set(true);
+                self.exited.store(true, std::sync::atomic::Ordering::Relaxed);
                 return;
             }
         };
@@ -1024,26 +1079,7 @@ impl TerminalView {
         self.notifier = Some(notifier);
 
         self.pid = pid;
-        self.exited.set(false);
-
-        let exited = self.exited.clone();
-        let pid_for_check = pid;
-        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            loop {
-                cx.background_executor().timer(Duration::from_millis(500)).await;
-                if !crate::platform::process_alive(pid_for_check) {
-                    let still_current = this
-                        .update(cx, |view: &mut Self, _| view.pid == pid_for_check)
-                        .unwrap_or(false);
-                    if still_current {
-                        exited.set(true);
-                        let _ = this.update(cx, |_, cx: &mut Context<Self>| cx.notify());
-                    }
-                    break;
-                }
-            }
-        })
-        .detach();
+        self.exited.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn shutdown(&self) {
@@ -3103,13 +3139,13 @@ mod tests {
             })
             .unwrap();
         window
-            .update(cx, |view, _window, cx| {
-                view.ensure_spawned(cx);
+            .update(cx, |view, _window, _cx| {
+                view.ensure_spawned();
                 assert!(view.is_spawned(), "shell forked after ensure_spawned");
                 assert!(view.pid() > 0, "a real pid now");
                 // Idempotent — a second call is a no-op.
                 let pid = view.pid();
-                view.ensure_spawned(cx);
+                view.ensure_spawned();
                 assert_eq!(view.pid(), pid);
                 view.shutdown();
             })

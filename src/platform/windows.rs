@@ -19,7 +19,6 @@
 //!
 //! Stubs awaiting the rest of the Windows port (tracked as follow-ups,
 //! all GUI-only so the headless build is unaffected):
-//!   * `process_alive` — needs `OpenProcess`/`GetExitCodeProcess`.
 //!   * `capture_focused_window` — needs GDI `BitBlt` / Windows.Graphics.Capture.
 //!   * `grab_hotkeys` — needs `RegisterHotKey` + a message-pump thread.
 //! And `process_cwd` (non-GUI) needs `NtQueryInformationProcess` to read
@@ -85,14 +84,6 @@ pub fn process_cwd(_pid: u32) -> Option<PathBuf> {
     // PEB (ProcessParameters->CurrentDirectory). Deferred; callers treat
     // `None` as "unknown cwd".
     None
-}
-
-#[cfg(feature = "gui")]
-pub fn process_alive(_pid: u32) -> bool {
-    // TODO(windows-port): OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)
-    // + GetExitCodeProcess, alive == STILL_ACTIVE. Stubbed `true` until
-    // the GUI build (the only caller) is wired up.
-    true
 }
 
 // --- Random ---
