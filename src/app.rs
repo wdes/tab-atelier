@@ -99,6 +99,13 @@ struct Tab {
     /// immutably.
     #[cfg(feature = "catbus")]
     tokens_last_saved: std::cell::Cell<Option<crate::TokenUsage>>,
+    /// Agent CLI pid found by this tick's LED sweep (`None` = no agent /
+    /// not yet swept). Lets the token loop resolve the session via
+    /// `find_session_for` instead of re-walking the shell's whole /proc
+    /// subtree a second time per tick. Transient; a stale pid (agent
+    /// restarted) just fails the /proc reads until the next sweep.
+    #[cfg(feature = "catbus")]
+    agent_pid: std::cell::Cell<Option<u32>>,
     /// Saved scrollback that hasn't been fed back into the terminal yet.
     /// Tabs other than the active one defer this work until first focus
     /// so cold-launch with many tabs doesn't block on vte-parsing each
@@ -755,6 +762,8 @@ impl AppState {
                         energy_wh_last_saved: ts.energy_wh.unwrap_or(0.0),
                         #[cfg(feature = "catbus")]
                         tokens_last_saved: std::cell::Cell::new(None),
+                        #[cfg(feature = "catbus")]
+                        agent_pid: std::cell::Cell::new(None),
                         // Seed with the hash of the just-restored output so the
                         // first persist tick after launch doesn't rewrite an
                         // identical file.
@@ -813,6 +822,8 @@ impl AppState {
                         energy_wh_last_saved: 0.0,
                         #[cfg(feature = "catbus")]
                         tokens_last_saved: std::cell::Cell::new(None),
+                        #[cfg(feature = "catbus")]
+                        agent_pid: std::cell::Cell::new(None),
                         pending_restore: None,
                         last_known_cwd: None,
                         last_known_cwd_string: None,
@@ -865,6 +876,8 @@ impl AppState {
                         energy_wh_last_saved: 0.0,
                         #[cfg(feature = "catbus")]
                         tokens_last_saved: std::cell::Cell::new(None),
+                        #[cfg(feature = "catbus")]
+                        agent_pid: std::cell::Cell::new(None),
                         pending_restore: None,
                         last_known_cwd: None,
                         last_known_cwd_string: None,
@@ -1376,6 +1389,8 @@ impl AppState {
                 energy_wh_last_saved: 0.0,
                 #[cfg(feature = "catbus")]
                 tokens_last_saved: std::cell::Cell::new(None),
+                #[cfg(feature = "catbus")]
+                agent_pid: std::cell::Cell::new(None),
                 pending_restore: None,
                 last_known_cwd_string: cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
                 last_known_cwd: cwd,
@@ -1760,8 +1775,14 @@ impl AppState {
                 if tab.agent_kind.is_none() && !discover {
                     continue;
                 }
-                let pid = tab.view.read(cx).pid();
-                if let Some(session) = crate::catbus_agent::find_session(pid)
+                // Reuse the LED sweep's subtree walk when it already
+                // located the agent; fall back to the full walk for
+                // discovery (non-agent tabs / first tick after attach).
+                let session = tab.agent_pid.get().map_or_else(
+                    || crate::catbus_agent::find_session(tab.view.read(cx).pid()),
+                    crate::catbus_agent::find_session_for,
+                );
+                if let Some(session) = session
                     && let Some(usage) = crate::catbus_agent::read_session_tokens(&session)
                     // Usage is cumulative and only moves when the agent
                     // finishes a prompt — skip the (double-fsync) rewrite
@@ -1962,7 +1983,10 @@ impl AppState {
                     continue;
                 }
                 let pid = tab.view.read(cx).pid();
-                let activity = crate::catbus_agent::agent_activity(pid);
+                let (activity, agent_pid) = crate::catbus_agent::agent_activity_with_pid(pid);
+                // Cache the found agent pid so the token loop can resolve
+                // the session without re-walking the same subtree.
+                tab.agent_pid.set(agent_pid);
                 if activity != crate::catbus_agent::AgentActivity::Gone {
                     live_agents.push((pid, tab.agent_session_id.clone().unwrap_or_default()));
                     // Remember it (start-time-pinned) so close-all / quit can
