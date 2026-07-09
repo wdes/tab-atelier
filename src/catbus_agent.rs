@@ -76,16 +76,6 @@ pub fn find_session(shell_pid: u32) -> Option<AgentSession> {
     })
 }
 
-/// Returns true if any descendant of `shell_pid` (inclusive) has
-/// a `comm` matching one of the known agent CLIs. Used by the
-/// app's per-tick sweep to clear the LED when an agent silently
-/// exited without firing a `SessionEnd` hook (Ctrl-C, crash,
-/// terminal closed without `/exit`, …).
-#[must_use]
-pub fn has_agent_descendant(shell_pid: u32) -> bool {
-    find_agent_descendant(shell_pid).is_some()
-}
-
 /// Returns true when the agent CLI under `shell_pid` has at least
 /// one child process — i.e. it's actively running a tool subprocess
 /// (Bash, Read, …). Used by the LED sweep to keep the indicator on

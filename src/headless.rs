@@ -162,6 +162,12 @@ struct HeadlessTab {
     /// Per-tab resource-limit overrides, carried so `persist()` writes
     /// them back to `tabs.json` instead of wiping them each tick.
     limits: crate::TabResourceLimits,
+    /// Last token usage flushed to `tokens_tab-<name>.json`. Skips the
+    /// rewrite when unchanged — `save_tab_tokens` fsyncs the file AND
+    /// its directory, and without this gate every agent tab paid those
+    /// two fsyncs every 2 s persist tick for an identical ~40-byte file.
+    #[cfg(feature = "catbus")]
+    tokens_last_saved: Option<crate::TokenUsage>,
 }
 
 impl crate::schedule::LockState for HeadlessTab {
@@ -625,6 +631,8 @@ fn spawn_pty_tab(
         pty_ring,
         snap_cache: None,
         limits: crate::TabResourceLimits::default(),
+        #[cfg(feature = "catbus")]
+        tokens_last_saved: None,
     })
 }
 
@@ -1312,11 +1320,16 @@ fn persist(
             }
         }
         #[cfg(feature = "catbus")]
-        for tab in tabs.iter() {
+        for tab in tabs.iter_mut() {
             if let Some(session) = crate::catbus_agent::find_session(tab.pid)
                 && let Some(usage) = crate::catbus_agent::read_session_tokens(&session)
+                // Usage is cumulative and only moves when the agent
+                // finishes a prompt — skip the (double-fsync) rewrite
+                // of an identical ~40-byte file on all other ticks.
+                && tab.tokens_last_saved != Some(usage)
             {
                 crate::save_tab_tokens(&state_base, &tab.name, &usage);
+                tab.tokens_last_saved = Some(usage);
             }
         }
     }
@@ -1543,43 +1556,65 @@ fn drain_pending(
         }
     }
 
-    // Working-subprocess sweep — same logic as the GUI tick. Keep an in-progress
-    // "thinking" LED (set by the PreToolUse hook) fresh through a long tool call
-    // where no hook fires between Pre and Post — but only REFRESH an existing
-    // thinking state while real work is on-CPU. Never fabricate one from a stray
-    // short-lived subprocess (the agent's own status hooks flit through `R`),
-    // which used to paint idle tabs green.
+    // Agent LED sweeps — same logic as the GUI tick, and same CADENCE
+    // (2 s). These used to run unthrottled here, i.e. on every 16 ms
+    // input tick: each `agent_activity` / `has_agent_descendant` call is
+    // a full BFS over the tab's /proc subtree (comm + children + stat
+    // per descendant — easily 100+ procfs reads for a claude tree), so
+    // per agent tab this was thousands of pure-overhead syscalls per
+    // second in the latency-critical drain loop.
     let now = Instant::now();
-    #[cfg(feature = "catbus")]
-    for tab in tabs.iter_mut() {
-        if tab.agent_kind.is_none() {
-            continue;
+    let sweep_due = {
+        use std::sync::OnceLock;
+        static LAST: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+        let lock = LAST.get_or_init(|| Mutex::new(None));
+        let mut last = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let due = last.is_none_or(|t| t.elapsed() >= Duration::from_secs(2));
+        if due {
+            *last = Some(now);
         }
-        if crate::catbus_agent::agent_activity(tab.pid) == crate::catbus_agent::AgentActivity::Working
-            && let Some(snap) = &mut tab.agent_state
-            && snap.state == crate::AgentState::Thinking
-        {
-            snap.updated_at = now;
+        due
+    };
+    if sweep_due {
+        // One BFS per agent tab answers BOTH questions: `Gone` means the
+        // agent CLI is no longer a descendant (the old separate presence
+        // sweep re-walked the same subtree for that), `Working` means a
+        // real tool call is on-CPU — keep an in-progress "thinking" LED
+        // (set by the PreToolUse hook) fresh through a long tool call
+        // where no hook fires between Pre and Post. Only REFRESH an
+        // existing thinking state; never fabricate one from a stray
+        // short-lived subprocess (the agent's own status hooks flit
+        // through `R`), which used to paint idle tabs green.
+        #[cfg(feature = "catbus")]
+        for tab in tabs.iter_mut() {
+            if tab.agent_kind.is_none() {
+                continue;
+            }
+            match crate::catbus_agent::agent_activity(tab.pid) {
+                crate::catbus_agent::AgentActivity::Gone => {
+                    tab.agent_state = None;
+                    tab.agent_session_id = None;
+                    tab.agent_kind = None;
+                    tab.agent_plan_mode = None;
+                }
+                crate::catbus_agent::AgentActivity::Working => {
+                    if let Some(snap) = &mut tab.agent_state
+                        && snap.state == crate::AgentState::Thinking
+                    {
+                        snap.updated_at = now;
+                    }
+                }
+                crate::catbus_agent::AgentActivity::Idle => {}
+            }
         }
-    }
 
-    // Staleness sweep: drop transient state older than 2 min.
-    for tab in tabs.iter_mut() {
-        if let Some(snap) = &tab.agent_state
-            && now.duration_since(snap.updated_at).as_secs() > 120
-        {
-            tab.agent_state = None;
-        }
-    }
-
-    // Process-presence sweep: clear agent attachment when CLI is gone.
-    #[cfg(feature = "catbus")]
-    for tab in tabs.iter_mut() {
-        if tab.agent_kind.is_some() && !crate::catbus_agent::has_agent_descendant(tab.pid) {
-            tab.agent_state = None;
-            tab.agent_session_id = None;
-            tab.agent_kind = None;
-            tab.agent_plan_mode = None;
+        // Staleness sweep: drop transient state older than 2 min.
+        for tab in tabs.iter_mut() {
+            if let Some(snap) = &tab.agent_state
+                && now.duration_since(snap.updated_at).as_secs() > 120
+            {
+                tab.agent_state = None;
+            }
         }
     }
 
