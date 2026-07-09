@@ -38,7 +38,7 @@ use crate::platform;
 use crate::save_tab_energy;
 use crate::{
     AgentStateSnapshot, DEFAULT_API_ADDR, DEFAULT_API_TLS_ADDR, SHUTDOWN_REQUESTED, SavedState, TabState, crc32,
-    default_tab_id, load_preferences, load_state_with_outputs, save_state, save_tab_output, save_tab_uptime,
+    default_tab_id, load_preferences, load_state_with_outputs, save_tab_output, save_tab_uptime,
 };
 
 const INITIAL_COLS: usize = 80;
@@ -1306,10 +1306,12 @@ fn persist(
         active,
         windowed: false,
     };
+    // The string serialized for the hash IS what gets written, so the
+    // dirty path doesn't serialize the same value a second time.
     let serialized = serde_json::to_string_pretty(&saved).unwrap_or_default();
     let new_hash = crc32(serialized.as_bytes());
     if !read_only && (final_flush || new_hash != *last_state_hash) {
-        save_state(&platform::config_base_dir(), &saved);
+        crate::save_state_serialized(&platform::config_base_dir(), &serialized);
         *last_state_hash = new_hash;
     }
 
