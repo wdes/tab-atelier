@@ -312,6 +312,18 @@ struct ExitConfirm {
     tab_idx: usize,
 }
 
+/// Everything `render_qr_modal` needs, computed once when the modal opens
+/// (see [`AppState::qr_modal`]): interface IPs, the click-to-open URL, and
+/// the encoded QR as a dark/light bitmap. Rebuilding the ~2000-div module
+/// grid each frame is unavoidable in immediate-mode gpui, but the `ip`
+/// subprocess and the QR encode don't have to be.
+struct QrModalData {
+    ips: Vec<String>,
+    url: String,
+    qr_width: usize,
+    qr_dark: Vec<bool>,
+}
+
 /// Height of the tab strip in pixels — matches `render_tab_bar`'s `.h(px(32.0))`.
 /// Subtracted from the viewport height to get the terminal area when computing a
 /// startup grid size for every tab (so unopened tabs' PTYs are sized right).
@@ -421,6 +433,15 @@ struct AppState {
     exit_confirm: Option<ExitConfirm>,
     close_confirm: Option<usize>,
     show_qr: bool,
+    /// QR-modal data, computed once when the modal opens. The `ip`
+    /// subprocess call + Reed-Solomon QR encode used to run inside
+    /// `render_qr_modal` on EVERY frame (30-60 fps while the active tab
+    /// streams) — a fork+exec per paint. Refreshed on each open so the
+    /// IPs still track routing changes (Wi-Fi switch, VPN up/down).
+    qr_modal: Option<QrModalData>,
+    /// Last title pushed via `set_window_title`, so render only re-sends
+    /// it when it actually changes (tab switch / rename), not per frame.
+    last_window_title: String,
     font_config: FontConfig,
     tracker: Option<WakatimeTracker>,
     api_token: String,
@@ -1095,6 +1116,8 @@ impl AppState {
             exit_confirm: None,
             close_confirm: None,
             show_qr: false,
+            qr_modal: None,
+            last_window_title: String::new(),
             font_config,
             tracker,
             api_token,
@@ -2663,7 +2686,6 @@ impl AppState {
             // first menu use and persisted via tabs.json so URLs
             // survive restarts.
             for (label, ro) in [(self.t().copy_share_link, false), (self.t().copy_share_link_ro, true)] {
-                let lan_ip = api::local_ip();
                 let port = port_of(&self.api_addr, crate::DEFAULT_API_PORT);
                 let tab_id = self.tabs[idx].id.clone();
                 let toast_msg = self.t().share_link_copied;
@@ -2710,8 +2732,14 @@ impl AppState {
                                         }
                                     }
                                 }
+                                // Resolved on click, not at render time — the
+                                // route lookup binds + connects a UDP socket,
+                                // and this menu re-renders every frame while
+                                // open (two lookups per frame for the RW/RO
+                                // pair). On-click also means the copied link
+                                // reflects the CURRENT routing table.
                                 let base = if share_base.is_empty() {
-                                    format!("http://{lan_ip}:{port}")
+                                    format!("http://{}:{port}", api::local_ip())
                                 } else {
                                     share_base.clone()
                                 };
@@ -3222,6 +3250,7 @@ impl AppState {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                            this.qr_modal = this.build_qr_modal_data();
                             this.show_qr = true;
                             this.context_menu = None;
                             cx.notify();
@@ -3641,14 +3670,11 @@ impl AppState {
         )
     }
 
-    fn render_qr_modal(&self, cx: &Context<Self>) -> Option<Stateful<Div>> {
-        if !self.show_qr {
-            return None;
-        }
-
-        // Refresh on every render so a freshly-opened modal reflects the
-        // current routing table (Wi-Fi switch, VPN up/down, …) rather
-        // than whatever IPs were live when the process started.
+    /// Gather the QR modal's inputs: interface IPs (one `ip` subprocess
+    /// call), the deep-link QR bitmap, and the clickable URL. Called once
+    /// per modal open — refreshed each time so the IPs reflect the current
+    /// routing table (Wi-Fi switch, VPN up/down, …), but never per frame.
+    fn build_qr_modal_data(&self) -> Option<QrModalData> {
         let ips = api::local_ips_all();
         let primary_ip = ips.first().cloned().unwrap_or_else(|| "127.0.0.1".into());
         let lan_url = format!(
@@ -3666,11 +3692,25 @@ impl AppState {
             self.api_token
         );
         let url = format!("{lan_url}?token={}", self.api_token);
-        let url_for_click = url.clone();
+        let qr = qrcode::QrCode::new(qr_payload.as_bytes()).ok()?;
+        let qr_width = qr.width();
+        let qr_dark = qr.to_colors().iter().map(|c| *c == qrcode::Color::Dark).collect();
+        Some(QrModalData {
+            ips,
+            url,
+            qr_width,
+            qr_dark,
+        })
+    }
 
-        let Ok(qr) = qrcode::QrCode::new(qr_payload.as_bytes()) else {
+    fn render_qr_modal(&self, cx: &Context<Self>) -> Option<Stateful<Div>> {
+        if !self.show_qr {
             return None;
-        };
+        }
+        let data = self.qr_modal.as_ref()?;
+        let ips = &data.ips;
+        let url = data.url.clone();
+        let url_for_click = url.clone();
 
         let th = self.th();
         let dialog_bg = th.surface_hsla();
@@ -3680,8 +3720,7 @@ impl AppState {
         let btn_hover = th.accent_hover_hsla();
         let link_fg = th.accent_hsla();
 
-        let colors = qr.to_colors();
-        let w = qr.width();
+        let w = data.qr_width;
         let module_size = px(4.0);
         let mut qr_grid = div()
             .mt(px(12.0))
@@ -3693,7 +3732,7 @@ impl AppState {
         for row in 0..w {
             let mut row_div = div().flex().flex_row();
             for col in 0..w {
-                let is_dark = colors[row * w + col] == qrcode::Color::Dark;
+                let is_dark = data.qr_dark[row * w + col];
                 row_div = row_div.child(
                     div()
                         .w(module_size)
@@ -4538,7 +4577,15 @@ impl Render for AppState {
         // was still a skeleton (e.g. the user switched to a not-yet-warmed tab
         // before the boot loader reached it). No-op once spawned.
         self.tabs[self.active].view.update(cx, TerminalView::ensure_spawned);
-        window.set_window_title(&format!("{}{}", self.tabs[self.active].name, self.t().title_suffix));
+        // Only push the title when it changed — gpui does no diffing, so an
+        // unconditional call here meant a format! + X11 property write on
+        // every frame (30-60 fps while the terminal streams) for a string
+        // that only moves on tab switch/rename.
+        let title = format!("{}{}", self.tabs[self.active].name, self.t().title_suffix);
+        if self.last_window_title != title {
+            window.set_window_title(&title);
+            self.last_window_title = title;
+        }
         let active_terminal = self.tabs[self.active].view.clone();
         #[cfg(feature = "energy")]
         let battery = *self
