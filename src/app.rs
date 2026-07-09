@@ -1621,15 +1621,9 @@ impl AppState {
                     (String::new(), None)
                 };
                 let (cols, rows) = view.dims();
-                Some(crate::term_export::GridSnapshotCache {
-                    ring_len,
-                    output: output.into(),
-                    cursor,
-                    raw_output: raw_output.into(),
-                    raw_cursor,
-                    cols,
-                    rows,
-                })
+                Some(crate::term_export::GridSnapshotCache::new(
+                    ring_len, output, cursor, raw_output, raw_cursor, cols, rows,
+                ))
             } else {
                 None
             };
@@ -1656,6 +1650,8 @@ impl AppState {
                 // colours instead of the previous flat-grey text.
                 output: grid.output,
                 raw_output: grid.raw_output,
+                output_crc: grid.output_crc,
+                raw_output_crc: grid.raw_output_crc,
                 raw_cursor: grid.raw_cursor,
                 uptime_secs: tab.uptime().as_secs_f64(),
                 cursor: grid.cursor,

@@ -280,6 +280,11 @@ pub struct SnapshotTab {
     /// viewer keep using `output` (logical lines, easier to word-wrap
     /// on a phone).
     pub raw_output: std::sync::Arc<str>,
+    /// CRC32 of `output` / `raw_output`, stamped when the grid dump was
+    /// (re)built (`GridSnapshotCache::new`) so `GET /output` doesn't
+    /// re-hash the whole payload on every poll.
+    pub output_crc: u32,
+    pub raw_output_crc: u32,
     /// Cursor (`row_in_raw_output`, col) — coordinates inside
     /// `raw_output` so the xterm.js viewer can issue a
     /// cursor-position escape after each write and the blinking
@@ -974,7 +979,33 @@ fn respond_with_etag<W: Write>(
     if_none_match: Option<&str>,
     extra_headers: &str,
 ) {
-    let etag = etag_for(body);
+    respond_with_etag_precomputed(
+        stream,
+        status,
+        content_type,
+        body,
+        accept_gzip,
+        if_none_match,
+        extra_headers,
+        None,
+    );
+}
+
+/// [`respond_with_etag`] for a caller that already knows the body's CRC
+/// (e.g. `/output`, whose full-payload CRC is cached on the snapshot) —
+/// skips the extra full-body hash pass per response.
+#[allow(clippy::too_many_arguments)]
+fn respond_with_etag_precomputed<W: Write>(
+    stream: &mut W,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+    accept_gzip: bool,
+    if_none_match: Option<&str>,
+    extra_headers: &str,
+    etag: Option<String>,
+) {
+    let etag = etag.unwrap_or_else(|| etag_for(body));
     if status == 200 && if_none_match.is_some_and(|v| v == etag) {
         // Content is byte-identical to what the client already has.
         let _ = write!(
@@ -1855,10 +1886,10 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             // and suffix search below — they walk up to hundreds of KB
             // per poll and used to run entirely under the mutex every
             // other API user (and every WS keystroke) needs.
-            let payload: std::sync::Arc<str> = if t.raw_output.is_empty() {
-                t.output.clone()
+            let (payload, total_crc): (std::sync::Arc<str>, u32) = if t.raw_output.is_empty() {
+                (t.output.clone(), t.output_crc)
             } else {
-                t.raw_output.clone()
+                (t.raw_output.clone(), t.raw_output_crc)
             };
             let full_cursor = t.cursor;
             let pty_cols = t.cols;
@@ -1882,7 +1913,6 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             });
             drop(state);
 
-            let total_crc = crate::crc32(payload.as_bytes());
             let total_len = payload.len();
 
             // Every response mode ships a suffix of `payload`, so track
@@ -1890,7 +1920,14 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             // shared Arc at respond time, no per-request copy.
             let (cursor, start_offset) = match (query_since, query_crc) {
                 (Some(n), Some(client_crc)) if n <= total_len => {
-                    let prefix_crc = crate::crc32(&payload.as_bytes()[..n]);
+                    // Steady state (>99% of polls): the client is fully
+                    // caught up, so its prefix IS the whole payload and
+                    // the cached total CRC answers without a hash pass.
+                    let prefix_crc = if n == total_len {
+                        total_crc
+                    } else {
+                        crate::crc32(&payload.as_bytes()[..n])
+                    };
                     if prefix_crc == client_crc {
                         // The client's history is still a real prefix of
                         // ours. Ship the suffix only — cursor row is
@@ -2001,7 +2038,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             // mid-session unlock / agent-state flip wouldn't reach
             // the JS until a full page reload. Force 200 so every
             // poll carries fresh headers in a fresh response.
-            respond_with_etag(
+            respond_with_etag_precomputed(
                 stream,
                 200,
                 "text/plain; charset=utf-8",
@@ -2009,6 +2046,9 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 accept_gzip,
                 None,
                 &extra,
+                // Full-body response ⇒ the cached total CRC IS the etag;
+                // a delta ships a small suffix, hashed cheaply as usual.
+                (start_offset == 0).then(|| format!("{total_crc:08x}")),
             );
         }
         ("DELETE", p)
@@ -3530,6 +3570,8 @@ mod tests {
                     name: "shell".into(),
                     cwd: Some("/home/user".into()),
                     output: "$ ls\nfoo bar baz".into(),
+                    output_crc: crate::crc32(b"$ ls\nfoo bar baz"),
+                    raw_output_crc: crate::crc32(b""),
                     uptime_secs: 0.0,
                     cursor: None,
                     cols: 80,
@@ -3560,6 +3602,8 @@ mod tests {
                     name: "build".into(),
                     cwd: None,
                     output: "".into(),
+                    output_crc: crate::crc32(b""),
+                    raw_output_crc: crate::crc32(b""),
                     uptime_secs: 0.0,
                     cursor: None,
                     cols: 80,
@@ -4435,11 +4479,12 @@ mod tests {
     #[test]
     fn get_tab_output_lines_param_tails() {
         let (port, state, token) = spawn_server();
-        state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).tabs[0].output = (1..=10)
-            .map(|i| format!("line {i}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-            .into();
+        let full: String = (1..=10).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        {
+            let mut snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            snap.tabs[0].output_crc = crate::crc32(full.as_bytes());
+            snap.tabs[0].output = full.into();
+        }
         let resp = request(
             port,
             &format!("GET /tabs/0/output?lines=3&token={token} HTTP/1.1\r\n\r\n"),
@@ -4532,6 +4577,7 @@ mod tests {
     /// gzip path kicks in (we threshold at 4 KB).
     fn fill_output(state: &Arc<Mutex<TabSnapshot>>, idx: usize, content: &str) {
         let mut snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        snap.tabs[idx].output_crc = crate::crc32(content.as_bytes());
         snap.tabs[idx].output = content.into();
         snap.cached_response = None; // invalidate /tabs cache
     }

@@ -47,6 +47,43 @@ pub struct GridSnapshotCache {
     pub raw_cursor: Option<(usize, usize)>,
     pub cols: u16,
     pub rows: u16,
+    /// CRC32 of `output` / `raw_output`, computed once when the dump is
+    /// (re)built. `GET /output` needs the payload's total CRC on every
+    /// poll (the `X-Output-Crc` header + the `?since`/`crc` delta
+    /// handshake); recomputing it per request walked up to hundreds of
+    /// KB at the poll rate for a value that only changes when the grid
+    /// does.
+    pub output_crc: u32,
+    pub raw_output_crc: u32,
+}
+
+impl GridSnapshotCache {
+    /// Build the cache from freshly-scanned dumps, stamping their CRCs.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        ring_len: u64,
+        output: String,
+        cursor: Option<(usize, usize)>,
+        raw_output: String,
+        raw_cursor: Option<(usize, usize)>,
+        cols: u16,
+        rows: u16,
+    ) -> Self {
+        let output_crc = crate::crc32(output.as_bytes());
+        let raw_output_crc = crate::crc32(raw_output.as_bytes());
+        Self {
+            ring_len,
+            output: output.into(),
+            cursor,
+            raw_output: raw_output.into(),
+            raw_cursor,
+            cols,
+            rows,
+            output_crc,
+            raw_output_crc,
+        }
+    }
 }
 
 /// Minimal `Dimensions` impl for constructing a `Term`.
