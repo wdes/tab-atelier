@@ -517,6 +517,10 @@ struct AppState {
     /// Last time `tab_connections` was refreshed (throttled — the /proc scan
     /// is too heavy for every persist tick).
     last_conn_meter: std::cell::Cell<Option<std::time::Instant>>,
+    /// Last time non-agent tabs were probed for a manually-launched agent
+    /// (the token-stats discovery walk) — see `persist`'s token block.
+    #[cfg(feature = "catbus")]
+    last_token_discovery: std::cell::Cell<Option<std::time::Instant>>,
     /// Mirror of the API snapshot's lock-free `activity` counter (see
     /// `api::TabSnapshot::activity`), so persist-tick work that only serves
     /// API consumers can be skipped entirely while nobody is connected.
@@ -1217,6 +1221,8 @@ impl AppState {
             activity_last_seen: std::cell::Cell::new(0),
             activity_last_at: std::cell::Cell::new(None),
             last_conn_meter: std::cell::Cell::new(None),
+            #[cfg(feature = "catbus")]
+            last_token_discovery: std::cell::Cell::new(None),
             last_broadcast_size: std::cell::Cell::new(None),
             logo: Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, LOGO_PNG.to_vec())),
             output_saver: OutputSaver::spawn(platform::state_base_dir()),
@@ -1733,8 +1739,27 @@ impl AppState {
             // persist it to the standard per-tab state file so the rest of
             // the app (and the mobile remote) can read cumulative totals
             // without knowing about the ~/.claude/projects layout.
+            //
+            // `find_session` is a full /proc subtree walk per tab. Tabs
+            // with an attached agent session refresh every tick; tabs
+            // WITHOUT one are only probed for discovery (a claude launched
+            // by hand, no hooks) every ~30 s — a plain shell almost never
+            // grows an agent between ticks, so walking its subtree 30×/min
+            // was pure overhead.
+            #[cfg(feature = "catbus")]
+            let discover = self
+                .last_token_discovery
+                .get()
+                .is_none_or(|t| t.elapsed().as_secs() >= 30);
+            #[cfg(feature = "catbus")]
+            if discover {
+                self.last_token_discovery.set(Some(std::time::Instant::now()));
+            }
             #[cfg(feature = "catbus")]
             for tab in &self.tabs {
+                if tab.agent_kind.is_none() && !discover {
+                    continue;
+                }
                 let pid = tab.view.read(cx).pid();
                 if let Some(session) = crate::catbus_agent::find_session(pid)
                     && let Some(usage) = crate::catbus_agent::read_session_tokens(&session)

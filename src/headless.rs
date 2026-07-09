@@ -1415,8 +1415,28 @@ fn persist(
                 }
             }
         }
+        // `find_session` is a full /proc subtree walk per tab. Tabs with
+        // an attached agent session refresh every tick; tabs WITHOUT one
+        // are only probed for discovery (a claude launched by hand, no
+        // hooks) every ~30 s — a plain shell almost never grows an agent
+        // between ticks, so walking its subtree 30x/min was pure overhead.
+        #[cfg(feature = "catbus")]
+        let discover = {
+            use std::sync::OnceLock;
+            static LAST: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+            let lock = LAST.get_or_init(|| Mutex::new(None));
+            let mut last = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let due = last.is_none_or(|t| t.elapsed() >= Duration::from_secs(30));
+            if due {
+                *last = Some(Instant::now());
+            }
+            due
+        };
         #[cfg(feature = "catbus")]
         for tab in tabs.iter_mut() {
+            if tab.agent_kind.is_none() && !discover {
+                continue;
+            }
             if let Some(session) = crate::catbus_agent::find_session(tab.pid)
                 && let Some(usage) = crate::catbus_agent::read_session_tokens(&session)
                 // Usage is cumulative and only moves when the agent
