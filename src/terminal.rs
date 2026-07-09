@@ -2707,15 +2707,45 @@ impl Element for TerminalElement {
             let cw = f32::from(cell.width);
             let chh = f32::from(cell.height);
             for (line_idx, line) in state.lines.iter().enumerate() {
-                for bc in &line.raw.box_cells {
+                let cell_y = origin.y + cell.height * line_idx as f32;
+                let cells = &line.raw.box_cells;
+                let mut i = 0;
+                while i < cells.len() {
+                    let bc = &cells[i];
+                    // Pure horizontals (`─`, `━`, dashed forms) each
+                    // paint one full-width bar, so a contiguous
+                    // same-glyph same-colour run merges into a single
+                    // quad — a table rule across 200 columns was 400
+                    // `paint_quad` calls per frame, now it's 1. Corners
+                    // / tees / crosses have vertical ink and stay on
+                    // the per-cell path below.
+                    if let Some(bar) = crate::box_drawing::h_bar(bc.parts, cw, chh) {
+                        let mut end = i + 1;
+                        while end < cells.len() {
+                            let next = &cells[end];
+                            if next.col != cells[end - 1].col + 1
+                                || next.parts != bc.parts
+                                || !hsla_eq(next.color, bc.color)
+                            {
+                                break;
+                            }
+                            end += 1;
+                        }
+                        let run_cols = cells[end - 1].col - bc.col + 1;
+                        let pos = point(origin.x + cell.width * bc.col as f32, cell_y + px(bar.y));
+                        let sz = size(px(cw * run_cols as f32), px(bar.h));
+                        window.paint_quad(fill(Bounds::new(pos, sz), bc.color));
+                        i = end;
+                        continue;
+                    }
                     let cell_x = origin.x + cell.width * bc.col as f32;
-                    let cell_y = origin.y + cell.height * line_idx as f32;
                     let (bars, n) = crate::box_drawing::rects(bc.parts, cw, chh);
                     for r in &bars[..n] {
                         let pos = point(cell_x + px(r.x), cell_y + px(r.y));
                         let sz = size(px(r.w), px(r.h));
                         window.paint_quad(fill(Bounds::new(pos, sz), bc.color));
                     }
+                    i += 1;
                 }
             }
 
