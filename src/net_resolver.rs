@@ -142,20 +142,32 @@ fn refresh_loop(
     while !shutdown.load(Ordering::Relaxed) {
         let mut min_ttl = REFRESH_MAX_S;
         let mut resolved: Vec<(String, Vec<(IpAddr, u32)>)> = Vec::with_capacity(domains.len());
+        // One socket for the whole cycle instead of a fresh bind per query.
+        let sock = UdpSocket::bind(("0.0.0.0", 0))
+            .and_then(|s| s.set_read_timeout(Some(Duration::from_secs(3))).map(|()| s))
+            .ok();
         for domain in &domains {
-            let ips = resolve(domain, upstream);
+            let ips = sock.as_ref().map_or_else(Vec::new, |s| resolve(s, domain, upstream));
             for &(_, ttl) in &ips {
                 min_ttl = min_ttl.min(ttl.max(1));
             }
             resolved.push((domain.clone(), ips));
         }
+        drop(sock);
         let sleep_s = min_ttl.clamp(REFRESH_MIN_S, REFRESH_MAX_S);
         let elem_timeout = sleep_s + TTL_GRACE_S;
+        // Program the whole cycle's IPs in ONE nft invocation (this loop
+        // used to fork a subprocess per IP; see `net_nft::add_allow_ips`).
+        let batch: Vec<(IpAddr, u32, &str)> = resolved
+            .iter()
+            .flat_map(|(domain, ips)| {
+                ips.iter()
+                    // Live at least until the next refresh reprograms it.
+                    .map(move |&(ip, ttl)| (ip, ttl.max(elem_timeout), domain.as_str()))
+            })
+            .collect();
+        crate::net_nft::add_allow_ips(tab_id, &batch);
         for (domain, ips) in &resolved {
-            for &(ip, ttl) in ips {
-                // Live at least until the next refresh reprograms it.
-                crate::net_nft::add_allow_ip(tab_id, ip, ttl.max(elem_timeout), domain);
-            }
             record(log, domain, ips.iter().map(|(ip, _)| *ip).collect());
         }
         sleep_with_shutdown(sleep_s, shutdown);
@@ -172,12 +184,13 @@ fn sleep_with_shutdown(secs: u32, shutdown: &Arc<AtomicBool>) {
     }
 }
 
-/// Resolve `domain` to its A and AAAA IPs (with TTLs) via `upstream`.
-fn resolve(domain: &str, upstream: SocketAddr) -> Vec<(IpAddr, u32)> {
+/// Resolve `domain` to its A and AAAA IPs (with TTLs) via `upstream`,
+/// reusing the caller's socket across queries.
+fn resolve(sock: &UdpSocket, domain: &str, upstream: SocketAddr) -> Vec<(IpAddr, u32)> {
     let mut ips = Vec::new();
     for qtype in [1u16 /* A */, 28u16 /* AAAA */] {
         if let Some(q) = build_query(domain, qtype)
-            && let Some(resp) = forward(&q, upstream)
+            && let Some(resp) = forward(sock, &q, upstream)
         {
             ips.extend(extract_answer_ips(&resp));
         }
@@ -205,12 +218,10 @@ pub fn build_query(name: &str, qtype: u16) -> Option<Vec<u8>> {
 }
 
 /// Forward a raw query to `upstream` and return the raw response (best-effort).
-fn forward(query: &[u8], upstream: SocketAddr) -> Option<Vec<u8>> {
-    let up = UdpSocket::bind(("0.0.0.0", 0)).ok()?;
-    up.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
-    up.send_to(query, upstream).ok()?;
+fn forward(sock: &UdpSocket, query: &[u8], upstream: SocketAddr) -> Option<Vec<u8>> {
+    sock.send_to(query, upstream).ok()?;
     let mut buf = [0u8; 1500];
-    let n = up.recv(&mut buf).ok()?;
+    let n = sock.recv(&mut buf).ok()?;
     Some(buf[..n].to_vec())
 }
 

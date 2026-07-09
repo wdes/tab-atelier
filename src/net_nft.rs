@@ -307,6 +307,16 @@ pub fn apply_domain(tab_id: &str, cgroup_rel: &str, cidrs: &[Cidr], dns_servers:
 /// v4/v6 by the address.
 pub fn add_allow_ip(tab_id: &str, ip: std::net::IpAddr, ttl_secs: u32, domain: &str) {
     let table = table_name(tab_id);
+    let _ = std::process::Command::new(nft_bin())
+        .args(["add", "element", "inet", &table, &allow_element(ip, ttl_secs, domain)])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// `<set> { addr timeout Ns comment "domain" }` — the per-IP argument tail
+/// shared by the single and batch add paths.
+fn allow_element(ip: std::net::IpAddr, ttl_secs: u32, domain: &str) -> String {
     let (set, addr) = match ip {
         std::net::IpAddr::V4(a) => ("allow_dyn", a.to_string()),
         std::net::IpAddr::V6(a) => ("allow_dyn6", a.to_string()),
@@ -314,12 +324,32 @@ pub fn add_allow_ip(tab_id: &str, ip: std::net::IpAddr, ttl_secs: u32, domain: &
     // Domain is the resolver's gated query name (already validated against the
     // allowlist); still strip quotes to keep the nft element syntax clean.
     let safe_domain: String = domain.chars().filter(|c| *c != '"' && *c != '\\').collect();
-    let element = format!("{{ {addr} timeout {ttl_secs}s comment \"{safe_domain}\" }}");
-    let _ = std::process::Command::new(nft_bin())
-        .args(["add", "element", "inet", &table, set, &element])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+    format!("{set} {{ {addr} timeout {ttl_secs}s comment \"{safe_domain}\" }}")
+}
+
+/// Add a whole refresh cycle's resolved IPs in ONE `nft -f` invocation.
+///
+/// The resolver used to fork one `nft` per IP per refresh — 20 domains
+/// with a few A/AAAA answers each is 40-120 subprocess spawns every
+/// 20-120 s per allowlist tab. Best-effort like `add_allow_ip`: if the
+/// transactional batch is refused (one bad element aborts `nft -f`),
+/// fall back to per-element adds so a single oddity can't starve the
+/// rest of the cycle.
+pub fn add_allow_ips(tab_id: &str, entries: &[(std::net::IpAddr, u32, &str)]) {
+    if entries.is_empty() {
+        return;
+    }
+    let table = table_name(tab_id);
+    let mut script = String::with_capacity(entries.len() * 64);
+    for (ip, ttl, domain) in entries {
+        use std::fmt::Write as _;
+        let _ = writeln!(script, "add element inet {table} {}", allow_element(*ip, *ttl, domain));
+    }
+    if !matches!(run_nft_stdin(&script), Ok(true)) {
+        for (ip, ttl, domain) in entries {
+            add_allow_ip(tab_id, *ip, *ttl, domain);
+        }
+    }
 }
 
 /// Format a u128 as a fully-expanded IPv6 address (no `::` compression —
