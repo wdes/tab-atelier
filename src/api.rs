@@ -268,14 +268,18 @@ pub struct SnapshotTab {
     pub id: String,
     pub name: String,
     pub cwd: Option<String>,
-    pub output: String,
+    /// `Arc<str>` (shared with the per-tab `GridSnapshotCache`): the
+    /// snapshot is rebuilt per tab on every refresh tick, and these two
+    /// dumps are by far its heaviest fields — sharing makes the rebuild
+    /// a refcount bump instead of a multi-hundred-KB copy per tab.
+    pub output: std::sync::Arc<str>,
     /// Row-by-row dump for the xterm.js viewer — server grid rows
     /// emitted as separate `\n`-terminated lines (NO WRAPLINE join),
     /// so the browser-side terminal at the same cols reproduces the
     /// server's layout cell-for-cell. The mobile remote and CLI
     /// viewer keep using `output` (logical lines, easier to word-wrap
     /// on a phone).
-    pub raw_output: String,
+    pub raw_output: std::sync::Arc<str>,
     /// Cursor (`row_in_raw_output`, col) — coordinates inside
     /// `raw_output` so the xterm.js viewer can issue a
     /// cursor-position escape after each write and the blinking
@@ -1818,13 +1822,17 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             // can reproduce the server's layout exactly when it's
             // resized to the same cols/rows. The mobile remote keeps
             // talking to /tabs (which returns the joined `output`).
-            let payload = if t.raw_output.is_empty() {
-                &t.output
+            // Clone the Arc handle (refcount bump) + the small fields,
+            // then drop the global snapshot lock BEFORE the CRC passes
+            // and suffix search below — they walk up to hundreds of KB
+            // per poll and used to run entirely under the mutex every
+            // other API user (and every WS keystroke) needs.
+            let payload: std::sync::Arc<str> = if t.raw_output.is_empty() {
+                t.output.clone()
             } else {
-                &t.raw_output
+                t.raw_output.clone()
             };
-            let total_crc = crate::crc32(payload.as_bytes());
-            let total_len = payload.len();
+            let full_cursor = t.cursor;
             let pty_cols = t.cols;
             let pty_rows = t.rows;
             let raw_cursor = t.raw_cursor;
@@ -1844,8 +1852,15 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 };
                 (Some(key), s.label.clone())
             });
+            drop(state);
 
-            let (body, cursor, start_offset) = match (query_since, query_crc) {
+            let total_crc = crate::crc32(payload.as_bytes());
+            let total_len = payload.len();
+
+            // Every response mode ships a suffix of `payload`, so track
+            // just the start offset — the body is sliced out of the
+            // shared Arc at respond time, no per-request copy.
+            let (cursor, start_offset) = match (query_since, query_crc) {
                 (Some(n), Some(client_crc)) if n <= total_len => {
                     let prefix_crc = crate::crc32(&payload.as_bytes()[..n]);
                     if prefix_crc == client_crc {
@@ -1853,9 +1868,9 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                         // ours. Ship the suffix only — cursor row is
                         // relative to the full buffer, the client knows
                         // how to add its own line count.
-                        (payload[n..].to_string(), t.cursor, n)
+                        (full_cursor, n)
                     } else {
-                        (payload.clone(), t.cursor, 0)
+                        (full_cursor, 0)
                     }
                 }
                 _ => match query_lines {
@@ -1863,7 +1878,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                         let total_lines = payload.lines().count();
                         let drop_count = total_lines.saturating_sub(n);
                         if drop_count == 0 {
-                            (payload.clone(), t.cursor, 0)
+                            (full_cursor, 0)
                         } else {
                             let mut offset = 0;
                             for _ in 0..drop_count {
@@ -1874,20 +1889,19 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                                     break;
                                 }
                             }
-                            let cur = t.cursor.and_then(|(r, c)| {
+                            let cur = full_cursor.and_then(|(r, c)| {
                                 if r >= drop_count {
                                     Some((r - drop_count, c))
                                 } else {
                                     None
                                 }
                             });
-                            (payload[offset..].to_string(), cur, offset)
+                            (cur, offset)
                         }
                     }
-                    _ => (payload.clone(), t.cursor, 0),
+                    _ => (full_cursor, 0),
                 },
             };
-            drop(state);
 
             let mut extra = String::new();
             if let Some((row, col)) = cursor {
@@ -1963,7 +1977,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 stream,
                 200,
                 "text/plain; charset=utf-8",
-                body.as_bytes(),
+                payload[start_offset..].as_bytes(),
                 accept_gzip,
                 None,
                 &extra,
@@ -3486,7 +3500,7 @@ mod tests {
                     cursor: None,
                     cols: 80,
                     rows: 24,
-                    raw_output: String::new(),
+                    raw_output: "".into(),
                     raw_cursor: None,
                     share_token_rw: String::new(),
                     share_token_ro: String::new(),
@@ -3511,12 +3525,12 @@ mod tests {
                     id: "tab-b".into(),
                     name: "build".into(),
                     cwd: None,
-                    output: String::new(),
+                    output: "".into(),
                     uptime_secs: 0.0,
                     cursor: None,
                     cols: 80,
                     rows: 24,
-                    raw_output: String::new(),
+                    raw_output: "".into(),
                     raw_cursor: None,
                     share_token_rw: String::new(),
                     share_token_ro: String::new(),
@@ -4387,7 +4401,7 @@ mod tests {
     fn get_tab_output_lines_param_tails() {
         let (port, state, token) = spawn_server();
         state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).tabs[0].output =
-            (1..=10).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+            (1..=10).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n").into();
         let resp = request(
             port,
             &format!("GET /tabs/0/output?lines=3&token={token} HTTP/1.1\r\n\r\n"),
@@ -4480,7 +4494,7 @@ mod tests {
     /// gzip path kicks in (we threshold at 4 KB).
     fn fill_output(state: &Arc<Mutex<TabSnapshot>>, idx: usize, content: &str) {
         let mut snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        snap.tabs[idx].output = content.to_string();
+        snap.tabs[idx].output = content.into();
         snap.cached_response = None; // invalidate /tabs cache
     }
 

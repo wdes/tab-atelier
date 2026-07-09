@@ -1483,9 +1483,9 @@ impl AppState {
                 let (cols, rows) = view.dims();
                 Some(crate::term_export::GridSnapshotCache {
                     ring_len,
-                    output,
+                    output: output.into(),
                     cursor,
-                    raw_output,
+                    raw_output: raw_output.into(),
                     raw_cursor,
                     cols,
                     rows,

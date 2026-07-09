@@ -316,9 +316,9 @@ impl HeadlessTab {
         let (cols, rows) = self.dims();
         let grid = crate::term_export::GridSnapshotCache {
             ring_len,
-            output,
+            output: output.into(),
             cursor,
-            raw_output,
+            raw_output: raw_output.into(),
             raw_cursor,
             cols,
             rows,
