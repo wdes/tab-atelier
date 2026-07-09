@@ -132,6 +132,22 @@ const OUTPUT_DEBOUNCE_MS: u64 = 2;
 const WS_MAX_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
 const WS_MAX_FRAME_BYTES: usize = 1024 * 1024;
 
+/// `out` payloads at or above this size gzip on tokio's blocking pool
+/// instead of inline — the WS runtime is a single thread shared by every
+/// connection, and the `since=0` scrollback bootstrap can be megabytes.
+const OFFLOAD_MIN_BYTES: usize = 64 * 1024;
+
+/// One tick's output-flush decision — computed under the ring lock,
+/// acted on after it's dropped. See the flush block in [`run_pump`].
+enum OutFlush {
+    Nothing,
+    /// A sibling viewer already encoded this exact range; send its frame.
+    Shared(Bytes),
+    /// First pump to reach this range: `(from, to, raw bytes)` — encode,
+    /// publish to the ring's frame cache, send.
+    Fresh(u64, u64, Vec<u8>),
+}
+
 /// Dedup window for mobile-IME `compositionupdate` + `compositionend`
 /// duplicates. Android Gboard / iOS soft keyboards fire xterm.js's
 /// `onData` cumulatively as the user types (`"h"`, `"he"`,
@@ -741,24 +757,55 @@ async fn run_pump(
         // `ring_offset` — so a spurious wake is a cheap no-op. The lock
         // is dropped before we await the sink so the PTY-read side
         // (pty_ring) is never blocked while we talk to the socket.
-        let chunk = {
+        //
+        // When several viewers watch one tab they flush the same suffix
+        // in lockstep, so the encoded frame is cached on the ring: the
+        // first pump to reach a range pays the copy + gzip, siblings
+        // send the shared `Bytes`.
+        let flush = {
             let Ok(r) = ring.lock() else {
                 return;
             };
             let new_total = r.total_len();
             if new_total == ring_offset {
-                Vec::new()
-            } else {
-                let bytes = r.since(ring_offset);
+                OutFlush::Nothing
+            } else if let Some(frame) = r.cached_frame(ring_offset, new_total) {
                 ring_offset = new_total;
-                bytes
+                OutFlush::Shared(frame)
+            } else {
+                let from = ring_offset;
+                ring_offset = new_total;
+                OutFlush::Fresh(from, new_total, r.since(from))
             }
         };
-        if !chunk.is_empty() {
-            let frame = encode_out_frame(chunk);
-            if sink.send(Message::Binary(frame.into())).await.is_err() {
-                return;
+        match flush {
+            OutFlush::Shared(frame) => {
+                if sink.send(Message::Binary(frame)).await.is_err() {
+                    return;
+                }
             }
+            OutFlush::Fresh(from, to, chunk) if !chunk.is_empty() => {
+                // Big payloads (the since=0 scrollback bootstrap can be
+                // MiBs) gzip on the blocking pool — this runtime is
+                // single-threaded and shared by EVERY connection, so an
+                // inline multi-MiB deflate stalls all of them.
+                let frame: Bytes = if chunk.len() >= OFFLOAD_MIN_BYTES {
+                    match tokio::task::spawn_blocking(move || encode_out_frame(chunk)).await {
+                        Ok(f) => f.into(),
+                        Err(_) => return,
+                    }
+                } else {
+                    encode_out_frame(chunk).into()
+                };
+                if let Ok(mut r) = ring.lock() {
+                    r.store_frame(from, to, frame.clone());
+                }
+                if sink.send(Message::Binary(frame)).await.is_err() {
+                    return;
+                }
+            }
+            // Nothing new, or an empty fresh chunk — no frame this tick.
+            OutFlush::Nothing | OutFlush::Fresh(..) => {}
         }
 
         tokio::select! {

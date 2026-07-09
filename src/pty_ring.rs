@@ -93,6 +93,15 @@ pub struct PtyRing {
     /// this tab" — the GUI's dormant-LED suppressor and the `/tabs`
     /// `viewers` field.
     viewers: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// One-entry cache of the last encoded `out` wire frame, keyed by
+    /// the byte range it covers. N viewers of one tab flush the same
+    /// suffix in lockstep (they all stay caught up), so without this
+    /// each connection copied the bytes out of the ring and gzipped
+    /// them independently — the first pump to encode a range now
+    /// shares the `Bytes` with the rest for free. A range mismatch
+    /// (viewers at different offsets) just misses; correctness never
+    /// depends on the cache.
+    frame_cache: Option<(u64, u64, bytes::Bytes)>,
 }
 
 impl Default for PtyRing {
@@ -114,6 +123,32 @@ impl PtyRing {
             cap: cap.max(1),
             notify: std::sync::Arc::new(tokio::sync::Notify::new()),
             viewers: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            frame_cache: None,
+        }
+    }
+
+    /// Ceiling on a cached wire frame. Anything larger (a `since=0`
+    /// scrollback bootstrap can be megabytes) is a per-connection one-off —
+    /// caching it would just pin the memory until the next steady-state
+    /// frame overwrites it.
+    const FRAME_CACHE_MAX: usize = 512 * 1024;
+
+    /// The encoded wire frame covering exactly `[from, to)`, if a pump
+    /// already built one. See the `frame_cache` field.
+    #[must_use]
+    pub fn cached_frame(&self, from: u64, to: u64) -> Option<bytes::Bytes> {
+        self.frame_cache
+            .as_ref()
+            .filter(|(f, t, _)| *f == from && *t == to)
+            .map(|(_, _, b)| b.clone())
+    }
+
+    /// Publish the encoded wire frame for `[from, to)` so sibling
+    /// viewers of this tab can reuse it. Oversized frames are skipped
+    /// (see [`Self::FRAME_CACHE_MAX`]).
+    pub fn store_frame(&mut self, from: u64, to: u64, frame: bytes::Bytes) {
+        if frame.len() <= Self::FRAME_CACHE_MAX {
+            self.frame_cache = Some((from, to, frame));
         }
     }
 
@@ -153,6 +188,11 @@ impl PtyRing {
         // the pump's 100 ms meta tick backstops any connect race.
         if !data.is_empty() && self.viewer_count() > 0 {
             self.notify.notify_waiters();
+        } else if self.frame_cache.is_some() {
+            // No viewer left to reuse it — drop the retained wire frame
+            // so an unwatched tab doesn't pin up to 512 KiB of encoded
+            // output indefinitely.
+            self.frame_cache = None;
         }
     }
 
