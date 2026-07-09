@@ -442,6 +442,10 @@ struct AppState {
     /// Last title pushed via `set_window_title`, so render only re-sends
     /// it when it actually changes (tab switch / rename), not per frame.
     last_window_title: String,
+    /// Cached `"tab-{i}"` element-id strings for the tab bar, grown on
+    /// demand — saves a `format!` per tab per frame. Index-keyed, so
+    /// entries never need invalidation.
+    tab_el_ids: Vec<SharedString>,
     font_config: FontConfig,
     tracker: Option<WakatimeTracker>,
     api_token: String,
@@ -1156,6 +1160,7 @@ impl AppState {
             show_qr: false,
             qr_modal: None,
             last_window_title: String::new(),
+            tab_el_ids: Vec::new(),
             font_config,
             tracker,
             api_token,
@@ -2304,12 +2309,22 @@ impl AppState {
         #[cfg(feature = "energy")]
         let watts_fg = th.fg_muted_hsla();
 
+        // Element ids are index-keyed and stable — build each "tab-{i}"
+        // SharedString once and reuse it, instead of a format! per tab
+        // per frame (the bar re-renders at 30-60 fps while the terminal
+        // streams).
+        while self.tab_el_ids.len() < self.tabs.len() {
+            self.tab_el_ids
+                .push(SharedString::from(format!("tab-{}", self.tab_el_ids.len())));
+        }
+
+        // Hold the guard for the (microseconds-long) bar build instead
+        // of cloning the whole per-tab power Vec every frame.
         #[cfg(feature = "energy")]
         let watts = self
             .power_watts
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let mut bar = div()
             .id("tab-bar")
@@ -2447,7 +2462,7 @@ impl AppState {
 
             let drag_name = tab.name.clone();
             let tab_el = div()
-                .id(ElementId::Name(format!("tab-{i}").into()))
+                .id(ElementId::Name(self.tab_el_ids[i].clone()))
                 .flex()
                 .items_center()
                 .px(px(12.0))
@@ -2580,6 +2595,8 @@ impl AppState {
 
             bar = bar.child(tab_el);
         }
+        #[cfg(feature = "energy")]
+        drop(watts);
 
         let plus_btn = div()
             .id("tab-plus")
