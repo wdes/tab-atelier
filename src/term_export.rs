@@ -32,12 +32,18 @@ use vte::ansi::{Color, NamedColor};
 /// first, a `ring_len` equal to the cached one means the grid is
 /// byte-for-byte unchanged and the prior scan can be reused, so idle
 /// tabs stop paying for the full-grid walk each tick.
+/// The two grid dumps are `Arc<str>` rather than `String`: the cache is
+/// cloned into the API snapshot for EVERY tab on every refresh tick
+/// (2 s GUI persist, ~96 ms headless), and `raw_output` alone can be
+/// hundreds of KB with a viewer attached — as owned `String`s that was
+/// a multi-MB memcpy + allocator churn per tick even when fully idle.
+/// A clone is now two refcount bumps.
 #[derive(Clone)]
 pub struct GridSnapshotCache {
     pub ring_len: u64,
-    pub output: String,
+    pub output: std::sync::Arc<str>,
     pub cursor: Option<(usize, usize)>,
-    pub raw_output: String,
+    pub raw_output: std::sync::Arc<str>,
     pub raw_cursor: Option<(usize, usize)>,
     pub cols: u16,
     pub rows: u16,
