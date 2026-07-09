@@ -1287,10 +1287,16 @@ pub fn load_state_at(path: &std::path::Path) -> Option<SavedState> {
 
 /// Load tab list and hydrate each tab's output / uptime / energy from its
 /// per-tab file under `state_base`.
+///
+/// Per-tab hydration fans out over a few threads: each tab is up to ~8
+/// independent file probes (each metric retries a `.bak` on miss) plus a
+/// JSON parse of a possibly multi-hundred-KB output string, and it all
+/// runs before the first paint — serially, a 60-tab startup paid ~480
+/// opens + every parse back to back on one core.
 #[must_use]
 pub fn load_state_with_outputs(config_base: &std::path::Path, state_base: &std::path::Path) -> Option<SavedState> {
     let mut state = load_state_at(&config_state_path(config_base))?;
-    for t in &mut state.tabs {
+    let hydrate = |t: &mut TabState| {
         if t.output.is_none() {
             t.output = load_tab_output(state_base, &t.name);
         }
@@ -1303,6 +1309,20 @@ pub fn load_state_with_outputs(config_base: &std::path::Path, state_base: &std::
         if t.tokens.is_none() {
             t.tokens = load_tab_tokens(state_base, &t.name);
         }
+    };
+    // Scoped threads over disjoint chunks; the files are independent.
+    // A handful of workers is plenty — this is I/O + JSON parsing, and
+    // more threads just fight over the page cache.
+    let workers = std::thread::available_parallelism().map_or(2, |n| n.get().min(4));
+    if state.tabs.len() <= 1 || workers <= 1 {
+        state.tabs.iter_mut().for_each(hydrate);
+    } else {
+        let chunk = state.tabs.len().div_ceil(workers);
+        std::thread::scope(|s| {
+            for tabs in state.tabs.chunks_mut(chunk) {
+                s.spawn(|| tabs.iter_mut().for_each(hydrate));
+            }
+        });
     }
     Some(state)
 }
