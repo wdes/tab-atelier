@@ -444,6 +444,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn activity_walk_on_agentless_process_reports_gone() {
+        // The test process has no claude/catbus-agent descendant, so the
+        // walk lands on Gone with no pid — the pair the sweeps key off.
+        let (activity, pid) = agent_activity_with_pid(std::process::id());
+        assert_eq!(activity, AgentActivity::Gone);
+        assert_eq!(pid, None);
+    }
+
+    #[test]
+    fn find_session_for_dead_pid_is_none() {
+        // A pid that can't exist: the /proc reads fail and the cached-pid
+        // fast path degrades to None (caller falls back / waits a sweep).
+        assert!(find_session_for(u32::MAX).is_none());
+    }
+
+    #[test]
     fn escape_cwd_replaces_every_non_alpha_with_dash() {
         let p = Path::new("/mnt/Dev/@wdes");
         assert_eq!(escape_cwd(p), "-mnt-Dev--wdes");
