@@ -2864,9 +2864,13 @@ use tokio::net::TcpListener as TokioListener;
 
 /// In-memory adapter that lets the existing sync handler read a
 /// pre-formatted HTTP/1.1 request and write its response into a
-/// `Vec<u8>` we can hand back to hyper.
+/// `Vec<u8>` we can hand back to hyper. The input is the header block
+/// CHAINED with hyper's collected body `Bytes` — the body used to be
+/// appended into the header buffer, which duplicated every upload
+/// (100 MiB cap, 3 in flight per token ⇒ hundreds of MiB of transient
+/// RSS for data hyper already held).
 struct MemAdapter {
-    input: std::io::Cursor<Vec<u8>>,
+    input: std::io::Chain<std::io::Cursor<Vec<u8>>, std::io::Cursor<Bytes>>,
     output: Vec<u8>,
 }
 impl Read for MemAdapter {
@@ -2888,8 +2892,8 @@ impl Write for MemAdapter {
 /// path from the request line, headers (Authorization, Content-Length,
 /// Accept-Encoding, If-None-Match), and then a body of `Content-Length`
 /// bytes — everything else hyper sent is dropped.
-fn format_h1_request(method: &str, uri: &str, headers: &hyper::HeaderMap, body: &[u8]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(256 + body.len());
+fn format_h1_request(method: &str, uri: &str, headers: &hyper::HeaderMap, body_len: usize) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(512);
     let _ = write!(&mut buf, "{method} {uri} HTTP/1.1\r\n");
     for (name, value) in headers {
         if name == hyper::header::CONTENT_LENGTH {
@@ -2900,8 +2904,7 @@ fn format_h1_request(method: &str, uri: &str, headers: &hyper::HeaderMap, body: 
             let _ = write!(&mut buf, "{}: {}\r\n", name.as_str(), v);
         }
     }
-    let _ = write!(&mut buf, "Content-Length: {}\r\n\r\n", body.len());
-    buf.extend_from_slice(body);
+    let _ = write!(&mut buf, "Content-Length: {body_len}\r\n\r\n");
     buf
 }
 
@@ -2910,11 +2913,15 @@ fn format_h1_request(method: &str, uri: &str, headers: &hyper::HeaderMap, body: 
 /// The handler always emits `HTTP/1.1 STATUS REASON` + headers + body.
 /// We ignore the reason phrase (hyper rebuilds it) and pass headers +
 /// body through.
-fn parse_h1_response(bytes: &[u8]) -> Response<Full<Bytes>> {
+fn parse_h1_response(bytes: Vec<u8>) -> Response<Full<Bytes>> {
     // Find header/body split.
     let split = bytes.windows(4).position(|w| w == b"\r\n\r\n");
-    let (head, body) = split.map_or((bytes, &[][..]), |i| (&bytes[..i], &bytes[i + 4..]));
-    let head_text = std::str::from_utf8(head).unwrap_or("");
+    // Move the handler's Vec into `Bytes` and slice the body out of it —
+    // zero-copy, where this used to `copy_from_slice` the whole body
+    // (up to a full file download) once more per request.
+    let all = Bytes::from(bytes);
+    let (head, body) = split.map_or_else(|| (all.clone(), Bytes::new()), |i| (all.slice(..i), all.slice(i + 4..)));
+    let head_text = std::str::from_utf8(&head).unwrap_or("");
     let mut lines = head_text.split("\r\n");
     let status = lines
         .next()
@@ -2942,10 +2949,7 @@ fn parse_h1_response(bytes: &[u8]) -> Response<Full<Bytes>> {
         }
     }
     let _ = content_encoding_gzip;
-    let body_bytes = content_length.map_or_else(
-        || Bytes::copy_from_slice(body),
-        |n| Bytes::copy_from_slice(&body[..n.min(body.len())]),
-    );
+    let body_bytes = content_length.map_or_else(|| body.clone(), |n| body.slice(..n.min(body.len())));
     builder
         .body(Full::new(body_bytes))
         .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))
@@ -2984,10 +2988,12 @@ async fn handle_hyper_request(
                 .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()))));
         }
     };
-    let req_bytes = format_h1_request(&method, &uri, &headers, &body);
+    let head = format_h1_request(&method, &uri, &headers, body.len());
     let resp = tokio::task::spawn_blocking(move || {
         let mut adapter = MemAdapter {
-            input: std::io::Cursor::new(req_bytes),
+            // Chain the header block with hyper's body `Bytes` instead of
+            // concatenating — no second copy of the (up to 100 MiB) body.
+            input: std::io::Read::chain(std::io::Cursor::new(head), std::io::Cursor::new(body)),
             output: Vec::with_capacity(1024),
         };
         handle_connection(&mut adapter, &state, &token, read_only);
@@ -2995,7 +3001,7 @@ async fn handle_hyper_request(
     })
     .await
     .unwrap_or_default();
-    Ok(parse_h1_response(&resp))
+    Ok(parse_h1_response(resp))
 }
 
 /// Pick the right hyper connection driver for the negotiated ALPN.
