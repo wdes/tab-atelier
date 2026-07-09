@@ -2336,6 +2336,17 @@ pub fn save_preferences_at(path: &std::path::Path, prefs: &Preferences) {
     }
 }
 
+/// Line cap for the PERIODIC (every-2 s) scrollback saves in both the GUI
+/// and headless output savers.
+///
+/// The full-history walk serializes up to 10 000 lines × cols cells while
+/// holding the tab's Term lock — the alacritty parser blocks on that same
+/// lock, so a busy tab hiccuped every save tick. 2 000 lines keeps a
+/// restart restore deep enough to scroll through while cutting the
+/// walk ~5×; the SHUTDOWN flush still saves the full history inline, so a
+/// clean quit loses nothing (only a crash/kill restores the capped depth).
+pub const PERIODIC_OUTPUT_SAVE_LINES: usize = 2000;
+
 /// Persist a single tab's output buffer to its own file
 /// (`{state_base}/tab-atelier/output_tab-<sanitized-name>.json`). Atomic,
 /// with one rotated backup.

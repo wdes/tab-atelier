@@ -1705,7 +1705,7 @@ impl AppState {
                     SaveJob {
                         name: tab.name.clone(),
                         ring_len: view.pty_ring().lock().map_or(0, |r| r.total_len()),
-                        serialize: Box::new(view.history_job()),
+                        serialize: Box::new(view.history_job(Some(crate::PERIODIC_OUTPUT_SAVE_LINES))),
                     }
                 })
                 .collect();
