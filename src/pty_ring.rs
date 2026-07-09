@@ -64,6 +64,28 @@ use polling::{Event, PollMode, Poller};
 /// runaway tab can't grow without limit.
 pub const DEFAULT_CAPACITY_BYTES: usize = 4 * 1024 * 1024;
 
+/// One deflate-compressed block of aged-out ring bytes. Terminal
+/// output compresses 5-10×, so keeping the cold majority of the ring
+/// compressed cuts a full tab's resident cost from `cap` (4 MiB) to
+/// well under 1 MiB without giving up a byte of replayable history.
+#[derive(Debug)]
+struct ColdChunk {
+    /// Uncompressed size — the chunk's extent in offset space.
+    raw_len: u32,
+    deflated: Vec<u8>,
+}
+
+impl ColdChunk {
+    fn inflate(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.raw_len as usize);
+        let mut dec = flate2::read::DeflateDecoder::new(self.deflated.as_slice());
+        // Reading our own well-formed deflate stream into a Vec cannot
+        // fail; a partial result would only follow memory corruption.
+        let _ = std::io::Read::read_to_end(&mut dec, &mut out);
+        out
+    }
+}
+
 /// Bounded byte ring with monotonic [`u64`] addressing.
 ///
 /// Cheap, all-purpose append + read-from-offset structure. We
@@ -71,11 +93,23 @@ pub const DEFAULT_CAPACITY_BYTES: usize = 4 * 1024 * 1024;
 /// terminal protocol so we don't have to keep up with escape-sequence
 /// boundary detection. xterm.js's parser already does that on the
 /// client side.
+///
+/// Storage is two-tier: the newest [`Self::HOT_MAX`] bytes stay plain
+/// in `hot` (the WS pump reads the tail ~33×/s — that path must stay
+/// O(result)), everything older is deflated into `cold` chunks. The
+/// capacity bounds the UNCOMPRESSED total, so offset semantics and
+/// retained history are identical to the uncompressed ring.
 #[derive(Debug)]
 pub struct PtyRing {
-    bytes: VecDeque<u8>,
-    /// Monotonic byte offset of `bytes[0]` since the ring was
-    /// constructed. Grows whenever the ring drops bytes from the
+    /// Plain tail — the newest bytes, uncompressed.
+    hot: VecDeque<u8>,
+    /// Compressed older blocks, oldest first. Contiguous with `hot`:
+    /// offsets run `base_offset` → cold chunks → hot.
+    cold: VecDeque<ColdChunk>,
+    /// Σ `raw_len` over `cold` — the cold section's extent.
+    cold_raw: usize,
+    /// Monotonic byte offset of the first retained byte since the ring
+    /// was constructed. Grows whenever the ring drops bytes from the
     /// front to make room.
     base_offset: u64,
     cap: usize,
@@ -93,6 +127,12 @@ pub struct PtyRing {
     /// this tab" — the GUI's dormant-LED suppressor and the `/tabs`
     /// `viewers` field.
     viewers: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Lock-free mirror of [`Self::total_len`], updated on every push.
+    /// The GUI's per-tab repaint pump reads it each tick to answer
+    /// "did output arrive" — through this handle that's one atomic
+    /// load instead of taking the ring mutex the PTY reader thread
+    /// contends on.
+    len_mirror: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// One-entry cache of the last encoded `out` wire frame, keyed by
     /// the byte range it covers. N viewers of one tab flush the same
     /// suffix in lockstep (they all stay caught up), so without this
@@ -111,6 +151,15 @@ impl Default for PtyRing {
 }
 
 impl PtyRing {
+    /// Plain-tail budget: bytes newer than this stay uncompressed so
+    /// the steady-state `since` reads (WS pump tail polls) never touch
+    /// a decompressor. Compaction only engages when the capacity
+    /// meaningfully exceeds it, so small test rings behave exactly
+    /// like the historical uncompressed ring.
+    const HOT_MAX: usize = 256 * 1024;
+    /// Uncompressed size of one cold chunk.
+    const CHUNK_RAW: usize = 128 * 1024;
+
     #[must_use]
     pub fn with_capacity(cap: usize) -> Self {
         Self {
@@ -118,13 +167,22 @@ impl PtyRing {
             // the old 1 MiB pre-allocation charged every tab ~1 MiB of
             // RSS at spawn even if it never printed more than a prompt
             // (60 restored tabs ⇒ ~60 MiB of mostly-untouched buffers).
-            bytes: VecDeque::with_capacity(cap.min(64 * 1024)),
+            hot: VecDeque::with_capacity(cap.min(64 * 1024)),
+            cold: VecDeque::new(),
+            cold_raw: 0,
             base_offset: 0,
             cap: cap.max(1),
             notify: std::sync::Arc::new(tokio::sync::Notify::new()),
             viewers: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            len_mirror: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             frame_cache: None,
         }
+    }
+
+    /// Clone the lock-free `total_len` mirror. See the `len_mirror` field.
+    #[must_use]
+    pub fn total_len_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        self.len_mirror.clone()
     }
 
     /// Ceiling on a cached wire frame. Anything larger (a `since=0`
@@ -178,6 +236,8 @@ impl PtyRing {
     /// monotonic.
     pub fn push(&mut self, data: &[u8]) {
         self.push_inner(data);
+        self.len_mirror
+            .store(self.total_len(), std::sync::atomic::Ordering::Relaxed);
         // Wake the viewer pump so the new bytes flush within
         // microseconds. Skip on an empty push (nothing to flush) and
         // when nobody is attached — `notify_waiters` takes an internal
@@ -201,20 +261,63 @@ impl PtyRing {
         // tail of `data`. Drop everything we had AND skip the head of
         // `data` so only the last `cap` bytes remain.
         if data.len() >= self.cap {
-            let drop_existing = self.bytes.len();
-            self.bytes.clear();
+            let drop_existing = self.cold_raw + self.hot.len();
+            self.cold.clear();
+            self.cold_raw = 0;
+            self.hot.clear();
             self.base_offset += drop_existing as u64;
             let skip = data.len() - self.cap;
             self.base_offset += skip as u64;
-            self.bytes.extend(&data[skip..]);
+            self.hot.extend(&data[skip..]);
+            self.compact();
             return;
         }
-        let overflow = (self.bytes.len() + data.len()).saturating_sub(self.cap);
-        if overflow > 0 {
-            self.bytes.drain(..overflow);
-            self.base_offset += overflow as u64;
+        self.hot.extend(data);
+        self.compact();
+        self.evict_over_cap();
+    }
+
+    /// Deflate the oldest hot bytes into cold chunks until the plain
+    /// tail is back under [`Self::HOT_MAX`]. No-op for small rings
+    /// (tests, custom caps) — they keep the historical plain behaviour.
+    fn compact(&mut self) {
+        if self.cap <= Self::HOT_MAX * 2 {
+            return;
         }
-        self.bytes.extend(data);
+        while self.hot.len() > Self::HOT_MAX {
+            let raw: Vec<u8> = self.hot.drain(..Self::CHUNK_RAW).collect();
+            let mut enc =
+                flate2::write::DeflateEncoder::new(Vec::with_capacity(raw.len() / 4), flate2::Compression::fast());
+            // Writing into a Vec sink cannot fail.
+            let _ = std::io::Write::write_all(&mut enc, &raw);
+            let deflated = enc.finish().unwrap_or_default();
+            self.cold_raw += raw.len();
+            self.cold.push_back(ColdChunk {
+                raw_len: raw.len() as u32,
+                deflated,
+            });
+        }
+    }
+
+    /// Drop the oldest bytes until the UNCOMPRESSED total fits `cap`.
+    /// Cold chunks go whole (recompressing a partial chunk isn't worth
+    /// it — at most one chunk of slack); with no cold section this is
+    /// the historical front-drain.
+    fn evict_over_cap(&mut self) {
+        let mut overflow = (self.cold_raw + self.hot.len()).saturating_sub(self.cap);
+        while overflow > 0 {
+            if let Some(front) = self.cold.front() {
+                let n = front.raw_len as usize;
+                self.cold.pop_front();
+                self.cold_raw -= n;
+                self.base_offset += n as u64;
+                overflow = overflow.saturating_sub(n);
+            } else {
+                self.hot.drain(..overflow);
+                self.base_offset += overflow as u64;
+                break;
+            }
+        }
     }
 
     /// Monotonic high-water mark — total bytes ever written through
@@ -223,7 +326,7 @@ impl PtyRing {
     /// bytes.
     #[must_use]
     pub fn total_len(&self) -> u64 {
-        self.base_offset + self.bytes.len() as u64
+        self.base_offset + (self.cold_raw + self.hot.len()) as u64
     }
 
     /// Lowest offset still retained. When a caller's `since` is below
@@ -248,28 +351,59 @@ impl PtyRing {
     /// the available window: when `offset < base_offset`, callers
     /// receive everything we still have (and `base_offset()` lets
     /// them detect the gap).
+    ///
+    /// Steady-state callers (the WS pump tailing new output) land in
+    /// the plain hot section and never pay for decompression; only a
+    /// read reaching back into cold history (a viewer's scrollback
+    /// bootstrap — once per connection) inflates chunks.
     #[must_use]
     pub fn since(&self, offset: u64) -> Vec<u8> {
         if offset >= self.total_len() {
             return Vec::new();
         }
         let start = offset.max(self.base_offset);
-        let skip = (start - self.base_offset) as usize;
-        // Seek directly to `skip` via the deque's two contiguous
-        // slices instead of `iter().skip(skip)`, which walks every
-        // skipped byte one at a time. In steady state the WS pump polls
-        // ~33x/s with `skip` near the end of a multi-MB ring, so the
-        // old form re-scanned the whole buffer on every tick. This is
-        // O(result) rather than O(buffer).
-        let (head, tail) = self.bytes.as_slices();
-        let mut out = Vec::with_capacity(self.bytes.len() - skip);
-        if skip < head.len() {
-            out.extend_from_slice(&head[skip..]);
-            out.extend_from_slice(tail);
-        } else {
-            out.extend_from_slice(&tail[skip - head.len()..]);
+        let hot_start = self.base_offset + self.cold_raw as u64;
+        if start >= hot_start {
+            let skip = (start - hot_start) as usize;
+            // Seek directly to `skip` via the deque's two contiguous
+            // slices instead of `iter().skip(skip)`, which walks every
+            // skipped byte one at a time. In steady state the WS pump
+            // polls ~33x/s with `skip` near the end of the tail, so
+            // this stays O(result) rather than O(buffer).
+            let (head, tail) = self.hot.as_slices();
+            let mut out = Vec::with_capacity(self.hot.len() - skip);
+            if skip < head.len() {
+                out.extend_from_slice(&head[skip..]);
+                out.extend_from_slice(tail);
+            } else {
+                out.extend_from_slice(&tail[skip - head.len()..]);
+            }
+            return out;
         }
+        let mut out = Vec::with_capacity((self.total_len() - start) as usize);
+        let mut pos = self.base_offset;
+        for chunk in &self.cold {
+            let end = pos + u64::from(chunk.raw_len);
+            if end > start {
+                let raw = chunk.inflate();
+                let skip = start.saturating_sub(pos) as usize;
+                out.extend_from_slice(&raw[skip..]);
+            }
+            pos = end;
+        }
+        let (head, tail) = self.hot.as_slices();
+        out.extend_from_slice(head);
+        out.extend_from_slice(tail);
         out
+    }
+
+    /// Actual resident bytes (compressed cold + plain hot) — what the
+    /// two-tier storage costs, as opposed to `total_len - base_offset`
+    /// which is what it *represents*. Telemetry/test hook.
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn stored_bytes(&self) -> usize {
+        self.cold.iter().map(|c| c.deflated.len()).sum::<usize>() + self.hot.len()
     }
 }
 
@@ -458,6 +592,82 @@ mod tests {
         let big = bytes::Bytes::from(vec![0u8; PtyRing::FRAME_CACHE_MAX + 1]);
         r.store_frame(0, 1, big);
         assert!(r.cached_frame(0, 1).is_none(), "oversized frame not cached");
+    }
+
+    /// Pseudo-terminal-ish payload: repetitive enough to compress like
+    /// real output, varied enough that offsets are distinguishable.
+    fn payload(len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| b"$ cargo build --release\r\n"[i % 25] ^ (i / 1024) as u8)
+            .collect()
+    }
+
+    #[test]
+    fn cold_compression_roundtrips_byte_exact() {
+        let mut r = PtyRing::with_capacity(DEFAULT_CAPACITY_BYTES);
+        let data = payload(PtyRing::HOT_MAX * 3);
+        // Push in PTY-read-sized pieces so compaction runs mid-stream.
+        for piece in data.chunks(4096) {
+            r.push(piece);
+        }
+        assert_eq!(r.total_len(), data.len() as u64);
+        assert_eq!(r.base_offset(), 0, "under cap — nothing dropped");
+        assert_eq!(r.since(0), data, "cold + hot reassemble byte-exact");
+        // A mid-cold-chunk offset (spans chunk boundary + hot).
+        let mid = PtyRing::CHUNK_RAW as u64 / 2;
+        assert_eq!(r.since(mid), data[mid as usize..]);
+        // The point of the exercise: resident < represented.
+        assert!(
+            r.stored_bytes() < data.len() / 2,
+            "stored {} for {} raw",
+            r.stored_bytes(),
+            data.len()
+        );
+    }
+
+    #[test]
+    fn hot_tail_reads_stay_plain() {
+        let mut r = PtyRing::with_capacity(DEFAULT_CAPACITY_BYTES);
+        let data = payload(PtyRing::HOT_MAX * 2);
+        r.push(&data);
+        // A tail read (the WS pump's steady state) must round-trip.
+        let tail_from = r.total_len() - 100;
+        assert_eq!(r.since(tail_from), data[data.len() - 100..]);
+    }
+
+    #[test]
+    fn cold_eviction_advances_base_offset_by_whole_chunks() {
+        // Cap big enough to compact, small enough to overflow quickly.
+        let cap = PtyRing::HOT_MAX * 2 + PtyRing::CHUNK_RAW;
+        let mut r = PtyRing::with_capacity(cap);
+        let data = payload(cap * 2);
+        for piece in data.chunks(4096) {
+            r.push(piece);
+        }
+        assert_eq!(r.total_len(), data.len() as u64);
+        let base = r.base_offset();
+        assert!(base > 0, "over cap — oldest bytes dropped");
+        assert!(
+            (r.total_len() - base) as usize <= cap,
+            "retained window fits the (uncompressed) cap"
+        );
+        // Whole-chunk eviction: the boundary sits on a chunk edge.
+        assert_eq!(base % PtyRing::CHUNK_RAW as u64, 0);
+        // Everything still retained reassembles byte-exact.
+        assert_eq!(r.since(base), data[base as usize..]);
+        // Aged-out offsets fall back to the surviving window.
+        assert_eq!(r.since(0), data[base as usize..]);
+    }
+
+    #[test]
+    fn len_mirror_tracks_total_len() {
+        let mut r = PtyRing::with_capacity(1024);
+        let mirror = r.total_len_handle();
+        assert_eq!(mirror.load(std::sync::atomic::Ordering::Relaxed), 0);
+        r.push(b"hello");
+        assert_eq!(mirror.load(std::sync::atomic::Ordering::Relaxed), 5);
+        r.push(&[0u8; 2048]); // oversized push still lands on total_len
+        assert_eq!(mirror.load(std::sync::atomic::Ordering::Relaxed), r.total_len());
     }
 
     #[test]

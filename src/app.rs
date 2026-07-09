@@ -1642,6 +1642,11 @@ impl AppState {
                     .snap_cache
                     .as_ref()
                     .is_some_and(|c| c.raw_output.is_empty() && !c.output.is_empty());
+            // Last viewer detached and the tab then went quiet: the dump
+            // would normally be dropped by the next rebuild-on-output, but
+            // a silent tab would pin megabytes of scrollback text nobody
+            // can read anymore. Shed it without rescanning the grid.
+            let needs_raw_drop = !want_raw && tab.snap_cache.as_ref().is_some_and(|c| !c.raw_output.is_empty());
             let fresh = if stale || needs_raw_backfill {
                 let (output, cursor) = view.ansi_text_with_cursor(Some(200));
                 let (raw_output, raw_cursor) = if want_raw {
@@ -1653,6 +1658,10 @@ impl AppState {
                 Some(crate::term_export::GridSnapshotCache::new(
                     ring_len, output, cursor, raw_output, raw_cursor, cols, rows,
                 ))
+            } else if needs_raw_drop {
+                tab.snap_cache
+                    .as_ref()
+                    .map(crate::term_export::GridSnapshotCache::without_raw)
             } else {
                 None
             };
@@ -1662,8 +1671,11 @@ impl AppState {
                 tab.snap_cache = Some(c);
                 // The ring grew ⇒ the tab produced output (claude streaming /
                 // its spinner animating / a build printing). Mark it so the
-                // dormant-blue LED reflects real silence, not just un-focus.
-                tab.last_output_at = Some(std::time::Instant::now());
+                // dormant-blue LED reflects real silence, not just un-focus
+                // (the raw-drop and viewer-backfill paths are not output).
+                if stale {
+                    tab.last_output_at = Some(std::time::Instant::now());
+                }
             }
             // Populated just above; if somehow absent, skip this tab in the
             // snapshot this tick rather than panic (next tick refills it).
