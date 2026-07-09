@@ -648,7 +648,7 @@ impl TerminalView {
             // foreground tab (a few cursor-blink heartbeats of slack), and
             // how long until a background tab is considered parked.
             const FRESH: Duration = Duration::from_secs(2);
-            const PARKED: Duration = Duration::from_secs(60);
+            const PARKED: Duration = Duration::from_mins(1);
             let ring_len_mirror = ring_len_mirror_pump;
             let mut interval = FAST;
             let mut parked = false;
