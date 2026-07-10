@@ -252,6 +252,15 @@
           copySelectionAndClear();
           return false;
         }
+        // Tab / Shift+Tab: on desktop the browser consumes these for focus
+        // traversal — moving focus OUT of the terminal before xterm can send
+        // the byte, so Shift+Tab (back-tab `\x1b[Z`, used by Claude Code to
+        // cycle modes) "does nothing". Stop the browser default but let xterm
+        // still emit `\t` / `\x1b[Z`.
+        if (ev.key === "Tab") {
+          ev.preventDefault();
+          return true;
+        }
         return true;
       });
     }
@@ -271,15 +280,28 @@
       // refuse the IME. Calling .focus() on the textarea itself
       // (inside the click handler = a fresh user gesture) is the
       // most reliable cross-browser way to ask for the keyboard.
-      kbdToggle.addEventListener("click", (e) => {
-        e.preventDefault();
-        e.stopPropagation();
+      // `pointerdown` preventDefault stops the BUTTON itself from taking focus
+      // — the usual reason this toggle "does nothing": the click moved focus to
+      // the button, so focusing the terminal afterward didn't stick / didn't
+      // surface the IME. Keeping focus off the button lets the terminal receive
+      // (and hold) it, and do the focus in the same trusted gesture.
+      const focusTerm = () => {
         const helper = termEl.querySelector(".xterm-helper-textarea");
         if (helper) {
           helper.focus({ preventScroll: true });
         } else {
           term.focus();
         }
+      };
+      kbdToggle.addEventListener("pointerdown", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        focusTerm();
+      });
+      kbdToggle.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        focusTerm();
       });
     }
 
@@ -341,6 +363,9 @@
       ];
       const ROW_NORMAL_2 = [
         { label: "TAB", bytes: "\t" },
+        // Shift+Tab / back-tab (CSI Z). A soft keyboard can't produce it, and
+        // Claude Code uses it to cycle modes — so give mobile a dedicated key.
+        { label: "⇧TAB", bytes: "\x1b[Z" },
         { label: "CTRL", type: "ctrl" },
         { label: "ALT", type: "alt" },
         { icon: "←", bytes: "\x1b[D" },
