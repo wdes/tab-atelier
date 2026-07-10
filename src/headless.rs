@@ -187,6 +187,10 @@ struct HeadlessTab {
     /// lock-free atomic instead of taking the ring mutex the PTY reader
     /// thread contends on.
     viewers: Arc<std::sync::atomic::AtomicUsize>,
+    /// Lock-free mirror of the ring's `total_len` — the main loop's
+    /// snapshot-dirtiness probe reads it every slow pass without
+    /// touching the ring mutex the PTY reader thread contends on.
+    ring_len_mirror: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl crate::schedule::LockState for HeadlessTab {
@@ -326,6 +330,11 @@ impl HeadlessTab {
     /// Lock-free WS viewer count (see the `viewers` field).
     fn viewer_count(&self) -> usize {
         self.viewers.load(Ordering::Relaxed)
+    }
+
+    /// Lock-free ring byte counter (see the `ring_len_mirror` field).
+    fn ring_len(&self) -> u64 {
+        self.ring_len_mirror.load(Ordering::Relaxed)
     }
 
     /// Return the grid-derived snapshot fields, scanning the terminal
@@ -637,10 +646,10 @@ fn spawn_pty_tab(
     #[cfg(not(feature = "energy"))]
     let _ = energy_wh;
 
-    let viewers_handle = pty_ring
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .viewers_handle();
+    let (viewers_handle, ring_len_mirror) = {
+        let r = pty_ring.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        (r.viewers_handle(), r.total_len_handle())
+    };
     Some(HeadlessTab {
         id,
         name,
@@ -682,6 +691,7 @@ fn spawn_pty_tab(
         pending_agent_resume,
         colors_enabled,
         viewers: viewers_handle,
+        ring_len_mirror,
         pty_ring,
         snap_cache: None,
         limits: crate::TabResourceLimits::default(),
@@ -907,6 +917,8 @@ pub fn run() -> std::io::Result<()> {
         pending_status_updates: Vec::new(),
         cached_response: None,
         activity: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        activity_waker: std::sync::Arc::new((std::sync::Mutex::new(()), std::sync::Condvar::new())),
+        generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     }));
     info!("API server starting on {api_addr} (TLS {api_tls_addr})");
     api::start_api_server(api_state.clone(), api_token.clone(), read_only, api_addr);
@@ -950,24 +962,29 @@ pub fn run() -> std::io::Result<()> {
     // drain runs every tick.
     //
     // The 16 ms cadence only pays for itself while someone is actually
-    // connected. The daemon idles at 250 ms otherwise, keyed on two
-    // cheap lock-free signals: the snapshot's `activity` counter
-    // (bumped by every authenticated HTTP request and WS `in` frame)
-    // and the per-tab WS viewer counts. A headless box with agents
-    // running but nobody attached stops waking 62×/s; the first
-    // request after an idle stretch pays ≤250 ms once and the loop is
-    // back on the fast tick.
-    let activity = api_state
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .activity
-        .clone();
+    // connected. The daemon idles at 250 ms otherwise, keyed on the
+    // snapshot's `activity` counter (bumped by every authenticated
+    // HTTP request and WS `in` frame). Idle-but-connected viewers no
+    // longer hold the loop fast: their first keystroke cuts the park
+    // short through `activity_waker` (see the wait below), so input
+    // latency doesn't depend on the tick at all — output already
+    // streams event-driven off the ring notify.
+    let (activity, waker) = {
+        let s = api_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        (s.activity.clone(), s.activity_waker.clone())
+    };
     let mut activity_last_seen = activity.load(Ordering::Relaxed);
     let mut activity_last_change = Instant::now();
     let mut tick_interval = TICK_FAST;
     // Counts fast ticks; the slow block fires every 6th (~96 ms on the
     // fast tick). Input drain is NOT gated by it.
     let mut slow_ctr: u32 = 0;
+    // Snapshot-refresh dirtiness: (tab count, Σ ring lens, Σ viewers).
+    // Ring lens are monotonic, so the sum moves iff any tab printed.
+    let mut last_snap_key = (0usize, 0u64, 0usize);
+    let mut last_snap_refresh = Instant::now()
+        .checked_sub(Duration::from_secs(2))
+        .unwrap_or_else(Instant::now);
     // Seed the persist clock 2s in the past so the very first tick
     // forces a flush (state hashing then deduplicates on subsequent
     // ticks). `checked_sub` defensively handles a boot-time clock
@@ -979,22 +996,31 @@ pub fn run() -> std::io::Result<()> {
     // can't stall the 16 ms input drain.
     let output_saver = OutputSaver::spawn(platform::state_base_dir());
     loop {
-        std::thread::sleep(tick_interval);
+        // Timed park that input can cut short: `touch()` nudges the
+        // condvar, so a keystroke arriving mid-park is drained within a
+        // scheduler quantum even while the loop idles at `TICK_IDLE`.
+        // Re-checking the counter under the pairing mutex closes the
+        // check-then-park window (a touch between the two either sees
+        // the mutex held until we park, or flips the counter first).
+        {
+            let guard = waker.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if activity.load(Ordering::Relaxed) == activity_last_seen {
+                let _ = waker.1.wait_timeout(guard, tick_interval);
+            }
+        }
 
-        // Pick the NEXT sleep's length from the two wake-keeping
-        // signals. Viewer counts are only consulted once the activity
-        // signal has gone cold, so the fast path stays two atomic loads.
         let seq = activity.load(Ordering::Relaxed);
         if seq != activity_last_seen {
             activity_last_seen = seq;
             activity_last_change = Instant::now();
         }
-        tick_interval = if activity_last_change.elapsed() < TICK_HOT || tabs.iter().any(|t| t.viewer_count() > 0) {
+        tick_interval = if activity_last_change.elapsed() < TICK_HOT {
             TICK_FAST
         } else {
             TICK_IDLE
         };
-        // Same signal drives the power sampler's hot/cold cadence.
+        // The power sampler's hot/cold cadence follows the same signal —
+        // watts are read through /tabs, whose pollers bump `activity`.
         #[cfg(feature = "energy")]
         power_hot.store(tick_interval == TICK_FAST, Ordering::Relaxed);
 
@@ -1028,7 +1054,7 @@ pub fn run() -> std::io::Result<()> {
 
         // Drain pending actions EVERY tick (~16 ms) — this is the
         // latency-critical input path (WS `in` frames / POST /input).
-        drain_pending(
+        let drained = drain_pending(
             &mut tabs,
             &mut active,
             &api_state,
@@ -1044,28 +1070,45 @@ pub fn run() -> std::io::Result<()> {
         // ~10 Hz so the fast input loop doesn't pay for grid scans,
         // disk writes, and the resume sweep on every 16 ms tick.
         slow_ctr += 1;
+        if drained {
+            // Commands (rename/lock/close/…) must reach the snapshot on
+            // THIS slow pass, not survive until the 2 s heartbeat.
+            last_snap_key = (0, 0, 0);
+        }
         if slow_ctr < 6 {
             continue;
         }
         slow_ctr = 0;
 
         // Refresh the API snapshot so /output (HTTP poll path) and the
-        // WS meta frame reflect shell echo within ~96 ms. Cheap —
-        // grid reads only re-scan a tab whose ring advanced.
-        refresh_snapshot(
-            &mut tabs,
-            active,
-            &global_bg,
-            &api_state,
-            #[cfg(feature = "energy")]
-            &power_watts,
-            #[cfg(feature = "energy")]
-            &battery_percent,
-            // Same "anyone connected?" signal that keeps the loop fast —
-            // gates the metering sweep, whose numbers only exist for API
-            // consumers.
-            tick_interval == TICK_FAST,
+        // WS meta frame reflect shell echo within ~96 ms — but ONLY
+        // when something could have changed: any tab printed (Σ of the
+        // monotonic ring lens moved), a viewer came or went, a command
+        // was drained, or the 2 s heartbeat is due (uptime/watts). A
+        // daemon with an idle viewer attached stops rebuilding N tabs'
+        // worth of snapshot strings 10×/s for identical content.
+        let snap_key = (
+            tabs.len(),
+            tabs.iter().map(HeadlessTab::ring_len).fold(0u64, u64::wrapping_add),
+            tabs.iter().map(HeadlessTab::viewer_count).sum::<usize>(),
         );
+        if snap_key != last_snap_key || last_snap_refresh.elapsed() >= Duration::from_secs(2) {
+            last_snap_key = snap_key;
+            last_snap_refresh = Instant::now();
+            refresh_snapshot(
+                &mut tabs,
+                active,
+                &global_bg,
+                &api_state,
+                #[cfg(feature = "energy")]
+                &power_watts,
+                #[cfg(feature = "energy")]
+                &battery_percent,
+                // Consumer-activity signal — gates the metering sweep,
+                // whose numbers only exist for API consumers.
+                tick_interval == TICK_FAST,
+            );
+        }
 
         // Persist on a 2 Hz tick like the GUI's `cx.spawn(timer(2s))`.
         if last_persist.elapsed() >= Duration::from_secs(2) {
@@ -1089,6 +1132,9 @@ pub fn run() -> std::io::Result<()> {
             if !crate::read_only() {
                 output_saver.submit(&tabs);
             }
+            // The sweep may have changed agent LED state — surface it
+            // on the next slow pass instead of the 2 s heartbeat.
+            last_snap_key = (0, 0, 0);
             last_persist = Instant::now();
         }
 
@@ -1215,6 +1261,9 @@ fn refresh_snapshot(
     let mut snapshot = api_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     snapshot.tabs = api_tabs;
     snapshot.active = active;
+    // Every write is a (potential) content change now that the caller
+    // gates the call on its dirtiness key — let WS meta ticks notice.
+    snapshot.generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // Invalidate the cached /tabs body at the GUI's persist cadence
     // (2 s), not on every ~96 ms refresh. Unconditional invalidation
     // made the cache a no-op — any poller slower than one refresh tick
@@ -1613,7 +1662,7 @@ fn drain_pending(
     pty_rows: usize,
     default_limits: &crate::TabResourceLimits,
     default_net_allow: &crate::net_policy::AllowConfig,
-) {
+) -> bool {
     let mut s = api_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut closes: Vec<usize> = s.pending_closes.drain(..).collect();
     let activate = s.pending_activate.take();
@@ -1632,6 +1681,22 @@ fn drain_pending(
     let new_tabs = std::mem::take(&mut s.pending_new_tabs);
     let new_tab_cwds: std::collections::VecDeque<std::path::PathBuf> = std::mem::take(&mut s.pending_new_tab_cwds);
     drop(s);
+    // Whether this drain mutated anything — the caller uses it to force
+    // the next snapshot refresh instead of waiting on the heartbeat.
+    let did_work = !(closes.is_empty()
+        && activate.is_none()
+        && inputs.is_empty()
+        && renames.is_empty()
+        && status_updates.is_empty()
+        && lock_changes.is_empty()
+        && net_changes.is_empty()
+        && net_allow_changes.is_empty()
+        && bg_color_changes.is_empty()
+        && context_changes.is_empty()
+        && token_rotations.is_empty()
+        && schedule_changes.is_empty()
+        && new_tabs == 0
+        && new_tab_cwds.is_empty());
     // CLI / API lock toggles → runtime HeadlessTab. tabs.json picks
     // it up on the same persist tick a few lines below.
     for (tab_id, locked) in lock_changes {
@@ -1931,4 +1996,5 @@ fn drain_pending(
             *active = tabs.len() - 1;
         }
     }
+    did_work
 }

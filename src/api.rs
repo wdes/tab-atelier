@@ -501,6 +501,18 @@ pub struct TabSnapshot {
     /// spinning at 60 Hz forever on a machine where the terminal is
     /// hidden and nobody remote is connected.
     pub activity: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Companion to `activity` for the headless main loop: `touch()`
+    /// nudges this condvar so the drain loop wakes the moment input
+    /// arrives instead of discovering it on its next timed tick — which
+    /// is what lets that loop idle slowly even while viewers are
+    /// connected. The mutex carries no data; the wake predicate is the
+    /// `activity` counter.
+    pub activity_waker: std::sync::Arc<(std::sync::Mutex<()>, std::sync::Condvar)>,
+    /// Monotonic generation of tab-visible state: bumped by every
+    /// snapshot rewrite and every direct tab mutation (the same places
+    /// that drop `cached_response`). WS meta ticks compare it lock-free
+    /// and skip rebuilding a meta frame nothing could have changed.
+    pub generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl TabSnapshot {
@@ -508,6 +520,19 @@ impl TabSnapshot {
     /// enough: consumers only compare against the last value they saw.
     pub fn touch(&self) {
         self.activity.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Wake the headless drain loop. Take-and-drop the pairing mutex
+        // first so a loop that just re-checked the counter and is about
+        // to park cannot miss this notification.
+        drop(self.activity_waker.0.lock());
+        self.activity_waker.1.notify_all();
+    }
+
+    /// Drop the cached `/tabs` body and bump the meta generation. Call
+    /// after ANY mutation of `tabs` or per-tab fields so both cached
+    /// consumers (the /tabs body, per-connection WS meta) notice.
+    pub fn invalidate_tabs(&mut self) {
+        self.cached_response = None;
+        self.generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -2740,7 +2765,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             }
             let ids: Vec<String> = state.tabs.iter().map(|t| t.id.clone()).collect();
             state.pending_token_rotations.extend(ids);
-            state.cached_response = None;
+            state.invalidate_tabs();
             drop(state);
             respond_json(stream, 200, &format!(r#"{{"revoked":{revoked}}}"#));
         }
@@ -3573,6 +3598,47 @@ mod tests {
         assert_eq!(resolve_sandbox_path(dir, "inbox/foo\0bar").unwrap_err().0, 400);
     }
 
+    #[test]
+    fn invalidate_tabs_bumps_generation_and_drops_cache() {
+        let state = test_state();
+        let mut s = state.lock().unwrap();
+        s.cached_response = Some("body".into());
+        let g0 = s.generation.load(std::sync::atomic::Ordering::Relaxed);
+        s.invalidate_tabs();
+        assert!(s.cached_response.is_none(), "/tabs cache dropped");
+        let g1 = s.generation.load(std::sync::atomic::Ordering::Relaxed);
+        drop(s);
+        assert_eq!(g1, g0 + 1, "meta generation bumped");
+    }
+
+    /// The headless main loop parks on `activity_waker` with the
+    /// `activity` counter as predicate; `touch()` must cut the park
+    /// short (this is what lets the loop idle slowly while a viewer
+    /// is connected without adding input latency).
+    #[test]
+    fn touch_wakes_a_parked_waiter() {
+        let state = test_state();
+        let (activity, waker) = {
+            let s = state.lock().unwrap();
+            (s.activity.clone(), s.activity_waker.clone())
+        };
+        let last_seen = activity.load(std::sync::atomic::Ordering::Relaxed);
+        let t0 = std::time::Instant::now();
+        let waiter = std::thread::spawn(move || {
+            let guard = waker.0.lock().unwrap();
+            if activity.load(std::sync::atomic::Ordering::Relaxed) == last_seen {
+                let _ = waker.1.wait_timeout(guard, std::time::Duration::from_secs(5)).unwrap();
+            }
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        state.lock().unwrap().touch();
+        waiter.join().unwrap();
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(5),
+            "woken by touch(), not by the timeout"
+        );
+    }
+
     fn test_state() -> Arc<Mutex<TabSnapshot>> {
         Arc::new(Mutex::new(TabSnapshot {
             tabs: vec![
@@ -3662,6 +3728,8 @@ mod tests {
             pending_status_updates: vec![],
             cached_response: None,
             activity: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            activity_waker: std::sync::Arc::new((std::sync::Mutex::new(()), std::sync::Condvar::new())),
+            generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             master_token: String::new(),
         }))
     }
@@ -4590,7 +4658,7 @@ mod tests {
         let mut snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         snap.tabs[idx].output_crc = crate::crc32(content.as_bytes());
         snap.tabs[idx].output = content.into();
-        snap.cached_response = None; // invalidate /tabs cache
+        snap.invalidate_tabs(); // invalidate /tabs cache
     }
 
     #[test]
@@ -4653,7 +4721,7 @@ mod tests {
             let mut s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             s.tabs[0].cwd = Some(cwd.path().to_string_lossy().into_owned());
             s.tabs[0].locked = true;
-            s.cached_response = None;
+            s.invalidate_tabs();
         }
         let body = b"blocked";
         let raw = request_bytes(
@@ -4723,7 +4791,7 @@ mod tests {
     fn set_agent_state(state: &Arc<Mutex<TabSnapshot>>, idx: usize, snap: Option<crate::AgentStateSnapshot>) {
         let mut s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         s.tabs[idx].agent_state = snap;
-        s.cached_response = None;
+        s.invalidate_tabs();
     }
 
     #[test]
@@ -5096,7 +5164,7 @@ mod tests {
         {
             let mut s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             s.tabs[0].cwd = Some(cwd.path().to_string_lossy().into_owned());
-            s.cached_response = None;
+            s.invalidate_tabs();
         }
         let raw = request_bytes(
             port,
@@ -5125,7 +5193,7 @@ mod tests {
         {
             let mut s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             s.tabs[0].cwd = Some(cwd.path().to_string_lossy().into_owned());
-            s.cached_response = None;
+            s.invalidate_tabs();
         }
         let body = b"hello upload";
         let raw = request_bytes(
@@ -5155,7 +5223,7 @@ mod tests {
         {
             let mut s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             s.tabs[0].cwd = Some(cwd.path().to_string_lossy().into_owned());
-            s.cached_response = None;
+            s.invalidate_tabs();
         }
         let raw = request_bytes(
             port,
@@ -5225,7 +5293,7 @@ mod tests {
             let mut s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             s.tabs[0].share_token_rw = "rw-inbox-tok".into();
             s.tabs[0].cwd = Some(cwd.path().to_string_lossy().into_owned());
-            s.cached_response = None;
+            s.invalidate_tabs();
         }
         let raw = request_bytes(
             port,
@@ -5248,7 +5316,7 @@ mod tests {
             let mut s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             s.tabs[0].share_token_ro = "ro-inbox-tok".into();
             s.tabs[0].cwd = Some(cwd.path().to_string_lossy().into_owned());
-            s.cached_response = None;
+            s.invalidate_tabs();
         }
         let raw = request_bytes(
             port,
@@ -5296,7 +5364,7 @@ mod tests {
             let mut s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             s.tabs[0].share_token_ro = "ro-token".into();
             s.tabs[0].cwd = Some("/tmp".into());
-            s.cached_response = None;
+            s.invalidate_tabs();
         }
         // Use by-id form (share-token auth path requires it).
         let raw = request_bytes(
@@ -5316,7 +5384,7 @@ mod tests {
             let mut s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             s.tabs[0].share_token_ro = "ro-token-2".into();
             s.tabs[0].cwd = Some(cwd.path().to_string_lossy().into_owned());
-            s.cached_response = None;
+            s.invalidate_tabs();
         }
         let raw = request_bytes(
             port,
@@ -5368,7 +5436,7 @@ mod tests {
             let mut s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             s.tabs[0].share_token_ro = "ro-token-3".into();
             s.tabs[0].cwd = Some(cwd.path().to_string_lossy().into_owned());
-            s.cached_response = None;
+            s.invalidate_tabs();
         }
         let raw = request_bytes(
             port,

@@ -541,6 +541,12 @@ struct MetaSnapshot {
     outbox_count: usize,
     inbox_count: usize,
     build_hash: &'static str,
+    /// Wall-clock instant of the next schedule transition — kept off
+    /// the wire (`schedule_next` above is the client's copy) so the
+    /// pump knows when a time-driven lock flip makes its generation
+    /// gate stale without parsing the RFC 3339 string back.
+    #[serde(skip)]
+    next_transition: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Per-connection cache of the tab's inbox/outbox file counts. Each
@@ -568,9 +574,12 @@ impl DirCountCache {
         }
     }
 
-    fn refresh(&mut self, cwd: Option<&str>, authz: Authz) {
+    /// Re-scan if the TTL elapsed; returns whether the counts changed
+    /// (always `false` when the TTL suppressed the scan) — one input to
+    /// the pump's skip-the-meta-rebuild gate.
+    fn refresh(&mut self, cwd: Option<&str>, authz: Authz) -> bool {
         if self.scanned_at.is_some_and(|t| t.elapsed() < Self::TTL) {
-            return;
+            return false;
         }
         self.scanned_at = Some(Instant::now());
         let dir_count = |dirname: &str| -> usize {
@@ -580,17 +589,19 @@ impl DirCountCache {
                 })
             })
         };
-        self.outbox = dir_count("outbox");
+        let (old_out, old_in) = (self.outbox, self.inbox);
         // RO viewers don't see `inbox_count`. The HTTP `/inbox` listing
         // endpoint is RW-only specifically so RO recipients can't
         // enumerate uploads (`src/api.rs` needs_rw includes "inbox"); a
         // count here would be a milder version of the same info leak.
         // `outbox_count` is fine for RO — downloads are allowed.
+        self.outbox = dir_count("outbox");
         self.inbox = if matches!(authz, Authz::Ro) {
             0
         } else {
             dir_count("inbox")
         };
+        (self.outbox, self.inbox) != (old_out, old_in)
     }
 }
 
@@ -607,10 +618,10 @@ fn snapshot_meta(t: &SnapshotTab) -> MetaSnapshot {
         };
         (Some(key), s.label.clone())
     });
-    let (schedule_tz, schedule_rule, schedule_next) = t.schedule.as_ref().map_or((None, None, None), |s| {
-        let next = s.next_change_from_now().map(|d| d.to_rfc3339());
-        (Some(s.tz.clone()), Some(s.rule.clone()), next)
+    let (schedule_tz, schedule_rule, next_transition) = t.schedule.as_ref().map_or((None, None, None), |s| {
+        (Some(s.tz.clone()), Some(s.rule.clone()), s.next_change_from_now())
     });
+    let schedule_next = next_transition.map(|d| d.to_rfc3339());
     MetaSnapshot {
         name: t.name.clone(),
         cols: t.cols,
@@ -626,6 +637,7 @@ fn snapshot_meta(t: &SnapshotTab) -> MetaSnapshot {
         outbox_count: 0,
         inbox_count: 0,
         build_hash: crate::api::BUILD_HASH,
+        next_transition,
     }
 }
 
@@ -715,19 +727,35 @@ async fn run_pump(
     // Send the initial meta on connect and keep the last one so the
     // first tick after this doesn't re-emit the same payload. We hold
     // the whole `MetaSnapshot` and compare structurally rather than
-    // re-serialising + hashing it on every 30 ms tick — the meta only
-    // changes on a lock/agent/schedule/file-count event, so the common
-    // case is an allocation-free `==` against the cached value.
-    let mut dir_counts = DirCountCache::new();
-    let mut last_meta: Option<MetaSnapshot> = if let Some(meta) = current_meta(&state, &uuid, authz, &mut dir_counts) {
-        let bytes = encode_frame(TAG_META, serde_json::to_vec(&meta).unwrap_or_default());
-        if sink.send(Message::Binary(bytes.into())).await.is_err() {
-            return;
-        }
-        Some(meta)
-    } else {
-        None
+    // re-serialising + hashing it on every tick — and the tick itself
+    // is gated on the snapshot's lock-free generation counter, so the
+    // idle steady state doesn't even take the snapshot lock or build
+    // the struct: it's one atomic load per 100 ms. The three ways meta
+    // can change without a generation bump are carved out explicitly —
+    // inbox/outbox file counts (fs state, re-scanned on their own 1 s
+    // TTL), a schedule transition crossing "now", and the initial gen
+    // load racing a concurrent bump (read BEFORE the first build, so a
+    // lost race re-builds once rather than skipping a change).
+    let generation = {
+        let Ok(s) = state.lock() else { return };
+        s.generation.clone()
     };
+    let mut last_gen = generation.load(std::sync::atomic::Ordering::Relaxed);
+    let mut dir_counts = DirCountCache::new();
+    let mut next_transition: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut last_cwd: Option<String> = None;
+    let mut last_meta: Option<MetaSnapshot> =
+        if let Some((meta, cwd)) = current_meta(&state, &uuid, authz, &mut dir_counts) {
+            let bytes = encode_frame(TAG_META, serde_json::to_vec(&meta).unwrap_or_default());
+            if sink.send(Message::Binary(bytes.into())).await.is_err() {
+                return;
+            }
+            next_transition = meta.next_transition;
+            last_cwd = cwd;
+            Some(meta)
+        } else {
+            None
+        };
 
     // Event-driven output: wake on a `PtyRing` push and flush
     // immediately. `notify` is cloned from the ring once up front, along
@@ -833,17 +861,31 @@ async fn run_pump(
             () = &mut notified => {
                 tokio::time::sleep(Duration::from_millis(OUTPUT_DEBOUNCE_MS)).await;
             }
-            // Meta frame — only when something actually changed.
-            // Structural compare; serialise only on a real diff.
+            // Meta frame — only when something could have changed: the
+            // snapshot generation moved, the 1 s dir re-scan found new
+            // files, or a schedule transition crossed "now". Otherwise
+            // this arm is one atomic load; rebuilding costs the lock +
+            // a handful of Strings and used to run 10×/s per viewer
+            // for identical content. Structural compare still gates
+            // the send; serialise only on a real diff.
             _ = meta_tick.tick() => {
-                if let Some(meta) = current_meta(&state, &uuid, authz, &mut dir_counts)
-                    && last_meta.as_ref() != Some(&meta)
-                {
-                    let bytes = encode_frame(TAG_META, serde_json::to_vec(&meta).unwrap_or_default());
-                    if sink.send(Message::Binary(bytes.into())).await.is_err() {
-                        return;
+                let snap_gen = generation.load(std::sync::atomic::Ordering::Relaxed);
+                let counts_changed = dir_counts.refresh(last_cwd.as_deref(), authz);
+                let transition_due =
+                    next_transition.is_some_and(|t| chrono::Utc::now() >= t);
+                if snap_gen != last_gen || counts_changed || transition_due {
+                    last_gen = snap_gen;
+                    if let Some((meta, cwd)) = current_meta(&state, &uuid, authz, &mut dir_counts) {
+                        next_transition = meta.next_transition;
+                        last_cwd = cwd;
+                        if last_meta.as_ref() != Some(&meta) {
+                            let bytes = encode_frame(TAG_META, serde_json::to_vec(&meta).unwrap_or_default());
+                            if sink.send(Message::Binary(bytes.into())).await.is_err() {
+                                return;
+                            }
+                            last_meta = Some(meta);
+                        }
                     }
-                    last_meta = Some(meta);
                 }
             }
         }
@@ -1029,7 +1071,7 @@ fn current_meta(
     uuid: &str,
     authz: Authz,
     counts: &mut DirCountCache,
-) -> Option<MetaSnapshot> {
+) -> Option<(MetaSnapshot, Option<String>)> {
     let snap = state.lock().ok()?;
     let t = snap.tabs.iter().find(|t| t.id == uuid)?;
     let mut meta = snapshot_meta(t);
@@ -1039,7 +1081,7 @@ fn current_meta(
     counts.refresh(cwd.as_deref(), authz);
     meta.outbox_count = counts.outbox;
     meta.inbox_count = counts.inbox;
-    Some(meta)
+    Some((meta, cwd))
 }
 
 #[cfg(test)]
@@ -1060,7 +1102,7 @@ mod tests {
 
         let cwd_str = cwd.to_str().unwrap();
         let mut rw = DirCountCache::new();
-        rw.refresh(Some(cwd_str), Authz::Rw);
+        assert!(rw.refresh(Some(cwd_str), Authz::Rw), "first scan is a change");
         assert_eq!((rw.outbox, rw.inbox), (2, 1));
 
         // RO viewers never see the inbox count (info-leak guard).
@@ -1070,12 +1112,19 @@ mod tests {
 
         // Within the TTL the cache does NOT re-scan (stale counts kept)…
         std::fs::write(cwd.join("outbox/c.txt"), b"x").unwrap();
-        rw.refresh(Some(cwd_str), Authz::Rw);
+        assert!(!rw.refresh(Some(cwd_str), Authz::Rw), "TTL scan is never a change");
         assert_eq!(rw.outbox, 2, "TTL suppresses the re-scan");
-        // …and once it expires, the new file is picked up.
+        // …and once it expires, the new file is picked up + reported as
+        // a change (the pump's meta-rebuild gate keys on this).
         rw.scanned_at = Instant::now().checked_sub(DirCountCache::TTL);
-        rw.refresh(Some(cwd_str), Authz::Rw);
+        assert!(rw.refresh(Some(cwd_str), Authz::Rw));
         assert_eq!(rw.outbox, 3);
+        // Expired but nothing moved ⇒ scan happens, no change reported.
+        rw.scanned_at = Instant::now().checked_sub(DirCountCache::TTL);
+        assert!(
+            !rw.refresh(Some(cwd_str), Authz::Rw),
+            "unchanged counts are not a change"
+        );
 
         // No cwd / missing dirs ⇒ zero, no error.
         let mut none = DirCountCache::new();
@@ -1103,6 +1152,7 @@ mod tests {
             outbox_count: 0,
             inbox_count: 0,
             build_hash: crate::api::BUILD_HASH,
+            next_transition: None,
         };
         assert!(
             mk("shell", false) == mk("shell", false),
