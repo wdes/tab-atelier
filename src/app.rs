@@ -1211,6 +1211,8 @@ impl AppState {
             pending_status_updates: Vec::new(),
             cached_response: None,
             activity: activity_signal.clone(),
+            activity_waker: std::sync::Arc::new((std::sync::Mutex::new(()), std::sync::Condvar::new())),
+            generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }));
         let api_read_only = crate::read_only();
         api::start_api_server(api_state.clone(), api_token.clone(), api_read_only, api_addr.clone());
@@ -1898,8 +1900,9 @@ impl AppState {
             let mut snapshot = self.api_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             snapshot.tabs = api_tabs;
             snapshot.active = self.active;
-            // Invalidate the /tabs cache; next GET rebuilds it once.
-            snapshot.cached_response = None;
+            // Invalidate the /tabs cache (next GET rebuilds once) and bump
+            // the meta generation so WS meta ticks rebuild.
+            snapshot.invalidate_tabs();
             #[cfg(feature = "energy")]
             snapshot.power.clone_from(
                 &self
