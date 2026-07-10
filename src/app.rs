@@ -2136,17 +2136,17 @@ impl AppState {
                     self.agent_probe.observe(&probe_base, &tab.name, pid, state, probe_now);
                 }
                 match activity {
-                    // The agent process is gone but no `idle` status POST cleared
-                    // the session (killed / crashed / Ctrl-D / closed without
-                    // `/exit` — cases where the SessionEnd hook never ran). Drop
-                    // the stale session so the tab stops showing a phantom LED
-                    // for an agent that isn't there anymore. `Gone` is exactly
-                    // `!has_agent_descendant`, so this arm IS the process-
-                    // presence sweep — no separate `/proc` walk needed.
+                    // The agent process is gone (killed / crashed / Ctrl-D /
+                    // closed without `/exit` — the SessionEnd hook never ran).
+                    // Demote the LIVE LED, but KEEP the durable session anchor
+                    // (id / kind / plan): the transcript is still on disk and the
+                    // tab must be able to `--resume` it later — clearing it here
+                    // silently lost resumable sessions (tabs came back as bare
+                    // shells). Only Claude Code's explicit SessionEnd (the
+                    // `__clear__` POST above) drops the durable attachment.
+                    // `Gone` is exactly `!has_agent_descendant`, so this arm IS
+                    // the process-presence sweep — no separate `/proc` walk.
                     crate::catbus_agent::AgentActivity::Gone => {
-                        tab.agent_kind = None;
-                        tab.agent_session_id = None;
-                        tab.agent_plan_mode = None;
                         tab.agent_state = None;
                     }
                     // A real tool call is on-CPU. Keep an in-progress "thinking"
@@ -2188,8 +2188,9 @@ impl AppState {
             }
             // (The process-presence sweep that used to live here re-walked
             // every agent tab's `/proc` subtree a second time per tick; the
-            // `AgentActivity::Gone` arm above already clears the attachment
-            // from the same walk, so it was pure duplicate syscall traffic.)
+            // `AgentActivity::Gone` arm above already demotes the LED from the
+            // same walk — and keeps the durable session — so it was pure
+            // duplicate syscall traffic.)
             // Auto-resume sweep: type the queued resume command into
             // any tab whose shell has had ~500ms to print its prompt.
             // `flush_pending_agent_resume` takes the queued command,
