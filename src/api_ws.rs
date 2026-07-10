@@ -220,10 +220,6 @@ struct ImeDedup {
     /// (the word-doubling bug). Also holds the last multi-byte frame, for the
     /// cumulative-prefix pattern.
     buf: Vec<u8>,
-    /// True while `buf` was built by live single-char typing (an in-progress
-    /// composition); false once a multi-byte frame set it. Gates the
-    /// erase-preedit conversion path so a paste is never mistaken for one.
-    composing: bool,
     last_at: Option<Instant>,
 }
 
@@ -250,7 +246,6 @@ impl ImeDedup {
     const fn new() -> Self {
         Self {
             buf: Vec::new(),
-            composing: false,
             last_at: None,
         }
     }
@@ -258,7 +253,6 @@ impl ImeDedup {
     fn set_baseline(&mut self, bytes: &[u8], now: Instant) {
         self.buf.clear();
         self.buf.extend_from_slice(bytes);
-        self.composing = false;
         self.last_at = Some(now);
     }
 
@@ -272,8 +266,11 @@ impl ImeDedup {
     ///   web-viewer bug) — the single chars are accumulated in `buf` so the
     ///   whole-word commit is recognised and dropped.
     ///
-    /// Plus IME **conversion** (`"8"`,`"0"`,`"€"`; dead-key `"ù"`): the commit
-    /// replaces the live composition, so erase the preedit then send it.
+    /// Only EXACT re-sends and prefix-extensions are suppressed. A differing
+    /// multi-byte frame is passed through as-is — it's an appended char
+    /// (`"parl"`+`"é"`), not a preedit to erase. (An earlier version tried to
+    /// erase the preedit on a "conversion" like `"80"`→`"€"`, but that's
+    /// byte-indistinguishable from an append and dropped real input.)
     fn classify(&mut self, bytes: &[u8]) -> Option<Vec<u8>> {
         // Control / cursor-key sequences (arrows `\x1b[D`, Home/End, F-keys,
         // Delete `\x1b[3~`, PageUp/Down, Alt+<key>) all begin with ESC. They are
@@ -295,10 +292,8 @@ impl ImeDedup {
             let b = bytes[0];
             if b <= b' ' || b == 0x7f {
                 self.buf.clear();
-                self.composing = false;
             } else {
                 self.buf.push(b);
-                self.composing = true;
             }
             self.last_at = Some(now);
             return Some(bytes.to_vec());
@@ -321,21 +316,9 @@ impl ImeDedup {
                 self.set_baseline(bytes, now);
                 return Some(suffix);
             }
-            if self.composing {
-                // The commit REPLACES a live single-char composition (IME
-                // conversion: `"80"`→`"€"`, dead-key `"ù"`). Erase the preedit we
-                // already injected (one DEL per char), then send the commit.
-                // Gated on `composing`, so a paste right after typing — `buf`
-                // set from a prior multi-byte frame — is never erased.
-                let preedit_chars = std::str::from_utf8(&self.buf).map_or(self.buf.len(), |s| s.chars().count());
-                let mut out = vec![0x7f; preedit_chars];
-                out.extend_from_slice(bytes);
-                self.set_baseline(bytes, now);
-                return Some(out);
-            }
         }
-        // Fresh / paste / two distinct commits → send as-is, becoming the new
-        // baseline for any following cumulative-prefix extension.
+        // Fresh / paste / appended char / two distinct commits → send as-is,
+        // becoming the new baseline for any following cumulative-prefix extension.
         self.set_baseline(bytes, now);
         Some(bytes.to_vec())
     }
@@ -1403,27 +1386,37 @@ mod tests {
     }
 
     #[test]
-    fn ime_dedup_erases_preedit_on_ime_conversion() {
-        // IME conversion (captured "80"→"€", and dead-key "ù"): the commit
-        // REPLACES the live single-char composition, so the already-injected
-        // preedit is erased (one DEL per char) and the commit sent.
+    fn ime_dedup_appends_accented_char_after_word() {
+        // Regression: typing "parl" then an accented "é" (a multi-byte frame
+        // that ISN'T a prefix of "parl") must APPEND "é" — giving "parlé" — not
+        // erase the preedit down to just "é". A differing multi-byte frame is
+        // an appended char, indistinguishable from a "conversion", so we never
+        // erase.
         let mut d = ImeDedup::new();
-        assert_eq!(d.classify(b"8"), Some(b"8".to_vec()));
-        assert_eq!(d.classify(b"0"), Some(b"0".to_vec()));
-        let euro = "€".as_bytes();
-        let mut expected = vec![0x7f, 0x7f]; // erase the "80" preedit
-        expected.extend_from_slice(euro);
-        assert_eq!(d.classify(euro), Some(expected), "erase preedit then send €");
+        for c in b"parl" {
+            assert_eq!(d.classify(&[*c]), Some(vec![*c]));
+        }
+        let e = "é".as_bytes();
+        assert_eq!(d.classify(e), Some(e.to_vec()), "é appended, not erased — yields parlé");
     }
 
     #[test]
-    fn ime_dedup_paste_after_word_not_erased() {
-        // Safety: a multi-byte frame that follows a COMMITTED word (not a live
-        // single-char composition) must never be treated as a conversion +
-        // erase the previous word. `composing` is false here.
+    fn ime_dedup_multibyte_after_word_not_erased() {
+        // A multi-byte frame that follows text is passed through as-is (append),
+        // never erasing the preceding input — for both a committed word and a
+        // live single-char composition.
         let mut d = ImeDedup::new();
-        assert_eq!(d.classify(b"hello"), Some(b"hello".to_vec())); // commit → composing=false
+        assert_eq!(d.classify(b"hello"), Some(b"hello".to_vec()));
         assert_eq!(d.classify(b"pasted"), Some(b"pasted".to_vec()), "sent as-is, no erase");
+        let mut d2 = ImeDedup::new();
+        assert_eq!(d2.classify(b"8"), Some(b"8".to_vec()));
+        assert_eq!(d2.classify(b"0"), Some(b"0".to_vec()));
+        let euro = "€".as_bytes();
+        assert_eq!(
+            d2.classify(euro),
+            Some(euro.to_vec()),
+            "€ appended (→ 80€), input never erased"
+        );
     }
 
     #[test]
