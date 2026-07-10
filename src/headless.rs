@@ -176,6 +176,13 @@ struct HeadlessTab {
     /// two fsyncs every 2 s persist tick for an identical ~40-byte file.
     #[cfg(feature = "catbus")]
     tokens_last_saved: Option<crate::TokenUsage>,
+    /// Ring length at the last token-sidecar probe — see the gate in
+    /// `persist`'s token loop.
+    #[cfg(feature = "catbus")]
+    tokens_last_ring: u64,
+    /// Bit pattern of the last `save_tab_uptime` value, to skip
+    /// rewriting frozen (deactivated) tabs' files every 30 s.
+    uptime_last_saved: Option<u64>,
     /// Agent CLI pid found by the last LED sweep (`None` = no agent / not
     /// yet swept). Lets the token loop resolve the session without
     /// re-walking the shell's whole /proc subtree; a stale pid just fails
@@ -697,6 +704,9 @@ fn spawn_pty_tab(
         limits: crate::TabResourceLimits::default(),
         #[cfg(feature = "catbus")]
         tokens_last_saved: None,
+        #[cfg(feature = "catbus")]
+        tokens_last_ring: 0,
+        uptime_last_saved: None,
         #[cfg(feature = "catbus")]
         agent_pid: None,
     })
@@ -1512,8 +1522,14 @@ fn persist(
     if !read_only {
         let should_save_uptime = final_flush || last_uptime_save.is_none_or(|t| t.elapsed() >= Duration::from_secs(30));
         if should_save_uptime {
-            for tab in tabs.iter() {
-                save_tab_uptime(&state_base, &tab.name, tab.uptime().as_secs_f64());
+            for tab in tabs.iter_mut() {
+                let secs = tab.uptime().as_secs_f64();
+                // Deactivated tabs' uptime is frozen — skip the atomic
+                // rewrite of an identical value (N-1 of N tabs, every 30 s).
+                if final_flush || tab.uptime_last_saved != Some(secs.to_bits()) {
+                    save_tab_uptime(&state_base, &tab.name, secs);
+                    tab.uptime_last_saved = Some(secs.to_bits());
+                }
             }
             *last_uptime_save = Some(Instant::now());
         }
@@ -1549,6 +1565,14 @@ fn persist(
             if tab.agent_kind.is_none() && !discover {
                 continue;
             }
+            // Token counters only move when the agent finishes a prompt,
+            // which always prints — a tab whose ring hasn't advanced can't
+            // have new totals. The 30 s discovery beat doubles as failsafe.
+            let ring_len = tab.ring_len();
+            if !discover && ring_len == tab.tokens_last_ring {
+                continue;
+            }
+            tab.tokens_last_ring = ring_len;
             // Reuse the LED sweep's subtree walk when it already located
             // the agent; full walk only for discovery (non-agent tabs).
             let session = tab.agent_pid.map_or_else(
