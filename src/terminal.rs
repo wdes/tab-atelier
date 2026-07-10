@@ -1913,6 +1913,55 @@ struct BoxCell {
     color: Hsla,
 }
 
+/// One merged background rectangle in grid coordinates — the output of
+/// [`merge_bg_rects`], painted as a single quad.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct BgRect {
+    col: usize,
+    row: usize,
+    len: usize,
+    rows: usize,
+    color: Hsla,
+}
+
+/// Merge per-row background runs into vertical spans: a run whose
+/// (col, len, color) matches one directly above extends that rectangle
+/// downward instead of emitting its own quad. TUI blocks paint the
+/// same run on dozens of consecutive rows (Claude Code's message
+/// bubbles / diff views, panel fills) — one GPU quad instead of one
+/// per row. Runs within a row are disjoint, so merged rects are too.
+fn merge_bg_rects<'a>(rows: impl Iterator<Item = &'a [BgRun]>) -> Vec<BgRect> {
+    let mut done: Vec<BgRect> = Vec::new();
+    // Rects whose bottom edge touches the previous row (extendable).
+    let mut open: Vec<BgRect> = Vec::new();
+    let mut next_open: Vec<BgRect> = Vec::new();
+    for (row, runs) in rows.enumerate() {
+        for run in runs {
+            let extended = open.iter().position(|r| {
+                r.col == run.col && r.len == run.len && r.row + r.rows == row && hsla_eq(r.color, run.color)
+            });
+            if let Some(i) = extended {
+                let mut r = open.swap_remove(i);
+                r.rows += 1;
+                next_open.push(r);
+            } else {
+                next_open.push(BgRect {
+                    col: run.col,
+                    row,
+                    len: run.len,
+                    rows: 1,
+                    color: run.color,
+                });
+            }
+        }
+        // Whatever wasn't extended this row can never grow again.
+        done.append(&mut open);
+        std::mem::swap(&mut open, &mut next_open);
+    }
+    done.append(&mut open);
+    done
+}
+
 /// One same-style run of glyphs inside a [`RawLine`]. Output of
 /// Phase 1 (cell scan) and input to Phase 2 (`shape_line`).
 #[derive(Clone)]
@@ -2674,16 +2723,15 @@ impl Element for TerminalElement {
             let term_bg = theme::theme(self.theme).term_bg_hsla();
             window.paint_quad(fill(bounds, term_bg));
 
-            // Paint backgrounds.
-            for (line_idx, line) in state.lines.iter().enumerate() {
-                for bg in &line.raw.bg_runs {
-                    let pos = point(
-                        origin.x + cell.width * bg.col as f32,
-                        origin.y + cell.height * line_idx as f32,
-                    );
-                    let size = size(cell.width * bg.len as f32, cell.height);
-                    window.paint_quad(fill(Bounds::new(pos, size), bg.color));
-                }
+            // Paint backgrounds, with vertically-contiguous identical
+            // runs merged into single quads (see `merge_bg_rects`).
+            for r in merge_bg_rects(state.lines.iter().map(|l| l.raw.bg_runs.as_slice())) {
+                let pos = point(
+                    origin.x + cell.width * r.col as f32,
+                    origin.y + cell.height * r.row as f32,
+                );
+                let size = size(cell.width * r.len as f32, cell.height * r.rows as f32);
+                window.paint_quad(fill(Bounds::new(pos, size), r.color));
             }
 
             // Paint selection. Selection coordinates are in alacritty's
@@ -2975,6 +3023,60 @@ mod tests {
         let mut v: Vec<Option<u32>> = vec![Some(0), Some(1)];
         shift_rows(&mut v, -40);
         assert_eq!(v, vec![None, None]);
+    }
+
+    fn run(col: usize, len: usize, l: f32) -> BgRun {
+        BgRun {
+            col,
+            len,
+            color: Hsla {
+                h: 0.6,
+                s: 0.5,
+                l,
+                a: 1.0,
+            },
+        }
+    }
+
+    /// A TUI block painting the same run on consecutive rows must melt
+    /// into ONE rectangle spanning them; anything that differs (column,
+    /// width, colour) or skips a row starts a fresh rect.
+    #[test]
+    fn bg_rects_merge_vertically_and_break_correctly() {
+        // Three identical rows + one row with a different colour.
+        let rows: Vec<Vec<BgRun>> = vec![
+            vec![run(2, 10, 0.3)],
+            vec![run(2, 10, 0.3)],
+            vec![run(2, 10, 0.3)],
+            vec![run(2, 10, 0.9)],
+        ];
+        let mut rects = merge_bg_rects(rows.iter().map(Vec::as_slice));
+        rects.sort_by_key(|r| r.row);
+        assert_eq!(rects.len(), 2, "3-row span + 1 colour-break rect");
+        assert_eq!((rects[0].row, rects[0].rows), (0, 3));
+        assert_eq!((rects[1].row, rects[1].rows), (3, 1));
+
+        // A gap row breaks the span; different col/len never merge.
+        let rows: Vec<Vec<BgRun>> = vec![
+            vec![run(0, 4, 0.3), run(8, 2, 0.3)],
+            vec![],
+            vec![run(0, 4, 0.3), run(8, 3, 0.3)],
+        ];
+        let rects = merge_bg_rects(rows.iter().map(Vec::as_slice));
+        assert_eq!(rects.len(), 4, "gap + width change: nothing merges");
+        assert!(rects.iter().all(|r| r.rows == 1));
+
+        // Independent columns merge independently.
+        let rows: Vec<Vec<BgRun>> = vec![
+            vec![run(0, 4, 0.3), run(8, 2, 0.5)],
+            vec![run(0, 4, 0.3), run(8, 2, 0.5)],
+        ];
+        let mut rects = merge_bg_rects(rows.iter().map(Vec::as_slice));
+        rects.sort_by_key(|r| r.col);
+        assert_eq!(rects.len(), 2);
+        assert!(rects.iter().all(|r| r.rows == 2), "both columns span both rows");
+
+        assert!(merge_bg_rects(std::iter::empty()).is_empty());
     }
 
     /// Guards the "pasted text is invisible until you edit it" fix. Readline

@@ -99,6 +99,13 @@ struct Tab {
     /// immutably.
     #[cfg(feature = "catbus")]
     tokens_last_saved: std::cell::Cell<Option<crate::TokenUsage>>,
+    /// Ring length at the last token-sidecar probe — see the gate in
+    /// `persist`'s token loop.
+    #[cfg(feature = "catbus")]
+    tokens_last_ring: std::cell::Cell<u64>,
+    /// Bit pattern of the last `save_tab_uptime` value, to skip
+    /// rewriting frozen (deactivated) tabs' files every 30 s.
+    uptime_last_saved: std::cell::Cell<Option<u64>>,
     /// Agent CLI pid found by this tick's LED sweep (`None` = no agent /
     /// not yet swept). Lets the token loop resolve the session via
     /// `find_session_for` instead of re-walking the shell's whole /proc
@@ -781,6 +788,9 @@ impl AppState {
                     #[cfg(feature = "catbus")]
                     tokens_last_saved: std::cell::Cell::new(None),
                     #[cfg(feature = "catbus")]
+                    tokens_last_ring: std::cell::Cell::new(0),
+                    uptime_last_saved: std::cell::Cell::new(None),
+                    #[cfg(feature = "catbus")]
                     agent_pid: std::cell::Cell::new(None),
                     // Seed with the hash of the just-restored output so the
                     // first persist tick after launch doesn't rewrite an
@@ -841,6 +851,9 @@ impl AppState {
                     #[cfg(feature = "catbus")]
                     tokens_last_saved: std::cell::Cell::new(None),
                     #[cfg(feature = "catbus")]
+                    tokens_last_ring: std::cell::Cell::new(0),
+                    uptime_last_saved: std::cell::Cell::new(None),
+                    #[cfg(feature = "catbus")]
                     agent_pid: std::cell::Cell::new(None),
                     pending_restore: None,
                     last_known_cwd: None,
@@ -894,6 +907,9 @@ impl AppState {
                     energy_wh_last_saved: 0.0,
                     #[cfg(feature = "catbus")]
                     tokens_last_saved: std::cell::Cell::new(None),
+                    #[cfg(feature = "catbus")]
+                    tokens_last_ring: std::cell::Cell::new(0),
+                    uptime_last_saved: std::cell::Cell::new(None),
                     #[cfg(feature = "catbus")]
                     agent_pid: std::cell::Cell::new(None),
                     pending_restore: None,
@@ -1464,6 +1480,9 @@ impl AppState {
                 #[cfg(feature = "catbus")]
                 tokens_last_saved: std::cell::Cell::new(None),
                 #[cfg(feature = "catbus")]
+                tokens_last_ring: std::cell::Cell::new(0),
+                uptime_last_saved: std::cell::Cell::new(None),
+                #[cfg(feature = "catbus")]
                 agent_pid: std::cell::Cell::new(None),
                 pending_restore: None,
                 last_known_cwd_string: cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
@@ -1830,7 +1849,13 @@ impl AppState {
                 .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(30));
             if should_save_uptime {
                 for tab in &self.tabs {
-                    save_tab_uptime(&state_base, &tab.name, tab.uptime().as_secs_f64());
+                    let secs = tab.uptime().as_secs_f64();
+                    // Deactivated tabs' uptime is frozen — skip the atomic
+                    // rewrite of an identical value (N-1 of N tabs, every 30 s).
+                    if tab.uptime_last_saved.get() != Some(secs.to_bits()) {
+                        save_tab_uptime(&state_base, &tab.name, secs);
+                        tab.uptime_last_saved.set(Some(secs.to_bits()));
+                    }
                 }
                 self.last_uptime_save.set(Some(std::time::Instant::now()));
             }
@@ -1869,6 +1894,15 @@ impl AppState {
                 if tab.agent_kind.is_none() && !discover {
                     continue;
                 }
+                // Token counters only move when the agent finishes a
+                // prompt, which always prints — a tab whose ring hasn't
+                // advanced can't have new totals. The 30 s discovery
+                // beat doubles as failsafe.
+                let ring_len = tab.view.read(cx).ring_len();
+                if !discover && ring_len == tab.tokens_last_ring.get() {
+                    continue;
+                }
+                tab.tokens_last_ring.set(ring_len);
                 // Reuse the LED sweep's subtree walk when it already
                 // located the agent; fall back to the full walk for
                 // discovery (non-agent tabs / first tick after attach).
