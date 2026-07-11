@@ -250,21 +250,29 @@ gpui = { version = "0.2", default-features = false, optional = true }
 [package.metadata.deb]
 section = "x11"
 priority = "optional"
-# Font Depends rationale: the GUI defaults to font-family "monospace"
-# (src/lib.rs::FontConfig::default), a Fontconfig generic alias. With
-# NO monospace font installed, Fontconfig may resolve to a fallback
-# missing Latin Extended (no precomposed é/è/à/ç glyphs), and the
-# fallback's per-glyph advance metrics don't match the host font —
-# producing the visible horizontal gaps around accented chars we
-# saw in the wild.
+# Font Depends rationale: gpui resolves its UI font (`.SystemUIFont`)
+# against a HARD-CODED family fallback chain and panics outright when
+# none is present — the crash a fresh Debian hit:
+#   failed to resolve font '.SystemUIFont' or any of the fallbacks:
+#   .ZedMono, .ZedSans, Helvetica, Segoe UI, Ubuntu, Adwaita Sans,
+#   Cantarell, Noto Sans, DejaVu Sans, Arial
+# gpui matches EXACT family names (it does not go through Fontconfig's
+# Arial→Liberation aliasing), so of the fonts-* packages, only
+# `fonts-dejavu-core` provides a family in that chain (DejaVu Sans) —
+# and it also carries DejaVu Sans Mono for the terminal's "monospace"
+# default (src/lib.rs::FontConfig::default), whose Latin-Extended
+# coverage keeps accented chars é/è/à/ç from getting the wrong advance
+# metrics. So it MUST be a hard dependency: the previous
+# `fonts-dejavu-core | fonts-liberation | fonts-noto-mono` let a box
+# that already had Liberation or Noto-Mono satisfy dpkg WITHOUT ever
+# pulling DejaVu, leaving gpui with no resolvable UI font → panic on
+# launch. Liberation Sans / Noto Sans Mono aren't in gpui's chain.
 #
 # Per Debian Fonts Task Force convention we don't ship our own font
-# subpackage (we're not the upstream); we Depends on existing
-# `fonts-*` packages with `|` alternatives so any of these satisfies.
-# Order from most-likely-already-installed to least: dejavu-core is
-# pulled in by task-desktop / gnome / kde metapackages, so most
-# desktops add zero bytes. The other two are common Liberation /
-# Noto fallbacks shipped with many distros.
+# subpackage (we're not the upstream); we Depends on the existing
+# `fonts-dejavu-core` package. It's tiny (~1.5 MB) and pulled in by
+# task-desktop / gnome / kde metapackages, so most desktops add zero
+# bytes.
 #
 # `$auto` is cargo-deb's automatic shared-library resolver: it reads the
 # binary's ELF DT_NEEDED entries and emits VERSIONED deps —
@@ -279,7 +287,7 @@ priority = "optional"
 #     omits it; keep it explicit so the dep is correct per Debian policy.
 #   * libfreetype6 — loaded for glyph rasterisation; not a direct
 #     DT_NEEDED link, so $auto can't see it.
-depends = "$auto, libgcc-s1, libfreetype6, fonts-dejavu-core | fonts-liberation | fonts-noto-mono"
+depends = "$auto, libgcc-s1, libfreetype6, fonts-dejavu-core"
 # Desktop and headless ship the same `catbus-agent` helper binary in
 # `/usr/bin/`, so they can't both be installed at once.
 # `Conflicts:` makes apt refuse the second install with a clean
