@@ -222,6 +222,23 @@ pub const PATTERNS: &[Pattern] = &[
         label: "auto-mode-classifier-down",
         action: "continue\r",
     },
+    // Claude Code's own auto-retry banner while an API call is failing:
+    //   "✻ Waiting for API response · will retry in 1m 57s · check your
+    //    network"
+    // The countdown ticks every second, so a LIVE retry keeps the screen
+    // moving and never trips the STABLE_SECS freeze gate — brain stays out
+    // of its way and lets Claude retry itself (the intended behaviour). This
+    // pattern only bites when that banner is FROZEN, i.e. the TUI hung on it
+    // without actually counting down: after STABLE_SECS of a byte-identical
+    // screen, `continue` unsticks it the same as the other transient errors.
+    // Needle is the stable prefix before the countdown ("will retry in"),
+    // which never appears in healthy output nor collides with the rate-limit
+    // wording ("retrying in").
+    Pattern {
+        needle: "will retry in",
+        label: "api-retry-waiting",
+        action: "continue\r",
+    },
 ];
 
 /// Searches the trailing window of `text` for a known failure pattern.
@@ -927,6 +944,27 @@ mod tests {
             .expect("must match");
         assert_eq!(p.label, "connection-closed-mid-response");
         assert_eq!(p.action, "continue\r");
+    }
+
+    #[test]
+    fn scan_matches_api_retry_waiting_banner() {
+        // Claude Code's auto-retry banner. Matches on the stable prefix so
+        // the ticking countdown / "check your network" tail don't matter.
+        // (A live countdown never freezes STABLE_SECS, so brain only acts on
+        // a hung one — the pattern just makes that case recoverable.)
+        let p =
+            scan_output("✻ Waiting for API response · will retry in 1m 57s · check your network").expect("must match");
+        assert_eq!(p.label, "api-retry-waiting");
+        assert_eq!(p.action, "continue\r");
+    }
+
+    #[test]
+    fn scan_retry_banner_does_not_collide_with_rate_limit_wording() {
+        // The rate-limit banner says "retrying in", NOT "will retry in", so
+        // the new needle must not swallow it (it has its own label/handling).
+        let p = scan_output("● Rate limited · retrying in 38s\n❯ continue");
+        // No "will retry in" here → the api-retry-waiting needle must miss.
+        assert!(p.is_none_or(|p| p.label != "api-retry-waiting"));
     }
 
     #[test]
