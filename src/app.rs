@@ -59,6 +59,12 @@ use std::sync::{Arc, Mutex};
 /// after 2 min of agent silence, so this is the extra "and you haven't
 /// looked at it" grace on top of that.
 const DORMANT_AFTER_SECS: u64 = 180;
+/// How recently a tab must have produced PTY output to read as "talking"
+/// (agent actively streaming a reply / spinner / a tool printing) and light
+/// the green LED, even when the stored hook-state is `Waiting`/`None` — e.g. a
+/// `--resume`d session that continues without a fresh `UserPromptSubmit`. Kept
+/// short so the LED reverts to the real state the moment output goes quiet.
+const STREAMING_LED_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
 
 struct Tab {
     view: Entity<TerminalView>,
@@ -2616,13 +2622,16 @@ impl AppState {
                     b: 0.45,
                     a: 1.0,
                 });
+                // Green = the agent is thinking/talking. Named so the
+                // "actively streaming" overlay below can reuse the exact hue.
+                let thinking_green = Hsla::from(Rgba {
+                    r: 0.306,
+                    g: 0.788,
+                    b: 0.690,
+                    a: 1.0,
+                });
                 let color = match tab.agent_state.as_ref().map(|s| s.state) {
-                    Some(crate::AgentState::Thinking) => Hsla::from(Rgba {
-                        r: 0.306,
-                        g: 0.788,
-                        b: 0.690,
-                        a: 1.0,
-                    }),
+                    Some(crate::AgentState::Thinking) => thinking_green,
                     Some(crate::AgentState::Waiting) => {
                         if blink_on {
                             Hsla::from(Rgba {
@@ -2676,6 +2685,21 @@ impl AppState {
                         }
                     }
                 };
+                // "Talking in background" overlay: an attached agent that put new
+                // bytes through the PTY in the last few seconds is actively
+                // streaming, so light it green even when the stored state is
+                // Waiting/None (a `--resume`d session that keeps talking never
+                // fires a fresh thinking hook, and `agent_activity` only counts
+                // *child* processes on-CPU, so claude rendering its own reply
+                // reads Idle). Overlay-only: never mutates the stored state, so
+                // the LED drops back to the real state the instant output stops —
+                // no 2-min stuck-green. An explicit Error still wins.
+                let talking = tab.last_output_at.is_some_and(|t| t.elapsed() < STREAMING_LED_WINDOW);
+                let is_error = matches!(
+                    tab.agent_state.as_ref().map(|s| s.state),
+                    Some(crate::AgentState::Error)
+                );
+                let color = if talking && !is_error { thinking_green } else { color };
                 Some(div().w(px(7.0)).h(px(7.0)).mr(px(5.0)).rounded_full().bg(color))
             } else {
                 None
