@@ -288,6 +288,16 @@ priority = "optional"
 #   * libfreetype6 — loaded for glyph rasterisation; not a direct
 #     DT_NEEDED link, so $auto can't see it.
 depends = "$auto, libgcc-s1, libfreetype6, fonts-dejavu-core"
+# Emoji font — Recommends, not Depends: the UI decorates a handful of
+# spots with emoji (🐾 "Summon/Dismiss a pet" in the background menu, 🔒
+# lock marker, ⛑/✅ status) and DejaVu carries none of them, so on a box
+# without a colour-emoji font those render as tofu boxes. It's purely
+# cosmetic — the app runs fine without it — so a hard Depends (Noto Color
+# Emoji is ~10 MB) would be too heavy. Recommends is apt's default-on, so
+# a normal `apt install` pulls it while a `--no-install-recommends` /
+# minimal setup can skip the 10 MB. gpui/cosmic-text rasterises Noto's
+# COLR/CBDT colour glyphs, so this is the font that makes them appear.
+recommends = "fonts-noto-color-emoji"
 # Desktop and headless ship the same `catbus-agent` helper binary in
 # `/usr/bin/`, so they can't both be installed at once.
 # `Conflicts:` makes apt refuse the second install with a clean
