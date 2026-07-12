@@ -1980,6 +1980,11 @@ struct RawSegment {
 /// [`TerminalView::prev_frame`] for damage-driven re-use.
 #[derive(Clone)]
 struct RawLine {
+    /// Memoised [`line_style_sig`] of `segments` — computed once on the
+    /// row's first Phase 2 encounter (outside the Term lock) and reused
+    /// for the cached row's whole lifetime. Recomputing it walked every
+    /// visible row's runs on EVERY paint, cache hit or not.
+    style_sig_memo: Cell<Option<u64>>,
     /// Content-stable line coordinate: `history_size - display_offset +
     /// viewport_row`, i.e. the row's distance from the top of the
     /// scrollback. Unlike a viewport index it does NOT change when the
@@ -2000,6 +2005,18 @@ struct RawLine {
 #[inline]
 const fn fnv_mix(h: u64, v: u64) -> u64 {
     (h ^ v).wrapping_mul(0x0000_0100_0000_01b3)
+}
+
+impl RawLine {
+    /// Memoised style signature — see the `style_sig_memo` field.
+    fn style_sig(&self) -> u64 {
+        if let Some(s) = self.style_sig_memo.get() {
+            return s;
+        }
+        let s = line_style_sig(&self.segments);
+        self.style_sig_memo.set(Some(s));
+        s
+    }
 }
 
 /// FNV-1a fingerprint of a line's *shaping inputs* — the per-run foreground
@@ -2519,6 +2536,7 @@ impl Element for TerminalElement {
                 }
 
                 *slot = Some(Rc::new(RawLine {
+                    style_sig_memo: Cell::new(None),
                     abs_line,
                     text: full_text,
                     segments,
@@ -2579,7 +2597,7 @@ impl Element for TerminalElement {
         let mut result_lines = Vec::with_capacity(raw_lines.len());
         let mut detected: Vec<DetectedUrl> = Vec::new();
         for (line_idx, raw) in raw_lines.into_iter().enumerate() {
-            let sig = line_style_sig(&raw.segments);
+            let sig = raw.style_sig();
             if let Some(cached) = cache.remove(&raw.abs_line)
                 && cached.text == raw.text
                 && cached.sig == sig
@@ -3077,6 +3095,43 @@ mod tests {
         assert!(rects.iter().all(|r| r.rows == 2), "both columns span both rows");
 
         assert!(merge_bg_rects(std::iter::empty()).is_empty());
+    }
+
+    /// The per-row style signature is memoised on the shared `RawLine` —
+    /// it must equal the free-function result and stay stable across
+    /// calls (the whole point: cache hits stop re-walking the runs).
+    #[test]
+    fn raw_line_style_sig_is_memoised_and_consistent() {
+        let segments = vec![RawSegment {
+            col_start: 0,
+            text: "hello".to_string(),
+            runs: vec![TextRun {
+                len: 5,
+                font: font("monospace"),
+                color: Hsla {
+                    h: 0.1,
+                    s: 0.2,
+                    l: 0.3,
+                    a: 1.0,
+                },
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            }],
+            cell_span: 1,
+        }];
+        let raw = RawLine {
+            style_sig_memo: Cell::new(None),
+            abs_line: 7,
+            text: "hello".into(),
+            segments,
+            bg_runs: Vec::new(),
+            box_cells: Vec::new(),
+        };
+        let expect = line_style_sig(&raw.segments);
+        assert_eq!(raw.style_sig(), expect, "memo equals the direct computation");
+        assert_eq!(raw.style_sig(), expect, "second call serves the memo");
+        assert_eq!(raw.style_sig_memo.get(), Some(expect), "memo populated");
     }
 
     /// Guards the "pasted text is invisible until you edit it" fix. Readline
