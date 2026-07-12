@@ -180,6 +180,10 @@ struct HeadlessTab {
     /// `persist`'s token loop.
     #[cfg(feature = "catbus")]
     tokens_last_ring: u64,
+    /// Ring length at the last LED-sweep visit — a parked agent's
+    /// subtree walk is skipped until its ring moves (30 s failsafe).
+    #[cfg(feature = "catbus")]
+    sweep_last_ring: u64,
     /// Bit pattern of the last `save_tab_uptime` value, to skip
     /// rewriting frozen (deactivated) tabs' files every 30 s.
     uptime_last_saved: Option<u64>,
@@ -706,6 +710,8 @@ fn spawn_pty_tab(
         tokens_last_saved: None,
         #[cfg(feature = "catbus")]
         tokens_last_ring: 0,
+        #[cfg(feature = "catbus")]
+        sweep_last_ring: 0,
         uptime_last_saved: None,
         #[cfg(feature = "catbus")]
         agent_pid: None,
@@ -1856,6 +1862,22 @@ fn drain_pending(
         due
     };
     if sweep_due {
+        // A parked agent (idle at its prompt, printing nothing, not
+        // thinking) can't change activity state — its subtree walk is
+        // skipped until output resumes, with a 30 s full-sweep beat as
+        // the failsafe so `Gone` (killed / crashed) still demotes the
+        // LED within half a minute.
+        let full_sweep = {
+            use std::sync::OnceLock;
+            static LAST_FULL: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+            let lock = LAST_FULL.get_or_init(|| Mutex::new(None));
+            let mut last = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let due = last.is_none_or(|t| t.elapsed() >= Duration::from_secs(30));
+            if due {
+                *last = Some(now);
+            }
+            due
+        };
         // One BFS per agent tab answers BOTH questions: `Gone` means the
         // agent CLI is no longer a descendant (the old separate presence
         // sweep re-walked the same subtree for that), `Working` means a
@@ -1870,6 +1892,15 @@ fn drain_pending(
             if tab.agent_kind.is_none() {
                 continue;
             }
+            let ring = tab.ring_len();
+            let thinking = tab
+                .agent_state
+                .as_ref()
+                .is_some_and(|s| s.state == crate::AgentState::Thinking);
+            if crate::catbus_agent::sweep_may_skip(full_sweep, thinking, ring, tab.sweep_last_ring) {
+                continue;
+            }
+            tab.sweep_last_ring = ring;
             let (activity, agent_pid) = crate::catbus_agent::agent_activity_with_pid(tab.pid);
             // Cache the found agent pid so the persist tick's token loop
             // can resolve the session without re-walking the subtree.

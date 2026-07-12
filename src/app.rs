@@ -116,6 +116,10 @@ struct Tab {
     /// tracked separately from `snap_cache`, which only refreshes while
     /// the API has consumers.
     led_last_ring: std::cell::Cell<u64>,
+    /// Ring length at the last LED-sweep visit — a parked agent's
+    /// subtree walk is skipped until its ring moves (30 s failsafe).
+    #[cfg(feature = "catbus")]
+    sweep_last_ring: std::cell::Cell<u64>,
     /// Agent CLI pid found by this tick's LED sweep (`None` = no agent /
     /// not yet swept). Lets the token loop resolve the session via
     /// `find_session_for` instead of re-walking the shell's whole /proc
@@ -536,6 +540,10 @@ struct AppState {
     /// every 2s would burn through disk writes for a value that only
     /// advances by ~2s anyway; we batch writes to once every 30s.
     last_uptime_save: std::cell::Cell<Option<std::time::Instant>>,
+    /// 30 s beat for the complete agent LED sweep; between beats only
+    /// non-parked (recently-printing / thinking) agent tabs are walked.
+    #[cfg(feature = "catbus")]
+    last_agent_full_sweep: std::cell::Cell<Option<std::time::Instant>>,
     /// CRC32 of the last serialized `tabs.json` content. Skips the write+
     /// rotate when nothing in the tab list changed since last tick.
     last_state_hash: std::cell::Cell<u32>,
@@ -802,6 +810,8 @@ impl AppState {
                     uptime_last_saved: std::cell::Cell::new(None),
                     led_last_ring: std::cell::Cell::new(0),
                     #[cfg(feature = "catbus")]
+                    sweep_last_ring: std::cell::Cell::new(0),
+                    #[cfg(feature = "catbus")]
                     agent_pid: std::cell::Cell::new(None),
                     // Seed with the hash of the just-restored output so the
                     // first persist tick after launch doesn't rewrite an
@@ -866,6 +876,8 @@ impl AppState {
                     uptime_last_saved: std::cell::Cell::new(None),
                     led_last_ring: std::cell::Cell::new(0),
                     #[cfg(feature = "catbus")]
+                    sweep_last_ring: std::cell::Cell::new(0),
+                    #[cfg(feature = "catbus")]
                     agent_pid: std::cell::Cell::new(None),
                     pending_restore: None,
                     last_known_cwd: None,
@@ -923,6 +935,8 @@ impl AppState {
                     tokens_last_ring: std::cell::Cell::new(0),
                     uptime_last_saved: std::cell::Cell::new(None),
                     led_last_ring: std::cell::Cell::new(0),
+                    #[cfg(feature = "catbus")]
+                    sweep_last_ring: std::cell::Cell::new(0),
                     #[cfg(feature = "catbus")]
                     agent_pid: std::cell::Cell::new(None),
                     pending_restore: None,
@@ -1330,6 +1344,8 @@ impl AppState {
             remote_endpoints,
             hotkey_handle: None,
             last_uptime_save: std::cell::Cell::new(None),
+            #[cfg(feature = "catbus")]
+            last_agent_full_sweep: std::cell::Cell::new(None),
             last_state_hash: std::cell::Cell::new(0),
             tab_connections: Arc::new(Mutex::new(std::collections::HashMap::new())),
             activity_signal,
@@ -1496,6 +1512,8 @@ impl AppState {
                 tokens_last_ring: std::cell::Cell::new(0),
                 uptime_last_saved: std::cell::Cell::new(None),
                 led_last_ring: std::cell::Cell::new(0),
+                #[cfg(feature = "catbus")]
+                sweep_last_ring: std::cell::Cell::new(0),
                 #[cfg(feature = "catbus")]
                 agent_pid: std::cell::Cell::new(None),
                 pending_restore: None,
@@ -2133,11 +2151,34 @@ impl AppState {
             // (and only it) on the next startup. See `agent_reaper`.
             #[cfg(feature = "catbus")]
             let mut live_agents: Vec<(u32, String)> = Vec::new();
+            // A parked agent (idle at its prompt, printing nothing, not
+            // thinking) can't change activity state — skip its subtree
+            // walk (and the probe's second walk + sample append) until
+            // output resumes, with a 30 s full-sweep beat as failsafe
+            // so `Gone` still demotes the LED within half a minute.
+            #[cfg(feature = "catbus")]
+            let full_sweep = self
+                .last_agent_full_sweep
+                .get()
+                .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(30));
+            #[cfg(feature = "catbus")]
+            if full_sweep {
+                self.last_agent_full_sweep.set(Some(now));
+            }
             #[cfg(feature = "catbus")]
             for tab in &mut self.tabs {
                 if tab.agent_kind.is_none() {
                     continue;
                 }
+                let ring = tab.view.read(cx).ring_len();
+                let thinking = tab
+                    .agent_state
+                    .as_ref()
+                    .is_some_and(|s| s.state == crate::AgentState::Thinking);
+                if crate::catbus_agent::sweep_may_skip(full_sweep, thinking, ring, tab.sweep_last_ring.get()) {
+                    continue;
+                }
+                tab.sweep_last_ring.set(ring);
                 let pid = tab.view.read(cx).pid();
                 let (activity, agent_pid) = crate::catbus_agent::agent_activity_with_pid(pid);
                 // Cache the found agent pid so the token loop can resolve
@@ -2194,9 +2235,11 @@ impl AppState {
             }
             // Not in read-only: an inspect-only instance must not overwrite
             // the record with processes it didn't launch (it shares the state
-            // dir and skips the single-instance lock).
+            // dir and skips the single-instance lock). Full sweeps only —
+            // a partial (parked-tabs-skipped) tick would truncate the
+            // record and let a crash-leaked ghost dodge the reaper.
             #[cfg(feature = "catbus")]
-            if !crate::read_only() {
+            if full_sweep && !crate::read_only() {
                 crate::agent_reaper::record_live_agents(&probe_base, &live_agents);
             }
             // Staleness sweep: drop transient LED state when the last
