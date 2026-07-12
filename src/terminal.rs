@@ -172,6 +172,14 @@ use gpui::{
 const INITIAL_COLS: usize = 80;
 const INITIAL_LINES: usize = 24;
 const SCROLLBAR_WIDTH: f32 = 8.0;
+/// Minimum spacing between grid reflows during a resize storm. A live
+/// window drag crosses a cell boundary on nearly every frame, and each
+/// crossing used to reflow the full 10k-line scrollback + SIGWINCH the
+/// PTY app, synchronously on the UI thread. The first change applies
+/// instantly (a lone maximize keeps its immediate reflow); faster
+/// follow-ups park as pending and the repaint pump applies the final
+/// size once the drag settles.
+const RESIZE_SETTLE: Duration = Duration::from_millis(150);
 
 #[derive(Clone)]
 pub struct DetectedUrl {
@@ -297,6 +305,12 @@ pub struct TerminalView {
     focus: FocusHandle,
     cell_size: Option<Size<Pixels>>,
     last_size: Rc<Cell<Option<(usize, usize)>>>,
+    /// Resize parked during a storm: `(cols, lines, requested_at)` —
+    /// applied by [`Self::apply_pending_resize`] once stable. See
+    /// [`RESIZE_SETTLE`].
+    pending_resize: Rc<Cell<Option<(usize, usize, std::time::Instant)>>>,
+    /// When the grid was last actually reflowed (leading-edge stamp).
+    last_resize_apply: Rc<Cell<Option<std::time::Instant>>>,
     content_origin: Rc<Cell<gpui::Point<Pixels>>>,
     bounds_size: Rc<Cell<Size<Pixels>>>,
     line_cache: Rc<RefCell<HashMap<i32, CachedLine>>>,
@@ -693,6 +707,11 @@ impl TerminalView {
                 interval = FAST;
                 parked = false;
                 let Ok(()) = this.update(cx, |view, cx: &mut Context<Self>| {
+                    // A resize parked by the prepaint rate-limit applies
+                    // here once the drag settles (see RESIZE_SETTLE).
+                    if view.apply_pending_resize() {
+                        cx.notify();
+                    }
                     if grid_dirty {
                         let streak = dirty_streak.get().wrapping_add(1);
                         dirty_streak.set(streak);
@@ -759,6 +778,8 @@ impl TerminalView {
             // re-measure the cell or thrash a resize on its first paint.
             cell_size: init_cell,
             last_size: Rc::new(Cell::new(initial_grid.map(|(c, l, _)| (c, l)))),
+            pending_resize: Rc::new(Cell::new(None)),
+            last_resize_apply: Rc::new(Cell::new(None)),
             content_origin: Rc::new(Cell::new(point(px(0.0), px(0.0)))),
             bounds_size: Rc::new(Cell::new(size(px(0.0), px(0.0)))),
             line_cache: Rc::new(RefCell::new(HashMap::new())),
@@ -1285,6 +1306,25 @@ impl TerminalView {
             (Some((cols, lines)), Some(cell)) => Some((cols, lines, cell)),
             _ => None,
         }
+    }
+
+    /// Apply a resize parked by the prepaint rate-limit once it has
+    /// been stable for [`RESIZE_SETTLE`]. Called from the repaint pump;
+    /// returns whether a reflow happened (the caller repaints).
+    fn apply_pending_resize(&mut self) -> bool {
+        let Some((cols, lines, at)) = self.pending_resize.get() else {
+            return false;
+        };
+        if at.elapsed() < RESIZE_SETTLE {
+            return false;
+        }
+        self.pending_resize.set(None);
+        let Some(cell) = self.cell_size else {
+            return false;
+        };
+        self.last_resize_apply.set(Some(std::time::Instant::now()));
+        self.force_resize(cols, lines, cell);
+        true
     }
 
     /// Resize the grid + PTY without going through a paint — for background
@@ -1814,6 +1854,8 @@ impl Render for TerminalView {
                 notifier: self.notifier.clone(),
                 cell_size,
                 last_size: self.last_size.clone(),
+                pending_resize: self.pending_resize.clone(),
+                last_resize_apply: self.last_resize_apply.clone(),
                 content_origin: self.content_origin.clone(),
                 bounds_size: self.bounds_size.clone(),
                 line_cache: self.line_cache.clone(),
@@ -1842,6 +1884,12 @@ struct TerminalElement {
     notifier: Option<EventLoopSender>,
     cell_size: Size<Pixels>,
     last_size: Rc<Cell<Option<(usize, usize)>>>,
+    /// Resize parked during a storm: `(cols, lines, requested_at)` —
+    /// applied by [`Self::apply_pending_resize`] once stable. See
+    /// [`RESIZE_SETTLE`].
+    pending_resize: Rc<Cell<Option<(usize, usize, std::time::Instant)>>>,
+    /// When the grid was last actually reflowed (leading-edge stamp).
+    last_resize_apply: Rc<Cell<Option<std::time::Instant>>>,
     content_origin: Rc<Cell<gpui::Point<Pixels>>>,
     bounds_size: Rc<Cell<Size<Pixels>>>,
     line_cache: Rc<RefCell<HashMap<i32, CachedLine>>>,
@@ -2102,22 +2150,41 @@ impl Element for TerminalElement {
         let cols = ((bounds.size.width / cell.width) as usize).max(2);
         let lines = ((bounds.size.height / cell.height) as usize).max(1);
 
-        if self.last_size.get() != Some((cols, lines)) {
-            self.last_size.set(Some((cols, lines)));
-            {
-                let mut t = self.term.lock();
-                t.resize(TermDims {
-                    columns: cols,
-                    screen_lines: lines,
-                });
-            }
-            if let Some(n) = self.notifier.as_ref() {
-                let _ = n.send(Msg::Resize(WindowSize {
-                    num_lines: lines as u16,
-                    num_cols: cols as u16,
-                    cell_width: f32::from(cell.width) as u16,
-                    cell_height: f32::from(cell.height) as u16,
-                }));
+        if self.last_size.get() == Some((cols, lines)) {
+            // Bounds settled back onto the applied grid mid-storm —
+            // nothing left to apply.
+            self.pending_resize.set(None);
+        } else {
+            // See RESIZE_SETTLE: leading edge reflows immediately, a
+            // storm parks the newest size for the pump to apply. Until
+            // then the old grid keeps painting — the scan below clamps
+            // to min(grid, bounds) and the content mask clips, so a
+            // transiently mismatched frame is safe.
+            let quiet = self
+                .last_resize_apply
+                .get()
+                .is_none_or(|t| t.elapsed() >= RESIZE_SETTLE);
+            if quiet {
+                self.pending_resize.set(None);
+                self.last_resize_apply.set(Some(std::time::Instant::now()));
+                self.last_size.set(Some((cols, lines)));
+                {
+                    let mut t = self.term.lock();
+                    t.resize(TermDims {
+                        columns: cols,
+                        screen_lines: lines,
+                    });
+                }
+                if let Some(n) = self.notifier.as_ref() {
+                    let _ = n.send(Msg::Resize(WindowSize {
+                        num_lines: lines as u16,
+                        num_cols: cols as u16,
+                        cell_width: f32::from(cell.width) as u16,
+                        cell_height: f32::from(cell.height) as u16,
+                    }));
+                }
+            } else {
+                self.pending_resize.set(Some((cols, lines, std::time::Instant::now())));
             }
         }
 
@@ -3305,6 +3372,53 @@ mod tests {
                 view.ensure_spawned();
                 assert_eq!(view.pid(), pid);
                 view.shutdown();
+            })
+            .unwrap();
+    }
+
+    /// The resize-storm rate limit: a parked size only reflows the grid
+    /// once it has been stable for `RESIZE_SETTLE`, and the reflow goes
+    /// through `force_resize` (grid actually changes size).
+    #[gpui::test]
+    fn pending_resize_applies_only_after_settling(cx: &mut TestAppContext) {
+        let window = cx.add_window(|window, cx| {
+            TerminalView::new_with_colors_and_env(
+                None,
+                FontConfig::default(),
+                default_browser(),
+                default_editor(),
+                true,
+                std::collections::HashMap::new(),
+                None,
+                Some((80, 24, size(px(8.0), px(16.0)))),
+                true, // skeleton — no shell needed to resize the grid
+                window,
+                cx,
+            )
+        });
+        window
+            .update(cx, |view, _window, _cx| {
+                // The test window's first paint applies its own size —
+                // work relative to whatever the grid is now.
+                let base = view.dims();
+                let target = (usize::from(base.0) + 7, usize::from(base.1) + 3);
+                // Mid-storm: request too fresh — nothing applies.
+                view.pending_resize
+                    .set(Some((target.0, target.1, std::time::Instant::now())));
+                assert!(!view.apply_pending_resize(), "still settling");
+                assert_eq!(view.dims(), base, "grid untouched mid-storm");
+                // Settled: same request, aged past RESIZE_SETTLE.
+                let old = std::time::Instant::now().checked_sub(RESIZE_SETTLE).unwrap();
+                view.pending_resize.set(Some((target.0, target.1, old)));
+                assert!(view.apply_pending_resize(), "settled — reflow happens");
+                assert_eq!(
+                    (usize::from(view.dims().0), usize::from(view.dims().1)),
+                    target,
+                    "grid reflowed to the parked size"
+                );
+                assert!(view.pending_resize.get().is_none(), "pending consumed");
+                // Idempotent once consumed.
+                assert!(!view.apply_pending_resize());
             })
             .unwrap();
     }
