@@ -236,6 +236,17 @@ fn newest_session(project_dir: &Path) -> Option<(PathBuf, String)> {
     best.map(|(p, id, _)| (p, id))
 }
 
+/// Whether the LED sweep may skip a tab's `/proc` subtree walk this
+/// tick. A parked agent — not thinking, ring byte counter unchanged
+/// since its last visit — cannot have changed activity state: `Gone`
+/// and `Working` both imply process-tree changes that always come with
+/// output or a hook POST. `full_sweep` (the 30 s beat) overrides so a
+/// silently-killed agent still demotes within half a minute.
+#[must_use]
+pub const fn sweep_may_skip(full_sweep: bool, thinking: bool, ring: u64, last_ring: u64) -> bool {
+    !full_sweep && !thinking && ring == last_ring
+}
+
 /// Convenience wrapper that returns every parsed message — equivalent
 /// to `parse_messages_since(path, 0)`. Used by tests and any caller
 /// that wants the full transcript.
@@ -536,5 +547,22 @@ mod tests {
             &msgs[1].segments[0],
             MessageSegment::ToolResult { text, .. } if text == "foo\nbar"
         ));
+    }
+}
+
+#[cfg(test)]
+mod sweep_gate_tests {
+    use super::sweep_may_skip;
+
+    #[test]
+    fn parked_skips_but_every_signal_forces_a_walk() {
+        // Parked: no full sweep, not thinking, ring unchanged.
+        assert!(sweep_may_skip(false, false, 42, 42));
+        // Output arrived → walk.
+        assert!(!sweep_may_skip(false, false, 43, 42));
+        // Thinking (long quiet tool call) → keep refreshing the LED.
+        assert!(!sweep_may_skip(false, true, 42, 42));
+        // The 30 s failsafe beat walks everything (Gone detection).
+        assert!(!sweep_may_skip(true, false, 42, 42));
     }
 }
