@@ -105,6 +105,21 @@ fn drain(sock: &mut WebSocket<MaybeTlsStream<TcpStream>>) {
     while sock.read().is_ok() {}
 }
 
+/// Per-sample probe bytes. Unique per sample so the echo matcher can't
+/// confuse unrelated output with our keystrokes — the old fixed `x`
+/// matched any `x` a busy tab happened to print and inflated runs
+/// (issue #9 item 4). Plain ASCII so every shell echoes it verbatim.
+fn nonce(sample: usize) -> Vec<u8> {
+    format!("q{sample:03}z").into_bytes()
+}
+
+/// Whether the accumulated echo stream contains the nonce. The echo can
+/// arrive split across several `TAG_OUT` frames, so the caller appends
+/// each frame's payload and re-checks the whole buffer.
+fn contains_seq(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
 #[must_use]
 pub fn run(view_url: &str, samples: usize) -> i32 {
     let ws_url = match to_ws_url(view_url) {
@@ -131,26 +146,37 @@ pub fn run(view_url: &str, samples: usize) -> i32 {
     drain(&mut sock);
 
     let mut lags: Vec<f64> = Vec::with_capacity(samples);
-    for _ in 0..samples {
+    for sample in 0..samples {
         drain(&mut sock);
+        let probe = nonce(sample);
+        let mut frame = Vec::with_capacity(1 + probe.len());
+        frame.push(TAG_IN);
+        frame.extend_from_slice(&probe);
         let t0 = Instant::now();
-        if sock.send(Message::Binary(vec![TAG_IN, b'x'].into())).is_err() {
+        if sock.send(Message::Binary(frame.into())).is_err() {
             break;
         }
         let deadline = t0 + Duration::from_secs(2);
+        let mut echoed: Vec<u8> = Vec::new();
         while Instant::now() < deadline {
             match sock.read() {
-                Ok(Message::Binary(b)) if b.first() == Some(&TAG_OUT) && b[1..].contains(&b'x') => {
-                    lags.push(t0.elapsed().as_secs_f64() * 1000.0);
-                    break;
+                Ok(Message::Binary(b)) if b.first() == Some(&TAG_OUT) => {
+                    echoed.extend_from_slice(&b[1..]);
+                    if contains_seq(&echoed, &probe) {
+                        lags.push(t0.elapsed().as_secs_f64() * 1000.0);
+                        break;
+                    }
                 }
                 Ok(_) => {}
                 Err(e) if is_timeout(&e) => {}
                 Err(_) => break,
             }
         }
-        // Erase the `x` so the prompt line is net-unchanged.
-        let _ = sock.send(Message::Binary(vec![TAG_IN, 0x7f].into()));
+        // Erase the probe so the prompt line is net-unchanged: ONE
+        // input frame carrying a backspace per probe byte.
+        let mut erase = vec![TAG_IN];
+        erase.resize(1 + probe.len(), 0x7f);
+        let _ = sock.send(Message::Binary(erase.into()));
         std::thread::sleep(Duration::from_millis(120));
     }
     let _ = sock.close(None);
@@ -186,7 +212,30 @@ fn report(lags: &[f64], requested: usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::to_ws_url;
+    use super::{contains_seq, nonce, to_ws_url};
+
+    #[test]
+    fn nonces_are_unique_and_shell_safe() {
+        let all: Vec<Vec<u8>> = (0..200).map(nonce).collect();
+        for (i, n) in all.iter().enumerate() {
+            assert!(n.iter().all(u8::is_ascii_alphanumeric), "echoes verbatim");
+            assert!(!all[..i].contains(n), "sample {i} nonce repeats");
+        }
+    }
+
+    #[test]
+    fn echo_matches_across_frame_boundaries_only_on_the_real_nonce() {
+        let probe = nonce(7);
+        // Unrelated output containing plain letters must NOT match.
+        assert!(!contains_seq(b"onstff q00z blah", &probe));
+        // The echo split across two frames matches once accumulated.
+        let (a, b) = probe.split_at(2);
+        let mut buf = b"prompt$ ".to_vec();
+        buf.extend_from_slice(a);
+        assert!(!contains_seq(&buf, &probe), "half a nonce is not a match");
+        buf.extend_from_slice(b);
+        assert!(contains_seq(&buf, &probe));
+    }
 
     #[test]
     fn view_url_becomes_ws_with_since() {
