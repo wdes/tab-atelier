@@ -58,6 +58,8 @@ pub mod tasks;
 /// verbs (dispatch handles send-a-prompt-and-wait; this is the rest).
 pub mod team;
 pub mod tokens;
+/// `tab-atelier upgrade` — hot-swap the running binary, tabs stay live.
+pub mod upgrade;
 /// `tab-atelier announce / bid / award / take / done` — the verbs an agent
 /// uses to join the fleet and pick up work on its own.
 pub mod work;
