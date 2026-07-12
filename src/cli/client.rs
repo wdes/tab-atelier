@@ -26,7 +26,9 @@
 //! `dispatch` if headless should list it in `--help`).
 
 use super::{aligator, bench, bench_lag, brain, claude_hook, delegate, flags, logging, remote};
-use super::{set_assignment, set_card, set_context, set_font, set_rehome, set_status, share_link, team, tokens};
+use super::{
+    set_assignment, set_card, set_context, set_font, set_rehome, set_status, share_link, team, tokens, upgrade,
+};
 
 /// Dispatch a client subcommand by name against raw `&[String]` args.
 ///
@@ -56,6 +58,9 @@ pub fn dispatch(name: &str, rest: &[String]) -> Option<i32> {
         "token" => tokens::show(rest),
         "rotate-tokens" => tokens::rotate(rest),
         "reset-master-token" => tokens::reset_master(rest),
+        // Hot-swap the running instance onto the newly installed binary,
+        // keeping every tab's shell alive across the exec.
+        "upgrade" => upgrade::run(rest),
         "claude-hook" => claude_hook::run(rest),
         // Orchestration / teamwork.
         "dispatch" => delegate::run(rest),
