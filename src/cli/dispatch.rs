@@ -55,6 +55,13 @@ pub struct Cli {
     #[arg(long, global = true, hide = true)]
     pub check_crypto: bool,
 
+    /// (internal) Hot-swap handoff manifest, left on argv by the
+    /// previous binary exec'ing into us. Consumed at daemon boot by
+    /// `hotswap::adopt_from_args` (which re-scans argv, so this field
+    /// only exists to keep clap from rejecting the flag).
+    #[arg(long, hide = true, value_name = "PATH")]
+    pub handoff: Option<PathBuf>,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -297,6 +304,11 @@ pub enum Commands {
     /// Hot-swap the master API token. Every client/link carrying the old
     /// token 401s; the new token is written to `api.token`.
     ResetMasterToken,
+
+    /// Hot-swap the running daemon onto the binary now installed at its
+    /// path — every tab (and whatever runs inside) stays live across the
+    /// switch. Install the new binary first, then run this.
+    Upgrade,
 
     /// Bridge a Claude Code hook event to set-status. Reads JSON from stdin.
     ClaudeHook {
@@ -654,6 +666,7 @@ pub fn dispatch(cli: Cli) -> bool {
             }
             crate::cli::client::run("peek", &args)
         }
+        Commands::Upgrade => crate::cli::client::run("upgrade", &[]),
         Commands::Brain { once, interval } => {
             let mut args: Vec<String> = Vec::new();
             if once {

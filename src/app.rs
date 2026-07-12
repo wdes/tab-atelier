@@ -878,17 +878,32 @@ impl AppState {
                 // airgapped. Skipped (net left on) when bwrap isn't
                 // installed, so a persisted net-off tab doesn't boot
                 // into a dead shell on a host without bubblewrap.
+                // A hot-swap-adopted shell is skipped too: it is still
+                // inside the bubblewrap netns the previous run put it
+                // in, and respawning would kill exactly the process the
+                // handoff kept alive. (Net-off tabs never defer their
+                // spawn, so `was_adopted` is already accurate here.)
                 if ts.net_disabled && crate::bwrap_available() {
                     view.update(cx, |v, _| {
                         v.set_net_disabled(true);
-                        v.respawn(cwd.as_deref());
+                        if !v.was_adopted() {
+                            v.respawn(cwd.as_deref());
+                        }
                     });
                 }
                 // Auto-resume: if this tab had an agent session and kind
                 // persisted, queue the resume command to be typed into the
                 // freshly-spawned shell — UNLESS we already launched the
                 // agent directly above (then typing it would double-launch).
-                let pending_agent_resume = if agent_launch.is_some() || crate::read_only() {
+                // …and never into a hot-swap-adopted shell: its agent is
+                // still running, so typing a `--resume` would double-
+                // launch the session. `adoptable` covers deferred tabs
+                // whose adoption happens later in the boot loader.
+                let pending_agent_resume = if agent_launch.is_some()
+                    || crate::read_only()
+                    || crate::hotswap::adoptable(&ts.id)
+                    || view.read(cx).was_adopted()
+                {
                     None
                 } else {
                     match (ts.agent_kind.as_deref(), ts.agent_session_id.as_deref()) {
@@ -981,6 +996,12 @@ impl AppState {
                     })
                     .unwrap_or(true);
                 if done {
+                    // Every tab has spawned (and claimed its hot-swap
+                    // handoff, if any). A handoff fd still unclaimed
+                    // belongs to a tab that no longer exists — close it
+                    // so its orphaned shell gets its HUP instead of
+                    // wedging on a full PTY buffer nobody drains.
+                    crate::hotswap::close_unclaimed();
                     break;
                 }
             }
@@ -1981,6 +2002,16 @@ impl AppState {
             return;
         }
 
+        // A hot-swap upgrade came in (`POST /upgrade`): flush all state,
+        // then replace this process with the (re)installed binary at our
+        // own path, handing every tab's live PTY across the exec — the
+        // shells never notice. Returns only if the exec failed.
+        #[cfg(unix)]
+        if crate::hotswap::upgrade_requested() && !crate::read_only() {
+            self.hot_swap(cx);
+            return;
+        }
+
         // Skipped entirely while nobody consumes the API — the previous
         // snapshot stays in place (never wiped with an empty one) and
         // the first request after idle serves it, at most 2 s + idle
@@ -2486,7 +2517,11 @@ impl AppState {
         self.tabs[idx].name = new_name.into();
     }
 
-    fn close_all_tabs(&mut self, cx: &mut Context<Self>) {
+    /// Unconditional flush of tabs.json + every tab's output / uptime /
+    /// energy files — the "this process is about to go away" save.
+    /// Shared by `close_all_tabs` (quit) and `hot_swap` (exec into the
+    /// next binary).
+    fn flush_all_state(&mut self, cx: &mut Context<Self>) {
         let state_base = platform::state_base_dir();
         // Snapshot cwd from /proc one last time before child processes
         // disappear; fall back to the cached last_known_cwd otherwise.
@@ -2551,6 +2586,47 @@ impl AppState {
                 tab.energy_wh_last_saved = tab.energy_wh;
             }
         }
+    }
+
+    /// Replace this process with the binary at our own install path,
+    /// handing every live tab's PTY across the exec (see
+    /// [`crate::hotswap`]). The window closes and reopens; the shells —
+    /// and whatever is running in them — never notice. Returns only if
+    /// the exec failed, in which case we keep running as before.
+    #[cfg(unix)]
+    fn hot_swap(&mut self, cx: &mut Context<Self>) {
+        crate::hotswap::clear_upgrade_request();
+        self.flush_all_state(cx);
+        let mut sources = Vec::new();
+        for tab in &self.tabs {
+            let view = tab.view.read(cx);
+            // Skeletons (no shell yet) and exited shells carry no fd —
+            // they restore from tabs.json exactly like today.
+            if view.has_exited() {
+                continue;
+            }
+            let Some(master) = view.handoff_master() else {
+                continue;
+            };
+            let ring_arc = view.pty_ring();
+            let ring = ring_arc
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .since(0);
+            sources.push(crate::hotswap::HandoffSource {
+                id: tab.id.to_string(),
+                master,
+                pid: view.pid(),
+                ring,
+            });
+        }
+        log::info!("hot swap: handing off {} live tab(s)", sources.len());
+        let err = crate::hotswap::exec_swap(&sources);
+        log::error!("hot swap failed, continuing on the old binary: {err}");
+    }
+
+    fn close_all_tabs(&mut self, cx: &mut Context<Self>) {
+        self.flush_all_state(cx);
 
         if let Some(ref tracker) = self.tracker {
             tracker.shutdown();
@@ -5625,6 +5701,16 @@ pub fn run() {
     }
 
     info!("starting Tab Atelier v{}", env!("CARGO_PKG_VERSION"));
+
+    // Hot-swap handoff: when the previous binary exec'd into us it left
+    // `--handoff <manifest>` on argv, naming the live PTY fds it kept
+    // open across the exec. Adopt them BEFORE the reaper and the tab
+    // restore below, so restored tabs reattach to their running shells
+    // instead of forking fresh ones.
+    let adopted = crate::hotswap::adopt_from_args();
+    if adopted > 0 {
+        info!("hot swap: inherited {adopted} live tab(s) from the previous binary");
+    }
 
     // Reap agent processes leaked by a prior (unclean) run before we
     // restore any tab — reclaims the stopped `claude` ghosts that

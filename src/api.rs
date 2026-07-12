@@ -2870,6 +2870,36 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             drop(state);
             respond_json(stream, 200, &format!(r#"{{"revoked":{revoked}}}"#));
         }
+        ("POST", "/upgrade") => {
+            // Hot-swap upgrade: re-exec the (freshly installed) binary at
+            // our own install path while every tab's live PTY is handed
+            // across the exec — the shells, and whatever runs in them,
+            // never notice (see src/hotswap.rs). Master token only (not
+            // in the share-token allowlist); refused in read-only mode by
+            // the is_mutating gate above. The swap happens on the owner
+            // loop's next tick, after this response has flushed — expect
+            // the API to drop for a moment while the new binary boots and
+            // re-binds.
+            #[cfg(unix)]
+            {
+                if !crate::hotswap::reexec_target_ok() {
+                    error_json(
+                        stream,
+                        409,
+                        "re-exec target missing — install the new binary at this binary's path first",
+                    );
+                    return;
+                }
+                crate::hotswap::request_upgrade();
+                respond_json(
+                    stream,
+                    200,
+                    &format!(r#"{{"upgrading":true,"pid":{}}}"#, std::process::id()),
+                );
+            }
+            #[cfg(not(unix))]
+            error_json(stream, 501, "hot swap is not supported on this platform");
+        }
         ("POST", "/master-token/reset") => {
             // Hot-swap the master API token: generate a fresh one, persist
             // it to api.token (so `tab-atelier token` and saved configs

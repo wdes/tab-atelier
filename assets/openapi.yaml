@@ -25,6 +25,8 @@ tags:
     description: Tab list, I/O and per-tab state
   - name: tokens
     description: Master token + share-link token management
+  - name: admin
+    description: Process-level administration (hot-swap upgrade)
 paths:
   /tabs:
     get:
@@ -295,6 +297,33 @@ paths:
               schema: { type: object, properties: { token: { type: string } } }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "500": { description: Could not persist token }
+  /upgrade:
+    post:
+      tags: [admin]
+      summary: Hot-swap onto the newly installed binary (tabs stay live)
+      description: >
+        Re-exec the running process onto the binary currently installed at
+        its own path, handing every tab's live PTY across the exec — the
+        shells, and whatever runs inside them, are never restarted. Install
+        the new binary first (apt upgrade / copy over the file), then call
+        this. The swap happens moments after the response flushes; expect
+        the API to drop briefly while the new binary boots and re-binds.
+        Unix only; master token only.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Swap armed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  upgrading: { type: boolean }
+                  pid: { type: integer }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { description: No binary found at the re-exec path }
+        "501": { description: Platform without exec-based handoff (Windows) }
 components:
   securitySchemes:
     bearerAuth:

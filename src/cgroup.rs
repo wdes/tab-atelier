@@ -281,7 +281,15 @@ pub fn kill_tab(tab_id: &str) -> bool {
 /// respawning tabs, so a fresh `claude --resume <id>` can't run alongside a
 /// still-live copy of the same session — the root cause of the duplicate
 /// ghost sessions. Skips the `supervisor` leaf (that's us). Best-effort.
-pub fn reap_stale_tabs() {
+///
+/// `keep_tab_ids` are NOT stale: tabs whose live shells a hot-swap handoff
+/// carried across the exec ([`crate::hotswap`]). Their cgroups (and the
+/// processes in them) are exactly what the swap kept alive.
+pub fn reap_stale_tabs(keep_tab_ids: &[String]) {
+    let keep: std::collections::HashSet<String> = keep_tab_ids
+        .iter()
+        .map(|id| format!("tab-{}", sanitize_id(id)))
+        .collect();
     let Some(Some(base)) = DELEGATED_BASE.get() else {
         return;
     };
@@ -291,8 +299,9 @@ pub fn reap_stale_tabs() {
     let mut n = 0u32;
     for e in entries.flatten() {
         let name = e.file_name();
-        // Only our per-tab cgroups; never the `supervisor` leaf (the daemon).
-        if !name.to_string_lossy().starts_with("tab-") {
+        // Only our per-tab cgroups; never the `supervisor` leaf (the daemon)
+        // or a hot-swap-adopted tab's live tree.
+        if !name.to_string_lossy().starts_with("tab-") || keep.contains(&*name.to_string_lossy()) {
             continue;
         }
         let dir = e.path();
