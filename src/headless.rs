@@ -1102,7 +1102,13 @@ pub fn run() -> std::io::Result<()> {
             tabs.iter().map(HeadlessTab::ring_len).fold(0u64, u64::wrapping_add),
             tabs.iter().map(HeadlessTab::viewer_count).sum::<usize>(),
         );
-        if snap_key != last_snap_key || last_snap_refresh.elapsed() >= Duration::from_secs(2) {
+        // No consumers at all (activity cold, zero viewers): the snapshot's
+        // staleness is invisible, so even a daemon full of streaming agents
+        // does zero grid scans. The first request after idle serves the old
+        // snapshot once and flips the loop hot; the 2 s heartbeat is then
+        // long overdue, so the next slow pass refreshes everything.
+        let consumers = tick_interval == TICK_FAST || snap_key.2 > 0;
+        if consumers && (snap_key != last_snap_key || last_snap_refresh.elapsed() >= Duration::from_secs(2)) {
             last_snap_key = snap_key;
             last_snap_refresh = Instant::now();
             refresh_snapshot(
