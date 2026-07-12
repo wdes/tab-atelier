@@ -32,3 +32,5 @@ pub mod share_link;
 /// verbs (dispatch handles send-a-prompt-and-wait; this is the rest).
 pub mod team;
 pub mod tokens;
+/// `tab-atelier upgrade` — hot-swap the running binary, tabs stay live.
+pub mod upgrade;
