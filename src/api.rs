@@ -2987,6 +2987,20 @@ fn format_h1_request(method: &str, uri: &str, headers: &hyper::HeaderMap, body_l
 /// We ignore the reason phrase (hyper rebuilds it) and pass headers +
 /// body through.
 fn parse_h1_response(bytes: Vec<u8>) -> Response<Full<Bytes>> {
+    let (status, headers, body_bytes) = parse_h1_parts(bytes);
+    let mut builder = Response::builder().status(status);
+    for (name, value) in &headers {
+        builder = builder.header(name, value);
+    }
+    builder
+        .body(Full::new(body_bytes))
+        .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))
+}
+
+/// Pure core of [`parse_h1_response`]: (status, headers, body) parsed
+/// out of the handler's raw bytes, with the body sliced zero-copy and
+/// clamped to `Content-Length` when present.
+fn parse_h1_parts(bytes: Vec<u8>) -> (u16, Vec<(String, String)>, Bytes) {
     // Find header/body split.
     let split = bytes.windows(4).position(|w| w == b"\r\n\r\n");
     // Move the handler's Vec into `Bytes` and slice the body out of it —
@@ -3005,8 +3019,7 @@ fn parse_h1_response(bytes: Vec<u8>) -> Response<Full<Bytes>> {
         })
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(500);
-    let mut builder = Response::builder().status(status);
-    let mut content_encoding_gzip = false;
+    let mut headers: Vec<(String, String)> = Vec::new();
     let mut content_length: Option<usize> = None;
     for line in lines {
         if let Some(colon) = line.find(':') {
@@ -3015,17 +3028,11 @@ fn parse_h1_response(bytes: Vec<u8>) -> Response<Full<Bytes>> {
             if name.eq_ignore_ascii_case("content-length") {
                 content_length = value.parse().ok();
             }
-            if name.eq_ignore_ascii_case("content-encoding") && value.eq_ignore_ascii_case("gzip") {
-                content_encoding_gzip = true;
-            }
-            builder = builder.header(name, value);
+            headers.push((name.to_string(), value.to_string()));
         }
     }
-    let _ = content_encoding_gzip;
     let body_bytes = content_length.map_or_else(|| body.clone(), |n| body.slice(..n.min(body.len())));
-    builder
-        .body(Full::new(body_bytes))
-        .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))
+    (status, headers, body_bytes)
 }
 
 /// hyper service: collects the body, hands the request to the sync
@@ -3596,6 +3603,60 @@ mod tests {
         let dir = cwd.path().to_str().unwrap();
         assert_eq!(resolve_sandbox_path(dir, "").unwrap_err().0, 400);
         assert_eq!(resolve_sandbox_path(dir, "inbox/foo\0bar").unwrap_err().0, 400);
+    }
+
+    #[test]
+    fn etag_is_the_crc32_in_hex() {
+        assert_eq!(etag_for(b"hello"), format!("{:08x}", crate::crc32(b"hello")));
+        assert_eq!(etag_for(b"").len(), 8, "zero-padded to a stable width");
+    }
+
+    #[test]
+    fn maybe_gzip_compresses_only_when_worthwhile() {
+        let big = "the same line of terminal text over and over\n".repeat(200);
+        assert!(maybe_gzip(big.as_bytes(), false).is_none(), "client can't gzip");
+        assert!(maybe_gzip(b"tiny", true).is_none(), "under the 4 KB floor");
+        let gz = maybe_gzip(big.as_bytes(), true).expect("big + accepted");
+        assert!(gz.len() < big.len() / 4, "repetitive text shrinks a lot");
+        let mut dec = flate2::read::GzDecoder::new(gz.as_slice());
+        let mut round = String::new();
+        std::io::Read::read_to_string(&mut dec, &mut round).unwrap();
+        assert_eq!(round, big, "round-trips byte-exact");
+    }
+
+    #[test]
+    fn h1_request_forces_a_consistent_content_length() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(hyper::header::HOST, "localhost".parse().unwrap());
+        // A stale client-supplied length must NOT pass through.
+        headers.insert(hyper::header::CONTENT_LENGTH, "9999".parse().unwrap());
+        let buf = format_h1_request("POST", "/input", &headers, 5);
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.starts_with("POST /input HTTP/1.1\r\n"));
+        assert!(text.contains("host: localhost\r\n"));
+        assert!(text.ends_with("Content-Length: 5\r\n\r\n"));
+        assert!(!text.contains("9999"), "client content-length dropped");
+    }
+
+    #[test]
+    fn h1_response_parts_slice_the_body_by_content_length() {
+        let raw = b"HTTP/1.1 201 Created\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhelloJUNK".to_vec();
+        let (status, headers, body) = parse_h1_parts(raw);
+        assert_eq!(status, 201);
+        assert!(
+            headers
+                .iter()
+                .any(|(n, v)| n.eq_ignore_ascii_case("content-type") && v == "text/plain")
+        );
+        assert_eq!(&body[..], b"hello", "clamped to Content-Length");
+        // No Content-Length: the whole remainder is the body.
+        let raw = b"HTTP/1.1 200 OK\r\nX-A: b\r\n\r\nrest".to_vec();
+        let (status, _, body) = parse_h1_parts(raw);
+        assert_eq!((status, &body[..]), (200, &b"rest"[..]));
+        // Garbage: 500 with an empty body, never a panic.
+        let (status, headers, body) = parse_h1_parts(b"not http at all".to_vec());
+        assert_eq!(status, 500);
+        assert!(headers.is_empty() && body.is_empty());
     }
 
     #[test]
