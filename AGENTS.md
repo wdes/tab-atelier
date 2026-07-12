@@ -19,6 +19,7 @@ Tab Atelier is a Guake-style drop-down terminal emulator for Linux (X11), built 
 - `src/screenshot.rs` — X11 screenshot capture to BMP
 - `src/cli/style.rs` — per-project (folder-keyed) tab colour + badge. See `docs/tab-style.md`.
 - `src/schedule.rs` — per-tab off-hours auto-lock (OSM `opening_hours` + IANA tz). See `docs/schedule.md`.
+- `src/hotswap.rs` — in-place binary upgrade keeping every tab's shell alive (exec + PTY-fd handoff). See `docs/hot-swap.md`.
 - `src/tracking.rs` — Wakatime integration
 - `src/platform/linux.rs` — Linux-specific platform code (XDG dirs, X11 hotkeys, process info)
 

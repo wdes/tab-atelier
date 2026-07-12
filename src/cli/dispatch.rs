@@ -66,6 +66,13 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub relay: bool,
 
+    /// (internal) Hot-swap handoff manifest, left on argv by the
+    /// previous binary exec'ing into us. Consumed at daemon boot by
+    /// `hotswap::adopt_from_args` (which re-scans argv, so this field
+    /// only exists to keep clap from rejecting the flag).
+    #[arg(long, hide = true, value_name = "PATH")]
+    pub handoff: Option<PathBuf>,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -451,6 +458,11 @@ pub enum Commands {
     /// Hot-swap the master API token. Every client/link carrying the old
     /// token 401s; the new token is written to `api.token`.
     ResetMasterToken,
+
+    /// Hot-swap the running daemon onto the binary now installed at its
+    /// path — every tab (and whatever runs inside) stays live across the
+    /// switch. Install the new binary first, then run this.
+    Upgrade,
 
     /// Bridge a Claude Code hook event to set-status. Reads JSON from stdin.
     ClaudeHook {
@@ -875,6 +887,7 @@ fn command_exit_code(cli: Cli) -> Option<i32> {
         }
         Commands::Resize { tab, cols, rows, clear } => crate::cli::share_link::resize(&tab, cols, rows, clear),
         Commands::Claude { args } => crate::cli::agent::run(&args),
+        Commands::Upgrade => crate::cli::client::run("upgrade", &[]),
         Commands::Brain { once, interval } => {
             let mut args: Vec<String> = Vec::new();
             if once {
@@ -982,6 +995,7 @@ mod tests {
                 &["tab-atelier-headless", "ssh-agent", "0", "--off"],
                 &["tab-atelier-headless", "style", "--list"],
                 &["tab-atelier-headless", "token"],
+                &["tab-atelier-headless", "upgrade"],
             ];
             for line in lines {
                 let cli = Cli::try_parse_from(*line).unwrap_or_else(|e| panic!("parse {line:?}: {e}"));
@@ -1004,6 +1018,9 @@ mod tests {
             );
             drop(s);
             assert_eq!((closes, renames, locks, inputs), (1, 1, 2, 1));
+            // `upgrade` arms a process-global flag rather than queueing on
+            // the snapshot; un-arm it so no later test inherits a swap.
+            crate::hotswap::clear_upgrade_request();
         });
     }
 
