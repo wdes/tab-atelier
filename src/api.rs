@@ -906,6 +906,12 @@ fn maybe_gzip(bytes: &[u8], accept_gzip: bool) -> Option<Vec<u8>> {
     enc.finish().ok()
 }
 
+/// Cap gzip on file downloads at this size: past it the encoder
+/// allocates a second near-body-sized buffer and burns CPU on payloads
+/// that are usually already-compressed artifacts (tarballs, images) —
+/// a 1 GiB outbox file would transiently hold ~2 GiB.
+const DOWNLOAD_GZIP_MAX: usize = 4 * 1024 * 1024;
+
 /// Generic body writer with `Accept-Encoding: gzip` and `ETag` support.
 /// `extra_headers` is appended verbatim (each line should end with `\r\n`);
 /// callers pass per-endpoint metadata there (e.g. X-Output-* on
@@ -2438,6 +2444,8 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             };
             let display_name = canonical.file_name().and_then(|s| s.to_str()).unwrap_or("download");
             info!("API: served {} bytes from {}", bytes.len(), canonical.display());
+            // See DOWNLOAD_GZIP_MAX — no gzip for big binary downloads.
+            let accept_gzip = accept_gzip && bytes.len() <= DOWNLOAD_GZIP_MAX;
             // RFC 5987 `filename*=UTF-8''…` so accented / non-ASCII
             // names ("Frédéric.txt") survive transit; the ASCII
             // fallback `filename="…"` is also included for legacy
