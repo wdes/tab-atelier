@@ -547,6 +547,10 @@ struct AppState {
     /// non-parked (recently-printing / thinking) agent tabs are walked.
     #[cfg(feature = "catbus")]
     last_agent_full_sweep: std::cell::Cell<Option<std::time::Instant>>,
+    /// Persist's fsyncing state writes run here, off the main thread —
+    /// see [`crate::StateWriter`]. Shutdown flushes it, then writes
+    /// synchronously.
+    state_writer: crate::StateWriter,
     /// CRC32 of the last serialized `tabs.json` content. Skips the write+
     /// rotate when nothing in the tab list changed since last tick.
     last_state_hash: std::cell::Cell<u32>,
@@ -1350,6 +1354,7 @@ impl AppState {
             pending_broadcast_size: std::cell::Cell::new(None),
             #[cfg(feature = "catbus")]
             last_agent_full_sweep: std::cell::Cell::new(None),
+            state_writer: crate::StateWriter::spawn(),
             last_state_hash: std::cell::Cell::new(0),
             tab_connections: Arc::new(Mutex::new(std::collections::HashMap::new())),
             activity_signal,
@@ -1870,8 +1875,13 @@ impl AppState {
         let serialized = serde_json::to_string_pretty(&saved).unwrap_or_default();
         let new_hash = crate::crc32(serialized.as_bytes());
         if !read_only && new_hash != self.last_state_hash.get() {
-            crate::save_state_serialized(&platform::config_base_dir(), &serialized);
             self.last_state_hash.set(new_hash);
+            // Off-thread: the atomic write ends in an fsync that can
+            // stall tens of ms — a keystroke landing mid-persist froze
+            // for it (issue #9).
+            let config_base = platform::config_base_dir();
+            self.state_writer
+                .submit(move || crate::save_state_serialized(&config_base, &serialized));
         }
         if !read_only {
             // Hand the scrollback-save off to the worker thread: build a cheap
@@ -1907,8 +1917,10 @@ impl AppState {
                     // Deactivated tabs' uptime is frozen — skip the atomic
                     // rewrite of an identical value (N-1 of N tabs, every 30 s).
                     if tab.uptime_last_saved.get() != Some(secs.to_bits()) {
-                        save_tab_uptime(&state_base, &tab.name, secs);
                         tab.uptime_last_saved.set(Some(secs.to_bits()));
+                        let base = state_base.clone();
+                        let name = tab.name.clone();
+                        self.state_writer.submit(move || save_tab_uptime(&base, &name, secs));
                     }
                 }
                 self.last_uptime_save.set(Some(std::time::Instant::now()));
@@ -1918,8 +1930,11 @@ impl AppState {
                 const ENERGY_DELTA_WH: f64 = 0.1;
                 for tab in &mut self.tabs {
                     if (tab.energy_wh - tab.energy_wh_last_saved).abs() >= ENERGY_DELTA_WH {
-                        save_tab_energy(&state_base, &tab.name, tab.energy_wh);
                         tab.energy_wh_last_saved = tab.energy_wh;
+                        let base = state_base.clone();
+                        let name = tab.name.clone();
+                        let wh = tab.energy_wh;
+                        self.state_writer.submit(move || save_tab_energy(&base, &name, wh));
                     }
                 }
             }
@@ -1971,8 +1986,12 @@ impl AppState {
                     // of an identical ~40-byte file on all other ticks.
                     && tab.tokens_last_saved.get() != Some(usage)
                 {
-                    save_tab_tokens(&state_base, &tab.name, &usage);
                     tab.tokens_last_saved.set(Some(usage));
+                    // The double fsync (file + dir) is exactly the stall
+                    // the writer thread exists for.
+                    let base = state_base.clone();
+                    let name = tab.name.clone();
+                    self.state_writer.submit(move || save_tab_tokens(&base, &name, &usage));
                 }
             }
         }
@@ -2467,6 +2486,9 @@ impl AppState {
             })
             .collect();
         if !crate::read_only() {
+            // Drain queued periodic writes FIRST so none of them can land
+            // after (and clobber) the final synchronous state below.
+            self.state_writer.flush();
             save_state(
                 &platform::config_base_dir(),
                 &SavedState {

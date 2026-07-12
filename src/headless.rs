@@ -1011,6 +1011,9 @@ pub fn run() -> std::io::Result<()> {
     // Heavy per-tab output saves run here, off the main loop, so they
     // can't stall the 16 ms input drain.
     let output_saver = OutputSaver::spawn(platform::state_base_dir());
+    // Small state writes (tabs.json, uptime/energy/tokens) also leave
+    // this thread — each ends in an fsync (see crate::StateWriter).
+    let state_writer = crate::StateWriter::spawn();
     loop {
         // Timed park that input can cut short: `touch()` nudges the
         // condvar, so a keystroke arriving mid-park is drained within a
@@ -1045,6 +1048,7 @@ pub fn run() -> std::io::Result<()> {
             persist(
                 &mut tabs,
                 active,
+                &state_writer,
                 &api_state,
                 #[cfg(feature = "energy")]
                 &power_pids,
@@ -1137,6 +1141,7 @@ pub fn run() -> std::io::Result<()> {
             persist(
                 &mut tabs,
                 active,
+                &state_writer,
                 &api_state,
                 #[cfg(feature = "energy")]
                 &power_pids,
@@ -1413,6 +1418,7 @@ impl OutputSaver {
 fn persist(
     tabs: &mut [HeadlessTab],
     active: usize,
+    state_writer: &crate::StateWriter,
     // Snapshot writeback moved to refresh_snapshot; this is kept on
     // the signature for forward compat (callers shouldn't have to
     // change). _-prefixed to silence unused-warning.
@@ -1496,8 +1502,19 @@ fn persist(
     let serialized = serde_json::to_string_pretty(&saved).unwrap_or_default();
     let new_hash = crc32(serialized.as_bytes());
     if !read_only && (final_flush || new_hash != *last_state_hash) {
-        crate::save_state_serialized(&platform::config_base_dir(), &serialized);
         *last_state_hash = new_hash;
+        if final_flush {
+            // Shutdown: drain queued periodic writes first so none can
+            // land after (and clobber) the final synchronous state.
+            state_writer.flush();
+            crate::save_state_serialized(&platform::config_base_dir(), &serialized);
+        } else {
+            // Off-thread: the atomic write ends in an fsync that can
+            // stall tens of ms — a keystroke landing mid-persist froze
+            // for it (issue #9); this loop is also the input drain.
+            let config_base = platform::config_base_dir();
+            state_writer.submit(move || crate::save_state_serialized(&config_base, &serialized));
+        }
     }
 
     // Periodic output saves run on the background `OutputSaver` thread
@@ -1539,8 +1556,14 @@ fn persist(
                 // Deactivated tabs' uptime is frozen — skip the atomic
                 // rewrite of an identical value (N-1 of N tabs, every 30 s).
                 if final_flush || tab.uptime_last_saved != Some(secs.to_bits()) {
-                    save_tab_uptime(&state_base, &tab.name, secs);
                     tab.uptime_last_saved = Some(secs.to_bits());
+                    if final_flush {
+                        save_tab_uptime(&state_base, &tab.name, secs);
+                    } else {
+                        let base = state_base.clone();
+                        let name = tab.name.clone();
+                        state_writer.submit(move || save_tab_uptime(&base, &name, secs));
+                    }
                 }
             }
             *last_uptime_save = Some(Instant::now());
@@ -1550,8 +1573,15 @@ fn persist(
             const ENERGY_DELTA_WH: f64 = 0.1;
             for tab in tabs.iter_mut() {
                 if final_flush || (tab.energy_wh - tab.energy_wh_last_saved).abs() >= ENERGY_DELTA_WH {
-                    save_tab_energy(&state_base, &tab.name, tab.energy_wh);
                     tab.energy_wh_last_saved = tab.energy_wh;
+                    if final_flush {
+                        save_tab_energy(&state_base, &tab.name, tab.energy_wh);
+                    } else {
+                        let base = state_base.clone();
+                        let name = tab.name.clone();
+                        let wh = tab.energy_wh;
+                        state_writer.submit(move || save_tab_energy(&base, &name, wh));
+                    }
                 }
             }
         }
@@ -1598,8 +1628,12 @@ fn persist(
                 // of an identical ~40-byte file on all other ticks.
                 && tab.tokens_last_saved != Some(usage)
             {
-                crate::save_tab_tokens(&state_base, &tab.name, &usage);
                 tab.tokens_last_saved = Some(usage);
+                // The double fsync (file + dir) is exactly the stall
+                // the writer thread exists for.
+                let base = state_base.clone();
+                let name = tab.name.clone();
+                state_writer.submit(move || crate::save_tab_tokens(&base, &name, &usage));
             }
         }
     }
