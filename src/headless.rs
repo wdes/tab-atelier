@@ -1867,6 +1867,7 @@ fn drain_pending(
         // skipped until output resumes, with a 30 s full-sweep beat as
         // the failsafe so `Gone` (killed / crashed) still demotes the
         // LED within half a minute.
+        #[cfg(feature = "catbus")]
         let full_sweep = {
             use std::sync::OnceLock;
             static LAST_FULL: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
