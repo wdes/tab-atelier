@@ -1177,6 +1177,61 @@ pub fn load_tab_uptime(state_base: &std::path::Path, tab_name: &str) -> Option<f
     load_f64_with_bak(&tab_uptime_path(state_base, tab_name))
 }
 
+/// Single background thread that serialises persist's small state
+/// writes off the input-latency-critical thread.
+///
+/// Covers tabs.json and the per-tab uptime / energy / token files:
+/// every one of those writes ends in an `fsync`, and an fsync on a
+/// busy disk stalls for tens of milliseconds — a keystroke landing
+/// mid-persist used to freeze until it finished (issue #9). One
+/// thread, FIFO, so successive writes to the same path keep their
+/// order (last submit wins on disk).
+///
+/// Shutdown paths write synchronously instead; call [`Self::flush`]
+/// FIRST so a periodic write queued moments earlier can't land after
+/// (and clobber) the final state.
+pub struct StateWriter {
+    tx: std::sync::mpsc::Sender<StateWriteJob>,
+}
+
+enum StateWriteJob {
+    Run(Box<dyn FnOnce() + Send>),
+    Flush(std::sync::mpsc::Sender<()>),
+}
+
+impl StateWriter {
+    #[must_use]
+    pub fn spawn() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<StateWriteJob>();
+        let _ = std::thread::Builder::new().name("state-writer".into()).spawn(move || {
+            while let Ok(job) = rx.recv() {
+                match job {
+                    StateWriteJob::Run(f) => f(),
+                    StateWriteJob::Flush(done) => {
+                        let _ = done.send(());
+                    }
+                }
+            }
+        });
+        Self { tx }
+    }
+
+    /// Queue one write. The closure owns everything it needs (paths,
+    /// serialized bytes) — the caller's dedup state is updated at
+    /// submit time, exactly as it was when the write ran inline.
+    pub fn submit(&self, job: impl FnOnce() + Send + 'static) {
+        let _ = self.tx.send(StateWriteJob::Run(Box::new(job)));
+    }
+
+    /// Block until every previously-submitted write has completed.
+    pub fn flush(&self) {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        if self.tx.send(StateWriteJob::Flush(done_tx)).is_ok() {
+            let _ = done_rx.recv();
+        }
+    }
+}
+
 pub fn save_tab_energy(state_base: &std::path::Path, tab_name: &str, energy_wh: f64) {
     let dir = state_dir(state_base);
     let path = tab_power_path(state_base, tab_name);
@@ -3887,5 +3942,28 @@ mod tests {
         assert_eq!(restored.remote_endpoints[1].label, "build-box");
         assert_eq!(restored.remote_endpoints[1].cert_sha256, "");
         assert!(!restored.remote_endpoints[1].autoconnect);
+    }
+}
+
+#[cfg(test)]
+mod state_writer_tests {
+    use super::StateWriter;
+
+    #[test]
+    fn writes_run_in_order_and_flush_waits_for_them() {
+        let w = StateWriter::spawn();
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        for i in 0..8 {
+            let log = log.clone();
+            w.submit(move || log.lock().unwrap().push(i));
+        }
+        w.flush();
+        assert_eq!(
+            *log.lock().unwrap(),
+            (0..8).collect::<Vec<_>>(),
+            "FIFO, all done at flush"
+        );
+        // A second flush with an empty queue returns immediately.
+        w.flush();
     }
 }
