@@ -540,6 +540,9 @@ struct AppState {
     /// every 2s would burn through disk writes for a value that only
     /// advances by ~2s anyway; we batch writes to once every 30s.
     last_uptime_save: std::cell::Cell<Option<std::time::Instant>>,
+    /// Candidate size for `broadcast_active_size`'s two-tick stability
+    /// gate — pushed to background tabs only after it stops changing.
+    pending_broadcast_size: std::cell::Cell<Option<(usize, usize)>>,
     /// 30 s beat for the complete agent LED sweep; between beats only
     /// non-parked (recently-printing / thinking) agent tabs are walked.
     #[cfg(feature = "catbus")]
@@ -1344,6 +1347,7 @@ impl AppState {
             remote_endpoints,
             hotkey_handle: None,
             last_uptime_save: std::cell::Cell::new(None),
+            pending_broadcast_size: std::cell::Cell::new(None),
             #[cfg(feature = "catbus")]
             last_agent_full_sweep: std::cell::Cell::new(None),
             last_state_hash: std::cell::Cell::new(0),
@@ -1373,6 +1377,15 @@ impl AppState {
             return;
         };
         if self.last_broadcast_size.get() == Some((cols, lines)) {
+            return;
+        }
+        // Only push a size the active tab has held for two consecutive
+        // 500 ms ticks: a live resize drag otherwise reflowed every
+        // background tab's full scrollback (and SIGWINCHed its agent)
+        // on each step. Background tabs get the FINAL size once,
+        // ~a second after the drag settles.
+        if self.pending_broadcast_size.get() != Some((cols, lines)) {
+            self.pending_broadcast_size.set(Some((cols, lines)));
             return;
         }
         self.last_broadcast_size.set(Some((cols, lines)));
