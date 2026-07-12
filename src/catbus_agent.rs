@@ -236,6 +236,37 @@ fn newest_session(project_dir: &Path) -> Option<(PathBuf, String)> {
     best.map(|(p, id, _)| (p, id))
 }
 
+/// Apply one sweep observation to a tab's transient LED state and
+/// report whether the agent process is still present.
+///
+/// `Gone` drops the LED — the CALLER decides the durable session
+/// fields' fate (the GUI keeps id/kind/plan so the tab can `--resume`
+/// the transcript later; headless clears them). `Working` refreshes an
+/// in-progress "thinking" LED through a long tool call where no hook
+/// fires between Pre and Post — and only refreshes, never fabricates
+/// one from a stray short-lived subprocess. `Idle` changes nothing.
+pub fn apply_sweep_activity(
+    state: &mut Option<crate::AgentStateSnapshot>,
+    activity: AgentActivity,
+    now: std::time::Instant,
+) -> bool {
+    match activity {
+        AgentActivity::Gone => {
+            *state = None;
+            false
+        }
+        AgentActivity::Working => {
+            if let Some(snap) = state
+                && snap.state == crate::AgentState::Thinking
+            {
+                snap.updated_at = now;
+            }
+            true
+        }
+        AgentActivity::Idle => true,
+    }
+}
+
 /// Whether the LED sweep may skip a tab's `/proc` subtree walk this
 /// tick. A parked agent — not thinking, ring byte counter unchanged
 /// since its last visit — cannot have changed activity state: `Gone`
@@ -552,7 +583,7 @@ mod tests {
 
 #[cfg(test)]
 mod sweep_gate_tests {
-    use super::sweep_may_skip;
+    use super::{AgentActivity, apply_sweep_activity, sweep_may_skip};
 
     #[test]
     fn parked_skips_but_every_signal_forces_a_walk() {
@@ -564,5 +595,48 @@ mod sweep_gate_tests {
         assert!(!sweep_may_skip(false, true, 42, 42));
         // The 30 s failsafe beat walks everything (Gone detection).
         assert!(!sweep_may_skip(true, false, 42, 42));
+    }
+
+    fn snap(state: crate::AgentState, at: std::time::Instant) -> crate::AgentStateSnapshot {
+        crate::AgentStateSnapshot {
+            state,
+            label: None,
+            updated_at: at,
+        }
+    }
+
+    #[test]
+    fn gone_drops_the_led_and_reports_dead() {
+        let now = std::time::Instant::now();
+        let mut led = Some(snap(crate::AgentState::Thinking, now));
+        assert!(!apply_sweep_activity(&mut led, AgentActivity::Gone, now));
+        assert!(led.is_none(), "transient LED dropped");
+    }
+
+    #[test]
+    fn working_refreshes_only_an_existing_thinking_led() {
+        let now = std::time::Instant::now();
+        let old = now.checked_sub(std::time::Duration::from_secs(90)).unwrap();
+        // Thinking: timestamp refreshed so the 2 min staleness sweep
+        // doesn't demote a long-running tool call.
+        let mut led = Some(snap(crate::AgentState::Thinking, old));
+        assert!(apply_sweep_activity(&mut led, AgentActivity::Working, now));
+        assert_eq!(led.as_ref().map(|s| s.updated_at), Some(now));
+        // Waiting: untouched — a busy subprocess is not the agent talking.
+        let mut led = Some(snap(crate::AgentState::Waiting, old));
+        assert!(apply_sweep_activity(&mut led, AgentActivity::Working, now));
+        assert_eq!(led.as_ref().map(|s| s.updated_at), Some(old));
+        // No LED: never fabricated from a stray subprocess.
+        let mut led = None;
+        assert!(apply_sweep_activity(&mut led, AgentActivity::Working, now));
+        assert!(led.is_none());
+    }
+
+    #[test]
+    fn idle_changes_nothing() {
+        let now = std::time::Instant::now();
+        let mut led = Some(snap(crate::AgentState::Waiting, now));
+        assert!(apply_sweep_activity(&mut led, AgentActivity::Idle, now));
+        assert_eq!(led.as_ref().map(|s| s.state), Some(crate::AgentState::Waiting));
     }
 }

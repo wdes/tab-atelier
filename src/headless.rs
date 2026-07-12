@@ -1906,21 +1906,12 @@ fn drain_pending(
             // Cache the found agent pid so the persist tick's token loop
             // can resolve the session without re-walking the subtree.
             tab.agent_pid = agent_pid;
-            match activity {
-                crate::catbus_agent::AgentActivity::Gone => {
-                    tab.agent_state = None;
-                    tab.agent_session_id = None;
-                    tab.agent_kind = None;
-                    tab.agent_plan_mode = None;
-                }
-                crate::catbus_agent::AgentActivity::Working => {
-                    if let Some(snap) = &mut tab.agent_state
-                        && snap.state == crate::AgentState::Thinking
-                    {
-                        snap.updated_at = now;
-                    }
-                }
-                crate::catbus_agent::AgentActivity::Idle => {}
+            if !crate::catbus_agent::apply_sweep_activity(&mut tab.agent_state, activity, now) {
+                // Unlike the GUI (which keeps the durable anchor for its
+                // `--resume` flow), headless clears it with the LED.
+                tab.agent_session_id = None;
+                tab.agent_kind = None;
+                tab.agent_plan_mode = None;
             }
         }
 

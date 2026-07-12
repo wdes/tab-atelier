@@ -2184,53 +2184,30 @@ impl AppState {
                 // Cache the found agent pid so the token loop can resolve
                 // the session without re-walking the same subtree.
                 tab.agent_pid.set(agent_pid);
-                if activity != crate::catbus_agent::AgentActivity::Gone {
+                // LED transition lives in the shared, tested helper. On
+                // `Gone` the durable session anchor (id / kind / plan) is
+                // KEPT: the transcript is still on disk and the tab must
+                // be able to `--resume` it later. Only Claude Code's
+                // explicit SessionEnd (the `__clear__` POST above) drops
+                // the durable attachment.
+                let alive = crate::catbus_agent::apply_sweep_activity(&mut tab.agent_state, activity, now);
+                if alive {
                     live_agents.push((pid, tab.agent_session_id.clone().unwrap_or_default()));
                     // Remember it (start-time-pinned) so close-all / quit can
                     // kill it even if it later escapes its tab's process group.
                     if let Some(st) = crate::agent_reaper::proc_start_time(pid) {
                         self.launched_agents.insert(pid, st);
                     }
-                }
-                // Resource sampler: append this tick's CPU/RSS/ctxsw line for
-                // live agents (Gone has no process to sample). The PTY child
-                // *is* claude (agent tabs `exec claude`), so `pid` roots the
-                // agent subtree directly.
-                if let Some(state) = match activity {
-                    crate::catbus_agent::AgentActivity::Idle => Some("idle"),
-                    crate::catbus_agent::AgentActivity::Working => Some("working"),
-                    crate::catbus_agent::AgentActivity::Gone => None,
-                } {
+                    // Resource sampler: append this tick's CPU/RSS/ctxsw line
+                    // (Gone has no process to sample). The PTY child *is*
+                    // claude (agent tabs `exec claude`), so `pid` roots the
+                    // agent subtree directly.
+                    let state = if activity == crate::catbus_agent::AgentActivity::Working {
+                        "working"
+                    } else {
+                        "idle"
+                    };
                     self.agent_probe.observe(&probe_base, &tab.name, pid, state, probe_now);
-                }
-                match activity {
-                    // The agent process is gone (killed / crashed / Ctrl-D /
-                    // closed without `/exit` — the SessionEnd hook never ran).
-                    // Demote the LIVE LED, but KEEP the durable session anchor
-                    // (id / kind / plan): the transcript is still on disk and the
-                    // tab must be able to `--resume` it later — clearing it here
-                    // silently lost resumable sessions (tabs came back as bare
-                    // shells). Only Claude Code's explicit SessionEnd (the
-                    // `__clear__` POST above) drops the durable attachment.
-                    // `Gone` is exactly `!has_agent_descendant`, so this arm IS
-                    // the process-presence sweep — no separate `/proc` walk.
-                    crate::catbus_agent::AgentActivity::Gone => {
-                        tab.agent_state = None;
-                    }
-                    // A real tool call is on-CPU. Keep an in-progress "thinking"
-                    // LED (set by the PreToolUse hook) fresh through a long tool
-                    // call, where no hook fires between Pre and Post. We only
-                    // REFRESH an existing thinking state — never fabricate one
-                    // from a stray short-lived subprocess (the agent's own status
-                    // hooks flit through `R`), which used to paint idle tabs green.
-                    crate::catbus_agent::AgentActivity::Working => {
-                        if let Some(snap) = &mut tab.agent_state
-                            && snap.state == crate::AgentState::Thinking
-                        {
-                            snap.updated_at = now;
-                        }
-                    }
-                    crate::catbus_agent::AgentActivity::Idle => {}
                 }
             }
             // Not in read-only: an inspect-only instance must not overwrite
