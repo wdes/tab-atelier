@@ -112,6 +112,10 @@ struct Tab {
     /// Bit pattern of the last `save_tab_uptime` value, to skip
     /// rewriting frozen (deactivated) tabs' files every 30 s.
     uptime_last_saved: std::cell::Cell<Option<u64>>,
+    /// Ring length at the last dormant-LED stamp (`last_output_at`) —
+    /// tracked separately from `snap_cache`, which only refreshes while
+    /// the API has consumers.
+    led_last_ring: std::cell::Cell<u64>,
     /// Agent CLI pid found by this tick's LED sweep (`None` = no agent /
     /// not yet swept). Lets the token loop resolve the session via
     /// `find_session_for` instead of re-walking the shell's whole /proc
@@ -796,6 +800,7 @@ impl AppState {
                     #[cfg(feature = "catbus")]
                     tokens_last_ring: std::cell::Cell::new(0),
                     uptime_last_saved: std::cell::Cell::new(None),
+                    led_last_ring: std::cell::Cell::new(0),
                     #[cfg(feature = "catbus")]
                     agent_pid: std::cell::Cell::new(None),
                     // Seed with the hash of the just-restored output so the
@@ -859,6 +864,7 @@ impl AppState {
                     #[cfg(feature = "catbus")]
                     tokens_last_ring: std::cell::Cell::new(0),
                     uptime_last_saved: std::cell::Cell::new(None),
+                    led_last_ring: std::cell::Cell::new(0),
                     #[cfg(feature = "catbus")]
                     agent_pid: std::cell::Cell::new(None),
                     pending_restore: None,
@@ -916,6 +922,7 @@ impl AppState {
                     #[cfg(feature = "catbus")]
                     tokens_last_ring: std::cell::Cell::new(0),
                     uptime_last_saved: std::cell::Cell::new(None),
+                    led_last_ring: std::cell::Cell::new(0),
                     #[cfg(feature = "catbus")]
                     agent_pid: std::cell::Cell::new(None),
                     pending_restore: None,
@@ -1488,6 +1495,7 @@ impl AppState {
                 #[cfg(feature = "catbus")]
                 tokens_last_ring: std::cell::Cell::new(0),
                 uptime_last_saved: std::cell::Cell::new(None),
+                led_last_ring: std::cell::Cell::new(0),
                 #[cfg(feature = "catbus")]
                 agent_pid: std::cell::Cell::new(None),
                 pending_restore: None,
@@ -1622,6 +1630,14 @@ impl AppState {
         // (which every tab paid every 2 s forever).
         for tab in &mut self.tabs {
             let ring_len = tab.view.read(cx).ring_len();
+            // Dormant-LED stamp: the ring grew ⇒ the tab produced output
+            // (claude streaming / a build printing). Tracked on its own
+            // memo — decoupled from the snapshot cache, which no longer
+            // refreshes while nobody consumes the API.
+            if ring_len != tab.led_last_ring.get() {
+                tab.led_last_ring.set(ring_len);
+                tab.last_output_at = Some(std::time::Instant::now());
+            }
             if tab.snap_cache.as_ref().is_some_and(|c| c.ring_len == ring_len) {
                 continue;
             }
@@ -1698,8 +1714,16 @@ impl AppState {
                 }
             })
             .collect();
+        // Anyone actually consuming the API snapshot? With no recent
+        // authenticated request and no WS viewer, grid scans and
+        // SnapshotTab rebuilds produce data nobody reads — staleness is
+        // invisible until a consumer returns, and their first request
+        // flips `api_hot` so the next 2 s tick catches up.
+        let api_consumers = api_hot || self.tabs.iter().any(|tab| tab.view.read(cx).viewer_count() > 0);
         let mut api_tabs: Vec<api::SnapshotTab> = Vec::with_capacity(self.tabs.len());
-        for (tab, ts) in self.tabs.iter_mut().zip(tabs.iter()) {
+        // Loop-invariant consumer gate — `filter` keeps the long body
+        // un-reindented; with no consumers the loop runs zero times.
+        for (tab, ts) in self.tabs.iter_mut().zip(tabs.iter()).filter(|_| api_consumers) {
             let view = tab.view.read(cx);
             let shell_pid = view.pid();
             let pty_ring = view.pty_ring();
@@ -1751,13 +1775,6 @@ impl AppState {
             // `tab.view` ends and we can mutate `tab.snap_cache`.
             if let Some(c) = fresh {
                 tab.snap_cache = Some(c);
-                // The ring grew ⇒ the tab produced output (claude streaming /
-                // its spinner animating / a build printing). Mark it so the
-                // dormant-blue LED reflects real silence, not just un-focus
-                // (the raw-drop and viewer-backfill paths are not output).
-                if stale {
-                    tab.last_output_at = Some(std::time::Instant::now());
-                }
             }
             // Populated just above; if somehow absent, skip this tab in the
             // snapshot this tick rather than panic (next tick refills it).
@@ -1936,7 +1953,11 @@ impl AppState {
             return;
         }
 
-        {
+        // Skipped entirely while nobody consumes the API — the previous
+        // snapshot stays in place (never wiped with an empty one) and
+        // the first request after idle serves it, at most 2 s + idle
+        // staleness, then flips `api_hot` for the next tick.
+        if api_consumers {
             let mut snapshot = self.api_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             snapshot.tabs = api_tabs;
             snapshot.active = self.active;
