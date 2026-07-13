@@ -1428,6 +1428,16 @@ impl TerminalView {
             .cloned()
     }
 
+    /// The detected link currently under the mouse cursor (the last hover
+    /// grid cell ∩ a detected URL/path), or `None`. Backs the right-click
+    /// menu's "Copy path (link)" entry — the hover cell is updated on
+    /// mouse-move, so on a right-click it already reflects the clicked cell.
+    #[must_use]
+    pub fn hovered_url(&self) -> Option<String> {
+        let (line, col) = self.hover_grid.get()?;
+        self.url_at_grid(line, col).map(|u| u.url.to_string())
+    }
+
     /// Returns viewport-relative grid point and side (Line(0) = top of
     /// visible region, regardless of scrollback offset). Use
     /// `pixel_to_absolute_grid` when the result feeds alacritty's selection,
