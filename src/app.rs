@@ -282,6 +282,10 @@ struct ContextMenu {
     kind: MenuKind,
     position: Point<Pixels>,
     open_upward: bool,
+    /// The detected link under the cursor when the menu opened, if any.
+    /// Populated for a terminal-area right-click over a URL/path so the
+    /// menu can surface "Copy path (link)"; `None` everywhere else.
+    link: Option<String>,
 }
 
 struct Toast {
@@ -2660,6 +2664,8 @@ impl AppState {
                         kind: MenuKind::Background,
                         position: ev.position,
                         open_upward: true,
+                        // Tab-bar background — never over terminal text.
+                        link: None,
                     });
                     cx.notify();
                 }),
@@ -2868,6 +2874,7 @@ impl AppState {
                             kind: MenuKind::Tab(i),
                             position: ev.position,
                             open_upward: true,
+                            link: None,
                         });
                         cx.notify();
                     }),
@@ -3413,8 +3420,30 @@ impl AppState {
         }
 
         // Clipboard section
+        container = container.child(sep());
+        // "Copy path (link)" — shown only when the right-click landed on a
+        // detected link (populated on the terminal-area menu). Copies the raw
+        // URL/path text to the system clipboard.
+        if let Some(link) = menu.link.clone() {
+            container = container.child(
+                div()
+                    .id("menu-copy-link")
+                    .px(px(12.0))
+                    .py(px(4.0))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(menu_hover))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(link.clone()));
+                            this.context_menu = None;
+                            cx.notify();
+                        }),
+                    )
+                    .child(self.t().copy_link),
+            );
+        }
         container = container
-            .child(sep())
             .child(
                 div()
                     .id("menu-copy")
@@ -5088,10 +5117,16 @@ impl Render for AppState {
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(|this, ev: &MouseDownEvent, _window, cx| {
+                            // Grab the link under the cursor (if the right-click
+                            // landed on a detected URL/path) so the menu can offer
+                            // "Copy path (link)". The hover cell tracks the mouse,
+                            // so it already points at the clicked cell.
+                            let link = this.tabs[this.active].view.read(cx).hovered_url();
                             this.context_menu = Some(ContextMenu {
                                 kind: MenuKind::Background,
                                 position: ev.position,
                                 open_upward: false,
+                                link,
                             });
                             cx.notify();
                         }),
