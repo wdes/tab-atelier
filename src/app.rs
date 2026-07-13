@@ -54,11 +54,6 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-/// How long an attached-but-quiet tab must go un-focused before its LED
-/// turns blue ("dormant"). The transient state is already swept to None
-/// after 2 min of agent silence, so this is the extra "and you haven't
-/// looked at it" grace on top of that.
-const DORMANT_AFTER_SECS: u64 = 180;
 /// How recently a tab must have produced PTY output to read as "talking"
 /// (agent actively streaming a reply / spinner / a tool printing) and light
 /// the green LED, even when the stored hook-state is `Waiting`/`None` — e.g. a
@@ -79,17 +74,17 @@ struct Tab {
     prior_uptime: std::time::Duration,
     active_duration: std::time::Duration,
     last_activated: Option<std::time::Instant>,
-    /// When this tab was last the foreground (focused) tab. Refreshed
-    /// every persist tick for the active tab; ages for the rest. Drives
-    /// the "dormant" (blue) LED — an attached-but-quiet session you
-    /// haven't opened in a while. `None` = never focused this run.
-    last_focused_at: Option<std::time::Instant>,
-    /// When this tab last produced terminal output (PTY ring grew). A tab that
-    /// is actively streaming/redrawing — e.g. an agent thinking, its spinner
-    /// animating, or a `cargo build` printing — is NOT dormant even if you
-    /// haven't clicked it, so the blue "dormant" LED reflects genuine silence
-    /// rather than "un-focused for 180 s while claude works." `None` = no
-    /// output observed yet this run.
+    /// "Unreviewed work" flag — drives the blue LED. Set true when the agent
+    /// works (thinks / streams) on a tab you are NOT currently looking at, and
+    /// stays set (sticky) after it stops, so the tab flags "there's output here
+    /// you haven't seen." Cleared to false the moment you review the tab (make
+    /// it active, or open its web viewer). A tab whose agent never worked never
+    /// sets it. Maintained by the LED sweep; read by the tab-strip renderer.
+    unreviewed_work: bool,
+    /// When this tab last produced terminal output (PTY ring grew). A recent
+    /// value means the agent is actively streaming/redrawing — its reply, a
+    /// spinner, or a `cargo build` printing — which lights the LED green
+    /// ("talking") even without a fresh status hook. `None` = no output yet.
     last_output_at: Option<std::time::Instant>,
     #[cfg(feature = "energy")]
     energy_wh: f64,
@@ -237,6 +232,8 @@ impl Tab {
         if self.last_activated.is_none() {
             self.last_activated = Some(std::time::Instant::now());
         }
+        // Reviewing a tab clears its "unreviewed work" (blue) flag.
+        self.unreviewed_work = false;
     }
 
     /// If this tab had its scrollback restore deferred until first focus,
@@ -803,12 +800,10 @@ impl AppState {
                     prior_uptime: std::time::Duration::from_secs_f64(ts.uptime_secs.unwrap_or(0.0)),
                     active_duration: std::time::Duration::ZERO,
                     last_activated: None,
-                    // Treat a restored tab as "just seen" at boot so
-                    // it starts grey and only ages into the blue
-                    // dormant state after DORMANT_AFTER_SECS without
-                    // you opening it — otherwise every attached
-                    // session would flash blue on every restart.
-                    last_focused_at: Some(std::time::Instant::now()),
+                    // Boots un-flagged (grey): it only goes blue once its
+                    // agent WORKS while you're not looking. Restoring a tab
+                    // isn't "new work", so it must not flash blue on restart.
+                    unreviewed_work: false,
                     last_output_at: None,
                     #[cfg(feature = "energy")]
                     energy_wh: ts.energy_wh.unwrap_or(0.0),
@@ -869,12 +864,10 @@ impl AppState {
                     prior_uptime: std::time::Duration::ZERO,
                     active_duration: std::time::Duration::ZERO,
                     last_activated: None,
-                    // Treat a restored tab as "just seen" at boot so
-                    // it starts grey and only ages into the blue
-                    // dormant state after DORMANT_AFTER_SECS without
-                    // you opening it — otherwise every attached
-                    // session would flash blue on every restart.
-                    last_focused_at: Some(std::time::Instant::now()),
+                    // Boots un-flagged (grey): it only goes blue once its
+                    // agent WORKS while you're not looking. Restoring a tab
+                    // isn't "new work", so it must not flash blue on restart.
+                    unreviewed_work: false,
                     last_output_at: None,
                     #[cfg(feature = "energy")]
                     energy_wh: 0.0,
@@ -934,7 +927,7 @@ impl AppState {
                     prior_uptime: std::time::Duration::ZERO,
                     active_duration: std::time::Duration::ZERO,
                     last_activated: Some(std::time::Instant::now()),
-                    last_focused_at: Some(std::time::Instant::now()),
+                    unreviewed_work: false,
                     last_output_at: None,
                     #[cfg(feature = "energy")]
                     energy_wh: 0.0,
@@ -1522,7 +1515,7 @@ impl AppState {
                 prior_uptime: std::time::Duration::ZERO,
                 active_duration: std::time::Duration::ZERO,
                 last_activated: Some(std::time::Instant::now()),
-                last_focused_at: Some(std::time::Instant::now()),
+                unreviewed_work: false,
                 last_output_at: None,
                 #[cfg(feature = "energy")]
                 energy_wh: 0.0,
@@ -2172,11 +2165,25 @@ impl AppState {
             // `PostToolUse`. Also covers manual subshell commands the
             // user starts inside an active agent tab.
             let now = std::time::Instant::now();
-            // Keep the foreground tab "freshly seen" so it never reads as
-            // dormant; every other tab's last_focused_at ages until you
-            // switch to it. Drives the blue dormant LED below.
-            if let Some(t) = self.tabs.get_mut(self.active) {
-                t.last_focused_at = Some(now);
+            // Unreviewed-work (blue LED) maintenance. A tab whose agent is
+            // working while you're NOT looking at it is flagged; the flag is
+            // sticky (survives the agent stopping) so the blue dot means
+            // "there's output here you haven't seen." Reviewing a tab — it's
+            // the active tab, or someone has its web viewer open — clears it.
+            let active = self.active;
+            for (i, tab) in self.tabs.iter_mut().enumerate() {
+                let reviewed = i == active || tab.view.read(cx).viewer_count() > 0;
+                if reviewed {
+                    tab.unreviewed_work = false;
+                } else {
+                    let working = matches!(
+                        tab.agent_state.as_ref().map(|s| s.state),
+                        Some(crate::AgentState::Thinking)
+                    ) || tab.last_output_at.is_some_and(|t| t.elapsed() < STREAMING_LED_WINDOW);
+                    if working {
+                        tab.unreviewed_work = true;
+                    }
+                }
             }
             #[cfg(feature = "catbus")]
             let probe_base = platform::state_base_dir();
@@ -2671,7 +2678,6 @@ impl AppState {
                 }),
             );
 
-        let blink_on = self.blink_on;
         let theme_name = self.theme_name;
         for (i, tab) in self.tabs.iter().enumerate() {
             let is_active = i == self.active;
@@ -2689,13 +2695,16 @@ impl AppState {
             } else {
                 base_name
             };
-            // Agent-state LED to the left of the tab name. Visible
-            // whenever a session is attached (agent_kind set) OR a
-            // transient state is live; cleared only when the session
-            // actually ends (the `idle` POST wipes agent_kind too).
-            // Waiting alternates amber ↔ grey with the same 500 ms
-            // `blink_on` toggle that drives the battery indicator;
-            // thinking / error stay steady.
+            // Agent-state LED to the left of the tab name. Visible whenever a
+            // session is attached (agent_kind set) OR a transient state is live;
+            // cleared only when the session actually ends (the `idle` POST wipes
+            // agent_kind too). Colour is an "unreviewed work" model:
+            //   green  — the agent is working right now (thinking / streaming);
+            //   blue   — it worked and has stopped, and you haven't reviewed
+            //            this tab since (sticky until you focus it — set by the
+            //            sweep above); "you have output to look at here";
+            //   red    — the agent hit an error;
+            //   grey   — nothing to review (never worked, or already reviewed).
             let session_attached = tab.agent_kind.is_some();
             let agent_led = if tab.agent_state.is_some() || session_attached {
                 let grey = Hsla::from(Rgba {
@@ -2704,84 +2713,39 @@ impl AppState {
                     b: 0.45,
                     a: 1.0,
                 });
-                // Green = the agent is thinking/talking. Named so the
-                // "actively streaming" overlay below can reuse the exact hue.
                 let thinking_green = Hsla::from(Rgba {
                     r: 0.306,
                     g: 0.788,
                     b: 0.690,
                     a: 1.0,
                 });
-                let color = match tab.agent_state.as_ref().map(|s| s.state) {
-                    Some(crate::AgentState::Thinking) => thinking_green,
-                    Some(crate::AgentState::Waiting) => {
-                        if blink_on {
-                            Hsla::from(Rgba {
-                                r: 0.851,
-                                g: 0.467,
-                                b: 0.024,
-                                a: 1.0,
-                            })
-                        } else {
-                            grey
-                        }
-                    }
-                    Some(crate::AgentState::Error) => Hsla::from(Rgba {
+                let state = tab.agent_state.as_ref().map(|s| s.state);
+                // Working = a live thinking hook OR fresh PTY output (a
+                // `--resume`d session streams a reply without a thinking hook,
+                // and `agent_activity` only counts *child* processes on-CPU, so
+                // claude rendering its own reply reads Idle — the output window
+                // is what catches it).
+                let working = matches!(state, Some(crate::AgentState::Thinking))
+                    || tab.last_output_at.is_some_and(|t| t.elapsed() < STREAMING_LED_WINDOW);
+                let color = if matches!(state, Some(crate::AgentState::Error)) {
+                    Hsla::from(Rgba {
                         r: 0.937,
                         g: 0.267,
                         b: 0.267,
                         a: 1.0,
-                    }),
-                    // Session attached but quiet (state swept to None
-                    // after ≥2 min of agent silence). If you also haven't
-                    // opened this tab in a while it's "dormant" — show
-                    // blue so a long-untended session stands out among
-                    // many tabs; the steady grey is kept for one you've
-                    // looked at recently. Opening the tab refreshes
-                    // last_focused_at (persist tick) → back to grey.
-                    None => {
-                        // A tab someone is watching over the web/remote
-                        // viewer is being tended too — never dormant.
-                        let watched = tab.view.read(cx).viewer_count() > 0;
-                        // Recent terminal output (claude streaming a reply /
-                        // its spinner animating / a build printing) also means
-                        // "not dormant" — otherwise an actively-working session
-                        // reads blue just because you haven't clicked it.
-                        let quiet_output = tab
-                            .last_output_at
-                            .is_none_or(|t| t.elapsed().as_secs() > DORMANT_AFTER_SECS);
-                        let dormant = !watched
-                            && quiet_output
-                            && tab
-                                .last_focused_at
-                                .is_none_or(|t| t.elapsed().as_secs() > DORMANT_AFTER_SECS);
-                        if dormant {
-                            Hsla::from(Rgba {
-                                r: 0.36,
-                                g: 0.60,
-                                b: 1.0,
-                                a: 1.0,
-                            })
-                        } else {
-                            grey
-                        }
-                    }
+                    })
+                } else if working {
+                    thinking_green
+                } else if tab.unreviewed_work {
+                    Hsla::from(Rgba {
+                        r: 0.36,
+                        g: 0.60,
+                        b: 1.0,
+                        a: 1.0,
+                    })
+                } else {
+                    grey
                 };
-                // "Talking in background" overlay: an attached agent that put new
-                // bytes through the PTY in the last few seconds is actively
-                // streaming, so light it green even when the stored state is
-                // Waiting/None (a `--resume`d session that keeps talking never
-                // fires a fresh thinking hook, and `agent_activity` only counts
-                // *child* processes on-CPU, so claude rendering its own reply
-                // reads Idle). Overlay-only: never mutates the stored state, so
-                // the LED drops back to the real state the instant output stops —
-                // no 2-min stuck-green. An explicit Error still wins.
-                let talking = tab.last_output_at.is_some_and(|t| t.elapsed() < STREAMING_LED_WINDOW);
-                let is_error = matches!(
-                    tab.agent_state.as_ref().map(|s| s.state),
-                    Some(crate::AgentState::Error)
-                );
-                let color = if talking && !is_error { thinking_green } else { color };
                 Some(div().w(px(7.0)).h(px(7.0)).mr(px(5.0)).rounded_full().bg(color))
             } else {
                 None
