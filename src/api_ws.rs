@@ -1429,4 +1429,52 @@ mod tests {
         assert_eq!(d.classify(e), None, "2nd identical commit dropped");
         assert_eq!(d.classify(e), None, "3rd identical commit dropped");
     }
+
+    #[test]
+    fn ime_dedup_appends_final_accent_for_reported_words() {
+        // Real words the user hit before dbe3926: some collapsed "…é" → just
+        // "é", others rendered fine — and it looked random because the letters
+        // never mattered. The only difference was which frame shape the phone's
+        // predictive engine emitted: a standalone accent CONVERSION frame (the
+        // bug path — "incendié", "perlé", "arimé") versus a prefix-extension /
+        // whole-word commit that DOES start with the typed buffer (the safe
+        // path — "corrigé", "gouré").
+        //
+        // The bug shape (captured live, same as `ime_dedup_appends_accented_
+        // char_after_word`): type the base ASCII char-by-char, then the accent
+        // "é" arrives as its OWN 2-byte frame that is neither an exact match nor
+        // a prefix of the buffer. The old code treated that as a conversion and
+        // emitted `DEL × base_len + "é"`, erasing the whole preedit down to "é".
+        // The fix appends it. Model EVERY reported word through the dangerous
+        // shape so none can regress — including the two that happened to dodge
+        // it on the reporter's phone.
+        let e = "é".as_bytes();
+        for word in ["incendié", "corrigé", "gouré", "perlé", "arimé"] {
+            let base = &word[..word.len() - e.len()]; // strip the trailing "é"
+            let mut d = ImeDedup::new();
+            let mut reconstructed: Vec<u8> = Vec::new();
+            for c in base.bytes() {
+                let r = d.classify(&[c]);
+                assert_eq!(r, Some(vec![c]), "{word}: base char {c:#x} passes through");
+                reconstructed.extend(r.unwrap_or_default());
+            }
+            let r = d.classify(e);
+            assert_eq!(
+                r,
+                Some(e.to_vec()),
+                "{word}: é appended as-is — not erased, not dropped"
+            );
+            let out = r.unwrap_or_default();
+            assert!(
+                !out.contains(&0x7f),
+                "{word}: accent frame must emit no DEL (no preedit erase)"
+            );
+            reconstructed.extend(out);
+            assert_eq!(
+                reconstructed,
+                word.as_bytes(),
+                "{word}: reconstructs the full word, not collapsed to é",
+            );
+        }
+    }
 }
