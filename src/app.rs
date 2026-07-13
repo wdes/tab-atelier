@@ -81,6 +81,11 @@ struct Tab {
     /// it active, or open its web viewer). A tab whose agent never worked never
     /// sets it. Maintained by the LED sweep; read by the tab-strip renderer.
     unreviewed_work: bool,
+    /// When this tab was last the foreground (focused) tab — refreshed every
+    /// LED sweep for the active tab, ages for the rest. No longer drives the
+    /// LED (the `unreviewed_work` flag does that); kept as diagnostic data,
+    /// surfaced as "Last seen" in the tab's right-click stats popup.
+    last_focused_at: Option<std::time::Instant>,
     /// When this tab last produced terminal output (PTY ring grew). A recent
     /// value means the agent is actively streaming/redrawing — its reply, a
     /// spinner, or a `cargo build` printing — which lights the LED green
@@ -804,6 +809,7 @@ impl AppState {
                     // agent WORKS while you're not looking. Restoring a tab
                     // isn't "new work", so it must not flash blue on restart.
                     unreviewed_work: false,
+                    last_focused_at: Some(std::time::Instant::now()),
                     last_output_at: None,
                     #[cfg(feature = "energy")]
                     energy_wh: ts.energy_wh.unwrap_or(0.0),
@@ -868,6 +874,7 @@ impl AppState {
                     // agent WORKS while you're not looking. Restoring a tab
                     // isn't "new work", so it must not flash blue on restart.
                     unreviewed_work: false,
+                    last_focused_at: Some(std::time::Instant::now()),
                     last_output_at: None,
                     #[cfg(feature = "energy")]
                     energy_wh: 0.0,
@@ -928,6 +935,7 @@ impl AppState {
                     active_duration: std::time::Duration::ZERO,
                     last_activated: Some(std::time::Instant::now()),
                     unreviewed_work: false,
+                    last_focused_at: Some(std::time::Instant::now()),
                     last_output_at: None,
                     #[cfg(feature = "energy")]
                     energy_wh: 0.0,
@@ -1516,6 +1524,7 @@ impl AppState {
                 active_duration: std::time::Duration::ZERO,
                 last_activated: Some(std::time::Instant::now()),
                 unreviewed_work: false,
+                last_focused_at: Some(std::time::Instant::now()),
                 last_output_at: None,
                 #[cfg(feature = "energy")]
                 energy_wh: 0.0,
@@ -2172,6 +2181,11 @@ impl AppState {
             // the active tab, or someone has its web viewer open — clears it.
             let active = self.active;
             for (i, tab) in self.tabs.iter_mut().enumerate() {
+                if i == active {
+                    // Diagnostic timestamp (shown as "Last seen" in the stats
+                    // popup); ages for every non-active tab.
+                    tab.last_focused_at = Some(now);
+                }
                 let reviewed = i == active || tab.view.read(cx).viewer_count() > 0;
                 if reviewed {
                     tab.unreviewed_work = false;
@@ -3354,6 +3368,11 @@ impl AppState {
                 }
             }
             stats_lines.push(format!("{}: {}", t.uptime, format_duration(elapsed)));
+            // How long since this tab was last the foreground tab. The active
+            // tab reads ~0 (refreshed every sweep); background tabs age.
+            if let Some(seen) = self.tabs[stats_idx].last_focused_at {
+                stats_lines.push(format!("{}: {}", t.last_seen, format_duration(seen.elapsed())));
+            }
             let conns = self
                 .tab_connections
                 .lock()

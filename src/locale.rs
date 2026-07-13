@@ -68,6 +68,7 @@ pub struct Strings {
     pub power: &'static str,
     pub energy: &'static str,
     pub uptime: &'static str,
+    pub last_seen: &'static str,
     pub connections: &'static str,
 
     // Rename dialog
@@ -168,6 +169,7 @@ pub static EN: Strings = Strings {
     power: "Power",
     energy: "Energy",
     uptime: "Active time",
+    last_seen: "Last seen",
     connections: "Connections",
 
     rename_tab: "Rename tab:",
@@ -261,6 +263,7 @@ pub static FR: Strings = Strings {
     power: "Puissance",
     energy: "Énergie",
     uptime: "Temps actif",
+    last_seen: "Dernier accès",
     connections: "Connexions",
 
     rename_tab: "Renommer l'onglet :",
