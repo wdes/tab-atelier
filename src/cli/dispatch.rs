@@ -394,6 +394,14 @@ pub enum Commands {
         #[arg(long)]
         samples: Option<usize>,
     },
+
+    /// List sibling tabs (teammates) — name, state, cwd, hover context — so a
+    /// Claude can pick a collaborator or wait on one by name.
+    Peers {
+        /// Show every tab, not just Claude sessions.
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 /// Returns true iff a subcommand was dispatched (caller should not
@@ -526,6 +534,7 @@ pub fn dispatch(cli: Cli) -> bool {
         Commands::ClaudeHook { event } => crate::cli::claude_hook::run(&[event]),
         Commands::Remote { args } => crate::cli::remote::run(&args),
         Commands::Dispatch { args } => crate::cli::delegate::run(&args),
+        Commands::Peers { all } => crate::cli::team::peers(all),
         Commands::Brain { once, interval } => {
             let mut args: Vec<String> = Vec::new();
             if once {
