@@ -15,7 +15,7 @@
 //! Sending a prompt to another agent and waiting for its answer already lives
 //! in `tab-atelier dispatch` (see `cli::delegate`); this module is the rest.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -114,6 +114,39 @@ pub fn peers(all: bool) -> i32 {
         println!("{}", format_peer_line(t));
     }
     0
+}
+
+/// Resolve a target key to exactly one tab.
+///
+/// Tries, in order: exact name, then index, then UUID. An ambiguous name (more
+/// than one tab shares it) is an error listing the indexes, so a message never
+/// silently goes to the wrong twin.
+///
+/// # Errors
+/// When no tab matches `key`, or when several tabs share the name `key` (which
+/// index to use is then the caller's to disambiguate).
+pub fn resolve_target<'a>(tabs: &'a [TabView], key: &str) -> Result<&'a TabView, String> {
+    let named: Vec<&TabView> = tabs.iter().filter(|t| t.name == key).collect();
+    match named.as_slice() {
+        [one] => return Ok(one),
+        [] => {}
+        many => {
+            let idxs = many.iter().map(|t| t.index.to_string()).collect::<Vec<_>>().join(", ");
+            return Err(format!(
+                "{} tabs named {key:?} (indexes {idxs}); address by index",
+                many.len()
+            ));
+        }
+    }
+    if let Ok(idx) = key.parse::<usize>()
+        && let Some(t) = tabs.iter().find(|t| t.index == idx)
+    {
+        return Ok(t);
+    }
+    if let Some(t) = tabs.iter().find(|t| t.id == key) {
+        return Ok(t);
+    }
+    Err(format!("no tab matches {key:?}"))
 }
 
 // --- blackboard (`note` / `notes`) ---------------------------------------
@@ -229,6 +262,75 @@ pub fn notes(topic: Option<&str>, since: Option<usize>) -> i32 {
     0
 }
 
+// --- file handoff (`handoff`) --------------------------------------------
+
+/// Where a handed-off file lands: the target tab's `inbox/<basename>`. Mirrors
+/// the upload route (`api.rs`: files land in `<tab cwd>/inbox`).
+///
+/// # Errors
+/// When `file` has no final component (e.g. it ends in `..` or `/`), so there's
+/// no basename to place under `inbox/`.
+pub fn inbox_dest(cwd: &Path, file: &Path) -> Result<PathBuf, String> {
+    let name = file
+        .file_name()
+        .ok_or_else(|| format!("{} has no file name", file.display()))?;
+    Ok(cwd.join("inbox").join(name))
+}
+
+/// `tab-atelier handoff <file> <tab>` — copy a file into a peer tab's `inbox/`
+/// so its agent can pick it up (drag the path into Claude, or poll the dir).
+#[must_use]
+pub fn handoff(file: &Path, tab: &str) -> i32 {
+    if !file.is_file() {
+        eprintln!("handoff: {} is not a readable file", file.display());
+        return 1;
+    }
+    let ep = match discover_endpoint() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("handoff: {e}");
+            return 1;
+        }
+    };
+    let tabs = match fetch_tab_views(&ep) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("handoff: {e}");
+            return 1;
+        }
+    };
+    let target = match resolve_target(&tabs, tab) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("handoff: {e}");
+            return 1;
+        }
+    };
+    if target.cwd.is_empty() {
+        eprintln!("handoff: tab {:?} has no cwd", target.name);
+        return 1;
+    }
+    let dest = match inbox_dest(Path::new(&target.cwd), file) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("handoff: {e}");
+            return 1;
+        }
+    };
+    if let Some(parent) = dest.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        eprintln!("handoff: mkdir {}: {e}", parent.display());
+        return 1;
+    }
+    if let Err(e) = std::fs::copy(file, &dest) {
+        eprintln!("handoff: copy → {}: {e}", dest.display());
+        return 1;
+    }
+    println!("handed {} → {} ({})", file.display(), dest.display(), target.name);
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,6 +432,35 @@ mod tests {
     fn format_note_omits_absent_topic_and_from() {
         assert_eq!(format_note(0, &note(1, Some("db"), Some("a"), "hi")), "#0 [db] a: hi");
         assert_eq!(format_note(5, &note(1, None, None, "bare")), "#5 bare");
+    }
+
+    #[test]
+    fn resolve_target_prefers_name_then_index_then_uuid() {
+        let mut tabs = vec![tab(0, "db", Some("claude"), None), tab(1, "web", Some("claude"), None)];
+        tabs[1].id = "uuid-web".into();
+        assert_eq!(resolve_target(&tabs, "db").unwrap().index, 0);
+        assert_eq!(resolve_target(&tabs, "1").unwrap().name, "web");
+        assert_eq!(resolve_target(&tabs, "uuid-web").unwrap().index, 1);
+        assert!(resolve_target(&tabs, "nope").is_err());
+    }
+
+    #[test]
+    fn resolve_target_rejects_ambiguous_name() {
+        let tabs = vec![
+            tab(2, "m-PF", Some("claude"), None),
+            tab(5, "m-PF", Some("claude"), None),
+        ];
+        let err = resolve_target(&tabs, "m-PF").unwrap_err();
+        assert!(err.contains("2 tabs named"), "got: {err}");
+        assert!(err.contains("2, 5"), "should list indexes: {err}");
+    }
+
+    #[test]
+    fn inbox_dest_is_cwd_inbox_basename() {
+        let dest = inbox_dest(Path::new("/mnt/proj"), Path::new("/tmp/report.md")).unwrap();
+        assert_eq!(dest, PathBuf::from("/mnt/proj/inbox/report.md"));
+        // A path ending in `..` has no file name → error, not a bad dest.
+        assert!(inbox_dest(Path::new("/mnt/proj"), Path::new("/tmp/..")).is_err());
     }
 
     #[test]
