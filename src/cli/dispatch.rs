@@ -424,6 +424,14 @@ pub enum Commands {
         #[arg(long)]
         since: Option<usize>,
     },
+
+    /// Copy a file into a peer tab's `inbox/` so its agent can pick it up.
+    Handoff {
+        /// File to hand off.
+        file: PathBuf,
+        /// Target tab — name, index, or UUID.
+        tab: String,
+    },
 }
 
 /// Returns true iff a subcommand was dispatched (caller should not
@@ -559,6 +567,7 @@ pub fn dispatch(cli: Cli) -> bool {
         Commands::Peers { all } => crate::cli::team::peers(all),
         Commands::Note { msg, topic, from } => crate::cli::team::note(topic, from, &msg),
         Commands::Notes { topic, since } => crate::cli::team::notes(topic.as_deref(), since),
+        Commands::Handoff { file, tab } => crate::cli::team::handoff(&file, &tab),
         Commands::Brain { once, interval } => {
             let mut args: Vec<String> = Vec::new();
             if once {
