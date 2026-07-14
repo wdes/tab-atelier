@@ -2,23 +2,27 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Per-tab cgroup v2 resource limits for the headless daemon.
+//! Per-tab cgroup v2 resource limits, shared by the GUI and the
+//! headless daemon.
 //!
 //! ## Why
 //!
-//! Every tab is a child of the single `tab-atelier-headless.service`,
-//! so a unit-level `MemoryMax=` would limit *all tabs together*. To cap
-//! a single tab's memory / CPU / task count we put each tab's shell in
-//! its own cgroup under the service's **delegated** subtree and write
-//! that cgroup's `memory.max` / `cpu.max` / `pids.max`.
+//! Every tab is a child of one process (the GUI, or
+//! `tab-atelier-headless.service`), so a scope/unit-level `MemoryMax=`
+//! would limit *all tabs together*. To cap a single tab's memory / CPU /
+//! task count we put each tab's shell in its own cgroup under our
+//! **delegated** subtree and write that cgroup's `memory.max` /
+//! `cpu.max` / `pids.max`.
 //!
 //! ## Requirements
 //!
 //! - cgroup v2 (Debian 13 default).
-//! - `Delegate=yes` on the unit, so systemd hands the service write
-//!   access to its own cgroup subtree (and turns off the read-only
+//! - `Delegate=yes` on the unit/scope, so systemd hands us write
+//!   access to our own cgroup subtree (and turns off the read-only
 //!   `/sys/fs/cgroup` that `ProtectControlGroups=` would otherwise set
-//!   for the owned subtree).
+//!   for the owned subtree). The headless unit ships it; the GUI needs
+//!   its app scope launched with `-p Delegate=yes` (see
+//!   `docs/per-tab-limits.md`).
 //!
 //! ## cgroup v2 "no internal processes" rule
 //!
@@ -35,7 +39,7 @@
 //! init disables limiting and [`apply`] becomes a no-op — tabs still
 //! spawn normally, just unlimited. Nothing here can fail a tab spawn.
 
-#![cfg(all(target_os = "linux", not(feature = "gui")))]
+#![cfg(target_os = "linux")]
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -165,6 +169,7 @@ pub fn apply(tab_id: &str, pid: u32, limits: &TabResourceLimits) {
 /// the tab's shell is spawned — there is no unconfined window. Pair with
 /// [`move_pid_to_tab_cgroup`] once the pid exists. `None` when delegation
 /// isn't set up. Idempotent.
+#[cfg(not(feature = "gui"))]
 #[must_use]
 pub fn prepare_tab_cgroup(tab_id: &str) -> Option<String> {
     let Some(Some(base)) = DELEGATED_BASE.get() else {
@@ -180,6 +185,7 @@ pub fn prepare_tab_cgroup(tab_id: &str) -> Option<String> {
 /// Move `pid` into the tab's (already [`prepare_tab_cgroup`]d) cgroup, so
 /// the nft rules keyed on it take effect. Best-effort: `false` if delegation
 /// is off or the write fails.
+#[cfg(not(feature = "gui"))]
 pub fn move_pid_to_tab_cgroup(tab_id: &str, pid: u32) -> bool {
     let Some(Some(base)) = DELEGATED_BASE.get() else {
         return false;
@@ -196,6 +202,7 @@ pub fn move_pid_to_tab_cgroup(tab_id: &str, pid: u32) -> bool {
 /// shell stays in the daemon's `supervisor` leaf, so its orphaned children
 /// (a `claude --resume …` that ignored SIGHUP) couldn't be killed by cgroup
 /// without also killing the daemon. Best-effort no-op when delegation is off.
+#[cfg(not(feature = "gui"))]
 pub fn ensure_tab(tab_id: &str, pid: u32) {
     if prepare_tab_cgroup(tab_id).is_some() {
         move_pid_to_tab_cgroup(tab_id, pid);
@@ -209,6 +216,7 @@ pub fn ensure_tab(tab_id: &str, pid: u32) {
 /// `claude` (Node) and its detached tool/MCP subprocesses orphan. Then removes
 /// the (now-empty) cgroup dir. No-op when delegation is off or the cgroup is
 /// already gone. Returns `true` if the kill was issued.
+#[cfg(not(feature = "gui"))]
 pub fn kill_tab(tab_id: &str) -> bool {
     let Some(Some(base)) = DELEGATED_BASE.get() else {
         return false;
@@ -229,6 +237,7 @@ pub fn kill_tab(tab_id: &str) -> bool {
 /// respawning tabs, so a fresh `claude --resume <id>` can't run alongside a
 /// still-live copy of the same session — the root cause of the duplicate
 /// ghost sessions. Skips the `supervisor` leaf (that's us). Best-effort.
+#[cfg(not(feature = "gui"))]
 pub fn reap_stale_tabs() {
     let Some(Some(base)) = DELEGATED_BASE.get() else {
         return;

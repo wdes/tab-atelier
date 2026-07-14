@@ -22,7 +22,7 @@ pub mod app;
 pub(crate) mod box_drawing;
 #[cfg(feature = "catbus")]
 pub(crate) mod catbus_agent;
-#[cfg(all(target_os = "linux", not(feature = "gui")))]
+#[cfg(target_os = "linux")]
 pub(crate) mod cgroup;
 pub mod cli;
 #[cfg(not(feature = "gui"))]
@@ -1673,7 +1673,8 @@ pub struct Preferences {
     /// Global default per-tab resource ceilings, applied to every tab
     /// whose own [`TabState::limits`] leaves an axis unset. Each axis is
     /// optional; all unset (the default) keeps tabs unlimited as before.
-    /// Headless-only (needs a delegated cgroup); set in
+    /// Applied by both the GUI and the headless daemon on Linux (needs a
+    /// delegated cgroup subtree — see `docs/per-tab-limits.md`); set in
     /// `preferences.json`, e.g.
     /// `"default_tab_limits": {"memory_max": "1G", "tasks_max": 512}`.
     #[serde(default, skip_serializing_if = "TabResourceLimits::is_empty")]

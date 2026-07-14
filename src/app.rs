@@ -206,10 +206,10 @@ struct Tab {
     /// `total_len` means the previous scan is still valid. `None` until
     /// the first scan.
     snap_cache: Option<crate::term_export::GridSnapshotCache>,
-    /// Per-tab resource-limit overrides. The GUI doesn't *apply* these
-    /// (cgroup limits are headless-only), but it round-trips them
-    /// through tabs.json so a desktop session doesn't wipe limits a
-    /// headless run set on the same machine.
+    /// Per-tab resource-limit overrides (cgroup v2), layered under
+    /// `Preferences::default_tab_limits` and applied at spawn on Linux by
+    /// both the GUI and the headless daemon. Round-trips through
+    /// tabs.json so neither run wipes limits the other set.
     limits: crate::TabResourceLimits,
 }
 
@@ -541,6 +541,11 @@ struct AppState {
     /// `preferences.json` at startup, edited via the "Remote endpoints"
     /// section of the Preferences modal, and persisted back on Save.
     remote_endpoints: Vec<crate::RemoteEndpoint>,
+    /// Global default per-tab cgroup ceilings from
+    /// `Preferences::default_tab_limits`, layered under each tab's own
+    /// `limits` and applied at every spawn. Linux-only (cgroup v2).
+    #[cfg(target_os = "linux")]
+    default_limits: crate::TabResourceLimits,
     hotkey_handle: Option<platform::HotkeyHandle>,
     /// When the per-tab uptime files were last written. Persisting uptime
     /// every 2s would burn through disk writes for a value that only
@@ -648,6 +653,10 @@ impl AppState {
         let pref_api_tls_addr_focus = cx.focus_handle();
         let pref_share_url_base_focus = cx.focus_handle();
         let prefs = load_preferences(&platform::config_dir());
+        // Per-tab cgroup ceilings (Linux). Cloned before `prefs` fields
+        // are moved below; layered under each tab's own limits at spawn.
+        #[cfg(target_os = "linux")]
+        let default_limits = prefs.default_tab_limits.clone();
         // Font: preferences.json `font_family`/`font_size` → zed
         // settings → fontconfig-resolved monospace (the generic
         // "monospace" can render with a too-wide cell advance).
@@ -686,6 +695,12 @@ impl AppState {
         // spawns its PTY at this size instead of 80×24, so even a tab the user
         // never opens (and its remote viewer) is correctly sized from the start.
         let boot_grid = Self::grid_size(window, &font_config);
+
+        // Delegate our cgroup subtree before any tab spawns, so limits
+        // apply from the first shell. No-op when no default ceiling is
+        // configured or the app scope isn't delegated (see cgroup.rs).
+        #[cfg(target_os = "linux")]
+        crate::cgroup::init(!default_limits.is_empty());
 
         let (tabs, active, restored_windowed) = if let Some(mut saved) =
             load_state_with_outputs(&platform::config_base_dir(), &platform::state_base_dir())
@@ -1296,6 +1311,18 @@ impl AppState {
             power_hot.clone(),
         );
 
+        // Move every spawned tab (restore + the initial tab) into its
+        // own per-tab cgroup. No-op unless delegation succeeded above.
+        #[cfg(target_os = "linux")]
+        for tab in &tabs {
+            let pid = tab.view.read(cx).pid();
+            crate::cgroup::apply(
+                &tab.id,
+                pid,
+                &crate::TabResourceLimits::resolve(&tab.limits, &default_limits),
+            );
+        }
+
         Self {
             tabs,
             active,
@@ -1354,6 +1381,8 @@ impl AppState {
             pref_share_url_base_text: String::new(),
             pref_share_url_base_focus,
             remote_endpoints,
+            #[cfg(target_os = "linux")]
+            default_limits,
             hotkey_handle: None,
             last_uptime_save: std::cell::Cell::new(None),
             pending_broadcast_size: std::cell::Cell::new(None),
@@ -1466,6 +1495,20 @@ impl AppState {
             .into_any_element()
     }
 
+    /// Move tab `idx`'s freshly-spawned shell (and its future children)
+    /// into a per-tab cgroup v2 with its effective ceilings. No-op unless
+    /// delegation is set up and a limit is configured (see `cgroup`).
+    #[cfg(target_os = "linux")]
+    fn apply_tab_limits(&self, idx: usize, cx: &mut Context<Self>) {
+        let tab = &self.tabs[idx];
+        let pid = tab.view.read(cx).pid();
+        crate::cgroup::apply(
+            &tab.id,
+            pid,
+            &crate::TabResourceLimits::resolve(&tab.limits, &self.default_limits),
+        );
+    }
+
     fn add_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.insert_tab(self.tabs.len(), None, window, cx);
     }
@@ -1561,6 +1604,8 @@ impl AppState {
             },
         );
         self.active = idx;
+        #[cfg(target_os = "linux")]
+        self.apply_tab_limits(idx, cx);
         self.tabs[self.active].view.read(cx).focus_handle(cx).focus(window);
         cx.notify();
     }
@@ -2402,6 +2447,8 @@ impl AppState {
             tv
         });
         self.tabs[idx].view = view;
+        #[cfg(target_os = "linux")]
+        self.apply_tab_limits(idx, cx);
         self.tabs[idx].created_at = std::time::Instant::now();
         self.tabs[idx].prior_uptime = std::time::Duration::ZERO;
         self.tabs[idx].active_duration = std::time::Duration::ZERO;
@@ -2428,6 +2475,8 @@ impl AppState {
         self.tabs[idx].view.update(cx, |view, _| {
             view.respawn(cwd.as_deref());
         });
+        #[cfg(target_os = "linux")]
+        self.apply_tab_limits(idx, cx);
         self.tabs[idx].created_at = std::time::Instant::now();
         self.tabs[idx].prior_uptime = std::time::Duration::ZERO;
         self.tabs[idx].active_duration = std::time::Duration::ZERO;
