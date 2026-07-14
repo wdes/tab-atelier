@@ -402,6 +402,28 @@ pub enum Commands {
         #[arg(long)]
         all: bool,
     },
+
+    /// Post a message to the shared blackboard every tab can read (broadcast).
+    Note {
+        /// The message.
+        msg: String,
+        /// Optional channel, filtered by `notes --topic`.
+        #[arg(long)]
+        topic: Option<String>,
+        /// Who's posting (your tab name); shown to readers.
+        #[arg(long)]
+        from: Option<String>,
+    },
+
+    /// Read the shared blackboard.
+    Notes {
+        /// Only this channel.
+        #[arg(long)]
+        topic: Option<String>,
+        /// Skip notes before this index (for incremental polling).
+        #[arg(long)]
+        since: Option<usize>,
+    },
 }
 
 /// Returns true iff a subcommand was dispatched (caller should not
@@ -535,6 +557,8 @@ pub fn dispatch(cli: Cli) -> bool {
         Commands::Remote { args } => crate::cli::remote::run(&args),
         Commands::Dispatch { args } => crate::cli::delegate::run(&args),
         Commands::Peers { all } => crate::cli::team::peers(all),
+        Commands::Note { msg, topic, from } => crate::cli::team::note(topic, from, &msg),
+        Commands::Notes { topic, since } => crate::cli::team::notes(topic.as_deref(), since),
         Commands::Brain { once, interval } => {
             let mut args: Vec<String> = Vec::new();
             if once {

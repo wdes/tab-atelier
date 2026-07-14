@@ -15,7 +15,10 @@
 //! Sending a prompt to another agent and waiting for its answer already lives
 //! in `tab-atelier dispatch` (see `cli::delegate`); this module is the rest.
 
-use serde::Deserialize;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
 
 use crate::cli::share_link::{Endpoint, discover_endpoint, fetch_tabs};
 
@@ -113,6 +116,119 @@ pub fn peers(all: bool) -> i32 {
     0
 }
 
+// --- blackboard (`note` / `notes`) ---------------------------------------
+
+/// One shared-blackboard entry.
+///
+/// Persisted as one JSON line in `<state>/tab-atelier/blackboard.jsonl` — an
+/// append-only log every tab reads.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Note {
+    /// Unix seconds when posted.
+    pub ts: u64,
+    /// Who posted it (a tab name), if given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// Optional channel so readers can filter (`--topic`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    pub msg: String,
+}
+
+fn blackboard_path() -> PathBuf {
+    crate::platform::state_base_dir()
+        .join("tab-atelier")
+        .join("blackboard.jsonl")
+}
+
+/// One note as a JSONL line (trailing newline included). Never panics — the
+/// crate forbids unwrap/expect, and this shape always serialises anyway.
+#[must_use]
+pub fn encode_note_line(n: &Note) -> String {
+    serde_json::to_string(n).unwrap_or_else(|_| "{}".to_string()) + "\n"
+}
+
+/// Parse a blackboard body into notes, skipping blank / unparseable lines (a
+/// half-written line from a racing appender is dropped, not fatal).
+#[must_use]
+pub fn parse_notes(body: &str) -> Vec<Note> {
+    body.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<Note>(l).ok())
+        .collect()
+}
+
+/// Notes matching `topic` (None = all) whose position in the FULL list is
+/// `>= since`.
+///
+/// The index is the position in the full log — stable regardless of the topic
+/// filter — so `--since <n>` polls incrementally without a topic shifting the
+/// numbering.
+#[must_use]
+pub fn select_notes<'a>(notes: &'a [Note], topic: Option<&str>, since: usize) -> Vec<(usize, &'a Note)> {
+    notes
+        .iter()
+        .enumerate()
+        .filter(|(i, n)| *i >= since && topic.is_none_or(|t| n.topic.as_deref() == Some(t)))
+        .collect()
+}
+
+/// One `notes` line: `#idx [topic] from: msg` (topic/from omitted when absent).
+#[must_use]
+pub fn format_note(idx: usize, n: &Note) -> String {
+    let topic = n.topic.as_deref().map_or_else(String::new, |t| format!("[{t}] "));
+    let from = n.from.as_deref().map_or_else(String::new, |f| format!("{f}: "));
+    format!("#{idx} {topic}{from}{}", n.msg)
+}
+
+/// `tab-atelier note [--topic T] [--from NAME] <msg>` — post to the blackboard.
+#[must_use]
+pub fn note(topic: Option<String>, from: Option<String>, msg: &str) -> i32 {
+    use std::io::Write as _;
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let n = Note {
+        ts,
+        from,
+        topic,
+        msg: msg.to_string(),
+    };
+    let path = blackboard_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // Append mode: concurrent small writes from many tabs stay line-atomic.
+    match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(mut f) => {
+            if let Err(e) = f.write_all(encode_note_line(&n).as_bytes()) {
+                eprintln!("note: write {}: {e}", path.display());
+                return 1;
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("note: open {}: {e}", path.display());
+            1
+        }
+    }
+}
+
+/// `tab-atelier notes [--topic T] [--since N]` — read the blackboard.
+#[must_use]
+pub fn notes(topic: Option<&str>, since: Option<usize>) -> i32 {
+    let path = blackboard_path();
+    let body = std::fs::read_to_string(&path).unwrap_or_default();
+    let all = parse_notes(&body);
+    let sel = select_notes(&all, topic, since.unwrap_or(0));
+    if sel.is_empty() {
+        println!("(no notes)");
+        return 0;
+    }
+    for (i, n) in sel {
+        println!("{}", format_note(i, n));
+    }
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,6 +278,58 @@ mod tests {
         let mut l = tab(4, "ops", Some("claude"), None);
         l.locked = true;
         assert_eq!(format_peer_line(&l), "[4] ops 🔒 · idle · /w/ops");
+    }
+
+    fn note(ts: u64, topic: Option<&str>, from: Option<&str>, msg: &str) -> Note {
+        Note {
+            ts,
+            topic: topic.map(Into::into),
+            from: from.map(Into::into),
+            msg: msg.into(),
+        }
+    }
+
+    #[test]
+    fn parse_notes_skips_blank_and_broken_lines() {
+        let body = format!(
+            "{}\n\n  \nnot json\n{}\n",
+            encode_note_line(&note(1, Some("db"), Some("a"), "hi")).trim_end(),
+            encode_note_line(&note(2, None, None, "yo")).trim_end(),
+        );
+        let n = parse_notes(&body);
+        assert_eq!(n.len(), 2);
+        assert_eq!(n[0].msg, "hi");
+        assert_eq!(n[1].topic, None);
+    }
+
+    #[test]
+    fn encode_then_parse_roundtrips() {
+        let n = note(42, Some("t"), Some("f"), "message");
+        let parsed = parse_notes(&encode_note_line(&n));
+        assert_eq!(parsed, vec![n]);
+    }
+
+    #[test]
+    fn select_notes_filters_by_topic_and_keeps_global_index() {
+        let all = vec![
+            note(1, Some("db"), None, "a"),
+            note(2, Some("net"), None, "b"),
+            note(3, Some("db"), None, "c"),
+        ];
+        // Topic filter keeps the position in the FULL log as the index.
+        let db = select_notes(&all, Some("db"), 0);
+        assert_eq!(db.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![0, 2]);
+        // `since` is measured against the full log, not the filtered view.
+        let db_since = select_notes(&all, Some("db"), 1);
+        assert_eq!(db_since.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![2]);
+        // No topic → everything from `since` on.
+        assert_eq!(select_notes(&all, None, 2).len(), 1);
+    }
+
+    #[test]
+    fn format_note_omits_absent_topic_and_from() {
+        assert_eq!(format_note(0, &note(1, Some("db"), Some("a"), "hi")), "#0 [db] a: hi");
+        assert_eq!(format_note(5, &note(1, None, None, "bare")), "#5 bare");
     }
 
     #[test]
