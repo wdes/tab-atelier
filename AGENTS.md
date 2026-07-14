@@ -14,6 +14,7 @@ Tab Atelier is a Guake-style drop-down terminal emulator for Linux (X11), built 
 - `src/terminal_utils.rs` — color conversion, keystroke mapping, ANSI color tables
 - `src/locale.rs` — i18n with English/French translations
 - `src/api.rs` — HTTP API server for remote control
+- `src/cli/team.rs` + `src/cli/delegate.rs` — Claude-to-Claude teamwork verbs (`peers`, `note`/`notes`, `handoff`, `dispatch`). See `docs/teamwork.md`.
 - `src/power.rs` — per-tab power/energy monitoring via wattaouille
 - `src/screenshot.rs` — X11 screenshot capture to BMP
 - `src/schedule.rs` — per-tab off-hours auto-lock (OSM `opening_hours` + IANA tz). See `docs/schedule.md`.
