@@ -1518,6 +1518,21 @@ impl Render for TerminalView {
         // Mark this view as the foreground one this frame. Only the active
         // tab is mounted, so this stamp only advances for the visible tab;
         // the repaint pump uses its staleness to mute background tabs.
+        //
+        // First frame after a gap → force a full rebuild. The prepaint reuses
+        // last frame's rows for cells alacritty didn't mark damaged. That's
+        // only safe while we paint continuously: a tab that went un-painted
+        // (parked, window hidden, or just switched to) may have had an in-place
+        // TUI redraw (Claude Code re-opening, htop, …) whose damage was never
+        // consumed, so the cached rows are stale and reuse would leave the
+        // screen half-painted until a keystroke re-damaged it. Dropping the
+        // frame cache here makes this paint rebuild every row from the live
+        // grid. Steady-state painting (gap < REPAINT_FULL_GAP) is untouched, so
+        // the damage optimisation still applies to the common case.
+        const REPAINT_FULL_GAP: Duration = Duration::from_secs(2);
+        if self.last_render.get().is_none_or(|t| t.elapsed() >= REPAINT_FULL_GAP) {
+            self.release_render_caches();
+        }
         self.last_render.set(Some(std::time::Instant::now()));
         let focus = self.focus.clone();
         let term = self.term.clone();
