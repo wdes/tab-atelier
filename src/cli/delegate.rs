@@ -154,12 +154,9 @@ pub fn run(args: &[String]) -> i32 {
         let key = o.target.clone().unwrap_or_default();
         match resolve_target(&ep, &key) {
             Ok(id) => {
-                // Existing tab: type the prompt (+ Enter) into it.
-                let mut bytes = prompt.into_bytes();
-                if o.submit {
-                    bytes.push(b'\r');
-                }
-                if let Err(e) = send_input(&ep, &id, &bytes) {
+                // Existing tab: type the prompt into the running agent, then
+                // press Enter SEPARATELY (see `submit_prompt`).
+                if let Err(e) = submit_prompt(&ep, &id, &prompt, o.submit) {
                     eprintln!("dispatch: {e}");
                     return 1;
                 }
@@ -280,6 +277,27 @@ fn spawn_agent_tab(ep: &Endpoint, o: &Opts, prompt: &str) -> Result<String, Stri
     send_input(ep, &uuid, launch.as_bytes())?;
     println!("→ launched: {} {}", o.cmd, shell_single_quote(prompt));
     Ok(uuid)
+}
+
+/// How long to wait between typing a prompt and the Enter that submits it, so
+/// the agent's input has ingested the text as one thing before Enter lands.
+const SUBMIT_DELAY: Duration = Duration::from_millis(400);
+
+/// Type `prompt` into a tab, then — unless `!submit` — press Enter as a
+/// SEPARATE write a beat later.
+///
+/// Claude Code's input treats a prompt and a trailing `\r` that arrive in the
+/// SAME write as pasted multiline text: the `\r` becomes a newline in the
+/// buffer instead of submitting, so the message just sits there half-entered
+/// (the "sending Enter struggles" symptom). Sending the Enter as its own
+/// keystroke, after a short delay, is what actually submits it to the peer.
+fn submit_prompt(ep: &Endpoint, uuid: &str, prompt: &str, submit: bool) -> Result<(), String> {
+    send_input(ep, uuid, prompt.as_bytes())?;
+    if submit {
+        std::thread::sleep(SUBMIT_DELAY);
+        send_input(ep, uuid, b"\r")?;
+    }
+    Ok(())
 }
 
 fn send_input(ep: &Endpoint, uuid: &str, bytes: &[u8]) -> Result<(), String> {
