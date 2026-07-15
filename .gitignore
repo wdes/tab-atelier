@@ -1,1 +1,4 @@
 /target
+
+# LLVM coverage artifacts from local instrumented runs
+*.profraw
