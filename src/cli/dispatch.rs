@@ -432,6 +432,18 @@ pub enum Commands {
         /// Target tab — name, index, or UUID.
         tab: String,
     },
+
+    /// Read a peer tab's current screen (ANSI-stripped, last N lines).
+    Peek {
+        /// Target tab — name, index, or UUID.
+        tab: String,
+        /// How many trailing lines to show (default 40).
+        #[arg(long)]
+        lines: Option<usize>,
+        /// Keep ANSI escapes instead of stripping them.
+        #[arg(long)]
+        raw: bool,
+    },
 }
 
 /// Returns true iff a subcommand was dispatched (caller should not
@@ -568,6 +580,7 @@ pub fn dispatch(cli: Cli) -> bool {
         Commands::Note { msg, topic, from } => crate::cli::team::note(topic, from, &msg),
         Commands::Notes { topic, since } => crate::cli::team::notes(topic.as_deref(), since),
         Commands::Handoff { file, tab } => crate::cli::team::handoff(&file, &tab),
+        Commands::Peek { tab, lines, raw } => crate::cli::team::peek(&tab, lines.unwrap_or(40), raw),
         Commands::Brain { once, interval } => {
             let mut args: Vec<String> = Vec::new();
             if once {
