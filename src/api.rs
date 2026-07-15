@@ -118,7 +118,7 @@ fn parse_tab_key<'a>(path: &'a str, suffix: &str) -> Option<(&'a str, bool)> {
 
 fn resolve_tab_idx(state: &TabSnapshot, key_raw: &str, is_uuid: bool) -> Option<usize> {
     if is_uuid {
-        state.tabs.iter().position(|t| t.id == key_raw)
+        state.tabs.iter().position(|t| &*t.id == key_raw)
     } else {
         let idx: usize = key_raw.parse().ok()?;
         state.tabs.get(idx).map(|_| idx)
@@ -265,9 +265,17 @@ pub struct SnapshotTab {
     /// Stable per-tab UUID, mirrored from `TabState.id`. Used to route
     /// `POST /tabs/by-id/{id}/status` to the right tab independent of
     /// its position in the list (renames don't change it).
-    pub id: String,
-    pub name: String,
-    pub cwd: Option<String>,
+    /// The small per-tab strings are `Arc<str>` for the same reason the
+    /// two big dumps below are: the snapshot is rebuilt per tab on
+    /// every refresh, and under attended streaming that's ~10x/s — as
+    /// owned `String`s each rebuild re-allocated every tab's id, name,
+    /// tokens, cwd, … for content that almost never changes. The
+    /// headless tab state holds the same `Arc`s, so a rebuild clone is
+    /// a refcount bump. (Consumers that need owned text — the /tabs
+    /// JSON, WS meta — pay one copy on their own, rarer, cadence.)
+    pub id: std::sync::Arc<str>,
+    pub name: std::sync::Arc<str>,
+    pub cwd: Option<std::sync::Arc<str>>,
     /// `Arc<str>` (shared with the per-tab `GridSnapshotCache`): the
     /// snapshot is rebuilt per tab on every refresh tick, and these two
     /// dumps are by far its heaviest fields — sharing makes the rebuild
@@ -308,8 +316,8 @@ pub struct SnapshotTab {
     /// the permission scope (stripping `&ro=1` does nothing because
     /// the *token* is what's checked). Both default to empty until
     /// the GUI menu mints them on first share.
-    pub share_token_rw: String,
-    pub share_token_ro: String,
+    pub share_token_rw: std::sync::Arc<str>,
+    pub share_token_ro: std::sync::Arc<str>,
     /// Manual lock — user-toggled via right-click / `POST /lock`.
     ///
     /// **Gate authors:** read [`crate::schedule::LockState::effective_locked`]
@@ -329,12 +337,12 @@ pub struct SnapshotTab {
     /// override or global default; never `None`). Shipped to the
     /// viewer via `X-Tab-Bg` on /output + `__TAB_BG__` template
     /// substitution on /view.
-    pub bg_color: String,
+    pub bg_color: std::sync::Arc<str>,
     /// Free-text context an in-tab agent set for itself via
     /// `tab-atelier set-context "…"` — e.g. the PR/issue it's working
     /// on. Surfaced on `/tabs` and as a hover tooltip on the GUI tab
     /// name. `None` ⇒ no context set.
-    pub context: Option<String>,
+    pub context: Option<std::sync::Arc<str>>,
     /// PID of the tab's shell. The /catbus endpoints walk its
     /// descendant processes to find a catbus-agent (or fallback
     /// `claude` TUI) and resolve the session's transcript file.
@@ -351,11 +359,11 @@ pub struct SnapshotTab {
     /// auto-resume after a daemon restart can reconstruct the
     /// agent's session.
     #[allow(dead_code)]
-    pub agent_session_id: Option<String>,
+    pub agent_session_id: Option<std::sync::Arc<str>>,
     /// Durable agent CLI kind (`catbus` / `claude` / …). Same
     /// "session attached" semantic the desktop LED uses to render a
     /// steady grey dot when there's no transient state.
-    pub agent_kind: Option<String>,
+    pub agent_kind: Option<std::sync::Arc<str>>,
     /// How many WS viewers (browser share-link / `remote attach`) are
     /// currently watching this tab. Surfaced on `/tabs` so `tabs`-list
     /// consumers can see who's being watched; also the GUI's "tab is
@@ -1488,7 +1496,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 "view" | "output" | "stream" | "input" | "files" | "outbox" | "inbox"
             ) {
             let state_g = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let verdict = state_g.tabs.iter().find(|t| t.id == uuid).and_then(|t| {
+            let verdict = state_g.tabs.iter().find(|t| &*t.id == uuid).and_then(|t| {
                 // Constant-time per-byte comparison so a brute-force
                 // probe can't shave bits off the search space by
                 // timing how long the reject takes (audit #2).
@@ -1581,9 +1589,9 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 .enumerate()
                 .map(|(i, t)| TabInfo {
                     index: i,
-                    id: t.id.clone(),
-                    name: t.name.clone(),
-                    cwd: t.cwd.clone(),
+                    id: t.id.to_string(),
+                    name: t.name.to_string(),
+                    cwd: t.cwd.as_deref().map(str::to_string),
                     active: i == state.active,
                     // The cached output now ships ANSI SGR escapes for
                     // remote-side colouring, but the tab-list preview is
@@ -1600,14 +1608,14 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                         crate::AgentState::Waiting => "waiting",
                         crate::AgentState::Error => "error",
                     }),
-                    agent_kind: t.agent_kind.clone(),
-                    agent_session_id: t.agent_session_id.clone(),
+                    agent_kind: t.agent_kind.as_deref().map(str::to_string),
+                    agent_session_id: t.agent_session_id.as_deref().map(str::to_string),
                     viewers: t.viewers,
                     locked: crate::schedule::LockState::effective_locked(t),
                     lock_reason: crate::schedule::LockState::lock_reason(t),
                     schedule_rule: t.schedule.as_ref().map(|s| s.rule.clone()),
                     schedule_tz: t.schedule.as_ref().map(|s| s.tz.clone()),
-                    context: t.context.clone(),
+                    context: t.context.as_deref().map(str::to_string),
                     net_disabled: t.net_disabled,
                     connections: t.connections,
                     tx_bytes: t.tx_bytes,
@@ -1805,7 +1813,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             let tab_bg = if t.bg_color.is_empty() {
                 crate::DEFAULT_TAB_BG_COLOR.to_string()
             } else {
-                t.bg_color.clone()
+                t.bg_color.to_string()
             };
             drop(state_g);
             let key_for_html = if is_uuid {
@@ -2269,14 +2277,14 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                     // marker the loop interprets as "wipe"; simpler than
                     // adding a fourth enum variant just for the wire.
                     let mut snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let Some(t) = snap.tabs.iter().find(|t| t.id == tab_id) else {
+                    let Some(t) = snap.tabs.iter().find(|t| &*t.id == tab_id) else {
                         drop(snap);
                         error_json(stream, 404, "tab not found");
                         return;
                     };
                     let id = t.id.clone();
                     snap.pending_status_updates.push(PendingStatusUpdate {
-                        tab_id: id,
+                        tab_id: id.to_string(),
                         state: crate::AgentState::Thinking, // ignored — clear flag below
                         label: Some("__clear__".into()),
                         session_id: None,
@@ -2306,7 +2314,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 .map(std::string::ToString::to_string);
             let plan_mode = parsed.get("planMode").and_then(serde_json::Value::as_bool);
             let mut snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(t) = snap.tabs.iter().find(|t| t.id == tab_id) else {
+            let Some(t) = snap.tabs.iter().find(|t| &*t.id == tab_id) else {
                 drop(snap);
                 error_json(stream, 404, "tab not found");
                 return;
@@ -2318,7 +2326,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 agent_kind.as_deref().unwrap_or("-")
             );
             snap.pending_status_updates.push(PendingStatusUpdate {
-                tab_id: id,
+                tab_id: id.to_string(),
                 state: agent_state,
                 label,
                 session_id,
@@ -2397,7 +2405,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 error_json(stream, 413, &format!("upload exceeds {UPLOAD_MAX_BYTES_MIB} MiB limit"));
                 return;
             }
-            let inbox = std::path::Path::new(&cwd).join("inbox");
+            let inbox = std::path::Path::new(&*cwd).join("inbox");
             if let Err(e) = std::fs::create_dir_all(&inbox) {
                 error_json(stream, 500, &format!("mkdir inbox: {e}"));
                 return;
@@ -2410,7 +2418,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             // write to an arbitrary file. Canonicalise and confirm the
             // resolved inbox is a real directory *inside* the tab's cwd
             // whose final component is still `inbox`.
-            let resolved = std::path::Path::new(&cwd)
+            let resolved = std::path::Path::new(&*cwd)
                 .canonicalize()
                 .ok()
                 .zip(inbox.canonicalize().ok());
@@ -2572,7 +2580,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 respond_json(stream, 200, r#"{"files":[],"dir":""}"#);
                 return;
             };
-            let dir_path = std::path::Path::new(&cwd).join(dirname);
+            let dir_path = std::path::Path::new(&*cwd).join(dirname);
             let mut files: Vec<serde_json::Value> = Vec::new();
             if let Ok(rd) = std::fs::read_dir(&dir_path) {
                 for entry in rd.flatten() {
@@ -2627,12 +2635,12 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                     .and_then(|v| v.get("on").and_then(serde_json::Value::as_bool))
             };
             let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(idx) = state.tabs.iter().position(|t| t.id == inner) else {
+            let Some(idx) = state.tabs.iter().position(|t| &*t.id == inner) else {
                 drop(state);
                 error_json(stream, 404, "tab not found");
                 return;
             };
-            let tab_id = state.tabs[idx].id.clone();
+            let tab_id = state.tabs[idx].id.to_string();
             let current_locked = state.tabs[idx].locked;
             let new_val = on_body.unwrap_or(!current_locked);
             // Manual unlock OUTSIDE the schedule's open windows is
@@ -2673,12 +2681,12 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                     .and_then(|v| v.get("disabled").and_then(serde_json::Value::as_bool))
             };
             let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(idx) = state.tabs.iter().position(|t| t.id == inner) else {
+            let Some(idx) = state.tabs.iter().position(|t| &*t.id == inner) else {
                 drop(state);
                 error_json(stream, 404, "tab not found");
                 return;
             };
-            let tab_id = state.tabs[idx].id.clone();
+            let tab_id = state.tabs[idx].id.to_string();
             let new_val = disabled_body.unwrap_or(!state.tabs[idx].net_disabled);
             // Refuse turning net OFF when bubblewrap isn't installed —
             // there's no way to build the netns jail, and silently
@@ -2758,12 +2766,12 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                     cidrs,
                 };
                 let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                let Some(idx) = state.tabs.iter().position(|t| t.id == inner) else {
+                let Some(idx) = state.tabs.iter().position(|t| &*t.id == inner) else {
                     drop(state);
                     error_json(stream, 404, "tab not found");
                     return;
                 };
-                let tab_id = state.tabs[idx].id.clone();
+                let tab_id = state.tabs[idx].id.to_string();
                 // A non-empty allowlist clears full-airgap (mutually exclusive).
                 if !config.is_empty() {
                     state.tabs[idx].net_disabled = false;
@@ -2819,12 +2827,12 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 }
             };
             let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(idx) = state.tabs.iter().position(|t| t.id == inner) else {
+            let Some(idx) = state.tabs.iter().position(|t| &*t.id == inner) else {
                 drop(state);
                 error_json(stream, 404, "tab not found");
                 return;
             };
-            let tab_id = state.tabs[idx].id.clone();
+            let tab_id = state.tabs[idx].id.to_string();
             // Mirror immediately in the snapshot so the next /output
             // poll already returns the new locked state via
             // `effective_locked`; persist tick mirrors onto the runtime
@@ -2852,11 +2860,11 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 if t.share_token_rw.is_empty() && t.share_token_ro.is_empty() {
                     continue;
                 }
-                t.share_token_rw.clear();
-                t.share_token_ro.clear();
+                t.share_token_rw = "".into();
+                t.share_token_ro = "".into();
                 revoked += 1;
             }
-            let ids: Vec<String> = state.tabs.iter().map(|t| t.id.clone()).collect();
+            let ids: Vec<String> = state.tabs.iter().map(|t| t.id.to_string()).collect();
             state.pending_token_rotations.extend(ids);
             state.invalidate_tabs();
             drop(state);
@@ -2915,16 +2923,16 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 return;
             }
             let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(idx) = state.tabs.iter().position(|t| t.id == inner) else {
+            let Some(idx) = state.tabs.iter().position(|t| &*t.id == inner) else {
                 drop(state);
                 error_json(stream, 404, "tab not found");
                 return;
             };
-            let tab_id = state.tabs[idx].id.clone();
+            let tab_id = state.tabs[idx].id.to_string();
             // Reflect immediately in the snapshot so the next /output
             // poll already returns the new color; persist tick syncs
             // the runtime Tab on the next 100 ms tick.
-            state.tabs[idx].bg_color = color_opt.clone().unwrap_or_default();
+            state.tabs[idx].bg_color = color_opt.as_deref().unwrap_or_default().into();
             state.pending_bg_color_changes.push((tab_id, color_opt.clone()));
             drop(state);
             let body = serde_json::to_string(&serde_json::json!({
@@ -2958,13 +2966,13 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 .map(|s| s.chars().take(2000).collect::<String>())
                 .filter(|s| !s.trim().is_empty());
             let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(idx) = state.tabs.iter().position(|t| t.id == inner) else {
+            let Some(idx) = state.tabs.iter().position(|t| &*t.id == inner) else {
                 drop(state);
                 error_json(stream, 404, "tab not found");
                 return;
             };
-            let tab_id = state.tabs[idx].id.clone();
-            state.tabs[idx].context.clone_from(&context_opt);
+            let tab_id = state.tabs[idx].id.to_string();
+            state.tabs[idx].context = context_opt.as_deref().map(std::sync::Arc::from);
             state.pending_context_changes.push((tab_id, context_opt.clone()));
             drop(state);
             let body = serde_json::to_string(&serde_json::json!({ "context": context_opt })).unwrap_or_default();
@@ -3809,11 +3817,11 @@ mod tests {
                     rows: 24,
                     raw_output: "".into(),
                     raw_cursor: None,
-                    share_token_rw: String::new(),
-                    share_token_ro: String::new(),
+                    share_token_rw: "".into(),
+                    share_token_ro: "".into(),
                     locked: false,
                     schedule: None,
-                    bg_color: String::new(),
+                    bg_color: "".into(),
                     context: None,
                     shell_pid: 0,
                     agent_state: None,
@@ -3841,11 +3849,11 @@ mod tests {
                     rows: 24,
                     raw_output: "".into(),
                     raw_cursor: None,
-                    share_token_rw: String::new(),
-                    share_token_ro: String::new(),
+                    share_token_rw: "".into(),
+                    share_token_ro: "".into(),
                     locked: false,
                     schedule: None,
-                    bg_color: String::new(),
+                    bg_color: "".into(),
                     context: None,
                     shell_pid: 0,
                     agent_state: None,
@@ -4905,7 +4913,7 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         {
             let mut s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            s.tabs[0].cwd = Some(cwd.path().to_string_lossy().into_owned());
+            s.tabs[0].cwd = Some(cwd.path().to_string_lossy().into());
             s.tabs[0].locked = true;
             s.invalidate_tabs();
         }
@@ -5349,7 +5357,7 @@ mod tests {
         std::fs::create_dir_all(cwd.path().join("outbox").join("subdir")).unwrap();
         {
             let mut s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            s.tabs[0].cwd = Some(cwd.path().to_string_lossy().into_owned());
+            s.tabs[0].cwd = Some(cwd.path().to_string_lossy().into());
             s.invalidate_tabs();
         }
         let raw = request_bytes(
@@ -5378,7 +5386,7 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         {
             let mut s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            s.tabs[0].cwd = Some(cwd.path().to_string_lossy().into_owned());
+            s.tabs[0].cwd = Some(cwd.path().to_string_lossy().into());
             s.invalidate_tabs();
         }
         let body = b"hello upload";
@@ -5408,7 +5416,7 @@ mod tests {
         let cwd = make_cwd_with_outbox(&[("Frédéric report.txt", b"hi")]);
         {
             let mut s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            s.tabs[0].cwd = Some(cwd.path().to_string_lossy().into_owned());
+            s.tabs[0].cwd = Some(cwd.path().to_string_lossy().into());
             s.invalidate_tabs();
         }
         let raw = request_bytes(
@@ -5478,7 +5486,7 @@ mod tests {
         {
             let mut s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             s.tabs[0].share_token_rw = "rw-inbox-tok".into();
-            s.tabs[0].cwd = Some(cwd.path().to_string_lossy().into_owned());
+            s.tabs[0].cwd = Some(cwd.path().to_string_lossy().into());
             s.invalidate_tabs();
         }
         let raw = request_bytes(
@@ -5501,7 +5509,7 @@ mod tests {
         {
             let mut s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             s.tabs[0].share_token_ro = "ro-inbox-tok".into();
-            s.tabs[0].cwd = Some(cwd.path().to_string_lossy().into_owned());
+            s.tabs[0].cwd = Some(cwd.path().to_string_lossy().into());
             s.invalidate_tabs();
         }
         let raw = request_bytes(
@@ -5569,7 +5577,7 @@ mod tests {
         {
             let mut s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             s.tabs[0].share_token_ro = "ro-token-2".into();
-            s.tabs[0].cwd = Some(cwd.path().to_string_lossy().into_owned());
+            s.tabs[0].cwd = Some(cwd.path().to_string_lossy().into());
             s.invalidate_tabs();
         }
         let raw = request_bytes(
@@ -5621,7 +5629,7 @@ mod tests {
         {
             let mut s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             s.tabs[0].share_token_ro = "ro-token-3".into();
-            s.tabs[0].cwd = Some(cwd.path().to_string_lossy().into_owned());
+            s.tabs[0].cwd = Some(cwd.path().to_string_lossy().into());
             s.invalidate_tabs();
         }
         let raw = request_bytes(

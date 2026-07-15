@@ -346,11 +346,11 @@ fn authorise_and_ring(
     key: &str,
     is_uuid: bool,
     provided: &[u8],
-) -> Option<(Authz, Arc<Mutex<PtyRing>>, String)> {
+) -> Option<(Authz, Arc<Mutex<PtyRing>>, std::sync::Arc<str>)> {
     let (rw_tok, ro_tok, ring, uuid) = {
         let snap = state.lock().ok()?;
         let t = if is_uuid {
-            snap.tabs.iter().find(|t| t.id == key)?
+            snap.tabs.iter().find(|t| &*t.id == key)?
         } else {
             let idx: usize = key.parse().ok()?;
             snap.tabs.get(idx)?
@@ -606,7 +606,7 @@ fn snapshot_meta(t: &SnapshotTab) -> MetaSnapshot {
     });
     let schedule_next = next_transition.map(|d| d.to_rfc3339());
     MetaSnapshot {
-        name: t.name.clone(),
+        name: t.name.to_string(),
         cols: t.cols,
         rows: t.rows,
         locked: t.effective_locked(),
@@ -614,7 +614,7 @@ fn snapshot_meta(t: &SnapshotTab) -> MetaSnapshot {
         schedule_tz,
         schedule_rule,
         schedule_next,
-        bg_color: (!t.bg_color.is_empty()).then(|| t.bg_color.clone()),
+        bg_color: (!t.bg_color.is_empty()).then(|| t.bg_color.to_string()),
         agent_state,
         agent_label,
         outbox_count: 0,
@@ -693,7 +693,7 @@ fn text_response(status: u16, msg: &str) -> Response<Full<Bytes>> {
 async fn run_pump(
     ws: hyper_tungstenite::HyperWebsocketStream,
     state: Arc<Mutex<TabSnapshot>>,
-    uuid: String,
+    uuid: std::sync::Arc<str>,
     authz: Authz,
     ring: Arc<Mutex<PtyRing>>,
     read_only_process: bool,
@@ -726,7 +726,7 @@ async fn run_pump(
     let mut last_gen = generation.load(std::sync::atomic::Ordering::Relaxed);
     let mut dir_counts = DirCountCache::new();
     let mut next_transition: Option<chrono::DateTime<chrono::Utc>> = None;
-    let mut last_cwd: Option<String> = None;
+    let mut last_cwd: Option<std::sync::Arc<str>> = None;
     let mut last_meta: Option<MetaSnapshot> =
         if let Some((meta, cwd)) = current_meta(&state, &uuid, authz, &mut dir_counts) {
             let bytes = encode_frame(TAG_META, serde_json::to_vec(&meta).unwrap_or_default());
@@ -969,7 +969,7 @@ fn handle_inbound(
             reason: "snapshot poisoned".into(),
         });
     };
-    let Some(idx) = snap.tabs.iter().position(|t| t.id == uuid) else {
+    let Some(idx) = snap.tabs.iter().position(|t| &*t.id == uuid) else {
         return Err(CloseFrame {
             code: CloseCode::Away,
             reason: "tab vanished".into(),
@@ -1054,9 +1054,9 @@ fn current_meta(
     uuid: &str,
     authz: Authz,
     counts: &mut DirCountCache,
-) -> Option<(MetaSnapshot, Option<String>)> {
+) -> Option<(MetaSnapshot, Option<std::sync::Arc<str>>)> {
     let snap = state.lock().ok()?;
-    let t = snap.tabs.iter().find(|t| t.id == uuid)?;
+    let t = snap.tabs.iter().find(|t| &*t.id == uuid)?;
     let mut meta = snapshot_meta(t);
     let cwd = t.cwd.clone();
     drop(snap);
