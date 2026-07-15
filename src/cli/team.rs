@@ -149,6 +149,62 @@ pub fn resolve_target<'a>(tabs: &'a [TabView], key: &str) -> Result<&'a TabView,
     Err(format!("no tab matches {key:?}"))
 }
 
+// --- peek (`peek`) -------------------------------------------------------
+
+/// The last `n` lines of `text` (all of it when it has fewer), joined with
+/// `\n`. Trailing blank lines are dropped first so a screen padded to the
+/// window height doesn't spend the budget on emptiness.
+#[must_use]
+pub fn tail_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.trim_end_matches('\n').lines().collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join("\n")
+}
+
+/// `tab-atelier peek <tab> [--lines N] [--raw]` — read a peer tab's screen.
+///
+/// ANSI-stripped (unless `--raw`), last `N` lines. The ergonomic read primitive
+/// agents otherwise hand-roll (name-addressed, token auto-discovered).
+#[must_use]
+pub fn peek(tab: &str, lines: usize, raw: bool) -> i32 {
+    let ep = match discover_endpoint() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("peek: {e}");
+            return 1;
+        }
+    };
+    let tabs = match fetch_tab_views(&ep) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("peek: {e}");
+            return 1;
+        }
+    };
+    let target = match resolve_target(&tabs, tab) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("peek: {e}");
+            return 1;
+        }
+    };
+    let body = match crate::cli::share_link::agent()
+        .get(format!("{}/tabs/by-id/{}/output", ep.url, target.id))
+        .header("Authorization", format!("Bearer {}", ep.token))
+        .call()
+        .and_then(|mut r| r.body_mut().read_to_string())
+    {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("peek: read {}: {e}", target.name);
+            return 1;
+        }
+    };
+    let text = if raw { body } else { crate::strip_ansi(&body) };
+    println!("{}", tail_lines(&text, lines));
+    0
+}
+
 // --- blackboard (`note` / `notes`) ---------------------------------------
 
 /// One shared-blackboard entry.
@@ -453,6 +509,15 @@ mod tests {
         let err = resolve_target(&tabs, "m-PF").unwrap_err();
         assert!(err.contains("2 tabs named"), "got: {err}");
         assert!(err.contains("2, 5"), "should list indexes: {err}");
+    }
+
+    #[test]
+    fn tail_lines_keeps_last_n_and_drops_trailing_blanks() {
+        let screen = "one\ntwo\nthree\nfour\n\n\n";
+        assert_eq!(tail_lines(screen, 2), "three\nfour");
+        // Asking for more lines than exist returns all (no padding, no panic).
+        assert_eq!(tail_lines("a\nb", 10), "a\nb");
+        assert_eq!(tail_lines("", 5), "");
     }
 
     #[test]
