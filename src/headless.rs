@@ -64,8 +64,10 @@ use crate::term_export::TermDims;
 /// participate in tabs.json / the API snapshot is intentionally
 /// missing (no font config, no focus, no scrollbar drag flag, …).
 struct HeadlessTab {
-    id: String,
-    name: String,
+    // String-ish fields that flow verbatim into `SnapshotTab` are
+    // `Arc<str>` so every snapshot rebuild clones a refcount, not bytes.
+    id: Arc<str>,
+    name: Arc<str>,
     term: Arc<FairMutex<Term<EventProxy>>>,
     notifier: EventLoopSender,
     #[allow(dead_code)]
@@ -90,13 +92,13 @@ struct HeadlessTab {
     output_ring_len_last_saved: Option<u64>,
     pending_restore: Option<String>,
     last_known_cwd: Option<PathBuf>,
-    last_known_cwd_string: Option<String>,
+    last_known_cwd_string: Option<Arc<str>>,
     agent_state: Option<AgentStateSnapshot>,
-    agent_session_id: Option<String>,
-    agent_kind: Option<String>,
+    agent_session_id: Option<Arc<str>>,
+    agent_kind: Option<Arc<str>>,
     agent_plan_mode: Option<bool>,
-    share_token_rw: String,
-    share_token_ro: String,
+    share_token_rw: Arc<str>,
+    share_token_ro: Arc<str>,
     /// Manual lock — user-toggled via right-click / `POST /lock`.
     /// **Gate authors:** read [`crate::schedule::LockState::effective_locked`]
     /// (via `tab.effective_locked()`) instead of this raw field.
@@ -125,7 +127,7 @@ struct HeadlessTab {
     tx_denied_bytes: u64,
     /// Free-text context the in-tab agent set via `set-context`.
     /// In-memory only (not persisted); reflected on `/tabs`.
-    context: Option<String>,
+    context: Option<Arc<str>>,
     pending_agent_resume: Option<String>,
     colors_enabled: bool,
     /// Raw PTY byte ring captured BEFORE alacritty's parser sees the
@@ -614,7 +616,7 @@ fn spawn_pty_tab(
         _ => None,
     };
 
-    let last_known_cwd_string = cwd.as_ref().map(|p| p.to_string_lossy().into_owned());
+    let last_known_cwd_string = cwd.as_ref().map(|p| p.to_string_lossy().into());
     #[cfg(not(feature = "energy"))]
     let _ = energy_wh;
 
@@ -623,8 +625,8 @@ fn spawn_pty_tab(
         (r.viewers_handle(), r.total_len_handle())
     };
     Some(HeadlessTab {
-        id,
-        name,
+        id: id.into(),
+        name: name.into(),
         term,
         notifier,
         event_proxy: proxy,
@@ -644,11 +646,11 @@ fn spawn_pty_tab(
         last_known_cwd: cwd,
         last_known_cwd_string,
         agent_state: None,
-        agent_session_id,
-        agent_kind,
+        agent_session_id: agent_session_id.map(Arc::from),
+        agent_kind: agent_kind.map(Arc::from),
         agent_plan_mode,
-        share_token_rw,
-        share_token_ro,
+        share_token_rw: share_token_rw.into(),
+        share_token_ro: share_token_ro.into(),
         locked,
         schedule,
         bg_color,
@@ -1178,7 +1180,7 @@ fn refresh_snapshot(
         let pending = results.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
         if let Some((counts, nft)) = pending {
             for tab in tabs.iter_mut() {
-                if let Some(&n) = counts.get(&tab.id) {
+                if let Some(&n) = counts.get(&*tab.id) {
                     tab.connections = n;
                 }
                 // Byte counters from the tab's nftables table. Every
@@ -1198,7 +1200,7 @@ fn refresh_snapshot(
         if client_hot && last.is_none_or(|t| t.elapsed() >= Duration::from_secs(5)) {
             *last = Some(Instant::now());
             drop(last);
-            let roots: Vec<(String, u32)> = tabs.iter().map(|t| (t.id.clone(), t.pid)).collect();
+            let roots: Vec<(String, u32)> = tabs.iter().map(|t| (t.id.to_string(), t.pid)).collect();
             let _ = std::thread::Builder::new().name("net-meter".into()).spawn(move || {
                 let counts = crate::net_meter::connection_counts(&roots);
                 let nft = crate::net_nft::read_counters_all();
@@ -1231,7 +1233,7 @@ fn refresh_snapshot(
             share_token_ro: tab.share_token_ro.clone(),
             locked: tab.locked,
             schedule: tab.schedule.clone(),
-            bg_color: crate::effective_tab_bg(tab.bg_color.as_deref(), Some(global_bg)).to_string(),
+            bg_color: crate::effective_tab_bg(tab.bg_color.as_deref(), Some(global_bg)).into(),
             context: tab.context.clone(),
             shell_pid: tab.pid,
             agent_state: tab.agent_state.clone(),
@@ -1292,7 +1294,7 @@ fn refresh_snapshot(
 // only adds plumbing.
 /// One tab's output-save job handed to the background saver thread.
 struct SaveJob {
-    name: String,
+    name: Arc<str>,
     term: Arc<FairMutex<Term<EventProxy>>>,
     ring_len: u64,
 }
@@ -1319,7 +1321,7 @@ impl OutputSaver {
             .spawn(move || {
                 // Per-tab dirtiness gate (ring_len, output crc) — the
                 // same logic the inline loop used, just kept here now.
-                let mut seen: HashMap<String, (u64, u32)> = HashMap::new();
+                let mut seen: HashMap<Arc<str>, (u64, u32)> = HashMap::new();
                 while let Ok(mut batch) = rx.recv() {
                     // Saves are current-state + idempotent, so if newer
                     // batches queued while we worked, jump to the latest.
@@ -1422,7 +1424,7 @@ fn persist(
         if let Some(p) = platform::process_cwd(tab.pid)
             && tab.last_known_cwd.as_deref() != Some(p.as_path())
         {
-            tab.last_known_cwd_string = Some(p.to_string_lossy().into_owned());
+            tab.last_known_cwd_string = Some(p.to_string_lossy().into());
             tab.last_known_cwd = Some(p);
         }
     }
@@ -1430,15 +1432,15 @@ fn persist(
     let tab_states: Vec<TabState> = tabs
         .iter()
         .map(|tab| TabState {
-            id: tab.id.clone(),
-            name: tab.name.clone(),
-            cwd: tab.last_known_cwd_string.clone(),
+            id: tab.id.to_string(),
+            name: tab.name.to_string(),
+            cwd: tab.last_known_cwd_string.as_deref().map(str::to_string),
             colors_enabled: tab.colors_enabled,
-            agent_session_id: tab.agent_session_id.clone(),
-            agent_kind: tab.agent_kind.clone(),
+            agent_session_id: tab.agent_session_id.as_deref().map(str::to_string),
+            agent_kind: tab.agent_kind.as_deref().map(str::to_string),
             agent_plan_mode: tab.agent_plan_mode,
-            share_token_rw: tab.share_token_rw.clone(),
-            share_token_ro: tab.share_token_ro.clone(),
+            share_token_rw: tab.share_token_rw.to_string(),
+            share_token_ro: tab.share_token_ro.to_string(),
             locked: tab.locked,
             net_disabled: tab.net_disabled,
             net_allow_presets: tab.net_allow.presets.clone(),
@@ -1631,19 +1633,19 @@ fn respawn_tab_net(
     let history = tabs[idx].copy_all_history();
     let pending_restore = if history.is_empty() { None } else { Some(history) };
     let env = tab_env_extras(&tabs[idx].id, api_url_for_pty, api_token);
-    let id = tabs[idx].id.clone();
-    let name = tabs[idx].name.clone();
+    let id = tabs[idx].id.to_string();
+    let name = tabs[idx].name.to_string();
     let prior = tabs[idx].uptime().as_secs_f64();
     #[cfg(feature = "energy")]
     let energy = tabs[idx].energy_wh;
     #[cfg(not(feature = "energy"))]
     let energy = 0.0;
     let saved_hash = tabs[idx].output_hash_last_saved;
-    let agent_session_id = tabs[idx].agent_session_id.clone();
-    let agent_kind = tabs[idx].agent_kind.clone();
+    let agent_session_id = tabs[idx].agent_session_id.as_deref().map(str::to_string);
+    let agent_kind = tabs[idx].agent_kind.as_deref().map(str::to_string);
     let agent_plan_mode = tabs[idx].agent_plan_mode;
-    let rw = tabs[idx].share_token_rw.clone();
-    let ro = tabs[idx].share_token_ro.clone();
+    let rw = tabs[idx].share_token_rw.to_string();
+    let ro = tabs[idx].share_token_ro.to_string();
     let locked = tabs[idx].locked;
     let schedule = tabs[idx].schedule.clone();
     let bg = tabs[idx].bg_color.clone();
@@ -1734,13 +1736,13 @@ fn drain_pending(
     // CLI / API lock toggles → runtime HeadlessTab. tabs.json picks
     // it up on the same persist tick a few lines below.
     for (tab_id, locked) in lock_changes {
-        if let Some(t) = tabs.iter_mut().find(|t| t.id == tab_id) {
+        if let Some(t) = tabs.iter_mut().find(|t| *t.id == tab_id) {
             t.locked = locked;
         }
     }
     // Schedule changes — None clears, Some sets.
     for (tab_id, sched) in schedule_changes {
-        if let Some(t) = tabs.iter_mut().find(|t| t.id == tab_id) {
+        if let Some(t) = tabs.iter_mut().find(|t| *t.id == tab_id) {
             t.schedule = sched;
         }
     }
@@ -1751,7 +1753,7 @@ fn drain_pending(
     // agent/uptime) carry across. The bwrap-availability guard lives at
     // the endpoint, so a queued change is already known applicable.
     for (tab_id, disabled) in net_changes {
-        if let Some(idx) = tabs.iter().position(|t| t.id == tab_id) {
+        if let Some(idx) = tabs.iter().position(|t| *t.id == tab_id) {
             let allow = tabs[idx].net_allow.clone();
             respawn_tab_net(
                 tabs,
@@ -1771,7 +1773,7 @@ fn drain_pending(
     // airgap); an empty config clears allowlist mode, keeping whatever
     // net_disabled the tab already had.
     for (tab_id, config) in net_allow_changes {
-        if let Some(idx) = tabs.iter().position(|t| t.id == tab_id) {
+        if let Some(idx) = tabs.iter().position(|t| *t.id == tab_id) {
             let disabled = if config.is_empty() {
                 tabs[idx].net_disabled
             } else {
@@ -1794,21 +1796,21 @@ fn drain_pending(
     // Revoke per-tab share tokens (the snapshot was already cleared by
     // the endpoint); persists the cleared state into tabs.json below.
     for tab_id in token_rotations {
-        if let Some(t) = tabs.iter_mut().find(|t| t.id == tab_id) {
-            t.share_token_rw.clear();
-            t.share_token_ro.clear();
+        if let Some(t) = tabs.iter_mut().find(|t| *t.id == tab_id) {
+            t.share_token_rw = "".into();
+            t.share_token_ro = "".into();
         }
     }
     // Same path for the bg-color override.
     for (tab_id, color) in bg_color_changes {
-        if let Some(t) = tabs.iter_mut().find(|t| t.id == tab_id) {
+        if let Some(t) = tabs.iter_mut().find(|t| *t.id == tab_id) {
             t.bg_color = color;
         }
     }
     // …and the per-tab agent context.
     for (tab_id, context) in context_changes {
-        if let Some(t) = tabs.iter_mut().find(|t| t.id == tab_id) {
-            t.context = context;
+        if let Some(t) = tabs.iter_mut().find(|t| *t.id == tab_id) {
+            t.context = context.map(Arc::from);
         }
     }
 
@@ -1835,7 +1837,7 @@ fn drain_pending(
 
     // Status updates: write transient + durable agent fields.
     for upd in status_updates {
-        let Some(tab) = tabs.iter_mut().find(|t| t.id == upd.tab_id) else {
+        let Some(tab) = tabs.iter_mut().find(|t| *t.id == upd.tab_id) else {
             continue;
         };
         if upd.label.as_deref() == Some("__clear__") {
@@ -1850,10 +1852,10 @@ fn drain_pending(
                 updated_at: Instant::now(),
             });
             if upd.session_id.is_some() {
-                tab.agent_session_id = upd.session_id;
+                tab.agent_session_id = upd.session_id.map(Arc::from);
             }
             if upd.agent_kind.is_some() {
-                tab.agent_kind = upd.agent_kind;
+                tab.agent_kind = upd.agent_kind.map(Arc::from);
             }
             if upd.plan_mode.is_some() {
                 tab.agent_plan_mode = upd.plan_mode;
@@ -1950,7 +1952,7 @@ fn drain_pending(
             continue;
         }
         let old_name = tabs[idx].name.clone();
-        if old_name == new_name {
+        if *old_name == *new_name {
             continue;
         }
         if !crate::read_only() {
@@ -1968,7 +1970,7 @@ fn drain_pending(
                 }
             }
         }
-        tabs[idx].name = new_name;
+        tabs[idx].name = new_name.into();
     }
 
     // Closes (highest index first).
