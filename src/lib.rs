@@ -2658,6 +2658,17 @@ pub fn detect_urls(text: &str) -> Vec<(usize, usize, String, bool)> {
     urls
 }
 
+/// The `<name> vX.Y.Z (<build-hash>)` line both binaries print for `--version`.
+///
+/// `BUILD_HASH` is `git rev-parse --short=12 HEAD` at compile time (see
+/// `build.rs`), so it pins the exact commit a deployed binary was built from —
+/// which the crate version alone can't answer (every nightly is `0.5.0-dev`),
+/// making "is this binary actually up to date?" a one-command check.
+#[must_use]
+pub fn version_line(bin: &str) -> String {
+    format!("{bin} v{} ({})", env!("CARGO_PKG_VERSION"), env!("BUILD_HASH"))
+}
+
 /// Strip ANSI CSI/SGR escapes (`ESC [ … final`) from `s`.
 ///
 /// Used when copying scrollback to the system clipboard so the receiving
@@ -2705,6 +2716,19 @@ pub fn file_path_for_open(path: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_line_carries_name_version_and_nonempty_build_hash() {
+        let v = version_line("tab-atelier");
+        assert!(v.starts_with("tab-atelier v"), "got: {v}");
+        assert!(v.contains(env!("CARGO_PKG_VERSION")));
+        // Build hash is present, non-empty, and parenthesised at the end.
+        assert!(
+            !env!("BUILD_HASH").is_empty(),
+            "build.rs must set a non-empty BUILD_HASH"
+        );
+        assert!(v.ends_with(')') && v.contains(" ("), "hash must be in parens: {v}");
+    }
 
     #[test]
     fn agent_launch_suffix_execs_the_resume_command() {

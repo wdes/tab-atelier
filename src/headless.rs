@@ -737,11 +737,11 @@ pub fn run() -> std::io::Result<()> {
     }
 
     if std::env::args().any(|a| a == "-V" || a == "--version") {
-        println!("tab-atelier-headless v{}", env!("CARGO_PKG_VERSION"));
+        println!("{}", crate::version_line("tab-atelier-headless"));
         return Ok(());
     }
 
-    info!("starting tab-atelier-headless v{}", env!("CARGO_PKG_VERSION"));
+    info!("starting {}", crate::version_line("tab-atelier-headless"));
 
     let prefs = load_preferences(&platform::config_dir());
     // Default allowlist for NEW tabs (the seed tab + API-created ones).

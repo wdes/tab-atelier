@@ -128,7 +128,7 @@ fn main() {
     for a in std::env::args().skip(1) {
         match a.as_str() {
             "-V" | "--version" => {
-                println!("tab-atelier v{}", env!("CARGO_PKG_VERSION"));
+                println!("{}", tab_atelier::version_line("tab-atelier"));
                 std::process::exit(0);
             }
             "-h" | "--help" => {
