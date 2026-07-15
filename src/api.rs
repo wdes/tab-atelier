@@ -3628,6 +3628,75 @@ fn load_or_generate_cert(
     Ok((vec![cert_der], key_der))
 }
 
+/// Test-only fixture builders, shared with `api_ws`'s tests (hence
+/// `pub(crate)` rather than living inside `mod tests`).
+#[cfg(test)]
+pub fn test_snapshot_tab(id: &str, name: &str) -> SnapshotTab {
+    SnapshotTab {
+        id: id.into(),
+        name: name.into(),
+        cwd: None,
+        output: "".into(),
+        output_crc: crate::crc32(b""),
+        raw_output_crc: crate::crc32(b""),
+        uptime_secs: 0.0,
+        cursor: None,
+        cols: 80,
+        rows: 24,
+        raw_output: "".into(),
+        raw_cursor: None,
+        share_token_rw: "".into(),
+        share_token_ro: "".into(),
+        locked: false,
+        schedule: None,
+        bg_color: "".into(),
+        context: None,
+        shell_pid: 0,
+        agent_state: None,
+        agent_session_id: None,
+        agent_kind: None,
+        viewers: 0,
+        pty_ring: None,
+        net_disabled: false,
+        connections: 0,
+        tx_bytes: 0,
+        tx_denied_bytes: 0,
+        net_allow: crate::net_policy::AllowConfig::default(),
+        dns_entries: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+pub fn test_snapshot(tabs: Vec<SnapshotTab>) -> TabSnapshot {
+    TabSnapshot {
+        tabs,
+        active: 0,
+        #[cfg(feature = "energy")]
+        power: vec![],
+        #[cfg(feature = "energy")]
+        battery_percent: None,
+        pending_closes: vec![],
+        pending_activate: None,
+        pending_input: vec![],
+        pending_lock_changes: vec![],
+        pending_net_changes: vec![],
+        pending_net_allow_changes: vec![],
+        pending_bg_color_changes: vec![],
+        pending_context_changes: vec![],
+        pending_token_rotations: vec![],
+        pending_schedule_changes: vec![],
+        pending_new_tabs: 0,
+        pending_new_tab_cwds: std::collections::VecDeque::new(),
+        pending_renames: vec![],
+        pending_status_updates: vec![],
+        cached_response: None,
+        activity: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        activity_waker: std::sync::Arc::new((std::sync::Mutex::new(()), std::sync::Condvar::new())),
+        generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        master_token: String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3802,99 +3871,12 @@ mod tests {
     }
 
     fn test_state() -> Arc<Mutex<TabSnapshot>> {
-        Arc::new(Mutex::new(TabSnapshot {
-            tabs: vec![
-                SnapshotTab {
-                    id: "tab-a".into(),
-                    name: "shell".into(),
-                    cwd: Some("/home/user".into()),
-                    output: "$ ls\nfoo bar baz".into(),
-                    output_crc: crate::crc32(b"$ ls\nfoo bar baz"),
-                    raw_output_crc: crate::crc32(b""),
-                    uptime_secs: 0.0,
-                    cursor: None,
-                    cols: 80,
-                    rows: 24,
-                    raw_output: "".into(),
-                    raw_cursor: None,
-                    share_token_rw: "".into(),
-                    share_token_ro: "".into(),
-                    locked: false,
-                    schedule: None,
-                    bg_color: "".into(),
-                    context: None,
-                    shell_pid: 0,
-                    agent_state: None,
-                    agent_session_id: None,
-                    agent_kind: None,
-                    viewers: 0,
-                    pty_ring: None,
-                    net_disabled: false,
-                    connections: 0,
-                    tx_bytes: 0,
-                    tx_denied_bytes: 0,
-                    net_allow: crate::net_policy::AllowConfig::default(),
-                    dns_entries: Vec::new(),
-                },
-                SnapshotTab {
-                    id: "tab-b".into(),
-                    name: "build".into(),
-                    cwd: None,
-                    output: "".into(),
-                    output_crc: crate::crc32(b""),
-                    raw_output_crc: crate::crc32(b""),
-                    uptime_secs: 0.0,
-                    cursor: None,
-                    cols: 80,
-                    rows: 24,
-                    raw_output: "".into(),
-                    raw_cursor: None,
-                    share_token_rw: "".into(),
-                    share_token_ro: "".into(),
-                    locked: false,
-                    schedule: None,
-                    bg_color: "".into(),
-                    context: None,
-                    shell_pid: 0,
-                    agent_state: None,
-                    agent_session_id: None,
-                    agent_kind: None,
-                    viewers: 0,
-                    pty_ring: None,
-                    net_disabled: false,
-                    connections: 0,
-                    tx_bytes: 0,
-                    tx_denied_bytes: 0,
-                    net_allow: crate::net_policy::AllowConfig::default(),
-                    dns_entries: Vec::new(),
-                },
-            ],
-            active: 0,
-            #[cfg(feature = "energy")]
-            power: vec![],
-            #[cfg(feature = "energy")]
-            battery_percent: None,
-            pending_closes: vec![],
-            pending_activate: None,
-            pending_input: vec![],
-            pending_lock_changes: vec![],
-            pending_net_changes: vec![],
-            pending_net_allow_changes: vec![],
-            pending_bg_color_changes: vec![],
-            pending_context_changes: vec![],
-            pending_token_rotations: vec![],
-            pending_schedule_changes: vec![],
-            pending_new_tabs: 0,
-            pending_new_tab_cwds: std::collections::VecDeque::new(),
-            pending_limit_changes: Vec::new(),
-            pending_renames: vec![],
-            pending_status_updates: vec![],
-            cached_response: None,
-            activity: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            activity_waker: std::sync::Arc::new((std::sync::Mutex::new(()), std::sync::Condvar::new())),
-            generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            master_token: String::new(),
-        }))
+        let mut a = super::test_snapshot_tab("tab-a", "shell");
+        a.cwd = Some("/home/user".into());
+        a.output = "$ ls\nfoo bar baz".into();
+        a.output_crc = crate::crc32(b"$ ls\nfoo bar baz");
+        let b = super::test_snapshot_tab("tab-b", "build");
+        Arc::new(Mutex::new(super::test_snapshot(vec![a, b])))
     }
 
     fn spawn_server() -> (u16, Arc<Mutex<TabSnapshot>>, String) {
@@ -5665,5 +5647,189 @@ mod tests {
         let (h, _) = split_response(&raw);
         let label = header_value(&h, "x-agent-label").expect("present");
         assert_eq!(label.len(), 256, "encoded label length capped at 256 chars: {label:?}");
+    }
+
+    #[test]
+    fn lock_toggle_flips_and_queues_the_change() {
+        let (port, state, token) = spawn_server();
+        // Empty body ⇒ toggle (false → true).
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/tab-a/lock HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\n\r\n"
+            ),
+        );
+        assert_eq!(status_code(&resp), 200);
+        let json: serde_json::Value = serde_json::from_str(body(&resp)).unwrap();
+        assert_eq!(json["locked"], true);
+        let (locked, queued) = {
+            let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            (s.tabs[0].locked, s.pending_lock_changes.last().cloned())
+        };
+        assert!(locked, "snapshot mirrors immediately");
+        assert_eq!(queued, Some(("tab-a".to_string(), true)));
+        // Unknown id ⇒ 404, nothing queued.
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/nope/lock HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\n\r\n"
+            ),
+        );
+        assert_eq!(status_code(&resp), 404);
+    }
+
+    #[test]
+    fn schedule_sets_validates_and_clears() {
+        let (port, state, token) = spawn_server();
+        let set = r#"{"rule":"Mo-Fr 09:00-18:00","tz":"Europe/Paris"}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/tab-a/schedule HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{set}",
+                set.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 200);
+        let (rule, queued) = {
+            let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                s.tabs[0].schedule.clone(),
+                s.pending_schedule_changes.last().unwrap().clone(),
+            )
+        };
+        assert_eq!(rule.map(|sc| sc.rule), Some("Mo-Fr 09:00-18:00".to_string()));
+        assert_eq!(queued.0, "tab-a");
+        assert!(queued.1.is_some());
+        // Garbage rule ⇒ 400, schedule untouched.
+        let bad = r#"{"rule":"whenever","tz":"Europe/Paris"}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/tab-a/schedule HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{bad}",
+                bad.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 400);
+        // `{}` ⇒ clear.
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/tab-a/schedule HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: 2\r\n\r\n{{}}"
+            ),
+        );
+        assert_eq!(status_code(&resp), 200);
+        let cleared = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).tabs[0]
+            .schedule
+            .is_none();
+        assert!(cleared);
+    }
+
+    #[test]
+    fn bg_color_sets_validates_and_clears() {
+        let (port, state, token) = spawn_server();
+        let set = r##"{"color":"#112233"}"##;
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/tab-a/bg-color HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{set}",
+                set.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 200);
+        let (bg, queued) = {
+            let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            (s.tabs[0].bg_color.clone(), s.pending_bg_color_changes.last().cloned())
+        };
+        assert_eq!(&*bg, "#112233", "snapshot mirrors immediately");
+        assert_eq!(queued, Some(("tab-a".to_string(), Some("#112233".to_string()))));
+        // Bad hex ⇒ 400.
+        let bad = r#"{"color":"red"}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/tab-a/bg-color HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{bad}",
+                bad.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 400);
+        // null ⇒ clear (falls back to the global default).
+        let clear = r#"{"color":null}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/tab-a/bg-color HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{clear}",
+                clear.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 200);
+        let (bg, queued) = {
+            let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            (s.tabs[0].bg_color.clone(), s.pending_bg_color_changes.last().cloned())
+        };
+        assert!(bg.is_empty());
+        assert_eq!(queued, Some(("tab-a".to_string(), None)));
+    }
+
+    #[test]
+    fn view_page_ships_the_tab_bg_override() {
+        let (port, state, token) = spawn_server();
+        state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).tabs[0].bg_color = "#445566".into();
+        let resp = request(
+            port,
+            &format!("GET /tabs/by-id/tab-a/view?token={token} HTTP/1.1\r\n\r\n"),
+        );
+        assert_eq!(status_code(&resp), 200);
+        assert!(body(&resp).contains("#445566"), "template substitutes the override");
+        // And the default when no override is set (tab-b).
+        let resp = request(
+            port,
+            &format!("GET /tabs/by-id/tab-b/view?token={token} HTTP/1.1\r\n\r\n"),
+        );
+        assert_eq!(status_code(&resp), 200);
+        assert!(body(&resp).contains(crate::DEFAULT_TAB_BG_COLOR));
+    }
+
+    #[test]
+    fn status_updates_queue_and_idle_clears() {
+        let (port, state, token) = spawn_server();
+        let set = r#"{"state":"thinking","label":"building","sessionId":"sess-9","agentKind":"claude"}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/tab-a/status HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{set}",
+                set.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 200);
+        let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let upd = s.pending_status_updates.last().unwrap();
+        let (tab_id, agent_state, label, session_id, agent_kind) = (
+            upd.tab_id.clone(),
+            upd.state,
+            upd.label.clone(),
+            upd.session_id.clone(),
+            upd.agent_kind.clone(),
+        );
+        drop(s);
+        assert_eq!(tab_id, "tab-a");
+        assert_eq!(agent_state, crate::AgentState::Thinking);
+        assert_eq!(label.as_deref(), Some("building"));
+        assert_eq!(session_id.as_deref(), Some("sess-9"));
+        assert_eq!(agent_kind.as_deref(), Some("claude"));
+        // "idle" ⇒ the wipe marker.
+        let idle = r#"{"state":"idle"}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/tab-a/status HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{idle}",
+                idle.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 200);
+        let label = {
+            let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            s.pending_status_updates.last().unwrap().label.clone()
+        };
+        assert_eq!(label.as_deref(), Some("__clear__"));
     }
 }

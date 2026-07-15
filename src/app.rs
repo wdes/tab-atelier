@@ -225,6 +225,71 @@ impl crate::schedule::LockState for Tab {
 }
 
 impl Tab {
+    /// Boot-state constructor: every construction site (restore from
+    /// tabs.json, first-run, empty-restore fallback, Cmd-T insert)
+    /// funnels here so the boot invariants — grey LED, "just seen"
+    /// focus stamp, deferred caches — live in one place. `ts` seeds
+    /// the durable fields (a `TabState::default()` for fresh tabs);
+    /// `activated` marks the tab foreground from birth.
+    fn from_state(
+        view: Entity<TerminalView>,
+        ts: &TabState,
+        cwd: Option<PathBuf>,
+        pending_restore: Option<String>,
+        pending_agent_resume: Option<String>,
+        activated: bool,
+    ) -> Self {
+        Self {
+            view,
+            id: ts.id.as_str().into(),
+            name: ts.name.as_str().into(),
+            created_at: std::time::Instant::now(),
+            prior_uptime: std::time::Duration::from_secs_f64(ts.uptime_secs.unwrap_or(0.0)),
+            active_duration: std::time::Duration::ZERO,
+            last_activated: activated.then(std::time::Instant::now),
+            // Boots un-flagged (grey): it only goes blue once its
+            // agent WORKS while you're not looking. Restoring a tab
+            // isn't "new work", so it must not flash blue on restart.
+            unreviewed_work: false,
+            // "Just seen" at boot so an attached session only ages into
+            // the blue dormant state after DORMANT_AFTER_SECS without
+            // being opened — not instantly on every restart.
+            last_focused_at: Some(std::time::Instant::now()),
+            last_output_at: None,
+            #[cfg(feature = "energy")]
+            energy_wh: ts.energy_wh.unwrap_or(0.0),
+            #[cfg(feature = "energy")]
+            energy_wh_last_saved: ts.energy_wh.unwrap_or(0.0),
+            #[cfg(feature = "catbus")]
+            tokens_last_saved: std::cell::Cell::new(None),
+            #[cfg(feature = "catbus")]
+            tokens_last_ring: std::cell::Cell::new(0),
+            uptime_last_saved: std::cell::Cell::new(None),
+            led_last_ring: std::cell::Cell::new(0),
+            #[cfg(feature = "catbus")]
+            sweep_last_ring: std::cell::Cell::new(0),
+            #[cfg(feature = "catbus")]
+            agent_pid: std::cell::Cell::new(None),
+            pending_restore,
+            last_known_cwd_string: cwd.as_ref().map(|p| p.to_string_lossy().into()),
+            last_known_cwd: cwd,
+            agent_state: None,
+            agent_session_id: ts.agent_session_id.as_deref().map(std::sync::Arc::from),
+            agent_kind: ts.agent_kind.as_deref().map(std::sync::Arc::from),
+            agent_plan_mode: ts.agent_plan_mode,
+            share_token_rw: ts.share_token_rw.as_str().into(),
+            share_token_ro: ts.share_token_ro.as_str().into(),
+            locked: ts.locked,
+            schedule: ts.schedule.clone(),
+            bg_color: ts.bg_color.clone(),
+            context: None,
+            last_pushed_locked: None,
+            pending_agent_resume,
+            snap_cache: None,
+            limits: ts.limits.clone(),
+        }
+    }
+
     /// Active time this tab has been used (live run + persisted prior runs).
     /// Counts only periods when the user typed in the last 30s — the same
     /// idle threshold `persist()` uses to flip activate/deactivate. Idle
@@ -834,58 +899,14 @@ impl AppState {
                         _ => None,
                     }
                 };
-                tabs.push(Tab {
+                tabs.push(Tab::from_state(
                     view,
-                    id: ts.id.as_str().into(),
-                    name: ts.name.as_str().into(),
-                    created_at: std::time::Instant::now(),
-                    prior_uptime: std::time::Duration::from_secs_f64(ts.uptime_secs.unwrap_or(0.0)),
-                    active_duration: std::time::Duration::ZERO,
-                    last_activated: None,
-                    // Boots un-flagged (grey): it only goes blue once its
-                    // agent WORKS while you're not looking. Restoring a tab
-                    // isn't "new work", so it must not flash blue on restart.
-                    unreviewed_work: false,
-                    last_focused_at: Some(std::time::Instant::now()),
-                    last_output_at: None,
-                    #[cfg(feature = "energy")]
-                    energy_wh: ts.energy_wh.unwrap_or(0.0),
-                    #[cfg(feature = "energy")]
-                    energy_wh_last_saved: ts.energy_wh.unwrap_or(0.0),
-                    #[cfg(feature = "catbus")]
-                    tokens_last_saved: std::cell::Cell::new(None),
-                    #[cfg(feature = "catbus")]
-                    tokens_last_ring: std::cell::Cell::new(0),
-                    uptime_last_saved: std::cell::Cell::new(None),
-                    led_last_ring: std::cell::Cell::new(0),
-                    #[cfg(feature = "catbus")]
-                    sweep_last_ring: std::cell::Cell::new(0),
-                    #[cfg(feature = "catbus")]
-                    agent_pid: std::cell::Cell::new(None),
-                    // Seed with the hash of the just-restored output so the
-                    // first persist tick after launch doesn't rewrite an
-                    // identical file.
+                    ts,
+                    cwd,
                     pending_restore,
-                    // Seed from saved state so an immediate persist tick
-                    // before the new shell has a /proc/PID/cwd readable
-                    // doesn't overwrite the restored value with None.
-                    last_known_cwd_string: cwd.as_ref().map(|p| p.to_string_lossy().into()),
-                    last_known_cwd: cwd.clone(),
-                    agent_state: None,
-                    agent_session_id: ts.agent_session_id.as_deref().map(std::sync::Arc::from),
-                    agent_kind: ts.agent_kind.as_deref().map(std::sync::Arc::from),
-                    agent_plan_mode: ts.agent_plan_mode,
-                    share_token_rw: ts.share_token_rw.as_str().into(),
-                    share_token_ro: ts.share_token_ro.as_str().into(),
-                    locked: ts.locked,
-                    schedule: ts.schedule.clone(),
-                    bg_color: ts.bg_color.clone(),
-                    context: None,
-                    last_pushed_locked: None,
                     pending_agent_resume,
-                    snap_cache: None,
-                    limits: ts.limits.clone(),
-                });
+                    false,
+                ));
             }
             if tabs.is_empty() {
                 let fc = font_config.clone();
@@ -900,52 +921,12 @@ impl AppState {
                     tv.set_theme(theme_name);
                     tv
                 });
-                tabs.push(Tab {
-                    view,
-                    name: locale::strings(lang).terminal.into(),
-                    created_at: std::time::Instant::now(),
-                    prior_uptime: std::time::Duration::ZERO,
-                    active_duration: std::time::Duration::ZERO,
-                    last_activated: None,
-                    // Boots un-flagged (grey): it only goes blue once its
-                    // agent WORKS while you're not looking. Restoring a tab
-                    // isn't "new work", so it must not flash blue on restart.
-                    unreviewed_work: false,
-                    last_focused_at: Some(std::time::Instant::now()),
-                    last_output_at: None,
-                    #[cfg(feature = "energy")]
-                    energy_wh: 0.0,
-                    #[cfg(feature = "energy")]
-                    energy_wh_last_saved: 0.0,
-                    #[cfg(feature = "catbus")]
-                    tokens_last_saved: std::cell::Cell::new(None),
-                    #[cfg(feature = "catbus")]
-                    tokens_last_ring: std::cell::Cell::new(0),
-                    uptime_last_saved: std::cell::Cell::new(None),
-                    led_last_ring: std::cell::Cell::new(0),
-                    #[cfg(feature = "catbus")]
-                    sweep_last_ring: std::cell::Cell::new(0),
-                    #[cfg(feature = "catbus")]
-                    agent_pid: std::cell::Cell::new(None),
-                    pending_restore: None,
-                    last_known_cwd: None,
-                    last_known_cwd_string: None,
-                    id: new_id.into(),
-                    agent_state: None,
-                    agent_session_id: None,
-                    agent_kind: None,
-                    agent_plan_mode: None,
-                    share_token_rw: "".into(),
-                    share_token_ro: "".into(),
-                    locked: false,
-                    schedule: None,
-                    bg_color: None,
-                    context: None,
-                    last_pushed_locked: None,
-                    pending_agent_resume: None,
-                    snap_cache: None,
-                    limits: crate::TabResourceLimits::default(),
-                });
+                let seed = TabState {
+                    id: new_id,
+                    name: locale::strings(lang).terminal.to_owned(),
+                    ..TabState::default()
+                };
+                tabs.push(Tab::from_state(view, &seed, None, None, None, false));
             }
             let active = saved.active.min(tabs.len() - 1);
             tabs[active].activate();
@@ -963,53 +944,12 @@ impl AppState {
                 tv.set_theme(theme_name);
                 tv
             });
-            (
-                vec![Tab {
-                    view,
-                    name: locale::strings(lang).terminal.into(),
-                    created_at: std::time::Instant::now(),
-                    prior_uptime: std::time::Duration::ZERO,
-                    active_duration: std::time::Duration::ZERO,
-                    last_activated: Some(std::time::Instant::now()),
-                    unreviewed_work: false,
-                    last_focused_at: Some(std::time::Instant::now()),
-                    last_output_at: None,
-                    #[cfg(feature = "energy")]
-                    energy_wh: 0.0,
-                    #[cfg(feature = "energy")]
-                    energy_wh_last_saved: 0.0,
-                    #[cfg(feature = "catbus")]
-                    tokens_last_saved: std::cell::Cell::new(None),
-                    #[cfg(feature = "catbus")]
-                    tokens_last_ring: std::cell::Cell::new(0),
-                    uptime_last_saved: std::cell::Cell::new(None),
-                    led_last_ring: std::cell::Cell::new(0),
-                    #[cfg(feature = "catbus")]
-                    sweep_last_ring: std::cell::Cell::new(0),
-                    #[cfg(feature = "catbus")]
-                    agent_pid: std::cell::Cell::new(None),
-                    pending_restore: None,
-                    last_known_cwd: None,
-                    last_known_cwd_string: None,
-                    id: new_id.into(),
-                    agent_state: None,
-                    agent_session_id: None,
-                    agent_kind: None,
-                    agent_plan_mode: None,
-                    share_token_rw: "".into(),
-                    share_token_ro: "".into(),
-                    locked: false,
-                    schedule: None,
-                    bg_color: None,
-                    context: None,
-                    last_pushed_locked: None,
-                    pending_agent_resume: None,
-                    snap_cache: None,
-                    limits: crate::TabResourceLimits::default(),
-                }],
-                0,
-                false,
-            )
+            let seed = TabState {
+                id: new_id,
+                name: locale::strings(lang).terminal.to_owned(),
+                ..TabState::default()
+            };
+            (vec![Tab::from_state(view, &seed, None, None, None, true)], 0, false)
         };
         if restored_windowed {
             window.toggle_fullscreen();
@@ -1583,52 +1523,13 @@ impl AppState {
             tv
         });
         let idx = at.min(self.tabs.len());
-        self.tabs.insert(
-            idx,
-            Tab {
-                view,
-                name: format!("{} {}", self.t().terminal_n, self.tabs.len()).into(),
-                created_at: std::time::Instant::now(),
-                prior_uptime: std::time::Duration::ZERO,
-                active_duration: std::time::Duration::ZERO,
-                last_activated: Some(std::time::Instant::now()),
-                unreviewed_work: false,
-                last_focused_at: Some(std::time::Instant::now()),
-                last_output_at: None,
-                #[cfg(feature = "energy")]
-                energy_wh: 0.0,
-                #[cfg(feature = "energy")]
-                energy_wh_last_saved: 0.0,
-                #[cfg(feature = "catbus")]
-                tokens_last_saved: std::cell::Cell::new(None),
-                #[cfg(feature = "catbus")]
-                tokens_last_ring: std::cell::Cell::new(0),
-                uptime_last_saved: std::cell::Cell::new(None),
-                led_last_ring: std::cell::Cell::new(0),
-                #[cfg(feature = "catbus")]
-                sweep_last_ring: std::cell::Cell::new(0),
-                #[cfg(feature = "catbus")]
-                agent_pid: std::cell::Cell::new(None),
-                pending_restore: None,
-                last_known_cwd_string: cwd.as_ref().map(|p| p.to_string_lossy().into()),
-                last_known_cwd: cwd,
-                id: new_id.into(),
-                agent_state: None,
-                agent_session_id: None,
-                agent_kind: None,
-                agent_plan_mode: None,
-                share_token_rw: "".into(),
-                share_token_ro: "".into(),
-                locked: false,
-                schedule: None,
-                bg_color: None,
-                context: None,
-                last_pushed_locked: None,
-                pending_agent_resume: None,
-                snap_cache: None,
-                limits: crate::TabResourceLimits::default(),
-            },
-        );
+        let seed = TabState {
+            id: new_id,
+            name: format!("{} {}", self.t().terminal_n, self.tabs.len()),
+            ..TabState::default()
+        };
+        self.tabs
+            .insert(idx, Tab::from_state(view, &seed, cwd, None, None, true));
         self.active = idx;
         #[cfg(target_os = "linux")]
         self.apply_tab_limits(idx, cx);
@@ -5851,6 +5752,158 @@ fn spawn_hotkey_listener(keycodes: &[u8], window_handle: WindowHandle<AppState>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_view(cx: &mut gpui::TestAppContext) -> Entity<TerminalView> {
+        let window = cx.add_window(|window, cx| {
+            TerminalView::new_with_colors_and_env(
+                None,
+                FontConfig::default(),
+                Rc::new(RefCell::new(None)),
+                Rc::new(RefCell::new(None)),
+                true,
+                std::collections::HashMap::new(),
+                None,
+                Some((80, 24, gpui::size(gpui::px(8.0), gpui::px(16.0)))),
+                true, // skeleton — no shell needed to seed a Tab
+                window,
+                cx,
+            )
+        });
+        window.update(cx, |_, _, cx| cx.entity()).unwrap()
+    }
+
+    #[gpui::test]
+    fn from_state_seeds_a_restored_tab(cx: &mut gpui::TestAppContext) {
+        let view = test_view(cx);
+        let ts = TabState {
+            id: "tab-42".to_string(),
+            name: "builds".to_string(),
+            uptime_secs: Some(90.0),
+            agent_session_id: Some("sess-1".to_string()),
+            agent_kind: Some("claude".to_string()),
+            agent_plan_mode: Some(true),
+            share_token_rw: "rw-tok".to_string(),
+            share_token_ro: "ro-tok".to_string(),
+            locked: true,
+            bg_color: Some("#112233".to_string()),
+            ..TabState::default()
+        };
+        let tab = Tab::from_state(
+            view,
+            &ts,
+            Some(PathBuf::from("/tmp/somewhere")),
+            Some("saved scrollback".to_string()),
+            Some("claude --resume sess-1\n".to_string()),
+            false,
+        );
+        assert_eq!(&*tab.id, "tab-42");
+        assert_eq!(&*tab.name, "builds");
+        assert_eq!(tab.prior_uptime, std::time::Duration::from_secs(90));
+        assert!(tab.last_activated.is_none(), "restored tabs boot deactivated");
+        assert!(!tab.unreviewed_work, "restored tabs boot grey");
+        assert!(
+            tab.last_focused_at.is_some(),
+            "boots 'just seen' so it doesn't flash dormant"
+        );
+        assert_eq!(tab.agent_session_id.as_deref(), Some("sess-1"));
+        assert_eq!(tab.agent_kind.as_deref(), Some("claude"));
+        assert_eq!(tab.agent_plan_mode, Some(true));
+        assert_eq!(&*tab.share_token_rw, "rw-tok");
+        assert_eq!(&*tab.share_token_ro, "ro-tok");
+        assert!(tab.locked);
+        assert_eq!(tab.bg_color.as_deref(), Some("#112233"));
+        assert_eq!(tab.last_known_cwd_string.as_deref(), Some("/tmp/somewhere"));
+        assert_eq!(tab.last_known_cwd, Some(PathBuf::from("/tmp/somewhere")));
+        assert_eq!(tab.pending_restore.as_deref(), Some("saved scrollback"));
+        assert!(tab.pending_agent_resume.is_some());
+        assert!(tab.context.is_none());
+        assert!(tab.snap_cache.is_none());
+    }
+
+    #[gpui::test]
+    fn from_state_seeds_a_fresh_active_tab(cx: &mut gpui::TestAppContext) {
+        let view = test_view(cx);
+        let seed = TabState {
+            id: "fresh-id".to_string(),
+            name: "Terminal 3".to_string(),
+            ..TabState::default()
+        };
+        let tab = Tab::from_state(view, &seed, None, None, None, true);
+        assert_eq!(&*tab.id, "fresh-id");
+        assert_eq!(&*tab.name, "Terminal 3");
+        assert!(tab.last_activated.is_some(), "fresh tabs are foreground from birth");
+        assert_eq!(tab.prior_uptime, std::time::Duration::ZERO);
+        assert!(tab.share_token_rw.is_empty() && tab.share_token_ro.is_empty());
+        assert!(!tab.locked && tab.schedule.is_none() && tab.bg_color.is_none());
+        assert!(tab.agent_session_id.is_none() && tab.agent_kind.is_none());
+        assert!(tab.last_known_cwd.is_none() && tab.last_known_cwd_string.is_none());
+    }
+
+    /// Drives the saver thread through its three verdicts: write, skip
+    /// via unchanged ring (serialize must not even run), skip via
+    /// unchanged content crc. `t2` jobs double as ordering fences —
+    /// the channel is FIFO, so once t2's effect is visible t1's
+    /// preceding job has been fully processed.
+    #[test]
+    fn output_saver_dedups_by_ring_then_by_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        let saver = OutputSaver::spawn(base.clone());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let job = |name: &str, ring: u64, out: &str| -> SaveJob {
+            let calls = calls.clone();
+            let out = out.to_string();
+            SaveJob {
+                name: name.into(),
+                ring_len: ring,
+                serialize: Box::new(move || {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    out
+                }),
+            }
+        };
+        let wait_for = |pred: &dyn Fn() -> bool| {
+            for _ in 0..200 {
+                if pred() {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            false
+        };
+        // The worker jumps to the LATEST queued batch (saves are
+        // idempotent), so each phase rides in a single batch and the
+        // trailing `t2` job doubles as the completion fence.
+        saver.tx.send(vec![job("t1", 1, "hello")]).unwrap();
+        assert!(
+            wait_for(&|| crate::load_tab_output(&base, "t1").is_some()),
+            "first job writes the file"
+        );
+        assert_eq!(crate::load_tab_output(&base, "t1").as_deref(), Some("hello"));
+        // Same ring_len → the scrollback serialize is skipped entirely.
+        saver
+            .tx
+            .send(vec![job("t1", 1, "SHOULD NOT RUN"), job("t2", 1, "fence")])
+            .unwrap();
+        assert!(wait_for(&|| crate::load_tab_output(&base, "t2").is_some()));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "unchanged ring must not pay the serialize"
+        );
+        assert_eq!(crate::load_tab_output(&base, "t1").as_deref(), Some("hello"));
+        // New ring but identical bytes → serialized once more, but the
+        // crc gate stops the rewrite.
+        saver
+            .tx
+            .send(vec![job("t1", 2, "hello"), job("t2", 2, "fence2")])
+            .unwrap();
+        assert!(wait_for(
+            &|| crate::load_tab_output(&base, "t2").as_deref() == Some("fence2")
+        ));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert_eq!(crate::load_tab_output(&base, "t1").as_deref(), Some("hello"));
+    }
 
     #[test]
     fn agent_led_hidden_for_a_dead_session_with_nothing_to_review() {
