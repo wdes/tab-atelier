@@ -2174,11 +2174,13 @@ impl AppState {
             // `PostToolUse`. Also covers manual subshell commands the
             // user starts inside an active agent tab.
             let now = std::time::Instant::now();
-            // Unreviewed-work (blue LED) maintenance. A tab whose agent is
-            // working while you're NOT looking at it is flagged; the flag is
-            // sticky (survives the agent stopping) so the blue dot means
-            // "there's output here you haven't seen." Reviewing a tab — it's
-            // the active tab, or someone has its web viewer open — clears it.
+            // Unreviewed-work (blue LED) maintenance. A tab whose agent takes a
+            // real turn (Thinking) while you're NOT looking at it is flagged;
+            // the flag is sticky (survives the turn ending) so the blue dot
+            // means "an agent worked here and you haven't reviewed it." Reviewing
+            // — it's the active tab, or someone has its web viewer open — clears
+            // it. Gated on Thinking, NOT raw output, so a reboot resuming every
+            // agent doesn't blue them all.
             let active = self.active;
             for (i, tab) in self.tabs.iter_mut().enumerate() {
                 if i == active {
@@ -2189,14 +2191,17 @@ impl AppState {
                 let reviewed = i == active || tab.view.read(cx).viewer_count() > 0;
                 if reviewed {
                     tab.unreviewed_work = false;
-                } else {
-                    let working = matches!(
-                        tab.agent_state.as_ref().map(|s| s.state),
-                        Some(crate::AgentState::Thinking)
-                    ) || tab.last_output_at.is_some_and(|t| t.elapsed() < STREAMING_LED_WINDOW);
-                    if working {
-                        tab.unreviewed_work = true;
-                    }
+                } else if matches!(
+                    tab.agent_state.as_ref().map(|s| s.state),
+                    Some(crate::AgentState::Thinking)
+                ) {
+                    // Only a real hook-driven turn (Thinking) marks unreviewed
+                    // work — NOT raw PTY output. A claude restart/resume redraws
+                    // its ENTIRE TUI, and a build prints: that's output, but not
+                    // "work you asked for and must review." Keying off Thinking
+                    // stops a reboot (which resumes every agent) from painting
+                    // all background tabs blue and forcing a click on each.
+                    tab.unreviewed_work = true;
                 }
             }
             #[cfg(feature = "catbus")]
