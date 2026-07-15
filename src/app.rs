@@ -63,7 +63,9 @@ const STREAMING_LED_WINDOW: std::time::Duration = std::time::Duration::from_secs
 
 struct Tab {
     view: Entity<TerminalView>,
-    name: String,
+    // String-ish fields that flow verbatim into `api::SnapshotTab` are
+    // `Arc<str>` so each snapshot rebuild clones a refcount, not bytes.
+    name: std::sync::Arc<str>,
     /// Wall-clock instant we started this tab in *this* process run.
     /// Persisted uptime is folded in via `prior_uptime` so a restart
     /// doesn't reset the counter to zero.
@@ -139,12 +141,12 @@ struct Tab {
     /// String form of `last_known_cwd`. Held alongside the `PathBuf` so the
     /// 2 s persist tick doesn't redo `to_string_lossy` for every tab on
     /// every tick — most ticks see no cwd change at all.
-    last_known_cwd_string: Option<String>,
+    last_known_cwd_string: Option<std::sync::Arc<str>>,
     /// Stable per-tab UUID — sourced from `TabState.id` on first
     /// load, generated fresh on tab creation. Exported into the
     /// shell as `_TAB_ID` so tools can call `POST /tabs/by-id/{id}/
     /// status` without caring about renames.
-    id: String,
+    id: std::sync::Arc<str>,
     /// Transient agent status published by a tool inside the tab
     /// (via the local API). Drives the tab-strip LED. Cleared by
     /// the staleness sweep after 5 minutes of no updates.
@@ -152,12 +154,12 @@ struct Tab {
     /// Durable: last agent session UUID associated with this tab.
     /// Persisted to tabs.json so auto-resume can pick the same
     /// session back up after a restart.
-    agent_session_id: Option<String>,
+    agent_session_id: Option<std::sync::Arc<str>>,
     /// Durable: which agent CLI owns the session ("catbus" or
     /// "claude" today). Free-form string so future agents can
     /// register without a code change. Used by the resume path
     /// to decide which command to type.
-    agent_kind: Option<String>,
+    agent_kind: Option<std::sync::Arc<str>>,
     /// Durable: whether the agent was in plan / read-only mode
     /// at last save. Restored along with the session so the tab
     /// comes back in the same mode.
@@ -165,8 +167,8 @@ struct Tab {
     /// Per-tab share secrets. Minted lazily by the right-click
     /// share-link menu and persisted to tabs.json so URLs survive
     /// restarts. Empty until first share.
-    share_token_rw: String,
-    share_token_ro: String,
+    share_token_rw: std::sync::Arc<str>,
+    share_token_ro: std::sync::Arc<str>,
     /// Manual lock — user-toggled via right-click / `POST /lock`.
     ///
     /// **Gate authors:** call `tab.effective_locked()` (via
@@ -192,7 +194,7 @@ struct Tab {
     /// Free-text context the in-tab agent set via `set-context` (e.g.
     /// the PR/task it's on). Shown as a hover tooltip on the tab name.
     /// In-memory; set via the API + drained from the snapshot.
-    context: Option<String>,
+    context: Option<std::sync::Arc<str>>,
     /// One-shot resume command queued on tab restore — when the
     /// shell is up the next tick types `<command>\n` into the
     /// PTY, then clears this. Set in `insert_tab` from the
@@ -299,7 +301,7 @@ struct Toast {
 #[derive(Clone)]
 struct DraggedTab {
     idx: usize,
-    name: String,
+    name: Arc<str>,
     theme: ThemeName,
 }
 
@@ -314,7 +316,7 @@ impl Render for DraggedTab {
             .text_size(px(13.0))
             .rounded(px(4.0))
             .opacity(0.8)
-            .child(self.name.clone())
+            .child(self.name.to_string())
     }
 }
 
@@ -395,7 +397,7 @@ fn grid_dims(vp_w: f32, vp_h: f32, cell_w: f32, cell_h: f32) -> Option<(usize, u
 /// scrollback. The main thread builds these (an `Arc` clone + a brief ring lock
 /// per tab); the worker runs the expensive serialize + atomic disk write.
 struct SaveJob {
-    name: String,
+    name: Arc<str>,
     ring_len: u64,
     serialize: Box<dyn FnOnce() -> String + Send>,
 }
@@ -417,7 +419,7 @@ impl OutputSaver {
             .spawn(move || {
                 // Per-tab dirtiness gate (ring_len, then output crc), kept here in
                 // the worker instead of on the `Tab` struct.
-                let mut seen: std::collections::HashMap<String, (u64, u32)> = std::collections::HashMap::new();
+                let mut seen: std::collections::HashMap<Arc<str>, (u64, u32)> = std::collections::HashMap::new();
                 while let Ok(mut batch) = rx.recv() {
                     // Saves are current-state + idempotent, so if newer batches
                     // queued while we worked, jump to the latest.
@@ -834,8 +836,8 @@ impl AppState {
                 };
                 tabs.push(Tab {
                     view,
-                    id: ts.id.clone(),
-                    name: ts.name.clone(),
+                    id: ts.id.as_str().into(),
+                    name: ts.name.as_str().into(),
                     created_at: std::time::Instant::now(),
                     prior_uptime: std::time::Duration::from_secs_f64(ts.uptime_secs.unwrap_or(0.0)),
                     active_duration: std::time::Duration::ZERO,
@@ -867,14 +869,14 @@ impl AppState {
                     // Seed from saved state so an immediate persist tick
                     // before the new shell has a /proc/PID/cwd readable
                     // doesn't overwrite the restored value with None.
-                    last_known_cwd_string: cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                    last_known_cwd_string: cwd.as_ref().map(|p| p.to_string_lossy().into()),
                     last_known_cwd: cwd.clone(),
                     agent_state: None,
-                    agent_session_id: ts.agent_session_id.clone(),
-                    agent_kind: ts.agent_kind.clone(),
+                    agent_session_id: ts.agent_session_id.as_deref().map(std::sync::Arc::from),
+                    agent_kind: ts.agent_kind.as_deref().map(std::sync::Arc::from),
                     agent_plan_mode: ts.agent_plan_mode,
-                    share_token_rw: ts.share_token_rw.clone(),
-                    share_token_ro: ts.share_token_ro.clone(),
+                    share_token_rw: ts.share_token_rw.as_str().into(),
+                    share_token_ro: ts.share_token_ro.as_str().into(),
                     locked: ts.locked,
                     schedule: ts.schedule.clone(),
                     bg_color: ts.bg_color.clone(),
@@ -928,13 +930,13 @@ impl AppState {
                     pending_restore: None,
                     last_known_cwd: None,
                     last_known_cwd_string: None,
-                    id: new_id,
+                    id: new_id.into(),
                     agent_state: None,
                     agent_session_id: None,
                     agent_kind: None,
                     agent_plan_mode: None,
-                    share_token_rw: String::new(),
-                    share_token_ro: String::new(),
+                    share_token_rw: "".into(),
+                    share_token_ro: "".into(),
                     locked: false,
                     schedule: None,
                     bg_color: None,
@@ -989,13 +991,13 @@ impl AppState {
                     pending_restore: None,
                     last_known_cwd: None,
                     last_known_cwd_string: None,
-                    id: new_id,
+                    id: new_id.into(),
                     agent_state: None,
                     agent_session_id: None,
                     agent_kind: None,
                     agent_plan_mode: None,
-                    share_token_rw: String::new(),
-                    share_token_ro: String::new(),
+                    share_token_rw: "".into(),
+                    share_token_ro: "".into(),
                     locked: false,
                     schedule: None,
                     bg_color: None,
@@ -1585,7 +1587,7 @@ impl AppState {
             idx,
             Tab {
                 view,
-                name: format!("{} {}", self.t().terminal_n, self.tabs.len()),
+                name: format!("{} {}", self.t().terminal_n, self.tabs.len()).into(),
                 created_at: std::time::Instant::now(),
                 prior_uptime: std::time::Duration::ZERO,
                 active_duration: std::time::Duration::ZERO,
@@ -1608,15 +1610,15 @@ impl AppState {
                 #[cfg(feature = "catbus")]
                 agent_pid: std::cell::Cell::new(None),
                 pending_restore: None,
-                last_known_cwd_string: cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                last_known_cwd_string: cwd.as_ref().map(|p| p.to_string_lossy().into()),
                 last_known_cwd: cwd,
-                id: new_id,
+                id: new_id.into(),
                 agent_state: None,
                 agent_session_id: None,
                 agent_kind: None,
                 agent_plan_mode: None,
-                share_token_rw: String::new(),
-                share_token_ro: String::new(),
+                share_token_rw: "".into(),
+                share_token_ro: "".into(),
                 locked: false,
                 schedule: None,
                 bg_color: None,
@@ -1756,7 +1758,7 @@ impl AppState {
             if let Some(p) = platform::process_cwd(pid)
                 && tab.last_known_cwd.as_deref() != Some(p.as_path())
             {
-                tab.last_known_cwd_string = Some(p.to_string_lossy().into_owned());
+                tab.last_known_cwd_string = Some(p.to_string_lossy().into());
                 tab.last_known_cwd = Some(p);
             }
         }
@@ -1791,7 +1793,7 @@ impl AppState {
             let roots: Vec<(String, u32)> = self
                 .tabs
                 .iter()
-                .map(|tab| (tab.id.clone(), tab.view.read(cx).pid()))
+                .map(|tab| (tab.id.to_string(), tab.view.read(cx).pid()))
                 .collect();
             let out = self.tab_connections.clone();
             cx.background_executor()
@@ -1805,18 +1807,18 @@ impl AppState {
             .tabs
             .iter()
             .map(|tab| {
-                let cwd = tab.last_known_cwd_string.clone();
+                let cwd = tab.last_known_cwd_string.as_deref().map(str::to_string);
                 TabState {
-                    id: tab.id.clone(),
-                    name: tab.name.clone(),
+                    id: tab.id.to_string(),
+                    name: tab.name.to_string(),
                     cwd,
                     colors_enabled: tab.view.read(cx).colors_enabled(),
                     net_disabled: tab.view.read(cx).net_disabled(),
-                    agent_session_id: tab.agent_session_id.clone(),
-                    agent_kind: tab.agent_kind.clone(),
+                    agent_session_id: tab.agent_session_id.as_deref().map(str::to_string),
+                    agent_kind: tab.agent_kind.as_deref().map(str::to_string),
                     agent_plan_mode: tab.agent_plan_mode,
-                    share_token_rw: tab.share_token_rw.clone(),
-                    share_token_ro: tab.share_token_ro.clone(),
+                    share_token_rw: tab.share_token_rw.to_string(),
+                    share_token_ro: tab.share_token_ro.to_string(),
                     locked: tab.locked,
                     schedule: tab.schedule.clone(),
                     bg_color: tab.bg_color.clone(),
@@ -1892,11 +1894,11 @@ impl AppState {
             let Some(grid) = tab.snap_cache.clone() else {
                 continue;
             };
-            let bg_color = crate::effective_tab_bg(tab.bg_color.as_deref(), self.tab_bg_global.as_deref()).to_string();
+            let bg_color = crate::effective_tab_bg(tab.bg_color.as_deref(), self.tab_bg_global.as_deref()).into();
             api_tabs.push(api::SnapshotTab {
                 id: tab.id.clone(),
-                name: ts.name.clone(),
-                cwd: ts.cwd.clone(),
+                name: tab.name.clone(),
+                cwd: tab.last_known_cwd_string.clone(),
                 // ANSI escapes are kept so the mobile remote can render
                 // colours instead of the previous flat-grey text.
                 output: grid.output,
@@ -1908,8 +1910,8 @@ impl AppState {
                 cursor: grid.cursor,
                 cols: grid.cols,
                 rows: grid.rows,
-                share_token_rw: ts.share_token_rw.clone(),
-                share_token_ro: ts.share_token_ro.clone(),
+                share_token_rw: tab.share_token_rw.clone(),
+                share_token_ro: tab.share_token_ro.clone(),
                 locked: ts.locked,
                 schedule: ts.schedule.clone(),
                 bg_color,
@@ -1925,7 +1927,7 @@ impl AppState {
                     .tab_connections
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .get(&tab.id)
+                    .get(&*tab.id)
                     .copied()
                     .unwrap_or(0),
                 // Desktop is unprivileged → no nft byte counters.
@@ -2138,7 +2140,7 @@ impl AppState {
             // so a future caller can't accidentally toggle the view
             // without also covering schedule-driven locks.
             for (tab_id, locked) in lock_changes {
-                if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+                if let Some(tab) = self.tabs.iter_mut().find(|t| *t.id == tab_id) {
                     tab.locked = locked;
                 }
             }
@@ -2149,7 +2151,7 @@ impl AppState {
             // than `respawn_tab_with_history`; refocus isn't needed for a
             // background toggle.
             for (tab_id, disabled) in net_changes {
-                if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+                if let Some(tab) = self.tabs.iter_mut().find(|t| *t.id == tab_id) {
                     let cwd = platform::process_cwd(tab.view.read(cx).pid()).or_else(|| std::env::current_dir().ok());
                     tab.view.update(cx, |v, _| {
                         v.set_net_disabled(disabled);
@@ -2158,7 +2160,7 @@ impl AppState {
                 }
             }
             for (tab_id, color) in bg_color_changes {
-                if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+                if let Some(tab) = self.tabs.iter_mut().find(|t| *t.id == tab_id) {
                     tab.bg_color = color;
                 }
             }
@@ -2166,14 +2168,14 @@ impl AppState {
             // cleared state persists into tabs.json (the snapshot was
             // already cleared by the endpoint for instant 401s).
             for tab_id in token_rotations {
-                if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
-                    tab.share_token_rw.clear();
-                    tab.share_token_ro.clear();
+                if let Some(tab) = self.tabs.iter_mut().find(|t| *t.id == tab_id) {
+                    tab.share_token_rw = "".into();
+                    tab.share_token_ro = "".into();
                 }
             }
             for (tab_id, context) in context_changes {
-                if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
-                    tab.context = context;
+                if let Some(tab) = self.tabs.iter_mut().find(|t| *t.id == tab_id) {
+                    tab.context = context.map(std::sync::Arc::from);
                 }
             }
             // Schedule changes — None clears, Some sets. Mirrors the
@@ -2181,7 +2183,7 @@ impl AppState {
             // `Tab` so the next persist tick rebuilds `tabs.json` +
             // `api_tabs` with the new value.
             for (tab_id, sched) in schedule_changes {
-                if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+                if let Some(tab) = self.tabs.iter_mut().find(|t| *t.id == tab_id) {
                     tab.schedule = sched;
                 }
             }
@@ -2227,7 +2229,7 @@ impl AppState {
                 }
             }
             for upd in status_updates {
-                let Some(tab) = self.tabs.iter_mut().find(|t| t.id == upd.tab_id) else {
+                let Some(tab) = self.tabs.iter_mut().find(|t| *t.id == upd.tab_id) else {
                     continue;
                 };
                 // "__clear__" sentinel from a POST with state=idle.
@@ -2247,10 +2249,10 @@ impl AppState {
                         updated_at: std::time::Instant::now(),
                     });
                     if upd.session_id.is_some() {
-                        tab.agent_session_id = upd.session_id;
+                        tab.agent_session_id = upd.session_id.map(std::sync::Arc::from);
                     }
                     if upd.agent_kind.is_some() {
-                        tab.agent_kind = upd.agent_kind;
+                        tab.agent_kind = upd.agent_kind.map(std::sync::Arc::from);
                     }
                     if upd.plan_mode.is_some() {
                         tab.agent_plan_mode = upd.plan_mode;
@@ -2346,7 +2348,7 @@ impl AppState {
                 // the durable attachment.
                 let alive = crate::catbus_agent::apply_sweep_activity(&mut tab.agent_state, activity, now);
                 if alive {
-                    live_agents.push((pid, tab.agent_session_id.clone().unwrap_or_default()));
+                    live_agents.push((pid, tab.agent_session_id.as_deref().unwrap_or_default().to_string()));
                     // Remember it (start-time-pinned) so close-all / quit can
                     // kill it even if it later escapes its tab's process group.
                     if let Some(st) = crate::agent_reaper::proc_start_time(pid) {
@@ -2480,8 +2482,8 @@ impl AppState {
             match (&self.tabs[idx].agent_kind, &self.tabs[idx].agent_session_id) {
                 (Some(k), Some(s)) => {
                     // Name the agent process after the tab (see the restore path).
-                    let title = crate::shell_supports_exec_a(&crate::clear_env_shell_path())
-                        .then_some(self.tabs[idx].name.as_str());
+                    let title =
+                        crate::shell_supports_exec_a(&crate::clear_env_shell_path()).then_some(&*self.tabs[idx].name);
                     crate::agent_launch_shell_suffix_instrumented(k, s, self.tabs[idx].agent_plan_mode, title)
                 }
                 _ => None,
@@ -2562,7 +2564,7 @@ impl AppState {
             return;
         }
         let old_name = self.tabs[idx].name.clone();
-        if old_name == new_name {
+        if *old_name == *new_name {
             return;
         }
         if !crate::read_only() {
@@ -2580,7 +2582,7 @@ impl AppState {
                 }
             }
         }
-        self.tabs[idx].name = new_name;
+        self.tabs[idx].name = new_name.into();
     }
 
     fn close_all_tabs(&mut self, cx: &mut Context<Self>) {
@@ -2592,7 +2594,7 @@ impl AppState {
             if let Some(p) = platform::process_cwd(pid)
                 && tab.last_known_cwd.as_deref() != Some(p.as_path())
             {
-                tab.last_known_cwd_string = Some(p.to_string_lossy().into_owned());
+                tab.last_known_cwd_string = Some(p.to_string_lossy().into());
                 tab.last_known_cwd = Some(p);
             }
         }
@@ -2600,18 +2602,18 @@ impl AppState {
             .tabs
             .iter()
             .map(|tab| {
-                let cwd = tab.last_known_cwd_string.clone();
+                let cwd = tab.last_known_cwd_string.as_deref().map(str::to_string);
                 TabState {
-                    id: tab.id.clone(),
-                    name: tab.name.clone(),
+                    id: tab.id.to_string(),
+                    name: tab.name.to_string(),
                     cwd,
                     colors_enabled: tab.view.read(cx).colors_enabled(),
                     net_disabled: tab.view.read(cx).net_disabled(),
-                    agent_session_id: tab.agent_session_id.clone(),
-                    agent_kind: tab.agent_kind.clone(),
+                    agent_session_id: tab.agent_session_id.as_deref().map(str::to_string),
+                    agent_kind: tab.agent_kind.as_deref().map(str::to_string),
                     agent_plan_mode: tab.agent_plan_mode,
-                    share_token_rw: tab.share_token_rw.clone(),
-                    share_token_ro: tab.share_token_ro.clone(),
+                    share_token_rw: tab.share_token_rw.to_string(),
+                    share_token_ro: tab.share_token_ro.to_string(),
                     locked: tab.locked,
                     bg_color: tab.bg_color.clone(),
                     limits: tab.limits.clone(),
@@ -2679,7 +2681,7 @@ impl AppState {
         let tab_name = if mode == ScreenshotMode::Redacted {
             "redacted".to_string()
         } else {
-            self.tabs[self.active].name.clone()
+            self.tabs[self.active].name.to_string()
         };
         // Turn tab names into redaction bars for this capture. The frame renders
         // censored (below, via `cx.notify()`), we wait, capture, then clear it.
@@ -2809,9 +2811,9 @@ impl AppState {
             // and stays out of the rename text (still raw name in the
             // rename editor).
             let base_name = if let Some((ri, ref text)) = self.renaming {
-                if ri == i { text.clone() } else { tab.name.clone() }
+                if ri == i { text.clone() } else { tab.name.to_string() }
             } else {
-                tab.name.clone()
+                tab.name.to_string()
             };
             let name = if tab.locked && self.renaming.as_ref().is_none_or(|(ri, _)| *ri != i) {
                 format!("🔒 {base_name}")
@@ -2931,7 +2933,7 @@ impl AppState {
                 .when_some(tab.context.clone(), |el, ctx| {
                     el.tooltip(move |_window, cx| {
                         cx.new(|_| TabContextTooltip {
-                            text: ctx.clone(),
+                            text: ctx.to_string(),
                             theme: theme_name,
                         })
                         .into()
@@ -2939,7 +2941,7 @@ impl AppState {
                 })
                 .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
                     if ev.click_count() >= 2 {
-                        let name = this.tabs[i].name.clone();
+                        let name = this.tabs[i].name.to_string();
                         this.renaming = Some((i, name));
                         this.rename_select_all = true;
                         this.rename_focus.focus(window);
@@ -3134,7 +3136,7 @@ impl AppState {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _ev: &MouseDownEvent, window, cx| {
-                            let name = this.tabs[idx].name.clone();
+                            let name = this.tabs[idx].name.to_string();
                             this.renaming = Some((idx, name));
                             this.rename_select_all = true;
                             this.context_menu = None;
@@ -3215,13 +3217,13 @@ impl AppState {
                                     &mut this.tabs[idx].share_token_rw
                                 };
                                 if slot_ref.is_empty() {
-                                    *slot_ref = crate::mint_share_token();
+                                    *slot_ref = crate::mint_share_token().into();
                                 }
                                 let token = slot_ref.clone();
                                 {
                                     let mut snap =
                                         this.api_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                                    if let Some(t) = snap.tabs.iter_mut().find(|t| t.id == tab_id) {
+                                    if let Some(t) = snap.tabs.iter_mut().find(|t| *t.id == *tab_id) {
                                         if ro {
                                             t.share_token_ro.clone_from(&token);
                                         } else {
@@ -3401,7 +3403,7 @@ impl AppState {
                             this.tabs[idx].view.read(cx).set_locked(next);
                             {
                                 let mut snap = this.api_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                                if let Some(t) = snap.tabs.iter_mut().find(|t| t.id == tab_id_for_lock) {
+                                if let Some(t) = snap.tabs.iter_mut().find(|t| *t.id == *tab_id_for_lock) {
                                     t.locked = next;
                                 }
                             }
@@ -3443,7 +3445,7 @@ impl AppState {
                                 {
                                     let mut snap =
                                         this.api_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                                    if let Some(t) = snap.tabs.iter_mut().find(|t| t.id == tab_id_for_net) {
+                                    if let Some(t) = snap.tabs.iter_mut().find(|t| *t.id == *tab_id_for_net) {
                                         t.net_disabled = next;
                                     }
                                 }
@@ -3511,7 +3513,7 @@ impl AppState {
                 .tab_connections
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(&self.tabs[stats_idx].id)
+                .get(&*self.tabs[stats_idx].id)
                 .copied()
                 .unwrap_or(0);
             if conns > 0 {
