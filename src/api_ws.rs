@@ -1477,4 +1477,94 @@ mod tests {
             );
         }
     }
+
+    fn snapshot_with(tab: crate::api::SnapshotTab) -> Arc<Mutex<TabSnapshot>> {
+        let mut snap = crate::api::test_snapshot(vec![tab]);
+        snap.master_token = "master-tok".to_string();
+        Arc::new(Mutex::new(snap))
+    }
+
+    #[test]
+    fn authorise_and_ring_grades_master_rw_and_ro_tokens() {
+        let mut tab = crate::api::test_snapshot_tab("uuid-1", "shell");
+        tab.share_token_rw = "rw-tok".into();
+        tab.share_token_ro = "ro-tok".into();
+        tab.pty_ring = Some(Arc::new(Mutex::new(PtyRing::default())));
+        let state = snapshot_with(tab);
+        let by = |key: &str, is_uuid: bool, provided: &str| {
+            authorise_and_ring(&state, "master-tok", key, is_uuid, provided.as_bytes())
+        };
+        let (authz, _, uuid) = by("uuid-1", true, "master-tok").expect("master grants rw");
+        assert!(matches!(authz, Authz::Rw));
+        assert_eq!(&*uuid, "uuid-1");
+        let (authz, _, _) = by("uuid-1", true, "rw-tok").expect("rw token grants rw");
+        assert!(matches!(authz, Authz::Rw));
+        let (authz, _, _) = by("0", false, "ro-tok").expect("index form + ro token");
+        assert!(matches!(authz, Authz::Ro));
+        assert!(by("uuid-1", true, "wrong").is_none(), "bad token refused");
+        assert!(by("uuid-9", true, "master-tok").is_none(), "unknown tab refused");
+    }
+
+    #[test]
+    fn snapshot_meta_carries_name_and_only_a_set_bg() {
+        let mut tab = crate::api::test_snapshot_tab("uuid-1", "builds");
+        let meta = snapshot_meta(&tab);
+        assert_eq!(meta.name, "builds");
+        assert_eq!(meta.bg_color, None, "empty override stays off the wire");
+        assert!(!meta.locked);
+        tab.bg_color = "#112233".into();
+        tab.locked = true;
+        let meta = snapshot_meta(&tab);
+        assert_eq!(meta.bg_color.as_deref(), Some("#112233"));
+        assert!(meta.locked);
+    }
+
+    #[test]
+    fn current_meta_resolves_the_tab_and_hands_back_its_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("outbox")).unwrap();
+        std::fs::write(tmp.path().join("outbox/r.txt"), b"x").unwrap();
+        let mut tab = crate::api::test_snapshot_tab("uuid-1", "shell");
+        tab.cwd = Some(tmp.path().to_string_lossy().into());
+        let state = snapshot_with(tab);
+        let mut counts = DirCountCache::new();
+        let (meta, cwd) = current_meta(&state, "uuid-1", Authz::Rw, &mut counts).expect("tab exists");
+        assert_eq!(meta.name, "shell");
+        assert_eq!(meta.outbox_count, 1, "counts filled after the lock is dropped");
+        assert_eq!(cwd.as_deref(), Some(&*tmp.path().to_string_lossy()));
+        assert!(
+            current_meta(&state, "uuid-9", Authz::Rw, &mut counts).is_none(),
+            "vanished tab yields None"
+        );
+    }
+
+    #[test]
+    fn handle_inbound_gates_ro_locked_and_vanished_tabs() {
+        let mut tab = crate::api::test_snapshot_tab("uuid-1", "shell");
+        tab.locked = false;
+        let state = snapshot_with(tab);
+        let mut dedup = ImeDedup::new();
+        // RW input frame queues the payload.
+        let frame = [&[1u8][..], b"ls\n"].concat();
+        handle_inbound(&frame, Authz::Rw, false, &state, "uuid-1", &mut dedup).expect("rw accepted");
+        let (idx, bytes) = {
+            let snap = state.lock().unwrap();
+            snap.pending_input.last().expect("queued").clone()
+        };
+        assert_eq!(idx, 0);
+        assert_eq!(bytes, b"ls\n");
+        // RO is a policy close before anything is parsed.
+        let err = handle_inbound(&frame, Authz::Ro, false, &state, "uuid-1", &mut dedup).unwrap_err();
+        assert_eq!(err.code, CloseCode::Policy);
+        // Process-level read-only closes too, even for RW tokens.
+        let err = handle_inbound(&frame, Authz::Rw, true, &state, "uuid-1", &mut dedup).unwrap_err();
+        assert_eq!(err.code, CloseCode::Policy);
+        // Unknown tab: the viewer's tab was closed under it.
+        let err = handle_inbound(&frame, Authz::Rw, false, &state, "uuid-9", &mut dedup).unwrap_err();
+        assert_eq!(err.code, CloseCode::Away);
+        // Locked tab refuses input.
+        state.lock().unwrap().tabs[0].locked = true;
+        let err = handle_inbound(&frame, Authz::Rw, false, &state, "uuid-1", &mut dedup).unwrap_err();
+        assert_eq!(err.code, CloseCode::Policy);
+    }
 }
