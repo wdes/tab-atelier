@@ -5440,6 +5440,17 @@ pub fn run() {
     });
 }
 
+/// Guake toggle decision for a hotkey press: SHOW (raise) the window unless it
+/// is already the visible, foreground window — in which case hide it.
+///
+/// Raising a window that's `visible` but NOT the active one (e.g. it's behind a
+/// browser opened by clicking a link) is what fixes the "press the hotkey twice
+/// to get it back" bug: a naive `!visible` flip would first minimise the
+/// already-behind window instead of revealing it.
+const fn hotkey_should_show(visible: bool, window_active: bool) -> bool {
+    !visible || !window_active
+}
+
 fn spawn_hotkey_listener(keycodes: &[u8], window_handle: WindowHandle<AppState>, cx: &mut App) {
     // An awaitable channel, not a polled std::mpsc: the old loop woke
     // 20×/s forever to try_recv a hotkey that fires a few times an hour.
@@ -5459,11 +5470,17 @@ fn spawn_hotkey_listener(keycodes: &[u8], window_handle: WindowHandle<AppState>,
         while rx.recv().await.is_some() {
             let _ = cx.update(|cx| {
                 let _ = window_handle.update(cx, |state, window, _cx| {
-                    state.visible = !state.visible;
-                    state
-                        .visible_flag
-                        .store(state.visible, std::sync::atomic::Ordering::Relaxed);
-                    if state.visible {
+                    // Toggle from the ACTUAL window state, not just our `visible`
+                    // flag. Clicking a link opens a browser on top of us: we stay
+                    // `visible == true` but are no longer the foreground window,
+                    // so a plain flip would minimise the already-behind window
+                    // (press 1) and only reveal it on press 2. Raising a
+                    // visible-but-unfocused window instead makes one press bring
+                    // us back.
+                    let show = hotkey_should_show(state.visible, window.is_window_active());
+                    state.visible = show;
+                    state.visible_flag.store(show, std::sync::atomic::Ordering::Relaxed);
+                    if show {
                         state.tabs[state.active].activate();
                         window.activate_window();
                     } else {
@@ -5480,6 +5497,18 @@ fn spawn_hotkey_listener(keycodes: &[u8], window_handle: WindowHandle<AppState>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hotkey_toggle_raises_a_visible_but_unfocused_window() {
+        // Foreground + visible → the hotkey hides it (normal Guake toggle).
+        assert!(!hotkey_should_show(true, true));
+        // Visible but NOT focused (a browser opened from a link is on top) →
+        // RAISE, not hide — this is the one-press-not-two fix.
+        assert!(hotkey_should_show(true, false));
+        // Hidden/minimised → show, regardless of the stale active bit.
+        assert!(hotkey_should_show(false, false));
+        assert!(hotkey_should_show(false, true));
+    }
 
     #[test]
     fn grid_dims_fits_viewport_minus_tab_bar() {
