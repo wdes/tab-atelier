@@ -416,6 +416,50 @@ When a tab carries both `agent_kind` and `agent_session_id` in `tabs.json`, the 
 
 If the agent CLI is no longer on `PATH`, the shell prints `command not found` and the tab is otherwise unaffected.
 
+## Tabs driving other tabs
+
+Every tab can shell out to the local API — the `tab-atelier` CLI is on `PATH` and auto-discovers the API token the same way `brain` does — so an agent (a `claude` session) running in one tab can see, message, and hand files to the other tabs. These are **client** commands: they talk to the running instance over the API, so they work alongside the desktop GUI without tripping the single-instance lock. `<tab>` is a **name, index, or UUID** everywhere (an ambiguous name errors and lists the candidate indexes, so a message never hits the wrong twin).
+
+**See who's around:**
+
+```bash
+tab-atelier tabs            # every tab: idx  uuid  name
+tab-atelier peers           # just the Claude tabs — name · state · cwd · current task
+tab-atelier peers --all     # include non-agent tabs
+tab-atelier peek <tab>      # read a peer's screen (ANSI-stripped, last 40 lines; --lines N, --raw)
+```
+
+**Send work to another agent** — `dispatch` (see also `docs/teamwork.md`):
+
+```bash
+# Fire-and-forget: type a prompt into another tab's agent.
+tab-atelier dispatch --to <tab> "re-run the migration and report the diff"
+
+# Ask-and-wait: send, poll until the target goes idle, then print its screen back.
+tab-atelier dispatch --to <tab> --wait "is this schema change safe?"
+
+# Spin up a FRESH agent tab and launch work in it.
+tab-atelier dispatch --new --name worker --cmd claude "port the auth tests to vitest"
+```
+
+`--wait` reports once the target's screen has been unchanged for `--quiet` seconds (default 8; `--timeout` bounds the total wait). The Enter that submits a prompt is sent as its own keystroke after a short delay, because Claude Code treats a prompt and a trailing newline arriving together as a paste.
+
+**Broadcast to everyone** — an append-only shared blackboard at `<state>/tab-atelier/blackboard.jsonl`:
+
+```bash
+tab-atelier note --topic schema --from api "users.email is now NOT NULL"
+tab-atelier notes --topic schema      # read a channel
+tab-atelier notes --since 42          # only entries after index 42 (incremental polling)
+```
+
+**Hand off a file** — copy it into a peer tab's `inbox/` (same place web uploads land):
+
+```bash
+tab-atelier handoff ./report.md db-expert
+```
+
+**Etiquette (and safety):** only `dispatch` to a tab `peers` shows as `idle`/`waiting`, never mid-turn; a locked tab refuses input; and never `--resume`/`--continue` another tab's session — it rotates/strips the session id. To make every agent aware of these verbs, drop the snippet from [`docs/teamwork.md`](docs/teamwork.md) into `~/.claude/CLAUDE.md`.
+
 ## Wakatime
 
 Wakatime integration is automatic if your Zed settings contain `wakatime.settings.api-key`. Heartbeats are sent with project detection (walks up to find `.git`).
