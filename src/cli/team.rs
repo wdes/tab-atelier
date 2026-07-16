@@ -116,6 +116,69 @@ pub fn peers(all: bool) -> i32 {
     0
 }
 
+/// One `tabs` line: `<idx>  <uuid>  <name>` — UUID-first so it copy-pastes
+/// straight into `dispatch --to <uuid>` or an API path.
+#[must_use]
+pub fn format_tab_line(t: &TabView) -> String {
+    format!("{:>3}  {}  {}", t.index, t.id, t.name)
+}
+
+/// List every tab as `idx  uuid  name`.
+///
+/// Unlike `peers` (Claude teammates only), this shows all tabs. A client
+/// command: it talks to the running instance over the local API, so it never
+/// trips the single-instance lock.
+#[must_use]
+pub fn tabs() -> i32 {
+    let ep = match discover_endpoint() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("tabs: {e}");
+            return 1;
+        }
+    };
+    let views = match fetch_tab_views(&ep) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("tabs: {e}");
+            return 1;
+        }
+    };
+    for t in &views {
+        println!("{}", format_tab_line(t));
+    }
+    0
+}
+
+/// CLI entry for `peek <tab> [--lines N] [--raw]`. Parses the flags the
+/// hand-rolled GUI dispatcher can't model with clap, then calls [`peek`].
+#[must_use]
+pub fn run_peek(args: &[String]) -> i32 {
+    let mut tab: Option<&str> = None;
+    let mut lines: usize = 40;
+    let mut raw = false;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--raw" => raw = true,
+            "--lines" => {
+                if let Some(n) = it.next().and_then(|v| v.parse().ok()) {
+                    lines = n;
+                }
+            }
+            other if tab.is_none() => tab = Some(other),
+            _ => {}
+        }
+    }
+    tab.map_or_else(
+        || {
+            eprintln!("peek: usage: tab-atelier peek <tab> [--lines N] [--raw]");
+            2
+        },
+        |t| peek(t, lines, raw),
+    )
+}
+
 /// Resolve a target key to exactly one tab.
 ///
 /// Tries, in order: exact name, then index, then UUID. An ambiguous name (more
@@ -268,6 +331,58 @@ pub fn format_note(idx: usize, n: &Note) -> String {
     let topic = n.topic.as_deref().map_or_else(String::new, |t| format!("[{t}] "));
     let from = n.from.as_deref().map_or_else(String::new, |f| format!("{f}: "));
     format!("#{idx} {topic}{from}{}", n.msg)
+}
+
+/// CLI entry for `note [--topic T] [--from NAME] <msg>` — parses the flags the
+/// GUI binary's hand-rolled dispatcher needs, then calls [`note`].
+#[must_use]
+pub fn run_note(args: &[String]) -> i32 {
+    let mut topic: Option<String> = None;
+    let mut from: Option<String> = None;
+    let mut msg: Option<&str> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--topic" => topic = it.next().cloned(),
+            "--from" => from = it.next().cloned(),
+            other if msg.is_none() => msg = Some(other),
+            _ => {}
+        }
+    }
+    msg.map_or_else(
+        || {
+            eprintln!("note: usage: tab-atelier note [--topic T] [--from NAME] <msg>");
+            2
+        },
+        |m| note(topic, from, m),
+    )
+}
+
+/// CLI entry for `notes [--topic T] [--since N]` — parses flags, calls [`notes`].
+#[must_use]
+pub fn run_notes(args: &[String]) -> i32 {
+    let mut topic: Option<&str> = None;
+    let mut since: Option<usize> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--topic" => topic = it.next().map(String::as_str),
+            "--since" => since = it.next().and_then(|v| v.parse().ok()),
+            _ => {}
+        }
+    }
+    notes(topic, since)
+}
+
+/// CLI entry for `handoff <file> <tab>` — calls [`handoff`].
+#[must_use]
+pub fn run_handoff(args: &[String]) -> i32 {
+    if let [file, tab, ..] = args {
+        handoff(Path::new(file), tab)
+    } else {
+        eprintln!("handoff: usage: tab-atelier handoff <file> <tab>");
+        2
+    }
 }
 
 /// `tab-atelier note [--topic T] [--from NAME] <msg>` — post to the blackboard.
@@ -436,6 +551,11 @@ mod tests {
         let mut l = tab(4, "ops", Some("claude"), None);
         l.locked = true;
         assert_eq!(format_peer_line(&l), "[4] ops 🔒 · idle · /w/ops");
+    }
+
+    #[test]
+    fn format_tab_line_is_index_uuid_name() {
+        assert_eq!(format_tab_line(&tab(7, "deb", None, None)), "  7  id-7  deb");
     }
 
     fn note(ts: u64, topic: Option<&str>, from: Option<&str>, msg: &str) -> Note {

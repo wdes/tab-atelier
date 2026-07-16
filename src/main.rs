@@ -114,6 +114,40 @@ fn main() {
                 let rest: Vec<String> = std::env::args().skip(2).collect();
                 std::process::exit(cli::flags::run(&rest));
             }
+            "tabs" | "list" => {
+                // List EVERY tab (idx, uuid, name) over the local API — a
+                // client command, so it works alongside the running GUI
+                // instead of tripping the single-instance lock.
+                std::process::exit(cli::team::tabs());
+            }
+            "peers" => {
+                // List sibling Claude tabs (name / state / cwd / context);
+                // `--all` includes non-Claude tabs.
+                let all = std::env::args().any(|a| a == "--all");
+                std::process::exit(cli::team::peers(all));
+            }
+            "peek" => {
+                // Read another tab's screen (ANSI-cleaned) — `peek <tab>
+                // [--lines N] [--raw]`.
+                let rest: Vec<String> = std::env::args().skip(2).collect();
+                std::process::exit(cli::team::run_peek(&rest));
+            }
+            "note" => {
+                // Post to the shared blackboard — `note [--topic T]
+                // [--from NAME] <msg>`.
+                let rest: Vec<String> = std::env::args().skip(2).collect();
+                std::process::exit(cli::team::run_note(&rest));
+            }
+            "notes" => {
+                // Read the shared blackboard — `notes [--topic T] [--since N]`.
+                let rest: Vec<String> = std::env::args().skip(2).collect();
+                std::process::exit(cli::team::run_notes(&rest));
+            }
+            "handoff" => {
+                // Drop a file into a peer tab's inbox/ — `handoff <file> <tab>`.
+                let rest: Vec<String> = std::env::args().skip(2).collect();
+                std::process::exit(cli::team::run_handoff(&rest));
+            }
             _ => {}
         }
     }
@@ -142,6 +176,9 @@ fn main() {
                      tab-atelier set-font …       set GUI font (--font NAME --size PX)\n  \
                      tab-atelier set-context …    label this tab with its PR/task (hover tooltip)\n  \
                      tab-atelier token            print the master API token (for API calls)\n  \
+                     tab-atelier tabs             list all tabs (idx, uuid, name)\n  \
+                     tab-atelier peers [--all]    list sibling Claude tabs (state, cwd)\n  \
+                     tab-atelier peek <tab> …     read another tab's screen (--lines N, --raw)\n  \
                      tab-atelier rotate-tokens    revoke all share tokens (old share links 401)\n  \
                      tab-atelier reset-master-token  rotate the master API token (old token 401s)\n  \
                      tab-atelier remote …         attach to a remote tab-atelier-headless\n  \
