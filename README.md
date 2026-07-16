@@ -91,7 +91,7 @@ The `.deb` lays out the following under FHS-standard paths:
 - **Ctrl+Shift+T** to open a new tab (inherits working directory)
 - **Alt+Tab** to cycle between tabs
 - Shell exit detection with close/respawn confirmation
-- Per-tab **agent state LED** to the left of the tab name (thinking / waiting / error / dormant), driven by an in-tab CLI (see [Agent state](#agent-state))
+- Per-tab **agent state LED** to the left of the tab name (working / unreviewed / error / idle), driven by an in-tab CLI (see [Agent state](#agent-state))
 
 **Session**
 - Tabs, working directories, and full terminal output persisted across restarts
@@ -244,7 +244,7 @@ tab-atelier rotate-tokens      # revoke every tab's share tokens → existing sh
 tab-atelier reset-master-token # rotate the master token live (no restart) → old token 401s
 ```
 
-`/tabs` also reports a `viewers` count per tab (how many web/remote viewers are attached); the headless `tabs` listing shows it as `👁 N`, and the desktop dormant-LED treats a watched tab as "tended".
+`/tabs` also reports a `viewers` count per tab (how many web/remote viewers are attached); the headless `tabs` listing shows it as `👁 N`, and the desktop LED treats a web-viewed tab as reviewed, so its "unreviewed work" (blue) flag is cleared while someone is watching.
 
 ## Remote tabs
 
@@ -313,18 +313,17 @@ The connection is allowed through (Phase 2 uses `disable_verification` on the wi
 
 ## Agent state
 
-Each tab carries an optional **agent state** rendered as a small colored LED to the left of the tab name:
+Each tab carries an optional **agent state** rendered as a small colored LED to the left of the tab name. The colour answers "_did an agent do work here, and have you seen it?_":
 
-| LED | State | What it means |
-|---|---|---|
-| ![#4ec9b0](https://placehold.co/13x13/4ec9b0/4ec9b0.png) steady teal | `thinking` | agent is actively working (or a tool subprocess is running) |
-| ![#d97706](https://placehold.co/13x13/d97706/d97706.png) ⇄ ![#737373](https://placehold.co/13x13/737373/737373.png) blinking amber | `waiting` | agent finished its turn — **your move**. Alternates amber↔grey every 500 ms (same cadence as the low-battery indicator) so it catches the eye without strobing |
-| ![#ef4444](https://placehold.co/13x13/ef4444/ef4444.png) steady red | `error` | the last turn errored or was aborted |
-| ![#5c99ff](https://placehold.co/13x13/5c99ff/5c99ff.png) steady blue | _dormant_ | a session is attached but it's been quiet **and** you haven't opened this tab in a while (≈3 min) — so a long-untended agent stands out across dozens of tabs. Opening the tab clears it back to grey |
-| ![#737373](https://placehold.co/13x13/737373/737373.png) steady grey | _attached, quiet_ | agent CLI lives here, no recent activity, but you've looked at it recently |
-| _(hidden)_ | _no session_ | no agent attached to this tab |
+| LED | Meaning |
+|---|---|
+| ![#4ec9b0](https://placehold.co/13x13/4ec9b0/4ec9b0.png) green | **working now** — a `thinking` hook is live, **or** the tab is streaming output (a reply, a spinner, a build printing) within the last few seconds |
+| ![#5c99ff](https://placehold.co/13x13/5c99ff/5c99ff.png) blue | **unreviewed work** — an agent took a real turn here while you weren't looking and has since stopped. Sticky until you **review** the tab (make it the foreground tab, or open its web viewer), then it clears to grey. Set only by a genuine turn, so restarting/resuming every agent at once does **not** turn them all blue |
+| ![#ef4444](https://placehold.co/13x13/ef4444/ef4444.png) red | **error** — the last turn errored or was aborted |
+| ![#737373](https://placehold.co/13x13/737373/737373.png) grey | **idle / seen** — a session is attached but there's nothing to review: it never took a turn, or you've already looked since it last worked |
+| _(hidden)_ | **no session** — no agent attached to this tab |
 
-The grey/blue-when-idle behaviour means the LED stays visible for the entire life of an attached agent session: once your shell sends a `--session <uuid>` it sticks until the session genuinely ends. After ~2 min of agent silence the transient `thinking`/`waiting`/`error` state is swept and the LED falls back to grey, then to **blue** once the tab has also gone ~3 min without you opening it. Claude Code's `SessionEnd` hook (or a manual `tab-atelier set-status idle`) wipes both the transient state and the durable session attachment so the LED disappears.
+The LED stays visible for the entire life of an attached session: once your shell sends a `--session <uuid>` it sticks until the session genuinely ends. While a background agent works its dot is green; when that turn finishes it goes **blue** ("you have output to look at here") and stays blue until you review the tab — then grey. "Review" means making the tab active or having its web viewer open. Claude Code's `SessionEnd` hook (or a manual `tab-atelier set-status idle`) wipes both the transient state and the durable session attachment, so the LED disappears.
 
 State is stored in RAM only (the durable session id, agent kind, and plan-mode flag are persisted to `tabs.json` for auto-resume).
 
