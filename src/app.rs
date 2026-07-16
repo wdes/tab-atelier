@@ -2725,7 +2725,23 @@ impl AppState {
             //   red    — the agent hit an error;
             //   grey   — nothing to review (never worked, or already reviewed).
             let session_attached = tab.agent_kind.is_some();
-            let agent_led = if tab.agent_state.is_some() || session_attached {
+            // Is the agent PROCESS actually running? The catbus sweep stamps
+            // `agent_pid` = Some when it finds a live `claude`/`catbus-agent`
+            // descendant, None when it's Gone. Without the sweep (catbus off) we
+            // can't tell, so assume alive and keep the old anchor-based LED.
+            #[cfg(feature = "catbus")]
+            let agent_alive = tab.agent_pid.get().is_some();
+            #[cfg(not(feature = "catbus"))]
+            let agent_alive = true;
+            // A tab whose durable session anchor survived but whose `claude`
+            // didn't restart (auto-resume failed / it was killed) no longer lights
+            // a "healthy" LED — the anchor stays in tabs.json for a manual resume,
+            // but the dot doesn't pretend an agent is there.
+            let agent_led = if agent_led_visible(
+                tab.agent_state.is_some(),
+                session_attached,
+                agent_alive || tab.unreviewed_work,
+            ) {
                 let grey = Hsla::from(Rgba {
                     r: 0.45,
                     g: 0.45,
@@ -5451,6 +5467,19 @@ const fn hotkey_should_show(visible: bool, window_active: bool) -> bool {
     !visible || !window_active
 }
 
+/// Whether the per-tab agent LED should be shown.
+///
+/// Visible for a live transient state (`thinking`/`waiting`/`error`), OR an
+/// attached session that still has something behind it — `live_or_unreviewed` is
+/// "the process is actually running, or it left unreviewed output". NOT for a
+/// session whose durable anchor outlived a `claude` that didn't restart (dead +
+/// reviewed + no state) — that lit an LED with no agent behind it, which reads as
+/// broken. The anchor still persists in `tabs.json` for a manual resume; the dot
+/// just stops pretending.
+const fn agent_led_visible(has_state: bool, attached: bool, live_or_unreviewed: bool) -> bool {
+    has_state || (attached && live_or_unreviewed)
+}
+
 fn spawn_hotkey_listener(keycodes: &[u8], window_handle: WindowHandle<AppState>, cx: &mut App) {
     // An awaitable channel, not a polled std::mpsc: the old loop woke
     // 20×/s forever to try_recv a hotkey that fires a few times an hour.
@@ -5497,6 +5526,19 @@ fn spawn_hotkey_listener(keycodes: &[u8], window_handle: WindowHandle<AppState>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_led_hidden_for_a_dead_session_with_nothing_to_review() {
+        // Live agent running (or unreviewed output left) → LED on.
+        assert!(agent_led_visible(false, true, true));
+        // A transient state always shows (a hook just fired).
+        assert!(agent_led_visible(true, true, false));
+        // The reported bug: durable anchor attached, but the claude never
+        // restarted (dead) and nothing to review, no state → NO LED.
+        assert!(!agent_led_visible(false, true, false));
+        // No session at all → never.
+        assert!(!agent_led_visible(false, false, false));
+    }
 
     #[test]
     fn hotkey_toggle_raises_a_visible_but_unfocused_window() {
