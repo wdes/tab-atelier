@@ -25,7 +25,7 @@ sudo apt install tab-atelier            # desktop / GUI
 sudo apt install tab-atelier-headless   # display-less server variant
 ```
 
-Replace `stable` with `nightly` to track `main` (versions look like `0.4.0~nightly20260527.123000-1` — the `~` makes them sort strictly **before** the next stable release per [Debian Versioning](https://wiki.debian.org/Versioning), so apt auto-downgrades-then-upgrades on the next stable bump).
+Replace `stable` with `nightly` to track `main` (versions look like `0.5.0~nightly20260715.082716-1` — the `~` makes them sort strictly **before** the next stable release per [Debian Versioning](https://wiki.debian.org/Versioning), so apt auto-downgrades-then-upgrades on the next stable bump).
 
 The two packages **conflict by design** (they both ship `/usr/bin/catbus-agent`). `apt install tab-atelier-headless` after `tab-atelier` swaps cleanly; `dpkg -i …` on both at once is what produced the file-collision error you saw on early `.deb` builds.
 
