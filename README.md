@@ -85,7 +85,7 @@ Always pass `-p tab-atelier` — a bare `cargo deb` in this workspace can packag
 - Full terminal emulation via alacritty_terminal (colors, scrollback, bracketed paste, ...)
 - GPU-accelerated rendering via gpui
 - Text selection with mouse, copy/paste from context menu
-- Clickable URLs and file paths detected in terminal output
+- Clickable URLs and file paths detected in terminal output — double-click opens; right-click a detected link for **Copy path (link)**
 - Reset input & color for misbehaving programs
 
 **Tabs**
