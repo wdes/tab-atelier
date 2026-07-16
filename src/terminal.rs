@@ -825,6 +825,14 @@ impl TerminalView {
         let Some(recipe) = self.spawn_recipe.take() else {
             return;
         };
+        // A shell tab prints its prompt as its very first output. On a fresh
+        // PTY that can glue onto whatever's already on the grid — a restored
+        // prompt, or bash's own SIGWINCH re-display after the initial resize —
+        // leaving two prompts on one line (`…$ …$`). Emit a leading CRLF (below,
+        // once the term exists) so the first prompt lands on its own clean line.
+        // Agent tabs exec `claude`, which clears + redraws its own screen, so
+        // they don't need — and shouldn't get — the extra line.
+        let is_shell = recipe.agent_launch.is_none();
         let (cols, lines) = self.last_size.get().unwrap_or((INITIAL_COLS, INITIAL_LINES));
         let cell = self.cell_size.unwrap_or(Size {
             width: px(8.4),
@@ -890,6 +898,16 @@ impl TerminalView {
         el.spawn();
         self.notifier = Some(notifier);
         self.pid = pid;
+        // A shell tab prints its prompt as its first output, which on a fresh /
+        // just-resized PTY can land glued to a reprint of itself (`…$ …$` on one
+        // line, from bash's SIGWINCH re-display). Send one Enter so bash emits a
+        // clean CRLF + a fresh prompt on its own line. RAW PTY write — NOT via
+        // `send_input`, whose keystroke bookkeeping (last_input stamp, predictive
+        // echo) must not fire for a synthetic newline. Agent tabs exec `claude`
+        // (clears + draws its own screen), so skip them.
+        if is_shell && let Some(n) = &self.notifier {
+            let _ = n.send(Msg::Input(b"\r".to_vec().into()));
+        }
         self.exited.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -1100,6 +1118,12 @@ impl TerminalView {
         self.notifier = Some(notifier);
 
         self.pid = pid;
+        // Respawn keeps the old grid, so the re-forked shell's prompt would glue
+        // onto it — same clean-line fix as `ensure_spawned` (raw PTY write, not a
+        // keystroke). Respawn always forks a shell.
+        if let Some(n) = &self.notifier {
+            let _ = n.send(Msg::Input(b"\r".to_vec().into()));
+        }
         self.exited.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -3592,7 +3616,11 @@ mod tests {
 
         window
             .update(cx, |view, _window, _cx| {
-                view.restore_output("select this text");
+                // Clear + home first so the seeded text lands at (0,0)
+                // deterministically — the live shell forked by `new` emits its
+                // prompt (and a startup newline) asynchronously, which would
+                // otherwise race the cursor.
+                view.restore_output("\x1b[2J\x1b[Hselect this text");
                 assert!(!view.has_selection(), "no selection yet");
                 let start = GridPoint::new(Line(0), Column(0));
                 let end = GridPoint::new(Line(0), Column(5));
