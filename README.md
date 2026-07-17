@@ -419,6 +419,16 @@ When a tab carries both `agent_kind` and `agent_session_id` in `tabs.json`, the 
 
 If the agent CLI is no longer on `PATH`, the shell prints `command not found` and the tab is otherwise unaffected.
 
+### Launching Claude in auto mode
+
+tab-atelier just types `claude --resume <uuid>` — the **permission mode** (manual, auto-accept, `auto`, plan) is Claude Code's own setting, not something tab-atelier overrides. To make sessions start in a given mode, use Claude Code's user-level default in `~/.claude/settings.json`:
+
+```json
+{ "permissions": { "defaultMode": "auto" } }
+```
+
+Values: `default` (manual — prompts for everything), `acceptEdits` (auto-accept file edits), `auto` (classifier-based auto-approval — the "⏵⏵ auto mode on" indicator; **requires account opt-in** and must be set at the **user** level, project-level `auto` is silently ignored), `plan`, `bypassPermissions`. This sets the default for **new** sessions; `--resume` restores whatever mode a session was last in (v2.1.143+), so once a tab's session has run in auto it resumes in auto. To force a mode on resume regardless, you'd pass `--permission-mode <mode>` yourself.
+
 ## Tabs driving other tabs
 
 Every tab can shell out to the local API — the `tab-atelier` CLI is on `PATH` and auto-discovers the API token the same way `brain` does — so an agent (a `claude` session) running in one tab can see, message, and hand files to the other tabs. These are **client** commands: they talk to the running instance over the API, so they work alongside the desktop GUI without tripping the single-instance lock. `<tab>` is a **name, index, or UUID** everywhere (an ambiguous name errors and lists the candidate indexes, so a message never hits the wrong twin).
