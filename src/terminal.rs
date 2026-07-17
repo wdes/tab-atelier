@@ -504,6 +504,29 @@ fn shift_rows<T>(rows: &mut [Option<T>], shift: i32) {
 /// scroll-forward — matches Zed's `alt_scroll()`.
 ///
 /// Positive `lines` ⇒ user wants OLDER content ⇒ up-arrow.
+/// Expand a leading `~`, `~/…`, or `$VAR/…`, or pass through an already-absolute
+/// path. `None` for a plain relative path — the caller joins it onto a cwd.
+fn expand_path_prefix(raw: &str) -> Option<std::path::PathBuf> {
+    use std::path::{Path, PathBuf};
+    if let Some(tail) = raw.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        Some(PathBuf::from(home).join(tail))
+    } else if raw == "~"
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        Some(PathBuf::from(home))
+    } else if let Some(rest) = raw.strip_prefix('$')
+        && let Some(slash) = rest.find('/')
+        && let Some(val) = std::env::var_os(&rest[..slash])
+    {
+        Some(PathBuf::from(val).join(&rest[slash + 1..]))
+    } else {
+        let p = Path::new(raw);
+        p.is_absolute().then(|| p.to_path_buf())
+    }
+}
+
 fn alt_scroll_bytes(lines: i32) -> Vec<u8> {
     let cmd = if lines > 0 { b'A' } else { b'B' };
     let n = lines.unsigned_abs() as usize;
@@ -1459,7 +1482,32 @@ impl TerminalView {
     #[must_use]
     pub fn hovered_url(&self) -> Option<String> {
         let (line, col) = self.hover_grid.get()?;
-        self.url_at_grid(line, col).map(|u| u.url.to_string())
+        let u = self.url_at_grid(line, col)?;
+        if u.is_file {
+            // Copy the FULL real path for a file link: expand ~/$VAR, make a
+            // cwd-relative path absolute against the tab's shell cwd, then
+            // canonicalise (realpath — symlinks + `.`/`..` resolved).
+            let abs = self.resolve_link_abs(file_path_for_open(&u.url));
+            Some(
+                std::fs::canonicalize(&abs)
+                    .unwrap_or(abs)
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        } else {
+            Some(u.url.to_string())
+        }
+    }
+
+    /// The `~`/`$VAR`/absolute/cwd-relative resolution of a detected file link,
+    /// shared by the open-file path and the "Copy path (link)" copy. A relative
+    /// path is joined onto the tab's shell cwd; if that can't be read it's
+    /// returned as-is (the caller's canonicalise will resolve it against the
+    /// process cwd or leave it).
+    fn resolve_link_abs(&self, raw: &str) -> std::path::PathBuf {
+        expand_path_prefix(raw)
+            .or_else(|| crate::platform::process_cwd(self.pid).map(|cwd| cwd.join(raw)))
+            .unwrap_or_else(|| std::path::PathBuf::from(raw))
     }
 
     /// Returns viewport-relative grid point and side (Line(0) = top of
@@ -1815,28 +1863,7 @@ impl Render for TerminalView {
                             if let Some(url) = this.url_at_grid(line, col) {
                                 let browser = this.browser.borrow().clone();
                                 if url.is_file {
-                                    let raw = file_path_for_open(&url.url);
-                                    let path = std::path::Path::new(raw);
-                                    let resolved = if let Some(tail) = raw.strip_prefix("~/")
-                                        && let Some(home) = std::env::var_os("HOME")
-                                    {
-                                        std::path::PathBuf::from(home).join(tail)
-                                    } else if raw == "~"
-                                        && let Some(home) = std::env::var_os("HOME")
-                                    {
-                                        std::path::PathBuf::from(home)
-                                    } else if let Some(rest) = raw.strip_prefix('$')
-                                        && let Some(slash) = rest.find('/')
-                                        && let Some(val) = std::env::var_os(&rest[..slash])
-                                    {
-                                        std::path::PathBuf::from(val).join(&rest[slash + 1..])
-                                    } else if path.is_absolute() {
-                                        path.to_path_buf()
-                                    } else if let Some(cwd) = crate::platform::process_cwd(this.pid) {
-                                        cwd.join(path)
-                                    } else {
-                                        path.to_path_buf()
-                                    };
+                                    let resolved = this.resolve_link_abs(file_path_for_open(&url.url));
                                     let ext = resolved
                                         .extension()
                                         .and_then(|e| e.to_str())
@@ -3072,6 +3099,25 @@ mod tests {
     use crate::term_export::sgr_color;
     use gpui::TestAppContext;
     use vte::ansi::{Color, NamedColor};
+
+    #[test]
+    fn expand_path_prefix_handles_home_env_and_absolute() {
+        use std::path::PathBuf;
+        // Already-absolute → passthrough.
+        assert_eq!(expand_path_prefix("/etc/hosts"), Some(PathBuf::from("/etc/hosts")));
+        // Plain relative → None (caller joins onto the tab cwd).
+        assert_eq!(expand_path_prefix("src/main.rs"), None);
+        assert_eq!(expand_path_prefix("./a"), None);
+        // ~ / ~/… expand against the real $HOME (set in every test env).
+        if let Some(home) = std::env::var_os("HOME") {
+            assert_eq!(expand_path_prefix("~"), Some(PathBuf::from(&home)));
+            assert_eq!(expand_path_prefix("~/x/y"), Some(PathBuf::from(&home).join("x/y")));
+        }
+        // $VAR/… expands from the environment; PATH is always present.
+        if let Some(_p) = std::env::var_os("PATH") {
+            assert!(expand_path_prefix("$PATH/bin").is_some());
+        }
+    }
 
     fn default_browser() -> Rc<RefCell<Option<String>>> {
         Rc::new(RefCell::new(None))
