@@ -2,12 +2,13 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Per-tab cgroup v2 resource limits for the headless daemon.
+//! Per-tab cgroup v2 resource limits (used by both binaries).
 //!
 //! ## Why
 //!
-//! Every tab is a child of the single `tab-atelier-headless.service`,
-//! so a unit-level `MemoryMax=` would limit *all tabs together*. To cap
+//! Every tab is a child of one process (the `tab-atelier-headless.service`,
+//! or the GUI app), so a unit-level `MemoryMax=` would limit *all tabs
+//! together*. To cap
 //! a single tab's memory / CPU / task count we put each tab's shell in
 //! its own cgroup under the service's **delegated** subtree and write
 //! that cgroup's `memory.max` / `cpu.max` / `pids.max`.
@@ -34,8 +35,18 @@
 //! outside systemd, cgroup v1, missing `Delegate=`, denied writes), the
 //! init disables limiting and [`apply`] becomes a no-op — tabs still
 //! spawn normally, just unlimited. Nothing here can fail a tab spawn.
+//!
+//! ## Shared by both binaries
+//!
+//! The GUI (`tab-atelier`) and the headless daemon (`tab-atelier-headless`)
+//! both use the `init` + `apply`/`reapply` here, so per-tab limits behave
+//! identically whichever binary owns the tab. The tab-LIFECYCLE helpers below
+//! (`ensure_tab`/`kill_tab`/`reap_stale_tabs`/`prepare_tab_cgroup`/
+//! `move_pid_to_tab_cgroup`) are the headless daemon's own teardown + nftables
+//! wiring and are gated `not(feature = "gui")` — the GUI drives its tabs a
+//! different way and would only get dead-code warnings for them.
 
-#![cfg(all(target_os = "linux", not(feature = "gui")))]
+#![cfg(target_os = "linux")]
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -158,6 +169,42 @@ pub fn apply(tab_id: &str, pid: u32, limits: &TabResourceLimits) {
     }
 }
 
+/// Re-apply `limits` to a tab's EXISTING cgroup at runtime (a `tab-atelier
+/// limit …` / `POST /tabs/<id>/limits` change on a *live* tab).
+///
+/// Unlike [`apply`] — spawn-time, a no-op when empty — this writes EVERY axis
+/// unconditionally, resetting any that's now unset back to `max`, so *lifting*
+/// a limit actually takes effect (writing only the `Some` axes would leave a
+/// previously-set ceiling in place). Creates the tab cgroup if the tab predates
+/// limiting, and re-adds the pid (a no-op if it's already there). No-op only
+/// when delegation is off. Same code drives both the GUI and headless.
+pub fn reapply(tab_id: &str, pid: u32, limits: &TabResourceLimits) {
+    let Some(Some(base)) = DELEGATED_BASE.get() else {
+        return;
+    };
+    let dir = base.join(format!("tab-{}", sanitize_id(tab_id)));
+    if std::fs::create_dir_all(&dir).is_err() {
+        debug!("cgroup: could not create {}; tab {tab_id} left as-is", dir.display());
+        return;
+    }
+    let _ = write_cgroup(
+        &dir.join("memory.max"),
+        &limits
+            .memory_max_bytes()
+            .map_or_else(|| "max".to_string(), |b| b.to_string()),
+    );
+    let _ = write_cgroup(
+        &dir.join("cpu.max"),
+        &limits.cpu_max_line().unwrap_or_else(|| "max 100000".to_string()),
+    );
+    let _ = write_cgroup(
+        &dir.join("pids.max"),
+        &limits.tasks_max.map_or_else(|| "max".to_string(), |t| t.to_string()),
+    );
+    let _ = write_cgroup(&dir.join("cgroup.procs"), &pid.to_string());
+    debug!("cgroup: re-applied limits to tab {tab_id} (pid {pid})");
+}
+
 /// Create a tab's cgroup (empty) and return its path **relative to the
 /// cgroup v2 mount** (e.g. `system.slice/tab-atelier-headless.service/tab-<id>`)
 /// for nftables' `socket cgroupv2` match. The path is deterministic and
@@ -166,6 +213,7 @@ pub fn apply(tab_id: &str, pid: u32, limits: &TabResourceLimits) {
 /// [`move_pid_to_tab_cgroup`] once the pid exists. `None` when delegation
 /// isn't set up. Idempotent.
 #[must_use]
+#[cfg(not(feature = "gui"))]
 pub fn prepare_tab_cgroup(tab_id: &str) -> Option<String> {
     let Some(Some(base)) = DELEGATED_BASE.get() else {
         return None;
@@ -177,6 +225,7 @@ pub fn prepare_tab_cgroup(tab_id: &str) -> Option<String> {
         .map(|rel| rel.to_string_lossy().into_owned())
 }
 
+#[cfg(not(feature = "gui"))]
 /// Move `pid` into the tab's (already [`prepare_tab_cgroup`]d) cgroup, so
 /// the nft rules keyed on it take effect. Best-effort: `false` if delegation
 /// is off or the write fails.
@@ -188,6 +237,7 @@ pub fn move_pid_to_tab_cgroup(tab_id: &str, pid: u32) -> bool {
     write_cgroup(&dir.join("cgroup.procs"), &pid.to_string()).is_ok()
 }
 
+#[cfg(not(feature = "gui"))]
 /// Ensure `tab_id` has its own cgroup and `pid` is in it. Idempotent.
 ///
 /// EVERY tab gets its own cgroup — even one with no resource limits — so its
@@ -202,6 +252,7 @@ pub fn ensure_tab(tab_id: &str, pid: u32) {
     }
 }
 
+#[cfg(not(feature = "gui"))]
 /// Kill a tab's ENTIRE process subtree and remove its cgroup. Best-effort.
 ///
 /// Writes `1` to the tab cgroup's `cgroup.kill` — a cgroup-v2 atomic SIGKILL
@@ -221,6 +272,7 @@ pub fn kill_tab(tab_id: &str) -> bool {
     killed
 }
 
+#[cfg(not(feature = "gui"))]
 /// On startup, kill + remove any `tab-*` cgroups left over from a PRIOR run.
 ///
 /// An unclean stop (crash, SIGKILL, or a `claude` that survived SIGHUP) leaves

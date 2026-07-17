@@ -148,6 +148,15 @@ fn main() {
                 let rest: Vec<String> = std::env::args().skip(2).collect();
                 std::process::exit(cli::team::run_handoff(&rest));
             }
+            "limit" => {
+                // Cap a tab's RAM/CPU/process-count (cgroup v2) over the local
+                // API — `limit <tab> [--memory 8G] [--cpu 250] [--tasks 512] |
+                // --clear`. Same POST the headless `limit` subcommand uses, so a
+                // user who only installed the GUI deb can still set per-tab
+                // ceilings from a shell (the two debs conflict).
+                let rest: Vec<String> = std::env::args().skip(2).collect();
+                std::process::exit(cli::share_link::limit_cli(&rest));
+            }
             _ => {}
         }
     }

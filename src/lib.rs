@@ -22,7 +22,9 @@ pub mod app;
 pub(crate) mod box_drawing;
 #[cfg(feature = "catbus")]
 pub(crate) mod catbus_agent;
-#[cfg(all(target_os = "linux", not(feature = "gui")))]
+// Shared by both binaries now (GUI applies per-tab cgroup limits too); the
+// module's own `#![cfg(target_os = "linux")]` scopes it to Linux.
+#[cfg(target_os = "linux")]
 pub(crate) mod cgroup;
 pub mod cli;
 #[cfg(not(feature = "gui"))]
@@ -895,6 +897,32 @@ impl TabResourceLimits {
         }
         // period = 100_000 µs; quota = pct% of one core within that.
         Some(format!("{} 100000", u64::from(pct) * 1000))
+    }
+
+    /// Apply a partial override: each `Some` axis in `over` replaces the one
+    /// here; `None` axes are left untouched. Backs `POST /tabs/<id>/limits`
+    /// (and the `tab-atelier limit` CLI) so a client can set just memory
+    /// without disturbing cpu/tasks.
+    pub fn merge(&mut self, over: &Self) {
+        if over.memory_max.is_some() {
+            self.memory_max.clone_from(&over.memory_max);
+        }
+        if over.cpu_quota_percent.is_some() {
+            self.cpu_quota_percent = over.cpu_quota_percent;
+        }
+        if over.tasks_max.is_some() {
+            self.tasks_max = over.tasks_max;
+        }
+    }
+
+    /// `false` when `memory_max` is set but doesn't parse to a byte count — so
+    /// the CLI/API can reject a bad value up front instead of silently no-op'ing
+    /// at cgroup-write time.
+    #[must_use]
+    pub fn memory_max_valid(&self) -> bool {
+        self.memory_max
+            .as_deref()
+            .is_none_or(|s| parse_memory_bytes(s).is_some())
     }
 }
 
@@ -2910,6 +2938,56 @@ mod tests {
             }
             .cpu_max_line()
             .is_none()
+        );
+    }
+
+    #[test]
+    fn tab_limits_merge_overrides_only_some_axes() {
+        let mut base = TabResourceLimits {
+            memory_max: Some("1G".into()),
+            cpu_quota_percent: Some(100),
+            tasks_max: Some(512),
+        };
+        // A partial override touches only the axes it sets.
+        base.merge(&TabResourceLimits {
+            cpu_quota_percent: Some(250),
+            ..Default::default()
+        });
+        assert_eq!(base.memory_max.as_deref(), Some("1G"), "memory untouched");
+        assert_eq!(base.cpu_quota_percent, Some(250), "cpu replaced");
+        assert_eq!(base.tasks_max, Some(512), "tasks untouched");
+        // Overriding memory replaces just that axis.
+        base.merge(&TabResourceLimits {
+            memory_max: Some("2G".into()),
+            ..Default::default()
+        });
+        assert_eq!(base.memory_max.as_deref(), Some("2G"));
+        assert_eq!(base.cpu_quota_percent, Some(250), "cpu still from prior merge");
+        // An empty override is a no-op.
+        let before = base.clone();
+        base.merge(&TabResourceLimits::default());
+        assert_eq!(base, before, "empty override changes nothing");
+    }
+
+    #[test]
+    fn tab_limits_memory_max_valid_gates_bad_values() {
+        // Unset is valid (nothing to reject).
+        assert!(TabResourceLimits::default().memory_max_valid());
+        // Parseable values pass.
+        assert!(
+            TabResourceLimits {
+                memory_max: Some("8G".into()),
+                ..Default::default()
+            }
+            .memory_max_valid()
+        );
+        // Garbage is rejected up front.
+        assert!(
+            !TabResourceLimits {
+                memory_max: Some("lots".into()),
+                ..Default::default()
+            }
+            .memory_max_valid()
         );
     }
 

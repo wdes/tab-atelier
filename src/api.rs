@@ -478,6 +478,13 @@ pub struct TabSnapshot {
     /// is fine — the remainder fall back to inheriting from the
     /// currently-active tab as before.
     pub pending_new_tab_cwds: std::collections::VecDeque<std::path::PathBuf>,
+    /// Per-tab resource-limit changes queued by `POST /tabs/<id>/limits`,
+    /// drained by the owner (GUI render loop / headless tick): `(tab uuid,
+    /// override, clear)`. `clear == true` lifts every axis; otherwise the
+    /// override's `Some` axes merge into the tab's current limits. The owner
+    /// persists the new limits to `tabs.json` and re-applies them to the live
+    /// cgroup — same handling in both binaries.
+    pub pending_limit_changes: Vec<(String, crate::TabResourceLimits, bool)>,
     /// (tab index, new name) pairs queued by `POST /tabs/{idx}/rename`.
     pub pending_renames: Vec<(usize, String)>,
     /// Queued agent-status updates from `POST /tabs/by-id/{id}/status`.
@@ -2141,6 +2148,62 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             let body = serde_json::to_string(&serde_json::json!({"queued": "new"})).unwrap_or_default();
             respond_json(stream, 200, &body);
         }
+        ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/limits") => {
+            // Set or clear per-tab resource limits on a live tab. Body (all
+            // fields optional): {"memory_max":"8G","cpu_quota_percent":250,
+            // "tasks_max":512} sets those axes; {"clear":true} lifts every
+            // limit back to unlimited. Accepts both /tabs/by-id/<uuid>/limits
+            // and /tabs/<idx>/limits, mirroring the /catbus routes.
+            let Some((key_raw, is_uuid)) = parse_tab_key(p, "/limits") else {
+                error_json(stream, 404, "missing tab id");
+                return;
+            };
+            let parsed: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+                Ok(v) => v,
+                Err(e) => {
+                    error_json(stream, 400, &format!("invalid JSON body: {e}"));
+                    return;
+                }
+            };
+            let clear = parsed
+                .get("clear")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let over = crate::TabResourceLimits {
+                memory_max: parsed.get("memory_max").and_then(|v| v.as_str()).map(str::to_owned),
+                cpu_quota_percent: parsed
+                    .get("cpu_quota_percent")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|n| u32::try_from(n).ok()),
+                tasks_max: parsed.get("tasks_max").and_then(serde_json::Value::as_u64),
+            };
+            if !clear && over.is_empty() {
+                error_json(
+                    stream,
+                    400,
+                    "provide memory_max / cpu_quota_percent / tasks_max, or clear:true",
+                );
+                return;
+            }
+            if !over.memory_max_valid() {
+                error_json(
+                    stream,
+                    400,
+                    "memory_max must be a byte count or K/M/G/T value (e.g. \"8G\")",
+                );
+                return;
+            }
+            let mut snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(idx) = resolve_tab_idx(&snap, key_raw, is_uuid) else {
+                drop(snap);
+                error_json(stream, 404, "tab not found");
+                return;
+            };
+            let id = snap.tabs[idx].id.clone();
+            snap.pending_limit_changes.push((id, over, clear));
+            drop(snap);
+            respond_json(stream, 200, r#"{"queued":"limits"}"#);
+        }
         ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/rename") => {
             let idx_str = &p["/tabs/".len()..p.len() - "/rename".len()];
             if let Ok(idx) = idx_str.parse::<usize>() {
@@ -3793,6 +3856,7 @@ mod tests {
             pending_schedule_changes: vec![],
             pending_new_tabs: 0,
             pending_new_tab_cwds: std::collections::VecDeque::new(),
+            pending_limit_changes: Vec::new(),
             pending_renames: vec![],
             pending_status_updates: vec![],
             cached_response: None,
