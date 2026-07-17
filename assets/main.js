@@ -171,6 +171,24 @@
       const endTouch = () => { lastTouchY = null; accumPx = 0; };
       termEl.addEventListener("touchend", endTouch, { passive: true });
       termEl.addEventListener("touchcancel", endTouch, { passive: true });
+
+      // Mouse wheel scrolls the LOCAL buffer, same as touch above — never the
+      // app. xterm.js's default forwards the wheel to the PTY as alternate-scroll
+      // arrow keys whenever a full-screen TUI (claude, less, vim) is on the
+      // alt-screen, so wheeling over a claude tab typed arrows INTO it instead of
+      // scrolling ("scroll sends keys"). Intercept in the capture phase, before
+      // xterm's own handler, and scroll xterm's scrollback ourselves. Shift+wheel
+      // is left alone so the browser can page-scroll.
+      termEl.addEventListener("wheel", (e) => {
+        if (e.shiftKey) return;
+        const ch = cellHeightPx();
+        const lines = e.deltaMode === 1
+          ? (Math.trunc(e.deltaY) || Math.sign(e.deltaY))       // DOM_DELTA_LINE
+          : (Math.trunc(e.deltaY / ch) || Math.sign(e.deltaY)); // DOM_DELTA_PIXEL
+        if (lines) term.scrollLines(lines);
+        e.preventDefault();
+        e.stopPropagation();
+      }, { passive: false, capture: true });
     }
 
     // Copy-selection UX. The /stream poll already pauses term.write()
