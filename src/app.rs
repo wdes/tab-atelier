@@ -5862,8 +5862,10 @@ mod tests {
                 }),
             }
         };
+        // Generous ceiling: the saver fsyncs, and a fully parallel test
+        // run can starve it well past a "reasonable" couple of seconds.
         let wait_for = |pred: &dyn Fn() -> bool| {
-            for _ in 0..200 {
+            for _ in 0..1000 {
                 if pred() {
                     return true;
                 }
