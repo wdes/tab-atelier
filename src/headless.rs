@@ -929,6 +929,7 @@ pub fn run() -> std::io::Result<()> {
         pending_schedule_changes: Vec::new(),
         pending_new_tabs: 0,
         pending_new_tab_cwds: std::collections::VecDeque::new(),
+        pending_limit_changes: Vec::new(),
         pending_renames: Vec::new(),
         pending_status_updates: Vec::new(),
         cached_response: None,
@@ -1748,6 +1749,7 @@ fn drain_pending(
     let token_rotations: Vec<String> = s.pending_token_rotations.drain(..).collect();
     let schedule_changes: Vec<(String, Option<crate::schedule::TabSchedule>)> =
         s.pending_schedule_changes.drain(..).collect();
+    let limit_changes: Vec<(String, crate::TabResourceLimits, bool)> = s.pending_limit_changes.drain(..).collect();
     let new_tabs = std::mem::take(&mut s.pending_new_tabs);
     let new_tab_cwds: std::collections::VecDeque<std::path::PathBuf> = std::mem::take(&mut s.pending_new_tab_cwds);
     drop(s);
@@ -1765,6 +1767,7 @@ fn drain_pending(
         && context_changes.is_empty()
         && token_rotations.is_empty()
         && schedule_changes.is_empty()
+        && limit_changes.is_empty()
         && new_tabs == 0
         && new_tab_cwds.is_empty());
     // CLI / API lock toggles → runtime HeadlessTab. tabs.json picks
@@ -1845,6 +1848,27 @@ fn drain_pending(
     for (tab_id, context) in context_changes {
         if let Some(t) = tabs.iter_mut().find(|t| t.id == tab_id) {
             t.context = context;
+        }
+    }
+
+    // Per-tab resource-limit changes (`tab-atelier limit …` / POST
+    // /tabs/<id>/limits): `clear` resets every axis, otherwise the override's
+    // `Some` axes merge in. The new limits persist to tabs.json on the tick
+    // below; re-applied live against the tab's cgroup so a running tab is
+    // capped (or freed) without a respawn.
+    for (tab_id, over, clear) in limit_changes {
+        if let Some(t) = tabs.iter_mut().find(|t| t.id == tab_id) {
+            if clear {
+                t.limits = crate::TabResourceLimits::default();
+            } else {
+                t.limits.merge(&over);
+            }
+            #[cfg(target_os = "linux")]
+            crate::cgroup::reapply(
+                &t.id,
+                t.pid,
+                &crate::TabResourceLimits::resolve(&t.limits, default_limits),
+            );
         }
     }
 

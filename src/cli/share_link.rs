@@ -432,6 +432,142 @@ pub fn net_on(args: &[String]) -> i32 {
     set_net(args, false, "net-on")
 }
 
+/// `limit <tab> [--memory V] [--cpu PCT] [--tasks N] | --clear` — cap a tab's
+/// RAM / CPU / process-count by `POST`ing to `/tabs/by-id/<uuid>/limits`.
+///
+/// Each flag sets one axis (`--memory 8G`, `--cpu 250` = 2.5 cores,
+/// `--tasks 512`); axes you don't pass keep their current value. `--clear`
+/// lifts every limit. The daemon (or GUI) re-applies the tab's cgroup on its
+/// next drain tick, so a running tab is capped — or freed — without a respawn.
+#[must_use]
+pub fn limit(tab: &str, memory: Option<&str>, cpu: Option<u32>, tasks: Option<u64>, clear: bool) -> i32 {
+    if !clear && memory.is_none() && cpu.is_none() && tasks.is_none() {
+        eprintln!("limit: pass --memory/--cpu/--tasks to set a ceiling, or --clear to lift all");
+        return 2;
+    }
+    let ep = match discover_endpoint() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("limit: {e}");
+            return 1;
+        }
+    };
+    let (idx, uuid) = match resolve(&ep, tab) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("limit: {e}");
+            return 1;
+        }
+    };
+    let mut body = serde_json::Map::new();
+    if clear {
+        body.insert("clear".into(), serde_json::Value::Bool(true));
+    }
+    let mut set_parts: Vec<String> = Vec::new();
+    if let Some(m) = memory {
+        body.insert("memory_max".into(), serde_json::Value::String(m.to_owned()));
+        set_parts.push(format!("memory={m}"));
+    }
+    if let Some(c) = cpu {
+        body.insert("cpu_quota_percent".into(), serde_json::Value::from(c));
+        set_parts.push(format!("cpu={c}%"));
+    }
+    if let Some(t) = tasks {
+        body.insert("tasks_max".into(), serde_json::Value::from(t));
+        set_parts.push(format!("tasks={t}"));
+    }
+    let payload = serde_json::Value::Object(body).to_string();
+    match agent()
+        .post(format!("{}/tabs/by-id/{uuid}/limits", ep.url))
+        .header("Authorization", format!("Bearer {}", ep.token))
+        .header("Content-Type", "application/json")
+        .send(payload.as_bytes())
+    {
+        Ok(_) => {
+            if clear {
+                println!("limits cleared for tab {idx} (applies on the next drain tick)");
+            } else {
+                println!(
+                    "limits set for tab {idx}: {} (applies on the next drain tick)",
+                    set_parts.join(", ")
+                );
+            }
+            0
+        }
+        Err(ureq::Error::StatusCode(400)) => {
+            eprintln!("limit: server rejected the request — check --memory (bytes or K/M/G/T, e.g. 8G)");
+            1
+        }
+        Err(ureq::Error::StatusCode(404)) => {
+            eprintln!("limit: no such tab '{tab}'");
+            1
+        }
+        Err(e) => {
+            eprintln!("limit: {e}");
+            1
+        }
+    }
+}
+
+/// `&[String]` front-end for [`limit`], used by the GUI binary's subcommand
+/// match (`tab-atelier limit <tab> …`).
+///
+/// The headless binary reaches [`limit`] through clap instead; both funnel into
+/// the same POST so the two implementations stay identical.
+#[must_use]
+pub fn limit_cli(args: &[String]) -> i32 {
+    let mut tab: Option<&str> = None;
+    let mut memory: Option<&str> = None;
+    let mut cpu: Option<u32> = None;
+    let mut tasks: Option<u64> = None;
+    let mut clear = false;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--memory" | "-m" => {
+                let Some(v) = it.next() else {
+                    eprintln!("limit: --memory needs a value (e.g. 8G)");
+                    return 2;
+                };
+                memory = Some(v.as_str());
+            }
+            "--cpu" | "-c" => {
+                let Some(v) = it.next() else {
+                    eprintln!("limit: --cpu needs a value (percent of one core)");
+                    return 2;
+                };
+                let Ok(n) = v.parse::<u32>() else {
+                    eprintln!("limit: --cpu must be a whole number (percent of one core, e.g. 250)");
+                    return 2;
+                };
+                cpu = Some(n);
+            }
+            "--tasks" | "-t" => {
+                let Some(v) = it.next() else {
+                    eprintln!("limit: --tasks needs a value");
+                    return 2;
+                };
+                let Ok(n) = v.parse::<u64>() else {
+                    eprintln!("limit: --tasks must be a whole number");
+                    return 2;
+                };
+                tasks = Some(n);
+            }
+            "--clear" => clear = true,
+            other if tab.is_none() && !other.starts_with('-') => tab = Some(other),
+            other => {
+                eprintln!("limit: unexpected argument '{other}'");
+                return 2;
+            }
+        }
+    }
+    let Some(tab) = tab else {
+        eprintln!("usage: tab-atelier limit <tab> [--memory 8G] [--cpu 250] [--tasks 512] | --clear");
+        return 2;
+    };
+    limit(tab, memory, cpu, tasks, clear)
+}
+
 /// Human-readable byte size (1.5 KB, 3.4 MB, …).
 fn human_bytes(n: u64) -> String {
     const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];

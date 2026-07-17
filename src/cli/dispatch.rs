@@ -88,6 +88,27 @@ pub enum Commands {
         tab: String,
     },
 
+    /// Cap a tab's resources (cgroup v2): RAM, CPU, and process count. Flags
+    /// set one axis each; unset axes keep their current value. `--clear` lifts
+    /// every limit. Applied live on the next drain tick — no respawn. Linux +
+    /// a delegated cgroup subtree only (see docs/per-tab-limits.md).
+    Limit {
+        /// Tab index or UUID.
+        tab: String,
+        /// Memory ceiling (`memory.max`): bytes or K/M/G/T, e.g. `8G`.
+        #[arg(long)]
+        memory: Option<String>,
+        /// CPU ceiling as a percent of one core: `100` = one core, `250` = 2.5.
+        #[arg(long)]
+        cpu: Option<u32>,
+        /// Max tasks (processes + threads) in the tab's tree (`pids.max`).
+        #[arg(long)]
+        tasks: Option<u64>,
+        /// Lift every limit on the tab (back to unlimited).
+        #[arg(long, conflicts_with_all = ["memory", "cpu", "tasks"])]
+        clear: bool,
+    },
+
     /// Cut a tab's internet — respawn its shell inside a bubblewrap
     /// network namespace (loopback only). Needs `bubblewrap` installed.
     #[command(name = "net-off")]
@@ -466,6 +487,13 @@ pub fn dispatch(cli: Cli) -> bool {
         Commands::Rename { tab, name } => crate::cli::share_link::rename(&[tab, name]),
         Commands::Lock { tab } => crate::cli::share_link::lock(&[tab]),
         Commands::Unlock { tab } => crate::cli::share_link::unlock(&[tab]),
+        Commands::Limit {
+            tab,
+            memory,
+            cpu,
+            tasks,
+            clear,
+        } => crate::cli::share_link::limit(&tab, memory.as_deref(), cpu, tasks, clear),
         Commands::NetOff { tab } => crate::cli::share_link::net_off(&[tab]),
         Commands::NetOn { tab } => crate::cli::share_link::net_on(&[tab]),
         Commands::NetAllow {
