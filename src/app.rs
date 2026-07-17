@@ -2300,12 +2300,20 @@ impl AppState {
             // `AgentActivity::Gone` arm above already demotes the LED from the
             // same walk — and keeps the durable session — so it was pure
             // duplicate syscall traffic.)
-            // Auto-resume sweep: type the queued resume command into
-            // any tab whose shell has had ~500ms to print its prompt.
-            // `flush_pending_agent_resume` takes the queued command,
-            // so each tab fires at most once.
+            // Auto-resume sweep: type the queued resume command into a tab once
+            // its shell is actually up and has printed its prompt — keyed off
+            // "the PTY ring has produced bytes", NOT a fixed delay after tab
+            // CREATION. Tabs spawn LAZILY (the background loader forks ~2 shells
+            // per 40 ms, so a 60-tab restore takes >1 s); a creation-relative
+            // timer fired the resume ~500 ms in, while a not-yet-spawned tab had
+            // no shell — `flush` then `take()`s the command and sends it into a
+            // dead notifier, silently losing it, so `claude` never resumed and
+            // the anchor went stale. Gating on real output means each tab
+            // resumes whenever its shell comes up, however late. A live shell
+            // buffers the typed bytes, so it's safe the moment it's produced its
+            // prompt. `flush` takes the command, so each tab fires at most once.
             for tab in &mut self.tabs {
-                if tab.pending_agent_resume.is_some() && tab.created_at.elapsed().as_millis() >= 500 {
+                if tab.pending_agent_resume.is_some() && tab.view.read(cx).ring_len() > 0 {
                     tab.flush_pending_agent_resume(cx);
                 }
             }
