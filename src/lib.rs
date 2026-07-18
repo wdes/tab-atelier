@@ -27,6 +27,9 @@ pub(crate) mod catbus_agent;
 #[cfg(target_os = "linux")]
 pub(crate) mod cgroup;
 pub mod cli;
+/// The shared alacritty `EventListener` both editions attach to their `Term`.
+pub(crate) mod event_proxy;
+pub(crate) use event_proxy::EventProxy;
 #[cfg(not(feature = "gui"))]
 pub mod headless;
 /// Experimental HTTP/3 + WebTransport transport (behind `http3`).
@@ -170,6 +173,26 @@ pub fn apply_telemetry_disable_env<S: std::hash::BuildHasher>(env: &mut std::col
     for (k, v) in TELEMETRY_DISABLE_ENV {
         env.insert((*k).to_string(), (*v).to_string());
     }
+}
+
+/// Per-tab environment extras for the NORMAL (non-cleared) spawn path.
+///
+/// The colour vars from the tab's own flag, plus the telemetry opt-out;
+/// layered on top of the inherited parent environment by the caller. Shared by
+/// both editions (the GUI's `terminal.rs` and the headless daemon) so the two
+/// spawn paths can't drift; the cleared-env path uses [`minimal_pty_env`].
+#[must_use]
+pub fn pty_env(colors_enabled: bool) -> std::collections::HashMap<String, String> {
+    let mut env = std::collections::HashMap::new();
+    if colors_enabled {
+        env.insert("TERM".into(), "xterm-256color".into());
+        env.insert("COLORTERM".into(), "truecolor".into());
+    } else {
+        env.insert("TERM".into(), "dumb".into());
+    }
+    // Force the telemetry / feedback-survey opt-out onto every tab.
+    apply_telemetry_disable_env(&mut env);
+    env
 }
 
 /// Parent-environment variables carried over into a cleared-env tab.

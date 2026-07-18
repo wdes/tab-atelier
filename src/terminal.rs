@@ -145,7 +145,7 @@ mod paint_log {
     }
 }
 
-use alacritty_terminal::event::{Event as AlacrittyEvent, EventListener, WindowSize};
+use alacritty_terminal::event::WindowSize;
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point as GridPoint, Side};
@@ -193,74 +193,7 @@ pub struct DetectedUrl {
     pub is_file: bool,
 }
 
-/// Alacritty calls `send_event(Event::PtyWrite(text))` whenever the
-/// VT parser produces a reply that has to travel back into the PTY's
-/// stdin — Device Status Report (`ESC[6n`), primary device attributes,
-/// window-size queries, color queries, and so on. The default trait
-/// impl is a no-op, which silently drops those replies and breaks
-/// anything that waits on them (reedline times out on its cursor-
-/// position probe, for instance). This proxy holds a slot for the
-/// `EventLoopSender` that the caller fills in once `EventLoop::spawn`
-/// has handed it back; until then events are buffered into the void,
-/// which is fine because no PTY exists to read them yet.
-#[derive(Clone, Default)]
-struct EventProxy {
-    notifier: Arc<std::sync::Mutex<Option<EventLoopSender>>>,
-    /// Active theme, so OSC colour queries (see `send_event`) answer with
-    /// the palette the tab is actually painted in. Kept in sync by
-    /// [`TerminalView::set_theme`]. `Arc<Mutex<_>>` because the proxy is
-    /// cloned into the parser thread.
-    theme: Arc<std::sync::Mutex<ThemeName>>,
-    /// Flipped by `ChildExit` — alacritty's event loop already watches
-    /// the PTY child, so the shell's death arrives as an event instead
-    /// of the 500 ms `process_alive` `/proc` poll every tab used to run
-    /// for its whole life. Shared with [`TerminalView::exited`].
-    exited: Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl EventProxy {
-    fn set_notifier(&self, sender: EventLoopSender) {
-        if let Ok(mut slot) = self.notifier.lock() {
-            *slot = Some(sender);
-        }
-    }
-
-    fn set_theme(&self, theme: ThemeName) {
-        if let Ok(mut t) = self.theme.lock() {
-            *t = theme;
-        }
-    }
-}
-
-impl EventListener for EventProxy {
-    fn send_event(&self, event: AlacrittyEvent) {
-        let bytes: Vec<u8> = match event {
-            AlacrittyEvent::PtyWrite(text) => text.into_bytes(),
-            AlacrittyEvent::ChildExit(_) => {
-                self.exited.store(true, std::sync::atomic::Ordering::Relaxed);
-                return;
-            }
-            // Answer OSC colour queries (OSC 4 palette / 10 fg / 11 bg /
-            // 12 cursor). Without a reply the query times out and the app
-            // assumes a default (near-black) background — Claude Code then
-            // computes its diff highlight colours for that imagined bg, and
-            // those clash with our real navy theme (added lines render a
-            // blue that nearly matches the background). Replying with the
-            // actual palette lets the app blend against the right bg.
-            AlacrittyEvent::ColorRequest(index, formatter) => {
-                let theme = self.theme.lock().map_or_else(|_| ThemeName::default(), |t| *t);
-                formatter(crate::theme::theme(theme).color_index_to_rgb(index)).into_bytes()
-            }
-            _ => return,
-        };
-        if let Ok(slot) = self.notifier.lock()
-            && let Some(sender) = slot.as_ref()
-        {
-            let _ = sender.send(Msg::Input(bytes.into()));
-        }
-    }
-}
-
+use crate::EventProxy;
 use crate::term_export::TermDims;
 
 /// `(start_col, end_col, url, is_file)` — one detected URL in a cached line.
@@ -535,19 +468,6 @@ fn alt_scroll_bytes(lines: i32) -> Vec<u8> {
         out.extend_from_slice(&[0x1b, b'O', cmd]);
     }
     out
-}
-
-fn pty_env(colors_enabled: bool) -> HashMap<String, String> {
-    let mut env = HashMap::new();
-    if colors_enabled {
-        env.insert("TERM".into(), "xterm-256color".into());
-        env.insert("COLORTERM".into(), "truecolor".into());
-    } else {
-        env.insert("TERM".into(), "dumb".into());
-    }
-    // Force the telemetry / feedback-survey opt-out onto every tab.
-    crate::apply_telemetry_disable_env(&mut env);
-    env
 }
 
 impl TerminalView {
@@ -883,7 +803,7 @@ impl TerminalView {
                 ..Default::default()
             }
         } else {
-            let mut env = pty_env(colors);
+            let mut env = crate::pty_env(colors);
             env.extend(recipe.extra_env);
             tty::Options {
                 working_directory: recipe.cwd,
@@ -1094,13 +1014,13 @@ impl TerminalView {
             tty::Options {
                 shell: Some(tty::Shell::new(prog, args)),
                 working_directory: cwd.map(std::path::Path::to_path_buf),
-                env: pty_env(self.colors_enabled.get()),
+                env: crate::pty_env(self.colors_enabled.get()),
                 ..Default::default()
             }
         } else {
             tty::Options {
                 working_directory: cwd.map(std::path::Path::to_path_buf),
-                env: pty_env(self.colors_enabled.get()),
+                env: crate::pty_env(self.colors_enabled.get()),
                 ..Default::default()
             }
         };
