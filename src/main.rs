@@ -64,6 +64,18 @@ fn main() {
                      tab-atelier tabs             list all tabs (idx, uuid, name)\n  \
                      tab-atelier peers [--all]    list sibling Claude tabs (state, cwd)\n  \
                      tab-atelier peek <tab> …     read another tab's screen (--lines N, --raw)\n  \
+                     tab-atelier note|notes …     post / read the shared blackboard\n  \
+                     tab-atelier handoff <file> <tab>  drop a file into a tab's inbox/\n  \
+                     tab-atelier add <path> [name]  open a new tab at a path\n  \
+                     tab-atelier close <tab>      close a tab\n  \
+                     tab-atelier rename <tab> <name>  rename a tab\n  \
+                     tab-atelier lock|unlock <tab>  block / allow input on a tab\n  \
+                     tab-atelier input <tab> <text>  send keystrokes to a tab\n  \
+                     tab-atelier output <tab>     print a tab's scrollback\n  \
+                     tab-atelier share-link <tab> [--ro]  print a share URL for a tab\n  \
+                     tab-atelier bg-color <tab> <color>  set a tab's background\n  \
+                     tab-atelier net-off|net-on <tab>  cut / restore a tab's internet\n  \
+                     tab-atelier limit <tab> …    cap a tab's RAM/CPU (--memory/--cpu/--tasks | --clear)\n  \
                      tab-atelier rotate-tokens    revoke all share tokens (old share links 401)\n  \
                      tab-atelier reset-master-token  rotate the master API token (old token 401s)\n  \
                      tab-atelier remote …         attach to a remote tab-atelier-headless\n  \
