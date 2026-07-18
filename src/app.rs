@@ -3975,7 +3975,7 @@ impl AppState {
                             this.select_tab(idx, window, cx);
                         }),
                     )
-                    .child(div().overflow_hidden().child(name))
+                    .child(div().overflow_hidden().child(name.to_string()))
                     .child(div().flex_none().text_size(px(12.0)).text_color(muted).child(ago)),
             );
         }
