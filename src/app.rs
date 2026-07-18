@@ -5365,13 +5365,13 @@ impl Render for AppState {
                     let len = this.tab_switcher.as_ref().map_or(0, |s| s.order.len());
                     match ks.key.as_str() {
                         "escape" => this.close_tab_switcher(window, cx),
-                        "up" | "k" => {
+                        "up" => {
                             if let Some(s) = this.tab_switcher.as_mut() {
                                 s.selected = s.selected.saturating_sub(1);
                             }
                             cx.notify();
                         }
-                        "down" | "j" => {
+                        "down" => {
                             if let Some(s) = this.tab_switcher.as_mut()
                                 && s.selected + 1 < len
                             {
