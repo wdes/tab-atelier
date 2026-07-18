@@ -24,7 +24,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use alacritty_terminal::event::{Event as AlacrittyEvent, EventListener, WindowSize};
+use alacritty_terminal::event::WindowSize;
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::sync::FairMutex;
@@ -56,33 +56,7 @@ const TICK_HOT: Duration = Duration::from_secs(2);
 // `crate::api_url_for_local_clients`, and
 // `crate::build_agent_resume_command` in lib.rs.
 
-/// Tiny `EventListener` that just keeps the PTY-reply channel hooked
-/// up. Same shape as `terminal.rs::EventProxy` minus the gpui-side
-/// notify call.
-#[derive(Clone, Default)]
-struct EventProxy {
-    notifier: Arc<Mutex<Option<EventLoopSender>>>,
-}
-
-impl EventProxy {
-    fn set_notifier(&self, sender: EventLoopSender) {
-        if let Ok(mut slot) = self.notifier.lock() {
-            *slot = Some(sender);
-        }
-    }
-}
-
-impl EventListener for EventProxy {
-    fn send_event(&self, event: AlacrittyEvent) {
-        if let AlacrittyEvent::PtyWrite(text) = event
-            && let Ok(slot) = self.notifier.lock()
-            && let Some(sender) = slot.as_ref()
-        {
-            let _ = sender.send(Msg::Input(text.into_bytes().into()));
-        }
-    }
-}
-
+use crate::EventProxy;
 use crate::term_export::TermDims;
 
 /// Per-tab headless state. Mirrors the persistable fields of the
@@ -407,19 +381,6 @@ impl HeadlessTab {
     }
 }
 
-fn pty_env(colors_enabled: bool) -> HashMap<String, String> {
-    let mut env = HashMap::new();
-    if colors_enabled {
-        env.insert("TERM".into(), "xterm-256color".into());
-        env.insert("COLORTERM".into(), "truecolor".into());
-    } else {
-        env.insert("TERM".into(), "dumb".into());
-    }
-    // Force the telemetry / feedback-survey opt-out onto every tab.
-    crate::apply_telemetry_disable_env(&mut env);
-    env
-}
-
 #[allow(clippy::too_many_arguments)]
 fn spawn_pty_tab(
     id: String,
@@ -492,7 +453,7 @@ fn spawn_pty_tab(
         // telemetry opt-out (pty_env) and the per-tab API vars. No `-l`:
         // a login shell would source /etc/profile + ~/.profile, which
         // under ProtectHome=true can fail noisily for the service account.
-        let mut env = pty_env(colors_enabled);
+        let mut env = crate::pty_env(colors_enabled);
         env.extend(extra_env);
         (env, shell_program, vec![])
     };
