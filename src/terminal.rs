@@ -1582,6 +1582,12 @@ impl Render for TerminalView {
                 if ks.modifiers.alt && ks.key.as_str() == "tab" {
                     return;
                 }
+                // Ctrl+P opens the app-level MRU tab switcher — handled by the
+                // root `on_key_down` once this bubbles up. Swallow it here so it
+                // doesn't also reach the shell as `^P` (readline "previous").
+                if ks.modifiers.control && !ks.modifiers.shift && !ks.modifiers.alt && ks.key.as_str() == "p" {
+                    return;
+                }
                 if ks.modifiers.shift && !ks.modifiers.control {
                     match ks.key.as_str() {
                         "pageup" => {
