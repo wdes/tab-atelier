@@ -13,6 +13,13 @@
 //! layer — the actual argument validation / HTTP calls live in
 //! `src/cli/{share_link,tabs,remote,set_status,claude_hook}.rs`.
 //!
+//! Those arms forward the reconstructed args to [`crate::cli::client`] — the
+//! ONE name→handler table shared with the GUI binary's subcommand match, so
+//! the two editions can't drift. The arms that stay clap-native here (the
+//! `team` verbs, `net-allow`/`net-default`/`net-stats`/`net-dns`, `limit`,
+//! and `tabs --json`) are the ones with typed or headless-only handlers that
+//! have no raw-`&[String]` equivalent in `client`.
+//!
 //! Wins over the previous hand-rolled `match args[0].as_str()`:
 //! - `tab-atelier-headless --help` lists every subcommand
 //!   with one-line descriptions.
@@ -481,12 +488,12 @@ pub fn dispatch(cli: Cli) -> bool {
             if let Some(n) = name {
                 args.push(n);
             }
-            crate::cli::share_link::add(&args)
+            crate::cli::client::run("add", &args)
         }
-        Commands::Close { tab } => crate::cli::share_link::close(&[tab]),
-        Commands::Rename { tab, name } => crate::cli::share_link::rename(&[tab, name]),
-        Commands::Lock { tab } => crate::cli::share_link::lock(&[tab]),
-        Commands::Unlock { tab } => crate::cli::share_link::unlock(&[tab]),
+        Commands::Close { tab } => crate::cli::client::run("close", &[tab]),
+        Commands::Rename { tab, name } => crate::cli::client::run("rename", &[tab, name]),
+        Commands::Lock { tab } => crate::cli::client::run("lock", &[tab]),
+        Commands::Unlock { tab } => crate::cli::client::run("unlock", &[tab]),
         Commands::Limit {
             tab,
             memory,
@@ -494,8 +501,8 @@ pub fn dispatch(cli: Cli) -> bool {
             tasks,
             clear,
         } => crate::cli::share_link::limit(&tab, memory.as_deref(), cpu, tasks, clear),
-        Commands::NetOff { tab } => crate::cli::share_link::net_off(&[tab]),
-        Commands::NetOn { tab } => crate::cli::share_link::net_on(&[tab]),
+        Commands::NetOff { tab } => crate::cli::client::run("net-off", &[tab]),
+        Commands::NetOn { tab } => crate::cli::client::run("net-on", &[tab]),
         Commands::NetAllow {
             tab,
             presets,
@@ -513,14 +520,14 @@ pub fn dispatch(cli: Cli) -> bool {
             cidrs,
             clear,
         } => crate::cli::share_link::net_default(&presets, &domains, &cidrs, clear),
-        Commands::Input { tab, text } => crate::cli::share_link::send_input(&[tab, text]),
-        Commands::Output { tab } => crate::cli::share_link::output(&[tab]),
+        Commands::Input { tab, text } => crate::cli::client::run("input", &[tab, text]),
+        Commands::Output { tab } => crate::cli::client::run("output", &[tab]),
         Commands::ShareLink { tab, ro } => {
             let mut args = vec![tab];
             if ro {
                 args.push("--ro".into());
             }
-            crate::cli::share_link::run(&args)
+            crate::cli::client::run("share-link", &args)
         }
         Commands::BgColor { global, tab, color } => {
             let mut args: Vec<String> = Vec::new();
@@ -531,7 +538,7 @@ pub fn dispatch(cli: Cli) -> bool {
                 args.push(tab);
                 args.push(color);
             }
-            crate::cli::share_link::bg_color(&args)
+            crate::cli::client::run("bg-color", &args)
         }
         Commands::Settings {
             api_addr,
@@ -566,7 +573,7 @@ pub fn dispatch(cli: Cli) -> bool {
                 args.push("--bg-color".into());
                 args.push(v);
             }
-            crate::cli::share_link::ports(&args)
+            crate::cli::client::run("settings", &args)
         }
         Commands::SetStatus {
             state,
@@ -595,15 +602,15 @@ pub fn dispatch(cli: Cli) -> bool {
             if no_plan {
                 args.push("--no-plan".into());
             }
-            crate::cli::set_status::run(&args)
+            crate::cli::client::run("set-status", &args)
         }
-        Commands::SetContext { args } => crate::cli::set_context::run(&args),
-        Commands::Token => crate::cli::tokens::show(&[]),
-        Commands::RotateTokens => crate::cli::tokens::rotate(&[]),
-        Commands::ResetMasterToken => crate::cli::tokens::reset_master(&[]),
-        Commands::ClaudeHook { event } => crate::cli::claude_hook::run(&[event]),
-        Commands::Remote { args } => crate::cli::remote::run(&args),
-        Commands::Dispatch { args } => crate::cli::delegate::run(&args),
+        Commands::SetContext { args } => crate::cli::client::run("set-context", &args),
+        Commands::Token => crate::cli::client::run("token", &[]),
+        Commands::RotateTokens => crate::cli::client::run("rotate-tokens", &[]),
+        Commands::ResetMasterToken => crate::cli::client::run("reset-master-token", &[]),
+        Commands::ClaudeHook { event } => crate::cli::client::run("claude-hook", &[event]),
+        Commands::Remote { args } => crate::cli::client::run("remote", &args),
+        Commands::Dispatch { args } => crate::cli::client::run("dispatch", &args),
         Commands::Peers { all } => crate::cli::team::peers(all),
         Commands::Note { msg, topic, from } => crate::cli::team::note(topic, from, &msg),
         Commands::Notes { topic, since } => crate::cli::team::notes(topic.as_deref(), since),
@@ -618,7 +625,7 @@ pub fn dispatch(cli: Cli) -> bool {
                 args.push("--interval".into());
                 args.push(s.to_string());
             }
-            crate::cli::brain::run(&args)
+            crate::cli::client::run("brain", &args)
         }
         Commands::Schedule { tab, rule, tz, clear } => {
             let mut args: Vec<String> = vec![tab];
@@ -631,10 +638,10 @@ pub fn dispatch(cli: Cli) -> bool {
                     args.push(z);
                 }
             }
-            crate::cli::share_link::schedule(&args)
+            crate::cli::client::run("schedule", &args)
         }
-        Commands::Flags { args } => crate::cli::flags::run(&args),
-        Commands::Log { args } => crate::cli::logging::run(&args),
+        Commands::Flags { args } => crate::cli::client::run("flags", &args),
+        Commands::Log { args } => crate::cli::client::run("log", &args),
         Commands::Tabs { json } => {
             let args = if json { vec!["--json".to_string()] } else { vec![] };
             crate::cli::share_link::tabs(&args)
@@ -662,7 +669,7 @@ pub fn dispatch(cli: Cli) -> bool {
                 args.push("--rows".into());
                 args.push(n.to_string());
             }
-            crate::cli::bench::run(&args)
+            crate::cli::client::run("bench", &args)
         }
         Commands::BenchLag { url, samples } => crate::cli::bench_lag::run(&url, samples.unwrap_or(25)),
     };
