@@ -488,6 +488,21 @@ pub fn build_agent_resume_command(kind: &str, session_id: &str, plan: Option<boo
             Some(format!("catbus-agent --resume {session_id}{flag}"))
         }
         "claude" => Some(format!("claude --resume {session_id}")),
+        // The ⛑ brain watchdog has no session to resume — it's a standalone
+        // tool that re-attaches to every OTHER tab over the local API. On
+        // restart we just relaunch it. `session_id` is unused. The binary
+        // differs by edition (the two debs conflict, so each ships only its
+        // own name on PATH).
+        "brain" => {
+            #[cfg(feature = "gui")]
+            {
+                Some("tab-atelier brain".to_string())
+            }
+            #[cfg(not(feature = "gui"))]
+            {
+                Some("tab-atelier-headless brain".to_string())
+            }
+        }
         _ => None,
     }
 }
@@ -2791,6 +2806,17 @@ mod tests {
         assert_eq!(c.last().unwrap(), "exec catbus-agent --resume s1 --plan");
         // Unknown kind → no direct launch (caller keeps the plain shell).
         assert!(agent_launch_shell_suffix("bash", "x", None).is_none());
+    }
+
+    #[test]
+    fn brain_resumes_by_relaunch_ignoring_session() {
+        // The brain watchdog has no session; auto-resume just relaunches it.
+        // `session_id` is ignored, so an empty one still yields the command.
+        let cmd = build_agent_resume_command("brain", "", None).unwrap();
+        #[cfg(feature = "gui")]
+        assert_eq!(cmd, "tab-atelier brain");
+        #[cfg(not(feature = "gui"))]
+        assert_eq!(cmd, "tab-atelier-headless brain");
     }
 
     #[test]

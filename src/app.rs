@@ -809,7 +809,10 @@ impl AppState {
                 let pending_agent_resume = if agent_launch.is_some() || crate::read_only() {
                     None
                 } else {
-                    match (&ts.agent_kind, &ts.agent_session_id) {
+                    match (ts.agent_kind.as_deref(), ts.agent_session_id.as_deref()) {
+                        // Brain has no session — it re-attaches over the API.
+                        // Relaunch it whenever the tab is flagged as one.
+                        (Some("brain"), _) => build_agent_resume_command("brain", "", ts.agent_plan_mode),
                         (Some(kind), Some(sid)) => build_agent_resume_command(kind, sid, ts.agent_plan_mode),
                         _ => None,
                     }
@@ -3317,6 +3320,15 @@ impl AppState {
                                 .view
                                 .read(cx)
                                 .send_input_bytes(b"\x15tab-atelier brain\n".to_vec());
+                            // Flag the tab as the brain watchdog so it
+                            // auto-relaunches on restart. Unlike claude/catbus,
+                            // brain has no session and never self-announces its
+                            // kind, so nothing else would mark it — and the
+                            // restore path keys auto-resume off `agent_kind`.
+                            // Overwritten if the tab later runs a real agent.
+                            this.tabs[idx].agent_kind = Some("brain".to_string());
+                            this.tabs[idx].agent_session_id = None;
+                            this.tabs[idx].agent_plan_mode = None;
                             this.context_menu = None;
                             cx.notify();
                         }),
