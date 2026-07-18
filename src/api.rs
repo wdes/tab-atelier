@@ -213,6 +213,14 @@ struct TabInfo {
     /// Per-tab resolver DNS log (domain-allowlist tabs). Omitted when empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     dns: Vec<DnsEntryInfo>,
+    /// Resident memory (bytes) of the tab's process subtree. Omitted until
+    /// the first `/proc` sample lands (or when the walk fails).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resident_memory_bytes: Option<u64>,
+    /// Cumulative agent token usage (`{input, output}`). Omitted for
+    /// non-agent tabs so existing consumers don't see a new field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tokens: Option<crate::TokenUsage>,
 }
 
 /// One DNS-entries-view row for the `/tabs` response.
@@ -397,6 +405,15 @@ pub struct SnapshotTab {
     /// from the per-tab resolver — including DENIED queries (what the tab
     /// tried to reach and couldn't). Empty when no resolver.
     pub dns_entries: Vec<(String, bool, Vec<String>)>,
+    /// Resident set size (bytes) of the tab's shell-process subtree,
+    /// sampled from `/proc` at the 2 s snapshot cadence (`agent_probe::sample_tree`).
+    /// `None` until the first sample, or when the subtree walk fails.
+    /// Surfaced on `/tabs` + `/tabs/usage` as `resident_memory_bytes`.
+    pub resident_memory_bytes: Option<u64>,
+    /// Cumulative agent token usage, mirrored from the runtime tab's
+    /// catbus-agent `tokens.json` sidecar. `None` for non-agent tabs (or
+    /// builds without `catbus`). Surfaced as `tokens: {input, output}`.
+    pub tokens: Option<crate::TokenUsage>,
 }
 
 impl crate::schedule::LockState for SnapshotTab {
@@ -1632,6 +1649,8 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                             ips: ips.clone(),
                         })
                         .collect(),
+                    resident_memory_bytes: t.resident_memory_bytes,
+                    tokens: t.tokens,
                 })
                 .collect();
             #[cfg(feature = "energy")]
@@ -1654,6 +1673,52 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             };
             let body: std::sync::Arc<str> = serde_json::to_string_pretty(&resp).unwrap_or_default().into();
             state.cached_response = Some(body.clone());
+            drop(state);
+            respond_with_etag(
+                stream,
+                200,
+                "application/json",
+                body.as_bytes(),
+                accept_gzip,
+                if_none_match.as_deref(),
+                "",
+            );
+        }
+        // Lean per-tab consumption projection for a dashboard poller — the
+        // same live numbers as `/tabs` but WITHOUT the heavy `output` /
+        // `raw_output` scrollback dumps, so it's cheap to poll ~1 s. Same
+        // auth gate as `/tabs` (checked upstream of this match).
+        ("GET", "/tabs/usage") => {
+            #[derive(Serialize)]
+            struct UsageTab {
+                id: String,
+                name: String,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                resident_memory_bytes: Option<u64>,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                tokens: Option<crate::TokenUsage>,
+                #[cfg(feature = "energy")]
+                cpu_percent: f64,
+                connections: usize,
+                tx_bytes: u64,
+            }
+            let state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let usage: Vec<UsageTab> = state
+                .tabs
+                .iter()
+                .enumerate()
+                .map(|(_i, t)| UsageTab {
+                    id: t.id.to_string(),
+                    name: t.name.to_string(),
+                    resident_memory_bytes: t.resident_memory_bytes,
+                    tokens: t.tokens,
+                    #[cfg(feature = "energy")]
+                    cpu_percent: state.power.get(_i).map_or(0.0, |p| p.cpu_percent),
+                    connections: t.connections,
+                    tx_bytes: t.tx_bytes,
+                })
+                .collect();
+            let body = serde_json::to_string_pretty(&usage).unwrap_or_default();
             drop(state);
             respond_with_etag(
                 stream,
@@ -3663,6 +3728,8 @@ pub fn test_snapshot_tab(id: &str, name: &str) -> SnapshotTab {
         tx_denied_bytes: 0,
         net_allow: crate::net_policy::AllowConfig::default(),
         dns_entries: Vec::new(),
+        resident_memory_bytes: None,
+        tokens: None,
     }
 }
 
@@ -3703,6 +3770,62 @@ mod tests {
     use super::*;
     use std::io::Read;
     use std::net::TcpStream;
+
+    /// A `TabInfo` with every field at its empty/default so a test can
+    /// override just the two consumption fields (issue #28, S1/S2).
+    fn tab_info_fixture() -> TabInfo {
+        TabInfo {
+            index: 0,
+            id: "t".into(),
+            name: "n".into(),
+            cwd: None,
+            active: false,
+            locked: false,
+            lock_reason: None,
+            schedule_rule: None,
+            schedule_tz: None,
+            preview: String::new(),
+            uptime_secs: 0.0,
+            #[cfg(feature = "energy")]
+            cpu_percent: 0.0,
+            #[cfg(feature = "energy")]
+            watts: None,
+            agent_state: None,
+            agent_kind: None,
+            agent_session_id: None,
+            context: None,
+            viewers: 0,
+            net_disabled: false,
+            connections: 0,
+            tx_bytes: 0,
+            tx_denied_bytes: 0,
+            net_allow_presets: vec![],
+            net_allow_domains: vec![],
+            net_allow_cidrs: vec![],
+            dns: vec![],
+            resident_memory_bytes: None,
+            tokens: None,
+        }
+    }
+
+    #[test]
+    fn tabinfo_omits_usage_fields_when_none() {
+        let json = serde_json::to_string(&tab_info_fixture()).unwrap();
+        assert!(!json.contains("resident_memory_bytes"), "{json}");
+        assert!(!json.contains("\"tokens\""), "{json}");
+    }
+
+    #[test]
+    fn tabinfo_emits_usage_fields_when_set() {
+        let t = TabInfo {
+            resident_memory_bytes: Some(4096),
+            tokens: Some(crate::TokenUsage { input: 100, output: 50 }),
+            ..tab_info_fixture()
+        };
+        let json = serde_json::to_string(&t).unwrap();
+        assert!(json.contains("\"resident_memory_bytes\":4096"), "{json}");
+        assert!(json.contains("\"tokens\":{\"input\":100,\"output\":50}"), "{json}");
+    }
 
     #[test]
     fn sandbox_path_accepts_inbox_files() {
