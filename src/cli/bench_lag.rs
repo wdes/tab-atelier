@@ -120,6 +120,43 @@ fn contains_seq(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
+/// `&[String]` front-end for [`run`], used by the GUI binary's subcommand
+/// match (`tab-atelier bench-lag <url> [--samples N]`).
+///
+/// The headless binary reaches [`run`] through clap; both share this same
+/// measurement path.
+#[must_use]
+pub fn run_cli(args: &[String]) -> i32 {
+    let mut url: Option<&str> = None;
+    let mut samples: usize = 25;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--samples" | "-n" => {
+                let Some(v) = it.next() else {
+                    eprintln!("bench-lag: --samples needs a value");
+                    return 2;
+                };
+                let Ok(n) = v.parse::<usize>() else {
+                    eprintln!("bench-lag: --samples must be a whole number");
+                    return 2;
+                };
+                samples = n;
+            }
+            other if url.is_none() && !other.starts_with('-') => url = Some(other),
+            other => {
+                eprintln!("bench-lag: unexpected argument '{other}'");
+                return 2;
+            }
+        }
+    }
+    let Some(url) = url else {
+        eprintln!("usage: tab-atelier bench-lag <viewer-url> [--samples N]");
+        return 2;
+    };
+    run(url, samples)
+}
+
 #[must_use]
 pub fn run(view_url: &str, samples: usize) -> i32 {
     let ws_url = match to_ws_url(view_url) {
