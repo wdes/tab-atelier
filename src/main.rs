@@ -157,6 +157,54 @@ fn main() {
                 let rest: Vec<String> = std::env::args().skip(2).collect();
                 std::process::exit(cli::share_link::limit_cli(&rest));
             }
+            // Plain tab commands that only POST to the local API — exposed here
+            // too so a GUI-deb-only user has the same shell surface as the
+            // headless deb (the two conflict). Each handler self-parses `rest`.
+            "add" => {
+                // Open a new tab at a path — `add <path> [name]`.
+                let rest: Vec<String> = std::env::args().skip(2).collect();
+                std::process::exit(cli::share_link::add(&rest));
+            }
+            "close" => {
+                // Close a tab — `close <tab>`.
+                let rest: Vec<String> = std::env::args().skip(2).collect();
+                std::process::exit(cli::share_link::close(&rest));
+            }
+            "rename" => {
+                // Rename a tab — `rename <tab> <name>`.
+                let rest: Vec<String> = std::env::args().skip(2).collect();
+                std::process::exit(cli::share_link::rename(&rest));
+            }
+            "lock" => {
+                // Refuse every input source on a tab — `lock <tab>`.
+                let rest: Vec<String> = std::env::args().skip(2).collect();
+                std::process::exit(cli::share_link::lock(&rest));
+            }
+            "unlock" => {
+                // Re-open a locked tab — `unlock <tab>`.
+                let rest: Vec<String> = std::env::args().skip(2).collect();
+                std::process::exit(cli::share_link::unlock(&rest));
+            }
+            "input" => {
+                // Send keystrokes to a tab — `input <tab> <text>` (\n/\r/\t escapes).
+                let rest: Vec<String> = std::env::args().skip(2).collect();
+                std::process::exit(cli::share_link::send_input(&rest));
+            }
+            "output" => {
+                // Dump a tab's current scrollback — `output <tab>`.
+                let rest: Vec<String> = std::env::args().skip(2).collect();
+                std::process::exit(cli::share_link::output(&rest));
+            }
+            "share-link" => {
+                // Print a share URL for a tab — `share-link <tab> [--ro]`.
+                let rest: Vec<String> = std::env::args().skip(2).collect();
+                std::process::exit(cli::share_link::run(&rest));
+            }
+            "bg-color" => {
+                // Set a tab's (or the global) background — `bg-color [--global] <tab> <color>`.
+                let rest: Vec<String> = std::env::args().skip(2).collect();
+                std::process::exit(cli::share_link::bg_color(&rest));
+            }
             _ => {}
         }
     }
