@@ -1570,16 +1570,13 @@ pub fn tabs(args: &[String]) -> i32 {
     let header_id = "ID";
     let header_status = "STATUS";
     let header_name = "NAME";
-    println!("{header_idx:>3}  {header_id:<8}  {header_status:<22}  {header_name}");
+    // Full UUID (not truncated) so a line copy-pastes straight into
+    // `dispatch --to <uuid>` / an API path — the reason the GUI's old
+    // `team::tabs` printed the whole id.
+    println!("{header_idx:>3}  {header_id:<36}  {header_status:<22}  {header_name}");
     for t in &raw {
         let idx = t.get("index").and_then(serde_json::Value::as_u64).unwrap_or(0);
-        let id_short = t
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("?")
-            .chars()
-            .take(8)
-            .collect::<String>();
+        let id = t.get("id").and_then(serde_json::Value::as_str).unwrap_or("?");
         let name = t.get("name").and_then(serde_json::Value::as_str).unwrap_or("?");
         let active = t.get("active").and_then(serde_json::Value::as_bool).unwrap_or(false);
         let locked = t.get("locked").and_then(serde_json::Value::as_bool).unwrap_or(false);
@@ -1603,7 +1600,7 @@ pub fn tabs(args: &[String]) -> i32 {
         } else {
             String::new()
         };
-        println!("{marker}{idx:>2}  {id_short:<8}  {status:<22}  {name}{watch}");
+        println!("{marker}{idx:>2}  {id:<36}  {status:<22}  {name}{watch}");
         if locked && reason == Some("schedule") {
             let rule = t
                 .get("schedule_rule")

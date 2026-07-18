@@ -16,11 +16,11 @@
 //! - **GUI** (`src/main.rs`) calls it directly on `argv[1]`; `None` means "not
 //!   a client subcommand" so it falls through to launching the app.
 //! - **headless** ([`super::dispatch`]) keeps its `clap` enum (for typed
-//!   `--help` and validation) but its match arms forward here, so the
-//!   name→handler wiring lives in one spot. The genuinely typed arms that have
-//!   no raw `&[String]` handler (the `team` verbs' `--topic`/`--from`,
-//!   `net-allow`/`net-default`/`net-stats`/`net-dns`, `limit`) stay in
-//!   `dispatch` and are intentionally absent here.
+//!   `--help` and validation) but its match arms reconstruct the `&[String]`
+//!   form and forward here, so the name→handler wiring lives in one spot. The
+//!   only arms that stay clap-native (absent here) are the ones with no raw
+//!   `&[String]` handler and no GUI equivalent: `net-allow`, `net-stats`,
+//!   `net-dns`, `net-default` (headless-only nftables) and `limit` (typed).
 //!
 //! Adding a client command is now one arm here (+ one `clap` variant in
 //! `dispatch` if headless should list it in `--help`).
@@ -52,7 +52,10 @@ pub fn dispatch(name: &str, rest: &[String]) -> Option<i32> {
         "schedule" => share_link::schedule(rest),
         "log" => logging::run(rest),
         "flags" => flags::run(rest),
-        "tabs" | "list" => team::tabs(),
+        // `tabs`/`list` share the richer `share_link::tabs` (full-UUID +
+        // lock/viewer status + `--json`) across both editions, replacing the
+        // GUI's old bare `team::tabs`.
+        "tabs" | "list" => share_link::tabs(rest),
         "peers" => team::peers(rest.iter().any(|a| a == "--all")),
         "peek" => team::run_peek(rest),
         "note" => team::run_note(rest),
