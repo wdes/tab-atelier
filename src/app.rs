@@ -346,6 +346,16 @@ struct ExitConfirm {
     tab_idx: usize,
 }
 
+/// State for the Ctrl+P MRU tab switcher modal.
+struct TabSwitcher {
+    /// Tab indices in most-recently-visited order (the current active tab is
+    /// excluded — you're already on it), captured when the modal opens.
+    order: Vec<usize>,
+    /// Highlighted row into `order`. Starts at 0 (the previous tab) so a bare
+    /// Ctrl+P → Enter jumps straight back to where you just were.
+    selected: usize,
+}
+
 /// Everything `render_qr_modal` needs, computed once when the modal opens
 /// (see [`AppState::qr_modal`]): interface IPs, the click-to-open URL, and
 /// the encoded QR as a dark/light bitmap. Rebuilding the ~2000-div module
@@ -522,6 +532,10 @@ struct AppState {
     show_hotkey_picker: bool,
     hotkey_picker_focus: FocusHandle,
     hotkey_picker_error: Option<String>,
+    /// Ctrl+P MRU tab switcher — `None` when closed. When `Some`, its focus
+    /// handle is anchored each render so keys hit the modal, not the terminal.
+    tab_switcher: Option<TabSwitcher>,
+    tab_switcher_focus: FocusHandle,
     browser: Rc<RefCell<Option<String>>>,
     code_editor: Rc<RefCell<Option<String>>>,
     pref_browser_text: String,
@@ -647,6 +661,7 @@ impl AppState {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let rename_focus = cx.focus_handle();
         let hotkey_picker_focus = cx.focus_handle();
+        let tab_switcher_focus = cx.focus_handle();
         let pref_browser_focus = cx.focus_handle();
         let pref_editor_focus = cx.focus_handle();
         let pref_api_addr_focus = cx.focus_handle();
@@ -1374,6 +1389,8 @@ impl AppState {
             show_hotkey_picker: false,
             hotkey_picker_focus,
             hotkey_picker_error: None,
+            tab_switcher: None,
+            tab_switcher_focus,
             browser,
             code_editor,
             pref_browser_text: String::new(),
@@ -3964,6 +3981,152 @@ impl AppState {
         )
     }
 
+    /// Switch to tab `idx`: deactivate the current tab, activate the target,
+    /// focus its terminal, and flush any deferred scrollback restore. Shared by
+    /// Alt+Tab and the Ctrl+P switcher.
+    fn select_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if idx >= self.tabs.len() {
+            return;
+        }
+        // Stamp the tab we're leaving so its "… ago" in the switcher is exact,
+        // not up to one persist tick stale.
+        self.tabs[self.active].last_focused_at = Some(std::time::Instant::now());
+        if idx != self.active {
+            self.tabs[self.active].deactivate();
+            self.active = idx;
+            self.tabs[self.active].activate();
+        }
+        self.tabs[self.active].flush_pending_restore(cx);
+        self.tabs[self.active].view.read(cx).focus_handle(cx).focus(window);
+        cx.notify();
+    }
+
+    /// Open the Ctrl+P MRU tab switcher: list every tab EXCEPT the current one,
+    /// most-recently-visited first, highlighting the previous tab so a bare
+    /// Ctrl+P → Enter jumps straight back. No-op with fewer than two tabs.
+    fn open_tab_switcher(&mut self, cx: &mut Context<Self>) {
+        // Need something to switch to, and don't stack over another modal.
+        if self.tabs.len() < 2
+            || self.show_preferences
+            || self.show_hotkey_picker
+            || self.show_qr
+            || self.renaming.is_some()
+            || self.exit_confirm.is_some()
+            || self.close_confirm.is_some()
+        {
+            return;
+        }
+        let keys: Vec<Option<std::time::Instant>> = self.tabs.iter().map(|t| t.last_focused_at).collect();
+        let order = mru_tab_order(self.active, &keys);
+        self.tab_switcher = Some(TabSwitcher { order, selected: 0 });
+        cx.notify();
+    }
+
+    /// Close the switcher without switching, returning focus to the terminal.
+    fn close_tab_switcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.tab_switcher = None;
+        self.tabs[self.active].view.read(cx).focus_handle(cx).focus(window);
+        cx.notify();
+    }
+
+    fn render_tab_switcher(&self, cx: &Context<Self>) -> Option<Stateful<Div>> {
+        let sw = self.tab_switcher.as_ref()?;
+        let th = self.th();
+        let dialog_bg = th.surface_hsla();
+        let dialog_fg = th.fg_hsla();
+        let dialog_border = th.border_hsla();
+        let sel_bg = th.accent_hsla();
+        let hover_bg = th.selection_hsla();
+        let muted = th.border_hsla();
+
+        let mut list = div().flex().flex_col().gap(px(2.0)).mt(px(10.0));
+        for (row, &idx) in sw.order.iter().enumerate() {
+            if idx >= self.tabs.len() {
+                continue;
+            }
+            let tab = &self.tabs[idx];
+            let name = tab.name.clone();
+            let ago = tab.last_focused_at.map_or_else(
+                || "never".to_string(),
+                |t| format!("{} ago", format_duration(t.elapsed())),
+            );
+            let selected = row == sw.selected;
+            list = list.child(
+                div()
+                    .id(SharedString::from(format!("switcher-row-{row}")))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(16.0))
+                    .px(px(12.0))
+                    .py(px(6.0))
+                    .rounded(px(4.0))
+                    .cursor_pointer()
+                    .when(selected, |d| d.bg(sel_bg))
+                    .when(!selected, |d| d.hover(|s| s.bg(hover_bg)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev: &MouseDownEvent, window, cx| {
+                            this.tab_switcher = None;
+                            this.select_tab(idx, window, cx);
+                        }),
+                    )
+                    .child(div().overflow_hidden().child(name))
+                    .child(div().flex_none().text_size(px(12.0)).text_color(muted).child(ago)),
+            );
+        }
+
+        Some(
+            div()
+                .id("tab-switcher-overlay")
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .track_focus(&self.tab_switcher_focus)
+                .bg(Hsla::from(Rgba {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 0.5,
+                }))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _ev: &MouseDownEvent, window, cx| {
+                        this.close_tab_switcher(window, cx);
+                    }),
+                )
+                .child(
+                    div()
+                        // Clicks inside the card must not hit the overlay's
+                        // close handler.
+                        .on_mouse_down(MouseButton::Left, |_ev: &MouseDownEvent, _window, _cx| {})
+                        .bg(dialog_bg)
+                        .border_1()
+                        .border_color(dialog_border)
+                        .rounded(px(6.0))
+                        .p(px(16.0))
+                        .min_w(px(360.0))
+                        .max_w(px(560.0))
+                        .max_h(px(440.0))
+                        .overflow_hidden()
+                        .text_color(dialog_fg)
+                        .text_size(px(14.0))
+                        .child(div().text_size(px(13.0)).text_color(muted).child("Recent tabs"))
+                        .child(list)
+                        .child(
+                            div().mt(px(10.0)).text_size(px(11.0)).text_color(muted).child(
+                                "\u{2191}\u{2193} select \u{b7} Ctrl+P cycle \u{b7} Enter open \u{b7} Esc cancel",
+                            ),
+                        ),
+                ),
+        )
+    }
+
     fn render_exit_confirm(&self, cx: &Context<Self>) -> Option<Stateful<Div>> {
         let confirm = self.exit_confirm.as_ref()?;
         let idx = confirm.tab_idx;
@@ -5130,6 +5293,7 @@ impl Render for AppState {
             && self.close_confirm.is_none()
             && !self.show_qr
             && !self.show_preferences
+            && self.tab_switcher.is_none()
         {
             self.render_context_menu(window, cx)
         } else {
@@ -5143,6 +5307,11 @@ impl Render for AppState {
         }
         if self.show_hotkey_picker {
             self.hotkey_picker_focus.focus(window);
+        }
+        // Anchor focus on the switcher while it's open so its keys (↑↓/Enter/
+        // Esc) hit this modal instead of leaking into the terminal behind it.
+        if self.tab_switcher.is_some() {
+            self.tab_switcher_focus.focus(window);
         }
         // When the prefs modal is open, force focus onto one of its
         // inputs every render. Without this, the terminal's focus
@@ -5188,17 +5357,61 @@ impl Render for AppState {
             .flex_col()
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 let ks = &ev.keystroke;
+                // Ctrl+P MRU tab switcher. While it's open the modal holds
+                // focus (so the terminal gets no keys); these arrive here by
+                // bubbling. Handle every switcher key and return so nothing
+                // below (alt+tab / ctrl+shift+t) also fires.
+                if this.tab_switcher.is_some() {
+                    let len = this.tab_switcher.as_ref().map_or(0, |s| s.order.len());
+                    match ks.key.as_str() {
+                        "escape" => this.close_tab_switcher(window, cx),
+                        "up" | "k" => {
+                            if let Some(s) = this.tab_switcher.as_mut() {
+                                s.selected = s.selected.saturating_sub(1);
+                            }
+                            cx.notify();
+                        }
+                        "down" | "j" => {
+                            if let Some(s) = this.tab_switcher.as_mut()
+                                && s.selected + 1 < len
+                            {
+                                s.selected += 1;
+                            }
+                            cx.notify();
+                        }
+                        // Tapping Ctrl+P again cycles the highlight downward.
+                        "p" if ks.modifiers.control && len > 0 => {
+                            if let Some(s) = this.tab_switcher.as_mut() {
+                                s.selected = (s.selected + 1) % len;
+                            }
+                            cx.notify();
+                        }
+                        "enter" => {
+                            let pick = this
+                                .tab_switcher
+                                .as_ref()
+                                .and_then(|s| s.order.get(s.selected).copied());
+                            this.tab_switcher = None;
+                            match pick {
+                                Some(idx) => this.select_tab(idx, window, cx),
+                                None => this.close_tab_switcher(window, cx),
+                            }
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
+                if ks.modifiers.control && !ks.modifiers.shift && !ks.modifiers.alt && ks.key.as_str() == "p" {
+                    this.open_tab_switcher(cx);
+                    return;
+                }
                 if ks.modifiers.control && ks.modifiers.shift && ks.key.as_str() == "t" {
                     this.add_tab_after_current(window, cx);
                     return;
                 }
                 if ks.modifiers.alt && ks.key.as_str() == "tab" {
-                    this.tabs[this.active].deactivate();
-                    this.active = (this.active + 1) % this.tabs.len();
-                    this.tabs[this.active].activate();
-                    this.tabs[this.active].flush_pending_restore(cx);
-                    this.tabs[this.active].view.read(cx).focus_handle(cx).focus(window);
-                    cx.notify();
+                    let next = (this.active + 1) % this.tabs.len();
+                    this.select_tab(next, window, cx);
                 }
             }))
             .child(
@@ -5284,6 +5497,10 @@ impl Render for AppState {
 
         if let Some(picker) = self.render_hotkey_picker(cx) {
             root = root.child(picker);
+        }
+
+        if let Some(switcher) = self.render_tab_switcher(cx) {
+            root = root.child(switcher);
         }
 
         if !self.toasts.is_empty() {
@@ -5407,6 +5624,16 @@ const fn is_url_char(c: char) -> bool {
 }
 
 const MAX_URL_LEN: usize = 256;
+
+/// Tab indices for the Ctrl+P switcher: every index except `active`, ordered
+/// most-recently-focused first. `None` (never focused) sorts last; ties keep
+/// their original relative order (stable sort). Pure so it can be unit-tested
+/// without a live window.
+fn mru_tab_order<T: Ord>(active: usize, last_focused: &[Option<T>]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..last_focused.len()).filter(|&i| i != active).collect();
+    order.sort_by(|&a, &b| last_focused[b].cmp(&last_focused[a]));
+    order
+}
 
 fn format_duration(d: std::time::Duration) -> String {
     let secs = d.as_secs();
@@ -5693,5 +5920,18 @@ mod tests {
         assert_eq!(format_duration(std::time::Duration::from_hours(1)), "1h 0m");
         assert_eq!(format_duration(std::time::Duration::from_mins(121)), "2h 1m");
         assert_eq!(format_duration(std::time::Duration::from_hours(24)), "24h 0m");
+    }
+
+    #[test]
+    fn mru_tab_order_excludes_active_recent_first_none_last() {
+        // Fake "instants" as u64 (larger = more recent). Active tab (2) is
+        // dropped; the rest sort newest→oldest, and the never-focused tab (3)
+        // trails.
+        let ts = vec![Some(10u64), Some(30), Some(99), None, Some(20)];
+        assert_eq!(mru_tab_order(2, &ts), vec![1, 4, 0, 3]);
+        // A single-tab window yields an empty list (nothing to switch to).
+        assert_eq!(mru_tab_order(0, &[Some(5u64)]), Vec::<usize>::new());
+        // All never-focused → original order preserved (stable), active gone.
+        assert_eq!(mru_tab_order(1, &[None::<u64>, None, None]), vec![0, 2]);
     }
 }
