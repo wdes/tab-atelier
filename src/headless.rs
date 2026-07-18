@@ -1820,7 +1820,7 @@ fn drain_pending(
     // below; re-applied live against the tab's cgroup so a running tab is
     // capped (or freed) without a respawn.
     for (tab_id, over, clear) in limit_changes {
-        if let Some(t) = tabs.iter_mut().find(|t| t.id == tab_id) {
+        if let Some(t) = tabs.iter_mut().find(|t| *t.id == tab_id) {
             if clear {
                 t.limits = crate::TabResourceLimits::default();
             } else {

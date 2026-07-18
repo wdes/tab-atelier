@@ -2095,7 +2095,7 @@ impl AppState {
             // we also re-apply them live so a running tab is capped (or freed)
             // without a respawn — the same handling the headless daemon does.
             for (tab_id, over, clear) in limit_changes {
-                if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+                if let Some(tab) = self.tabs.iter_mut().find(|t| *t.id == tab_id) {
                     if clear {
                         tab.limits = crate::TabResourceLimits::default();
                     } else {
