@@ -116,40 +116,6 @@ pub fn peers(all: bool) -> i32 {
     0
 }
 
-/// One `tabs` line: `<idx>  <uuid>  <name>` — UUID-first so it copy-pastes
-/// straight into `dispatch --to <uuid>` or an API path.
-#[must_use]
-pub fn format_tab_line(t: &TabView) -> String {
-    format!("{:>3}  {}  {}", t.index, t.id, t.name)
-}
-
-/// List every tab as `idx  uuid  name`.
-///
-/// Unlike `peers` (Claude teammates only), this shows all tabs. A client
-/// command: it talks to the running instance over the local API, so it never
-/// trips the single-instance lock.
-#[must_use]
-pub fn tabs() -> i32 {
-    let ep = match discover_endpoint() {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("tabs: {e}");
-            return 1;
-        }
-    };
-    let views = match fetch_tab_views(&ep) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("tabs: {e}");
-            return 1;
-        }
-    };
-    for t in &views {
-        println!("{}", format_tab_line(t));
-    }
-    0
-}
-
 /// CLI entry for `peek <tab> [--lines N] [--raw]`. Parses the flags the
 /// hand-rolled GUI dispatcher can't model with clap, then calls [`peek`].
 #[must_use]
@@ -162,9 +128,15 @@ pub fn run_peek(args: &[String]) -> i32 {
         match a.as_str() {
             "--raw" => raw = true,
             "--lines" => {
-                if let Some(n) = it.next().and_then(|v| v.parse().ok()) {
-                    lines = n;
-                }
+                let Some(v) = it.next() else {
+                    eprintln!("peek: --lines needs a value");
+                    return 2;
+                };
+                let Ok(n) = v.parse::<usize>() else {
+                    eprintln!("peek: --lines must be a whole number");
+                    return 2;
+                };
+                lines = n;
             }
             other if tab.is_none() => tab = Some(other),
             _ => {}
@@ -367,7 +339,17 @@ pub fn run_notes(args: &[String]) -> i32 {
     while let Some(a) = it.next() {
         match a.as_str() {
             "--topic" => topic = it.next().map(String::as_str),
-            "--since" => since = it.next().and_then(|v| v.parse().ok()),
+            "--since" => {
+                let Some(v) = it.next() else {
+                    eprintln!("notes: --since needs a value");
+                    return 2;
+                };
+                let Ok(n) = v.parse::<usize>() else {
+                    eprintln!("notes: --since must be a whole number");
+                    return 2;
+                };
+                since = Some(n);
+            }
             _ => {}
         }
     }
@@ -551,11 +533,6 @@ mod tests {
         let mut l = tab(4, "ops", Some("claude"), None);
         l.locked = true;
         assert_eq!(format_peer_line(&l), "[4] ops 🔒 · idle · /w/ops");
-    }
-
-    #[test]
-    fn format_tab_line_is_index_uuid_name() {
-        assert_eq!(format_tab_line(&tab(7, "deb", None, None)), "  7  id-7  deb");
     }
 
     fn note(ts: u64, topic: Option<&str>, from: Option<&str>, msg: &str) -> Note {

@@ -15,10 +15,10 @@
 //!
 //! Those arms forward the reconstructed args to [`crate::cli::client`] — the
 //! ONE name→handler table shared with the GUI binary's subcommand match, so
-//! the two editions can't drift. The arms that stay clap-native here (the
-//! `team` verbs, `net-allow`/`net-default`/`net-stats`/`net-dns`, `limit`,
-//! and `tabs --json`) are the ones with typed or headless-only handlers that
-//! have no raw-`&[String]` equivalent in `client`.
+//! the two editions can't drift. The only arms that stay clap-native here (no
+//! `client` entry) are `net-allow`/`net-default`/`net-stats`/`net-dns` (the
+//! headless-only nftables allowlist) and `limit` (typed) — everything else,
+//! including the `team` verbs and `tabs --json`, routes through `client`.
 //!
 //! Wins over the previous hand-rolled `match args[0].as_str()`:
 //! - `tab-atelier-headless --help` lists every subcommand
@@ -611,11 +611,49 @@ pub fn dispatch(cli: Cli) -> bool {
         Commands::ClaudeHook { event } => crate::cli::client::run("claude-hook", &[event]),
         Commands::Remote { args } => crate::cli::client::run("remote", &args),
         Commands::Dispatch { args } => crate::cli::client::run("dispatch", &args),
-        Commands::Peers { all } => crate::cli::team::peers(all),
-        Commands::Note { msg, topic, from } => crate::cli::team::note(topic, from, &msg),
-        Commands::Notes { topic, since } => crate::cli::team::notes(topic.as_deref(), since),
-        Commands::Handoff { file, tab } => crate::cli::team::handoff(&file, &tab),
-        Commands::Peek { tab, lines, raw } => crate::cli::team::peek(&tab, lines.unwrap_or(40), raw),
+        Commands::Peers { all } => {
+            let args: Vec<String> = if all { vec!["--all".into()] } else { vec![] };
+            crate::cli::client::run("peers", &args)
+        }
+        Commands::Note { msg, topic, from } => {
+            let mut args: Vec<String> = Vec::new();
+            if let Some(t) = topic {
+                args.push("--topic".into());
+                args.push(t);
+            }
+            if let Some(f) = from {
+                args.push("--from".into());
+                args.push(f);
+            }
+            args.push(msg);
+            crate::cli::client::run("note", &args)
+        }
+        Commands::Notes { topic, since } => {
+            let mut args: Vec<String> = Vec::new();
+            if let Some(t) = topic {
+                args.push("--topic".into());
+                args.push(t);
+            }
+            if let Some(n) = since {
+                args.push("--since".into());
+                args.push(n.to_string());
+            }
+            crate::cli::client::run("notes", &args)
+        }
+        Commands::Handoff { file, tab } => {
+            crate::cli::client::run("handoff", &[file.to_string_lossy().into_owned(), tab])
+        }
+        Commands::Peek { tab, lines, raw } => {
+            let mut args: Vec<String> = vec![tab];
+            if let Some(n) = lines {
+                args.push("--lines".into());
+                args.push(n.to_string());
+            }
+            if raw {
+                args.push("--raw".into());
+            }
+            crate::cli::client::run("peek", &args)
+        }
         Commands::Brain { once, interval } => {
             let mut args: Vec<String> = Vec::new();
             if once {
@@ -644,7 +682,7 @@ pub fn dispatch(cli: Cli) -> bool {
         Commands::Log { args } => crate::cli::client::run("log", &args),
         Commands::Tabs { json } => {
             let args = if json { vec!["--json".to_string()] } else { vec![] };
-            crate::cli::share_link::tabs(&args)
+            crate::cli::client::run("tabs", &args)
         }
         Commands::Bench {
             mb,
