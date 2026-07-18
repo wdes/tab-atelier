@@ -279,25 +279,61 @@ fn spawn_agent_tab(ep: &Endpoint, o: &Opts, prompt: &str) -> Result<String, Stri
     Ok(uuid)
 }
 
-/// How long to wait between typing a prompt and the Enter that submits it, so
-/// the agent's input has ingested the text as one thing before Enter lands.
-const SUBMIT_DELAY: Duration = Duration::from_millis(400);
+/// Floor before the submitting Enter — always waited, so a small prompt keeps
+/// the old snappy feel and a still-connecting peer has a beat to catch up.
+const SUBMIT_DELAY_MIN: Duration = Duration::from_millis(400);
+/// Hard cap on the settle wait, so a pathologically slow (or endlessly
+/// repainting) target can't hang the dispatch forever.
+const SUBMIT_DELAY_MAX: Duration = Duration::from_secs(5);
+/// The paste is "settled" once the target screen has stopped changing for this
+/// long: the bracketed paste finished rendering, so a separate keystroke now
+/// registers as *submit* instead of being swallowed into the still-open paste.
+const SUBMIT_SETTLE_QUIET: Duration = Duration::from_millis(300);
+/// Poll cadence while waiting for the paste to settle.
+const SUBMIT_SETTLE_POLL: Duration = Duration::from_millis(80);
 
-/// Type `prompt` into a tab, then — unless `!submit` — press Enter as a
-/// SEPARATE write a beat later.
+/// Type `prompt` into a tab, wait for the paste to settle, then — unless
+/// `!submit` — press Enter as a SEPARATE write.
 ///
 /// Claude Code's input treats a prompt and a trailing `\r` that arrive in the
 /// SAME write as pasted multiline text: the `\r` becomes a newline in the
-/// buffer instead of submitting, so the message just sits there half-entered
-/// (the "sending Enter struggles" symptom). Sending the Enter as its own
-/// keystroke, after a short delay, is what actually submits it to the peer.
+/// buffer instead of submitting. A *fixed* delay before the separate Enter
+/// fixed that for small prompts but still lost the Enter on long / multi-line
+/// ones — the paste was still open when the `\r` landed, so the target showed
+/// `[Pasted text #N]` and sat idle. Instead of guessing a delay, watch the
+/// screen: once it's been unchanged for [`SUBMIT_SETTLE_QUIET`] the paste has
+/// finished rendering and the Enter submits reliably — bounded by
+/// `[SUBMIT_DELAY_MIN, SUBMIT_DELAY_MAX]`.
 fn submit_prompt(ep: &Endpoint, uuid: &str, prompt: &str, submit: bool) -> Result<(), String> {
     send_input(ep, uuid, prompt.as_bytes())?;
     if submit {
-        std::thread::sleep(SUBMIT_DELAY);
+        wait_for_paste_settled(ep, uuid);
         send_input(ep, uuid, b"\r")?;
     }
     Ok(())
+}
+
+/// Block until the target screen has been byte-for-byte unchanged for
+/// [`SUBMIT_SETTLE_QUIET`], after an unconditional [`SUBMIT_DELAY_MIN`] floor,
+/// giving up after [`SUBMIT_DELAY_MAX`]. Best-effort: an output-read error is
+/// treated as "still settling" and never blocks the caller's Enter — the worst
+/// case degrades to roughly the old fixed-delay behaviour.
+fn wait_for_paste_settled(ep: &Endpoint, uuid: &str) {
+    let start = Instant::now();
+    std::thread::sleep(SUBMIT_DELAY_MIN);
+    let mut last = read_output(ep, uuid).unwrap_or_default();
+    let mut stable_since = Instant::now();
+    while start.elapsed() < SUBMIT_DELAY_MAX {
+        if stable_since.elapsed() >= SUBMIT_SETTLE_QUIET {
+            return;
+        }
+        std::thread::sleep(SUBMIT_SETTLE_POLL);
+        let cur = read_output(ep, uuid).unwrap_or_default();
+        if cur != last {
+            last = cur;
+            stable_since = Instant::now();
+        }
+    }
 }
 
 fn send_input(ep: &Endpoint, uuid: &str, bytes: &[u8]) -> Result<(), String> {
@@ -359,7 +395,9 @@ fn shell_single_quote(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::shell_single_quote;
+    use super::{
+        SUBMIT_DELAY_MAX, SUBMIT_DELAY_MIN, SUBMIT_SETTLE_POLL, SUBMIT_SETTLE_QUIET, shell_single_quote,
+    };
 
     #[test]
     fn single_quotes_are_escaped() {
@@ -367,5 +405,19 @@ mod tests {
         assert_eq!(shell_single_quote("it's a test"), "'it'\\''s a test'");
         // The result is a single shell word that reproduces the input.
         assert_eq!(shell_single_quote("a; rm -rf /"), "'a; rm -rf /'");
+    }
+
+    #[test]
+    fn settle_timing_bounds_are_coherent() {
+        // The floor must not exceed the cap, or the settle loop would exit on
+        // its very first `start.elapsed() < MAX` check having already slept
+        // past MAX — the Enter would still fire, but never actually wait for
+        // the paste to settle, reintroducing the bug on large pastes.
+        assert!(SUBMIT_DELAY_MIN <= SUBMIT_DELAY_MAX);
+        // A settle window longer than the cap could never be observed.
+        assert!(SUBMIT_SETTLE_QUIET <= SUBMIT_DELAY_MAX);
+        // Polling coarser than the settle window would risk missing an
+        // intermediate change and declaring "settled" too early.
+        assert!(SUBMIT_SETTLE_POLL <= SUBMIT_SETTLE_QUIET);
     }
 }
