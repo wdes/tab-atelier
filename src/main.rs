@@ -205,6 +205,22 @@ fn main() {
                 let rest: Vec<String> = std::env::args().skip(2).collect();
                 std::process::exit(cli::share_link::bg_color(&rest));
             }
+            // Airgap on/off is the ONE network control that works on the desktop:
+            // the GUI drains `pending_net_changes` and respawns the shell in (or
+            // out of) a bubblewrap netns. The allowlist commands (net-allow /
+            // net-default / net-dns / net-stats bytes) rely on the per-tab
+            // nftables + resolver wiring that is headless-only, so they're
+            // deliberately NOT exposed here — they'd queue and no-op on the GUI.
+            "net-off" => {
+                // Cut a tab's internet (loopback-only netns) — `net-off <tab>`.
+                let rest: Vec<String> = std::env::args().skip(2).collect();
+                std::process::exit(cli::share_link::net_off(&rest));
+            }
+            "net-on" => {
+                // Restore a tab's internet — `net-on <tab>`.
+                let rest: Vec<String> = std::env::args().skip(2).collect();
+                std::process::exit(cli::share_link::net_on(&rest));
+            }
             _ => {}
         }
     }
