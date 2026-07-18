@@ -1247,6 +1247,12 @@ fn refresh_snapshot(
             tx_denied_bytes: tab.tx_denied_bytes,
             net_allow: tab.net_allow.clone(),
             dns_entries: tab.dns_entries(),
+            // Per-tab consumption (issue #28): RSS of the shell subtree.
+            // Token mirroring is GUI-only for now (HeadlessTab has no token
+            // sidecar cache yet) — headless reports None here.
+            resident_memory_bytes: crate::agent_probe::sample_tree(tab.pid)
+                .map(|s| s.rss_kb.saturating_mul(1024)),
+            tokens: None,
         });
     }
     let mut snapshot = api_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);

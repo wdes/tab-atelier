@@ -70,6 +70,8 @@ pub struct Strings {
     pub uptime: &'static str,
     pub last_seen: &'static str,
     pub connections: &'static str,
+    pub memory: &'static str,
+    pub tokens: &'static str,
 
     // Rename dialog
     pub rename_tab: &'static str,
@@ -171,6 +173,8 @@ pub static EN: Strings = Strings {
     uptime: "Active time",
     last_seen: "Last seen",
     connections: "Connections",
+    memory: "Memory",
+    tokens: "Tokens",
 
     rename_tab: "Rename tab:",
 
@@ -265,6 +269,8 @@ pub static FR: Strings = Strings {
     uptime: "Temps actif",
     last_seen: "Dernier accès",
     connections: "Connexions",
+    memory: "Mémoire",
+    tokens: "Tokens",
 
     rename_tab: "Renommer l'onglet :",
 

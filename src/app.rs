@@ -1837,6 +1837,12 @@ impl AppState {
                 // Desktop allowlist isn't wired (headless-only feature).
                 net_allow: crate::net_policy::AllowConfig::default(),
                 dns_entries: Vec::new(),
+                // Per-tab consumption (issue #28): RSS of the shell subtree,
+                // sampled here at the 2 s persist cadence (`persist` runs on a
+                // 2 s timer), and the last token total mirrored from the tab.
+                resident_memory_bytes: crate::agent_probe::sample_tree(shell_pid)
+                    .map(|s| s.rss_kb.saturating_mul(1024)),
+                tokens: tab.tokens_last_saved.get(),
             });
         }
 
@@ -3409,6 +3415,17 @@ impl AppState {
             // tab reads ~0 (refreshed every sweep); background tabs age.
             if let Some(seen) = self.tabs[stats_idx].last_focused_at {
                 stats_lines.push(format!("{}: {}", t.last_seen, format_duration(seen.elapsed())));
+            }
+            // Per-tab consumption (issue #28): resident memory of the shell
+            // subtree + last agent token totals. Sampled once here, on popup
+            // open — not per frame. GUI renders memory in MB.
+            let shell_pid = self.tabs[stats_idx].view.read(cx).pid();
+            if let Some(sample) = crate::agent_probe::sample_tree(shell_pid) {
+                let mb = sample.rss_kb as f64 / 1024.0;
+                stats_lines.push(format!("{}: {mb:.0} MB", t.memory));
+            }
+            if let Some(usage) = self.tabs[stats_idx].tokens_last_saved.get() {
+                stats_lines.push(format!("{}: {} in / {} out", t.tokens, usage.input, usage.output));
             }
             let conns = self
                 .tab_connections
