@@ -3246,7 +3246,7 @@ impl AppState {
                             // kind, so nothing else would mark it — and the
                             // restore path keys auto-resume off `agent_kind`.
                             // Overwritten if the tab later runs a real agent.
-                            this.tabs[idx].agent_kind = Some("brain".to_string());
+                            this.tabs[idx].agent_kind = Some("brain".into());
                             this.tabs[idx].agent_session_id = None;
                             this.tabs[idx].agent_plan_mode = None;
                             this.context_menu = None;
