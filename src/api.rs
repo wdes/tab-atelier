@@ -2211,7 +2211,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 error_json(stream, 404, "tab not found");
                 return;
             };
-            let id = snap.tabs[idx].id.clone();
+            let id = snap.tabs[idx].id.to_string();
             snap.pending_limit_changes.push((id, over, clear));
             drop(snap);
             respond_json(stream, 200, r#"{"queued":"limits"}"#);
@@ -3687,6 +3687,7 @@ pub fn test_snapshot(tabs: Vec<SnapshotTab>) -> TabSnapshot {
         pending_schedule_changes: vec![],
         pending_new_tabs: 0,
         pending_new_tab_cwds: std::collections::VecDeque::new(),
+        pending_limit_changes: Vec::new(),
         pending_renames: vec![],
         pending_status_updates: vec![],
         cached_response: None,
