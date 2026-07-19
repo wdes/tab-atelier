@@ -72,6 +72,8 @@ pub struct Strings {
     pub connections: &'static str,
     pub memory: &'static str,
     pub tokens: &'static str,
+    pub show_gauge: &'static str,
+    pub hide_gauge: &'static str,
 
     // Rename dialog
     pub rename_tab: &'static str,
@@ -175,6 +177,8 @@ pub static EN: Strings = Strings {
     connections: "Connections",
     memory: "Memory",
     tokens: "Tokens",
+    show_gauge: "Show RAM gauge",
+    hide_gauge: "Hide RAM gauge",
 
     rename_tab: "Rename tab:",
 
@@ -271,6 +275,8 @@ pub static FR: Strings = Strings {
     connections: "Connexions",
     memory: "Mémoire",
     tokens: "Tokens",
+    show_gauge: "Afficher la jauge RAM",
+    hide_gauge: "Masquer la jauge RAM",
 
     rename_tab: "Renommer l'onglet :",
 

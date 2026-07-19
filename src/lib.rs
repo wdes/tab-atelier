@@ -1625,6 +1625,11 @@ pub struct Preferences {
     pub theme: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opacity: Option<u8>,
+    /// Show a tiny per-tab RAM gauge in the tab bar (#28 V2 / S5). Off by
+    /// default — the tab bar can hold 30+ tabs, so the gauge stays visually
+    /// cheap and opt-in. Toggled from a tab's right-click menu.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub show_tab_gauge: bool,
     #[serde(
         default,
         deserialize_with = "deserialize_hotkeys",
