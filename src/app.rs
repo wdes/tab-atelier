@@ -111,6 +111,11 @@ struct Tab {
     /// `persist`'s token loop.
     #[cfg(feature = "catbus")]
     tokens_last_ring: std::cell::Cell<u64>,
+    /// Resident memory (bytes) of the tab's shell subtree, sampled in `persist`
+    /// at the 2 s cadence (same walk that fills the API snapshot, #28 S1). Read
+    /// by the tab-bar mini gauge (#28 S5). `Cell` because the persist loop
+    /// borrows `self.tabs` immutably; `None` until the first sample.
+    rss_bytes: std::cell::Cell<Option<u64>>,
     /// Bit pattern of the last `save_tab_uptime` value, to skip
     /// rewriting frozen (deactivated) tabs' files every 30 s.
     uptime_last_saved: std::cell::Cell<Option<u64>>,
@@ -264,6 +269,7 @@ impl Tab {
             tokens_last_saved: std::cell::Cell::new(None),
             #[cfg(feature = "catbus")]
             tokens_last_ring: std::cell::Cell::new(0),
+            rss_bytes: std::cell::Cell::new(None),
             uptime_last_saved: std::cell::Cell::new(None),
             led_last_ring: std::cell::Cell::new(0),
             #[cfg(feature = "catbus")]
@@ -536,6 +542,9 @@ struct AppState {
     /// Flipped on only for the duration of a "Screenshot (redacted)" capture so
     /// the real names never reach the pixel buffer — nothing to reverse.
     screenshot_censor: bool,
+    /// Show the per-tab RAM mini gauge in the tab bar (#28 S5). Mirrors
+    /// `Preferences::show_tab_gauge`; toggled from a tab's right-click menu.
+    show_tab_gauge: bool,
     renaming: Option<(usize, String)>,
     rename_select_all: bool,
     rename_focus: FocusHandle,
@@ -1326,6 +1335,7 @@ impl AppState {
             lang,
             theme_name,
             opacity,
+            show_tab_gauge: prefs.show_tab_gauge,
             hotkeys,
             show_preferences: false,
             show_hotkey_picker: false,
@@ -1796,6 +1806,11 @@ impl AppState {
                 continue;
             };
             let bg_color = crate::effective_tab_bg(tab.bg_color.as_deref(), self.tab_bg_global.as_deref()).into();
+            // Per-tab RSS (#28 S1/S5): one /proc-subtree walk at the 2 s persist
+            // cadence, cached on the tab for the tab-bar gauge and mirrored to
+            // the snapshot below.
+            let rss_bytes = crate::agent_probe::sample_tree(shell_pid).map(|s| s.rss_kb.saturating_mul(1024));
+            tab.rss_bytes.set(rss_bytes);
             api_tabs.push(api::SnapshotTab {
                 id: tab.id.clone(),
                 name: tab.name.clone(),
@@ -1837,11 +1852,10 @@ impl AppState {
                 // Desktop allowlist isn't wired (headless-only feature).
                 net_allow: crate::net_policy::AllowConfig::default(),
                 dns_entries: Vec::new(),
-                // Per-tab consumption (issue #28): RSS of the shell subtree,
-                // sampled here at the 2 s persist cadence (`persist` runs on a
-                // 2 s timer), and the last token total mirrored from the tab.
-                resident_memory_bytes: crate::agent_probe::sample_tree(shell_pid)
-                    .map(|s| s.rss_kb.saturating_mul(1024)),
+                // Per-tab consumption (issue #28): RSS sampled just above (also
+                // cached on the tab for the tab-bar gauge), token total mirrored
+                // from the tab.
+                resident_memory_bytes: rss_bytes,
                 tokens: tab.tokens_last_saved.get(),
             });
         }
@@ -2711,6 +2725,15 @@ impl AppState {
             );
 
         let theme_name = self.theme_name;
+        // Per-tab RAM mini gauge (#28 S5): scale each bar against the busiest
+        // tab. Computed once per render from the RSS the persist loop cached on
+        // each tab (no /proc walk here). Off unless the pref is toggled on.
+        let show_tab_gauge = self.show_tab_gauge;
+        let max_rss = if show_tab_gauge {
+            self.tabs.iter().filter_map(|t| t.rss_bytes.get()).max().unwrap_or(0)
+        } else {
+            0
+        };
         for (i, tab) in self.tabs.iter().enumerate() {
             let is_active = i == self.active;
             // Visual lock marker — a 🔒 ahead of the name is enough to
@@ -2932,6 +2955,37 @@ impl AppState {
                     .child(power_label),
             );
 
+            // Per-tab RAM mini gauge (#28 S5): a 24 px track with a fill sized
+            // by this tab's RSS as a fraction of the busiest tab. Only when the
+            // pref is on and at least one tab has a sample — off by default so
+            // the tab bar stays byte-for-byte unchanged for everyone else.
+            let tab_el = if show_tab_gauge && max_rss > 0 {
+                let frac = (tab.rss_bytes.get().unwrap_or(0) as f32 / max_rss as f32).clamp(0.0, 1.0);
+                let gauge_fill = Hsla::from(Rgba {
+                    r: 0.36,
+                    g: 0.60,
+                    b: 1.0,
+                    a: 0.85,
+                });
+                let gauge_track = Hsla::from(Rgba {
+                    r: 0.5,
+                    g: 0.5,
+                    b: 0.5,
+                    a: 0.25,
+                });
+                tab_el.child(
+                    div()
+                        .w(px(24.0))
+                        .h(px(4.0))
+                        .ml(px(4.0))
+                        .rounded_sm()
+                        .bg(gauge_track)
+                        .child(div().w(px(24.0 * frac)).h(px(4.0)).rounded_sm().bg(gauge_fill)),
+                )
+            } else {
+                tab_el
+            };
+
             // Measure this tab's top edge as a pet ledge (see PetOverlay).
             #[cfg(feature = "pets")]
             // Only measure ledges while pets are actually on screen — this
@@ -3052,6 +3106,34 @@ impl AppState {
                         }),
                     )
                     .child(self.t().rename),
+            );
+
+            // Toggle the per-tab RAM mini gauge in the tab bar (#28 S5) and
+            // persist the preference so it survives a restart.
+            let gauge_label = if self.show_tab_gauge {
+                self.t().hide_gauge
+            } else {
+                self.t().show_gauge
+            };
+            container = container.child(
+                div()
+                    .id("menu-toggle-gauge")
+                    .px(px(12.0))
+                    .py(px(4.0))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(menu_hover))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                            this.show_tab_gauge = !this.show_tab_gauge;
+                            let mut prefs = load_preferences(&platform::config_dir());
+                            prefs.show_tab_gauge = this.show_tab_gauge;
+                            save_preferences(&platform::config_dir(), &prefs);
+                            this.context_menu = None;
+                            cx.notify();
+                        }),
+                    )
+                    .child(gauge_label),
             );
 
             // Copy the tab's working directory to the clipboard.
@@ -4983,6 +5065,10 @@ impl AppState {
                                                         lang: Some(lang_str.into()),
                                                         theme: Some(this.theme_name.id().into()),
                                                         opacity: Some(this.opacity),
+                                                        // Menu-toggled, not in this dialog — carry the
+                                                        // on-disk value through so saving prefs doesn't
+                                                        // wipe the gauge setting.
+                                                        show_tab_gauge: this.show_tab_gauge,
                                                         hotkeys: this.hotkeys.clone(),
                                                         browser,
                                                         code_editor: editor,
