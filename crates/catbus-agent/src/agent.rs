@@ -48,6 +48,15 @@ const SYSTEM_STATIC_INSTRUCTIONS: &str = "Your text replies are rendered directl
     \x1b[33m for yellow, \x1b[31m for red, \x1b[36m for cyan, \
     \x1b[0m to reset.";
 
+/// Which API backend answers this session's prompts. Chosen once at
+/// startup from the CLI; the tool loop is backend-agnostic.
+pub enum Provider {
+    /// Anthropic Messages API via Claude Code's OAuth credentials.
+    Anthropic(Auth),
+    /// Infomaniak AI Tools via their OpenAI-compatible endpoint.
+    Infomaniak(crate::infomaniak::Config),
+}
+
 /// Session + history bundled together so swapping sessions mid-REPL
 /// is atomic — we hold one write-lock and replace both at once.
 struct ActiveSession {
@@ -56,7 +65,7 @@ struct ActiveSession {
 }
 
 pub struct Agent {
-    auth: Auth,
+    provider: Provider,
     http: reqwest::Client,
     active: tokio::sync::RwLock<ActiveSession>,
     /// Plan-mode flag. When on, write/edit/bash refuse and tell the
@@ -78,9 +87,9 @@ pub struct Agent {
 
 impl Agent {
     #[must_use]
-    pub fn new(auth: Auth, session: Session) -> Self {
+    pub fn new(provider: Provider, session: Session) -> Self {
         Self {
-            auth,
+            provider,
             http: reqwest::Client::builder()
                 .user_agent("catbus-agent/0.1 (tab-atelier)")
                 .build()
@@ -309,7 +318,29 @@ impl Agent {
     }
 
     async fn call_messages(&self) -> Result<MessagesResp, AgentError> {
-        let token = self.auth.access_token().await.map_err(AgentError::Auth)?;
+        match &self.provider {
+            Provider::Anthropic(auth) => self.call_anthropic(auth).await,
+            Provider::Infomaniak(cfg) => self.call_infomaniak(cfg).await,
+        }
+    }
+
+    /// The per-call system text shared by both backends: cwd +
+    /// plan-mode flag.
+    fn dynamic_system_text(&self, cwd: &str) -> String {
+        format!(
+            "You are operating as `catbus-agent` inside tab-atelier. \
+             Current working directory: {cwd}. \
+             Plan-mode is {plan}.",
+            plan = if self.plan_mode.load(std::sync::atomic::Ordering::Relaxed) {
+                "ON — propose changes, do not execute write/edit/bash."
+            } else {
+                "off"
+            },
+        )
+    }
+
+    async fn call_anthropic(&self, auth: &Auth) -> Result<MessagesResp, AgentError> {
+        let token = auth.access_token().await.map_err(AgentError::Auth)?;
         let active = self.active.read().await;
         let cwd = active.session.cwd.display().to_string();
         let tool_specs = tools::tool_specs();
@@ -327,16 +358,7 @@ impl Agent {
                 },
                 SystemBlock {
                     kind: "text",
-                    text: std::borrow::Cow::Owned(format!(
-                        "You are operating as `catbus-agent` inside tab-atelier. \
-                         Current working directory: {cwd}. \
-                         Plan-mode is {plan}.",
-                        plan = if self.plan_mode.load(std::sync::atomic::Ordering::Relaxed) {
-                            "ON — propose changes, do not execute write/edit/bash."
-                        } else {
-                            "off"
-                        },
-                    )),
+                    text: std::borrow::Cow::Owned(self.dynamic_system_text(&cwd)),
                 },
                 SystemBlock {
                     kind: "text",
@@ -363,6 +385,37 @@ impl Agent {
         resp.json::<MessagesResp>()
             .await
             .map_err(|e| AgentError::Http(format!("decode: {e}")))
+    }
+
+    /// Same turn, different wire: translate our Anthropic-shaped
+    /// history into an `OpenAI` chat-completions request against
+    /// Infomaniak's endpoint, and fold the response back into
+    /// `MessagesResp`. No OAuth dance — the API token is static.
+    async fn call_infomaniak(&self, cfg: &crate::infomaniak::Config) -> Result<MessagesResp, AgentError> {
+        let active = self.active.read().await;
+        let cwd = active.session.cwd.display().to_string();
+        let system = format!("{}\n\n{SYSTEM_STATIC_INSTRUCTIONS}", self.dynamic_system_text(&cwd));
+        let tool_specs = tools::tool_specs();
+        let body = crate::infomaniak::build_request(&cfg.model, &system, &tool_specs, &active.history);
+        drop(active);
+        let resp = self
+            .http
+            .post(cfg.chat_url())
+            .bearer_auth(&cfg.token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| AgentError::Http(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(AgentError::Api(format!("{status}: {body}")));
+        }
+        let raw = resp
+            .json::<crate::infomaniak::ChatResp>()
+            .await
+            .map_err(|e| AgentError::Http(format!("decode: {e}")))?;
+        Ok(crate::infomaniak::into_messages_resp(raw))
     }
 }
 
@@ -555,32 +608,32 @@ struct SystemBlock<'a> {
 }
 
 #[derive(Deserialize, Debug, Clone)]
-struct MessagesResp {
-    content: Vec<Block>,
-    model: String,
+pub struct MessagesResp {
+    pub content: Vec<Block>,
+    pub model: String,
     #[serde(default)]
-    stop_reason: Option<String>,
+    pub stop_reason: Option<String>,
     #[serde(default)]
-    usage: Usage,
+    pub usage: Usage,
 }
 
 #[derive(Deserialize, Debug, Clone, Default)]
-struct Usage {
+pub struct Usage {
     #[serde(default)]
-    input_tokens: u64,
+    pub input_tokens: u64,
     #[serde(default)]
-    output_tokens: u64,
+    pub output_tokens: u64,
 }
 
 #[derive(Serialize, Clone)]
-struct ApiMessage {
-    role: String,
-    content: ApiContent,
+pub struct ApiMessage {
+    pub role: String,
+    pub content: ApiContent,
 }
 
 #[derive(Serialize, Clone)]
 #[serde(untagged)]
-enum ApiContent {
+pub enum ApiContent {
     Plain(String),
     Blocks(Vec<Block>),
 }
