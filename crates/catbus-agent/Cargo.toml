@@ -48,3 +48,7 @@ reedline = "0.42"
 # CancellationToken — propagates Ctrl+C from the REPL into the agent's
 # HTTP / tool loop so an in-flight request can be aborted cleanly.
 tokio-util = { version = "0.7", default-features = false }
+
+[dev-dependencies]
+# Isolated $HOME + cwd for the end-to-end mock-API tests.
+tempfile = "3"

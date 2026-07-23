@@ -241,3 +241,248 @@ pub fn into_messages_resp(resp: ChatResp) -> MessagesResp {
         },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn user_plain(text: &str) -> ApiMessage {
+        ApiMessage {
+            role: "user".into(),
+            content: ApiContent::Plain(text.into()),
+        }
+    }
+
+    fn blocks(role: &str, blocks: Vec<Block>) -> ApiMessage {
+        ApiMessage {
+            role: role.into(),
+            content: ApiContent::Blocks(blocks),
+        }
+    }
+
+    #[test]
+    fn chat_url_from_base_appends_endpoint() {
+        assert_eq!(
+            chat_url_from_base("https://api.x.ai/v1"),
+            "https://api.x.ai/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn chat_url_from_base_strips_trailing_slash() {
+        assert_eq!(
+            chat_url_from_base("http://localhost:11434/v1/"),
+            "http://localhost:11434/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn chat_url_from_base_accepts_full_endpoint() {
+        assert_eq!(
+            chat_url_from_base("https://api.x.ai/v1/chat/completions"),
+            "https://api.x.ai/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn infomaniak_chat_url_is_product_scoped() {
+        assert_eq!(
+            infomaniak_chat_url("12345"),
+            "https://api.infomaniak.com/1/ai/12345/openai/chat/completions"
+        );
+    }
+
+    #[test]
+    fn build_request_converts_history_and_tools() {
+        let history = vec![
+            user_plain("read hello.txt please"),
+            blocks(
+                "assistant",
+                vec![
+                    Block::Text { text: "on it".into() },
+                    Block::ToolUse {
+                        id: "call_1".into(),
+                        name: "Read".into(),
+                        input: json!({"path": "hello.txt"}),
+                    },
+                ],
+            ),
+            blocks(
+                "user",
+                vec![Block::ToolResult {
+                    tool_use_id: "call_1".into(),
+                    content: "mock says hi".into(),
+                    is_error: false,
+                }],
+            ),
+        ];
+        let specs = crate::tools::tool_specs();
+        let req = build_request("test-model", "be helpful", &specs, &history);
+
+        assert_eq!(req["model"], "test-model");
+        assert_eq!(req["max_tokens"], 8192);
+
+        let messages = req["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"], "be helpful");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"], "read hello.txt please");
+        assert_eq!(messages[2]["role"], "assistant");
+        assert_eq!(messages[2]["content"], "on it");
+        let call = &messages[2]["tool_calls"][0];
+        assert_eq!(call["id"], "call_1");
+        assert_eq!(call["type"], "function");
+        assert_eq!(call["function"]["name"], "Read");
+        // Arguments cross the wire as a JSON *string*, not an object.
+        let args: Value = serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["path"], "hello.txt");
+        assert_eq!(messages[3]["role"], "tool");
+        assert_eq!(messages[3]["tool_call_id"], "call_1");
+        assert_eq!(messages[3]["content"], "mock says hi");
+
+        // Every agent tool must survive the spec conversion.
+        let tools = req["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), specs.len());
+        for (converted, spec) in tools.iter().zip(&specs) {
+            assert_eq!(converted["type"], "function");
+            assert_eq!(converted["function"]["name"], spec["name"]);
+            assert_eq!(converted["function"]["parameters"], spec["input_schema"]);
+        }
+    }
+
+    #[test]
+    fn build_request_splits_tool_results_from_trailing_text() {
+        let history = vec![blocks(
+            "user",
+            vec![
+                Block::ToolResult {
+                    tool_use_id: "call_1".into(),
+                    content: "output".into(),
+                    is_error: true,
+                },
+                Block::Text {
+                    text: "carry on".into(),
+                },
+            ],
+        )];
+        let req = build_request("m", "s", &[], &history);
+        let messages = req["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[2]["content"], "carry on");
+    }
+
+    #[test]
+    fn build_request_drops_empty_assistant_turns() {
+        let history = vec![blocks("assistant", vec![])];
+        let req = build_request("m", "s", &[], &history);
+        // Only the system message survives.
+        assert_eq!(req["messages"].as_array().unwrap().len(), 1);
+    }
+
+    /// Mock of a plain text answer, `x.ai` / `OpenAI` shape.
+    const TEXT_RESPONSE: &str = r#"{
+        "id": "cmpl-1",
+        "object": "chat.completion",
+        "model": "grok-4-0709",
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": "hello from grok" },
+            "finish_reason": "stop"
+        }],
+        "usage": { "prompt_tokens": 12, "completion_tokens": 4, "total_tokens": 16 }
+    }"#;
+
+    /// Mock of a function-call answer with an empty content string,
+    /// as Grok and Mistral-family models emit while calling tools.
+    const TOOL_CALL_RESPONSE: &str = r#"{
+        "id": "cmpl-2",
+        "model": "test-model",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_9",
+                    "type": "function",
+                    "function": { "name": "Bash", "arguments": "{\"command\":\"ls\"}" }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "usage": { "prompt_tokens": 30, "completion_tokens": 9 }
+    }"#;
+
+    #[test]
+    fn text_response_maps_to_end_turn() {
+        let resp: ChatResp = serde_json::from_str(TEXT_RESPONSE).unwrap();
+        let out = into_messages_resp(resp);
+        assert_eq!(out.model, "grok-4-0709");
+        assert_eq!(out.stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(out.usage.input_tokens, 12);
+        assert_eq!(out.usage.output_tokens, 4);
+        assert_eq!(out.content.len(), 1);
+        assert!(matches!(&out.content[0], Block::Text { text } if text == "hello from grok"));
+    }
+
+    #[test]
+    fn tool_call_response_maps_to_tool_use() {
+        let resp: ChatResp = serde_json::from_str(TOOL_CALL_RESPONSE).unwrap();
+        let out = into_messages_resp(resp);
+        assert_eq!(out.stop_reason.as_deref(), Some("tool_use"));
+        // The empty content string must not become an empty Text block.
+        assert_eq!(out.content.len(), 1);
+        match &out.content[0] {
+            Block::ToolUse { id, name, input } => {
+                assert_eq!(id, "call_9");
+                assert_eq!(name, "Bash");
+                assert_eq!(input["command"], "ls");
+            }
+            other => panic!("expected ToolUse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_tool_arguments_become_empty_input() {
+        let raw = r#"{
+            "model": "m",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": { "name": "Read", "arguments": "{not json" }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }"#;
+        let resp: ChatResp = serde_json::from_str(raw).unwrap();
+        let out = into_messages_resp(resp);
+        assert!(matches!(&out.content[0], Block::ToolUse { input, .. } if *input == json!({})));
+    }
+
+    #[test]
+    fn length_and_unknown_finish_reasons() {
+        for (wire, mapped) in [("length", "max_tokens"), ("content_filter", "content_filter")] {
+            let raw = format!(
+                r#"{{"model":"m","choices":[{{"message":{{"role":"assistant","content":"x"}},"finish_reason":"{wire}"}}]}}"#
+            );
+            let resp: ChatResp = serde_json::from_str(&raw).unwrap();
+            assert_eq!(into_messages_resp(resp).stop_reason.as_deref(), Some(mapped));
+        }
+    }
+
+    #[test]
+    fn empty_choices_yield_empty_resp() {
+        let resp: ChatResp = serde_json::from_str(r#"{"model":"m","choices":[]}"#).unwrap();
+        let out = into_messages_resp(resp);
+        assert!(out.content.is_empty());
+        assert!(out.stop_reason.is_none());
+        assert_eq!(out.usage.input_tokens, 0);
+    }
+}
