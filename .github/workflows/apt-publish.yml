@@ -243,6 +243,90 @@ jobs:
                       echo '<p><a href="../">&larr; back to the apt repo</a></p>'
                   } > windows/index.html
 
+            # Android APK: built on a runner by android-apk.yml (needs the NDK,
+            # can't be produced here). Same raw-artifact fetch pattern as the MSI
+            # above — pull the latest successful build's .apk into site/android/
+            # and regenerate that folder's index. The gh-pages clone preserved
+            # any previously-published APKs, so if no fresh artifact is found the
+            # existing set carries over.
+            - name: Find latest Android APK run
+              id: apk_run
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  RUN_ID=$(gh run list --repo "$GITHUB_REPOSITORY" \
+                      --workflow=android-apk.yml --status=success \
+                      -L 1 --json databaseId --jq '.[0].databaseId // empty')
+                  echo "run_id=${RUN_ID}" >> "$GITHUB_OUTPUT"
+                  if [ -n "$RUN_ID" ]; then
+                      echo "→ will pull APK from android-apk run $RUN_ID"
+                  else
+                      echo "→ no successful android-apk run yet; keeping existing APKs"
+                  fi
+            - name: Stage APK artifact + regenerate index
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  RUN_ID: ${{ steps.apk_run.outputs.run_id }}
+              run: |
+                  cd site
+                  mkdir -p android
+                  if [ -n "$RUN_ID" ]; then
+                      # Each artifact's name is the destination filename
+                      # (`ta-remote-<sha>-<ver>.apk`, raw single-file upload).
+                      gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts" \
+                          --jq '.artifacts[] | "\(.id)\t\(.name)"' \
+                      | while IFS=$'\t' read -r ID NAME; do
+                          case "$NAME" in
+                              *.apk)
+                                  TMP="android/$NAME.partial"
+                                  echo "→ fetching artifact $ID → android/$NAME"
+                                  if curl -fSL --write-out 'http=%{http_code} bytes=%{size_download}\n' \
+                                      -H "Authorization: Bearer $GH_TOKEN" \
+                                      -H "X-GitHub-Api-Version: 2022-11-28" \
+                                      -o "$TMP" \
+                                      "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/artifacts/$ID/zip" \
+                                  ; then
+                                      # APKs are ZIP archives — magic PK\x03\x04
+                                      # (50 4b 03 04). Reject anything else so
+                                      # the site never serves a broken download.
+                                      if head -c 4 "$TMP" | od -An -tx1 | tr -d ' \n' | grep -q '^504b0304$'; then
+                                          mv "$TMP" "android/$NAME"
+                                      else
+                                          echo "  ✗ wrong magic on $NAME — discarding"
+                                          rm -f "$TMP"
+                                      fi
+                                  else
+                                      echo "  ✗ curl failed for artifact $ID — skipping"
+                                      rm -f "$TMP"
+                                  fi
+                                  ;;
+                              *) echo "→ skipping non-APK artifact: $NAME" ;;
+                          esac
+                      done
+                  fi
+                  # Cap at the 10 most recent APKs.
+                  ls -1t android/*.apk 2>/dev/null | tail -n +11 | xargs -r rm -f
+                  # Regenerate the folder index (newest first).
+                  {
+                      echo '<!DOCTYPE html><meta charset=utf-8><title>tab-atelier Android app</title>'
+                      echo '<style>body{font-family:system-ui;max-width:48em;margin:3em auto;padding:0 1em}'
+                      echo 'code{background:#f4f4f4;padding:.1em .3em;border-radius:3px}'
+                      echo '.note{background:#fff8d6;border-left:3px solid #d9a900;padding:.6em .9em;margin:1em 0;font-size:.95em}</style>'
+                      echo '<h1>tab-atelier Android app (ta-remote)</h1>'
+                      echo '<p>Signed release APKs of the remote-control app, newest first. Each filename carries the commit short SHA.</p>'
+                      echo '<ul>'
+                      for f in $(ls -1t android/*.apk 2>/dev/null); do
+                          bn=$(basename "$f")
+                          sz=$(du -h "$f" | cut -f1)
+                          echo "<li><a href=\"$bn\">$bn</a> &mdash; $sz</li>"
+                      done
+                      echo '</ul>'
+                      echo '<h2>Installing</h2>'
+                      echo '<p>Download the newest <code>.apk</code> on your Android device and open it. Android asks you to allow installing from this source the first time (Settings &rarr; Apps &rarr; Special access &rarr; Install unknown apps).</p>'
+                      echo '<div class="note">Self-signed (not on the Play Store). It talks to a tab-atelier headless host over its HTTP API — pair by scanning the QR from the desktop share menu, then set the host&rsquo;s public URL for remote access.</div>'
+                      echo '<p><a href="../">&larr; back to the apt repo</a></p>'
+                  } > android/index.html
+
             - name: Regenerate Packages + Release
               env:
                   CHANNEL: ${{ steps.ver.outputs.channel }}
@@ -348,6 +432,8 @@ jobs:
                   </div>
                   <h2>Windows</h2>
                   <p>Headless MSI installers for Windows are at <a href="/windows/">/windows/</a>.</p>
+                  <h2>Android</h2>
+                  <p>The Android remote-control app (APK) is at <a href="/android/">/android/</a>.</p>
                   <p>Source: <a href="https://github.com/wdes/tab-atelier">github.com/wdes/tab-atelier</a>.</p>
 
                   <script>

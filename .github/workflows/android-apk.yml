@@ -1,0 +1,99 @@
+name: android-apk
+
+# Builds the ta-remote Android app (android/ta-remote — a Slint/Rust app; see
+# AGENTS.md "Mobile app") into a signed release APK on a GH runner, emitted as a
+# raw (un-zipped) build artifact named with the short commit SHA — the Android
+# analogue of the per-build .deb / .msi. The `apt-publish.yml` workflow pulls the
+# latest successful APK into the gh-pages site under /android/ (the "deb
+# website"), the same way it pulls the Windows MSI into /windows/.
+#
+# Run on demand (Actions -> android-apk -> Run workflow), on every push to main
+# (tracks the nightly channel), or on a v* tag.
+
+on:
+    workflow_dispatch:
+    push:
+        branches: [main]
+        tags: ['v*']
+
+permissions:
+    contents: read
+
+env:
+    RUST_VERSION: "1.95.0"
+
+jobs:
+    apk:
+        name: Build signed release APK
+        runs-on: ubuntu-latest
+        # The signing keystore + password live in this environment's secrets
+        # (set via `gh secret set --env android-app`), so the APK is signed with
+        # the real release key without committing it.
+        environment: android-app
+        # Skip doc-only / chore commits that opt out, matching apt-publish.
+        if: ${{ !contains(github.event.head_commit.message, '[skip apk]') }}
+        steps:
+            - uses: actions/checkout@v7
+
+            - name: Compute version + short SHA
+              run: |
+                  if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+                      echo "APK_VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_ENV"
+                  else
+                      echo "APK_VERSION=$(grep -m1 '^version = ' android/ta-remote/Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_ENV"
+                  fi
+                  echo "SHORT_SHA=${GITHUB_SHA::8}" >> "$GITHUB_ENV"
+
+            - uses: dtolnay/rust-toolchain@stable
+              with:
+                  toolchain: ${{ env.RUST_VERSION }}
+                  targets: aarch64-linux-android
+
+            - uses: Swatinem/rust-cache@v2
+              with:
+                  workspaces: android/ta-remote
+
+            - name: Install cargo-apk2
+              run: cargo install cargo-apk2 --locked
+
+            # Provide the release keystore from the environment secret rather
+            # than relying on the copy in the repo — so the signing key can be
+            # rotated (or removed from git) without touching the workflow. The
+            # keystore password stays in Cargo.toml's signing config
+            # ([package.metadata.android.signing.release]).
+            - name: Restore signing keystore from secret
+              run: |
+                  echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > android/ta-remote/release.keystore
+                  test -s android/ta-remote/release.keystore && echo "keystore restored ($(wc -c < android/ta-remote/release.keystore) bytes)"
+
+            # ubuntu-latest ships the Android SDK + an NDK preinstalled;
+            # cargo-apk2 needs ANDROID_HOME (already set) and the NDK path.
+            # ANDROID_NDK_LATEST_HOME is the runner's canonical NDK env var.
+            - name: Build signed release APK
+              working-directory: android/ta-remote
+              run: |
+                  export ANDROID_NDK_ROOT="${ANDROID_NDK_ROOT:-$ANDROID_NDK_LATEST_HOME}"
+                  echo "SDK: $ANDROID_HOME"
+                  echo "NDK: $ANDROID_NDK_ROOT"
+                  # Release build is signed with the in-repo release.keystore
+                  # ([package.metadata.android.signing.release] in Cargo.toml).
+                  cargo apk2 build --release
+                  ls -la target/release/apk/
+
+            - name: Stage APK with build name
+              run: |
+                  mkdir -p out
+                  cp android/ta-remote/target/release/apk/ta-remote.apk \
+                     "out/ta-remote-${SHORT_SHA}-${APK_VERSION}.apk"
+                  ls -la out/
+
+            # archive: false emits the .apk as-is (single raw file), not wrapped
+            # in the usual artifact .zip — same as the raw MSI upload, so
+            # apt-publish can fetch the bytes directly from the artifacts API.
+            - name: Upload APK artifact (raw)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: ta-remote-apk-${{ env.SHORT_SHA }}
+                  path: out/ta-remote-${{ env.SHORT_SHA }}-${{ env.APK_VERSION }}.apk
+                  archive: false
+                  if-no-files-found: error
