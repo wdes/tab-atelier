@@ -275,8 +275,8 @@ pub static FR: Strings = Strings {
     connections: "Connexions",
     memory: "Mémoire",
     tokens: "Tokens",
-    show_gauge: "Afficher la jauge RAM",
-    hide_gauge: "Masquer la jauge RAM",
+    show_gauge: "Afficher la jauge de RAM",
+    hide_gauge: "Masquer la jauge de RAM",
 
     rename_tab: "Renommer l'onglet :",
 
