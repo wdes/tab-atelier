@@ -111,11 +111,22 @@ fn read_http_request(stream: &mut TcpStream) -> String {
     String::from_utf8_lossy(&buf).to_string()
 }
 
-/// Kill the agent when the test ends, pass or fail.
+/// Stop the agent when the test ends, pass or fail. SIGTERM first —
+/// the agent exits cleanly on it (socket.rs installs a handler), and
+/// a clean exit is what lets a coverage-instrumented binary flush its
+/// profile to disk. SIGKILL only if it hasn't exited within 5 s.
 struct KillOnDrop(Child);
 
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
+        let _ = Command::new("kill").args(["-TERM", &self.0.id().to_string()]).status();
+        for _ in 0..100 {
+            match self.0.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Err(_) => break,
+            }
+        }
         let _ = self.0.kill();
         let _ = self.0.wait();
     }

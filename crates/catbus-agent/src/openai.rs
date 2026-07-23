@@ -374,6 +374,34 @@ mod tests {
     }
 
     #[test]
+    fn build_request_passes_plain_assistant_and_skips_unknown_roles() {
+        let history = vec![
+            ApiMessage {
+                role: "assistant".into(),
+                content: ApiContent::Plain("prior answer".into()),
+            },
+            ApiMessage {
+                role: "system".into(),
+                content: ApiContent::Plain("not a turn".into()),
+            },
+        ];
+        let req = build_request("m", "s", &[], &history);
+        let messages = req["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"], "prior answer");
+    }
+
+    #[test]
+    fn tool_spec_without_schema_gets_empty_parameters() {
+        let specs = [json!({ "name": "Bare" })];
+        let req = build_request("m", "s", &specs, &[]);
+        let tool = &req["tools"][0]["function"];
+        assert_eq!(tool["name"], "Bare");
+        assert_eq!(tool["parameters"], json!({ "type": "object", "properties": {} }));
+    }
+
+    #[test]
     fn build_request_drops_empty_assistant_turns() {
         let history = vec![blocks("assistant", vec![])];
         let req = build_request("m", "s", &[], &history);
