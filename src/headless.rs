@@ -1250,8 +1250,7 @@ fn refresh_snapshot(
             // Per-tab consumption (issue #28): RSS of the shell subtree.
             // Token mirroring is GUI-only for now (HeadlessTab has no token
             // sidecar cache yet) — headless reports None here.
-            resident_memory_bytes: crate::agent_probe::sample_tree(tab.pid)
-                .map(|s| s.rss_kb.saturating_mul(1024)),
+            resident_memory_bytes: crate::agent_probe::sample_tree(tab.pid).map(|s| s.rss_kb.saturating_mul(1024)),
             tokens: None,
         });
     }

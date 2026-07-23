@@ -1697,23 +1697,29 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 resident_memory_bytes: Option<u64>,
                 #[serde(skip_serializing_if = "Option::is_none")]
                 tokens: Option<crate::TokenUsage>,
-                #[cfg(feature = "energy")]
                 cpu_percent: f64,
                 connections: usize,
                 tx_bytes: u64,
             }
             let state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            // CPU% is sampled by the `energy` feature (`state.power`, parallel to
+            // `state.tabs` by index); 0.0 when the binary was built without it.
+            // Isolated to this closure so the usage projection below stays
+            // feature-agnostic — the endpoint's shape doesn't depend on `energy`.
+            #[cfg(feature = "energy")]
+            let cpu_of = |i: usize| state.power.get(i).map_or(0.0, |p| p.cpu_percent);
+            #[cfg(not(feature = "energy"))]
+            let cpu_of = |_i: usize| 0.0_f64;
             let usage: Vec<UsageTab> = state
                 .tabs
                 .iter()
                 .enumerate()
-                .map(|(_i, t)| UsageTab {
+                .map(|(i, t)| UsageTab {
                     id: t.id.to_string(),
                     name: t.name.to_string(),
                     resident_memory_bytes: t.resident_memory_bytes,
                     tokens: t.tokens,
-                    #[cfg(feature = "energy")]
-                    cpu_percent: state.power.get(_i).map_or(0.0, |p| p.cpu_percent),
+                    cpu_percent: cpu_of(i),
                     connections: t.connections,
                     tx_bytes: t.tx_bytes,
                 })
