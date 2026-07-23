@@ -21,6 +21,34 @@ Tab Atelier is a Guake-style drop-down terminal emulator for Linux (X11), built 
 - `src/tracking.rs` — Wakatime integration
 - `src/platform/linux.rs` — Linux-specific platform code (XDG dirs, X11 hotkeys, process info)
 
+## Mobile app (`android/ta-remote`)
+
+The Android remote client lives IN this repo — a Slint (Rust) app, not a
+separate project:
+- `src/android_app.rs` — native glue + the reachability poller and API calls.
+- `src/onboard.rs` — parses the `taremote://onboard?url&tls_url&token` deep link
+  (the QR from the desktop share modal — note it carries **LAN** addresses only;
+  the public host is the app's separately-set `remote_url`).
+- `ui/*.slint` — the UI; `java/fr/wdes/tab_atelier/WebViewHost.java` — the
+  fullscreen WebView hosting the `/tabs/<id>/view` share-viewer.
+- Build: `cargo-apk2` (config under `[package.metadata.android]` in its
+  `Cargo.toml`; `aarch64-linux-android`, minSdk 23, pkg `fr.wdes.tab_atelier`).
+
+Reachability: the app polls `GET {url|remote_url}/tabs` (Bearer token) with
+`ureq` → `Lan` / `Remote` / `Forbidden` (401/403) / **`Offline`** (anything
+else). A 200 whose body doesn't deserialize into the app's `ApiResponse`, OR any
+non-401/403 error, reads as Offline — so a `/tabs` JSON-shape change can silently
+make the app report the host offline.
+
+**TLS gotcha (a recurring "host offline" cause):** the headless origin usually
+serves a self-signed / Cloudflare-Origin cert Android doesn't trust. The WebView
+waves it through (`handler.proceed()` in WebViewHost.java), but the `ureq`
+reachability agent (`android_app.rs`, ~`AgentBuilder::new()`) uses **default TLS
+validation** — so it rejects that cert and shows Offline on remote HTTPS even
+though the browser/WebView works. The bearer token is the authn material; TLS is
+confidentiality only. Any reachability/API agent must accept the host's cert the
+same way the WebView does.
+
 ## Constraints
 
 - No in-app keyboard shortcuts. Only global hotkeys (F12). Mouse-driven UI.
