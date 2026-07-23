@@ -72,6 +72,7 @@ fn main() {
                      tab-atelier lock|unlock <tab>  block / allow input on a tab\n  \
                      tab-atelier input <tab> <text>  send keystrokes to a tab\n  \
                      tab-atelier output <tab>     print a tab's scrollback\n  \
+                     tab-atelier stats <tab> [--json]  per-tab diagnostics (the Stats popup)\n  \
                      tab-atelier share-link <tab> [--ro]  print a share URL for a tab\n  \
                      tab-atelier bg-color <tab> <color>  set a tab's background\n  \
                      tab-atelier net-off|net-on <tab>  cut / restore a tab's internet\n  \
