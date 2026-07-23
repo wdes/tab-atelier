@@ -1,24 +1,24 @@
 Architectures: amd64
 Codename: nightly
 Components: main
-Date: Thu, 23 Jul 2026 11:50:29 +0000
+Date: Thu, 23 Jul 2026 12:10:21 +0000
 Description: tab-atelier nightly channel
 Label: tab-atelier
 Origin: tab-atelier
 Suite: nightly
 MD5Sum:
- 26ab3aa31a64ef2fc339d7157b2f7003              189 Release
- 614f1a646a3157302a52e9970d522589            23870 main/binary-amd64/Packages
- b9e6c2af78ba0d0d66313d0800b56fef             4751 main/binary-amd64/Packages.gz
+ 194f2a8f7484977140d2a622355f601b              189 Release
+ fce2cf0bca51e5df3e83271e095ca25e            23870 main/binary-amd64/Packages
+ 9b3d4a105fd2807980a0a38e282e9dff             4746 main/binary-amd64/Packages.gz
 SHA1:
- a67e68394832cfeb95dbf3cb1eefc878c1dcc5b0              189 Release
- 28ae91651d23aaf4138303bdb526442ea12cd0e5            23870 main/binary-amd64/Packages
- 44079229e753f886b97a3aacb08ba699f4b89e10             4751 main/binary-amd64/Packages.gz
+ d01f7836fa7439ea00518e7de3d3e54a97982bc0              189 Release
+ b154c9a075906dee8e6ee054c037a8de95f1099f            23870 main/binary-amd64/Packages
+ b570f39297ea6d457c0452419a7f855ccf45df85             4746 main/binary-amd64/Packages.gz
 SHA256:
- e16581cae870604e9b295d07e15cb1a0165a38c544ca78825ed1eaaa716fb772              189 Release
- ce2a5e2d1cfe702e2ce3d1c0d21bd503b0265abd75655c5cccb31faf9cacbe70            23870 main/binary-amd64/Packages
- 02d4a584cab81c21217f87876ebd07ca8da1b1c2921f8631b3fbf5d1f8cd9daa             4751 main/binary-amd64/Packages.gz
+ ac5f507d97f6d1c26e5c25c43f1d48e2fc5e60eb748ac396f899685cb415ee58              189 Release
+ a8474fd09edc675c8d36344c446da9ff7920a2747a15ea74a2bc9831292fc8ce            23870 main/binary-amd64/Packages
+ a017f52bf45a01d8fb9228d6a6cf09586118774972a8e4ed9e10aac97597b1af             4746 main/binary-amd64/Packages.gz
 SHA512:
- d27eb1b563382b5213f30a0f75a9ee283d472e3cc204ba930e03c75b52c45086053d4f2849a2813157339a12ff3312047ca5990f7096367ef7f4af10bdd54c1d              189 Release
- 050b3617c8611d5ae6af54a0fb73fbf0357851a6a9cefe0e3b15d0269d5dcb4df324d038411a967610973b81eb341ab8acff9f7fe5f38ba50ef0628d953d0580            23870 main/binary-amd64/Packages
- 0b8df34bcf877926ef1578a2a6240b417c4d74148100128640ca72f599c211ac9db39f77b4b29e6611455ebc549d1a6d9ecdda0cce3c1f5d0be2fc7be5682d99             4751 main/binary-amd64/Packages.gz
+ a39896c687e79e589577a3f6b453c62a59119959d2dc6bbf0a2ff173a5f9b9b21c9fa7afbfab46299ecb41354116ffbb5fcd685b283317fb13845562539fadbe              189 Release
+ c27d76831bdaba10f53ab39f22fd0ec5185742308f65ff589a7a7d2755f969e04ea66f945dd76212eaa18a964220e8f28ea6a367fc615a3f55d37746ddd2daac            23870 main/binary-amd64/Packages
+ 86036d31fb3ecdb5543a3bdeef6f3729a19256cc85540cc366c5d0c57892e0f7766918969aa1637b4f338fa147a86e19902491e2e05d46dc353ff9a2769faa58             4746 main/binary-amd64/Packages.gz
