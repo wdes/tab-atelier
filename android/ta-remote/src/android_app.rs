@@ -238,10 +238,17 @@ struct StoredConfig {
     active: usize,
 }
 
+// Every field defaults: a reachable host whose `/tabs` shape drifts (new/renamed
+// fields on the daemon) must still deserialize, so the app never reads a live
+// host as "offline" over a JSON mismatch. serde already ignores unknown fields;
+// `default` covers missing/renamed ones too.
 #[derive(Debug, Deserialize)]
 struct ApiTab {
+    #[serde(default)]
     name: String,
+    #[serde(default)]
     cwd: Option<String>,
+    #[serde(default)]
     active: bool,
     #[serde(default)]
     cpu_percent: f64,
@@ -265,6 +272,7 @@ struct ApiHost {
 struct ApiResponse {
     #[serde(default)]
     host: ApiHost,
+    #[serde(default)]
     tabs: Vec<ApiTab>,
 }
 
@@ -343,6 +351,77 @@ enum FetchOutcome {
     Ok(ApiResponse),
     Forbidden,
     NoResponse,
+}
+
+/// TLS config for the reachability/API agent that accepts ANY server cert.
+///
+/// The bearer token is the authentication material and TLS here is
+/// confidentiality only — the in-app WebView already does the same
+/// (`handler.proceed()` in WebViewHost.java), and headless origins commonly
+/// serve a self-signed / Cloudflare-Origin cert Android doesn't trust. Without
+/// this the `GET /tabs` poll fails the TLS handshake on every `https://` host
+/// and the app reports it "offline" even though the browser works.
+fn permissive_tls_config() -> rustls::ClientConfig {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("ring provider supports the default protocol versions")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert))
+        .with_no_client_auth()
+}
+
+/// Server-cert verifier that trusts everything. Signature checks still run
+/// against the ring provider (the cert chain is what we skip). See
+/// [`permissive_tls_config`] for why.
+#[derive(Debug)]
+struct AcceptAnyServerCert;
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
 }
 
 fn try_fetch_tabs(agent: &ureq::Agent, base: &str, token: &str, timeout: Duration) -> FetchOutcome {
@@ -709,7 +788,12 @@ pub fn android_main(app: slint::android::AndroidApp) {
         ui.set_editor_open(true);
     }
 
-    let agent: Arc<ureq::Agent> = Arc::new(ureq::AgentBuilder::new().timeout(Duration::from_secs(5)).build());
+    let agent: Arc<ureq::Agent> = Arc::new(
+        ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(5))
+            .tls_config(Arc::new(permissive_tls_config()))
+            .build(),
+    );
 
     let last_reach: Arc<Mutex<Reach>> = Arc::new(Mutex::new(Reach::Offline));
     let seen_previews: SeenPreviews = Arc::new(Mutex::new(HashMap::new()));

@@ -48,12 +48,18 @@ slint = { version = "1", default-features = false, features = [
     "renderer-femtovg",
     "backend-android-activity-06",
 ] }
-ureq = { version = "2", default-features = false, features = ["json"] }
+# `tls` is REQUIRED — without it ureq can't do HTTPS at all, so every remote
+# (https://) host silently reads as "offline" while LAN http:// works. The
+# reachability agent then uses a permissive cert verifier (see android_app.rs)
+# to accept the self-signed / Cloudflare-Origin certs the WebView already waves
+# through — the bearer token is the authn material, TLS is confidentiality only.
+ureq = { version = "2", default-features = false, features = ["json", "tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 log = "0.4"
 android_logger = "0.14"
 jni = "0.21"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 
 [build-dependencies]
 slint-build = "1"
