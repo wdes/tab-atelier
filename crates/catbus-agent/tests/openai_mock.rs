@@ -180,7 +180,7 @@ fn connect_socket(path: &Path) -> (BufReader<UnixStream>, UnixStream) {
         );
         std::thread::sleep(Duration::from_millis(50));
     };
-    stream.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+    stream.set_read_timeout(Some(Duration::from_mins(1))).unwrap();
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut line = String::new();
     reader.read_line(&mut line).unwrap();
