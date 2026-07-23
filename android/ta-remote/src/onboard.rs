@@ -36,6 +36,31 @@ pub fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Upgrade a headless base URL to its TLS form: `http://` → `https://`, and the
+/// default API port `7890` → the TLS listener port `7891`. Other schemes/ports
+/// pass through untouched. Kept here (host-compiled) so it's unit-testable —
+/// `android_app` is `cfg(target_os = "android")` and never builds on the host.
+#[must_use]
+pub fn to_tls_url(http_url: &str) -> String {
+    let mut s = http_url.to_string();
+    if let Some(rest) = s.strip_prefix("http://") {
+        s = format!("https://{rest}");
+    }
+    if let Some(idx) = s.rfind(":7890") {
+        s = format!("{}:7891{}", &s[..idx], &s[idx + 5..]);
+    }
+    s
+}
+
+/// A host URL stripped of its scheme, for compact display (`https://h:7891` →
+/// `h:7891`).
+#[must_use]
+pub fn host_detail(url: &str) -> String {
+    url.trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,5 +122,31 @@ mod tests {
     #[test]
     fn parse_wrong_host_returns_none() {
         assert!(parse_onboard_url("taremote://other?url=x&token=y").is_none());
+    }
+
+    #[test]
+    fn to_tls_url_upgrades_scheme_and_port() {
+        // http → https AND the default API port 7890 → the TLS port 7891.
+        assert_eq!(to_tls_url("http://192.168.1.5:7890"), "https://192.168.1.5:7891");
+    }
+
+    #[test]
+    fn to_tls_url_already_https_only_bumps_port() {
+        assert_eq!(to_tls_url("https://host:7890"), "https://host:7891");
+    }
+
+    #[test]
+    fn to_tls_url_keeps_trailing_path_and_leaves_other_ports() {
+        assert_eq!(to_tls_url("http://host:7890/tabs"), "https://host:7891/tabs");
+        // A non-default port is untouched (only the scheme upgrades).
+        assert_eq!(to_tls_url("http://host:8443"), "https://host:8443");
+    }
+
+    #[test]
+    fn host_detail_strips_scheme() {
+        assert_eq!(host_detail("https://t-atelier.example:7891"), "t-atelier.example:7891");
+        assert_eq!(host_detail("http://192.168.1.5:7890"), "192.168.1.5:7890");
+        // Already scheme-less → unchanged.
+        assert_eq!(host_detail("bare-host:7890"), "bare-host:7890");
     }
 }

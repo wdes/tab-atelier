@@ -9,7 +9,7 @@ use jni::objects::{JObject, JString, JValue};
 use serde::{Deserialize, Serialize};
 use slint::{ComponentHandle, Model, SharedString, VecModel, Weak};
 
-use crate::onboard::parse_onboard_url;
+use crate::onboard::{host_detail, parse_onboard_url};
 
 slint::include_modules!();
 
@@ -100,7 +100,9 @@ fn load_app_class<'local>(
         .map_err(|e| format!("activity.getClassLoader: {e}"))?
         .l()
         .map_err(|e| format!("getClassLoader result: {e}"))?;
-    let name_jstr = env.new_string(name).map_err(|e| format!("new_string class name: {e}"))?;
+    let name_jstr = env
+        .new_string(name)
+        .map_err(|e| format!("new_string class name: {e}"))?;
     let load_result = env.call_method(
         &loader,
         "loadClass",
@@ -172,22 +174,6 @@ fn dismiss_webview(app: &slint::android::AndroidApp) -> bool {
     )
     .and_then(|v| v.z())
     .unwrap_or(false)
-}
-
-/// Swap `http://host:7890` into `https://host:7891` so the WebView
-/// loads the TLS endpoint instead of the cleartext one. The TLS
-/// endpoint serves the same `/tabs/.../view` route + WS upgrade —
-/// the only difference is the channel encryption. If the URL is
-/// already `https://`, leave it untouched.
-fn to_tls_url(http_url: &str) -> String {
-    let mut s = http_url.to_string();
-    if let Some(rest) = s.strip_prefix("http://") {
-        s = format!("https://{rest}");
-    }
-    if let Some(idx) = s.rfind(":7890") {
-        s = format!("{}:7891{}", &s[..idx], &s[idx + 5..]);
-    }
-    s
 }
 
 fn launch_intent_uri(app: &slint::android::AndroidApp) -> Option<String> {
@@ -495,7 +481,6 @@ fn delete_tab(agent: &ureq::Agent, host: &HostConfig, reach: Reach, idx: i32) {
     }
 }
 
-
 /// Fold sticky CTRL / ALT into a typed UTF-8 string.
 ///
 /// CTRL maps the *first* ASCII letter (case-insensitive) to its Ctrl
@@ -656,12 +641,6 @@ fn push_hosts(ui_weak: &Weak<AppWindow>, data: &AppData) {
             ui.set_active_host(active);
         }
     });
-}
-
-fn host_detail(url: &str) -> String {
-    url.trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .to_string()
 }
 
 fn show_toast(ui_weak: &Weak<AppWindow>, msg: String) {
