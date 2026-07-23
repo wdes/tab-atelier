@@ -8,7 +8,9 @@
 //! Totoro*. Each `tab-atelier` tab can run one catbus instance, and
 //! you talk to it through a per-session UNIX socket. Internally it
 //! authenticates via Claude Code's OAuth credentials (so a Max
-//! subscription works without an API key), persists the conversation
+//! subscription works without an API key) — or, with
+//! `--infomaniak-product-id` + `--infomaniak-token`, talks to
+//! Infomaniak's OpenAI-compatible API instead. It persists the conversation
 //! in the same JSONL shape Claude Code uses (so the existing
 //! `/tabs/N/catbus/messages` endpoint Just Works), and runs a small
 //! Read / Write / Edit / Bash tool loop.
@@ -27,6 +29,7 @@ use tokio::io::AsyncWriteExt;
 
 mod agent;
 mod auth;
+mod infomaniak;
 mod session;
 mod socket;
 mod tools;
@@ -74,6 +77,29 @@ struct Args {
     /// rather than from a tab the user is staring at.
     #[arg(long)]
     no_tui: bool,
+
+    /// Infomaniak AI Tools product id. Together with
+    /// --infomaniak-token this routes the session through Infomaniak's
+    /// OpenAI-compatible API instead of Anthropic OAuth.
+    #[arg(long, env = "INFOMANIAK_PRODUCT_ID", requires = "infomaniak_token")]
+    infomaniak_product_id: Option<String>,
+
+    /// Infomaniak API token (sent as a Bearer header). Prefer the env
+    /// var over the flag so the secret stays out of `ps` output and
+    /// shell history.
+    #[arg(
+        long,
+        env = "INFOMANIAK_API_TOKEN",
+        hide_env_values = true,
+        requires = "infomaniak_product_id"
+    )]
+    infomaniak_token: Option<String>,
+
+    /// Model to request from Infomaniak. Only used when the two flags
+    /// above are set; pick a function-calling-capable model or the
+    /// tool loop degrades to text-only answers.
+    #[arg(long, env = "INFOMANIAK_MODEL", default_value = infomaniak::DEFAULT_MODEL)]
+    infomaniak_model: String,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -94,8 +120,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Auth must succeed *before* we open the socket — no point
-    // accepting prompts we can't service.
-    let auth = auth::load()?;
+    // accepting prompts we can't service. With Infomaniak configured
+    // the Claude OAuth credentials are never touched, so catbus runs
+    // on machines without a Claude Code login.
+    let provider = match (args.infomaniak_product_id, args.infomaniak_token) {
+        (Some(product_id), Some(token)) => agent::Provider::Infomaniak(infomaniak::Config {
+            product_id,
+            token,
+            model: args.infomaniak_model,
+        }),
+        _ => agent::Provider::Anthropic(auth::load()?),
+    };
     let session = session::open(&cwd, args.resume.as_deref(), args.new_session)?;
 
     // Apply --name if provided (also works as a rename on resume).
@@ -111,7 +146,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     log::info!("session {} ready at {}", session.id, socket_path.display());
-    let agent = Arc::new(agent::Agent::new(auth, session));
+    let agent = Arc::new(agent::Agent::new(provider, session));
 
     let socket_task = tokio::spawn({
         let agent = Arc::clone(&agent);
