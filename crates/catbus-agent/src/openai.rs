@@ -2,12 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Infomaniak AI Tools — OpenAI-compatible chat-completions backend.
-//!
-//! Infomaniak exposes its hosted models behind an OpenAI-compatible
-//! endpoint scoped to a product:
-//! `https://api.infomaniak.com/1/ai/{product_id}/openai/chat/completions`,
-//! authenticated with a plain `Authorization: Bearer` API token.
+//! `OpenAI`-compatible chat-completions backend — any service that
+//! speaks the `POST {base}/chat/completions` dialect with Bearer-token
+//! auth: `x.ai` (`https://api.x.ai/v1`, Grok models), Infomaniak AI
+//! Tools, `OpenAI` itself, a local `llama.cpp`/Ollama server, etc.
 //!
 //! The agent keeps its history in Anthropic Messages shape (the same
 //! blocks the JSONL transcript stores), so this module translates in
@@ -25,23 +23,35 @@ use crate::session::Block;
 /// Default model requested from Infomaniak. Must be one of their
 /// function-calling-capable models or the tool loop degrades to
 /// text-only answers.
-pub const DEFAULT_MODEL: &str = "mistral24b";
+pub const INFOMANIAK_DEFAULT_MODEL: &str = "mistral24b";
 
-/// Everything needed to reach one Infomaniak AI Tools product.
+/// Everything needed to reach one `OpenAI`-compatible service.
 pub struct Config {
-    pub product_id: String,
+    /// Full chat-completions endpoint URL.
+    pub chat_url: String,
     pub token: String,
     pub model: String,
 }
 
-impl Config {
-    #[must_use]
-    pub fn chat_url(&self) -> String {
-        format!(
-            "https://api.infomaniak.com/1/ai/{}/openai/chat/completions",
-            self.product_id
-        )
+/// Turn a base URL (`https://api.x.ai/v1`) into the full
+/// chat-completions endpoint. A URL that already ends in
+/// `/chat/completions` passes through untouched, so both spellings
+/// work on the CLI.
+#[must_use]
+pub fn chat_url_from_base(base: &str) -> String {
+    let trimmed = base.trim_end_matches('/');
+    if trimmed.ends_with("/chat/completions") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/chat/completions")
     }
+}
+
+/// Infomaniak AI Tools scopes its `OpenAI`-compatible endpoint under a
+/// product id: `https://api.infomaniak.com/1/ai/{product_id}/openai`.
+#[must_use]
+pub fn infomaniak_chat_url(product_id: &str) -> String {
+    format!("https://api.infomaniak.com/1/ai/{product_id}/openai/chat/completions")
 }
 
 /// Build the chat-completions request body from the agent's

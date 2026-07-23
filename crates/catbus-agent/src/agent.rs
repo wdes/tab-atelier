@@ -53,8 +53,9 @@ const SYSTEM_STATIC_INSTRUCTIONS: &str = "Your text replies are rendered directl
 pub enum Provider {
     /// Anthropic Messages API via Claude Code's OAuth credentials.
     Anthropic(Auth),
-    /// Infomaniak AI Tools via their OpenAI-compatible endpoint.
-    Infomaniak(crate::infomaniak::Config),
+    /// Any `OpenAI`-compatible chat-completions endpoint (`x.ai`/Grok,
+    /// Infomaniak AI Tools, `OpenAI`, a local server, ...).
+    OpenAiCompat(crate::openai::Config),
 }
 
 /// Session + history bundled together so swapping sessions mid-REPL
@@ -320,7 +321,7 @@ impl Agent {
     async fn call_messages(&self) -> Result<MessagesResp, AgentError> {
         match &self.provider {
             Provider::Anthropic(auth) => self.call_anthropic(auth).await,
-            Provider::Infomaniak(cfg) => self.call_infomaniak(cfg).await,
+            Provider::OpenAiCompat(cfg) => self.call_openai_compat(cfg).await,
         }
     }
 
@@ -388,19 +389,19 @@ impl Agent {
     }
 
     /// Same turn, different wire: translate our Anthropic-shaped
-    /// history into an `OpenAI` chat-completions request against
-    /// Infomaniak's endpoint, and fold the response back into
+    /// history into an `OpenAI` chat-completions request against the
+    /// configured endpoint, and fold the response back into
     /// `MessagesResp`. No OAuth dance — the API token is static.
-    async fn call_infomaniak(&self, cfg: &crate::infomaniak::Config) -> Result<MessagesResp, AgentError> {
+    async fn call_openai_compat(&self, cfg: &crate::openai::Config) -> Result<MessagesResp, AgentError> {
         let active = self.active.read().await;
         let cwd = active.session.cwd.display().to_string();
         let system = format!("{}\n\n{SYSTEM_STATIC_INSTRUCTIONS}", self.dynamic_system_text(&cwd));
         let tool_specs = tools::tool_specs();
-        let body = crate::infomaniak::build_request(&cfg.model, &system, &tool_specs, &active.history);
+        let body = crate::openai::build_request(&cfg.model, &system, &tool_specs, &active.history);
         drop(active);
         let resp = self
             .http
-            .post(cfg.chat_url())
+            .post(&cfg.chat_url)
             .bearer_auth(&cfg.token)
             .json(&body)
             .send()
@@ -412,10 +413,10 @@ impl Agent {
             return Err(AgentError::Api(format!("{status}: {body}")));
         }
         let raw = resp
-            .json::<crate::infomaniak::ChatResp>()
+            .json::<crate::openai::ChatResp>()
             .await
             .map_err(|e| AgentError::Http(format!("decode: {e}")))?;
-        Ok(crate::infomaniak::into_messages_resp(raw))
+        Ok(crate::openai::into_messages_resp(raw))
     }
 }
 

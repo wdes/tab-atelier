@@ -8,12 +8,13 @@
 //! Totoro*. Each `tab-atelier` tab can run one catbus instance, and
 //! you talk to it through a per-session UNIX socket. Internally it
 //! authenticates via Claude Code's OAuth credentials (so a Max
-//! subscription works without an API key) — or, with
-//! `--infomaniak-product-id` + `--infomaniak-token`, talks to
-//! Infomaniak's OpenAI-compatible API instead. It persists the conversation
-//! in the same JSONL shape Claude Code uses (so the existing
-//! `/tabs/N/catbus/messages` endpoint Just Works), and runs a small
-//! Read / Write / Edit / Bash tool loop.
+//! subscription works without an API key) — or talks to any
+//! OpenAI-compatible service instead (`--openai-url`, `--openai-token`
+//! and `--openai-model` for `x.ai`/Grok, `OpenAI`, a local server,
+//! etc., or the `--infomaniak-*` shortcut for Infomaniak AI Tools).
+//! It persists the conversation in the same JSONL shape Claude Code
+//! uses (so the existing `/tabs/N/catbus/messages` endpoint Just
+//! Works), and runs a small Read / Write / Edit / Bash tool loop.
 
 #![allow(clippy::module_name_repetitions)]
 
@@ -29,7 +30,7 @@ use tokio::io::AsyncWriteExt;
 
 mod agent;
 mod auth;
-mod infomaniak;
+mod openai;
 mod session;
 mod socket;
 mod tools;
@@ -78,9 +79,35 @@ struct Args {
     #[arg(long)]
     no_tui: bool,
 
-    /// Infomaniak AI Tools product id. Together with
-    /// --infomaniak-token this routes the session through Infomaniak's
-    /// OpenAI-compatible API instead of Anthropic OAuth.
+    /// Base URL of any OpenAI-compatible service, e.g.
+    /// `https://api.x.ai/v1` (Grok) or `http://localhost:11434/v1`
+    /// (Ollama). `/chat/completions` is appended when missing. Routes
+    /// the session through that service instead of Anthropic OAuth.
+    #[arg(
+        long,
+        env = "CATBUS_OPENAI_URL",
+        requires = "openai_token",
+        requires = "openai_model",
+        conflicts_with = "infomaniak_product_id"
+    )]
+    openai_url: Option<String>,
+
+    /// API token for --openai-url (sent as a Bearer header). Prefer
+    /// the env var over the flag so the secret stays out of `ps`
+    /// output and shell history.
+    #[arg(long, env = "CATBUS_OPENAI_TOKEN", hide_env_values = true, requires = "openai_url")]
+    openai_token: Option<String>,
+
+    /// Model to request from --openai-url (e.g. grok-4). Pick a
+    /// function-calling-capable model or the tool loop degrades to
+    /// text-only answers.
+    #[arg(long, env = "CATBUS_OPENAI_MODEL", requires = "openai_url")]
+    openai_model: Option<String>,
+
+    /// Infomaniak AI Tools product id — a shortcut for --openai-url
+    /// that builds the product-scoped Infomaniak endpoint. Together
+    /// with --infomaniak-token this routes the session through
+    /// Infomaniak's OpenAI-compatible API instead of Anthropic OAuth.
     #[arg(long, env = "INFOMANIAK_PRODUCT_ID", requires = "infomaniak_token")]
     infomaniak_product_id: Option<String>,
 
@@ -95,10 +122,10 @@ struct Args {
     )]
     infomaniak_token: Option<String>,
 
-    /// Model to request from Infomaniak. Only used when the two flags
-    /// above are set; pick a function-calling-capable model or the
-    /// tool loop degrades to text-only answers.
-    #[arg(long, env = "INFOMANIAK_MODEL", default_value = infomaniak::DEFAULT_MODEL)]
+    /// Model to request from Infomaniak. Only used with the two flags
+    /// above; pick a function-calling-capable model or the tool loop
+    /// degrades to text-only answers.
+    #[arg(long, env = "INFOMANIAK_MODEL", default_value = openai::INFOMANIAK_DEFAULT_MODEL)]
     infomaniak_model: String,
 }
 
@@ -120,17 +147,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Auth must succeed *before* we open the socket — no point
-    // accepting prompts we can't service. With Infomaniak configured
-    // the Claude OAuth credentials are never touched, so catbus runs
-    // on machines without a Claude Code login.
-    let provider = match (args.infomaniak_product_id, args.infomaniak_token) {
-        (Some(product_id), Some(token)) => agent::Provider::Infomaniak(infomaniak::Config {
-            product_id,
-            token,
-            model: args.infomaniak_model,
-        }),
-        _ => agent::Provider::Anthropic(auth::load()?),
-    };
+    // accepting prompts we can't service. With an OpenAI-compatible
+    // backend configured the Claude OAuth credentials are never
+    // touched, so catbus runs on machines without a Claude Code login.
+    let provider =
+        if let (Some(url), Some(token), Some(model)) = (args.openai_url, args.openai_token, args.openai_model) {
+            agent::Provider::OpenAiCompat(openai::Config {
+                chat_url: openai::chat_url_from_base(&url),
+                token,
+                model,
+            })
+        } else if let (Some(product_id), Some(token)) = (args.infomaniak_product_id, args.infomaniak_token) {
+            agent::Provider::OpenAiCompat(openai::Config {
+                chat_url: openai::infomaniak_chat_url(&product_id),
+                token,
+                model: args.infomaniak_model,
+            })
+        } else {
+            agent::Provider::Anthropic(auth::load()?)
+        };
     let session = session::open(&cwd, args.resume.as_deref(), args.new_session)?;
 
     // Apply --name if provided (also works as a rename on resume).
