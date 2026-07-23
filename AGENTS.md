@@ -33,6 +33,12 @@ separate project:
   fullscreen WebView hosting the `/tabs/<id>/view` share-viewer.
 - Build: `cargo-apk2` (config under `[package.metadata.android]` in its
   `Cargo.toml`; `aarch64-linux-android`, minSdk 23, pkg `fr.wdes.tab_atelier`).
+  Check/build from `android/ta-remote` with `ANDROID_HOME` + `ANDROID_NDK_ROOT`
+  set to an SDK carrying an NDK (25/26): `cargo apk2 check` (compile-check) /
+  `cargo apk2 build` (APK). A plain `cargo check --target aarch64-linux-android`
+  fails on the Slint android-activity build-script — go through `cargo apk2`.
+  Host-only pure logic still runs with `cargo test --lib` there (the `onboard`
+  module is unconditional; `android_app` is `cfg(android)`).
 
 Reachability: the app polls `GET {url|remote_url}/tabs` (Bearer token) with
 `ureq` → `Lan` / `Remote` / `Forbidden` (401/403) / **`Offline`** (anything
