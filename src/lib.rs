@@ -32,6 +32,7 @@ pub(crate) mod event_proxy;
 pub(crate) use event_proxy::EventProxy;
 #[cfg(not(feature = "gui"))]
 pub mod headless;
+pub mod hotswap;
 /// Experimental HTTP/3 + WebTransport transport (behind `http3`).
 #[cfg(feature = "http3")]
 pub mod http3;

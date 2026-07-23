@@ -429,6 +429,13 @@ impl<P: EventedPty> PtyTap<P> {
 
 impl<P: EventedPty> io::Read for PtyTap<P> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // Hot-swap handoff in progress: park the reader so unread bytes
+        // stay in the kernel PTY buffer — the post-exec process reads
+        // them into its fresh parser, losing nothing. The event loop
+        // treats `WouldBlock` as "drained" and returns to polling.
+        if crate::hotswap::frozen() {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
         let n = self.inner.reader().read(buf)?;
         if n > 0 {
             // T2 — instrumentation: bytes arrived from the PTY (about

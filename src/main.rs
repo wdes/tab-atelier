@@ -79,6 +79,7 @@ fn main() {
                      tab-atelier limit <tab> …    cap a tab's RAM/CPU (--memory/--cpu/--tasks | --clear)\n  \
                      tab-atelier rotate-tokens    revoke all share tokens (old share links 401)\n  \
                      tab-atelier reset-master-token  rotate the master API token (old token 401s)\n  \
+                     tab-atelier upgrade          hot-swap onto the newly installed binary (tabs stay live)\n  \
                      tab-atelier remote …         attach to a remote tab-atelier-headless\n  \
                      tab-atelier brain [--once]   watchdog tab that auto-recovers stuck agents\n  \
                      tab-atelier dispatch …       hand work to another tab / a new agent\n  \

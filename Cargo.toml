@@ -222,6 +222,15 @@ tempfile = "3"
 # platform::random_bytes() has a real CSPRNG. Already present
 # transitively (rand, uuid) — gated to Windows so the Linux dep graph
 # is untouched.
+# Hot-swap upgrade (src/hotswap.rs): safe wrappers for the fd handoff —
+# fcntl CLOEXEC twiddling, waitpid/kill on the adopted PTY children,
+# TIOCSWINSZ on the inherited masters. Both crates are already in the
+# tree transitively (alacritty_terminal / polling), so these direct
+# deps add no new compilation units.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs", "process", "termios"] }
+signal-hook = "0.3"
+
 # gpui with the X11 backend — Linux desktop build only.
 [target.'cfg(target_os = "linux")'.dependencies]
 gpui = { version = "0.2", default-features = false, features = ["x11"], optional = true }
