@@ -56,6 +56,16 @@ jobs:
             - name: Install cargo-apk2
               run: cargo install cargo-apk2 --locked
 
+            # The app targets android-33 ([package.metadata.android.sdk]
+            # target_sdk_version), but the runner's preinstalled SDK only ships
+            # newer platforms — cargo-apk2 fails with "Platform `33` is not
+            # installed." Pull it (licenses are pre-accepted on the runner).
+            - name: Install Android platform 33
+              run: |
+                  yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-33" > /dev/null 2>&1 || \
+                      "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-33"
+                  test -d "$ANDROID_HOME/platforms/android-33" && echo "platform 33 present"
+
             # Provide the release keystore from the environment secret rather
             # than relying on the copy in the repo — so the signing key can be
             # rotated (or removed from git) without touching the workflow. The
