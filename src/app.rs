@@ -2375,9 +2375,21 @@ impl AppState {
             // resumes whenever its shell comes up, however late. A live shell
             // buffers the typed bytes, so it's safe the moment it's produced its
             // prompt. `flush` takes the command, so each tab fires at most once.
+            // Stagger the resumes: a cold start with dozens of restored agent
+            // tabs would otherwise type `claude --resume` into every ready shell
+            // in ONE tick, launching them all at once — each ~260 MB, all
+            // JIT-compiling — which spikes CPU+RAM and freezes the app for
+            // seconds. Cap how many fire per persist tick (2 s) so the fleet
+            // comes online gradually instead. Each still resumes as soon as its
+            // shell is up; only the burst is spread out.
+            let mut resumes_left = 4u8;
             for tab in &mut self.tabs {
+                if resumes_left == 0 {
+                    break;
+                }
                 if tab.pending_agent_resume.is_some() && tab.view.read(cx).ring_len() > 0 {
                     tab.flush_pending_agent_resume(cx);
+                    resumes_left -= 1;
                 }
             }
             for (idx, name) in renames {
