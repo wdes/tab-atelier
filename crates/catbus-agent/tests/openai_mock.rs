@@ -132,8 +132,34 @@ impl Drop for KillOnDrop {
     }
 }
 
+/// Base command for the agent binary with the test environment set up:
+/// $HOME inside the tempdir (sessions + transcripts never touch the
+/// real one), no proxies (the agent must talk to the mock directly),
+/// no stray backend config from the environment, and coverage profiles
+/// redirected to the target tmpdir (an instrumented child would
+/// otherwise write ./default.profraw into the deleted tempdir).
+fn agent_command(dir: &Path) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_catbus-agent"));
+    cmd.env("HOME", dir)
+        .env_remove("HTTP_PROXY")
+        .env_remove("HTTPS_PROXY")
+        .env_remove("http_proxy")
+        .env_remove("https_proxy")
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env_remove("CATBUS_OPENAI_URL")
+        .env_remove("CATBUS_OPENAI_TOKEN")
+        .env_remove("CATBUS_OPENAI_MODEL")
+        .env_remove("INFOMANIAK_PRODUCT_ID")
+        .env_remove("INFOMANIAK_API_TOKEN")
+        .env(
+            "LLVM_PROFILE_FILE",
+            format!("{}/catbus-e2e-%p.profraw", env!("CARGO_TARGET_TMPDIR")),
+        );
+    cmd
+}
+
 fn spawn_agent(dir: &Path, socket: &Path, port: u16) -> KillOnDrop {
-    let child = Command::new(env!("CARGO_BIN_EXE_catbus-agent"))
+    let child = agent_command(dir)
         .args([
             "--no-tui",
             "--new-session",
@@ -148,29 +174,6 @@ fn spawn_agent(dir: &Path, socket: &Path, port: u16) -> KillOnDrop {
             "--openai-model",
             "test-model",
         ])
-        // Sessions + transcripts land under $HOME/.claude — keep them
-        // inside the tempdir so the test never touches the real one.
-        .env("HOME", dir)
-        // The agent must talk to the mock directly, never a proxy.
-        .env_remove("HTTP_PROXY")
-        .env_remove("HTTPS_PROXY")
-        .env_remove("http_proxy")
-        .env_remove("https_proxy")
-        .env("NO_PROXY", "127.0.0.1,localhost")
-        // A stray backend config in the test environment must not
-        // override the flags above.
-        .env_remove("CATBUS_OPENAI_URL")
-        .env_remove("CATBUS_OPENAI_TOKEN")
-        .env_remove("CATBUS_OPENAI_MODEL")
-        .env_remove("INFOMANIAK_PRODUCT_ID")
-        .env_remove("INFOMANIAK_API_TOKEN")
-        // Coverage-instrumented builds default to ./default.profraw in
-        // the child's cwd — the tempdir, which is deleted. Redirect to
-        // the target tmpdir so grcov still picks the run up.
-        .env(
-            "LLVM_PROFILE_FILE",
-            format!("{}/catbus-e2e-%p.profraw", env!("CARGO_TARGET_TMPDIR")),
-        )
         .spawn()
         .unwrap();
     KillOnDrop(child)
@@ -276,6 +279,14 @@ fn api_error_is_reported_over_the_socket() {
     let _agent = spawn_agent(dir.path(), &socket, port);
 
     let (mut reader, mut stream) = connect_socket(&socket);
+
+    // Flip plan-mode over the socket first, so the failing request is
+    // also built with the plan-mode system prompt branch.
+    stream.write_all(b"{\"kind\":\"set_plan_mode\",\"on\":true}\n").unwrap();
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    assert!(line.contains("plan-mode = true"), "unexpected reply: {line}");
+
     let reply = send_prompt(&mut stream, &mut reader, "hello?");
     assert_eq!(reply["kind"], "error", "unexpected reply: {reply}");
     let message = reply["message"].as_str().unwrap();
@@ -283,4 +294,57 @@ fn api_error_is_reported_over_the_socket() {
         message.contains("500") && message.contains("mock exploded"),
         "error should surface status and body: {message}"
     );
+}
+
+#[test]
+fn print_socket_works_with_the_infomaniak_shortcut() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("agent.sock");
+    // --print-socket exits before any HTTP, so the Infomaniak backend
+    // config is constructed but never contacted.
+    let out = agent_command(dir.path())
+        .args([
+            "--new-session",
+            "--cwd",
+            dir.path().to_str().unwrap(),
+            "--socket",
+            socket.to_str().unwrap(),
+            "--infomaniak-product-id",
+            "12345",
+            "--infomaniak-token",
+            "test-token",
+            "--print-socket",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), socket.to_str().unwrap());
+}
+
+#[test]
+fn anthropic_is_the_default_backend_when_credentials_exist() {
+    let dir = tempfile::tempdir().unwrap();
+    let claude_dir = dir.path().join(".claude");
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    // Far-future expiry so load() succeeds without hitting the
+    // refresh endpoint; --print-socket exits before any API call.
+    std::fs::write(
+        claude_dir.join(".credentials.json"),
+        r#"{"claudeAiOauth":{"accessToken":"sk-test","refreshToken":"sk-r","expiresAt":9999999999999,"scopes":["user:inference"]}}"#,
+    )
+    .unwrap();
+    let socket = dir.path().join("agent.sock");
+    let out = agent_command(dir.path())
+        .args([
+            "--new-session",
+            "--cwd",
+            dir.path().to_str().unwrap(),
+            "--socket",
+            socket.to_str().unwrap(),
+            "--print-socket",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), socket.to_str().unwrap());
 }
