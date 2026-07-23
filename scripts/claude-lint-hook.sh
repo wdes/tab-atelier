@@ -4,10 +4,11 @@
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #
 # Claude Code PostToolUse hook (see .claude/settings.json): after every
-# Write/Edit of a Rust file, auto-format the owning package and run the
-# same strict clippy CI runs. Clippy failures exit 2, which feeds the
-# errors straight back to Claude so they get fixed in the same turn
-# instead of surfacing later in CI.
+# Write/Edit of a Rust file, auto-fix what clippy can fix mechanically,
+# auto-format the owning package, and run the same strict clippy CI
+# runs. Only what survives auto-fixing exits 2, which feeds the errors
+# straight back to Claude so they get fixed in the same turn instead of
+# surfacing later in CI.
 set -u
 
 command -v jq >/dev/null 2>&1 || exit 0
@@ -33,6 +34,11 @@ android/*) exit 0 ;; # separate cargo project, not a workspace member
 *) pkg=tab-atelier clippy_extra=(--no-default-features --features headless,energy) ;;
 esac
 
+# Apply clippy's machine-applicable fixes first (--allow-dirty /
+# --allow-staged: the hook always runs on an uncommitted tree), then
+# format — which also cleans up after the fixer. Only what remains
+# unfixable is reported back.
+cargo clippy --fix --allow-dirty --allow-staged -p "$pkg" "${clippy_extra[@]}" --all-targets >/dev/null 2>&1
 cargo fmt -p "$pkg" 2>/dev/null
 
 if ! out=$(cargo clippy -p "$pkg" "${clippy_extra[@]}" --all-targets 2>&1); then
