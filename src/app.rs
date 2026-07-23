@@ -1856,7 +1856,13 @@ impl AppState {
                 // cached on the tab for the tab-bar gauge), token total mirrored
                 // from the tab.
                 resident_memory_bytes: rss_bytes,
+                // Token totals come from the catbus sidecar cache; without the
+                // `catbus` feature (e.g. the Windows GUI build) there's no such
+                // field, so the tab reports no tokens.
+                #[cfg(feature = "catbus")]
                 tokens: tab.tokens_last_saved.get(),
+                #[cfg(not(feature = "catbus"))]
+                tokens: None,
             });
         }
 
@@ -3506,6 +3512,7 @@ impl AppState {
                 let mb = sample.rss_kb as f64 / 1024.0;
                 stats_lines.push(format!("{}: {mb:.0} MB", t.memory));
             }
+            #[cfg(feature = "catbus")]
             if let Some(usage) = self.tabs[stats_idx].tokens_last_saved.get() {
                 stats_lines.push(format!("{}: {} in / {} out", t.tokens, usage.input, usage.output));
             }
