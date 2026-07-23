@@ -206,6 +206,16 @@ pub enum Commands {
         tab: String,
     },
 
+    /// Per-tab diagnostics (the desktop right-click "Stats" popup): uptime,
+    /// CPU, power, memory, agent tokens, connections, egress, net.
+    Stats {
+        /// Tab index or UUID.
+        tab: String,
+        /// Emit that tab's raw `/tabs` object as JSON instead of the table.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Print a browser URL for the xterm.js viewer.
     ShareLink {
         /// Tab index or UUID.
@@ -522,6 +532,13 @@ pub fn dispatch(cli: Cli) -> bool {
         } => crate::cli::share_link::net_default(&presets, &domains, &cidrs, clear),
         Commands::Input { tab, text } => crate::cli::client::run("input", &[tab, text]),
         Commands::Output { tab } => crate::cli::client::run("output", &[tab]),
+        Commands::Stats { tab, json } => {
+            let mut args = vec![tab];
+            if json {
+                args.push("--json".into());
+            }
+            crate::cli::client::run("stats", &args)
+        }
         Commands::ShareLink { tab, ro } => {
             let mut args = vec![tab];
             if ro {

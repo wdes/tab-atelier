@@ -71,6 +71,7 @@ pub fn dispatch(name: &str, rest: &[String]) -> Option<i32> {
         "unlock" => share_link::unlock(rest),
         "input" => share_link::send_input(rest),
         "output" => share_link::output(rest),
+        "stats" => share_link::stats_cli(rest),
         "share-link" => share_link::run(rest),
         "bg-color" => share_link::bg_color(rest),
         // Airgap toggle — the one network control the GUI also enforces (netns

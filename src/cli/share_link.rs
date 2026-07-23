@@ -432,6 +432,133 @@ pub fn net_on(args: &[String]) -> i32 {
     set_net(args, false, "net-on")
 }
 
+/// Human "1h 12m" / "3m 5s" / "45s" from a second count. Local to the CLI —
+/// the GUI's `format_duration` lives behind the `gui` feature.
+fn fmt_uptime(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+/// `stats <tab> [--json]` — per-tab diagnostics, the CLI form of the desktop
+/// right-click "Stats" popup, read over the local API (`/tabs`).
+///
+/// The human view prints the labelled fields the API exposes (uptime, CPU,
+/// power, memory + agent tokens once the tab-usage fields land, connections,
+/// egress, viewers, agent, net). `--json` dumps that tab's raw `/tabs` object
+/// for scripting. (The popup's Energy-Wh and "Last seen" are GUI-only — not on
+/// the API yet.)
+#[must_use]
+pub fn stats(tab: &str, json: bool) -> i32 {
+    let ep = match discover_endpoint() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("stats: {e}");
+            return 1;
+        }
+    };
+    let (idx, _uuid) = match resolve(&ep, tab) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("stats: {e}");
+            return 1;
+        }
+    };
+    let tabs = match fetch_tabs(&ep) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("stats: {e}");
+            return 1;
+        }
+    };
+    let Some(t) = tabs
+        .iter()
+        .find(|t| t.get("index").and_then(serde_json::Value::as_u64) == Some(idx as u64))
+    else {
+        eprintln!("stats: tab {idx} not found");
+        return 1;
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(t).unwrap_or_else(|_| "{}".into()));
+        return 0;
+    }
+    let str_of = |k: &str| t.get(k).and_then(serde_json::Value::as_str);
+    let f64_of = |k: &str| t.get(k).and_then(serde_json::Value::as_f64);
+    let u64_of = |k: &str| t.get(k).and_then(serde_json::Value::as_u64);
+    let bool_of = |k: &str| t.get(k).and_then(serde_json::Value::as_bool).unwrap_or(false);
+    let line = |label: &str, val: &str| println!("  {label:<13}{val}");
+
+    let name = str_of("name").unwrap_or("?");
+    let active = if bool_of("active") { "  (active)" } else { "" };
+    println!("Tab {idx}  {name}{active}");
+    if let Some(cwd) = str_of("cwd") {
+        line("cwd", cwd);
+    }
+    if let Some(up) = f64_of("uptime_secs") {
+        line("Active time", &fmt_uptime(up as u64));
+    }
+    if let Some(cpu) = f64_of("cpu_percent") {
+        line("CPU", &format!("{cpu:.1} %"));
+    }
+    if let Some(w) = f64_of("watts") {
+        line("Power", &format!("{w:.1} W"));
+    }
+    if let Some(mem) = u64_of("resident_memory_bytes") {
+        line("Memory", &human_bytes(mem));
+    }
+    if let Some(tok) = t.get("tokens") {
+        let inp = tok.get("input").and_then(serde_json::Value::as_u64).unwrap_or(0);
+        let out = tok.get("output").and_then(serde_json::Value::as_u64).unwrap_or(0);
+        line("Tokens", &format!("{inp} in / {out} out"));
+    }
+    line("Connections", &u64_of("connections").unwrap_or(0).to_string());
+    let tx = u64_of("tx_bytes").unwrap_or(0);
+    if tx > 0 {
+        line("Egress", &human_bytes(tx));
+    }
+    let viewers = u64_of("viewers").unwrap_or(0);
+    if viewers > 0 {
+        line("Viewers", &viewers.to_string());
+    }
+    if let Some(kind) = str_of("agent_kind") {
+        let state = str_of("agent_state").map_or_else(String::new, |s| format!(" ({s})"));
+        line("Agent", &format!("{kind}{state}"));
+    }
+    line("Net", if bool_of("net_disabled") { "off" } else { "on" });
+    if bool_of("locked") {
+        line("Locked", str_of("lock_reason").unwrap_or("yes"));
+    }
+    0
+}
+
+/// `&[String]` front-end for [`stats`], used by the GUI binary's subcommand
+/// match; the headless binary reaches [`stats`] through clap. Both share the
+/// same output.
+#[must_use]
+pub fn stats_cli(args: &[String]) -> i32 {
+    let mut tab: Option<&str> = None;
+    let mut json = false;
+    for a in args {
+        match a.as_str() {
+            "--json" => json = true,
+            other if tab.is_none() && !other.starts_with('-') => tab = Some(other),
+            other => {
+                eprintln!("stats: unexpected argument '{other}'");
+                return 2;
+            }
+        }
+    }
+    let Some(tab) = tab else {
+        eprintln!("usage: tab-atelier stats <tab> [--json]");
+        return 2;
+    };
+    stats(tab, json)
+}
+
 /// `limit <tab> [--memory V] [--cpu PCT] [--tasks N] | --clear` — cap a tab's
 /// RAM / CPU / process-count by `POST`ing to `/tabs/by-id/<uuid>/limits`.
 ///
