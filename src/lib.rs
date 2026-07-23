@@ -462,6 +462,41 @@ pub fn kill_tab_pgroup(pid: u32) {
     }
 }
 
+/// SIGSTOP (`pause = true`) or SIGCONT (`pause = false`) a tab's process group.
+///
+/// Signals the whole tab subtree (shell + `claude` + children) via the same
+/// `pid == pgid` setsid invariant as [`kill_tab_pgroup`]. Used to suspend an
+/// idle agent tab and resume it on focus / viewer attach.
+/// Pausing stops CPU/timers immediately; the ~260 MB private JS heap is only
+/// physically reclaimed if swap (ideally zram) is configured for the kernel to
+/// page the now-frozen pages into — otherwise it just freezes in place.
+/// `unsafe`-free: shells to `kill(1)` with the `-s SIG -- -PGID` form.
+#[cfg(unix)]
+pub fn suspend_tab_pgroup(pid: u32, pause: bool) {
+    if pid <= 1 {
+        return;
+    }
+    let target = format!("-{pid}");
+    let sig = if pause { "STOP" } else { "CONT" };
+    let _ = std::process::Command::new("kill")
+        .args(["-s", sig, "--", &target])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// Resolve the effective idle-suspend threshold from
+/// [`Preferences::suspend_idle_agents_after_secs`]: absent (`None`) → the
+/// 900 s (15 min) default; `Some(0)` → disabled; `Some(n)` → `n` seconds.
+#[must_use]
+pub const fn suspend_after(pref: Option<u64>) -> Option<std::time::Duration> {
+    match pref {
+        Some(0) => None,
+        Some(n) => Some(std::time::Duration::from_secs(n)),
+        None => Some(std::time::Duration::from_mins(15)),
+    }
+}
+
 /// Build the value handed to in-tab tools as `TAB_ATELIER_API_URL`.
 ///
 /// The stored `api_addr` is a bind spec (`0.0.0.0:7890`, `:7890`,
@@ -1710,6 +1745,15 @@ pub struct Preferences {
     pub pty_cols: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pty_rows: Option<u16>,
+
+    /// Suspend (SIGSTOP) an agent tab that's gone untouched this many seconds —
+    /// not focused, no viewers, not "thinking", no recent output — and resume
+    /// (SIGCONT) it the moment it's focused or a viewer attaches. Frees CPU
+    /// immediately and, with swap/zram configured, lets the kernel page the
+    /// idle ~260 MB claude heap out. Absent = the 900 s (15 min) default;
+    /// `0` disables it. See [`suspend_after`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suspend_idle_agents_after_secs: Option<u64>,
 
     /// GUI terminal font family. Highest-priority source for the
     /// font (over `zed/settings.json`'s `ui_font_family`). Set this to
@@ -3043,6 +3087,17 @@ mod tests {
             }
             .memory_max_valid()
         );
+    }
+
+    #[test]
+    fn suspend_after_resolves_default_and_disable() {
+        use std::time::Duration;
+        // Absent → the 15 min default.
+        assert_eq!(suspend_after(None), Some(Duration::from_mins(15)));
+        // Explicit 0 → disabled.
+        assert_eq!(suspend_after(Some(0)), None);
+        // Custom value passes through.
+        assert_eq!(suspend_after(Some(120)), Some(Duration::from_mins(2)));
     }
 
     #[test]
