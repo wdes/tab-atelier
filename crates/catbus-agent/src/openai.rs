@@ -363,6 +363,14 @@ mod tests {
                 Block::Text {
                     text: "carry on".into(),
                 },
+                // A tool_use inside a *user* turn is malformed history
+                // (only assistants call tools) — it must be dropped,
+                // not forwarded.
+                Block::ToolUse {
+                    id: "bogus".into(),
+                    name: "Bash".into(),
+                    input: json!({}),
+                },
             ],
         )];
         let req = build_request("m", "s", &[], &history);
