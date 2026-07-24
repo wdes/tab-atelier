@@ -93,10 +93,14 @@ struct Tab {
     /// spinner, or a `cargo build` printing — which lights the LED green
     /// ("talking") even without a fresh status hook. `None` = no output yet.
     last_output_at: Option<std::time::Instant>,
-    /// True while this tab's process group is SIGSTOP'd by the idle-suspend
-    /// sweep (see `suspend_idle_agents_after_secs`). Resumed (SIGCONT) the
-    /// moment the tab is focused or a viewer attaches.
-    suspended: bool,
+    /// `Some(agent_pid)` while this tab's AGENT process group is SIGSTOP'd by the
+    /// idle-suspend sweep (see `suspend_idle_agents_after_secs`); the pid is
+    /// stored so wake SIGCONTs the exact group we paused. Resumed the moment the
+    /// tab is focused or a viewer attaches. We signal the *agent's* pgroup, not
+    /// the shell's — `claude` runs as a foreground job in its own process group,
+    /// so the shell's pgroup wouldn't include it. Needs catbus (the agent pid).
+    #[cfg(feature = "catbus")]
+    suspended: Option<u32>,
     #[cfg(feature = "energy")]
     energy_wh: f64,
     /// Last `energy_wh` value flushed to disk. Used to skip writes when no
@@ -265,7 +269,8 @@ impl Tab {
             // being opened — not instantly on every restart.
             last_focused_at: Some(std::time::Instant::now()),
             last_output_at: None,
-            suspended: false,
+            #[cfg(feature = "catbus")]
+            suspended: None,
             #[cfg(feature = "energy")]
             energy_wh: ts.energy_wh.unwrap_or(0.0),
             #[cfg(feature = "energy")]
@@ -618,7 +623,9 @@ struct AppState {
     tab_switcher: Option<TabSwitcher>,
     tab_switcher_focus: FocusHandle,
     /// Resolved idle-agent suspend threshold (`suspend_idle_agents_after_secs`
-    /// via `crate::suspend_after`). `None` = the feature is off.
+    /// via `crate::suspend_after`). `None` = the feature is off. Needs the
+    /// catbus agent-pid sweep to know which process group to signal.
+    #[cfg(feature = "catbus")]
     suspend_after: Option<std::time::Duration>,
     browser: Rc<RefCell<Option<String>>>,
     code_editor: Rc<RefCell<Option<String>>>,
@@ -1351,6 +1358,7 @@ impl AppState {
             hotkey_picker_error: None,
             tab_switcher: None,
             tab_switcher_focus,
+            #[cfg(feature = "catbus")]
             suspend_after: crate::suspend_after(prefs.suspend_idle_agents_after_secs),
             browser,
             code_editor,
@@ -2212,6 +2220,7 @@ impl AppState {
             // it. Gated on Thinking, NOT raw output, so a reboot resuming every
             // agent doesn't blue them all.
             let active = self.active;
+            #[cfg(feature = "catbus")]
             let suspend_after = self.suspend_after;
             for (i, tab) in self.tabs.iter_mut().enumerate() {
                 if i == active {
@@ -2238,31 +2247,27 @@ impl AppState {
                 }
                 // Idle-agent suspend (SIGSTOP) / wake (SIGCONT). A focused tab or
                 // one with a viewer must never stay paused, so wake wins; only an
-                // untouched, idle, non-thinking agent tab gets suspended.
+                // untouched, idle, non-thinking agent tab gets suspended. We
+                // signal the AGENT's process group (its pid == pgid: bash ran it
+                // as a foreground job in its own group), NOT the shell's — the
+                // shell's group wouldn't include the ~260 MB claude.
+                #[cfg(feature = "catbus")]
                 if let Some(threshold) = suspend_after {
-                    if tab.suspended {
+                    if let Some(stopped_pid) = tab.suspended {
                         if is_active || viewers > 0 {
-                            crate::suspend_tab_pgroup(tab.view.read(cx).pid(), false);
-                            tab.suspended = false;
+                            crate::suspend_tab_pgroup(stopped_pid, false);
+                            tab.suspended = None;
                         }
-                    } else {
+                    } else if let Some(agent_pid) = tab.agent_pid.get() {
                         let thinking = matches!(
                             tab.agent_state.as_ref().map(|s| s.state),
                             Some(crate::AgentState::Thinking)
                         );
                         let idle_for = tab.last_focused_at.map_or(std::time::Duration::MAX, |t| t.elapsed());
                         let output_idle_for = tab.last_output_at.map(|t| t.elapsed());
-                        if should_suspend(
-                            tab.agent_kind.is_some(),
-                            is_active,
-                            viewers,
-                            thinking,
-                            idle_for,
-                            output_idle_for,
-                            threshold,
-                        ) {
-                            crate::suspend_tab_pgroup(tab.view.read(cx).pid(), true);
-                            tab.suspended = true;
+                        if should_suspend(true, is_active, viewers, thinking, idle_for, output_idle_for, threshold) {
+                            crate::suspend_tab_pgroup(agent_pid, true);
+                            tab.suspended = Some(agent_pid);
                         }
                     }
                 }
@@ -4060,10 +4065,11 @@ impl AppState {
             self.tabs[self.active].activate();
         }
         // Wake a suspended tab the instant it's focused — before input can reach
-        // its (SIGSTOP'd) shell — rather than waiting for the next sweep tick.
-        if self.tabs[self.active].suspended {
-            crate::suspend_tab_pgroup(self.tabs[self.active].view.read(cx).pid(), false);
-            self.tabs[self.active].suspended = false;
+        // its (SIGSTOP'd) agent — rather than waiting for the next sweep tick.
+        #[cfg(feature = "catbus")]
+        if let Some(stopped_pid) = self.tabs[self.active].suspended {
+            crate::suspend_tab_pgroup(stopped_pid, false);
+            self.tabs[self.active].suspended = None;
         }
         self.tabs[self.active].flush_pending_restore(cx);
         self.tabs[self.active].view.read(cx).focus_handle(cx).focus(window);
@@ -5707,6 +5713,7 @@ const MAX_URL_LEN: usize = 256;
 /// True only for an agent tab (`is_agent`) that is NOT the active one, has no
 /// viewers, isn't "thinking", and has been untouched — no focus and no output —
 /// for at least `threshold`. Pure so it's unit-testable without a live window.
+#[cfg(feature = "catbus")]
 fn should_suspend(
     is_agent: bool,
     active: bool,
@@ -6188,6 +6195,7 @@ mod tests {
         assert_eq!(mru_tab_order(1, &[None::<u64>, None, None]), vec![0, 2]);
     }
 
+    #[cfg(feature = "catbus")]
     #[test]
     fn should_suspend_gates() {
         use std::time::Duration;
