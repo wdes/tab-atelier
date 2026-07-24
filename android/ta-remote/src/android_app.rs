@@ -229,6 +229,8 @@ enum Reach {
     Lan,
     Remote,
     Forbidden,
+    /// Reachable, but a Cloudflare Access / Zero Trust login is required.
+    CloudflareAuth,
     Offline,
 }
 
@@ -350,6 +352,9 @@ impl AppData {
 enum FetchOutcome {
     Ok(ApiResponse),
     Forbidden,
+    /// A Cloudflare Access / Zero Trust login challenge — the host is reachable
+    /// but the request needs a Cloudflare login or service token.
+    CloudflareAuth,
     NoResponse,
 }
 
@@ -430,6 +435,21 @@ fn try_fetch_tabs(agent: &ureq::Agent, base: &str, token: &str, timeout: Duratio
         .set("Authorization", &format!("Bearer {token}"))
         .timeout(timeout);
     match req.call() {
+        // Cloudflare Access: with redirects disabled (see the agent builder), the
+        // Zero Trust gate answers a programmatic request with a 3xx to its login
+        // (`*.cloudflareaccess.com` / `/cdn-cgi/access/`). ureq treats any status
+        // < 400 as success, so an un-followed 302 lands HERE as `Ok`, not as an
+        // error — detect it before trying to parse the (login-HTML) body as JSON.
+        // The host IS reachable — it just needs a Cloudflare login or service
+        // token — so surface that distinctly rather than as "offline".
+        Ok(resp) if (300..400).contains(&resp.status()) => {
+            let loc = resp.header("location").unwrap_or_default();
+            if loc.contains("cloudflareaccess.com") || loc.contains("/cdn-cgi/access/") {
+                FetchOutcome::CloudflareAuth
+            } else {
+                FetchOutcome::NoResponse
+            }
+        }
         Ok(resp) => resp
             .into_json::<ApiResponse>()
             .map_or(FetchOutcome::NoResponse, FetchOutcome::Ok),
@@ -449,6 +469,7 @@ struct TabsFetch {
 
 fn fetch_tabs(agent: &ureq::Agent, host: &HostConfig) -> TabsFetch {
     let mut saw_forbidden = false;
+    let mut saw_cloudflare = false;
     if !host.url.is_empty() {
         match try_fetch_tabs(agent, &host.url, &host.token, Duration::from_millis(1500)) {
             FetchOutcome::Ok(r) => {
@@ -459,6 +480,7 @@ fn fetch_tabs(agent: &ureq::Agent, host: &HostConfig) -> TabsFetch {
                 };
             }
             FetchOutcome::Forbidden => saw_forbidden = true,
+            FetchOutcome::CloudflareAuth => saw_cloudflare = true,
             FetchOutcome::NoResponse => {}
         }
     }
@@ -472,11 +494,16 @@ fn fetch_tabs(agent: &ureq::Agent, host: &HostConfig) -> TabsFetch {
                 };
             }
             FetchOutcome::Forbidden => saw_forbidden = true,
+            FetchOutcome::CloudflareAuth => saw_cloudflare = true,
             FetchOutcome::NoResponse => {}
         }
     }
+    // Reachable-but-gated states beat "offline": a Cloudflare login prompt or a
+    // stale token means the host is up and the fix is auth, not connectivity.
     TabsFetch {
-        reach: if saw_forbidden {
+        reach: if saw_cloudflare {
+            Reach::CloudflareAuth
+        } else if saw_forbidden {
             Reach::Forbidden
         } else {
             Reach::Offline
@@ -737,6 +764,7 @@ fn push_reachability(ui_weak: &Weak<AppWindow>, active: usize, reach: Reach) {
         Reach::Lan => "lan",
         Reach::Remote => "remote",
         Reach::Forbidden => "forbidden",
+        Reach::CloudflareAuth => "cloudflare-auth",
         Reach::Offline => "offline",
     };
     let weak = ui_weak.clone();
@@ -792,6 +820,11 @@ pub fn android_main(app: slint::android::AndroidApp) {
         ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(5))
             .tls_config(Arc::new(permissive_tls_config()))
+            // Don't follow redirects: the local API never redirects, so a 3xx is
+            // a Cloudflare Access login challenge — we detect it (Location →
+            // *.cloudflareaccess.com) in try_fetch_tabs instead of chasing it to
+            // an HTML login page that would just read as "no JSON → offline".
+            .redirects(0)
             .build(),
     );
 
