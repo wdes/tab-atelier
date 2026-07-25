@@ -84,6 +84,7 @@ pub fn cmd_put(args: &[String]) -> i32 {
 
     let agent = ureq::Agent::config_builder()
         .timeout_global(Some(REQUEST_TIMEOUT))
+        .user_agent(crate::remote::SIDECAR_USER_AGENT)
         .tls_config(
             ureq::tls::TlsConfig::builder()
                 .provider(ureq::tls::TlsProvider::Rustls)
@@ -97,9 +98,7 @@ pub fn cmd_put(args: &[String]) -> i32 {
         endpoint.url.trim_end_matches('/'),
         url_encode(&remote_name),
     );
-    match agent
-        .post(&url)
-        .header("Authorization", &format!("Bearer {}", endpoint.token))
+    match crate::remote::authorized(agent.post(&url), &endpoint)
         .header("Content-Type", "application/octet-stream")
         .send(&bytes[..])
     {
@@ -165,6 +164,7 @@ pub fn cmd_get(args: &[String]) -> i32 {
 
     let agent = ureq::Agent::config_builder()
         .timeout_global(Some(REQUEST_TIMEOUT))
+        .user_agent(crate::remote::SIDECAR_USER_AGENT)
         .tls_config(
             ureq::tls::TlsConfig::builder()
                 .provider(ureq::tls::TlsProvider::Rustls)
@@ -178,11 +178,7 @@ pub fn cmd_get(args: &[String]) -> i32 {
         endpoint.url.trim_end_matches('/'),
         url_encode(&remote_path),
     );
-    let bytes = match agent
-        .get(&url)
-        .header("Authorization", &format!("Bearer {}", endpoint.token))
-        .call()
-    {
+    let bytes = match crate::remote::authorized(agent.get(&url), &endpoint).call() {
         Ok(mut resp) => match resp.body_mut().read_to_vec() {
             Ok(b) => b,
             Err(e) => {

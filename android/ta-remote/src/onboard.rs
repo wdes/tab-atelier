@@ -1,19 +1,40 @@
 //! Parsing of the `taremote://onboard?url=...&token=...` deep link.
 
+/// Parsed contents of a `taremote://onboard?…` deep link. `url` + `token` are
+/// required; `cf_access_client_id` / `cf_access_client_secret` are the optional
+/// Cloudflare Access service-token pair (query params `cf_id` / `cf_secret`),
+/// empty when the link doesn't carry one.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Onboard {
+    pub url: String,
+    pub token: String,
+    pub cf_access_client_id: String,
+    pub cf_access_client_secret: String,
+}
+
 #[must_use]
-pub fn parse_onboard_url(url: &str) -> Option<(String, String)> {
+pub fn parse_onboard_url(url: &str) -> Option<Onboard> {
     let q = url.strip_prefix("taremote://onboard?")?;
     let mut host_url = None;
     let mut token = None;
+    let mut cf_id = String::new();
+    let mut cf_secret = String::new();
     for pair in q.split('&') {
         let (k, v) = pair.split_once('=')?;
         match k {
             "url" => host_url = Some(percent_decode(v)),
             "token" => token = Some(percent_decode(v)),
+            "cf_id" => cf_id = percent_decode(v),
+            "cf_secret" => cf_secret = percent_decode(v),
             _ => {}
         }
     }
-    Some((host_url?, token?))
+    Some(Onboard {
+        url: host_url?,
+        token: token?,
+        cf_access_client_id: cf_id,
+        cf_access_client_secret: cf_secret,
+    })
 }
 
 #[must_use]
@@ -89,24 +110,40 @@ mod tests {
 
     #[test]
     fn parse_minimal() {
-        let (u, t) = parse_onboard_url("taremote://onboard?url=http://1.2.3.4:7890&token=abc").unwrap();
-        assert_eq!(u, "http://1.2.3.4:7890");
-        assert_eq!(t, "abc");
+        let o = parse_onboard_url("taremote://onboard?url=http://1.2.3.4:7890&token=abc").unwrap();
+        assert_eq!(o.url, "http://1.2.3.4:7890");
+        assert_eq!(o.token, "abc");
+        // No CF service token in the link → empty pair.
+        assert_eq!(o.cf_access_client_id, "");
+        assert_eq!(o.cf_access_client_secret, "");
     }
 
     #[test]
     fn parse_url_encoded() {
-        let (u, t) =
-            parse_onboard_url("taremote://onboard?url=http%3A%2F%2F1.2.3.4%3A7890&token=deadbeef0123").unwrap();
-        assert_eq!(u, "http://1.2.3.4:7890");
-        assert_eq!(t, "deadbeef0123");
+        let o = parse_onboard_url("taremote://onboard?url=http%3A%2F%2F1.2.3.4%3A7890&token=deadbeef0123").unwrap();
+        assert_eq!(o.url, "http://1.2.3.4:7890");
+        assert_eq!(o.token, "deadbeef0123");
     }
 
     #[test]
     fn parse_extra_params_ignored() {
-        let (u, t) = parse_onboard_url("taremote://onboard?foo=bar&url=http://x:7890&extra=baz&token=tok").unwrap();
-        assert_eq!(u, "http://x:7890");
-        assert_eq!(t, "tok");
+        let o = parse_onboard_url("taremote://onboard?foo=bar&url=http://x:7890&extra=baz&token=tok").unwrap();
+        assert_eq!(o.url, "http://x:7890");
+        assert_eq!(o.token, "tok");
+    }
+
+    #[test]
+    fn parse_cf_service_token() {
+        // A CF Access service token rides along as cf_id / cf_secret and is
+        // percent-decoded like the rest. `.access` suffix on the id is typical.
+        let o = parse_onboard_url(
+            "taremote://onboard?url=https%3A%2F%2Fh%3A7891&token=tok&cf_id=abc.access&cf_secret=s%3Ae%3Ac",
+        )
+        .unwrap();
+        assert_eq!(o.url, "https://h:7891");
+        assert_eq!(o.token, "tok");
+        assert_eq!(o.cf_access_client_id, "abc.access");
+        assert_eq!(o.cf_access_client_secret, "s:e:c");
     }
 
     #[test]

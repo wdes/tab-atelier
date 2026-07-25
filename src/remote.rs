@@ -276,8 +276,30 @@ fn run(endpoint: &RemoteEndpoint, cmd_rx: &mpsc::Receiver<RemoteCommand>, evt_tx
     }
 }
 
+/// User-Agent every sidecar request carries — identifies the client in the
+/// daemon's and Cloudflare's access logs instead of the bare `ureq/x.y` default.
+/// Shared with the one-shot `remote put`/`get` agents in [`crate::cli::remote`].
+pub(crate) const SIDECAR_USER_AGENT: &str = concat!("tab-atelier/", env!("CARGO_PKG_VERSION"), " (remote-sidecar)");
+
+/// Attach the bearer token and, when the endpoint carries a Cloudflare Access
+/// service token, the `CF-Access-Client-Id` / `CF-Access-Client-Secret` headers
+/// — so a remote fronted by Cloudflare Zero Trust authorizes the sidecar's
+/// requests without an interactive browser login. Generic over the builder's
+/// body-state so it decorates `get`/`post`/`delete` alike.
+pub(crate) fn authorized<Any>(req: ureq::RequestBuilder<Any>, endpoint: &RemoteEndpoint) -> ureq::RequestBuilder<Any> {
+    let req = req.header("Authorization", &format!("Bearer {}", endpoint.token));
+    if endpoint.has_cf_service_token() {
+        req.header("CF-Access-Client-Id", &endpoint.cf_access_client_id)
+            .header("CF-Access-Client-Secret", &endpoint.cf_access_client_secret)
+    } else {
+        req
+    }
+}
+
 fn build_agent(endpoint: &RemoteEndpoint) -> ureq::Agent {
-    let mut config_builder = ureq::Agent::config_builder().timeout_global(Some(REQUEST_TIMEOUT));
+    let mut config_builder = ureq::Agent::config_builder()
+        .timeout_global(Some(REQUEST_TIMEOUT))
+        .user_agent(SIDECAR_USER_AGENT);
 
     if endpoint.url.starts_with("https://") {
         // ureq 3's TlsConfig doesn't expose a fully custom rustls
@@ -304,9 +326,7 @@ fn build_agent(endpoint: &RemoteEndpoint) -> ureq::Agent {
 
 fn fetch_tabs(agent: &ureq::Agent, endpoint: &RemoteEndpoint) -> Result<Vec<RemoteTabSnapshot>, String> {
     let url = format!("{}/tabs", endpoint.url.trim_end_matches('/'));
-    let mut resp = agent
-        .get(&url)
-        .header("Authorization", &format!("Bearer {}", endpoint.token))
+    let mut resp = authorized(agent.get(&url), endpoint)
         .call()
         .map_err(|e| format!("GET /tabs: {e}"))?;
     let body: serde_json::Value = resp.body_mut().read_json().map_err(|e| format!("parse /tabs: {e}"))?;
@@ -374,9 +394,7 @@ fn fetch_output(
             endpoint.url.trim_end_matches('/')
         )
     };
-    let mut resp = agent
-        .get(&url)
-        .header("Authorization", &format!("Bearer {}", endpoint.token))
+    let mut resp = authorized(agent.get(&url), endpoint)
         .call()
         .map_err(|e| format!("GET /output: {e}"))?;
     let total_len: u64 = header_u64(resp.headers(), "X-Output-Length").unwrap_or(0);
@@ -419,9 +437,7 @@ fn run_command(
         RemoteCommand::SendInput { remote_id, bytes } => {
             let idx = resolve_index(remote_id)?;
             let url = format!("{}/tabs/{idx}/input", endpoint.url.trim_end_matches('/'));
-            agent
-                .post(&url)
-                .header("Authorization", &format!("Bearer {}", endpoint.token))
+            authorized(agent.post(&url), endpoint)
                 .header("Content-Type", "application/octet-stream")
                 .send(&bytes[..])
                 .map_err(|e| format!("POST /input: {e}"))?;
@@ -430,9 +446,7 @@ fn run_command(
         RemoteCommand::Activate { remote_id } => {
             let idx = resolve_index(remote_id)?;
             let url = format!("{}/tabs/{idx}/activate", endpoint.url.trim_end_matches('/'));
-            agent
-                .post(&url)
-                .header("Authorization", &format!("Bearer {}", endpoint.token))
+            authorized(agent.post(&url), endpoint)
                 .send_empty()
                 .map_err(|e| format!("POST /activate: {e}"))?;
             Ok(())
@@ -441,9 +455,7 @@ fn run_command(
             let idx = resolve_index(remote_id)?;
             let url = format!("{}/tabs/{idx}/rename", endpoint.url.trim_end_matches('/'));
             let body = serde_json::json!({ "name": name }).to_string();
-            agent
-                .post(&url)
-                .header("Authorization", &format!("Bearer {}", endpoint.token))
+            authorized(agent.post(&url), endpoint)
                 .header("Content-Type", "application/json")
                 .send(&body)
                 .map_err(|e| format!("POST /rename: {e}"))?;
@@ -452,9 +464,7 @@ fn run_command(
         RemoteCommand::Close { remote_id } => {
             let idx = resolve_index(remote_id)?;
             let url = format!("{}/tabs/{idx}", endpoint.url.trim_end_matches('/'));
-            agent
-                .delete(&url)
-                .header("Authorization", &format!("Bearer {}", endpoint.token))
+            authorized(agent.delete(&url), endpoint)
                 .call()
                 .map_err(|e| format!("DELETE /tabs: {e}"))?;
             Ok(())

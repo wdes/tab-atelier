@@ -14,6 +14,7 @@
 //! ```text
 //! tab-atelier remote list
 //! tab-atelier remote add    --label L --url U --token T [--no-pin] [--autoconnect]
+//!                           [--cf-id ID --cf-secret SECRET]   # Cloudflare Access
 //! tab-atelier remote remove <label-or-id>
 //! tab-atelier remote test   <label-or-id>            # one-shot tab list
 //! tab-atelier remote watch  <label-or-id>            # follow until Ctrl-C
@@ -68,7 +69,8 @@ fn usage() {
          \n\
          list                                          list configured endpoints\n\
          add --label L --url U --token T [--no-pin] [--autoconnect]\n\
-                                                       persist a new endpoint\n\
+             [--cf-id ID --cf-secret SECRET]           persist a new endpoint\n\
+                                                       (--cf-* = Cloudflare Access service token)\n\
          remove <label-or-id>                          drop one\n\
          test <label-or-id>                            connect, list remote tabs, exit\n\
          watch <label-or-id>                           follow scrollback events until Ctrl-C\n\
@@ -114,6 +116,8 @@ fn cmd_add(args: &[String]) -> i32 {
     let mut no_pin = false;
     let mut autoconnect = false;
     let mut cert_sha256: Option<String> = None;
+    let mut cf_id: Option<String> = None;
+    let mut cf_secret: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -132,6 +136,14 @@ fn cmd_add(args: &[String]) -> i32 {
             "--cert-sha256" => {
                 i += 1;
                 cert_sha256 = args.get(i).cloned();
+            }
+            "--cf-id" => {
+                i += 1;
+                cf_id = args.get(i).cloned();
+            }
+            "--cf-secret" => {
+                i += 1;
+                cf_secret = args.get(i).cloned();
             }
             "--no-pin" => no_pin = true,
             "--autoconnect" => autoconnect = true,
@@ -198,6 +210,8 @@ fn cmd_add(args: &[String]) -> i32 {
         token,
         cert_sha256: fingerprint.clone(),
         autoconnect,
+        cf_access_client_id: cf_id.unwrap_or_default().trim().to_string(),
+        cf_access_client_secret: cf_secret.unwrap_or_default().trim().to_string(),
     };
     prefs.remote_endpoints.push(endpoint);
     save_preferences(&platform::config_dir(), &prefs);
