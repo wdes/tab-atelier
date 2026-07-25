@@ -1857,6 +1857,24 @@ pub struct RemoteEndpoint {
     /// instead of waiting for an explicit "Connect" click.
     #[serde(default)]
     pub autoconnect: bool,
+    /// Cloudflare Access service-token pair. When both are set, every request
+    /// (HTTP + WebSocket upgrade) carries them as `CF-Access-Client-Id` /
+    /// `CF-Access-Client-Secret` so a remote behind Cloudflare Zero Trust
+    /// authorizes the sidecar without an interactive browser login. Empty when
+    /// the endpoint isn't behind Access.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cf_access_client_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cf_access_client_secret: String,
+}
+
+impl RemoteEndpoint {
+    /// True when a Cloudflare Access service token is configured (both halves
+    /// present) — callers add the `CF-Access-Client-*` headers to each request.
+    #[must_use]
+    pub const fn has_cf_service_token(&self) -> bool {
+        !self.cf_access_client_id.is_empty() && !self.cf_access_client_secret.is_empty()
+    }
 }
 
 pub const DEFAULT_API_PORT: u16 = 7890;
@@ -4132,6 +4150,8 @@ mod tests {
                     token: "deadbeef".into(),
                     cert_sha256: "a".repeat(64),
                     autoconnect: true,
+                    cf_access_client_id: "svc.access".into(),
+                    cf_access_client_secret: "s3cr3t".into(),
                 },
                 RemoteEndpoint {
                     id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
@@ -4140,6 +4160,7 @@ mod tests {
                     token: "feedface".into(),
                     cert_sha256: String::new(),
                     autoconnect: false,
+                    ..Default::default()
                 },
             ],
             ..Preferences::default()
@@ -4150,9 +4171,19 @@ mod tests {
         assert_eq!(restored.remote_endpoints[0].label, "colossus");
         assert_eq!(restored.remote_endpoints[0].url, "https://192.168.1.42:7891");
         assert!(restored.remote_endpoints[0].autoconnect);
+        // CF Access service token round-trips and flips has_cf_service_token().
+        assert_eq!(restored.remote_endpoints[0].cf_access_client_id, "svc.access");
+        assert_eq!(restored.remote_endpoints[0].cf_access_client_secret, "s3cr3t");
+        assert!(restored.remote_endpoints[0].has_cf_service_token());
         assert_eq!(restored.remote_endpoints[1].label, "build-box");
         assert_eq!(restored.remote_endpoints[1].cert_sha256, "");
         assert!(!restored.remote_endpoints[1].autoconnect);
+        // Absent CF token → empty pair, and the JSON omits the fields entirely.
+        assert!(!restored.remote_endpoints[1].has_cf_service_token());
+        assert!(
+            !json.contains("cf_access_client_id") || json.matches("cf_access_client_id").count() == 1,
+            "empty CF token must be skipped in serialization, got {json}"
+        );
     }
 }
 

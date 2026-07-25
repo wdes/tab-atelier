@@ -214,6 +214,29 @@ struct HostConfig {
     #[serde(default)]
     remote_url: String,
     token: String,
+    /// Cloudflare Access service-token pair. When both are set, every API
+    /// request carries them as `CF-Access-Client-Id` / `CF-Access-Client-Secret`
+    /// so the Zero Trust gate authorizes the poller without an interactive login
+    /// (create one under Cloudflare → Access → Service Auth). Empty otherwise.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    cf_access_client_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    cf_access_client_secret: String,
+}
+
+impl HostConfig {
+    /// Decorate an outgoing API request with the bearer token and, when a
+    /// Cloudflare Access service token is configured, the service-token headers
+    /// that let the Zero Trust gate authorize the request non-interactively.
+    fn authorize(&self, req: ureq::Request) -> ureq::Request {
+        let req = req.set("Authorization", &format!("Bearer {}", self.token));
+        if self.cf_access_client_id.is_empty() || self.cf_access_client_secret.is_empty() {
+            req
+        } else {
+            req.set("CF-Access-Client-Id", &self.cf_access_client_id)
+                .set("CF-Access-Client-Secret", &self.cf_access_client_secret)
+        }
+    }
 }
 
 /// Outcome of an HTTP request that may have been tried against the LAN URL
@@ -429,11 +452,8 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCert {
     }
 }
 
-fn try_fetch_tabs(agent: &ureq::Agent, base: &str, token: &str, timeout: Duration) -> FetchOutcome {
-    let req = agent
-        .get(&format!("{base}/tabs"))
-        .set("Authorization", &format!("Bearer {token}"))
-        .timeout(timeout);
+fn try_fetch_tabs(agent: &ureq::Agent, host: &HostConfig, base: &str, timeout: Duration) -> FetchOutcome {
+    let req = host.authorize(agent.get(&format!("{base}/tabs")).timeout(timeout));
     match req.call() {
         // Cloudflare Access: with redirects disabled (see the agent builder), the
         // Zero Trust gate answers a programmatic request with a 3xx to its login
@@ -471,7 +491,7 @@ fn fetch_tabs(agent: &ureq::Agent, host: &HostConfig) -> TabsFetch {
     let mut saw_forbidden = false;
     let mut saw_cloudflare = false;
     if !host.url.is_empty() {
-        match try_fetch_tabs(agent, &host.url, &host.token, Duration::from_millis(1500)) {
+        match try_fetch_tabs(agent, host, &host.url, Duration::from_millis(1500)) {
             FetchOutcome::Ok(r) => {
                 return TabsFetch {
                     reach: Reach::Lan,
@@ -485,7 +505,7 @@ fn fetch_tabs(agent: &ureq::Agent, host: &HostConfig) -> TabsFetch {
         }
     }
     if !host.remote_url.is_empty() {
-        match try_fetch_tabs(agent, &host.remote_url, &host.token, Duration::from_secs(4)) {
+        match try_fetch_tabs(agent, host, &host.remote_url, Duration::from_secs(4)) {
             FetchOutcome::Ok(r) => {
                 return TabsFetch {
                     reach: Reach::Remote,
@@ -526,9 +546,8 @@ fn post_input(agent: &ureq::Agent, host: &HostConfig, reach: Reach, idx: i32, by
         return;
     }
     let url = format!("{base}/tabs/{idx}/input");
-    if let Err(e) = agent
-        .post(&url)
-        .set("Authorization", &format!("Bearer {}", host.token))
+    if let Err(e) = host
+        .authorize(agent.post(&url))
         .set("Content-Type", "application/octet-stream")
         .timeout(Duration::from_secs(2))
         .send_bytes(bytes)
@@ -544,9 +563,8 @@ fn post_rename_tab(agent: &ureq::Agent, host: &HostConfig, reach: Reach, idx: i3
     }
     let body = serde_json::json!({ "name": name }).to_string();
     let url = format!("{base}/tabs/{idx}/rename");
-    if let Err(e) = agent
-        .post(&url)
-        .set("Authorization", &format!("Bearer {}", host.token))
+    if let Err(e) = host
+        .authorize(agent.post(&url))
         .set("Content-Type", "application/json")
         .timeout(Duration::from_secs(2))
         .send_string(&body)
@@ -561,9 +579,8 @@ fn post_new_tab(agent: &ureq::Agent, host: &HostConfig, reach: Reach) {
         return;
     }
     let url = format!("{base}/tabs");
-    if let Err(e) = agent
-        .post(&url)
-        .set("Authorization", &format!("Bearer {}", host.token))
+    if let Err(e) = host
+        .authorize(agent.post(&url))
         .timeout(Duration::from_secs(2))
         .send_string("")
     {
@@ -577,9 +594,8 @@ fn delete_tab(agent: &ureq::Agent, host: &HostConfig, reach: Reach, idx: i32) {
         return;
     }
     let url = format!("{base}/tabs/{idx}");
-    if let Err(e) = agent
-        .delete(&url)
-        .set("Authorization", &format!("Bearer {}", host.token))
+    if let Err(e) = host
+        .authorize(agent.delete(&url))
         .timeout(Duration::from_secs(2))
         .call()
     {
@@ -737,6 +753,8 @@ fn push_hosts(ui_weak: &Weak<AppWindow>, data: &AppData) {
             url: SharedString::from(h.url.as_str()),
             remote_url: SharedString::from(h.remote_url.as_str()),
             token: SharedString::from(h.token.as_str()),
+            cf_id: SharedString::from(h.cf_access_client_id.as_str()),
+            cf_secret: SharedString::from(h.cf_access_client_secret.as_str()),
         })
         .collect();
     let active = data.active as i32;
@@ -809,16 +827,21 @@ pub fn android_main(app: slint::android::AndroidApp) {
     push_hosts(&ui_weak, &data.lock().unwrap());
 
     // Pre-fill the host editor from a launch deep link, if any.
-    if let Some((host_url, token)) = launch_onboard {
-        log::info!("launched with onboard deep link for {host_url}");
-        ui.set_editor_url(SharedString::from(host_url));
-        ui.set_editor_token(SharedString::from(token));
+    if let Some(o) = launch_onboard {
+        log::info!("launched with onboard deep link for {}", o.url);
+        ui.set_editor_url(SharedString::from(o.url));
+        ui.set_editor_token(SharedString::from(o.token));
+        ui.set_editor_cf_id(SharedString::from(o.cf_access_client_id));
+        ui.set_editor_cf_secret(SharedString::from(o.cf_access_client_secret));
         ui.set_editor_open(true);
     }
 
     let agent: Arc<ureq::Agent> = Arc::new(
         ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(5))
+            // Identify the client to the daemon and to Cloudflare's edge (shows
+            // up in access logs) rather than the bare `ureq/x.y` default.
+            .user_agent(concat!("ta-remote/", env!("CARGO_PKG_VERSION"), " (Android; Slint)"))
             .tls_config(Arc::new(permissive_tls_config()))
             // Don't follow redirects: the local API never redirects, so a 3xx is
             // a Cloudflare Access login challenge — we detect it (Location →
@@ -1033,7 +1056,7 @@ pub fn android_main(app: slint::android::AndroidApp) {
 
     let add_data = data.clone();
     let add_weak = ui_weak.clone();
-    ui.on_request_add_host(move |name, url, remote_url, token| {
+    ui.on_request_add_host(move |name, url, remote_url, token, cf_id, cf_secret| {
         let name = name.to_string();
         let url = url.trim_end_matches('/').to_string();
         let remote_url = remote_url.trim_end_matches('/').to_string();
@@ -1048,6 +1071,8 @@ pub fn android_main(app: slint::android::AndroidApp) {
             url,
             remote_url,
             token,
+            cf_access_client_id: cf_id.trim().to_string(),
+            cf_access_client_secret: cf_secret.trim().to_string(),
         });
         data.active = new_idx;
         data.save();
@@ -1056,7 +1081,7 @@ pub fn android_main(app: slint::android::AndroidApp) {
 
     let upd_data = data;
     let upd_weak = ui_weak.clone();
-    ui.on_request_update_host(move |idx, name, url, remote_url, token| {
+    ui.on_request_update_host(move |idx, name, url, remote_url, token, cf_id, cf_secret| {
         let idx = idx as usize;
         let url = url.trim_end_matches('/').to_string();
         let remote_url = remote_url.trim_end_matches('/').to_string();
@@ -1074,6 +1099,8 @@ pub fn android_main(app: slint::android::AndroidApp) {
             h.url = url;
             h.remote_url = remote_url;
             h.token = token;
+            h.cf_access_client_id = cf_id.trim().to_string();
+            h.cf_access_client_secret = cf_secret.trim().to_string();
             data.save();
             push_hosts(&upd_weak, &data);
         }
@@ -1100,12 +1127,16 @@ pub fn android_main(app: slint::android::AndroidApp) {
             ui.set_editor_name(SharedString::new());
             ui.set_editor_remote_url(SharedString::new());
             ui.set_editor_error(SharedString::new());
-            if let Some((url, token)) = parsed {
-                ui.set_editor_url(SharedString::from(url));
-                ui.set_editor_token(SharedString::from(token));
+            if let Some(o) = parsed {
+                ui.set_editor_url(SharedString::from(o.url));
+                ui.set_editor_token(SharedString::from(o.token));
+                ui.set_editor_cf_id(SharedString::from(o.cf_access_client_id));
+                ui.set_editor_cf_secret(SharedString::from(o.cf_access_client_secret));
             } else {
                 ui.set_editor_url(SharedString::new());
                 ui.set_editor_token(SharedString::new());
+                ui.set_editor_cf_id(SharedString::new());
+                ui.set_editor_cf_secret(SharedString::new());
             }
             ui.set_editor_open(true);
         });
@@ -1133,13 +1164,17 @@ pub fn android_main(app: slint::android::AndroidApp) {
             ui.set_editor_edit_index(-1);
             ui.set_editor_name(SharedString::new());
             ui.set_editor_remote_url(SharedString::new());
-            if let Some((url, token)) = parsed {
-                ui.set_editor_url(SharedString::from(url));
-                ui.set_editor_token(SharedString::from(token));
+            if let Some(o) = parsed {
+                ui.set_editor_url(SharedString::from(o.url));
+                ui.set_editor_token(SharedString::from(o.token));
+                ui.set_editor_cf_id(SharedString::from(o.cf_access_client_id));
+                ui.set_editor_cf_secret(SharedString::from(o.cf_access_client_secret));
                 ui.set_editor_error(SharedString::new());
             } else {
                 ui.set_editor_url(SharedString::new());
                 ui.set_editor_token(SharedString::new());
+                ui.set_editor_cf_id(SharedString::new());
+                ui.set_editor_cf_secret(SharedString::new());
                 ui.set_editor_error(SharedString::from(
                     "Clipboard didn't contain a taremote:// URL. Copy the URL under the QR code on the desktop and try again.",
                 ));

@@ -43,11 +43,13 @@ struct ColorLine {
 
 struct Host {
     name: string,
-    reachability: string,    // "lan" | "remote" | "offline"
+    reachability: string,    // "lan" | "remote" | "offline" | "cloudflare-auth"
     detail: string,          // shown next to the badge
     url: string,             // LAN URL
     remote-url: string,      // optional remote URL
     token: string,
+    cf-id: string,           // Cloudflare Access service-token client id (optional)
+    cf-secret: string,       // Cloudflare Access service-token client secret (optional)
 }
 
 component HeaderBar inherits Rectangle {
@@ -414,8 +416,10 @@ component HostEditor inherits Rectangle {
     in-out property <string> url-text;
     in-out property <string> remote-url-text;
     in-out property <string> token-text;
+    in-out property <string> cf-id-text;
+    in-out property <string> cf-secret-text;
     in-out property <string> error;
-    callback save(string, string, string, string);
+    callback save(string, string, string, string, string, string);
     callback dismiss();
 
     background: #000000aa;
@@ -426,7 +430,7 @@ component HostEditor inherits Rectangle {
 
     Rectangle {
         width: min(parent.width * 88%, 480px);
-        height: root.error == "" ? 440px : 472px;
+        height: root.error == "" ? 596px : 628px;
         background: #1c1c1c;
         border-radius: 14px;
         border-width: 1px;
@@ -543,6 +547,42 @@ component HostEditor inherits Rectangle {
                         }
                     }
                 }
+
+                Text { text: "Cloudflare service token — Client ID (optional)"; color: #888; font-size: 11px; }
+                Rectangle {
+                    height: 40px;
+                    background: #232323;
+                    border-radius: 6px;
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        TextInput {
+                            text <=> root.cf-id-text;
+                            color: #e0e0e0;
+                            font-size: 14px;
+                            single-line: true;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+
+                Text { text: "Cloudflare service token — Client Secret (optional)"; color: #888; font-size: 11px; }
+                Rectangle {
+                    height: 40px;
+                    background: #232323;
+                    border-radius: 6px;
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        TextInput {
+                            text <=> root.cf-secret-text;
+                            color: #e0e0e0;
+                            font-size: 14px;
+                            single-line: true;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
                 if root.error != "" : Text {
                     text: root.error;
                     color: #ef5350;
@@ -577,7 +617,7 @@ component HostEditor inherits Rectangle {
 
                 TouchArea {
                     horizontal-stretch: 1;
-                    clicked => { root.save(root.name-text, root.url-text, root.remote-url-text, root.token-text) }
+                    clicked => { root.save(root.name-text, root.url-text, root.remote-url-text, root.token-text, root.cf-id-text, root.cf-secret-text) }
                     Rectangle {
                         height: 40px;
                         background: parent.has-hover ? #5599ff : #4a8cff;
@@ -729,6 +769,8 @@ export component AppWindow inherits Window {
     in-out property <string> editor-url: "";
     in-out property <string> editor-remote-url: "";
     in-out property <string> editor-token: "";
+    in-out property <string> editor-cf-id: "";
+    in-out property <string> editor-cf-secret: "";
     in-out property <string> editor-error: "";
     /// -1 = no close confirmation dialog open; >= 0 = index of the tab the
     /// user just hit the X on.
@@ -760,8 +802,8 @@ export component AppWindow inherits Window {
     /// CTRL/ALT before being sent to the active tab. Implemented on
     /// the Rust side so the ASCII→Ctrl-byte mapping doesn't have to
     /// live in Slint.
-    callback request-add-host(string, string, string, string);
-    callback request-update-host(int, string, string, string, string);
+    callback request-add-host(string, string, string, string, string, string);
+    callback request-update-host(int, string, string, string, string, string, string);
     callback request-close-tab(int);
     callback request-new-tab();
     callback request-rename-tab(int, string);
@@ -984,6 +1026,8 @@ export component AppWindow inherits Window {
             root.editor-url = root.hosts[i].url;
             root.editor-remote-url = root.hosts[i].remote-url;
             root.editor-token = root.hosts[i].token;
+            root.editor-cf-id = root.hosts[i].cf-id;
+            root.editor-cf-secret = root.hosts[i].cf-secret;
             root.editor-error = "";
             root.picker-open = false;
             root.editor-open = true;
@@ -1011,17 +1055,19 @@ export component AppWindow inherits Window {
         url-text <=> root.editor-url;
         remote-url-text <=> root.editor-remote-url;
         token-text <=> root.editor-token;
+        cf-id-text <=> root.editor-cf-id;
+        cf-secret-text <=> root.editor-cf-secret;
         error <=> root.editor-error;
-        save(n, u, r, t) => {
+        save(n, u, r, t, cfid, cfsecret) => {
             if (u == "" || t == "") {
                 root.editor-error = "URL and Token are required.";
             } else {
                 root.editor-error = "";
                 root.editor-open = false;
                 if (root.editor-edit-index >= 0) {
-                    root.request-update-host(root.editor-edit-index, n, u, r, t);
+                    root.request-update-host(root.editor-edit-index, n, u, r, t, cfid, cfsecret);
                 } else {
-                    root.request-add-host(n, u, r, t);
+                    root.request-add-host(n, u, r, t, cfid, cfsecret);
                 }
             }
         }
