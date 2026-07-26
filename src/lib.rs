@@ -2910,6 +2910,23 @@ mod tests {
     }
 
     #[test]
+    fn instrumented_suffix_clears_the_grid_before_exec() {
+        // The instrumented variant is the path the GUI/headless actually use.
+        // Regardless of whether tracing/frame-timing env is on (which prefixes
+        // strace / env vars onto the exec), the command must start with the grid
+        // clear so a prior agent run's tail can't linger under the fresh UI, then
+        // exec the resumed agent.
+        let s = agent_launch_shell_suffix_instrumented("claude", "abc-123", None, None).unwrap();
+        assert_eq!(&s[..2], ["-i", "-c"]);
+        let cmd = s.last().unwrap();
+        assert!(cmd.starts_with(AGENT_LAUNCH_CLEAR), "must clear first: {cmd}");
+        assert!(cmd.contains("exec"), "then exec: {cmd}");
+        assert!(cmd.contains("claude --resume abc-123"), "the resumed agent: {cmd}");
+        // Unknown kind → no direct launch, same as the plain variant.
+        assert!(agent_launch_shell_suffix_instrumented("bash", "x", None, None).is_none());
+    }
+
+    #[test]
     fn brain_resumes_by_relaunch_ignoring_session() {
         // The brain watchdog has no session; auto-resume just relaunches it.
         // `session_id` is ignored, so an empty one still yields the command.
