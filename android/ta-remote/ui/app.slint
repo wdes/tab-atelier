@@ -430,7 +430,14 @@ component HostEditor inherits Rectangle {
 
     Rectangle {
         width: min(parent.width * 88%, 480px);
-        height: root.error == "" ? 596px : 628px;
+        // Bound the dialog to the space actually on screen: the natural height of
+        // all six fields (596/628px) OR whatever is left above the keyboard +
+        // safe area, whichever is smaller. The field column below is a Flickable,
+        // so when the dialog is capped short the fields scroll — the Cloudflare
+        // service-token inputs and the Save row stay reachable on any screen.
+        height: min(
+            root.error == "" ? 596px : 628px,
+            parent.height - root.safe-top - root.ime-height - 32px);
         background: #1c1c1c;
         border-radius: 14px;
         border-width: 1px;
@@ -472,123 +479,131 @@ component HostEditor inherits Rectangle {
                 }
             }
 
-            VerticalLayout {
-                padding: 16px;
-                spacing: 12px;
+            // Scrollable field column — takes the space between the fixed header
+            // and the Save/Cancel row, and scrolls when the dialog is capped
+            // shorter than its six fields (small screens / keyboard open).
+            Flickable {
+                vertical-stretch: 1;
+                viewport-width: self.width;
 
-                Text { text: "Name"; color: #888; font-size: 11px; }
-                Rectangle {
-                    height: 40px;
-                    background: #232323;
-                    border-radius: 6px;
-                    HorizontalLayout {
-                        padding-left: 10px;
-                        padding-right: 10px;
-                        TextInput {
-                            text <=> root.name-text;
-                            color: #e0e0e0;
-                            font-size: 14px;
-                            single-line: true;
-                            vertical-alignment: center;
+                VerticalLayout {
+                    padding: 16px;
+                    spacing: 12px;
+
+                    Text { text: "Name"; color: #888; font-size: 11px; }
+                    Rectangle {
+                        height: 40px;
+                        background: #232323;
+                        border-radius: 6px;
+                        HorizontalLayout {
+                            padding-left: 10px;
+                            padding-right: 10px;
+                            TextInput {
+                                text <=> root.name-text;
+                                color: #e0e0e0;
+                                font-size: 14px;
+                                single-line: true;
+                                vertical-alignment: center;
+                            }
                         }
                     }
-                }
 
-                Text { text: "LAN URL (http://192.168.x.x:7890)"; color: #888; font-size: 11px; }
-                Rectangle {
-                    height: 40px;
-                    background: #232323;
-                    border-radius: 6px;
-                    HorizontalLayout {
-                        padding-left: 10px;
-                        padding-right: 10px;
-                        TextInput {
-                            text <=> root.url-text;
-                            color: #e0e0e0;
-                            font-size: 14px;
-                            single-line: true;
-                            vertical-alignment: center;
+                    Text { text: "LAN URL (http://192.168.x.x:7890)"; color: #888; font-size: 11px; }
+                    Rectangle {
+                        height: 40px;
+                        background: #232323;
+                        border-radius: 6px;
+                        HorizontalLayout {
+                            padding-left: 10px;
+                            padding-right: 10px;
+                            TextInput {
+                                text <=> root.url-text;
+                                color: #e0e0e0;
+                                font-size: 14px;
+                                single-line: true;
+                                vertical-alignment: center;
+                            }
                         }
                     }
-                }
 
-                Text { text: "Remote URL (optional)"; color: #888; font-size: 11px; }
-                Rectangle {
-                    height: 40px;
-                    background: #232323;
-                    border-radius: 6px;
-                    HorizontalLayout {
-                        padding-left: 10px;
-                        padding-right: 10px;
-                        TextInput {
-                            text <=> root.remote-url-text;
-                            color: #e0e0e0;
-                            font-size: 14px;
-                            single-line: true;
-                            vertical-alignment: center;
+                    Text { text: "Remote URL (optional)"; color: #888; font-size: 11px; }
+                    Rectangle {
+                        height: 40px;
+                        background: #232323;
+                        border-radius: 6px;
+                        HorizontalLayout {
+                            padding-left: 10px;
+                            padding-right: 10px;
+                            TextInput {
+                                text <=> root.remote-url-text;
+                                color: #e0e0e0;
+                                font-size: 14px;
+                                single-line: true;
+                                vertical-alignment: center;
+                            }
                         }
                     }
-                }
 
-                Text { text: "Token"; color: #888; font-size: 11px; }
-                Rectangle {
-                    height: 40px;
-                    background: #232323;
-                    border-radius: 6px;
-                    HorizontalLayout {
-                        padding-left: 10px;
-                        padding-right: 10px;
-                        TextInput {
-                            text <=> root.token-text;
-                            color: #e0e0e0;
-                            font-size: 14px;
-                            single-line: true;
-                            vertical-alignment: center;
+                    Text { text: "Token"; color: #888; font-size: 11px; }
+                    Rectangle {
+                        height: 40px;
+                        background: #232323;
+                        border-radius: 6px;
+                        HorizontalLayout {
+                            padding-left: 10px;
+                            padding-right: 10px;
+                            TextInput {
+                                text <=> root.token-text;
+                                color: #e0e0e0;
+                                font-size: 14px;
+                                single-line: true;
+                                vertical-alignment: center;
+                            }
                         }
                     }
-                }
 
-                Text { text: "Cloudflare service token — Client ID (optional)"; color: #888; font-size: 11px; }
-                Rectangle {
-                    height: 40px;
-                    background: #232323;
-                    border-radius: 6px;
-                    HorizontalLayout {
-                        padding-left: 10px;
-                        padding-right: 10px;
-                        TextInput {
-                            text <=> root.cf-id-text;
-                            color: #e0e0e0;
-                            font-size: 14px;
-                            single-line: true;
-                            vertical-alignment: center;
+                    Text { text: "Cloudflare service token — Client ID (optional)"; color: #888; font-size: 11px; }
+                    Rectangle {
+                        height: 40px;
+                        background: #232323;
+                        border-radius: 6px;
+                        HorizontalLayout {
+                            padding-left: 10px;
+                            padding-right: 10px;
+                            TextInput {
+                                text <=> root.cf-id-text;
+                                color: #e0e0e0;
+                                font-size: 14px;
+                                single-line: true;
+                                vertical-alignment: center;
+                            }
                         }
                     }
-                }
 
-                Text { text: "Cloudflare service token — Client Secret (optional)"; color: #888; font-size: 11px; }
-                Rectangle {
-                    height: 40px;
-                    background: #232323;
-                    border-radius: 6px;
-                    HorizontalLayout {
-                        padding-left: 10px;
-                        padding-right: 10px;
-                        TextInput {
-                            text <=> root.cf-secret-text;
-                            color: #e0e0e0;
-                            font-size: 14px;
-                            single-line: true;
-                            vertical-alignment: center;
+                    Text { text: "Cloudflare service token — Client Secret (optional)"; color: #888; font-size: 11px; }
+                    Rectangle {
+                        height: 40px;
+                        background: #232323;
+                        border-radius: 6px;
+                        HorizontalLayout {
+                            padding-left: 10px;
+                            padding-right: 10px;
+                            TextInput {
+                                text <=> root.cf-secret-text;
+                                color: #e0e0e0;
+                                font-size: 14px;
+                                single-line: true;
+                                vertical-alignment: center;
+                            }
                         }
                     }
-                }
-                if root.error != "" : Text {
-                    text: root.error;
-                    color: #ef5350;
-                    font-size: 12px;
-                    horizontal-alignment: center;
-                    wrap: word-wrap;
+                    if root.error != "" : Text {
+                        text: root.error;
+                        color: #ef5350;
+                        font-size: 12px;
+                        horizontal-alignment: center;
+                        wrap: word-wrap;
+                    }
                 }
             }
 
