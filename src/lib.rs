@@ -1043,6 +1043,36 @@ fn parse_memory_bytes(s: &str) -> Option<u64> {
     Some(n.saturating_mul(mult))
 }
 
+/// Parse total physical RAM (bytes) from a `/proc/meminfo` blob — its
+/// `MemTotal:` line reports kibibytes (`MemTotal:  65780904 kB`). `None` if the
+/// line is missing or unparseable.
+#[must_use]
+pub fn parse_meminfo_total(meminfo: &str) -> Option<u64> {
+    for line in meminfo.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return kb.checked_mul(1024);
+        }
+    }
+    None
+}
+
+/// Total physical RAM in bytes, read once from `/proc/meminfo` and cached.
+///
+/// Total RAM doesn't change at runtime, so the first read is memoized. `None` off
+/// Linux or on parse failure. Used as the per-tab RAM-gauge denominator when a
+/// tab has no explicit memory cap.
+#[must_use]
+pub fn system_total_ram_bytes() -> Option<u64> {
+    static CACHE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .as_deref()
+            .and_then(parse_meminfo_total)
+    })
+}
+
 /// Default viewer background — Tomorrow Night Blue. Softer than pitch
 /// black; legible foreground contrast on most monitors.
 pub const DEFAULT_TAB_BG_COLOR: &str = "#002451";
@@ -3055,6 +3085,21 @@ mod tests {
         assert_eq!(parse_memory_bytes(""), None);
         assert_eq!(parse_memory_bytes("abc"), None);
         assert_eq!(parse_memory_bytes("12X"), None);
+    }
+
+    #[test]
+    fn parse_meminfo_total_reads_kb_line_as_bytes() {
+        let sample = "MemTotal:       65780904 kB\nMemFree:  1234 kB\nMemAvailable: 5678 kB\n";
+        assert_eq!(parse_meminfo_total(sample), Some(65_780_904 * 1024));
+        // First matching line wins; leading fields are tolerated.
+        assert_eq!(
+            parse_meminfo_total("MemFree: 10 kB\nMemTotal: 1024 kB"),
+            Some(1024 * 1024)
+        );
+        // Missing / malformed → None.
+        assert_eq!(parse_meminfo_total("MemFree: 10 kB"), None);
+        assert_eq!(parse_meminfo_total("MemTotal: notanumber kB"), None);
+        assert_eq!(parse_meminfo_total(""), None);
     }
 
     #[test]

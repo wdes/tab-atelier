@@ -113,6 +113,7 @@ pub struct Strings {
     pub api_addr: &'static str,
     pub api_tls_addr: &'static str,
     pub share_url_base: &'static str,
+    pub default_tab_ram: &'static str,
     pub save: &'static str,
 
     // Remote endpoints (Preferences > Remote endpoints)
@@ -212,6 +213,7 @@ pub static EN: Strings = Strings {
     api_addr: "Remote API bind (addr:port, restart required)",
     api_tls_addr: "Remote API TLS bind (addr:port, restart required)",
     share_url_base: "Share URL base (public URL of a reverse proxy, optional)",
+    default_tab_ram: "Max RAM per tab (default, e.g. 8G — empty = unlimited)",
     save: "Save",
 
     remote_endpoints: "Remote endpoints",
@@ -310,6 +312,7 @@ pub static FR: Strings = Strings {
     api_addr: "API distante (adresse:port, redémarrage requis)",
     api_tls_addr: "API distante TLS (adresse:port, redémarrage requis)",
     share_url_base: "URL de base pour le partage (URL publique d'un proxy inverse, optionnel)",
+    default_tab_ram: "RAM max par onglet (défaut, ex. 8G — vide = illimité)",
     save: "Enregistrer",
 
     remote_endpoints: "Points d'accès distants",

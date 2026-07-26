@@ -476,6 +476,34 @@ fn grid_dims(vp_w: f32, vp_h: f32, cell_w: f32, cell_h: f32) -> Option<(usize, u
     Some((cols, lines))
 }
 
+/// Fill colour for the per-tab RAM gauge, by fill fraction: blue up to 75 %,
+/// amber 75–90 %, red past 90 % — so a tab nearing its memory cap (OOM risk)
+/// visibly reddens.
+fn ram_gauge_fill(frac: f32) -> Rgba {
+    if frac >= 0.9 {
+        Rgba {
+            r: 0.94,
+            g: 0.33,
+            b: 0.31,
+            a: 0.9,
+        } // red — at/near the cap
+    } else if frac >= 0.75 {
+        Rgba {
+            r: 0.95,
+            g: 0.66,
+            b: 0.22,
+            a: 0.9,
+        } // amber — getting close
+    } else {
+        Rgba {
+            r: 0.36,
+            g: 0.60,
+            b: 1.0,
+            a: 0.85,
+        } // blue — comfortable
+    }
+}
+
 /// One tab's output-save request for the [`OutputSaver`] worker: its name, the
 /// ring length (a cheap dirtiness key), and a `Send` closure that serialises the
 /// scrollback. The main thread builds these (an `Arc` clone + a brief ring lock
@@ -645,6 +673,16 @@ struct AppState {
     pref_api_tls_addr_focus: FocusHandle,
     pref_share_url_base_text: String,
     pref_share_url_base_focus: FocusHandle,
+    /// Edit buffer + focus for the global "max RAM per tab" default
+    /// (`Preferences::default_tab_limits.memory_max`). Empty = unlimited.
+    pref_default_mem_text: String,
+    pref_default_mem_focus: FocusHandle,
+    /// Live mirror of the persisted global per-tab RAM cap
+    /// (`default_tab_limits.memory_max`), e.g. `"8G"`. Cross-platform (the
+    /// Linux-only `default_limits` field carries the same value for cgroup use);
+    /// kept here so the Preferences dialog + save path work on every OS. `None` =
+    /// unlimited. Feeds the RAM gauge's denominator via [`Self::tab_mem_ceiling`].
+    default_tab_mem_max: Option<String>,
     /// Saved remote `tab-atelier-headless` endpoints. Loaded from
     /// `preferences.json` at startup, edited via the "Remote endpoints"
     /// section of the Preferences modal, and persisted back on Save.
@@ -740,6 +778,18 @@ impl AppState {
     /// a never-opened tab (and its remote xterm.js viewer) is then correctly
     /// sized from birth. `None` before the window has a real size (viewport not
     /// laid out yet); callers fall back to 80×24 and the first paint corrects it.
+    /// RAM-gauge denominator for a tab: its effective memory cap (the tab's own
+    /// over the global default, Linux cgroup v2) when set, else `sys_ram` (total
+    /// system RAM). `None` = no ceiling to scale against → no bar.
+    #[cfg_attr(not(target_os = "linux"), allow(clippy::unused_self))]
+    fn tab_mem_ceiling(&self, tab: &Tab, sys_ram: Option<u64>) -> Option<u64> {
+        #[cfg(target_os = "linux")]
+        let cap = crate::TabResourceLimits::resolve(&tab.limits, &self.default_limits).memory_max_bytes();
+        #[cfg(not(target_os = "linux"))]
+        let cap = tab.limits.memory_max_bytes();
+        cap.or(sys_ram)
+    }
+
     fn grid_size(window: &mut Window, fc: &crate::FontConfig) -> Option<(usize, usize, gpui::Size<Pixels>)> {
         let vp = window.viewport_size();
         let cell = crate::terminal::measure_cell(window, fc);
@@ -761,11 +811,15 @@ impl AppState {
         let pref_api_addr_focus = cx.focus_handle();
         let pref_api_tls_addr_focus = cx.focus_handle();
         let pref_share_url_base_focus = cx.focus_handle();
+        let pref_default_mem_focus = cx.focus_handle();
         let prefs = load_preferences(&platform::config_dir());
         // Per-tab cgroup ceilings (Linux). Cloned before `prefs` fields
         // are moved below; layered under each tab's own limits at spawn.
         #[cfg(target_os = "linux")]
         let default_limits = prefs.default_tab_limits.clone();
+        // Global per-tab RAM cap mirror (cross-platform) — drives the gauge
+        // denominator + the Preferences input. Cloned before `prefs` moves.
+        let default_tab_mem_max = prefs.default_tab_limits.memory_max.clone();
         // Font: preferences.json `font_family`/`font_size` → zed
         // settings → fontconfig-resolved monospace (the generic
         // "monospace" can render with a too-wide cell advance).
@@ -1375,6 +1429,9 @@ impl AppState {
             pref_api_tls_addr_focus,
             pref_share_url_base_text: String::new(),
             pref_share_url_base_focus,
+            pref_default_mem_text: String::new(),
+            pref_default_mem_focus,
+            default_tab_mem_max,
             remote_endpoints,
             #[cfg(target_os = "linux")]
             default_limits,
@@ -2793,14 +2850,17 @@ impl AppState {
             );
 
         let theme_name = self.theme_name;
-        // Per-tab RAM mini gauge (#28 S5): scale each bar against the busiest
-        // tab. Computed once per render from the RSS the persist loop cached on
-        // each tab (no /proc walk here). Off unless the pref is toggled on.
+        // Per-tab RAM mini gauge (#28 S5): each bar is this tab's RSS as a
+        // fraction of a real ceiling — the tab's effective memory cap (own over
+        // the global default) when one is set, else total system RAM. So 100%
+        // means "at the cap" (or "using all the machine's RAM"), not "heaviest
+        // tab". Computed from the RSS the persist loop cached (no /proc walk
+        // here). Off unless the pref is toggled on.
         let show_tab_gauge = self.show_tab_gauge;
-        let max_rss = if show_tab_gauge {
-            self.tabs.iter().filter_map(|t| t.rss_bytes.get()).max().unwrap_or(0)
+        let sys_ram = if show_tab_gauge {
+            crate::system_total_ram_bytes()
         } else {
-            0
+            None
         };
         for (i, tab) in self.tabs.iter().enumerate() {
             let is_active = i == self.active;
@@ -3023,35 +3083,36 @@ impl AppState {
                     .child(power_label),
             );
 
-            // Per-tab RAM mini gauge (#28 S5): a 24 px track with a fill sized
-            // by this tab's RSS as a fraction of the busiest tab. Only when the
-            // pref is on and at least one tab has a sample — off by default so
-            // the tab bar stays byte-for-byte unchanged for everyone else.
-            let tab_el = if show_tab_gauge && max_rss > 0 {
-                let frac = (tab.rss_bytes.get().unwrap_or(0) as f32 / max_rss as f32).clamp(0.0, 1.0);
-                let gauge_fill = Hsla::from(Rgba {
-                    r: 0.36,
-                    g: 0.60,
-                    b: 1.0,
-                    a: 0.85,
-                });
-                let gauge_track = Hsla::from(Rgba {
-                    r: 0.5,
-                    g: 0.5,
-                    b: 0.5,
-                    a: 0.25,
-                });
-                tab_el.child(
-                    div()
-                        .w(px(24.0))
-                        .h(px(4.0))
-                        .ml(px(4.0))
-                        .rounded_sm()
-                        .bg(gauge_track)
-                        .child(div().w(px(24.0 * frac)).h(px(4.0)).rounded_sm().bg(gauge_fill)),
-                )
-            } else {
-                tab_el
+            // Per-tab RAM mini gauge (#28 S5): a 24 px track with a fill sized by
+            // this tab's RSS as a fraction of its ceiling (cap, else system RAM;
+            // see the setup above). Fill goes amber past 75% and red past 90% so
+            // a tab nearing its cap (OOM) stands out. Only when the pref is on and
+            // both a sample and a ceiling exist — off by default so the tab bar
+            // stays byte-for-byte unchanged for everyone else.
+            let tab_el = match (
+                show_tab_gauge.then(|| tab.rss_bytes.get()).flatten(),
+                self.tab_mem_ceiling(tab, sys_ram),
+            ) {
+                (Some(rss), Some(ceiling)) if ceiling > 0 => {
+                    let frac = (rss as f32 / ceiling as f32).clamp(0.0, 1.0);
+                    let gauge_fill = Hsla::from(ram_gauge_fill(frac));
+                    let gauge_track = Hsla::from(Rgba {
+                        r: 0.5,
+                        g: 0.5,
+                        b: 0.5,
+                        a: 0.25,
+                    });
+                    tab_el.child(
+                        div()
+                            .w(px(24.0))
+                            .h(px(4.0))
+                            .ml(px(4.0))
+                            .rounded_sm()
+                            .bg(gauge_track)
+                            .child(div().w(px(24.0 * frac)).h(px(4.0)).rounded_sm().bg(gauge_fill)),
+                    )
+                }
+                _ => tab_el,
             };
 
             // Measure this tab's top edge as a pet ledge (see PetOverlay).
@@ -3878,6 +3939,7 @@ impl AppState {
                             this.pref_api_addr_text = this.api_addr.clone();
                             this.pref_api_tls_addr_text = this.api_tls_addr.clone();
                             this.pref_share_url_base_text = this.share_url_base.clone();
+                            this.pref_default_mem_text = this.default_tab_mem_max.clone().unwrap_or_default();
                             this.show_preferences = true;
                             this.context_menu = None;
                             // Move focus into the first prefs input on
@@ -4962,6 +5024,60 @@ impl AppState {
                     .child(div().w(px(1.0)).h(px(16.0)).bg(cursor_color))
             });
 
+        // Global "max RAM per tab" default. A byte count with an optional
+        // K/M/G/T suffix (e.g. `8G`); empty = unlimited. Applies to tabs spawned
+        // afterwards and is the RAM gauge's 100% mark. Char filter: digits +
+        // suffix letters only.
+        let default_mem_text = self.pref_default_mem_text.clone();
+        let default_mem_input = div()
+            .id("pref-default-mem-input")
+            .key_context("pref-default-mem")
+            .track_focus(&self.pref_default_mem_focus)
+            .mt(px(8.0))
+            .w_full()
+            .flex()
+            .flex_row()
+            .items_center()
+            .bg(th.bg_hsla())
+            .border_1()
+            .border_color(input_border)
+            .rounded(px(3.0))
+            .px(px(8.0))
+            .py(px(4.0))
+            .min_h(px(28.0))
+            .cursor_text()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _ev: &MouseDownEvent, window, cx| {
+                    this.pref_default_mem_focus.focus(window);
+                    cx.notify();
+                }),
+            )
+            .on_key_down(
+                cx.listener(|this, ev: &KeyDownEvent, _window, cx| match ev.keystroke.key.as_str() {
+                    "backspace" => {
+                        this.pref_default_mem_text.pop();
+                        cx.notify();
+                    }
+                    _ => {
+                        if let Some(ref ch) = ev.keystroke.key_char
+                            && ch.chars().all(is_mem_char)
+                            && this.pref_default_mem_text.len() + ch.len() <= 12
+                        {
+                            this.pref_default_mem_text.push_str(ch);
+                            cx.notify();
+                        }
+                    }
+                }),
+            )
+            .when(default_mem_text.is_empty(), |el| {
+                el.child(div().text_color(placeholder_fg).child("unlimited (e.g. 8G)"))
+            })
+            .when(!default_mem_text.is_empty(), |el| {
+                el.child(default_mem_text)
+                    .child(div().w(px(1.0)).h(px(16.0)).bg(cursor_color))
+            });
+
         let editor_text = self.pref_editor_text.clone();
         let editor_input = div()
             .id("pref-editor-input")
@@ -5043,6 +5159,7 @@ impl AppState {
                         .child(div().mt(px(16.0)).child(t.api_addr).child(api_addr_input))
                         .child(div().mt(px(16.0)).child(t.api_tls_addr).child(api_tls_addr_input))
                         .child(div().mt(px(16.0)).child(t.share_url_base).child(share_url_base_input))
+                        .child(div().mt(px(16.0)).child(t.default_tab_ram).child(default_mem_input))
                         .child(
                             div()
                                 .mt(px(20.0))
@@ -5128,6 +5245,28 @@ impl AppState {
                                                 } else {
                                                     Some(this.share_url_base.clone())
                                                 };
+                                                // Global "max RAM per tab" default. Empty = unlimited;
+                                                // otherwise must parse as a byte count (e.g. "8G") to be
+                                                // accepted — an unparseable entry keeps the prior value.
+                                                let mem_in = this.pref_default_mem_text.trim().to_string();
+                                                let mem_valid = !mem_in.is_empty()
+                                                    && crate::TabResourceLimits {
+                                                        memory_max: Some(mem_in.clone()),
+                                                        ..Default::default()
+                                                    }
+                                                    .memory_max_bytes()
+                                                    .is_some();
+                                                if mem_in.is_empty() {
+                                                    this.default_tab_mem_max = None;
+                                                } else if mem_valid {
+                                                    this.default_tab_mem_max = Some(mem_in);
+                                                }
+                                                // Reflect it immediately for the gauge + new-tab spawns.
+                                                #[cfg(target_os = "linux")]
+                                                {
+                                                    this.default_limits.memory_max = this.default_tab_mem_max.clone();
+                                                }
+                                                let default_mem_max = this.default_tab_mem_max.clone();
                                                 let on_disk_prefs = load_preferences(&platform::config_dir());
                                                 save_preferences(
                                                     &platform::config_dir(),
@@ -5176,10 +5315,18 @@ impl AppState {
                                                         default_net_allow_domains: on_disk_prefs
                                                             .default_net_allow_domains,
                                                         default_net_allow_cidrs: on_disk_prefs.default_net_allow_cidrs,
-                                                        // Headless-only advanced fields set directly
-                                                        // in preferences.json; not exposed in the GUI
-                                                        // dialog, same treatment as pty_cols above.
-                                                        default_tab_limits: crate::TabResourceLimits::default(),
+                                                        // The GUI dialog edits only the RAM cap
+                                                        // (memory_max); the CPU/tasks axes are headless-
+                                                        // only, so carry them through from disk rather
+                                                        // than resetting the whole struct to Default
+                                                        // (which silently wiped a CLI-set cpu/tasks cap).
+                                                        default_tab_limits: crate::TabResourceLimits {
+                                                            memory_max: default_mem_max,
+                                                            cpu_quota_percent: on_disk_prefs
+                                                                .default_tab_limits
+                                                                .cpu_quota_percent,
+                                                            tasks_max: on_disk_prefs.default_tab_limits.tasks_max,
+                                                        },
                                                         clear_env: None,
                                                         clear_env_vars: std::collections::BTreeMap::new(),
                                                         // Advanced field, not in the dialog — carry the
@@ -5679,6 +5826,13 @@ fn is_addr_port_char(c: char) -> bool {
     c.is_ascii_digit() || matches!(c, '.' | ':' | '[' | ']') || ('a'..='f').contains(&c.to_ascii_lowercase())
 }
 
+/// Char predicate for the "max RAM per tab" input: a digit or a single K/M/G/T
+/// (1024-based) suffix. Matches what [`crate::TabResourceLimits::memory_max_bytes`]
+/// accepts, so anything typed either parses or is a partial prefix of it.
+const fn is_mem_char(c: char) -> bool {
+    c.is_ascii_digit() || matches!(c.to_ascii_uppercase(), 'K' | 'M' | 'G' | 'T')
+}
+
 const MAX_ADDR_LEN: usize = 64;
 
 /// Char predicate for the share-URL-base input — accepts the URL-safe
@@ -6136,6 +6290,22 @@ mod tests {
         // Hidden/minimised → show, regardless of the stale active bit.
         assert!(hotkey_should_show(false, false));
         assert!(hotkey_should_show(false, true));
+    }
+
+    #[test]
+    fn ram_gauge_fill_reddens_near_the_cap() {
+        // Comfortable (<75%) → blue; getting close (75–90%) → amber; near the
+        // cap (>=90%) → red. Compare the dominant channel to keep it robust.
+        let blue = ram_gauge_fill(0.5);
+        assert!(blue.b > blue.r, "low usage should be blue-dominant");
+        let amber = ram_gauge_fill(0.8);
+        assert!(amber.r > amber.b && amber.g > amber.b, "mid usage should be amber");
+        let red = ram_gauge_fill(0.95);
+        assert!(red.r > red.g && red.r > red.b, "high usage should be red-dominant");
+        // 0.9 is the start of the red band: red's green channel is much lower
+        // than amber's, so this distinguishes the two without an f32 == compare.
+        assert!(ram_gauge_fill(0.9).g < 0.5, "0.9 should already be in the red band");
+        assert!(ram_gauge_fill(0.89).g > 0.5, "just under 0.9 is still amber");
     }
 
     #[test]
