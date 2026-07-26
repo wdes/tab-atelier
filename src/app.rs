@@ -345,7 +345,10 @@ impl Tab {
         if let Some(cmd) = self.pending_agent_resume.take() {
             let view = self.view.read(cx);
             view.send_input_bytes(vec![0x15]); // Ctrl-U
-            let mut bytes = cmd.into_bytes();
+            // Clear the grid first so the previous run's tail (e.g. the
+            // `claude --resume …` exit line) doesn't linger under the resumed
+            // agent's fresh UI — see `crate::AGENT_LAUNCH_CLEAR`.
+            let mut bytes = format!("{}{cmd}", crate::AGENT_LAUNCH_CLEAR).into_bytes();
             bytes.push(b'\n');
             view.send_input_bytes(bytes);
         }

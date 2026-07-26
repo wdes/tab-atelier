@@ -512,6 +512,19 @@ pub fn api_url_for_local_clients(api_addr: &str) -> String {
     format!("http://127.0.0.1:{port}")
 }
 
+/// Shell fragment that wipes the terminal — scrollback (`ESC[3J`), cursor home
+/// (`ESC[H`), then the visible screen (`ESC[2J`) — before an agent is launched.
+///
+/// Agents like `claude` repaint their UI in place with cursor positioning and
+/// per-line erases; they never clear the rows *below* their UI. So when one is
+/// (re)launched over a grid that still holds a previous run's output — most
+/// visibly the `Resume this session with: claude --resume …` line a prior
+/// `claude` prints on exit — that stale tail survives at the bottom of the
+/// screen (and in the byte ring the web viewer replays). Emitting a full clear
+/// first gives the agent a clean grid to paint on. `printf` is a shell builtin,
+/// so this needs nothing on PATH and works in the cleared-env minimal shell.
+pub const AGENT_LAUNCH_CLEAR: &str = r"printf '\033[3J\033[H\033[2J'; ";
+
 /// Translate a persisted (`agent_kind`, `session_id`, `plan_mode`) into
 /// the shell command to type for auto-resume. Returns None when the
 /// `agent_kind` isn't one we know how to drive.
@@ -561,7 +574,13 @@ pub fn build_agent_resume_command(kind: &str, session_id: &str, plan: Option<boo
 #[must_use]
 pub fn agent_launch_shell_suffix(kind: &str, session_id: &str, plan: Option<bool>) -> Option<Vec<String>> {
     let cmd = build_agent_resume_command(kind, session_id, plan)?;
-    Some(vec!["-i".to_string(), "-c".to_string(), format!("exec {cmd}")])
+    // Clear the grid before `exec` so a previous run's tail doesn't linger under
+    // the fresh agent UI — see [`AGENT_LAUNCH_CLEAR`].
+    Some(vec![
+        "-i".to_string(),
+        "-c".to_string(),
+        format!("{AGENT_LAUNCH_CLEAR}exec {cmd}"),
+    ])
 }
 
 /// Tracer-wrapping variant of [`agent_launch_shell_suffix`].
@@ -610,11 +629,14 @@ pub fn agent_launch_shell_suffix_instrumented(
         }
         log.to_string_lossy().into_owned()
     });
-    Some(vec![
-        "-i".to_string(),
-        "-c".to_string(),
-        wrap_exec_command(&cmd, trace.as_ref(), frames.as_deref(), proctitle),
-    ])
+    // Clear the grid before the agent execs so a previous run's tail (e.g. the
+    // `claude --resume …` exit line) doesn't linger under the fresh UI — see
+    // [`AGENT_LAUNCH_CLEAR`].
+    let launch = format!(
+        "{AGENT_LAUNCH_CLEAR}{}",
+        wrap_exec_command(&cmd, trace.as_ref(), frames.as_deref(), proctitle)
+    );
+    Some(vec!["-i".to_string(), "-c".to_string(), launch])
 }
 
 /// True when `shell_path`'s `exec` builtin accepts `-a argv0`.
@@ -2866,11 +2888,23 @@ mod tests {
     #[test]
     fn agent_launch_suffix_execs_the_resume_command() {
         let s = agent_launch_shell_suffix("claude", "abc-123", None).unwrap();
-        // Interactive shell (sources rc for PATH), then exec the agent.
-        assert_eq!(s, vec!["-i", "-c", "exec claude --resume abc-123"]);
+        // Interactive shell (sources rc for PATH), clear the grid, then exec the
+        // agent so a prior run's tail can't linger below the fresh UI.
+        assert_eq!(
+            s,
+            vec![
+                "-i",
+                "-c",
+                r"printf '\033[3J\033[H\033[2J'; exec claude --resume abc-123"
+            ]
+        );
+        assert!(s.last().unwrap().starts_with(AGENT_LAUNCH_CLEAR));
         // catbus + plan flag flows through build_agent_resume_command.
         let c = agent_launch_shell_suffix("catbus", "s1", Some(true)).unwrap();
-        assert_eq!(c.last().unwrap(), "exec catbus-agent --resume s1 --plan");
+        assert_eq!(
+            c.last().unwrap(),
+            r"printf '\033[3J\033[H\033[2J'; exec catbus-agent --resume s1 --plan"
+        );
         // Unknown kind → no direct launch (caller keeps the plain shell).
         assert!(agent_launch_shell_suffix("bash", "x", None).is_none());
     }
