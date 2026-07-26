@@ -843,13 +843,17 @@ impl TerminalView {
         self.pid = pid;
         // A shell tab prints its prompt as its first output, which on a fresh /
         // just-resized PTY can land glued to a reprint of itself (`…$ …$` on one
-        // line, from bash's SIGWINCH re-display). Send one Enter so bash emits a
-        // clean CRLF + a fresh prompt on its own line. RAW PTY write — NOT via
+        // line, from bash's SIGWINCH re-display). Send one Ctrl-L (form feed):
+        // readline treats it as clear-screen, so bash wipes the glued grid and
+        // redraws a single clean prompt at the top with the cursor right after
+        // it. We deliberately do NOT send Enter — that runs an empty command,
+        // which leaves a SECOND prompt below and the cursor on the next line
+        // (feels like the shell "started weird"). RAW PTY write — NOT via
         // `send_input`, whose keystroke bookkeeping (last_input stamp, predictive
-        // echo) must not fire for a synthetic newline. Agent tabs exec `claude`
+        // echo) must not fire for this synthetic redraw. Agent tabs exec `claude`
         // (clears + draws its own screen), so skip them.
         if is_shell && let Some(n) = &self.notifier {
-            let _ = n.send(Msg::Input(b"\r".to_vec().into()));
+            let _ = n.send(Msg::Input(b"\x0c".to_vec().into()));
         }
         self.exited.store(false, std::sync::atomic::Ordering::Relaxed);
     }
