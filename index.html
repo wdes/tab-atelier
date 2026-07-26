@@ -50,12 +50,28 @@ sudo apt install tab-atelier</pre>
 // block is visible. Each pre carries the same body modulo
 // "stable" → "nightly", so selecting a channel swaps the
 // visible snippet without touching the copy text.
+//
+// The channel is mirrored in the URL fragment, so `…/#nightly`
+// (or `#stable`) links straight to that channel's snippet, and
+// picking a channel updates the hash for a shareable link.
+function applyChannel(ch) {
+  if (ch !== 'stable' && ch !== 'nightly') { return; }
+  document.querySelectorAll('input[name="channel"]').forEach(function (r) {
+    r.checked = (r.value === ch);
+  });
+  document.querySelectorAll('[data-channel]').forEach(function (el) {
+    el.classList.toggle('hidden', el.dataset.channel !== ch);
+  });
+}
 document.querySelectorAll('input[name="channel"]').forEach(function (r) {
   r.addEventListener('change', function (e) {
-    var ch = e.target.value;
-    document.querySelectorAll('[data-channel]').forEach(function (el) {
-      el.classList.toggle('hidden', el.dataset.channel !== ch);
-    });
+    applyChannel(e.target.value);
+    history.replaceState(null, '', '#' + e.target.value);
   });
 });
+function channelFromHash() { return (location.hash || '').replace('#', ''); }
+// Honour a #stable / #nightly fragment on first load and if the
+// fragment is edited afterwards; default to stable otherwise.
+applyChannel(channelFromHash() || 'stable');
+window.addEventListener('hashchange', function () { applyChannel(channelFromHash()); });
 </script>
