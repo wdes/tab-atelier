@@ -172,6 +172,17 @@ use gpui::{
 const INITIAL_COLS: usize = 80;
 const INITIAL_LINES: usize = 24;
 const SCROLLBAR_WIDTH: f32 = 8.0;
+
+/// The synthetic byte fed into a freshly-spawned tab's PTY to tidy its first
+/// prompt. For a SHELL tab it's Ctrl-L (`0x0c`, form feed): readline treats it as
+/// clear-screen, so bash wipes any SIGWINCH-reprint glue and redraws a single
+/// clean prompt at the top with the cursor right after it — deliberately NOT
+/// `\r` (`0x0d`), which runs an empty command and leaves a second prompt with the
+/// cursor a line below. Agent tabs exec `claude` (it paints its own screen), so
+/// they get `None`.
+const fn first_prompt_cleanup_byte(is_shell: bool) -> Option<u8> {
+    if is_shell { Some(0x0c) } else { None }
+}
 /// Minimum spacing between grid reflows during a resize storm. A live
 /// window drag crosses a cell boundary on nearly every frame, and each
 /// crossing used to reflow the full 10k-line scrollback + SIGWINCH the
@@ -852,8 +863,10 @@ impl TerminalView {
         // `send_input`, whose keystroke bookkeeping (last_input stamp, predictive
         // echo) must not fire for this synthetic redraw. Agent tabs exec `claude`
         // (clears + draws its own screen), so skip them.
-        if is_shell && let Some(n) = &self.notifier {
-            let _ = n.send(Msg::Input(b"\x0c".to_vec().into()));
+        if let Some(byte) = first_prompt_cleanup_byte(is_shell)
+            && let Some(n) = &self.notifier
+        {
+            let _ = n.send(Msg::Input(vec![byte].into()));
         }
         self.exited.store(false, std::sync::atomic::Ordering::Relaxed);
     }
@@ -3029,6 +3042,17 @@ mod tests {
     use crate::term_export::sgr_color;
     use gpui::TestAppContext;
     use vte::ansi::{Color, NamedColor};
+
+    #[test]
+    fn first_prompt_cleanup_is_ctrl_l_for_shells_only() {
+        // Shell tabs get Ctrl-L (form feed) to clear-and-redraw a clean first
+        // prompt — NOT `\r`, which would run an empty command + stack a second
+        // prompt (the "cursor on the next line" weirdness this replaced).
+        assert_eq!(first_prompt_cleanup_byte(true), Some(0x0c));
+        assert_ne!(first_prompt_cleanup_byte(true), Some(b'\r'));
+        // Agent tabs exec `claude`, which paints its own screen → no synthetic byte.
+        assert_eq!(first_prompt_cleanup_byte(false), None);
+    }
 
     #[test]
     fn expand_path_prefix_handles_home_env_and_absolute() {
