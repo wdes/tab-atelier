@@ -513,6 +513,12 @@ pub struct TabSnapshot {
     /// persists the new limits to `tabs.json` and re-applies them to the live
     /// cgroup — same handling in both binaries.
     pub pending_limit_changes: Vec<(String, crate::TabResourceLimits, bool)>,
+    /// Global default resource-limit change queued by `POST /limits/default`
+    /// (the CLI `limit --all`): `(override, clear)`. The owner updates its live
+    /// `default_tab_limits`, persists it to `preferences.json`, and re-applies
+    /// the cgroup to every tab — so tabs without their own override AND all
+    /// future tabs pick it up immediately, no restart. `None` = nothing queued.
+    pub pending_default_limits: Option<(crate::TabResourceLimits, bool)>,
     /// (tab index, new name) pairs queued by `POST /tabs/{idx}/rename`.
     pub pending_renames: Vec<(usize, String)>,
     /// Queued agent-status updates from `POST /tabs/by-id/{id}/status`.
@@ -2231,6 +2237,52 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             let body = serde_json::to_string(&serde_json::json!({"queued": "new"})).unwrap_or_default();
             respond_json(stream, 200, &body);
         }
+        ("POST", "/limits/default") => {
+            // Set or clear the GLOBAL default resource limits (the CLI
+            // `limit --all`). Same JSON body as the per-tab route. The owner
+            // updates its live `default_tab_limits`, persists preferences.json,
+            // and re-applies the cgroup to every tab (tabs without their own
+            // override + all future tabs pick it up with no restart).
+            let parsed: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+                Ok(v) => v,
+                Err(e) => {
+                    error_json(stream, 400, &format!("invalid JSON body: {e}"));
+                    return;
+                }
+            };
+            let clear = parsed
+                .get("clear")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let over = crate::TabResourceLimits {
+                memory_max: parsed.get("memory_max").and_then(|v| v.as_str()).map(str::to_owned),
+                cpu_quota_percent: parsed
+                    .get("cpu_quota_percent")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|n| u32::try_from(n).ok()),
+                tasks_max: parsed.get("tasks_max").and_then(serde_json::Value::as_u64),
+            };
+            if !clear && over.is_empty() {
+                error_json(
+                    stream,
+                    400,
+                    "provide memory_max / cpu_quota_percent / tasks_max, or clear:true",
+                );
+                return;
+            }
+            if !over.memory_max_valid() {
+                error_json(
+                    stream,
+                    400,
+                    "memory_max must be a byte count or K/M/G/T value (e.g. \"8G\")",
+                );
+                return;
+            }
+            let mut snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            snap.pending_default_limits = Some((over, clear));
+            drop(snap);
+            respond_json(stream, 200, r#"{"queued":"default-limits"}"#);
+        }
         ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/limits") => {
             // Set or clear per-tab resource limits on a live tab. Body (all
             // fields optional): {"memory_max":"8G","cpu_quota_percent":250,
@@ -3761,6 +3813,7 @@ pub fn test_snapshot(tabs: Vec<SnapshotTab>) -> TabSnapshot {
         pending_new_tabs: 0,
         pending_new_tab_cwds: std::collections::VecDeque::new(),
         pending_limit_changes: Vec::new(),
+        pending_default_limits: None,
         pending_renames: vec![],
         pending_status_updates: vec![],
         cached_response: None,

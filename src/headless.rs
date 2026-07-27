@@ -713,7 +713,7 @@ pub fn run() -> std::io::Result<()> {
     // Global default per-tab resource ceilings; each tab's own
     // `limits` overrides per axis. Cloned out before `prefs` is picked
     // apart by the `unwrap_or_else` extractions below.
-    let default_limits = prefs.default_tab_limits.clone();
+    let mut default_limits = prefs.default_tab_limits.clone();
 
     // Latch the cleared-env opt-in for every tab spawn this process does.
     if prefs.clear_env.unwrap_or(false) {
@@ -893,6 +893,7 @@ pub fn run() -> std::io::Result<()> {
         pending_new_tabs: 0,
         pending_new_tab_cwds: std::collections::VecDeque::new(),
         pending_limit_changes: Vec::new(),
+        pending_default_limits: None,
         pending_renames: Vec::new(),
         pending_status_updates: Vec::new(),
         cached_response: None,
@@ -1046,7 +1047,7 @@ pub fn run() -> std::io::Result<()> {
             &api_url_for_pty,
             pty_cols,
             pty_rows,
-            &default_limits,
+            &mut default_limits,
             &default_net_allow,
         );
 
@@ -1699,7 +1700,7 @@ fn drain_pending(
     api_url_for_pty: &str,
     pty_cols: usize,
     pty_rows: usize,
-    default_limits: &crate::TabResourceLimits,
+    default_limits: &mut crate::TabResourceLimits,
     default_net_allow: &crate::net_policy::AllowConfig,
 ) -> bool {
     let mut s = api_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1718,6 +1719,7 @@ fn drain_pending(
     let schedule_changes: Vec<(String, Option<crate::schedule::TabSchedule>)> =
         s.pending_schedule_changes.drain(..).collect();
     let limit_changes: Vec<(String, crate::TabResourceLimits, bool)> = s.pending_limit_changes.drain(..).collect();
+    let default_limit_change: Option<(crate::TabResourceLimits, bool)> = s.pending_default_limits.take();
     let new_tabs = std::mem::take(&mut s.pending_new_tabs);
     let new_tab_cwds: std::collections::VecDeque<std::path::PathBuf> = std::mem::take(&mut s.pending_new_tab_cwds);
     drop(s);
@@ -1736,6 +1738,7 @@ fn drain_pending(
         && token_rotations.is_empty()
         && schedule_changes.is_empty()
         && limit_changes.is_empty()
+        && default_limit_change.is_none()
         && new_tabs == 0
         && new_tab_cwds.is_empty());
     // CLI / API lock toggles → runtime HeadlessTab. tabs.json picks
@@ -1832,6 +1835,32 @@ fn drain_pending(
                 t.limits.merge(&over);
             }
             #[cfg(target_os = "linux")]
+            crate::cgroup::reapply(
+                &t.id,
+                t.pid,
+                &crate::TabResourceLimits::resolve(&t.limits, default_limits),
+            );
+        }
+    }
+
+    // Global default-limit change (`tab-atelier limit --all` / POST
+    // /limits/default): update the live default, persist it to preferences.json
+    // (unless read-only), and re-apply the cgroup to every tab so tabs without
+    // their own override are recapped now; future tabs read the updated default.
+    if let Some((over, clear)) = default_limit_change {
+        if clear {
+            *default_limits = crate::TabResourceLimits::default();
+        } else {
+            default_limits.merge(&over);
+        }
+        if !crate::read_only() {
+            let dir = crate::platform::config_dir();
+            let mut prefs = crate::load_preferences(&dir);
+            prefs.default_tab_limits = default_limits.clone();
+            crate::save_preferences(&dir, &prefs);
+        }
+        #[cfg(target_os = "linux")]
+        for t in tabs.iter() {
             crate::cgroup::reapply(
                 &t.id,
                 t.pid,

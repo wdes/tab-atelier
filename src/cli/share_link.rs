@@ -636,6 +636,70 @@ pub fn limit(tab: &str, memory: Option<&str>, cpu: Option<u32>, tasks: Option<u6
     }
 }
 
+/// `limit --all` — set the GLOBAL default cap (POST `/limits/default`).
+///
+/// The daemon updates its live `default_tab_limits`, persists preferences.json,
+/// and re-applies the cgroup to every tab, so tabs without their own override
+/// are recapped now and future tabs inherit it with no restart.
+#[must_use]
+pub fn limit_default(memory: Option<&str>, cpu: Option<u32>, tasks: Option<u64>, clear: bool) -> i32 {
+    if !clear && memory.is_none() && cpu.is_none() && tasks.is_none() {
+        eprintln!("limit --all: pass --memory/--cpu/--tasks to set a default, or --clear to lift it");
+        return 2;
+    }
+    let ep = match discover_endpoint() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("limit: {e}");
+            return 1;
+        }
+    };
+    let mut body = serde_json::Map::new();
+    if clear {
+        body.insert("clear".into(), serde_json::Value::Bool(true));
+    }
+    let mut set_parts: Vec<String> = Vec::new();
+    if let Some(m) = memory {
+        body.insert("memory_max".into(), serde_json::Value::String(m.to_owned()));
+        set_parts.push(format!("memory={m}"));
+    }
+    if let Some(c) = cpu {
+        body.insert("cpu_quota_percent".into(), serde_json::Value::from(c));
+        set_parts.push(format!("cpu={c}%"));
+    }
+    if let Some(t) = tasks {
+        body.insert("tasks_max".into(), serde_json::Value::from(t));
+        set_parts.push(format!("tasks={t}"));
+    }
+    let payload = serde_json::Value::Object(body).to_string();
+    match agent()
+        .post(format!("{}/limits/default", ep.url))
+        .header("Authorization", format!("Bearer {}", ep.token))
+        .header("Content-Type", "application/json")
+        .send(payload.as_bytes())
+    {
+        Ok(_) => {
+            if clear {
+                println!("default tab limits cleared (all tabs + new tabs, applies on the next tick)");
+            } else {
+                println!(
+                    "default tab limits set: {} (all tabs + new tabs, applies on the next tick)",
+                    set_parts.join(", ")
+                );
+            }
+            0
+        }
+        Err(ureq::Error::StatusCode(400)) => {
+            eprintln!("limit --all: server rejected the request — check --memory (bytes or K/M/G/T, e.g. 8G)");
+            1
+        }
+        Err(e) => {
+            eprintln!("limit --all: {e}");
+            1
+        }
+    }
+}
+
 /// `&[String]` front-end for [`limit`], used by the GUI binary's subcommand
 /// match (`tab-atelier limit <tab> …`).
 ///
