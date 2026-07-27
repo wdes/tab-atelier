@@ -5375,6 +5375,11 @@ impl AppState {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                        // Swallow the click: without this it also lands on
+                        // whatever sits underneath — now that the prefs page
+                        // fills the screen, that's always a live control
+                        // (Save/Cancel, a theme row, a hotkey "×").
+                        cx.stop_propagation();
                         this.show_hotkey_picker = false;
                         if let Some(ref handle) = this.hotkey_handle {
                             handle.resume();
@@ -5395,7 +5400,12 @@ impl AppState {
                         .p(px(24.0))
                         .min_w(px(260.0))
                         .text_size(px(14.0))
-                        .on_mouse_down(MouseButton::Left, |_ev: &MouseDownEvent, _window, _cx| {})
+                        // stop_propagation (not a no-op) so a click inside the
+                        // box doesn't reach the overlay's dismiss handler
+                        // behind it and close the picker.
+                        .on_mouse_down(MouseButton::Left, |_ev: &MouseDownEvent, _window, cx| {
+                            cx.stop_propagation();
+                        })
                         .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _window, cx| {
                             let key = ev.keystroke.key.as_str();
                             if key == "escape" {
@@ -5638,6 +5648,13 @@ impl Render for AppState {
                         }
                         _ => {}
                     }
+                    return;
+                }
+                // The preferences screen replaces the terminal + tab bar, so
+                // tab shortcuts bubbling up from its inputs would mutate tabs
+                // invisibly (Ctrl+Shift+T spawning one, Alt+Tab switching) —
+                // the keyboard variant of the old click-through bug.
+                if this.show_preferences {
                     return;
                 }
                 if ks.modifiers.control && !ks.modifiers.shift && !ks.modifiers.alt && ks.key.as_str() == "p" {
