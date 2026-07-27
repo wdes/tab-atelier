@@ -93,14 +93,6 @@ struct Tab {
     /// spinner, or a `cargo build` printing — which lights the LED green
     /// ("talking") even without a fresh status hook. `None` = no output yet.
     last_output_at: Option<std::time::Instant>,
-    /// `Some(agent_pid)` while this tab's AGENT process group is SIGSTOP'd by the
-    /// idle-suspend sweep (see `suspend_idle_agents_after_secs`); the pid is
-    /// stored so wake SIGCONTs the exact group we paused. Resumed the moment the
-    /// tab is focused or a viewer attaches. We signal the *agent's* pgroup, not
-    /// the shell's — `claude` runs as a foreground job in its own process group,
-    /// so the shell's pgroup wouldn't include it. Needs catbus (the agent pid).
-    #[cfg(feature = "catbus")]
-    suspended: Option<u32>,
     #[cfg(feature = "energy")]
     energy_wh: f64,
     /// Last `energy_wh` value flushed to disk. Used to skip writes when no
@@ -269,8 +261,6 @@ impl Tab {
             // being opened — not instantly on every restart.
             last_focused_at: Some(std::time::Instant::now()),
             last_output_at: None,
-            #[cfg(feature = "catbus")]
-            suspended: None,
             #[cfg(feature = "energy")]
             energy_wh: ts.energy_wh.unwrap_or(0.0),
             #[cfg(feature = "energy")]
@@ -653,11 +643,6 @@ struct AppState {
     /// handle is anchored each render so keys hit the modal, not the terminal.
     tab_switcher: Option<TabSwitcher>,
     tab_switcher_focus: FocusHandle,
-    /// Resolved idle-agent suspend threshold (`suspend_idle_agents_after_secs`
-    /// via `crate::suspend_after`). `None` = the feature is off. Needs the
-    /// catbus agent-pid sweep to know which process group to signal.
-    #[cfg(feature = "catbus")]
-    suspend_after: Option<std::time::Duration>,
     browser: Rc<RefCell<Option<String>>>,
     code_editor: Rc<RefCell<Option<String>>>,
     pref_browser_text: String,
@@ -1416,8 +1401,6 @@ impl AppState {
             hotkey_picker_error: None,
             tab_switcher: None,
             tab_switcher_focus,
-            #[cfg(feature = "catbus")]
-            suspend_after: crate::suspend_after(prefs.suspend_idle_agents_after_secs),
             browser,
             code_editor,
             pref_browser_text: String::new(),
@@ -2310,8 +2293,6 @@ impl AppState {
             // it. Gated on Thinking, NOT raw output, so a reboot resuming every
             // agent doesn't blue them all.
             let active = self.active;
-            #[cfg(feature = "catbus")]
-            let suspend_after = self.suspend_after;
             for (i, tab) in self.tabs.iter_mut().enumerate() {
                 if i == active {
                     // Diagnostic timestamp (shown as "Last seen" in the stats
@@ -2334,32 +2315,6 @@ impl AppState {
                     // stops a reboot (which resumes every agent) from painting
                     // all background tabs blue and forcing a click on each.
                     tab.unreviewed_work = true;
-                }
-                // Idle-agent suspend (SIGSTOP) / wake (SIGCONT). A focused tab or
-                // one with a viewer must never stay paused, so wake wins; only an
-                // untouched, idle, non-thinking agent tab gets suspended. We
-                // signal the AGENT's process group (its pid == pgid: bash ran it
-                // as a foreground job in its own group), NOT the shell's — the
-                // shell's group wouldn't include the ~260 MB claude.
-                #[cfg(feature = "catbus")]
-                if let Some(threshold) = suspend_after {
-                    if let Some(stopped_pid) = tab.suspended {
-                        if is_active || viewers > 0 {
-                            crate::suspend_tab_pgroup(stopped_pid, false);
-                            tab.suspended = None;
-                        }
-                    } else if let Some(agent_pid) = tab.agent_pid.get() {
-                        let thinking = matches!(
-                            tab.agent_state.as_ref().map(|s| s.state),
-                            Some(crate::AgentState::Thinking)
-                        );
-                        let idle_for = tab.last_focused_at.map_or(std::time::Duration::MAX, |t| t.elapsed());
-                        let output_idle_for = tab.last_output_at.map(|t| t.elapsed());
-                        if should_suspend(true, is_active, viewers, thinking, idle_for, output_idle_for, threshold) {
-                            crate::suspend_tab_pgroup(agent_pid, true);
-                            tab.suspended = Some(agent_pid);
-                        }
-                    }
                 }
             }
             #[cfg(feature = "catbus")]
@@ -4159,13 +4114,6 @@ impl AppState {
             self.active = idx;
             self.tabs[self.active].activate();
         }
-        // Wake a suspended tab the instant it's focused — before input can reach
-        // its (SIGSTOP'd) agent — rather than waiting for the next sweep tick.
-        #[cfg(feature = "catbus")]
-        if let Some(stopped_pid) = self.tabs[self.active].suspended {
-            crate::suspend_tab_pgroup(stopped_pid, false);
-            self.tabs[self.active].suspended = None;
-        }
         self.tabs[self.active].flush_pending_restore(cx);
         self.tabs[self.active].view.read(cx).focus_handle(cx).focus(window);
         cx.notify();
@@ -5359,10 +5307,6 @@ impl AppState {
                                                         },
                                                         clear_env: None,
                                                         clear_env_vars: std::collections::BTreeMap::new(),
-                                                        // Advanced field, not in the dialog — carry the
-                                                        // on-disk value so Save doesn't reset it.
-                                                        suspend_idle_agents_after_secs: on_disk_prefs
-                                                            .suspend_idle_agents_after_secs,
                                                     },
                                                 );
                                                 if let Some(ref handle) = this.hotkey_handle {
@@ -5919,29 +5863,6 @@ const fn is_url_char(c: char) -> bool {
 
 const MAX_URL_LEN: usize = 256;
 
-/// Whether an agent tab should be SIGSTOP'd by the idle-suspend sweep.
-///
-/// True only for an agent tab (`is_agent`) that is NOT the active one, has no
-/// viewers, isn't "thinking", and has been untouched — no focus and no output —
-/// for at least `threshold`. Pure so it's unit-testable without a live window.
-#[cfg(feature = "catbus")]
-fn should_suspend(
-    is_agent: bool,
-    active: bool,
-    viewers: usize,
-    thinking: bool,
-    idle_for: std::time::Duration,
-    output_idle_for: Option<std::time::Duration>,
-    threshold: std::time::Duration,
-) -> bool {
-    is_agent
-        && !active
-        && viewers == 0
-        && !thinking
-        && idle_for >= threshold
-        && output_idle_for.is_none_or(|d| d >= threshold)
-}
-
 /// Tab indices for the Ctrl+P switcher: every index except `active`, ordered
 /// most-recently-focused first. `None` (never focused) sorts last; ties keep
 /// their original relative order (stable sort). Pure so it can be unit-tested
@@ -6420,30 +6341,5 @@ mod tests {
         assert_eq!(mru_tab_order(0, &[Some(5u64)]), Vec::<usize>::new());
         // All never-focused → original order preserved (stable), active gone.
         assert_eq!(mru_tab_order(1, &[None::<u64>, None, None]), vec![0, 2]);
-    }
-
-    #[cfg(feature = "catbus")]
-    #[test]
-    fn should_suspend_gates() {
-        use std::time::Duration;
-        let t = Duration::from_mins(15);
-        let long = Duration::from_secs(1000);
-        let short = Duration::from_secs(10);
-        // Idle agent tab, untouched > threshold, no output → suspend.
-        assert!(should_suspend(true, false, 0, false, long, None, t));
-        assert!(should_suspend(true, false, 0, false, long, Some(long), t));
-        // Any single gate blocks it:
-        assert!(!should_suspend(false, false, 0, false, long, None, t), "non-agent tab");
-        assert!(!should_suspend(true, true, 0, false, long, None, t), "active tab");
-        assert!(!should_suspend(true, false, 1, false, long, None, t), "has a viewer");
-        assert!(!should_suspend(true, false, 0, true, long, None, t), "thinking");
-        assert!(
-            !should_suspend(true, false, 0, false, short, None, t),
-            "focused recently"
-        );
-        assert!(
-            !should_suspend(true, false, 0, false, long, Some(short), t),
-            "output recently"
-        );
     }
 }
