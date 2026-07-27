@@ -347,6 +347,18 @@ pub enum Commands {
         args: Vec<String>,
     },
 
+    /// Launch `claude` cleanly: clear the grid, then `exec claude ARGS…`.
+    ///
+    /// A no-fuss agent launcher — every argument passes through, so
+    /// `tab-atelier claude --resume <id>` runs `claude --resume <id>` after
+    /// wiping any previous run's leftover screen. Replaces the process so the
+    /// tab's foreground job is `claude` itself.
+    Claude {
+        /// Arguments forwarded verbatim to `claude` (e.g. `--resume <id>`).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// `⛑ brain` — watch every tab for known agent-failure signatures
     /// (Anthropic API unreachable, 5xx, etc.) and auto-send `continue`
     /// to stuck agents. Best run as its own tab.
@@ -712,6 +724,7 @@ pub fn dispatch(cli: Cli) -> bool {
             }
             crate::cli::client::run("peek", &args)
         }
+        Commands::Claude { args } => crate::cli::agent::run(&args),
         Commands::Brain { once, interval } => {
             let mut args: Vec<String> = Vec::new();
             if once {
@@ -874,6 +887,10 @@ mod tests {
             (
                 &["tab-atelier-headless", "limit", "--all", "--clear"],
                 "limit --all --clear",
+            ),
+            (
+                &["tab-atelier-headless", "claude", "--resume", "sess-1"],
+                "claude passthrough (hyphen args)",
             ),
         ];
         for (argv, label) in cases {

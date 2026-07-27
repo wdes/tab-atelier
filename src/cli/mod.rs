@@ -2,6 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+/// `tab-atelier claude [ARGS…]` — clear the grid + `exec claude` (a correct,
+/// no-fuss agent launcher; see the module docs).
+pub mod agent;
 pub mod bench;
 pub mod bench_lag;
 pub mod brain;
