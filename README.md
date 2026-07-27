@@ -95,7 +95,7 @@ Always pass `-p tab-atelier` — a bare `cargo deb` in this workspace can packag
 - **Ctrl+Shift+T** to open a new tab (inherits working directory)
 - **Alt+Tab** to cycle between tabs
 - Shell exit detection with close/respawn confirmation
-- Per-tab **agent state LED** to the left of the tab name (working / unreviewed / error / idle), driven by an in-tab CLI (see [Agent state](#agent-state))
+- Per-tab **agent state LED** to the left of the tab name (working / unreviewed / error / dead / idle), driven by an in-tab CLI (see [Agent state](#agent-state))
 
 **Session**
 - Tabs, working directories, and full terminal output persisted across restarts
@@ -324,6 +324,7 @@ Each tab carries an optional **agent state** rendered as a small colored LED to 
 | ![#4ec9b0](https://placehold.co/13x13/4ec9b0/4ec9b0.png) green | **working now** — a `thinking` hook is live, **or** the tab is streaming output (a reply, a spinner, a build printing) within the last few seconds |
 | ![#5c99ff](https://placehold.co/13x13/5c99ff/5c99ff.png) blue | **unreviewed work** — an agent took a real turn here while you weren't looking and has since stopped. Sticky until you **review** the tab (make it the foreground tab, or open its web viewer), then it clears to grey. Set only by a genuine turn, so restarting/resuming every agent at once does **not** turn them all blue |
 | ![#ef4444](https://placehold.co/13x13/ef4444/ef4444.png) red | **error** — the last turn errored or was aborted |
+| ![#8c2929](https://placehold.co/13x13/8c2929/8c2929.png) dark red | **dead — needs relaunch** — a session is attached but the agent **process is gone** (crashed, killed, or auto-resume failed). Deliberately duller than the error red so "dead" reads differently from "errored but alive". Bring it back with the **"⟳ Relaunch dead agents"** right-click menu item, or `tab-atelier claude --resume <id>`. Requires the catbus liveness sweep; the `⛑ brain` watchdog is exempt (it has no session to resume) and stays grey |
 | ![#737373](https://placehold.co/13x13/737373/737373.png) grey | **idle / seen** — a session is attached but there's nothing to review: it never took a turn, or you've already looked since it last worked |
 | _(hidden)_ | **no session** — no agent attached to this tab |
 
