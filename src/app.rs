@@ -2568,7 +2568,12 @@ impl AppState {
         {
             self.tabs
                 .iter()
-                .filter(|t| t.agent_kind.is_some() && t.agent_session_id.is_some() && t.agent_pid.get().is_none())
+                .filter(|t| {
+                    t.agent_kind.is_some()
+                        && t.agent_kind.as_deref() != Some("brain")
+                        && t.agent_session_id.is_some()
+                        && t.agent_pid.get().is_none()
+                })
                 .count()
         }
         #[cfg(not(feature = "catbus"))]
@@ -2592,7 +2597,12 @@ impl AppState {
                 .tabs
                 .iter()
                 .enumerate()
-                .filter(|(_, t)| t.agent_kind.is_some() && t.agent_session_id.is_some() && t.agent_pid.get().is_none())
+                .filter(|(_, t)| {
+                    t.agent_kind.is_some()
+                        && t.agent_kind.as_deref() != Some("brain")
+                        && t.agent_session_id.is_some()
+                        && t.agent_pid.get().is_none()
+                })
                 .map(|(i, _)| i)
                 .collect();
             for idx in dead {
@@ -2950,7 +2960,13 @@ impl AppState {
             // after boot, before the first full sweep confirms it's actually
             // alive. Only claimable-dead once we've truly looked.
             #[cfg(feature = "catbus")]
-            let agent_dead = session_attached && !agent_alive && self.last_agent_full_sweep.get().is_some();
+            // The ⛑ brain watchdog is exempt: it has no session to resume (it
+            // re-attaches to other tabs over the API), the sweep doesn't count it
+            // as an "agent" descendant, and it stays grey — never dim-red "dead".
+            let agent_dead = session_attached
+                && !agent_alive
+                && tab.agent_kind.as_deref() != Some("brain")
+                && self.last_agent_full_sweep.get().is_some();
             #[cfg(not(feature = "catbus"))]
             let agent_dead = false;
             let agent_led = if agent_dead
