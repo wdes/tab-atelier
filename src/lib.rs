@@ -2782,6 +2782,26 @@ pub fn detect_urls(text: &str) -> Vec<(usize, usize, String, bool)> {
             if start > 0 && matches!(chars[start - 1], '~' | '$') {
                 start -= 1;
             }
+            // A path never begins with a flag dash. Tools glue a flag straight
+            // onto a relative/absolute path with no separator — dpkg prints
+            // `-O../foo`, gcc `-I../inc`, `-o./out`. When the backward scan
+            // stopped on a `-`, that `-` starts a flag, not the path: re-anchor
+            // to the first real path start (`/`, `./`, or `../`) inside the token
+            // so the flag isn't linkified. (A `--opt=../x` form already stops at
+            // the `=`, which isn't a path char.)
+            if chars[start] == '-' {
+                let mut p = start + 1;
+                while p < i {
+                    let rel_marker = chars[p] == '.'
+                        && (chars.get(p + 1) == Some(&'/')
+                            || (chars.get(p + 1) == Some(&'.') && chars.get(p + 2) == Some(&'/')));
+                    if chars[p] == '/' || rel_marker {
+                        break;
+                    }
+                    p += 1;
+                }
+                start = p;
+            }
             let mut j = i;
             while j < len
                 && !chars[j].is_whitespace()
@@ -2803,7 +2823,11 @@ pub fn detect_urls(text: &str) -> Vec<(usize, usize, String, bool)> {
             // while catching relative file paths a tool just printed.
             let slashes = path.matches('/').count();
             let single_slash_file = slashes == 1 && looks_like_filename(path.rsplit('/').next().unwrap_or(""));
-            if slashes >= 2 || single_slash_file {
+            // A leading `./` or `../` is an unambiguous relative-path marker —
+            // accept it regardless of the filename heuristic, so a long or
+            // unusual extension (`../foo.buildinfo`, ext > 8 chars) still links.
+            let relative_marker = path.starts_with("./") || path.starts_with("../");
+            if slashes >= 2 || single_slash_file || relative_marker {
                 urls.push((start, j, path, true));
                 i = j;
                 continue;
@@ -3997,6 +4021,36 @@ mod tests {
     fn detect_file_path_needs_two_components() {
         let urls = detect_urls("see /tmp or /dev");
         assert!(urls.is_empty());
+    }
+
+    #[test]
+    fn detect_relative_path_strips_flag_prefix_and_allows_long_ext() {
+        // dpkg glues its `-O` flag straight onto a relative path. The link must
+        // start at `../` (NOT include `-O`), and `.buildinfo` (9-char ext) must
+        // still link because the `../` marker is unambiguous — both lines the
+        // user reported.
+        let a = detect_urls(" dpkg-genbuildinfo --build=source -O../twig-i18n-extension_5.0.2-1_source.buildinfo");
+        assert_eq!(a.len(), 1, "buildinfo line should detect exactly one path: {a:?}");
+        assert_eq!(a[0].2, "../twig-i18n-extension_5.0.2-1_source.buildinfo");
+        assert!(a[0].3, "should be flagged as a path");
+        let b = detect_urls(" dpkg-genchanges -sa --build=source -O../twig-i18n-extension_5.0.2-1_source.changes");
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].2, "../twig-i18n-extension_5.0.2-1_source.changes");
+    }
+
+    #[test]
+    fn detect_relative_path_dot_slash_and_gcc_flag() {
+        // Leading `./` with a long extension links despite the filename check.
+        let u = detect_urls("wrote ./out.buildinfo now");
+        assert_eq!(u.len(), 1);
+        assert_eq!(u[0].2, "./out.buildinfo");
+        // gcc-style `-I../include/foo.h`: path from `../`, flag `-I` dropped.
+        let g = detect_urls("cc -I../include/foo.h x.c");
+        assert!(g.iter().any(|d| d.2 == "../include/foo.h"), "got: {g:?}");
+        assert!(
+            !g.iter().any(|d| d.2.contains("-I")),
+            "flag must not be in the link: {g:?}"
+        );
     }
 
     #[test]
