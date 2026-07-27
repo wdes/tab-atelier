@@ -7,6 +7,7 @@
 
 use std::sync::atomic::Ordering;
 
+use clap::{CommandFactory, FromArgMatches};
 use tab_atelier::{READ_ONLY, SHUTDOWN_REQUESTED, app, cli, install_rustls_provider, try_acquire_single_instance_lock};
 
 // Use mimalloc instead of glibc malloc: with one PTY-reader thread per tab
@@ -24,91 +25,44 @@ fn main() {
     // idempotent — second call is a no-op.
     install_rustls_provider();
 
-    // Subcommand dispatch — keeps the entry point short and lets
-    // shell-side helpers (`tab-atelier set-status …`) run without ever
-    // touching the gpui app::run path. The name→handler table is shared
-    // with the headless daemon via `cli::client::dispatch` (single source
-    // of truth), so the two editions can't drift. `None` means "not a
-    // client subcommand" → fall through to launching the desktop app.
-    if let Some(sub) = std::env::args().nth(1) {
-        let rest: Vec<String> = std::env::args().skip(2).collect();
-        if let Some(code) = cli::client::dispatch(&sub, &rest) {
-            std::process::exit(code);
-        }
-    }
+    // Parse args with the SAME clap surface as the headless daemon
+    // (`cli::dispatch::Cli`), overriding only the top-level name / version /
+    // about for this GUI binary. Reusing one `Commands` enum means `--help`
+    // for both editions is generated from a single source and can't drift —
+    // the hand-written help this replaced had already fallen behind (missing
+    // `settings`, `bench`, `net-*`, the RAM-cap flags…). clap handles
+    // `--help` / `--version` / an unknown subcommand (error + exit 2, no longer
+    // silently launching the GUI on a typo) before the single-instance lock
+    // below. No subcommand → launch the desktop GUI.
+    let cmd = cli::dispatch::Cli::command()
+        .name("tab-atelier")
+        .bin_name("tab-atelier")
+        .version(concat!("v", env!("CARGO_PKG_VERSION"), " (", env!("BUILD_HASH"), ")"))
+        .about("A Guake-style drop-down terminal with an HTTP API + share-link viewer.")
+        .long_about(
+            "Run with no subcommand to start the desktop GUI. Subcommands talk to a running \
+             instance via its local HTTP API (token + URL discovered from env / the state dir).",
+        );
+    let cli_args = cli::dispatch::Cli::from_arg_matches(&cmd.get_matches()).unwrap_or_else(|e| e.exit());
 
-    // Pre-lock metadata flags. `--version` / `--help` ask the binary
-    // to print a static string and exit; they don't touch disk state
-    // and shouldn't be blocked by the single-instance lock check
-    // below. Handle them here so a user running a second
-    // `tab-atelier --version` from a different shell while the
-    // primary instance is up gets the version string, not the
-    // "another instance is already running" error.
-    for a in std::env::args().skip(1) {
-        match a.as_str() {
-            "-V" | "--version" => {
-                println!("{}", tab_atelier::version_line("tab-atelier"));
-                std::process::exit(0);
-            }
-            "-h" | "--help" => {
-                println!(
-                    "tab-atelier v{ver}\n\
-                     A Guake-style drop-down terminal emulator with HTTP API + share-link viewer.\n\
-                     \n\
-                     usage:\n  \
-                     tab-atelier                  start the desktop GUI (default)\n  \
-                     tab-atelier set-status …     publish agent state (Claude Code hook target)\n  \
-                     tab-atelier set-font …       set GUI font (--font NAME --size PX)\n  \
-                     tab-atelier set-context …    label this tab with its PR/task (hover tooltip)\n  \
-                     tab-atelier token            print the master API token (for API calls)\n  \
-                     tab-atelier tabs             list all tabs (idx, uuid, name)\n  \
-                     tab-atelier peers [--all]    list sibling Claude tabs (state, cwd)\n  \
-                     tab-atelier peek <tab> …     read another tab's screen (--lines N, --raw)\n  \
-                     tab-atelier note|notes …     post / read the shared blackboard\n  \
-                     tab-atelier handoff <file> <tab>  drop a file into a tab's inbox/\n  \
-                     tab-atelier add <path> [name]  open a new tab at a path\n  \
-                     tab-atelier close <tab>      close a tab\n  \
-                     tab-atelier rename <tab> <name>  rename a tab\n  \
-                     tab-atelier lock|unlock <tab>  block / allow input on a tab\n  \
-                     tab-atelier input <tab> <text>  send keystrokes to a tab\n  \
-                     tab-atelier output <tab>     print a tab's scrollback\n  \
-                     tab-atelier stats <tab> [--json]  per-tab diagnostics (the Stats popup)\n  \
-                     tab-atelier share-link <tab> [--ro]  print a share URL for a tab\n  \
-                     tab-atelier bg-color <tab> <color>  set a tab's background\n  \
-                     tab-atelier net-off|net-on <tab>  cut / restore a tab's internet\n  \
-                     tab-atelier limit <tab> …    cap a tab's RAM/CPU (--memory/--cpu/--tasks | --clear)\n  \
-                     tab-atelier rotate-tokens    revoke all share tokens (old share links 401)\n  \
-                     tab-atelier reset-master-token  rotate the master API token (old token 401s)\n  \
-                     tab-atelier remote …         attach to a remote tab-atelier-headless\n  \
-                     tab-atelier brain [--once]   watchdog tab that auto-recovers stuck agents\n  \
-                     tab-atelier dispatch …       hand work to another tab / a new agent\n  \
-                     tab-atelier schedule …       off-hours auto-lock per tab (OSM opening_hours)\n  \
-                     tab-atelier log [input|off|…] enable/disable the GUI file logger (applies next launch)\n  \
-                     tab-atelier flags [name on|off] toggle agent instrumentation (frame-timing/trace/probe/reap)\n  \
-                     tab-atelier --read-only      start inspect-only (no disk writes, no lock)\n  \
-                     tab-atelier --version        print version and exit\n  \
-                     tab-atelier --help           print this help and exit\n",
-                    ver = env!("CARGO_PKG_VERSION"),
-                );
-                std::process::exit(0);
-            }
-            _ => {}
-        }
-    }
-
-    // Smoke check used by tests/rustls_provider.rs to guard against
-    // future regressions of the install_default() call above OR any
-    // change to the workspace feature graph that re-introduces the
-    // panic. Exercises the same rustls path the API TLS server uses
-    // and exits 0 if the provider is happy.
-    if std::env::args().any(|a| a == "--check-crypto") {
+    // `--check-crypto` — CI probe: build the rustls server config with the
+    // bundled provider and exit 0, so a broken crypto build surfaces here.
+    if cli_args.check_crypto {
         let _config = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_cert_resolver(std::sync::Arc::new(rustls::server::ResolvesServerCertUsingSni::new()));
         std::process::exit(0);
     }
 
-    let read_only = std::env::args().any(|a| a == "--read-only");
+    let read_only = cli_args.read_only;
+
+    // A subcommand runs against a live instance's local API and exits inside
+    // the dispatcher (shared with the headless binary). Returns here only when
+    // no subcommand was given → start the desktop GUI.
+    if cli::dispatch::dispatch(cli_args) {
+        return; // unreachable in practice — dispatch() exits inside.
+    }
+
     READ_ONLY.store(read_only, Ordering::SeqCst);
 
     if !read_only && !try_acquire_single_instance_lock() {

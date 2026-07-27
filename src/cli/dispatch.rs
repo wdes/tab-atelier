@@ -263,6 +263,18 @@ pub enum Commands {
         bg_color: Option<String>,
     },
 
+    /// Set the GUI terminal font in preferences.json (restart to apply).
+    ///
+    /// At least one of `--font` / `--size` is required.
+    SetFont {
+        /// Font family name (e.g. `"JetBrains Mono"`).
+        #[arg(long, alias = "family")]
+        font: Option<String>,
+        /// Font size in px, in the range (0, 200].
+        #[arg(long)]
+        size: Option<f32>,
+    },
+
     /// Publish an agent state for the current tab.
     ///
     /// Used by Claude Code / catbus-agent hooks. Silently no-ops outside a tab-atelier tab.
@@ -621,6 +633,18 @@ pub fn dispatch(cli: Cli) -> bool {
             }
             crate::cli::client::run("set-status", &args)
         }
+        Commands::SetFont { font, size } => {
+            let mut args: Vec<String> = Vec::new();
+            if let Some(f) = font {
+                args.push("--font".into());
+                args.push(f);
+            }
+            if let Some(s) = size {
+                args.push("--size".into());
+                args.push(s.to_string());
+            }
+            crate::cli::client::run("set-font", &args)
+        }
         Commands::SetContext { args } => crate::cli::client::run("set-context", &args),
         Commands::Token => crate::cli::client::run("token", &[]),
         Commands::RotateTokens => crate::cli::client::run("rotate-tokens", &[]),
@@ -775,6 +799,17 @@ mod tests {
                     "200",
                 ],
                 "settings --flag",
+            ),
+            (
+                &[
+                    "tab-atelier-headless",
+                    "set-font",
+                    "--font",
+                    "JetBrains Mono",
+                    "--size",
+                    "14",
+                ],
+                "set-font flags",
             ),
             (&["tab-atelier-headless", "set-status", "thinking"], "set-status state"),
             (
