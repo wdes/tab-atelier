@@ -101,6 +101,7 @@ Always pass `-p tab-atelier` — a bare `cargo deb` in this workspace can packag
 - Tabs, working directories, and full terminal output persisted across restarts
 - Active tab selection restored on startup
 - **Agent auto-resume**: tabs that were running `catbus-agent` or `claude` at last save reopen with `catbus-agent --resume <uuid>` / `claude --resume <uuid>` typed into the freshly-spawned shell
+- **Hot-swap upgrade**: `tab-atelier upgrade` re-execs the newly installed binary in place, handing every tab's live PTY across — shells (and the agents running in them) are never restarted. See [docs/hot-swap.md](docs/hot-swap.md)
 
 **Preferences**
 - Theme selection (Dark, Tomorrow Night Blue)
@@ -230,6 +231,7 @@ Selected routes:
 | `DELETE` | `/tabs/{idx}` | Close a tab |
 | `POST` | `/tabs/rotate-tokens` | Revoke all per-tab share tokens (share links 401) — master only |
 | `POST` | `/master-token/reset` | Hot-swap the master API token (old token 401s) — master only |
+| `POST` | `/upgrade` | Hot-swap onto the newly installed binary, tabs stay live ([docs](docs/hot-swap.md)) — master only |
 
 Bind addresses for both listeners are configurable in preferences (`api_addr`, `api_tls_addr`); pass `--read-only` to launch a second instance that serves the API but refuses every mutating verb.
 
