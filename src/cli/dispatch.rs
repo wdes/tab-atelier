@@ -100,8 +100,14 @@ pub enum Commands {
     /// every limit. Applied live on the next drain tick — no respawn. Linux +
     /// a delegated cgroup subtree only (see docs/per-tab-limits.md).
     Limit {
-        /// Tab index or UUID.
-        tab: String,
+        /// Tab index or UUID. Omit when using `--all`.
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        tab: Option<String>,
+        /// Apply as the GLOBAL default instead of to one tab: every current tab
+        /// without its own cap is recapped now, and every future tab inherits it
+        /// (persisted to preferences.json; no restart needed).
+        #[arg(long)]
+        all: bool,
         /// Memory ceiling (`memory.max`): bytes or K/M/G/T, e.g. `8G`.
         #[arg(long)]
         memory: Option<String>,
@@ -111,7 +117,7 @@ pub enum Commands {
         /// Max tasks (processes + threads) in the tab's tree (`pids.max`).
         #[arg(long)]
         tasks: Option<u64>,
-        /// Lift every limit on the tab (back to unlimited).
+        /// Lift every limit (back to unlimited).
         #[arg(long, conflicts_with_all = ["memory", "cpu", "tasks"])]
         clear: bool,
     },
@@ -518,11 +524,22 @@ pub fn dispatch(cli: Cli) -> bool {
         Commands::Unlock { tab } => crate::cli::client::run("unlock", &[tab]),
         Commands::Limit {
             tab,
+            all,
             memory,
             cpu,
             tasks,
             clear,
-        } => crate::cli::share_link::limit(&tab, memory.as_deref(), cpu, tasks, clear),
+        } => {
+            if all {
+                crate::cli::share_link::limit_default(memory.as_deref(), cpu, tasks, clear)
+            } else if let Some(tab) = tab {
+                crate::cli::share_link::limit(&tab, memory.as_deref(), cpu, tasks, clear)
+            } else {
+                // clap's `required_unless_present = "all"` guarantees a tab here.
+                eprintln!("limit: pass a tab, or --all for the global default");
+                2
+            }
+        }
         Commands::NetOff { tab } => crate::cli::client::run("net-off", &[tab]),
         Commands::NetOn { tab } => crate::cli::client::run("net-on", &[tab]),
         Commands::NetAllow {
@@ -846,6 +863,18 @@ mod tests {
                 "schedule set",
             ),
             (&["tab-atelier-headless", "schedule", "0", "--clear"], "schedule clear"),
+            (
+                &["tab-atelier-headless", "limit", "0", "--memory", "8G"],
+                "limit one tab",
+            ),
+            (
+                &["tab-atelier-headless", "limit", "--all", "--memory", "8G"],
+                "limit --all",
+            ),
+            (
+                &["tab-atelier-headless", "limit", "--all", "--clear"],
+                "limit --all --clear",
+            ),
         ];
         for (argv, label) in cases {
             let _ = Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("parse failed for {label}: {e}"));
@@ -877,6 +906,29 @@ mod tests {
             msg.contains("required") || msg.contains("missing"),
             "expected required-arg error, got: {msg}"
         );
+    }
+
+    /// `limit` needs a tab OR `--all` (the global default); bare flags with
+    /// neither target must fail at parse time, and the two are mutually
+    /// exclusive.
+    #[test]
+    fn limit_requires_tab_or_all_and_they_conflict() {
+        // Neither tab nor --all → required-arg error.
+        let missing =
+            Cli::try_parse_from(["tab-atelier-headless", "limit", "--memory", "8G"]).expect_err("needs a tab or --all");
+        assert!(
+            missing.to_string().contains("required") || missing.to_string().contains("missing"),
+            "expected required-arg error, got: {missing}"
+        );
+        // Both a tab AND --all → conflict.
+        let both = Cli::try_parse_from(["tab-atelier-headless", "limit", "0", "--all", "--memory", "8G"])
+            .expect_err("tab and --all conflict");
+        assert!(
+            both.to_string().contains("cannot be used with") || both.to_string().contains("conflict"),
+            "expected conflict error, got: {both}"
+        );
+        // --all alone (no tab) parses.
+        assert!(Cli::try_parse_from(["tab-atelier-headless", "limit", "--all", "--memory", "8G"]).is_ok());
     }
 
     /// Unknown subcommands must error out — they used to silently

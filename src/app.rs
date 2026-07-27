@@ -1321,6 +1321,7 @@ impl AppState {
             pending_new_tabs: 0,
             pending_new_tab_cwds: std::collections::VecDeque::new(),
             pending_limit_changes: Vec::new(),
+            pending_default_limits: None,
             pending_renames: Vec::new(),
             pending_status_updates: Vec::new(),
             cached_response: None,
@@ -2136,6 +2137,7 @@ impl AppState {
                 snapshot.pending_schedule_changes.drain(..).collect();
             let limit_changes: Vec<(String, crate::TabResourceLimits, bool)> =
                 snapshot.pending_limit_changes.drain(..).collect();
+            let default_limit_change: Option<(crate::TabResourceLimits, bool)> = snapshot.pending_default_limits.take();
             drop(snapshot);
             // Apply lock toggles from the API/CLI onto the runtime
             // Tab's manual flag. The view's set_locked() push happens
@@ -2212,6 +2214,34 @@ impl AppState {
                     }
                 }
             }
+            // Global default-limit change (`tab-atelier limit --all` / POST
+            // /limits/default): update the live default, persist it to
+            // preferences.json, sync the RAM-gauge mirror, and re-apply the
+            // cgroup to every tab so tabs without their own override are
+            // recapped now; new tabs read the updated default. cgroups are
+            // Linux-only, so this is a no-op (just drained) elsewhere.
+            #[cfg(target_os = "linux")]
+            if let Some((over, clear)) = default_limit_change {
+                if clear {
+                    self.default_limits = crate::TabResourceLimits::default();
+                } else {
+                    self.default_limits.merge(&over);
+                }
+                self.default_tab_mem_max = self.default_limits.memory_max.clone();
+                if !crate::read_only() {
+                    let dir = platform::config_dir();
+                    let mut prefs = load_preferences(&dir);
+                    prefs.default_tab_limits = self.default_limits.clone();
+                    save_preferences(&dir, &prefs);
+                }
+                for tab in &self.tabs {
+                    let pid = tab.view.read(cx).pid();
+                    let effective = crate::TabResourceLimits::resolve(&tab.limits, &self.default_limits);
+                    crate::cgroup::reapply(&tab.id, pid, &effective);
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = default_limit_change; // cgroup limits are Linux-only
             // Per-tick effective-lock mirror.
             //
             // The view's `set_locked()` gate is what stops LOCAL
