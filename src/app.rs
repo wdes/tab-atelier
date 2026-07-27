@@ -2882,15 +2882,27 @@ impl AppState {
             let agent_alive = tab.agent_pid.get().is_some();
             #[cfg(not(feature = "catbus"))]
             let agent_alive = true;
-            // A tab whose durable session anchor survived but whose `claude`
-            // didn't restart (auto-resume failed / it was killed) no longer lights
-            // a "healthy" LED — the anchor stays in tabs.json for a manual resume,
-            // but the dot doesn't pretend an agent is there.
-            let agent_led = if agent_led_visible(
-                tab.agent_state.is_some(),
-                session_attached,
-                agent_alive || tab.unreviewed_work,
-            ) {
+            // A tab with a durable session anchor whose agent PROCESS is gone
+            // (crashed / failed auto-resume / killed) is DEAD, not idle. Its stale
+            // `agent_state` would otherwise keep lighting a healthy green/grey dot
+            // for up to 2 min — "very wrong." Force a distinct dim-red "needs
+            // relaunch" dot instead, so it's obvious which tabs to
+            // `tab-atelier claude --resume`. The anchor stays in tabs.json.
+            // Gate on a full agent sweep having run at least once: `agent_pid`
+            // starts None and idle background tabs are skipped, so without this
+            // every restored agent would flash red for the first second or two
+            // after boot, before the first full sweep confirms it's actually
+            // alive. Only claimable-dead once we've truly looked.
+            #[cfg(feature = "catbus")]
+            let agent_dead = session_attached && !agent_alive && self.last_agent_full_sweep.get().is_some();
+            #[cfg(not(feature = "catbus"))]
+            let agent_dead = false;
+            let agent_led = if agent_dead
+                || agent_led_visible(
+                    tab.agent_state.is_some(),
+                    session_attached,
+                    agent_alive || tab.unreviewed_work,
+                ) {
                 let grey = Hsla::from(Rgba {
                     r: 0.45,
                     g: 0.45,
@@ -2911,7 +2923,17 @@ impl AppState {
                 // is what catches it).
                 let working = matches!(state, Some(crate::AgentState::Thinking))
                     || tab.last_output_at.is_some_and(|t| t.elapsed() < STREAMING_LED_WINDOW);
-                let color = if matches!(state, Some(crate::AgentState::Error)) {
+                let color = if agent_dead {
+                    // Dim red — the agent process is gone; needs a relaunch.
+                    // Deliberately darker/duller than the bright error red so
+                    // "dead" reads differently from "hit an error but alive".
+                    Hsla::from(Rgba {
+                        r: 0.55,
+                        g: 0.16,
+                        b: 0.16,
+                        a: 1.0,
+                    })
+                } else if matches!(state, Some(crate::AgentState::Error)) {
                     Hsla::from(Rgba {
                         r: 0.937,
                         g: 0.267,
