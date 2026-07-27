@@ -2559,6 +2559,62 @@ impl AppState {
         cx.notify();
     }
 
+    /// Number of agent tabs whose durable session survived but whose process is
+    /// gone (the dim-red "dead" LED). Drives the "Relaunch dead agents" menu
+    /// item's visibility + count. Always 0 without the catbus sweep (no liveness).
+    #[cfg_attr(not(feature = "catbus"), allow(clippy::unused_self, clippy::missing_const_for_fn))]
+    fn dead_agent_count(&self) -> usize {
+        #[cfg(feature = "catbus")]
+        {
+            self.tabs
+                .iter()
+                .filter(|t| t.agent_kind.is_some() && t.agent_session_id.is_some() && t.agent_pid.get().is_none())
+                .count()
+        }
+        #[cfg(not(feature = "catbus"))]
+        {
+            0
+        }
+    }
+
+    /// Relaunch every agent tab whose process died (failed auto-resume, crash,
+    /// or kill) — `respawn_tab` rebuilds the `--resume <id>` launch, so each
+    /// comes back on its persisted session. In non-clear-env mode respawn yields
+    /// a bare shell, so also queue the typed resume there. No-op in read-only.
+    #[cfg_attr(not(feature = "catbus"), allow(clippy::unused_self, clippy::missing_const_for_fn))]
+    fn relaunch_dead_agents(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(feature = "catbus")]
+        {
+            if crate::read_only() {
+                return;
+            }
+            let dead: Vec<usize> = self
+                .tabs
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| t.agent_kind.is_some() && t.agent_session_id.is_some() && t.agent_pid.get().is_none())
+                .map(|(i, _)| i)
+                .collect();
+            for idx in dead {
+                self.respawn_tab(idx, window, cx);
+                // clear-env respawn already exec's the agent; otherwise queue the
+                // typed `--resume` so the agent comes back in the fresh shell too.
+                if !crate::clear_env() {
+                    let kind = self.tabs[idx].agent_kind.as_deref().map(str::to_string);
+                    let sid = self.tabs[idx].agent_session_id.as_deref().map(str::to_string);
+                    let plan = self.tabs[idx].agent_plan_mode;
+                    if let (Some(k), Some(s)) = (kind, sid) {
+                        self.tabs[idx].pending_agent_resume = crate::build_agent_resume_command(&k, &s, plan);
+                    }
+                }
+            }
+        }
+        #[cfg(not(feature = "catbus"))]
+        {
+            let _ = (window, cx);
+        }
+    }
+
     fn respawn_tab_with_history(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
         if idx >= self.tabs.len() {
             return;
@@ -3896,6 +3952,29 @@ impl AppState {
                         self.t().windowed_mode
                     }),
             )
+            // Only shown when at least one agent tab is dead (dim-red LED) — a
+            // one-click "bring back every agent whose process died" that respawns
+            // each on its persisted `--resume` session.
+            .when(self.dead_agent_count() > 0, |c| {
+                let label = format!("⟳ {} ({})", self.t().relaunch_dead_agents, self.dead_agent_count());
+                c.child(
+                    div()
+                        .id("menu-relaunch-dead")
+                        .px(px(12.0))
+                        .py(px(4.0))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(menu_hover))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _ev: &MouseDownEvent, window, cx| {
+                                this.relaunch_dead_agents(window, cx);
+                                this.context_menu = None;
+                                cx.notify();
+                            }),
+                        )
+                        .child(label),
+                )
+            })
             .child(
                 div()
                     .id("menu-close-all")
