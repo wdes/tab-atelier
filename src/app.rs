@@ -6175,7 +6175,16 @@ impl AppState {
                                                 // so carry the on-disk values through rather
                                                 // than wiping them on save.
                                                 font_family: on_disk_prefs.font_family,
-                                                font_size: on_disk_prefs.font_size,
+                                                font_size: Some(this.font_config.size),
+                                                // Same reason: the fleet-sweep settings are
+                                                // file-only, and saving from this dialog must
+                                                // not silently stop a configured sweep.
+                                                fleet_sweep_minutes: on_disk_prefs.fleet_sweep_minutes,
+                                                fleet_sweep_sources: on_disk_prefs.fleet_sweep_sources,
+                                                fleet_sweep_lcov: on_disk_prefs.fleet_sweep_lcov,
+                                                fleet_sweep_root: on_disk_prefs.fleet_sweep_root,
+                                                fleet_sweep_gossip: on_disk_prefs.fleet_sweep_gossip,
+                                                fleet_sweep_cooldown_days: on_disk_prefs.fleet_sweep_cooldown_days,
                                                 lang: Some(lang_str.into()),
                                                 theme: Some(this.theme_name.id().into()),
                                                 cursor_style: Some(this.cursor_style.id().into()),
@@ -6216,6 +6225,7 @@ impl AppState {
                                                 pty_cols: None,
                                                 pty_rows: None,
                                                 tab_bg_color: this.tab_bg_global.clone(),
+                                                folder_styles: on_disk_prefs.folder_styles,
                                                 // Headless-only: default allowlist for new
                                                 // tabs, set via the CLI. Preserve on-disk.
                                                 default_net_allow_presets: on_disk_prefs.default_net_allow_presets,
@@ -6291,9 +6301,10 @@ impl AppState {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
-                        // Swallow the dismiss click so it doesn't also land on
-                        // whatever control sits under the overlay (a theme row,
-                        // a hotkey "×", Save/Cancel).
+                        // Swallow the click: without this it also lands on
+                        // whatever sits underneath; now that the prefs page
+                        // fills the screen, that's always a live control
+                        // (Save/Cancel, a theme row, a hotkey "×").
                         cx.stop_propagation();
                         this.show_hotkey_picker = false;
                         if let Some(ref handle) = this.hotkey_handle {
@@ -6316,8 +6327,8 @@ impl AppState {
                         .min_w(px(260.0))
                         .text_size(px(14.0))
                         // stop_propagation (not a no-op) so a click inside the
-                        // box doesn't reach the overlay's dismiss handler behind
-                        // it and close the picker.
+                        // box doesn't reach the overlay's dismiss handler
+                        // behind it and close the picker.
                         .on_mouse_down(MouseButton::Left, |_ev: &MouseDownEvent, _window, cx| {
                             cx.stop_propagation();
                         })
@@ -6610,6 +6621,13 @@ impl Render for AppState {
                             }
                         }
                     }
+                    return;
+                }
+                // The preferences screen replaces the terminal + tab bar, so
+                // tab shortcuts bubbling up from its inputs would mutate tabs
+                // invisibly (Ctrl+Shift+T spawning one, Alt+Tab switching);
+                // the keyboard variant of the old click-through bug.
+                if this.show_preferences {
                     return;
                 }
                 // Same table the terminal swallows on, so the two can't drift.
