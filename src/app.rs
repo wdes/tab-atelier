@@ -5611,6 +5611,21 @@ impl Render for AppState {
         } else {
             rgba((self.th().bg << 8) | alpha)
         };
+        // Battery-low red wash. It used to live on `#app-root`'s bg
+        // (above), but commit 24ac421 ("terminal: paint an opaque base
+        // bg so default cells overwrite the last frame") made the
+        // terminal fill its whole area with an opaque `term_bg` quad,
+        // which occludes the root bg — so on low battery only the tab
+        // bar's blink survived. Float the tint as a translucent overlay
+        // ABOVE the terminal instead. Steady (not blinking); the tab bar
+        // keeps its own blink. 0xRRGGBBAA, matching `rgba` above.
+        let battery_tint = if battery.is_some_and(|b| b < 10) {
+            Some(rgba(0xff00_002e)) // ~18% red
+        } else if battery.is_some_and(|b| b < 20) {
+            Some(rgba(0xff00_0019)) // ~10% red
+        } else {
+            None
+        };
 
         let mut root = div()
             .id("app-root")
@@ -5680,6 +5695,7 @@ impl Render for AppState {
             .child(
                 div()
                     .id("terminal-area")
+                    .relative()
                     // Take full width but DON'T claim full height — the
                     // tab bar below uses flex-wrap to grow to 2/3 rows
                     // (32 px each) and needs space to expand into. With
@@ -5707,7 +5723,15 @@ impl Render for AppState {
                             cx.notify();
                         }),
                     )
-                    .child(active_terminal),
+                    .child(active_terminal)
+                    // Low-battery red wash, anchored to `terminal-area`
+                    // (hence the `.relative()` above) so it covers the
+                    // terminal but leaves the tab bar's blink untouched.
+                    // Non-interactive → mouse events pass through to the
+                    // terminal below.
+                    .when_some(battery_tint, |area, tint| {
+                        area.child(div().absolute().top(px(0.0)).left(px(0.0)).size_full().bg(tint))
+                    }),
             )
             .child(tab_bar);
 
