@@ -452,7 +452,26 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCert {
     }
 }
 
-fn try_fetch_tabs(agent: &ureq::Agent, host: &HostConfig, base: &str, timeout: Duration) -> FetchOutcome {
+/// The host part of a URL for compact display (`https://h:7891/cdn-cgi/…` → `h`).
+fn url_host(url: &str) -> &str {
+    url.trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap_or(url)
+}
+
+/// One `/tabs` attempt. Returns the outcome plus a short human diagnostic (HTTP
+/// status, redirect host, and whether the Cloudflare service-token headers were
+/// attached) so the UI can show WHY a fetch failed — e.g. `302→x.cloudflareaccess.com
+/// cf:sent` means the token was sent but Access still bounced it (bad/absent
+/// service-auth policy), whereas `cf:none` means the app has no token stored.
+fn try_fetch_tabs(agent: &ureq::Agent, host: &HostConfig, base: &str, timeout: Duration) -> (FetchOutcome, String) {
+    let cf = if host.cf_access_client_id.is_empty() || host.cf_access_client_secret.is_empty() {
+        "cf:none"
+    } else {
+        "cf:sent"
+    };
     let req = host.authorize(agent.get(&format!("{base}/tabs")).timeout(timeout));
     match req.call() {
         // Cloudflare Access: with redirects disabled (see the agent builder), the
@@ -463,18 +482,31 @@ fn try_fetch_tabs(agent: &ureq::Agent, host: &HostConfig, base: &str, timeout: D
         // The host IS reachable — it just needs a Cloudflare login or service
         // token — so surface that distinctly rather than as "offline".
         Ok(resp) if (300..400).contains(&resp.status()) => {
-            let loc = resp.header("location").unwrap_or_default();
+            let code = resp.status();
+            let loc = resp.header("location").unwrap_or_default().to_string();
             if loc.contains("cloudflareaccess.com") || loc.contains("/cdn-cgi/access/") {
-                FetchOutcome::CloudflareAuth
+                // `cf:` first so the crucial bit (was the token attached?)
+                // survives if the header elides the tail on a narrow screen.
+                (FetchOutcome::CloudflareAuth, format!("{cf} {code}→{}", url_host(&loc)))
             } else {
-                FetchOutcome::NoResponse
+                (FetchOutcome::NoResponse, format!("{code}→{}", url_host(&loc)))
             }
         }
-        Ok(resp) => resp
-            .into_json::<ApiResponse>()
-            .map_or(FetchOutcome::NoResponse, FetchOutcome::Ok),
-        Err(ureq::Error::Status(code, _)) if code == 401 || code == 403 => FetchOutcome::Forbidden,
-        Err(_) => FetchOutcome::NoResponse,
+        Ok(resp) => {
+            let code = resp.status();
+            match resp.into_json::<ApiResponse>() {
+                Ok(r) => (FetchOutcome::Ok(r), String::new()),
+                Err(_) => (FetchOutcome::NoResponse, format!("{code} bad-json")),
+            }
+        }
+        Err(ureq::Error::Status(code, _)) if code == 401 || code == 403 => {
+            (FetchOutcome::Forbidden, format!("{code} {cf}"))
+        }
+        Err(ureq::Error::Status(code, _)) => (FetchOutcome::NoResponse, format!("http {code}")),
+        Err(e) => {
+            let msg: String = e.to_string().chars().take(48).collect();
+            (FetchOutcome::NoResponse, format!("net: {msg}"))
+        }
     }
 }
 
@@ -485,38 +517,58 @@ struct TabsFetch {
     reach: Reach,
     tabs: Option<Vec<ApiTab>>,
     host: ApiHost,
+    /// Human diagnostic for the header's detail line: `host:port` when
+    /// connected, otherwise the per-URL failure tags (status / redirect host /
+    /// `cf:sent`|`cf:none`) so the user can see WHY without adb logcat.
+    detail: String,
 }
 
 fn fetch_tabs(agent: &ureq::Agent, host: &HostConfig) -> TabsFetch {
     let mut saw_forbidden = false;
     let mut saw_cloudflare = false;
+    let mut diag = String::new();
+    let mut note = |scope: &str, d: String| {
+        if d.is_empty() {
+            return;
+        }
+        if !diag.is_empty() {
+            diag.push_str(" · ");
+        }
+        diag.push_str(&format!("{scope} {d}"));
+    };
     if !host.url.is_empty() {
-        match try_fetch_tabs(agent, host, &host.url, Duration::from_millis(1500)) {
+        let (outcome, d) = try_fetch_tabs(agent, host, &host.url, Duration::from_millis(1500));
+        match outcome {
             FetchOutcome::Ok(r) => {
                 return TabsFetch {
                     reach: Reach::Lan,
                     tabs: Some(r.tabs),
                     host: r.host,
+                    detail: host_detail(&host.url),
                 };
             }
             FetchOutcome::Forbidden => saw_forbidden = true,
             FetchOutcome::CloudflareAuth => saw_cloudflare = true,
             FetchOutcome::NoResponse => {}
         }
+        note("lan", d);
     }
     if !host.remote_url.is_empty() {
-        match try_fetch_tabs(agent, host, &host.remote_url, Duration::from_secs(4)) {
+        let (outcome, d) = try_fetch_tabs(agent, host, &host.remote_url, Duration::from_secs(4));
+        match outcome {
             FetchOutcome::Ok(r) => {
                 return TabsFetch {
                     reach: Reach::Remote,
                     tabs: Some(r.tabs),
                     host: r.host,
+                    detail: host_detail(&host.remote_url),
                 };
             }
             FetchOutcome::Forbidden => saw_forbidden = true,
             FetchOutcome::CloudflareAuth => saw_cloudflare = true,
             FetchOutcome::NoResponse => {}
         }
+        note("rmt", d);
     }
     // Reachable-but-gated states beat "offline": a Cloudflare login prompt or a
     // stale token means the host is up and the fix is auth, not connectivity.
@@ -530,6 +582,7 @@ fn fetch_tabs(agent: &ureq::Agent, host: &HostConfig) -> TabsFetch {
         },
         tabs: None,
         host: ApiHost::default(),
+        detail: diag,
     }
 }
 
@@ -777,7 +830,7 @@ fn show_toast(ui_weak: &Weak<AppWindow>, msg: String) {
     });
 }
 
-fn push_reachability(ui_weak: &Weak<AppWindow>, active: usize, reach: Reach) {
+fn push_reachability(ui_weak: &Weak<AppWindow>, active: usize, reach: Reach, detail: String) {
     let label = match reach {
         Reach::Lan => "lan",
         Reach::Remote => "remote",
@@ -792,6 +845,11 @@ fn push_reachability(ui_weak: &Weak<AppWindow>, active: usize, reach: Reach) {
             let mut list: Vec<Host> = (0..model.row_count()).filter_map(|i| model.row_data(i)).collect();
             if let Some(h) = list.get_mut(active) {
                 h.reachability = SharedString::from(label);
+                // Diagnostic on failure (status / redirect host / cf:sent|none),
+                // host:port on success — so a stuck "cloudflare-auth" shows why.
+                if !detail.is_empty() {
+                    h.detail = SharedString::from(detail);
+                }
             }
             ui.set_hosts(VecModel::from_slice(&list));
         }
@@ -875,7 +933,7 @@ pub fn android_main(app: slint::android::AndroidApp) {
                     push_tabs(&poll_weak, t, &poll_seen);
                 }
                 push_host_stats(&poll_weak, &result.host);
-                log::debug!("poll {}: {reach:?}", host.name);
+                log::debug!("poll {}: {reach:?} [{}]", host.name, result.detail);
                 // Show a toast when reachability transitions between online and
                 // offline so a connection drop doesn't go unnoticed.
                 // Forbidden gets its own message — the host answered, the
@@ -900,7 +958,7 @@ pub fn android_main(app: slint::android::AndroidApp) {
                     }
                     *last = reach;
                 }
-                push_reachability(&poll_weak, active_idx, reach);
+                push_reachability(&poll_weak, active_idx, reach, result.detail);
             }
             std::thread::sleep(Duration::from_secs(2));
         }
