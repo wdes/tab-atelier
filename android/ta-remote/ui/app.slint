@@ -138,6 +138,9 @@ component HeaderBar inherits Rectangle {
                                 : #ef5350;
                             font-size: 12px;
                             vertical-alignment: center;
+                            // Diagnostics can be long (status + redirect host);
+                            // elide the tail rather than break the header layout.
+                            overflow: elide;
                         }
                         if root.battery-level >= 0 : Text {
                             // Workstation battery: goes red ≤20 %, pulses
