@@ -28,11 +28,17 @@
     const BASE = location.pathname.replace(/\/view\/?$/, "/");
 
     const term = new Terminal({
-      // LF must reset to col 0; without convertEol xterm.js leaves the
-      // cursor at the previous column on the next row, so each row of
-      // the row-by-row /output dump starts wherever the previous row
-      // happened to end (= mid-line garbage in the screenshot).
-      convertEol: true,
+      // convertEol MUST stay off. It was added for the old row-by-row
+      // /output dump (each line a bare `\n`), but the viewer now replays
+      // the raw PTY byte stream over the WebSocket (see `handleOut`).
+      // Forcing `\n`→`\r\n` there behaves like LNM (Line Feed/New Line
+      // mode) is on, which real terminals (alacritty, the desktop tab)
+      // keep off: apps that redraw a table in place use bare LF as
+      // "cursor down, SAME column", and an injected CR yanks the cursor
+      // to col 0 mid-redraw — corrupting/eating the table's top rows.
+      // The PTY's ONLCR already emits CRLF for cooked output, so leaving
+      // this off renders byte-for-byte like the local terminal.
+      convertEol: false,
       cursorBlink: !READ_ONLY,
       disableStdin: READ_ONLY,
       // 'TermSymbols' is the bundled WOFF2 with media-control +
