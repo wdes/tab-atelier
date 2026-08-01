@@ -6184,7 +6184,7 @@ fn spawn_hotkey_listener(keycodes: &[u8], window_handle: WindowHandle<AppState>,
     cx.spawn(async move |cx: &mut AsyncApp| {
         while rx.recv().await.is_some() {
             let _ = cx.update(|cx| {
-                let _ = window_handle.update(cx, |state, window, _cx| {
+                let _ = window_handle.update(cx, |state, window, app_cx| {
                     // Toggle from the ACTUAL window state, not just our `visible`
                     // flag. Clicking a link opens a browser on top of us: we stay
                     // `visible == true` but are no longer the foreground window,
@@ -6196,7 +6196,20 @@ fn spawn_hotkey_listener(keycodes: &[u8], window_handle: WindowHandle<AppState>,
                     state.visible = show;
                     state.visible_flag.store(show, std::sync::atomic::Ordering::Relaxed);
                     if show {
-                        state.tabs[state.active].activate();
+                        let active = state.active;
+                        state.tabs[active].activate();
+                        // While hidden, the active tab's repaint pump parks and its
+                        // frame cache goes stale — remote-driven output or an
+                        // in-place TUI redraw that happened while we were down was
+                        // never painted. Drop the cache + notify so `render()`
+                        // rebuilds every row from the live grid on reveal; without
+                        // this the drop-down shows the frame from when it was
+                        // hidden (stale, and the bottom isn't cleaned) until a
+                        // keystroke re-damages it.
+                        state.tabs[active].view.update(app_cx, |v, vcx| {
+                            v.release_render_caches();
+                            vcx.notify();
+                        });
                         window.activate_window();
                     } else {
                         state.tabs[state.active].deactivate();
