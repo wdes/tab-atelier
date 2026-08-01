@@ -139,6 +139,13 @@ pub fn apply(tab_id: &str, pid: u32, limits: &TabResourceLimits) {
     if limits.is_empty() {
         return;
     }
+    // Guard against moving our own master into a per-tab cgroup — see
+    // [`unsafe_tab_pid`]. This is the fix for issue #36 (per-tab memory.max
+    // OOM-killing the whole GUI when a deferred tab's pid=0 landed the master
+    // in a tab cgroup that then became a catch-all for every agent).
+    if unsafe_tab_pid(pid) {
+        return;
+    }
     let Some(Some(base)) = DELEGATED_BASE.get() else {
         return;
     };
@@ -179,6 +186,9 @@ pub fn apply(tab_id: &str, pid: u32, limits: &TabResourceLimits) {
 /// limiting, and re-adds the pid (a no-op if it's already there). No-op only
 /// when delegation is off. Same code drives both the GUI and headless.
 pub fn reapply(tab_id: &str, pid: u32, limits: &TabResourceLimits) {
+    if unsafe_tab_pid(pid) {
+        return;
+    }
     let Some(Some(base)) = DELEGATED_BASE.get() else {
         return;
     };
@@ -230,6 +240,9 @@ pub fn prepare_tab_cgroup(tab_id: &str) -> Option<String> {
 /// the nft rules keyed on it take effect. Best-effort: `false` if delegation
 /// is off or the write fails.
 pub fn move_pid_to_tab_cgroup(tab_id: &str, pid: u32) -> bool {
+    if unsafe_tab_pid(pid) {
+        return false;
+    }
     let Some(Some(base)) = DELEGATED_BASE.get() else {
         return false;
     };
@@ -305,6 +318,19 @@ pub fn reap_stale_tabs() {
     }
 }
 
+/// True for a pid we must **never** write into a tab's `cgroup.procs`.
+///
+/// Writing `"0"` to `cgroup.procs` moves the **calling** process — our own
+/// GUI/daemon master — into that per-tab cgroup. The tab's `memory.max` then
+/// bounds the master (plus every tab forked afterwards, which inherit its
+/// cgroup), and hitting the cap makes the memcg OOM-killer take down the whole
+/// app. `0` is what a deferred/unspawned tab reports for its pid; `1` is init;
+/// our own pid would be equally fatal. Skip all three — a deferred tab gets its
+/// cgroup when it actually spawns with a real child pid. (Issue #36.)
+fn unsafe_tab_pid(pid: u32) -> bool {
+    pid <= 1 || pid == std::process::id()
+}
+
 /// Sanitise a tab id into a safe single path component.
 fn sanitize_id(tab_id: &str) -> String {
     tab_id
@@ -323,4 +349,24 @@ fn sanitize_id(tab_id: &str) -> String {
 /// value with no trailing newline required, but a newline is accepted.
 fn write_cgroup(path: &Path, value: &str) -> std::io::Result<()> {
     std::fs::write(path, value.as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsafe_tab_pid_rejects_caller_and_reserved_pids() {
+        // 0 → writing it to cgroup.procs moves the CALLER (our master); the
+        // whole issue-#36 crash. 1 → init. Our own pid → equally fatal.
+        assert!(unsafe_tab_pid(0), "pid 0 must be rejected (it moves the master)");
+        assert!(unsafe_tab_pid(1), "pid 1 (init) must be rejected");
+        assert!(unsafe_tab_pid(std::process::id()), "our own pid must be rejected");
+        // A normal child pid that's neither reserved nor ours is allowed.
+        let mut child = 2;
+        if child == std::process::id() {
+            child = 3;
+        }
+        assert!(!unsafe_tab_pid(child), "a real tab child pid must be allowed");
+    }
 }

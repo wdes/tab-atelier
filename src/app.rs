@@ -1033,15 +1033,23 @@ impl AppState {
                     .await;
                 let done = this
                     .update(cx, |app, cx| {
-                        let mut spawned = 0;
-                        for tab in &app.tabs {
-                            if spawned >= 2 {
+                        let mut newly: Vec<usize> = Vec::new();
+                        for (i, tab) in app.tabs.iter().enumerate() {
+                            if newly.len() >= 2 {
                                 break;
                             }
                             if !tab.view.read(cx).is_spawned() {
                                 tab.view.update(cx, |v, _| v.ensure_spawned());
-                                spawned += 1;
+                                newly.push(i);
                             }
+                        }
+                        // Apply each newly-spawned tab's per-tab cgroup limits now
+                        // that it has a real child pid. The startup pass skipped
+                        // deferred tabs (pid 0) so it couldn't move the master into
+                        // a tab cgroup (issue #36); this is where they get limited.
+                        #[cfg(target_os = "linux")]
+                        for &i in &newly {
+                            app.apply_tab_limits(i, cx);
                         }
                         app.tabs.iter().all(|t| t.view.read(cx).is_spawned())
                     })
