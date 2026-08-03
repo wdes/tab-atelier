@@ -228,8 +228,15 @@ impl HostConfig {
     /// Decorate an outgoing API request with the bearer token and, when a
     /// Cloudflare Access service token is configured, the service-token headers
     /// that let the Zero Trust gate authorize the request non-interactively.
+    ///
+    /// Also sets `Accept: application/json`: our endpoints are all JSON, and CF
+    /// Access can treat a request without it as a browser "document" navigation
+    /// — bouncing it to the interactive login (302) instead of honouring the
+    /// service token on the API path.
     fn authorize(&self, req: ureq::Request) -> ureq::Request {
-        let req = req.set("Authorization", &format!("Bearer {}", self.token));
+        let req = req
+            .set("Authorization", &format!("Bearer {}", self.token))
+            .set("Accept", "application/json");
         if self.cf_access_client_id.is_empty() || self.cf_access_client_secret.is_empty() {
             req
         } else {
@@ -897,9 +904,15 @@ pub fn android_main(app: slint::android::AndroidApp) {
     let agent: Arc<ureq::Agent> = Arc::new(
         ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(5))
-            // Identify the client to the daemon and to Cloudflare's edge (shows
-            // up in access logs) rather than the bare `ureq/x.y` default.
-            .user_agent(concat!("ta-remote/", env!("CARGO_PKG_VERSION"), " (Android; Slint)"))
+            // Identify the client to the daemon and to Cloudflare's edge rather
+            // than the bare `ureq/x.y` default. RFC 9110 `product/version
+            // (comment)` shape — an app name/version plus the platform in a
+            // standard comment, matching how browsers and HTTP libraries
+            // (curl, python-requests, okhttp) structure theirs, so a WAF/bot rule
+            // reads it as an ordinary client. No odd tokens (the old
+            // `(Android; Slint)`), and not browser-ish (which would push CF toward
+            // the interactive-login path).
+            .user_agent(concat!("ta-remote/", env!("CARGO_PKG_VERSION"), " (Android)"))
             .tls_config(Arc::new(permissive_tls_config()))
             // Don't follow redirects: the local API never redirects, so a 3xx is
             // a Cloudflare Access login challenge — we detect it (Location →
