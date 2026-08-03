@@ -286,8 +286,16 @@ pub(crate) const SIDECAR_USER_AGENT: &str = concat!("tab-atelier/", env!("CARGO_
 /// — so a remote fronted by Cloudflare Zero Trust authorizes the sidecar's
 /// requests without an interactive browser login. Generic over the builder's
 /// body-state so it decorates `get`/`post`/`delete` alike.
+///
+/// Also sets `Accept: application/json` (mirrors the Android app): CF Access can
+/// treat a request lacking it as a browser document navigation and bounce it to
+/// the interactive login (302) instead of honouring the service token on the API
+/// path. The daemon ignores `Accept` (it serves raw bytes for `/output` /
+/// `/files`), so this is safe on every request.
 pub(crate) fn authorized<Any>(req: ureq::RequestBuilder<Any>, endpoint: &RemoteEndpoint) -> ureq::RequestBuilder<Any> {
-    let req = req.header("Authorization", &format!("Bearer {}", endpoint.token));
+    let req = req
+        .header("Authorization", &format!("Bearer {}", endpoint.token))
+        .header("Accept", "application/json");
     if endpoint.has_cf_service_token() {
         req.header("CF-Access-Client-Id", &endpoint.cf_access_client_id)
             .header("CF-Access-Client-Secret", &endpoint.cf_access_client_secret)
