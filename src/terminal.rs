@@ -332,6 +332,12 @@ pub struct TerminalView {
     /// instead of blocking — see the `try_lock_unfair` path in
     /// `prepaint`. The next 16 ms tick retries with fresh grid data.
     last_prepaint: Rc<RefCell<Option<TermPrepaint>>>,
+    /// When `Some((cols, rows))` this tab's grid is PINNED to that fixed size
+    /// (`tab-atelier resize <tab> --cols N --rows M`) and ignores window-driven
+    /// sizing: the active tab's prepaint uses it instead of the laid-out bounds,
+    /// and `broadcast_active_size` skips it. Lets a web viewer of a tab on a
+    /// large desktop window be capped to a phone-friendly size. `None` = normal.
+    pinned_grid: Rc<Cell<Option<(usize, usize)>>>,
     /// Wall-clock of the last time this view was actually rendered (i.e.
     /// mounted as the visible/active tab). `render` stamps it; the repaint
     /// pump reads it to decide whether it's the foreground view. Only the
@@ -759,6 +765,7 @@ impl TerminalView {
             net_disabled: Cell::new(false),
             prev_frame: Rc::new(RefCell::new(None)),
             last_prepaint: Rc::new(RefCell::new(None)),
+            pinned_grid: Rc::new(Cell::new(None)),
             last_render,
         };
         // The active tab forks its shell now (so the first frame is live); a
@@ -1289,6 +1296,28 @@ impl TerminalView {
         match (self.last_size.get(), self.cell_size) {
             (Some((cols, lines)), Some(cell)) => Some((cols, lines, cell)),
             _ => None,
+        }
+    }
+
+    /// The tab's pinned fixed grid size, if any (`tab-atelier resize`).
+    /// `None` = normal window-driven sizing.
+    #[must_use]
+    pub fn pinned_grid(&self) -> Option<(usize, usize)> {
+        self.pinned_grid.get()
+    }
+
+    /// Pin (or, with `None`, un-pin) the tab's grid to a fixed size, applying it
+    /// immediately. While pinned, the active tab's prepaint and
+    /// `broadcast_active_size` leave the size alone; un-pinning lets the next
+    /// paint/broadcast resize it back to the window.
+    pub fn set_pinned_grid(&mut self, dims: Option<(usize, usize)>) {
+        self.pinned_grid.set(dims);
+        if let Some((cols, lines)) = dims {
+            let cell = self.cell_size.unwrap_or(Size {
+                width: px(8.4),
+                height: px(19.6),
+            });
+            self.force_resize(cols.max(2), lines.max(1), cell);
         }
     }
 
@@ -1885,6 +1914,7 @@ impl Render for TerminalView {
                 hover_grid: self.hover_grid.clone(),
                 prev_frame: self.prev_frame.clone(),
                 last_prepaint: self.last_prepaint.clone(),
+                pinned_grid: self.pinned_grid.clone(),
                 pty_ring: self.pty_ring.clone(),
             })
     }
@@ -1919,6 +1949,9 @@ struct TerminalElement {
     hover_grid: Rc<Cell<Option<(usize, usize)>>>,
     prev_frame: Rc<RefCell<Option<CachedFrame>>>,
     last_prepaint: Rc<RefCell<Option<TermPrepaint>>>,
+    /// Shared with [`TerminalView::pinned_grid`]; when `Some`, prepaint sizes the
+    /// grid to this fixed value instead of the laid-out bounds.
+    pinned_grid: Rc<Cell<Option<(usize, usize)>>>,
     /// Same ring as [`TerminalView::pty_ring`]; prepaint reads its byte
     /// counter as the "did any output arrive since the cached frame was
     /// built" signal for [`CachedFrame::shift_for`].
@@ -2166,8 +2199,15 @@ impl Element for TerminalElement {
     ) -> Self::PrepaintState {
         let paint_t0 = std::time::Instant::now();
         let cell = self.cell_size;
-        let cols = ((bounds.size.width / cell.width) as usize).max(2);
-        let lines = ((bounds.size.height / cell.height) as usize).max(1);
+        // A pinned tab keeps its fixed grid regardless of the laid-out bounds
+        // (renders letterboxed in a larger window); otherwise fill the bounds.
+        let (cols, lines) = match self.pinned_grid.get() {
+            Some((pc, pl)) => (pc.max(2), pl.max(1)),
+            None => (
+                ((bounds.size.width / cell.width) as usize).max(2),
+                ((bounds.size.height / cell.height) as usize).max(1),
+            ),
+        };
 
         if self.last_size.get() == Some((cols, lines)) {
             // Bounds settled back onto the applied grid mid-storm —

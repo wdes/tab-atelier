@@ -97,6 +97,10 @@ struct HeadlessTab {
     agent_session_id: Option<Arc<str>>,
     agent_kind: Option<Arc<str>>,
     agent_plan_mode: Option<bool>,
+    /// Pinned fixed grid size (`tab-atelier resize`); `None` = spawn default.
+    /// Persisted to tabs.json so the size survives a restart.
+    pinned_cols: Option<u16>,
+    pinned_rows: Option<u16>,
     share_token_rw: Arc<str>,
     share_token_ro: Arc<str>,
     /// Manual lock — user-toggled via right-click / `POST /lock`.
@@ -248,6 +252,28 @@ impl HeadlessTab {
         }
         self.last_input = Some(Instant::now());
         let _ = self.notifier.send(Msg::Input(bytes.into()));
+    }
+
+    /// Pin the tab's grid to a fixed `cols`×`rows` (`tab-atelier resize`):
+    /// resize the alacritty grid + the PTY, and record the pin so it persists.
+    fn resize_to(&mut self, cols: u16, rows: u16) {
+        let cols = cols.max(2);
+        let rows = rows.max(1);
+        {
+            let mut t = self.term.lock();
+            t.resize(TermDims {
+                columns: cols as usize,
+                screen_lines: rows as usize,
+            });
+        }
+        let _ = self.notifier.send(Msg::Resize(WindowSize {
+            num_lines: rows,
+            num_cols: cols,
+            cell_width: 9,
+            cell_height: 18,
+        }));
+        self.pinned_cols = Some(cols);
+        self.pinned_rows = Some(rows);
     }
 
     fn restore_output(&self, text: &str) {
@@ -649,6 +675,9 @@ fn spawn_pty_tab(
         agent_session_id: agent_session_id.map(Arc::from),
         agent_kind: agent_kind.map(Arc::from),
         agent_plan_mode,
+        // Set by the restore path (spawns at the pinned size) / the resize drain.
+        pinned_cols: None,
+        pinned_rows: None,
         share_token_rw: share_token_rw.into(),
         share_token_ro: share_token_ro.into(),
         locked,
@@ -789,6 +818,12 @@ pub fn run() -> std::io::Result<()> {
                     (None, Some(out))
                 }
             });
+            // A pinned tab (`tab-atelier resize`) spawns at its fixed size, not
+            // the global default, so its web viewer isn't oversized from boot.
+            let (spawn_cols, spawn_rows) = match (ts.pinned_cols, ts.pinned_rows) {
+                (Some(c), Some(r)) => ((c as usize).max(2), (r as usize).max(1)),
+                _ => (pty_cols, pty_rows),
+            };
             if let Some(mut t) = spawn_pty_tab(
                 ts.id.clone(),
                 ts.name.clone(),
@@ -807,12 +842,14 @@ pub fn run() -> std::io::Result<()> {
                 ts.locked,
                 ts.schedule.clone(),
                 ts.bg_color.clone(),
-                pty_cols,
-                pty_rows,
+                spawn_cols,
+                spawn_rows,
                 ts.net_disabled,
                 ts.allow_config(),
             ) {
                 t.limits = ts.limits.clone();
+                t.pinned_cols = ts.pinned_cols;
+                t.pinned_rows = ts.pinned_rows;
                 #[cfg(target_os = "linux")]
                 crate::cgroup::apply(
                     &t.id,
@@ -894,6 +931,7 @@ pub fn run() -> std::io::Result<()> {
         pending_new_tab_cwds: std::collections::VecDeque::new(),
         pending_limit_changes: Vec::new(),
         pending_default_limits: None,
+        pending_resizes: Vec::new(),
         pending_renames: Vec::new(),
         pending_status_updates: Vec::new(),
         cached_response: None,
@@ -1445,6 +1483,8 @@ fn persist(
             agent_session_id: tab.agent_session_id.as_deref().map(str::to_string),
             agent_kind: tab.agent_kind.as_deref().map(str::to_string),
             agent_plan_mode: tab.agent_plan_mode,
+            pinned_cols: tab.pinned_cols,
+            pinned_rows: tab.pinned_rows,
             share_token_rw: tab.share_token_rw.to_string(),
             share_token_ro: tab.share_token_ro.to_string(),
             locked: tab.locked,
@@ -1720,6 +1760,7 @@ fn drain_pending(
         s.pending_schedule_changes.drain(..).collect();
     let limit_changes: Vec<(String, crate::TabResourceLimits, bool)> = s.pending_limit_changes.drain(..).collect();
     let default_limit_change: Option<(crate::TabResourceLimits, bool)> = s.pending_default_limits.take();
+    let resize_changes: Vec<(String, Option<(u16, u16)>)> = s.pending_resizes.drain(..).collect();
     let new_tabs = std::mem::take(&mut s.pending_new_tabs);
     let new_tab_cwds: std::collections::VecDeque<std::path::PathBuf> = std::mem::take(&mut s.pending_new_tab_cwds);
     drop(s);
@@ -1739,6 +1780,7 @@ fn drain_pending(
         && schedule_changes.is_empty()
         && limit_changes.is_empty()
         && default_limit_change.is_none()
+        && resize_changes.is_empty()
         && new_tabs == 0
         && new_tab_cwds.is_empty());
     // CLI / API lock toggles → runtime HeadlessTab. tabs.json picks
@@ -1840,6 +1882,20 @@ fn drain_pending(
                 t.pid,
                 &crate::TabResourceLimits::resolve(&t.limits, default_limits),
             );
+        }
+    }
+
+    // Per-tab fixed-size pins (`tab-atelier resize`): resize the grid + PTY and
+    // record the pin so the next persist tick writes it to tabs.json. `None`
+    // un-pins (kept as-is at the current size until the next spawn).
+    for (tab_id, dims) in resize_changes {
+        if let Some(t) = tabs.iter_mut().find(|t| *t.id == tab_id) {
+            if let Some((cols, rows)) = dims {
+                t.resize_to(cols, rows);
+            } else {
+                t.pinned_cols = None;
+                t.pinned_rows = None;
+            }
         }
     }
 

@@ -122,6 +122,26 @@ pub enum Commands {
         clear: bool,
     },
 
+    /// Pin a tab's grid to a fixed size (or `--clear` to un-pin).
+    ///
+    /// A tab's grid is shared by the desktop paint and the web viewer, so on a
+    /// large desktop window the viewer is oversized. Pinning fixes both to N×M
+    /// (the desktop tab renders letterboxed); `--clear` returns to window-driven
+    /// sizing. Persisted across restarts.
+    Resize {
+        /// Tab index or UUID.
+        tab: String,
+        /// Fixed column count (>= 2). Required unless `--clear`.
+        #[arg(long, required_unless_present = "clear")]
+        cols: Option<u16>,
+        /// Fixed row count (>= 1). Required unless `--clear`.
+        #[arg(long, required_unless_present = "clear")]
+        rows: Option<u16>,
+        /// Un-pin — back to window-driven sizing.
+        #[arg(long, conflicts_with_all = ["cols", "rows"])]
+        clear: bool,
+    },
+
     /// Cut a tab's internet — respawn its shell inside a bubblewrap
     /// network namespace (loopback only). Needs `bubblewrap` installed.
     #[command(name = "net-off")]
@@ -724,6 +744,7 @@ pub fn dispatch(cli: Cli) -> bool {
             }
             crate::cli::client::run("peek", &args)
         }
+        Commands::Resize { tab, cols, rows, clear } => crate::cli::share_link::resize(&tab, cols, rows, clear),
         Commands::Claude { args } => crate::cli::agent::run(&args),
         Commands::Brain { once, interval } => {
             let mut args: Vec<String> = Vec::new();
@@ -892,6 +913,11 @@ mod tests {
                 &["tab-atelier-headless", "claude", "--resume", "sess-1"],
                 "claude passthrough (hyphen args)",
             ),
+            (
+                &["tab-atelier-headless", "resize", "0", "--cols", "80", "--rows", "24"],
+                "resize fixed size",
+            ),
+            (&["tab-atelier-headless", "resize", "0", "--clear"], "resize --clear"),
         ];
         for (argv, label) in cases {
             let _ = Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("parse failed for {label}: {e}"));
@@ -946,6 +972,27 @@ mod tests {
         );
         // --all alone (no tab) parses.
         assert!(Cli::try_parse_from(["tab-atelier-headless", "limit", "--all", "--memory", "8G"]).is_ok());
+    }
+
+    /// `resize` needs both `--cols` and `--rows` unless `--clear`, and `--clear`
+    /// conflicts with them.
+    #[test]
+    fn resize_requires_cols_rows_or_clear() {
+        // Missing rows → required-arg error.
+        let missing =
+            Cli::try_parse_from(["tab-atelier-headless", "resize", "0", "--cols", "80"]).expect_err("needs rows too");
+        assert!(
+            missing.to_string().contains("required") || missing.to_string().contains("missing"),
+            "expected required-arg error, got: {missing}"
+        );
+        // --clear alone parses; --cols + --clear conflict.
+        assert!(Cli::try_parse_from(["tab-atelier-headless", "resize", "0", "--clear"]).is_ok());
+        let both = Cli::try_parse_from(["tab-atelier-headless", "resize", "0", "--cols", "80", "--clear"])
+            .expect_err("cols and clear conflict");
+        assert!(
+            both.to_string().contains("cannot be used with") || both.to_string().contains("conflict"),
+            "expected conflict error, got: {both}"
+        );
     }
 
     /// Unknown subcommands must error out — they used to silently
