@@ -519,6 +519,12 @@ pub struct TabSnapshot {
     /// the cgroup to every tab — so tabs without their own override AND all
     /// future tabs pick it up immediately, no restart. `None` = nothing queued.
     pub pending_default_limits: Option<(crate::TabResourceLimits, bool)>,
+    /// Per-tab fixed-grid-size changes queued by `POST /tabs/<id>/resize` (the
+    /// CLI `resize`): `(tab uuid, Some((cols, rows)))` pins the tab to that size,
+    /// `(uuid, None)` un-pins it (back to window-driven). Drained by the owner,
+    /// which resizes the PTY + grid and persists the pin — so a web viewer of a
+    /// tab on a large desktop window can be capped to a phone-friendly size.
+    pub pending_resizes: Vec<(String, Option<(u16, u16)>)>,
     /// (tab index, new name) pairs queued by `POST /tabs/{idx}/rename`.
     pub pending_renames: Vec<(usize, String)>,
     /// Queued agent-status updates from `POST /tabs/by-id/{id}/status`.
@@ -2283,6 +2289,56 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             drop(snap);
             respond_json(stream, 200, r#"{"queued":"default-limits"}"#);
         }
+        ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/resize") => {
+            // Pin (or clear) a tab's fixed grid size (the CLI `resize`). Body:
+            // {"cols":N,"rows":M} pins to that size (both >= 2 / >= 1), or
+            // {"clear":true} un-pins it back to window-driven sizing. Accepts
+            // /tabs/by-id/<uuid>/resize and /tabs/<idx>/resize.
+            let Some((key_raw, is_uuid)) = parse_tab_key(p, "/resize") else {
+                error_json(stream, 404, "missing tab id");
+                return;
+            };
+            let parsed: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+                Ok(v) => v,
+                Err(e) => {
+                    error_json(stream, 400, &format!("invalid JSON body: {e}"));
+                    return;
+                }
+            };
+            let clear = parsed
+                .get("clear")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let dims = if clear {
+                None
+            } else {
+                let cols = parsed
+                    .get("cols")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|n| u16::try_from(n).ok());
+                let rows = parsed
+                    .get("rows")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|n| u16::try_from(n).ok());
+                match (cols, rows) {
+                    (Some(c), Some(r)) if c >= 2 && r >= 1 => Some((c, r)),
+                    _ => {
+                        error_json(stream, 400, "provide cols (>=2) and rows (>=1), or clear:true");
+                        return;
+                    }
+                }
+            };
+            let mut snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(idx) = resolve_tab_idx(&snap, key_raw, is_uuid) else {
+                drop(snap);
+                error_json(stream, 404, "tab not found");
+                return;
+            };
+            let id = snap.tabs[idx].id.to_string();
+            snap.pending_resizes.push((id, dims));
+            drop(snap);
+            respond_json(stream, 200, r#"{"queued":"resize"}"#);
+        }
         ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/limits") => {
             // Set or clear per-tab resource limits on a live tab. Body (all
             // fields optional): {"memory_max":"8G","cpu_quota_percent":250,
@@ -3814,6 +3870,7 @@ pub fn test_snapshot(tabs: Vec<SnapshotTab>) -> TabSnapshot {
         pending_new_tab_cwds: std::collections::VecDeque::new(),
         pending_limit_changes: Vec::new(),
         pending_default_limits: None,
+        pending_resizes: Vec::new(),
         pending_renames: vec![],
         pending_status_updates: vec![],
         cached_response: None,

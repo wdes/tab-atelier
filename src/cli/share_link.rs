@@ -559,6 +559,74 @@ pub fn stats_cli(args: &[String]) -> i32 {
     stats(tab, json)
 }
 
+/// `resize <tab> --cols N --rows M | --clear` — pin a tab's grid to a fixed
+/// size by `POST`ing to `/tabs/by-id/<uuid>/resize`.
+///
+/// A tab's grid is shared by the desktop paint and the web viewer; on a large
+/// desktop window that makes the viewer oversized. Pinning fixes both to N×M
+/// (the desktop tab renders letterboxed). `--clear` un-pins back to
+/// window-driven sizing. Applied on the owner's next drain tick and persisted.
+#[must_use]
+pub fn resize(tab: &str, cols: Option<u16>, rows: Option<u16>, clear: bool) -> i32 {
+    if !clear && (cols.is_none() || rows.is_none()) {
+        eprintln!("resize: pass --cols N --rows M to set a fixed size, or --clear to un-pin");
+        return 2;
+    }
+    let ep = match discover_endpoint() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("resize: {e}");
+            return 1;
+        }
+    };
+    let (idx, uuid) = match resolve(&ep, tab) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("resize: {e}");
+            return 1;
+        }
+    };
+    let mut body = serde_json::Map::new();
+    if clear {
+        body.insert("clear".into(), serde_json::Value::Bool(true));
+    } else {
+        body.insert("cols".into(), serde_json::Value::from(cols.unwrap_or(0)));
+        body.insert("rows".into(), serde_json::Value::from(rows.unwrap_or(0)));
+    }
+    let payload = serde_json::Value::Object(body).to_string();
+    match agent()
+        .post(format!("{}/tabs/by-id/{uuid}/resize", ep.url))
+        .header("Authorization", format!("Bearer {}", ep.token))
+        .header("Content-Type", "application/json")
+        .send(payload.as_bytes())
+    {
+        Ok(_) => {
+            if clear {
+                println!("tab {idx} size un-pinned (back to window-driven, applies on the next tick)");
+            } else {
+                println!(
+                    "tab {idx} pinned to {}x{} (applies on the next tick)",
+                    cols.unwrap_or(0),
+                    rows.unwrap_or(0)
+                );
+            }
+            0
+        }
+        Err(ureq::Error::StatusCode(400)) => {
+            eprintln!("resize: server rejected — cols must be >= 2 and rows >= 1");
+            1
+        }
+        Err(ureq::Error::StatusCode(404)) => {
+            eprintln!("resize: no such tab '{tab}'");
+            1
+        }
+        Err(e) => {
+            eprintln!("resize: {e}");
+            1
+        }
+    }
+}
+
 /// `limit <tab> [--memory V] [--cpu PCT] [--tasks N] | --clear` — cap a tab's
 /// RAM / CPU / process-count by `POST`ing to `/tabs/by-id/<uuid>/limits`.
 ///

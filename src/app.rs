@@ -93,6 +93,11 @@ struct Tab {
     /// spinner, or a `cargo build` printing — which lights the LED green
     /// ("talking") even without a fresh status hook. `None` = no output yet.
     last_output_at: Option<std::time::Instant>,
+    /// Persisted fixed-grid pin (`tab-atelier resize`), mirrored onto the view's
+    /// `pinned_grid`. `None` = window-driven sizing. Round-trips through
+    /// tabs.json so the size survives a restart.
+    pinned_cols: Option<u16>,
+    pinned_rows: Option<u16>,
     #[cfg(feature = "energy")]
     energy_wh: f64,
     /// Last `energy_wh` value flushed to disk. Used to skip writes when no
@@ -261,6 +266,8 @@ impl Tab {
             // being opened — not instantly on every restart.
             last_focused_at: Some(std::time::Instant::now()),
             last_output_at: None,
+            pinned_cols: ts.pinned_cols,
+            pinned_rows: ts.pinned_rows,
             #[cfg(feature = "energy")]
             energy_wh: ts.energy_wh.unwrap_or(0.0),
             #[cfg(feature = "energy")]
@@ -1315,6 +1322,7 @@ impl AppState {
             pending_new_tab_cwds: std::collections::VecDeque::new(),
             pending_limit_changes: Vec::new(),
             pending_default_limits: None,
+            pending_resizes: Vec::new(),
             pending_renames: Vec::new(),
             pending_status_updates: Vec::new(),
             cached_response: None,
@@ -1348,6 +1356,16 @@ impl AppState {
             battery_percent.clone(),
             power_hot.clone(),
         );
+
+        // Restore per-tab fixed-size pins (`tab-atelier resize`) onto the views
+        // so a pinned tab keeps its size across restarts (and its web viewer
+        // isn't oversized) from the first frame.
+        for tab in &tabs {
+            if let (Some(c), Some(r)) = (tab.pinned_cols, tab.pinned_rows) {
+                tab.view
+                    .update(cx, |v, _| v.set_pinned_grid(Some((c as usize, r as usize))));
+            }
+        }
 
         // Move every spawned tab (restore + the initial tab) into its own
         // per-tab cgroup. No-op unless delegation succeeded above.
@@ -1456,6 +1474,16 @@ impl AppState {
     /// a no-op until the active tab's measured size actually changes (launch,
     /// window resize), then one `force_resize` per other tab.
     fn broadcast_active_size(&self, cx: &mut Context<Self>) {
+        // If the active tab is pinned (`tab-atelier resize`), its size is NOT the
+        // window size, so don't broadcast it — background tabs keep their size
+        // until a non-pinned tab is active again.
+        if self
+            .tabs
+            .get(self.active)
+            .is_some_and(|t| t.view.read(cx).pinned_grid().is_some())
+        {
+            return;
+        }
         let Some((cols, lines, cell)) = self.tabs.get(self.active).and_then(|t| t.view.read(cx).measured_grid()) else {
             return;
         };
@@ -1473,7 +1501,9 @@ impl AppState {
         }
         self.last_broadcast_size.set(Some((cols, lines)));
         for (i, tab) in self.tabs.iter().enumerate() {
-            if i == self.active {
+            // Pinned tabs (`tab-atelier resize`) keep their fixed size — never
+            // reflow them to the window.
+            if i == self.active || tab.view.read(cx).pinned_grid().is_some() {
                 continue;
             }
             tab.view.update(cx, |v, _| v.force_resize(cols, lines, cell));
@@ -1797,6 +1827,8 @@ impl AppState {
                     agent_session_id: tab.agent_session_id.as_deref().map(str::to_string),
                     agent_kind: tab.agent_kind.as_deref().map(str::to_string),
                     agent_plan_mode: tab.agent_plan_mode,
+                    pinned_cols: tab.pinned_cols,
+                    pinned_rows: tab.pinned_rows,
                     share_token_rw: tab.share_token_rw.to_string(),
                     share_token_ro: tab.share_token_ro.to_string(),
                     locked: tab.locked,
@@ -2129,7 +2161,19 @@ impl AppState {
             let limit_changes: Vec<(String, crate::TabResourceLimits, bool)> =
                 snapshot.pending_limit_changes.drain(..).collect();
             let default_limit_change: Option<(crate::TabResourceLimits, bool)> = snapshot.pending_default_limits.take();
+            let resize_changes: Vec<(String, Option<(u16, u16)>)> = snapshot.pending_resizes.drain(..).collect();
             drop(snapshot);
+            // Per-tab fixed-size pins (`tab-atelier resize`): set the view's
+            // pinned grid (applies immediately) + mirror onto the runtime Tab so
+            // the next persist tick writes it to tabs.json. `None` un-pins.
+            for (tab_id, dims) in resize_changes {
+                if let Some(tab) = self.tabs.iter_mut().find(|t| *t.id == tab_id) {
+                    let grid = dims.map(|(c, r)| (c as usize, r as usize));
+                    tab.view.update(cx, |v, _| v.set_pinned_grid(grid));
+                    tab.pinned_cols = dims.map(|(c, _)| c);
+                    tab.pinned_rows = dims.map(|(_, r)| r);
+                }
+            }
             // Apply lock toggles from the API/CLI onto the runtime
             // Tab's manual flag. The view's set_locked() push happens
             // in the per-tick mirror below — that's the single site
@@ -2717,6 +2761,8 @@ impl AppState {
                     agent_session_id: tab.agent_session_id.as_deref().map(str::to_string),
                     agent_kind: tab.agent_kind.as_deref().map(str::to_string),
                     agent_plan_mode: tab.agent_plan_mode,
+                    pinned_cols: tab.pinned_cols,
+                    pinned_rows: tab.pinned_rows,
                     share_token_rw: tab.share_token_rw.to_string(),
                     share_token_ro: tab.share_token_ro.to_string(),
                     locked: tab.locked,

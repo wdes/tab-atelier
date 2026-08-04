@@ -825,6 +825,14 @@ pub struct TabState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_plan_mode: Option<bool>,
 
+    /// Fixed grid size the tab is PINNED to (`tab-atelier resize <tab> --cols N
+    /// --rows M`), overriding window-driven sizing so a web viewer isn't
+    /// oversized. Both `None` = normal. Persisted so the pin survives a restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_cols: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_rows: Option<u16>,
+
     /// Per-tab share secrets. Carried in the `?token=` query of share
     /// URLs and validated server-side on the `/tabs/by-id/{uuid}/...`
     /// routes so a read-only link can't be promoted to interactive by
@@ -1083,6 +1091,8 @@ impl Default for TabState {
             agent_session_id: None,
             agent_kind: None,
             agent_plan_mode: None,
+            pinned_cols: None,
+            pinned_rows: None,
             share_token_rw: String::new(),
             share_token_ro: String::new(),
             locked: false,
