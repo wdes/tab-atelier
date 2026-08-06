@@ -51,6 +51,50 @@ impl ThemeName {
     }
 }
 
+/// Shape of the text cursor drawn over the active cell.
+///
+/// `Block` fills the whole cell (the classic terminal cursor). `Bar` is a
+/// slim vertical beam at the cell's leading edge — the "text input" look
+/// Ghostty calls `bar` — for users who find the block too heavy. `Underline`
+/// is a thin line along the cell bottom. Purely a paint concern (see the
+/// cursor block in `terminal.rs`); it never changes cell metrics.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
+pub enum CursorStyle {
+    #[default]
+    Block,
+    Bar,
+    Underline,
+}
+
+impl CursorStyle {
+    pub const ALL: &[Self] = &[Self::Block, Self::Bar, Self::Underline];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Block => "Block",
+            Self::Bar => "Bar (slim)",
+            Self::Underline => "Underline",
+        }
+    }
+
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Block => "block",
+            Self::Bar => "bar",
+            Self::Underline => "underline",
+        }
+    }
+
+    pub fn from_id(s: &str) -> Option<Self> {
+        match s {
+            "block" => Some(Self::Block),
+            "bar" => Some(Self::Bar),
+            "underline" => Some(Self::Underline),
+            _ => None,
+        }
+    }
+}
+
 pub struct Theme {
     pub term_fg: u32,
     pub term_bg: u32,
@@ -358,6 +402,17 @@ mod tests_palette {
                 assert!(c <= 0xff_ffff);
             }
         }
+    }
+
+    #[test]
+    fn cursor_style_roundtrip_and_labels() {
+        for s in CursorStyle::ALL {
+            assert_eq!(CursorStyle::from_id(s.id()), Some(*s));
+            assert!(!s.label().is_empty());
+        }
+        assert_eq!(CursorStyle::from_id("nonexistent"), None);
+        // Default is the classic full block.
+        assert_eq!(CursorStyle::default(), CursorStyle::Block);
     }
 }
 

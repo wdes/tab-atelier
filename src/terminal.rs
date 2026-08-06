@@ -152,7 +152,7 @@ use alacritty_terminal::index::{Column, Line, Point as GridPoint, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 
 use crate::terminal_utils::{hsla_eq, is_default_bg, is_default_fg, keystroke_to_bytes};
-use crate::theme::{self, ThemeName};
+use crate::theme::{self, CursorStyle, ThemeName};
 use crate::{FontConfig, detect_urls, file_path_for_open};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags as CellFlags;
@@ -272,6 +272,9 @@ pub struct TerminalView {
     scrollbar_dragging: Rc<Cell<bool>>,
     scroll_acc: Rc<Cell<f32>>,
     pub theme: ThemeName,
+    /// Shape of the cursor quad drawn over the active cell. Copied into the
+    /// element each `render` (like `theme`) and read at paint time.
+    cursor_style: CursorStyle,
     font_config: FontConfig,
     browser: Rc<RefCell<Option<String>>>,
     code_editor: Rc<RefCell<Option<String>>>,
@@ -750,6 +753,7 @@ impl TerminalView {
             scrollbar_dragging: Rc::new(Cell::new(false)),
             scroll_acc: Rc::new(Cell::new(0.0)),
             theme: ThemeName::default(),
+            cursor_style: CursorStyle::default(),
             font_config,
             browser,
             code_editor,
@@ -922,6 +926,12 @@ impl TerminalView {
     pub fn set_theme(&mut self, theme: ThemeName) {
         self.theme = theme;
         self.event_proxy.set_theme(theme);
+    }
+
+    /// Set the cursor shape (block / slim bar / underline). Takes effect on
+    /// the next paint; nothing in the PTY or grid changes.
+    pub const fn set_cursor_style(&mut self, style: CursorStyle) {
+        self.cursor_style = style;
     }
 
     pub fn restore_output(&self, text: &str) {
@@ -1909,6 +1919,7 @@ impl Render for TerminalView {
                 line_cache: self.line_cache.clone(),
                 line_cache_scratch: self.line_cache_scratch.clone(),
                 theme: self.theme,
+                cursor_style: self.cursor_style,
                 font_config: self.font_config.clone(),
                 detected_urls: self.detected_urls.clone(),
                 hover_grid: self.hover_grid.clone(),
@@ -1944,6 +1955,7 @@ struct TerminalElement {
     line_cache: Rc<RefCell<HashMap<i32, CachedLine>>>,
     line_cache_scratch: Rc<RefCell<HashMap<i32, CachedLine>>>,
     theme: ThemeName,
+    cursor_style: CursorStyle,
     font_config: FontConfig,
     detected_urls: Rc<RefCell<Vec<DetectedUrl>>>,
     hover_grid: Rc<Cell<Option<(usize, usize)>>>,
@@ -2998,19 +3010,35 @@ impl Element for TerminalElement {
             }
             drop(urls);
 
-            // Paint cursor.
+            // Paint cursor. The cell's top-left; the quad's size/offset within
+            // it depends on the configured shape (block fills it, bar is a slim
+            // leading-edge beam, underline a thin bottom strip).
             if let Some((row, col)) = state.cursor {
-                let pos = point(origin.x + cell.width * col as f32, origin.y + cell.height * row as f32);
-                let cursor_size = size(cell.width, cell.height);
-                window.paint_quad(fill(
-                    Bounds::new(pos, cursor_size),
-                    Hsla::from(Rgba {
-                        r: 0.86,
-                        g: 0.86,
-                        b: 0.86,
-                        a: 0.7,
-                    }),
-                ));
+                let cell_origin = point(origin.x + cell.width * col as f32, origin.y + cell.height * row as f32);
+                let cursor_color = Hsla::from(Rgba {
+                    r: 0.86,
+                    g: 0.86,
+                    b: 0.86,
+                    a: 0.7,
+                });
+                let (pos, cursor_size) = match self.cursor_style {
+                    CursorStyle::Block => (cell_origin, size(cell.width, cell.height)),
+                    CursorStyle::Bar => {
+                        // Slim vertical beam at the leading edge (~15% of the
+                        // cell, clamped so it stays visible but never a block).
+                        let w = px((f32::from(cell.width) * 0.15).clamp(1.5, 3.0));
+                        (cell_origin, size(w, cell.height))
+                    }
+                    CursorStyle::Underline => {
+                        // Thin strip along the cell bottom.
+                        let h = px((f32::from(cell.height) * 0.12).clamp(1.5, 3.0));
+                        (
+                            point(cell_origin.x, cell_origin.y + cell.height - h),
+                            size(cell.width, h),
+                        )
+                    }
+                };
+                window.paint_quad(fill(Bounds::new(pos, cursor_size), cursor_color));
             }
 
             // Paint scrollbar.

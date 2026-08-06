@@ -103,11 +103,13 @@ Always pass `-p tab-atelier` — a bare `cargo deb` in this workspace can packag
 - **Agent auto-resume**: tabs that were running `catbus-agent` or `claude` at last save reopen with `catbus-agent --resume <uuid>` / `claude --resume <uuid>` typed into the freshly-spawned shell
 
 **Preferences**
-- Theme selection (Dark, Tomorrow Night Blue)
+- Theme selection (Dark, Tomorrow Night Blue, Light)
+- Cursor style (Block, Bar — a slim beam — or Underline)
 - Window opacity (1%-100% slider)
 - Language (English, French)
 - Configurable toggle hotkeys (press any key to register, applied immediately)
 - Configurable browser and code editor for opening links
+- **Claude-only mode** (right-click → *Claude-only mode*): forces every new tab to launch `claude` in `auto` mode; right-click → *New bash tab* cancels it and drops back to a shell. Also settable at launch with `--claude-only`.
 
 **Monitoring**
 - Per-tab CPU usage, power draw (watts), energy consumption (Wh), and uptime
