@@ -320,6 +320,17 @@ assets = [
     # Application Autostart). Defaults to enabled; users can untick.
     ["assets/tab-atelier-autostart.desktop", "/etc/xdg/autostart/tab-atelier.desktop", "644"],
     ["assets/tab-atelier.svg", "/usr/share/icons/hicolor/scalable/apps/tab-atelier.svg", "644"],
+    # Rasterized PNG fallbacks alongside the scalable SVG. KDE/Plasma (and some
+    # taskbars via _NET_WM_ICON) often fail to render an SVG-only app icon, so
+    # ship the standard hicolor sizes too. Installing into /usr/share/icons/
+    # hicolor fires the hicolor-icon-theme dpkg trigger, refreshing the cache.
+    ["assets/icons/hicolor/16x16/apps/tab-atelier.png", "/usr/share/icons/hicolor/16x16/apps/tab-atelier.png", "644"],
+    ["assets/icons/hicolor/24x24/apps/tab-atelier.png", "/usr/share/icons/hicolor/24x24/apps/tab-atelier.png", "644"],
+    ["assets/icons/hicolor/32x32/apps/tab-atelier.png", "/usr/share/icons/hicolor/32x32/apps/tab-atelier.png", "644"],
+    ["assets/icons/hicolor/48x48/apps/tab-atelier.png", "/usr/share/icons/hicolor/48x48/apps/tab-atelier.png", "644"],
+    ["assets/icons/hicolor/64x64/apps/tab-atelier.png", "/usr/share/icons/hicolor/64x64/apps/tab-atelier.png", "644"],
+    ["assets/icons/hicolor/128x128/apps/tab-atelier.png", "/usr/share/icons/hicolor/128x128/apps/tab-atelier.png", "644"],
+    ["assets/icons/hicolor/256x256/apps/tab-atelier.png", "/usr/share/icons/hicolor/256x256/apps/tab-atelier.png", "644"],
     # System-wide preferences fallback. `lib.rs::load_preferences()`
     # reads this when no per-user $HOME/.local/tab-atelier/preferences.json
     # exists — so an admin can pre-seed bind addresses for a fresh
