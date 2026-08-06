@@ -32,7 +32,7 @@ use gpui::{
     App, AppContext, Application, AsyncApp, ClickEvent, ClipboardItem, Context, Div, ElementId, Entity, FocusHandle,
     Focusable, Hsla, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Pixels,
     Point, Render, Rgba, SharedString, Stateful, StatefulInteractiveElement, Styled, WeakEntity, Window,
-    WindowBackgroundAppearance, WindowHandle, WindowOptions, div, px, rgba,
+    WindowBackgroundAppearance, WindowHandle, WindowOptions, div, px, relative, rgba,
 };
 use log::{debug, error, info, warn};
 
@@ -1341,6 +1341,7 @@ impl AppState {
             pending_limit_changes: Vec::new(),
             pending_default_limits: None,
             pending_resizes: Vec::new(),
+            pending_claude_only: None,
             pending_renames: Vec::new(),
             pending_status_updates: Vec::new(),
             cached_response: None,
@@ -1610,9 +1611,11 @@ impl AppState {
     fn set_claude_only_mode(&mut self, on: bool) {
         self.claude_only = on;
         crate::set_claude_only(on);
-        let mut prefs = load_preferences(&platform::config_dir());
-        prefs.claude_only = on;
-        save_preferences(&platform::config_dir(), &prefs);
+        if !crate::read_only() {
+            let mut prefs = load_preferences(&platform::config_dir());
+            prefs.claude_only = on;
+            save_preferences(&platform::config_dir(), &prefs);
+        }
     }
 
     fn add_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2210,7 +2213,14 @@ impl AppState {
                 snapshot.pending_limit_changes.drain(..).collect();
             let default_limit_change: Option<(crate::TabResourceLimits, bool)> = snapshot.pending_default_limits.take();
             let resize_changes: Vec<(String, Option<(u16, u16)>)> = snapshot.pending_resizes.drain(..).collect();
+            let claude_only_change: Option<bool> = snapshot.pending_claude_only.take();
             drop(snapshot);
+            // Forced Claude-only toggle from the CLI/API (`claude-only on|off`).
+            // Mirror onto the struct field + global (read by `insert_tab`) and
+            // persist, so the change survives a restart like the menu toggle.
+            if let Some(on) = claude_only_change {
+                self.set_claude_only_mode(on);
+            }
             // Per-tab fixed-size pins (`tab-atelier resize`): set the view's
             // pinned grid (applies immediately) + mirror onto the runtime Tab so
             // the next persist tick writes it to tabs.json. `None` un-pins.
@@ -5404,21 +5414,49 @@ impl AppState {
                         .border_color(modal_border)
                         .rounded(px(6.0))
                         .p(px(24.0))
-                        .min_w(px(320.0))
+                        // Two-column body: wide enough to fit both columns on a
+                        // normal screen (halving the height so it fits short
+                        // screens), capped to 95% width on narrow ones. The
+                        // 90%-height cap + vertical scroll is the fallback when
+                        // even two columns are taller than the viewport.
+                        .w(px(660.0))
+                        .max_w(relative(0.95))
+                        .max_h(relative(0.9))
+                        .overflow_y_scroll()
                         .text_size(px(14.0))
                         .on_mouse_down(MouseButton::Left, |_ev: &MouseDownEvent, _window, _cx| {})
                         .child(div().text_size(px(16.0)).mb(px(16.0)).child(t.preferences))
-                        .child(div().child(t.theme).child(theme_options))
-                        .child(div().mt(px(16.0)).child("Cursor").child(cursor_options))
-                        .child(div().mt(px(16.0)).child(t.opacity).child(opacity_slider))
-                        .child(div().mt(px(16.0)).child(t.toggle_hotkeys).child(hotkey_list))
-                        .child(div().mt(px(16.0)).child(t.language).child(lang_options))
-                        .child(div().mt(px(16.0)).child(t.browser).child(browser_input))
-                        .child(div().mt(px(16.0)).child(t.code_editor).child(editor_input))
-                        .child(div().mt(px(16.0)).child(t.api_addr).child(api_addr_input))
-                        .child(div().mt(px(16.0)).child(t.api_tls_addr).child(api_tls_addr_input))
-                        .child(div().mt(px(16.0)).child(t.share_url_base).child(share_url_base_input))
-                        .child(div().mt(px(16.0)).child(t.default_tab_ram).child(default_mem_input))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .gap(px(24.0))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .flex_1()
+                                        .gap(px(16.0))
+                                        .child(div().child(t.theme).child(theme_options))
+                                        .child(div().child("Cursor").child(cursor_options))
+                                        .child(div().child(t.opacity).child(opacity_slider))
+                                        .child(div().child(t.toggle_hotkeys).child(hotkey_list))
+                                        .child(div().child(t.language).child(lang_options))
+                                        .child(div().child(t.browser).child(browser_input)),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .flex_1()
+                                        .gap(px(16.0))
+                                        .child(div().child(t.code_editor).child(editor_input))
+                                        .child(div().child(t.api_addr).child(api_addr_input))
+                                        .child(div().child(t.api_tls_addr).child(api_tls_addr_input))
+                                        .child(div().child(t.share_url_base).child(share_url_base_input))
+                                        .child(div().child(t.default_tab_ram).child(default_mem_input)),
+                                ),
+                        )
                         .child(
                             div()
                                 .mt(px(20.0))

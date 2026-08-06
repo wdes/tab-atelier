@@ -71,6 +71,7 @@ Always pass `-p tab-atelier` — a bare `cargo deb` in this workspace can packag
 | `/etc/tab-atelier/preferences.json` | `0644` | System-wide preferences fallback an admin can pre-seed — a **conffile** |
 | `/etc/claude-code/managed-settings.json` | `0644` | Claude Code hooks so `claude` tracks agent state + tab context out of the box — a **conffile** |
 | `/usr/share/icons/hicolor/scalable/apps/tab-atelier.svg` | `0644` | App icon (scalable SVG, via the `Icon=tab-atelier` line in the .desktop) |
+| `/usr/share/icons/hicolor/{16,24,32,48,64,128,256}x…/apps/tab-atelier.png` | `0644` | Rasterized PNG icon fallbacks (KDE/Plasma often won't render an SVG-only app icon) |
 | `/usr/share/tab-atelier/pets/` | `0644` | Screen-mate pet sprite sheets (`*.png`) + animations (`*.xml`) |
 | `/usr/share/doc/tab-atelier/` | `0644` | `README.md`, `LICENSE`, `copyright`, `openapi.yaml` |
 
@@ -109,7 +110,7 @@ Always pass `-p tab-atelier` — a bare `cargo deb` in this workspace can packag
 - Language (English, French)
 - Configurable toggle hotkeys (press any key to register, applied immediately)
 - Configurable browser and code editor for opening links
-- **Claude-only mode** (right-click → *Claude-only mode*): forces every new tab to launch `claude` in `auto` mode; right-click → *New bash tab* cancels it and drops back to a shell. Also settable at launch with `--claude-only`.
+- **Claude-only mode** (right-click → *Claude-only mode*): forces every new tab to launch `claude` in `auto` mode; right-click → *New bash tab* cancels it and drops back to a shell. Also settable at launch with `--claude-only`, or live on a running instance with `tab-atelier claude-only on|off`.
 
 **Monitoring**
 - Per-tab CPU usage, power draw (watts), energy consumption (Wh), and uptime
