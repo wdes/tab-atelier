@@ -19,15 +19,17 @@ pub enum ThemeName {
     Dark,
     #[default]
     TomorrowNightBlue,
+    Light,
 }
 
 impl ThemeName {
-    pub const ALL: &[Self] = &[Self::Dark, Self::TomorrowNightBlue];
+    pub const ALL: &[Self] = &[Self::Dark, Self::TomorrowNightBlue, Self::Light];
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::Dark => "Dark",
             Self::TomorrowNightBlue => "Tomorrow Night Blue",
+            Self::Light => "Light",
         }
     }
 
@@ -35,6 +37,7 @@ impl ThemeName {
         match self {
             Self::Dark => "dark",
             Self::TomorrowNightBlue => "tomorrow-night-blue",
+            Self::Light => "light",
         }
     }
 
@@ -42,6 +45,7 @@ impl ThemeName {
         match s {
             "dark" => Some(Self::Dark),
             "tomorrow-night-blue" => Some(Self::TomorrowNightBlue),
+            "light" => Some(Self::Light),
             _ => None,
         }
     }
@@ -282,10 +286,47 @@ static TOMORROW_NIGHT_BLUE: Theme = Theme {
     danger: 0x5c_1010,
 };
 
+// White background, black text — a high-contrast light theme. The ANSI palette
+// is the VS Code "Light" integrated-terminal set: normal colours are dark enough
+// to read on white (pure green/yellow/cyan would vanish), brights a touch bolder.
+static LIGHT: Theme = Theme {
+    term_fg: 0x00_0000,
+    term_bg: 0xff_ffff,
+    ansi: [
+        0x00_0000, // Black
+        0xcd_3131, // Red
+        0x00_bc00, // Green
+        0x94_9800, // Yellow (olive — readable on white)
+        0x04_51a5, // Blue
+        0xbc_05bc, // Magenta
+        0x05_98bc, // Cyan
+        0x55_5555, // White (mid grey)
+        0x66_6666, // Bright Black
+        0xcd_3131, // Bright Red
+        0x14_ce14, // Bright Green
+        0xb5_ba00, // Bright Yellow
+        0x04_51a5, // Bright Blue
+        0xbc_05bc, // Bright Magenta
+        0x05_98bc, // Bright Cyan
+        0xa5_a5a5, // Bright White
+    ],
+    bg: 0xff_ffff,
+    surface: 0xf3_f3f3,
+    elevated: 0xe8_e8e8,
+    fg: 0x1e_1e1e,
+    fg_muted: 0x6e_6e6e,
+    border: 0xc8_c8c8,
+    selection: 0xad_d6ff,
+    accent: 0x00_7acc,
+    accent_hover: 0x00_6bb3,
+    danger: 0xf5_c6cb,
+};
+
 pub fn theme(name: ThemeName) -> &'static Theme {
     match name {
         ThemeName::Dark => &DARK,
         ThemeName::TomorrowNightBlue => &TOMORROW_NIGHT_BLUE,
+        ThemeName::Light => &LIGHT,
     }
 }
 
