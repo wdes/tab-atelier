@@ -55,6 +55,12 @@ pub struct Cli {
     #[arg(long, global = true, hide = true)]
     pub check_crypto: bool,
 
+    /// Start in forced Claude-only mode: every new tab launches `claude` in
+    /// `auto` mode instead of a shell (the right-click "New bash tab" item
+    /// cancels it). GUI only.
+    #[arg(long, global = true)]
+    pub claude_only: bool,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -972,6 +978,17 @@ mod tests {
         );
         // --all alone (no tab) parses.
         assert!(Cli::try_parse_from(["tab-atelier-headless", "limit", "--all", "--memory", "8G"]).is_ok());
+    }
+
+    #[test]
+    fn claude_only_is_a_global_flag() {
+        // Off by default, settable before any subcommand (GUI launch path).
+        assert!(!Cli::try_parse_from(["tab-atelier"]).unwrap().claude_only);
+        assert!(
+            Cli::try_parse_from(["tab-atelier", "--claude-only"])
+                .unwrap()
+                .claude_only
+        );
     }
 
     /// `resize` needs both `--cols` and `--rows` unless `--clear`, and `--clear`

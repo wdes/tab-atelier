@@ -11,7 +11,7 @@ use crate::platform;
 use crate::power;
 use crate::screenshot;
 use crate::terminal::TerminalView;
-use crate::theme::{self, ThemeName};
+use crate::theme::{self, CursorStyle, ThemeName};
 use crate::tracking::WakatimeTracker;
 use crate::{
     DEFAULT_HOTKEYS, FontConfig, Preferences, SavedState, TabState, gpui_key_to_keycode, keycode_label,
@@ -583,6 +583,10 @@ struct AppState {
     /// Show the per-tab RAM mini gauge in the tab bar (#28 S5). Mirrors
     /// `Preferences::show_tab_gauge`; toggled from a tab's right-click menu.
     show_tab_gauge: bool,
+    /// Force Claude-only mode: new tabs launch `claude` (auto mode) instead of
+    /// a shell. Mirrors [`crate::CLAUDE_ONLY`] / `Preferences::claude_only`;
+    /// the right-click "New bash tab" item cancels it.
+    claude_only: bool,
     renaming: Option<(usize, String)>,
     rename_select_all: bool,
     rename_focus: FocusHandle,
@@ -640,6 +644,7 @@ struct AppState {
     toasts: Vec<Toast>,
     lang: Lang,
     theme_name: ThemeName,
+    cursor_style: CursorStyle,
     opacity: u8,
     hotkeys: Vec<u8>,
     show_preferences: bool,
@@ -830,6 +835,16 @@ impl AppState {
             _ => locale::detect_lang(),
         };
         let theme_name = prefs.theme.as_deref().and_then(ThemeName::from_id).unwrap_or_default();
+        let cursor_style = prefs
+            .cursor_style
+            .as_deref()
+            .and_then(CursorStyle::from_id)
+            .unwrap_or_default();
+        // Claude-only mode is on if either the `--claude-only` flag (already in
+        // the global) or the persisted preference asked for it; sync the global
+        // so both agree from the first tab.
+        let claude_only = crate::claude_only() || prefs.claude_only;
+        crate::set_claude_only(claude_only);
         let opacity = prefs.opacity.unwrap_or(0xb8);
         let hotkeys = if prefs.hotkeys.is_empty() {
             DEFAULT_HOTKEYS.to_vec()
@@ -917,6 +932,7 @@ impl AppState {
                         cx,
                     );
                     tv.set_theme(theme_name);
+                    tv.set_cursor_style(cursor_style);
                     tv
                 });
                 // Defer restore_output for non-active tabs — feeding the
@@ -992,6 +1008,7 @@ impl AppState {
                         None, fc, br, ce, true, env, None, boot_grid, false, window, cx,
                     );
                     tv.set_theme(theme_name);
+                    tv.set_cursor_style(cursor_style);
                     tv
                 });
                 let seed = TabState {
@@ -1015,6 +1032,7 @@ impl AppState {
                     None, fc, br, ce, true, env, None, boot_grid, false, window, cx,
                 );
                 tv.set_theme(theme_name);
+                tv.set_cursor_style(cursor_style);
                 tv
             });
             let seed = TabState {
@@ -1418,8 +1436,10 @@ impl AppState {
             toasts: Vec::new(),
             lang,
             theme_name,
+            cursor_style,
             opacity,
             show_tab_gauge: prefs.show_tab_gauge,
+            claude_only,
             hotkeys,
             show_preferences: false,
             show_hotkey_picker: false,
@@ -1584,6 +1604,17 @@ impl AppState {
         );
     }
 
+    /// Flip forced Claude-only mode on/off: update the struct field, the
+    /// process-global (read by `insert_tab`), and persist the preference so it
+    /// survives a restart. The caller opens tabs / clears the menu as needed.
+    fn set_claude_only_mode(&mut self, on: bool) {
+        self.claude_only = on;
+        crate::set_claude_only(on);
+        let mut prefs = load_preferences(&platform::config_dir());
+        prefs.claude_only = on;
+        save_preferences(&platform::config_dir(), &prefs);
+    }
+
     fn add_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.insert_tab(self.tabs.len(), None, window, cx);
     }
@@ -1610,11 +1641,19 @@ impl AppState {
         let br = self.browser.clone();
         let ce = self.code_editor.clone();
         let tn = self.theme_name;
+        let cs = self.cursor_style;
         let new_id = crate::default_tab_id();
         let env = tab_env_extras(&new_id, &api_url_for_local_clients(&self.api_addr), &self.api_token);
+        // Claude-only mode: a fresh tab launches `claude` in `auto` permission
+        // mode instead of a plain shell. Under cleared-env we can `exec`
+        // it directly via the shell suffix; otherwise we type the command into
+        // the shell once its prompt appears (`pending_agent_resume`, below) —
+        // the same two mechanisms the restore path uses for agents. Read-only
+        // never force-launches. See `crate::FRESH_CLAUDE_AUTO_CMD`.
+        let force_claude = self.claude_only && !crate::read_only();
+        let exec_claude = force_claude && crate::clear_env();
+        let agent_launch = exec_claude.then(crate::fresh_claude_launch_suffix);
         let view = cx.new(|cx| {
-            // Fresh tab — no agent session yet, so a plain shell (None). Spawn at
-            // the live window's grid so the tab is correctly sized immediately.
             let mut tv = TerminalView::new_with_colors_and_env(
                 cwd.as_deref(),
                 fc,
@@ -1622,23 +1661,32 @@ impl AppState {
                 ce,
                 true,
                 env,
-                None,
+                agent_launch,
                 grid,
                 false,
                 window,
                 cx,
             );
             tv.set_theme(tn);
+            tv.set_cursor_style(cs);
             tv
         });
         let idx = at.min(self.tabs.len());
+        // Non-exec claude launch: queue the command to be typed into the shell
+        // once it prints its first prompt (`flush_pending_agent_resume`).
+        let pending_claude = (force_claude && !exec_claude).then(|| crate::FRESH_CLAUDE_AUTO_CMD.to_string());
+        let name = if force_claude {
+            format!("claude {}", self.tabs.len())
+        } else {
+            format!("{} {}", self.t().terminal_n, self.tabs.len())
+        };
         let seed = TabState {
             id: new_id,
-            name: format!("{} {}", self.t().terminal_n, self.tabs.len()),
+            name,
             ..TabState::default()
         };
         self.tabs
-            .insert(idx, Tab::from_state(view, &seed, cwd, None, None, true));
+            .insert(idx, Tab::from_state(view, &seed, cwd, None, pending_claude, true));
         self.active = idx;
         #[cfg(target_os = "linux")]
         self.apply_tab_limits(idx, cx);
@@ -2552,6 +2600,7 @@ impl AppState {
         let br = self.browser.clone();
         let ce = self.code_editor.clone();
         let tn = self.theme_name;
+        let cs = self.cursor_style;
         let env = tab_env_extras(
             &self.tabs[idx].id,
             &api_url_for_local_clients(&self.api_addr),
@@ -2589,6 +2638,7 @@ impl AppState {
                 cx,
             );
             tv.set_theme(tn);
+            tv.set_cursor_style(cs);
             tv
         });
         self.tabs[idx].view = view;
@@ -4062,6 +4112,39 @@ impl AppState {
             )
             // App section
             .child(sep())
+            // Claude-only mode. When off, this enables it (new tabs launch
+            // `claude` in auto mode). When on, it flips to a "New bash tab"
+            // escape hatch that cancels the mode AND opens a plain shell.
+            .child({
+                let label = if self.claude_only {
+                    "🐚 New bash tab"
+                } else {
+                    "🤖 Claude-only mode"
+                };
+                div()
+                    .id("menu-claude-only")
+                    .px(px(12.0))
+                    .py(px(4.0))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(menu_hover))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _ev: &MouseDownEvent, window, cx| {
+                            if this.claude_only {
+                                // Cancel the mode, then open a shell tab (now
+                                // that force-claude is off, `add_tab` yields bash).
+                                this.set_claude_only_mode(false);
+                                this.context_menu = None;
+                                this.add_tab(window, cx);
+                            } else {
+                                this.set_claude_only_mode(true);
+                                this.context_menu = None;
+                            }
+                            cx.notify();
+                        }),
+                    )
+                    .child(label)
+            })
             .child(
                 div()
                     .id("menu-remote")
@@ -4860,6 +4943,32 @@ impl AppState {
             );
         }
 
+        let mut cursor_options = div().flex().flex_col().gap(px(4.0)).mt(px(8.0));
+        for &st in CursorStyle::ALL {
+            let is_active = st == self.cursor_style;
+            cursor_options = cursor_options.child(
+                div()
+                    .id(SharedString::from(format!("pref-cursor-{}", st.id())))
+                    .px(px(12.0))
+                    .py(px(6.0))
+                    .rounded(px(3.0))
+                    .cursor_pointer()
+                    .bg(if is_active { option_active } else { option_bg })
+                    .hover(|s| s.bg(if is_active { option_active } else { btn_hover }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                            this.cursor_style = st;
+                            for tab in &this.tabs {
+                                tab.view.update(cx, |tv, _cx| tv.set_cursor_style(st));
+                            }
+                            cx.notify();
+                        }),
+                    )
+                    .child(st.label()),
+            );
+        }
+
         let opacity_pct = (self.opacity as f32 / 255.0 * 100.0).round() as u8;
         let mut opacity_slider = div().flex().flex_row().items_center().gap(px(8.0)).mt(px(8.0));
         let mut track = div().flex().flex_row().h(px(20.0)).rounded(px(3.0)).overflow_hidden();
@@ -5300,6 +5409,7 @@ impl AppState {
                         .on_mouse_down(MouseButton::Left, |_ev: &MouseDownEvent, _window, _cx| {})
                         .child(div().text_size(px(16.0)).mb(px(16.0)).child(t.preferences))
                         .child(div().child(t.theme).child(theme_options))
+                        .child(div().mt(px(16.0)).child("Cursor").child(cursor_options))
                         .child(div().mt(px(16.0)).child(t.opacity).child(opacity_slider))
                         .child(div().mt(px(16.0)).child(t.toggle_hotkeys).child(hotkey_list))
                         .child(div().mt(px(16.0)).child(t.language).child(lang_options))
@@ -5428,11 +5538,15 @@ impl AppState {
                                                         font_size: on_disk_prefs.font_size,
                                                         lang: Some(lang_str.into()),
                                                         theme: Some(this.theme_name.id().into()),
+                                                        cursor_style: Some(this.cursor_style.id().into()),
                                                         opacity: Some(this.opacity),
                                                         // Menu-toggled, not in this dialog — carry the
                                                         // on-disk value through so saving prefs doesn't
                                                         // wipe the gauge setting.
                                                         show_tab_gauge: this.show_tab_gauge,
+                                                        // Menu-toggled (right-click), not in this dialog —
+                                                        // carry it through so saving prefs doesn't drop it.
+                                                        claude_only: this.claude_only,
                                                         hotkeys: this.hotkeys.clone(),
                                                         browser,
                                                         code_editor: editor,

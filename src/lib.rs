@@ -105,6 +105,24 @@ pub fn clear_env() -> bool {
     CLEAR_ENV.load(Ordering::SeqCst)
 }
 
+/// "Claude-only" forced mode: every new tab launches `claude`.
+///
+/// New tabs run `claude` (auto-accept-edits) instead of a shell. Unlike
+/// [`READ_ONLY`]/[`CLEAR_ENV`] this is **runtime-mutable** — the right-click
+/// "New bash tab" item cancels it live — and seeded from either the
+/// `--claude-only` flag or the `claude_only` preference. The GUI mirrors it
+/// onto its own struct field for the menu.
+pub static CLAUDE_ONLY: AtomicBool = AtomicBool::new(false);
+
+#[must_use]
+pub fn claude_only() -> bool {
+    CLAUDE_ONLY.load(Ordering::SeqCst)
+}
+
+pub fn set_claude_only(on: bool) {
+    CLAUDE_ONLY.store(on, Ordering::SeqCst);
+}
+
 /// User-defined `key=value` pairs from the `clear_env_vars` preference,
 /// layered into every cleared-env tab (see [`minimal_pty_env`]). Set
 /// once at startup; reads after that are lock-free. Empty until set.
@@ -489,6 +507,29 @@ pub fn api_url_for_local_clients(api_addr: &str) -> String {
 /// first gives the agent a clean grid to paint on. `printf` is a shell builtin,
 /// so this needs nothing on PATH and works in the cleared-env minimal shell.
 pub const AGENT_LAUNCH_CLEAR: &str = r"printf '\033[3J\033[H\033[2J'; ";
+
+/// Command a fresh Claude-only tab runs.
+///
+/// `claude` started directly in `auto` permission mode — the classifier-based
+/// "⏵⏵ auto mode on" mode (distinct from `acceptEdits`; see the README).
+/// Used both as the exec target under cleared-env and as the string typed
+/// into the shell otherwise. See [`crate::CLAUDE_ONLY`].
+pub const FRESH_CLAUDE_AUTO_CMD: &str = "claude --permission-mode auto";
+
+/// Shell args that make a fresh Claude-only tab `exec` the agent directly.
+///
+/// The no-session analogue of [`agent_launch_shell_suffix`] (same
+/// `-i -c 'exec …'` shape, so the tab's foreground process *is* claude,
+/// running [`FRESH_CLAUDE_AUTO_CMD`]). Only used under cleared-env; the
+/// normal env types the command in via `pending_agent_resume`.
+#[must_use]
+pub fn fresh_claude_launch_suffix() -> Vec<String> {
+    vec![
+        "-i".to_string(),
+        "-c".to_string(),
+        format!("{AGENT_LAUNCH_CLEAR}exec {FRESH_CLAUDE_AUTO_CMD}"),
+    ]
+}
 
 /// Translate a persisted (`agent_kind`, `session_id`, `plan_mode`) into
 /// the shell command to type for auto-resume. Returns None when the
@@ -1685,6 +1726,10 @@ pub struct Preferences {
     pub lang: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
+    /// Cursor shape id (`block` / `bar` / `underline`, see
+    /// [`crate::theme::CursorStyle`]). `None` → block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_style: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opacity: Option<u8>,
     /// Show a tiny per-tab RAM gauge in the tab bar (#28 V2 / S5). Off by
@@ -1692,6 +1737,11 @@ pub struct Preferences {
     /// cheap and opt-in. Toggled from a tab's right-click menu.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub show_tab_gauge: bool,
+    /// Force "Claude-only" mode: every new tab launches `claude` in `auto`
+    /// mode instead of a shell. Toggled from the right-click menu (the
+    /// "New bash tab" item cancels it). Off by default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub claude_only: bool,
     #[serde(
         default,
         deserialize_with = "deserialize_hotkeys",
@@ -2927,6 +2977,25 @@ mod tests {
         );
         // Unknown kind → no direct launch (caller keeps the plain shell).
         assert!(agent_launch_shell_suffix("bash", "x", None).is_none());
+    }
+
+    #[test]
+    fn fresh_claude_suffix_execs_claude_in_auto_mode() {
+        // Claude-only mode launches a fresh `claude` in `auto` mode (the
+        // ⏵⏵ auto mode footer) — no --resume, since there's no session yet.
+        assert_eq!(FRESH_CLAUDE_AUTO_CMD, "claude --permission-mode auto");
+        let s = fresh_claude_launch_suffix();
+        assert_eq!(
+            s,
+            vec![
+                "-i",
+                "-c",
+                r"printf '\033[3J\033[H\033[2J'; exec claude --permission-mode auto",
+            ]
+        );
+        // Same clear-then-exec shape as the resume path.
+        assert!(s.last().unwrap().starts_with(AGENT_LAUNCH_CLEAR));
+        assert!(s.last().unwrap().contains(FRESH_CLAUDE_AUTO_CMD));
     }
 
     #[test]

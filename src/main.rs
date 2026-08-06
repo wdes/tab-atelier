@@ -55,6 +55,7 @@ fn main() {
     }
 
     let read_only = cli_args.read_only;
+    let claude_only = cli_args.claude_only;
 
     // A subcommand runs against a live instance's local API and exits inside
     // the dispatcher (shared with the headless binary). Returns here only when
@@ -64,6 +65,11 @@ fn main() {
     }
 
     READ_ONLY.store(read_only, Ordering::SeqCst);
+    // Seed forced Claude-only mode from the flag; App::new ORs in the persisted
+    // preference and re-syncs the global.
+    if claude_only {
+        tab_atelier::set_claude_only(true);
+    }
 
     if !read_only && !try_acquire_single_instance_lock() {
         eprintln!(
