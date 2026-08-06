@@ -257,6 +257,18 @@ pub enum Commands {
         ro: bool,
     },
 
+    /// Toggle forced Claude-only mode on the running instance (live, no restart).
+    ///
+    /// `on` makes every new tab launch `claude` in `auto` mode instead of a
+    /// shell; `off` restores normal shell tabs. Persists like the right-click
+    /// menu toggle and the `--claude-only` launch flag. (Tab forcing is GUI-only;
+    /// against a headless daemon this just records the flag.)
+    ClaudeOnly {
+        /// `on` to force claude tabs, `off` to restore shells.
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
+
     /// Set the per-tab viewer background color (or the global default with `--global`).
     ///
     /// Note: `--tab` is a flag (not a positional) so clap can model the
@@ -613,6 +625,7 @@ pub fn dispatch(cli: Cli) -> bool {
             }
             crate::cli::client::run("share-link", &args)
         }
+        Commands::ClaudeOnly { state } => crate::cli::share_link::claude_only(&[state]),
         Commands::BgColor { global, tab, color } => {
             let mut args: Vec<String> = Vec::new();
             if global {
@@ -845,6 +858,8 @@ mod tests {
                 &["tab-atelier-headless", "bg-color", "--tab", "0", "clear"],
                 "bg-color --tab clear",
             ),
+            (&["tab-atelier-headless", "claude-only", "on"], "claude-only on"),
+            (&["tab-atelier-headless", "claude-only", "off"], "claude-only off"),
             (&["tab-atelier-headless", "settings"], "settings (no flags)"),
             (
                 &[
@@ -989,6 +1004,15 @@ mod tests {
                 .unwrap()
                 .claude_only
         );
+    }
+
+    #[test]
+    fn claude_only_subcommand_accepts_on_off_only() {
+        assert!(Cli::try_parse_from(["tab-atelier-headless", "claude-only", "on"]).is_ok());
+        assert!(Cli::try_parse_from(["tab-atelier-headless", "claude-only", "off"]).is_ok());
+        // Anything else is a parse error (value_parser = ["on","off"]).
+        assert!(Cli::try_parse_from(["tab-atelier-headless", "claude-only", "maybe"]).is_err());
+        assert!(Cli::try_parse_from(["tab-atelier-headless", "claude-only"]).is_err());
     }
 
     /// `resize` needs both `--cols` and `--rows` unless `--clear`, and `--clear`

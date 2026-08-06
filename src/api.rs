@@ -525,6 +525,10 @@ pub struct TabSnapshot {
     /// which resizes the PTY + grid and persists the pin — so a web viewer of a
     /// tab on a large desktop window can be capped to a phone-friendly size.
     pub pending_resizes: Vec<(String, Option<(u16, u16)>)>,
+    /// Forced Claude-only mode toggle queued by `POST /claude-only` (the CLI
+    /// `claude-only on|off`). `Some(true/false)` sets the mode live; the owner
+    /// mirrors it onto [`crate::CLAUDE_ONLY`] + its struct field and persists.
+    pub pending_claude_only: Option<bool>,
     /// (tab index, new name) pairs queued by `POST /tabs/{idx}/rename`.
     pub pending_renames: Vec<(usize, String)>,
     /// Queued agent-status updates from `POST /tabs/by-id/{id}/status`.
@@ -2289,6 +2293,27 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             drop(snap);
             respond_json(stream, 200, r#"{"queued":"default-limits"}"#);
         }
+        ("POST", "/claude-only") => {
+            // Toggle forced Claude-only mode live (the CLI `claude-only on|off`).
+            // Body: {"on": true|false}. The owner mirrors it onto CLAUDE_ONLY +
+            // its struct field and persists, so new tabs launch claude (auto
+            // mode) or a shell with no restart.
+            let parsed: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+                Ok(v) => v,
+                Err(e) => {
+                    error_json(stream, 400, &format!("invalid JSON body: {e}"));
+                    return;
+                }
+            };
+            let Some(on) = parsed.get("on").and_then(serde_json::Value::as_bool) else {
+                error_json(stream, 400, r#"provide {"on": true|false}"#);
+                return;
+            };
+            let mut snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            snap.pending_claude_only = Some(on);
+            drop(snap);
+            respond_json(stream, 200, r#"{"queued":"claude-only"}"#);
+        }
         ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/resize") => {
             // Pin (or clear) a tab's fixed grid size (the CLI `resize`). Body:
             // {"cols":N,"rows":M} pins to that size (both >= 2 / >= 1), or
@@ -3871,6 +3896,7 @@ pub fn test_snapshot(tabs: Vec<SnapshotTab>) -> TabSnapshot {
         pending_limit_changes: Vec::new(),
         pending_default_limits: None,
         pending_resizes: Vec::new(),
+        pending_claude_only: None,
         pending_renames: vec![],
         pending_status_updates: vec![],
         cached_response: None,
