@@ -3756,6 +3756,30 @@ impl AppState {
                     .child("\u{26d1}\u{fe0f} Brain"),
             );
 
+            // 🐊 Aligator (PoC #35) — same take-over-the-tab pattern as Brain.
+            // Inside the tab the user sees the router log; aligator drains the
+            // swamp queue and types each entry into its target Claude tab.
+            container = container.child(
+                div()
+                    .id("menu-aligator")
+                    .px(px(12.0))
+                    .py(px(4.0))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(menu_hover))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                            this.tabs[idx]
+                                .view
+                                .read(cx)
+                                .send_input_bytes(b"\x15tab-atelier aligator\n".to_vec());
+                            this.context_menu = None;
+                            cx.notify();
+                        }),
+                    )
+                    .child("\u{1f40a} Aligator"),
+            );
+
             let colors_enabled = self.tabs[idx].view.read(cx).colors_enabled();
             let toggle_label = if colors_enabled {
                 self.t().disable_colors
