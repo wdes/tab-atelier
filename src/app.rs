@@ -3365,7 +3365,7 @@ impl AppState {
         self.pet.summon(f32::from(vp.width), f32::from(vp.height));
     }
 
-    fn render_context_menu(&self, window: &Window, cx: &Context<Self>) -> Option<Stateful<Div>> {
+    fn render_context_menu(&self, _window: &Window, cx: &Context<Self>) -> Option<gpui::AnyElement> {
         let menu = self.context_menu.as_ref()?;
         let th = self.th();
         let menu_bg = th.surface_hsla();
@@ -3373,27 +3373,17 @@ impl AppState {
         let menu_hover = th.selection_hsla();
         let menu_border = th.border_hsla();
 
+        // Anchor the menu at the click position and let gpui measure the ACTUAL
+        // menu height, then flip/clamp so it never runs off-screen. The old code
+        // used a hardcoded height estimate (350/400px) computed before the items
+        // were even built, so adding menu entries silently made it wrong — the
+        // "menu doesn't know its size" bug. `open_upward` now only picks the
+        // *base* corner (tab / tab-bar menus grow upward); `anchored`'s default
+        // SwitchAnchor still auto-flips it when that direction would overflow.
         let pos = menu.position;
-        let menu_width = px(150.0);
-        let menu_height_estimate = if matches!(menu.kind, MenuKind::Tab(_)) {
-            px(400.0)
-        } else {
-            px(350.0)
-        };
-        let vp = window.viewport_size();
-        let x = pos.x.min(vp.width - menu_width);
-        let open_upward = menu.open_upward || pos.y + menu_height_estimate > vp.height;
 
-        let mut container = div().id("context-menu").absolute().left(x);
-
-        container = if open_upward {
-            let bottom_offset = vp.height - pos.y;
-            container.bottom(bottom_offset)
-        } else {
-            container.top(pos.y)
-        };
-
-        container = container
+        let mut container = div()
+            .id("context-menu")
             .bg(menu_bg)
             .border_1()
             .border_color(menu_border)
@@ -4249,7 +4239,20 @@ impl AppState {
             }
         }
 
-        Some(container)
+        // Base corner from the persisted hint; anchored auto-switches it on
+        // overflow after measuring the real height.
+        let anchor = if menu.open_upward {
+            gpui::Corner::BottomLeft
+        } else {
+            gpui::Corner::TopLeft
+        };
+        Some(
+            gpui::anchored()
+                .position(pos)
+                .anchor(anchor)
+                .child(container)
+                .into_any_element(),
+        )
     }
 
     fn render_rename_input(&self, cx: &Context<Self>) -> Option<Stateful<Div>> {
