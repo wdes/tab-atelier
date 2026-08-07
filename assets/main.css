@@ -275,6 +275,22 @@
       word-break: break-all;
     }
     #files-panel a:hover { background: rgba(255, 255, 255, 0.08); }
+    /* Outbox download progress. A thin blue bar (outbox = blue) under the
+       row, collapsed to 0 height until the row gets `.downloading`, at which
+       point the row is dimmed + guarded against re-clicks. Turns red on
+       error before the row re-enables. */
+    #files-panel a .dl-progress {
+      height: 0; margin-top: 0; overflow: hidden;
+      background: rgba(120, 200, 255, 0.18); border-radius: 2px;
+      transition: height 0.15s ease, margin-top 0.15s ease;
+    }
+    #files-panel a.downloading .dl-progress { height: 3px; margin-top: 6px; }
+    #files-panel a .dl-bar {
+      height: 100%; width: 0; background: #7ac6ff;
+      transition: width 0.12s linear;
+    }
+    #files-panel a.downloading { opacity: 0.7; cursor: progress; }
+    #files-panel a.dl-error .dl-bar { background: #e5534b; }
     #files-panel .row {
       display: flex; gap: 4px; align-items: baseline; flex-wrap: wrap;
     }

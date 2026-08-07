@@ -717,6 +717,9 @@
             const a = document.createElement("a");
             const qpath = encodeURIComponent(`outbox/${f.name}`);
             a.href = `${BASE}files?path=${qpath}${TOKEN ? "&token=" + encodeURIComponent(TOKEN) : ""}`;
+            // Keep the native download attr so drag-to-desktop and
+            // modifier-clicks still work and it degrades gracefully; a plain
+            // left-click is intercepted below to stream with a progress bar.
             a.download = f.name;
             a.draggable = true;
             a.addEventListener("dragstart", (ev) => {
@@ -724,7 +727,15 @@
               ev.dataTransfer.setData("text/uri-list", `file://${absPath}`);
               ev.dataTransfer.effectAllowed = "copyLink";
             });
-            a.innerHTML = `${htmlEscape(f.name)}<div class="meta">${meta}</div>`;
+            a.innerHTML = `${htmlEscape(f.name)}<div class="meta">${meta}</div>`
+              + `<div class="dl-progress"><div class="dl-bar"></div></div>`;
+            a.addEventListener("click", (ev) => {
+              // Let modified clicks (ctrl/cmd/shift/middle) use the native
+              // download; intercept only the plain left-click for progress.
+              if (ev.button !== 0 || ev.ctrlKey || ev.metaKey || ev.shiftKey || ev.altKey) return;
+              ev.preventDefault();
+              downloadFile(a, a.href, f.name, f.size);
+            });
             filesList.appendChild(a);
           } else {
             // Inbox row: draggable absolute path, click-to-copy.
@@ -749,6 +760,69 @@
       } catch (e) {
         filesList.textContent = `offline: ${e.message || e}`;
       }
+    }
+
+    // Stream an outbox download with a live progress bar and a single-flight
+    // guard. We intercept the row click (rather than let the native
+    // `<a download>` navigate) so a big file over a slow link shows progress
+    // and the row is DISABLED until it finishes — no silent wait, no frantic
+    // re-clicks kicking off duplicate downloads. `size` is the server-reported
+    // byte count, used when the response omits Content-Length.
+    async function downloadFile(row, url, name, size) {
+      if (row.classList.contains("downloading")) return; // already running → disabled
+      row.classList.remove("dl-error");
+      row.classList.add("downloading");
+      const bar = row.querySelector(".dl-bar");
+      const setPct = (p) => { if (bar) bar.style.width = Math.max(0, Math.min(100, p)) + "%"; };
+      setPct(0);
+      try {
+        const resp = await fetch(url, { headers });
+        if (!resp.ok) throw new Error("HTTP " + resp.status);
+        const total = Number(resp.headers.get("content-length")) || Number(size) || 0;
+        if (!resp.body || !resp.body.getReader) {
+          // Browser can't stream the body — fall back to a plain blob (no live %).
+          saveBlob(await resp.blob(), name);
+          setPct(100);
+          return;
+        }
+        const reader = resp.body.getReader();
+        const chunks = [];
+        let received = 0;
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          chunks.push(value);
+          received += value.length;
+          setPct(total ? (received / total) * 100 : 0);
+        }
+        setPct(100);
+        saveBlob(new Blob(chunks), name);
+      } catch (e) {
+        row.classList.add("dl-error");
+        setPct(100);
+        toast(`download failed: ${e.message || e}`);
+      } finally {
+        // Re-enable shortly after (so the file can be re-fetched) and reset
+        // the bar; the brief delay lets the 100%/error state register visually.
+        setTimeout(() => {
+          row.classList.remove("downloading");
+          row.classList.remove("dl-error");
+          setPct(0);
+        }, 1200);
+      }
+    }
+
+    // Trigger a browser "save as" for an in-memory blob via a throwaway
+    // object-URL anchor (revoked shortly after so we don't leak).
+    function saveBlob(blob, name) {
+      const objUrl = URL.createObjectURL(blob);
+      const tmp = document.createElement("a");
+      tmp.href = objUrl;
+      tmp.download = name;
+      document.body.appendChild(tmp);
+      tmp.click();
+      tmp.remove();
+      setTimeout(() => URL.revokeObjectURL(objUrl), 10000);
     }
 
     // Monotonic PTY-byte offset we've fed into xterm.js. The server's
