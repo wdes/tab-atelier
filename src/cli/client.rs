@@ -25,7 +25,7 @@
 //! Adding a client command is now one arm here (+ one `clap` variant in
 //! `dispatch` if headless should list it in `--help`).
 
-use super::{bench, bench_lag, brain, claude_hook, delegate, flags, logging, remote};
+use super::{aligator, bench, bench_lag, brain, claude_hook, delegate, flags, logging, remote};
 use super::{set_context, set_font, set_status, share_link, team, tokens};
 
 /// Dispatch a client subcommand by name against raw `&[String]` args.
@@ -49,6 +49,9 @@ pub fn dispatch(name: &str, rest: &[String]) -> Option<i32> {
         "dispatch" => delegate::run(rest),
         "remote" => remote::run(rest),
         "brain" => brain::run(rest),
+        // 🐊 aligator (PoC #35): deterministic input router + its producer.
+        "aligator" => aligator::run(rest),
+        "swamp" => aligator::run_swamp(rest),
         "schedule" => share_link::schedule(rest),
         "log" => logging::run(rest),
         "flags" => flags::run(rest),
