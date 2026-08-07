@@ -2591,6 +2591,20 @@ impl AppState {
                 tracker.record_activity(cwd);
             }
         }
+
+        // Repaint the tab strip so background/remote-driven state actually
+        // shows. This 2s tick is the ONLY place the LED fields are refreshed —
+        // agent-status hooks (drained above), the blue "unreviewed work" flag,
+        // the green→grey streaming demotion, viewer-driven clearing, dead-agent
+        // red — but the tab bar only repaints when the App entity is notified,
+        // which otherwise happens solely on LOCAL input. Without this, doing
+        // work on a tab from the web viewer (or an agent streaming on a
+        // background tab) never moves its LED on the desktop until you click.
+        // Gated on visibility: a hidden drop-down needn't repaint (reveal drops
+        // caches + notifies), keeping idle CPU flat while parked in the tray.
+        if self.visible {
+            cx.notify();
+        }
     }
 
     fn respawn_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -3213,6 +3227,12 @@ impl AppState {
                                         app.active = i;
                                         app.tabs[i].activate();
                                         app.tabs[i].flush_pending_restore(cx);
+                                        // Rebuild from the live grid — the tab's caches went
+                                        // stale while it was backgrounded (see `select_tab`).
+                                        app.tabs[i].view.update(cx, |v, vcx| {
+                                            v.release_render_caches();
+                                            vcx.notify();
+                                        });
                                         app.context_menu = None;
                                         app.tabs[app.active].view.read(cx).focus_handle(cx).focus(window);
                                         cx.notify();
@@ -4382,6 +4402,16 @@ impl AppState {
             self.tabs[self.active].activate();
         }
         self.tabs[self.active].flush_pending_restore(cx);
+        // The tab we're switching TO wasn't mounted while backgrounded, so its
+        // grid may have advanced (remote/web-driven output, a TUI redraw) with
+        // no paint — its render caches are stale. Drop them + notify so the
+        // first frame rebuilds from the live grid; otherwise the desktop shows
+        // the frame from when we last left the tab (the "output not up to date
+        // after doing stuff from the web" bug).
+        self.tabs[self.active].view.update(cx, |v, vcx| {
+            v.release_render_caches();
+            vcx.notify();
+        });
         self.tabs[self.active].view.read(cx).focus_handle(cx).focus(window);
         cx.notify();
     }
