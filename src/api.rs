@@ -943,6 +943,68 @@ fn resolve_sandbox_path(cwd: &str, raw: &str) -> Result<std::path::PathBuf, (u16
     }
 }
 
+/// Max directory depth walked when listing `inbox/` or `outbox/`. Bounds
+/// the walk (and the response) against a pathologically deep tree; files
+/// below it aren't listed but remain downloadable by explicit `?path=`.
+const FILE_LIST_MAX_DEPTH: usize = 8;
+/// Hard cap on the number of files an `inbox/`/`outbox/` listing returns,
+/// so a directory with tens of thousands of entries can't blow up the
+/// JSON body or the viewer's tree.
+const FILE_LIST_MAX_ENTRIES: usize = 2000;
+
+/// Recursively collect regular files under `dir`, appending one JSON
+/// object per file. Each carries `path` (relative to the listing root,
+/// POSIX `/`-separated — the viewer builds its folder tree from this, and
+/// the download route accepts `<dir>/<path>`), `name` (the basename, used
+/// for display and the browser `download` attr), `size`, and `mtime`.
+/// The depth + entry caps above bound the walk and the response.
+///
+/// Symlinks are neither listed nor descended into: a symlinked directory
+/// could form a cycle or point outside the sandbox, and a symlinked file
+/// would 403 on download anyway ([`resolve_sandbox_path`] canonicalises
+/// and rejects escapes), so surfacing it would only leak the target's
+/// size/mtime. Each path component must pass [`sanitize_basename`] or the
+/// entry (and, for a directory, its whole subtree) is skipped — the same
+/// filter the flat listing used.
+fn collect_files_tree(dir: &std::path::Path, rel_prefix: &str, depth: usize, out: &mut Vec<serde_json::Value>) {
+    if depth > FILE_LIST_MAX_DEPTH || out.len() >= FILE_LIST_MAX_ENTRIES {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for entry in rd.flatten() {
+        if out.len() >= FILE_LIST_MAX_ENTRIES {
+            break;
+        }
+        let Some(name) = entry.file_name().to_str().and_then(sanitize_basename) else {
+            continue;
+        };
+        // `file_type()` does NOT follow symlinks, so a symlink is neither
+        // `is_dir()` nor `is_file()` here → it falls through, unlisted.
+        let Ok(ft) = entry.file_type() else { continue };
+        let rel = if rel_prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{rel_prefix}/{name}")
+        };
+        if ft.is_dir() {
+            collect_files_tree(&entry.path(), &rel, depth + 1, out);
+        } else if ft.is_file() {
+            let Ok(meta) = entry.metadata() else { continue };
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0u64, |d| d.as_secs());
+            out.push(serde_json::json!({
+                "name": name,
+                "path": rel,
+                "size": meta.len(),
+                "mtime": mtime,
+            }));
+        }
+    }
+}
+
 fn maybe_gzip(bytes: &[u8], accept_gzip: bool) -> Option<Vec<u8>> {
     const MIN_BODY: usize = 4096;
     if !accept_gzip || bytes.len() < MIN_BODY {
@@ -2785,34 +2847,15 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 return;
             };
             let dir_path = std::path::Path::new(&*cwd).join(dirname);
+            // Walk the whole subtree (not just the top level) so files the
+            // agent tucked into subfolders show up — the viewer renders
+            // them in tree mode. Each file carries a `path` relative to
+            // `dir_path`; downloads resolve it against `<dir>/<path>`.
             let mut files: Vec<serde_json::Value> = Vec::new();
-            if let Ok(rd) = std::fs::read_dir(&dir_path) {
-                for entry in rd.flatten() {
-                    let Some(name) = entry.file_name().to_str().and_then(sanitize_basename) else {
-                        // Skip anything that wouldn't be downloadable
-                        // anyway (sandbox_basename rejects `..`,
-                        // dotfiles, weird chars).
-                        continue;
-                    };
-                    let Ok(meta) = entry.metadata() else { continue };
-                    if !meta.is_file() {
-                        continue;
-                    }
-                    let mtime = meta
-                        .modified()
-                        .ok()
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map_or(0u64, |d| d.as_secs());
-                    files.push(serde_json::json!({
-                        "name": name,
-                        "size": meta.len(),
-                        "mtime": mtime,
-                    }));
-                }
-            }
-            // Stable order so the viewer's diff (new-file toast) is
-            // predictable across polls.
-            files.sort_by(|a, b| a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or("")));
+            collect_files_tree(&dir_path, "", 0, &mut files);
+            // Stable order (by relative path) so folders group together and
+            // the viewer's diff (new-file toast) is predictable across polls.
+            files.sort_by(|a, b| a["path"].as_str().unwrap_or("").cmp(b["path"].as_str().unwrap_or("")));
             let body = serde_json::to_string(&serde_json::json!({
                 "files": files,
                 "dir": dir_path.to_string_lossy(),
@@ -5597,12 +5640,14 @@ mod tests {
     }
 
     #[test]
-    fn outbox_endpoint_lists_real_files_alphabetically_and_skips_subdirs() {
+    fn outbox_endpoint_lists_files_recursively_with_relative_paths() {
         let (port, state, token) = spawn_server();
         let cwd = make_cwd_with_outbox(&[("zulu.bin", b"zz"), ("alpha.txt", b"a")]);
-        // Subdir must not appear in the listing — we only surface
-        // downloadable files.
-        std::fs::create_dir_all(cwd.path().join("outbox").join("subdir")).unwrap();
+        // A subfolder with a file: now surfaced with a relative `path` so
+        // the viewer can render it in tree mode (it used to be skipped).
+        let sub = cwd.path().join("outbox").join("reports");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("q1.csv"), b"xyz").unwrap();
         {
             let mut s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             s.tabs[0].cwd = Some(cwd.path().to_string_lossy().into());
@@ -5616,16 +5661,17 @@ mod tests {
         assert!(h.starts_with("HTTP/1.1 200"), "got: {h}");
         let parsed: serde_json::Value = serde_json::from_slice(&b).unwrap();
         let files = parsed["files"].as_array().expect("files array");
-        let names: Vec<&str> = files.iter().filter_map(|f| f["name"].as_str()).collect();
-        assert_eq!(names, vec!["alpha.txt", "zulu.bin"], "alphabetical + subdirs skipped");
-        let size_for = |n: &str| {
-            files
-                .iter()
-                .find(|f| f["name"].as_str() == Some(n))
-                .and_then(|f| f["size"].as_u64())
-        };
-        assert_eq!(size_for("alpha.txt"), Some(1));
-        assert_eq!(size_for("zulu.bin"), Some(2));
+        // Sorted by relative path: root files (alpha, zulu) plus the nested
+        // one under its folder prefix, interleaved alphabetically.
+        let paths: Vec<&str> = files.iter().filter_map(|f| f["path"].as_str()).collect();
+        assert_eq!(paths, vec!["alpha.txt", "reports/q1.csv", "zulu.bin"]);
+        // `name` stays the basename (display + the browser download attr).
+        let nested = files
+            .iter()
+            .find(|f| f["path"].as_str() == Some("reports/q1.csv"))
+            .expect("nested file listed");
+        assert_eq!(nested["name"].as_str(), Some("q1.csv"));
+        assert_eq!(nested["size"].as_u64(), Some(3));
     }
 
     #[test]
