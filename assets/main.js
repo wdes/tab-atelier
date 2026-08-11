@@ -685,12 +685,112 @@
         toast("copy failed — select & ⌘C manually");
       }
     }
-    // Render either the inbox or outbox listing. Inbox rows are
-    // draggable: dragstart populates text/plain + text/uri-list with
-    // the file's absolute path so the user can drop it straight into
-    // Claude, a code editor, or any other text target. Outbox rows
-    // are `<a download>` so left-click downloads, drag drags the
-    // file URL.
+    // Build one file row. Inbox rows are draggable divs: dragstart
+    // populates text/plain + text/uri-list with the file's absolute path
+    // so the user can drop it straight into Claude, a code editor, or any
+    // other text target, and a click copies that path. Outbox rows are
+    // `<a download>` so left-click downloads (intercepted for a progress
+    // bar) and drag drags the file URL. `f.path` is the file's path
+    // relative to the listing root (may contain `/`); `f.name` is its
+    // basename, shown as the row label since the folder is the tree node.
+    function makeFileRow(kind, f, dir) {
+      const relPath = f.path || f.name;
+      const absPath = dir ? `${dir.replace(/\/+$/, "")}/${relPath}` : `${kind}/${relPath}`;
+      const meta = `${humanSize(f.size)} · ${new Date(f.mtime * 1000).toISOString().slice(0, 16).replace("T", " ")}`;
+      if (kind === "outbox") {
+        const a = document.createElement("a");
+        const qpath = encodeURIComponent(`outbox/${relPath}`);
+        a.href = `${BASE}files?path=${qpath}${TOKEN ? "&token=" + encodeURIComponent(TOKEN) : ""}`;
+        // Keep the native download attr so drag-to-desktop and
+        // modifier-clicks still work and it degrades gracefully; a plain
+        // left-click is intercepted below to stream with a progress bar.
+        a.download = f.name;
+        a.draggable = true;
+        a.addEventListener("dragstart", (ev) => {
+          ev.dataTransfer.setData("text/plain", absPath);
+          ev.dataTransfer.setData("text/uri-list", `file://${absPath}`);
+          ev.dataTransfer.effectAllowed = "copyLink";
+        });
+        a.innerHTML = `${htmlEscape(f.name)}<div class="meta">${meta}</div>`
+          + `<div class="dl-progress"><div class="dl-bar"></div></div>`;
+        a.addEventListener("click", (ev) => {
+          // Let modified clicks (ctrl/cmd/shift/middle) use the native
+          // download; intercept only the plain left-click for progress.
+          if (ev.button !== 0 || ev.ctrlKey || ev.metaKey || ev.shiftKey || ev.altKey) return;
+          ev.preventDefault();
+          downloadFile(a, a.href, f.name, f.size);
+        });
+        return a;
+      }
+      // Inbox row: draggable absolute path, click-to-copy. Not a download
+      // link — the agent is what consumes these.
+      const div = document.createElement("div");
+      div.className = "copy-relpath";
+      div.draggable = true;
+      div.title = absPath + "\n(drag to Claude or click to copy)";
+      div.addEventListener("dragstart", (ev) => {
+        ev.dataTransfer.setData("text/plain", absPath);
+        ev.dataTransfer.setData("text/uri-list", `file://${absPath}`);
+        ev.dataTransfer.effectAllowed = "copyLink";
+      });
+      div.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        copyText(absPath, "copied: " + absPath);
+      });
+      div.innerHTML = `${htmlEscape(f.name)}<div class="meta">${meta}</div>`;
+      return div;
+    }
+
+    // Group the flat file list into a nested folder tree keyed off each
+    // file's `path` (POSIX `/`-separated, relative to the listing root).
+    // A file with no `/` sits at the root; with subfolders it nests. When
+    // nobody used subfolders this collapses to a flat list — the folder
+    // nodes just never get created.
+    function buildFileTree(files) {
+      const root = { dirs: new Map(), files: [] };
+      for (const f of files) {
+        const parts = (f.path || f.name).split("/");
+        parts.pop(); // drop the basename — it's the leaf row, not a folder
+        let node = root;
+        for (const part of parts) {
+          let child = node.dirs.get(part);
+          if (!child) { child = { dirs: new Map(), files: [] }; node.dirs.set(part, child); }
+          node = child;
+        }
+        node.files.push(f);
+      }
+      return root;
+    }
+
+    // Render a tree node into `container`. Folders come first (sorted,
+    // each collapsible by clicking its header), then this level's files.
+    // `depth` drives the left indent; folder collapse toggles the child
+    // container's display so descendant rows hide/show as a unit.
+    function renderFileTree(node, container, depth, kind, dir) {
+      const indent = (8 + depth * 14) + "px";
+      for (const name of [...node.dirs.keys()].sort((a, b) => a.localeCompare(b))) {
+        const folder = document.createElement("div");
+        folder.className = "tree-folder";
+        folder.style.paddingLeft = indent;
+        folder.innerHTML = `<span class="caret">▾</span> 📁 ${htmlEscape(name)}`;
+        const children = document.createElement("div");
+        children.className = "tree-children";
+        folder.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          children.style.display = folder.classList.toggle("collapsed") ? "none" : "";
+        });
+        container.appendChild(folder);
+        container.appendChild(children);
+        renderFileTree(node.dirs.get(name), children, depth + 1, kind, dir);
+      }
+      for (const f of node.files.slice().sort((a, b) => (a.name || "").localeCompare(b.name || ""))) {
+        const row = makeFileRow(kind, f, dir);
+        row.style.paddingLeft = indent;
+        container.appendChild(row);
+      }
+    }
+
+    // Render the inbox or outbox listing as a folder tree.
     async function refreshFiles(kind) {
       filesTitle.textContent = `${kind}/`;
       filesList.textContent = "loading…";
@@ -710,53 +810,7 @@
           return;
         }
         filesList.innerHTML = "";
-        for (const f of files) {
-          const absPath = j.dir ? `${j.dir.replace(/\/+$/, "")}/${f.name}` : `${kind}/${f.name}`;
-          const meta = `${humanSize(f.size)} · ${new Date(f.mtime * 1000).toISOString().slice(0, 16).replace("T", " ")}`;
-          if (kind === "outbox") {
-            const a = document.createElement("a");
-            const qpath = encodeURIComponent(`outbox/${f.name}`);
-            a.href = `${BASE}files?path=${qpath}${TOKEN ? "&token=" + encodeURIComponent(TOKEN) : ""}`;
-            // Keep the native download attr so drag-to-desktop and
-            // modifier-clicks still work and it degrades gracefully; a plain
-            // left-click is intercepted below to stream with a progress bar.
-            a.download = f.name;
-            a.draggable = true;
-            a.addEventListener("dragstart", (ev) => {
-              ev.dataTransfer.setData("text/plain", absPath);
-              ev.dataTransfer.setData("text/uri-list", `file://${absPath}`);
-              ev.dataTransfer.effectAllowed = "copyLink";
-            });
-            a.innerHTML = `${htmlEscape(f.name)}<div class="meta">${meta}</div>`
-              + `<div class="dl-progress"><div class="dl-bar"></div></div>`;
-            a.addEventListener("click", (ev) => {
-              // Let modified clicks (ctrl/cmd/shift/middle) use the native
-              // download; intercept only the plain left-click for progress.
-              if (ev.button !== 0 || ev.ctrlKey || ev.metaKey || ev.shiftKey || ev.altKey) return;
-              ev.preventDefault();
-              downloadFile(a, a.href, f.name, f.size);
-            });
-            filesList.appendChild(a);
-          } else {
-            // Inbox row: draggable absolute path, click-to-copy.
-            // Not a download link — the agent is what consumes these.
-            const div = document.createElement("div");
-            div.className = "copy-relpath";
-            div.draggable = true;
-            div.title = absPath + "\n(drag to Claude or click to copy)";
-            div.addEventListener("dragstart", (ev) => {
-              ev.dataTransfer.setData("text/plain", absPath);
-              ev.dataTransfer.setData("text/uri-list", `file://${absPath}`);
-              ev.dataTransfer.effectAllowed = "copyLink";
-            });
-            div.addEventListener("click", (ev) => {
-              ev.stopPropagation();
-              copyText(absPath, "copied: " + absPath);
-            });
-            div.innerHTML = `${htmlEscape(f.name)}<div class="meta">${meta}</div>`;
-            filesList.appendChild(div);
-          }
-        }
+        renderFileTree(buildFileTree(files), filesList, 0, kind, j.dir || "");
       } catch (e) {
         filesList.textContent = `offline: ${e.message || e}`;
       }
