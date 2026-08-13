@@ -1370,6 +1370,7 @@ impl AppState {
             pending_claude_only: None,
             pending_relay_mode: None,
             pending_env_changes: Vec::new(),
+            pending_relay_config: None,
             pending_renames: Vec::new(),
             pending_status_updates: Vec::new(),
             cached_response: None,
@@ -2262,11 +2263,16 @@ impl AppState {
             let resize_changes: Vec<(String, Option<(u16, u16)>)> = snapshot.pending_resizes.drain(..).collect();
             let claude_only_change: Option<bool> = snapshot.pending_claude_only.take();
             let relay_mode_change: Option<bool> = snapshot.pending_relay_mode.take();
+            let relay_config_change = snapshot.pending_relay_config.take();
             let env_changes: Vec<crate::api::EnvChange> = snapshot.pending_env_changes.drain(..).collect();
             drop(snapshot);
             // Relay-mode toggle from the CLI/API (`relay on|off`).
             if let Some(on) = relay_mode_change {
                 self.set_relay_mode_mode(on);
+            }
+            // Relay endpoint/egress change (`relay via` / `relay egress`).
+            if let Some(ch) = relay_config_change {
+                crate::apply_relay_config(&ch, &platform::config_dir());
             }
             // Env changes (`env set/unset`). Global → the process-global map +
             // preference; per-tab → the runtime Tab (persisted next tick). Both
