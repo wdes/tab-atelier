@@ -587,6 +587,10 @@ struct AppState {
     /// a shell. Mirrors [`crate::CLAUDE_ONLY`] / `Preferences::claude_only`;
     /// the right-click "New bash tab" item cancels it.
     claude_only: bool,
+    /// Relay mode: claude tabs' Anthropic calls go through the configured
+    /// remote. Mirrors [`crate::RELAY_MODE`] / `Preferences::relay_mode`;
+    /// toggled from the right-click menu.
+    relay_mode: bool,
     renaming: Option<(usize, String)>,
     rename_select_all: bool,
     rename_focus: FocusHandle,
@@ -845,6 +849,12 @@ impl AppState {
         // so both agree from the first tab.
         let claude_only = crate::claude_only() || prefs.claude_only;
         crate::set_claude_only(claude_only);
+        // Relay mode: on if the `--relay` flag (already in the global) or the
+        // preference asked for it; sync the global. Seed the global tab-env map
+        // from the preference so `env set --global` values apply from boot.
+        let relay_mode = crate::relay_mode() || prefs.relay_mode;
+        crate::set_relay_mode(relay_mode);
+        crate::set_tab_env_global(prefs.tab_env.clone());
         let opacity = prefs.opacity.unwrap_or(0xb8);
         let hotkeys = if prefs.hotkeys.is_empty() {
             DEFAULT_HOTKEYS.to_vec()
@@ -1342,6 +1352,7 @@ impl AppState {
             pending_default_limits: None,
             pending_resizes: Vec::new(),
             pending_claude_only: None,
+            pending_relay_mode: None,
             pending_renames: Vec::new(),
             pending_status_updates: Vec::new(),
             cached_response: None,
@@ -1441,6 +1452,7 @@ impl AppState {
             opacity,
             show_tab_gauge: prefs.show_tab_gauge,
             claude_only,
+            relay_mode,
             hotkeys,
             show_preferences: false,
             show_hotkey_picker: false,
@@ -1614,6 +1626,18 @@ impl AppState {
         if !crate::read_only() {
             let mut prefs = load_preferences(&platform::config_dir());
             prefs.claude_only = on;
+            save_preferences(&platform::config_dir(), &prefs);
+        }
+    }
+
+    /// Flip relay mode: struct field + global (read by `tab_env_extras`) +
+    /// persisted preference. Applies to tabs spawned after the toggle.
+    fn set_relay_mode_mode(&mut self, on: bool) {
+        self.relay_mode = on;
+        crate::set_relay_mode(on);
+        if !crate::read_only() {
+            let mut prefs = load_preferences(&platform::config_dir());
+            prefs.relay_mode = on;
             save_preferences(&platform::config_dir(), &prefs);
         }
     }
@@ -2214,7 +2238,12 @@ impl AppState {
             let default_limit_change: Option<(crate::TabResourceLimits, bool)> = snapshot.pending_default_limits.take();
             let resize_changes: Vec<(String, Option<(u16, u16)>)> = snapshot.pending_resizes.drain(..).collect();
             let claude_only_change: Option<bool> = snapshot.pending_claude_only.take();
+            let relay_mode_change: Option<bool> = snapshot.pending_relay_mode.take();
             drop(snapshot);
+            // Relay-mode toggle from the CLI/API (`relay on|off`).
+            if let Some(on) = relay_mode_change {
+                self.set_relay_mode_mode(on);
+            }
             // Forced Claude-only toggle from the CLI/API (`claude-only on|off`).
             // Mirror onto the struct field + global (read by `insert_tab`) and
             // persist, so the change survives a restart like the menu toggle.
@@ -5622,6 +5651,14 @@ impl AppState {
                                                         // Menu-toggled (right-click), not in this dialog —
                                                         // carry it through so saving prefs doesn't drop it.
                                                         claude_only: this.claude_only,
+                                                        // Relay + env are set via CLI/menu with
+                                                        // their own persist paths — carry the
+                                                        // on-disk values so the dialog save
+                                                        // doesn't clobber them.
+                                                        relay_mode: this.relay_mode,
+                                                        relay_endpoint_id: on_disk_prefs.relay_endpoint_id,
+                                                        relay_egress: on_disk_prefs.relay_egress,
+                                                        tab_env: on_disk_prefs.tab_env,
                                                         hotkeys: this.hotkeys.clone(),
                                                         browser,
                                                         code_editor: editor,

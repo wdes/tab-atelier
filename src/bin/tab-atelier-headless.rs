@@ -49,6 +49,12 @@ fn main() {
     }
 
     let read_only = cli_args.read_only;
+    let relay = cli_args.relay;
+    // Seed relay mode from the flag before the daemon reads the global;
+    // `headless::run` ORs in the persisted `relay_mode` preference.
+    if relay {
+        tab_atelier::set_relay_mode(true);
+    }
 
     // A subcommand short-circuits via std::process::exit inside the
     // dispatcher. Returns here only when the user gave no subcommand,

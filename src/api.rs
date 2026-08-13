@@ -529,6 +529,9 @@ pub struct TabSnapshot {
     /// `claude-only on|off`). `Some(true/false)` sets the mode live; the owner
     /// mirrors it onto [`crate::CLAUDE_ONLY`] + its struct field and persists.
     pub pending_claude_only: Option<bool>,
+    /// Relay-mode toggle queued by `POST /relay-mode` (the CLI `relay on|off`).
+    /// The owner mirrors it onto [`crate::RELAY_MODE`] + its struct field.
+    pub pending_relay_mode: Option<bool>,
     /// (tab index, new name) pairs queued by `POST /tabs/{idx}/rename`.
     pub pending_renames: Vec<(usize, String)>,
     /// Queued agent-status updates from `POST /tabs/by-id/{id}/status`.
@@ -2376,6 +2379,27 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             drop(snap);
             respond_json(stream, 200, r#"{"queued":"claude-only"}"#);
         }
+        ("POST", "/relay-mode") => {
+            // Toggle relay mode live (the CLI `relay on|off`). Body:
+            // {"on": true|false}. The owner mirrors it onto RELAY_MODE + its
+            // struct field and persists; claude tabs spawned after route their
+            // Anthropic calls through the configured remote.
+            let parsed: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+                Ok(v) => v,
+                Err(e) => {
+                    error_json(stream, 400, &format!("invalid JSON body: {e}"));
+                    return;
+                }
+            };
+            let Some(on) = parsed.get("on").and_then(serde_json::Value::as_bool) else {
+                error_json(stream, 400, r#"provide {"on": true|false}"#);
+                return;
+            };
+            let mut snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            snap.pending_relay_mode = Some(on);
+            drop(snap);
+            respond_json(stream, 200, r#"{"queued":"relay-mode"}"#);
+        }
         ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/resize") => {
             // Pin (or clear) a tab's fixed grid size (the CLI `resize`). Body:
             // {"cols":N,"rows":M} pins to that size (both >= 2 / >= 1), or
@@ -3940,6 +3964,7 @@ pub fn test_snapshot(tabs: Vec<SnapshotTab>) -> TabSnapshot {
         pending_default_limits: None,
         pending_resizes: Vec::new(),
         pending_claude_only: None,
+        pending_relay_mode: None,
         pending_renames: vec![],
         pending_status_updates: vec![],
         cached_response: None,
