@@ -48,9 +48,45 @@ struct CredentialsFile {
     claude_ai_oauth: OauthBlob,
 }
 
+/// Test/ops override for the credentials file location. Set via
+/// [`set_credentials_path`]; falls back to `~/.claude/.credentials.json`.
+static CREDS_PATH_OVERRIDE: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
+
+/// Point the egress at a different credentials file (tests use a fixture; ops
+/// could point at a service account's creds). `None` restores the default.
+pub fn set_credentials_path(path: Option<PathBuf>) {
+    if let Ok(mut g) = CREDS_PATH_OVERRIDE.write() {
+        *g = path;
+    }
+}
+
 fn credentials_path() -> Result<PathBuf, String> {
+    if let Some(p) = CREDS_PATH_OVERRIDE.read().ok().and_then(|g| g.clone()) {
+        return Ok(p);
+    }
     let home = std::env::var_os("HOME").ok_or("no $HOME — can't locate ~/.claude/.credentials.json")?;
     Ok(PathBuf::from(home).join(".claude").join(".credentials.json"))
+}
+
+/// Test/ops override for the egress upstream. Set via [`set_upstream`], else the
+/// `TAB_ATELIER_RELAY_UPSTREAM` env var, else [`ANTHROPIC_BASE`].
+static UPSTREAM_OVERRIDE: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+/// Point the egress at a different upstream (tests use a mock Anthropic).
+pub fn set_upstream(url: Option<String>) {
+    if let Ok(mut g) = UPSTREAM_OVERRIDE.write() {
+        *g = url;
+    }
+}
+
+/// The egress upstream base URL (no trailing slash).
+#[must_use]
+pub fn upstream() -> String {
+    if let Some(u) = UPSTREAM_OVERRIDE.read().ok().and_then(|g| g.clone()) {
+        return u.trim_end_matches('/').to_owned();
+    }
+    std::env::var("TAB_ATELIER_RELAY_UPSTREAM")
+        .map_or_else(|_| ANTHROPIC_BASE.to_owned(), |u| u.trim_end_matches('/').to_owned())
 }
 
 fn now_ms() -> u64 {

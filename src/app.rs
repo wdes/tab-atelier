@@ -854,6 +854,7 @@ impl AppState {
         // from the preference so `env set --global` values apply from boot.
         let relay_mode = crate::relay_mode() || prefs.relay_mode;
         crate::set_relay_mode(relay_mode);
+        crate::install_relay_config(&prefs);
         crate::set_tab_env_global(prefs.tab_env.clone());
         let opacity = prefs.opacity.unwrap_or(0xb8);
         let hotkeys = if prefs.hotkeys.is_empty() {

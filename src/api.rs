@@ -3297,8 +3297,14 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
 // POST and every output poll — the change the user could feel.
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
+use http_body_util::combinators::BoxBody;
+use http_body_util::{BodyExt, Full, StreamBody};
+use hyper::body::{Frame, Incoming};
+
+/// Unified response body for the hyper service: most routes buffer a
+/// `Full<Bytes>`, but the relay route streams SSE — both erase to this boxed
+/// body (error type `Infallible`; an upstream read error just ends the stream).
+type RespBody = BoxBody<Bytes, std::convert::Infallible>;
 use hyper::server::conn::http1 as h1_conn;
 use hyper::server::conn::http2 as h2_conn;
 use hyper::service::service_fn;
@@ -3414,16 +3420,20 @@ async fn handle_hyper_request(
     state: Arc<Mutex<TabSnapshot>>,
     token: String,
     read_only: bool,
-) -> Result<Response<Full<Bytes>>, Infallible> {
+) -> Result<Response<RespBody>, Infallible> {
     let path = req.uri().path().to_string();
     // Intercept WS upgrade BEFORE we collect the body into the sync
     // adapter — the WS handshake needs the original Request so it
     // can return a 101 Switching Protocols + park the connection.
     if let Some((key, is_uuid)) = crate::api_ws::parse_ws_path(&path) {
         let key = key.to_string();
-        return Ok(crate::api_ws::handle_upgrade(
-            req, state, &token, read_only, key, is_uuid,
-        ));
+        return Ok(crate::api_ws::handle_upgrade(req, state, &token, read_only, key, is_uuid).map(BodyExt::boxed));
+    }
+    // Anthropic API relay (streaming SSE) — also handled natively so the
+    // response body can stream, escaping the buffered `Full<Bytes>` path (like
+    // the WS upgrade above). Everything else falls through to the sync handler.
+    if path.starts_with("/relay/anthropic/") {
+        return Ok(handle_relay(req, &token).await);
     }
     let method = req.method().to_string();
     let uri = req
@@ -3439,8 +3449,8 @@ async fn handle_hyper_request(
         Err(_) => {
             return Ok(Response::builder()
                 .status(400)
-                .body(Full::new(Bytes::from("bad body")))
-                .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()))));
+                .body(Full::new(Bytes::from("bad body")).boxed())
+                .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()).boxed())));
         }
     };
     let head = format_h1_request(&method, &uri, &headers, body.len());
@@ -3456,7 +3466,168 @@ async fn handle_hyper_request(
     })
     .await
     .unwrap_or_default();
-    Ok(parse_h1_response(resp))
+    Ok(parse_h1_response(resp).map(BodyExt::boxed))
+}
+
+/// A small buffered relay response (errors / 401s), boxed to match [`RespBody`].
+fn relay_status(code: u16, msg: &str) -> Response<RespBody> {
+    Response::builder()
+        .status(code)
+        .header("content-type", "text/plain; charset=utf-8")
+        .body(Full::new(Bytes::from(msg.to_owned())).boxed())
+        .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()).boxed()))
+}
+
+/// Streaming Anthropic API relay (`/relay/anthropic/*`).
+///
+/// A native async handler so the SSE response streams end-to-end (the buffered
+/// sync path can't). Role is config-driven: the **egress** instance forwards to
+/// `api.anthropic.com` injecting the remote's Claude OAuth token (see
+/// [`crate::relay`]); otherwise the **local** instance forwards to the
+/// configured remote's `/relay/anthropic/*`. Auth: the local hop presents the
+/// stand-in `x-api-key`, the egress hop a `Bearer` — both must equal this
+/// instance's master token.
+async fn handle_relay(req: Request<Incoming>, master_token: &str) -> Response<RespBody> {
+    let method = req.method().clone();
+    let full = req.uri().path();
+    let sub = full.strip_prefix("/relay/anthropic").unwrap_or("").to_string();
+    let sub_pq = req.uri().query().map_or_else(|| sub.clone(), |q| format!("{sub}?{q}"));
+    let egress = crate::relay_egress();
+
+    // Auth against this instance's master token (constant-time).
+    let provided = if egress {
+        req.headers()
+            .get(hyper::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .unwrap_or("")
+            .to_owned()
+    } else {
+        req.headers()
+            .get("x-api-key")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_owned()
+    };
+    if !constant_time_eq(provided.as_bytes(), master_token.as_bytes()) {
+        return relay_status(401, "relay: unauthorized");
+    }
+
+    let content_type = req
+        .headers()
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json")
+        .to_owned();
+    let is_post = method == hyper::Method::POST;
+    let (_parts, body) = req.into_parts();
+    let body = match body.collect().await {
+        Ok(c) => c.to_bytes(),
+        Err(_) => return relay_status(400, "relay: bad request body"),
+    };
+    let target = crate::relay_target();
+
+    // Bridge ureq's blocking response reader → an async hyper stream. The
+    // blocking task sends the (status, content-type) meta over a oneshot, then
+    // pumps body chunks over an mpsc; the async side builds a StreamBody.
+    let (meta_tx, meta_rx) = tokio::sync::oneshot::channel::<Result<(u16, Option<String>), String>>();
+    let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Bytes>(16);
+    tokio::task::spawn_blocking(move || {
+        let agent = crate::relay::relay_agent();
+        let (url, bearer, cf) = if egress {
+            let token = match crate::relay::oauth_access_token() {
+                Ok(t) => t,
+                Err(e) => {
+                    let _ = meta_tx.send(Err(format!("egress oauth: {e}")));
+                    return;
+                }
+            };
+            (format!("{}{sub_pq}", crate::relay::upstream()), token, None)
+        } else if let Some(t) = target {
+            let cf = (!t.cf_access_client_id.is_empty())
+                .then(|| (t.cf_access_client_id.clone(), t.cf_access_client_secret.clone()));
+            (format!("{}/relay/anthropic{sub_pq}", t.url), t.token, cf)
+        } else {
+            let _ = meta_tx.send(Err("relay not configured (set relay_endpoint_id)".to_owned()));
+            return;
+        };
+
+        // Build the header list once (ureq's POST/GET builders are distinct
+        // typestates, so apply them inside each branch).
+        let mut hdrs: Vec<(&str, String)> = vec![
+            ("Content-Type", content_type),
+            ("Authorization", format!("Bearer {bearer}")),
+        ];
+        if egress {
+            hdrs.push(("anthropic-version", crate::relay::ANTHROPIC_VERSION.to_owned()));
+            hdrs.push(("anthropic-beta", crate::relay::ANTHROPIC_BETA.to_owned()));
+        } else {
+            hdrs.push(("Accept", "application/json".to_owned()));
+            if let Some((id, sec)) = cf {
+                hdrs.push(("CF-Access-Client-Id", id));
+                hdrs.push(("CF-Access-Client-Secret", sec));
+            }
+        }
+        let sent = if is_post {
+            let mut rb = agent.post(&url);
+            for (k, v) in &hdrs {
+                rb = rb.header(*k, v);
+            }
+            rb.send(&body[..])
+        } else {
+            let mut rb = agent.get(&url);
+            for (k, v) in &hdrs {
+                rb = rb.header(*k, v);
+            }
+            rb.call()
+        };
+        let mut resp = match sent {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = meta_tx.send(Err(format!("upstream: {e}")));
+                return;
+            }
+        };
+        let status = resp.status().as_u16();
+        let ctype = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        if meta_tx.send(Ok((status, ctype))).is_err() {
+            return;
+        }
+        let mut reader = resp.body_mut().as_reader();
+        let mut buf = [0u8; 8192];
+        loop {
+            match std::io::Read::read(&mut reader, &mut buf) {
+                Ok(0) | Err(_) => break, // EOF or upstream read error → end stream
+                Ok(n) => {
+                    if body_tx.blocking_send(Bytes::copy_from_slice(&buf[..n])).is_err() {
+                        break; // client hung up
+                    }
+                }
+            }
+        }
+    });
+
+    let meta = match meta_rx.await {
+        Ok(Ok(m)) => m,
+        Ok(Err(e)) => return relay_status(502, &format!("relay: {e}")),
+        Err(_) => return relay_status(502, "relay: forward task died"),
+    };
+    let stream = futures_util::stream::unfold(body_rx, |mut rx| async move {
+        rx.recv()
+            .await
+            .map(|b| (Ok::<_, std::convert::Infallible>(Frame::data(b)), rx))
+    });
+    let mut builder = Response::builder().status(meta.0);
+    if let Some(ct) = meta.1 {
+        builder = builder.header("content-type", ct);
+    }
+    builder
+        .body(StreamBody::new(stream).boxed())
+        .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()).boxed()))
 }
 
 /// Pick the right hyper connection driver for the negotiated ALPN.
@@ -4309,6 +4480,93 @@ mod tests {
 
     fn body(response: &str) -> &str {
         response.split("\r\n\r\n").nth(1).unwrap_or("")
+    }
+
+    /// End-to-end: a client POST through the EGRESS relay is forwarded to a
+    /// mock "Anthropic", streaming the SSE response back, with the stand-in
+    /// auth swapped for the remote's Claude OAuth token. Mocks the real Claude
+    /// API (mirrors `catbus-agent/tests/openai_mock.rs`).
+    #[test]
+    fn relay_egress_streams_sse_and_injects_oauth() {
+        use std::io::{Read, Write};
+
+        // Fixture credentials: a far-future access token so no network refresh.
+        let dir = tempfile::tempdir().unwrap();
+        let creds = dir.path().join("creds.json");
+        std::fs::write(
+            &creds,
+            r#"{"claudeAiOauth":{"accessToken":"oat-fixture-xyz","refreshToken":"ort-x","expiresAt":9999999999999,"scopes":["user:inference"]}}"#,
+        )
+        .unwrap();
+
+        // Mock upstream Anthropic: capture the Authorization header, then stream
+        // two SSE frames with a gap and close (connection-close framing).
+        let mock = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mock_port = mock.local_addr().unwrap().port();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = mock.accept() {
+                sock.set_read_timeout(Some(std::time::Duration::from_secs(2))).ok();
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 1024];
+                while let Ok(n) = sock.read(&mut tmp) {
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let head = String::from_utf8_lossy(&buf);
+                let auth = head
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
+                    .unwrap_or("")
+                    .to_owned();
+                let _ = seen_tx.send(auth);
+                let _ =
+                    sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n");
+                let _ = sock.write_all(b"data: {\"type\":\"message_start\"}\n\n");
+                let _ = sock.flush();
+                std::thread::sleep(std::time::Duration::from_millis(40));
+                let _ = sock.write_all(b"data: [DONE]\n\n");
+                let _ = sock.flush();
+            }
+        });
+
+        // Configure the egress role + point it at the mock + fixture creds.
+        crate::relay::set_credentials_path(Some(creds));
+        crate::relay::set_upstream(Some(format!("http://127.0.0.1:{mock_port}")));
+        crate::set_relay_egress(true);
+
+        let (port, _state, token) = spawn_server();
+        let payload = "{}";
+        let req = format!(
+            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+            payload.len()
+        );
+        let resp = request(port, &req);
+
+        // Restore globals so parallel/later tests aren't affected.
+        crate::set_relay_egress(false);
+        crate::relay::set_upstream(None);
+        crate::relay::set_credentials_path(None);
+
+        assert_eq!(status_code(&resp), 200, "resp: {resp}");
+        assert!(resp.contains("data:"), "expected streamed SSE, got: {resp}");
+        assert!(resp.contains("[DONE]"), "expected final SSE frame, got: {resp}");
+        let seen = seen_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap_or_default();
+        assert!(
+            seen.contains("oat-fixture-xyz"),
+            "egress must inject the Claude OAuth token; upstream saw: {seen}"
+        );
+        assert!(
+            !seen.contains(token.as_str()),
+            "the stand-in relay token must never reach Anthropic; saw: {seen}"
+        );
     }
 
     #[test]
