@@ -142,6 +142,58 @@ pub fn set_relay_mode(on: bool) {
     RELAY_MODE.store(on, Ordering::SeqCst);
 }
 
+/// Egress role: this instance terminates `/relay/anthropic/*` and forwards to
+/// `api.anthropic.com` using its own Claude login (set on the REMOTE).
+pub static RELAY_EGRESS: AtomicBool = AtomicBool::new(false);
+
+#[must_use]
+pub fn relay_egress() -> bool {
+    RELAY_EGRESS.load(Ordering::SeqCst)
+}
+
+pub fn set_relay_egress(on: bool) {
+    RELAY_EGRESS.store(on, Ordering::SeqCst);
+}
+
+/// Resolved forward target for the LOCAL relay hop: the remote tab-atelier's
+/// URL + credentials (from the `relay_endpoint_id` preference). `None` when
+/// unconfigured or when this instance is the egress.
+#[derive(Clone)]
+pub struct RelayTarget {
+    pub url: String,
+    pub token: String,
+    pub cf_access_client_id: String,
+    pub cf_access_client_secret: String,
+}
+
+static RELAY_TARGET: std::sync::RwLock<Option<RelayTarget>> = std::sync::RwLock::new(None);
+
+pub fn set_relay_target(target: Option<RelayTarget>) {
+    if let Ok(mut g) = RELAY_TARGET.write() {
+        *g = target;
+    }
+}
+
+#[must_use]
+pub fn relay_target() -> Option<RelayTarget> {
+    RELAY_TARGET.read().ok().and_then(|g| g.clone())
+}
+
+/// Resolve + install the relay egress flag and forward target from a loaded
+/// `Preferences`. Called at startup (both editions) and after a relay toggle.
+pub fn install_relay_config(prefs: &Preferences) {
+    set_relay_egress(prefs.relay_egress);
+    let target = prefs.relay_endpoint_id.as_deref().and_then(|id| {
+        prefs.remote_endpoints.iter().find(|e| e.id == id).map(|e| RelayTarget {
+            url: e.url.trim_end_matches('/').to_string(),
+            token: e.token.clone(),
+            cf_access_client_id: e.cf_access_client_id.clone(),
+            cf_access_client_secret: e.cf_access_client_secret.clone(),
+        })
+    });
+    set_relay_target(target);
+}
+
 /// Global user env vars injected into EVERY tab's PTY (the CLI
 /// `env set --global KEY=VAL`).
 ///

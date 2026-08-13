@@ -750,6 +750,7 @@ pub fn run() -> std::io::Result<()> {
     if crate::relay_mode() || prefs.relay_mode {
         crate::set_relay_mode(true);
     }
+    crate::install_relay_config(&prefs);
     crate::set_tab_env_global(prefs.tab_env.clone());
 
     // Latch the cleared-env opt-in for every tab spawn this process does.
