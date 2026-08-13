@@ -3047,11 +3047,15 @@ impl AppState {
             // make "this tab won't accept input" obvious at a glance,
             // and stays out of the rename text (still raw name in the
             // rename editor).
-            let base_name = if let Some((ri, ref text)) = self.renaming {
-                if ri == i { text.clone() } else { tab.name.to_string() }
-            } else {
-                tab.name.to_string()
-            };
+            // Always show the tab's STABLE name in the strip — never the
+            // in-progress rename text. The rename editor is the centered modal
+            // (`render_rename_input`); mirroring the live text here grew this
+            // tab as you typed, and the tab bar is `flex_wrap`, so a longer name
+            // could wrap the strip onto a second row, shrink the terminal area,
+            // and SIGWINCH-resize every background tab — whose redraw bumped
+            // `last_output_at` and falsely lit their green "streaming" LED
+            // (all tabs flashing green while renaming). A stable width avoids it.
+            let base_name = tab.name.to_string();
             let name = if tab.locked && self.renaming.as_ref().is_none_or(|(ri, _)| *ri != i) {
                 format!("🔒 {base_name}")
             } else {
