@@ -856,6 +856,90 @@ pub fn relay(args: &[String]) -> i32 {
     }
 }
 
+/// `env set KEY=VAL | env unset KEY | env list` (`--global` or `--tab <id>`).
+///
+/// Sets/removes env vars injected into tabs' PTYs. `set`/`unset` POST a merge
+/// to `/env` (global) or `/tabs/<id>/env` (per-tab); `list` GETs the global map.
+/// Changes take effect on a tab's next (re)spawn.
+#[must_use]
+pub fn env(action: &str, args: &[String], global: bool, tab: Option<&str>) -> i32 {
+    let ep = match discover_endpoint() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("env: {e}");
+            return 1;
+        }
+    };
+    if action == "list" {
+        if tab.is_some() {
+            eprintln!("env list: per-tab listing isn't supported — use --global (or read tabs.json)");
+            return 2;
+        }
+        match agent()
+            .get(format!("{}/env", ep.url))
+            .header("Authorization", format!("Bearer {}", ep.token))
+            .call()
+        {
+            Ok(mut r) => {
+                let map: std::collections::BTreeMap<String, String> = r.body_mut().read_json().unwrap_or_default();
+                for (k, v) in map {
+                    println!("{k}={v}");
+                }
+                0
+            }
+            Err(e) => {
+                eprintln!("env list: {e}");
+                1
+            }
+        }
+    } else {
+        if !global && tab.is_none() {
+            eprintln!("env {action}: pass --global or --tab <id>");
+            return 2;
+        }
+        let mut set = serde_json::Map::new();
+        let mut unset: Vec<serde_json::Value> = Vec::new();
+        for a in args {
+            if action == "set" {
+                if let Some((k, v)) = a.split_once('=') {
+                    set.insert(k.to_owned(), serde_json::Value::String(v.to_owned()));
+                } else {
+                    eprintln!("env set: expected KEY=VALUE, got `{a}`");
+                    return 2;
+                }
+            } else {
+                unset.push(serde_json::Value::String(a.clone()));
+            }
+        }
+        let body = serde_json::json!({ "set": set, "unset": unset }).to_string();
+        let url = tab.map_or_else(
+            || format!("{}/env", ep.url),
+            |t| {
+                if t.parse::<usize>().is_ok() {
+                    format!("{}/tabs/{t}/env", ep.url)
+                } else {
+                    format!("{}/tabs/by-id/{t}/env", ep.url)
+                }
+            },
+        );
+        match agent()
+            .post(url)
+            .header("Authorization", format!("Bearer {}", ep.token))
+            .header("Content-Type", "application/json")
+            .send(body.as_bytes())
+        {
+            Ok(_) => {
+                println!("env {action} queued (applies on the tab's next spawn)");
+                0
+            }
+            Err(e) => {
+                eprintln!("env {action}: {e}");
+                1
+            }
+        }
+    }
+}
+
 /// `&[String]` front-end for [`limit`], used by the GUI binary's subcommand
 /// match (`tab-atelier limit <tab> …`).
 ///

@@ -246,12 +246,21 @@ static INSTANCE_LOCK: OnceLock<std::fs::File> = OnceLock::new();
 /// (the `tab-atelier set-status` / `tabs` subcommands both rely on
 /// them).
 #[must_use]
-pub fn tab_env_extras(tab_id: &str, api_url: &str, api_token: &str) -> std::collections::HashMap<String, String> {
+pub fn tab_env_extras(
+    tab_id: &str,
+    api_url: &str,
+    api_token: &str,
+    per_tab: &std::collections::BTreeMap<String, String>,
+) -> std::collections::HashMap<String, String> {
     let mut m = std::collections::HashMap::new();
-    // Global user env (`env set --global`) — lowest priority; the functional
-    // vars below deliberately override it so a user can't shadow them.
+    // Layered lowest→highest: global user env (`env set --global`), then per-tab
+    // env (`env set --tab`), then the functional vars, then relay. The user env
+    // deliberately can't shadow the functional/relay vars.
     for (k, v) in tab_env_global() {
         m.insert(k, v);
+    }
+    for (k, v) in per_tab {
+        m.insert(k.clone(), v.clone());
     }
     m.insert("_TAB_ID".into(), tab_id.to_string());
     m.insert("TAB_ATELIER_API_URL".into(), api_url.to_string());
