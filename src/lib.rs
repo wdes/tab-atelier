@@ -49,6 +49,7 @@ pub(crate) mod platform;
 #[cfg(feature = "energy")]
 pub(crate) mod power;
 pub(crate) mod pty_ring;
+pub mod relay;
 pub mod remote;
 pub mod schedule;
 #[cfg(feature = "gui")]
@@ -123,6 +124,46 @@ pub fn set_claude_only(on: bool) {
     CLAUDE_ONLY.store(on, Ordering::SeqCst);
 }
 
+/// Relay mode: forward this instance's Claude tabs' Anthropic API calls
+/// through a configured remote tab-atelier (see `src/relay.rs`).
+///
+/// Runtime-mutable like [`CLAUDE_ONLY`]; seeded from the `--relay` flag or the
+/// `relay_mode` preference. When on, [`tab_env_extras`] injects
+/// `ANTHROPIC_BASE_URL`/`ANTHROPIC_API_KEY` so every claude tab talks to the
+/// local relay listener instead of `api.anthropic.com` directly.
+pub static RELAY_MODE: AtomicBool = AtomicBool::new(false);
+
+#[must_use]
+pub fn relay_mode() -> bool {
+    RELAY_MODE.load(Ordering::SeqCst)
+}
+
+pub fn set_relay_mode(on: bool) {
+    RELAY_MODE.store(on, Ordering::SeqCst);
+}
+
+/// Global user env vars injected into EVERY tab's PTY (the CLI
+/// `env set --global KEY=VAL`).
+///
+/// Runtime-mutable — unlike [`clear_env_user_vars`] (startup-only) — so a live
+/// `env set` takes effect on the next tab spawn. Seeded from the `tab_env`
+/// preference at startup and replaced wholesale by the env drain. Lowest
+/// priority in the layered PTY env: the functional `_TAB_ID`/`TAB_ATELIER_*`
+/// vars (and the relay injection) win over it.
+static TAB_ENV_GLOBAL: std::sync::RwLock<std::collections::BTreeMap<String, String>> =
+    std::sync::RwLock::new(std::collections::BTreeMap::new());
+
+pub fn set_tab_env_global(vars: std::collections::BTreeMap<String, String>) {
+    if let Ok(mut g) = TAB_ENV_GLOBAL.write() {
+        *g = vars;
+    }
+}
+
+#[must_use]
+pub fn tab_env_global() -> std::collections::BTreeMap<String, String> {
+    TAB_ENV_GLOBAL.read().map(|g| g.clone()).unwrap_or_default()
+}
+
 /// User-defined `key=value` pairs from the `clear_env_vars` preference,
 /// layered into every cleared-env tab (see [`minimal_pty_env`]). Set
 /// once at startup; reads after that are lock-free. Empty until set.
@@ -155,9 +196,26 @@ static INSTANCE_LOCK: OnceLock<std::fs::File> = OnceLock::new();
 #[must_use]
 pub fn tab_env_extras(tab_id: &str, api_url: &str, api_token: &str) -> std::collections::HashMap<String, String> {
     let mut m = std::collections::HashMap::new();
+    // Global user env (`env set --global`) — lowest priority; the functional
+    // vars below deliberately override it so a user can't shadow them.
+    for (k, v) in tab_env_global() {
+        m.insert(k, v);
+    }
     m.insert("_TAB_ID".into(), tab_id.to_string());
     m.insert("TAB_ATELIER_API_URL".into(), api_url.to_string());
     m.insert("TAB_ATELIER_API_TOKEN".into(), api_token.to_string());
+    // Relay mode: point every claude tab at the local relay listener. `api_url`
+    // is the local API base (`http://127.0.0.1:<port>`); the relay route lives
+    // under `/relay/anthropic`. The local API token doubles as the stand-in
+    // `ANTHROPIC_API_KEY` so Claude Code starts in API-key mode and
+    // authenticates to the loopback relay (other local procs can't abuse it).
+    if relay_mode() {
+        m.insert(
+            "ANTHROPIC_BASE_URL".into(),
+            format!("{}/relay/anthropic", api_url.trim_end_matches('/')),
+        );
+        m.insert("ANTHROPIC_API_KEY".into(), api_token.to_string());
+    }
     m
 }
 
@@ -865,6 +923,11 @@ pub struct TabState {
     /// brings the tab back into the same mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_plan_mode: Option<bool>,
+    /// Per-tab env vars injected into this tab's PTY (`env set --tab <id>`),
+    /// layered ON TOP of the global `tab_env` (per-tab wins). Applied on the
+    /// next spawn/respawn of the tab.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub tab_env: std::collections::BTreeMap<String, String>,
 
     /// Fixed grid size the tab is PINNED to (`tab-atelier resize <tab> --cols N
     /// --rows M`), overriding window-driven sizing so a web viewer isn't
@@ -1132,6 +1195,7 @@ impl Default for TabState {
             agent_session_id: None,
             agent_kind: None,
             agent_plan_mode: None,
+            tab_env: std::collections::BTreeMap::new(),
             pinned_cols: None,
             pinned_rows: None,
             share_token_rw: String::new(),
@@ -1742,6 +1806,22 @@ pub struct Preferences {
     /// "New bash tab" item cancels it). Off by default.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub claude_only: bool,
+    /// Relay mode: forward claude tabs' Anthropic API calls through the remote
+    /// tab-atelier named by `relay_endpoint_id`. Off by default. See
+    /// [`crate::RELAY_MODE`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub relay_mode: bool,
+    /// Which configured `remote_endpoints` entry (by `id`) to relay through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_endpoint_id: Option<String>,
+    /// Egress role: this instance accepts `/relay/anthropic/*` and forwards it
+    /// to `api.anthropic.com` using its own Claude login. Set on the REMOTE.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub relay_egress: bool,
+    /// Global env vars injected into every tab's PTY (`env set --global`).
+    /// Mirrored into [`crate::TAB_ENV_GLOBAL`] at startup.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub tab_env: std::collections::BTreeMap<String, String>,
     #[serde(
         default,
         deserialize_with = "deserialize_hotkeys",

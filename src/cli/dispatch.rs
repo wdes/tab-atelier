@@ -61,6 +61,11 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub claude_only: bool,
 
+    /// Start in relay mode: claude tabs' Anthropic API calls are forwarded
+    /// through the configured remote tab-atelier (`relay_endpoint_id`).
+    #[arg(long, global = true)]
+    pub relay: bool,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -265,6 +270,14 @@ pub enum Commands {
     /// against a headless daemon this just records the flag.)
     ClaudeOnly {
         /// `on` to force claude tabs, `off` to restore shells.
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
+
+    /// Toggle relay mode: forward claude tabs' Anthropic API calls through the
+    /// configured remote tab-atelier. Applies to tabs spawned after.
+    Relay {
+        /// `on` to route through the remote, `off` to call Anthropic directly.
         #[arg(value_parser = ["on", "off"])]
         state: String,
     },
@@ -626,6 +639,7 @@ pub fn dispatch(cli: Cli) -> bool {
             crate::cli::client::run("share-link", &args)
         }
         Commands::ClaudeOnly { state } => crate::cli::share_link::claude_only(&[state]),
+        Commands::Relay { state } => crate::cli::share_link::relay(&[state]),
         Commands::BgColor { global, tab, color } => {
             let mut args: Vec<String> = Vec::new();
             if global {
@@ -860,6 +874,8 @@ mod tests {
             ),
             (&["tab-atelier-headless", "claude-only", "on"], "claude-only on"),
             (&["tab-atelier-headless", "claude-only", "off"], "claude-only off"),
+            (&["tab-atelier-headless", "relay", "on"], "relay on"),
+            (&["tab-atelier-headless", "relay", "off"], "relay off"),
             (&["tab-atelier-headless", "settings"], "settings (no flags)"),
             (
                 &[

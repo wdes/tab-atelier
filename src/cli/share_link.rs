@@ -813,6 +813,49 @@ pub fn claude_only(args: &[String]) -> i32 {
     }
 }
 
+/// `relay on|off` — toggle relay mode on the running instance.
+///
+/// POSTs `/relay-mode`. When on, claude tabs' Anthropic API calls are forwarded
+/// through the configured remote tab-atelier. Applies to tabs spawned after.
+#[must_use]
+pub fn relay(args: &[String]) -> i32 {
+    let on = match args.first().map(String::as_str) {
+        Some("on") => true,
+        Some("off") => false,
+        _ => {
+            eprintln!("relay: pass `on` or `off`");
+            return 2;
+        }
+    };
+    let ep = match discover_endpoint() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("relay: {e}");
+            return 1;
+        }
+    };
+    let payload = format!(r#"{{"on":{on}}}"#);
+    match agent()
+        .post(format!("{}/relay-mode", ep.url))
+        .header("Authorization", format!("Bearer {}", ep.token))
+        .header("Content-Type", "application/json")
+        .send(payload.as_bytes())
+    {
+        Ok(_) => {
+            if on {
+                println!("relay mode enabled (new claude tabs route Anthropic calls through the remote)");
+            } else {
+                println!("relay mode disabled");
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("relay: {e}");
+            1
+        }
+    }
+}
+
 /// `&[String]` front-end for [`limit`], used by the GUI binary's subcommand
 /// match (`tab-atelier limit <tab> …`).
 ///

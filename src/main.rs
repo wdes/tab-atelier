@@ -56,6 +56,7 @@ fn main() {
 
     let read_only = cli_args.read_only;
     let claude_only = cli_args.claude_only;
+    let relay = cli_args.relay;
 
     // A subcommand runs against a live instance's local API and exits inside
     // the dispatcher (shared with the headless binary). Returns here only when
@@ -69,6 +70,10 @@ fn main() {
     // preference and re-syncs the global.
     if claude_only {
         tab_atelier::set_claude_only(true);
+    }
+    // Seed relay mode from the flag; App::new ORs in the persisted preference.
+    if relay {
+        tab_atelier::set_relay_mode(true);
     }
 
     if !read_only && !try_acquire_single_instance_lock() {

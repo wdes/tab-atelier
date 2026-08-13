@@ -744,6 +744,14 @@ pub fn run() -> std::io::Result<()> {
     // apart by the `unwrap_or_else` extractions below.
     let mut default_limits = prefs.default_tab_limits.clone();
 
+    // Seed relay mode + global tab-env from prefs (mirrors the GUI's App::new).
+    // Relay mode may also have been forced by the `--relay` flag (already in the
+    // global), so OR it in. `relay_egress` is read where the relay route runs.
+    if crate::relay_mode() || prefs.relay_mode {
+        crate::set_relay_mode(true);
+    }
+    crate::set_tab_env_global(prefs.tab_env.clone());
+
     // Latch the cleared-env opt-in for every tab spawn this process does.
     if prefs.clear_env.unwrap_or(false) {
         crate::CLEAR_ENV.store(true, Ordering::SeqCst);
@@ -933,6 +941,7 @@ pub fn run() -> std::io::Result<()> {
         pending_default_limits: None,
         pending_resizes: Vec::new(),
         pending_claude_only: None,
+        pending_relay_mode: None,
         pending_renames: Vec::new(),
         pending_status_updates: Vec::new(),
         cached_response: None,
@@ -1763,6 +1772,7 @@ fn drain_pending(
     let default_limit_change: Option<(crate::TabResourceLimits, bool)> = s.pending_default_limits.take();
     let resize_changes: Vec<(String, Option<(u16, u16)>)> = s.pending_resizes.drain(..).collect();
     let claude_only_change: Option<bool> = s.pending_claude_only.take();
+    let relay_mode_change: Option<bool> = s.pending_relay_mode.take();
     let new_tabs = std::mem::take(&mut s.pending_new_tabs);
     let new_tab_cwds: std::collections::VecDeque<std::path::PathBuf> = std::mem::take(&mut s.pending_new_tab_cwds);
     drop(s);
@@ -1784,6 +1794,7 @@ fn drain_pending(
         && default_limit_change.is_none()
         && resize_changes.is_empty()
         && claude_only_change.is_none()
+        && relay_mode_change.is_none()
         && new_tabs == 0
         && new_tab_cwds.is_empty());
     // CLI / API lock toggles → runtime HeadlessTab. tabs.json picks
@@ -1938,6 +1949,17 @@ fn drain_pending(
             let dir = crate::platform::config_dir();
             let mut prefs = crate::load_preferences(&dir);
             prefs.claude_only = on;
+            crate::save_preferences(&dir, &prefs);
+        }
+    }
+
+    // Relay-mode toggle (`relay on|off`): set the global + persist.
+    if let Some(on) = relay_mode_change {
+        crate::set_relay_mode(on);
+        if !crate::read_only() {
+            let dir = crate::platform::config_dir();
+            let mut prefs = crate::load_preferences(&dir);
+            prefs.relay_mode = on;
             crate::save_preferences(&dir, &prefs);
         }
     }
