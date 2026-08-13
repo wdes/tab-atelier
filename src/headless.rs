@@ -97,6 +97,8 @@ struct HeadlessTab {
     agent_session_id: Option<Arc<str>>,
     agent_kind: Option<Arc<str>>,
     agent_plan_mode: Option<bool>,
+    /// Per-tab env vars (`env set --tab <id>`); mirrors `TabState::tab_env`.
+    tab_env: std::collections::BTreeMap<String, String>,
     /// Pinned fixed grid size (`tab-atelier resize`); `None` = spawn default.
     /// Persisted to tabs.json so the size survives a restart.
     pinned_cols: Option<u16>,
@@ -423,6 +425,7 @@ fn spawn_pty_tab(
     agent_session_id: Option<String>,
     agent_kind: Option<String>,
     agent_plan_mode: Option<bool>,
+    tab_env: std::collections::BTreeMap<String, String>,
     share_token_rw: String,
     share_token_ro: String,
     locked: bool,
@@ -671,6 +674,7 @@ fn spawn_pty_tab(
         pending_restore,
         last_known_cwd: cwd,
         last_known_cwd_string,
+        tab_env,
         agent_state: None,
         agent_session_id: agent_session_id.map(Arc::from),
         agent_kind: agent_kind.map(Arc::from),
@@ -815,7 +819,7 @@ pub fn run() -> std::io::Result<()> {
         windowed = saved.windowed;
         for ts in &saved.tabs {
             let cwd = ts.cwd.as_ref().map(PathBuf::from);
-            let env = tab_env_extras(&ts.id, &api_url_for_pty, &api_token);
+            let env = tab_env_extras(&ts.id, &api_url_for_pty, &api_token, &ts.tab_env);
             let saved_hash = ts.output.as_deref().map_or(0, |s| crc32(s.as_bytes()));
             // Active tab restores eagerly; others defer until activate
             // (mirrors the GUI cold-launch optimization).
@@ -846,6 +850,7 @@ pub fn run() -> std::io::Result<()> {
                 ts.agent_session_id.clone(),
                 ts.agent_kind.clone(),
                 ts.agent_plan_mode,
+                ts.tab_env.clone(),
                 ts.share_token_rw.clone(),
                 ts.share_token_ro.clone(),
                 ts.locked,
@@ -880,7 +885,7 @@ pub fn run() -> std::io::Result<()> {
 
     if tabs.is_empty() {
         let id = default_tab_id();
-        let env = tab_env_extras(&id, &api_url_for_pty, &api_token);
+        let env = tab_env_extras(&id, &api_url_for_pty, &api_token, &std::collections::BTreeMap::new());
         if let Some(mut t) = spawn_pty_tab(
             id,
             "Terminal".into(),
@@ -894,6 +899,7 @@ pub fn run() -> std::io::Result<()> {
             None,
             None,
             None,
+            std::collections::BTreeMap::new(),
             String::new(),
             String::new(),
             false,
@@ -943,6 +949,7 @@ pub fn run() -> std::io::Result<()> {
         pending_resizes: Vec::new(),
         pending_claude_only: None,
         pending_relay_mode: None,
+        pending_env_changes: Vec::new(),
         pending_renames: Vec::new(),
         pending_status_updates: Vec::new(),
         cached_response: None,
@@ -1494,6 +1501,7 @@ fn persist(
             agent_session_id: tab.agent_session_id.as_deref().map(str::to_string),
             agent_kind: tab.agent_kind.as_deref().map(str::to_string),
             agent_plan_mode: tab.agent_plan_mode,
+            tab_env: tab.tab_env.clone(),
             pinned_cols: tab.pinned_cols,
             pinned_rows: tab.pinned_rows,
             share_token_rw: tab.share_token_rw.to_string(),
@@ -1689,7 +1697,7 @@ fn respawn_tab_net(
     let cwd = platform::process_cwd(tabs[idx].pid).or_else(|| tabs[idx].last_known_cwd.clone());
     let history = tabs[idx].copy_all_history();
     let pending_restore = if history.is_empty() { None } else { Some(history) };
-    let env = tab_env_extras(&tabs[idx].id, api_url_for_pty, api_token);
+    let env = tab_env_extras(&tabs[idx].id, api_url_for_pty, api_token, &tabs[idx].tab_env);
     let id = tabs[idx].id.to_string();
     let name = tabs[idx].name.to_string();
     let prior = tabs[idx].uptime().as_secs_f64();
@@ -1706,6 +1714,7 @@ fn respawn_tab_net(
     let locked = tabs[idx].locked;
     let schedule = tabs[idx].schedule.clone();
     let bg = tabs[idx].bg_color.clone();
+    let tab_env = tabs[idx].tab_env.clone();
     tabs[idx].shutdown();
     if let Some(mut t) = spawn_pty_tab(
         id,
@@ -1720,6 +1729,7 @@ fn respawn_tab_net(
         agent_session_id,
         agent_kind,
         agent_plan_mode,
+        tab_env,
         rw,
         ro,
         locked,
@@ -1774,6 +1784,7 @@ fn drain_pending(
     let resize_changes: Vec<(String, Option<(u16, u16)>)> = s.pending_resizes.drain(..).collect();
     let claude_only_change: Option<bool> = s.pending_claude_only.take();
     let relay_mode_change: Option<bool> = s.pending_relay_mode.take();
+    let env_changes: Vec<crate::api::EnvChange> = s.pending_env_changes.drain(..).collect();
     let new_tabs = std::mem::take(&mut s.pending_new_tabs);
     let new_tab_cwds: std::collections::VecDeque<std::path::PathBuf> = std::mem::take(&mut s.pending_new_tab_cwds);
     drop(s);
@@ -1796,6 +1807,7 @@ fn drain_pending(
         && resize_changes.is_empty()
         && claude_only_change.is_none()
         && relay_mode_change.is_none()
+        && env_changes.is_empty()
         && new_tabs == 0
         && new_tab_cwds.is_empty());
     // CLI / API lock toggles → runtime HeadlessTab. tabs.json picks
@@ -1962,6 +1974,36 @@ fn drain_pending(
             let mut prefs = crate::load_preferences(&dir);
             prefs.relay_mode = on;
             crate::save_preferences(&dir, &prefs);
+        }
+    }
+
+    // Env changes (`env set/unset`): global → the process-global map + pref;
+    // per-tab → the runtime tab (persisted next tick). Apply on next spawn.
+    for ch in env_changes {
+        if let Some(id) = ch.tab {
+            if let Some(t) = tabs.iter_mut().find(|t| *t.id == id) {
+                for (k, v) in ch.set {
+                    t.tab_env.insert(k, v);
+                }
+                for k in ch.unset {
+                    t.tab_env.remove(&k);
+                }
+            }
+        } else {
+            let mut g = crate::tab_env_global();
+            for (k, v) in ch.set {
+                g.insert(k, v);
+            }
+            for k in ch.unset {
+                g.remove(&k);
+            }
+            crate::set_tab_env_global(g.clone());
+            if !crate::read_only() {
+                let dir = crate::platform::config_dir();
+                let mut prefs = crate::load_preferences(&dir);
+                prefs.tab_env = g;
+                crate::save_preferences(&dir, &prefs);
+            }
         }
     }
 
@@ -2161,7 +2203,7 @@ fn drain_pending(
             }
         });
         let id = default_tab_id();
-        let env = tab_env_extras(&id, api_url_for_pty, api_token);
+        let env = tab_env_extras(&id, api_url_for_pty, api_token, &std::collections::BTreeMap::new());
         let name = format!("Terminal {}", tabs.len());
         if let Some(mut t) = spawn_pty_tab(
             id,
@@ -2176,6 +2218,7 @@ fn drain_pending(
             None,
             None,
             None,
+            std::collections::BTreeMap::new(),
             String::new(),
             String::new(),
             false,

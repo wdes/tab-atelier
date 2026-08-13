@@ -174,6 +174,10 @@ struct Tab {
     /// at last save. Restored along with the session so the tab
     /// comes back in the same mode.
     agent_plan_mode: Option<bool>,
+    /// Per-tab env vars (`env set --tab <id>`), injected on this tab's spawn.
+    /// Mirrors `TabState::tab_env`.
+    #[allow(clippy::struct_field_names)] // consistent name across TabState/HeadlessTab
+    tab_env: std::collections::BTreeMap<String, String>,
     /// Per-tab share secrets. Minted lazily by the right-click
     /// share-link menu and persisted to tabs.json so URLs survive
     /// restarts. Empty until first share.
@@ -290,6 +294,7 @@ impl Tab {
             agent_session_id: ts.agent_session_id.as_deref().map(std::sync::Arc::from),
             agent_kind: ts.agent_kind.as_deref().map(std::sync::Arc::from),
             agent_plan_mode: ts.agent_plan_mode,
+            tab_env: ts.tab_env.clone(),
             share_token_rw: ts.share_token_rw.as_str().into(),
             share_token_ro: ts.share_token_ro.as_str().into(),
             locked: ts.locked,
@@ -905,7 +910,7 @@ impl AppState {
                 let br = browser.clone();
                 let ce = code_editor.clone();
                 let colors = ts.colors_enabled;
-                let env = tab_env_extras(&ts.id, &api_url_for_pty, &api_token);
+                let env = tab_env_extras(&ts.id, &api_url_for_pty, &api_token, &ts.tab_env);
                 // Launch the agent directly (exec) when we can drive the
                 // shell command (cleared-env mode); otherwise fall back to
                 // typing the resume in (`pending_agent_resume` below).
@@ -1013,7 +1018,12 @@ impl AppState {
                 let br = browser.clone();
                 let ce = code_editor.clone();
                 let new_id = crate::default_tab_id();
-                let env = tab_env_extras(&new_id, &api_url_for_pty, &api_token);
+                let env = tab_env_extras(
+                    &new_id,
+                    &api_url_for_pty,
+                    &api_token,
+                    &std::collections::BTreeMap::new(),
+                );
                 let view = cx.new(|cx| {
                     let mut tv = TerminalView::new_with_colors_and_env(
                         None, fc, br, ce, true, env, None, boot_grid, false, window, cx,
@@ -1037,7 +1047,12 @@ impl AppState {
             let br = browser.clone();
             let ce = code_editor.clone();
             let new_id = crate::default_tab_id();
-            let env = tab_env_extras(&new_id, &api_url_for_pty, &api_token);
+            let env = tab_env_extras(
+                &new_id,
+                &api_url_for_pty,
+                &api_token,
+                &std::collections::BTreeMap::new(),
+            );
             let view = cx.new(|cx| {
                 let mut tv = TerminalView::new_with_colors_and_env(
                     None, fc, br, ce, true, env, None, boot_grid, false, window, cx,
@@ -1354,6 +1369,7 @@ impl AppState {
             pending_resizes: Vec::new(),
             pending_claude_only: None,
             pending_relay_mode: None,
+            pending_env_changes: Vec::new(),
             pending_renames: Vec::new(),
             pending_status_updates: Vec::new(),
             cached_response: None,
@@ -1671,7 +1687,12 @@ impl AppState {
         let tn = self.theme_name;
         let cs = self.cursor_style;
         let new_id = crate::default_tab_id();
-        let env = tab_env_extras(&new_id, &api_url_for_local_clients(&self.api_addr), &self.api_token);
+        let env = tab_env_extras(
+            &new_id,
+            &api_url_for_local_clients(&self.api_addr),
+            &self.api_token,
+            &std::collections::BTreeMap::new(),
+        );
         // Claude-only mode: a fresh tab launches `claude` in `auto` permission
         // mode instead of a plain shell. Under cleared-env we can `exec`
         // it directly via the shell suffix; otherwise we type the command into
@@ -1903,6 +1924,7 @@ impl AppState {
                     agent_session_id: tab.agent_session_id.as_deref().map(str::to_string),
                     agent_kind: tab.agent_kind.as_deref().map(str::to_string),
                     agent_plan_mode: tab.agent_plan_mode,
+                    tab_env: tab.tab_env.clone(),
                     pinned_cols: tab.pinned_cols,
                     pinned_rows: tab.pinned_rows,
                     share_token_rw: tab.share_token_rw.to_string(),
@@ -2240,10 +2262,40 @@ impl AppState {
             let resize_changes: Vec<(String, Option<(u16, u16)>)> = snapshot.pending_resizes.drain(..).collect();
             let claude_only_change: Option<bool> = snapshot.pending_claude_only.take();
             let relay_mode_change: Option<bool> = snapshot.pending_relay_mode.take();
+            let env_changes: Vec<crate::api::EnvChange> = snapshot.pending_env_changes.drain(..).collect();
             drop(snapshot);
             // Relay-mode toggle from the CLI/API (`relay on|off`).
             if let Some(on) = relay_mode_change {
                 self.set_relay_mode_mode(on);
+            }
+            // Env changes (`env set/unset`). Global → the process-global map +
+            // preference; per-tab → the runtime Tab (persisted next tick). Both
+            // apply on the tab's next (re)spawn.
+            for ch in env_changes {
+                if let Some(id) = ch.tab {
+                    if let Some(tab) = self.tabs.iter_mut().find(|t| *t.id == id) {
+                        for (k, v) in ch.set {
+                            tab.tab_env.insert(k, v);
+                        }
+                        for k in ch.unset {
+                            tab.tab_env.remove(&k);
+                        }
+                    }
+                } else {
+                    let mut g = crate::tab_env_global();
+                    for (k, v) in ch.set {
+                        g.insert(k, v);
+                    }
+                    for k in ch.unset {
+                        g.remove(&k);
+                    }
+                    crate::set_tab_env_global(g.clone());
+                    if !crate::read_only() {
+                        let mut prefs = load_preferences(&platform::config_dir());
+                        prefs.tab_env = g;
+                        save_preferences(&platform::config_dir(), &prefs);
+                    }
+                }
             }
             // Forced Claude-only toggle from the CLI/API (`claude-only on|off`).
             // Mirror onto the struct field + global (read by `insert_tab`) and
@@ -2659,6 +2711,7 @@ impl AppState {
             &self.tabs[idx].id,
             &api_url_for_local_clients(&self.api_addr),
             &self.api_token,
+            &self.tabs[idx].tab_env,
         );
         // Respawning an agent tab → relaunch the agent directly (exec), same as
         // a restore, so it comes back as claude rather than a bare shell. Never
@@ -2865,6 +2918,7 @@ impl AppState {
                     agent_session_id: tab.agent_session_id.as_deref().map(str::to_string),
                     agent_kind: tab.agent_kind.as_deref().map(str::to_string),
                     agent_plan_mode: tab.agent_plan_mode,
+                    tab_env: tab.tab_env.clone(),
                     pinned_cols: tab.pinned_cols,
                     pinned_rows: tab.pinned_rows,
                     share_token_rw: tab.share_token_rw.to_string(),

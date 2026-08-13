@@ -282,6 +282,23 @@ pub enum Commands {
         state: String,
     },
 
+    /// Set/unset/list env vars injected into tabs' PTYs (applies on next spawn).
+    ///
+    /// `env set KEY=VAL --global`, `env unset KEY --tab 3`, `env list --global`.
+    Env {
+        /// `set`, `unset`, or `list`.
+        #[arg(value_parser = ["set", "unset", "list"])]
+        action: String,
+        /// `KEY=VALUE` for set, `KEY` for unset; empty for list.
+        args: Vec<String>,
+        /// Apply to the global map (all tabs) instead of a single tab.
+        #[arg(long, short = 'g', conflicts_with = "tab")]
+        global: bool,
+        /// Tab index or UUID.
+        #[arg(long, short = 't', conflicts_with = "global")]
+        tab: Option<String>,
+    },
+
     /// Set the per-tab viewer background color (or the global default with `--global`).
     ///
     /// Note: `--tab` is a flag (not a positional) so clap can model the
@@ -640,6 +657,12 @@ pub fn dispatch(cli: Cli) -> bool {
         }
         Commands::ClaudeOnly { state } => crate::cli::share_link::claude_only(&[state]),
         Commands::Relay { state } => crate::cli::share_link::relay(&[state]),
+        Commands::Env {
+            action,
+            args,
+            global,
+            tab,
+        } => crate::cli::share_link::env(&action, &args, global, tab.as_deref()),
         Commands::BgColor { global, tab, color } => {
             let mut args: Vec<String> = Vec::new();
             if global {
@@ -876,6 +899,15 @@ mod tests {
             (&["tab-atelier-headless", "claude-only", "off"], "claude-only off"),
             (&["tab-atelier-headless", "relay", "on"], "relay on"),
             (&["tab-atelier-headless", "relay", "off"], "relay off"),
+            (
+                &["tab-atelier-headless", "env", "set", "FOO=bar", "--global"],
+                "env set global",
+            ),
+            (
+                &["tab-atelier-headless", "env", "unset", "FOO", "--tab", "0"],
+                "env unset tab",
+            ),
+            (&["tab-atelier-headless", "env", "list", "--global"], "env list global"),
             (&["tab-atelier-headless", "settings"], "settings (no flags)"),
             (
                 &[

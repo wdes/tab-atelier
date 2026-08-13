@@ -439,6 +439,16 @@ pub struct PendingStatusUpdate {
     pub plan_mode: Option<bool>,
 }
 
+/// A queued env-var change (the CLI `env set/unset`). `tab: None` targets the
+/// global map; `Some(uuid)` a single tab. `set` upserts, `unset` removes. Takes
+/// effect on the tab's next (re)spawn.
+#[derive(Clone, Debug)]
+pub struct EnvChange {
+    pub tab: Option<String>,
+    pub set: std::collections::BTreeMap<String, String>,
+    pub unset: Vec<String>,
+}
+
 pub struct TabSnapshot {
     pub tabs: Vec<SnapshotTab>,
     /// The live master API token the auth gate validates against.
@@ -532,6 +542,10 @@ pub struct TabSnapshot {
     /// Relay-mode toggle queued by `POST /relay-mode` (the CLI `relay on|off`).
     /// The owner mirrors it onto [`crate::RELAY_MODE`] + its struct field.
     pub pending_relay_mode: Option<bool>,
+    /// Env-var changes queued by `POST /env` (global, `tab: None`) or
+    /// `POST /tabs/by-id/<id>/env` (per-tab). Drained by the owner, which merges
+    /// them into the global/per-tab map, persists, and respawns if asked.
+    pub pending_env_changes: Vec<EnvChange>,
     /// (tab index, new name) pairs queued by `POST /tabs/{idx}/rename`.
     pub pending_renames: Vec<(usize, String)>,
     /// Queued agent-status updates from `POST /tabs/by-id/{id}/status`.
@@ -2400,6 +2414,54 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             drop(snap);
             respond_json(stream, 200, r#"{"queued":"relay-mode"}"#);
         }
+        ("GET", "/env") => {
+            // The current GLOBAL tab-env map (the CLI `env list`).
+            let map = crate::tab_env_global();
+            match serde_json::to_string(&map) {
+                Ok(j) => respond_json(stream, 200, &j),
+                Err(e) => error_json(stream, 500, &format!("serialize: {e}")),
+            }
+        }
+        ("POST", "/env") => {
+            // Global env change (`env set/unset --global`). Body:
+            // {"set":{"K":"V"},"unset":["K"],"respawn":bool}.
+            match parse_env_body(&body_bytes) {
+                Ok(change) => {
+                    let mut snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    snap.pending_env_changes.push(change);
+                    drop(snap);
+                    respond_json(stream, 200, r#"{"queued":"env"}"#);
+                }
+                Err(e) => error_json(stream, 400, &e),
+            }
+        }
+        ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/env") => {
+            // Per-tab env change (`env set/unset --tab <id>`).
+            let Some((key_raw, is_uuid)) = parse_tab_key(p, "/env") else {
+                error_json(stream, 404, "missing tab id");
+                return;
+            };
+            let parsed = parse_env_body(&body_bytes);
+            let mut snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(idx) = resolve_tab_idx(&snap, key_raw, is_uuid) else {
+                drop(snap);
+                error_json(stream, 404, "tab not found");
+                return;
+            };
+            let id = snap.tabs[idx].id.to_string();
+            match parsed {
+                Ok(mut change) => {
+                    change.tab = Some(id);
+                    snap.pending_env_changes.push(change);
+                    drop(snap);
+                    respond_json(stream, 200, r#"{"queued":"env"}"#);
+                }
+                Err(e) => {
+                    drop(snap);
+                    error_json(stream, 400, &e);
+                }
+            }
+        }
         ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/resize") => {
             // Pin (or clear) a tab's fixed grid size (the CLI `resize`). Body:
             // {"cols":N,"rows":M} pins to that size (both >= 2 / >= 1), or
@@ -3469,6 +3531,27 @@ async fn handle_hyper_request(
     Ok(parse_h1_response(resp).map(BodyExt::boxed))
 }
 
+/// Parse an env-change body: `{"set":{"K":"V"},"unset":["K"],"respawn":bool}`.
+/// Returns an [`EnvChange`] with `tab: None`; the caller sets the tab.
+fn parse_env_body(body: &[u8]) -> Result<EnvChange, String> {
+    let v: serde_json::Value = serde_json::from_slice(body).map_err(|e| format!("invalid JSON body: {e}"))?;
+    let set = v
+        .get("set")
+        .and_then(serde_json::Value::as_object)
+        .map(|o| {
+            o.iter()
+                .filter_map(|(k, val)| val.as_str().map(|s| (k.clone(), s.to_owned())))
+                .collect()
+        })
+        .unwrap_or_default();
+    let unset = v
+        .get("unset")
+        .and_then(serde_json::Value::as_array)
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect())
+        .unwrap_or_default();
+    Ok(EnvChange { tab: None, set, unset })
+}
+
 /// A small buffered relay response (errors / 401s), boxed to match [`RespBody`].
 fn relay_status(code: u16, msg: &str) -> Response<RespBody> {
     Response::builder()
@@ -4136,6 +4219,7 @@ pub fn test_snapshot(tabs: Vec<SnapshotTab>) -> TabSnapshot {
         pending_resizes: Vec::new(),
         pending_claude_only: None,
         pending_relay_mode: None,
+        pending_env_changes: Vec::new(),
         pending_renames: vec![],
         pending_status_updates: vec![],
         cached_response: None,
@@ -4482,6 +4566,28 @@ mod tests {
         response.split("\r\n\r\n").nth(1).unwrap_or("")
     }
 
+    /// Serialize the relay tests — they mutate process-global relay config
+    /// (egress flag, target, upstream), so they can't run concurrently.
+    static RELAY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Read an HTTP request head (until CRLFCRLF) from a mock-server socket.
+    fn read_head(sock: &mut std::net::TcpStream) -> String {
+        use std::io::Read;
+        sock.set_read_timeout(Some(std::time::Duration::from_secs(2))).ok();
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        while let Ok(n) = sock.read(&mut tmp) {
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
     /// End-to-end: a client POST through the EGRESS relay is forwarded to a
     /// mock "Anthropic", streaming the SSE response back, with the stand-in
     /// auth swapped for the remote's Claude OAuth token. Mocks the real Claude
@@ -4489,6 +4595,9 @@ mod tests {
     #[test]
     fn relay_egress_streams_sse_and_injects_oauth() {
         use std::io::{Read, Write};
+        let _guard = RELAY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         // Fixture credentials: a far-future access token so no network refresh.
         let dir = tempfile::tempdir().unwrap();
@@ -4566,6 +4675,72 @@ mod tests {
         assert!(
             !seen.contains(token.as_str()),
             "the stand-in relay token must never reach Anthropic; saw: {seen}"
+        );
+    }
+
+    /// End-to-end: a client POST through the LOCAL relay is forwarded to the
+    /// configured remote's `/relay/anthropic/*` with the remote's Bearer token,
+    /// preserving the sub-path and streaming the response back.
+    #[test]
+    fn relay_local_forwards_to_remote_with_bearer() {
+        use std::io::Write;
+        let _guard = RELAY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Mock "remote egress": capture the request line + Authorization, stream SSE.
+        let mock = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mock_port = mock.local_addr().unwrap().port();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel::<(String, String)>();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = mock.accept() {
+                let head = read_head(&mut sock);
+                let line = head.lines().next().unwrap_or("").to_owned();
+                let auth = head
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
+                    .unwrap_or("")
+                    .to_owned();
+                let _ = seen_tx.send((line, auth));
+                let _ =
+                    sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n");
+                let _ = sock.write_all(b"data: {\"ok\":true}\n\n");
+                let _ = sock.flush();
+            }
+        });
+
+        // Configure the LOCAL role: forward to the mock "remote".
+        crate::set_relay_egress(false);
+        crate::set_relay_target(Some(crate::RelayTarget {
+            url: format!("http://127.0.0.1:{mock_port}"),
+            token: "remote-tok-123".to_owned(),
+            cf_access_client_id: String::new(),
+            cf_access_client_secret: String::new(),
+        }));
+
+        let (port, _state, master) = spawn_server();
+        let payload = "{}";
+        // Claude presents the stand-in x-api-key (== the local master token).
+        let req = format!(
+            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {master}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+            payload.len()
+        );
+        let resp = request(port, &req);
+
+        crate::set_relay_target(None);
+
+        assert_eq!(status_code(&resp), 200, "resp: {resp}");
+        assert!(resp.contains("data:"), "expected streamed SSE, got: {resp}");
+        let (line, auth) = seen_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap_or_default();
+        assert!(
+            line.contains("/relay/anthropic/v1/messages"),
+            "local hop must preserve the sub-path; saw request line: {line}"
+        );
+        assert!(
+            auth.contains("remote-tok-123"),
+            "local hop must forward with the remote endpoint's token; saw: {auth}"
         );
     }
 
