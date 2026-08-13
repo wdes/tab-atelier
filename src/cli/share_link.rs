@@ -813,20 +813,13 @@ pub fn claude_only(args: &[String]) -> i32 {
     }
 }
 
-/// `relay on|off` — toggle relay mode on the running instance.
+/// `relay on|off|via <ep>|egress on|off|status` — configure relay mode.
 ///
-/// POSTs `/relay-mode`. When on, claude tabs' Anthropic API calls are forwarded
-/// through the configured remote tab-atelier. Applies to tabs spawned after.
+/// `on/off` toggle the mode; `via <label|id>` sets which remote to relay through
+/// (or clears it with `""`); `egress on|off` sets this instance as the terminal
+/// hop to Anthropic; `status` prints the live config. All take effect live.
 #[must_use]
-pub fn relay(args: &[String]) -> i32 {
-    let on = match args.first().map(String::as_str) {
-        Some("on") => true,
-        Some("off") => false,
-        _ => {
-            eprintln!("relay: pass `on` or `off`");
-            return 2;
-        }
-    };
+pub fn relay(action: &str, arg: Option<&str>) -> i32 {
     let ep = match discover_endpoint() {
         Ok(e) => e,
         Err(e) => {
@@ -834,24 +827,89 @@ pub fn relay(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let payload = format!(r#"{{"on":{on}}}"#);
-    match agent()
-        .post(format!("{}/relay-mode", ep.url))
-        .header("Authorization", format!("Bearer {}", ep.token))
-        .header("Content-Type", "application/json")
-        .send(payload.as_bytes())
-    {
-        Ok(_) => {
-            if on {
-                println!("relay mode enabled (new claude tabs route Anthropic calls through the remote)");
-            } else {
-                println!("relay mode disabled");
+    let post = |path: &str, payload: String| {
+        agent()
+            .post(format!("{}{path}", ep.url))
+            .header("Authorization", format!("Bearer {}", ep.token))
+            .header("Content-Type", "application/json")
+            .send(payload.as_bytes())
+    };
+    match action {
+        "on" | "off" => {
+            let on = action == "on";
+            match post("/relay-mode", format!(r#"{{"on":{on}}}"#)) {
+                Ok(_) => {
+                    println!("relay mode {}", if on { "enabled" } else { "disabled" });
+                    0
+                }
+                Err(e) => {
+                    eprintln!("relay: {e}");
+                    1
+                }
             }
-            0
         }
-        Err(e) => {
-            eprintln!("relay: {e}");
-            1
+        "via" => {
+            let target = arg.unwrap_or("");
+            let payload = serde_json::json!({ "endpoint": target }).to_string();
+            match post("/relay-config", payload) {
+                Ok(_) => {
+                    if target.is_empty() {
+                        println!("relay endpoint cleared");
+                    } else {
+                        println!("relaying through `{target}`");
+                    }
+                    0
+                }
+                Err(e) => {
+                    eprintln!("relay via: {e}");
+                    1
+                }
+            }
+        }
+        "egress" => {
+            let on = match arg {
+                Some("on") => true,
+                Some("off") => false,
+                _ => {
+                    eprintln!("relay egress: pass `on` or `off`");
+                    return 2;
+                }
+            };
+            match post("/relay-config", serde_json::json!({ "egress": on }).to_string()) {
+                Ok(_) => {
+                    println!(
+                        "relay egress {}",
+                        if on {
+                            "enabled (this host forwards to Anthropic)"
+                        } else {
+                            "disabled"
+                        }
+                    );
+                    0
+                }
+                Err(e) => {
+                    eprintln!("relay egress: {e}");
+                    1
+                }
+            }
+        }
+        "status" => match agent()
+            .get(format!("{}/relay-config", ep.url))
+            .header("Authorization", format!("Bearer {}", ep.token))
+            .call()
+        {
+            Ok(mut r) => {
+                println!("{}", r.body_mut().read_to_string().unwrap_or_default());
+                0
+            }
+            Err(e) => {
+                eprintln!("relay status: {e}");
+                1
+            }
+        },
+        _ => {
+            eprintln!("relay: expected on|off|via|egress|status");
+            2
         }
     }
 }

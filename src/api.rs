@@ -439,6 +439,16 @@ pub struct PendingStatusUpdate {
     pub plan_mode: Option<bool>,
 }
 
+/// A queued relay-config change (the CLI `relay via <ep>` / `relay egress`).
+/// `endpoint: Some("box")` sets `relay_endpoint_id` (resolved against
+/// `remote_endpoints`); `Some("")` clears it. `egress: Some(bool)` sets the
+/// egress role. Applied + persisted + re-installed live by the drain.
+#[derive(Clone, Debug, Default)]
+pub struct RelayConfigChange {
+    pub endpoint: Option<String>,
+    pub egress: Option<bool>,
+}
+
 /// A queued env-var change (the CLI `env set/unset`). `tab: None` targets the
 /// global map; `Some(uuid)` a single tab. `set` upserts, `unset` removes. Takes
 /// effect on the tab's next (re)spawn.
@@ -546,6 +556,8 @@ pub struct TabSnapshot {
     /// `POST /tabs/by-id/<id>/env` (per-tab). Drained by the owner, which merges
     /// them into the global/per-tab map, persists, and respawns if asked.
     pub pending_env_changes: Vec<EnvChange>,
+    /// Relay endpoint/egress change queued by `POST /relay-config`.
+    pub pending_relay_config: Option<RelayConfigChange>,
     /// (tab index, new name) pairs queued by `POST /tabs/{idx}/rename`.
     pub pending_renames: Vec<(usize, String)>,
     /// Queued agent-status updates from `POST /tabs/by-id/{id}/status`.
@@ -2414,6 +2426,37 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             drop(snap);
             respond_json(stream, 200, r#"{"queued":"relay-mode"}"#);
         }
+        ("GET", "/relay-config") => {
+            // Current relay config (the CLI `relay status`).
+            let (egress, target) = (crate::relay_egress(), crate::relay_target());
+            let body = serde_json::json!({
+                "mode": crate::relay_mode(),
+                "egress": egress,
+                "target": target.map(|t| t.url),
+            })
+            .to_string();
+            respond_json(stream, 200, &body);
+        }
+        ("POST", "/relay-config") => {
+            // Set the relay endpoint and/or egress role (`relay via` / `relay
+            // egress`). Body: {"endpoint":"<label|id|"">","egress":bool} — any
+            // subset. The owner resolves the endpoint, persists, and re-installs.
+            let parsed: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+                Ok(v) => v,
+                Err(e) => {
+                    error_json(stream, 400, &format!("invalid JSON body: {e}"));
+                    return;
+                }
+            };
+            let change = RelayConfigChange {
+                endpoint: parsed.get("endpoint").and_then(|v| v.as_str()).map(str::to_owned),
+                egress: parsed.get("egress").and_then(serde_json::Value::as_bool),
+            };
+            let mut snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            snap.pending_relay_config = Some(change);
+            drop(snap);
+            respond_json(stream, 200, r#"{"queued":"relay-config"}"#);
+        }
         ("GET", "/env") => {
             // The current GLOBAL tab-env map (the CLI `env list`).
             let map = crate::tab_env_global();
@@ -4220,6 +4263,7 @@ pub fn test_snapshot(tabs: Vec<SnapshotTab>) -> TabSnapshot {
         pending_claude_only: None,
         pending_relay_mode: None,
         pending_env_changes: Vec::new(),
+        pending_relay_config: None,
         pending_renames: vec![],
         pending_status_updates: vec![],
         cached_response: None,

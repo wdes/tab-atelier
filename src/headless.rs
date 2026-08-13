@@ -950,6 +950,7 @@ pub fn run() -> std::io::Result<()> {
         pending_claude_only: None,
         pending_relay_mode: None,
         pending_env_changes: Vec::new(),
+        pending_relay_config: None,
         pending_renames: Vec::new(),
         pending_status_updates: Vec::new(),
         cached_response: None,
@@ -1784,6 +1785,7 @@ fn drain_pending(
     let resize_changes: Vec<(String, Option<(u16, u16)>)> = s.pending_resizes.drain(..).collect();
     let claude_only_change: Option<bool> = s.pending_claude_only.take();
     let relay_mode_change: Option<bool> = s.pending_relay_mode.take();
+    let relay_config_change = s.pending_relay_config.take();
     let env_changes: Vec<crate::api::EnvChange> = s.pending_env_changes.drain(..).collect();
     let new_tabs = std::mem::take(&mut s.pending_new_tabs);
     let new_tab_cwds: std::collections::VecDeque<std::path::PathBuf> = std::mem::take(&mut s.pending_new_tab_cwds);
@@ -1807,6 +1809,7 @@ fn drain_pending(
         && resize_changes.is_empty()
         && claude_only_change.is_none()
         && relay_mode_change.is_none()
+        && relay_config_change.is_none()
         && env_changes.is_empty()
         && new_tabs == 0
         && new_tab_cwds.is_empty());
@@ -1975,6 +1978,11 @@ fn drain_pending(
             prefs.relay_mode = on;
             crate::save_preferences(&dir, &prefs);
         }
+    }
+
+    // Relay endpoint/egress change (`relay via` / `relay egress`).
+    if let Some(ch) = relay_config_change {
+        crate::apply_relay_config(&ch, &crate::platform::config_dir());
     }
 
     // Env changes (`env set/unset`): global → the process-global map + pref;

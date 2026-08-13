@@ -274,12 +274,18 @@ pub enum Commands {
         state: String,
     },
 
-    /// Toggle relay mode: forward claude tabs' Anthropic API calls through the
-    /// configured remote tab-atelier. Applies to tabs spawned after.
+    /// Configure relay mode: forward claude tabs' Anthropic API calls through
+    /// the configured remote tab-atelier.
+    ///
+    /// `relay on|off` toggles the mode; `relay via <label|id>` picks the remote
+    /// to relay through (`""` clears); `relay egress on|off` makes this host the
+    /// terminal hop to Anthropic; `relay status` prints the live config.
     Relay {
-        /// `on` to route through the remote, `off` to call Anthropic directly.
-        #[arg(value_parser = ["on", "off"])]
-        state: String,
+        /// `on`, `off`, `via`, `egress`, or `status`.
+        #[arg(value_parser = ["on", "off", "via", "egress", "status"])]
+        action: String,
+        /// For `via`: endpoint label/id (or empty to clear). For `egress`: on|off.
+        arg: Option<String>,
     },
 
     /// Set/unset/list env vars injected into tabs' PTYs (applies on next spawn).
@@ -656,7 +662,7 @@ pub fn dispatch(cli: Cli) -> bool {
             crate::cli::client::run("share-link", &args)
         }
         Commands::ClaudeOnly { state } => crate::cli::share_link::claude_only(&[state]),
-        Commands::Relay { state } => crate::cli::share_link::relay(&[state]),
+        Commands::Relay { action, arg } => crate::cli::share_link::relay(&action, arg.as_deref()),
         Commands::Env {
             action,
             args,
@@ -899,6 +905,9 @@ mod tests {
             (&["tab-atelier-headless", "claude-only", "off"], "claude-only off"),
             (&["tab-atelier-headless", "relay", "on"], "relay on"),
             (&["tab-atelier-headless", "relay", "off"], "relay off"),
+            (&["tab-atelier-headless", "relay", "via", "box"], "relay via"),
+            (&["tab-atelier-headless", "relay", "egress", "on"], "relay egress"),
+            (&["tab-atelier-headless", "relay", "status"], "relay status"),
             (
                 &["tab-atelier-headless", "env", "set", "FOO=bar", "--global"],
                 "env set global",

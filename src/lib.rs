@@ -179,6 +179,36 @@ pub fn relay_target() -> Option<RelayTarget> {
     RELAY_TARGET.read().ok().and_then(|g| g.clone())
 }
 
+/// Apply a `relay via` / `relay egress` change.
+///
+/// Resolves the endpoint (by id or label, case-insensitive), persists the
+/// preference (unless read-only), and re-installs the live config. Shared by
+/// the GUI + headless drains.
+pub fn apply_relay_config(change: &crate::api::RelayConfigChange, config_base: &std::path::Path) {
+    let mut prefs = load_preferences(config_base);
+    if let Some(ep) = &change.endpoint {
+        prefs.relay_endpoint_id = if ep.is_empty() {
+            None
+        } else {
+            // Prefer resolving a friendly label to its stable id; fall back to
+            // treating the value as an id so an unknown value still records.
+            prefs
+                .remote_endpoints
+                .iter()
+                .find(|e| e.id == *ep || e.label.eq_ignore_ascii_case(ep))
+                .map(|e| e.id.clone())
+                .or_else(|| Some(ep.clone()))
+        };
+    }
+    if let Some(eg) = change.egress {
+        prefs.relay_egress = eg;
+    }
+    if !read_only() {
+        save_preferences(config_base, &prefs);
+    }
+    install_relay_config(&prefs);
+}
+
 /// Resolve + install the relay egress flag and forward target from a loaded
 /// `Preferences`. Called at startup (both editions) and after a relay toggle.
 pub fn install_relay_config(prefs: &Preferences) {
