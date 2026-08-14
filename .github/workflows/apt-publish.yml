@@ -372,15 +372,20 @@ jobs:
                       # over the capped set inside a throwaway archlinux container
                       # (the runner is Ubuntu). Rebuilding fresh drops entries for
                       # any package we just pruned.
-                      docker run --rm -v "$PWD/arch:/repo" -w /repo archlinux:latest bash -c '
+                      # repo-add runs as root in the container, so it must also
+                      # fix perms + hand ownership back to the runner uid — a
+                      # host-side chmod can't touch the root-owned db files.
+                      docker run --rm -e HOSTUID="$(id -u)" -e HOSTGID="$(id -g)" \
+                          -v "$PWD/arch:/repo" -w /repo archlinux:latest bash -c '
                           set -e
                           rm -f tab-atelier.db* tab-atelier.files*
                           repo-add -q tab-atelier.db.tar.zst *.pkg.tar.zst
                           # GH Pages does not serve the db symlinks repo-add makes;
                           # replace them with real files pacman can fetch by name.
                           for e in db files; do rm -f tab-atelier.$e; cp tab-atelier.$e.tar.zst tab-atelier.$e; done
+                          chmod -R a+rX .
+                          chown -R "$HOSTUID:$HOSTGID" .
                       '
-                      chmod -R a+rX arch
                   fi
 
                   # Regenerate the folder index (newest first) + pacman.conf snippet.
