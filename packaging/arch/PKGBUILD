@@ -1,0 +1,151 @@
+# Maintainer: William Desportes <williamdes@wdes.fr>
+#
+# Split package: builds the desktop GUI (`tab-atelier`) and the display-less
+# daemon (`tab-atelier-headless`) from one source tree, mirroring the two
+# cargo-deb variants in Cargo.toml's [package.metadata.deb]. The two packages
+# both ship /usr/bin/catbus-agent, so they conflict — install one or the other,
+# exactly like the .deb pair.
+#
+# To test-build locally against a working tree instead of a release tarball,
+# see PKGBUILD.git next to this file.
+
+pkgbase=tab-atelier
+pkgname=('tab-atelier' 'tab-atelier-headless')
+pkgver=0.5.0
+pkgrel=1
+pkgdesc='Guake-style drop-down terminal emulator (alacritty_terminal + gpui)'
+arch=('x86_64')
+url='https://github.com/wdes/tab-atelier'
+license=('MPL-2.0')
+# `cargo` provides the Rust toolchain. gpui links X11 + text-shaping libs at
+# build time; their headers ship in the same Arch packages as the runtime libs.
+makedepends=('cargo' 'freetype2' 'fontconfig' 'libxcb' 'libxkbcommon'
+             'libxkbcommon-x11')
+options=('!lto') # Rust LTO is driven by [profile.release] in Cargo.toml, not
+                 # makepkg — this only stops makepkg injecting -flto into the
+                 # CFLAGS used by C build-scripts (ring, etc.), which can break
+                 # them.
+source=("$pkgbase-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+# Release tarballs are immutable; fill in the real digest at tag time with
+#   updpkgsums    (or  makepkg -g )
+# Kept as SKIP here because the tag does not exist until the release is cut.
+sha256sums=('SKIP')
+
+prepare() {
+  cd "$pkgbase-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  # Vendor every dependency now so build() can run fully offline (--frozen)
+  # and reproducibly against the pinned Cargo.lock.
+  cargo fetch --locked --target "$CARCH-unknown-linux-gnu"
+}
+
+build() {
+  cd "$pkgbase-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+
+  # 1. Desktop GUI (default features: gui,energy,catbus,pets) AND the
+  #    catbus-agent helper — both are default-members, so one build emits
+  #    target/release/tab-atelier and target/release/catbus-agent.
+  cargo build --frozen --release
+
+  # 2. Display-less daemon: no gpui/x11/qrcode, matching the deb headless
+  #    variant's `--no-default-features --features headless,energy,catbus`.
+  cargo build --frozen --release --no-default-features \
+    --features headless,energy,catbus --bin tab-atelier-headless
+}
+
+# --- Desktop GUI -----------------------------------------------------------
+package_tab-atelier() {
+  pkgdesc='Guake-style drop-down terminal emulator for Linux/X11 (desktop GUI)'
+  depends=('gcc-libs' 'freetype2' 'fontconfig' 'libxcb' 'libxkbcommon'
+           'libxkbcommon-x11' 'ttf-dejavu')
+  # Emoji in a few UI spots (🐾 pet menu, 🔒 lock marker, ⛑/✅ status). DejaVu
+  # carries none; without it they render as tofu. Cosmetic → optional.
+  optdepends=('noto-fonts-emoji: colour emoji in the UI (menus, status markers)')
+  conflicts=('tab-atelier-headless')
+  # /etc files pacman must preserve across upgrades (deb `conf-files`).
+  backup=('etc/tab-atelier/preferences.json'
+          'etc/claude-code/managed-settings.json')
+
+  local src="$srcdir/$pkgbase-$pkgver"
+  cd "$src"
+
+  install -Dm755 target/release/tab-atelier    "$pkgdir/usr/bin/tab-atelier"
+  # Bundled so the "Switch to catbus" tab menu resolves the binary on PATH.
+  install -Dm755 target/release/catbus-agent   "$pkgdir/usr/bin/catbus-agent"
+
+  install -Dm644 assets/tab-atelier.desktop \
+    "$pkgdir/usr/share/applications/tab-atelier.desktop"
+  # System-wide autostart entry (users can untick it in their session manager).
+  install -Dm644 assets/tab-atelier-autostart.desktop \
+    "$pkgdir/etc/xdg/autostart/tab-atelier.desktop"
+
+  install -Dm644 assets/tab-atelier.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/tab-atelier.svg"
+  local size
+  for size in 16 24 32 48 64 128 256; do
+    install -Dm644 "assets/icons/hicolor/${size}x${size}/apps/tab-atelier.png" \
+      "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/tab-atelier.png"
+  done
+
+  # System-wide fallbacks (both are backup= conffiles above).
+  install -Dm644 assets/preferences.default.json \
+    "$pkgdir/etc/tab-atelier/preferences.json"
+  install -Dm644 assets/claude-code-managed-settings.desktop.json \
+    "$pkgdir/etc/claude-code/managed-settings.json"
+
+  # eSheep pets (sprite sheet + animation XML), loaded from here at runtime.
+  install -d "$pkgdir/usr/share/tab-atelier/pets"
+  install -m644 assets/pets/*.xml assets/pets/*.png \
+    "$pkgdir/usr/share/tab-atelier/pets/"
+
+  # Docs + the live-served OpenAPI spec.
+  install -Dm644 README.md         "$pkgdir/usr/share/doc/tab-atelier/README.md"
+  install -Dm644 assets/openapi.yaml \
+    "$pkgdir/usr/share/doc/tab-atelier/openapi.yaml"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/tab-atelier/LICENSE"
+}
+
+# --- Display-less daemon ---------------------------------------------------
+package_tab-atelier-headless() {
+  pkgdesc='Display-less tab-atelier daemon: same HTTP/TLS API, no X11/gpui'
+  # nftables = per-tab egress allowlist; bubblewrap = net-off namespace.
+  # systemd provides the unit + the sysusers/tmpfiles pacman hooks.
+  depends=('gcc-libs' 'nftables' 'bubblewrap' 'systemd')
+  conflicts=('tab-atelier')
+  backup=('etc/tab-atelier/preferences.json'
+          'etc/claude-code/managed-settings.json')
+  install=tab-atelier-headless.install
+
+  local src="$srcdir/$pkgbase-$pkgver"
+  cd "$src"
+
+  install -Dm755 target/release/tab-atelier-headless \
+    "$pkgdir/usr/bin/tab-atelier-headless"
+  install -Dm755 target/release/catbus-agent \
+    "$pkgdir/usr/bin/catbus-agent"
+
+  install -Dm644 assets/tab-atelier-headless.service \
+    "$pkgdir/usr/lib/systemd/system/tab-atelier-headless.service"
+
+  # Service account + state dir, created automatically by pacman's
+  # systemd-sysusers / systemd-tmpfiles hooks (Arch's replacement for the
+  # deb's imperative adduser/install -d in postinst).
+  install -Dm644 packaging/arch/tab-atelier-headless.sysusers \
+    "$pkgdir/usr/lib/sysusers.d/tab-atelier.conf"
+  install -Dm644 packaging/arch/tab-atelier-headless.tmpfiles \
+    "$pkgdir/usr/lib/tmpfiles.d/tab-atelier.conf"
+
+  install -Dm644 assets/preferences.default.json \
+    "$pkgdir/etc/tab-atelier/preferences.json"
+  install -Dm644 assets/claude-code-managed-settings.json \
+    "$pkgdir/etc/claude-code/managed-settings.json"
+
+  install -Dm644 README.md \
+    "$pkgdir/usr/share/doc/tab-atelier-headless/README.md"
+  install -Dm644 assets/openapi.yaml \
+    "$pkgdir/usr/share/doc/tab-atelier-headless/openapi.yaml"
+  install -Dm644 LICENSE \
+    "$pkgdir/usr/share/licenses/tab-atelier-headless/LICENSE"
+}

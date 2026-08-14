@@ -1,0 +1,48 @@
+# pacman scriptlet for tab-atelier-headless.
+#
+# Unlike the Debian postinst, this does NOT enable or start the unit: Arch
+# policy is that packages never auto-start services (the admin decides). The
+# service account and /var/lib/tab-atelier are handled declaratively by the
+# sysusers.d / tmpfiles.d drop-ins via pacman's own hooks, and the systemd
+# hook reloads the daemon when the unit file changes — so all this scriptlet
+# does is print the same first-run cheat-sheet the deb shows.
+
+post_install() {
+  cat <<'EOF'
+
+==> tab-atelier-headless installed.
+
+  Enable + start it (Arch does not auto-start services):
+    systemctl enable --now tab-atelier-headless.service
+
+  Service control
+    systemctl status  tab-atelier-headless
+    systemctl restart tab-atelier-headless
+    journalctl -u tab-atelier-headless -f
+
+  Runs as tab-atelier:tab-atelier; state under /var/lib/tab-atelier (0750).
+
+  The unit sandboxes tabs with TemporaryFileSystem=/, so only /srv is
+  writable by default. To open tabs in another directory add it with:
+    systemctl edit tab-atelier-headless      # [Service] BindPaths=/your/path
+
+  System-wide defaults (pacman .pacnew on upgrade if you edited them):
+    /etc/tab-atelier/preferences.json
+
+  No TUI in the headless variant — talk to it over the local API:
+    curl http://127.0.0.1:7890/tabs
+    curl -X POST http://127.0.0.1:7890/tabs -H 'content-type: application/json' -d '{"name":"work"}'
+  or open the browser viewer:
+    http://127.0.0.1:7890/tabs/0/view?token=$(cat /var/lib/tab-atelier/api.token)
+
+EOF
+}
+
+post_upgrade() {
+  # Remind about the manual restart; systemd's pacman hook already reloaded
+  # the unit definition when the file changed.
+  if [ -d /run/systemd/system ]; then
+    echo '==> tab-atelier-headless upgraded — restart to apply:'
+    echo '      systemctl restart tab-atelier-headless.service'
+  fi
+}

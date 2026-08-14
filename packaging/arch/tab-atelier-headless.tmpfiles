@@ -1,0 +1,7 @@
+# State directory for tab-atelier-headless, created by the systemd-tmpfiles
+# pacman hook on install. Mirrors the deb postinst's `install -d -m 0750`.
+# The unit's StateDirectory= would also create it on first start, but
+# pre-creating it lets an admin run the daemon by hand for debugging and keeps
+# tabs.json / signing keys in place across restarts.
+#Type Path                 Mode UID          GID          Age Argument
+d     /var/lib/tab-atelier  0750 tab-atelier  tab-atelier  -   -
