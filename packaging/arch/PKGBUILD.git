@@ -20,7 +20,7 @@ license=('MPL-2.0')
 makedepends=('cargo' 'git' 'freetype2' 'fontconfig' 'libxcb' 'libx11'
              'libxkbcommon' 'libxkbcommon-x11' 'wayland' 'vulkan-headers'
              'vulkan-icd-loader')
-options=('!lto')
+options=('!lto' '!debug')
 source=("tab-atelier::git+$url.git")
 sha256sums=('SKIP')
 
