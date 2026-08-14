@@ -46,6 +46,11 @@ jobs:
             - name: Decide pkgver (arch-legal, no '~' or '-')
               id: ver
               run: |
+                  # The container runs as root but the checkout is owned by a
+                  # different uid, so git refuses to touch it ("dubious
+                  # ownership") until we allowlist it. --global persists to
+                  # root's ~/.gitconfig for the later build step too.
+                  git config --global --add safe.directory '*'
                   if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
                       PV="${GITHUB_REF#refs/tags/v}"
                   else
