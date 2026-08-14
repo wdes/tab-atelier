@@ -1,0 +1,97 @@
+name: Build Arch package
+
+# Builds the pacman split package (tab-atelier + tab-atelier-headless) inside an
+# archlinux container, because makepkg can't run on the Ubuntu .deb runner: it
+# refuses to run as root and needs pacman / base-devel. The built packages are
+# uploaded as an artifact; `apt-publish.yml` (the single gh-pages publisher)
+# pulls the latest successful run into site/arch/, builds the pacman repo db,
+# and serves it from https://deb.tab-atelier.wdes.eu/arch — same pattern as the
+# Windows MSI and Android APK builds.
+#
+# One rolling channel: each push/tag republishes whatever this builds (capped at
+# 10 by the publisher). The AUR PKGBUILD in packaging/arch/ is the versioned
+# story; this hosted repo is the "track it without makepkg" convenience.
+
+on:
+    push:
+        branches: [main]
+        tags: ['v*']
+    workflow_dispatch:
+
+permissions:
+    contents: read
+
+jobs:
+    build:
+        name: makepkg (archlinux container)
+        runs-on: ubuntu-latest
+        container:
+            image: archlinux:latest
+        steps:
+            # base-devel = makepkg + gcc/binutils; the rest mirror the .deb CI's
+            # -dev packages (Arch bundles headers into the runtime lib package).
+            - name: Install toolchain + build deps
+              run: |
+                  pacman -Syu --noconfirm --needed \
+                      base-devel git sudo rust \
+                      freetype2 fontconfig libxcb libx11 libxkbcommon \
+                      libxkbcommon-x11 wayland vulkan-headers vulkan-icd-loader \
+                      ttf-dejavu nftables bubblewrap
+
+            # Full history so the nightly pkgver (git rev-list --count) is stable.
+            - uses: actions/checkout@v7
+              with:
+                  fetch-depth: 0
+
+            - name: Decide pkgver (arch-legal, no '~' or '-')
+              id: ver
+              run: |
+                  if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+                      PV="${GITHUB_REF#refs/tags/v}"
+                  else
+                      BASE=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2 | sed 's/-dev$//')
+                      # pacman pkgver forbids '-'; use the VCS-style .r<n>.g<sha>.
+                      PV="${BASE}.r$(git rev-list --count HEAD).g$(git rev-parse --short=7 HEAD)"
+                  fi
+                  echo "pv=$PV" >> "$GITHUB_OUTPUT"
+                  echo "→ building pacman package $PV"
+
+            - name: Build packages (as non-root builder)
+              env:
+                  PV: ${{ steps.ver.outputs.pv }}
+              run: |
+                  set -euo pipefail
+                  # makepkg refuses to run as root — build under a throwaway user.
+                  useradd -m builder
+                  chown -R builder:builder "$GITHUB_WORKSPACE"
+
+                  # Package THIS commit: archive the checkout into the tarball the
+                  # versioned PKGBUILD expects (so we get clean package names,
+                  # `tab-atelier`, not the `-git` VCS names), and point the
+                  # PKGBUILD at that local file with the rolling version.
+                  cd packaging/arch
+                  git config --global --add safe.directory "$GITHUB_WORKSPACE"
+                  git -C "$GITHUB_WORKSPACE" archive --format=tar.gz \
+                      --prefix="tab-atelier-${PV}/" \
+                      -o "$PWD/tab-atelier-${PV}.tar.gz" HEAD
+                  sed -i "s/^pkgver=.*/pkgver=${PV}/" PKGBUILD
+                  sed -i "s/^sha256sums=.*/sha256sums=('SKIP')/" PKGBUILD
+                  chown -R builder:builder "$GITHUB_WORKSPACE"
+
+                  # Deps are pre-installed above, so no -s (which would need
+                  # pacman-as-builder). --noarchive keeps it fast; -f overwrites.
+                  sudo -u builder makepkg -p PKGBUILD -f --noconfirm --nocheck
+
+                  ls -la ./*.pkg.tar.zst
+                  mkdir -p "$GITHUB_WORKSPACE/arch-out"
+                  cp ./*.pkg.tar.zst "$GITHUB_WORKSPACE/arch-out/"
+
+            # One multi-file artifact; apt-publish `gh run download`s it and
+            # unzips the .pkg.tar.zst files into site/arch/.
+            - name: Upload packages
+              uses: actions/upload-artifact@v7
+              with:
+                  name: arch-pkgs
+                  path: arch-out/*.pkg.tar.zst
+                  if-no-files-found: error
+                  retention-days: 30

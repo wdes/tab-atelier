@@ -17,10 +17,12 @@ pkgdesc='Guake-style drop-down terminal emulator (alacritty_terminal + gpui)'
 arch=('x86_64')
 url='https://github.com/wdes/tab-atelier'
 license=('MPL-2.0')
-# `cargo` provides the Rust toolchain. gpui links X11 + text-shaping libs at
-# build time; their headers ship in the same Arch packages as the runtime libs.
-makedepends=('cargo' 'freetype2' 'fontconfig' 'libxcb' 'libxkbcommon'
-             'libxkbcommon-x11')
+# `cargo` provides the Rust toolchain. gpui links X11 + text-shaping libs and
+# compiles its blade (Vulkan) + wayland backends at build time; the Arch
+# library packages bundle the headers the .deb CI pulls as -dev packages
+# (libvulkan-dev → vulkan-headers/-icd-loader, libwayland-dev → wayland, …).
+makedepends=('cargo' 'freetype2' 'fontconfig' 'libxcb' 'libx11' 'libxkbcommon'
+             'libxkbcommon-x11' 'wayland' 'vulkan-headers' 'vulkan-icd-loader')
 options=('!lto') # Rust LTO is driven by [profile.release] in Cargo.toml, not
                  # makepkg — this only stops makepkg injecting -flto into the
                  # CFLAGS used by C build-scripts (ring, etc.), which can break

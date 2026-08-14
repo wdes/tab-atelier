@@ -327,6 +327,88 @@ jobs:
                       echo '<p><a href="../">&larr; back to the apt repo</a></p>'
                   } > android/index.html
 
+            # Arch packages: built in an archlinux container by arch-pkg.yml
+            # (makepkg can't run here). Same "pull latest successful run" pattern
+            # as MSI/APK, but the artifact is a normal multi-file zip, so a plain
+            # `gh run download` extracts it — no raw-bytes/magic dance needed. We
+            # then (re)build the pacman repo db over the merged set and serve it
+            # as a real pacman repository at /arch/.
+            - name: Find latest Arch build run
+              id: arch_run
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  RUN_ID=$(gh run list --repo "$GITHUB_REPOSITORY" \
+                      --workflow=arch-pkg.yml --status=success \
+                      -L 1 --json databaseId --jq '.[0].databaseId // empty')
+                  echo "run_id=${RUN_ID}" >> "$GITHUB_OUTPUT"
+                  if [ -n "$RUN_ID" ]; then
+                      echo "→ will pull Arch packages from arch-pkg run $RUN_ID"
+                  else
+                      echo "→ no successful arch-pkg run yet; keeping existing packages"
+                  fi
+            - name: Stage Arch packages + build pacman repo
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  RUN_ID: ${{ steps.arch_run.outputs.run_id }}
+              run: |
+                  cd site
+                  mkdir -p arch
+                  if [ -n "$RUN_ID" ]; then
+                      # Multi-file artifact → real zip → gh run download extracts
+                      # the .pkg.tar.zst files straight into arch/.
+                      gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" \
+                          --name arch-pkgs --dir arch || \
+                          echo "  ⚠ no arch-pkgs artifact on run $RUN_ID — keeping existing"
+                  fi
+                  # Cap each package at the 10 most recent. `tab-atelier-[0-9]*`
+                  # matches the GUI package without also matching the
+                  # `tab-atelier-headless-*` files.
+                  ls -1t arch/tab-atelier-[0-9]*.pkg.tar.zst 2>/dev/null | tail -n +11 | xargs -r rm -f
+                  ls -1t arch/tab-atelier-headless-*.pkg.tar.zst 2>/dev/null | tail -n +11 | xargs -r rm -f
+
+                  if ls arch/*.pkg.tar.zst >/dev/null 2>&1; then
+                      # repo-add lives in pacman; regenerate the db from scratch
+                      # over the capped set inside a throwaway archlinux container
+                      # (the runner is Ubuntu). Rebuilding fresh drops entries for
+                      # any package we just pruned.
+                      docker run --rm -v "$PWD/arch:/repo" -w /repo archlinux:latest bash -c '
+                          set -e
+                          rm -f tab-atelier.db* tab-atelier.files*
+                          repo-add -q tab-atelier.db.tar.zst *.pkg.tar.zst
+                          # GH Pages does not serve the db symlinks repo-add makes;
+                          # replace them with real files pacman can fetch by name.
+                          for e in db files; do rm -f tab-atelier.$e; cp tab-atelier.$e.tar.zst tab-atelier.$e; done
+                      '
+                      chmod -R a+rX arch
+                  fi
+
+                  # Regenerate the folder index (newest first) + pacman.conf snippet.
+                  {
+                      echo '<!DOCTYPE html><meta charset=utf-8><title>tab-atelier Arch repo</title>'
+                      echo '<style>body{font-family:system-ui;max-width:48em;margin:3em auto;padding:0 1em}'
+                      echo 'code{background:#f4f4f4;padding:.1em .3em;border-radius:3px}'
+                      echo 'pre{background:#f4f4f4;padding:.6em .8em;border-radius:4px;overflow-x:auto;white-space:pre-wrap;overflow-wrap:anywhere}'
+                      echo '.note{background:#fff8d6;border-left:3px solid #d9a900;padding:.6em .9em;margin:1em 0;font-size:.95em}</style>'
+                      echo '<h1>tab-atelier Arch Linux repo</h1>'
+                      echo '<p>A signed-optional pacman repository (rolling; newest build wins). Add it to <code>/etc/pacman.conf</code>:</p>'
+                      echo '<pre>[tab-atelier]'
+                      echo 'SigLevel = Optional TrustAll'
+                      echo 'Server = https://deb.tab-atelier.wdes.eu/arch</pre>'
+                      echo '<p>Then install (the two packages conflict — pick one):</p>'
+                      echo '<pre>sudo pacman -Sy tab-atelier            # desktop GUI'
+                      echo 'sudo pacman -Sy tab-atelier-headless   # display-less daemon</pre>'
+                      echo '<div class="note">Prefer building from source? The AUR-style <code>PKGBUILD</code> lives in <a href="https://github.com/wdes/tab-atelier/tree/main/packaging/arch">packaging/arch/</a>.</div>'
+                      echo '<h2>Packages</h2><ul>'
+                      for f in $(ls -1t arch/*.pkg.tar.zst 2>/dev/null); do
+                          bn=$(basename "$f")
+                          sz=$(du -h "$f" | cut -f1)
+                          echo "<li><a href=\"$bn\">$bn</a> &mdash; $sz</li>"
+                      done
+                      echo '</ul>'
+                      echo '<p><a href="../">&larr; back to the apt repo</a></p>'
+                  } > arch/index.html
+
             - name: Regenerate Packages + Release
               env:
                   CHANNEL: ${{ steps.ver.outputs.channel }}
@@ -432,6 +514,8 @@ jobs:
                   </div>
                   <h2>Windows</h2>
                   <p>Headless MSI installers for Windows are at <a href="/windows/">/windows/</a>.</p>
+                  <h2>Arch Linux</h2>
+                  <p>A pacman repository (packages <code>tab-atelier</code> / <code>tab-atelier-headless</code>) is at <a href="/arch/">/arch/</a>.</p>
                   <h2>Android</h2>
                   <p>The Android remote-control app (APK) is at <a href="/android/">/android/</a>.</p>
                   <p>Source: <a href="https://github.com/wdes/tab-atelier">github.com/wdes/tab-atelier</a>.</p>
