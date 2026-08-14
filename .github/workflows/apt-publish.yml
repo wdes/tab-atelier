@@ -361,6 +361,11 @@ jobs:
                           --name arch-pkgs --dir arch || \
                           echo "  ⚠ no arch-pkgs artifact on run $RUN_ID — keeping existing"
                   fi
+                  # This repo never ships split-debug packages (the PKGBUILD
+                  # sets options=!debug); purge any left behind by a pre-!debug
+                  # build so repo-add stops indexing them. They're matched by
+                  # neither cap glob below, so without this they'd linger forever.
+                  rm -f arch/tab-atelier-debug-*.pkg.tar.zst
                   # Cap each package at the 10 most recent. `tab-atelier-[0-9]*`
                   # matches the GUI package without also matching the
                   # `tab-atelier-headless-*` files.
