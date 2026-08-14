@@ -23,10 +23,12 @@ license=('MPL-2.0')
 # (libvulkan-dev → vulkan-headers/-icd-loader, libwayland-dev → wayland, …).
 makedepends=('cargo' 'freetype2' 'fontconfig' 'libxcb' 'libx11' 'libxkbcommon'
              'libxkbcommon-x11' 'wayland' 'vulkan-headers' 'vulkan-icd-loader')
-options=('!lto') # Rust LTO is driven by [profile.release] in Cargo.toml, not
-                 # makepkg — this only stops makepkg injecting -flto into the
-                 # CFLAGS used by C build-scripts (ring, etc.), which can break
-                 # them.
+options=('!lto' '!debug') # !lto: Rust LTO is driven by [profile.release] in
+                 # Cargo.toml, not makepkg — this only stops makepkg injecting
+                 # -flto into the CFLAGS used by C build-scripts (ring, etc.),
+                 # which can break them. !debug: skip the split-debug-symbol
+                 # `-debug` sub-package the archlinux container's makepkg.conf
+                 # builds by default (we ship a stripped release binary).
 source=("$pkgbase-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 # Release tarballs are immutable; fill in the real digest at tag time with
 #   updpkgsums    (or  makepkg -g )
