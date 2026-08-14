@@ -32,6 +32,26 @@ the sysusers/tmpfiles drop-ins are applied by pacman hooks, and **the service is
 not auto-started** (Arch policy) — the admin runs
 `systemctl enable --now tab-atelier-headless.service`.
 
+## Install from the hosted repo (no build)
+
+CI publishes a rolling pacman repository alongside the apt repo. Add to
+`/etc/pacman.conf`:
+
+```ini
+[tab-atelier]
+SigLevel = Optional TrustAll
+Server = https://deb.tab-atelier.wdes.eu/arch
+```
+
+then `sudo pacman -Sy tab-atelier` (or `tab-atelier-headless` — they conflict).
+The packages are built by `.github/workflows/arch-pkg.yml` in an `archlinux`
+container (makepkg can't run on the Ubuntu .deb runner), and
+`.github/workflows/apt-publish.yml` pulls the latest build into `site/arch/`,
+regenerates the repo db with `repo-add`, and serves it from GitHub Pages — the
+same single-publisher flow used for the Windows MSI and Android APK. It's a
+rolling channel (newest build wins, 10 kept); the AUR `PKGBUILD` below is the
+versioned path.
+
 ## Build & test today (from a working tree, no release tag needed)
 
 ```sh

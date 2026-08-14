@@ -17,8 +17,9 @@ pkgdesc='Guake-style drop-down terminal emulator (alacritty_terminal + gpui)'
 arch=('x86_64')
 url='https://github.com/wdes/tab-atelier'
 license=('MPL-2.0')
-makedepends=('cargo' 'git' 'freetype2' 'fontconfig' 'libxcb' 'libxkbcommon'
-             'libxkbcommon-x11')
+makedepends=('cargo' 'git' 'freetype2' 'fontconfig' 'libxcb' 'libx11'
+             'libxkbcommon' 'libxkbcommon-x11' 'wayland' 'vulkan-headers'
+             'vulkan-icd-loader')
 options=('!lto')
 source=("tab-atelier::git+$url.git")
 sha256sums=('SKIP')
