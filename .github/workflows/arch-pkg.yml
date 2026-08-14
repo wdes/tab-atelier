@@ -100,3 +100,38 @@ jobs:
                   path: arch-out/*.pkg.tar.zst
                   if-no-files-found: error
                   retention-days: 30
+
+    # Mirror of build.yml's Debian `integration` job: install the freshly
+    # built packages in a CLEAN archlinux container (NOT the builder — that one
+    # has every makedepend, which would mask a missing runtime `depends`) and
+    # run --check-crypto. The binaries are dynamically linked against
+    # libxcb/freetype/etc., so they won't even start unless `depends` is
+    # complete — this is what actually validates the dependency lists. Because
+    # apt-publish.yml only pulls the latest *successful run*, a smoke-test
+    # failure here also gates publishing (a broken package never reaches the
+    # repo). Runs on a plain runner so `docker run` is available (container
+    # jobs have no docker-in-docker).
+    smoke-test:
+        name: Install + --check-crypto (fresh archlinux)
+        runs-on: ubuntu-latest
+        needs: build
+        steps:
+            - uses: actions/download-artifact@v8
+              with:
+                  name: arch-pkgs
+                  path: pkgs
+            - name: Install packages + probe crypto
+              run: |
+                  # The two variants ship /usr/bin/catbus-agent and Conflict, so
+                  # install + probe sequentially. `tab-atelier-[0-9]*` matches the
+                  # GUI package without the `-headless`/`-debug` ones. The GUI's
+                  # --check-crypto runs headless (only rustls, no gpui).
+                  docker run --rm -v "$PWD/pkgs:/pkgs:ro" archlinux:latest bash -c '
+                      set -e
+                      pacman -Sy --noconfirm
+                      pacman -U --noconfirm /pkgs/tab-atelier-headless-*.pkg.tar.zst
+                      tab-atelier-headless --check-crypto
+                      pacman -Rns --noconfirm tab-atelier-headless
+                      pacman -U --noconfirm /pkgs/tab-atelier-[0-9]*.pkg.tar.zst
+                      tab-atelier --check-crypto
+                  '
