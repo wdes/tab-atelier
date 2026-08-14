@@ -1,0 +1,6 @@
+# Service account for tab-atelier-headless, created by the systemd-sysusers
+# pacman hook on install. Mirrors the deb postinst's `adduser --system --group`.
+# The daemon runs as this user (see tab-atelier-headless.service); its HOME and
+# StateDirectory both resolve to /var/lib/tab-atelier.
+#Type Name         ID  GECOS                          Home dir             Shell
+u     tab-atelier  -   "tab-atelier headless daemon"  /var/lib/tab-atelier  /usr/bin/nologin

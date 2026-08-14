@@ -1,0 +1,116 @@
+# Maintainer: William Desportes <williamdes@wdes.fr>
+#
+# VCS split package: builds tab-atelier + tab-atelier-headless straight from
+# the repo's main HEAD. Use this to test-build on Arch TODAY (the versioned
+# PKGBUILD next to it needs the v<ver> release tag to exist first):
+#
+#     makepkg -p PKGBUILD.git -si
+#
+# The two -git packages `provides` their stable names and `conflict` with both
+# stable packages, so only one tab-atelier of any flavour is ever installed.
+
+pkgbase=tab-atelier-git
+pkgname=('tab-atelier-git' 'tab-atelier-headless-git')
+pkgver=0.5.0.r0.gHEAD
+pkgrel=1
+pkgdesc='Guake-style drop-down terminal emulator (alacritty_terminal + gpui)'
+arch=('x86_64')
+url='https://github.com/wdes/tab-atelier'
+license=('MPL-2.0')
+makedepends=('cargo' 'git' 'freetype2' 'fontconfig' 'libxcb' 'libxkbcommon'
+             'libxkbcommon-x11')
+options=('!lto')
+source=("tab-atelier::git+$url.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$srcdir/tab-atelier"
+  # 0.5.0.r<commits>.g<sha>, cargo version prefix from Cargo.toml (strip -dev).
+  local base
+  base=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -n1 | sed 's/-.*//')
+  printf '%s.r%s.g%s' "$base" "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+}
+
+prepare() {
+  cd "$srcdir/tab-atelier"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$CARCH-unknown-linux-gnu"
+}
+
+build() {
+  cd "$srcdir/tab-atelier"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release
+  cargo build --frozen --release --no-default-features \
+    --features headless,energy,catbus --bin tab-atelier-headless
+}
+
+package_tab-atelier-git() {
+  pkgdesc='Guake-style drop-down terminal emulator for Linux/X11 (desktop GUI, git)'
+  depends=('gcc-libs' 'freetype2' 'fontconfig' 'libxcb' 'libxkbcommon'
+           'libxkbcommon-x11' 'ttf-dejavu')
+  optdepends=('noto-fonts-emoji: colour emoji in the UI (menus, status markers)')
+  provides=('tab-atelier')
+  conflicts=('tab-atelier' 'tab-atelier-headless')
+  backup=('etc/tab-atelier/preferences.json'
+          'etc/claude-code/managed-settings.json')
+
+  cd "$srcdir/tab-atelier"
+  install -Dm755 target/release/tab-atelier  "$pkgdir/usr/bin/tab-atelier"
+  install -Dm755 target/release/catbus-agent "$pkgdir/usr/bin/catbus-agent"
+  install -Dm644 assets/tab-atelier.desktop \
+    "$pkgdir/usr/share/applications/tab-atelier.desktop"
+  install -Dm644 assets/tab-atelier-autostart.desktop \
+    "$pkgdir/etc/xdg/autostart/tab-atelier.desktop"
+  install -Dm644 assets/tab-atelier.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/tab-atelier.svg"
+  local size
+  for size in 16 24 32 48 64 128 256; do
+    install -Dm644 "assets/icons/hicolor/${size}x${size}/apps/tab-atelier.png" \
+      "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/tab-atelier.png"
+  done
+  install -Dm644 assets/preferences.default.json \
+    "$pkgdir/etc/tab-atelier/preferences.json"
+  install -Dm644 assets/claude-code-managed-settings.desktop.json \
+    "$pkgdir/etc/claude-code/managed-settings.json"
+  install -d "$pkgdir/usr/share/tab-atelier/pets"
+  install -m644 assets/pets/*.xml assets/pets/*.png \
+    "$pkgdir/usr/share/tab-atelier/pets/"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/tab-atelier/README.md"
+  install -Dm644 assets/openapi.yaml \
+    "$pkgdir/usr/share/doc/tab-atelier/openapi.yaml"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/tab-atelier-git/LICENSE"
+}
+
+package_tab-atelier-headless-git() {
+  pkgdesc='Display-less tab-atelier daemon: same HTTP/TLS API, no X11/gpui (git)'
+  depends=('gcc-libs' 'nftables' 'bubblewrap' 'systemd')
+  provides=('tab-atelier-headless')
+  conflicts=('tab-atelier' 'tab-atelier-headless')
+  backup=('etc/tab-atelier/preferences.json'
+          'etc/claude-code/managed-settings.json')
+  install=tab-atelier-headless.install
+
+  cd "$srcdir/tab-atelier"
+  install -Dm755 target/release/tab-atelier-headless \
+    "$pkgdir/usr/bin/tab-atelier-headless"
+  install -Dm755 target/release/catbus-agent \
+    "$pkgdir/usr/bin/catbus-agent"
+  install -Dm644 assets/tab-atelier-headless.service \
+    "$pkgdir/usr/lib/systemd/system/tab-atelier-headless.service"
+  install -Dm644 packaging/arch/tab-atelier-headless.sysusers \
+    "$pkgdir/usr/lib/sysusers.d/tab-atelier.conf"
+  install -Dm644 packaging/arch/tab-atelier-headless.tmpfiles \
+    "$pkgdir/usr/lib/tmpfiles.d/tab-atelier.conf"
+  install -Dm644 assets/preferences.default.json \
+    "$pkgdir/etc/tab-atelier/preferences.json"
+  install -Dm644 assets/claude-code-managed-settings.json \
+    "$pkgdir/etc/claude-code/managed-settings.json"
+  install -Dm644 README.md \
+    "$pkgdir/usr/share/doc/tab-atelier-headless/README.md"
+  install -Dm644 assets/openapi.yaml \
+    "$pkgdir/usr/share/doc/tab-atelier-headless/openapi.yaml"
+  install -Dm644 LICENSE \
+    "$pkgdir/usr/share/licenses/tab-atelier-headless-git/LICENSE"
+}
