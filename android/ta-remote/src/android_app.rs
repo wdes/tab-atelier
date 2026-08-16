@@ -697,6 +697,19 @@ fn format_uptime(secs: f64) -> String {
 /// which case we just record the baseline silently).
 type SeenPreviews = Arc<Mutex<HashMap<String, u32>>>;
 
+/// Most-recently-used rank per tab name (higher = more recent), bumped when
+/// the user opens a tab. Drives the "up to 8 last-used tabs first, then the
+/// rest in server order" ordering of the list — a Ctrl-P-style quick jump.
+/// In-memory only (resets on app restart), keyed by name like `SeenPreviews`.
+type Recency = Arc<Mutex<HashMap<String, u64>>>;
+
+/// Monotonic use-counter feeding `Recency` values. A plain counter avoids a
+/// wall-clock and still gives a total order over "which tab was opened last".
+static USE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Number of most-recently-used tabs pinned to the top of the list.
+const RECENTS_PINNED: usize = 8;
+
 /// Small inline CRC32 (IEEE) — same polynomial as the desktop side's
 /// helper. Used to fingerprint tab previews for the "new output" dot.
 fn crc32(data: &[u8]) -> u32 {
@@ -727,11 +740,12 @@ fn led_color(slug: Option<&str>) -> (bool, slint::Color) {
     }
 }
 
-fn push_tabs(ui_weak: &Weak<AppWindow>, tabs: Vec<ApiTab>, seen: &SeenPreviews) {
+fn push_tabs(ui_weak: &Weak<AppWindow>, tabs: Vec<ApiTab>, seen: &SeenPreviews, recency: &Recency) {
     let rows: Vec<TabRow> = {
         let mut seen_guard = seen.lock().unwrap();
         tabs.into_iter()
-            .map(|t| {
+            .enumerate()
+            .map(|(server_index, t)| {
                 let preview_hash = crc32(t.preview.as_bytes());
                 let has_new = match seen_guard.get(&t.name) {
                     None => false, // first sighting, seed silently
@@ -755,10 +769,28 @@ fn push_tabs(ui_weak: &Weak<AppWindow>, tabs: Vec<ApiTab>, seen: &SeenPreviews) 
                     has_new,
                     led_show,
                     led_color,
+                    server_index: server_index as i32,
                 }
             })
             .collect()
     };
+    // Ctrl-P-style ordering: the (up to) RECENTS_PINNED most-recently-used
+    // tabs first, by recency rank desc; then every other tab in server order.
+    // Each row keeps its `server_index`, so reordering the list never
+    // misroutes a `/tabs/{i}/…` call (open / rename / close all use it).
+    let order: Vec<usize> = {
+        let rec = recency.lock().unwrap();
+        let rank = |i: usize| rec.get(rows[i].name.as_str()).copied().unwrap_or(0);
+        let mut recents: Vec<usize> = (0..rows.len()).filter(|&i| rank(i) > 0).collect();
+        // Highest rank (most recently opened) first. Ranks are unique per open,
+        // so ordering within a rank never matters.
+        recents.sort_by_key(|&i| std::cmp::Reverse(rank(i)));
+        recents.truncate(RECENTS_PINNED);
+        let pinned: std::collections::HashSet<usize> = recents.iter().copied().collect();
+        let rest = (0..rows.len()).filter(|i| !pinned.contains(i));
+        recents.into_iter().chain(rest).collect()
+    };
+    let rows: Vec<TabRow> = order.into_iter().map(|i| rows[i].clone()).collect();
     let weak = ui_weak.clone();
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(ui) = weak.upgrade() {
@@ -776,12 +808,14 @@ fn refresh_soon(
     data: &Arc<Mutex<AppData>>,
     reach: &Arc<Mutex<Reach>>,
     seen: &SeenPreviews,
+    recency: &Recency,
 ) {
     let weak = ui_weak.clone();
     let agent = agent.clone();
     let data = data.clone();
     let reach = reach.clone();
     let seen = seen.clone();
+    let recency = recency.clone();
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(250));
         let Some(host) = data.lock().unwrap().active_host() else {
@@ -789,7 +823,7 @@ fn refresh_soon(
         };
         let result = fetch_tabs(&agent, &host);
         if let Some(t) = result.tabs {
-            push_tabs(&weak, t, &seen);
+            push_tabs(&weak, t, &seen, &recency);
         }
         push_host_stats(&weak, &result.host);
         *reach.lock().unwrap() = result.reach;
@@ -948,6 +982,7 @@ pub fn android_main(app: slint::android::AndroidApp) {
 
     let last_reach: Arc<Mutex<Reach>> = Arc::new(Mutex::new(Reach::Offline));
     let seen_previews: SeenPreviews = Arc::new(Mutex::new(HashMap::new()));
+    let recency: Recency = Arc::new(Mutex::new(HashMap::new()));
     // Background poller — fetches the tab list + host stats. The old
     // per-tab /output poll (driven by `open_tab` when the user opened
     // a tab in the in-app TerminalView) is gone; the tap-to-browser
@@ -957,6 +992,7 @@ pub fn android_main(app: slint::android::AndroidApp) {
     let poll_data = data.clone();
     let poll_reach = last_reach.clone();
     let poll_seen = seen_previews.clone();
+    let poll_recency = recency.clone();
     std::thread::spawn(move || {
         loop {
             let (host, active_idx) = {
@@ -967,7 +1003,7 @@ pub fn android_main(app: slint::android::AndroidApp) {
                 let result = fetch_tabs(&poll_agent, &host);
                 let reach = result.reach;
                 if let Some(t) = result.tabs {
-                    push_tabs(&poll_weak, t, &poll_seen);
+                    push_tabs(&poll_weak, t, &poll_seen, &poll_recency);
                 }
                 push_host_stats(&poll_weak, &result.host);
                 log::debug!("poll {}: {reach:?} [{}]", host.name, result.detail);
@@ -1019,11 +1055,20 @@ pub fn android_main(app: slint::android::AndroidApp) {
         std::thread::spawn(move || post_input(&agent, &host, reach, idx, &bytes));
     });
 
+    // Opening a tab bumps its most-recently-used rank so it floats to the
+    // top of the list on the next refresh (Ctrl-P-style quick jump).
+    let used_recency = recency.clone();
+    ui.on_note_tab_used(move |name| {
+        let seq = USE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        used_recency.lock().unwrap().insert(name.to_string(), seq);
+    });
+
     let close_agent = agent.clone();
     let close_data = data.clone();
     let close_reach = last_reach.clone();
     let close_weak = ui_weak.clone();
     let close_seen = seen_previews.clone();
+    let close_recency = recency.clone();
     ui.on_request_close_tab(move |idx| {
         let Some(host) = close_data.lock().unwrap().active_host() else {
             return;
@@ -1031,7 +1076,7 @@ pub fn android_main(app: slint::android::AndroidApp) {
         let reach = *close_reach.lock().unwrap();
         let agent = close_agent.clone();
         std::thread::spawn(move || delete_tab(&agent, &host, reach, idx));
-        refresh_soon(&close_weak, &close_agent, &close_data, &close_reach, &close_seen);
+        refresh_soon(&close_weak, &close_agent, &close_data, &close_reach, &close_seen, &close_recency);
     });
 
     let new_agent = agent.clone();
@@ -1039,6 +1084,7 @@ pub fn android_main(app: slint::android::AndroidApp) {
     let new_reach = last_reach.clone();
     let new_weak = ui_weak.clone();
     let new_seen = seen_previews.clone();
+    let new_recency = recency.clone();
     ui.on_request_new_tab(move || {
         let Some(host) = new_data.lock().unwrap().active_host() else {
             return;
@@ -1046,7 +1092,7 @@ pub fn android_main(app: slint::android::AndroidApp) {
         let reach = *new_reach.lock().unwrap();
         let agent = new_agent.clone();
         std::thread::spawn(move || post_new_tab(&agent, &host, reach));
-        refresh_soon(&new_weak, &new_agent, &new_data, &new_reach, &new_seen);
+        refresh_soon(&new_weak, &new_agent, &new_data, &new_reach, &new_seen, &new_recency);
     });
 
     let rename_agent = agent.clone();
@@ -1054,6 +1100,9 @@ pub fn android_main(app: slint::android::AndroidApp) {
     let rename_reach = last_reach.clone();
     let rename_weak = ui_weak.clone();
     let rename_seen = seen_previews.clone();
+    // Last consumer of `recency` — move it in rather than clone (matches the
+    // surrounding handler-wiring style for the final use of a shared Arc).
+    let rename_recency = recency;
     ui.on_request_rename_tab(move |idx, name| {
         let Some(host) = rename_data.lock().unwrap().active_host() else {
             return;
@@ -1062,7 +1111,7 @@ pub fn android_main(app: slint::android::AndroidApp) {
         let agent = rename_agent.clone();
         let name = name.to_string();
         std::thread::spawn(move || post_rename_tab(&agent, &host, reach, idx, &name));
-        refresh_soon(&rename_weak, &rename_agent, &rename_data, &rename_reach, &rename_seen);
+        refresh_soon(&rename_weak, &rename_agent, &rename_data, &rename_reach, &rename_seen, &rename_recency);
     });
 
     // Tab tap → share-viewer in system browser. Build the URL from
