@@ -76,10 +76,14 @@ struct Tab {
     prior_uptime: std::time::Duration,
     active_duration: std::time::Duration,
     last_activated: Option<std::time::Instant>,
-    /// Unix-millis of the last time this tab was used (activated, or a viewer
-    /// open on it). Mirrored into the API snapshot's `last_used_at` so a
-    /// remote client can order the list most-recently-used-first.
+    /// Unix-millis of the last time the user switched to this tab (activated,
+    /// or a viewer newly opened on it). Mirrored into the API snapshot's
+    /// `last_used_at` so a remote client can order the list
+    /// most-recently-used-first. Written only on the change edge, not per tick.
     last_used_at: Option<u64>,
+    /// Viewer count at the previous snapshot, to stamp `last_used_at` only when
+    /// a NEW viewer opens the tab, not every tick it stays open.
+    last_used_viewers: std::cell::Cell<usize>,
     /// "Unreviewed work" flag — drives the blue LED. Set true when the agent
     /// works (thinks / streams) on a tab you are NOT currently looking at, and
     /// stays set (sticky) after it stops, so the tab flags "there's output here
@@ -266,6 +270,7 @@ impl Tab {
             active_duration: std::time::Duration::ZERO,
             last_activated: activated.then(std::time::Instant::now),
             last_used_at: activated.then(crate::unix_millis),
+            last_used_viewers: std::cell::Cell::new(0),
             // Boots un-flagged (grey): it only goes blue once its
             // agent WORKS while you're not looking. Restoring a tab
             // isn't "new work", so it must not flash blue on restart.
@@ -2017,12 +2022,15 @@ impl AppState {
             // the snapshot below.
             let rss_bytes = crate::agent_probe::sample_tree(shell_pid).map(|s| s.rss_kb.saturating_mul(1024));
             tab.rss_bytes.set(rss_bytes);
-            // A live viewer (browser / mobile remote) means the tab is being
-            // used right now — keep its MRU rank fresh so it stays near the top
-            // of a remote client's list while watched.
-            if pty_ring.lock().map_or(0, |r| r.viewer_count()) > 0 {
+            // A NEW viewer opening the tab (browser / mobile remote) is the
+            // "switched to this tab" edge — stamp MRU once. A viewer merely
+            // still open doesn't restamp, so a watched tab doesn't churn
+            // last_used_at (and the cached /tabs body) every tick.
+            let viewers_now = pty_ring.lock().map_or(0, |r| r.viewer_count());
+            if viewers_now > tab.last_used_viewers.get() {
                 tab.last_used_at = Some(crate::unix_millis());
             }
+            tab.last_used_viewers.set(viewers_now);
             api_tabs.push(api::SnapshotTab {
                 id: tab.id.clone(),
                 name: tab.name.clone(),
