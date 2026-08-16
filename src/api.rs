@@ -173,6 +173,13 @@ struct TabInfo {
     /// is attached, even if no transient state is current.
     #[serde(skip_serializing_if = "Option::is_none")]
     agent_kind: Option<String>,
+    /// Fully-derived per-tab LED, matching the desktop tab-strip dot:
+    /// `"dead"` (dim red) / `"error"` / `"working"` (green) / `"unreviewed"`
+    /// (blue) / `"idle"` (grey). Computed server-side by
+    /// [`crate::compute_tab_led`] so the mobile remote and CLI viewer render
+    /// the identical indicator. Omitted when no dot should show.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    led: Option<&'static str>,
     /// Durable agent session UUID — set by `set-status --session
     /// <id>` from inside the agent's PTY. The brain uses this to
     /// confirm a Claude (or other agent) is actually mid-task before
@@ -372,6 +379,12 @@ pub struct SnapshotTab {
     /// "session attached" semantic the desktop LED uses to render a
     /// steady grey dot when there's no transient state.
     pub agent_kind: Option<std::sync::Arc<str>>,
+    /// The fully-derived per-tab agent LED, computed once at snapshot-build
+    /// time (GUI and headless) by [`crate::compute_tab_led`] so the `/tabs`
+    /// `led` field, the CLI viewer and the mobile remote all render the exact
+    /// dot the desktop draws — without each consumer re-deriving it (they lack
+    /// the raw liveness / last-output / unreviewed signals). `None` ⇒ no dot.
+    pub agent_led: Option<crate::TabLed>,
     /// How many WS viewers (browser share-link / `remote attach`) are
     /// currently watching this tab. Surfaced on `/tabs` so `tabs`-list
     /// consumers can see who's being watched; also the GUI's "tab is
@@ -1733,6 +1746,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                         crate::AgentState::Error => "error",
                     }),
                     agent_kind: t.agent_kind.as_deref().map(str::to_string),
+                    led: t.agent_led.map(crate::TabLed::slug),
                     agent_session_id: t.agent_session_id.as_deref().map(str::to_string),
                     viewers: t.viewers,
                     locked: crate::schedule::LockState::effective_locked(t),
@@ -4223,6 +4237,7 @@ pub fn test_snapshot_tab(id: &str, name: &str) -> SnapshotTab {
         agent_state: None,
         agent_session_id: None,
         agent_kind: None,
+        agent_led: None,
         viewers: 0,
         pty_ring: None,
         net_disabled: false,
@@ -4301,6 +4316,7 @@ mod tests {
             watts: None,
             agent_state: None,
             agent_kind: None,
+            led: None,
             agent_session_id: None,
             context: None,
             viewers: 0,

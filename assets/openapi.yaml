@@ -346,6 +346,7 @@ components:
         lock_reason: { type: [string, "null"], enum: [manual, schedule, null] }
         agent_state: { type: [string, "null"], enum: [thinking, waiting, error, null] }
         agent_kind: { type: [string, "null"] }
+        led: { type: [string, "null"], enum: [dead, error, working, unreviewed, idle, null], description: "Fully-derived per-tab agent LED matching the desktop tab-strip dot; omitted when no dot should show" }
         context: { type: [string, "null"] }
         viewers: { type: integer, description: WS viewers currently watching this tab }
         watts: { type: [number, "null"] }
