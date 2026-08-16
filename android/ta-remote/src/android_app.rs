@@ -290,6 +290,12 @@ struct ApiTab {
     preview: String,
     #[serde(default)]
     uptime_secs: f64,
+    /// Fully-derived agent LED slug from `/tabs`: "dead" / "error" /
+    /// "working" / "unreviewed" / "idle". Absent ⇒ no dot. The daemon
+    /// computes it (crate::compute_tab_led) so the phone renders the exact
+    /// same dot the desktop tab strip does.
+    #[serde(default)]
+    led: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -706,6 +712,21 @@ fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
+/// Map the daemon's `led` slug to `(show, exact color)`. The RGB values are
+/// the byte form of the desktop palette (`tab_atelier::TabLed::rgb`) — this is
+/// a disjoint crate so the constants are mirrored, not imported. Keep in sync.
+fn led_color(slug: Option<&str>) -> (bool, slint::Color) {
+    use slint::Color;
+    match slug {
+        Some("dead") => (true, Color::from_rgb_u8(140, 41, 41)), // dim red  #8C2929
+        Some("error") => (true, Color::from_rgb_u8(239, 68, 68)), // red     #EF4444
+        Some("working") => (true, Color::from_rgb_u8(78, 201, 176)), // green #4EC9B0
+        Some("unreviewed") => (true, Color::from_rgb_u8(92, 153, 255)), // blue #5C99FF
+        Some("idle") => (true, Color::from_rgb_u8(115, 115, 115)), // grey   #737373
+        _ => (false, Color::default()),
+    }
+}
+
 fn push_tabs(ui_weak: &Weak<AppWindow>, tabs: Vec<ApiTab>, seen: &SeenPreviews) {
     let rows: Vec<TabRow> = {
         let mut seen_guard = seen.lock().unwrap();
@@ -717,6 +738,7 @@ fn push_tabs(ui_weak: &Weak<AppWindow>, tabs: Vec<ApiTab>, seen: &SeenPreviews) 
                     Some(&prev) => prev != preview_hash,
                 };
                 seen_guard.entry(t.name.clone()).or_insert(preview_hash);
+                let (led_show, led_color) = led_color(t.led.as_deref());
                 TabRow {
                     name: SharedString::from(t.name.clone()),
                     cwd: SharedString::from(t.cwd.unwrap_or_default()),
@@ -731,6 +753,8 @@ fn push_tabs(ui_weak: &Weak<AppWindow>, tabs: Vec<ApiTab>, seen: &SeenPreviews) 
                     preview: SharedString::from(t.preview),
                     uptime: SharedString::from(format_uptime(t.uptime_secs)),
                     has_new,
+                    led_show,
+                    led_color,
                 }
             })
             .collect()

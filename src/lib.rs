@@ -1362,6 +1362,111 @@ pub struct AgentStateSnapshot {
     pub updated_at: std::time::Instant,
 }
 
+/// How long after the last PTY output a tab's LED stays green ("working").
+///
+/// A `--resume`d agent streams its reply with no thinking hook, so fresh output
+/// is what keeps the dot green. Shared by the desktop renderer and the headless
+/// snapshot builder so both apply the identical window.
+pub const STREAMING_LED_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The per-tab agent "LED" — the single colored dot drawn left of a tab name.
+///
+/// Shared by the desktop tab strip (`app.rs`), the `/tabs` JSON (`led` field)
+/// and the mobile remote, so all three render the identical indicator.
+/// Precedence, highest first: `Dead` > `Error` > `Working` > `Unreviewed` >
+/// `Idle`. Derived by [`compute_tab_led`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TabLed {
+    /// Session anchored but the agent process is gone — needs relaunch.
+    Dead,
+    /// Agent reported an error.
+    Error,
+    /// Thinking, or fresh PTY output within the last few seconds.
+    Working,
+    /// Agent worked then stopped, not yet reviewed.
+    Unreviewed,
+    /// Session attached, nothing to review.
+    Idle,
+}
+
+impl TabLed {
+    /// Stable lowercase slug for the `/tabs` JSON `led` field.
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Dead => "dead",
+            Self::Error => "error",
+            Self::Working => "working",
+            Self::Unreviewed => "unreviewed",
+            Self::Idle => "idle",
+        }
+    }
+
+    /// Exact dot color `(r, g, b)` in `0.0..=1.0` sRGB — the SINGLE source of
+    /// truth for every renderer. The desktop passes it straight to gpui's
+    /// `Rgba`; the mobile remote mirrors these same values (it's a disjoint
+    /// crate and can't import this one).
+    #[must_use]
+    pub const fn rgb(self) -> (f32, f32, f32) {
+        match self {
+            Self::Dead => (0.55, 0.16, 0.16),       // dim red  #8C2929
+            Self::Error => (0.937, 0.267, 0.267),   // red      #EF4444
+            Self::Working => (0.306, 0.788, 0.690), // green    #4EC9B0
+            Self::Unreviewed => (0.36, 0.60, 1.0),  // blue     #5C99FF
+            Self::Idle => (0.45, 0.45, 0.45),       // grey     #737373
+        }
+    }
+}
+
+/// Derive the per-tab LED from raw agent signals.
+///
+/// The one implementation of the desktop tab strip's dot precedence and
+/// visibility gate, reused by the `/tabs` serializer so the CLI viewer and
+/// mobile remote show the identical LED. Returns `None` when no dot should be
+/// drawn (the desktop's `agent_led_visible` gate).
+///
+/// - `agent_state`: transient hook state, if any.
+/// - `session_attached`: a durable agent kind is set (`agent_kind.is_some()`).
+/// - `is_brain`: the attached kind is the auto-injector `"brain"` (exempt from
+///   the dead check — it has no long-lived process).
+/// - `agent_alive`: the agent process is present (catbus liveness). Pass `true`
+///   where liveness isn't tracked, so `Dead` never triggers.
+/// - `full_sweep_ran`: at least one liveness sweep has completed (avoids a
+///   false `Dead` before the first probe).
+/// - `unreviewed_work`: agent worked then stopped and hasn't been reviewed.
+/// - `recent_output`: fresh PTY output within the streaming window.
+#[must_use]
+#[allow(clippy::fn_params_excessive_bools)]
+pub const fn compute_tab_led(
+    agent_state: Option<AgentState>,
+    session_attached: bool,
+    is_brain: bool,
+    agent_alive: bool,
+    full_sweep_ran: bool,
+    unreviewed_work: bool,
+    recent_output: bool,
+) -> Option<TabLed> {
+    let agent_dead = session_attached && !agent_alive && !is_brain && full_sweep_ran;
+    // Visibility gate (app.rs::agent_led_visible): dead, or a transient state
+    // exists, or a session is attached and it's alive-or-unreviewed.
+    let visible = agent_dead || agent_state.is_some() || (session_attached && (agent_alive || unreviewed_work));
+    if !visible {
+        return None;
+    }
+    let working = matches!(agent_state, Some(AgentState::Thinking)) || recent_output;
+    Some(if agent_dead {
+        TabLed::Dead
+    } else if matches!(agent_state, Some(AgentState::Error)) {
+        TabLed::Error
+    } else if working {
+        TabLed::Working
+    } else if unreviewed_work {
+        TabLed::Unreviewed
+    } else {
+        TabLed::Idle
+    })
+}
+
 const fn default_true() -> bool {
     true
 }

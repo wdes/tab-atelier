@@ -59,7 +59,7 @@ use std::sync::{Arc, Mutex};
 /// the green LED, even when the stored hook-state is `Waiting`/`None` — e.g. a
 /// `--resume`d session that continues without a fresh `UserPromptSubmit`. Kept
 /// short so the LED reverts to the real state the moment output goes quiet.
-const STREAMING_LED_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
+use crate::STREAMING_LED_WINDOW;
 
 struct Tab {
     view: Entity<TerminalView>,
@@ -2036,6 +2036,27 @@ impl AppState {
                 agent_state: tab.agent_state.clone(),
                 agent_session_id: tab.agent_session_id.clone(),
                 agent_kind: tab.agent_kind.clone(),
+                // Derive the LED once here (same inputs the tab-strip renderer
+                // uses) so /tabs and the mobile remote match the desktop dot.
+                agent_led: {
+                    #[cfg(feature = "catbus")]
+                    let (agent_alive, full_sweep_ran) = (
+                        tab.agent_pid.get().is_some(),
+                        self.last_agent_full_sweep.get().is_some(),
+                    );
+                    #[cfg(not(feature = "catbus"))]
+                    let (agent_alive, full_sweep_ran) = (true, false);
+                    let recent_output = tab.last_output_at.is_some_and(|t| t.elapsed() < STREAMING_LED_WINDOW);
+                    crate::compute_tab_led(
+                        tab.agent_state.as_ref().map(|s| s.state),
+                        tab.agent_kind.is_some(),
+                        tab.agent_kind.as_deref() == Some("brain"),
+                        agent_alive,
+                        full_sweep_ran,
+                        tab.unreviewed_work,
+                        recent_output,
+                    )
+                },
                 viewers: pty_ring.lock().map_or(0, |r| r.viewer_count()),
                 pty_ring: Some(pty_ring),
                 net_disabled: ts.net_disabled,
@@ -3162,94 +3183,43 @@ impl AppState {
             //   red    — the agent hit an error;
             //   grey   — nothing to review (never worked, or already reviewed).
             let session_attached = tab.agent_kind.is_some();
-            // Is the agent PROCESS actually running? The catbus sweep stamps
-            // `agent_pid` = Some when it finds a live `claude`/`catbus-agent`
-            // descendant, None when it's Gone. Without the sweep (catbus off) we
-            // can't tell, so assume alive and keep the old anchor-based LED.
+            // Is the agent PROCESS running? The catbus sweep stamps `agent_pid`
+            // = Some for a live `claude`/`catbus-agent` descendant, None when
+            // Gone. Without the sweep (catbus off) we can't tell, so assume
+            // alive. `full_sweep_ran` gates the dim-red "dead" dot on the first
+            // sweep having completed, so a restored agent doesn't flash red for
+            // the first second or two after boot. The ⛑ brain watchdog is exempt
+            // from "dead" (no session to resume); compute_tab_led skips it.
             #[cfg(feature = "catbus")]
-            let agent_alive = tab.agent_pid.get().is_some();
+            let (agent_alive, full_sweep_ran) = (
+                tab.agent_pid.get().is_some(),
+                self.last_agent_full_sweep.get().is_some(),
+            );
             #[cfg(not(feature = "catbus"))]
-            let agent_alive = true;
-            // A tab with a durable session anchor whose agent PROCESS is gone
-            // (crashed / failed auto-resume / killed) is DEAD, not idle. Its stale
-            // `agent_state` would otherwise keep lighting a healthy green/grey dot
-            // for up to 2 min — "very wrong." Force a distinct dim-red "needs
-            // relaunch" dot instead, so it's obvious which tabs to
-            // `tab-atelier claude --resume`. The anchor stays in tabs.json.
-            // Gate on a full agent sweep having run at least once: `agent_pid`
-            // starts None and idle background tabs are skipped, so without this
-            // every restored agent would flash red for the first second or two
-            // after boot, before the first full sweep confirms it's actually
-            // alive. Only claimable-dead once we've truly looked.
-            #[cfg(feature = "catbus")]
-            // The ⛑ brain watchdog is exempt: it has no session to resume (it
-            // re-attaches to other tabs over the API), the sweep doesn't count it
-            // as an "agent" descendant, and it stays grey — never dim-red "dead".
-            let agent_dead = session_attached
-                && !agent_alive
-                && tab.agent_kind.as_deref() != Some("brain")
-                && self.last_agent_full_sweep.get().is_some();
-            #[cfg(not(feature = "catbus"))]
-            let agent_dead = false;
-            let agent_led = if agent_dead
-                || agent_led_visible(
-                    tab.agent_state.is_some(),
-                    session_attached,
-                    agent_alive || tab.unreviewed_work,
-                ) {
-                let grey = Hsla::from(Rgba {
-                    r: 0.45,
-                    g: 0.45,
-                    b: 0.45,
-                    a: 1.0,
-                });
-                let thinking_green = Hsla::from(Rgba {
-                    r: 0.306,
-                    g: 0.788,
-                    b: 0.690,
-                    a: 1.0,
-                });
-                let state = tab.agent_state.as_ref().map(|s| s.state);
-                // Working = a live thinking hook OR fresh PTY output (a
-                // `--resume`d session streams a reply without a thinking hook,
-                // and `agent_activity` only counts *child* processes on-CPU, so
-                // claude rendering its own reply reads Idle — the output window
-                // is what catches it).
-                let working = matches!(state, Some(crate::AgentState::Thinking))
-                    || tab.last_output_at.is_some_and(|t| t.elapsed() < STREAMING_LED_WINDOW);
-                let color = if agent_dead {
-                    // Dim red — the agent process is gone; needs a relaunch.
-                    // Deliberately darker/duller than the bright error red so
-                    // "dead" reads differently from "hit an error but alive".
-                    Hsla::from(Rgba {
-                        r: 0.55,
-                        g: 0.16,
-                        b: 0.16,
-                        a: 1.0,
-                    })
-                } else if matches!(state, Some(crate::AgentState::Error)) {
-                    Hsla::from(Rgba {
-                        r: 0.937,
-                        g: 0.267,
-                        b: 0.267,
-                        a: 1.0,
-                    })
-                } else if working {
-                    thinking_green
-                } else if tab.unreviewed_work {
-                    Hsla::from(Rgba {
-                        r: 0.36,
-                        g: 0.60,
-                        b: 1.0,
-                        a: 1.0,
-                    })
-                } else {
-                    grey
-                };
-                Some(div().w(px(7.0)).h(px(7.0)).mr(px(5.0)).rounded_full().bg(color))
-            } else {
-                None
-            };
+            let (agent_alive, full_sweep_ran) = (true, false);
+            // Single shared derivation so the desktop dot, the /tabs `led` field
+            // and the mobile remote can never drift. `working` counts fresh PTY
+            // output (a `--resume`d session streams a reply with no thinking
+            // hook) — see the block comment above for each color's meaning.
+            let recent_output = tab.last_output_at.is_some_and(|t| t.elapsed() < STREAMING_LED_WINDOW);
+            let agent_led = crate::compute_tab_led(
+                tab.agent_state.as_ref().map(|s| s.state),
+                session_attached,
+                tab.agent_kind.as_deref() == Some("brain"),
+                agent_alive,
+                full_sweep_ran,
+                tab.unreviewed_work,
+                recent_output,
+            )
+            .map(|led| {
+                let (r, g, b) = led.rgb();
+                div()
+                    .w(px(7.0))
+                    .h(px(7.0))
+                    .mr(px(5.0))
+                    .rounded_full()
+                    .bg(Hsla::from(Rgba { r, g, b, a: 1.0 }))
+            });
 
             #[cfg(feature = "energy")]
             let power_label = watts.get(i).map(power::TabPower::label).unwrap_or_default();
@@ -6486,19 +6456,6 @@ const fn hotkey_should_show(visible: bool, window_active: bool) -> bool {
     !visible || !window_active
 }
 
-/// Whether the per-tab agent LED should be shown.
-///
-/// Visible for a live transient state (`thinking`/`waiting`/`error`), OR an
-/// attached session that still has something behind it — `live_or_unreviewed` is
-/// "the process is actually running, or it left unreviewed output". NOT for a
-/// session whose durable anchor outlived a `claude` that didn't restart (dead +
-/// reviewed + no state) — that lit an LED with no agent behind it, which reads as
-/// broken. The anchor still persists in `tabs.json` for a manual resume; the dot
-/// just stops pretending.
-const fn agent_led_visible(has_state: bool, attached: bool, live_or_unreviewed: bool) -> bool {
-    has_state || (attached && live_or_unreviewed)
-}
-
 fn spawn_hotkey_listener(keycodes: &[u8], window_handle: WindowHandle<AppState>, cx: &mut App) {
     // An awaitable channel, not a polled std::mpsc: the old loop woke
     // 20×/s forever to try_recv a hotkey that fires a few times an hour.
@@ -6715,15 +6672,28 @@ mod tests {
 
     #[test]
     fn agent_led_hidden_for_a_dead_session_with_nothing_to_review() {
-        // Live agent running (or unreviewed output left) → LED on.
-        assert!(agent_led_visible(false, true, true));
-        // A transient state always shows (a hook just fired).
-        assert!(agent_led_visible(true, true, false));
-        // The reported bug: durable anchor attached, but the claude never
-        // restarted (dead) and nothing to review, no state → NO LED.
-        assert!(!agent_led_visible(false, true, false));
+        use crate::{AgentState, TabLed, compute_tab_led};
+        // Live agent running, session attached, nothing to review → grey Idle.
+        assert_eq!(
+            compute_tab_led(None, true, false, true, false, false, false),
+            Some(TabLed::Idle)
+        );
+        // A transient state always shows (a hook just fired) even if not alive.
+        assert_eq!(
+            compute_tab_led(Some(AgentState::Waiting), true, false, false, false, false, false),
+            Some(TabLed::Idle)
+        );
+        // The reported bug: durable anchor attached, but the agent never
+        // restarted and nothing to review, no state — and no sweep has yet run,
+        // so it isn't claimed dead either → NO LED.
+        assert_eq!(compute_tab_led(None, true, false, false, false, false, false), None);
+        // Once a full sweep confirms the process is gone → dim-red Dead dot.
+        assert_eq!(
+            compute_tab_led(None, true, false, false, true, false, false),
+            Some(TabLed::Dead)
+        );
         // No session at all → never.
-        assert!(!agent_led_visible(false, false, false));
+        assert_eq!(compute_tab_led(None, false, false, true, false, false, false), None);
     }
 
     #[test]

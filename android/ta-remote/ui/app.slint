@@ -26,6 +26,13 @@ struct TabRow {
     /// Set when the preview text has changed since the user last opened
     /// this tab — used to surface "this tab moved" without having to open it.
     has-new: bool,
+    /// Whether to draw the agent-state LED dot (the daemon's `led` field was
+    /// present). When false the 7px dot is omitted, exactly like the desktop.
+    led-show: bool,
+    /// Exact agent-LED color, mirrored from the desktop palette on the Rust
+    /// side (see `led_color` in android_app.rs): dim-red dead / red error /
+    /// green working / blue unreviewed / grey idle.
+    led-color: color,
 }
 
 // One contiguous run of same-colour glyphs in a terminal row. Built on
@@ -223,6 +230,15 @@ component TabCard inherits Rectangle {
                     HorizontalLayout {
                         spacing: 6px;
                         alignment: start;
+                        // Agent-state LED — the exact 7px dot the desktop tab
+                        // strip draws, colored server-side (crate::TabLed).
+                        if tab.led-show : Rectangle {
+                            width: 7px;
+                            height: 7px;
+                            y: parent.height / 2 - 3.5px;
+                            border-radius: 3.5px;
+                            background: tab.led-color;
+                        }
                         Text {
                             text: tab.name;
                             color: #f0f0f0;

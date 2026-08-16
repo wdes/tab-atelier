@@ -169,6 +169,18 @@ struct HeadlessTab {
     /// Bit pattern of the last `save_tab_uptime` value, to skip
     /// rewriting frozen (deactivated) tabs' files every 30 s.
     uptime_last_saved: Option<u64>,
+    /// Wall-clock of the last PTY-output advance, for the green "working"
+    /// LED window (mirrors the GUI's `Tab::last_output_at`). Stamped in
+    /// `persist` when the ring grows past `led_last_ring`, so a `--resume`d
+    /// agent streaming a reply still lights green with no thinking hook.
+    last_output_at: Option<Instant>,
+    /// Ring length at the last `last_output_at` stamp — cheap change detector.
+    led_last_ring: u64,
+    /// Blue "unreviewed" LED: the agent was thinking while no viewer was
+    /// attached, and hasn't been looked at since. Set/cleared in the LED
+    /// sweep — the headless analogue of the GUI's focus-based
+    /// `Tab::unreviewed_work` (no viewers ⇒ unattended ⇒ still unreviewed).
+    unreviewed_work: bool,
     /// Agent CLI pid found by the last LED sweep (`None` = no agent / not
     /// yet swept). Lets the token loop resolve the session without
     /// re-walking the shell's whole /proc subtree; a stale pid just fails
@@ -679,6 +691,9 @@ fn spawn_pty_tab(
         agent_session_id: agent_session_id.map(Arc::from),
         agent_kind: agent_kind.map(Arc::from),
         agent_plan_mode,
+        last_output_at: None,
+        led_last_ring: 0,
+        unreviewed_work: false,
         // Set by the restore path (spawns at the pinned size) / the resize drain.
         pinned_cols: None,
         pinned_rows: None,
@@ -1274,6 +1289,34 @@ fn refresh_snapshot(
         // fields (uptime, lock, agent state, …) are cheap and rebuilt
         // every tick so changes there still surface immediately.
         let grid = tab.cached_grid();
+        // Stamp the green-LED "last output" clock when the ring grew (mirrors
+        // the GUI's persist stamp) — the source of the `working` window.
+        let ring_len = tab.ring_len();
+        if ring_len != tab.led_last_ring {
+            tab.led_last_ring = ring_len;
+            tab.last_output_at = Some(Instant::now());
+        }
+        let agent_led = {
+            #[cfg(feature = "catbus")]
+            let (agent_alive, full_sweep_ran) = (
+                tab.agent_pid.is_some(),
+                AGENT_FULL_SWEEP_RAN.load(std::sync::atomic::Ordering::Relaxed),
+            );
+            #[cfg(not(feature = "catbus"))]
+            let (agent_alive, full_sweep_ran) = (true, false);
+            let recent_output = tab
+                .last_output_at
+                .is_some_and(|t| t.elapsed() < crate::STREAMING_LED_WINDOW);
+            crate::compute_tab_led(
+                tab.agent_state.as_ref().map(|s| s.state),
+                tab.agent_kind.is_some(),
+                tab.agent_kind.as_deref() == Some("brain"),
+                agent_alive,
+                full_sweep_ran,
+                tab.unreviewed_work,
+                recent_output,
+            )
+        };
         api_tabs.push(api::SnapshotTab {
             id: tab.id.clone(),
             name: tab.name.clone(),
@@ -1297,6 +1340,7 @@ fn refresh_snapshot(
             agent_state: tab.agent_state.clone(),
             agent_session_id: tab.agent_session_id.clone(),
             agent_kind: tab.agent_kind.clone(),
+            agent_led,
             viewers: tab.viewer_count(),
             pty_ring: Some(tab.pty_ring.clone()),
             net_disabled: tab.net_disabled,
@@ -1440,6 +1484,13 @@ impl OutputSaver {
         let _ = self.tx.send(batch); // ignore if the saver has exited
     }
 }
+
+/// Set true once the first catbus liveness full-sweep has completed, so the
+/// snapshot builder only paints the dim-red "dead" LED after we've probed at
+/// least once — the headless analogue of the GUI's `last_agent_full_sweep`
+/// gate (a restored agent otherwise flashes red for the first second or two).
+#[cfg(feature = "catbus")]
+static AGENT_FULL_SWEEP_RAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[allow(clippy::too_many_arguments)]
 fn persist(
@@ -2073,10 +2124,17 @@ fn drain_pending(
             use std::sync::OnceLock;
             static LAST_FULL: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
             let lock = LAST_FULL.get_or_init(|| Mutex::new(None));
-            let mut last = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let due = last.is_none_or(|t| t.elapsed() >= Duration::from_secs(30));
+            let due = {
+                let mut last = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let due = last.is_none_or(|t| t.elapsed() >= Duration::from_secs(30));
+                if due {
+                    *last = Some(now);
+                }
+                due
+            };
             if due {
-                *last = Some(now);
+                // Gate the dim-red "dead" LED on a probe having actually run.
+                AGENT_FULL_SWEEP_RAN.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             due
         };
@@ -2113,6 +2171,23 @@ fn drain_pending(
                 tab.agent_session_id = None;
                 tab.agent_kind = None;
                 tab.agent_plan_mode = None;
+            }
+        }
+
+        // Blue "unreviewed" LED — the headless analogue of the GUI's
+        // focus-based flag. Headless has no focused tab, so "unattended" =
+        // "no viewer attached": a tab the agent is thinking in while nobody
+        // watches becomes unreviewed, and stays sticky until a viewer opens
+        // it (which clears it, the mobile-remote equivalent of focusing it).
+        for tab in tabs.iter_mut() {
+            if tab.viewer_count() > 0 {
+                tab.unreviewed_work = false;
+            } else if tab
+                .agent_state
+                .as_ref()
+                .is_some_and(|s| s.state == crate::AgentState::Thinking)
+            {
+                tab.unreviewed_work = true;
             }
         }
 
