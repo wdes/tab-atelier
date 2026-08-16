@@ -180,6 +180,11 @@ struct TabInfo {
     /// the identical indicator. Omitted when no dot should show.
     #[serde(skip_serializing_if = "Option::is_none")]
     led: Option<&'static str>,
+    /// Unix-millis of the last time this tab was used (input / activate /
+    /// viewer open). Clients sort the list by this descending to show the
+    /// most-recently-used tabs first. Omitted for never-used tabs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_used_at: Option<u64>,
     /// Durable agent session UUID — set by `set-status --session
     /// <id>` from inside the agent's PTY. The brain uses this to
     /// confirm a Claude (or other agent) is actually mid-task before
@@ -385,6 +390,10 @@ pub struct SnapshotTab {
     /// dot the desktop draws — without each consumer re-deriving it (they lack
     /// the raw liveness / last-output / unreviewed signals). `None` ⇒ no dot.
     pub agent_led: Option<crate::TabLed>,
+    /// Unix-millis of the last time this tab was used (input / activate /
+    /// viewer open). Mirrored from the runtime tab and serialized on `/tabs`
+    /// so clients order the list most-recently-used-first server-side.
+    pub last_used_at: Option<u64>,
     /// How many WS viewers (browser share-link / `remote attach`) are
     /// currently watching this tab. Surfaced on `/tabs` so `tabs`-list
     /// consumers can see who's being watched; also the GUI's "tab is
@@ -1747,6 +1756,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                     }),
                     agent_kind: t.agent_kind.as_deref().map(str::to_string),
                     led: t.agent_led.map(crate::TabLed::slug),
+                    last_used_at: t.last_used_at,
                     agent_session_id: t.agent_session_id.as_deref().map(str::to_string),
                     viewers: t.viewers,
                     locked: crate::schedule::LockState::effective_locked(t),
@@ -4238,6 +4248,7 @@ pub fn test_snapshot_tab(id: &str, name: &str) -> SnapshotTab {
         agent_session_id: None,
         agent_kind: None,
         agent_led: None,
+        last_used_at: None,
         viewers: 0,
         pty_ring: None,
         net_disabled: false,
@@ -4317,6 +4328,7 @@ mod tests {
             agent_state: None,
             agent_kind: None,
             led: None,
+            last_used_at: None,
             agent_session_id: None,
             context: None,
             viewers: 0,

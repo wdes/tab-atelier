@@ -1362,6 +1362,17 @@ pub struct AgentStateSnapshot {
     pub updated_at: std::time::Instant,
 }
 
+/// Wall-clock milliseconds since the Unix epoch (`0` if the clock predates it).
+///
+/// Used to stamp `last_used_at` on tabs so any client can sort the list
+/// most-recently-used-first without keeping its own recency map.
+#[must_use]
+pub fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
 /// How long after the last PTY output a tab's LED stays green ("working").
 ///
 /// A `--resume`d agent streams its reply with no thinking hook, so fresh output

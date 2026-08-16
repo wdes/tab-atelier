@@ -76,6 +76,10 @@ struct Tab {
     prior_uptime: std::time::Duration,
     active_duration: std::time::Duration,
     last_activated: Option<std::time::Instant>,
+    /// Unix-millis of the last time this tab was used (activated, or a viewer
+    /// open on it). Mirrored into the API snapshot's `last_used_at` so a
+    /// remote client can order the list most-recently-used-first.
+    last_used_at: Option<u64>,
     /// "Unreviewed work" flag — drives the blue LED. Set true when the agent
     /// works (thinks / streams) on a tab you are NOT currently looking at, and
     /// stays set (sticky) after it stops, so the tab flags "there's output here
@@ -261,6 +265,7 @@ impl Tab {
             prior_uptime: std::time::Duration::from_secs_f64(ts.uptime_secs.unwrap_or(0.0)),
             active_duration: std::time::Duration::ZERO,
             last_activated: activated.then(std::time::Instant::now),
+            last_used_at: activated.then(crate::unix_millis),
             // Boots un-flagged (grey): it only goes blue once its
             // agent WORKS while you're not looking. Restoring a tab
             // isn't "new work", so it must not flash blue on restart.
@@ -319,6 +324,7 @@ impl Tab {
     }
 
     fn activate(&mut self) {
+        self.last_used_at = Some(crate::unix_millis());
         if self.last_activated.is_none() {
             self.last_activated = Some(std::time::Instant::now());
         }
@@ -2011,6 +2017,12 @@ impl AppState {
             // the snapshot below.
             let rss_bytes = crate::agent_probe::sample_tree(shell_pid).map(|s| s.rss_kb.saturating_mul(1024));
             tab.rss_bytes.set(rss_bytes);
+            // A live viewer (browser / mobile remote) means the tab is being
+            // used right now — keep its MRU rank fresh so it stays near the top
+            // of a remote client's list while watched.
+            if pty_ring.lock().map_or(0, |r| r.viewer_count()) > 0 {
+                tab.last_used_at = Some(crate::unix_millis());
+            }
             api_tabs.push(api::SnapshotTab {
                 id: tab.id.clone(),
                 name: tab.name.clone(),
@@ -2057,6 +2069,7 @@ impl AppState {
                         recent_output,
                     )
                 },
+                last_used_at: tab.last_used_at,
                 viewers: pty_ring.lock().map_or(0, |r| r.viewer_count()),
                 pty_ring: Some(pty_ring),
                 net_disabled: ts.net_disabled,

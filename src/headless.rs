@@ -81,6 +81,11 @@ struct HeadlessTab {
     active_duration: Duration,
     last_activated: Option<Instant>,
     last_input: Option<Instant>,
+    /// Unix-millis of the last time this tab was used — input sent, activated,
+    /// or a viewer (browser / mobile remote) open on it. Serialized on `/tabs`
+    /// so every client orders the list most-recently-used-first from one
+    /// server-side truth (the mobile remote's "top 8 last-used" list).
+    last_used_at: Option<u64>,
     #[cfg(feature = "energy")]
     energy_wh: f64,
     #[cfg(feature = "energy")]
@@ -238,6 +243,7 @@ impl HeadlessTab {
     }
 
     fn activate(&mut self) {
+        self.last_used_at = Some(crate::unix_millis());
         if self.last_activated.is_none() {
             self.last_activated = Some(Instant::now());
         }
@@ -265,6 +271,7 @@ impl HeadlessTab {
             return;
         }
         self.last_input = Some(Instant::now());
+        self.last_used_at = Some(crate::unix_millis());
         let _ = self.notifier.send(Msg::Input(bytes.into()));
     }
 
@@ -677,6 +684,7 @@ fn spawn_pty_tab(
         active_duration: Duration::ZERO,
         last_activated: None,
         last_input: None,
+        last_used_at: None,
         #[cfg(feature = "energy")]
         energy_wh,
         #[cfg(feature = "energy")]
@@ -1296,6 +1304,12 @@ fn refresh_snapshot(
             tab.led_last_ring = ring_len;
             tab.last_output_at = Some(Instant::now());
         }
+        // A tab with a live viewer (browser share-link / mobile remote) is
+        // being used right now — keep its MRU rank fresh so it stays near the
+        // top of the client's list while watched.
+        if tab.viewer_count() > 0 {
+            tab.last_used_at = Some(crate::unix_millis());
+        }
         let agent_led = {
             #[cfg(feature = "catbus")]
             let (agent_alive, full_sweep_ran) = (
@@ -1341,6 +1355,7 @@ fn refresh_snapshot(
             agent_session_id: tab.agent_session_id.clone(),
             agent_kind: tab.agent_kind.clone(),
             agent_led,
+            last_used_at: tab.last_used_at,
             viewers: tab.viewer_count(),
             pty_ring: Some(tab.pty_ring.clone()),
             net_disabled: tab.net_disabled,
