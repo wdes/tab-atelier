@@ -81,11 +81,16 @@ struct HeadlessTab {
     active_duration: Duration,
     last_activated: Option<Instant>,
     last_input: Option<Instant>,
-    /// Unix-millis of the last time this tab was used — input sent, activated,
-    /// or a viewer (browser / mobile remote) open on it. Serialized on `/tabs`
-    /// so every client orders the list most-recently-used-first from one
-    /// server-side truth (the mobile remote's "top 8 last-used" list).
+    /// Unix-millis of the last time the user switched to this tab — activated,
+    /// or a viewer (browser / mobile remote) newly opened on it. Serialized on
+    /// `/tabs` so every client orders the list most-recently-used-first from one
+    /// server-side truth (the mobile remote's "top 8 last-used" list). Written
+    /// only on the change edge, never per tick, to keep the snapshot stable.
     last_used_at: Option<u64>,
+    /// Viewer count at the previous snapshot, to detect a NEW viewer opening
+    /// (the mobile-remote "switched to this tab" edge) versus one that's just
+    /// still open — so `last_used_at` isn't restamped every tick while watched.
+    last_used_viewers: usize,
     #[cfg(feature = "energy")]
     energy_wh: f64,
     #[cfg(feature = "energy")]
@@ -271,7 +276,6 @@ impl HeadlessTab {
             return;
         }
         self.last_input = Some(Instant::now());
-        self.last_used_at = Some(crate::unix_millis());
         let _ = self.notifier.send(Msg::Input(bytes.into()));
     }
 
@@ -685,6 +689,7 @@ fn spawn_pty_tab(
         last_activated: None,
         last_input: None,
         last_used_at: None,
+        last_used_viewers: 0,
         #[cfg(feature = "energy")]
         energy_wh,
         #[cfg(feature = "energy")]
@@ -1304,12 +1309,15 @@ fn refresh_snapshot(
             tab.led_last_ring = ring_len;
             tab.last_output_at = Some(Instant::now());
         }
-        // A tab with a live viewer (browser share-link / mobile remote) is
-        // being used right now — keep its MRU rank fresh so it stays near the
-        // top of the client's list while watched.
-        if tab.viewer_count() > 0 {
+        // A NEW viewer opening the tab (browser share-link / mobile remote) is
+        // the "switched to this tab" edge — stamp MRU once. A viewer that's
+        // merely still open doesn't restamp, so a watched tab doesn't churn
+        // last_used_at (and the cached /tabs body) every tick.
+        let viewers_now = tab.viewer_count();
+        if viewers_now > tab.last_used_viewers {
             tab.last_used_at = Some(crate::unix_millis());
         }
+        tab.last_used_viewers = viewers_now;
         let agent_led = {
             #[cfg(feature = "catbus")]
             let (agent_alive, full_sweep_ran) = (
