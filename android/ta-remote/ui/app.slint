@@ -861,10 +861,6 @@ export component AppWindow inherits Window {
     // (loaded in the system browser, or via WebView in a follow-up)
     // is the one rendering pipeline.
     callback open-tab-in-browser(int);
-    // Fired when the user opens a tab, so the Rust side can bump its
-    // most-recently-used rank (keyed by name). Drives the "top 8 last-used
-    // tabs first" ordering of the list.
-    callback note-tab-used(string);
     // Back-press while a WebView is mounted on top of the Slint
     // surface. Rust side checks the WebViewHost state and
     // returns true if it dismissed a view (in which case Slint
@@ -1001,10 +997,7 @@ export component AppWindow inherits Window {
                     // native TerminalView is reachable as the failure
                     // fallback in the Rust handler. Long-press still
                     // surfaces the per-tab action sheet.
-                    tapped => {
-                        root.note-tab-used(tab.name);
-                        root.open-tab-in-browser(tab.server-index);
-                    }
+                    tapped => { root.open-tab-in-browser(tab.server-index); }
                     actions-requested => { root.actions-idx = i; }
                 }
 

@@ -347,6 +347,7 @@ components:
         agent_state: { type: [string, "null"], enum: [thinking, waiting, error, null] }
         agent_kind: { type: [string, "null"] }
         led: { type: [string, "null"], enum: [dead, error, working, unreviewed, idle, null], description: "Fully-derived per-tab agent LED matching the desktop tab-strip dot; omitted when no dot should show" }
+        last_used_at: { type: [integer, "null"], description: "Unix-millis of the last time this tab was used (input / activate / viewer open). Clients sort by this descending for a most-recently-used list. Omitted for never-used tabs" }
         context: { type: [string, "null"] }
         viewers: { type: integer, description: WS viewers currently watching this tab }
         watts: { type: [number, "null"] }
