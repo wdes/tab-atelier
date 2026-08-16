@@ -33,6 +33,11 @@ struct TabRow {
     /// side (see `led_color` in android_app.rs): dim-red dead / red error /
     /// green working / blue unreviewed / grey idle.
     led-color: color,
+    /// The tab's index in the daemon's `/tabs` list. The visible list is
+    /// reordered (most-recently-used first — see push_tabs), so the repeater
+    /// index no longer equals the API index; every `/tabs/{i}/…` call routes
+    /// through THIS field instead.
+    server-index: int,
 }
 
 // One contiguous run of same-colour glyphs in a terminal row. Built on
@@ -856,6 +861,10 @@ export component AppWindow inherits Window {
     // (loaded in the system browser, or via WebView in a follow-up)
     // is the one rendering pipeline.
     callback open-tab-in-browser(int);
+    // Fired when the user opens a tab, so the Rust side can bump its
+    // most-recently-used rank (keyed by name). Drives the "top 8 last-used
+    // tabs first" ordering of the list.
+    callback note-tab-used(string);
     // Back-press while a WebView is mounted on top of the Slint
     // surface. Rust side checks the WebViewHost state and
     // returns true if it dismissed a view (in which case Slint
@@ -992,7 +1001,10 @@ export component AppWindow inherits Window {
                     // native TerminalView is reachable as the failure
                     // fallback in the Rust handler. Long-press still
                     // surfaces the per-tab action sheet.
-                    tapped => { root.open-tab-in-browser(i); }
+                    tapped => {
+                        root.note-tab-used(tab.name);
+                        root.open-tab-in-browser(tab.server-index);
+                    }
                     actions-requested => { root.actions-idx = i; }
                 }
 
@@ -1242,7 +1254,7 @@ export component AppWindow inherits Window {
                     clicked => {
                         if (root.actions-idx >= 0) {
                             root.request-send-input(
-                                root.actions-idx,
+                                root.tabs[root.actions-idx].server-index,
                                 "clear && exec catbus-agent\n",
                             );
                             root.actions-idx = -1;
@@ -1353,7 +1365,7 @@ export component AppWindow inherits Window {
                                 vertical-alignment: center;
                                 accepted => {
                                     if (root.rename-text != "") {
-                                        root.request-rename-tab(root.rename-idx, root.rename-text);
+                                        root.request-rename-tab(root.tabs[root.rename-idx].server-index, root.rename-text);
                                     }
                                     root.rename-idx = -1;
                                 }
@@ -1387,7 +1399,7 @@ export component AppWindow inherits Window {
                         horizontal-stretch: 1;
                         clicked => {
                             if (root.rename-text != "") {
-                                root.request-rename-tab(root.rename-idx, root.rename-text);
+                                root.request-rename-tab(root.tabs[root.rename-idx].server-index, root.rename-text);
                             }
                             root.rename-idx = -1;
                         }
@@ -1491,7 +1503,7 @@ export component AppWindow inherits Window {
                     TouchArea {
                         horizontal-stretch: 1;
                         clicked => {
-                            root.request-close-tab(root.close-confirm-idx);
+                            root.request-close-tab(root.tabs[root.close-confirm-idx].server-index);
                             root.close-confirm-idx = -1;
                         }
                         Rectangle {
