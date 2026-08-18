@@ -23,9 +23,6 @@ struct TabRow {
     /// from the desktop's per-tab uptime so the phone shows the same
     /// clock without running its own timer.
     uptime: string,
-    /// Set when the preview text has changed since the user last opened
-    /// this tab — used to surface "this tab moved" without having to open it.
-    has-new: bool,
     /// Whether to draw the agent-state LED dot (the daemon's `led` field was
     /// present). When false the 7px dot is omitted, exactly like the desktop.
     led-show: bool,
@@ -250,13 +247,6 @@ component TabCard inherits Rectangle {
                             font-size: 16px;
                             font-weight: 600;
                             overflow: elide;
-                        }
-                        if tab.has-new : Rectangle {
-                            width: 8px;
-                            height: 8px;
-                            y: parent.height / 2 - 4px;
-                            border-radius: 4px;
-                            background: #66bb6a;
                         }
                     }
                     Text {
