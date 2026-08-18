@@ -5517,6 +5517,12 @@ impl AppState {
                 .top(px(0.0))
                 .left(px(0.0))
                 .size_full()
+                // Swallow ALL mouse input so a click on the dimmed area can't
+                // fall through to the tab strip's on_click underneath (which
+                // was activating whatever tab sat below the cursor when the
+                // dialog was dismissed). The empty handlers below don't stop
+                // propagation on their own; occlude does.
+                .occlude()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -5537,7 +5543,7 @@ impl AppState {
                         // screens), capped to 95% width on narrow ones. The
                         // 90%-height cap + vertical scroll is the fallback when
                         // even two columns are taller than the viewport.
-                        .w(px(660.0))
+                        .w(px(860.0))
                         .max_w(relative(0.95))
                         .max_h(relative(0.9))
                         .overflow_y_scroll()
