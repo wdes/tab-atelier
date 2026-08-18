@@ -87,10 +87,12 @@ struct HeadlessTab {
     /// server-side truth (the mobile remote's "top 8 last-used" list). Written
     /// only on the change edge, never per tick, to keep the snapshot stable.
     last_used_at: Option<u64>,
-    /// Viewer count at the previous snapshot, to detect a NEW viewer opening
-    /// (the mobile-remote "switched to this tab" edge) versus one that's just
-    /// still open — so `last_used_at` isn't restamped every tick while watched.
-    last_used_viewers: usize,
+    /// Cached handle to the ring's viewer-attach timestamp (`unix_millis`),
+    /// stamped by `api_ws::run_pump` the instant a viewer connects. `persist`
+    /// folds it into `last_used_at`, so an open is recorded reliably even if
+    /// the view closes between snapshot ticks — the old polled `viewer_count`
+    /// edge missed those and left the mobile list unsorted.
+    viewer_attached_at: Arc<std::sync::atomic::AtomicU64>,
     #[cfg(feature = "energy")]
     energy_wh: f64,
     #[cfg(feature = "energy")]
@@ -672,9 +674,9 @@ fn spawn_pty_tab(
     #[cfg(not(feature = "energy"))]
     let _ = energy_wh;
 
-    let (viewers_handle, ring_len_mirror) = {
+    let (viewers_handle, viewer_attached_handle, ring_len_mirror) = {
         let r = pty_ring.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        (r.viewers_handle(), r.total_len_handle())
+        (r.viewers_handle(), r.viewer_attached_handle(), r.total_len_handle())
     };
     Some(HeadlessTab {
         id: id.into(),
@@ -689,7 +691,7 @@ fn spawn_pty_tab(
         last_activated: None,
         last_input: None,
         last_used_at: None,
-        last_used_viewers: 0,
+        viewer_attached_at: viewer_attached_handle,
         #[cfg(feature = "energy")]
         energy_wh,
         #[cfg(feature = "energy")]
@@ -1309,15 +1311,15 @@ fn refresh_snapshot(
             tab.led_last_ring = ring_len;
             tab.last_output_at = Some(Instant::now());
         }
-        // A NEW viewer opening the tab (browser share-link / mobile remote) is
-        // the "switched to this tab" edge — stamp MRU once. A viewer that's
-        // merely still open doesn't restamp, so a watched tab doesn't churn
-        // last_used_at (and the cached /tabs body) every tick.
-        let viewers_now = tab.viewer_count();
-        if viewers_now > tab.last_used_viewers {
-            tab.last_used_at = Some(crate::unix_millis());
+        // Fold in the ring's viewer-attach timestamp: a viewer (browser
+        // share-link / mobile remote) opening the tab stamped it at connect
+        // time, so this records the open reliably even if the view already
+        // closed — a polled viewer_count edge would have missed it. Monotonic:
+        // only advances last_used_at, never rewinds.
+        let attached = tab.viewer_attached_at.load(std::sync::atomic::Ordering::Relaxed);
+        if attached > tab.last_used_at.unwrap_or(0) {
+            tab.last_used_at = Some(attached);
         }
-        tab.last_used_viewers = viewers_now;
         let agent_led = {
             #[cfg(feature = "catbus")]
             let (agent_alive, full_sweep_ran) = (

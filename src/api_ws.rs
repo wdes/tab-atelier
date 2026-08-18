@@ -743,12 +743,16 @@ async fn run_pump(
     // Event-driven output: wake on a `PtyRing` push and flush
     // immediately. `notify` is cloned from the ring once up front, along
     // with the viewer-count handle.
-    let (notify, viewers) = {
+    let (notify, viewers, attached_at) = {
         let Ok(r) = ring.lock() else {
             return;
         };
-        (r.notifier(), r.viewers_handle())
+        (r.notifier(), r.viewers_handle(), r.viewer_attached_handle())
     };
+    // Stamp "this tab was viewed now" the instant the WS connects, so the
+    // daemon's MRU ordering records the open even if the view closes before
+    // the next 2 s snapshot tick (a polled viewer_count edge would miss it).
+    attached_at.store(crate::unix_millis(), std::sync::atomic::Ordering::Relaxed);
     // Count this connection as a viewer for its whole lifetime. The
     // guard's Drop decrements on every exit path (clean close, error,
     // task cancel), so a crashed viewer can't leak a phantom count.

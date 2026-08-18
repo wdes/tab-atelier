@@ -81,9 +81,6 @@ struct Tab {
     /// `last_used_at` so a remote client can order the list
     /// most-recently-used-first. Written only on the change edge, not per tick.
     last_used_at: Option<u64>,
-    /// Viewer count at the previous snapshot, to stamp `last_used_at` only when
-    /// a NEW viewer opens the tab, not every tick it stays open.
-    last_used_viewers: std::cell::Cell<usize>,
     /// "Unreviewed work" flag — drives the blue LED. Set true when the agent
     /// works (thinks / streams) on a tab you are NOT currently looking at, and
     /// stays set (sticky) after it stops, so the tab flags "there's output here
@@ -270,7 +267,6 @@ impl Tab {
             active_duration: std::time::Duration::ZERO,
             last_activated: activated.then(std::time::Instant::now),
             last_used_at: activated.then(crate::unix_millis),
-            last_used_viewers: std::cell::Cell::new(0),
             // Boots un-flagged (grey): it only goes blue once its
             // agent WORKS while you're not looking. Restoring a tab
             // isn't "new work", so it must not flash blue on restart.
@@ -2022,15 +2018,14 @@ impl AppState {
             // the snapshot below.
             let rss_bytes = crate::agent_probe::sample_tree(shell_pid).map(|s| s.rss_kb.saturating_mul(1024));
             tab.rss_bytes.set(rss_bytes);
-            // A NEW viewer opening the tab (browser / mobile remote) is the
-            // "switched to this tab" edge — stamp MRU once. A viewer merely
-            // still open doesn't restamp, so a watched tab doesn't churn
-            // last_used_at (and the cached /tabs body) every tick.
-            let viewers_now = pty_ring.lock().map_or(0, |r| r.viewer_count());
-            if viewers_now > tab.last_used_viewers.get() {
-                tab.last_used_at = Some(crate::unix_millis());
+            // Fold in the ring's viewer-attach timestamp: a viewer (browser /
+            // mobile remote) opening the tab stamped it at connect time, so the
+            // open is recorded reliably even if the view already closed — a
+            // polled viewer_count edge missed those. Monotonic: only advances.
+            let attached = pty_ring.lock().map_or(0, |r| r.viewer_attached_at_millis());
+            if attached > tab.last_used_at.unwrap_or(0) {
+                tab.last_used_at = Some(attached);
             }
-            tab.last_used_viewers.set(viewers_now);
             api_tabs.push(api::SnapshotTab {
                 id: tab.id.clone(),
                 name: tab.name.clone(),

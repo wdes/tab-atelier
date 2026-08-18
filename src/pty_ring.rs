@@ -127,6 +127,12 @@ pub struct PtyRing {
     /// this tab" — the GUI's dormant-LED suppressor and the `/tabs`
     /// `viewers` field.
     viewers: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Unix-millis of the most recent viewer *attach* (0 = never). Stamped by
+    /// the connection guard in `api_ws::run_pump` the instant a WS connects, so
+    /// the daemon's `persist` can record "this tab was last viewed at T" for
+    /// the MRU ordering even for a view that opens and closes between its 2 s
+    /// snapshot ticks — a polled `viewer_count` edge misses those.
+    viewer_attached_at: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Lock-free mirror of [`Self::total_len`], updated on every push.
     /// The GUI's per-tab repaint pump reads it each tick to answer
     /// "did output arrive" — through this handle that's one atomic
@@ -174,6 +180,7 @@ impl PtyRing {
             cap: cap.max(1),
             notify: std::sync::Arc::new(tokio::sync::Notify::new()),
             viewers: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            viewer_attached_at: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             len_mirror: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             frame_cache: None,
         }
@@ -228,6 +235,22 @@ impl PtyRing {
     #[must_use]
     pub fn viewer_count(&self) -> usize {
         self.viewers.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Clone the viewer-attach timestamp handle so the connection guard can
+    /// stamp it on connect and `persist` can read it. See [`Self::viewer_attached_at`].
+    #[must_use]
+    pub fn viewer_attached_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        self.viewer_attached_at.clone()
+    }
+
+    /// Unix-millis of the most recent viewer attach (0 = never). See
+    /// [`Self::viewer_attached_at`]. Headless reads the handle directly; only
+    /// the GUI snapshot builder calls this.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    #[must_use]
+    pub fn viewer_attached_at_millis(&self) -> u64 {
+        self.viewer_attached_at.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Append `data` to the ring, dropping the oldest bytes if the
