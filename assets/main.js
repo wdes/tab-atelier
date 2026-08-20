@@ -1039,7 +1039,16 @@
       const nextTitle = `${nextTitleTag ? nextTitleTag.trim() + " · " : ""}${TAB_NAME} · tab-atelier`;
       if (document.title !== nextTitle) document.title = nextTitle;
 
-      // Server-side PTY dims → resize xterm.js to match.
+      // Server-side PTY dims → resize xterm.js to match. The viewer is a
+      // MIRROR of the server grid, not the driver: we render exactly cols×rows
+      // and only fit the FONT to the viewport width (fitFontToViewport). So on
+      // a tall phone an 80×24 PTY leaves empty space below the grid — that's
+      // the honest render of a fixed server terminal, NOT a layout bug. The
+      // client `0x04 resize` message is a deliberate no-op server-side
+      // (api_ws.rs) precisely so a phone viewer can't reflow the shared PTY out
+      // from under the agent's TUI or another (desktop) viewer. Letting the
+      // phone drive the size to fill its screen was considered and declined —
+      // see the discussion around this decision.
       const cols = Number(meta.cols || 0);
       const rows = Number(meta.rows || 0);
       if (cols > 0 && rows > 0 && (cols !== serverCols || rows !== serverRows)) {
