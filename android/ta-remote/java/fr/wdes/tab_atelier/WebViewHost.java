@@ -19,14 +19,18 @@ package fr.wdes.tab_atelier;
 
 import android.app.Activity;
 import android.app.Dialog;
+import android.content.Intent;
 import android.graphics.Color;
 import android.graphics.drawable.ColorDrawable;
+import android.net.Uri;
 import android.net.http.SslError;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.Window;
 import android.view.WindowManager;
 import android.webkit.SslErrorHandler;
+import android.webkit.ValueCallback;
+import android.webkit.WebChromeClient;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
@@ -34,6 +38,21 @@ import android.webkit.WebViewClient;
 public final class WebViewHost {
     private static volatile Dialog currentDialog;
     private static volatile WebView currentWebView;
+    // Pending <input type=file> callback, set when the WebView asks for a file
+    // chooser and cleared when FilePickerActivity delivers the result. Static
+    // because the picker runs in a separate activity (see FilePickerActivity).
+    private static volatile ValueCallback<Uri[]> pendingFileCallback;
+
+    /** Called by FilePickerActivity with the chosen URIs (null = cancelled /
+     *  no picker). Always fulfils the WebView's pending callback so a later
+     *  file-input tap isn't silently ignored. */
+    public static void deliverFileChooserResult(Uri[] uris) {
+        ValueCallback<Uri[]> cb = pendingFileCallback;
+        pendingFileCallback = null;
+        if (cb != null) {
+            cb.onReceiveValue(uris);
+        }
+    }
 
     /** Mount a fullscreen WebView pointed at `url` in a Dialog above
      *  the activity. Idempotent — replaces any currently-mounted
@@ -71,6 +90,28 @@ public final class WebViewHost {
                                                    SslErrorHandler handler,
                                                    SslError error) {
                         handler.proceed();
+                    }
+                });
+                // Make the viewer's <input type=file> (the ⬆-upload button in
+                // main.js) work: a bare WebView drops file-input clicks unless a
+                // chrome client handles them. Hand off to FilePickerActivity,
+                // which returns the chosen URIs via deliverFileChooserResult.
+                wv.setWebChromeClient(new WebChromeClient() {
+                    @Override
+                    public boolean onShowFileChooser(WebView view,
+                                                     ValueCallback<Uri[]> filePathCallback,
+                                                     FileChooserParams params) {
+                        if (pendingFileCallback != null) {
+                            pendingFileCallback.onReceiveValue(null);
+                        }
+                        pendingFileCallback = filePathCallback;
+                        try {
+                            activity.startActivity(new Intent(activity, FilePickerActivity.class));
+                            return true;
+                        } catch (Exception e) {
+                            pendingFileCallback = null;
+                            return false;
+                        }
                     }
                 });
                 dialog.setContentView(wv, new ViewGroup.LayoutParams(

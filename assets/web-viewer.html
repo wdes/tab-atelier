@@ -69,7 +69,12 @@
   <div id="files-controls">
     <button id="outbox-btn" class="files-btn" title="Files agent has placed in outbox/ for download">⬇ outbox<span class="badge" id="outbox-badge">0</span></button>
     <button id="inbox-btn" class="files-btn" title="Files you've uploaded to inbox/ — drag the path into Claude">⬆ inbox<span class="badge" id="inbox-badge">0</span></button>
+    <!-- Tap-to-pick upload: the mobile equivalent of dragging a file onto
+         the viewer (touch WebViews have no OS file drag-drop). RW-only —
+         hidden for read-only viewers via `body.read-only` CSS. -->
+    <button id="upload-btn" class="files-btn" title="Pick files to upload to inbox/">📎 upload</button>
   </div>
+  <input type="file" id="upload-input" multiple hidden>
   <div id="drop-overlay"><div class="inner">drop file to upload to <code>inbox/</code></div></div>
   <div id="files-panel">
     <span class="close" id="files-close" title="Close">×</span>

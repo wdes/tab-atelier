@@ -570,10 +570,29 @@
         xhr.send(file);
       });
     }
-    // Drag-drop wiring. dragover/leave maintain the overlay; drop
-    // fires the upload. Multiple files are uploaded sequentially so
-    // the status bar stays a single "uploading X" string instead of
-    // racing N progress values.
+    // Shared upload path for BOTH drag-drop and the mobile file-picker.
+    // Multiple files upload sequentially so the status bar stays a single
+    // "uploading X" string instead of racing N progress values.
+    async function uploadFiles(fileList) {
+      // Mirror the server-side refusal: POST /files returns 423 Locked when
+      // serverLocked, so give immediate feedback instead of a failed request.
+      if (serverLocked) {
+        toast("tab is locked — uploads refused");
+        return;
+      }
+      const files = Array.from(fileList || []);
+      if (!files.length) return;
+      for (const f of files) {
+        await uploadFile(f);
+      }
+      // Refresh the outbox panel in case a server-side script moves uploads
+      // into outbox/ on receipt.
+      if (panelKind === "outbox") refreshFiles("outbox");
+    }
+    // Drag-drop wiring. dragover/leave maintain the overlay; drop fires the
+    // upload. Touch devices can't drag an OS file into a WebView, so the
+    // ⬆-upload toolbar button + hidden <input type=file> below is the mobile
+    // equivalent — both funnel into uploadFiles().
     if (!READ_ONLY) {
       let dragDepth = 0;  // counter — dragenter/leave fire on every
                           // child element, so we need to balance them
@@ -595,22 +614,23 @@
         e.preventDefault();
         dragDepth = 0;
         document.body.classList.remove("drag-over");
-        // Mirror the server-side refusal: POST /files returns 423
-        // Locked when serverLocked is true, so suppress the upload
-        // pre-flight too and give the user immediate feedback.
-        if (serverLocked) {
-          toast("tab is locked — uploads refused");
-          return;
-        }
-        const files = Array.from(e.dataTransfer?.files || []);
-        if (!files.length) return;
-        for (const f of files) {
-          await uploadFile(f);
-        }
-        // Refresh the outbox panel in case a server-side script
-        // moves uploads into outbox/ on receipt.
-        if (panelKind === "outbox") refreshFiles("outbox");
+        await uploadFiles(e.dataTransfer?.files);
       });
+      // Mobile / touch fallback: the hidden <input type=file> opens the
+      // system picker (files, Photos, Drive, …); the ⬆-upload toolbar button
+      // triggers it. Clearing `.value` after each pick lets the user re-select
+      // the same file (a change event only fires on a different value).
+      const uploadInput = document.getElementById("upload-input");
+      const uploadBtn = document.getElementById("upload-btn");
+      if (uploadInput) {
+        uploadInput.addEventListener("change", async () => {
+          await uploadFiles(uploadInput.files);
+          uploadInput.value = "";
+        });
+      }
+      if (uploadBtn && uploadInput) {
+        uploadBtn.addEventListener("click", () => uploadInput.click());
+      }
     }
     // Files panel — single slide-in container, two buttons. The
     // "kind" state is whichever of outbox/inbox is currently open.
