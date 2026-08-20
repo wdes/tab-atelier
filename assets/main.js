@@ -18,6 +18,12 @@
     const READ_ONLY = PARAMS.get("ro") === "1";
     const headers = TOKEN ? { Authorization: "Bearer " + TOKEN } : {};
     const status = document.getElementById("status");
+    // Touch device (Android WebView / mobile browser): the JS blob download
+    // (fetch → Blob → object-URL <a>.click) can't save a file there, so outbox
+    // rows fall back to a plain native `<a href download>` navigation that the
+    // WebView's DownloadListener / the browser handles. Desktop keeps the
+    // streamed progress bar.
+    const IS_TOUCH = "ontouchstart" in window || navigator.maxTouchPoints > 0;
 
     // The page lives at `<some-prefix>/tabs/<TAB_KEY>/view`. Resolve
     // siblings (`output`, `input`) as relative paths so a reverse
@@ -734,8 +740,11 @@
         a.innerHTML = `${htmlEscape(f.name)}<div class="meta">${meta}</div>`
           + `<div class="dl-progress"><div class="dl-bar"></div></div>`;
         a.addEventListener("click", (ev) => {
-          // Let modified clicks (ctrl/cmd/shift/middle) use the native
-          // download; intercept only the plain left-click for progress.
+          // Touch: let the native `<a href download>` navigate so the platform
+          // downloader saves it — the JS blob path can't save in a WebView.
+          if (IS_TOUCH) return;
+          // Desktop: let modified clicks (ctrl/cmd/shift/middle) use the native
+          // download; intercept only the plain left-click for the progress bar.
           if (ev.button !== 0 || ev.ctrlKey || ev.metaKey || ev.shiftKey || ev.altKey) return;
           ev.preventDefault();
           downloadFile(a, a.href, f.name, f.size);

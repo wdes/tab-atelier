@@ -85,6 +85,13 @@ keystore_password = "tar3mote"
 [[package.metadata.android.uses_permission]]
 name = "android.permission.INTERNET"
 
+# DownloadManager writing to the public Downloads dir needs this only on
+# API ≤ 28; API 29+ (scoped storage) grants it without a permission. Capped
+# with maxSdkVersion so newer devices don't see a storage-permission request.
+[[package.metadata.android.uses_permission]]
+name = "android.permission.WRITE_EXTERNAL_STORAGE"
+max_sdk_version = 28
+
 [package.metadata.android.application]
 label = "Tab Atelier Remote"
 icon = "@mipmap/ic_launcher"
