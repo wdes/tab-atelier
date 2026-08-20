@@ -18,17 +18,21 @@
 package fr.wdes.tab_atelier;
 
 import android.app.Activity;
+import android.app.DownloadManager;
 import android.app.Dialog;
 import android.content.Intent;
 import android.graphics.Color;
 import android.graphics.drawable.ColorDrawable;
 import android.net.Uri;
 import android.net.http.SslError;
+import android.os.Environment;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.Window;
 import android.view.WindowManager;
+import android.webkit.DownloadListener;
 import android.webkit.SslErrorHandler;
+import android.webkit.URLUtil;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
 import android.webkit.WebSettings;
@@ -111,6 +115,36 @@ public final class WebViewHost {
                         } catch (Exception e) {
                             pendingFileCallback = null;
                             return false;
+                        }
+                    }
+                });
+                // Outbox downloads: a WebView saves nothing on its own. The
+                // viewer's outbox rows are <a href download> (token in the URL,
+                // server sends Content-Disposition: attachment), so a tap fires
+                // this listener — hand the URL to the system DownloadManager,
+                // which saves to the public Downloads folder and posts a
+                // tap-to-open notification. Cleartext (http) is fine here; the
+                // viewer already loads over http (WebView refuses self-signed
+                // wss/https), so DownloadManager isn't hit by the cert issue.
+                wv.setDownloadListener(new DownloadListener() {
+                    @Override
+                    public void onDownloadStart(String url, String userAgent,
+                                                String contentDisposition, String mimetype,
+                                                long contentLength) {
+                        try {
+                            String fname = URLUtil.guessFileName(url, contentDisposition, mimetype);
+                            DownloadManager.Request req = new DownloadManager.Request(Uri.parse(url));
+                            req.setTitle(fname);
+                            if (mimetype != null) req.setMimeType(mimetype);
+                            req.setNotificationVisibility(
+                                    DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+                            req.setDestinationInExternalPublicDir(
+                                    Environment.DIRECTORY_DOWNLOADS, fname);
+                            DownloadManager dm = (DownloadManager)
+                                    activity.getSystemService(Activity.DOWNLOAD_SERVICE);
+                            if (dm != null) dm.enqueue(req);
+                        } catch (Exception ignored) {
+                            // Best-effort — nothing else to do from the WebView.
                         }
                     }
                 });
