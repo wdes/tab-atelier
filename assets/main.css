@@ -226,7 +226,9 @@
       order: 1;
     }
     #inbox-btn:hover { background: rgba(140, 220, 140, 0.28); }
-    body.read-only #inbox-btn { display: none; }
+    /* Upload is RW-only (POST /files rejects read-only tokens), so hide the
+       picker button for read-only viewers just like the inbox chip. */
+    body.read-only #inbox-btn, body.read-only #upload-btn { display: none; }
     /* The locked banner takes the top 32 px when active; nudge the
        container down so the buttons don't collide with it. */
     body.locked #files-controls { top: 38px; }

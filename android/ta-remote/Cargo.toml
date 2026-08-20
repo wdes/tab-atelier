@@ -119,3 +119,11 @@ categories = ["android.intent.category.DEFAULT", "android.intent.category.BROWSA
 [[package.metadata.android.application.activity.intent_filter.data]]
 scheme = "taremote"
 host = "onboard"
+
+# Internal helper activity for the WebView's <input type=file> picker (see
+# WebViewHost / FilePickerActivity). Translucent so it doesn't flash a screen
+# over the viewer while the system file chooser is up. No intent-filter, so it
+# defaults to exported=false — only our own WebChromeClient starts it.
+[[package.metadata.android.application.activity]]
+name = "fr.wdes.tab_atelier.FilePickerActivity"
+theme = "@android:style/Theme.Translucent.NoTitleBar"
