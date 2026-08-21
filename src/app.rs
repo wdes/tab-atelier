@@ -32,7 +32,7 @@ use gpui::{
     App, AppContext, Application, AsyncApp, ClickEvent, ClipboardItem, Context, Div, ElementId, Entity, FocusHandle,
     Focusable, Hsla, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Pixels,
     Point, Render, Rgba, SharedString, Stateful, StatefulInteractiveElement, Styled, WeakEntity, Window,
-    WindowBackgroundAppearance, WindowHandle, WindowOptions, div, px, relative, rgba,
+    WindowBackgroundAppearance, WindowHandle, WindowOptions, div, px, rgba,
 };
 use log::{debug, error, info, warn};
 
@@ -5020,12 +5020,6 @@ impl AppState {
             return None;
         }
 
-        let overlay_bg = Hsla::from(Rgba {
-            r: 0.0,
-            g: 0.0,
-            b: 0.0,
-            a: 0.5,
-        });
         let th = self.th();
         let modal_bg = th.surface_hsla();
         let modal_fg = th.fg_hsla();
@@ -5505,272 +5499,253 @@ impl AppState {
                     .child(div().w(px(1.0)).h(px(16.0)).bg(cursor_color))
             });
 
+        // Rendered as a full-screen page that REPLACES the terminal area +
+        // tab bar (see `render`), not an overlay stacked on top of them.
+        // The old modal overlay let every click fall through to the live UI
+        // underneath — gpui dispatches mouse events to all hit elements
+        // unless propagation is stopped — so clicking in the dialog could
+        // drag/switch tabs behind it and the terminal's click-to-focus
+        // handler yanked focus out of the text inputs on every click.
+        // With the terminal and tab bar out of the tree entirely there is
+        // nothing underneath to mis-click or steal focus.
         Some(
             div()
-                .id("preferences-overlay")
-                .absolute()
-                .top(px(0.0))
-                .left(px(0.0))
-                .size_full()
-                // Swallow ALL mouse input so a click on the dimmed area can't
-                // fall through to the tab strip's on_click underneath (which
-                // was activating whatever tab sat below the cursor when the
-                // dialog was dismissed). The empty handlers below don't stop
-                // propagation on their own; occlude does.
-                .occlude()
+                .id("preferences-screen")
+                .w_full()
+                .min_h(px(0.0))
+                .flex_grow()
                 .flex()
-                .items_center()
-                .justify_center()
-                .bg(overlay_bg)
-                .on_mouse_down(MouseButton::Left, |_ev: &MouseDownEvent, _window, _cx| {})
-                .on_mouse_down(MouseButton::Right, |_ev: &MouseDownEvent, _window, _cx| {})
+                .flex_col()
+                .bg(modal_bg)
+                .text_color(modal_fg)
+                .text_size(px(14.0))
                 .child(
                     div()
-                        .id("preferences-box")
-                        .bg(modal_bg)
-                        .text_color(modal_fg)
-                        .border_1()
+                        .px(px(24.0))
+                        .pt(px(16.0))
+                        .pb(px(12.0))
+                        .border_b_1()
                         .border_color(modal_border)
-                        .rounded(px(6.0))
-                        .p(px(24.0))
-                        // Two-column body: wide enough to fit both columns on a
-                        // normal screen (halving the height so it fits short
-                        // screens), capped to 95% width on narrow ones. The
-                        // 90%-height cap + vertical scroll is the fallback when
-                        // even two columns are taller than the viewport.
-                        .w(px(860.0))
-                        .max_w(relative(0.95))
-                        .max_h(relative(0.9))
+                        .text_size(px(16.0))
+                        .child(t.preferences),
+                )
+                .child(
+                    div()
+                        .id("preferences-scroll")
+                        .flex_grow()
+                        .min_h(px(0.0))
                         .overflow_y_scroll()
-                        .text_size(px(14.0))
-                        .on_mouse_down(MouseButton::Left, |_ev: &MouseDownEvent, _window, _cx| {})
-                        .child(div().text_size(px(16.0)).mb(px(16.0)).child(t.preferences))
+                        .px(px(24.0))
+                        .py(px(16.0))
                         .child(
                             div()
-                                .flex()
-                                .flex_row()
-                                .gap(px(24.0))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .flex_1()
-                                        .gap(px(16.0))
-                                        .child(div().child(t.theme).child(theme_options))
-                                        .child(div().child("Cursor").child(cursor_options))
-                                        .child(div().child(t.opacity).child(opacity_slider))
-                                        .child(div().child(t.toggle_hotkeys).child(hotkey_list))
-                                        .child(div().child(t.language).child(lang_options))
-                                        .child(div().child(t.browser).child(browser_input)),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .flex_1()
-                                        .gap(px(16.0))
-                                        .child(div().child(t.code_editor).child(editor_input))
-                                        .child(div().child(t.api_addr).child(api_addr_input))
-                                        .child(div().child(t.api_tls_addr).child(api_tls_addr_input))
-                                        .child(div().child(t.share_url_base).child(share_url_base_input))
-                                        .child(div().child(t.default_tab_ram).child(default_mem_input)),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .mt(px(20.0))
-                                .flex()
-                                .flex_row()
-                                .justify_end()
-                                .gap(px(8.0))
-                                .child(
-                                    div()
-                                        .id("pref-cancel")
-                                        .px(px(14.0))
-                                        .py(px(6.0))
-                                        .bg(option_bg)
-                                        .rounded(px(3.0))
-                                        .cursor_pointer()
-                                        .hover(|s| s.bg(btn_hover))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
-                                                if this.show_hotkey_picker
-                                                    && let Some(ref handle) = this.hotkey_handle
-                                                {
-                                                    handle.resume();
-                                                }
-                                                this.show_preferences = false;
-                                                this.show_hotkey_picker = false;
-                                                cx.notify();
-                                            }),
-                                        )
-                                        .child(t.cancel),
-                                )
-                                .child({
-                                    let ro = crate::read_only();
-                                    let mut btn = div()
-                                        .id("pref-save")
-                                        .px(px(14.0))
-                                        .py(px(6.0))
-                                        .bg(btn_bg)
-                                        .rounded(px(3.0))
-                                        .child(t.save);
-                                    if ro {
-                                        btn = btn.opacity(0.4);
-                                    } else {
-                                        btn = btn.cursor_pointer().hover(|s| s.bg(btn_hover)).on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
-                                                let lang_str = match this.lang {
-                                                    Lang::En => "en",
-                                                    Lang::Fr => "fr",
-                                                };
-                                                let browser = if this.pref_browser_text.is_empty() {
-                                                    None
-                                                } else {
-                                                    Some(this.pref_browser_text.clone())
-                                                };
-                                                let editor = if this.pref_editor_text.is_empty() {
-                                                    None
-                                                } else {
-                                                    Some(this.pref_editor_text.clone())
-                                                };
-                                                (*this.browser.borrow_mut()).clone_from(&browser);
-                                                (*this.code_editor.borrow_mut()).clone_from(&editor);
-                                                // Validate each addr:port field
-                                                // via `SocketAddr::parse`. Anything
-                                                // that fails is kept as-is in the
-                                                // edit buffer but not persisted —
-                                                // the previous good value sticks.
-                                                let parsed_api =
-                                                    this.pref_api_addr_text.parse::<std::net::SocketAddr>().ok();
-                                                if parsed_api.is_some() {
-                                                    this.api_addr.clone_from(&this.pref_api_addr_text);
-                                                }
-                                                let parsed_tls =
-                                                    this.pref_api_tls_addr_text.parse::<std::net::SocketAddr>().ok();
-                                                if parsed_tls.is_some() {
-                                                    this.api_tls_addr.clone_from(&this.pref_api_tls_addr_text);
-                                                }
-                                                // share_url_base is a free-form URL; accept whatever
-                                                // the user typed (trimmed), empty means "use LAN URL".
-                                                this.share_url_base = this.pref_share_url_base_text.trim().to_string();
-                                                let share_url_base = if this.share_url_base.is_empty() {
-                                                    None
-                                                } else {
-                                                    Some(this.share_url_base.clone())
-                                                };
-                                                // Global "max RAM per tab" default. Empty = unlimited;
-                                                // otherwise must parse as a byte count (e.g. "8G") to be
-                                                // accepted — an unparseable entry keeps the prior value.
-                                                let mem_in = this.pref_default_mem_text.trim().to_string();
-                                                let mem_valid = !mem_in.is_empty()
-                                                    && crate::TabResourceLimits {
-                                                        memory_max: Some(mem_in.clone()),
-                                                        ..Default::default()
-                                                    }
-                                                    .memory_max_bytes()
-                                                    .is_some();
-                                                if mem_in.is_empty() {
-                                                    this.default_tab_mem_max = None;
-                                                } else if mem_valid {
-                                                    this.default_tab_mem_max = Some(mem_in);
-                                                }
-                                                // Reflect it immediately for the gauge + new-tab spawns.
-                                                #[cfg(target_os = "linux")]
-                                                {
-                                                    this.default_limits.memory_max = this.default_tab_mem_max.clone();
-                                                }
-                                                let default_mem_max = this.default_tab_mem_max.clone();
-                                                let on_disk_prefs = load_preferences(&platform::config_dir());
-                                                save_preferences(
-                                                    &platform::config_dir(),
-                                                    &Preferences {
-                                                        // Font lives in preferences.json (or zed /
-                                                        // fontconfig); the GUI dialog doesn't edit it,
-                                                        // so carry the on-disk values through rather
-                                                        // than wiping them on save.
-                                                        font_family: on_disk_prefs.font_family,
-                                                        font_size: on_disk_prefs.font_size,
-                                                        lang: Some(lang_str.into()),
-                                                        theme: Some(this.theme_name.id().into()),
-                                                        cursor_style: Some(this.cursor_style.id().into()),
-                                                        opacity: Some(this.opacity),
-                                                        // Menu-toggled, not in this dialog — carry the
-                                                        // on-disk value through so saving prefs doesn't
-                                                        // wipe the gauge setting.
-                                                        show_tab_gauge: this.show_tab_gauge,
-                                                        // Menu-toggled (right-click), not in this dialog —
-                                                        // carry it through so saving prefs doesn't drop it.
-                                                        claude_only: this.claude_only,
-                                                        // Relay + env are set via CLI/menu with
-                                                        // their own persist paths — carry the
-                                                        // on-disk values so the dialog save
-                                                        // doesn't clobber them.
-                                                        relay_mode: this.relay_mode,
-                                                        relay_endpoint_id: on_disk_prefs.relay_endpoint_id,
-                                                        relay_egress: on_disk_prefs.relay_egress,
-                                                        tab_env: on_disk_prefs.tab_env,
-                                                        hotkeys: this.hotkeys.clone(),
-                                                        browser,
-                                                        code_editor: editor,
-                                                        api_addr: Some(this.api_addr.clone()),
-                                                        api_tls_addr: Some(this.api_tls_addr.clone()),
-                                                        // Same "advanced field, not in the GUI dialog"
-                                                        // treatment as pty_cols / clear_env: the dialog
-                                                        // doesn't surface a cert/key picker, so leaving
-                                                        // these at None on save would silently wipe the
-                                                        // operator's Cloudflare Origin cert path. The
-                                                        // GUI never edits them.
-                                                        api_tls_cert_path: None,
-                                                        api_tls_key_path: None,
-                                                        api_tls_client_ca_path: None,
-                                                        share_url_base,
-                                                        remote_endpoints: this.remote_endpoints.clone(),
-                                                        // Headless-only fields the GUI never edits;
-                                                        // preserve whatever was on disk by leaving
-                                                        // them at the Default (None). The headless
-                                                        // CLI (`ports --pty-cols N`) writes them
-                                                        // directly into the JSON.
-                                                        pty_cols: None,
-                                                        pty_rows: None,
-                                                        tab_bg_color: this.tab_bg_global.clone(),
-                                                        // Headless-only: default allowlist for new
-                                                        // tabs, set via the CLI. Preserve on-disk.
-                                                        default_net_allow_presets: on_disk_prefs
-                                                            .default_net_allow_presets,
-                                                        default_net_allow_domains: on_disk_prefs
-                                                            .default_net_allow_domains,
-                                                        default_net_allow_cidrs: on_disk_prefs.default_net_allow_cidrs,
-                                                        // The GUI dialog edits only the RAM cap
-                                                        // (memory_max); the CPU/tasks axes are headless-
-                                                        // only, so carry them through from disk rather
-                                                        // than resetting the whole struct to Default
-                                                        // (which silently wiped a CLI-set cpu/tasks cap).
-                                                        default_tab_limits: crate::TabResourceLimits {
-                                                            memory_max: default_mem_max,
-                                                            cpu_quota_percent: on_disk_prefs
-                                                                .default_tab_limits
-                                                                .cpu_quota_percent,
-                                                            tasks_max: on_disk_prefs.default_tab_limits.tasks_max,
-                                                        },
-                                                        clear_env: None,
-                                                        clear_env_vars: std::collections::BTreeMap::new(),
-                                                    },
-                                                );
-                                                if let Some(ref handle) = this.hotkey_handle {
-                                                    handle.update_keys(&this.hotkeys);
-                                                }
-                                                this.show_preferences = false;
-                                                this.show_hotkey_picker = false;
-                                                cx.notify();
-                                            }),
-                                        );
-                                    }
-                                    btn
-                                }),
+                                .max_w(px(560.0))
+                                .child(div().child(t.theme).child(theme_options))
+                                .child(div().mt(px(16.0)).child("Cursor").child(cursor_options))
+                                .child(div().mt(px(16.0)).child(t.opacity).child(opacity_slider))
+                                .child(div().mt(px(16.0)).child(t.toggle_hotkeys).child(hotkey_list))
+                                .child(div().mt(px(16.0)).child(t.language).child(lang_options))
+                                .child(div().mt(px(16.0)).child(t.browser).child(browser_input))
+                                .child(div().mt(px(16.0)).child(t.code_editor).child(editor_input))
+                                .child(div().mt(px(16.0)).child(t.api_addr).child(api_addr_input))
+                                .child(div().mt(px(16.0)).child(t.api_tls_addr).child(api_tls_addr_input))
+                                .child(div().mt(px(16.0)).child(t.share_url_base).child(share_url_base_input))
+                                .child(div().mt(px(16.0)).child(t.default_tab_ram).child(default_mem_input)),
                         ),
+                )
+                .child(
+                    div()
+                        .px(px(24.0))
+                        .py(px(12.0))
+                        .border_t_1()
+                        .border_color(modal_border)
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .id("pref-cancel")
+                                .px(px(14.0))
+                                .py(px(6.0))
+                                .bg(option_bg)
+                                .rounded(px(3.0))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(btn_hover))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _ev: &MouseDownEvent, window, cx| {
+                                        if this.show_hotkey_picker
+                                            && let Some(ref handle) = this.hotkey_handle
+                                        {
+                                            handle.resume();
+                                        }
+                                        this.show_preferences = false;
+                                        this.show_hotkey_picker = false;
+                                        this.tabs[this.active].view.read(cx).focus_handle(cx).focus(window);
+                                        cx.notify();
+                                    }),
+                                )
+                                .child(t.cancel),
+                        )
+                        .child({
+                            let ro = crate::read_only();
+                            let mut btn = div()
+                                .id("pref-save")
+                                .px(px(14.0))
+                                .py(px(6.0))
+                                .bg(btn_bg)
+                                .rounded(px(3.0))
+                                .child(t.save);
+                            if ro {
+                                btn = btn.opacity(0.4);
+                            } else {
+                                btn = btn.cursor_pointer().hover(|s| s.bg(btn_hover)).on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _ev: &MouseDownEvent, window, cx| {
+                                        let lang_str = match this.lang {
+                                            Lang::En => "en",
+                                            Lang::Fr => "fr",
+                                        };
+                                        let browser = if this.pref_browser_text.is_empty() {
+                                            None
+                                        } else {
+                                            Some(this.pref_browser_text.clone())
+                                        };
+                                        let editor = if this.pref_editor_text.is_empty() {
+                                            None
+                                        } else {
+                                            Some(this.pref_editor_text.clone())
+                                        };
+                                        (*this.browser.borrow_mut()).clone_from(&browser);
+                                        (*this.code_editor.borrow_mut()).clone_from(&editor);
+                                        // Validate each addr:port field
+                                        // via `SocketAddr::parse`. Anything
+                                        // that fails is kept as-is in the
+                                        // edit buffer but not persisted —
+                                        // the previous good value sticks.
+                                        let parsed_api = this.pref_api_addr_text.parse::<std::net::SocketAddr>().ok();
+                                        if parsed_api.is_some() {
+                                            this.api_addr.clone_from(&this.pref_api_addr_text);
+                                        }
+                                        let parsed_tls =
+                                            this.pref_api_tls_addr_text.parse::<std::net::SocketAddr>().ok();
+                                        if parsed_tls.is_some() {
+                                            this.api_tls_addr.clone_from(&this.pref_api_tls_addr_text);
+                                        }
+                                        // share_url_base is a free-form URL; accept whatever
+                                        // the user typed (trimmed), empty means "use LAN URL".
+                                        this.share_url_base = this.pref_share_url_base_text.trim().to_string();
+                                        let share_url_base = if this.share_url_base.is_empty() {
+                                            None
+                                        } else {
+                                            Some(this.share_url_base.clone())
+                                        };
+                                        // Global "max RAM per tab" default. Empty = unlimited;
+                                        // otherwise must parse as a byte count (e.g. "8G") to be
+                                        // accepted — an unparseable entry keeps the prior value.
+                                        let mem_in = this.pref_default_mem_text.trim().to_string();
+                                        let mem_valid = !mem_in.is_empty()
+                                            && crate::TabResourceLimits {
+                                                memory_max: Some(mem_in.clone()),
+                                                ..Default::default()
+                                            }
+                                            .memory_max_bytes()
+                                            .is_some();
+                                        if mem_in.is_empty() {
+                                            this.default_tab_mem_max = None;
+                                        } else if mem_valid {
+                                            this.default_tab_mem_max = Some(mem_in);
+                                        }
+                                        // Reflect it immediately for the gauge + new-tab spawns.
+                                        #[cfg(target_os = "linux")]
+                                        {
+                                            this.default_limits.memory_max = this.default_tab_mem_max.clone();
+                                        }
+                                        let default_mem_max = this.default_tab_mem_max.clone();
+                                        let on_disk_prefs = load_preferences(&platform::config_dir());
+                                        save_preferences(
+                                            &platform::config_dir(),
+                                            &Preferences {
+                                                // Font lives in preferences.json (or zed /
+                                                // fontconfig); the GUI dialog doesn't edit it,
+                                                // so carry the on-disk values through rather
+                                                // than wiping them on save.
+                                                font_family: on_disk_prefs.font_family,
+                                                font_size: on_disk_prefs.font_size,
+                                                lang: Some(lang_str.into()),
+                                                theme: Some(this.theme_name.id().into()),
+                                                cursor_style: Some(this.cursor_style.id().into()),
+                                                opacity: Some(this.opacity),
+                                                // Menu-toggled, not in this dialog — carry the
+                                                // on-disk value through so saving prefs doesn't
+                                                // wipe the gauge setting.
+                                                show_tab_gauge: this.show_tab_gauge,
+                                                // Menu-toggled / headless-only knobs the dialog
+                                                // doesn't surface — carry the live or on-disk
+                                                // value through so a GUI save doesn't wipe them.
+                                                claude_only: this.claude_only,
+                                                relay_mode: this.relay_mode,
+                                                relay_endpoint_id: on_disk_prefs.relay_endpoint_id,
+                                                relay_egress: on_disk_prefs.relay_egress,
+                                                tab_env: on_disk_prefs.tab_env,
+                                                hotkeys: this.hotkeys.clone(),
+                                                browser,
+                                                code_editor: editor,
+                                                api_addr: Some(this.api_addr.clone()),
+                                                api_tls_addr: Some(this.api_tls_addr.clone()),
+                                                // Same "advanced field, not in the GUI dialog"
+                                                // treatment as pty_cols / clear_env: the dialog
+                                                // doesn't surface a cert/key picker, so leaving
+                                                // these at None on save would silently wipe the
+                                                // operator's Cloudflare Origin cert path. The
+                                                // GUI never edits them.
+                                                api_tls_cert_path: None,
+                                                api_tls_key_path: None,
+                                                api_tls_client_ca_path: None,
+                                                share_url_base,
+                                                remote_endpoints: this.remote_endpoints.clone(),
+                                                // Headless-only fields the GUI never edits;
+                                                // preserve whatever was on disk by leaving
+                                                // them at the Default (None). The headless
+                                                // CLI (`ports --pty-cols N`) writes them
+                                                // directly into the JSON.
+                                                pty_cols: None,
+                                                pty_rows: None,
+                                                tab_bg_color: this.tab_bg_global.clone(),
+                                                // Headless-only: default allowlist for new
+                                                // tabs, set via the CLI. Preserve on-disk.
+                                                default_net_allow_presets: on_disk_prefs.default_net_allow_presets,
+                                                default_net_allow_domains: on_disk_prefs.default_net_allow_domains,
+                                                default_net_allow_cidrs: on_disk_prefs.default_net_allow_cidrs,
+                                                // The GUI dialog edits only the RAM cap
+                                                // (memory_max); the CPU/tasks axes are headless-
+                                                // only, so carry them through from disk rather
+                                                // than resetting the whole struct to Default
+                                                // (which silently wiped a CLI-set cpu/tasks cap).
+                                                default_tab_limits: crate::TabResourceLimits {
+                                                    memory_max: default_mem_max,
+                                                    cpu_quota_percent: on_disk_prefs
+                                                        .default_tab_limits
+                                                        .cpu_quota_percent,
+                                                    tasks_max: on_disk_prefs.default_tab_limits.tasks_max,
+                                                },
+                                                clear_env: None,
+                                                clear_env_vars: std::collections::BTreeMap::new(),
+                                            },
+                                        );
+                                        if let Some(ref handle) = this.hotkey_handle {
+                                            handle.update_keys(&this.hotkeys);
+                                        }
+                                        this.show_preferences = false;
+                                        this.show_hotkey_picker = false;
+                                        this.tabs[this.active].view.read(cx).focus_handle(cx).focus(window);
+                                        cx.notify();
+                                    }),
+                                );
+                            }
+                            btn
+                        }),
                 ),
         )
     }
@@ -5813,6 +5788,11 @@ impl AppState {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                        // Swallow the click: without this it also lands on
+                        // whatever sits underneath — now that the prefs page
+                        // fills the screen, that's always a live control
+                        // (Save/Cancel, a theme row, a hotkey "×").
+                        cx.stop_propagation();
                         this.show_hotkey_picker = false;
                         if let Some(ref handle) = this.hotkey_handle {
                             handle.resume();
@@ -5833,7 +5813,12 @@ impl AppState {
                         .p(px(24.0))
                         .min_w(px(260.0))
                         .text_size(px(14.0))
-                        .on_mouse_down(MouseButton::Left, |_ev: &MouseDownEvent, _window, _cx| {})
+                        // stop_propagation (not a no-op) so a click inside the
+                        // box doesn't reach the overlay's dismiss handler
+                        // behind it and close the picker.
+                        .on_mouse_down(MouseButton::Left, |_ev: &MouseDownEvent, _window, cx| {
+                            cx.stop_propagation();
+                        })
                         .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _window, cx| {
                             let key = ev.keystroke.key.as_str();
                             if key == "escape" {
@@ -5943,8 +5928,13 @@ impl Render for AppState {
         #[cfg(not(feature = "energy"))]
         let battery: Option<u8> = None;
         // Per-tab ledges for the pet are collected inside `render_tab_bar` by
-        // measuring canvases (see `pet_ledges`).
-        let tab_bar = self.render_tab_bar(battery, window, cx);
+        // measuring canvases (see `pet_ledges`). Skipped while the
+        // preferences screen is up — it replaces the tab bar entirely.
+        let tab_bar = if self.show_preferences {
+            None
+        } else {
+            Some(self.render_tab_bar(battery, window, cx))
+        };
         let context_menu = if self.renaming.is_none()
             && self.exit_confirm.is_none()
             && self.close_confirm.is_none()
@@ -5970,28 +5960,28 @@ impl Render for AppState {
         if self.tab_switcher.is_some() {
             self.tab_switcher_focus.focus(window);
         }
-        // When the prefs modal is open, force focus onto one of its
-        // inputs every render. Without this, the terminal's focus
-        // handle (or whatever held focus before the modal opened)
-        // keeps receiving KeyDownEvents and typing leaks into the
-        // PTY behind the modal. The per-input on_mouse_down handlers
-        // still cover switching between inputs — if focus is already
-        // on a prefs input, we leave it; we only redirect to
-        // api_addr when focus drifted outside the modal entirely.
+        // While the preferences screen is up, keep focus anchored on one
+        // of its inputs. The terminal isn't rendered then, but whatever
+        // held focus before opening (or a dropped focus handle) would
+        // otherwise leave typing going nowhere. The per-input
+        // on_mouse_down handlers still cover switching between inputs —
+        // if focus is already on a prefs input, we leave it; we only
+        // redirect to api_addr when focus drifted outside the screen.
         //
         // EXCEPTION: when the hotkey picker is layered on top of the
-        // prefs modal, the picker has its own focus handle (anchored
-        // at line ~3700 above). Forcing api_addr focus here would
-        // yank focus back from the picker every frame and the user
-        // could never bind a key combo — keystrokes would just hop
-        // between the picker's window and api_addr at 60 Hz.
-        // Anchoring is the picker's job while it's open.
+        // prefs screen, the picker has its own focus handle (anchored
+        // just above). Forcing api_addr focus here would yank focus
+        // back from the picker every frame and the user could never
+        // bind a key combo — keystrokes would just hop between the
+        // picker's window and api_addr at 60 Hz. Anchoring is the
+        // picker's job while it's open.
         if self.show_preferences && !self.show_hotkey_picker {
             let already_in_prefs = self.pref_api_addr_focus.is_focused(window)
                 || self.pref_api_tls_addr_focus.is_focused(window)
                 || self.pref_share_url_base_focus.is_focused(window)
                 || self.pref_browser_focus.is_focused(window)
-                || self.pref_editor_focus.is_focused(window);
+                || self.pref_editor_focus.is_focused(window)
+                || self.pref_default_mem_focus.is_focused(window);
             if !already_in_prefs {
                 self.pref_api_addr_focus.focus(window);
             }
@@ -6073,6 +6063,13 @@ impl Render for AppState {
                     }
                     return;
                 }
+                // The preferences screen replaces the terminal + tab bar, so
+                // tab shortcuts bubbling up from its inputs would mutate tabs
+                // invisibly (Ctrl+Shift+T spawning one, Alt+Tab switching) —
+                // the keyboard variant of the old click-through bug.
+                if this.show_preferences {
+                    return;
+                }
                 if ks.modifiers.control && !ks.modifiers.shift && !ks.modifiers.alt && ks.key.as_str() == "p" {
                     this.open_tab_switcher(cx);
                     return;
@@ -6085,49 +6082,59 @@ impl Render for AppState {
                     let next = (this.active + 1) % this.tabs.len();
                     this.select_tab(next, window, cx);
                 }
-            }))
-            .child(
-                div()
-                    .id("terminal-area")
-                    .relative()
-                    // Take full width but DON'T claim full height — the
-                    // tab bar below uses flex-wrap to grow to 2/3 rows
-                    // (32 px each) and needs space to expand into. With
-                    // `size_full()` here the terminal-area pinned itself
-                    // to 100% of parent height and the tab bar's 3rd row
-                    // overflowed (only ~3/4 visible). `flex_grow()` is
-                    // enough to absorb whatever the tab bar doesn't use.
-                    .w_full()
-                    .min_h(px(0.0))
-                    .flex_grow()
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(|this, ev: &MouseDownEvent, _window, cx| {
-                            // Grab the link under the cursor (if the right-click
-                            // landed on a detected URL/path) so the menu can offer
-                            // "Copy path (link)". The hover cell tracks the mouse,
-                            // so it already points at the clicked cell.
-                            let link = this.tabs[this.active].view.read(cx).hovered_url();
-                            this.context_menu = Some(ContextMenu {
-                                kind: MenuKind::Background,
-                                position: ev.position,
-                                open_upward: false,
-                                link,
-                            });
-                            cx.notify();
+            }));
+
+        // The preferences screen REPLACES the terminal area + tab bar
+        // rather than overlaying them: with the old modal, clicks fell
+        // through to the tab bar (dragging/switching tabs) and the
+        // terminal's click-to-focus stole focus from the text inputs.
+        if let Some(prefs) = self.render_preferences(cx) {
+            root = root.child(prefs);
+        } else {
+            root = root
+                .child(
+                    div()
+                        .id("terminal-area")
+                        .relative()
+                        // Take full width but DON'T claim full height — the
+                        // tab bar below uses flex-wrap to grow to 2/3 rows
+                        // (32 px each) and needs space to expand into. With
+                        // `size_full()` here the terminal-area pinned itself
+                        // to 100% of parent height and the tab bar's 3rd row
+                        // overflowed (only ~3/4 visible). `flex_grow()` is
+                        // enough to absorb whatever the tab bar doesn't use.
+                        .w_full()
+                        .min_h(px(0.0))
+                        .flex_grow()
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(|this, ev: &MouseDownEvent, _window, cx| {
+                                // Grab the link under the cursor (if the right-click
+                                // landed on a detected URL/path) so the menu can offer
+                                // "Copy path (link)". The hover cell tracks the mouse,
+                                // so it already points at the clicked cell.
+                                let link = this.tabs[this.active].view.read(cx).hovered_url();
+                                this.context_menu = Some(ContextMenu {
+                                    kind: MenuKind::Background,
+                                    position: ev.position,
+                                    open_upward: false,
+                                    link,
+                                });
+                                cx.notify();
+                            }),
+                        )
+                        .child(active_terminal)
+                        // Low-battery red wash, anchored to `terminal-area`
+                        // (hence the `.relative()` above) so it covers the
+                        // terminal but leaves the tab bar's blink untouched.
+                        // Non-interactive → mouse events pass through to the
+                        // terminal below.
+                        .when_some(battery_tint, |area, tint| {
+                            area.child(div().absolute().top(px(0.0)).left(px(0.0)).size_full().bg(tint))
                         }),
-                    )
-                    .child(active_terminal)
-                    // Low-battery red wash, anchored to `terminal-area`
-                    // (hence the `.relative()` above) so it covers the
-                    // terminal but leaves the tab bar's blink untouched.
-                    // Non-interactive → mouse events pass through to the
-                    // terminal below.
-                    .when_some(battery_tint, |area, tint| {
-                        area.child(div().absolute().top(px(0.0)).left(px(0.0)).size_full().bg(tint))
-                    }),
-            )
-            .child(tab_bar);
+                )
+                .children(tab_bar);
+        }
 
         if let Some(menu) = context_menu {
             root = root
@@ -6170,10 +6177,6 @@ impl Render for AppState {
 
         if let Some(qr) = self.render_qr_modal(cx) {
             root = root.child(qr);
-        }
-
-        if let Some(prefs) = self.render_preferences(cx) {
-            root = root.child(prefs);
         }
 
         if let Some(picker) = self.render_hotkey_picker(cx) {
