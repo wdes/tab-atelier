@@ -565,11 +565,13 @@ impl DirCountCache {
             return false;
         }
         self.scanned_at = Some(Instant::now());
+        // Count recursively so subfolders are included — matches the tree the
+        // /outbox|/inbox listing renders (crate::api::count_files_tree). The old
+        // shallow read_dir counted only top-level files, so any output nested
+        // in a subfolder went uncounted and the badge disagreed with the list.
         let dir_count = |dirname: &str| -> usize {
             cwd.map_or(0, |cwd| {
-                std::fs::read_dir(std::path::Path::new(cwd).join(dirname)).map_or(0, |rd| {
-                    rd.flatten().filter(|e| e.metadata().is_ok_and(|m| m.is_file())).count()
-                })
+                crate::api::count_files_tree(&std::path::Path::new(cwd).join(dirname))
             })
         };
         let (old_out, old_in) = (self.outbox, self.inbox);
@@ -1117,6 +1119,27 @@ mod tests {
         let mut none = DirCountCache::new();
         none.refresh(None, Authz::Rw);
         assert_eq!((none.outbox, none.inbox), (0, 0));
+    }
+
+    #[test]
+    fn dir_count_recurses_into_subfolders() {
+        // Regression: the badge count used a shallow read_dir, so files nested
+        // in outbox subfolders were never counted and the badge disagreed with
+        // the tree the /outbox listing renders.
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        std::fs::create_dir(cwd.join("outbox")).unwrap();
+        std::fs::write(cwd.join("outbox/top.txt"), b"x").unwrap();
+        std::fs::create_dir(cwd.join("outbox/reports")).unwrap();
+        std::fs::write(cwd.join("outbox/reports/q1.pdf"), b"x").unwrap();
+        std::fs::write(cwd.join("outbox/reports/q2.pdf"), b"x").unwrap();
+        std::fs::create_dir(cwd.join("outbox/reports/old")).unwrap();
+        std::fs::write(cwd.join("outbox/reports/old/2019.pdf"), b"x").unwrap();
+
+        let mut c = DirCountCache::new();
+        c.refresh(Some(cwd.to_str().unwrap()), Authz::Rw);
+        // 1 top-level + 2 in reports/ + 1 in reports/old/ = 4.
+        assert_eq!(c.outbox, 4);
     }
 
     #[test]
