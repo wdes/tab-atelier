@@ -1056,6 +1056,38 @@ fn collect_files_tree(dir: &std::path::Path, rel_prefix: &str, depth: usize, out
     }
 }
 
+/// Count regular files under `dir`, recursively — the badge-count equivalent
+/// of [`collect_files_tree`]. Same traversal (skips symlinks via `file_type`,
+/// honours [`sanitize_basename`] and the depth/entry caps), so the number
+/// matches the tree the `/outbox`|`/inbox` listing renders even when
+/// subfolders are used. The previous badge used a shallow `read_dir` that
+/// counted only top-level files, undercounting anything nested in a subfolder.
+pub fn count_files_tree(dir: &std::path::Path) -> usize {
+    fn walk(dir: &std::path::Path, depth: usize, n: &mut usize) {
+        if depth > FILE_LIST_MAX_DEPTH || *n >= FILE_LIST_MAX_ENTRIES {
+            return;
+        }
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for entry in rd.flatten() {
+            if *n >= FILE_LIST_MAX_ENTRIES {
+                break;
+            }
+            if entry.file_name().to_str().and_then(sanitize_basename).is_none() {
+                continue;
+            }
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_dir() {
+                walk(&entry.path(), depth + 1, n);
+            } else if ft.is_file() {
+                *n += 1;
+            }
+        }
+    }
+    let mut n = 0;
+    walk(dir, 0, &mut n);
+    n
+}
+
 fn maybe_gzip(bytes: &[u8], accept_gzip: bool) -> Option<Vec<u8>> {
     const MIN_BODY: usize = 4096;
     if !accept_gzip || bytes.len() < MIN_BODY {
