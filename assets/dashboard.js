@@ -32,6 +32,14 @@ export function nodeMap(state) {
 const POLL_MS = 1500;
 const STATE_URL = "/dashboard/state";
 
+// The share-token the daemon gated this page on (master or the global dashboard
+// token), carried in the page URL's `?token=` exactly like the tab viewer
+// (main.js). Sent as `Authorization: Bearer` on the state poll so a remote,
+// token-only load authorises. Guarded so importing this module under Node (the
+// self-check) — where `location` is undefined — stays side-effect-free.
+const TOKEN = typeof location === "undefined" ? "" : new URLSearchParams(location.search).get("token") || "";
+const AUTH_HEADERS = TOKEN ? { Authorization: "Bearer " + TOKEN } : {};
+
 // Live snapshot the popup reads from, refreshed each poll.
 let currentNodes = new Map();
 let currentUnmapped = [];
@@ -131,7 +139,7 @@ function openViewerFrom(target) {
 async function poll() {
   const status = document.getElementById("status");
   try {
-    const res = await fetch(STATE_URL, { headers: { accept: "application/json" } });
+    const res = await fetch(STATE_URL, { headers: { accept: "application/json", ...AUTH_HEADERS } });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     applyState(await res.json());
     if (status) status.textContent = "live";

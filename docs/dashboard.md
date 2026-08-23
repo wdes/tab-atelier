@@ -103,6 +103,27 @@ and:
 
 Headless tabs appear exactly like GUI tabs (they are in `/tabs/usage` too).
 
+## Auth
+
+The dashboard is reached with a **global, read-only share token** — modelled on
+the tab viewer's share link so it can be handed to a remote browser later (like
+the mobile onboarding QR). It is **global** (one token for the whole panel, not
+per-tab) and **read-only** (the dashboard never sends input, so there is no
+RW/RO split — the day it grows actions, that path will need a separate RW
+token).
+
+- **Gated routes**: `GET /dashboard` (the HTML page) and `GET /dashboard/state`.
+  Both accept the **master token** OR the **dashboard share-token**, passed as
+  `?token=…` (browser-friendly) or `Authorization: Bearer …`, compared in
+  constant time. The static assets (`/assets/dashboard.{js,css}`) stay public —
+  the page loads them before its JS reads the token from the URL.
+- **Getting the link**: `tab-atelier-headless share-link --dashboard` prints
+  `http(s)://host:port/dashboard?token=<dashboard-token>`. The token is minted
+  lazily on that first request and **persisted in `tabs.json`**, so a shared
+  link survives a daemon restart.
+- **Revoking**: `POST /tabs/rotate-tokens` clears the dashboard token (alongside
+  every per-tab share token); the shared link 401s until a new one is minted.
+
 ## Acceptance (verified in GUI before ship)
 
 Per the harness rule: a GUI feature is done only when the intent is observed on
