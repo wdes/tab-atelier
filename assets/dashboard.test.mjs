@@ -3,7 +3,10 @@
 // No framework — just node:assert. Imports the real functions from dashboard.js
 // so this stays a check of shipped code, not a copy.
 import assert from "node:assert/strict";
-import { ledClass, nodeMap, CANONICAL_PHASES, resolveView, renderProjectCard, readProjectParam } from "./dashboard.js";
+import {
+  ledClass, nodeMap, CANONICAL_PHASES, resolveView, renderProjectCard,
+  readProjectParam, shortContext, nodeSubtitle,
+} from "./dashboard.js";
 
 // The five led states each map to their own distinct class.
 const cases = {
@@ -94,5 +97,17 @@ assert.equal(readProjectParam("?project=kalpin-back"), "kalpin-back");
 assert.equal(readProjectParam(""), null, "no query -> level 0");
 assert.equal(readProjectParam("?token=abc"), null, "other params -> level 0");
 assert.equal(readProjectParam("?project="), null, "empty value -> level 0");
+
+// --- shortContext / nodeSubtitle: node subtitles = context ~5 words (S4) ---
+assert.equal(shortContext("refactor the auth token flow now", 5), "refactor the auth token flow…", "clips to 5 words with ellipsis");
+assert.equal(shortContext("just three words here"), "just three words here", "under the cap -> verbatim");
+assert.equal(shortContext(""), "", "empty context -> empty");
+assert.equal(shortContext(null), "", "null context -> empty");
+// Empty node -> no subtitle.
+assert.equal(nodeSubtitle({ tabs: [] }), "");
+// One tab -> name · context.
+assert.equal(nodeSubtitle({ tabs: [{ name: "ta", context: "do a thing" }] }), "ta · do a thing");
+// Multiple tabs -> first + "+N".
+assert.match(nodeSubtitle({ tabs: [{ name: "a", context: "x" }, {}, {}] }), /\+2$/, "multi-tab node shows +N");
 
 console.log("dashboard.test.mjs: OK");

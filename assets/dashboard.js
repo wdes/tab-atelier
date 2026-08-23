@@ -84,6 +84,30 @@ export function readProjectParam(search) {
   return value ? value : null;
 }
 
+// Pure: first `maxWords` words of a context string, with an ellipsis if clipped.
+// context is the volatile prompt ("what this tab is on right now") — the "five
+// words" of docs/dashboard.md.
+export function shortContext(text, maxWords = 5) {
+  const words = String(text == null ? "" : text).trim().split(/\s+/).filter(Boolean);
+  if (!words.length) return "";
+  const head = words.slice(0, maxWords).join(" ");
+  return words.length > maxWords ? head + "…" : head;
+}
+
+// Pure: a node's on-diagram subtitle = first occupant's name + short context,
+// with a "+N" tail when the node holds more than one tab. Capped so it fits the
+// node box. Empty when the node has no tabs.
+export function nodeSubtitle(node) {
+  const tabs = (node && node.tabs) || [];
+  if (!tabs.length) return "";
+  const first = tabs[0] || {};
+  const name = first.name || "";
+  const ctx = shortContext(first.context || first.item);
+  let label = ctx ? `${name} · ${ctx}` : name;
+  if (label.length > 24) label = label.slice(0, 23) + "…";
+  return tabs.length > 1 ? `${label} +${tabs.length - 1}` : label;
+}
+
 const POLL_MS = 1500;
 const STATE_URL = "/dashboard/state";
 
@@ -168,6 +192,8 @@ function renderDiagram(view) {
     const count = node && node.tabs ? node.tabs.length : 0;
     const countEl = el.querySelector(".node-count");
     if (countEl) countEl.textContent = count ? String(count) : "";
+    const subEl = el.querySelector(".node-subtitle");
+    if (subEl) subEl.textContent = node ? nodeSubtitle(node) : "";
   }
 
   renderUnmapped();
