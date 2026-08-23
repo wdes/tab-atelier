@@ -54,6 +54,12 @@ const VENDOR_TERM_SYMBOLS_WOFF2: &[u8] = include_bytes!("../assets/vendor/term-s
 /// next page load with no user intervention.
 const MAIN_CSS: &str = include_str!("../assets/main.css");
 const MAIN_JS: &str = include_str!("../assets/main.js");
+/// Harness dashboard control-panel app (see docs/dashboard.md). Served public
+/// (like the viewer assets) at `/dashboard` + `/assets/dashboard.{js,css}`; the
+/// page's JS polls the authed `/dashboard/state`. Owned by the web-app slice.
+const DASHBOARD_HTML: &str = include_str!("../assets/dashboard.html");
+const DASHBOARD_JS: &str = include_str!("../assets/dashboard.js");
+const DASHBOARD_CSS: &str = include_str!("../assets/dashboard.css");
 // Site icons + metadata served at the origin root (`/favicon.ico`, …). The
 // `.svg` reuses the app icon; the raster set is rendered from it. `robots.txt`
 // mirrors the `X-Robots-Tag: noindex` stance for crawlers that check it first.
@@ -280,6 +286,118 @@ struct ErrorResponse {
     error: String,
 }
 
+/// The seven canonical phase-node ids of the harness dashboard skeleton, in
+/// flow order (see docs/dashboard.md). A tab whose `context` starts with one
+/// of these maps to that node; anything else falls to `unmapped`.
+const DASHBOARD_PHASES: [&str; 7] = ["scope", "plan", "build", "review", "verify", "sweep", "done"];
+
+/// One tab projected into the dashboard state: the same per-tab data as
+/// `/tabs/usage`, plus the `context` split into `role`/`item` and a ready-made
+/// `viewerUrl`. camelCase to match the documented JSON shape.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DashboardTab {
+    id: String,
+    name: String,
+    context: Option<String>,
+    role: String,
+    item: String,
+    agent_state: Option<&'static str>,
+    led: Option<&'static str>,
+    tokens: Option<crate::TokenUsage>,
+    viewer_url: String,
+}
+
+/// A phase node with its occupants and the worst-severity led among them.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DashboardNode {
+    id: &'static str,
+    rollup_led: Option<&'static str>,
+    tabs: Vec<DashboardTab>,
+}
+
+#[derive(Serialize)]
+struct DashboardState {
+    nodes: Vec<DashboardNode>,
+    unmapped: Vec<DashboardTab>,
+}
+
+/// Minimal per-tab projection the dashboard builder consumes, so the
+/// mapping/rollup logic is unit-testable without constructing a full
+/// `TabState`. Mirrors exactly the fields `/tabs/usage` reads plus `context`.
+struct DashboardTabInput {
+    id: String,
+    name: String,
+    context: Option<String>,
+    agent_state: Option<&'static str>,
+    led: Option<&'static str>,
+    tokens: Option<crate::TokenUsage>,
+}
+
+/// Rollup severity of a `led` slug — higher is worse. Mirrors [`crate::TabLed`]
+/// precedence: dead > error > working > unreviewed > idle. Unknown ⇒ 0.
+fn led_severity(led: &str) -> u8 {
+    match led {
+        "dead" => 5,
+        "error" => 4,
+        "working" => 3,
+        "unreviewed" => 2,
+        "idle" => 1,
+        _ => 0,
+    }
+}
+
+/// Group tabs by phase node, parse each `context` into `role`/`item`, and roll
+/// up each node's led to its worst-severity occupant. The pure core of
+/// `GET /dashboard/state` (see docs/dashboard.md).
+fn build_dashboard_state(inputs: Vec<DashboardTabInput>) -> DashboardState {
+    let mut nodes: Vec<DashboardNode> = DASHBOARD_PHASES
+        .iter()
+        .map(|id| DashboardNode {
+            id,
+            rollup_led: None,
+            tabs: vec![],
+        })
+        .collect();
+    let mut unmapped: Vec<DashboardTab> = vec![];
+    for t in inputs {
+        // Split "phase/role/item" on the first two slashes; item keeps any
+        // remaining slashes. Absent context ⇒ empty phase/role/item ⇒ unmapped.
+        let (phase, role, item) = t.context.as_deref().map_or_else(
+            || (String::new(), String::new(), String::new()),
+            |ctx| {
+                let mut parts = ctx.splitn(3, '/');
+                (
+                    parts.next().unwrap_or("").to_string(),
+                    parts.next().unwrap_or("").to_string(),
+                    parts.next().unwrap_or("").to_string(),
+                )
+            },
+        );
+        let viewer_url = format!("/tabs/by-id/{}/view", t.id);
+        let tab = DashboardTab {
+            id: t.id,
+            name: t.name,
+            context: t.context,
+            role,
+            item,
+            agent_state: t.agent_state,
+            led: t.led,
+            tokens: t.tokens,
+            viewer_url,
+        };
+        match nodes.iter_mut().find(|n| n.id == phase) {
+            Some(n) => n.tabs.push(tab),
+            None => unmapped.push(tab),
+        }
+    }
+    for n in &mut nodes {
+        n.rollup_led = n.tabs.iter().filter_map(|t| t.led).max_by_key(|led| led_severity(led));
+    }
+    DashboardState { nodes, unmapped }
+}
+
 #[derive(Clone)]
 pub struct SnapshotTab {
     /// Stable per-tab UUID, mirrored from `TabState.id`. Used to route
@@ -490,6 +608,13 @@ pub struct TabSnapshot {
     /// token is persisted to `api.token`, and `tab-atelier token`
     /// re-reads the file. Initialised at server start.
     pub master_token: String,
+    /// Global read-only share token for the dashboard (`GET /dashboard` +
+    /// `/dashboard/state`). One token for the whole panel (no per-tab scoping,
+    /// no RW/RO split — the dashboard never takes input). Minted lazily on the
+    /// first share-URL request, persisted in `tabs.json` (`SavedState`), and
+    /// revoked by `POST /tabs/rotate-tokens`. Empty ⇒ not minted; the auth
+    /// gate's non-empty guard means an empty token never authorises anyone.
+    pub dashboard_share_token: std::sync::Arc<str>,
     pub active: usize,
     #[cfg(feature = "energy")]
     pub power: Vec<crate::power::TabPower>,
@@ -1629,6 +1754,33 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
         }
     }
 
+    // Harness dashboard static assets (JS/CSS). Public like the viewer's
+    // main.{js,css}: the browser fetches them before the page's JS reads the
+    // token from the URL to poll the (authed) `/dashboard/state`. The
+    // `/dashboard` HTML page itself is NOT here — it goes through the auth gate
+    // (master or the dashboard share-token), same as the viewer's own page. No
+    // `?version=` cache-buster on these yet, so no-cache rather than immutable.
+    // See docs/dashboard.md.
+    if method.as_str() == "GET" {
+        let asset: Option<(&[u8], &str)> = match path.as_str() {
+            "/assets/dashboard.js" => Some((DASHBOARD_JS.as_bytes(), "application/javascript; charset=utf-8")),
+            "/assets/dashboard.css" => Some((DASHBOARD_CSS.as_bytes(), "text/css; charset=utf-8")),
+            _ => None,
+        };
+        if let Some((body, ctype)) = asset {
+            respond_with_etag(
+                stream,
+                200,
+                ctype,
+                body,
+                accept_gzip,
+                if_none_match.as_deref(),
+                "Cache-Control: no-cache\r\n",
+            );
+            return;
+        }
+    }
+
     let provided_token = auth_token.or(query_token);
     // Permission gate, in order:
     //
@@ -1665,7 +1817,24 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
         }
         ok
     };
-    if !is_master {
+    // Global dashboard share-token: one read-only token that authorises exactly
+    // the two dashboard read routes (`/dashboard` + `/dashboard/state`), via
+    // `?token=` (browser-friendly) or `Authorization: Bearer`, constant-time.
+    // ponytail: no RW/RO split — the dashboard never takes input; the day it
+    // accepts actions, that path needs a separate RW token.
+    let is_dashboard_token = !is_master && matches!(path.as_str(), "/dashboard" | "/dashboard/state") && {
+        let snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ok = !snap.dashboard_share_token.is_empty()
+            && constant_time_eq(
+                provided_token.as_deref().unwrap_or("").as_bytes(),
+                snap.dashboard_share_token.as_bytes(),
+            );
+        if ok {
+            snap.touch();
+        }
+        ok
+    };
+    if !is_master && !is_dashboard_token {
         let allowed = if let Some(p) = provided_token.as_deref()
             && let Some(rest) = path.strip_prefix("/tabs/by-id/")
             && let Some((uuid, action)) = rest.split_once('/')
@@ -1889,6 +2058,68 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 .collect();
             let body = serde_json::to_string_pretty(&usage).unwrap_or_default();
             drop(state);
+            respond_with_etag(
+                stream,
+                200,
+                "application/json",
+                body.as_bytes(),
+                accept_gzip,
+                if_none_match.as_deref(),
+                "",
+            );
+        }
+        // Mapped, aggregated view of the same per-tab data as `/tabs/usage`,
+        // grouped by the `context` phase node for the harness dashboard app.
+        // Same auth gate as `/tabs` (checked upstream). See docs/dashboard.md.
+        // The dashboard app page. Behind the auth gate (master or the dashboard
+        // share-token), same as the viewer's own `/view` page — the static
+        // assets it pulls (`/assets/dashboard.{js,css}`) stay public.
+        ("GET", "/dashboard") => {
+            respond_with_etag(
+                stream,
+                200,
+                "text/html; charset=utf-8",
+                DASHBOARD_HTML.as_bytes(),
+                accept_gzip,
+                if_none_match.as_deref(),
+                "Cache-Control: no-cache\r\n",
+            );
+        }
+        // Return (minting on first use) the global dashboard share-token, so
+        // `share-link --dashboard` can print a `/dashboard?token=…` URL. Master
+        // only — this path isn't in the dashboard-token allowlist, so the share
+        // token can't mint or read itself. ponytail: minting is a state change;
+        // under `--read-only` the daemon skips persistence, so a token minted
+        // there regenerates each restart (acceptable for a read-only instance).
+        ("GET", "/dashboard/share-token") => {
+            let mut snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if snap.dashboard_share_token.is_empty() {
+                snap.dashboard_share_token = crate::mint_share_token().into();
+            }
+            let token = snap.dashboard_share_token.to_string();
+            drop(snap);
+            respond_json(stream, 200, &format!(r#"{{"token":"{token}"}}"#));
+        }
+        ("GET", "/dashboard/state") => {
+            let state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let inputs: Vec<DashboardTabInput> = state
+                .tabs
+                .iter()
+                .map(|t| DashboardTabInput {
+                    id: t.id.to_string(),
+                    name: t.name.to_string(),
+                    context: t.context.as_deref().map(str::to_string),
+                    agent_state: t.agent_state.as_ref().map(|s| match s.state {
+                        crate::AgentState::Thinking => "thinking",
+                        crate::AgentState::Waiting => "waiting",
+                        crate::AgentState::Error => "error",
+                    }),
+                    led: t.agent_led.map(crate::TabLed::slug),
+                    tokens: t.tokens,
+                })
+                .collect();
+            drop(state);
+            let body = serde_json::to_string_pretty(&build_dashboard_state(inputs)).unwrap_or_default();
             respond_with_etag(
                 stream,
                 200,
@@ -3298,9 +3529,21 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             }
             let ids: Vec<String> = state.tabs.iter().map(|t| t.id.to_string()).collect();
             state.pending_token_rotations.extend(ids);
+            // Also revoke the global dashboard share-token: any outstanding
+            // `/dashboard?token=…` link 401s until re-minted. Cleared on the
+            // snapshot immediately; the next persist tick writes the empty token
+            // to tabs.json.
+            let dashboard_revoked = !state.dashboard_share_token.is_empty();
+            if dashboard_revoked {
+                state.dashboard_share_token = "".into();
+            }
             state.invalidate_tabs();
             drop(state);
-            respond_json(stream, 200, &format!(r#"{{"revoked":{revoked}}}"#));
+            respond_json(
+                stream,
+                200,
+                &format!(r#"{{"revoked":{revoked},"dashboard_revoked":{dashboard_revoked}}}"#),
+            );
         }
         ("POST", "/master-token/reset") => {
             // Hot-swap the master API token: generate a fresh one, persist
@@ -4329,6 +4572,7 @@ pub fn test_snapshot(tabs: Vec<SnapshotTab>) -> TabSnapshot {
         activity_waker: std::sync::Arc::new((std::sync::Mutex::new(()), std::sync::Condvar::new())),
         generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         master_token: String::new(),
+        dashboard_share_token: "".into(),
     }
 }
 
@@ -4394,6 +4638,238 @@ mod tests {
         let json = serde_json::to_string(&t).unwrap();
         assert!(json.contains("\"resident_memory_bytes\":4096"), "{json}");
         assert!(json.contains("\"tokens\":{\"input\":100,\"output\":50}"), "{json}");
+    }
+
+    /// Build one dashboard input tab with just the fields the mapper reads.
+    fn dash_input(id: &str, context: Option<&str>, led: Option<&'static str>) -> DashboardTabInput {
+        DashboardTabInput {
+            id: id.to_string(),
+            name: format!("tab-{id}"),
+            context: context.map(str::to_string),
+            agent_state: None,
+            led,
+            tokens: None,
+        }
+    }
+
+    fn node<'a>(state: &'a DashboardState, id: &str) -> &'a DashboardNode {
+        state.nodes.iter().find(|n| n.id == id).expect("node exists")
+    }
+
+    #[test]
+    fn dashboard_maps_context_phase_to_node() {
+        let state = build_dashboard_state(vec![dash_input(
+            "u1",
+            Some("build/implementer/slice-2-rust-state"),
+            Some("working"),
+        )]);
+        let build = node(&state, "build");
+        assert_eq!(build.tabs.len(), 1);
+        let tab = &build.tabs[0];
+        assert_eq!(tab.role, "implementer");
+        assert_eq!(tab.item, "slice-2-rust-state");
+        assert_eq!(tab.viewer_url, "/tabs/by-id/u1/view");
+        assert!(state.unmapped.is_empty());
+    }
+
+    #[test]
+    fn dashboard_item_keeps_trailing_slashes() {
+        // Only the first two slashes split phase/role/item — the rest stays in item.
+        let state = build_dashboard_state(vec![dash_input("u1", Some("build/impl/a/b/c"), None)]);
+        assert_eq!(node(&state, "build").tabs[0].item, "a/b/c");
+    }
+
+    #[test]
+    fn dashboard_unmapped_for_unknown_or_missing_phase() {
+        let state = build_dashboard_state(vec![
+            dash_input("u1", Some("frobnicate/x/y"), Some("working")),
+            dash_input("u2", None, Some("idle")),
+        ]);
+        assert_eq!(
+            state.unmapped.len(),
+            2,
+            "unknown phase and no-context both fall to unmapped"
+        );
+        for n in &state.nodes {
+            assert!(n.tabs.is_empty(), "node {} should be empty", n.id);
+        }
+    }
+
+    #[test]
+    fn dashboard_rollup_takes_worst_led() {
+        // dead > error > working > unreviewed > idle — order in the vec is deliberately
+        // NOT worst-first, to prove precedence rather than positional luck.
+        let state = build_dashboard_state(vec![
+            dash_input("u1", Some("build/r/i"), Some("idle")),
+            dash_input("u2", Some("build/r/i"), Some("working")),
+            dash_input("u3", Some("build/r/i"), Some("error")),
+            dash_input("u4", Some("build/r/i"), Some("dead")),
+        ]);
+        assert_eq!(node(&state, "build").rollup_led, Some("dead"));
+    }
+
+    #[test]
+    fn dashboard_rollup_unreviewed_beats_idle() {
+        let state = build_dashboard_state(vec![
+            dash_input("u1", Some("review/r/i"), Some("idle")),
+            dash_input("u2", Some("review/r/i"), Some("unreviewed")),
+        ]);
+        assert_eq!(node(&state, "review").rollup_led, Some("unreviewed"));
+    }
+
+    #[test]
+    fn dashboard_empty_node_has_null_rollup() {
+        let state = build_dashboard_state(vec![]);
+        assert_eq!(state.nodes.len(), 7);
+        for n in &state.nodes {
+            assert_eq!(n.rollup_led, None, "empty node {} rolls up to null", n.id);
+        }
+    }
+
+    #[test]
+    fn dashboard_rollup_null_when_all_tabs_ledless() {
+        let state = build_dashboard_state(vec![dash_input("u1", Some("build/r/i"), None)]);
+        assert_eq!(node(&state, "build").rollup_led, None);
+    }
+
+    #[test]
+    fn dashboard_passes_tokens_through_and_emits_camelcase() {
+        let input = DashboardTabInput {
+            tokens: Some(crate::TokenUsage {
+                input: 12345,
+                output: 6789,
+            }),
+            agent_state: Some("thinking"),
+            ..dash_input("u1", Some("build/implementer/x"), Some("working"))
+        };
+        let state = build_dashboard_state(vec![input]);
+        let tab = &node(&state, "build").tabs[0];
+        assert_eq!(
+            tab.tokens,
+            Some(crate::TokenUsage {
+                input: 12345,
+                output: 6789
+            })
+        );
+        let json = serde_json::to_string(&state).unwrap();
+        for key in ["\"rollupLed\"", "\"agentState\"", "\"viewerUrl\"", "\"unmapped\""] {
+            assert!(json.contains(key), "dashboard JSON must use {key}: {json}");
+        }
+    }
+
+    /// Publish a dashboard share-token on the running server's snapshot.
+    fn set_dashboard_token(state: &Arc<Mutex<TabSnapshot>>, tok: &str) {
+        state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .dashboard_share_token = tok.into();
+    }
+
+    #[test]
+    fn dashboard_state_accepts_master_or_dashboard_token() {
+        let (port, state, token) = spawn_server();
+        set_dashboard_token(&state, "dash-secret");
+        // Master token → 200.
+        let m = request(port, &format!("GET /dashboard/state?token={token} HTTP/1.1\r\n\r\n"));
+        assert_eq!(status_code(&m), 200, "master token should pass");
+        // Dashboard share-token via ?token= → 200.
+        let d = request(port, "GET /dashboard/state?token=dash-secret HTTP/1.1\r\n\r\n");
+        assert_eq!(status_code(&d), 200, "dashboard token should pass");
+        // No token → 401.
+        let none = request(port, "GET /dashboard/state HTTP/1.1\r\n\r\n");
+        assert_eq!(status_code(&none), 401, "no token must 401");
+        // Wrong token → 401.
+        let bad = request(port, "GET /dashboard/state?token=nope HTTP/1.1\r\n\r\n");
+        assert_eq!(status_code(&bad), 401, "wrong token must 401");
+    }
+
+    #[test]
+    fn dashboard_state_token_via_bearer_header() {
+        let (port, state, _token) = spawn_server();
+        set_dashboard_token(&state, "dash-secret");
+        let resp = request(
+            port,
+            "GET /dashboard/state HTTP/1.1\r\nAuthorization: Bearer dash-secret\r\n\r\n",
+        );
+        assert_eq!(status_code(&resp), 200, "dashboard token via Bearer should pass");
+    }
+
+    #[test]
+    fn dashboard_page_accepts_master_or_dashboard_token() {
+        let (port, state, token) = spawn_server();
+        set_dashboard_token(&state, "dash-secret");
+        let m = request(port, &format!("GET /dashboard?token={token} HTTP/1.1\r\n\r\n"));
+        assert_eq!(status_code(&m), 200, "master token should serve the page");
+        let d = request(port, "GET /dashboard?token=dash-secret HTTP/1.1\r\n\r\n");
+        assert_eq!(status_code(&d), 200, "dashboard token should serve the page");
+        let none = request(port, "GET /dashboard HTTP/1.1\r\n\r\n");
+        assert_eq!(status_code(&none), 401, "no token must 401");
+        let bad = request(port, "GET /dashboard?token=nope HTTP/1.1\r\n\r\n");
+        assert_eq!(status_code(&bad), 401, "wrong token must 401");
+    }
+
+    #[test]
+    fn dashboard_assets_stay_public() {
+        // The JS/CSS must serve without any token (the page loads them before
+        // its JS reads the token) — only the HTML page + state are gated.
+        let (port, _state, _token) = spawn_server();
+        for path in ["/assets/dashboard.js", "/assets/dashboard.css"] {
+            let resp = request(port, &format!("GET {path} HTTP/1.1\r\n\r\n"));
+            assert_eq!(status_code(&resp), 200, "{path} must stay public");
+        }
+    }
+
+    #[test]
+    fn dashboard_share_token_endpoint_mints_and_is_master_only() {
+        let (port, _state, token) = spawn_server();
+        // No token → 401 (the mint endpoint is master-only).
+        let anon = request(port, "GET /dashboard/share-token HTTP/1.1\r\n\r\n");
+        assert_eq!(status_code(&anon), 401, "mint endpoint must require master");
+        // Master → 200 and a non-empty token, lazily minted on first call.
+        let ok = request(
+            port,
+            &format!("GET /dashboard/share-token?token={token} HTTP/1.1\r\n\r\n"),
+        );
+        assert_eq!(status_code(&ok), 200);
+        let minted: serde_json::Value = serde_json::from_str(body(&ok)).unwrap();
+        let minted = minted.get("token").and_then(|t| t.as_str()).unwrap_or("");
+        assert!(!minted.is_empty(), "mint must return a token: {}", body(&ok));
+        // The minted token now authorises /dashboard/state...
+        let use_it = request(port, &format!("GET /dashboard/state?token={minted} HTTP/1.1\r\n\r\n"));
+        assert_eq!(status_code(&use_it), 200, "minted token should authorise the dashboard");
+        // ...but NOT the mint endpoint itself (dashboard token can't read itself).
+        let self_read = request(
+            port,
+            &format!("GET /dashboard/share-token?token={minted} HTTP/1.1\r\n\r\n"),
+        );
+        assert_eq!(
+            status_code(&self_read),
+            401,
+            "dashboard token can't reach the mint endpoint"
+        );
+    }
+
+    #[test]
+    fn rotate_tokens_revokes_dashboard_token() {
+        let (port, state, token) = spawn_server();
+        set_dashboard_token(&state, "dash-secret");
+        // Works before rotation.
+        let before = request(port, "GET /dashboard/state?token=dash-secret HTTP/1.1\r\n\r\n");
+        assert_eq!(status_code(&before), 200);
+        // Rotate (master only).
+        let rot = request(
+            port,
+            &format!("POST /tabs/rotate-tokens?token={token} HTTP/1.1\r\n\r\n"),
+        );
+        assert_eq!(status_code(&rot), 200);
+        assert!(
+            body(&rot).contains("\"dashboard_revoked\":true"),
+            "rotate report: {}",
+            body(&rot)
+        );
+        // The old dashboard token now 401s.
+        let after = request(port, "GET /dashboard/state?token=dash-secret HTTP/1.1\r\n\r\n");
+        assert_eq!(status_code(&after), 401, "rotated dashboard token must 401");
     }
 
     #[test]
@@ -6086,6 +6562,28 @@ mod tests {
             assert!(
                 std::str::from_utf8(&b).unwrap_or("").contains(expected_substr),
                 "{req_path} body should contain {expected_substr:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dashboard_assets_serve_unauthenticated_with_right_types() {
+        let (port, _state, _token) = spawn_server();
+        // The dashboard's JS/CSS must serve WITHOUT a token (the browser loads
+        // them before its JS reads the token to poll /dashboard/state), each with
+        // the content-type the browser needs. The `/dashboard` HTML PAGE itself
+        // is gated — see `dashboard_page_accepts_master_or_dashboard_token`.
+        for (req_path, want_ctype) in [
+            ("/assets/dashboard.js", "application/javascript; charset=utf-8"),
+            ("/assets/dashboard.css", "text/css; charset=utf-8"),
+        ] {
+            let raw = request_bytes(port, &format!("GET {req_path} HTTP/1.1\r\n\r\n"));
+            let (h, _b) = split_response(&raw);
+            assert!(h.starts_with("HTTP/1.1 200"), "{req_path} got: {h}");
+            assert_eq!(
+                header_value(&h, "content-type"),
+                Some(want_ctype),
+                "wrong type for {req_path}"
             );
         }
     }

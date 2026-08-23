@@ -897,7 +897,7 @@ impl AppState {
         #[cfg(target_os = "linux")]
         crate::cgroup::init(true);
 
-        let (tabs, active, restored_windowed) = if let Some(mut saved) =
+        let (tabs, active, restored_windowed, restored_dashboard_token) = if let Some(mut saved) =
             load_state_with_outputs(&platform::config_base_dir(), &platform::state_base_dir())
         {
             info!("restoring {} tab(s) from saved state", saved.tabs.len());
@@ -1048,7 +1048,7 @@ impl AppState {
             }
             let active = saved.active.min(tabs.len() - 1);
             tabs[active].activate();
-            (tabs, active, saved.windowed)
+            (tabs, active, saved.windowed, saved.dashboard_share_token)
         } else {
             let fc = font_config.clone();
             let br = browser.clone();
@@ -1073,7 +1073,12 @@ impl AppState {
                 name: locale::strings(lang).terminal.to_owned(),
                 ..TabState::default()
             };
-            (vec![Tab::from_state(view, &seed, None, None, None, true)], 0, false)
+            (
+                vec![Tab::from_state(view, &seed, None, None, None, true)],
+                0,
+                false,
+                String::new(),
+            )
         };
         if restored_windowed {
             window.toggle_fullscreen();
@@ -1354,6 +1359,9 @@ impl AppState {
             // is rejected by the auth gate's non-empty guard, so the brief
             // pre-start window can't authorise anyone.
             master_token: String::new(),
+            // Restored from tabs.json so a shared /dashboard link keeps working
+            // across restarts; empty until first minted.
+            dashboard_share_token: restored_dashboard_token.as_str().into(),
             active: 0,
             #[cfg(feature = "energy")]
             power: Vec::new(),
@@ -2104,10 +2112,19 @@ impl AppState {
         }
 
         let read_only = crate::read_only();
+        // Persist the global dashboard share-token (lives on the API snapshot,
+        // like the master token) so a shared /dashboard link survives a restart.
+        let dashboard_share_token = self
+            .api_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .dashboard_share_token
+            .to_string();
         let saved = SavedState {
             tabs,
             active: self.active,
             windowed: self.windowed,
+            dashboard_share_token,
         };
         // Skip the write+rotate when the serialized content is identical to
         // last tick — the common case once the user stops poking the UI.
@@ -2977,12 +2994,19 @@ impl AppState {
             // Drain queued periodic writes FIRST so none of them can land
             // after (and clobber) the final synchronous state below.
             self.state_writer.flush();
+            let dashboard_share_token = self
+                .api_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .dashboard_share_token
+                .to_string();
             save_state(
                 &platform::config_base_dir(),
                 &SavedState {
                     tabs,
                     active: self.active,
                     windowed: self.windowed,
+                    dashboard_share_token,
                 },
             );
             for tab in &self.tabs {
