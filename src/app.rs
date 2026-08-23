@@ -446,9 +446,14 @@ struct TabSwitcher {
     /// Tab indices in most-recently-visited order (the current active tab is
     /// excluded — you're already on it), captured when the modal opens.
     order: Vec<usize>,
-    /// Highlighted row into `order`. Starts at 0 (the previous tab) so a bare
-    /// Ctrl+P → Enter jumps straight back to where you just were.
+    /// Highlighted row into the *filtered* order (see
+    /// [`AppState::switcher_filtered`]). Starts at 0 (the previous tab) so a
+    /// bare Ctrl+P → Enter jumps straight back to where you just were; reset to
+    /// 0 whenever `query` changes.
     selected: usize,
+    /// Live filter text — type to narrow the list by tab name (case-insensitive
+    /// substring, SQL `LIKE '%query%'`). Empty ⇒ show the whole MRU order.
+    query: String,
 }
 
 /// Everything `render_qr_modal` needs, computed once when the modal opens
@@ -4517,8 +4522,31 @@ impl AppState {
         // phone (viewer attach bumps last_used_at) floats up here too.
         let keys: Vec<Option<u64>> = self.tabs.iter().map(|t| t.last_used_at).collect();
         let order = mru_tab_order(self.active, &keys);
-        self.tab_switcher = Some(TabSwitcher { order, selected: 0 });
+        self.tab_switcher = Some(TabSwitcher {
+            order,
+            selected: 0,
+            query: String::new(),
+        });
         cx.notify();
+    }
+
+    /// Indices from the switcher's captured MRU order whose tab name matches the
+    /// current filter — a case-insensitive substring match (the SQL `LIKE
+    /// '%query%'` equivalent). An empty query returns the full order. Returns
+    /// empty when the switcher is closed.
+    fn switcher_filtered(&self) -> Vec<usize> {
+        let Some(sw) = self.tab_switcher.as_ref() else {
+            return Vec::new();
+        };
+        if sw.query.is_empty() {
+            return sw.order.clone();
+        }
+        let q = sw.query.to_lowercase();
+        sw.order
+            .iter()
+            .copied()
+            .filter(|&idx| self.tabs.get(idx).is_some_and(|t| t.name.to_lowercase().contains(&q)))
+            .collect()
     }
 
     /// Close the switcher without switching, returning focus to the terminal.
@@ -4538,8 +4566,49 @@ impl AppState {
         let hover_bg = th.selection_hsla();
         let muted = th.border_hsla();
 
+        let filtered = self.switcher_filtered();
+        // Input box showing the live filter. gpui has no native text field, so
+        // this is a styled div echoing `sw.query` (with a caret) or a hint.
+        let query_row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .mt(px(8.0))
+            .px(px(10.0))
+            .py(px(6.0))
+            .rounded(px(4.0))
+            .bg(hover_bg)
+            .border_1()
+            .border_color(dialog_border)
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(12.0))
+                    .text_color(muted)
+                    .child("\u{1f50d}"),
+            )
+            .child(if sw.query.is_empty() {
+                div()
+                    .text_color(muted)
+                    .text_size(px(13.0))
+                    .child("Type to filter tabs\u{2026}")
+            } else {
+                div().text_color(dialog_fg).child(format!("{}\u{258c}", sw.query))
+            });
+
         let mut list = div().flex().flex_col().gap(px(2.0)).mt(px(10.0));
-        for (row, &idx) in sw.order.iter().enumerate() {
+        if filtered.is_empty() {
+            list = list.child(
+                div()
+                    .px(px(12.0))
+                    .py(px(6.0))
+                    .text_size(px(13.0))
+                    .text_color(muted)
+                    .child("No matching tabs"),
+            );
+        }
+        for (row, &idx) in filtered.iter().enumerate() {
             if idx >= self.tabs.len() {
                 continue;
             }
@@ -4621,10 +4690,11 @@ impl AppState {
                         .text_color(dialog_fg)
                         .text_size(px(14.0))
                         .child(div().text_size(px(13.0)).text_color(muted).child("Recent tabs"))
+                        .child(query_row)
                         .child(list)
                         .child(
                             div().mt(px(10.0)).text_size(px(11.0)).text_color(muted).child(
-                                "\u{2191}\u{2193} select \u{b7} Ctrl+P cycle \u{b7} Enter open \u{b7} Esc cancel",
+                                "\u{2191}\u{2193} select \u{b7} type to filter \u{b7} Ctrl+P cycle \u{b7} Enter open \u{b7} Esc cancel",
                             ),
                         ),
                 ),
@@ -6052,7 +6122,10 @@ impl Render for AppState {
                 // bubbling. Handle every switcher key and return so nothing
                 // below (alt+tab / ctrl+shift+t) also fires.
                 if this.tab_switcher.is_some() {
-                    let len = this.tab_switcher.as_ref().map_or(0, |s| s.order.len());
+                    // Bounds / selection track the FILTERED list, not the full
+                    // captured order, so ↑↓/Enter/cycle operate on what's shown.
+                    let filtered = this.switcher_filtered();
+                    let len = filtered.len();
                     match ks.key.as_str() {
                         "escape" => this.close_tab_switcher(window, cx),
                         "up" => {
@@ -6077,17 +6150,34 @@ impl Render for AppState {
                             cx.notify();
                         }
                         "enter" => {
-                            let pick = this
-                                .tab_switcher
-                                .as_ref()
-                                .and_then(|s| s.order.get(s.selected).copied());
+                            let pick = filtered
+                                .get(this.tab_switcher.as_ref().map_or(0, |s| s.selected))
+                                .copied();
                             this.tab_switcher = None;
                             match pick {
                                 Some(idx) => this.select_tab(idx, window, cx),
                                 None => this.close_tab_switcher(window, cx),
                             }
                         }
-                        _ => {}
+                        "backspace" => {
+                            if let Some(s) = this.tab_switcher.as_mut() {
+                                s.query.pop();
+                                s.selected = 0;
+                            }
+                            cx.notify();
+                        }
+                        // Any printable character narrows the filter. `key_char`
+                        // is None for the arrows/enter/ctrl-chords above, so a
+                        // bare Ctrl+P cycles rather than typing 'p'.
+                        _ => {
+                            if let Some(ch) = ks.key_char.as_ref().filter(|c| !c.is_empty() && !ks.modifiers.control)
+                                && let Some(s) = this.tab_switcher.as_mut()
+                            {
+                                s.query.push_str(ch);
+                                s.selected = 0;
+                                cx.notify();
+                            }
+                        }
                     }
                     return;
                 }
