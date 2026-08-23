@@ -379,6 +379,60 @@ fn should_nudge(stable_for: Duration, nudged_hash: Option<u64>, current_hash: u6
     stable_for >= Duration::from_secs(STABLE_SECS) && nudged_hash != Some(current_hash)
 }
 
+/// Global minimum spacing between nudges — anti thundering-herd / anti-runaway.
+///
+/// Per-tab backoff + the round-robin already space *which* tab fires, but after
+/// a restart / an API cap dozens of tabs go frozen at once and were nudged one
+/// per fast tick — ~50 `continue`s in 1–2 min re-caps the Claude API, re-freezes
+/// everything, and spirals (observed twice). This caps the FLEET-WIDE nudge rate
+/// at one every `NUDGE_MIN_INTERVAL`, independent of the tick interval, so 50
+/// frozen tabs get unstuck one at a time (2 s apart), never in a burst.
+const NUDGE_MIN_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Global throttle gate: may a nudge fire `now`? Yes when none has fired within
+/// [`NUDGE_MIN_INTERVAL`] — and then `now` is recorded as the last emission so
+/// the next is spaced out. `None` (never nudged) is always allowed. Pure +
+/// deterministic (injected `now`), so the anti-storm spacing is unit-testable.
+fn nudge_ready(last_nudge_at: &mut Option<Instant>, now: Instant) -> bool {
+    if let Some(t) = *last_nudge_at
+        && now.duration_since(t) < NUDGE_MIN_INTERVAL
+    {
+        return false;
+    }
+    *last_nudge_at = Some(now);
+    true
+}
+
+/// Circuit-breaker threshold: MORE than this many tabs frozen at the same time
+/// is treated as SYSTEMIC (a likely Claude API cap, not N independent failures).
+/// Count-based on purpose — no fragile screen-parsing / message-wording
+/// heuristics ("network-blocked vs rate-limited" is deliberately out of scope).
+const CIRCUIT_BREAKER_THRESHOLD: usize = 6;
+/// How long Brain stops nudging once the breaker trips. Nudging a fleet that's
+/// stuck on a cap only deepens the cap; backing off lets it clear.
+const CIRCUIT_BREAKER_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// Count-based circuit breaker. Returns `true` (suppress all nudges this tick)
+/// when Brain is either mid-cooldown OR the simultaneous-freeze count just
+/// tripped the breaker — which arms the cooldown. `false` = normal operation.
+///
+/// This kills a cap's amplification at the root: instead of firing `continue`
+/// at 50 tabs stuck on the same API limit (feeding the limit), Brain pauses for
+/// [`CIRCUIT_BREAKER_COOLDOWN`]. Pure + deterministic (injected `now`) → testable.
+fn circuit_breaker_open(breaker_until: &mut Option<Instant>, eligible_count: usize, now: Instant) -> bool {
+    if let Some(until) = *breaker_until {
+        if now < until {
+            return true; // still cooling down
+        }
+        *breaker_until = None; // cooldown elapsed — re-evaluate below
+    }
+    if eligible_count > CIRCUIT_BREAKER_THRESHOLD {
+        *breaker_until = Some(now + CIRCUIT_BREAKER_COOLDOWN);
+        return true;
+    }
+    false
+}
+
 /// Seconds to wait before the next nudge after `streak` consecutive
 /// nudges for the same error episode: `BASE * 2^(streak-1)`, capped at
 /// [`NUDGE_BACKOFF_MAX_SECS`]. So 60s, 120s, 240s, 480s, 900s, 900s…
@@ -421,6 +475,8 @@ fn tick(
     watches: &mut HashMap<String, TabWatch>,
     probe: &mut ConnectivityProbe,
     cursor: &mut usize,
+    last_nudge_at: &mut Option<Instant>,
+    breaker_until: &mut Option<Instant>,
 ) -> Result<(), String> {
     let ep: Endpoint = discover_endpoint()?;
     let ag = agent();
@@ -544,6 +600,22 @@ fn tick(
         return Ok(());
     }
 
+    // Count-based circuit breaker (before any send): MORE than
+    // CIRCUIT_BREAKER_THRESHOLD tabs frozen at once is systemic (a likely API
+    // cap), not N independent failures — nudging them all would feed the cap.
+    // Back off for CIRCUIT_BREAKER_COOLDOWN instead, without touching the
+    // throttle/cursor/watches, so every tab stays a candidate for when it clears.
+    if circuit_breaker_open(breaker_until, eligible.len(), now) {
+        println!(
+            "⛑ brain: {n} tabs frozen at once (> {thr}) — SYSTEMIC (likely API cap); \
+             backing off ~{cd}s instead of nudging",
+            n = eligible.len(),
+            thr = CIRCUIT_BREAKER_THRESHOLD,
+            cd = CIRCUIT_BREAKER_COOLDOWN.as_secs(),
+        );
+        return Ok(());
+    }
+
     // Connectivity gate. If the box can't reach the open internet,
     // sending `continue` would just trigger the same error again and
     // burn a cooldown for nothing. Skip the send AND skip updating
@@ -555,6 +627,21 @@ fn tick(
         println!(
             "⛑ brain: {n} tab(s) flagged but suppressed (no internet — probe failed)",
             n = eligible.len(),
+        );
+        return Ok(());
+    }
+
+    // Global anti-storm throttle: at most one nudge every NUDGE_MIN_INTERVAL
+    // across ALL tabs. If a nudge fired <2 s ago, skip this tick's send WITHOUT
+    // advancing the cursor or touching any watch — every eligible tab stays a
+    // candidate and fires at the next 2 s slot. This turns "50 frozen tabs →
+    // burst of 50 continues" into "one every 2 s", so a restart / API cap can't
+    // spiral into a self-inflicted rate-limit.
+    if !nudge_ready(last_nudge_at, now) {
+        println!(
+            "⛑ brain: {n} eligible, throttled (≤1 nudge / {s}s fleet-wide) — next slot soon",
+            n = eligible.len(),
+            s = NUDGE_MIN_INTERVAL.as_secs(),
         );
         return Ok(());
     }
@@ -655,8 +742,15 @@ pub fn run(args: &[String]) -> i32 {
                      Patterns: {n} known signatures (Anthropic API connectivity).\n\
                      Connectivity probe (Google generate_204 + Cloudflare 1.1.1.1) gates\n\
                      every send; offline → suppress, retry on next tick when back online.\n\
-                     Round-robin: at most one send per tick across all eligible tabs.",
+                     Round-robin: at most one send per tick across all eligible tabs.\n\
+                     Anti-storm: fleet-wide, at most one nudge every {throttle}s, so a\n\
+                     restart / API cap can't nudge dozens of frozen tabs in a burst.\n\
+                     Circuit breaker: > {thr} tabs frozen at once is treated as systemic\n\
+                     (likely an API cap) — Brain backs off ~{cd}s instead of nudging.",
                     n = PATTERNS.len(),
+                    throttle = NUDGE_MIN_INTERVAL.as_secs(),
+                    thr = CIRCUIT_BREAKER_THRESHOLD,
+                    cd = CIRCUIT_BREAKER_COOLDOWN.as_secs(),
                 );
                 return 0;
             }
@@ -679,6 +773,11 @@ pub fn run(args: &[String]) -> i32 {
     let mut watches: HashMap<String, TabWatch> = HashMap::new();
     let mut probe = ConnectivityProbe::default();
     let mut rr_cursor: usize = 0;
+    // Fleet-wide last-nudge clock for the anti-storm throttle (see nudge_ready).
+    let mut last_nudge_at: Option<Instant> = None;
+    // Circuit-breaker cooldown deadline: `Some(t)` while backing off (see
+    // circuit_breaker_open).
+    let mut breaker_until: Option<Instant> = None;
     loop {
         // Run the tick under catch_unwind so a panic anywhere in it (a
         // dependency edge case, a broken-pipe `println!`, …) is caught
@@ -686,7 +785,13 @@ pub fn run(args: &[String]) -> i32 {
         // is AssertUnwindSafe: a panic mid-tick may leave the watch map
         // slightly stale, which the next tick re-syncs from the daemon.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            tick(&mut watches, &mut probe, &mut rr_cursor)
+            tick(
+                &mut watches,
+                &mut probe,
+                &mut rr_cursor,
+                &mut last_nudge_at,
+                &mut breaker_until,
+            )
         }));
         match outcome {
             Ok(Ok(())) => {}
@@ -717,6 +822,80 @@ pub fn run(args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn circuit_breaker_backs_off_on_systemic_freeze_not_a_few() {
+        let t0 = Instant::now();
+        // A few frozen tabs = independent failures → normal operation (no trip).
+        let mut b: Option<Instant> = None;
+        assert!(!circuit_breaker_open(&mut b, 2, t0), "2 frozen tabs → nudge normally");
+        assert!(
+            !circuit_breaker_open(&mut b, CIRCUIT_BREAKER_THRESHOLD, t0),
+            "AT the threshold → still normal"
+        );
+        assert_eq!(b, None, "no cooldown armed below/at threshold");
+
+        // MORE than the threshold at once = SYSTEMIC → trip + back off (0 nudges).
+        let over = CIRCUIT_BREAKER_THRESHOLD + 1;
+        assert!(
+            circuit_breaker_open(&mut b, over, t0),
+            "> threshold → breaker trips (suppress)"
+        );
+        assert!(b.is_some(), "cooldown armed");
+        // During the cooldown, ALL nudges are suppressed — even if the count drops.
+        assert!(
+            circuit_breaker_open(&mut b, 1, t0 + Duration::from_secs(5)),
+            "still cooling down → suppressed regardless of count"
+        );
+        // Once the cooldown elapses and the spike is gone → back to normal.
+        assert!(
+            !circuit_breaker_open(&mut b, 2, t0 + CIRCUIT_BREAKER_COOLDOWN),
+            "after cooldown + count settled → nudge normally"
+        );
+        assert_eq!(b, None, "cooldown cleared");
+        // If it's STILL systemic after the cooldown, it re-trips (keeps backing off).
+        assert!(
+            circuit_breaker_open(&mut b, over, t0 + CIRCUIT_BREAKER_COOLDOWN),
+            "still systemic after cooldown → re-trips"
+        );
+    }
+
+    #[test]
+    fn nudge_throttle_spaces_bursts_and_never_simultaneous() {
+        // Two (or fifty) tabs freeze at once: the throttle lets exactly ONE
+        // nudge through per NUDGE_MIN_INTERVAL, so they're unstuck 2 s apart,
+        // never in a burst that re-caps the API.
+        let mut last: Option<Instant> = None;
+        let t0 = Instant::now();
+        // First frozen tab fires immediately (nothing nudged yet).
+        assert!(nudge_ready(&mut last, t0), "first nudge always allowed");
+        // A SECOND frozen tab in the same instant is throttled — not simultaneous.
+        assert!(
+            !nudge_ready(&mut last, t0),
+            "a second nudge in the same window is skipped"
+        );
+        // Still throttled just under the interval.
+        assert!(
+            !nudge_ready(&mut last, t0 + Duration::from_millis(1999)),
+            "still throttled just under {}s",
+            NUDGE_MIN_INTERVAL.as_secs()
+        );
+        // Once the interval has elapsed since the last EMITTED nudge, the next fires.
+        assert!(
+            nudge_ready(&mut last, t0 + NUDGE_MIN_INTERVAL),
+            "next nudge allowed ≥{}s after the previous one",
+            NUDGE_MIN_INTERVAL.as_secs()
+        );
+        // …and firing re-arms the throttle, so the third waits another interval.
+        assert!(
+            !nudge_ready(&mut last, t0 + NUDGE_MIN_INTERVAL),
+            "throttle re-arms on each emission"
+        );
+        assert!(
+            nudge_ready(&mut last, t0 + NUDGE_MIN_INTERVAL * 2),
+            "and the one after, a slot later"
+        );
+    }
 
     #[test]
     fn scan_finds_the_canonical_anthropic_unreachable_string() {
