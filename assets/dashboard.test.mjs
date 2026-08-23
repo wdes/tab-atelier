@@ -3,7 +3,7 @@
 // No framework — just node:assert. Imports the real functions from dashboard.js
 // so this stays a check of shipped code, not a copy.
 import assert from "node:assert/strict";
-import { ledClass, nodeMap, CANONICAL_PHASES, resolveView, renderProjectCard } from "./dashboard.js";
+import { ledClass, nodeMap, CANONICAL_PHASES, resolveView, renderProjectCard, readProjectParam } from "./dashboard.js";
 
 // The five led states each map to their own distinct class.
 const cases = {
@@ -88,5 +88,11 @@ assert.deepEqual(CANONICAL_PHASES, ["scope", "plan", "build", "review", "verify"
   assert.match(metaCard, /1 tab</, "singular count has no plural s");
   assert.doesNotMatch(metaCard, /orch-badge/, "no orchestrator badge when absent");
 }
+
+// --- readProjectParam: deep-link ?project= -> drilled project (S3) ---
+assert.equal(readProjectParam("?project=kalpin-back"), "kalpin-back");
+assert.equal(readProjectParam(""), null, "no query -> level 0");
+assert.equal(readProjectParam("?token=abc"), null, "other params -> level 0");
+assert.equal(readProjectParam("?project="), null, "empty value -> level 0");
 
 console.log("dashboard.test.mjs: OK");

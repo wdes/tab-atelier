@@ -45,6 +45,18 @@ body {
 #dashboard { padding: 1rem; }
 #flow { width: 100%; height: auto; max-height: 40vh; }
 
+.back-btn {
+  margin-bottom: 0.8rem;
+  padding: 0.35rem 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--fg);
+  font: inherit;
+  cursor: pointer;
+}
+.back-btn:hover { background: color-mix(in srgb, var(--fg) 6%, transparent); }
+
 /* --- phase nodes --- */
 .node { cursor: pointer; }
 .node-box {
