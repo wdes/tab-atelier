@@ -347,7 +347,7 @@ fn authorise_and_ring(
     is_uuid: bool,
     provided: &[u8],
 ) -> Option<(Authz, Arc<Mutex<PtyRing>>, std::sync::Arc<str>)> {
-    let (rw_tok, ro_tok, ring, uuid) = {
+    let (rw_tok, ro_tok, dash_tok, ring, uuid) = {
         let snap = state.lock().ok()?;
         let t = if is_uuid {
             snap.tabs.iter().find(|t| &*t.id == key)?
@@ -356,11 +356,20 @@ fn authorise_and_ring(
             snap.tabs.get(idx)?
         };
         let ring = t.pty_ring.clone()?;
-        (t.share_token_rw.clone(), t.share_token_ro.clone(), ring, t.id.clone())
+        (
+            t.share_token_rw.clone(),
+            t.share_token_ro.clone(),
+            snap.dashboard_share_token.clone(),
+            ring,
+            t.id.clone(),
+        )
     };
     let master_match = crate::api::constant_time_eq(provided, master.as_bytes());
     let rw_match = !rw_tok.is_empty() && crate::api::constant_time_eq(rw_tok.as_bytes(), provided);
-    let ro_match = !ro_tok.is_empty() && crate::api::constant_time_eq(ro_tok.as_bytes(), provided);
+    // The global dashboard token grants READ-ONLY WS on any tab (PO option B),
+    // exactly like a per-tab RO share token — the read-only live viewer stream.
+    let dash_match = !dash_tok.is_empty() && crate::api::constant_time_eq(dash_tok.as_bytes(), provided);
+    let ro_match = (!ro_tok.is_empty() && crate::api::constant_time_eq(ro_tok.as_bytes(), provided)) || dash_match;
     if master_match || rw_match {
         Some((Authz::Rw, ring, uuid))
     } else if ro_match {
@@ -1530,6 +1539,24 @@ mod tests {
         assert!(matches!(authz, Authz::Ro));
         assert!(by("uuid-1", true, "wrong").is_none(), "bad token refused");
         assert!(by("uuid-9", true, "master-tok").is_none(), "unknown tab refused");
+    }
+
+    #[test]
+    fn authorise_and_ring_grants_ro_for_dashboard_token() {
+        // PO option B: the global dashboard token opens a READ-ONLY live WS on
+        // ANY tab, exactly like a per-tab RO share token.
+        let mut tab = crate::api::test_snapshot_tab("uuid-1", "shell");
+        tab.pty_ring = Some(Arc::new(Mutex::new(PtyRing::default())));
+        let state = snapshot_with(tab);
+        state.lock().unwrap().dashboard_share_token = "dash-obs".into();
+        let (authz, _, uuid) =
+            authorise_and_ring(&state, "master-tok", "uuid-1", true, b"dash-obs").expect("dashboard token grants ro");
+        assert!(matches!(authz, Authz::Ro), "dashboard token is read-only on the WS");
+        assert_eq!(&*uuid, "uuid-1");
+        assert!(
+            authorise_and_ring(&state, "master-tok", "uuid-1", true, b"nope").is_none(),
+            "a non-matching token is still refused"
+        );
     }
 
     #[test]
