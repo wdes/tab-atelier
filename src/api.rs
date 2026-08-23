@@ -327,6 +327,11 @@ struct DashboardTab {
     context: Option<String>,
     /// Raw `"[<project>:]<phase>/<role>"` the agent set once. `None` ⇒ unassigned.
     assignment: Option<String>,
+    /// The team this tab is SERVING = the assignment's `<project>:` override
+    /// (S1). A méta with an override is busy serving that team (not available);
+    /// `None` ⇒ no override (a plain méta / a repo-cwd tab). Skipped when None.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    serving: Option<String>,
     /// Agent role, derived from `assignment` (never from the volatile context).
     role: String,
     /// The current unit of work — now the volatile `context` (the prompt).
@@ -383,6 +388,19 @@ struct DashboardProject {
     unmapped: Vec<DashboardTab>,
 }
 
+/// A service = a family of repos (Increment 6 S3): a shared prefix (≥2 repos) or
+/// an explicit `repo_families` map forms a named service; a lone repo stays a
+/// "mono" service named after itself. Wraps the flat `projects`, non-breaking.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DashboardService {
+    name: String,
+    /// Worst led among the service's sub-repos.
+    rollup_led: Option<&'static str>,
+    /// The member repo names (== `DashboardProject.name`s), sorted.
+    projects: Vec<String>,
+}
+
 /// One delegation edge: `child` was spawned by `parent` (both tab UUIDs).
 #[derive(Serialize, PartialEq, Eq, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -398,12 +416,65 @@ struct DashboardState {
     unmapped: Vec<DashboardTab>,
     /// Per-project buckets (Increment 2), sorted alpha with `méta`/`divers` last.
     projects: Vec<DashboardProject>,
+    /// Services (Increment 6 S3): the flat `projects` grouped into repo families.
+    /// Kept ALONGSIDE `projects` (non-breaking) — the web can use either level.
+    services: Vec<DashboardService>,
     /// Delegation lineage (S6): `parent_tab_id` edges whose parent is a known
     /// tab. A tab with no/unknown parent is a root (no edge). Self-edges dropped.
     lineage: Vec<LineageEdge>,
     /// Tabs with NO `assignment` at all (S5, #90) — legitimately un-placed,
     /// sorted by id. Distinct from `unmapped` (assigned but an unknown phase).
     unassigned: Vec<DashboardTab>,
+}
+
+/// Resolve a repo to its service key (Increment 6 S3): an explicit
+/// `repo_families` entry wins; else the prefix before the first `-`; else the
+/// repo's own name (mono, no `-`). Pure.
+#[must_use]
+pub fn service_of(project: &str, prefs: &crate::Preferences) -> String {
+    if let Some(fam) = prefs.repo_families.get(project) {
+        return fam.clone();
+    }
+    match project.split_once('-') {
+        Some((prefix, _)) if !prefix.is_empty() => prefix.to_string(),
+        _ => project.to_string(),
+    }
+}
+
+/// Group projects into services. A prefix shared by ≥2 repos (or an explicit
+/// map) forms a named service; a lone repo whose service key came from the
+/// prefix heuristic collapses back to a "mono" service named after the repo.
+/// Rollup = worst led of the members; services sorted by name. Pure.
+fn group_services(projects: &[DashboardProject], prefs: &crate::Preferences) -> Vec<DashboardService> {
+    let mut by_key: std::collections::BTreeMap<String, Vec<&DashboardProject>> = std::collections::BTreeMap::new();
+    for p in projects {
+        by_key.entry(service_of(&p.name, prefs)).or_default().push(p);
+    }
+    let mut services: Vec<DashboardService> = by_key
+        .into_iter()
+        .map(|(key, members)| {
+            // Keep the family name when it's a real grouping (≥2 repos, an
+            // explicit map, or a mono named after itself); otherwise a lone
+            // prefix-heuristic repo stays mono under its full name.
+            let keep_named = members.len() >= 2
+                || members.iter().any(|p| prefs.repo_families.contains_key(&p.name))
+                || members.iter().any(|p| p.name == key);
+            let name = if keep_named { key } else { members[0].name.clone() };
+            let rollup_led = members
+                .iter()
+                .filter_map(|p| p.rollup_led)
+                .max_by_key(|led| led_severity(led));
+            let mut names: Vec<String> = members.iter().map(|p| p.name.clone()).collect();
+            names.sort();
+            DashboardService {
+                name,
+                rollup_led,
+                projects: names,
+            }
+        })
+        .collect();
+    services.sort_by(|a, b| a.name.cmp(&b.name));
+    services
 }
 
 /// Build the delegation lineage from `(child_id, parent_id)` pairs. An edge is
@@ -540,11 +611,6 @@ fn role_altitude(role: &str) -> u8 {
     }
 }
 
-/// Phase id from an assignment (empty ⇒ unmapped).
-fn phase_of(assignment: Option<&str>) -> String {
-    assignment.map(|a| parse_assignment(a).1).unwrap_or_default()
-}
-
 /// Role from an assignment — never from the volatile `context`.
 pub fn role_of(assignment: Option<&str>) -> String {
     assignment.map(|a| parse_assignment(a).2).unwrap_or_default()
@@ -637,8 +703,11 @@ fn build_dashboard_state(inputs: Vec<DashboardTabInput>) -> DashboardState {
     let projected: Vec<Projected> = inputs
         .into_iter()
         .map(|t| {
-            let phase = phase_of(t.assignment.as_deref());
-            let role = role_of(t.assignment.as_deref());
+            // One parse: the `<project>:` override (== serving), phase, role.
+            let (serving, phase, role) = t
+                .assignment
+                .as_deref()
+                .map_or((None, String::new(), String::new()), parse_assignment);
             let project = project_of(t.cwd.as_deref(), t.assignment.as_deref());
             let viewer_url = format!("/tabs/by-id/{}/view", t.id);
             let altitude = role_altitude(&role);
@@ -648,6 +717,7 @@ fn build_dashboard_state(inputs: Vec<DashboardTabInput>) -> DashboardState {
                 item: t.context.clone().unwrap_or_default(),
                 context: t.context,
                 assignment: t.assignment,
+                serving,
                 role,
                 parent_tab_id: t.parent_tab_id,
                 rehome_status: t.rehome_status,
@@ -737,10 +807,16 @@ fn build_dashboard_state(inputs: Vec<DashboardTabInput>) -> DashboardState {
             .collect::<Vec<_>>(),
     );
 
+    // Services group the flat projects into repo families (default-prefs
+    // heuristic; the daemon can thread real `repo_families` later). Non-breaking:
+    // `projects` is preserved.
+    let services = group_services(&projects, &crate::Preferences::default());
+
     DashboardState {
         nodes,
         unmapped,
         projects,
+        services,
         lineage,
         unassigned,
     }

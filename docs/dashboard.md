@@ -166,6 +166,21 @@ gates the right-click "close the predecessor" action (enabled only at
   empty `{}` when absent or malformed (never 404/500). Same auth gate as
   `/dashboard/state` (master or the dashboard share-token; 401 otherwise).
 
+### Serving + services (Increment 6)
+
+- Each `DashboardTab` carries `serving` — the assignment's `<project>:` override,
+  i.e. the team a méta is currently serving (so it's busy, not available). `None`
+  when there's no override; skipped from the wire.
+- `DashboardState.services[]` groups the flat `projects` into repo families: a
+  shared prefix before the first `-` (≥2 repos), or an explicit
+  `Preferences.repo_families` map (e.g. `{"louis":"kalpin"}`), forms a named
+  service; a lone repo stays a "mono" service under its own name. Each carries a
+  `rollupLed` (worst led of its sub-repos) and its member repo names. `projects`
+  is kept alongside (non-breaking).
+- The `user-prompt` hook also mirrors a **genuine human direction** onto the
+  `direction` blackboard topic (never a cron/watcher tick, nudge, synthetic
+  injection, or flag) so the fleet knows where the PO stands.
+
 ## `GET /dashboard`
 
 Serves the static web app (`assets/dashboard.html` + `assets/dashboard.js` +
