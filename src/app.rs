@@ -214,6 +214,9 @@ struct Tab {
     /// the PR/task it's on). Shown as a hover tooltip on the tab name.
     /// In-memory; set via the API + drained from the snapshot.
     context: Option<std::sync::Arc<str>>,
+    /// Stable workflow assignment (`set-assignment`). Persisted (restored from
+    /// `TabState`, written back in `persist()`) and hook-immune, unlike `context`.
+    assignment: Option<std::sync::Arc<str>>,
     /// One-shot resume command queued on tab restore — when the
     /// shell is up the next tick types `<command>\n` into the
     /// PTY, then clears this. Set in `insert_tab` from the
@@ -307,6 +310,8 @@ impl Tab {
             schedule: ts.schedule.clone(),
             bg_color: ts.bg_color.clone(),
             context: None,
+            // Persisted: restore it so the tab keeps its phase/role across restarts.
+            assignment: ts.assignment.as_deref().map(std::sync::Arc::from),
             last_pushed_locked: None,
             pending_agent_resume,
             snap_cache: None,
@@ -1375,6 +1380,7 @@ impl AppState {
             pending_net_allow_changes: Vec::new(),
             pending_bg_color_changes: Vec::new(),
             pending_context_changes: Vec::new(),
+            pending_assignment_changes: Vec::new(),
             pending_token_rotations: Vec::new(),
             pending_schedule_changes: Vec::new(),
             pending_new_tabs: 0,
@@ -1948,6 +1954,7 @@ impl AppState {
                     locked: tab.locked,
                     schedule: tab.schedule.clone(),
                     bg_color: tab.bg_color.clone(),
+                    assignment: tab.assignment.as_deref().map(str::to_string),
                     limits: tab.limits.clone(),
                     ..TabState::default()
                 }
@@ -2055,6 +2062,7 @@ impl AppState {
                 schedule: ts.schedule.clone(),
                 bg_color,
                 context: tab.context.clone(),
+                assignment: tab.assignment.clone(),
                 shell_pid,
                 agent_state: tab.agent_state.clone(),
                 agent_session_id: tab.agent_session_id.clone(),
@@ -2308,6 +2316,8 @@ impl AppState {
             let net_changes: Vec<(String, bool)> = snapshot.pending_net_changes.drain(..).collect();
             let bg_color_changes: Vec<(String, Option<String>)> = snapshot.pending_bg_color_changes.drain(..).collect();
             let context_changes: Vec<(String, Option<String>)> = snapshot.pending_context_changes.drain(..).collect();
+            let assignment_changes: Vec<(String, Option<String>)> =
+                snapshot.pending_assignment_changes.drain(..).collect();
             let token_rotations: Vec<String> = snapshot.pending_token_rotations.drain(..).collect();
             let schedule_changes: Vec<(String, Option<crate::schedule::TabSchedule>)> =
                 snapshot.pending_schedule_changes.drain(..).collect();
@@ -2417,6 +2427,13 @@ impl AppState {
             for (tab_id, context) in context_changes {
                 if let Some(tab) = self.tabs.iter_mut().find(|t| *t.id == tab_id) {
                     tab.context = context.map(std::sync::Arc::from);
+                }
+            }
+            // Assignment changes — mirrored onto the runtime Tab so the next
+            // persist() writes them to tabs.json (they survive a restart).
+            for (tab_id, assignment) in assignment_changes {
+                if let Some(tab) = self.tabs.iter_mut().find(|t| *t.id == tab_id) {
+                    tab.assignment = assignment.map(std::sync::Arc::from);
                 }
             }
             // Schedule changes — None clears, Some sets. Mirrors the
@@ -2985,6 +3002,7 @@ impl AppState {
                     share_token_ro: tab.share_token_ro.to_string(),
                     locked: tab.locked,
                     bg_color: tab.bg_color.clone(),
+                    assignment: tab.assignment.as_deref().map(str::to_string),
                     limits: tab.limits.clone(),
                     ..TabState::default()
                 }
