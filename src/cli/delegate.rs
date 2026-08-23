@@ -170,6 +170,10 @@ pub fn run(args: &[String]) -> i32 {
         }
     };
 
+    // Q1c: mirror this dispatch onto the dedicated `dispatches` blackboard so
+    // who-dispatched-what-to-whom is visible beyond the private tab input.
+    record_dispatch(&uuid, &prompt);
+
     if !o.wait {
         return 0;
     }
@@ -197,6 +201,18 @@ pub fn run(args: &[String]) -> i32 {
             1
         }
     }
+}
+
+/// Best-effort double of this dispatch onto the `dispatches` blackboard topic:
+/// `from` = the delegator's `_TAB_ID` (injected into every PTY, like
+/// `set-status` reads), the message = target uuid + an ~80-char prompt snippet.
+/// Silent no-op outside a tab (no `_TAB_ID`) — never affects the dispatch exit.
+fn record_dispatch(to: &str, prompt: &str) {
+    let Some(from) = std::env::var("_TAB_ID").ok().filter(|s| !s.is_empty()) else {
+        return;
+    };
+    let msg = crate::cli::team::dispatch_note_msg(to, prompt);
+    crate::cli::team::note_best_effort(Some("dispatches".to_string()), Some(from), &msg);
 }
 
 /// Resolve a target: try index/uuid (`share_link`'s resolver), then fall
