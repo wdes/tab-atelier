@@ -57,6 +57,33 @@ fn is_nudge(prompt: &str) -> bool {
     NUDGES.iter().any(|n| p.eq_ignore_ascii_case(n))
 }
 
+/// True when a prompt is an AUTOMATED tick (watcher/cron/round/sage wakeup/roster
+/// refresh/restart) typed AS a prompt, not a genuine human direction (S9, mirror
+/// of the activity-scribe `CRON_TICK` detection). Matches known tick PHRASES as a
+/// PREFIX of the trimmed prompt — a real prompt starts with an action ("fix …",
+/// "PR #…"), so "fix the watcher restart bug" is NOT a tick while "Watcher
+/// restart after OOM" is.
+fn is_cron_tick(prompt: &str) -> bool {
+    const TICK_PREFIXES: &[&str] = &[
+        "restart mx",
+        "ronde ",
+        "watcher restart",
+        "réveil ",
+        "maintien de la session",
+        "refresh orchestrateur",
+    ];
+    let p = prompt.trim().to_lowercase();
+    TICK_PREFIXES.iter().any(|t| p.starts_with(t))
+}
+
+/// True when a prompt is a GENUINE human direction worth mirroring onto the
+/// `direction` blackboard (S9): non-empty, not a synthetic injection, not a
+/// nudge, not a `--flag`, and not an automated cron/watcher tick.
+fn is_human_direction(prompt: &str) -> bool {
+    let p = prompt.trim();
+    !p.is_empty() && !is_synthetic_prompt(p) && !is_nudge(p) && !p.starts_with("--") && !is_cron_tick(p)
+}
+
 #[must_use]
 pub fn run(args: &[String]) -> i32 {
     let Some(event) = args.first().map(String::as_str) else {
@@ -104,6 +131,16 @@ pub fn run(args: &[String]) -> i32 {
                     // chars anyway, but a one-line label reads better.
                     let snippet: String = p.chars().take(200).collect();
                     let _ = crate::cli::set_context::run(&[snippet]);
+                }
+                // S9: mirror a GENUINE human direction onto the `direction`
+                // blackboard (like the dispatch mirror), so the fleet knows where
+                // the PO stands — but NEVER a cron/watcher tick, nudge, synthetic
+                // injection, or flag (is_human_direction gates all of those).
+                // Best-effort; `from` = this tab's `_TAB_ID` when in a tab.
+                if is_human_direction(p) {
+                    let snippet: String = p.chars().take(200).collect();
+                    let from = std::env::var("_TAB_ID").ok().filter(|s| !s.is_empty());
+                    crate::cli::team::note_best_effort(Some("direction".to_string()), from, &snippet);
                 }
             }
         }
