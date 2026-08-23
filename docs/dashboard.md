@@ -128,6 +128,16 @@ under a **project**, and computes `rollupLed`. Shape:
 `item` is now the `context` subtitle. The global `nodes`/`unmapped` are the
 Increment 1 contract, preserved.
 
+### Lineage & altitude (S6)
+
+Each tab also carries `parentTabId` (the UUID of the tab that spawned it —
+`dispatch --new` stamps it via `POST /tabs/by-id/{id}/parent`, reading `_TAB_ID`)
+and a static `altitude` band from its role class (`0` tichef, `1` orchestrator,
+`2` worker/specialist). `DashboardState.lineage` is the deduped list of
+`{child, parent}` delegation edges whose parent is a known tab — an unknown or
+self parent degrades to a root (no edge), so no cycle survives. A root tab has
+no `parentTabId` and falls back to its role altitude.
+
 ## `GET /dashboard`
 
 Serves the static web app (`assets/dashboard.html` + `assets/dashboard.js` +

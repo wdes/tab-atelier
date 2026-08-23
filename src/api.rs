@@ -207,6 +207,10 @@ struct TabInfo {
     /// <role>"`). Persisted + hook-immune, unlike `context`. Omitted when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     assignment: Option<String>,
+    /// UUID of the spawning tab (`parent_tab_id`) — the dashboard lineage edge.
+    /// Omitted for a root (non-spawned) tab.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_tab_id: Option<String>,
     /// Number of WS viewers (browser share-link / `remote attach`)
     /// currently watching this tab. Omitted when zero.
     #[serde(skip_serializing_if = "is_zero")]
@@ -323,6 +327,11 @@ struct DashboardTab {
     role: String,
     /// The current unit of work — now the volatile `context` (the prompt).
     item: String,
+    /// UUID of the spawning tab, for the delegation lineage. `None` ⇒ root.
+    parent_tab_id: Option<String>,
+    /// Static altitude band from the role class: 0 tichef, 1 orchestrator,
+    /// 2 worker/specialist. A socle available without lineage data.
+    altitude: u8,
     agent_state: Option<&'static str>,
     led: Option<&'static str>,
     tokens: Option<crate::TokenUsage>,
@@ -352,6 +361,14 @@ struct DashboardProject {
     unmapped: Vec<DashboardTab>,
 }
 
+/// One delegation edge: `child` was spawned by `parent` (both tab UUIDs).
+#[derive(Serialize, PartialEq, Eq, Debug)]
+#[serde(rename_all = "camelCase")]
+struct LineageEdge {
+    child: String,
+    parent: String,
+}
+
 #[derive(Serialize)]
 struct DashboardState {
     /// Global 7-node diagram (Increment 1 contract — preserved).
@@ -359,6 +376,31 @@ struct DashboardState {
     unmapped: Vec<DashboardTab>,
     /// Per-project buckets (Increment 2), sorted alpha with `méta`/`divers` last.
     projects: Vec<DashboardProject>,
+    /// Delegation lineage (S6): `parent_tab_id` edges whose parent is a known
+    /// tab. A tab with no/unknown parent is a root (no edge). Self-edges dropped.
+    lineage: Vec<LineageEdge>,
+}
+
+/// Build the delegation lineage from `(child_id, parent_id)` pairs. An edge is
+/// kept only when the parent is a known tab and isn't the child itself, so an
+/// unknown parent degrades to a root and no self-cycle survives. Deduped.
+fn build_lineage(tabs: &[(String, Option<String>)]) -> Vec<LineageEdge> {
+    let ids: std::collections::HashSet<&str> = tabs.iter().map(|(id, _)| id.as_str()).collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut edges = vec![];
+    for (child, parent) in tabs {
+        if let Some(p) = parent
+            && p != child
+            && ids.contains(p.as_str())
+            && seen.insert((child.clone(), p.clone()))
+        {
+            edges.push(LineageEdge {
+                child: child.clone(),
+                parent: p.clone(),
+            });
+        }
+    }
+    edges
 }
 
 /// Minimal per-tab projection the dashboard builder consumes, so the
@@ -371,6 +413,7 @@ struct DashboardTabInput {
     cwd: Option<String>,
     assignment: Option<String>,
     context: Option<String>,
+    parent_tab_id: Option<String>,
     agent_state: Option<&'static str>,
     led: Option<&'static str>,
     tokens: Option<crate::TokenUsage>,
@@ -401,6 +444,16 @@ fn parse_assignment(a: &str) -> (Option<String>, String, String) {
     let phase = parts.next().unwrap_or("").trim().to_string();
     let role = parts.next().unwrap_or("").trim().to_string();
     (over.filter(|p| !p.is_empty()), phase, role)
+}
+
+/// Static altitude band from an agent role: 0 = tichef (top), 1 = orchestrator,
+/// 2 = worker/specialist (bottom). The socle available without any lineage.
+fn role_altitude(role: &str) -> u8 {
+    match role {
+        "tichef" => 0,
+        "orchestrator" => 1,
+        _ => 2,
+    }
 }
 
 /// Phase id from an assignment (empty ⇒ unmapped).
@@ -477,6 +530,7 @@ fn build_dashboard_state(inputs: Vec<DashboardTabInput>) -> DashboardState {
             let role = role_of(t.assignment.as_deref());
             let project = project_of(t.cwd.as_deref(), t.assignment.as_deref());
             let viewer_url = format!("/tabs/by-id/{}/view", t.id);
+            let altitude = role_altitude(&role);
             let tab = DashboardTab {
                 id: t.id,
                 name: t.name,
@@ -484,6 +538,8 @@ fn build_dashboard_state(inputs: Vec<DashboardTabInput>) -> DashboardState {
                 context: t.context,
                 assignment: t.assignment,
                 role,
+                parent_tab_id: t.parent_tab_id,
+                altitude,
                 agent_state: t.agent_state,
                 led: t.led,
                 tokens: t.tokens,
@@ -531,10 +587,18 @@ fn build_dashboard_state(inputs: Vec<DashboardTabInput>) -> DashboardState {
         })
         .collect();
 
+    let lineage = build_lineage(
+        &projected
+            .iter()
+            .map(|p| (p.tab.id.clone(), p.tab.parent_tab_id.clone()))
+            .collect::<Vec<_>>(),
+    );
+
     DashboardState {
         nodes,
         unmapped,
         projects,
+        lineage,
     }
 }
 
@@ -626,6 +690,9 @@ pub struct SnapshotTab {
     /// hook-immune (see [`crate::TabState::assignment`]); the dashboard maps a
     /// tab onto a phase node + project from this. `None` ⇒ unassigned.
     pub assignment: Option<std::sync::Arc<str>>,
+    /// UUID of the spawning tab (`parent_tab_id`), mirrored from the runtime
+    /// tab. Drives the dashboard delegation lineage. `None` ⇒ a root tab.
+    pub parent_tab_id: Option<std::sync::Arc<str>>,
     /// PID of the tab's shell. The /catbus endpoints walk its
     /// descendant processes to find a catbus-agent (or fallback
     /// `claude` TUI) and resolve the session's transcript file.
@@ -812,6 +879,10 @@ pub struct TabSnapshot {
     /// Unlike `pending_context_changes`, the owner loop mirrors this onto the
     /// runtime tab AND persists it (see the `persist()` in both binaries).
     pub pending_assignment_changes: Vec<(String, Option<String>)>,
+    /// (`tab_id`, `parent_tab_id`-or-None) queued by `POST /tabs/by-id/{id}/parent`
+    /// (the delegate stamps a spawned tab's lineage). Mirrored + persisted like
+    /// `pending_assignment_changes`.
+    pub pending_parent_changes: Vec<(String, Option<String>)>,
     /// Tab ids whose per-tab share tokens (`share_token_rw`/`_ro`) the
     /// owner loop should clear, queued by `POST /tabs/rotate-tokens`.
     /// Clearing revokes every outstanding share link for that tab (it
@@ -2123,6 +2194,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                     schedule_tz: t.schedule.as_ref().map(|s| s.tz.clone()),
                     context: t.context.as_deref().map(str::to_string),
                     assignment: t.assignment.as_deref().map(str::to_string),
+                    parent_tab_id: t.parent_tab_id.as_deref().map(str::to_string),
                     net_disabled: t.net_disabled,
                     connections: t.connections,
                     tx_bytes: t.tx_bytes,
@@ -2269,6 +2341,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                     cwd: t.cwd.as_deref().map(str::to_string),
                     assignment: t.assignment.as_deref().map(str::to_string),
                     context: t.context.as_deref().map(str::to_string),
+                    parent_tab_id: t.parent_tab_id.as_deref().map(str::to_string),
                     agent_state: t.agent_state.as_ref().map(|s| match s.state {
                         crate::AgentState::Thinking => "thinking",
                         crate::AgentState::Waiting => "waiting",
@@ -3897,6 +3970,41 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             let body = serde_json::to_string(&serde_json::json!({ "assignment": assignment_opt })).unwrap_or_default();
             respond_json(stream, 200, &body);
         }
+        ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/parent") => {
+            // Stamp a spawned tab's lineage: `{"parent_tab_id":"<uuid>"}` (null /
+            // empty clears it). `dispatch --new` calls this on the freshly-created
+            // tab with its own `_TAB_ID`. Persisted like /assignment. Master token.
+            let inner = &p["/tabs/by-id/".len()..p.len() - "/parent".len()];
+            let parent_opt: Option<String> = if body_bytes.is_empty() {
+                None
+            } else {
+                serde_json::from_slice::<serde_json::Value>(&body_bytes)
+                    .ok()
+                    .and_then(|v| v.get("parent_tab_id").cloned())
+                    .and_then(|c| {
+                        if c.is_null() {
+                            None
+                        } else {
+                            c.as_str().map(str::to_owned)
+                        }
+                    })
+            };
+            let parent_opt = parent_opt
+                .map(|s| s.chars().take(128).collect::<String>())
+                .filter(|s| !s.trim().is_empty());
+            let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(idx) = state.tabs.iter().position(|t| &*t.id == inner) else {
+                drop(state);
+                error_json(stream, 404, "tab not found");
+                return;
+            };
+            let tab_id = state.tabs[idx].id.to_string();
+            state.tabs[idx].parent_tab_id = parent_opt.as_deref().map(std::sync::Arc::from);
+            state.pending_parent_changes.push((tab_id, parent_opt.clone()));
+            drop(state);
+            let body = serde_json::to_string(&serde_json::json!({ "parent_tab_id": parent_opt })).unwrap_or_default();
+            respond_json(stream, 200, &body);
+        }
         ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/input") => {
             let Some((key_raw, is_uuid)) = parse_tab_key(p, "/input") else {
                 error_json(stream, 404, "invalid tab key");
@@ -4763,6 +4871,7 @@ pub fn test_snapshot_tab(id: &str, name: &str) -> SnapshotTab {
         bg_color: "".into(),
         context: None,
         assignment: None,
+        parent_tab_id: None,
         shell_pid: 0,
         agent_state: None,
         agent_session_id: None,
@@ -4801,6 +4910,7 @@ pub fn test_snapshot(tabs: Vec<SnapshotTab>) -> TabSnapshot {
         pending_bg_color_changes: vec![],
         pending_context_changes: vec![],
         pending_assignment_changes: vec![],
+        pending_parent_changes: vec![],
         pending_token_rotations: vec![],
         pending_schedule_changes: vec![],
         pending_new_tabs: 0,
@@ -4855,6 +4965,7 @@ mod tests {
             agent_session_id: None,
             context: None,
             assignment: None,
+            parent_tab_id: None,
             viewers: 0,
             net_disabled: false,
             connections: 0,
@@ -4897,6 +5008,7 @@ mod tests {
             cwd: None,
             assignment: assignment.map(str::to_string),
             context: None,
+            parent_tab_id: None,
             agent_state: None,
             led,
             tokens: None,
@@ -5120,6 +5232,78 @@ mod tests {
         assert_eq!(project_of(None, Some("plan/planner")), "méta");
         assert_eq!(project_of(None, Some("build/worker")), "divers");
         assert_eq!(project_of(Some("/home/u/dev"), Some("build/worker")), "divers");
+    }
+
+    #[test]
+    fn dashboard_altitude_from_role_class() {
+        assert_eq!(role_altitude("tichef"), 0);
+        assert_eq!(role_altitude("orchestrator"), 1);
+        assert_eq!(role_altitude("implementer"), 2);
+        assert_eq!(role_altitude(""), 2);
+        // Exposed per-tab in the built state.
+        let state = build_dashboard_state(vec![dash_input("u1", Some("scope/tichef"), None)]);
+        assert_eq!(node(&state, "scope").tabs[0].altitude, 0);
+    }
+
+    #[test]
+    fn dashboard_lineage_edges_no_cycle_unknown_parent_is_root() {
+        // b←a, c←b chain; d has an unknown parent (→ root, no edge); e is its own
+        // parent (self-cycle dropped). Duplicated a→? never double-counted.
+        let mk = |id: &str, parent: Option<&str>| DashboardTabInput {
+            parent_tab_id: parent.map(str::to_string),
+            ..dash_input(id, Some("build/worker"), None)
+        };
+        let state = build_dashboard_state(vec![
+            mk("a", None),
+            mk("b", Some("a")),
+            mk("c", Some("b")),
+            mk("d", Some("ghost")),
+            mk("e", Some("e")),
+        ]);
+        let mut edges: Vec<(&str, &str)> = state
+            .lineage
+            .iter()
+            .map(|e| (e.child.as_str(), e.parent.as_str()))
+            .collect();
+        edges.sort_unstable();
+        assert_eq!(
+            edges,
+            vec![("b", "a"), ("c", "b")],
+            "only real parent links; no cycle/unknown"
+        );
+    }
+
+    #[test]
+    fn set_parent_sets_and_exposes_lineage() {
+        let (port, state, token) = spawn_server();
+        let req_body = r#"{"parent_tab_id":"spawner-uuid"}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/tab-a/parent HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{req_body}",
+                req_body.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 200);
+        let (p, queued) = {
+            let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                s.tabs[0].parent_tab_id.clone(),
+                s.pending_parent_changes.last().cloned(),
+            )
+        };
+        assert_eq!(p.as_deref(), Some("spawner-uuid"));
+        assert_eq!(queued.unwrap().1.as_deref(), Some("spawner-uuid"));
+        state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .invalidate_tabs();
+        let tabs = request(port, &format!("GET /tabs?token={token} HTTP/1.1\r\n\r\n"));
+        assert!(
+            body(&tabs).contains("spawner-uuid"),
+            "parentTabId must surface on /tabs: {}",
+            body(&tabs)
+        );
     }
 
     /// Publish a dashboard share-token on the running server's snapshot.
