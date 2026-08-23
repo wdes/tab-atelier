@@ -47,3 +47,19 @@ pub fn run(args: &[String]) -> i32 {
         args,
     )
 }
+
+#[cfg(test)]
+mod tests {
+    /// Q3 guard: the human-facing `--help` + the 400 message are string literals
+    /// (can't derive a `&'static str` from the `REHOME_STEPS` const), so this
+    /// keeps them in sync with the single source of truth — adding a 5th state to
+    /// `crate::api::REHOME_STEPS` fails here until the two texts list it too.
+    #[test]
+    fn rehome_help_lists_every_state() {
+        let msg_400 = super::status_err(400).expect("400 maps to a message");
+        for step in crate::api::REHOME_STEPS {
+            assert!(super::USAGE.contains(step.slug), "--help missing state {}", step.slug);
+            assert!(msg_400.contains(step.slug), "400 message missing state {}", step.slug);
+        }
+    }
+}
