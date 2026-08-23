@@ -42,9 +42,16 @@ export function activityModel(json) {
   const totals = j.totals || {};
   const perDay = Array.isArray(j.per_day) ? j.per_day : [];
   const num = (v) => Number(v || 0);
+  // Inc6: the maturity/growth verdict (falsy when absent).
+  const verdictDetail = j.self_improvement_verdict || null;
   return {
     windowHours: num(j.window_hours),
     features: num(totals.features_implemented),
+    // Inc6: separate counters — features stays UNDIVIDED; these are distinct.
+    fixes: num(totals.fixes),
+    selfTooling: num(totals.self_tooling),
+    issuesOpened: num(totals.issues_opened),
+    issuesClosed: num(totals.issues_closed),
     tokensPerFeature: num(totals.tokens_per_feature),
     minutesSinceLastHumanPrompt: num(totals.minutes_since_last_human_prompt),
     aligatorCalls: num(totals.aligator_calls),
@@ -53,11 +60,15 @@ export function activityModel(json) {
     days: perDay.map((d) => (d && d.date) || ""),
     series: {
       features: perDay.map((d) => num(d && d.features)),
+      fixes: perDay.map((d) => num(d && d.fixes)),
+      selfTooling: perDay.map((d) => num(d && d.self_tooling)),
       tokensPerFeature: perDay.map((d) => num(d && d.tokens_per_feature)),
       autonomy: perDay.map((d) => num(d && d.autonomy_minutes_max)),
     },
     summaryLines: Array.isArray(j.summary_lines) ? j.summary_lines : [],
     record: j.record || null,
+    verdict: (verdictDetail && verdictDetail.verdict) || "",
+    verdictDetail,
   };
 }
 
@@ -239,6 +250,45 @@ export function overviewLayout(state) {
     });
   const unassigned = Array.isArray(s.unassigned) ? s.unassigned : [];
   return { order: ["META", "REPOS", "UNASSIGNED"], meta, repos, unassigned };
+}
+
+// Pure: the service nesting (Inc6 S4). One entry per service, in order, wrapping
+// its sub-repos; a single-repo service is `mono` (not over-nested). Repo entries
+// are normalised to {name} whether the server sends strings or objects. Null-safe.
+export function serviceLayout(state) {
+  const s = state || {};
+  const services = Array.isArray(s.services) ? s.services : [];
+  return services.map((svc) => {
+    const repos = Array.isArray(svc && svc.projects)
+      ? svc.projects.map((p) => (typeof p === "string" ? { name: p } : p))
+      : [];
+    return { service: svc && svc.name, rollupLed: svc && svc.rollupLed, repos, mono: repos.length <= 1 };
+  });
+}
+
+// Pure: the org-chart (Inc6 S2). A solo méta (serving null) stays on top; each
+// repo is a team whose LEAD is its orchestrator, with workers hanging under the
+// lead (parentTabId) and any méta `serving` this repo JOINING the team (indispo).
+// Never throws.
+export function orgLayout(state) {
+  const s = state || {};
+  const projects = Array.isArray(s.projects) ? s.projects : [];
+  const metaProjects = projects.filter((p) => p && p.isMeta);
+  const repos = projects.filter((p) => p && !p.isMeta);
+  const allTabs = [];
+  for (const p of projects) for (const t of projectTabs(p)) allTabs.push(t);
+  // Solo méta (not serving anyone) floats on top.
+  const metaTop = [];
+  for (const p of metaProjects) for (const t of projectTabs(p)) if (t && !t.serving) metaTop.push(t);
+  const teams = repos.map((p) => {
+    const tabs = projectTabs(p);
+    const lead = tabs.find((t) => t && isOrchestrator(t.role)) || null;
+    const workers = lead ? tabs.filter((t) => t && t.parentTabId === lead.id) : [];
+    // A serving méta from ANYWHERE joins the team of the repo it serves.
+    const serving = allTabs.filter((t) => t && t.serving === p.name);
+    return { repo: p.name, lead, workers, serving };
+  });
+  return { metaTop, teams };
 }
 
 // --- Slice C: predecessor -> successor re-home link (drill-in) ---
@@ -426,6 +476,71 @@ function unassignedTabHtml(tab) {
   return `<div class="unassigned-tab" data-viewer="${escapeHtml(t.viewerUrl || "")}">${escapeHtml(t.name || "tab")}</div>`;
 }
 
+// --- Inc6 S2/S4: org-chart (méta on top / team lead + workers / serving joins) ---
+
+// Service grouping for the org-chart. S2 renders teams flat; S4 wires this to the
+// exported serviceLayout so a family service wraps its sub-repo teams.
+function serviceGrouping(state) {
+  return typeof serviceLayout === "function" ? serviceLayout(state) : [];
+}
+
+function metaTopHtml(tab) {
+  const t = tab || {};
+  return `<div class="meta-top-tab" data-viewer="${escapeHtml(t.viewerUrl || "")}">${escapeHtml(t.name || "méta")}</div>`;
+}
+
+function teamMemberHtml(tab, cls) {
+  const t = tab || {};
+  return `<div class="${cls}" data-viewer="${escapeHtml(t.viewerUrl || "")}">${escapeHtml(t.name || "tab")}</div>`;
+}
+
+// One team = a repo's org sub-tree: orchestrator lead, workers below, and any
+// méta serving this repo joined in (marked indispo).
+function teamHtml(team) {
+  const t = team || { repo: "", lead: null, workers: [], serving: [] };
+  const lead = t.lead ? teamMemberHtml(t.lead, "team-lead") : `<div class="team-lead team-lead-none">${escapeHtml(t.repo)}</div>`;
+  const workers = (t.workers || []).map((w) => teamMemberHtml(w, "worker")).join("");
+  const serving = (t.serving || [])
+    .map((sv) => `<div class="serving" data-viewer="${escapeHtml((sv && sv.viewerUrl) || "")}" title="serving ${escapeHtml(t.repo)} — indispo">${escapeHtml((sv && sv.name) || "méta")} <span class="serving-badge">indispo</span></div>`)
+    .join("");
+  return `<div class="team project-card" data-repo="${escapeHtml(t.repo)}" data-project="${escapeHtml(t.repo)}"><div class="team-name">${escapeHtml(t.repo)}</div>${lead}<div class="team-members">${workers}${serving}</div></div>`;
+}
+
+// The Inc6 org-chart view, used when the server exposes the service dimension.
+function renderOrgChart() {
+  const grid = document.getElementById("project-grid");
+  if (!grid) return;
+  const org = orgLayout(currentState);
+  const teamByRepo = new Map(org.teams.map((t) => [t.repo, t]));
+  const parts = [];
+  if (org.metaTop.length) {
+    parts.push(`<div class="meta-top"><div class="meta-top-label">méta</div>${org.metaTop.map(metaTopHtml).join("")}</div>`);
+  }
+  const services = serviceGrouping(currentState);
+  if (services.length) {
+    // S4: group teams under their service (family wrapper; mono not over-nested).
+    const covered = new Set();
+    for (const svc of services) {
+      const teams = svc.repos
+        .map((r) => { covered.add(r.name); return teamHtml(teamByRepo.get(r.name) || { repo: r.name, lead: null, workers: [], serving: [] }); })
+        .join("");
+      parts.push(`<div class="service ${svc.mono ? "service-mono" : "service-family"}" data-service="${escapeHtml(svc.service)}"${svc.mono ? ' data-mono="true"' : ""}><div class="service-name">${escapeHtml(svc.service)}</div>${teams}</div>`);
+    }
+    // Safety: never drop a repo the services list forgot — render it flat.
+    for (const t of org.teams) if (!covered.has(t.repo)) parts.push(teamHtml(t));
+  } else {
+    // No service grouping yet -> flat teams.
+    for (const t of org.teams) parts.push(teamHtml(t));
+  }
+  grid.innerHTML = parts.join("");
+  const layer = document.getElementById("lineage-layer");
+  if (layer) layer.innerHTML = "";
+  currentNodes = new Map();
+  currentUnmapped = [];
+  renderRehome([]);
+  renderUnmapped();
+}
+
 // Level-0 overview (S6 reorg): META band on top, repos in the middle grouped by
 // altitude (orchestrators / workers — server order within a band, stable across
 // reloads), UNASSIGNED band at the bottom. Empty META/UNASSIGNED bands are
@@ -433,6 +548,11 @@ function unassignedTabHtml(tab) {
 function renderGrid() {
   const grid = document.getElementById("project-grid");
   if (!grid) return;
+  // Inc6: when the server exposes the service dimension, show the org-chart.
+  if (Array.isArray(currentState && currentState.services) && currentState.services.length) {
+    renderOrgChart();
+    return;
+  }
   const layout = overviewLayout(currentState);
   const parts = [];
   if (layout.meta.length) {
@@ -653,7 +773,12 @@ async function poll() {
 
 // --- S4: "Dernières heures" activity panel ---
 const ACTIVITY_FIGURES = [
+  // Inc6: features stays undivided; fixes / self-tooling / issues are SEPARATE.
   { key: "features_implemented", label: "features", get: (m) => m.features },
+  { key: "fixes", label: "fixes", get: (m) => m.fixes },
+  { key: "self_tooling", label: "self-tooling", get: (m) => m.selfTooling },
+  { key: "issues_opened", label: "issues opened", get: (m) => m.issuesOpened },
+  { key: "issues_closed", label: "issues closed", get: (m) => m.issuesClosed },
   { key: "tokens_per_feature", label: "tokens/feature", get: (m) => m.tokensPerFeature },
   { key: "minutes_since_last_human_prompt", label: "min since human", get: (m) => m.minutesSinceLastHumanPrompt },
   { key: "aligator_calls", label: "aligator", get: (m) => m.aligatorCalls },
@@ -661,6 +786,8 @@ const ACTIVITY_FIGURES = [
 ];
 const ACTIVITY_SERIES = [
   { key: "features", label: "features/day", get: (m) => m.series.features },
+  { key: "fixes", label: "fixes/day", get: (m) => m.series.fixes },
+  { key: "self_tooling", label: "self-tooling/day", get: (m) => m.series.selfTooling },
   { key: "tokens_per_feature", label: "tokens/feature", get: (m) => m.series.tokensPerFeature },
   { key: "autonomy", label: "autonomy (min)", get: (m) => m.series.autonomy },
 ];
@@ -690,7 +817,12 @@ function renderActivity(model) {
   const record = model.record
     ? `<div class="activity-record">record: ${escapeHtml(model.record.label || "")} · ~${escapeHtml(String(Math.round((Number(model.record.autonomy_minutes) || 0) / 60)))}h autonomy</div>`
     : "";
-  body.innerHTML = `<div class="activity-figures">${figures}</div><div class="activity-series">${series}</div>${summary}${record}`;
+  // Inc6: maturity/growth verdict badge (self-improvement), when present.
+  const trend = model.verdictDetail && model.verdictDetail.autonomy_trend ? ` (autonomy ${escapeHtml(model.verdictDetail.autonomy_trend)})` : "";
+  const verdict = model.verdict
+    ? `<div class="verdict-badge" data-verdict="${escapeHtml(model.verdict)}">${escapeHtml(model.verdict)}${trend}</div>`
+    : "";
+  body.innerHTML = `${verdict}<div class="activity-figures">${figures}</div><div class="activity-series">${series}</div>${summary}${record}`;
 }
 
 // --- S1: legend rendering + persistent on/off toggle ---
