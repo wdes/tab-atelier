@@ -379,6 +379,30 @@ fn should_nudge(stable_for: Duration, nudged_hash: Option<u64>, current_hash: u6
     stable_for >= Duration::from_secs(STABLE_SECS) && nudged_hash != Some(current_hash)
 }
 
+/// Global minimum spacing between nudges — anti thundering-herd / anti-runaway.
+///
+/// Per-tab backoff + the round-robin already space *which* tab fires, but after
+/// a restart / an API cap dozens of tabs go frozen at once and were nudged one
+/// per fast tick — ~50 `continue`s in 1–2 min re-caps the Claude API, re-freezes
+/// everything, and spirals (observed twice). This caps the FLEET-WIDE nudge rate
+/// at one every `NUDGE_MIN_INTERVAL`, independent of the tick interval, so 50
+/// frozen tabs get unstuck one at a time (2 s apart), never in a burst.
+const NUDGE_MIN_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Global throttle gate: may a nudge fire `now`? Yes when none has fired within
+/// [`NUDGE_MIN_INTERVAL`] — and then `now` is recorded as the last emission so
+/// the next is spaced out. `None` (never nudged) is always allowed. Pure +
+/// deterministic (injected `now`), so the anti-storm spacing is unit-testable.
+fn nudge_ready(last_nudge_at: &mut Option<Instant>, now: Instant) -> bool {
+    if let Some(t) = *last_nudge_at
+        && now.duration_since(t) < NUDGE_MIN_INTERVAL
+    {
+        return false;
+    }
+    *last_nudge_at = Some(now);
+    true
+}
+
 /// Seconds to wait before the next nudge after `streak` consecutive
 /// nudges for the same error episode: `BASE * 2^(streak-1)`, capped at
 /// [`NUDGE_BACKOFF_MAX_SECS`]. So 60s, 120s, 240s, 480s, 900s, 900s…
@@ -421,6 +445,7 @@ fn tick(
     watches: &mut HashMap<String, TabWatch>,
     probe: &mut ConnectivityProbe,
     cursor: &mut usize,
+    last_nudge_at: &mut Option<Instant>,
 ) -> Result<(), String> {
     let ep: Endpoint = discover_endpoint()?;
     let ag = agent();
@@ -559,6 +584,21 @@ fn tick(
         return Ok(());
     }
 
+    // Global anti-storm throttle: at most one nudge every NUDGE_MIN_INTERVAL
+    // across ALL tabs. If a nudge fired <2 s ago, skip this tick's send WITHOUT
+    // advancing the cursor or touching any watch — every eligible tab stays a
+    // candidate and fires at the next 2 s slot. This turns "50 frozen tabs →
+    // burst of 50 continues" into "one every 2 s", so a restart / API cap can't
+    // spiral into a self-inflicted rate-limit.
+    if !nudge_ready(last_nudge_at, now) {
+        println!(
+            "⛑ brain: {n} eligible, throttled (≤1 nudge / {s}s fleet-wide) — next slot soon",
+            n = eligible.len(),
+            s = NUDGE_MIN_INTERVAL.as_secs(),
+        );
+        return Ok(());
+    }
+
     // Round-robin: pick one from the eligible set. Cursor advances
     // on every successful tick (online + at least one eligible), so
     // the next tick walks past this tab to its neighbours. Single
@@ -655,8 +695,11 @@ pub fn run(args: &[String]) -> i32 {
                      Patterns: {n} known signatures (Anthropic API connectivity).\n\
                      Connectivity probe (Google generate_204 + Cloudflare 1.1.1.1) gates\n\
                      every send; offline → suppress, retry on next tick when back online.\n\
-                     Round-robin: at most one send per tick across all eligible tabs.",
+                     Round-robin: at most one send per tick across all eligible tabs.\n\
+                     Anti-storm: fleet-wide, at most one nudge every {throttle}s, so a\n\
+                     restart / API cap can't nudge dozens of frozen tabs in a burst.",
                     n = PATTERNS.len(),
+                    throttle = NUDGE_MIN_INTERVAL.as_secs(),
                 );
                 return 0;
             }
@@ -679,6 +722,8 @@ pub fn run(args: &[String]) -> i32 {
     let mut watches: HashMap<String, TabWatch> = HashMap::new();
     let mut probe = ConnectivityProbe::default();
     let mut rr_cursor: usize = 0;
+    // Fleet-wide last-nudge clock for the anti-storm throttle (see nudge_ready).
+    let mut last_nudge_at: Option<Instant> = None;
     loop {
         // Run the tick under catch_unwind so a panic anywhere in it (a
         // dependency edge case, a broken-pipe `println!`, …) is caught
@@ -686,7 +731,7 @@ pub fn run(args: &[String]) -> i32 {
         // is AssertUnwindSafe: a panic mid-tick may leave the watch map
         // slightly stale, which the next tick re-syncs from the daemon.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            tick(&mut watches, &mut probe, &mut rr_cursor)
+            tick(&mut watches, &mut probe, &mut rr_cursor, &mut last_nudge_at)
         }));
         match outcome {
             Ok(Ok(())) => {}
@@ -717,6 +762,43 @@ pub fn run(args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nudge_throttle_spaces_bursts_and_never_simultaneous() {
+        // Two (or fifty) tabs freeze at once: the throttle lets exactly ONE
+        // nudge through per NUDGE_MIN_INTERVAL, so they're unstuck 2 s apart,
+        // never in a burst that re-caps the API.
+        let mut last: Option<Instant> = None;
+        let t0 = Instant::now();
+        // First frozen tab fires immediately (nothing nudged yet).
+        assert!(nudge_ready(&mut last, t0), "first nudge always allowed");
+        // A SECOND frozen tab in the same instant is throttled — not simultaneous.
+        assert!(
+            !nudge_ready(&mut last, t0),
+            "a second nudge in the same window is skipped"
+        );
+        // Still throttled just under the interval.
+        assert!(
+            !nudge_ready(&mut last, t0 + Duration::from_millis(1999)),
+            "still throttled just under {}s",
+            NUDGE_MIN_INTERVAL.as_secs()
+        );
+        // Once the interval has elapsed since the last EMITTED nudge, the next fires.
+        assert!(
+            nudge_ready(&mut last, t0 + NUDGE_MIN_INTERVAL),
+            "next nudge allowed ≥{}s after the previous one",
+            NUDGE_MIN_INTERVAL.as_secs()
+        );
+        // …and firing re-arms the throttle, so the third waits another interval.
+        assert!(
+            !nudge_ready(&mut last, t0 + NUDGE_MIN_INTERVAL),
+            "throttle re-arms on each emission"
+        );
+        assert!(
+            nudge_ready(&mut last, t0 + NUDGE_MIN_INTERVAL * 2),
+            "and the one after, a slot later"
+        );
+    }
 
     #[test]
     fn scan_finds_the_canonical_anthropic_unreachable_string() {
