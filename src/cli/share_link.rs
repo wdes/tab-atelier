@@ -105,6 +105,12 @@ pub(crate) fn resolve(ep: &Endpoint, key: &str) -> Result<(usize, String), Strin
     Ok((idx, id))
 }
 
+/// Build the global read-only dashboard share URL. Split out so the URL shape
+/// (`/dashboard?token=…`) is unit-testable without a live daemon.
+fn dashboard_share_url(ip: &str, port: u16, token: &str) -> String {
+    format!("http://{ip}:{port}/dashboard?token={token}")
+}
+
 fn http_port(ep: &Endpoint) -> u16 {
     ep.url
         .rsplit_once(':')
@@ -171,7 +177,7 @@ pub fn run(args: &[String]) -> i32 {
             eprintln!("share-link --dashboard: daemon returned no token");
             return 1;
         };
-        println!("http://{ip}:{port}/dashboard?token={token}");
+        println!("{}", dashboard_share_url(&ip, port, &token));
         eprintln!("(read-only dashboard share token — revoke with `rotate-tokens`)");
         return 0;
     }
@@ -2184,4 +2190,20 @@ pub fn tabs(args: &[String]) -> i32 {
         }
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dashboard_share_url;
+
+    #[test]
+    fn dashboard_url_has_token_query() {
+        let url = dashboard_share_url("192.168.1.42", 7890, "deadbeef");
+        assert_eq!(url, "http://192.168.1.42:7890/dashboard?token=deadbeef");
+        // The shape the `--dashboard` flag promises: the dashboard route + a token.
+        assert!(
+            url.contains("/dashboard?token="),
+            "must carry the dashboard token: {url}"
+        );
+    }
 }
