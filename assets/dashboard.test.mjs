@@ -126,13 +126,24 @@ assert.equal(isOrchestrator(null), false);
   assert.doesNotMatch(plain, /orchestrator/, "no tint without an orchestrator");
 }
 
-// --- S6 altitude bands ---
+// --- S6 altitude bands: derived from ROLE, not phase/server altitude (finding a) ---
 assert.equal(roleAltitude("tichef"), 0);
 assert.equal(roleAltitude("orchestrator"), 1);
+assert.equal(roleAltitude(" Orchestrator "), 1, "trims + case-insensitive");
 assert.equal(roleAltitude("implementer"), 2, "workers/specialists at the bottom band");
-// Explicit altitude wins.
-assert.equal(projectAltitude({ altitude: 0, nodes: [] }), 0);
-// Otherwise: the most senior occupant sets the band.
+// A meta-lane orchestrator lands in the orchestrator band, NEVER the tichef band.
+assert.equal(
+  projectAltitude({ isMeta: true, nodes: [{ tabs: [{ role: "orchestrator" }, { role: "planner" }] }] }),
+  1,
+  "meta-lane orchestrator -> band 1 (not tichef band 0)"
+);
+// A server-provided altitude is IGNORED — role is authoritative.
+assert.equal(
+  projectAltitude({ altitude: 0, nodes: [{ tabs: [{ role: "orchestrator" }] }] }),
+  1,
+  "phase/server altitude ignored; role wins"
+);
+// The most senior occupant sets the band.
 assert.equal(
   projectAltitude({ nodes: [{ tabs: [{ role: "worker" }, { role: "orchestrator" }] }] }),
   1,
