@@ -157,7 +157,44 @@ pub fn run(args: &[String]) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_nudge, is_synthetic_prompt};
+    use super::{is_cron_tick, is_human_direction, is_nudge, is_synthetic_prompt};
+
+    // --- Increment 6 S9 (REFINER red) — mirror REAL human directions onto the
+    //     `direction` blackboard topic (like the dispatch mirror), so the fleet
+    //     knows where the PO stands. The user-prompt hook, AFTER stamping the
+    //     context, posts to topic `direction` IFF the prompt is a genuine human
+    //     direction — NEVER a cron/watcher tick (reusing S7's detection), a nudge,
+    //     or a synthetic injection. RED until is_cron_tick / is_human_direction
+    //     exist. Builder: rust (S9-hook).
+    #[test]
+    fn cron_ticks_are_detected() {
+        // Automated ticks that arrive typed AS prompts (watchers, rounds, sage
+        // wakeups, roster refresh) — mirror of scripts/activity-scribe CRON_TICK.
+        assert!(is_cron_tick("RESTART mx imminent — sauvegarde en cours"));
+        assert!(is_cron_tick("Ronde du matin : check the fleet"));
+        assert!(is_cron_tick("Watcher restart after OOM"));
+        assert!(is_cron_tick("réveil du sage"));
+        assert!(is_cron_tick("maintien de la session"));
+        assert!(is_cron_tick("refresh orchestrateurs"));
+        // A real prompt that merely mentions a watcher is not a tick.
+        assert!(!is_cron_tick("fix the watcher restart bug in api.rs"));
+        assert!(!is_cron_tick("PR #42: refactor the parser"));
+    }
+
+    #[test]
+    fn only_genuine_human_directions_are_mirrored() {
+        // Real PO directions -> mirrored to `direction`.
+        assert!(is_human_direction("PR #42: refactor the parser"));
+        assert!(is_human_direction("go build increment 6, start with S7"));
+        // Cron/watcher ticks (typed but automated) -> NOT mirrored.
+        assert!(!is_human_direction("RESTART mx imminent — sauvegarde"));
+        assert!(!is_human_direction("Ronde du matin : check the fleet"));
+        // Nudges, synthetic injections, empty, and flag-like -> NOT mirrored.
+        assert!(!is_human_direction("continue"));
+        assert!(!is_human_direction("<task-notification>x</task-notification>"));
+        assert!(!is_human_direction("   "));
+        assert!(!is_human_direction("--clear"));
+    }
 
     #[test]
     fn nudges_do_not_overwrite_context() {
