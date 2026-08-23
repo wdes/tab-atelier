@@ -1365,6 +1365,7 @@ impl AppState {
             pending_lock_changes: Vec::new(),
             pending_net_changes: Vec::new(),
             pending_net_allow_changes: Vec::new(),
+            pending_ssh_agent_changes: Vec::new(),
             pending_bg_color_changes: Vec::new(),
             pending_context_changes: Vec::new(),
             pending_token_rotations: Vec::new(),

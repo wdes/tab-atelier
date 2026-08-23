@@ -130,6 +130,10 @@ struct HeadlessTab {
     /// Persisted; applied on (re)spawn by installing per-tab nftables rules
     /// (CIDRs) before the shell starts. Empty ⇒ not in allowlist mode.
     net_allow: crate::net_policy::AllowConfig,
+    /// Per-tab ssh-agent config (`Some` ⇒ the daemon owns a dedicated agent
+    /// for this tab). Persisted; applied on (re)spawn by injecting the agent's
+    /// `SSH_AUTH_SOCK` before the shell starts. `None` = inherit the ambient env.
+    ssh_agent: Option<crate::SshAgentConfig>,
     /// Per-tab gating DNS resolver, alive while a DOMAIN allowlist tab runs.
     /// Drop-guard (its `Drop` stops the resolver) + source of the
     /// DNS-entries view. `None` outside domain-allowlist mode.
@@ -442,7 +446,7 @@ fn spawn_pty_tab(
     name: String,
     cwd: Option<PathBuf>,
     colors_enabled: bool,
-    extra_env: HashMap<String, String>,
+    mut extra_env: HashMap<String, String>,
     prior_uptime_secs: f64,
     energy_wh: f64,
     saved_output_hash: u32,
@@ -460,7 +464,17 @@ fn spawn_pty_tab(
     pty_rows: usize,
     net_disabled: bool,
     net_allow: crate::net_policy::AllowConfig,
+    ssh_agent: Option<crate::SshAgentConfig>,
 ) -> Option<HeadlessTab> {
+    // Per-tab ssh-agent: `ensure` is idempotent, so a respawn reuses the same
+    // agent (keys stay loaded). `SSH_AUTH_SOCK` can only enter a process at
+    // spawn, so this is where it must be injected — into `extra_env`, which
+    // both the cleared-env and inherited-env branches below carry through.
+    if let Some(cfg) = &ssh_agent
+        && let Some(sock) = crate::ssh_agent::ensure(&id, cfg.key.as_deref())
+    {
+        extra_env.insert("SSH_AUTH_SOCK".into(), sock.to_string_lossy().into_owned());
+    }
     let ws = WindowSize {
         num_lines: pty_rows as u16,
         num_cols: pty_cols as u16,
@@ -719,6 +733,7 @@ fn spawn_pty_tab(
         bg_color,
         net_disabled,
         net_allow,
+        ssh_agent,
         #[cfg(target_os = "linux")]
         net_resolver,
         connections: 0,
@@ -890,6 +905,7 @@ pub fn run() -> std::io::Result<()> {
                 spawn_rows,
                 ts.net_disabled,
                 ts.allow_config(),
+                ts.ssh_agent.clone(),
             ) {
                 t.limits = ts.limits.clone();
                 t.pinned_cols = ts.pinned_cols;
@@ -939,6 +955,7 @@ pub fn run() -> std::io::Result<()> {
             pty_rows,
             false,
             default_net_allow.clone(),
+            None,
         ) {
             // Fresh default tab — no per-tab overrides, so just the
             // global default ceilings.
@@ -968,6 +985,7 @@ pub fn run() -> std::io::Result<()> {
         pending_lock_changes: Vec::new(),
         pending_net_changes: Vec::new(),
         pending_net_allow_changes: Vec::new(),
+        pending_ssh_agent_changes: Vec::new(),
         pending_bg_color_changes: Vec::new(),
         pending_context_changes: Vec::new(),
         pending_token_rotations: Vec::new(),
@@ -1591,6 +1609,7 @@ fn persist(
             schedule: tab.schedule.clone(),
             bg_color: tab.bg_color.clone(),
             limits: tab.limits.clone(),
+            ssh_agent: tab.ssh_agent.clone(),
             ..TabState::default()
         })
         .collect();
@@ -1792,6 +1811,10 @@ fn respawn_tab_net(
     let schedule = tabs[idx].schedule.clone();
     let bg = tabs[idx].bg_color.clone();
     let tab_env = tabs[idx].tab_env.clone();
+    // The ssh-agent drain sets `tabs[idx].ssh_agent` before calling us, so this
+    // picks up the new config; `ensure` is idempotent so an unrelated respawn
+    // (net toggle) reuses the same agent.
+    let ssh_agent = tabs[idx].ssh_agent.clone();
     tabs[idx].shutdown();
     if let Some(mut t) = spawn_pty_tab(
         id,
@@ -1816,6 +1839,7 @@ fn respawn_tab_net(
         pty_rows,
         net_disabled,
         net_allow,
+        ssh_agent,
     ) {
         #[cfg(target_os = "linux")]
         crate::cgroup::apply(&t.id, t.pid, default_limits);
@@ -1851,6 +1875,8 @@ fn drain_pending(
     let net_changes: Vec<(String, bool)> = s.pending_net_changes.drain(..).collect();
     let net_allow_changes: Vec<(String, crate::net_policy::AllowConfig)> =
         s.pending_net_allow_changes.drain(..).collect();
+    let ssh_agent_changes: Vec<(String, Option<crate::SshAgentConfig>)> =
+        s.pending_ssh_agent_changes.drain(..).collect();
     let bg_color_changes: Vec<(String, Option<String>)> = s.pending_bg_color_changes.drain(..).collect();
     let context_changes: Vec<(String, Option<String>)> = s.pending_context_changes.drain(..).collect();
     let token_rotations: Vec<String> = s.pending_token_rotations.drain(..).collect();
@@ -1876,6 +1902,7 @@ fn drain_pending(
         && lock_changes.is_empty()
         && net_changes.is_empty()
         && net_allow_changes.is_empty()
+        && ssh_agent_changes.is_empty()
         && bg_color_changes.is_empty()
         && context_changes.is_empty()
         && token_rotations.is_empty()
@@ -1941,6 +1968,34 @@ fn drain_pending(
                 *active,
                 disabled,
                 config,
+                api_url_for_pty,
+                api_token,
+                pty_cols,
+                pty_rows,
+                default_limits,
+            );
+        }
+    }
+    // Per-tab ssh-agent set/clear: update the durable field, then respawn so
+    // the new `SSH_AUTH_SOCK` (or its absence) reaches the shell. We reap the
+    // old agent first for BOTH enable and disable: on disable it would else
+    // leak until process exit; on (re-)enable it means an explicit key change
+    // (`ssh-agent <tab> --key B`) starts a fresh agent with B rather than
+    // silently reusing the old one — `ensure` is idempotent, so without this
+    // the new key would never load. (The net-toggle respawn path does NOT
+    // teardown, so manually-loaded keys survive an unrelated respawn.)
+    for (tab_id, config) in ssh_agent_changes {
+        if let Some(idx) = tabs.iter().position(|t| *t.id == tab_id) {
+            crate::ssh_agent::teardown(&tab_id);
+            tabs[idx].ssh_agent = config;
+            let disabled = tabs[idx].net_disabled;
+            let allow = tabs[idx].net_allow.clone();
+            respawn_tab_net(
+                tabs,
+                idx,
+                *active,
+                disabled,
+                allow,
                 api_url_for_pty,
                 api_token,
                 pty_cols,
@@ -2269,6 +2324,8 @@ fn drain_pending(
                 crate::cgroup::kill_tab(&tabs[idx].id);
                 crate::net_nft::teardown(&tabs[idx].id);
             }
+            // Reap the tab's dedicated ssh-agent, if any (no-op otherwise).
+            crate::ssh_agent::teardown(&tabs[idx].id);
             tabs.remove(idx);
             if *active >= tabs.len() {
                 *active = tabs.len() - 1;
@@ -2336,6 +2393,7 @@ fn drain_pending(
             pty_rows,
             false,
             default_net_allow.clone(),
+            None,
         ) {
             // API-created tab — global default ceilings (no per-tab
             // overrides exist until one is set).

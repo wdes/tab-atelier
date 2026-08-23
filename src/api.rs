@@ -522,6 +522,14 @@ pub struct TabSnapshot {
     /// returns 501 and never pushes here — hence unread in the `gui` build.
     #[cfg_attr(feature = "gui", allow(dead_code))]
     pub pending_net_allow_changes: Vec<(String, crate::net_policy::AllowConfig)>,
+    /// (`tab_id`, ssh-agent-config-or-None) queued by
+    /// `POST /tabs/by-id/{id}/ssh-agent`. Drained by the headless main loop,
+    /// which sets the config on the `HeadlessTab` and respawns the PTY so the
+    /// new `SSH_AUTH_SOCK` (or its absence) takes effect; `None` reaps the
+    /// agent. Headless-only — the GUI spawn path isn't wired, so its route
+    /// returns 501 and never pushes here (unread in the `gui` build).
+    #[cfg_attr(feature = "gui", allow(dead_code))]
+    pub pending_ssh_agent_changes: Vec<(String, Option<crate::SshAgentConfig>)>,
     /// (`tab_id`, color-or-None) queued by `POST /tabs/by-id/{id}/bg-color`.
     /// `None` clears the per-tab override → tab falls back to the
     /// global default. Same drain shape as `pending_lock_changes`.
@@ -3215,6 +3223,52 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 respond_json(stream, 200, &body);
             }
         }
+        ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/ssh-agent") => {
+            // Enable/disable a per-tab ssh-agent. Master token only (same
+            // gate as /net). Body: `{"enabled": true, "key": "/path/to/key"}`
+            // to enable (key optional, must be passphrase-less to auto-load);
+            // `{"enabled": false}` to disable and reap the agent. The shell
+            // respawns to apply, so it's not instantaneous.
+            //
+            // The agent lifecycle is owned by the headless daemon; the GUI
+            // spawn path isn't wired for it, so the GUI returns 501 and never
+            // drains `pending_ssh_agent_changes`.
+            #[cfg(feature = "gui")]
+            error_json(
+                stream,
+                501,
+                "per-tab ssh-agent requires the headless daemon; the desktop GUI does not manage per-tab agents",
+            );
+            #[cfg(not(feature = "gui"))]
+            {
+                let inner = &p["/tabs/by-id/".len()..p.len() - "/ssh-agent".len()];
+                let val: serde_json::Value = if body_bytes.is_empty() {
+                    serde_json::json!({})
+                } else {
+                    let Ok(v) = serde_json::from_slice(&body_bytes) else {
+                        error_json(stream, 400, "invalid JSON body");
+                        return;
+                    };
+                    v
+                };
+                // Default enabled=true when the body omits it, so a bare
+                // `ssh-agent <tab>` enables; explicit `false` disables.
+                let enabled = val.get("enabled").and_then(serde_json::Value::as_bool).unwrap_or(true);
+                let key = val.get("key").and_then(serde_json::Value::as_str).map(str::to_string);
+                let config = enabled.then_some(crate::SshAgentConfig { key });
+                let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let Some(idx) = state.tabs.iter().position(|t| &*t.id == inner) else {
+                    drop(state);
+                    error_json(stream, 404, "tab not found");
+                    return;
+                };
+                let tab_id = state.tabs[idx].id.to_string();
+                state.pending_ssh_agent_changes.push((tab_id, config));
+                drop(state);
+                let body = serde_json::to_string(&serde_json::json!({"ssh_agent": enabled})).unwrap_or_default();
+                respond_json(stream, 200, &body);
+            }
+        }
         ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/schedule") => {
             // Set or clear the off-hours auto-lock schedule. Master
             // token only — same gate as /lock and /bg-color (the
@@ -4309,6 +4363,7 @@ pub fn test_snapshot(tabs: Vec<SnapshotTab>) -> TabSnapshot {
         pending_lock_changes: vec![],
         pending_net_changes: vec![],
         pending_net_allow_changes: vec![],
+        pending_ssh_agent_changes: vec![],
         pending_bg_color_changes: vec![],
         pending_context_changes: vec![],
         pending_token_rotations: vec![],
@@ -5459,6 +5514,94 @@ mod tests {
             queued.is_empty(),
             "GUI must not queue an allowlist change it can't apply"
         );
+    }
+
+    // ssh-agent is a headless-daemon feature (the GUI spawn path isn't wired).
+    #[cfg(not(feature = "gui"))]
+    #[test]
+    fn ssh_agent_endpoint_enable_returns_state_and_queues() {
+        let (port, state, token) = spawn_server();
+        let body_in = r#"{"enabled":true,"key":"/var/lib/tab-atelier/id_ed25519"}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/tab-a/ssh-agent HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body_in}",
+                body_in.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 200);
+        assert!(body(&resp).contains("\"ssh_agent\":true"), "body: {}", body(&resp));
+        let queued = {
+            let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            s.pending_ssh_agent_changes.clone()
+        };
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].0, "tab-a");
+        assert_eq!(
+            queued[0].1.as_ref().and_then(|c| c.key.as_deref()),
+            Some("/var/lib/tab-atelier/id_ed25519")
+        );
+    }
+
+    // Disabling queues a `None` config — the drain reaps the agent and respawns.
+    #[cfg(not(feature = "gui"))]
+    #[test]
+    fn ssh_agent_endpoint_disable_queues_none() {
+        let (port, state, token) = spawn_server();
+        let body_in = r#"{"enabled":false}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/tab-a/ssh-agent HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body_in}",
+                body_in.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 200);
+        assert!(body(&resp).contains("\"ssh_agent\":false"), "body: {}", body(&resp));
+        let queued = {
+            let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            s.pending_ssh_agent_changes.clone()
+        };
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].0, "tab-a");
+        assert!(queued[0].1.is_none(), "disable must queue None (reap)");
+    }
+
+    #[cfg(not(feature = "gui"))]
+    #[test]
+    fn ssh_agent_endpoint_unknown_tab_404() {
+        let (port, _state, token) = spawn_server();
+        let body_in = r#"{"enabled":true}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/does-not-exist/ssh-agent HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body_in}",
+                body_in.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 404);
+    }
+
+    // The GUI edition can't manage per-tab agents, so it refuses with 501 and
+    // queues nothing rather than faking success.
+    #[cfg(feature = "gui")]
+    #[test]
+    fn ssh_agent_endpoint_refused_on_gui() {
+        let (port, state, token) = spawn_server();
+        let body_in = r#"{"enabled":true}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/tab-a/ssh-agent HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body_in}",
+                body_in.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 501, "GUI must refuse ssh-agent, not fake success");
+        let queued = {
+            let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            s.pending_ssh_agent_changes.clone()
+        };
+        assert!(queued.is_empty(), "GUI must not queue a change it can't apply");
     }
 
     #[test]
