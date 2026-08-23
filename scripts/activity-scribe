@@ -1,0 +1,170 @@
+#!/usr/bin/env node
+// activity-scribe — deterministic aggregator for the "Dernières heures" dashboard
+// panel (docs/dashboard-increment-5.md, S3). Reads recent agent transcripts +
+// orchestrator-repo commits + the aligator swamp log, and writes a single
+// `$ACTIVITY_STATE_DIR/activity.json` that the Rust route /dashboard/activity (S2)
+// serves and the panel (S4) renders. Pure aggregation, no network, no writes
+// outside ACTIVITY_STATE_DIR. Self-check: scripts/activity-scribe.test.mjs.
+//
+// Env contract (all overridable so it stays testable AND the feature whitelist
+// stays DYNAMIC — never a hardcoded repo list):
+//   ACTIVITY_PROJECTS_DIR  dir of *.jsonl transcripts (walked recursively)
+//   ACTIVITY_STATE_DIR     holds swamp.jsonl (if any) + where activity.json lands
+//   ACTIVITY_ORCH_REPOS    comma-separated repo PATHS = the orchestrator whitelist
+//                          (prod: live tabs role=orchestrator -> their cwd)
+//   ACTIVITY_NOW           ISO-8601 "now" override (deterministic durations)
+//   ACTIVITY_WINDOW_HOURS  aggregation window in hours (default 24)
+
+"use strict";
+const fs = require("node:fs");
+const path = require("node:path");
+const { execFileSync } = require("node:child_process");
+
+const env = process.env;
+const projectsDir = env.ACTIVITY_PROJECTS_DIR || "";
+const stateDir = env.ACTIVITY_STATE_DIR || "";
+const orchRepos = (env.ACTIVITY_ORCH_REPOS || "")
+  .split(",").map((s) => s.trim()).filter(Boolean);
+const windowHours = Number(env.ACTIVITY_WINDOW_HOURS || 24);
+const now = env.ACTIVITY_NOW ? new Date(env.ACTIVITY_NOW) : new Date();
+const nowMs = now.getTime();
+const windowStartMs = nowMs - windowHours * 3600 * 1000;
+const inWindow = (ms) => ms >= windowStartMs && ms <= nowMs;
+const dayOf = (ms) => new Date(ms).toISOString().slice(0, 10); // UTC calendar day
+
+// --- 1. transcripts: tokens + human prompts --------------------------------
+function walkJsonl(dir, out) {
+  let entries;
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
+  catch { return; }
+  for (const e of entries) {
+    const p = path.join(dir, e.name);
+    if (e.isDirectory()) walkJsonl(p, out);
+    else if (e.isFile() && e.name.endsWith(".jsonl")) out.push(p);
+  }
+}
+
+const tokens = { input: 0, output: 0, cache_creation: 0, cache_read: 0 };
+const humanPromptMs = []; // ms timestamps of typed human prompts, in window
+
+const files = [];
+if (projectsDir) walkJsonl(projectsDir, files);
+files.sort();
+for (const file of files) {
+  const lines = fs.readFileSync(file, "utf8").split("\n");
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    let rec;
+    try { rec = JSON.parse(line); } catch { continue; }
+    const ms = rec.timestamp ? Date.parse(rec.timestamp) : NaN;
+    if (Number.isNaN(ms) || !inWindow(ms)) continue;
+    if (rec.type === "assistant") {
+      const u = (rec.message && rec.message.usage) || {};
+      tokens.input += u.input_tokens || 0;
+      tokens.output += u.output_tokens || 0;
+      tokens.cache_creation += u.cache_creation_input_tokens || 0;
+      tokens.cache_read += u.cache_read_input_tokens || 0;
+    } else if (rec.type === "user") {
+      // human prompt = typed AND a plain-string content (excludes tool_result
+      // list echoes and non-typed hook injections).
+      const content = rec.message && rec.message.content;
+      if (rec.promptSource === "typed" && typeof content === "string") {
+        humanPromptMs.push(ms);
+      }
+    }
+  }
+}
+
+// --- 2. features: `feat(` commits in-window from the orchestrator whitelist --
+const featMsByDay = {}; // day -> count
+let featuresImplemented = 0;
+for (const repo of orchRepos) {
+  let raw;
+  try {
+    raw = execFileSync(
+      "git", ["-C", repo, "log", "--no-merges", "--pretty=format:%aI\x1f%s"],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }
+    );
+  } catch { continue; } // not a repo / no commits -> contributes nothing
+  for (const line of raw.split("\n")) {
+    if (!line) continue;
+    const sep = line.indexOf("\x1f");
+    if (sep < 0) continue;
+    const ms = Date.parse(line.slice(0, sep));
+    const subject = line.slice(sep + 1);
+    if (Number.isNaN(ms) || !inWindow(ms)) continue;
+    if (!subject.startsWith("feat(")) continue;
+    featuresImplemented++;
+    const d = dayOf(ms);
+    featMsByDay[d] = (featMsByDay[d] || 0) + 1;
+  }
+}
+
+// --- 3. aligator: swamp.jsonl line count (absent -> 0) ----------------------
+let aligatorCalls = 0;
+if (stateDir) {
+  try {
+    const swamp = fs.readFileSync(path.join(stateDir, "swamp.jsonl"), "utf8");
+    aligatorCalls = swamp.split("\n").filter((l) => l.trim()).length;
+  } catch { aligatorCalls = 0; }
+}
+
+// --- 4. derived totals ------------------------------------------------------
+const humanPrompts = humanPromptMs.length;
+const lastHumanMs = humanPrompts ? Math.max(...humanPromptMs) : null;
+const minutesSinceLastHumanPrompt =
+  lastHumanMs === null ? null : Math.round((nowMs - lastHumanMs) / 60000);
+const tokensPerFeature = featuresImplemented
+  ? Math.round((tokens.input + tokens.output) / featuresImplemented)
+  : 0;
+
+// --- 5. per-day: autonomy (longest inter-prompt gap) + features -------------
+const promptsByDay = {}; // day -> [ms,...]
+for (const ms of humanPromptMs) {
+  const d = dayOf(ms);
+  (promptsByDay[d] || (promptsByDay[d] = [])).push(ms);
+}
+const days = new Set([...Object.keys(promptsByDay), ...Object.keys(featMsByDay)]);
+const perDay = [...days].sort().map((date) => {
+  const times = (promptsByDay[date] || []).slice().sort((a, b) => a - b);
+  let autonomy = 0;
+  for (let i = 1; i < times.length; i++) {
+    autonomy = Math.max(autonomy, Math.round((times[i] - times[i - 1]) / 60000));
+  }
+  return {
+    date,
+    autonomy_minutes_max: autonomy,
+    features: featMsByDay[date] || 0,
+  };
+});
+
+// --- 6. human-readable summary + PO benchmark -------------------------------
+const summaryLines = [
+  `${featuresImplemented} feature(s) livrée(s) sur ${windowHours}h`,
+  `${tokensPerFeature} tokens / feature (entrée+sortie)`,
+  `${humanPrompts} prompt(s) humain(s) — dernier il y a ${minutesSinceLastHumanPrompt ?? "?"} min`,
+  `aligator: ${aligatorCalls} relance(s) autonome(s)`,
+];
+
+const activity = {
+  generated_at: now.toISOString(),
+  window_hours: windowHours,
+  totals: {
+    tokens_total: tokens,
+    human_prompts: humanPrompts,
+    minutes_since_last_human_prompt: minutesSinceLastHumanPrompt,
+    features_implemented: featuresImplemented,
+    tokens_per_feature: tokensPerFeature,
+    aligator_calls: aligatorCalls,
+  },
+  per_day: perDay,
+  // PO benchmark to display alongside the panel: a full /go-build run ≈ 6h.
+  record: "go-build ~6h",
+  summary_lines: summaryLines,
+};
+
+fs.mkdirSync(stateDir, { recursive: true });
+fs.writeFileSync(
+  path.join(stateDir, "activity.json"),
+  JSON.stringify(activity, null, 2) + "\n"
+);
