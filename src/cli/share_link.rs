@@ -119,11 +119,13 @@ fn http_port(ep: &Endpoint) -> u16 {
 pub fn run(args: &[String]) -> i32 {
     let mut key: Option<String> = None;
     let mut ro = false;
+    let mut dashboard = false;
     for a in args {
         match a.as_str() {
             "--ro" | "-r" => ro = true,
+            "--dashboard" => dashboard = true,
             "--help" | "-h" => {
-                eprintln!("usage: tab-atelier-headless share-link <tab-index-or-uuid> [--ro]");
+                eprintln!("usage: tab-atelier-headless share-link <tab-index-or-uuid> [--ro] | --dashboard");
                 return 0;
             }
             _ if key.is_none() => key = Some(a.clone()),
@@ -133,16 +135,49 @@ pub fn run(args: &[String]) -> i32 {
             }
         }
     }
-    let Some(key) = key else {
-        eprintln!("usage: tab-atelier-headless share-link <tab-index-or-uuid> [--ro]");
-        return 2;
-    };
     let ep = match discover_endpoint() {
         Ok(e) => e,
         Err(e) => {
             eprintln!("share-link: {e}");
             return 1;
         }
+    };
+    let ip = crate::api::local_ip();
+    let port = http_port(&ep);
+    // The dashboard is global + read-only: one share URL, no tab and no `--ro`
+    // variant. Ask the daemon for its (lazily-minted) global dashboard token —
+    // scoped to `/dashboard` only, unlike the per-tab link's master token.
+    if dashboard {
+        if key.is_some() || ro {
+            eprintln!("share-link --dashboard: takes no tab and no --ro (the dashboard is global + read-only)");
+            return 2;
+        }
+        let token = match agent()
+            .get(format!("{}/dashboard/share-token", ep.url))
+            .header("Authorization", format!("Bearer {}", ep.token))
+            .call()
+        {
+            Ok(mut r) => r
+                .body_mut()
+                .read_json::<serde_json::Value>()
+                .ok()
+                .and_then(|v| v.get("token").and_then(|t| t.as_str().map(str::to_string))),
+            Err(e) => {
+                eprintln!("share-link --dashboard: {e}");
+                return 1;
+            }
+        };
+        let Some(token) = token.filter(|t| !t.is_empty()) else {
+            eprintln!("share-link --dashboard: daemon returned no token");
+            return 1;
+        };
+        println!("http://{ip}:{port}/dashboard?token={token}");
+        eprintln!("(read-only dashboard share token — revoke with `rotate-tokens`)");
+        return 0;
+    }
+    let Some(key) = key else {
+        eprintln!("usage: tab-atelier-headless share-link <tab-index-or-uuid> [--ro] | --dashboard");
+        return 2;
     };
     let (_, uuid) = match resolve(&ep, &key) {
         Ok(p) => p,
@@ -151,8 +186,6 @@ pub fn run(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let ip = crate::api::local_ip();
-    let port = http_port(&ep);
     let suffix = if ro { "&ro=1" } else { "" };
     println!("http://{ip}:{port}/tabs/by-id/{uuid}/view?token={}{suffix}", ep.token);
     eprintln!("(uses master token — full API access for the recipient until rotated)");
