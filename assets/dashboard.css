@@ -44,6 +44,10 @@ body {
 
 #dashboard { padding: 1rem; }
 #flow { width: 100%; height: auto; max-height: 40vh; }
+/* The UA `[hidden]{display:none}` rule doesn't reliably win over an SVG's
+   default `display:inline`, so hide #flow explicitly at level 0 (see the
+   toggleAttribute("hidden") in dashboard.js — SVGElement has no `hidden` prop). */
+#flow[hidden] { display: none; }
 
 .back-btn {
   margin-bottom: 0.8rem;
