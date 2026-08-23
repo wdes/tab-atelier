@@ -400,3 +400,69 @@ body {
   border-radius: 6px;
   color: var(--muted);
 }
+
+/* --- Inc6 S2/S4: org-chart (méta top / service -> team -> lead+workers) --- */
+.meta-top {
+  border: 1px dashed var(--orchestrator-accent);
+  border-radius: 8px;
+  padding: 0.5rem 0.6rem;
+  margin-bottom: 1rem;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+}
+.meta-top-label { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); margin-right: 0.3rem; }
+.meta-top-tab {
+  font-size: 0.78rem; font-weight: 600;
+  padding: 0.2rem 0.5rem;
+  border: 1px solid var(--border); border-radius: 6px;
+  background: var(--panel);
+}
+.service {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.6rem;
+  margin-bottom: 1rem;
+}
+.service-name { font-weight: 600; margin-bottom: 0.5rem; }
+.service-family { border-left: 3px solid var(--led-working-stroke); }
+.service-mono { border-style: dashed; }
+.service .team { display: inline-block; vertical-align: top; margin: 0 0.5rem 0.5rem 0; }
+.team {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.5rem;
+  min-width: 180px;
+}
+.team-name { font-weight: 600; font-size: 0.85rem; margin-bottom: 0.35rem; }
+.team-lead {
+  font-size: 0.8rem; font-weight: 600;
+  padding: 0.2rem 0.4rem;
+  border-radius: 6px;
+  box-shadow: inset 0.2rem 0 0 var(--orchestrator-accent);
+  background: var(--panel);
+}
+.team-lead-none { color: var(--muted); font-weight: 400; box-shadow: none; }
+/* Workers hang BELOW the lead, as a small tree. */
+.team-members {
+  margin-top: 0.3rem;
+  padding-left: 0.6rem;
+  border-left: 2px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+.worker { font-size: 0.78rem; color: var(--fg); }
+/* A serving méta joined the team — shown available-but-on-loan (indispo). */
+.serving { font-size: 0.78rem; color: var(--muted); font-style: italic; }
+.serving-badge {
+  font-size: 0.62rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  padding: 0.02rem 0.3rem;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--orchestrator-accent) 20%, transparent);
+  color: var(--orchestrator-accent);
+  font-style: normal;
+}

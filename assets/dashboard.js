@@ -241,6 +241,31 @@ export function overviewLayout(state) {
   return { order: ["META", "REPOS", "UNASSIGNED"], meta, repos, unassigned };
 }
 
+// Pure: the org-chart (Inc6 S2). A solo méta (serving null) stays on top; each
+// repo is a team whose LEAD is its orchestrator, with workers hanging under the
+// lead (parentTabId) and any méta `serving` this repo JOINING the team (indispo).
+// Never throws.
+export function orgLayout(state) {
+  const s = state || {};
+  const projects = Array.isArray(s.projects) ? s.projects : [];
+  const metaProjects = projects.filter((p) => p && p.isMeta);
+  const repos = projects.filter((p) => p && !p.isMeta);
+  const allTabs = [];
+  for (const p of projects) for (const t of projectTabs(p)) allTabs.push(t);
+  // Solo méta (not serving anyone) floats on top.
+  const metaTop = [];
+  for (const p of metaProjects) for (const t of projectTabs(p)) if (t && !t.serving) metaTop.push(t);
+  const teams = repos.map((p) => {
+    const tabs = projectTabs(p);
+    const lead = tabs.find((t) => t && isOrchestrator(t.role)) || null;
+    const workers = lead ? tabs.filter((t) => t && t.parentTabId === lead.id) : [];
+    // A serving méta from ANYWHERE joins the team of the repo it serves.
+    const serving = allTabs.filter((t) => t && t.serving === p.name);
+    return { repo: p.name, lead, workers, serving };
+  });
+  return { metaTop, teams };
+}
+
 // --- Slice C: predecessor -> successor re-home link (drill-in) ---
 // A re-homed tab (predecessor) carries a rehomeStatus through its bidirectional
 // proof loop; the successor's parentTabId points back at the predecessor
@@ -426,6 +451,68 @@ function unassignedTabHtml(tab) {
   return `<div class="unassigned-tab" data-viewer="${escapeHtml(t.viewerUrl || "")}">${escapeHtml(t.name || "tab")}</div>`;
 }
 
+// --- Inc6 S2/S4: org-chart (méta on top / team lead + workers / serving joins) ---
+
+// Service grouping for the org-chart. S2 renders teams flat; S4 wires this to the
+// exported serviceLayout so a family service wraps its sub-repo teams.
+function serviceGrouping(state) {
+  return typeof serviceLayout === "function" ? serviceLayout(state) : [];
+}
+
+function metaTopHtml(tab) {
+  const t = tab || {};
+  return `<div class="meta-top-tab" data-viewer="${escapeHtml(t.viewerUrl || "")}">${escapeHtml(t.name || "méta")}</div>`;
+}
+
+function teamMemberHtml(tab, cls) {
+  const t = tab || {};
+  return `<div class="${cls}" data-viewer="${escapeHtml(t.viewerUrl || "")}">${escapeHtml(t.name || "tab")}</div>`;
+}
+
+// One team = a repo's org sub-tree: orchestrator lead, workers below, and any
+// méta serving this repo joined in (marked indispo).
+function teamHtml(team) {
+  const t = team || { repo: "", lead: null, workers: [], serving: [] };
+  const lead = t.lead ? teamMemberHtml(t.lead, "team-lead") : `<div class="team-lead team-lead-none">${escapeHtml(t.repo)}</div>`;
+  const workers = (t.workers || []).map((w) => teamMemberHtml(w, "worker")).join("");
+  const serving = (t.serving || [])
+    .map((sv) => `<div class="serving" data-viewer="${escapeHtml((sv && sv.viewerUrl) || "")}" title="serving ${escapeHtml(t.repo)} — indispo">${escapeHtml((sv && sv.name) || "méta")} <span class="serving-badge">indispo</span></div>`)
+    .join("");
+  return `<div class="team project-card" data-repo="${escapeHtml(t.repo)}" data-project="${escapeHtml(t.repo)}"><div class="team-name">${escapeHtml(t.repo)}</div>${lead}<div class="team-members">${workers}${serving}</div></div>`;
+}
+
+// The Inc6 org-chart view, used when the server exposes the service dimension.
+function renderOrgChart() {
+  const grid = document.getElementById("project-grid");
+  if (!grid) return;
+  const org = orgLayout(currentState);
+  const teamByRepo = new Map(org.teams.map((t) => [t.repo, t]));
+  const parts = [];
+  if (org.metaTop.length) {
+    parts.push(`<div class="meta-top"><div class="meta-top-label">méta</div>${org.metaTop.map(metaTopHtml).join("")}</div>`);
+  }
+  const services = serviceGrouping(currentState);
+  if (services.length) {
+    // S4: group teams under their service (family wrapper; mono not over-nested).
+    for (const svc of services) {
+      const teams = svc.repos
+        .map((r) => teamHtml(teamByRepo.get(r.name) || { repo: r.name, lead: null, workers: [], serving: [] }))
+        .join("");
+      parts.push(`<div class="service ${svc.mono ? "service-mono" : "service-family"}" data-service="${escapeHtml(svc.service)}"${svc.mono ? ' data-mono="true"' : ""}><div class="service-name">${escapeHtml(svc.service)}</div>${teams}</div>`);
+    }
+  } else {
+    // No service grouping yet -> flat teams.
+    for (const t of org.teams) parts.push(teamHtml(t));
+  }
+  grid.innerHTML = parts.join("");
+  const layer = document.getElementById("lineage-layer");
+  if (layer) layer.innerHTML = "";
+  currentNodes = new Map();
+  currentUnmapped = [];
+  renderRehome([]);
+  renderUnmapped();
+}
+
 // Level-0 overview (S6 reorg): META band on top, repos in the middle grouped by
 // altitude (orchestrators / workers — server order within a band, stable across
 // reloads), UNASSIGNED band at the bottom. Empty META/UNASSIGNED bands are
@@ -433,6 +520,11 @@ function unassignedTabHtml(tab) {
 function renderGrid() {
   const grid = document.getElementById("project-grid");
   if (!grid) return;
+  // Inc6: when the server exposes the service dimension, show the org-chart.
+  if (Array.isArray(currentState && currentState.services) && currentState.services.length) {
+    renderOrgChart();
+    return;
+  }
   const layout = overviewLayout(currentState);
   const parts = [];
   if (layout.meta.length) {
