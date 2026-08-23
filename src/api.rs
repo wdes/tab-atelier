@@ -354,6 +354,19 @@ struct DashboardNode {
     tabs: Vec<DashboardTab>,
 }
 
+/// An orchestrator working in a project (S5): named, with its current `item`
+/// (the volatile context) and a GLOBAL `child_count` — the number of tabs whose
+/// `parent_tab_id` is this orchestrator, wherever they live. Feeds the "name the
+/// orchestrators under their repo + multi-orch tree" view.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct OrchestratorRef {
+    id: String,
+    name: String,
+    item: String,
+    child_count: usize,
+}
+
 /// A project bucket (level 0): the 7-phase subtree scoped to one project, plus
 /// its rollup. `méta` and `divers` are the two shared lanes.
 #[derive(Serialize)]
@@ -364,6 +377,8 @@ struct DashboardProject {
     rollup_led: Option<&'static str>,
     has_orchestrator: bool,
     is_meta: bool,
+    /// The orchestrators working in this repo, sorted by id (S5).
+    orchestrators: Vec<OrchestratorRef>,
     nodes: Vec<DashboardNode>,
     unmapped: Vec<DashboardTab>,
 }
@@ -386,6 +401,9 @@ struct DashboardState {
     /// Delegation lineage (S6): `parent_tab_id` edges whose parent is a known
     /// tab. A tab with no/unknown parent is a root (no edge). Self-edges dropped.
     lineage: Vec<LineageEdge>,
+    /// Tabs with NO `assignment` at all (S5, #90) — legitimately un-placed,
+    /// sorted by id. Distinct from `unmapped` (assigned but an unknown phase).
+    unassigned: Vec<DashboardTab>,
 }
 
 /// Build the delegation lineage from `(child_id, parent_id)` pairs. An edge is
@@ -454,31 +472,62 @@ fn parse_assignment(a: &str) -> (Option<String>, String, String) {
     (over.filter(|p| !p.is_empty()), phase, role)
 }
 
-/// The re-home lifecycle states on a predecessor tab, in progress order (used to
-/// validate `POST …/rehome`). The last, `safe-to-close`, is posted by the old
-/// agent itself on its ACK and gates the "close the predecessor" action.
-pub const REHOME_STATES: [&str; 4] = ["handoff-written", "successor-ready", "ack-sent", "safe-to-close"];
-
-/// True once a re-home's bidirectional proof is complete and the human may close
-/// the predecessor. The GUI's "close the predecessor" action enables only here;
-/// it never auto-closes — the human gate stays.
-#[must_use]
-pub fn rehome_safe_to_close(status: Option<&str>) -> bool {
-    status == Some("safe-to-close")
+/// One re-home lifecycle step: the wire slug + its French progress-badge label.
+pub struct RehomeStep {
+    pub slug: &'static str,
+    pub label: &'static str,
 }
 
-/// A re-home status → its progress-badge label + whether it's the final
-/// safe-to-close state (which the GUI paints green / uses to enable closing).
+/// THE single source of truth for the 4 re-home states, in progress order
+/// (audit Q3). Validation (`POST …/rehome`), the safe-to-close gate, and the
+/// badge all derive from this — adding a 5th state means editing only here. The
+/// last step is the terminal `safe-to-close`, posted by the old agent on its
+/// ACK, which gates the "close the predecessor" action. (`set_rehome.rs`'s
+/// `--help` / 400 text is kept in sync by `rehome_help_lists_every_state`.)
+pub const REHOME_STEPS: [RehomeStep; 4] = [
+    RehomeStep {
+        slug: "handoff-written",
+        label: "handoff écrit",
+    },
+    RehomeStep {
+        slug: "successor-ready",
+        label: "successeur prêt",
+    },
+    RehomeStep {
+        slug: "ack-sent",
+        label: "ACK envoyé",
+    },
+    RehomeStep {
+        slug: "safe-to-close",
+        label: "SAFE À FERMER",
+    },
+];
+
+/// Is `s` one of the canonical re-home states? Used to validate `POST …/rehome`.
+#[must_use]
+pub fn is_rehome_state(s: &str) -> bool {
+    REHOME_STEPS.iter().any(|st| st.slug == s)
+}
+
+/// True once a re-home's bidirectional proof is complete and the human may close
+/// the predecessor — i.e. the status is the terminal step. The GUI's "close the
+/// predecessor" action enables only here; it never auto-closes.
+#[must_use]
+pub fn rehome_safe_to_close(status: Option<&str>) -> bool {
+    status == REHOME_STEPS.last().map(|st| st.slug)
+}
+
+/// A re-home status → its progress-badge label + whether it's the terminal
+/// (safe-to-close) step, which the GUI paints green / uses to enable closing.
 /// `None` for a tab that isn't rehoming. Pure, so the mapping is unit-testable.
 #[must_use]
 pub fn rehome_badge(status: Option<&str>) -> Option<(&'static str, bool)> {
-    match status {
-        Some("handoff-written") => Some(("handoff écrit", false)),
-        Some("successor-ready") => Some(("successeur prêt", false)),
-        Some("ack-sent") => Some(("ACK envoyé", false)),
-        Some("safe-to-close") => Some(("SAFE À FERMER", true)),
-        _ => None,
-    }
+    let last = REHOME_STEPS.len() - 1;
+    REHOME_STEPS
+        .iter()
+        .enumerate()
+        .find(|(_, st)| Some(st.slug) == status)
+        .map(|(i, st)| (st.label, i == last))
 }
 
 /// Static altitude band from an agent role: 0 = tichef (top), 1 = orchestrator,
@@ -531,6 +580,20 @@ pub fn project_of(cwd: Option<&str>, assignment: Option<&str>) -> String {
         META_LANE.to_string()
     } else {
         DIVERS_LANE.to_string()
+    }
+}
+
+/// Thin passthrough of the activity scribe's `activity.json` (under the state
+/// dir). Returns the file VERBATIM when present + parseable; degrades to a
+/// graceful empty JSON object `{}` when absent or malformed — the panel reads
+/// valid JSON either way, never a 404/500. `base` is the state-base dir, so it's
+/// testable on a tempdir without touching XDG. `GET /dashboard/activity` wraps it.
+#[must_use]
+pub fn read_activity_json(base: &std::path::Path) -> String {
+    let path = crate::state_dir(base).join("activity.json");
+    match std::fs::read_to_string(&path) {
+        Ok(s) if serde_json::from_str::<serde_json::Value>(&s).is_ok() => s,
+        _ => "{}".to_string(),
     }
 }
 
@@ -601,6 +664,24 @@ fn build_dashboard_state(inputs: Vec<DashboardTabInput>) -> DashboardState {
     // Global diagram (Increment 1 contract).
     let (nodes, unmapped) = group_into_nodes(projected.iter().map(|p| (p.phase.clone(), p.tab.clone())));
 
+    // GLOBAL child count per tab id (how many tabs it spawned, anywhere) — for
+    // each orchestrator's `child_count`. Counts every `parent_tab_id` occurrence,
+    // cross-repo included.
+    let mut child_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for p in &projected {
+        if let Some(parent) = &p.tab.parent_tab_id {
+            *child_counts.entry(parent.clone()).or_default() += 1;
+        }
+    }
+
+    // Top-level `unassigned` (S5): tabs with no assignment at all, sorted by id.
+    let mut unassigned: Vec<DashboardTab> = projected
+        .iter()
+        .filter(|p| p.tab.assignment.is_none())
+        .map(|p| p.tab.clone())
+        .collect();
+    unassigned.sort_by(|a, b| a.id.cmp(&b.id));
+
     // Distinct projects, sorted alpha with méta/divers pinned last.
     let mut names: Vec<String> = projected.iter().map(|p| p.project.clone()).collect();
     names.sort();
@@ -622,6 +703,18 @@ fn build_dashboard_state(inputs: Vec<DashboardTabInput>) -> DashboardState {
                 .iter()
                 .filter_map(|p| p.tab.led)
                 .max_by_key(|led| led_severity(led));
+            // Orchestrators in this repo, named + with their GLOBAL child_count.
+            let mut orchestrators: Vec<OrchestratorRef> = mine
+                .iter()
+                .filter(|p| p.tab.role == "orchestrator")
+                .map(|p| OrchestratorRef {
+                    id: p.tab.id.clone(),
+                    name: p.tab.name.clone(),
+                    item: p.tab.item.clone(),
+                    child_count: child_counts.get(&p.tab.id).copied().unwrap_or(0),
+                })
+                .collect();
+            orchestrators.sort_by(|a, b| a.id.cmp(&b.id));
             let (nodes, unmapped) = group_into_nodes(mine.iter().map(|p| (p.phase.clone(), p.tab.clone())));
             let is_meta = name == META_LANE;
             DashboardProject {
@@ -630,6 +723,7 @@ fn build_dashboard_state(inputs: Vec<DashboardTabInput>) -> DashboardState {
                 rollup_led,
                 has_orchestrator,
                 is_meta,
+                orchestrators,
                 nodes,
                 unmapped,
             }
@@ -648,6 +742,7 @@ fn build_dashboard_state(inputs: Vec<DashboardTabInput>) -> DashboardState {
         unmapped,
         projects,
         lineage,
+        unassigned,
     }
 }
 
@@ -911,6 +1006,14 @@ pub struct TabSnapshot {
     /// returns 501 and never pushes here — hence unread in the `gui` build.
     #[cfg_attr(feature = "gui", allow(dead_code))]
     pub pending_net_allow_changes: Vec<(String, crate::net_policy::AllowConfig)>,
+    /// (`tab_id`, ssh-agent-config-or-None) queued by
+    /// `POST /tabs/by-id/{id}/ssh-agent`. Drained by the headless main loop,
+    /// which sets the config on the `HeadlessTab` and respawns the PTY so the
+    /// new `SSH_AUTH_SOCK` (or its absence) takes effect; `None` reaps the
+    /// agent. Headless-only — the GUI spawn path isn't wired, so its route
+    /// returns 501 and never pushes here (unread in the `gui` build).
+    #[cfg_attr(feature = "gui", allow(dead_code))]
+    pub pending_ssh_agent_changes: Vec<(String, Option<crate::SshAgentConfig>)>,
     /// (`tab_id`, color-or-None) queued by `POST /tabs/by-id/{id}/bg-color`.
     /// `None` clears the per-tab override → tab falls back to the
     /// global default. Same drain shape as `pending_lock_changes`.
@@ -2112,7 +2215,8 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
         }
         ok
     };
-    let is_dashboard_token = dashboard_matches && matches!(path.as_str(), "/dashboard" | "/dashboard/state");
+    let is_dashboard_token =
+        dashboard_matches && matches!(path.as_str(), "/dashboard" | "/dashboard/state" | "/dashboard/activity");
     if !is_master && !is_dashboard_token {
         let allowed = if let Some(p) = provided_token.as_deref()
             && let Some(rest) = path.strip_prefix("/tabs/by-id/")
@@ -2384,6 +2488,13 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             let token = snap.dashboard_share_token.to_string();
             drop(snap);
             respond_json(stream, 200, &format!(r#"{{"token":"{token}"}}"#));
+        }
+        // Thin passthrough of the activity scribe's `activity.json` — verbatim
+        // when present, gracefully empty (`{}`) when absent/malformed, never
+        // 404/500. Same auth as `/dashboard/state` (master or dashboard token).
+        ("GET", "/dashboard/activity") => {
+            let body = read_activity_json(&crate::platform::state_base_dir());
+            respond_json(stream, 200, &body);
         }
         ("GET", "/dashboard/state") => {
             let state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3735,6 +3846,52 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 respond_json(stream, 200, &body);
             }
         }
+        ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/ssh-agent") => {
+            // Enable/disable a per-tab ssh-agent. Master token only (same
+            // gate as /net). Body: `{"enabled": true, "key": "/path/to/key"}`
+            // to enable (key optional, must be passphrase-less to auto-load);
+            // `{"enabled": false}` to disable and reap the agent. The shell
+            // respawns to apply, so it's not instantaneous.
+            //
+            // The agent lifecycle is owned by the headless daemon; the GUI
+            // spawn path isn't wired for it, so the GUI returns 501 and never
+            // drains `pending_ssh_agent_changes`.
+            #[cfg(feature = "gui")]
+            error_json(
+                stream,
+                501,
+                "per-tab ssh-agent requires the headless daemon; the desktop GUI does not manage per-tab agents",
+            );
+            #[cfg(not(feature = "gui"))]
+            {
+                let inner = &p["/tabs/by-id/".len()..p.len() - "/ssh-agent".len()];
+                let val: serde_json::Value = if body_bytes.is_empty() {
+                    serde_json::json!({})
+                } else {
+                    let Ok(v) = serde_json::from_slice(&body_bytes) else {
+                        error_json(stream, 400, "invalid JSON body");
+                        return;
+                    };
+                    v
+                };
+                // Default enabled=true when the body omits it, so a bare
+                // `ssh-agent <tab>` enables; explicit `false` disables.
+                let enabled = val.get("enabled").and_then(serde_json::Value::as_bool).unwrap_or(true);
+                let key = val.get("key").and_then(serde_json::Value::as_str).map(str::to_string);
+                let config = enabled.then_some(crate::SshAgentConfig { key });
+                let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let Some(idx) = state.tabs.iter().position(|t| &*t.id == inner) else {
+                    drop(state);
+                    error_json(stream, 404, "tab not found");
+                    return;
+                };
+                let tab_id = state.tabs[idx].id.to_string();
+                state.pending_ssh_agent_changes.push((tab_id, config));
+                drop(state);
+                let body = serde_json::to_string(&serde_json::json!({"ssh_agent": enabled})).unwrap_or_default();
+                respond_json(stream, 200, &body);
+            }
+        }
         ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/schedule") => {
             // Set or clear the off-hours auto-lock schedule. Master
             // token only — same gate as /lock and /bg-color (the
@@ -4039,7 +4196,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             };
             let rehome_opt = rehome_opt.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
             if let Some(s) = &rehome_opt
-                && !REHOME_STATES.contains(&s.as_str())
+                && !is_rehome_state(s)
             {
                 error_json(stream, 400, "invalid rehome_status");
                 return;
@@ -4959,6 +5116,7 @@ pub fn test_snapshot(tabs: Vec<SnapshotTab>) -> TabSnapshot {
         pending_lock_changes: vec![],
         pending_net_changes: vec![],
         pending_net_allow_changes: vec![],
+        pending_ssh_agent_changes: vec![],
         pending_bg_color_changes: vec![],
         pending_context_changes: vec![],
         pending_assignment_changes: vec![],
@@ -5350,6 +5508,190 @@ mod tests {
             vec![("b", "a"), ("c", "b")],
             "only real parent links; no cycle/unknown"
         );
+    }
+
+    // ===================================================================
+    // Increment 5 — REFINER red tests (TDD red-green-refactor). These PIN the
+    // contract the *rust* builder makes green: S2 (`GET /dashboard/activity`
+    // thin passthrough + auth gate) and S5 (orchestrators-per-project +
+    // top-level `unassigned`). They reference symbols that DO NOT EXIST YET
+    // (`read_activity_json`, `DashboardProject.orchestrators` / `OrchestratorRef`,
+    // `DashboardState.unassigned`), so the whole test binary is RED (compile-fail)
+    // until the builder adds them — the intended red state. Builder: rust.
+    // ===================================================================
+
+    // --- S2: `GET /dashboard/activity` is a THIN passthrough of the scribe's
+    //     `activity.json` — verbatim when present, GRACEFULLY EMPTY (never
+    //     404/500) when absent or malformed. Pure helper on a tempdir state base
+    //     (no XDG env mutation → no cross-test race). Builder wires the route to it.
+    #[test]
+    fn activity_json_passthrough_present_absent_and_malformed() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = crate::state_dir(base.path());
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("activity.json");
+
+        // Present + well-formed -> returned VERBATIM (byte-for-byte, mince passthrough).
+        let payload = r#"{"totals":{"features_implemented":2,"human_prompts":3},"per_day":[]}"#;
+        std::fs::write(&file, payload).unwrap();
+        assert_eq!(
+            read_activity_json(base.path()).trim(),
+            payload,
+            "a present activity.json must pass through unchanged"
+        );
+
+        // Absent -> graceful empty: valid JSON object, no panic, NOT an error body.
+        std::fs::remove_file(&file).unwrap();
+        let empty = read_activity_json(base.path());
+        let v: serde_json::Value = serde_json::from_str(&empty).expect("absent -> still valid JSON (graceful empty)");
+        assert!(v.is_object(), "graceful-empty payload is a JSON object: {empty}");
+
+        // Malformed -> graceful empty too: the daemon must not echo the broken
+        // bytes nor 500; it returns valid JSON so the panel degrades cleanly.
+        std::fs::write(&file, "{ this is : not json ]").unwrap();
+        let recovered = read_activity_json(base.path());
+        let rv: serde_json::Value = serde_json::from_str(&recovered).expect("malformed -> recovered to valid JSON");
+        assert!(rv.is_object(), "malformed degrades to a JSON object: {recovered}");
+        assert_ne!(
+            recovered.trim(),
+            "{ this is : not json ]",
+            "must NOT echo malformed bytes"
+        );
+    }
+
+    // --- S2: the route sits behind the SAME auth gate as `/dashboard/state`
+    //     (master OR the dashboard share-token; 401 otherwise) and serves JSON.
+    //     The dashboard-token 200 forces the builder to add the path to the
+    //     dashboard-token allowlist alongside `/dashboard` + `/dashboard/state`.
+    #[test]
+    fn dashboard_activity_route_is_gated_and_serves_json() {
+        let (port, state, token) = spawn_server();
+        set_dashboard_token(&state, "dash-secret");
+        // Master token -> 200 + application/json.
+        let m = request(port, &format!("GET /dashboard/activity?token={token} HTTP/1.1\r\n\r\n"));
+        assert_eq!(status_code(&m), 200, "master token should pass: {m}");
+        assert!(
+            m.to_ascii_lowercase().contains("content-type: application/json"),
+            "activity is served as JSON: {m}"
+        );
+        // Dashboard share-token -> 200 (route in the dashboard-token allowlist).
+        let d = request(port, "GET /dashboard/activity?token=dash-secret HTTP/1.1\r\n\r\n");
+        assert_eq!(status_code(&d), 200, "dashboard token should pass: {d}");
+        // No token / wrong token -> 401.
+        assert_eq!(
+            status_code(&request(port, "GET /dashboard/activity HTTP/1.1\r\n\r\n")),
+            401,
+            "no token must 401"
+        );
+        assert_eq!(
+            status_code(&request(port, "GET /dashboard/activity?token=nope HTTP/1.1\r\n\r\n")),
+            401,
+            "wrong token must 401"
+        );
+    }
+
+    // --- S5: orchestrators grouped UNDER their repo — named, with their current
+    //     `item`, and a `child_count` (GLOBAL count of tabs whose parent_tab_id
+    //     is the orchestrator). Feeds S6 (name them under the repo + multi-orch tree).
+    #[test]
+    fn dashboard_orchestrators_grouped_per_project_with_child_count() {
+        let mk = |id: &str, cwd: &str, assignment: &str, parent: Option<&str>| DashboardTabInput {
+            parent_tab_id: parent.map(str::to_string),
+            ..dash_full(id, Some(cwd), Some(assignment), Some("idle"))
+        };
+        // proj: TWO orchestrators (o1 build, o2 scope). o1 has 2 in-repo children
+        // (w1,w2) + 1 CROSS-repo child (w4 in `other`) => child_count is GLOBAL = 3.
+        // o2 has 1 child (w3). solo: ONE orchestrator, no children. other: none.
+        let o1 = DashboardTabInput {
+            context: Some("delegating build slices".into()),
+            ..mk("o1", "/x/proj", "build/orchestrator", None)
+        };
+        let state = build_dashboard_state(vec![
+            mk("o2", "/x/proj", "scope/orchestrator", None),
+            o1,
+            mk("w1", "/x/proj", "build/implementer", Some("o1")),
+            mk("w2", "/x/proj", "build/implementer", Some("o1")),
+            mk("w3", "/x/proj", "scope/worker", Some("o2")),
+            mk("w4", "/x/other", "build/worker", Some("o1")),
+            mk("s1", "/x/solo", "build/orchestrator", None),
+        ]);
+        let proj = project(&state, "proj");
+        // Sorted deterministically (alpha by id) regardless of input order.
+        let orchs: Vec<(&str, usize)> = proj
+            .orchestrators
+            .iter()
+            .map(|o| (o.id.as_str(), o.child_count))
+            .collect();
+        assert_eq!(
+            orchs,
+            vec![("o1", 3usize), ("o2", 1usize)],
+            "2 named orchestrators, GLOBAL child_count via parent_tab_id"
+        );
+        // Each ref carries a display name + its current item (the volatile context).
+        assert_eq!(proj.orchestrators[0].name, "tab-o1");
+        assert_eq!(proj.orchestrators[0].item, "delegating build slices");
+        // A single-orchestrator repo -> exactly one entry, zero children.
+        assert_eq!(project(&state, "solo").orchestrators.len(), 1);
+        assert_eq!(project(&state, "solo").orchestrators[0].child_count, 0);
+        // A repo with no orchestrator -> empty list.
+        assert!(project(&state, "other").orchestrators.is_empty());
+    }
+
+    // --- S5: a top-level `unassigned` bucket = tabs with NO assignment (legit;
+    //     resolves #90). Distinct from `unmapped` (assigned but the phase is
+    //     unknown): an unknown-phase tab is unmapped but NEVER unassigned.
+    #[test]
+    fn dashboard_unassigned_is_assignmentless_and_distinct_from_unmapped() {
+        let state = build_dashboard_state(vec![
+            dash_full("u1", Some("/x/proj"), None, Some("idle")), // no assignment -> unassigned
+            dash_full("u2", Some("/x/proj"), Some("frobnicate/x"), Some("working")), // unknown phase
+            dash_full("a1", Some("/x/proj"), Some("build/implementer"), Some("idle")),
+        ]);
+        let ua: Vec<&str> = state.unassigned.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ua, vec!["u1"], "only assignment.is_none() tabs are unassigned");
+        assert!(
+            state.unmapped.iter().any(|t| t.id == "u2"),
+            "unknown-phase tab is unmapped"
+        );
+        assert!(
+            !state.unassigned.iter().any(|t| t.id == "u2"),
+            "unknown-phase tab is NOT unassigned"
+        );
+        assert!(
+            !state.unassigned.iter().any(|t| t.id == "a1"),
+            "an assigned+mapped tab is never unassigned"
+        );
+    }
+
+    // --- S5: both new fields are DETERMINISTICALLY ordered and serialize as
+    //     camelCase (the web reads `orchestrators` / `childCount` / `unassigned`).
+    #[test]
+    fn dashboard_s5_fields_sorted_and_camelcase() {
+        let mk = |id: &str, a: Option<&str>| dash_full(id, Some("/x/proj"), a, Some("idle"));
+        let state = build_dashboard_state(vec![
+            mk("z", None),
+            mk("a", None),
+            mk("o2", Some("build/orchestrator")),
+            mk("o1", Some("build/orchestrator")),
+        ]);
+        assert_eq!(
+            state.unassigned.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            vec!["a", "z"],
+            "unassigned sorted deterministically"
+        );
+        assert_eq!(
+            project(&state, "proj")
+                .orchestrators
+                .iter()
+                .map(|o| o.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["o1", "o2"],
+            "orchestrators sorted deterministically"
+        );
+        let json = serde_json::to_string(&state).unwrap();
+        for key in ["\"orchestrators\"", "\"childCount\"", "\"unassigned\""] {
+            assert!(json.contains(key), "S5 JSON must use {key}: {json}");
+        }
     }
 
     #[test]
@@ -6755,6 +7097,94 @@ mod tests {
             queued.is_empty(),
             "GUI must not queue an allowlist change it can't apply"
         );
+    }
+
+    // ssh-agent is a headless-daemon feature (the GUI spawn path isn't wired).
+    #[cfg(not(feature = "gui"))]
+    #[test]
+    fn ssh_agent_endpoint_enable_returns_state_and_queues() {
+        let (port, state, token) = spawn_server();
+        let body_in = r#"{"enabled":true,"key":"/var/lib/tab-atelier/id_ed25519"}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/tab-a/ssh-agent HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body_in}",
+                body_in.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 200);
+        assert!(body(&resp).contains("\"ssh_agent\":true"), "body: {}", body(&resp));
+        let queued = {
+            let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            s.pending_ssh_agent_changes.clone()
+        };
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].0, "tab-a");
+        assert_eq!(
+            queued[0].1.as_ref().and_then(|c| c.key.as_deref()),
+            Some("/var/lib/tab-atelier/id_ed25519")
+        );
+    }
+
+    // Disabling queues a `None` config — the drain reaps the agent and respawns.
+    #[cfg(not(feature = "gui"))]
+    #[test]
+    fn ssh_agent_endpoint_disable_queues_none() {
+        let (port, state, token) = spawn_server();
+        let body_in = r#"{"enabled":false}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/tab-a/ssh-agent HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body_in}",
+                body_in.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 200);
+        assert!(body(&resp).contains("\"ssh_agent\":false"), "body: {}", body(&resp));
+        let queued = {
+            let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            s.pending_ssh_agent_changes.clone()
+        };
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].0, "tab-a");
+        assert!(queued[0].1.is_none(), "disable must queue None (reap)");
+    }
+
+    #[cfg(not(feature = "gui"))]
+    #[test]
+    fn ssh_agent_endpoint_unknown_tab_404() {
+        let (port, _state, token) = spawn_server();
+        let body_in = r#"{"enabled":true}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/does-not-exist/ssh-agent HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body_in}",
+                body_in.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 404);
+    }
+
+    // The GUI edition can't manage per-tab agents, so it refuses with 501 and
+    // queues nothing rather than faking success.
+    #[cfg(feature = "gui")]
+    #[test]
+    fn ssh_agent_endpoint_refused_on_gui() {
+        let (port, state, token) = spawn_server();
+        let body_in = r#"{"enabled":true}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/tab-a/ssh-agent HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body_in}",
+                body_in.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 501, "GUI must refuse ssh-agent, not fake success");
+        let queued = {
+            let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            s.pending_ssh_agent_changes.clone()
+        };
+        assert!(queued.is_empty(), "GUI must not queue a change it can't apply");
     }
 
     #[test]

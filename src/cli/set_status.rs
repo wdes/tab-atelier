@@ -10,8 +10,6 @@
 //! no-ops (exit 0) when those aren't set so a shell rc file calling
 //! it outside a tab doesn't spam errors.
 
-use std::time::Duration;
-
 #[must_use]
 pub fn run(args: &[String]) -> i32 {
     let Ok(tab_id) = std::env::var("_TAB_ID") else {
@@ -82,17 +80,8 @@ pub fn run(args: &[String]) -> i32 {
     }
     let body = serde_json::Value::Object(body).to_string();
 
-    let url = format!("{api_url}/tabs/by-id/{tab_id}/status");
-    let agent = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(2)))
-        .build()
-        .new_agent();
-    match agent
-        .post(&url)
-        .header("Authorization", &format!("Bearer {api_token}"))
-        .header("Content-Type", "application/json")
-        .send(&body)
-    {
+    // Same HTTP tail as the single-field CLIs (shared to kill the dup).
+    match super::tab_field::send(&api_url, &api_token, &tab_id, "status", &body) {
         Ok(_) => 0,
         Err(e) => {
             eprintln!("tab-atelier set-status: {e}");

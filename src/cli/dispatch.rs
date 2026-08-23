@@ -229,6 +229,23 @@ pub enum Commands {
         clear: bool,
     },
 
+    /// Give a tab its own ssh-agent — respawn its shell with a dedicated
+    /// `SSH_AUTH_SOCK` so it holds a different SSH identity (or none) from
+    /// other tabs. `--key PATH` auto-loads a passphrase-less key; `--off`
+    /// disables the agent (and reaps it). Encrypted keys: `ssh-add` in the tab.
+    #[command(name = "ssh-agent")]
+    SshAgent {
+        /// Tab index or UUID.
+        tab: String,
+        /// Passphrase-less private key to auto-load at spawn (path on the
+        /// daemon host / inside its mount namespace).
+        #[arg(long, conflicts_with = "off")]
+        key: Option<String>,
+        /// Disable the tab's ssh-agent and reap it.
+        #[arg(long)]
+        off: bool,
+    },
+
     /// Send keystrokes to a tab (`\n` / `\r` / `\t` / `\\` escapes interpreted).
     Input {
         /// Tab index or UUID.
@@ -700,6 +717,7 @@ pub fn dispatch(cli: Cli) -> bool {
             cidrs,
             clear,
         } => crate::cli::share_link::net_default(&presets, &domains, &cidrs, clear),
+        Commands::SshAgent { tab, key, off } => crate::cli::share_link::ssh_agent(&tab, key.as_deref(), off),
         Commands::Input { tab, text } => crate::cli::client::run("input", &[tab, text]),
         Commands::Output { tab } => crate::cli::client::run("output", &[tab]),
         Commands::Stats { tab, json } => {

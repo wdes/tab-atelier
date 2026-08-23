@@ -1,0 +1,4 @@
+{"type":"user","promptSource":"typed","sessionId":"sessionB","timestamp":"2026-08-23T14:00:00.000Z","message":{"role":"user","content":"new task now"}}
+{"type":"assistant","sessionId":"sessionB","timestamp":"2026-08-23T14:10:00.000Z","message":{"role":"assistant","model":"claude-opus-4-8","usage":{"input_tokens":2000,"output_tokens":400,"cache_creation_input_tokens":100,"cache_read_input_tokens":20}}}
+{"type":"user","sessionId":"sessionB","timestamp":"2026-08-23T14:11:00.000Z","message":{"role":"user","content":[{"type":"tool_result","content":"ok"}]}}
+{"type":"user","sessionId":"sessionB","timestamp":"2026-08-23T14:12:00.000Z","message":{"role":"user","content":"injected by a hook, promptSource absent"}}
