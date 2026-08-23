@@ -3,7 +3,7 @@
 // No framework — just node:assert. Imports the real functions from dashboard.js
 // so this stays a check of shipped code, not a copy.
 import assert from "node:assert/strict";
-import { ledClass, nodeMap, CANONICAL_PHASES } from "./dashboard.js";
+import { ledClass, nodeMap, CANONICAL_PHASES, resolveView, renderProjectCard } from "./dashboard.js";
 
 // The five led states each map to their own distinct class.
 const cases = {
@@ -35,5 +35,58 @@ assert.equal(nodeMap({}).size, 0, "no nodes -> empty map");
 
 // The canonical skeleton is exactly the seven documented phases, in order.
 assert.deepEqual(CANONICAL_PHASES, ["scope", "plan", "build", "review", "verify", "sweep", "done"]);
+
+// --- resolveView: level-0 grid vs scoped/legacy diagram (S2/S3) ---
+// No projects[] (pre-S1 / legacy) -> the global diagram, whatever currentProject.
+{
+  const legacy = { nodes: [{ id: "build", rollupLed: "working", tabs: [] }], unmapped: [] };
+  const v = resolveView(legacy, null);
+  assert.equal(v.mode, "diagram");
+  assert.equal(v.scoped, false);
+  assert.equal(v.nodes.length, 1);
+  // A stray currentProject can't conjure a grid when the server sends no projects.
+  assert.equal(resolveView(legacy, "kalpin-back").mode, "diagram");
+}
+// projects[] present, none drilled -> grid, in server order (no re-sort).
+{
+  const state = {
+    projects: [
+      { name: "kalpin-back", tabCount: 2, rollupLed: "working", nodes: [{ id: "build", rollupLed: "working", tabs: [] }] },
+      { name: "méta", tabCount: 1, rollupLed: "idle", isMeta: true, nodes: [] },
+    ],
+    nodes: [], unmapped: [],
+  };
+  const grid = resolveView(state, null);
+  assert.equal(grid.mode, "grid");
+  assert.deepEqual(grid.projects.map((p) => p.name), ["kalpin-back", "méta"]);
+  // Drill into a known project -> scoped diagram with that project's nodes.
+  const drill = resolveView(state, "kalpin-back");
+  assert.equal(drill.mode, "diagram");
+  assert.equal(drill.scoped, true);
+  assert.equal(drill.nodes[0].id, "build");
+  // Unknown selected project -> empty scoped diagram, not an error/throw.
+  const unknown = resolveView(state, "nope");
+  assert.equal(unknown.mode, "diagram");
+  assert.equal(unknown.scoped, true);
+  assert.deepEqual(unknown.nodes, []);
+}
+
+// --- renderProjectCard: name, led class, count, meta + orchestrator markers ---
+{
+  const id = (s) => s; // identity escaper for the test
+  const card = renderProjectCard(
+    { name: "kalpin-back", tabCount: 3, rollupLed: "error", hasOrchestrator: true },
+    id
+  );
+  assert.match(card, /project-card led-error/, "card carries its led class");
+  assert.match(card, /data-project="kalpin-back"/, "card carries its project name for drill-in");
+  assert.match(card, /3 tabs/, "card shows the tab count (plural)");
+  assert.match(card, /orch-badge/, "card shows the orchestrator badge");
+  // meta lane + neutral led + singular count.
+  const metaCard = renderProjectCard({ name: "méta", tabCount: 1, rollupLed: null, isMeta: true }, id);
+  assert.match(metaCard, /project-card led-neutral meta/, "meta card is neutral + meta");
+  assert.match(metaCard, /1 tab</, "singular count has no plural s");
+  assert.doesNotMatch(metaCard, /orch-badge/, "no orchestrator badge when absent");
+}
 
 console.log("dashboard.test.mjs: OK");

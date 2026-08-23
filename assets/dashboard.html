@@ -16,6 +16,13 @@
   </header>
 
   <main id="dashboard" aria-label="harness workflow">
+    <!-- Level 0: project grid. Default view once the server exposes
+         state.projects[] (docs/dashboard.md). Cards are rendered by dashboard.js
+         in the ORDER RECEIVED from the server (no client re-sort) so a card keeps
+         its place across reloads. Hidden while a project is drilled into (L1) or
+         when the server predates the project dimension (legacy global diagram). -->
+    <section id="project-grid" class="project-grid" hidden aria-label="projects"></section>
+
     <!-- Phase-flow skeleton: the seven canonical nodes of docs/dashboard.md,
          drawn left-to-right. Each <g id="node-<phase>"> is recoloured live by
          dashboard.js from that node's rollupLed. Arrows show the flow. -->
