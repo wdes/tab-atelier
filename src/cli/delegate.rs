@@ -262,6 +262,21 @@ fn spawn_agent_tab(ep: &Endpoint, o: &Opts, prompt: &str) -> Result<String, Stri
     };
     println!("✓ created tab {uuid}");
 
+    // Stamp the delegation lineage: this delegator's own tab id (`_TAB_ID`,
+    // injected into every PTY) becomes the new tab's `parent_tab_id`, so the
+    // dashboard can draw who-spawned-whom. Best-effort; a delegator outside a
+    // tab (no `_TAB_ID`) just yields a root tab.
+    if let Ok(parent) = std::env::var("_TAB_ID")
+        && !parent.is_empty()
+    {
+        let body = format!("{{\"parent_tab_id\":{}}}", serde_json::Value::String(parent));
+        let _ = agent()
+            .post(format!("{}/tabs/by-id/{uuid}/parent", ep.url))
+            .header("Authorization", format!("Bearer {}", ep.token))
+            .header("Content-Type", "application/json")
+            .send(body.as_bytes());
+    }
+
     if let Some(name) = &o.name {
         let (idx, _) = resolve(ep, &uuid).map_err(|e| format!("resolve new tab: {e}"))?;
         let _ = agent()
