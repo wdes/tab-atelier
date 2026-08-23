@@ -1385,6 +1385,7 @@ impl AppState {
             pending_lock_changes: Vec::new(),
             pending_net_changes: Vec::new(),
             pending_net_allow_changes: Vec::new(),
+            pending_ssh_agent_changes: Vec::new(),
             pending_bg_color_changes: Vec::new(),
             pending_context_changes: Vec::new(),
             pending_assignment_changes: Vec::new(),
@@ -4748,7 +4749,10 @@ impl AppState {
         {
             return;
         }
-        let keys: Vec<Option<std::time::Instant>> = self.tabs.iter().map(|t| t.last_focused_at).collect();
+        // Order by `last_used_at` (the same field the mobile remote sorts by)
+        // so desktop Ctrl+P and the phone agree — and so a tab opened on the
+        // phone (viewer attach bumps last_used_at) floats up here too.
+        let keys: Vec<Option<u64>> = self.tabs.iter().map(|t| t.last_used_at).collect();
         let order = mru_tab_order(self.active, &keys);
         self.tab_switcher = Some(TabSwitcher { order, selected: 0 });
         cx.notify();
@@ -4778,9 +4782,14 @@ impl AppState {
             }
             let tab = &self.tabs[idx];
             let name = tab.name.clone();
-            let ago = tab.last_focused_at.map_or_else(
+            // "… ago" from the same last_used_at that drives the order, so the
+            // label can't disagree with the row's position.
+            let ago = tab.last_used_at.map_or_else(
                 || "never".to_string(),
-                |t| format!("{} ago", format_duration(t.elapsed())),
+                |ms| {
+                    let elapsed = std::time::Duration::from_millis(crate::unix_millis().saturating_sub(ms));
+                    format!("{} ago", format_duration(elapsed))
+                },
             );
             let selected = row == sw.selected;
             list = list.child(

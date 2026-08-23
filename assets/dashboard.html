@@ -111,6 +111,19 @@
       <h2>unmapped</h2>
       <ul id="unmapped-list"></ul>
     </section>
+
+    <!-- S4: "Dernières heures" activity panel — the 5 figures + per-day bars from
+         GET /dashboard/activity (a 3rd poll leg). Populated by dashboard.js. -->
+    <section id="activity" class="activity" aria-label="last hours activity">
+      <h2>Dernières heures</h2>
+      <div id="activity-body"></div>
+    </section>
+
+    <!-- S1: legend (visual vocabulary key), below the graph. Populated from
+         legendModel(); the toggle lives OUTSIDE #legend so it stays clickable
+         while the legend is hidden, and its state persists in localStorage. -->
+    <button id="legend-toggle" class="legend-toggle" aria-controls="legend">legend</button>
+    <section id="legend" class="legend" aria-label="legend"></section>
   </main>
 
   <!-- Hover popup, populated by dashboard.js. Right-click a tab entry to open
