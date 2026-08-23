@@ -5438,6 +5438,190 @@ mod tests {
         );
     }
 
+    // ===================================================================
+    // Increment 5 — REFINER red tests (TDD red-green-refactor). These PIN the
+    // contract the *rust* builder makes green: S2 (`GET /dashboard/activity`
+    // thin passthrough + auth gate) and S5 (orchestrators-per-project +
+    // top-level `unassigned`). They reference symbols that DO NOT EXIST YET
+    // (`read_activity_json`, `DashboardProject.orchestrators` / `OrchestratorRef`,
+    // `DashboardState.unassigned`), so the whole test binary is RED (compile-fail)
+    // until the builder adds them — the intended red state. Builder: rust.
+    // ===================================================================
+
+    // --- S2: `GET /dashboard/activity` is a THIN passthrough of the scribe's
+    //     `activity.json` — verbatim when present, GRACEFULLY EMPTY (never
+    //     404/500) when absent or malformed. Pure helper on a tempdir state base
+    //     (no XDG env mutation → no cross-test race). Builder wires the route to it.
+    #[test]
+    fn activity_json_passthrough_present_absent_and_malformed() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = crate::state_dir(base.path());
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("activity.json");
+
+        // Present + well-formed -> returned VERBATIM (byte-for-byte, mince passthrough).
+        let payload = r#"{"totals":{"features_implemented":2,"human_prompts":3},"per_day":[]}"#;
+        std::fs::write(&file, payload).unwrap();
+        assert_eq!(
+            read_activity_json(base.path()).trim(),
+            payload,
+            "a present activity.json must pass through unchanged"
+        );
+
+        // Absent -> graceful empty: valid JSON object, no panic, NOT an error body.
+        std::fs::remove_file(&file).unwrap();
+        let empty = read_activity_json(base.path());
+        let v: serde_json::Value = serde_json::from_str(&empty).expect("absent -> still valid JSON (graceful empty)");
+        assert!(v.is_object(), "graceful-empty payload is a JSON object: {empty}");
+
+        // Malformed -> graceful empty too: the daemon must not echo the broken
+        // bytes nor 500; it returns valid JSON so the panel degrades cleanly.
+        std::fs::write(&file, "{ this is : not json ]").unwrap();
+        let recovered = read_activity_json(base.path());
+        let rv: serde_json::Value = serde_json::from_str(&recovered).expect("malformed -> recovered to valid JSON");
+        assert!(rv.is_object(), "malformed degrades to a JSON object: {recovered}");
+        assert_ne!(
+            recovered.trim(),
+            "{ this is : not json ]",
+            "must NOT echo malformed bytes"
+        );
+    }
+
+    // --- S2: the route sits behind the SAME auth gate as `/dashboard/state`
+    //     (master OR the dashboard share-token; 401 otherwise) and serves JSON.
+    //     The dashboard-token 200 forces the builder to add the path to the
+    //     dashboard-token allowlist alongside `/dashboard` + `/dashboard/state`.
+    #[test]
+    fn dashboard_activity_route_is_gated_and_serves_json() {
+        let (port, state, token) = spawn_server();
+        set_dashboard_token(&state, "dash-secret");
+        // Master token -> 200 + application/json.
+        let m = request(port, &format!("GET /dashboard/activity?token={token} HTTP/1.1\r\n\r\n"));
+        assert_eq!(status_code(&m), 200, "master token should pass: {m}");
+        assert!(
+            m.to_ascii_lowercase().contains("content-type: application/json"),
+            "activity is served as JSON: {m}"
+        );
+        // Dashboard share-token -> 200 (route in the dashboard-token allowlist).
+        let d = request(port, "GET /dashboard/activity?token=dash-secret HTTP/1.1\r\n\r\n");
+        assert_eq!(status_code(&d), 200, "dashboard token should pass: {d}");
+        // No token / wrong token -> 401.
+        assert_eq!(
+            status_code(&request(port, "GET /dashboard/activity HTTP/1.1\r\n\r\n")),
+            401,
+            "no token must 401"
+        );
+        assert_eq!(
+            status_code(&request(port, "GET /dashboard/activity?token=nope HTTP/1.1\r\n\r\n")),
+            401,
+            "wrong token must 401"
+        );
+    }
+
+    // --- S5: orchestrators grouped UNDER their repo — named, with their current
+    //     `item`, and a `child_count` (GLOBAL count of tabs whose parent_tab_id
+    //     is the orchestrator). Feeds S6 (name them under the repo + multi-orch tree).
+    #[test]
+    fn dashboard_orchestrators_grouped_per_project_with_child_count() {
+        let mk = |id: &str, cwd: &str, assignment: &str, parent: Option<&str>| DashboardTabInput {
+            parent_tab_id: parent.map(str::to_string),
+            ..dash_full(id, Some(cwd), Some(assignment), Some("idle"))
+        };
+        // proj: TWO orchestrators (o1 build, o2 scope). o1 has 2 in-repo children
+        // (w1,w2) + 1 CROSS-repo child (w4 in `other`) => child_count is GLOBAL = 3.
+        // o2 has 1 child (w3). solo: ONE orchestrator, no children. other: none.
+        let o1 = DashboardTabInput {
+            context: Some("delegating build slices".into()),
+            ..mk("o1", "/x/proj", "build/orchestrator", None)
+        };
+        let state = build_dashboard_state(vec![
+            mk("o2", "/x/proj", "scope/orchestrator", None),
+            o1,
+            mk("w1", "/x/proj", "build/implementer", Some("o1")),
+            mk("w2", "/x/proj", "build/implementer", Some("o1")),
+            mk("w3", "/x/proj", "scope/worker", Some("o2")),
+            mk("w4", "/x/other", "build/worker", Some("o1")),
+            mk("s1", "/x/solo", "build/orchestrator", None),
+        ]);
+        let proj = project(&state, "proj");
+        // Sorted deterministically (alpha by id) regardless of input order.
+        let orchs: Vec<(&str, usize)> = proj
+            .orchestrators
+            .iter()
+            .map(|o| (o.id.as_str(), o.child_count))
+            .collect();
+        assert_eq!(
+            orchs,
+            vec![("o1", 3usize), ("o2", 1usize)],
+            "2 named orchestrators, GLOBAL child_count via parent_tab_id"
+        );
+        // Each ref carries a display name + its current item (the volatile context).
+        assert_eq!(proj.orchestrators[0].name, "tab-o1");
+        assert_eq!(proj.orchestrators[0].item, "delegating build slices");
+        // A single-orchestrator repo -> exactly one entry, zero children.
+        assert_eq!(project(&state, "solo").orchestrators.len(), 1);
+        assert_eq!(project(&state, "solo").orchestrators[0].child_count, 0);
+        // A repo with no orchestrator -> empty list.
+        assert!(project(&state, "other").orchestrators.is_empty());
+    }
+
+    // --- S5: a top-level `unassigned` bucket = tabs with NO assignment (legit;
+    //     resolves #90). Distinct from `unmapped` (assigned but the phase is
+    //     unknown): an unknown-phase tab is unmapped but NEVER unassigned.
+    #[test]
+    fn dashboard_unassigned_is_assignmentless_and_distinct_from_unmapped() {
+        let state = build_dashboard_state(vec![
+            dash_full("u1", Some("/x/proj"), None, Some("idle")), // no assignment -> unassigned
+            dash_full("u2", Some("/x/proj"), Some("frobnicate/x"), Some("working")), // unknown phase
+            dash_full("a1", Some("/x/proj"), Some("build/implementer"), Some("idle")),
+        ]);
+        let ua: Vec<&str> = state.unassigned.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ua, vec!["u1"], "only assignment.is_none() tabs are unassigned");
+        assert!(
+            state.unmapped.iter().any(|t| t.id == "u2"),
+            "unknown-phase tab is unmapped"
+        );
+        assert!(
+            !state.unassigned.iter().any(|t| t.id == "u2"),
+            "unknown-phase tab is NOT unassigned"
+        );
+        assert!(
+            !state.unassigned.iter().any(|t| t.id == "a1"),
+            "an assigned+mapped tab is never unassigned"
+        );
+    }
+
+    // --- S5: both new fields are DETERMINISTICALLY ordered and serialize as
+    //     camelCase (the web reads `orchestrators` / `childCount` / `unassigned`).
+    #[test]
+    fn dashboard_s5_fields_sorted_and_camelcase() {
+        let mk = |id: &str, a: Option<&str>| dash_full(id, Some("/x/proj"), a, Some("idle"));
+        let state = build_dashboard_state(vec![
+            mk("z", None),
+            mk("a", None),
+            mk("o2", Some("build/orchestrator")),
+            mk("o1", Some("build/orchestrator")),
+        ]);
+        assert_eq!(
+            state.unassigned.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            vec!["a", "z"],
+            "unassigned sorted deterministically"
+        );
+        assert_eq!(
+            project(&state, "proj")
+                .orchestrators
+                .iter()
+                .map(|o| o.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["o1", "o2"],
+            "orchestrators sorted deterministically"
+        );
+        let json = serde_json::to_string(&state).unwrap();
+        for key in ["\"orchestrators\"", "\"childCount\"", "\"unassigned\""] {
+            assert!(json.contains(key), "S5 JSON must use {key}: {json}");
+        }
+    }
+
     #[test]
     fn set_parent_sets_and_exposes_lineage() {
         let (port, state, token) = spawn_server();
