@@ -2050,12 +2050,14 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
         }
         ok
     };
-    // Global dashboard share-token: one read-only token that authorises exactly
-    // the two dashboard read routes (`/dashboard` + `/dashboard/state`), via
-    // `?token=` (browser-friendly) or `Authorization: Bearer`, constant-time.
-    // ponytail: no RW/RO split — the dashboard never takes input; the day it
-    // accepts actions, that path needs a separate RW token.
-    let is_dashboard_token = !is_master && matches!(path.as_str(), "/dashboard" | "/dashboard/state") && {
+    // Global dashboard share-token — a READ-ONLY observability credential for the
+    // whole fleet (PO option B). It authorises, via `?token=` or `Bearer`
+    // (constant-time): the two dashboard routes (`/dashboard` + `/dashboard/state`),
+    // AND every tab's read-only viewer routes (same perimeter as a per-tab
+    // `share_token_ro`: view/output/stream, never input/inbox/files-POST → 403).
+    // This is what lets the dashboard's right-click open a tab viewer without a
+    // per-tab token. Computed once here; folded into the per-tab RO verdict below.
+    let dashboard_matches = !is_master && {
         let snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let ok = !snap.dashboard_share_token.is_empty()
             && constant_time_eq(
@@ -2067,6 +2069,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
         }
         ok
     };
+    let is_dashboard_token = dashboard_matches && matches!(path.as_str(), "/dashboard" | "/dashboard/state");
     if !is_master && !is_dashboard_token {
         let allowed = if let Some(p) = provided_token.as_deref()
             && let Some(rest) = path.strip_prefix("/tabs/by-id/")
@@ -2082,8 +2085,11 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 // timing how long the reject takes (audit #2).
                 let rw_match =
                     !t.share_token_rw.is_empty() && constant_time_eq(t.share_token_rw.as_bytes(), p.as_bytes());
-                let ro_match =
-                    !t.share_token_ro.is_empty() && constant_time_eq(t.share_token_ro.as_bytes(), p.as_bytes());
+                // The global dashboard token acts as a read-only share token on
+                // ANY tab (PO option B), so a match here grades exactly like an
+                // RO link: read routes pass, input/inbox/files-POST stay 403.
+                let ro_match = dashboard_matches
+                    || (!t.share_token_ro.is_empty() && constant_time_eq(t.share_token_ro.as_bytes(), p.as_bytes()));
                 // Mutating + privileged-read share-token actions
                 // require RW. The RO link is read-only by construction
                 // so:
@@ -5294,6 +5300,38 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .dashboard_share_token = tok.into();
+    }
+
+    #[test]
+    fn dashboard_token_grants_readonly_viewer_of_any_tab() {
+        // PO option B: the dashboard token is a fleet-wide READ-ONLY credential,
+        // so the dashboard's right-click can open any tab's viewer without a
+        // per-tab token — exactly the share_token_ro perimeter.
+        let (port, state, _master) = spawn_server();
+        set_dashboard_token(&state, "dash-obs");
+        // Read routes on ANY tab → 200.
+        for path in ["view", "output"] {
+            let resp = request(
+                port,
+                &format!("GET /tabs/by-id/tab-a/{path}?token=dash-obs HTTP/1.1\r\n\r\n"),
+            );
+            assert_eq!(status_code(&resp), 200, "dashboard token should read /{path}");
+        }
+        // input is a write (RW-only) → 403, like a read-only share token.
+        let resp = request(
+            port,
+            "POST /tabs/by-id/tab-a/input?token=dash-obs HTTP/1.1\r\nContent-Length: 0\r\n\r\n",
+        );
+        assert_eq!(status_code(&resp), 403, "dashboard token is read-only on input");
+        // POST /files (upload) is RW-only → 403.
+        let resp = request(
+            port,
+            "POST /tabs/by-id/tab-a/files?token=dash-obs HTTP/1.1\r\nContent-Length: 0\r\n\r\n",
+        );
+        assert_eq!(status_code(&resp), 403, "dashboard token can't upload");
+        // No token → 401 (unchanged).
+        let resp = request(port, "GET /tabs/by-id/tab-a/output HTTP/1.1\r\n\r\n");
+        assert_eq!(status_code(&resp), 401, "no token still 401s");
     }
 
     #[test]
