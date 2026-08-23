@@ -295,16 +295,33 @@ struct ErrorResponse {
 /// of these maps to that node; anything else falls to `unmapped`.
 const DASHBOARD_PHASES: [&str; 7] = ["scope", "plan", "build", "review", "verify", "sweep", "done"];
 
+/// Roles that mark an itinerant meta-specialist: with no repo cwd and no
+/// project override, such a tab lands in the shared **`méta`** lane rather than
+/// `divers`. See docs/dashboard.md "Dimension projet + voie méta".
+const META_ROLES: [&str; 4] = ["planner", "auditor", "tichef", "orchestrator"];
+/// Dev work-roots whose basename is NOT a project (a shell parked at the parent
+/// of the repos). `ponytail:` heuristic list, no git detection — a tab actually
+/// inside `~/Dev/kalpin-back` still maps to `kalpin-back`; upgrade = walk to
+/// the enclosing `.git`.
+const WORK_ROOT_NAMES: [&str; 6] = ["dev", "src", "code", "projects", "repos", "workspace"];
+const META_LANE: &str = "méta";
+const DIVERS_LANE: &str = "divers";
+
 /// One tab projected into the dashboard state: the same per-tab data as
-/// `/tabs/usage`, plus the `context` split into `role`/`item` and a ready-made
-/// `viewerUrl`. camelCase to match the documented JSON shape.
-#[derive(Serialize)]
+/// `/tabs/usage`, plus `role` (from `assignment`), the `context` subtitle, the
+/// raw `assignment`, and a ready-made `viewerUrl`. camelCase.
+#[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct DashboardTab {
     id: String,
     name: String,
+    /// The volatile "5 words" (the current prompt); kept for the S4 subtitle.
     context: Option<String>,
+    /// Raw `"[<project>:]<phase>/<role>"` the agent set once. `None` ⇒ unassigned.
+    assignment: Option<String>,
+    /// Agent role, derived from `assignment` (never from the volatile context).
     role: String,
+    /// The current unit of work — now the volatile `context` (the prompt).
     item: String,
     agent_state: Option<&'static str>,
     led: Option<&'static str>,
@@ -313,7 +330,7 @@ struct DashboardTab {
 }
 
 /// A phase node with its occupants and the worst-severity led among them.
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct DashboardNode {
     id: &'static str,
@@ -321,18 +338,38 @@ struct DashboardNode {
     tabs: Vec<DashboardTab>,
 }
 
+/// A project bucket (level 0): the 7-phase subtree scoped to one project, plus
+/// its rollup. `méta` and `divers` are the two shared lanes.
 #[derive(Serialize)]
-struct DashboardState {
+#[serde(rename_all = "camelCase")]
+struct DashboardProject {
+    name: String,
+    tab_count: usize,
+    rollup_led: Option<&'static str>,
+    has_orchestrator: bool,
+    is_meta: bool,
     nodes: Vec<DashboardNode>,
     unmapped: Vec<DashboardTab>,
 }
 
+#[derive(Serialize)]
+struct DashboardState {
+    /// Global 7-node diagram (Increment 1 contract — preserved).
+    nodes: Vec<DashboardNode>,
+    unmapped: Vec<DashboardTab>,
+    /// Per-project buckets (Increment 2), sorted alpha with `méta`/`divers` last.
+    projects: Vec<DashboardProject>,
+}
+
 /// Minimal per-tab projection the dashboard builder consumes, so the
 /// mapping/rollup logic is unit-testable without constructing a full
-/// `TabState`. Mirrors exactly the fields `/tabs/usage` reads plus `context`.
+/// `TabState`. `assignment` drives phase/role/project; `cwd` drives project;
+/// `context` is the volatile subtitle.
 struct DashboardTabInput {
     id: String,
     name: String,
+    cwd: Option<String>,
+    assignment: Option<String>,
     context: Option<String>,
     agent_state: Option<&'static str>,
     led: Option<&'static str>,
@@ -352,10 +389,54 @@ fn led_severity(led: &str) -> u8 {
     }
 }
 
-/// Group tabs by phase node, parse each `context` into `role`/`item`, and roll
-/// up each node's led to its worst-severity occupant. The pure core of
-/// `GET /dashboard/state` (see docs/dashboard.md).
-fn build_dashboard_state(inputs: Vec<DashboardTabInput>) -> DashboardState {
+/// Parse `"[<project>:]<phase>/<role>"` → (project override, phase, role). The
+/// optional `<project>:` override is a prefix ending at the first `:` that
+/// precedes the first `/` (so a `:` inside a role is left alone).
+fn parse_assignment(a: &str) -> (Option<String>, String, String) {
+    let head_end = a.find('/').unwrap_or(a.len());
+    let (over, rest) = a[..head_end].find(':').map_or((None, a), |colon| {
+        (Some(a[..colon].trim().to_string()), &a[colon + 1..])
+    });
+    let mut parts = rest.splitn(2, '/');
+    let phase = parts.next().unwrap_or("").trim().to_string();
+    let role = parts.next().unwrap_or("").trim().to_string();
+    (over.filter(|p| !p.is_empty()), phase, role)
+}
+
+/// Phase id from an assignment (empty ⇒ unmapped).
+fn phase_of(assignment: Option<&str>) -> String {
+    assignment.map(|a| parse_assignment(a).1).unwrap_or_default()
+}
+
+/// Role from an assignment — never from the volatile `context`.
+fn role_of(assignment: Option<&str>) -> String {
+    assignment.map(|a| parse_assignment(a).2).unwrap_or_default()
+}
+
+/// Resolve a tab's project, in order: (1) `<project>:` override; (2) basename of
+/// a repo cwd; (3) `méta` lane for a meta-role itinerant; (4) `divers`.
+fn project_of(cwd: Option<&str>, assignment: Option<&str>) -> String {
+    let (over, _phase, role) = assignment.map_or((None, String::new(), String::new()), parse_assignment);
+    if let Some(p) = over {
+        return p;
+    }
+    if let Some(c) = cwd {
+        let base = c.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+        if !base.is_empty() && !WORK_ROOT_NAMES.contains(&base.to_ascii_lowercase().as_str()) {
+            return base.to_string();
+        }
+    }
+    if META_ROLES.contains(&role.as_str()) {
+        META_LANE.to_string()
+    } else {
+        DIVERS_LANE.to_string()
+    }
+}
+
+/// Group `(phase, tab)` pairs into the 7 canonical nodes + an unmapped bucket,
+/// rolling up each node's led to its worst occupant. Shared by the global
+/// diagram and each project subtree.
+fn group_into_nodes<I: Iterator<Item = (String, DashboardTab)>>(items: I) -> (Vec<DashboardNode>, Vec<DashboardTab>) {
     let mut nodes: Vec<DashboardNode> = DASHBOARD_PHASES
         .iter()
         .map(|id| DashboardNode {
@@ -365,32 +446,7 @@ fn build_dashboard_state(inputs: Vec<DashboardTabInput>) -> DashboardState {
         })
         .collect();
     let mut unmapped: Vec<DashboardTab> = vec![];
-    for t in inputs {
-        // Split "phase/role/item" on the first two slashes; item keeps any
-        // remaining slashes. Absent context ⇒ empty phase/role/item ⇒ unmapped.
-        let (phase, role, item) = t.context.as_deref().map_or_else(
-            || (String::new(), String::new(), String::new()),
-            |ctx| {
-                let mut parts = ctx.splitn(3, '/');
-                (
-                    parts.next().unwrap_or("").to_string(),
-                    parts.next().unwrap_or("").to_string(),
-                    parts.next().unwrap_or("").to_string(),
-                )
-            },
-        );
-        let viewer_url = format!("/tabs/by-id/{}/view", t.id);
-        let tab = DashboardTab {
-            id: t.id,
-            name: t.name,
-            context: t.context,
-            role,
-            item,
-            agent_state: t.agent_state,
-            led: t.led,
-            tokens: t.tokens,
-            viewer_url,
-        };
+    for (phase, tab) in items {
         match nodes.iter_mut().find(|n| n.id == phase) {
             Some(n) => n.tabs.push(tab),
             None => unmapped.push(tab),
@@ -399,7 +455,87 @@ fn build_dashboard_state(inputs: Vec<DashboardTabInput>) -> DashboardState {
     for n in &mut nodes {
         n.rollup_led = n.tabs.iter().filter_map(|t| t.led).max_by_key(|led| led_severity(led));
     }
-    DashboardState { nodes, unmapped }
+    (nodes, unmapped)
+}
+
+/// Map tabs onto phase nodes **via `assignment`**, group them under projects
+/// (via cwd/override), and roll up leds. The pure core of `GET /dashboard/state`
+/// (see docs/dashboard.md). The global `nodes`/`unmapped` are the Increment 1
+/// contract; `projects` is the Increment 2 addition.
+fn build_dashboard_state(inputs: Vec<DashboardTabInput>) -> DashboardState {
+    // Project each input once into (project, phase, tab). The tab is cloned into
+    // both the global diagram and its project subtree.
+    struct Projected {
+        project: String,
+        phase: String,
+        tab: DashboardTab,
+    }
+    let projected: Vec<Projected> = inputs
+        .into_iter()
+        .map(|t| {
+            let phase = phase_of(t.assignment.as_deref());
+            let role = role_of(t.assignment.as_deref());
+            let project = project_of(t.cwd.as_deref(), t.assignment.as_deref());
+            let viewer_url = format!("/tabs/by-id/{}/view", t.id);
+            let tab = DashboardTab {
+                id: t.id,
+                name: t.name,
+                item: t.context.clone().unwrap_or_default(),
+                context: t.context,
+                assignment: t.assignment,
+                role,
+                agent_state: t.agent_state,
+                led: t.led,
+                tokens: t.tokens,
+                viewer_url,
+            };
+            Projected { project, phase, tab }
+        })
+        .collect();
+
+    // Global diagram (Increment 1 contract).
+    let (nodes, unmapped) = group_into_nodes(projected.iter().map(|p| (p.phase.clone(), p.tab.clone())));
+
+    // Distinct projects, sorted alpha with méta/divers pinned last.
+    let mut names: Vec<String> = projected.iter().map(|p| p.project.clone()).collect();
+    names.sort();
+    names.dedup();
+    let rank = |n: &str| match n {
+        META_LANE => 1,
+        DIVERS_LANE => 2,
+        _ => 0,
+    };
+    names.sort_by(|a, b| rank(a).cmp(&rank(b)).then_with(|| a.cmp(b)));
+
+    let projects: Vec<DashboardProject> = names
+        .into_iter()
+        .map(|name| {
+            let mine: Vec<&Projected> = projected.iter().filter(|p| p.project == name).collect();
+            let tab_count = mine.len();
+            let has_orchestrator = mine.iter().any(|p| p.tab.role == "orchestrator");
+            let rollup_led = mine
+                .iter()
+                .filter_map(|p| p.tab.led)
+                .max_by_key(|led| led_severity(led));
+            let (nodes, unmapped) = group_into_nodes(mine.iter().map(|p| (p.phase.clone(), p.tab.clone())));
+            let is_meta = name == META_LANE;
+            DashboardProject {
+                name,
+                tab_count,
+                rollup_led,
+                has_orchestrator,
+                is_meta,
+                nodes,
+                unmapped,
+            }
+        })
+        .collect();
+
+    DashboardState {
+        nodes,
+        unmapped,
+        projects,
+    }
 }
 
 #[derive(Clone)]
@@ -2122,6 +2258,8 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 .map(|t| DashboardTabInput {
                     id: t.id.to_string(),
                     name: t.name.to_string(),
+                    cwd: t.cwd.as_deref().map(str::to_string),
+                    assignment: t.assignment.as_deref().map(str::to_string),
                     context: t.context.as_deref().map(str::to_string),
                     agent_state: t.agent_state.as_ref().map(|s| match s.state {
                         crate::AgentState::Thinking => "thinking",
@@ -4695,16 +4833,36 @@ mod tests {
         assert!(json.contains("\"tokens\":{\"input\":100,\"output\":50}"), "{json}");
     }
 
-    /// Build one dashboard input tab with just the fields the mapper reads.
-    fn dash_input(id: &str, context: Option<&str>, led: Option<&'static str>) -> DashboardTabInput {
+    /// A dashboard input tab whose phase/role come from `assignment` (the S0
+    /// field), no cwd. The 2nd arg is now the ASSIGNMENT, not the context.
+    fn dash_input(id: &str, assignment: Option<&str>, led: Option<&'static str>) -> DashboardTabInput {
         DashboardTabInput {
             id: id.to_string(),
             name: format!("tab-{id}"),
-            context: context.map(str::to_string),
+            cwd: None,
+            assignment: assignment.map(str::to_string),
+            context: None,
             agent_state: None,
             led,
             tokens: None,
         }
+    }
+
+    /// Full builder for project-dimension tests: pick cwd + assignment.
+    fn dash_full(
+        id: &str,
+        cwd: Option<&str>,
+        assignment: Option<&str>,
+        led: Option<&'static str>,
+    ) -> DashboardTabInput {
+        DashboardTabInput {
+            cwd: cwd.map(str::to_string),
+            ..dash_input(id, assignment, led)
+        }
+    }
+
+    fn project<'a>(state: &'a DashboardState, name: &str) -> &'a DashboardProject {
+        state.projects.iter().find(|p| p.name == name).expect("project exists")
     }
 
     fn node<'a>(state: &'a DashboardState, id: &str) -> &'a DashboardNode {
@@ -4712,38 +4870,42 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_maps_context_phase_to_node() {
-        let state = build_dashboard_state(vec![dash_input(
-            "u1",
-            Some("build/implementer/slice-2-rust-state"),
-            Some("working"),
-        )]);
+    fn dashboard_maps_assignment_phase_to_node() {
+        // Phase + role now come from `assignment` (S0), never from `context`.
+        let mut input = dash_input("u1", Some("build/implementer"), Some("working"));
+        input.context = Some("looking at the parser".into()); // volatile subtitle
+        let state = build_dashboard_state(vec![input]);
         let build = node(&state, "build");
         assert_eq!(build.tabs.len(), 1);
         let tab = &build.tabs[0];
         assert_eq!(tab.role, "implementer");
-        assert_eq!(tab.item, "slice-2-rust-state");
+        assert_eq!(tab.item, "looking at the parser", "item is now the volatile context");
+        assert_eq!(tab.assignment.as_deref(), Some("build/implementer"));
         assert_eq!(tab.viewer_url, "/tabs/by-id/u1/view");
         assert!(state.unmapped.is_empty());
     }
 
     #[test]
-    fn dashboard_item_keeps_trailing_slashes() {
-        // Only the first two slashes split phase/role/item — the rest stays in item.
-        let state = build_dashboard_state(vec![dash_input("u1", Some("build/impl/a/b/c"), None)]);
-        assert_eq!(node(&state, "build").tabs[0].item, "a/b/c");
+    fn dashboard_role_ignores_volatile_context() {
+        // Even with a context that LOOKS like a phase/role, role comes from
+        // assignment — proving the S0 immunity survives into the mapper.
+        let mut input = dash_input("u1", Some("review/reviewer"), None);
+        input.context = Some("scope/planner/whatever".into());
+        let state = build_dashboard_state(vec![input]);
+        assert_eq!(node(&state, "review").tabs[0].role, "reviewer");
+        assert!(node(&state, "scope").tabs.is_empty(), "context must not drive mapping");
     }
 
     #[test]
-    fn dashboard_unmapped_for_unknown_or_missing_phase() {
+    fn dashboard_unmapped_for_unknown_or_missing_assignment() {
         let state = build_dashboard_state(vec![
-            dash_input("u1", Some("frobnicate/x/y"), Some("working")),
+            dash_input("u1", Some("frobnicate/x"), Some("working")),
             dash_input("u2", None, Some("idle")),
         ]);
         assert_eq!(
             state.unmapped.len(),
             2,
-            "unknown phase and no-context both fall to unmapped"
+            "unknown phase and no-assignment both fall to unmapped"
         );
         for n in &state.nodes {
             assert!(n.tabs.is_empty(), "node {} should be empty", n.id);
@@ -4807,9 +4969,102 @@ mod tests {
             })
         );
         let json = serde_json::to_string(&state).unwrap();
-        for key in ["\"rollupLed\"", "\"agentState\"", "\"viewerUrl\"", "\"unmapped\""] {
+        for key in [
+            "\"rollupLed\"",
+            "\"agentState\"",
+            "\"viewerUrl\"",
+            "\"unmapped\"",
+            "\"projects\"",
+            "\"tabCount\"",
+            "\"hasOrchestrator\"",
+            "\"isMeta\"",
+            "\"assignment\"",
+        ] {
             assert!(json.contains(key), "dashboard JSON must use {key}: {json}");
         }
+    }
+
+    #[test]
+    fn dashboard_groups_projects_by_cwd_and_override() {
+        // Two repos (by cwd), one meta specialist (no repo, meta role), one root
+        // tab (no repo, worker) → divers, and a meta specialist that serves a
+        // repo via the `<project>:` override.
+        let state = build_dashboard_state(vec![
+            dash_full(
+                "a",
+                Some("/home/u/Dev/kalpin-back"),
+                Some("build/implementer"),
+                Some("working"),
+            ),
+            dash_full(
+                "b",
+                Some("/home/u/Dev/kalpin-front"),
+                Some("review/reviewer"),
+                Some("idle"),
+            ),
+            dash_full("c", None, Some("plan/planner"), Some("working")), // meta lane
+            dash_full("d", Some("/home/u/Dev"), Some("build/worker"), Some("idle")), // dev root → divers
+            dash_full("e", None, Some("kalpin-back:review/auditor"), Some("error")), // override → kalpin-back
+        ]);
+        // Sorted alpha, méta + divers pinned last.
+        let names: Vec<&str> = state.projects.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["kalpin-back", "kalpin-front", "méta", "divers"]);
+        // kalpin-back has the cwd tab + the override guest (auditor).
+        assert_eq!(project(&state, "kalpin-back").tab_count, 2);
+        assert!(project(&state, "méta").is_meta);
+        assert!(!project(&state, "kalpin-back").is_meta);
+        // Override auditor (led error) drives kalpin-back's rollup.
+        assert_eq!(project(&state, "kalpin-back").rollup_led, Some("error"));
+        // The dev-root tab landed in divers, not a "Dev" project.
+        assert_eq!(project(&state, "divers").tab_count, 1);
+    }
+
+    #[test]
+    fn dashboard_project_subtree_scopes_nodes_and_has_orchestrator() {
+        let state = build_dashboard_state(vec![
+            dash_full("a", Some("/x/proj"), Some("build/implementer"), Some("working")),
+            dash_full("b", Some("/x/proj"), Some("scope/orchestrator"), Some("idle")),
+        ]);
+        let p = project(&state, "proj");
+        assert!(p.has_orchestrator, "an orchestrator role sets hasOrchestrator");
+        // Its 7-node subtree scopes tabs to their phase.
+        let build = p.nodes.iter().find(|n| n.id == "build").unwrap();
+        let scope = p.nodes.iter().find(|n| n.id == "scope").unwrap();
+        assert_eq!(build.tabs.len(), 1);
+        assert_eq!(scope.tabs.len(), 1);
+    }
+
+    #[test]
+    fn dashboard_unassigned_tab_is_unmapped_but_under_its_project() {
+        // No assignment → unmapped globally, but still shown under its cwd project.
+        let state = build_dashboard_state(vec![dash_full("a", Some("/x/kalpin-back"), None, Some("idle"))]);
+        assert_eq!(state.unmapped.len(), 1, "unassigned → global unmapped");
+        let p = project(&state, "kalpin-back");
+        assert_eq!(p.tab_count, 1);
+        assert_eq!(p.unmapped.len(), 1, "and in the project's own unmapped bucket");
+    }
+
+    #[test]
+    fn assignment_parse_and_project_helpers() {
+        assert_eq!(
+            parse_assignment("build/implementer"),
+            (None, "build".into(), "implementer".into())
+        );
+        assert_eq!(
+            parse_assignment("kalpin-back:review/reviewer"),
+            (Some("kalpin-back".into()), "review".into(), "reviewer".into())
+        );
+        // A ':' inside the role (after the first '/') is not an override.
+        assert_eq!(
+            parse_assignment("build/impl:er"),
+            (None, "build".into(), "impl:er".into())
+        );
+        // Override beats cwd; cwd basename beats lane; meta role → méta; else divers.
+        assert_eq!(project_of(Some("/x/repo"), Some("meta:build/x")), "meta");
+        assert_eq!(project_of(Some("/x/repo"), Some("build/x")), "repo");
+        assert_eq!(project_of(None, Some("plan/planner")), "méta");
+        assert_eq!(project_of(None, Some("build/worker")), "divers");
+        assert_eq!(project_of(Some("/home/u/dev"), Some("build/worker")), "divers");
     }
 
     /// Publish a dashboard share-token on the running server's snapshot.
