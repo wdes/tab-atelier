@@ -5958,6 +5958,9 @@ impl AppState {
                                                         relay_endpoint_id: on_disk_prefs.relay_endpoint_id,
                                                         relay_egress: on_disk_prefs.relay_egress,
                                                         tab_env: on_disk_prefs.tab_env,
+                                                        // Dashboard repo→service map — CLI/config managed,
+                                                        // not in this dialog; carry the on-disk value through.
+                                                        repo_families: on_disk_prefs.repo_families,
                                                         hotkeys: this.hotkeys.clone(),
                                                         browser,
                                                         code_editor: editor,

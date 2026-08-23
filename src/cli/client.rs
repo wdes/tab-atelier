@@ -54,6 +54,7 @@ pub fn dispatch(name: &str, rest: &[String]) -> Option<i32> {
         // 🐊 aligator (PoC #35): deterministic input router + its producer.
         "aligator" => aligator::run(rest),
         "swamp" => aligator::run_swamp(rest),
+        "clarify" => super::clarify::run(rest),
         "schedule" => share_link::schedule(rest),
         "log" => logging::run(rest),
         "flags" => flags::run(rest),
