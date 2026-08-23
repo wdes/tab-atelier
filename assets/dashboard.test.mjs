@@ -7,6 +7,7 @@ import {
   ledClass, nodeMap, CANONICAL_PHASES, resolveView, renderProjectCard,
   readProjectParam, shortContext, nodeSubtitle,
   isOrchestrator, roleAltitude, projectAltitude, lineageEdges,
+  viewerUrlWithToken,
 } from "./dashboard.js";
 
 // The five led states each map to their own distinct class.
@@ -153,5 +154,21 @@ assert.equal(projectAltitude({ nodes: [] }), 2, "empty project -> worker band");
   assert.deepEqual(lineageEdges([]), [], "no projects -> no edges");
   assert.deepEqual(lineageEdges(null), [], "malformed input -> no edges");
 }
+
+// --- viewer open carries the page share-token (fix-viewer-token) ---
+// The right-click open must append the page token so the viewer routes (now
+// authorised by the read-only dashboard token) don't 401. Host stays relative.
+assert.equal(
+  viewerUrlWithToken("/tabs/by-id/abc/view", "dash-obs"),
+  "/tabs/by-id/abc/view?token=dash-obs",
+  "appends ?token= to a token-less viewer url"
+);
+assert.equal(
+  viewerUrlWithToken("/tabs/by-id/abc/view?ro=1", "d&x"),
+  "/tabs/by-id/abc/view?ro=1&token=d%26x",
+  "uses & when a query already exists, and encodes the token"
+);
+assert.equal(viewerUrlWithToken("/x/view", ""), "/x/view", "no token -> url unchanged");
+assert.equal(viewerUrlWithToken("", "t"), "", "no url -> empty");
 
 console.log("dashboard.test.mjs: OK");
