@@ -151,6 +151,21 @@ gates the right-click "close the predecessor" action (enabled only at
 `safe-to-close`; never auto-closes — the human still clicks). The successor's
 `parentTabId` is set to the old uuid so the dashboard draws the old→new edge.
 
+### Orchestrators, unassigned, activity (Increment 5)
+
+- Each `DashboardProject` carries `orchestrators[]` — the orchestrators working
+  in that repo, sorted by id, each with `id`, `name`, its current `item` (the
+  volatile context) and a GLOBAL `childCount` (how many tabs it spawned, counted
+  via `parentTabId` across every repo).
+- `DashboardState.unassigned[]` is the top-level bucket of tabs with **no
+  `assignment` at all** (sorted by id) — legitimately un-placed. It's distinct
+  from `unmapped` (assigned but an unknown phase): an unknown-phase tab is
+  unmapped but never unassigned.
+- `GET /dashboard/activity` is a thin passthrough of the activity scribe's
+  `~/.local/state/tab-atelier/activity.json` — verbatim when present, a graceful
+  empty `{}` when absent or malformed (never 404/500). Same auth gate as
+  `/dashboard/state` (master or the dashboard share-token; 401 otherwise).
+
 ## `GET /dashboard`
 
 Serves the static web app (`assets/dashboard.html` + `assets/dashboard.js` +
