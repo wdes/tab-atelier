@@ -233,6 +233,24 @@ body {
 .tab-tokens { grid-column: 2; grid-row: 2; color: var(--muted); font-size: 0.8rem; white-space: nowrap; }
 .popup-hint { margin-top: 0.4rem; font-size: 0.72rem; color: var(--muted); }
 
+/* Tooltip detail chips (finding b): assignment / cwd / rehome / RAM / CPU. */
+.tab-details {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  margin-top: 0.2rem;
+}
+.tab-details .td {
+  font-size: 0.68rem;
+  color: var(--muted);
+  padding: 0.05rem 0.35rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  white-space: nowrap;
+}
+.tab-details .td-rehome[data-status="safe-to-close"] { color: #1a7f37; border-color: #2da44e; }
+
 /* --- re-home links (Slice C) --- */
 .rehome { margin-top: 1rem; }
 .rehome h2 { font-size: 0.85rem; color: var(--muted); margin: 0 0 0.4rem; }

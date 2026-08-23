@@ -9,6 +9,7 @@ import {
   isOrchestrator, roleAltitude, projectAltitude, lineageEdges,
   viewerUrlWithToken,
   REHOME_STATES, rehomeStep, rehomePairs, rehomePairHtml,
+  usageMap, fmtBytes, fmtCpu, tabDetailChips,
 } from "./dashboard.js";
 
 // The five led states each map to their own distinct class.
@@ -218,6 +219,40 @@ assert.equal(rehomeStep(null), -1, "none -> -1");
   assert.match(safeHtml, /rehome-pair safe/, "safe-to-close marks the pair safe");
   const pendingHtml = rehomePairHtml(pending, id);
   assert.match(pendingHtml, /\(successor pending\)/, "no successor -> pending label");
+}
+
+// --- finding b: tooltip enrichment (usage merge + detail chips) ---
+{
+  const um = usageMap([
+    { id: "a", resident_memory_bytes: 26759168, cpu_percent: 1.5 },
+    { id: "b", resident_memory_bytes: 0, cpu_percent: 0 },
+    { bogus: true }, // no id -> skipped
+  ]);
+  assert.equal(um.size, 2, "entries without id are skipped");
+  assert.deepEqual(um.get("a"), { ram: 26759168, cpu: 1.5 });
+  assert.deepEqual(usageMap(null), new Map(), "malformed usage -> empty map");
+}
+assert.equal(fmtBytes(0), "0 B");
+assert.equal(fmtBytes(512), "512 B");
+assert.equal(fmtBytes(26759168), "25.5 MB", "bytes -> compact MB");
+assert.equal(fmtBytes(1024), "1.0 KB");
+assert.equal(fmtCpu(1.5), "2%");
+assert.equal(fmtCpu(0), "0%");
+{
+  const id = (s) => s;
+  const chips = tabDetailChips(
+    { assignment: "tab-atelier:build/implementer", cwd: "/home/x", rehomeStatus: "ack-sent" },
+    { ram: 26759168, cpu: 1.5 },
+    id
+  );
+  assert.match(chips, /assign tab-atelier:build\/implementer/);
+  assert.match(chips, /cwd \/home\/x/);
+  assert.match(chips, /rehome ack-sent/);
+  assert.match(chips, /RAM 25\.5 MB/);
+  assert.match(chips, /CPU 2%/);
+  // Absent fields -> no chip (clean tooltip). No usage -> no RAM/CPU chips.
+  assert.equal(tabDetailChips({ name: "x" }, null, id), "", "nothing known -> no chips");
+  assert.doesNotMatch(tabDetailChips({ assignment: "p:build/impl" }, null, id), /RAM|CPU|cwd|rehome/);
 }
 
 console.log("dashboard.test.mjs: OK");
