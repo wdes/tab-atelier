@@ -3295,6 +3295,10 @@ impl AppState {
             #[cfg(feature = "energy")]
             let power_label = watts.get(i).map(power::TabPower::label).unwrap_or_default();
 
+            // S5: an orchestrator tab gets a lighter background tint so its role
+            // reads at a glance in the bar. Role comes from `assignment` (S0),
+            // never the volatile `context`.
+            let is_orchestrator = crate::api::role_of(tab.assignment.as_deref()) == "orchestrator";
             let drag_name = tab.name.clone();
             let tab_el = div()
                 .id(ElementId::Name(self.tab_el_ids[i].clone()))
@@ -3317,12 +3321,22 @@ impl AppState {
                 .border_l_1()
                 .border_t_1()
                 .border_b_1()
-                .bg(if blink_red {
-                    tab_blink_bg
-                } else if is_active {
-                    tab_active_bg
-                } else {
-                    tab_bg
+                .bg({
+                    let base = if blink_red {
+                        tab_blink_bg
+                    } else if is_active {
+                        tab_active_bg
+                    } else {
+                        tab_bg
+                    };
+                    if is_orchestrator {
+                        Hsla {
+                            l: (base.l + 0.12).min(1.0),
+                            ..base
+                        }
+                    } else {
+                        base
+                    }
                 })
                 .border_r_1()
                 .border_color(tab_border)
@@ -3810,6 +3824,54 @@ impl AppState {
                     )
                     .child("\u{26d1}\u{fe0f} Brain"),
             );
+
+            // 📊 Dashboard (S5) — opens the harness dashboard scoped to this
+            // tab's team, role-aware: a worker/orchestrator drills into its
+            // project, a tichef / méta specialist gets the global level 0. Role
+            // + project come from `assignment` (S0), never the volatile context.
+            // The URL carries the GLOBAL read-only dashboard share token (minted
+            // lazily) so it also works from a remote browser.
+            {
+                let port = port_of(&self.api_addr, crate::DEFAULT_API_PORT);
+                let share_base = self.share_url_base.trim_end_matches('/').to_string();
+                container = container.child(
+                    div()
+                        .id("menu-dashboard")
+                        .px(px(12.0))
+                        .py(px(4.0))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(menu_hover))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                                let token = {
+                                    let mut snap =
+                                        this.api_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                                    if snap.dashboard_share_token.is_empty() {
+                                        snap.dashboard_share_token = crate::mint_share_token().into();
+                                    }
+                                    snap.dashboard_share_token.to_string()
+                                };
+                                let role = crate::api::role_of(this.tabs[idx].assignment.as_deref());
+                                let project = crate::api::project_of(
+                                    this.tabs[idx].last_known_cwd_string.as_deref(),
+                                    this.tabs[idx].assignment.as_deref(),
+                                );
+                                let base = if share_base.is_empty() {
+                                    format!("http://{}:{port}", crate::api::local_ip())
+                                } else {
+                                    share_base.clone()
+                                };
+                                let url = crate::api::dashboard_url_for_role(&role, &project, &base, &token);
+                                let browser = this.browser.borrow().clone();
+                                platform::open_url(&url, browser.as_deref());
+                                this.context_menu = None;
+                                cx.notify();
+                            }),
+                        )
+                        .child("\u{1F4CA} Dashboard"),
+                );
+            }
 
             let colors_enabled = self.tabs[idx].view.read(cx).colors_enabled();
             let toggle_label = if colors_enabled {
