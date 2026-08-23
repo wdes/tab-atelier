@@ -354,6 +354,19 @@ struct DashboardNode {
     tabs: Vec<DashboardTab>,
 }
 
+/// An orchestrator working in a project (S5): named, with its current `item`
+/// (the volatile context) and a GLOBAL `child_count` — the number of tabs whose
+/// `parent_tab_id` is this orchestrator, wherever they live. Feeds the "name the
+/// orchestrators under their repo + multi-orch tree" view.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct OrchestratorRef {
+    id: String,
+    name: String,
+    item: String,
+    child_count: usize,
+}
+
 /// A project bucket (level 0): the 7-phase subtree scoped to one project, plus
 /// its rollup. `méta` and `divers` are the two shared lanes.
 #[derive(Serialize)]
@@ -364,6 +377,8 @@ struct DashboardProject {
     rollup_led: Option<&'static str>,
     has_orchestrator: bool,
     is_meta: bool,
+    /// The orchestrators working in this repo, sorted by id (S5).
+    orchestrators: Vec<OrchestratorRef>,
     nodes: Vec<DashboardNode>,
     unmapped: Vec<DashboardTab>,
 }
@@ -386,6 +401,9 @@ struct DashboardState {
     /// Delegation lineage (S6): `parent_tab_id` edges whose parent is a known
     /// tab. A tab with no/unknown parent is a root (no edge). Self-edges dropped.
     lineage: Vec<LineageEdge>,
+    /// Tabs with NO `assignment` at all (S5, #90) — legitimately un-placed,
+    /// sorted by id. Distinct from `unmapped` (assigned but an unknown phase).
+    unassigned: Vec<DashboardTab>,
 }
 
 /// Build the delegation lineage from `(child_id, parent_id)` pairs. An edge is
@@ -565,6 +583,20 @@ pub fn project_of(cwd: Option<&str>, assignment: Option<&str>) -> String {
     }
 }
 
+/// Thin passthrough of the activity scribe's `activity.json` (under the state
+/// dir). Returns the file VERBATIM when present + parseable; degrades to a
+/// graceful empty JSON object `{}` when absent or malformed — the panel reads
+/// valid JSON either way, never a 404/500. `base` is the state-base dir, so it's
+/// testable on a tempdir without touching XDG. `GET /dashboard/activity` wraps it.
+#[must_use]
+pub fn read_activity_json(base: &std::path::Path) -> String {
+    let path = crate::state_dir(base).join("activity.json");
+    match std::fs::read_to_string(&path) {
+        Ok(s) if serde_json::from_str::<serde_json::Value>(&s).is_ok() => s,
+        _ => "{}".to_string(),
+    }
+}
+
 /// Group `(phase, tab)` pairs into the 7 canonical nodes + an unmapped bucket,
 /// rolling up each node's led to its worst occupant. Shared by the global
 /// diagram and each project subtree.
@@ -632,6 +664,24 @@ fn build_dashboard_state(inputs: Vec<DashboardTabInput>) -> DashboardState {
     // Global diagram (Increment 1 contract).
     let (nodes, unmapped) = group_into_nodes(projected.iter().map(|p| (p.phase.clone(), p.tab.clone())));
 
+    // GLOBAL child count per tab id (how many tabs it spawned, anywhere) — for
+    // each orchestrator's `child_count`. Counts every `parent_tab_id` occurrence,
+    // cross-repo included.
+    let mut child_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for p in &projected {
+        if let Some(parent) = &p.tab.parent_tab_id {
+            *child_counts.entry(parent.clone()).or_default() += 1;
+        }
+    }
+
+    // Top-level `unassigned` (S5): tabs with no assignment at all, sorted by id.
+    let mut unassigned: Vec<DashboardTab> = projected
+        .iter()
+        .filter(|p| p.tab.assignment.is_none())
+        .map(|p| p.tab.clone())
+        .collect();
+    unassigned.sort_by(|a, b| a.id.cmp(&b.id));
+
     // Distinct projects, sorted alpha with méta/divers pinned last.
     let mut names: Vec<String> = projected.iter().map(|p| p.project.clone()).collect();
     names.sort();
@@ -653,6 +703,18 @@ fn build_dashboard_state(inputs: Vec<DashboardTabInput>) -> DashboardState {
                 .iter()
                 .filter_map(|p| p.tab.led)
                 .max_by_key(|led| led_severity(led));
+            // Orchestrators in this repo, named + with their GLOBAL child_count.
+            let mut orchestrators: Vec<OrchestratorRef> = mine
+                .iter()
+                .filter(|p| p.tab.role == "orchestrator")
+                .map(|p| OrchestratorRef {
+                    id: p.tab.id.clone(),
+                    name: p.tab.name.clone(),
+                    item: p.tab.item.clone(),
+                    child_count: child_counts.get(&p.tab.id).copied().unwrap_or(0),
+                })
+                .collect();
+            orchestrators.sort_by(|a, b| a.id.cmp(&b.id));
             let (nodes, unmapped) = group_into_nodes(mine.iter().map(|p| (p.phase.clone(), p.tab.clone())));
             let is_meta = name == META_LANE;
             DashboardProject {
@@ -661,6 +723,7 @@ fn build_dashboard_state(inputs: Vec<DashboardTabInput>) -> DashboardState {
                 rollup_led,
                 has_orchestrator,
                 is_meta,
+                orchestrators,
                 nodes,
                 unmapped,
             }
@@ -679,6 +742,7 @@ fn build_dashboard_state(inputs: Vec<DashboardTabInput>) -> DashboardState {
         unmapped,
         projects,
         lineage,
+        unassigned,
     }
 }
 
@@ -2151,7 +2215,8 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
         }
         ok
     };
-    let is_dashboard_token = dashboard_matches && matches!(path.as_str(), "/dashboard" | "/dashboard/state");
+    let is_dashboard_token =
+        dashboard_matches && matches!(path.as_str(), "/dashboard" | "/dashboard/state" | "/dashboard/activity");
     if !is_master && !is_dashboard_token {
         let allowed = if let Some(p) = provided_token.as_deref()
             && let Some(rest) = path.strip_prefix("/tabs/by-id/")
@@ -2423,6 +2488,13 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             let token = snap.dashboard_share_token.to_string();
             drop(snap);
             respond_json(stream, 200, &format!(r#"{{"token":"{token}"}}"#));
+        }
+        // Thin passthrough of the activity scribe's `activity.json` — verbatim
+        // when present, gracefully empty (`{}`) when absent/malformed, never
+        // 404/500. Same auth as `/dashboard/state` (master or dashboard token).
+        ("GET", "/dashboard/activity") => {
+            let body = read_activity_json(&crate::platform::state_base_dir());
+            respond_json(stream, 200, &body);
         }
         ("GET", "/dashboard/state") => {
             let state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
