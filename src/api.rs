@@ -211,6 +211,10 @@ struct TabInfo {
     /// Omitted for a root (non-spawned) tab.
     #[serde(skip_serializing_if = "Option::is_none")]
     parent_tab_id: Option<String>,
+    /// Re-home progress on a predecessor tab (`handoff-written` → `successor-ready`
+    /// → `ack-sent` → `safe-to-close`). Omitted when not rehoming.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rehome_status: Option<String>,
     /// Number of WS viewers (browser share-link / `remote attach`)
     /// currently watching this tab. Omitted when zero.
     #[serde(skip_serializing_if = "is_zero")]
@@ -329,6 +333,9 @@ struct DashboardTab {
     item: String,
     /// UUID of the spawning tab, for the delegation lineage. `None` ⇒ root.
     parent_tab_id: Option<String>,
+    /// Re-home progress on a predecessor tab (annotates the old→new drill-in
+    /// link with readiness/ACK). `None` ⇒ not rehoming.
+    rehome_status: Option<String>,
     /// Static altitude band from the role class: 0 tichef, 1 orchestrator,
     /// 2 worker/specialist. A socle available without lineage data.
     altitude: u8,
@@ -414,6 +421,7 @@ struct DashboardTabInput {
     assignment: Option<String>,
     context: Option<String>,
     parent_tab_id: Option<String>,
+    rehome_status: Option<String>,
     agent_state: Option<&'static str>,
     led: Option<&'static str>,
     tokens: Option<crate::TokenUsage>,
@@ -444,6 +452,33 @@ fn parse_assignment(a: &str) -> (Option<String>, String, String) {
     let phase = parts.next().unwrap_or("").trim().to_string();
     let role = parts.next().unwrap_or("").trim().to_string();
     (over.filter(|p| !p.is_empty()), phase, role)
+}
+
+/// The re-home lifecycle states on a predecessor tab, in progress order (used to
+/// validate `POST …/rehome`). The last, `safe-to-close`, is posted by the old
+/// agent itself on its ACK and gates the "close the predecessor" action.
+pub const REHOME_STATES: [&str; 4] = ["handoff-written", "successor-ready", "ack-sent", "safe-to-close"];
+
+/// True once a re-home's bidirectional proof is complete and the human may close
+/// the predecessor. The GUI's "close the predecessor" action enables only here;
+/// it never auto-closes — the human gate stays.
+#[must_use]
+pub fn rehome_safe_to_close(status: Option<&str>) -> bool {
+    status == Some("safe-to-close")
+}
+
+/// A re-home status → its progress-badge label + whether it's the final
+/// safe-to-close state (which the GUI paints green / uses to enable closing).
+/// `None` for a tab that isn't rehoming. Pure, so the mapping is unit-testable.
+#[must_use]
+pub fn rehome_badge(status: Option<&str>) -> Option<(&'static str, bool)> {
+    match status {
+        Some("handoff-written") => Some(("handoff écrit", false)),
+        Some("successor-ready") => Some(("successeur prêt", false)),
+        Some("ack-sent") => Some(("ACK envoyé", false)),
+        Some("safe-to-close") => Some(("SAFE À FERMER", true)),
+        _ => None,
+    }
 }
 
 /// Static altitude band from an agent role: 0 = tichef (top), 1 = orchestrator,
@@ -552,6 +587,7 @@ fn build_dashboard_state(inputs: Vec<DashboardTabInput>) -> DashboardState {
                 assignment: t.assignment,
                 role,
                 parent_tab_id: t.parent_tab_id,
+                rehome_status: t.rehome_status,
                 altitude,
                 agent_state: t.agent_state,
                 led: t.led,
@@ -706,6 +742,9 @@ pub struct SnapshotTab {
     /// UUID of the spawning tab (`parent_tab_id`), mirrored from the runtime
     /// tab. Drives the dashboard delegation lineage. `None` ⇒ a root tab.
     pub parent_tab_id: Option<std::sync::Arc<str>>,
+    /// Re-home progress on a predecessor tab, mirrored from the runtime tab.
+    /// See [`crate::TabState::rehome_status`]. `None` ⇒ not rehoming.
+    pub rehome_status: Option<std::sync::Arc<str>>,
     /// PID of the tab's shell. The /catbus endpoints walk its
     /// descendant processes to find a catbus-agent (or fallback
     /// `claude` TUI) and resolve the session's transcript file.
@@ -896,6 +935,10 @@ pub struct TabSnapshot {
     /// (the delegate stamps a spawned tab's lineage). Mirrored + persisted like
     /// `pending_assignment_changes`.
     pub pending_parent_changes: Vec<(String, Option<String>)>,
+    /// (`tab_id`, `rehome_status`-or-None) queued by `POST /tabs/by-id/{id}/rehome`
+    /// (rehome-tab.sh + the old agent's ACK). Mirrored + persisted like
+    /// `pending_assignment_changes`.
+    pub pending_rehome_changes: Vec<(String, Option<String>)>,
     /// Tab ids whose per-tab share tokens (`share_token_rw`/`_ro`) the
     /// owner loop should clear, queued by `POST /tabs/rotate-tokens`.
     /// Clearing revokes every outstanding share link for that tab (it
@@ -2214,6 +2257,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                     context: t.context.as_deref().map(str::to_string),
                     assignment: t.assignment.as_deref().map(str::to_string),
                     parent_tab_id: t.parent_tab_id.as_deref().map(str::to_string),
+                    rehome_status: t.rehome_status.as_deref().map(str::to_string),
                     net_disabled: t.net_disabled,
                     connections: t.connections,
                     tx_bytes: t.tx_bytes,
@@ -2361,6 +2405,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                     assignment: t.assignment.as_deref().map(str::to_string),
                     context: t.context.as_deref().map(str::to_string),
                     parent_tab_id: t.parent_tab_id.as_deref().map(str::to_string),
+                    rehome_status: t.rehome_status.as_deref().map(str::to_string),
                     agent_state: t.agent_state.as_ref().map(|s| match s.state {
                         crate::AgentState::Thinking => "thinking",
                         crate::AgentState::Waiting => "waiting",
@@ -4024,6 +4069,48 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             let body = serde_json::to_string(&serde_json::json!({ "parent_tab_id": parent_opt })).unwrap_or_default();
             respond_json(stream, 200, &body);
         }
+        ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/rehome") => {
+            // Set/clear a predecessor tab's re-home progress:
+            // `{"rehome_status":"<state>"}` (null / empty clears). `rehome-tab.sh`
+            // stamps handoff-written/successor-ready/ack-sent at its steps; the old
+            // agent itself posts `safe-to-close` on its ACK. Only the 4 canonical
+            // states are accepted (a typo → 400, so a bad value can't unlock the
+            // "close predecessor" action). Persisted like /assignment. Master token.
+            let inner = &p["/tabs/by-id/".len()..p.len() - "/rehome".len()];
+            let rehome_opt: Option<String> = if body_bytes.is_empty() {
+                None
+            } else {
+                serde_json::from_slice::<serde_json::Value>(&body_bytes)
+                    .ok()
+                    .and_then(|v| v.get("rehome_status").cloned())
+                    .and_then(|c| {
+                        if c.is_null() {
+                            None
+                        } else {
+                            c.as_str().map(str::to_owned)
+                        }
+                    })
+            };
+            let rehome_opt = rehome_opt.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+            if let Some(s) = &rehome_opt
+                && !REHOME_STATES.contains(&s.as_str())
+            {
+                error_json(stream, 400, "invalid rehome_status");
+                return;
+            }
+            let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(idx) = state.tabs.iter().position(|t| &*t.id == inner) else {
+                drop(state);
+                error_json(stream, 404, "tab not found");
+                return;
+            };
+            let tab_id = state.tabs[idx].id.to_string();
+            state.tabs[idx].rehome_status = rehome_opt.as_deref().map(std::sync::Arc::from);
+            state.pending_rehome_changes.push((tab_id, rehome_opt.clone()));
+            drop(state);
+            let body = serde_json::to_string(&serde_json::json!({ "rehome_status": rehome_opt })).unwrap_or_default();
+            respond_json(stream, 200, &body);
+        }
         ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/input") => {
             let Some((key_raw, is_uuid)) = parse_tab_key(p, "/input") else {
                 error_json(stream, 404, "invalid tab key");
@@ -4891,6 +4978,7 @@ pub fn test_snapshot_tab(id: &str, name: &str) -> SnapshotTab {
         context: None,
         assignment: None,
         parent_tab_id: None,
+        rehome_status: None,
         shell_pid: 0,
         agent_state: None,
         agent_session_id: None,
@@ -4930,6 +5018,7 @@ pub fn test_snapshot(tabs: Vec<SnapshotTab>) -> TabSnapshot {
         pending_context_changes: vec![],
         pending_assignment_changes: vec![],
         pending_parent_changes: vec![],
+        pending_rehome_changes: vec![],
         pending_token_rotations: vec![],
         pending_schedule_changes: vec![],
         pending_new_tabs: 0,
@@ -4985,6 +5074,7 @@ mod tests {
             context: None,
             assignment: None,
             parent_tab_id: None,
+            rehome_status: None,
             viewers: 0,
             net_disabled: false,
             connections: 0,
@@ -5028,6 +5118,7 @@ mod tests {
             assignment: assignment.map(str::to_string),
             context: None,
             parent_tab_id: None,
+            rehome_status: None,
             agent_state: None,
             led,
             tokens: None,
@@ -5346,6 +5437,80 @@ mod tests {
             body(&tabs).contains("spawner-uuid"),
             "parentTabId must surface on /tabs: {}",
             body(&tabs)
+        );
+    }
+
+    #[test]
+    fn rehome_safe_to_close_only_at_final_state() {
+        assert!(rehome_safe_to_close(Some("safe-to-close")));
+        for s in ["handoff-written", "successor-ready", "ack-sent", "garbage", ""] {
+            assert!(!rehome_safe_to_close(Some(s)), "{s} must not be safe-to-close");
+        }
+        assert!(!rehome_safe_to_close(None), "no rehome → not safe-to-close");
+    }
+
+    #[test]
+    fn rehome_badge_maps_each_state_and_flags_safe() {
+        // Only the final state flags safe=true (green / unlocks close).
+        assert_eq!(rehome_badge(Some("handoff-written")), Some(("handoff écrit", false)));
+        assert_eq!(rehome_badge(Some("successor-ready")), Some(("successeur prêt", false)));
+        assert_eq!(rehome_badge(Some("ack-sent")), Some(("ACK envoyé", false)));
+        assert_eq!(rehome_badge(Some("safe-to-close")), Some(("SAFE À FERMER", true)));
+        assert_eq!(rehome_badge(None), None);
+        assert_eq!(rehome_badge(Some("garbage")), None);
+    }
+
+    #[test]
+    fn set_rehome_status_validates_persists_and_exposes() {
+        let (port, state, token) = spawn_server();
+        let post = |body: &str| {
+            request(
+                port,
+                &format!(
+                    "POST /tabs/by-id/tab-a/rehome HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len(),
+                ),
+            )
+        };
+        // A valid state → 200, set on the snapshot + queued.
+        assert_eq!(status_code(&post(r#"{"rehome_status":"successor-ready"}"#)), 200);
+        let (s, queued) = {
+            let g = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                g.tabs[0].rehome_status.clone(),
+                g.pending_rehome_changes.last().cloned(),
+            )
+        };
+        assert_eq!(s.as_deref(), Some("successor-ready"));
+        assert_eq!(queued.unwrap().1.as_deref(), Some("successor-ready"));
+        // Surfaces on /tabs.
+        state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .invalidate_tabs();
+        let tabs = request(port, &format!("GET /tabs?token={token} HTTP/1.1\r\n\r\n"));
+        assert!(
+            body(&tabs).contains("successor-ready"),
+            "rehome_status on /tabs: {}",
+            body(&tabs)
+        );
+        // An unknown state → 400, and the snapshot is UNCHANGED (a typo can't
+        // clobber the gate to safe-to-close).
+        assert_eq!(status_code(&post(r#"{"rehome_status":"safe-too-close"}"#)), 400);
+        assert_eq!(
+            state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).tabs[0]
+                .rehome_status
+                .as_deref(),
+            Some("successor-ready"),
+            "a rejected state must not overwrite the previous one"
+        );
+        // safe-to-close is accepted (the gate state).
+        assert_eq!(status_code(&post(r#"{"rehome_status":"safe-to-close"}"#)), 200);
+        // Empty body clears it.
+        assert_eq!(status_code(&post("")), 200);
+        assert_eq!(
+            state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).tabs[0].rehome_status,
+            None
         );
     }
 
