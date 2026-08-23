@@ -241,6 +241,20 @@ export function overviewLayout(state) {
   return { order: ["META", "REPOS", "UNASSIGNED"], meta, repos, unassigned };
 }
 
+// Pure: the service nesting (Inc6 S4). One entry per service, in order, wrapping
+// its sub-repos; a single-repo service is `mono` (not over-nested). Repo entries
+// are normalised to {name} whether the server sends strings or objects. Null-safe.
+export function serviceLayout(state) {
+  const s = state || {};
+  const services = Array.isArray(s.services) ? s.services : [];
+  return services.map((svc) => {
+    const repos = Array.isArray(svc && svc.projects)
+      ? svc.projects.map((p) => (typeof p === "string" ? { name: p } : p))
+      : [];
+    return { service: svc && svc.name, rollupLed: svc && svc.rollupLed, repos, mono: repos.length <= 1 };
+  });
+}
+
 // Pure: the org-chart (Inc6 S2). A solo méta (serving null) stays on top; each
 // repo is a team whose LEAD is its orchestrator, with workers hanging under the
 // lead (parentTabId) and any méta `serving` this repo JOINING the team (indispo).
@@ -494,12 +508,15 @@ function renderOrgChart() {
   const services = serviceGrouping(currentState);
   if (services.length) {
     // S4: group teams under their service (family wrapper; mono not over-nested).
+    const covered = new Set();
     for (const svc of services) {
       const teams = svc.repos
-        .map((r) => teamHtml(teamByRepo.get(r.name) || { repo: r.name, lead: null, workers: [], serving: [] }))
+        .map((r) => { covered.add(r.name); return teamHtml(teamByRepo.get(r.name) || { repo: r.name, lead: null, workers: [], serving: [] }); })
         .join("");
       parts.push(`<div class="service ${svc.mono ? "service-mono" : "service-family"}" data-service="${escapeHtml(svc.service)}"${svc.mono ? ' data-mono="true"' : ""}><div class="service-name">${escapeHtml(svc.service)}</div>${teams}</div>`);
     }
+    // Safety: never drop a repo the services list forgot — render it flat.
+    for (const t of org.teams) if (!covered.has(t.repo)) parts.push(teamHtml(t));
   } else {
     // No service grouping yet -> flat teams.
     for (const t of org.teams) parts.push(teamHtml(t));
