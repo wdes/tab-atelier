@@ -270,13 +270,19 @@ pub enum Commands {
         json: bool,
     },
 
-    /// Print a browser URL for the xterm.js viewer.
+    /// Print a browser URL for the xterm.js viewer, or the harness dashboard.
     ShareLink {
-        /// Tab index or UUID.
-        tab: String,
+        /// Tab index or UUID. Omit when `--dashboard` is given.
+        #[arg(required_unless_present = "dashboard", conflicts_with = "dashboard")]
+        tab: Option<String>,
         /// Read-only share link (recipient cannot type).
         #[arg(long, short)]
         ro: bool,
+        /// Print the global, read-only harness dashboard URL
+        /// (`/dashboard?token=…`) instead of a tab viewer link. Takes no tab;
+        /// the dashboard is read-only by nature, so `--ro` doesn't apply.
+        #[arg(long, conflicts_with_all = ["ro"])]
+        dashboard: bool,
     },
 
     /// Toggle forced Claude-only mode on the running instance (live, no restart).
@@ -672,10 +678,19 @@ pub fn dispatch(cli: Cli) -> bool {
             }
             crate::cli::client::run("stats", &args)
         }
-        Commands::ShareLink { tab, ro } => {
-            let mut args = vec![tab];
-            if ro {
-                args.push("--ro".into());
+        Commands::ShareLink { tab, ro, dashboard } => {
+            // clap guarantees exactly one of (tab, --dashboard) — `tab` is
+            // required unless `--dashboard`, and the two conflict. Translate to
+            // the flags `share_link::run` already understands (same path as the
+            // headless hand-parser), so the dashboard logic lives in one place.
+            let mut args: Vec<String> = Vec::new();
+            if dashboard {
+                args.push("--dashboard".into());
+            } else if let Some(tab) = tab {
+                args.push(tab);
+                if ro {
+                    args.push("--ro".into());
+                }
             }
             crate::cli::client::run("share-link", &args)
         }
@@ -1068,6 +1083,43 @@ mod tests {
         );
         // --all alone (no tab) parses.
         assert!(Cli::try_parse_from(["tab-atelier-headless", "limit", "--all", "--memory", "8G"]).is_ok());
+    }
+
+    /// `share-link` takes a tab OR `--dashboard` (the global read-only panel);
+    /// the two are mutually exclusive and one is required. Regression guard for
+    /// the GUI clap parser rejecting `--dashboard` (it lived only in the headless
+    /// hand-parser before).
+    #[test]
+    fn share_link_dashboard_flag_parses_and_is_exclusive() {
+        // A bare tab still parses (unchanged behaviour).
+        assert!(Cli::try_parse_from(["tab-atelier", "share-link", "0"]).is_ok());
+        // `--dashboard` parses with NO tab.
+        let dash = Cli::try_parse_from(["tab-atelier", "share-link", "--dashboard"]).expect("--dashboard parses");
+        assert!(
+            matches!(
+                dash.command,
+                Some(Commands::ShareLink {
+                    tab: None,
+                    dashboard: true,
+                    ..
+                })
+            ),
+            "expected ShareLink{{tab:None,dashboard:true}}, got: {:?}",
+            dash.command
+        );
+        // Both a tab AND --dashboard → conflict.
+        let both = Cli::try_parse_from(["tab-atelier", "share-link", "0", "--dashboard"])
+            .expect_err("tab and --dashboard conflict");
+        assert!(
+            both.to_string().contains("cannot be used with") || both.to_string().contains("conflict"),
+            "expected conflict error, got: {both}"
+        );
+        // Neither a tab nor --dashboard → required-arg error.
+        let neither = Cli::try_parse_from(["tab-atelier", "share-link"]).expect_err("needs a tab or --dashboard");
+        assert!(
+            neither.to_string().contains("required") || neither.to_string().contains("missing"),
+            "expected required-arg error, got: {neither}"
+        );
     }
 
     #[test]
