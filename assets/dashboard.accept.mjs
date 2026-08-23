@@ -26,6 +26,7 @@ const CSS = read("dashboard.css");
 
 const ORIGIN = "http://ta-dash.local";
 const POLL_MS = 1500; // must match dashboard.js POLL_MS
+const TESTTOKEN = "TESTTOKEN"; // the dashboard share token carried in ?token= (S5)
 
 // --- Fixtures conforming to docs/dashboard.md "GET /dashboard/state" shape. ---
 
@@ -147,7 +148,9 @@ async function main() {
   let state = stateWorking();
   await wireRoutes(page, () => state, seenRequests);
 
-  await page.goto(`${ORIGIN}/dashboard`, { waitUntil: "networkidle" });
+  // Load WITH ?token= (S5): the daemon gates /dashboard on the share token and
+  // the browser carries it in the URL, exactly like the tab viewer's share link.
+  await page.goto(`${ORIGIN}/dashboard?token=${TESTTOKEN}`, { waitUntil: "networkidle" });
   // Wait for the first poll to have coloured the nodes.
   await page.waitForFunction(() => document.getElementById("node-build")?.classList.contains("led-working"), null, {
     timeout: 5000,
@@ -255,31 +258,42 @@ async function main() {
     );
   }
 
-  // --- AUTH FINDING (report-only, do NOT fix): the poll carries no credential.
+  // --- S5 AUTH re-validation: the share token now travels ?token= URL -> Bearer.
+  // (Was flagged as an intent/impl gap in S4; fixed by commit 86594ee.)
+
+  // S5.1: the JS reads ?token= from the URL and sends it as Authorization: Bearer
+  // on every /dashboard/state poll (proves the token round-trips through the JS).
   {
     const anyReq = seenRequests[0];
-    const noAuthHeader = seenRequests.every((r) => r.authorization == null);
-    const noTokenQuery = seenRequests.every((r) => !r.hasTokenQuery);
+    const allBearer = seenRequests.every((r) => r.authorization === `Bearer ${TESTTOKEN}`);
     ok(
-      "AUTH: dashboard.js polls /dashboard/state with NO Authorization header",
-      noAuthHeader && !!anyReq,
+      "S5.1: poll carries Authorization: Bearer <token> read from ?token=",
+      allBearer && !!anyReq,
       JSON.stringify(anyReq)
     );
-    ok("AUTH: ...and NO ?token= query param either", noTokenQuery && !!anyReq);
   }
 
-  // --- AUTH consequence: an authed endpoint returning 401 => UI reads "offline".
+  // S5.2: a 200 (token accepted) drives the UI to 'live' and colours the nodes.
+  {
+    const status = (await page.textContent("#status"))?.trim();
+    const buildCls = await page.getAttribute("#node-build", "class");
+    ok("S5.2: token accepted -> UI status 'live'", status === "live", `status=${status}`);
+    ok("S5.2: token accepted -> nodes coloured (build != neutral)", !buildCls?.includes("led-neutral"), buildCls);
+  }
+
+  // S5.3: a 401 (no/wrong token) renders 'offline (HTTP 401)' — same failure the
+  // real daemon returns to a token-less browser.
   {
     const page2 = await browser.newPage();
     let s2 = 401;
     await wireRoutes(page2, () => s2, null);
-    await page2.goto(`${ORIGIN}/dashboard`, { waitUntil: "networkidle" });
+    await page2.goto(`${ORIGIN}/dashboard`, { waitUntil: "networkidle" }); // no ?token=
     await page2.waitForFunction(() => /offline/i.test(document.getElementById("status")?.textContent || ""), null, {
       timeout: 5000,
     });
     const status = (await page2.textContent("#status"))?.trim();
     ok(
-      "AUTH: a 401 from /dashboard/state renders as 'offline' in the UI",
+      "S5.3: 401 (no/wrong token) renders 'offline (HTTP 401)'",
       /offline/i.test(status || "") && /401/.test(status || ""),
       `status=${status}`
     );
