@@ -77,6 +77,13 @@ export function renderProjectCard(project, esc) {
   </button>`;
 }
 
+// Pure: the drilled project from a URL query string (`?project=<name>`), or null
+// for the level-0 grid. Deep-links open straight into a project.
+export function readProjectParam(search) {
+  const value = new URLSearchParams(search || "").get("project");
+  return value ? value : null;
+}
+
 const POLL_MS = 1500;
 const STATE_URL = "/dashboard/state";
 
@@ -177,6 +184,21 @@ function setViewChrome(view) {
   if (back) back.hidden = !(view.mode === "diagram" && view.scoped);
 }
 
+// Drill into a project (or back out with null), keeping the URL's ?project= in
+// sync so the view is deep-linkable and the browser back button works. Re-renders
+// from the last state immediately — no wait for the next poll.
+function navigateTo(project, push) {
+  currentProject = project || null;
+  if (typeof history !== "undefined" && typeof location !== "undefined") {
+    const url = new URL(location.href);
+    if (currentProject) url.searchParams.set("project", currentProject);
+    else url.searchParams.delete("project");
+    if (push) history.pushState({ project: currentProject }, "", url);
+    else history.replaceState({ project: currentProject }, "", url);
+  }
+  render();
+}
+
 function renderUnmapped() {
   const section = document.getElementById("unmapped");
   const list = document.getElementById("unmapped-list");
@@ -256,6 +278,26 @@ function bootstrap() {
   document.addEventListener("contextmenu", (e) => {
     if (openViewerFrom(e.target)) e.preventDefault();
   });
+
+  // Drill into a project card (delegated — the grid is re-rendered each poll).
+  const grid = document.getElementById("project-grid");
+  if (grid) {
+    grid.addEventListener("click", (e) => {
+      const card = e.target.closest && e.target.closest(".project-card");
+      if (card) navigateTo(card.dataset.project, true);
+    });
+  }
+  // Back to the grid.
+  const back = document.getElementById("back-btn");
+  if (back) back.addEventListener("click", () => navigateTo(null, true));
+  // Browser back/forward moves between grid and drilled project.
+  window.addEventListener("popstate", () => {
+    currentProject = readProjectParam(location.search);
+    render();
+  });
+
+  // Deep-link: open straight into ?project= if present.
+  currentProject = readProjectParam(location.search);
 
   poll();
   setInterval(poll, POLL_MS);

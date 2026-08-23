@@ -16,6 +16,10 @@
   </header>
 
   <main id="dashboard" aria-label="harness workflow">
+    <!-- Back to the project grid. Shown only while drilled into a project (L1).
+         Deep-linkable: the drilled project lives in the URL's ?project=. -->
+    <button id="back-btn" class="back-btn" hidden>← projects</button>
+
     <!-- Level 0: project grid. Default view once the server exposes
          state.projects[] (docs/dashboard.md). Cards are rendered by dashboard.js
          in the ORDER RECEIVED from the server (no client re-sort) so a card keeps
