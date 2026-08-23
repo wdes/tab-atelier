@@ -509,6 +509,9 @@ pub enum Commands {
         /// Scan once and exit (daemon).
         #[arg(long)]
         once: bool,
+        /// Log the decision + the rehome-tab.sh command, spawn nothing.
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Off-hours auto-lock — OSM `opening_hours` rule + IANA timezone.
@@ -902,6 +905,7 @@ pub fn dispatch(cli: Cli) -> bool {
             watch,
             interval,
             once,
+            dry_run,
         } => {
             let mut args: Vec<String> = Vec::new();
             if let Some(tab) = tab {
@@ -912,6 +916,9 @@ pub fn dispatch(cli: Cli) -> bool {
             }
             if once {
                 args.push("--once".into());
+            }
+            if dry_run {
+                args.push("--dry-run".into());
             }
             if let Some(s) = interval {
                 args.push("--interval".into());
