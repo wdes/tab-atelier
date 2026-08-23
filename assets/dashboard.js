@@ -34,6 +34,33 @@ export function legendModel() {
   ];
 }
 
+// Pure: /dashboard/activity payload -> the panel model (S4). Five headline
+// figures + three per-day series (one point per day) + summary lines + the PO
+// benchmark record. Absent/empty/null payload -> zeros + empty series, no throw.
+export function activityModel(json) {
+  const j = json || {};
+  const totals = j.totals || {};
+  const perDay = Array.isArray(j.per_day) ? j.per_day : [];
+  const num = (v) => Number(v || 0);
+  return {
+    windowHours: num(j.window_hours),
+    features: num(totals.features_implemented),
+    tokensPerFeature: num(totals.tokens_per_feature),
+    minutesSinceLastHumanPrompt: num(totals.minutes_since_last_human_prompt),
+    aligatorCalls: num(totals.aligator_calls),
+    humanPrompts: num(totals.human_prompts),
+    tokensTotal: totals.tokens_total || {},
+    days: perDay.map((d) => (d && d.date) || ""),
+    series: {
+      features: perDay.map((d) => num(d && d.features)),
+      tokensPerFeature: perDay.map((d) => num(d && d.tokens_per_feature)),
+      autonomy: perDay.map((d) => num(d && d.autonomy_minutes_max)),
+    },
+    summaryLines: Array.isArray(j.summary_lines) ? j.summary_lines : [],
+    record: j.record || null,
+  };
+}
+
 // Pure: /dashboard/state -> Map<phaseId, node>. Defensive against a missing or
 // malformed `nodes` array so a bad poll never wipes the diagram with a throw.
 export function nodeMap(state) {
@@ -256,6 +283,8 @@ const STATE_URL = "/dashboard/state";
 // Per-tab RAM/CPU live in /tabs/usage (not /dashboard/state) — polled alongside
 // and merged by id for the hover tooltip (tichef finding b).
 const USAGE_URL = "/tabs/usage";
+// The "Dernières heures" figures live in /dashboard/activity — a 3rd poll leg (S4).
+const ACTIVITY_URL = "/dashboard/activity";
 
 // Pure: /tabs/usage array -> Map<id, {ram, cpu}>. Tolerant of a missing array.
 export function usageMap(list) {
@@ -556,15 +585,20 @@ async function poll() {
   const status = document.getElementById("status");
   const headers = { accept: "application/json", ...AUTH_HEADERS };
   try {
-    // /tabs/usage is best-effort (RAM/CPU tooltip); its failure never breaks the
-    // dashboard — only the state poll gates 'live'/'offline'.
-    const [res, usageRes] = await Promise.all([
+    // /tabs/usage (RAM/CPU tooltip) and /dashboard/activity (S4 panel) are
+    // best-effort side legs; their failure never breaks the dashboard — only the
+    // state poll gates 'live'/'offline'.
+    const [res, usageRes, actRes] = await Promise.all([
       fetch(STATE_URL, { headers }),
       fetch(USAGE_URL, { headers }).catch(() => null),
+      fetch(ACTIVITY_URL, { headers }).catch(() => null),
     ]);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     if (usageRes && usageRes.ok) {
       try { usageById = usageMap(await usageRes.json()); } catch { /* keep last */ }
+    }
+    if (actRes && actRes.ok) {
+      try { renderActivity(activityModel(await actRes.json())); } catch { /* keep last */ }
     }
     applyState(await res.json());
     if (status) status.textContent = "live";
@@ -573,6 +607,48 @@ async function poll() {
     if (status) status.textContent = `offline (${err.message})`;
     if (status) status.className = "status err";
   }
+}
+
+// --- S4: "Dernières heures" activity panel ---
+const ACTIVITY_FIGURES = [
+  { key: "features_implemented", label: "features", get: (m) => m.features },
+  { key: "tokens_per_feature", label: "tokens/feature", get: (m) => m.tokensPerFeature },
+  { key: "minutes_since_last_human_prompt", label: "min since human", get: (m) => m.minutesSinceLastHumanPrompt },
+  { key: "aligator_calls", label: "aligator", get: (m) => m.aligatorCalls },
+  { key: "human_prompts", label: "human prompts", get: (m) => m.humanPrompts },
+];
+const ACTIVITY_SERIES = [
+  { key: "features", label: "features/day", get: (m) => m.series.features },
+  { key: "tokens_per_feature", label: "tokens/feature", get: (m) => m.series.tokensPerFeature },
+  { key: "autonomy", label: "autonomy (min)", get: (m) => m.series.autonomy },
+];
+
+// One bar per day, height scaled to the series max (min 2px so a nonzero day is
+// always visible). Empty series -> no bars (the empty-panel state).
+function drawActivityBars(values) {
+  const nums = (values || []).map((v) => Number(v || 0));
+  const max = Math.max(1, ...nums);
+  return nums
+    .map((v) => `<span class="activity-bar" style="height:${Math.max(2, Math.round((v / max) * 40))}px" title="${escapeHtml(String(v))}"></span>`)
+    .join("");
+}
+
+function renderActivity(model) {
+  const body = document.getElementById("activity-body");
+  if (!body) return;
+  const figures = ACTIVITY_FIGURES
+    .map((f) => `<div class="activity-figure"><span class="fig-value" data-figure="${f.key}">${escapeHtml(String(f.get(model)))}</span><span class="fig-label">${escapeHtml(f.label)}</span></div>`)
+    .join("");
+  const series = ACTIVITY_SERIES
+    .map((s) => `<div class="activity-serie"><span class="serie-label">${escapeHtml(s.label)}</span><div class="activity-bars" data-series="${s.key}">${drawActivityBars(s.get(model))}</div></div>`)
+    .join("");
+  const summary = model.summaryLines.length
+    ? `<ul class="activity-summary">${model.summaryLines.map((l) => `<li>${escapeHtml(l)}</li>`).join("")}</ul>`
+    : "";
+  const record = model.record
+    ? `<div class="activity-record">record: ${escapeHtml(model.record.label || "")} · ~${escapeHtml(String(Math.round((Number(model.record.autonomy_minutes) || 0) / 60)))}h autonomy</div>`
+    : "";
+  body.innerHTML = `<div class="activity-figures">${figures}</div><div class="activity-series">${series}</div>${summary}${record}`;
 }
 
 // --- S1: legend rendering + persistent on/off toggle ---
