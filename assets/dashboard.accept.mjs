@@ -382,8 +382,12 @@ async function main() {
       JSON.stringify(order1) === JSON.stringify(order2),
       JSON.stringify([order1, order2])
     );
-    const last2 = order1.slice(-2);
-    ok("I2-S2: méta & divers pinned last", last2[0] === "méta" && last2[1] === "divers", JSON.stringify(order1));
+    // Inc5 reorg: the méta lane now sits in the META band (top), not "pinned
+    // last". divers is a normal repo card in the middle.
+    const metaInMetaBand = await gp.locator('.altitude-band[data-band-label="META"] .project-card[data-project="méta"]').count();
+    ok("I2-S2: méta sits in the META band (Inc5 reorg)", metaInMetaBand === 1, JSON.stringify(order1));
+    const diversPresent = await gp.locator('.project-card[data-project="divers"]').count();
+    ok("I2-S2: divers renders as a repo card", diversPresent === 1, JSON.stringify(order1));
     const kbBadge = await gp.locator('.project-card[data-project="kalpin-back"] .orch-badge').count();
     const kfBadge = await gp.locator('.project-card[data-project="kalpin-front"] .orch-badge').count();
     ok("I2-S2: hasOrchestrator project shows the ◆ badge", kbBadge === 1);
