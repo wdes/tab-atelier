@@ -829,6 +829,9 @@ pub fn run() -> std::io::Result<()> {
     let mut tabs: Vec<HeadlessTab> = Vec::new();
     let mut active: usize = 0;
     let mut windowed = false;
+    // Restored global dashboard share-token (empty until minted). Published onto
+    // the API snapshot below so a shared `/dashboard` link survives a restart.
+    let mut dashboard_token = String::new();
 
     let saved_state = load_state_with_outputs(&platform::config_base_dir(), &platform::state_base_dir());
     // Set up cgroup delegation once, before any tab spawns. Always attempted
@@ -847,6 +850,7 @@ pub fn run() -> std::io::Result<()> {
     if let Some(saved) = saved_state {
         info!("restoring {} tab(s) from saved state", saved.tabs.len());
         windowed = saved.windowed;
+        dashboard_token.clone_from(&saved.dashboard_share_token);
         for ts in &saved.tabs {
             let cwd = ts.cwd.as_ref().map(PathBuf::from);
             let env = tab_env_extras(&ts.id, &api_url_for_pty, &api_token, &ts.tab_env);
@@ -957,6 +961,7 @@ pub fn run() -> std::io::Result<()> {
     let api_state = Arc::new(Mutex::new(api::TabSnapshot {
         tabs: Vec::<api::SnapshotTab>::new(),
         master_token: String::new(),
+        dashboard_share_token: dashboard_token.as_str().into(),
         active,
         #[cfg(feature = "energy")]
         power: Vec::new(),
@@ -1522,10 +1527,10 @@ fn persist(
     tabs: &mut [HeadlessTab],
     active: usize,
     state_writer: &crate::StateWriter,
-    // Snapshot writeback moved to refresh_snapshot; this is kept on
-    // the signature for forward compat (callers shouldn't have to
-    // change). _-prefixed to silence unused-warning.
-    _api_state: &Arc<Mutex<api::TabSnapshot>>,
+    // Snapshot writeback moved to refresh_snapshot; still read here to
+    // persist the global dashboard share-token (lives on the snapshot, like
+    // the master token) into tabs.json so a shared link survives a restart.
+    api_state: &Arc<Mutex<api::TabSnapshot>>,
     #[cfg(feature = "energy")] power_pids: &Arc<Mutex<Vec<u32>>>,
     #[cfg(feature = "energy")] power_watts: &Arc<Mutex<Vec<crate::power::TabPower>>>,
     #[cfg(feature = "energy")] _battery_percent: &Arc<Mutex<Option<u8>>>,
@@ -1602,6 +1607,11 @@ fn persist(
         tabs: tab_states,
         active,
         windowed: false,
+        dashboard_share_token: api_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .dashboard_share_token
+            .to_string(),
     };
     // The string serialized for the hash IS what gets written, so the
     // dirty path doesn't serialize the same value a second time.
