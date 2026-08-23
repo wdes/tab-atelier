@@ -42,9 +42,16 @@ export function activityModel(json) {
   const totals = j.totals || {};
   const perDay = Array.isArray(j.per_day) ? j.per_day : [];
   const num = (v) => Number(v || 0);
+  // Inc6: the maturity/growth verdict (falsy when absent).
+  const verdictDetail = j.self_improvement_verdict || null;
   return {
     windowHours: num(j.window_hours),
     features: num(totals.features_implemented),
+    // Inc6: separate counters — features stays UNDIVIDED; these are distinct.
+    fixes: num(totals.fixes),
+    selfTooling: num(totals.self_tooling),
+    issuesOpened: num(totals.issues_opened),
+    issuesClosed: num(totals.issues_closed),
     tokensPerFeature: num(totals.tokens_per_feature),
     minutesSinceLastHumanPrompt: num(totals.minutes_since_last_human_prompt),
     aligatorCalls: num(totals.aligator_calls),
@@ -53,11 +60,15 @@ export function activityModel(json) {
     days: perDay.map((d) => (d && d.date) || ""),
     series: {
       features: perDay.map((d) => num(d && d.features)),
+      fixes: perDay.map((d) => num(d && d.fixes)),
+      selfTooling: perDay.map((d) => num(d && d.self_tooling)),
       tokensPerFeature: perDay.map((d) => num(d && d.tokens_per_feature)),
       autonomy: perDay.map((d) => num(d && d.autonomy_minutes_max)),
     },
     summaryLines: Array.isArray(j.summary_lines) ? j.summary_lines : [],
     record: j.record || null,
+    verdict: (verdictDetail && verdictDetail.verdict) || "",
+    verdictDetail,
   };
 }
 
@@ -762,7 +773,12 @@ async function poll() {
 
 // --- S4: "Dernières heures" activity panel ---
 const ACTIVITY_FIGURES = [
+  // Inc6: features stays undivided; fixes / self-tooling / issues are SEPARATE.
   { key: "features_implemented", label: "features", get: (m) => m.features },
+  { key: "fixes", label: "fixes", get: (m) => m.fixes },
+  { key: "self_tooling", label: "self-tooling", get: (m) => m.selfTooling },
+  { key: "issues_opened", label: "issues opened", get: (m) => m.issuesOpened },
+  { key: "issues_closed", label: "issues closed", get: (m) => m.issuesClosed },
   { key: "tokens_per_feature", label: "tokens/feature", get: (m) => m.tokensPerFeature },
   { key: "minutes_since_last_human_prompt", label: "min since human", get: (m) => m.minutesSinceLastHumanPrompt },
   { key: "aligator_calls", label: "aligator", get: (m) => m.aligatorCalls },
@@ -770,6 +786,8 @@ const ACTIVITY_FIGURES = [
 ];
 const ACTIVITY_SERIES = [
   { key: "features", label: "features/day", get: (m) => m.series.features },
+  { key: "fixes", label: "fixes/day", get: (m) => m.series.fixes },
+  { key: "self_tooling", label: "self-tooling/day", get: (m) => m.series.selfTooling },
   { key: "tokens_per_feature", label: "tokens/feature", get: (m) => m.series.tokensPerFeature },
   { key: "autonomy", label: "autonomy (min)", get: (m) => m.series.autonomy },
 ];
@@ -799,7 +817,12 @@ function renderActivity(model) {
   const record = model.record
     ? `<div class="activity-record">record: ${escapeHtml(model.record.label || "")} · ~${escapeHtml(String(Math.round((Number(model.record.autonomy_minutes) || 0) / 60)))}h autonomy</div>`
     : "";
-  body.innerHTML = `<div class="activity-figures">${figures}</div><div class="activity-series">${series}</div>${summary}${record}`;
+  // Inc6: maturity/growth verdict badge (self-improvement), when present.
+  const trend = model.verdictDetail && model.verdictDetail.autonomy_trend ? ` (autonomy ${escapeHtml(model.verdictDetail.autonomy_trend)})` : "";
+  const verdict = model.verdict
+    ? `<div class="verdict-badge" data-verdict="${escapeHtml(model.verdict)}">${escapeHtml(model.verdict)}${trend}</div>`
+    : "";
+  body.innerHTML = `${verdict}<div class="activity-figures">${figures}</div><div class="activity-series">${series}</div>${summary}${record}`;
 }
 
 // --- S1: legend rendering + persistent on/off toggle ---

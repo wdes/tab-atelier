@@ -466,3 +466,27 @@ body {
   color: var(--orchestrator-accent);
   font-style: normal;
 }
+
+/* --- Inc6 S6: maturity/growth verdict badge --- */
+.verdict-badge {
+  display: inline-block;
+  margin-bottom: 0.5rem;
+  padding: 0.15rem 0.55rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: capitalize;
+  background: color-mix(in srgb, var(--led-working-stroke) 18%, transparent);
+  color: var(--led-working-stroke);
+  border: 1px solid var(--led-working-stroke);
+}
+.verdict-badge[data-verdict="maturité"], .verdict-badge[data-verdict="maturite"] {
+  background: color-mix(in srgb, var(--led-idle-stroke) 18%, transparent);
+  color: var(--led-idle-stroke);
+  border-color: var(--led-idle-stroke);
+}
+.verdict-badge[data-verdict="stagnation"], .verdict-badge[data-verdict="régression"], .verdict-badge[data-verdict="regression"] {
+  background: color-mix(in srgb, var(--led-error-stroke) 18%, transparent);
+  color: var(--led-error-stroke);
+  border-color: var(--led-error-stroke);
+}
