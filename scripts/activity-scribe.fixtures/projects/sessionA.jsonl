@@ -1,0 +1,4 @@
+{"type":"user","promptSource":"typed","sessionId":"sessionA","timestamp":"2026-08-23T08:00:00.000Z","message":{"role":"user","content":"start the build"}}
+{"type":"assistant","sessionId":"sessionA","timestamp":"2026-08-23T08:05:00.000Z","message":{"role":"assistant","model":"claude-opus-4-8","usage":{"input_tokens":1000,"output_tokens":200,"cache_creation_input_tokens":50,"cache_read_input_tokens":10}}}
+{"type":"user","promptSource":"typed","sessionId":"sessionA","timestamp":"2026-08-23T09:30:00.000Z","message":{"role":"user","content":"continue please"}}
+{"type":"assistant","sessionId":"sessionA","timestamp":"2026-08-23T09:35:00.000Z","message":{"role":"assistant","model":"claude-opus-4-8","usage":{"input_tokens":500,"output_tokens":100,"cache_creation_input_tokens":0,"cache_read_input_tokens":5}}}

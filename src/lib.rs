@@ -54,6 +54,7 @@ pub mod remote;
 pub mod schedule;
 #[cfg(feature = "gui")]
 pub(crate) mod screenshot;
+pub mod ssh_agent;
 pub(crate) mod term_export;
 #[cfg(feature = "gui")]
 pub(crate) mod terminal;
@@ -1119,6 +1120,28 @@ pub struct TabState {
     /// delegated cgroup. Skipped from JSON when fully unset.
     #[serde(default, skip_serializing_if = "TabResourceLimits::is_empty")]
     pub limits: TabResourceLimits,
+
+    /// Per-tab ssh-agent. `Some(_)` = the daemon owns a dedicated
+    /// `ssh-agent` for this tab and injects its `SSH_AUTH_SOCK` at spawn;
+    /// `None` = the tab inherits the ambient environment (today's
+    /// behaviour). Toggled via `tab-atelier-headless ssh-agent <tab>` /
+    /// `POST /tabs/by-id/{uuid}/ssh-agent`; applied on (re)spawn. Persisted
+    /// so the agent is re-provisioned on boot. Skipped from JSON when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_agent: Option<SshAgentConfig>,
+}
+
+/// Per-tab ssh-agent configuration (see [`TabState::ssh_agent`]).
+///
+/// Presence enables a dedicated agent; [`Self::key`] optionally names a
+/// passphrase-less private key the daemon auto-loads at spawn. Encrypted
+/// keys are the user's job to `ssh-add` inside the tab.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SshAgentConfig {
+    /// Passphrase-less private key to `ssh-add` at spawn. `None` = start an
+    /// empty agent and let the user load keys themselves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
 }
 
 /// Optional resource ceilings for a tab's process tree.
@@ -1325,6 +1348,7 @@ impl Default for TabState {
             rehome_status: None,
             schedule: None,
             limits: TabResourceLimits::default(),
+            ssh_agent: None,
         }
     }
 }
