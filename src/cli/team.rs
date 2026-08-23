@@ -161,6 +161,9 @@ pub fn run_peek(args: &[String]) -> i32 {
 /// When no tab matches `key`, or when several tabs share the name `key` (which
 /// index to use is then the caller's to disambiguate).
 pub fn resolve_target<'a>(tabs: &'a [TabView], key: &str) -> Result<&'a TabView, String> {
+    // G2 guardrail: nudge toward the stable UUID when addressed by index (peek /
+    // handoff). Non-blocking — the index still resolves below.
+    crate::cli::share_link::warn_if_index(key);
     let named: Vec<&TabView> = tabs.iter().filter(|t| t.name == key).collect();
     match named.as_slice() {
         [one] => return Ok(one),
