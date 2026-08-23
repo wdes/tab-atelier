@@ -16,6 +16,21 @@
   </header>
 
   <main id="dashboard" aria-label="harness workflow">
+    <!-- Back to the project grid. Shown only while drilled into a project (L1).
+         Deep-linkable: the drilled project lives in the URL's ?project=. -->
+    <button id="back-btn" class="back-btn" hidden>← projects</button>
+
+    <!-- Level 0: project grid, grouped into altitude bands (S6). Cards render in
+         the ORDER RECEIVED from the server within each band (no client re-sort)
+         so a card keeps its place across reloads. The lineage layer draws
+         delegation edges (parent -> child) over the cards. The whole wrapper is
+         hidden while a project is drilled into (L1) or when the server predates
+         the project dimension (legacy global diagram). -->
+    <div id="grid-wrap" class="grid-wrap" hidden>
+      <svg id="lineage-layer" class="lineage-layer" aria-hidden="true"></svg>
+      <section id="project-grid" class="project-grid" aria-label="projects"></section>
+    </div>
+
     <!-- Phase-flow skeleton: the seven canonical nodes of docs/dashboard.md,
          drawn left-to-right. Each <g id="node-<phase>"> is recoloured live by
          dashboard.js from that node's rollupLed. Arrows show the flow. -->
@@ -36,40 +51,49 @@
       <line class="arrow" x1="780" y1="72" x2="818" y2="72" marker-end="url(#arrow)"/>
       <line class="arrow" x1="940" y1="72" x2="978" y2="72" marker-end="url(#arrow)"/>
 
+      <!-- Each node: phase label, a live subtitle (occupant name + context ~5
+           words, filled by dashboard.js — S4), and an occupant count. -->
       <g id="node-scope" class="node" data-phase="scope" tabindex="0" role="button" aria-label="scope phase">
         <rect class="node-box" x="20" y="40" width="120" height="64" rx="10"/>
-        <text class="node-label" x="80" y="70">scope</text>
-        <text class="node-count" x="80" y="92"></text>
+        <text class="node-label" x="80" y="60">scope</text>
+        <text class="node-subtitle" x="80" y="78"></text>
+        <text class="node-count" x="80" y="96"></text>
       </g>
       <g id="node-plan" class="node" data-phase="plan" tabindex="0" role="button" aria-label="plan phase">
         <rect class="node-box" x="180" y="40" width="120" height="64" rx="10"/>
-        <text class="node-label" x="240" y="70">plan</text>
-        <text class="node-count" x="240" y="92"></text>
+        <text class="node-label" x="240" y="60">plan</text>
+        <text class="node-subtitle" x="240" y="78"></text>
+        <text class="node-count" x="240" y="96"></text>
       </g>
       <g id="node-build" class="node" data-phase="build" tabindex="0" role="button" aria-label="build phase">
         <rect class="node-box" x="340" y="40" width="120" height="64" rx="10"/>
-        <text class="node-label" x="400" y="70">build</text>
-        <text class="node-count" x="400" y="92"></text>
+        <text class="node-label" x="400" y="60">build</text>
+        <text class="node-subtitle" x="400" y="78"></text>
+        <text class="node-count" x="400" y="96"></text>
       </g>
       <g id="node-review" class="node" data-phase="review" tabindex="0" role="button" aria-label="review phase">
         <rect class="node-box" x="500" y="40" width="120" height="64" rx="10"/>
-        <text class="node-label" x="560" y="70">review</text>
-        <text class="node-count" x="560" y="92"></text>
+        <text class="node-label" x="560" y="60">review</text>
+        <text class="node-subtitle" x="560" y="78"></text>
+        <text class="node-count" x="560" y="96"></text>
       </g>
       <g id="node-verify" class="node" data-phase="verify" tabindex="0" role="button" aria-label="verify phase">
         <rect class="node-box" x="660" y="40" width="120" height="64" rx="10"/>
-        <text class="node-label" x="720" y="70">verify</text>
-        <text class="node-count" x="720" y="92"></text>
+        <text class="node-label" x="720" y="60">verify</text>
+        <text class="node-subtitle" x="720" y="78"></text>
+        <text class="node-count" x="720" y="96"></text>
       </g>
       <g id="node-sweep" class="node" data-phase="sweep" tabindex="0" role="button" aria-label="sweep phase">
         <rect class="node-box" x="820" y="40" width="120" height="64" rx="10"/>
-        <text class="node-label" x="880" y="70">sweep</text>
-        <text class="node-count" x="880" y="92"></text>
+        <text class="node-label" x="880" y="60">sweep</text>
+        <text class="node-subtitle" x="880" y="78"></text>
+        <text class="node-count" x="880" y="96"></text>
       </g>
       <g id="node-done" class="node" data-phase="done" tabindex="0" role="button" aria-label="done phase">
         <rect class="node-box" x="980" y="40" width="120" height="64" rx="10"/>
-        <text class="node-label" x="1040" y="70">done</text>
-        <text class="node-count" x="1040" y="92"></text>
+        <text class="node-label" x="1040" y="60">done</text>
+        <text class="node-subtitle" x="1040" y="78"></text>
+        <text class="node-count" x="1040" y="96"></text>
       </g>
     </svg>
 

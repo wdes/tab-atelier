@@ -45,6 +45,18 @@ body {
 #dashboard { padding: 1rem; }
 #flow { width: 100%; height: auto; max-height: 40vh; }
 
+.back-btn {
+  margin-bottom: 0.8rem;
+  padding: 0.35rem 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--fg);
+  font: inherit;
+  cursor: pointer;
+}
+.back-btn:hover { background: color-mix(in srgb, var(--fg) 6%, transparent); }
+
 /* --- phase nodes --- */
 .node { cursor: pointer; }
 .node-box {
@@ -56,13 +68,19 @@ body {
 .node-label {
   text-anchor: middle;
   fill: var(--fg);
-  font-size: 16px;
+  font-size: 15px;
   font-weight: 600;
+}
+/* Live subtitle: occupant name + context (~5 words), truncated in JS. */
+.node-subtitle {
+  text-anchor: middle;
+  fill: var(--muted);
+  font-size: 10px;
 }
 .node-count {
   text-anchor: middle;
   fill: var(--muted);
-  font-size: 12px;
+  font-size: 11px;
 }
 .node:focus { outline: none; }
 .node:focus .node-box,
@@ -92,6 +110,93 @@ body {
 @keyframes pulse { 50% { opacity: 0.6; } }
 @media (prefers-reduced-motion: reduce) {
   .node.led-working .node-box { animation: none; }
+}
+
+/* --- level 0: project grid + altitude bands (S6) --- */
+.grid-wrap { position: relative; }
+/* The grid stacks altitude bands top (tichef) -> bottom (workers). */
+.project-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 1.1rem;
+}
+/* One band = one row of cards, laid out in a responsive grid. Server order is
+   preserved within the band. A band with a single altitude looks like a plain
+   grid (clean degrade when no altitude signal exists). */
+.altitude-band {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 0.75rem;
+  position: relative;
+}
+/* Band label (tichef / orchestrators / workers) from data-altitude. */
+.altitude-band::before {
+  content: attr(data-band-label);
+  position: absolute;
+  top: -1.05rem;
+  left: 0;
+  font-size: 0.7rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+/* Delegation edges overlay — drawn by dashboard.js, never eats card clicks. */
+.lineage-layer {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 2;
+  overflow: visible;
+}
+.lineage-edge { stroke: var(--muted); stroke-width: 1.5; opacity: 0.7; }
+.lineage-arrow-head { fill: var(--muted); }
+.project-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  text-align: left;
+  padding: 0.7rem 0.8rem;
+  border: 2px solid var(--neutral-stroke);
+  border-radius: 10px;
+  background: var(--neutral-fill);
+  color: var(--fg);
+  font: inherit;
+  cursor: pointer;
+  transition: fill 0.25s ease, border-color 0.25s ease, transform 0.1s ease;
+}
+.project-card:hover { transform: translateY(-1px); }
+.project-card:focus-visible { outline: 2px solid var(--muted); outline-offset: 2px; }
+.card-name { font-weight: 600; display: flex; align-items: center; gap: 0.35rem; }
+.card-count { color: var(--muted); font-size: 0.8rem; }
+/* The "méta" lane (itinerant specialists) reads as a dashed, transverse card. */
+.project-card.meta { border-style: dashed; }
+/* Orchestrator tint (S5 web): a purple accent on the card / occupant whose role
+   is orchestrator — the lighter treatment the native tab bar gets in gpui. */
+.orch-badge { color: #8250df; font-size: 0.85em; }
+.project-card.orchestrator { box-shadow: inset 0.25rem 0 0 #8250df; }
+.popup-tab.orchestrator { box-shadow: inset 0.2rem 0 0 #8250df; }
+.popup-tab.orchestrator .tab-name::after { content: " ◆"; color: #8250df; font-size: 0.85em; }
+@media (prefers-color-scheme: dark) {
+  .orch-badge, .popup-tab.orchestrator .tab-name::after { color: #d2a8ff; }
+  .project-card.orchestrator { box-shadow: inset 0.25rem 0 0 #d2a8ff; }
+  .popup-tab.orchestrator { box-shadow: inset 0.2rem 0 0 #d2a8ff; }
+}
+
+/* Led rollup on a card mirrors the node palette (docs "led rollup"). */
+.project-card.led-neutral    { border-color: var(--neutral-stroke); background: var(--neutral-fill); }
+.project-card.led-idle       { border-color: #54aeff; background: #ddf4ff; }
+.project-card.led-unreviewed { border-color: #d4a72c; background: #fff8c5; }
+.project-card.led-working    { border-color: #2da44e; background: #dafbe1; }
+.project-card.led-error      { border-color: #cf222e; background: #ffebe9; }
+.project-card.led-dead       { border-color: #6e7781; background: #d0d7de; }
+@media (prefers-color-scheme: dark) {
+  .project-card.led-idle       { border-color: #3b82f6; background: #0c2d4a; }
+  .project-card.led-unreviewed { border-color: #d4a72c; background: #3b2e00; }
+  .project-card.led-working    { border-color: #2da44e; background: #0f3d22; }
+  .project-card.led-error      { border-color: #f85149; background: #4a1512; }
+  .project-card.led-dead       { border-color: #6e7781; background: #2b3138; }
 }
 
 /* --- popup --- */
