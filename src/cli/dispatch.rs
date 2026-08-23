@@ -411,6 +411,18 @@ pub enum Commands {
         args: Vec<String>,
     },
 
+    /// Declare this tab's stable workflow assignment (`"[<project>:]<phase>/
+    /// <role>"`) for the harness dashboard.
+    ///
+    /// Unlike `set-context` (the volatile prompt label), this is set once,
+    /// hook-immune and persisted. `--tab <id>` targets another tab; `--clear`
+    /// removes it.
+    SetAssignment {
+        /// Passed straight through to `cli::set_assignment::run`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Print the master API token, so the local API can be called
     /// without locating the `api.token` state file.
     Token,
@@ -790,6 +802,7 @@ pub fn dispatch(cli: Cli) -> bool {
             crate::cli::client::run("set-font", &args)
         }
         Commands::SetContext { args } => crate::cli::client::run("set-context", &args),
+        Commands::SetAssignment { args } => crate::cli::client::run("set-assignment", &args),
         Commands::Token => crate::cli::client::run("token", &[]),
         Commands::RotateTokens => crate::cli::client::run("rotate-tokens", &[]),
         Commands::ResetMasterToken => crate::cli::client::run("reset-master-token", &[]),
@@ -922,6 +935,10 @@ mod tests {
             (&["tab-atelier-headless", "output", "0"], "output"),
             (&["tab-atelier-headless", "share-link", "0"], "share-link"),
             (&["tab-atelier-headless", "share-link", "0", "--ro"], "share-link --ro"),
+            (
+                &["tab-atelier-headless", "set-assignment", "build/implementer"],
+                "set-assignment",
+            ),
             (
                 &["tab-atelier-headless", "bg-color", "--global", "#002451"],
                 "bg-color global",
@@ -1120,6 +1137,24 @@ mod tests {
             neither.to_string().contains("required") || neither.to_string().contains("missing"),
             "expected required-arg error, got: {neither}"
         );
+    }
+
+    /// `set-assignment` forwards its trailing args verbatim (like `set-context`),
+    /// including the `<project>:<phase>/<role>` grammar and `--clear`, without
+    /// clap trying to interpret them as flags.
+    #[test]
+    fn set_assignment_captures_trailing_args() {
+        let cli = Cli::try_parse_from(["tab-atelier", "set-assignment", "kalpin-back:review/reviewer"])
+            .expect("set-assignment parses");
+        match cli.command {
+            Some(Commands::SetAssignment { args }) => {
+                assert_eq!(args, vec!["kalpin-back:review/reviewer".to_string()]);
+            }
+            other => panic!("expected SetAssignment, got: {other:?}"),
+        }
+        // --clear and --tab flow through as trailing args (handled by the runner).
+        let cli = Cli::try_parse_from(["tab-atelier", "set-assignment", "--clear"]).expect("clear parses");
+        assert!(matches!(cli.command, Some(Commands::SetAssignment { .. })));
     }
 
     #[test]

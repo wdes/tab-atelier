@@ -203,6 +203,10 @@ struct TabInfo {
     /// PR/task it's on. Omitted when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     context: Option<String>,
+    /// Stable workflow assignment (`set-assignment`, `"[<project>:]<phase>/
+    /// <role>"`). Persisted + hook-immune, unlike `context`. Omitted when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    assignment: Option<String>,
     /// Number of WS viewers (browser share-link / `remote attach`)
     /// currently watching this tab. Omitted when zero.
     #[serde(skip_serializing_if = "is_zero")]
@@ -481,6 +485,11 @@ pub struct SnapshotTab {
     /// on. Surfaced on `/tabs` and as a hover tooltip on the GUI tab
     /// name. `None` ⇒ no context set.
     pub context: Option<std::sync::Arc<str>>,
+    /// The agent's stable workflow assignment (`"[<project>:]<phase>/<role>"`),
+    /// mirrored from the runtime tab. Unlike `context`, it's persisted and
+    /// hook-immune (see [`crate::TabState::assignment`]); the dashboard maps a
+    /// tab onto a phase node + project from this. `None` ⇒ unassigned.
+    pub assignment: Option<std::sync::Arc<str>>,
     /// PID of the tab's shell. The /catbus endpoints walk its
     /// descendant processes to find a catbus-agent (or fallback
     /// `claude` TUI) and resolve the session's transcript file.
@@ -663,6 +672,10 @@ pub struct TabSnapshot {
     /// `None` clears the tab's context. Same drain shape as
     /// `pending_bg_color_changes`.
     pub pending_context_changes: Vec<(String, Option<String>)>,
+    /// (`tab_id`, assignment-or-None) queued by `POST /tabs/by-id/{id}/assignment`.
+    /// Unlike `pending_context_changes`, the owner loop mirrors this onto the
+    /// runtime tab AND persists it (see the `persist()` in both binaries).
+    pub pending_assignment_changes: Vec<(String, Option<String>)>,
     /// Tab ids whose per-tab share tokens (`share_token_rw`/`_ro`) the
     /// owner loop should clear, queued by `POST /tabs/rotate-tokens`.
     /// Clearing revokes every outstanding share link for that tab (it
@@ -1973,6 +1986,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                     schedule_rule: t.schedule.as_ref().map(|s| s.rule.clone()),
                     schedule_tz: t.schedule.as_ref().map(|s| s.tz.clone()),
                     context: t.context.as_deref().map(str::to_string),
+                    assignment: t.assignment.as_deref().map(str::to_string),
                     net_disabled: t.net_disabled,
                     connections: t.connections,
                     tx_bytes: t.tx_bytes,
@@ -3707,6 +3721,44 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             let body = serde_json::to_string(&serde_json::json!({ "context": context_opt })).unwrap_or_default();
             respond_json(stream, 200, &body);
         }
+        ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/assignment") => {
+            // Set or clear this tab's stable workflow assignment
+            // (`"[<project>:]<phase>/<role>"`, set once via `set-assignment`).
+            // Body `{"assignment":"…"}` to set, `{"assignment":null}` or empty to
+            // clear. Mirrors /context, but the owner loop ALSO persists it — this
+            // field is hook-immune and survives a restart. RW/master token only.
+            let inner = &p["/tabs/by-id/".len()..p.len() - "/assignment".len()];
+            let assignment_opt: Option<String> = if body_bytes.is_empty() {
+                None
+            } else {
+                serde_json::from_slice::<serde_json::Value>(&body_bytes)
+                    .ok()
+                    .and_then(|v| v.get("assignment").cloned())
+                    .and_then(|c| {
+                        if c.is_null() {
+                            None
+                        } else {
+                            c.as_str().map(str::to_owned)
+                        }
+                    })
+            };
+            // Same length cap + whitespace-clear as /context.
+            let assignment_opt = assignment_opt
+                .map(|s| s.chars().take(2000).collect::<String>())
+                .filter(|s| !s.trim().is_empty());
+            let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(idx) = state.tabs.iter().position(|t| &*t.id == inner) else {
+                drop(state);
+                error_json(stream, 404, "tab not found");
+                return;
+            };
+            let tab_id = state.tabs[idx].id.to_string();
+            state.tabs[idx].assignment = assignment_opt.as_deref().map(std::sync::Arc::from);
+            state.pending_assignment_changes.push((tab_id, assignment_opt.clone()));
+            drop(state);
+            let body = serde_json::to_string(&serde_json::json!({ "assignment": assignment_opt })).unwrap_or_default();
+            respond_json(stream, 200, &body);
+        }
         ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/input") => {
             let Some((key_raw, is_uuid)) = parse_tab_key(p, "/input") else {
                 error_json(stream, 404, "invalid tab key");
@@ -4572,6 +4624,7 @@ pub fn test_snapshot_tab(id: &str, name: &str) -> SnapshotTab {
         schedule: None,
         bg_color: "".into(),
         context: None,
+        assignment: None,
         shell_pid: 0,
         agent_state: None,
         agent_session_id: None,
@@ -4609,6 +4662,7 @@ pub fn test_snapshot(tabs: Vec<SnapshotTab>) -> TabSnapshot {
         pending_ssh_agent_changes: vec![],
         pending_bg_color_changes: vec![],
         pending_context_changes: vec![],
+        pending_assignment_changes: vec![],
         pending_token_rotations: vec![],
         pending_schedule_changes: vec![],
         pending_new_tabs: 0,
@@ -4662,6 +4716,7 @@ mod tests {
             last_used_at: None,
             agent_session_id: None,
             context: None,
+            assignment: None,
             viewers: 0,
             net_disabled: false,
             connections: 0,
@@ -5618,6 +5673,92 @@ mod tests {
             .last()
             .cloned();
         assert_eq!(last.unwrap().1, None);
+    }
+
+    #[test]
+    fn set_assignment_sets_and_persists_on_snapshot() {
+        let (port, state, token) = spawn_server();
+        let body = r#"{"assignment":"build/implementer"}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/tab-a/assignment HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 200);
+        let a = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).tabs[0]
+            .assignment
+            .clone();
+        assert_eq!(a.as_deref(), Some("build/implementer"));
+        // Queued for the owner loop to mirror onto the runtime tab + persist.
+        let last = state
+            .lock()
+            .expect("lock poisoned")
+            .pending_assignment_changes
+            .last()
+            .cloned();
+        assert_eq!(last.unwrap().1.as_deref(), Some("build/implementer"));
+    }
+
+    #[test]
+    fn assignment_is_immune_to_context_change() {
+        // The whole point of S0: a prompt fires the hook → set-context, which
+        // must NOT touch `assignment` (phase/role stays stable while the
+        // "5 words" subtitle churns).
+        let (port, state, token) = spawn_server();
+        let post = |path: &str, body: &str| {
+            request(
+                port,
+                &format!(
+                    "POST /tabs/by-id/tab-a/{path} HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len(),
+                ),
+            )
+        };
+        assert_eq!(
+            status_code(&post("assignment", r#"{"assignment":"review/reviewer"}"#)),
+            200
+        );
+        // Simulate the prompt hook overwriting context.
+        assert_eq!(status_code(&post("context", r#"{"context":"looking at PR #99"}"#)), 200);
+        let (a, c) = {
+            let snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            (snap.tabs[0].assignment.clone(), snap.tabs[0].context.clone())
+        };
+        assert_eq!(
+            a.as_deref(),
+            Some("review/reviewer"),
+            "assignment untouched by the hook"
+        );
+        assert_eq!(c.as_deref(), Some("looking at PR #99"), "context did change");
+    }
+
+    #[test]
+    fn assignment_is_exposed_in_tabs_json() {
+        let (port, state, token) = spawn_server();
+        let req_body = r#"{"assignment":"kalpin-back:review/reviewer"}"#;
+        let _ = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/tab-a/assignment HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{req_body}",
+                req_body.len(),
+            ),
+        );
+        // Mirror the snapshot mutation onto the SnapshotTab the /tabs handler reads.
+        state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .invalidate_tabs();
+        let resp = request(port, &format!("GET /tabs?token={token} HTTP/1.1\r\n\r\n"));
+        assert_eq!(status_code(&resp), 200);
+        // The override prefix is stored raw here (parsing is S1's job). /tabs is
+        // pretty-printed (`"assignment": "…"`), so match key + value loosely.
+        let b = body(&resp);
+        assert!(
+            b.contains("\"assignment\"") && b.contains("kalpin-back:review/reviewer"),
+            "assignment must surface on /tabs: {b}"
+        );
     }
 
     #[test]
