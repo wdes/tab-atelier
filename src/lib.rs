@@ -1519,6 +1519,14 @@ pub struct SavedState {
     /// `false` so an unchanged session stays out of the serialized file.
     #[serde(default, skip_serializing_if = "is_false")]
     pub windowed: bool,
+    /// Global read-only share token for the harness dashboard (`GET
+    /// /dashboard`). Unlike the per-tab `share_token_rw/ro`, this one is not
+    /// scoped to a tab — the dashboard is a global, read-only view. Minted
+    /// lazily on the first share-URL request and persisted here so a shared
+    /// link survives a daemon restart. Empty ⇒ never minted (default);
+    /// skipped from JSON so old files stay clean.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub dashboard_share_token: String,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -3774,6 +3782,7 @@ mod tests {
             ],
             active: 1,
             windowed: false,
+            dashboard_share_token: String::new(),
         };
         let json = serde_json::to_string(&state).unwrap();
         let restored: SavedState = serde_json::from_str(&json).unwrap();
@@ -3801,6 +3810,7 @@ mod tests {
             }],
             active: 0,
             windowed: false,
+            dashboard_share_token: String::new(),
         };
         let json = serde_json::to_string(&state).unwrap();
         assert!(
@@ -3830,6 +3840,7 @@ mod tests {
             }],
             active: 0,
             windowed: false,
+            dashboard_share_token: String::new(),
         };
         let json = serde_json::to_string(&state).unwrap();
         let restored: SavedState = serde_json::from_str(&json).unwrap();
@@ -3851,6 +3862,7 @@ mod tests {
             tabs: vec![],
             active: 0,
             windowed: false,
+            dashboard_share_token: String::new(),
         };
         let json = serde_json::to_string(&state).unwrap();
         let restored: SavedState = serde_json::from_str(&json).unwrap();
@@ -3936,6 +3948,7 @@ mod tests {
             }],
             active: 0,
             windowed: false,
+            dashboard_share_token: String::new(),
         };
 
         save_state(&dir, &mk("v1"));
@@ -3979,6 +3992,7 @@ mod tests {
             }],
             active: 0,
             windowed: false,
+            dashboard_share_token: String::new(),
         };
         std::fs::write(sd.join("tabs.json"), "broken json").unwrap();
         std::fs::write(sd.join("tabs.json.bak"), serde_json::to_string(&good).unwrap()).unwrap();
@@ -4020,6 +4034,7 @@ mod tests {
             ],
             active: 1,
             windowed: false,
+            dashboard_share_token: String::new(),
         };
         save_state(&dir, &state);
         let loaded = load_state_from(&dir).expect("should load saved state");
@@ -4058,6 +4073,7 @@ mod tests {
                 tabs: vec![mk("one"), mk("two"), mk("three")],
                 active: 0,
                 windowed: false,
+                dashboard_share_token: String::new(),
             },
         );
         save_tab_output(&dir, "one", "hello from one");
@@ -4273,6 +4289,7 @@ mod tests {
             }],
             active: 0,
             windowed: false,
+            dashboard_share_token: String::new(),
         };
         save_state(&dir, &state);
         assert!(dir.join(format!("{APP_DIR}/tabs.json")).exists());
@@ -4512,6 +4529,7 @@ mod tests {
             }],
             active: 999,
             windowed: false,
+            dashboard_share_token: String::new(),
         };
         let json = serde_json::to_string_pretty(&state).unwrap();
         std::fs::write(sd.join("tabs.json"), json).unwrap();
