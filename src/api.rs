@@ -462,13 +462,26 @@ fn phase_of(assignment: Option<&str>) -> String {
 }
 
 /// Role from an assignment — never from the volatile `context`.
-fn role_of(assignment: Option<&str>) -> String {
+pub fn role_of(assignment: Option<&str>) -> String {
     assignment.map(|a| parse_assignment(a).2).unwrap_or_default()
+}
+
+/// Build the dashboard URL a right-click "Dashboard" entry opens, role-aware
+/// (S5). A **worker** or **orchestrator** drills into its project (team =
+/// project in v1); a **tichef** or an itinerant **méta** specialist opens the
+/// global level 0. Pure so the routing is unit-testable without gpui.
+pub fn dashboard_url_for_role(role: &str, project: &str, base: &str, token: &str) -> String {
+    let base = base.trim_end_matches('/');
+    if role == "tichef" || project == META_LANE || project.is_empty() {
+        format!("{base}/dashboard?token={token}")
+    } else {
+        format!("{base}/dashboard?project={project}&token={token}")
+    }
 }
 
 /// Resolve a tab's project, in order: (1) `<project>:` override; (2) basename of
 /// a repo cwd; (3) `méta` lane for a meta-role itinerant; (4) `divers`.
-fn project_of(cwd: Option<&str>, assignment: Option<&str>) -> String {
+pub fn project_of(cwd: Option<&str>, assignment: Option<&str>) -> String {
     let (over, _phase, role) = assignment.map_or((None, String::new(), String::new()), parse_assignment);
     if let Some(p) = over {
         return p;
@@ -5232,6 +5245,30 @@ mod tests {
         assert_eq!(project_of(None, Some("plan/planner")), "méta");
         assert_eq!(project_of(None, Some("build/worker")), "divers");
         assert_eq!(project_of(Some("/home/u/dev"), Some("build/worker")), "divers");
+    }
+
+    #[test]
+    fn dashboard_url_for_role_routes_by_role() {
+        // worker → its project scope.
+        assert_eq!(
+            dashboard_url_for_role("implementer", "kalpin-back", "http://h:7890", "T"),
+            "http://h:7890/dashboard?project=kalpin-back&token=T"
+        );
+        // orchestrator → its team (= project in v1).
+        assert_eq!(
+            dashboard_url_for_role("orchestrator", "kalpin-front", "http://h:7890/", "T"),
+            "http://h:7890/dashboard?project=kalpin-front&token=T"
+        );
+        // tichef → global level 0.
+        assert_eq!(
+            dashboard_url_for_role("tichef", "kalpin-back", "http://h:7890", "T"),
+            "http://h:7890/dashboard?token=T"
+        );
+        // itinerant méta specialist → global.
+        assert_eq!(
+            dashboard_url_for_role("auditor", "méta", "http://h:7890", "T"),
+            "http://h:7890/dashboard?token=T"
+        );
     }
 
     #[test]
