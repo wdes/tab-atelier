@@ -150,6 +150,9 @@ struct HeadlessTab {
     /// Free-text context the in-tab agent set via `set-context`.
     /// In-memory only (not persisted); reflected on `/tabs`.
     context: Option<Arc<str>>,
+    /// Stable workflow assignment (`set-assignment`). Persisted (unlike
+    /// `context`) — restored from `TabState` and written back in `persist()`.
+    assignment: Option<Arc<str>>,
     pending_agent_resume: Option<String>,
     colors_enabled: bool,
     /// Raw PTY byte ring captured BEFORE alacritty's parser sees the
@@ -740,6 +743,9 @@ fn spawn_pty_tab(
         tx_bytes: 0,
         tx_denied_bytes: 0,
         context: None,
+        // Restored from the saved TabState at the call site (like `limits`),
+        // since spawn_pty_tab is also used for fresh tabs (no assignment).
+        assignment: None,
         pending_agent_resume,
         colors_enabled,
         viewers: viewers_handle,
@@ -912,6 +918,7 @@ pub fn run() -> std::io::Result<()> {
                 ts.ssh_agent.clone(),
             ) {
                 t.limits = ts.limits.clone();
+                t.assignment = ts.assignment.as_deref().map(Arc::from);
                 t.pinned_cols = ts.pinned_cols;
                 t.pinned_rows = ts.pinned_rows;
                 #[cfg(target_os = "linux")]
@@ -993,6 +1000,7 @@ pub fn run() -> std::io::Result<()> {
         pending_ssh_agent_changes: Vec::new(),
         pending_bg_color_changes: Vec::new(),
         pending_context_changes: Vec::new(),
+        pending_assignment_changes: Vec::new(),
         pending_token_rotations: Vec::new(),
         pending_schedule_changes: Vec::new(),
         pending_new_tabs: 0,
@@ -1383,6 +1391,7 @@ fn refresh_snapshot(
             schedule: tab.schedule.clone(),
             bg_color: crate::effective_tab_bg(tab.bg_color.as_deref(), Some(global_bg)).into(),
             context: tab.context.clone(),
+            assignment: tab.assignment.clone(),
             shell_pid: tab.pid,
             agent_state: tab.agent_state.clone(),
             agent_session_id: tab.agent_session_id.clone(),
@@ -1613,6 +1622,7 @@ fn persist(
             net_allow_cidrs: tab.net_allow.cidrs.clone(),
             schedule: tab.schedule.clone(),
             bg_color: tab.bg_color.clone(),
+            assignment: tab.assignment.as_deref().map(str::to_string),
             limits: tab.limits.clone(),
             ssh_agent: tab.ssh_agent.clone(),
             ..TabState::default()
@@ -1889,6 +1899,7 @@ fn drain_pending(
         s.pending_ssh_agent_changes.drain(..).collect();
     let bg_color_changes: Vec<(String, Option<String>)> = s.pending_bg_color_changes.drain(..).collect();
     let context_changes: Vec<(String, Option<String>)> = s.pending_context_changes.drain(..).collect();
+    let assignment_changes: Vec<(String, Option<String>)> = s.pending_assignment_changes.drain(..).collect();
     let token_rotations: Vec<String> = s.pending_token_rotations.drain(..).collect();
     let schedule_changes: Vec<(String, Option<crate::schedule::TabSchedule>)> =
         s.pending_schedule_changes.drain(..).collect();
@@ -1915,6 +1926,7 @@ fn drain_pending(
         && ssh_agent_changes.is_empty()
         && bg_color_changes.is_empty()
         && context_changes.is_empty()
+        && assignment_changes.is_empty()
         && token_rotations.is_empty()
         && schedule_changes.is_empty()
         && limit_changes.is_empty()
@@ -2032,6 +2044,12 @@ fn drain_pending(
     for (tab_id, context) in context_changes {
         if let Some(t) = tabs.iter_mut().find(|t| *t.id == tab_id) {
             t.context = context.map(Arc::from);
+        }
+    }
+    // …and the per-tab assignment (persisted on the next tick, unlike context).
+    for (tab_id, assignment) in assignment_changes {
+        if let Some(t) = tabs.iter_mut().find(|t| *t.id == tab_id) {
+            t.assignment = assignment.map(Arc::from);
         }
     }
 
