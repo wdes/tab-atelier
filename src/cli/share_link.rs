@@ -461,6 +461,57 @@ fn set_net(args: &[String], disabled: bool, verb: &str) -> i32 {
     0
 }
 
+/// Enable / disable a tab's dedicated ssh-agent.
+///
+/// `off` disables (and reaps it); otherwise the agent is enabled, auto-loading
+/// `key` when given. The shell respawns to apply. Headless-only — the GUI
+/// returns 501.
+#[must_use]
+pub fn ssh_agent(tab: &str, key: Option<&str>, off: bool) -> i32 {
+    let ep = match discover_endpoint() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("ssh-agent: {e}");
+            return 1;
+        }
+    };
+    let (idx, uuid) = match resolve(&ep, tab) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("ssh-agent: {e}");
+            return 1;
+        }
+    };
+    let enabled = !off;
+    let body = serde_json::json!({"enabled": enabled, "key": key}).to_string();
+    let resp = match agent()
+        .post(format!("{}/tabs/by-id/{uuid}/ssh-agent", ep.url))
+        .header("Authorization", format!("Bearer {}", ep.token))
+        .header("Content-Type", "application/json")
+        .send(body.as_bytes())
+    {
+        Ok(r) => r,
+        Err(ureq::Error::StatusCode(501)) => {
+            eprintln!("ssh-agent: per-tab ssh-agent requires the headless daemon (not the desktop GUI)");
+            return 1;
+        }
+        Err(e) => {
+            eprintln!("ssh-agent: {e}");
+            return 1;
+        }
+    };
+    drop(resp);
+    if enabled {
+        match key {
+            Some(k) => println!("ssh-agent on for tab {idx}, loading {k} (shell respawns)"),
+            None => println!("ssh-agent on for tab {idx} (shell respawns; `ssh-add` your keys in the tab)"),
+        }
+    } else {
+        println!("ssh-agent off for tab {idx} (shell respawns)");
+    }
+    0
+}
+
 #[must_use]
 pub fn net_off(args: &[String]) -> i32 {
     set_net(args, true, "net-off")
