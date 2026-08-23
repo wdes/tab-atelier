@@ -94,6 +94,51 @@ body {
   .node.led-working .node-box { animation: none; }
 }
 
+/* --- level 0: project grid --- */
+.project-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 0.75rem;
+}
+.project-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  text-align: left;
+  padding: 0.7rem 0.8rem;
+  border: 2px solid var(--neutral-stroke);
+  border-radius: 10px;
+  background: var(--neutral-fill);
+  color: var(--fg);
+  font: inherit;
+  cursor: pointer;
+  transition: fill 0.25s ease, border-color 0.25s ease, transform 0.1s ease;
+}
+.project-card:hover { transform: translateY(-1px); }
+.project-card:focus-visible { outline: 2px solid var(--muted); outline-offset: 2px; }
+.card-name { font-weight: 600; display: flex; align-items: center; gap: 0.35rem; }
+.card-count { color: var(--muted); font-size: 0.8rem; }
+/* The "méta" lane (itinerant specialists) reads as a dashed, transverse card. */
+.project-card.meta { border-style: dashed; }
+/* Orchestrator badge on a card / occupant (shared with S5 web tint). */
+.orch-badge { color: #8250df; font-size: 0.85em; }
+@media (prefers-color-scheme: dark) { .orch-badge { color: #d2a8ff; } }
+
+/* Led rollup on a card mirrors the node palette (docs "led rollup"). */
+.project-card.led-neutral    { border-color: var(--neutral-stroke); background: var(--neutral-fill); }
+.project-card.led-idle       { border-color: #54aeff; background: #ddf4ff; }
+.project-card.led-unreviewed { border-color: #d4a72c; background: #fff8c5; }
+.project-card.led-working    { border-color: #2da44e; background: #dafbe1; }
+.project-card.led-error      { border-color: #cf222e; background: #ffebe9; }
+.project-card.led-dead       { border-color: #6e7781; background: #d0d7de; }
+@media (prefers-color-scheme: dark) {
+  .project-card.led-idle       { border-color: #3b82f6; background: #0c2d4a; }
+  .project-card.led-unreviewed { border-color: #d4a72c; background: #3b2e00; }
+  .project-card.led-working    { border-color: #2da44e; background: #0f3d22; }
+  .project-card.led-error      { border-color: #f85149; background: #4a1512; }
+  .project-card.led-dead       { border-color: #6e7781; background: #2b3138; }
+}
+
 /* --- popup --- */
 .popup {
   position: absolute;
