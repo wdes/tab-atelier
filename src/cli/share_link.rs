@@ -77,10 +77,31 @@ pub(crate) fn fetch_tabs(ep: &Endpoint) -> Result<Vec<serde_json::Value>, String
     Ok(v.get("tabs").and_then(|t| t.as_array()).cloned().unwrap_or_default())
 }
 
+/// A bare tab INDEX (all ASCII digits) — the unstable addressing form. A UUID
+/// (hex + dashes) or a name is not. Pure, so the guardrail is unit-testable.
+#[must_use]
+pub(crate) fn is_bare_index(target: &str) -> bool {
+    !target.is_empty() && target.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Governance guardrail (G2): a non-blocking stderr nudge when a tab is targeted
+/// by its INDEX instead of its UUID. The index drifts as tabs open/close, so a
+/// script / handoff pinned to it silently retargets after a restart — the index
+/// is still accepted, this only points at the stable handle.
+pub(crate) fn warn_if_index(target: &str) {
+    if is_bare_index(target) {
+        eprintln!(
+            "warning: tab '{target}' is an INDEX — unstable across restarts; \
+             prefer the UUID (tabs --json .id)"
+        );
+    }
+}
+
 /// Resolve a CLI key argument ("0", "3", "<uuid>") to (index, uuid).
 /// We need both because some routes are index-based (rename, close)
 /// and some are uuid-based (view/output/input via /by-id/).
 pub(crate) fn resolve(ep: &Endpoint, key: &str) -> Result<(usize, String), String> {
+    warn_if_index(key);
     let tabs = fetch_tabs(ep)?;
     let pick = key.parse::<usize>().map_or_else(
         |_| {
@@ -2194,7 +2215,20 @@ pub fn tabs(args: &[String]) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::dashboard_share_url;
+    use super::{dashboard_share_url, is_bare_index};
+
+    #[test]
+    fn is_bare_index_flags_integers_not_uuids() {
+        // Bare integers → an index (the guardrail warns).
+        assert!(is_bare_index("0"));
+        assert!(is_bare_index("3"));
+        assert!(is_bare_index("42"));
+        // A UUID / name / empty → silent (not an index).
+        assert!(!is_bare_index("180ae3fb-1c55-4a2d-8bd3-de8ef1ffebf0"));
+        assert!(!is_bare_index("m-invoice"));
+        assert!(!is_bare_index("3a")); // hex-ish, not all digits
+        assert!(!is_bare_index(""));
+    }
 
     #[test]
     fn dashboard_url_has_token_query() {

@@ -173,6 +173,12 @@ pub fn post(field: &Field, args: &[String]) -> i32 {
         Action::Set(v) => Some(v),
         Action::Help => unreachable!("handled above"),
     };
+    // G2 guardrail: `--tab <index>` is unstable across restarts; nudge toward
+    // the UUID (non-blocking). Only for an explicit `--tab` — the `_TAB_ID`
+    // fallback is always a UUID.
+    if let Some(t) = &parsed.tab {
+        crate::cli::share_link::warn_if_index(t);
+    }
     let Some(tab_id) = parsed
         .tab
         .or_else(|| std::env::var("_TAB_ID").ok())
