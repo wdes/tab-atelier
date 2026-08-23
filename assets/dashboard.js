@@ -116,9 +116,17 @@ export function renderProjectCard(project, esc) {
     ? ` <span class="orch-badge" title="has an orchestrator">◆</span>`
     : "";
   const count = Number((project && project.tabCount) || 0);
+  // S6: name each orchestrator under the repo; a repo with >1 renders a tree.
+  const orchestrators = Array.isArray(project && project.orchestrators) ? project.orchestrators : [];
+  const orchList = orchestrators.length
+    ? `<span class="orch-list${orchestrators.length > 1 ? " orch-tree" : ""}">${orchestrators
+        .map((o) => `<span class="orch-name" title="${esc((o && o.item) || "")}">${esc((o && o.name) || "orchestrator")}</span>`)
+        .join("")}</span>`
+    : "";
   return `<button class="project-card ${led}${meta}${orchCls}" data-project="${esc(name)}">
     <span class="card-name">${esc(name)}${orch}</span>
     <span class="card-count">${count} tab${count === 1 ? "" : "s"}</span>
+    ${orchList}
   </button>`;
 }
 
@@ -214,6 +222,23 @@ export function lineageEdges(projects) {
     }
   }
   return edges;
+}
+
+// Pure: the overview reorg (S6). META band first, repos in the middle (each
+// naming its orchestrators; >1 orchestrator => a tree), UNASSIGNED band last.
+// Consumes S5's project.orchestrators[] and state.unassigned[]. Never throws.
+export function overviewLayout(state) {
+  const s = state || {};
+  const projects = Array.isArray(s.projects) ? s.projects : [];
+  const meta = projects.filter((p) => p && p.isMeta);
+  const repos = projects
+    .filter((p) => p && !p.isMeta)
+    .map((p) => {
+      const orchestrators = Array.isArray(p.orchestrators) ? p.orchestrators : [];
+      return { ...p, orchestrators, tree: orchestrators.length > 1 };
+    });
+  const unassigned = Array.isArray(s.unassigned) ? s.unassigned : [];
+  return { order: ["META", "REPOS", "UNASSIGNED"], meta, repos, unassigned };
 }
 
 // --- Slice C: predecessor -> successor re-home link (drill-in) ---
@@ -384,33 +409,50 @@ function applyState(state) {
 // view switch (drill-in / back).
 function render() {
   const view = resolveView(currentState, currentProject);
-  if (view.mode === "grid") renderGrid(view.projects);
+  if (view.mode === "grid") renderGrid();
   else renderDiagram(view);
   setViewChrome(view);
 }
 
 const BAND_LABELS = { 0: "tichef", 1: "orchestrators", 2: "workers" };
 
-function renderGrid(projects) {
+function bandHtml(label, inner) {
+  return `<div class="altitude-band" data-band-label="${escapeHtml(label)}">${inner}</div>`;
+}
+
+// An assignment-less tab in the UNASSIGNED band — legitimate, NOT an error (#90).
+function unassignedTabHtml(tab) {
+  const t = tab || {};
+  return `<div class="unassigned-tab" data-viewer="${escapeHtml(t.viewerUrl || "")}">${escapeHtml(t.name || "tab")}</div>`;
+}
+
+// Level-0 overview (S6 reorg): META band on top, repos in the middle grouped by
+// altitude (orchestrators / workers — server order within a band, stable across
+// reloads), UNASSIGNED band at the bottom. Empty META/UNASSIGNED bands are
+// skipped, but META always renders first and UNASSIGNED always last.
+function renderGrid() {
   const grid = document.getElementById("project-grid");
   if (!grid) return;
-  // Group into altitude bands (S6). Server order preserved WITHIN each band, so
-  // positions stay stable across reloads; a single band == a plain grid.
+  const layout = overviewLayout(currentState);
+  const parts = [];
+  if (layout.meta.length) {
+    parts.push(bandHtml("META", layout.meta.map((p) => renderProjectCard(p, escapeHtml)).join("")));
+  }
   const bands = new Map();
-  for (const p of projects) {
+  for (const p of layout.repos) {
     const a = projectAltitude(p);
     if (!bands.has(a)) bands.set(a, []);
     bands.get(a).push(p);
   }
-  grid.innerHTML = [...bands.keys()]
-    .sort((x, y) => x - y)
-    .map((a) => {
-      const label = BAND_LABELS[a] || `altitude ${a}`;
-      const cards = bands.get(a).map((p) => renderProjectCard(p, escapeHtml)).join("");
-      return `<div class="altitude-band" data-altitude="${a}" data-band-label="${escapeHtml(label)}">${cards}</div>`;
-    })
-    .join("");
-  drawLineage(projects);
+  for (const a of [...bands.keys()].sort((x, y) => x - y)) {
+    const label = BAND_LABELS[a] || `altitude ${a}`;
+    parts.push(bandHtml(label, bands.get(a).map((p) => renderProjectCard(p, escapeHtml)).join("")));
+  }
+  if (layout.unassigned.length) {
+    parts.push(bandHtml("UNASSIGNED", layout.unassigned.map(unassignedTabHtml).join("")));
+  }
+  grid.innerHTML = parts.join("");
+  drawLineage(layout.meta.concat(layout.repos));
   currentNodes = new Map();
   currentUnmapped = [];
   renderRehome([]); // re-home links are a drill-in concern; hide at level 0
