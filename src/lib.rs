@@ -2087,6 +2087,13 @@ pub struct Preferences {
     /// Mirrored into [`crate::TAB_ENV_GLOBAL`] at startup.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub tab_env: std::collections::BTreeMap<String, String>,
+
+    /// Explicit repo → service-family map for the dashboard (Increment 6 S3):
+    /// e.g. `{"louis": "kalpin"}` folds the `louis` repo into the `kalpin`
+    /// service. Wins over the `prefix-before-first-'-'` heuristic. Empty ⇒
+    /// heuristic only.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub repo_families: std::collections::BTreeMap<String, String>,
     #[serde(
         default,
         deserialize_with = "deserialize_hotkeys",

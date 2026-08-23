@@ -57,6 +57,33 @@ fn is_nudge(prompt: &str) -> bool {
     NUDGES.iter().any(|n| p.eq_ignore_ascii_case(n))
 }
 
+/// True when a prompt is an AUTOMATED tick (watcher/cron/round/sage wakeup/roster
+/// refresh/restart) typed AS a prompt, not a genuine human direction (S9, mirror
+/// of the activity-scribe `CRON_TICK` detection). Matches known tick PHRASES as a
+/// PREFIX of the trimmed prompt — a real prompt starts with an action ("fix …",
+/// "PR #…"), so "fix the watcher restart bug" is NOT a tick while "Watcher
+/// restart after OOM" is.
+fn is_cron_tick(prompt: &str) -> bool {
+    const TICK_PREFIXES: &[&str] = &[
+        "restart mx",
+        "ronde ",
+        "watcher restart",
+        "réveil ",
+        "maintien de la session",
+        "refresh orchestrateur",
+    ];
+    let p = prompt.trim().to_lowercase();
+    TICK_PREFIXES.iter().any(|t| p.starts_with(t))
+}
+
+/// True when a prompt is a GENUINE human direction worth mirroring onto the
+/// `direction` blackboard (S9): non-empty, not a synthetic injection, not a
+/// nudge, not a `--flag`, and not an automated cron/watcher tick.
+fn is_human_direction(prompt: &str) -> bool {
+    let p = prompt.trim();
+    !p.is_empty() && !is_synthetic_prompt(p) && !is_nudge(p) && !p.starts_with("--") && !is_cron_tick(p)
+}
+
 #[must_use]
 pub fn run(args: &[String]) -> i32 {
     let Some(event) = args.first().map(String::as_str) else {
@@ -104,6 +131,16 @@ pub fn run(args: &[String]) -> i32 {
                     // chars anyway, but a one-line label reads better.
                     let snippet: String = p.chars().take(200).collect();
                     let _ = crate::cli::set_context::run(&[snippet]);
+                }
+                // S9: mirror a GENUINE human direction onto the `direction`
+                // blackboard (like the dispatch mirror), so the fleet knows where
+                // the PO stands — but NEVER a cron/watcher tick, nudge, synthetic
+                // injection, or flag (is_human_direction gates all of those).
+                // Best-effort; `from` = this tab's `_TAB_ID` when in a tab.
+                if is_human_direction(p) {
+                    let snippet: String = p.chars().take(200).collect();
+                    let from = std::env::var("_TAB_ID").ok().filter(|s| !s.is_empty());
+                    crate::cli::team::note_best_effort(Some("direction".to_string()), from, &snippet);
                 }
             }
         }
@@ -157,7 +194,44 @@ pub fn run(args: &[String]) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_nudge, is_synthetic_prompt};
+    use super::{is_cron_tick, is_human_direction, is_nudge, is_synthetic_prompt};
+
+    // --- Increment 6 S9 (REFINER red) — mirror REAL human directions onto the
+    //     `direction` blackboard topic (like the dispatch mirror), so the fleet
+    //     knows where the PO stands. The user-prompt hook, AFTER stamping the
+    //     context, posts to topic `direction` IFF the prompt is a genuine human
+    //     direction — NEVER a cron/watcher tick (reusing S7's detection), a nudge,
+    //     or a synthetic injection. RED until is_cron_tick / is_human_direction
+    //     exist. Builder: rust (S9-hook).
+    #[test]
+    fn cron_ticks_are_detected() {
+        // Automated ticks that arrive typed AS prompts (watchers, rounds, sage
+        // wakeups, roster refresh) — mirror of scripts/activity-scribe CRON_TICK.
+        assert!(is_cron_tick("RESTART mx imminent — sauvegarde en cours"));
+        assert!(is_cron_tick("Ronde du matin : check the fleet"));
+        assert!(is_cron_tick("Watcher restart after OOM"));
+        assert!(is_cron_tick("réveil du sage"));
+        assert!(is_cron_tick("maintien de la session"));
+        assert!(is_cron_tick("refresh orchestrateurs"));
+        // A real prompt that merely mentions a watcher is not a tick.
+        assert!(!is_cron_tick("fix the watcher restart bug in api.rs"));
+        assert!(!is_cron_tick("PR #42: refactor the parser"));
+    }
+
+    #[test]
+    fn only_genuine_human_directions_are_mirrored() {
+        // Real PO directions -> mirrored to `direction`.
+        assert!(is_human_direction("PR #42: refactor the parser"));
+        assert!(is_human_direction("go build increment 6, start with S7"));
+        // Cron/watcher ticks (typed but automated) -> NOT mirrored.
+        assert!(!is_human_direction("RESTART mx imminent — sauvegarde"));
+        assert!(!is_human_direction("Ronde du matin : check the fleet"));
+        // Nudges, synthetic injections, empty, and flag-like -> NOT mirrored.
+        assert!(!is_human_direction("continue"));
+        assert!(!is_human_direction("<task-notification>x</task-notification>"));
+        assert!(!is_human_direction("   "));
+        assert!(!is_human_direction("--clear"));
+    }
 
     #[test]
     fn nudges_do_not_overwrite_context() {
