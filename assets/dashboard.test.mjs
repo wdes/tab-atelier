@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import {
   ledClass, nodeMap, CANONICAL_PHASES, resolveView, renderProjectCard,
   readProjectParam, shortContext, nodeSubtitle,
+  isOrchestrator, roleAltitude, projectAltitude, lineageEdges,
 } from "./dashboard.js";
 
 // The five led states each map to their own distinct class.
@@ -109,5 +110,48 @@ assert.equal(nodeSubtitle({ tabs: [] }), "");
 assert.equal(nodeSubtitle({ tabs: [{ name: "ta", context: "do a thing" }] }), "ta · do a thing");
 // Multiple tabs -> first + "+N".
 assert.match(nodeSubtitle({ tabs: [{ name: "a", context: "x" }, {}, {}] }), /\+2$/, "multi-tab node shows +N");
+
+// --- S5 orchestrator tint + card marker ---
+assert.equal(isOrchestrator("orchestrator"), true);
+assert.equal(isOrchestrator("Orchestrator"), true, "case-insensitive");
+assert.equal(isOrchestrator("worker"), false);
+assert.equal(isOrchestrator(null), false);
+{
+  const id = (s) => s;
+  const card = renderProjectCard({ name: "kalpin-back", tabCount: 2, rollupLed: "idle", hasOrchestrator: true }, id);
+  assert.match(card, /project-card led-idle orchestrator/, "orchestrator project card carries the tint class");
+  const plain = renderProjectCard({ name: "x", tabCount: 1, rollupLed: "idle" }, id);
+  assert.doesNotMatch(plain, /orchestrator/, "no tint without an orchestrator");
+}
+
+// --- S6 altitude bands ---
+assert.equal(roleAltitude("tichef"), 0);
+assert.equal(roleAltitude("orchestrator"), 1);
+assert.equal(roleAltitude("implementer"), 2, "workers/specialists at the bottom band");
+// Explicit altitude wins.
+assert.equal(projectAltitude({ altitude: 0, nodes: [] }), 0);
+// Otherwise: the most senior occupant sets the band.
+assert.equal(
+  projectAltitude({ nodes: [{ tabs: [{ role: "worker" }, { role: "orchestrator" }] }] }),
+  1,
+  "an orchestrator in the project lifts it to band 1"
+);
+assert.equal(projectAltitude({ nodes: [] }), 2, "empty project -> worker band");
+
+// --- S6 lineage edges (cross-project delegation only, deduped) ---
+{
+  const projects = [
+    { name: "méta", nodes: [{ tabs: [{ id: "orch1", role: "orchestrator" }] }], unmapped: [] },
+    { name: "kalpin-back", nodes: [{ tabs: [
+      { id: "w1", role: "worker", parentTabId: "orch1" },
+      { id: "w2", role: "worker", parentTabId: "orch1" }, // same parent+project -> deduped
+      { id: "w3", role: "worker", parentTabId: "w1" },    // intra-project -> not an inter-card edge
+    ] }], unmapped: [] },
+  ];
+  const edges = lineageEdges(projects);
+  assert.deepEqual(edges, [{ from: "méta", to: "kalpin-back" }], "one deduped cross-project delegation edge");
+  assert.deepEqual(lineageEdges([]), [], "no projects -> no edges");
+  assert.deepEqual(lineageEdges(null), [], "malformed input -> no edges");
+}
 
 console.log("dashboard.test.mjs: OK");
