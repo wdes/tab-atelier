@@ -1,14 +1,90 @@
 <!doctype html>
-<!-- Harness control panel. Filled in by slice S3 (web app). See docs/dashboard.md. -->
+<!-- Harness control panel. Slice S3 (web app). See docs/dashboard.md.
+     Vanilla JS, inline SVG skeleton, no build step. Served at GET /dashboard. -->
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Harness dashboard</title>
+  <meta name="robots" content="noindex, nofollow, noarchive">
+  <title>Harness dashboard · tab-atelier</title>
   <link rel="stylesheet" href="/assets/dashboard.css">
 </head>
 <body>
-  <main id="dashboard" aria-label="harness workflow"></main>
-  <script src="/assets/dashboard.js"></script>
+  <header class="topbar">
+    <h1>Harness</h1>
+    <span id="status" class="status" aria-live="polite">connecting…</span>
+  </header>
+
+  <main id="dashboard" aria-label="harness workflow">
+    <!-- Phase-flow skeleton: the seven canonical nodes of docs/dashboard.md,
+         drawn left-to-right. Each <g id="node-<phase>"> is recoloured live by
+         dashboard.js from that node's rollupLed. Arrows show the flow. -->
+    <svg id="flow" viewBox="0 0 1120 170" preserveAspectRatio="xMidYMid meet"
+         role="img" aria-label="project phase flow">
+      <defs>
+        <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5"
+                markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" class="arrow-head"/>
+        </marker>
+      </defs>
+
+      <!-- flow arrows scope->plan->build->review->verify->sweep->done -->
+      <line class="arrow" x1="140" y1="72" x2="178" y2="72" marker-end="url(#arrow)"/>
+      <line class="arrow" x1="300" y1="72" x2="338" y2="72" marker-end="url(#arrow)"/>
+      <line class="arrow" x1="460" y1="72" x2="498" y2="72" marker-end="url(#arrow)"/>
+      <line class="arrow" x1="620" y1="72" x2="658" y2="72" marker-end="url(#arrow)"/>
+      <line class="arrow" x1="780" y1="72" x2="818" y2="72" marker-end="url(#arrow)"/>
+      <line class="arrow" x1="940" y1="72" x2="978" y2="72" marker-end="url(#arrow)"/>
+
+      <g id="node-scope" class="node" data-phase="scope" tabindex="0" role="button" aria-label="scope phase">
+        <rect class="node-box" x="20" y="40" width="120" height="64" rx="10"/>
+        <text class="node-label" x="80" y="70">scope</text>
+        <text class="node-count" x="80" y="92"></text>
+      </g>
+      <g id="node-plan" class="node" data-phase="plan" tabindex="0" role="button" aria-label="plan phase">
+        <rect class="node-box" x="180" y="40" width="120" height="64" rx="10"/>
+        <text class="node-label" x="240" y="70">plan</text>
+        <text class="node-count" x="240" y="92"></text>
+      </g>
+      <g id="node-build" class="node" data-phase="build" tabindex="0" role="button" aria-label="build phase">
+        <rect class="node-box" x="340" y="40" width="120" height="64" rx="10"/>
+        <text class="node-label" x="400" y="70">build</text>
+        <text class="node-count" x="400" y="92"></text>
+      </g>
+      <g id="node-review" class="node" data-phase="review" tabindex="0" role="button" aria-label="review phase">
+        <rect class="node-box" x="500" y="40" width="120" height="64" rx="10"/>
+        <text class="node-label" x="560" y="70">review</text>
+        <text class="node-count" x="560" y="92"></text>
+      </g>
+      <g id="node-verify" class="node" data-phase="verify" tabindex="0" role="button" aria-label="verify phase">
+        <rect class="node-box" x="660" y="40" width="120" height="64" rx="10"/>
+        <text class="node-label" x="720" y="70">verify</text>
+        <text class="node-count" x="720" y="92"></text>
+      </g>
+      <g id="node-sweep" class="node" data-phase="sweep" tabindex="0" role="button" aria-label="sweep phase">
+        <rect class="node-box" x="820" y="40" width="120" height="64" rx="10"/>
+        <text class="node-label" x="880" y="70">sweep</text>
+        <text class="node-count" x="880" y="92"></text>
+      </g>
+      <g id="node-done" class="node" data-phase="done" tabindex="0" role="button" aria-label="done phase">
+        <rect class="node-box" x="980" y="40" width="120" height="64" rx="10"/>
+        <text class="node-label" x="1040" y="70">done</text>
+        <text class="node-count" x="1040" y="92"></text>
+      </g>
+    </svg>
+
+    <!-- Tabs whose context has no/unknown phase — never silently dropped
+         (docs/dashboard.md). Hidden while empty. -->
+    <section id="unmapped" class="unmapped" hidden>
+      <h2>unmapped</h2>
+      <ul id="unmapped-list"></ul>
+    </section>
+  </main>
+
+  <!-- Hover popup, populated by dashboard.js. Right-click a tab entry to open
+       its viewer. Kept outside the SVG so it can overflow freely. -->
+  <div id="popup" class="popup" role="tooltip" hidden></div>
+
+  <script type="module" src="/assets/dashboard.js"></script>
 </body>
 </html>
