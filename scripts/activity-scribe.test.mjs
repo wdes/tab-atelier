@@ -18,6 +18,13 @@
 //   ACTIVITY_NOW           ISO-8601 "now" override (deterministic durations)
 //   ACTIVITY_WINDOW_HOURS  aggregation window (default 24)
 
+// Fixtures include a `sessionC.jsonl` of automated ticks dispatched AS typed
+// (a `RESTART mx imminent` broadcast, a `Watcher restart`, and two `Ronde …`
+// rounds — one at 14:59) plus a `system`-source round. NONE are human: they must
+// NOT count toward human_prompts NOR shrink minutes_since_last / autonomy. They
+// carry no assistant records, so the token totals below are unchanged — which is
+// why human_prompts===3 / minutes===60 / autonomy===270 double as the cron-
+// exclusion proof (they would be 5 / 1 / small if the ticks leaked in).
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
@@ -128,6 +135,46 @@ try {
   ok("S3: a `record` benchmark is emitted (go-build ~6h)",
      a.record !== undefined && /go-build/i.test(JSON.stringify(a.record)),
      JSON.stringify(a.record));
+
+  // Cron/watcher/round ticks dispatched AS typed (sessionC, incl. one at 14:59)
+  // are NOT human intervention — explicit guard on top of the ===3/===60 asserts.
+  ok("S3: cron/watcher/round ticks excluded from human prompts (typed but automated)",
+     t.human_prompts === 3 && t.minutes_since_last_human_prompt === 60,
+     `${t.human_prompts}/${t.minutes_since_last_human_prompt}`);
+
+  // ---- Fix 1: whitelist derived from live tabs (ACTIVITY_TABS_JSON) must resolve
+  //      each orchestrator to its PROJECT (assignment `<project>:` override >
+  //      basename cwd) and scan `<DEV_ROOT>/<project>` — NOT the raw cwd. An
+  //      orchestrator sitting in a work-root cwd but overriding to a project must
+  //      credit THAT project's feat( commits; a non-orchestrator tab is ignored.
+  {
+    const devRoot = mkdtempSync(join(tmpdir(), "scribe-devroot-"));
+    const proj = "overridden-proj";
+    const projRepo = join(devRoot, proj);
+    mkdirSync(projRepo);
+    const g = (a2, date) => execFileSync("git", ["-C", projRepo, ...a2], {
+      env: { ...process.env,
+        GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t",
+        GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t",
+        ...(date ? { GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date } : {}) },
+      stdio: "pipe",
+    });
+    g(["init", "-q", "-b", "main"]);
+    const c = (subj, date) => { writeFileSync(join(projRepo, "f"), subj); g(["add", "f"]); g(["commit", "-q", "-m", subj], date); };
+    c("feat(x): one", "2026-08-23T09:00:00");
+    c("feat(y): two", "2026-08-23T10:00:00");
+    c("feat(z): three", "2026-08-23T11:00:00");
+    c("feat(old): out of window", "2026-08-20T09:00:00");
+    const tabsFile = join(devRoot, "tabs.json");
+    writeFileSync(tabsFile, JSON.stringify([
+      { assignment: `${proj}:build/orchestrator`, cwd: "/home/mox2/Dev" }, // project via OVERRIDE, cwd is a work root
+      { assignment: "build/worker", cwd: projRepo },                        // in the repo but NOT an orchestrator -> ignored
+    ]));
+    const e = runScribe(stateDir, FIXTURES, { ACTIVITY_ORCH_REPOS: "", ACTIVITY_TABS_JSON: tabsFile, ACTIVITY_DEV_ROOT: devRoot });
+    ok("S3: whitelist resolves orchestrator PROJECT via override, not raw cwd -> features = 3",
+       (e.totals || {}).features_implemented === 3, `${(e.totals || {}).features_implemented}`);
+    rmSync(devRoot, { recursive: true, force: true });
+  }
 
   // ---- No hardcoded whitelist: empty ACTIVITY_ORCH_REPOS -> 0 features.
   const b = runScribe(stateDir, FIXTURES, { ACTIVITY_ORCH_REPOS: "" });
