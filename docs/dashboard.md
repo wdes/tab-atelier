@@ -138,6 +138,19 @@ and a static `altitude` band from its role class (`0` tichef, `1` orchestrator,
 self parent degrades to a root (no edge), so no cycle survives. A root tab has
 no `parentTabId` and falls back to its role altitude.
 
+### Re-home status (predecessor lifecycle)
+
+A tab being re-homed (`~/Dev/Botmox/rehome-tab.sh`) carries a `rehomeStatus`
+through its bidirectional-proof loop: `handoff-written` → `successor-ready` →
+`ack-sent` → `safe-to-close`. `rehome-tab.sh` stamps the first three via
+`tab-atelier set-rehome-status <state> --tab <old-uuid>` (route `POST
+/tabs/by-id/{id}/rehome`, only the 4 states accepted); the old agent posts
+`safe-to-close` on itself when it replies REHOME ACK — the final proof from the
+predecessor's own side. It drives a progress badge on the predecessor tab and
+gates the right-click "close the predecessor" action (enabled only at
+`safe-to-close`; never auto-closes — the human still clicks). The successor's
+`parentTabId` is set to the old uuid so the dashboard draws the old→new edge.
+
 ## `GET /dashboard`
 
 Serves the static web app (`assets/dashboard.html` + `assets/dashboard.js` +
