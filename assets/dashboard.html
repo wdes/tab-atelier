@@ -20,12 +20,16 @@
          Deep-linkable: the drilled project lives in the URL's ?project=. -->
     <button id="back-btn" class="back-btn" hidden>← projects</button>
 
-    <!-- Level 0: project grid. Default view once the server exposes
-         state.projects[] (docs/dashboard.md). Cards are rendered by dashboard.js
-         in the ORDER RECEIVED from the server (no client re-sort) so a card keeps
-         its place across reloads. Hidden while a project is drilled into (L1) or
-         when the server predates the project dimension (legacy global diagram). -->
-    <section id="project-grid" class="project-grid" hidden aria-label="projects"></section>
+    <!-- Level 0: project grid, grouped into altitude bands (S6). Cards render in
+         the ORDER RECEIVED from the server within each band (no client re-sort)
+         so a card keeps its place across reloads. The lineage layer draws
+         delegation edges (parent -> child) over the cards. The whole wrapper is
+         hidden while a project is drilled into (L1) or when the server predates
+         the project dimension (legacy global diagram). -->
+    <div id="grid-wrap" class="grid-wrap" hidden>
+      <svg id="lineage-layer" class="lineage-layer" aria-hidden="true"></svg>
+      <section id="project-grid" class="project-grid" aria-label="projects"></section>
+    </div>
 
     <!-- Phase-flow skeleton: the seven canonical nodes of docs/dashboard.md,
          drawn left-to-right. Each <g id="node-<phase>"> is recoloured live by

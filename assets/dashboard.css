@@ -112,12 +112,46 @@ body {
   .node.led-working .node-box { animation: none; }
 }
 
-/* --- level 0: project grid --- */
+/* --- level 0: project grid + altitude bands (S6) --- */
+.grid-wrap { position: relative; }
+/* The grid stacks altitude bands top (tichef) -> bottom (workers). */
 .project-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 1.1rem;
+}
+/* One band = one row of cards, laid out in a responsive grid. Server order is
+   preserved within the band. A band with a single altitude looks like a plain
+   grid (clean degrade when no altitude signal exists). */
+.altitude-band {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
   gap: 0.75rem;
+  position: relative;
 }
+/* Band label (tichef / orchestrators / workers) from data-altitude. */
+.altitude-band::before {
+  content: attr(data-band-label);
+  position: absolute;
+  top: -1.05rem;
+  left: 0;
+  font-size: 0.7rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+/* Delegation edges overlay — drawn by dashboard.js, never eats card clicks. */
+.lineage-layer {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 2;
+  overflow: visible;
+}
+.lineage-edge { stroke: var(--muted); stroke-width: 1.5; opacity: 0.7; }
+.lineage-arrow-head { fill: var(--muted); }
 .project-card {
   display: flex;
   flex-direction: column;
@@ -138,9 +172,17 @@ body {
 .card-count { color: var(--muted); font-size: 0.8rem; }
 /* The "méta" lane (itinerant specialists) reads as a dashed, transverse card. */
 .project-card.meta { border-style: dashed; }
-/* Orchestrator badge on a card / occupant (shared with S5 web tint). */
+/* Orchestrator tint (S5 web): a purple accent on the card / occupant whose role
+   is orchestrator — the lighter treatment the native tab bar gets in gpui. */
 .orch-badge { color: #8250df; font-size: 0.85em; }
-@media (prefers-color-scheme: dark) { .orch-badge { color: #d2a8ff; } }
+.project-card.orchestrator { box-shadow: inset 0.25rem 0 0 #8250df; }
+.popup-tab.orchestrator { box-shadow: inset 0.2rem 0 0 #8250df; }
+.popup-tab.orchestrator .tab-name::after { content: " ◆"; color: #8250df; font-size: 0.85em; }
+@media (prefers-color-scheme: dark) {
+  .orch-badge, .popup-tab.orchestrator .tab-name::after { color: #d2a8ff; }
+  .project-card.orchestrator { box-shadow: inset 0.25rem 0 0 #d2a8ff; }
+  .popup-tab.orchestrator { box-shadow: inset 0.2rem 0 0 #d2a8ff; }
+}
 
 /* Led rollup on a card mirrors the node palette (docs "led rollup"). */
 .project-card.led-neutral    { border-color: var(--neutral-stroke); background: var(--neutral-fill); }
