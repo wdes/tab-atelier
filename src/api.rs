@@ -280,6 +280,118 @@ struct ErrorResponse {
     error: String,
 }
 
+/// The seven canonical phase-node ids of the harness dashboard skeleton, in
+/// flow order (see docs/dashboard.md). A tab whose `context` starts with one
+/// of these maps to that node; anything else falls to `unmapped`.
+const DASHBOARD_PHASES: [&str; 7] = ["scope", "plan", "build", "review", "verify", "sweep", "done"];
+
+/// One tab projected into the dashboard state: the same per-tab data as
+/// `/tabs/usage`, plus the `context` split into `role`/`item` and a ready-made
+/// `viewerUrl`. camelCase to match the documented JSON shape.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DashboardTab {
+    id: String,
+    name: String,
+    context: Option<String>,
+    role: String,
+    item: String,
+    agent_state: Option<&'static str>,
+    led: Option<&'static str>,
+    tokens: Option<crate::TokenUsage>,
+    viewer_url: String,
+}
+
+/// A phase node with its occupants and the worst-severity led among them.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DashboardNode {
+    id: &'static str,
+    rollup_led: Option<&'static str>,
+    tabs: Vec<DashboardTab>,
+}
+
+#[derive(Serialize)]
+struct DashboardState {
+    nodes: Vec<DashboardNode>,
+    unmapped: Vec<DashboardTab>,
+}
+
+/// Minimal per-tab projection the dashboard builder consumes, so the
+/// mapping/rollup logic is unit-testable without constructing a full
+/// `TabState`. Mirrors exactly the fields `/tabs/usage` reads plus `context`.
+struct DashboardTabInput {
+    id: String,
+    name: String,
+    context: Option<String>,
+    agent_state: Option<&'static str>,
+    led: Option<&'static str>,
+    tokens: Option<crate::TokenUsage>,
+}
+
+/// Rollup severity of a `led` slug — higher is worse. Mirrors [`crate::TabLed`]
+/// precedence: dead > error > working > unreviewed > idle. Unknown ⇒ 0.
+fn led_severity(led: &str) -> u8 {
+    match led {
+        "dead" => 5,
+        "error" => 4,
+        "working" => 3,
+        "unreviewed" => 2,
+        "idle" => 1,
+        _ => 0,
+    }
+}
+
+/// Group tabs by phase node, parse each `context` into `role`/`item`, and roll
+/// up each node's led to its worst-severity occupant. The pure core of
+/// `GET /dashboard/state` (see docs/dashboard.md).
+fn build_dashboard_state(inputs: Vec<DashboardTabInput>) -> DashboardState {
+    let mut nodes: Vec<DashboardNode> = DASHBOARD_PHASES
+        .iter()
+        .map(|id| DashboardNode {
+            id,
+            rollup_led: None,
+            tabs: vec![],
+        })
+        .collect();
+    let mut unmapped: Vec<DashboardTab> = vec![];
+    for t in inputs {
+        // Split "phase/role/item" on the first two slashes; item keeps any
+        // remaining slashes. Absent context ⇒ empty phase/role/item ⇒ unmapped.
+        let (phase, role, item) = t.context.as_deref().map_or_else(
+            || (String::new(), String::new(), String::new()),
+            |ctx| {
+                let mut parts = ctx.splitn(3, '/');
+                (
+                    parts.next().unwrap_or("").to_string(),
+                    parts.next().unwrap_or("").to_string(),
+                    parts.next().unwrap_or("").to_string(),
+                )
+            },
+        );
+        let viewer_url = format!("/tabs/by-id/{}/view", t.id);
+        let tab = DashboardTab {
+            id: t.id,
+            name: t.name,
+            context: t.context,
+            role,
+            item,
+            agent_state: t.agent_state,
+            led: t.led,
+            tokens: t.tokens,
+            viewer_url,
+        };
+        match nodes.iter_mut().find(|n| n.id == phase) {
+            Some(n) => n.tabs.push(tab),
+            None => unmapped.push(tab),
+        }
+    }
+    for n in &mut nodes {
+        n.rollup_led = n.tabs.iter().filter_map(|t| t.led).max_by_key(|led| led_severity(led));
+    }
+    DashboardState { nodes, unmapped }
+}
+
 #[derive(Clone)]
 pub struct SnapshotTab {
     /// Stable per-tab UUID, mirrored from `TabState.id`. Used to route
@@ -1897,6 +2009,39 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 .collect();
             let body = serde_json::to_string_pretty(&usage).unwrap_or_default();
             drop(state);
+            respond_with_etag(
+                stream,
+                200,
+                "application/json",
+                body.as_bytes(),
+                accept_gzip,
+                if_none_match.as_deref(),
+                "",
+            );
+        }
+        // Mapped, aggregated view of the same per-tab data as `/tabs/usage`,
+        // grouped by the `context` phase node for the harness dashboard app.
+        // Same auth gate as `/tabs` (checked upstream). See docs/dashboard.md.
+        ("GET", "/dashboard/state") => {
+            let state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let inputs: Vec<DashboardTabInput> = state
+                .tabs
+                .iter()
+                .map(|t| DashboardTabInput {
+                    id: t.id.to_string(),
+                    name: t.name.to_string(),
+                    context: t.context.as_deref().map(str::to_string),
+                    agent_state: t.agent_state.as_ref().map(|s| match s.state {
+                        crate::AgentState::Thinking => "thinking",
+                        crate::AgentState::Waiting => "waiting",
+                        crate::AgentState::Error => "error",
+                    }),
+                    led: t.agent_led.map(crate::TabLed::slug),
+                    tokens: t.tokens,
+                })
+                .collect();
+            drop(state);
+            let body = serde_json::to_string_pretty(&build_dashboard_state(inputs)).unwrap_or_default();
             respond_with_etag(
                 stream,
                 200,
@@ -4449,6 +4594,123 @@ mod tests {
         let json = serde_json::to_string(&t).unwrap();
         assert!(json.contains("\"resident_memory_bytes\":4096"), "{json}");
         assert!(json.contains("\"tokens\":{\"input\":100,\"output\":50}"), "{json}");
+    }
+
+    /// Build one dashboard input tab with just the fields the mapper reads.
+    fn dash_input(id: &str, context: Option<&str>, led: Option<&'static str>) -> DashboardTabInput {
+        DashboardTabInput {
+            id: id.to_string(),
+            name: format!("tab-{id}"),
+            context: context.map(str::to_string),
+            agent_state: None,
+            led,
+            tokens: None,
+        }
+    }
+
+    fn node<'a>(state: &'a DashboardState, id: &str) -> &'a DashboardNode {
+        state.nodes.iter().find(|n| n.id == id).expect("node exists")
+    }
+
+    #[test]
+    fn dashboard_maps_context_phase_to_node() {
+        let state = build_dashboard_state(vec![dash_input(
+            "u1",
+            Some("build/implementer/slice-2-rust-state"),
+            Some("working"),
+        )]);
+        let build = node(&state, "build");
+        assert_eq!(build.tabs.len(), 1);
+        let tab = &build.tabs[0];
+        assert_eq!(tab.role, "implementer");
+        assert_eq!(tab.item, "slice-2-rust-state");
+        assert_eq!(tab.viewer_url, "/tabs/by-id/u1/view");
+        assert!(state.unmapped.is_empty());
+    }
+
+    #[test]
+    fn dashboard_item_keeps_trailing_slashes() {
+        // Only the first two slashes split phase/role/item — the rest stays in item.
+        let state = build_dashboard_state(vec![dash_input("u1", Some("build/impl/a/b/c"), None)]);
+        assert_eq!(node(&state, "build").tabs[0].item, "a/b/c");
+    }
+
+    #[test]
+    fn dashboard_unmapped_for_unknown_or_missing_phase() {
+        let state = build_dashboard_state(vec![
+            dash_input("u1", Some("frobnicate/x/y"), Some("working")),
+            dash_input("u2", None, Some("idle")),
+        ]);
+        assert_eq!(
+            state.unmapped.len(),
+            2,
+            "unknown phase and no-context both fall to unmapped"
+        );
+        for n in &state.nodes {
+            assert!(n.tabs.is_empty(), "node {} should be empty", n.id);
+        }
+    }
+
+    #[test]
+    fn dashboard_rollup_takes_worst_led() {
+        // dead > error > working > unreviewed > idle — order in the vec is deliberately
+        // NOT worst-first, to prove precedence rather than positional luck.
+        let state = build_dashboard_state(vec![
+            dash_input("u1", Some("build/r/i"), Some("idle")),
+            dash_input("u2", Some("build/r/i"), Some("working")),
+            dash_input("u3", Some("build/r/i"), Some("error")),
+            dash_input("u4", Some("build/r/i"), Some("dead")),
+        ]);
+        assert_eq!(node(&state, "build").rollup_led, Some("dead"));
+    }
+
+    #[test]
+    fn dashboard_rollup_unreviewed_beats_idle() {
+        let state = build_dashboard_state(vec![
+            dash_input("u1", Some("review/r/i"), Some("idle")),
+            dash_input("u2", Some("review/r/i"), Some("unreviewed")),
+        ]);
+        assert_eq!(node(&state, "review").rollup_led, Some("unreviewed"));
+    }
+
+    #[test]
+    fn dashboard_empty_node_has_null_rollup() {
+        let state = build_dashboard_state(vec![]);
+        assert_eq!(state.nodes.len(), 7);
+        for n in &state.nodes {
+            assert_eq!(n.rollup_led, None, "empty node {} rolls up to null", n.id);
+        }
+    }
+
+    #[test]
+    fn dashboard_rollup_null_when_all_tabs_ledless() {
+        let state = build_dashboard_state(vec![dash_input("u1", Some("build/r/i"), None)]);
+        assert_eq!(node(&state, "build").rollup_led, None);
+    }
+
+    #[test]
+    fn dashboard_passes_tokens_through_and_emits_camelcase() {
+        let input = DashboardTabInput {
+            tokens: Some(crate::TokenUsage {
+                input: 12345,
+                output: 6789,
+            }),
+            agent_state: Some("thinking"),
+            ..dash_input("u1", Some("build/implementer/x"), Some("working"))
+        };
+        let state = build_dashboard_state(vec![input]);
+        let tab = &node(&state, "build").tabs[0];
+        assert_eq!(
+            tab.tokens,
+            Some(crate::TokenUsage {
+                input: 12345,
+                output: 6789
+            })
+        );
+        let json = serde_json::to_string(&state).unwrap();
+        for key in ["\"rollupLed\"", "\"agentState\"", "\"viewerUrl\"", "\"unmapped\""] {
+            assert!(json.contains(key), "dashboard JSON must use {key}: {json}");
+        }
     }
 
     #[test]
