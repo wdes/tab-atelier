@@ -491,6 +491,26 @@ pub enum Commands {
         interval: Option<u64>,
     },
 
+    /// `clarify` — controlled context refresh: re-home a saturated Claude tab
+    /// IN PLACE (same cwd/assignment/name) instead of opaque auto-compaction.
+    ///
+    /// `clarify <tab>` re-homes one tab now; `--watch` runs the poller that
+    /// fires at >90% context. Guardrails: per-tab cooldown, skips meta/daemon
+    /// tabs + orchestrators, count-based anti-storm breaker.
+    Clarify {
+        /// Tab to re-home now (index or UUID). Omit with `--watch`.
+        tab: Option<String>,
+        /// Run as a daemon poller instead of a one-shot.
+        #[arg(long)]
+        watch: bool,
+        /// Seconds between scans (daemon). Default 30.
+        #[arg(long)]
+        interval: Option<u64>,
+        /// Scan once and exit (daemon).
+        #[arg(long)]
+        once: bool,
+    },
+
     /// Off-hours auto-lock — OSM `opening_hours` rule + IANA timezone.
     ///
     /// Set: `schedule <tab> "Mo-Fr 09:00-18:00" --tz Europe/Paris`.
@@ -877,6 +897,28 @@ pub fn dispatch(cli: Cli) -> bool {
             }
             crate::cli::client::run("brain", &args)
         }
+        Commands::Clarify {
+            tab,
+            watch,
+            interval,
+            once,
+        } => {
+            let mut args: Vec<String> = Vec::new();
+            if let Some(tab) = tab {
+                args.push(tab);
+            }
+            if watch {
+                args.push("--watch".into());
+            }
+            if once {
+                args.push("--once".into());
+            }
+            if let Some(s) = interval {
+                args.push("--interval".into());
+                args.push(s.to_string());
+            }
+            crate::cli::client::run("clarify", &args)
+        }
         Commands::Schedule { tab, rule, tz, clear } => {
             let mut args: Vec<String> = vec![tab];
             if clear {
@@ -1189,6 +1231,31 @@ mod tests {
             }
             other => panic!("expected SetRehomeStatus, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn clarify_parses_manual_and_watch_forms() {
+        // Manual one-shot: a tab, no --watch.
+        let m = Cli::try_parse_from(["tab-atelier", "clarify", "0"]).expect("manual parses");
+        assert!(matches!(
+            m.command,
+            Some(Commands::Clarify {
+                tab: Some(_),
+                watch: false,
+                ..
+            })
+        ));
+        // Daemon: --watch, no tab.
+        let w = Cli::try_parse_from(["tab-atelier", "clarify", "--watch", "--interval", "60"]).expect("watch parses");
+        assert!(matches!(
+            w.command,
+            Some(Commands::Clarify {
+                tab: None,
+                watch: true,
+                interval: Some(60),
+                ..
+            })
+        ));
     }
 
     #[test]
