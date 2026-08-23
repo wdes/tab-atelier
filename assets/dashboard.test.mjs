@@ -8,6 +8,8 @@ import {
   readProjectParam, shortContext, nodeSubtitle,
   isOrchestrator, roleAltitude, projectAltitude, lineageEdges,
   viewerUrlWithToken,
+  REHOME_STATES, rehomeStep, rehomePairs, rehomePairHtml,
+  usageMap, fmtBytes, fmtCpu, tabDetailChips,
 } from "./dashboard.js";
 
 // The five led states each map to their own distinct class.
@@ -125,13 +127,24 @@ assert.equal(isOrchestrator(null), false);
   assert.doesNotMatch(plain, /orchestrator/, "no tint without an orchestrator");
 }
 
-// --- S6 altitude bands ---
+// --- S6 altitude bands: derived from ROLE, not phase/server altitude (finding a) ---
 assert.equal(roleAltitude("tichef"), 0);
 assert.equal(roleAltitude("orchestrator"), 1);
+assert.equal(roleAltitude(" Orchestrator "), 1, "trims + case-insensitive");
 assert.equal(roleAltitude("implementer"), 2, "workers/specialists at the bottom band");
-// Explicit altitude wins.
-assert.equal(projectAltitude({ altitude: 0, nodes: [] }), 0);
-// Otherwise: the most senior occupant sets the band.
+// A meta-lane orchestrator lands in the orchestrator band, NEVER the tichef band.
+assert.equal(
+  projectAltitude({ isMeta: true, nodes: [{ tabs: [{ role: "orchestrator" }, { role: "planner" }] }] }),
+  1,
+  "meta-lane orchestrator -> band 1 (not tichef band 0)"
+);
+// A server-provided altitude is IGNORED — role is authoritative.
+assert.equal(
+  projectAltitude({ altitude: 0, nodes: [{ tabs: [{ role: "orchestrator" }] }] }),
+  1,
+  "phase/server altitude ignored; role wins"
+);
+// The most senior occupant sets the band.
 assert.equal(
   projectAltitude({ nodes: [{ tabs: [{ role: "worker" }, { role: "orchestrator" }] }] }),
   1,
@@ -170,5 +183,76 @@ assert.equal(
 );
 assert.equal(viewerUrlWithToken("/x/view", ""), "/x/view", "no token -> url unchanged");
 assert.equal(viewerUrlWithToken("", "t"), "", "no url -> empty");
+
+// --- Slice C: re-home predecessor -> successor pairs + progress ---
+assert.deepEqual(REHOME_STATES, ["handoff-written", "successor-ready", "ack-sent", "safe-to-close"]);
+assert.equal(rehomeStep("handoff-written"), 0);
+assert.equal(rehomeStep("safe-to-close"), 3);
+assert.equal(rehomeStep("bogus"), -1, "unknown -> -1");
+assert.equal(rehomeStep(null), -1, "none -> -1");
+{
+  const tabs = [
+    { id: "old1", name: "team titour (old)", rehomeStatus: "ack-sent" },
+    { id: "new1", name: "team titour", parentTabId: "old1" }, // successor
+    { id: "solo", name: "just-delegated", parentTabId: "old1" === "x" ? "x" : "unrelated" }, // not a rehome parent
+    { id: "old2", name: "predecessor-no-succ", rehomeStatus: "handoff-written" }, // no successor yet
+    { id: "plain", name: "no rehome" },
+  ];
+  const pairs = rehomePairs(tabs);
+  assert.equal(pairs.length, 2, "only tabs with a rehomeStatus are predecessors");
+  const ack = pairs.find((p) => p.predecessor.id === "old1");
+  assert.equal(ack.successor.id, "new1", "successor found via parentTabId");
+  assert.equal(ack.step, 2, "ack-sent is step 2");
+  const pending = pairs.find((p) => p.predecessor.id === "old2");
+  assert.equal(pending.successor, null, "no successor linked yet -> null");
+  assert.deepEqual(rehomePairs([]), [], "no tabs -> no pairs");
+  assert.deepEqual(rehomePairs(null), [], "malformed -> no pairs");
+  // HTML: names, arrow, status badge, safe class, 4 progress dots (filled to step).
+  const id = (s) => s;
+  const html = rehomePairHtml(pairs.find((p) => p.predecessor.id === "old1"), id);
+  assert.match(html, /team titour \(old\)/);
+  assert.match(html, /→/);
+  assert.match(html, /data-status="ack-sent"/);
+  assert.equal((html.match(/rehome-dot/g) || []).length, 4, "always four progress dots");
+  assert.equal((html.match(/rehome-dot on/g) || []).length, 3, "filled up to and including the current step");
+  const safeHtml = rehomePairHtml({ predecessor: { name: "o" }, successor: { name: "n" }, status: "safe-to-close" }, id);
+  assert.match(safeHtml, /rehome-pair safe/, "safe-to-close marks the pair safe");
+  const pendingHtml = rehomePairHtml(pending, id);
+  assert.match(pendingHtml, /\(successor pending\)/, "no successor -> pending label");
+}
+
+// --- finding b: tooltip enrichment (usage merge + detail chips) ---
+{
+  const um = usageMap([
+    { id: "a", resident_memory_bytes: 26759168, cpu_percent: 1.5 },
+    { id: "b", resident_memory_bytes: 0, cpu_percent: 0 },
+    { bogus: true }, // no id -> skipped
+  ]);
+  assert.equal(um.size, 2, "entries without id are skipped");
+  assert.deepEqual(um.get("a"), { ram: 26759168, cpu: 1.5 });
+  assert.deepEqual(usageMap(null), new Map(), "malformed usage -> empty map");
+}
+assert.equal(fmtBytes(0), "0 B");
+assert.equal(fmtBytes(512), "512 B");
+assert.equal(fmtBytes(26759168), "25.5 MB", "bytes -> compact MB");
+assert.equal(fmtBytes(1024), "1.0 KB");
+assert.equal(fmtCpu(1.5), "2%");
+assert.equal(fmtCpu(0), "0%");
+{
+  const id = (s) => s;
+  const chips = tabDetailChips(
+    { assignment: "tab-atelier:build/implementer", cwd: "/home/x", rehomeStatus: "ack-sent" },
+    { ram: 26759168, cpu: 1.5 },
+    id
+  );
+  assert.match(chips, /assign tab-atelier:build\/implementer/);
+  assert.match(chips, /cwd \/home\/x/);
+  assert.match(chips, /rehome ack-sent/);
+  assert.match(chips, /RAM 25\.5 MB/);
+  assert.match(chips, /CPU 2%/);
+  // Absent fields -> no chip (clean tooltip). No usage -> no RAM/CPU chips.
+  assert.equal(tabDetailChips({ name: "x" }, null, id), "", "nothing known -> no chips");
+  assert.doesNotMatch(tabDetailChips({ assignment: "p:build/impl" }, null, id), /RAM|CPU|cwd|rehome/);
+}
 
 console.log("dashboard.test.mjs: OK");
