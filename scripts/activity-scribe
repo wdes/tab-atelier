@@ -10,8 +10,14 @@
 // stays DYNAMIC — never a hardcoded repo list):
 //   ACTIVITY_PROJECTS_DIR  dir of *.jsonl transcripts (walked recursively)
 //   ACTIVITY_STATE_DIR     holds swamp.jsonl (if any) + where activity.json lands
-//   ACTIVITY_ORCH_REPOS    comma-separated repo PATHS = the orchestrator whitelist
-//                          (prod: live tabs role=orchestrator -> their cwd)
+//   ACTIVITY_ORCH_REPOS    comma-separated repo PATHS = explicit orchestrator whitelist
+//   ACTIVITY_TABS_JSON     path to `tab-atelier tabs --json` output; the scribe
+//                          derives the whitelist from tabs whose role is
+//                          `orchestrator`, resolving each to its PROJECT exactly
+//                          like the dashboard (`<project>:` assignment override >
+//                          basename of cwd) and scanning `<DEV_ROOT>/<project>`.
+//                          Unioned with ACTIVITY_ORCH_REPOS. (prod path)
+//   ACTIVITY_DEV_ROOT      repos root for the tabs->project resolution (default ~/Dev)
 //   ACTIVITY_NOW           ISO-8601 "now" override (deterministic durations)
 //   ACTIVITY_WINDOW_HOURS  aggregation window in hours (default 24)
 
@@ -23,14 +29,50 @@ const { execFileSync } = require("node:child_process");
 const env = process.env;
 const projectsDir = env.ACTIVITY_PROJECTS_DIR || "";
 const stateDir = env.ACTIVITY_STATE_DIR || "";
-const orchRepos = (env.ACTIVITY_ORCH_REPOS || "")
-  .split(",").map((s) => s.trim()).filter(Boolean);
 const windowHours = Number(env.ACTIVITY_WINDOW_HOURS || 24);
 const now = env.ACTIVITY_NOW ? new Date(env.ACTIVITY_NOW) : new Date();
 const nowMs = now.getTime();
 const windowStartMs = nowMs - windowHours * 3600 * 1000;
 const inWindow = (ms) => ms >= windowStartMs && ms <= nowMs;
 const dayOf = (ms) => new Date(ms).toISOString().slice(0, 10); // UTC calendar day
+
+// A HUMAN prompt is `promptSource:"typed"` with string content — this already
+// drops the harness's `system` injections (cron rounds, task-notifications) and
+// the `null`-source tool_result echoes. But a few automated broadcasts are
+// *dispatched* as typed (they simulate the keyboard): the cron watcher/rounds
+// and the roster nudges. Their wording is fixed, so exclude it by content too.
+// This is THE key figure for the PO — autonomy = time without HUMAN intervention.
+const CRON_TICK = /^\s*(ronde\b|watcher\s+restart|restart\s+mx\s+imminent|r[ée]veil\s+(du\s+sage|des)\b|maintien\b|refresh\s+(orchestr|roster))/i;
+
+// Names of generic work roots that are NOT a project (mirror of Rust
+// WORK_ROOT_NAMES in src/api.rs) — a cwd basename of one of these is not a repo.
+const WORK_ROOT_NAMES = new Set(["dev", "src", "code", "projects", "repos", "workspace"]);
+
+// Parse an assignment `[<project>:]<phase>/<role>` exactly like the dashboard's
+// parse_assignment (src/api.rs:464): the `:` override is only honoured when it
+// sits before the first `/`.
+function parseAssignment(a) {
+  if (!a) return { over: null, phase: "", role: "" };
+  const headEnd = a.indexOf("/") < 0 ? a.length : a.indexOf("/");
+  let over = null, rest = a;
+  const colon = a.slice(0, headEnd).indexOf(":");
+  if (colon >= 0) { over = a.slice(0, colon).trim(); rest = a.slice(colon + 1); }
+  const parts = rest.split("/");
+  return { over: over || null, phase: (parts[0] || "").trim(), role: (parts[1] || "").trim() };
+}
+
+// Resolve a tab's project like the dashboard's project_of (src/api.rs:568):
+// override `<project>:` > basename of a repo cwd. Returns null for an itinerant
+// méta cwd (a generic work root) — nothing to scan there.
+function projectOf(cwd, assignment) {
+  const { over } = parseAssignment(assignment);
+  if (over) return over;
+  if (cwd) {
+    const base = cwd.replace(/\/+$/, "").split("/").pop() || "";
+    if (base && !WORK_ROOT_NAMES.has(base.toLowerCase())) return base;
+  }
+  return null;
+}
 
 // --- 1. transcripts: tokens + human prompts --------------------------------
 function walkJsonl(dir, out) {
@@ -65,10 +107,11 @@ for (const file of files) {
       tokens.cache_creation += u.cache_creation_input_tokens || 0;
       tokens.cache_read += u.cache_read_input_tokens || 0;
     } else if (rec.type === "user") {
-      // human prompt = typed AND a plain-string content (excludes tool_result
-      // list echoes and non-typed hook injections).
+      // human prompt = typed AND plain-string content AND not a cron/roster tick
+      // (excludes tool_result echoes, non-typed hook/`system` injections, and the
+      // dispatched-as-typed watcher/round broadcasts).
       const content = rec.message && rec.message.content;
-      if (rec.promptSource === "typed" && typeof content === "string") {
+      if (rec.promptSource === "typed" && typeof content === "string" && !CRON_TICK.test(content)) {
         humanPromptMs.push(ms);
       }
     }
@@ -76,6 +119,26 @@ for (const file of files) {
 }
 
 // --- 2. features: `feat(` commits in-window from the orchestrator whitelist --
+// The whitelist is explicit paths (ACTIVITY_ORCH_REPOS) UNIONED with repos
+// resolved from live orchestrator tabs (ACTIVITY_TABS_JSON). Resolving each tab
+// to its PROJECT (override > basename cwd) — not its raw cwd — is what lets an
+// orchestrator whose cwd is a work root but whose assignment overrides to
+// `tab-atelier:...` still credit tab-atelier's feat( commits (where the harness
+// itself lives). Without this the overridden repo's features stay stuck at 0.
+const repoSet = new Set((env.ACTIVITY_ORCH_REPOS || "").split(",").map((s) => s.trim()).filter(Boolean));
+if (env.ACTIVITY_TABS_JSON) {
+  const devRoot = env.ACTIVITY_DEV_ROOT || path.join(env.HOME || "", "Dev");
+  try {
+    const tabs = JSON.parse(fs.readFileSync(env.ACTIVITY_TABS_JSON, "utf8"));
+    for (const tab of Array.isArray(tabs) ? tabs : []) {
+      if (parseAssignment(tab.assignment).role !== "orchestrator") continue;
+      const proj = projectOf(tab.cwd, tab.assignment);
+      if (proj) repoSet.add(path.join(devRoot, proj));
+    }
+  } catch { /* no/malformed tabs json -> rely on explicit ACTIVITY_ORCH_REPOS */ }
+}
+const orchRepos = [...repoSet];
+
 const featMsByDay = {}; // day -> count
 let featuresImplemented = 0;
 for (const repo of orchRepos) {
