@@ -1,2 +1,131 @@
-/* Harness control panel. Implemented by slice S3. See docs/dashboard.md. */
-:root { color-scheme: light dark; }
+/* Harness control panel. Slice S3. See docs/dashboard.md. */
+:root {
+  color-scheme: light dark;
+  --bg: #f7f7f8;
+  --fg: #1f2328;
+  --panel: #ffffff;
+  --border: #d0d7de;
+  --muted: #57606a;
+  /* Neutral (empty node): faint, dashed. Led colours below work on both themes. */
+  --neutral-fill: #eaeef2;
+  --neutral-stroke: #c0c7cf;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14171c;
+    --fg: #e6edf3;
+    --panel: #1e232b;
+    --border: #30363d;
+    --muted: #9198a1;
+    --neutral-fill: #232a33;
+    --neutral-stroke: #3a424c;
+  }
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font: 14px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+.topbar {
+  display: flex;
+  align-items: baseline;
+  gap: 1rem;
+  padding: 0.6rem 1rem;
+  border-bottom: 1px solid var(--border);
+}
+.topbar h1 { font-size: 1rem; margin: 0; font-weight: 600; }
+.status { font-size: 0.8rem; color: var(--muted); }
+.status.ok { color: #2da44e; }
+.status.err { color: #cf222e; }
+
+#dashboard { padding: 1rem; }
+#flow { width: 100%; height: auto; max-height: 40vh; }
+
+/* --- phase nodes --- */
+.node { cursor: pointer; }
+.node-box {
+  fill: var(--neutral-fill);
+  stroke: var(--neutral-stroke);
+  stroke-width: 2;
+  transition: fill 0.25s ease, stroke 0.25s ease;
+}
+.node-label {
+  text-anchor: middle;
+  fill: var(--fg);
+  font-size: 16px;
+  font-weight: 600;
+}
+.node-count {
+  text-anchor: middle;
+  fill: var(--muted);
+  font-size: 12px;
+}
+.node:focus { outline: none; }
+.node:focus .node-box,
+.node:hover .node-box { stroke-width: 3; }
+
+.arrow { stroke: var(--border); stroke-width: 2; }
+.arrow-head { fill: var(--border); }
+
+/* Led highlight: one class per state (docs/dashboard.md "led rollup"). */
+.node.led-neutral .node-box  { fill: var(--neutral-fill);  stroke: var(--neutral-stroke); stroke-dasharray: 4 4; }
+.node.led-idle .node-box       { fill: #ddf4ff; stroke: #54aeff; }
+.node.led-unreviewed .node-box { fill: #fff8c5; stroke: #d4a72c; }
+.node.led-working .node-box    { fill: #dafbe1; stroke: #2da44e; }
+.node.led-error .node-box      { fill: #ffebe9; stroke: #cf222e; }
+.node.led-dead .node-box       { fill: #d0d7de; stroke: #6e7781; }
+
+@media (prefers-color-scheme: dark) {
+  .node.led-idle .node-box       { fill: #0c2d4a; stroke: #3b82f6; }
+  .node.led-unreviewed .node-box { fill: #3b2e00; stroke: #d4a72c; }
+  .node.led-working .node-box    { fill: #0f3d22; stroke: #2da44e; }
+  .node.led-error .node-box      { fill: #4a1512; stroke: #f85149; }
+  .node.led-dead .node-box       { fill: #2b3138; stroke: #6e7781; }
+}
+
+/* Working nodes pulse so an active phase reads at a glance. */
+.node.led-working .node-box { animation: pulse 1.6s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: 0.6; } }
+@media (prefers-reduced-motion: reduce) {
+  .node.led-working .node-box { animation: none; }
+}
+
+/* --- popup --- */
+.popup {
+  position: absolute;
+  z-index: 10;
+  min-width: 260px;
+  max-width: 420px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.25);
+  padding: 0.5rem 0.6rem;
+}
+.popup-title { font-weight: 600; margin-bottom: 0.4rem; text-transform: capitalize; }
+.popup-tabs { list-style: none; margin: 0; padding: 0; }
+.popup-tab {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 0 0.6rem;
+  padding: 0.35rem 0.3rem;
+  border-top: 1px solid var(--border);
+  cursor: context-menu;
+}
+.popup-tab:hover { background: color-mix(in srgb, var(--fg) 6%, transparent); }
+.tab-name { font-weight: 600; }
+.tab-role { color: var(--muted); font-size: 0.8rem; }
+.tab-item { grid-column: 1; color: var(--fg); }
+.tab-state { grid-column: 2; grid-row: 1; color: var(--muted); font-size: 0.8rem; }
+.tab-tokens { grid-column: 2; grid-row: 2; color: var(--muted); font-size: 0.8rem; white-space: nowrap; }
+.popup-hint { margin-top: 0.4rem; font-size: 0.72rem; color: var(--muted); }
+
+/* --- unmapped bucket --- */
+.unmapped { margin-top: 1rem; }
+.unmapped h2 { font-size: 0.85rem; color: var(--muted); margin: 0 0 0.4rem; }
+.unmapped ul { list-style: none; margin: 0; padding: 0; max-width: 420px; }
+.unmapped .popup-tab { border: 1px solid var(--border); border-radius: 6px; margin-bottom: 0.3rem; }
