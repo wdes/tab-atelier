@@ -168,11 +168,33 @@ fn rehome_script() -> String {
     })
 }
 
+/// The exact `rehome-tab.sh` invocation as a single copy-pasteable line, for
+/// `--dry-run` / logs. Args with whitespace are double-quoted. Pure + testable.
+fn rehome_display(script: &str, args: &[String]) -> String {
+    let quoted: Vec<String> = args
+        .iter()
+        .map(|a| {
+            if a.chars().any(char::is_whitespace) {
+                format!("\"{a}\"")
+            } else {
+                a.clone()
+            }
+        })
+        .collect();
+    format!("{script} {}", quoted.join(" "))
+}
+
 /// Fire `rehome-tab.sh` detached (it runs for minutes — handoff, spawn, wait;
 /// `--auto-close` closes the old tab). Fire-and-forget: we don't block the tick.
-fn fire_rehome(script: &str, uuid: &str, cwd: &str, assignment: &str, name: &str) -> Result<(), String> {
+/// `dry_run` logs the exact command it WOULD run and spawns nothing.
+fn fire_rehome(script: &str, uuid: &str, cwd: &str, assignment: &str, name: &str, dry_run: bool) -> Result<(), String> {
+    let args = rehome_command(uuid, cwd, assignment, name);
+    if dry_run {
+        println!("clarify[dry-run] would run: {}", rehome_display(script, &args));
+        return Ok(());
+    }
     std::process::Command::new(script)
-        .args(rehome_command(uuid, cwd, assignment, name))
+        .args(args)
         .spawn()
         .map(|_child| ())
         .map_err(|e| format!("spawn {script}: {e}"))
@@ -194,6 +216,7 @@ fn watch_tick(
     last_rehome: &mut HashMap<String, Instant>,
     breaker_until: &mut Option<Instant>,
     cursor: &mut usize,
+    dry_run: bool,
 ) -> Result<(), String> {
     let ep: Endpoint = discover_endpoint()?;
     let ag = agent();
@@ -279,10 +302,13 @@ fn watch_tick(
         pct = pick.pct,
         thr = CONTEXT_THRESHOLD_PCT,
     );
-    match fire_rehome(&script, &pick.id, &pick.cwd, &pick.assignment, &pick.name) {
-        Ok(()) => {
+    match fire_rehome(&script, &pick.id, &pick.cwd, &pick.assignment, &pick.name, dry_run) {
+        // In dry-run nothing was launched, so don't arm the cooldown — keep
+        // reporting the detection as-is.
+        Ok(()) if !dry_run => {
             last_rehome.insert(pick.id.clone(), now);
         }
+        Ok(()) => {}
         Err(e) => eprintln!("clarify: {e}"),
     }
     Ok(())
@@ -290,7 +316,7 @@ fn watch_tick(
 
 /// Manual one-shot: re-home `key` (index/UUID) now, regardless of context% —
 /// the human asked. Still requires a cwd + assignment to re-seed in place.
-fn clarify_one(key: &str) -> i32 {
+fn clarify_one(key: &str, dry_run: bool) -> i32 {
     let ep = match discover_endpoint() {
         Ok(e) => e,
         Err(e) => {
@@ -329,9 +355,11 @@ fn clarify_one(key: &str) -> i32 {
         return 1;
     };
     let script = rehome_script();
-    match fire_rehome(&script, &uuid, &cwd, &assignment, &tab.name) {
+    match fire_rehome(&script, &uuid, &cwd, &assignment, &tab.name, dry_run) {
         Ok(()) => {
-            println!("clarify: re-homing {name} ({uuid}) in place", name = tab.name);
+            if !dry_run {
+                println!("clarify: re-homing {name} ({uuid}) in place", name = tab.name);
+            }
             0
         }
         Err(e) => {
@@ -345,6 +373,7 @@ fn clarify_one(key: &str) -> i32 {
 pub fn run(args: &[String]) -> i32 {
     let mut watch = false;
     let mut once = false;
+    let mut dry_run = false;
     let mut interval = DEFAULT_INTERVAL_SECS;
     let mut key: Option<String> = None;
     let mut i = 0;
@@ -352,6 +381,7 @@ pub fn run(args: &[String]) -> i32 {
         match args[i].as_str() {
             "--watch" => watch = true,
             "--once" => once = true,
+            "--dry-run" => dry_run = true,
             "--interval" => {
                 i += 1;
                 match args.get(i).and_then(|v| v.parse::<u64>().ok()) {
@@ -364,12 +394,13 @@ pub fn run(args: &[String]) -> i32 {
             }
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: tab-atelier-headless clarify <tab>            # re-home one tab now\n       \
-                            tab-atelier-headless clarify --watch [--interval SECS] [--once]\n\
+                    "usage: tab-atelier-headless clarify <tab> [--dry-run]   # re-home one tab now\n       \
+                            tab-atelier-headless clarify --watch [--interval SECS] [--once] [--dry-run]\n\
                      Controlled context refresh: re-home a saturated Claude tab in place\n\
                      (same cwd/assignment/name) instead of opaque auto-compaction.\n\
                      Daemon fires at > {CONTEXT_THRESHOLD_PCT}% context. Guardrails: per-tab\n\
-                     cooldown, skips meta/daemon tabs + orchestrators, anti-storm breaker."
+                     cooldown, skips meta/daemon tabs + orchestrators, anti-storm breaker.\n\
+                     --dry-run: log the decision + the rehome-tab.sh command, spawn nothing."
                 );
                 return 0;
             }
@@ -387,19 +418,26 @@ pub fn run(args: &[String]) -> i32 {
             eprintln!("clarify: pass a tab OR --watch, not both");
             return 2;
         }
-        return clarify_one(&key);
+        return clarify_one(&key, dry_run);
     }
     if !watch {
         eprintln!("clarify: pass a tab to re-home now, or --watch to run the poller (see --help)");
         return 2;
     }
 
-    println!("clarify — watching every {interval}s · auto re-home at > {CONTEXT_THRESHOLD_PCT}% context (in place)");
+    println!(
+        "clarify — watching every {interval}s · auto re-home at > {CONTEXT_THRESHOLD_PCT}% context (in place){dry}",
+        dry = if dry_run {
+            " · DRY-RUN (log only, no spawn)"
+        } else {
+            ""
+        },
+    );
     let mut last_rehome: HashMap<String, Instant> = HashMap::new();
     let mut breaker_until: Option<Instant> = None;
     let mut cursor: usize = 0;
     loop {
-        if let Err(e) = watch_tick(&mut last_rehome, &mut breaker_until, &mut cursor) {
+        if let Err(e) = watch_tick(&mut last_rehome, &mut breaker_until, &mut cursor, dry_run) {
             eprintln!("clarify: tick failed: {e}");
         }
         if once {
@@ -439,6 +477,17 @@ mod tests {
         // A plain worker with a mundane name → NOT skipped.
         assert!(!should_skip_rehome("team-back-worker", Some("build/implementer")));
         assert!(!should_skip_rehome("m-invoice", Some("review/reviewer")));
+    }
+
+    #[test]
+    fn rehome_display_is_copy_pasteable_with_quoting() {
+        // --dry-run prints exactly the command it WOULD run; args with spaces
+        // (name/assignment) are quoted so it's copy-pasteable.
+        let args = rehome_command("uuid-1", "/x/kalpin-back", "build/implementer", "team back");
+        assert_eq!(
+            rehome_display("~/Dev/Botmox/rehome-tab.sh", &args),
+            "~/Dev/Botmox/rehome-tab.sh uuid-1 /x/kalpin-back build/implementer \"team back\" --go --auto-close"
+        );
     }
 
     #[test]
