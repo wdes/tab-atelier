@@ -1077,6 +1077,21 @@ pub struct TabState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bg_color: Option<String>,
 
+    /// The agent's stable place in the workflow: `"[<project>:]<phase>/<role>"`,
+    /// set once via `tab-atelier set-assignment`. Unlike [`Self`]'s in-RAM
+    /// `context` (rewritten every prompt by the `UserPromptSubmit` hook and never
+    /// persisted), this is **hook-immune and persisted** — it's what maps a tab
+    /// onto a dashboard phase node and a project. `None` ⇒ unassigned (the tab
+    /// still shows under its project, in the `unmapped` bucket).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignment: Option<String>,
+
+    /// UUID of the tab that spawned this one (`dispatch --new` reads `_TAB_ID`
+    /// and posts it). Drives the dashboard's delegation lineage / altitude.
+    /// Persisted like `assignment`; `None` ⇒ a root tab (not spawned).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_tab_id: Option<String>,
+
     /// Off-hours auto-lock. When set, the schedule's `(rule, tz)`
     /// pair feeds [`crate::schedule::effective_locked`] alongside the
     /// manual [`Self::locked`] flag. Outside the rule's open windows
@@ -1297,6 +1312,8 @@ impl Default for TabState {
             net_allow_domains: Vec::new(),
             net_allow_cidrs: Vec::new(),
             bg_color: None,
+            assignment: None,
+            parent_tab_id: None,
             schedule: None,
             limits: TabResourceLimits::default(),
         }
@@ -3799,6 +3816,53 @@ mod tests {
         // Missing field deserializes to the default (true).
         let restored: SavedState = serde_json::from_str(r#"{"tabs":[{"name":"x","cwd":null}],"active":0}"#).unwrap();
         assert!(restored.tabs[0].colors_enabled);
+    }
+
+    #[test]
+    fn test_tab_state_assignment_round_trip() {
+        // assignment IS persisted (unlike the RAM-only `context`, which isn't
+        // even a TabState field): survives a round-trip, omitted when None.
+        let with = SavedState {
+            tabs: vec![TabState {
+                name: "worker".into(),
+                assignment: Some("kalpin-back:review/reviewer".into()),
+                parent_tab_id: Some("spawner-uuid".into()),
+                ..Default::default()
+            }],
+            active: 0,
+            windowed: false,
+            dashboard_share_token: String::new(),
+        };
+        let json = serde_json::to_string(&with).unwrap();
+        assert!(
+            json.contains(r#""assignment":"kalpin-back:review/reviewer""#),
+            "assignment must persist: {json}"
+        );
+        assert!(
+            json.contains(r#""parent_tab_id":"spawner-uuid""#),
+            "parent_tab_id must persist too: {json}"
+        );
+        let restored: SavedState = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            restored.tabs[0].assignment.as_deref(),
+            Some("kalpin-back:review/reviewer")
+        );
+        assert_eq!(restored.tabs[0].parent_tab_id.as_deref(), Some("spawner-uuid"));
+
+        // None is skipped from the JSON, and old files (no field) load as None.
+        let without = SavedState {
+            tabs: vec![TabState {
+                name: "x".into(),
+                ..Default::default()
+            }],
+            active: 0,
+            windowed: false,
+            dashboard_share_token: String::new(),
+        };
+        let json = serde_json::to_string(&without).unwrap();
+        assert!(!json.contains("assignment"), "None assignment must be skipped: {json}");
+        let restored: SavedState = serde_json::from_str(r#"{"tabs":[{"name":"x","cwd":null}],"active":0}"#).unwrap();
+        assert_eq!(restored.tabs[0].assignment, None);
     }
 
     #[test]

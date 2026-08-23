@@ -253,13 +253,19 @@ pub enum Commands {
         json: bool,
     },
 
-    /// Print a browser URL for the xterm.js viewer.
+    /// Print a browser URL for the xterm.js viewer, or the harness dashboard.
     ShareLink {
-        /// Tab index or UUID.
-        tab: String,
+        /// Tab index or UUID. Omit when `--dashboard` is given.
+        #[arg(required_unless_present = "dashboard", conflicts_with = "dashboard")]
+        tab: Option<String>,
         /// Read-only share link (recipient cannot type).
         #[arg(long, short)]
         ro: bool,
+        /// Print the global, read-only harness dashboard URL
+        /// (`/dashboard?token=…`) instead of a tab viewer link. Takes no tab;
+        /// the dashboard is read-only by nature, so `--ro` doesn't apply.
+        #[arg(long, conflicts_with_all = ["ro"])]
+        dashboard: bool,
     },
 
     /// Toggle forced Claude-only mode on the running instance (live, no restart).
@@ -384,6 +390,18 @@ pub enum Commands {
     /// `--tab <id>` targets another tab; `--clear` removes the label.
     SetContext {
         /// Passed straight through to `cli::set_context::run`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Declare this tab's stable workflow assignment (`"[<project>:]<phase>/
+    /// <role>"`) for the harness dashboard.
+    ///
+    /// Unlike `set-context` (the volatile prompt label), this is set once,
+    /// hook-immune and persisted. `--tab <id>` targets another tab; `--clear`
+    /// removes it.
+    SetAssignment {
+        /// Passed straight through to `cli::set_assignment::run`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -680,10 +698,19 @@ pub fn dispatch(cli: Cli) -> bool {
             }
             crate::cli::client::run("stats", &args)
         }
-        Commands::ShareLink { tab, ro } => {
-            let mut args = vec![tab];
-            if ro {
-                args.push("--ro".into());
+        Commands::ShareLink { tab, ro, dashboard } => {
+            // clap guarantees exactly one of (tab, --dashboard) — `tab` is
+            // required unless `--dashboard`, and the two conflict. Translate to
+            // the flags `share_link::run` already understands (same path as the
+            // headless hand-parser), so the dashboard logic lives in one place.
+            let mut args: Vec<String> = Vec::new();
+            if dashboard {
+                args.push("--dashboard".into());
+            } else if let Some(tab) = tab {
+                args.push(tab);
+                if ro {
+                    args.push("--ro".into());
+                }
             }
             crate::cli::client::run("share-link", &args)
         }
@@ -783,6 +810,7 @@ pub fn dispatch(cli: Cli) -> bool {
             crate::cli::client::run("set-font", &args)
         }
         Commands::SetContext { args } => crate::cli::client::run("set-context", &args),
+        Commands::SetAssignment { args } => crate::cli::client::run("set-assignment", &args),
         Commands::Token => crate::cli::client::run("token", &[]),
         Commands::RotateTokens => crate::cli::client::run("rotate-tokens", &[]),
         Commands::ResetMasterToken => crate::cli::client::run("reset-master-token", &[]),
@@ -942,6 +970,10 @@ mod tests {
             (&["tab-atelier-headless", "output", "0"], "output"),
             (&["tab-atelier-headless", "share-link", "0"], "share-link"),
             (&["tab-atelier-headless", "share-link", "0", "--ro"], "share-link --ro"),
+            (
+                &["tab-atelier-headless", "set-assignment", "build/implementer"],
+                "set-assignment",
+            ),
             (
                 &["tab-atelier-headless", "bg-color", "--global", "#002451"],
                 "bg-color global",
@@ -1103,6 +1135,61 @@ mod tests {
         );
         // --all alone (no tab) parses.
         assert!(Cli::try_parse_from(["tab-atelier-headless", "limit", "--all", "--memory", "8G"]).is_ok());
+    }
+
+    /// `share-link` takes a tab OR `--dashboard` (the global read-only panel);
+    /// the two are mutually exclusive and one is required. Regression guard for
+    /// the GUI clap parser rejecting `--dashboard` (it lived only in the headless
+    /// hand-parser before).
+    #[test]
+    fn share_link_dashboard_flag_parses_and_is_exclusive() {
+        // A bare tab still parses (unchanged behaviour).
+        assert!(Cli::try_parse_from(["tab-atelier", "share-link", "0"]).is_ok());
+        // `--dashboard` parses with NO tab.
+        let dash = Cli::try_parse_from(["tab-atelier", "share-link", "--dashboard"]).expect("--dashboard parses");
+        assert!(
+            matches!(
+                dash.command,
+                Some(Commands::ShareLink {
+                    tab: None,
+                    dashboard: true,
+                    ..
+                })
+            ),
+            "expected ShareLink{{tab:None,dashboard:true}}, got: {:?}",
+            dash.command
+        );
+        // Both a tab AND --dashboard → conflict.
+        let both = Cli::try_parse_from(["tab-atelier", "share-link", "0", "--dashboard"])
+            .expect_err("tab and --dashboard conflict");
+        assert!(
+            both.to_string().contains("cannot be used with") || both.to_string().contains("conflict"),
+            "expected conflict error, got: {both}"
+        );
+        // Neither a tab nor --dashboard → required-arg error.
+        let neither = Cli::try_parse_from(["tab-atelier", "share-link"]).expect_err("needs a tab or --dashboard");
+        assert!(
+            neither.to_string().contains("required") || neither.to_string().contains("missing"),
+            "expected required-arg error, got: {neither}"
+        );
+    }
+
+    /// `set-assignment` forwards its trailing args verbatim (like `set-context`),
+    /// including the `<project>:<phase>/<role>` grammar and `--clear`, without
+    /// clap trying to interpret them as flags.
+    #[test]
+    fn set_assignment_captures_trailing_args() {
+        let cli = Cli::try_parse_from(["tab-atelier", "set-assignment", "kalpin-back:review/reviewer"])
+            .expect("set-assignment parses");
+        match cli.command {
+            Some(Commands::SetAssignment { args }) => {
+                assert_eq!(args, vec!["kalpin-back:review/reviewer".to_string()]);
+            }
+            other => panic!("expected SetAssignment, got: {other:?}"),
+        }
+        // --clear and --tab flow through as trailing args (handled by the runner).
+        let cli = Cli::try_parse_from(["tab-atelier", "set-assignment", "--clear"]).expect("clear parses");
+        assert!(matches!(cli.command, Some(Commands::SetAssignment { .. })));
     }
 
     #[test]

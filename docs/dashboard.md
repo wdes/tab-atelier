@@ -33,18 +33,40 @@ A node is drawn once and shows the tabs currently occupying it as its
 occupants (the L0-L4 "who works on what" dimension). Per-run adaptations
 (extra or renamed nodes) come from an optional run manifest, v2, not v1.
 
-### `context` grammar
+### Three sources of truth per tab
 
-A tab declares its place with `set-context "<phase>/<role>/<item>"`:
+A tab carries three dimensions **from distinct sources**, so none clobbers
+another (Increment 2):
 
-- `phase` : one of the canonical node ids above. Required to map to a node.
-- `role`  : free label of the agent role (e.g. `implementer`, `reviewer`,
-  `verifier`, `scoper`). Shown in the hover popup.
-- `item`  : free short label of the current unit of work, the "five words"
-  (e.g. `slice-2-rust-state`). Shown in the hover popup.
+- **`assignment`** (persistent, hook-immune) — the agent's place in the
+  workflow: `assignment = "[<project>:]<phase>/<role>"`. Set **once** via
+  `set-assignment`, never touched by the prompt hook. `<phase>` ∈ {scope, plan,
+  build, review, verify, sweep, done}. `<role>` is a free label (`implementer`,
+  `reviewer`, `planner`, `orchestrator`, `auditor`…). The optional `<project>:`
+  prefix **overrides** the project derived from cwd.
+- **`cwd`** — the **project**: basename of the repo (`~/Dev/kalpin-back` →
+  `kalpin-back`). A dev work-root (`~/Dev`, `/src`…) or no cwd → the **`divers`**
+  lane; an itinerant meta-specialist → the **`méta`** lane (below).
+- **`context`** — the **"five words" subtitle**: the current prompt, rewritten
+  by the `user-prompt` hook every turn. **Volatile by design** — "what this tab
+  is doing right now".
 
-A tab whose `context` does not start with a known phase id is listed under an
-`unmapped` bucket, never silently dropped.
+The dashboard maps a tab onto a **phase node via `assignment`** (never via the
+volatile `context`), buckets it under a **project via `cwd`/override**, and
+labels it with **`context`**. A tab with **no `assignment`** stays `unmapped`
+(never dropped) but still appears under its project at level 0.
+
+### Project dimension + `méta` lane
+
+Project resolution, in order: (1) the `<project>:` override; (2) basename of a
+repo cwd; (3) the **`méta`** lane if the role is meta-class (planner, auditor,
+tichef, orchestrator with no repo); (4) **`divers`**. Projects are sorted
+alphabetically with `méta` then `divers` pinned last. Each project carries
+`tabCount`, `rollupLed` (worst led of its tabs), `hasOrchestrator`, `isMeta`,
+and its own scoped 7-node subtree (`nodes`/`unmapped`).
+
+`ponytail:` project = basename of cwd, no git-root detection — a tab in a
+subfolder maps the subfolder; upgrade = walk to the enclosing `.git`.
 
 ### `led` rollup
 
@@ -61,8 +83,8 @@ An empty node (no tabs) has `rollupLed: null` and renders neutral.
 ## `GET /dashboard/state`
 
 Rust endpoint (unit-tested, counts toward codecov). Reads the same source as
-`/tabs/usage`, parses each tab's `context` into a phase, groups tabs by node,
-and computes `rollupLed`. Shape:
+`/tabs/usage`, maps each tab onto a phase node **via `assignment`**, buckets it
+under a **project**, and computes `rollupLed`. Shape:
 
 ```json
 {
@@ -74,9 +96,10 @@ and computes `rollupLed`. Shape:
         {
           "id": "<uuid>",
           "name": "ta-rust-builder",
-          "context": "build/implementer/slice-2-rust-state",
+          "assignment": "build/implementer",
           "role": "implementer",
-          "item": "slice-2-rust-state",
+          "context": "wiring the parser",
+          "item": "wiring the parser",
           "agentState": "thinking",
           "led": "working",
           "tokens": { "input": 12345, "output": 6789 },
@@ -85,9 +108,35 @@ and computes `rollupLed`. Shape:
       ]
     }
   ],
-  "unmapped": [ /* same tab shape, for tabs with no/unknown phase */ ]
+  "unmapped": [ /* same tab shape, for tabs with no/unknown assignment */ ],
+  "projects": [
+    {
+      "name": "kalpin-back",
+      "tabCount": 2,
+      "rollupLed": "working",
+      "hasOrchestrator": false,
+      "isMeta": false,
+      "nodes": [ /* the 7-node subtree, scoped to this project */ ],
+      "unmapped": [ /* this project's unassigned tabs */ ]
+    }
+    /* … sorted alpha, "méta" then "divers" pinned last */
+  ]
 }
 ```
+
+`role` and the phase come from `assignment` (never the volatile `context`);
+`item` is now the `context` subtitle. The global `nodes`/`unmapped` are the
+Increment 1 contract, preserved.
+
+### Lineage & altitude (S6)
+
+Each tab also carries `parentTabId` (the UUID of the tab that spawned it —
+`dispatch --new` stamps it via `POST /tabs/by-id/{id}/parent`, reading `_TAB_ID`)
+and a static `altitude` band from its role class (`0` tichef, `1` orchestrator,
+`2` worker/specialist). `DashboardState.lineage` is the deduped list of
+`{child, parent}` delegation edges whose parent is a known tab — an unknown or
+self parent degrades to a root (no edge), so no cycle survives. A root tab has
+no `parentTabId` and falls back to its role altitude.
 
 ## `GET /dashboard`
 

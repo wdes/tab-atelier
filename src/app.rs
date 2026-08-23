@@ -214,6 +214,11 @@ struct Tab {
     /// the PR/task it's on). Shown as a hover tooltip on the tab name.
     /// In-memory; set via the API + drained from the snapshot.
     context: Option<std::sync::Arc<str>>,
+    /// Stable workflow assignment (`set-assignment`). Persisted (restored from
+    /// `TabState`, written back in `persist()`) and hook-immune, unlike `context`.
+    assignment: Option<std::sync::Arc<str>>,
+    /// UUID of the spawning tab (`parent_tab_id`). Persisted like `assignment`.
+    parent_tab_id: Option<std::sync::Arc<str>>,
     /// One-shot resume command queued on tab restore — when the
     /// shell is up the next tick types `<command>\n` into the
     /// PTY, then clears this. Set in `insert_tab` from the
@@ -307,6 +312,9 @@ impl Tab {
             schedule: ts.schedule.clone(),
             bg_color: ts.bg_color.clone(),
             context: None,
+            // Persisted: restore it so the tab keeps its phase/role across restarts.
+            assignment: ts.assignment.as_deref().map(std::sync::Arc::from),
+            parent_tab_id: ts.parent_tab_id.as_deref().map(std::sync::Arc::from),
             last_pushed_locked: None,
             pending_agent_resume,
             snap_cache: None,
@@ -1375,6 +1383,8 @@ impl AppState {
             pending_net_allow_changes: Vec::new(),
             pending_bg_color_changes: Vec::new(),
             pending_context_changes: Vec::new(),
+            pending_assignment_changes: Vec::new(),
+            pending_parent_changes: Vec::new(),
             pending_token_rotations: Vec::new(),
             pending_schedule_changes: Vec::new(),
             pending_new_tabs: 0,
@@ -1948,6 +1958,8 @@ impl AppState {
                     locked: tab.locked,
                     schedule: tab.schedule.clone(),
                     bg_color: tab.bg_color.clone(),
+                    assignment: tab.assignment.as_deref().map(str::to_string),
+                    parent_tab_id: tab.parent_tab_id.as_deref().map(str::to_string),
                     limits: tab.limits.clone(),
                     ..TabState::default()
                 }
@@ -2055,6 +2067,8 @@ impl AppState {
                 schedule: ts.schedule.clone(),
                 bg_color,
                 context: tab.context.clone(),
+                assignment: tab.assignment.clone(),
+                parent_tab_id: tab.parent_tab_id.clone(),
                 shell_pid,
                 agent_state: tab.agent_state.clone(),
                 agent_session_id: tab.agent_session_id.clone(),
@@ -2308,6 +2322,9 @@ impl AppState {
             let net_changes: Vec<(String, bool)> = snapshot.pending_net_changes.drain(..).collect();
             let bg_color_changes: Vec<(String, Option<String>)> = snapshot.pending_bg_color_changes.drain(..).collect();
             let context_changes: Vec<(String, Option<String>)> = snapshot.pending_context_changes.drain(..).collect();
+            let assignment_changes: Vec<(String, Option<String>)> =
+                snapshot.pending_assignment_changes.drain(..).collect();
+            let parent_changes: Vec<(String, Option<String>)> = snapshot.pending_parent_changes.drain(..).collect();
             let token_rotations: Vec<String> = snapshot.pending_token_rotations.drain(..).collect();
             let schedule_changes: Vec<(String, Option<crate::schedule::TabSchedule>)> =
                 snapshot.pending_schedule_changes.drain(..).collect();
@@ -2417,6 +2434,18 @@ impl AppState {
             for (tab_id, context) in context_changes {
                 if let Some(tab) = self.tabs.iter_mut().find(|t| *t.id == tab_id) {
                     tab.context = context.map(std::sync::Arc::from);
+                }
+            }
+            // Assignment changes — mirrored onto the runtime Tab so the next
+            // persist() writes them to tabs.json (they survive a restart).
+            for (tab_id, assignment) in assignment_changes {
+                if let Some(tab) = self.tabs.iter_mut().find(|t| *t.id == tab_id) {
+                    tab.assignment = assignment.map(std::sync::Arc::from);
+                }
+            }
+            for (tab_id, parent) in parent_changes {
+                if let Some(tab) = self.tabs.iter_mut().find(|t| *t.id == tab_id) {
+                    tab.parent_tab_id = parent.map(std::sync::Arc::from);
                 }
             }
             // Schedule changes — None clears, Some sets. Mirrors the
@@ -2985,6 +3014,8 @@ impl AppState {
                     share_token_ro: tab.share_token_ro.to_string(),
                     locked: tab.locked,
                     bg_color: tab.bg_color.clone(),
+                    assignment: tab.assignment.as_deref().map(str::to_string),
+                    parent_tab_id: tab.parent_tab_id.as_deref().map(str::to_string),
                     limits: tab.limits.clone(),
                     ..TabState::default()
                 }
@@ -3264,6 +3295,10 @@ impl AppState {
             #[cfg(feature = "energy")]
             let power_label = watts.get(i).map(power::TabPower::label).unwrap_or_default();
 
+            // S5: an orchestrator tab gets a lighter background tint so its role
+            // reads at a glance in the bar. Role comes from `assignment` (S0),
+            // never the volatile `context`.
+            let is_orchestrator = crate::api::role_of(tab.assignment.as_deref()) == "orchestrator";
             let drag_name = tab.name.clone();
             let tab_el = div()
                 .id(ElementId::Name(self.tab_el_ids[i].clone()))
@@ -3286,12 +3321,22 @@ impl AppState {
                 .border_l_1()
                 .border_t_1()
                 .border_b_1()
-                .bg(if blink_red {
-                    tab_blink_bg
-                } else if is_active {
-                    tab_active_bg
-                } else {
-                    tab_bg
+                .bg({
+                    let base = if blink_red {
+                        tab_blink_bg
+                    } else if is_active {
+                        tab_active_bg
+                    } else {
+                        tab_bg
+                    };
+                    if is_orchestrator {
+                        Hsla {
+                            l: (base.l + 0.12).min(1.0),
+                            ..base
+                        }
+                    } else {
+                        base
+                    }
                 })
                 .border_r_1()
                 .border_color(tab_border)
@@ -3803,6 +3848,54 @@ impl AppState {
                     )
                     .child("\u{1f40a} Aligator"),
             );
+
+            // 📊 Dashboard (S5) — opens the harness dashboard scoped to this
+            // tab's team, role-aware: a worker/orchestrator drills into its
+            // project, a tichef / méta specialist gets the global level 0. Role
+            // + project come from `assignment` (S0), never the volatile context.
+            // The URL carries the GLOBAL read-only dashboard share token (minted
+            // lazily) so it also works from a remote browser.
+            {
+                let port = port_of(&self.api_addr, crate::DEFAULT_API_PORT);
+                let share_base = self.share_url_base.trim_end_matches('/').to_string();
+                container = container.child(
+                    div()
+                        .id("menu-dashboard")
+                        .px(px(12.0))
+                        .py(px(4.0))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(menu_hover))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                                let token = {
+                                    let mut snap =
+                                        this.api_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                                    if snap.dashboard_share_token.is_empty() {
+                                        snap.dashboard_share_token = crate::mint_share_token().into();
+                                    }
+                                    snap.dashboard_share_token.to_string()
+                                };
+                                let role = crate::api::role_of(this.tabs[idx].assignment.as_deref());
+                                let project = crate::api::project_of(
+                                    this.tabs[idx].last_known_cwd_string.as_deref(),
+                                    this.tabs[idx].assignment.as_deref(),
+                                );
+                                let base = if share_base.is_empty() {
+                                    format!("http://{}:{port}", crate::api::local_ip())
+                                } else {
+                                    share_base.clone()
+                                };
+                                let url = crate::api::dashboard_url_for_role(&role, &project, &base, &token);
+                                let browser = this.browser.borrow().clone();
+                                platform::open_url(&url, browser.as_deref());
+                                this.context_menu = None;
+                                cx.notify();
+                            }),
+                        )
+                        .child("\u{1F4CA} Dashboard"),
+                );
+            }
 
             let colors_enabled = self.tabs[idx].view.read(cx).colors_enabled();
             let toggle_label = if colors_enabled {

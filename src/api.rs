@@ -203,6 +203,14 @@ struct TabInfo {
     /// PR/task it's on. Omitted when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     context: Option<String>,
+    /// Stable workflow assignment (`set-assignment`, `"[<project>:]<phase>/
+    /// <role>"`). Persisted + hook-immune, unlike `context`. Omitted when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    assignment: Option<String>,
+    /// UUID of the spawning tab (`parent_tab_id`) — the dashboard lineage edge.
+    /// Omitted for a root (non-spawned) tab.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_tab_id: Option<String>,
     /// Number of WS viewers (browser share-link / `remote attach`)
     /// currently watching this tab. Omitted when zero.
     #[serde(skip_serializing_if = "is_zero")]
@@ -291,17 +299,39 @@ struct ErrorResponse {
 /// of these maps to that node; anything else falls to `unmapped`.
 const DASHBOARD_PHASES: [&str; 7] = ["scope", "plan", "build", "review", "verify", "sweep", "done"];
 
+/// Roles that mark an itinerant meta-specialist: with no repo cwd and no
+/// project override, such a tab lands in the shared **`méta`** lane rather than
+/// `divers`. See docs/dashboard.md "Dimension projet + voie méta".
+const META_ROLES: [&str; 4] = ["planner", "auditor", "tichef", "orchestrator"];
+/// Dev work-roots whose basename is NOT a project (a shell parked at the parent
+/// of the repos). `ponytail:` heuristic list, no git detection — a tab actually
+/// inside `~/Dev/kalpin-back` still maps to `kalpin-back`; upgrade = walk to
+/// the enclosing `.git`.
+const WORK_ROOT_NAMES: [&str; 6] = ["dev", "src", "code", "projects", "repos", "workspace"];
+const META_LANE: &str = "méta";
+const DIVERS_LANE: &str = "divers";
+
 /// One tab projected into the dashboard state: the same per-tab data as
-/// `/tabs/usage`, plus the `context` split into `role`/`item` and a ready-made
-/// `viewerUrl`. camelCase to match the documented JSON shape.
-#[derive(Serialize)]
+/// `/tabs/usage`, plus `role` (from `assignment`), the `context` subtitle, the
+/// raw `assignment`, and a ready-made `viewerUrl`. camelCase.
+#[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct DashboardTab {
     id: String,
     name: String,
+    /// The volatile "5 words" (the current prompt); kept for the S4 subtitle.
     context: Option<String>,
+    /// Raw `"[<project>:]<phase>/<role>"` the agent set once. `None` ⇒ unassigned.
+    assignment: Option<String>,
+    /// Agent role, derived from `assignment` (never from the volatile context).
     role: String,
+    /// The current unit of work — now the volatile `context` (the prompt).
     item: String,
+    /// UUID of the spawning tab, for the delegation lineage. `None` ⇒ root.
+    parent_tab_id: Option<String>,
+    /// Static altitude band from the role class: 0 tichef, 1 orchestrator,
+    /// 2 worker/specialist. A socle available without lineage data.
+    altitude: u8,
     agent_state: Option<&'static str>,
     led: Option<&'static str>,
     tokens: Option<crate::TokenUsage>,
@@ -309,7 +339,7 @@ struct DashboardTab {
 }
 
 /// A phase node with its occupants and the worst-severity led among them.
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct DashboardNode {
     id: &'static str,
@@ -317,19 +347,73 @@ struct DashboardNode {
     tabs: Vec<DashboardTab>,
 }
 
+/// A project bucket (level 0): the 7-phase subtree scoped to one project, plus
+/// its rollup. `méta` and `divers` are the two shared lanes.
 #[derive(Serialize)]
-struct DashboardState {
+#[serde(rename_all = "camelCase")]
+struct DashboardProject {
+    name: String,
+    tab_count: usize,
+    rollup_led: Option<&'static str>,
+    has_orchestrator: bool,
+    is_meta: bool,
     nodes: Vec<DashboardNode>,
     unmapped: Vec<DashboardTab>,
 }
 
+/// One delegation edge: `child` was spawned by `parent` (both tab UUIDs).
+#[derive(Serialize, PartialEq, Eq, Debug)]
+#[serde(rename_all = "camelCase")]
+struct LineageEdge {
+    child: String,
+    parent: String,
+}
+
+#[derive(Serialize)]
+struct DashboardState {
+    /// Global 7-node diagram (Increment 1 contract — preserved).
+    nodes: Vec<DashboardNode>,
+    unmapped: Vec<DashboardTab>,
+    /// Per-project buckets (Increment 2), sorted alpha with `méta`/`divers` last.
+    projects: Vec<DashboardProject>,
+    /// Delegation lineage (S6): `parent_tab_id` edges whose parent is a known
+    /// tab. A tab with no/unknown parent is a root (no edge). Self-edges dropped.
+    lineage: Vec<LineageEdge>,
+}
+
+/// Build the delegation lineage from `(child_id, parent_id)` pairs. An edge is
+/// kept only when the parent is a known tab and isn't the child itself, so an
+/// unknown parent degrades to a root and no self-cycle survives. Deduped.
+fn build_lineage(tabs: &[(String, Option<String>)]) -> Vec<LineageEdge> {
+    let ids: std::collections::HashSet<&str> = tabs.iter().map(|(id, _)| id.as_str()).collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut edges = vec![];
+    for (child, parent) in tabs {
+        if let Some(p) = parent
+            && p != child
+            && ids.contains(p.as_str())
+            && seen.insert((child.clone(), p.clone()))
+        {
+            edges.push(LineageEdge {
+                child: child.clone(),
+                parent: p.clone(),
+            });
+        }
+    }
+    edges
+}
+
 /// Minimal per-tab projection the dashboard builder consumes, so the
 /// mapping/rollup logic is unit-testable without constructing a full
-/// `TabState`. Mirrors exactly the fields `/tabs/usage` reads plus `context`.
+/// `TabState`. `assignment` drives phase/role/project; `cwd` drives project;
+/// `context` is the volatile subtitle.
 struct DashboardTabInput {
     id: String,
     name: String,
+    cwd: Option<String>,
+    assignment: Option<String>,
     context: Option<String>,
+    parent_tab_id: Option<String>,
     agent_state: Option<&'static str>,
     led: Option<&'static str>,
     tokens: Option<crate::TokenUsage>,
@@ -348,10 +432,77 @@ fn led_severity(led: &str) -> u8 {
     }
 }
 
-/// Group tabs by phase node, parse each `context` into `role`/`item`, and roll
-/// up each node's led to its worst-severity occupant. The pure core of
-/// `GET /dashboard/state` (see docs/dashboard.md).
-fn build_dashboard_state(inputs: Vec<DashboardTabInput>) -> DashboardState {
+/// Parse `"[<project>:]<phase>/<role>"` → (project override, phase, role). The
+/// optional `<project>:` override is a prefix ending at the first `:` that
+/// precedes the first `/` (so a `:` inside a role is left alone).
+fn parse_assignment(a: &str) -> (Option<String>, String, String) {
+    let head_end = a.find('/').unwrap_or(a.len());
+    let (over, rest) = a[..head_end].find(':').map_or((None, a), |colon| {
+        (Some(a[..colon].trim().to_string()), &a[colon + 1..])
+    });
+    let mut parts = rest.splitn(2, '/');
+    let phase = parts.next().unwrap_or("").trim().to_string();
+    let role = parts.next().unwrap_or("").trim().to_string();
+    (over.filter(|p| !p.is_empty()), phase, role)
+}
+
+/// Static altitude band from an agent role: 0 = tichef (top), 1 = orchestrator,
+/// 2 = worker/specialist (bottom). The socle available without any lineage.
+fn role_altitude(role: &str) -> u8 {
+    match role {
+        "tichef" => 0,
+        "orchestrator" => 1,
+        _ => 2,
+    }
+}
+
+/// Phase id from an assignment (empty ⇒ unmapped).
+fn phase_of(assignment: Option<&str>) -> String {
+    assignment.map(|a| parse_assignment(a).1).unwrap_or_default()
+}
+
+/// Role from an assignment — never from the volatile `context`.
+pub fn role_of(assignment: Option<&str>) -> String {
+    assignment.map(|a| parse_assignment(a).2).unwrap_or_default()
+}
+
+/// Build the dashboard URL a right-click "Dashboard" entry opens, role-aware
+/// (S5). A **worker** or **orchestrator** drills into its project (team =
+/// project in v1); a **tichef** or an itinerant **méta** specialist opens the
+/// global level 0. Pure so the routing is unit-testable without gpui.
+pub fn dashboard_url_for_role(role: &str, project: &str, base: &str, token: &str) -> String {
+    let base = base.trim_end_matches('/');
+    if role == "tichef" || project == META_LANE || project.is_empty() {
+        format!("{base}/dashboard?token={token}")
+    } else {
+        format!("{base}/dashboard?project={project}&token={token}")
+    }
+}
+
+/// Resolve a tab's project, in order: (1) `<project>:` override; (2) basename of
+/// a repo cwd; (3) `méta` lane for a meta-role itinerant; (4) `divers`.
+pub fn project_of(cwd: Option<&str>, assignment: Option<&str>) -> String {
+    let (over, _phase, role) = assignment.map_or((None, String::new(), String::new()), parse_assignment);
+    if let Some(p) = over {
+        return p;
+    }
+    if let Some(c) = cwd {
+        let base = c.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+        if !base.is_empty() && !WORK_ROOT_NAMES.contains(&base.to_ascii_lowercase().as_str()) {
+            return base.to_string();
+        }
+    }
+    if META_ROLES.contains(&role.as_str()) {
+        META_LANE.to_string()
+    } else {
+        DIVERS_LANE.to_string()
+    }
+}
+
+/// Group `(phase, tab)` pairs into the 7 canonical nodes + an unmapped bucket,
+/// rolling up each node's led to its worst occupant. Shared by the global
+/// diagram and each project subtree.
+fn group_into_nodes<I: Iterator<Item = (String, DashboardTab)>>(items: I) -> (Vec<DashboardNode>, Vec<DashboardTab>) {
     let mut nodes: Vec<DashboardNode> = DASHBOARD_PHASES
         .iter()
         .map(|id| DashboardNode {
@@ -361,32 +512,7 @@ fn build_dashboard_state(inputs: Vec<DashboardTabInput>) -> DashboardState {
         })
         .collect();
     let mut unmapped: Vec<DashboardTab> = vec![];
-    for t in inputs {
-        // Split "phase/role/item" on the first two slashes; item keeps any
-        // remaining slashes. Absent context ⇒ empty phase/role/item ⇒ unmapped.
-        let (phase, role, item) = t.context.as_deref().map_or_else(
-            || (String::new(), String::new(), String::new()),
-            |ctx| {
-                let mut parts = ctx.splitn(3, '/');
-                (
-                    parts.next().unwrap_or("").to_string(),
-                    parts.next().unwrap_or("").to_string(),
-                    parts.next().unwrap_or("").to_string(),
-                )
-            },
-        );
-        let viewer_url = format!("/tabs/by-id/{}/view", t.id);
-        let tab = DashboardTab {
-            id: t.id,
-            name: t.name,
-            context: t.context,
-            role,
-            item,
-            agent_state: t.agent_state,
-            led: t.led,
-            tokens: t.tokens,
-            viewer_url,
-        };
+    for (phase, tab) in items {
         match nodes.iter_mut().find(|n| n.id == phase) {
             Some(n) => n.tabs.push(tab),
             None => unmapped.push(tab),
@@ -395,7 +521,98 @@ fn build_dashboard_state(inputs: Vec<DashboardTabInput>) -> DashboardState {
     for n in &mut nodes {
         n.rollup_led = n.tabs.iter().filter_map(|t| t.led).max_by_key(|led| led_severity(led));
     }
-    DashboardState { nodes, unmapped }
+    (nodes, unmapped)
+}
+
+/// Map tabs onto phase nodes **via `assignment`**, group them under projects
+/// (via cwd/override), and roll up leds. The pure core of `GET /dashboard/state`
+/// (see docs/dashboard.md). The global `nodes`/`unmapped` are the Increment 1
+/// contract; `projects` is the Increment 2 addition.
+fn build_dashboard_state(inputs: Vec<DashboardTabInput>) -> DashboardState {
+    // Project each input once into (project, phase, tab). The tab is cloned into
+    // both the global diagram and its project subtree.
+    struct Projected {
+        project: String,
+        phase: String,
+        tab: DashboardTab,
+    }
+    let projected: Vec<Projected> = inputs
+        .into_iter()
+        .map(|t| {
+            let phase = phase_of(t.assignment.as_deref());
+            let role = role_of(t.assignment.as_deref());
+            let project = project_of(t.cwd.as_deref(), t.assignment.as_deref());
+            let viewer_url = format!("/tabs/by-id/{}/view", t.id);
+            let altitude = role_altitude(&role);
+            let tab = DashboardTab {
+                id: t.id,
+                name: t.name,
+                item: t.context.clone().unwrap_or_default(),
+                context: t.context,
+                assignment: t.assignment,
+                role,
+                parent_tab_id: t.parent_tab_id,
+                altitude,
+                agent_state: t.agent_state,
+                led: t.led,
+                tokens: t.tokens,
+                viewer_url,
+            };
+            Projected { project, phase, tab }
+        })
+        .collect();
+
+    // Global diagram (Increment 1 contract).
+    let (nodes, unmapped) = group_into_nodes(projected.iter().map(|p| (p.phase.clone(), p.tab.clone())));
+
+    // Distinct projects, sorted alpha with méta/divers pinned last.
+    let mut names: Vec<String> = projected.iter().map(|p| p.project.clone()).collect();
+    names.sort();
+    names.dedup();
+    let rank = |n: &str| match n {
+        META_LANE => 1,
+        DIVERS_LANE => 2,
+        _ => 0,
+    };
+    names.sort_by(|a, b| rank(a).cmp(&rank(b)).then_with(|| a.cmp(b)));
+
+    let projects: Vec<DashboardProject> = names
+        .into_iter()
+        .map(|name| {
+            let mine: Vec<&Projected> = projected.iter().filter(|p| p.project == name).collect();
+            let tab_count = mine.len();
+            let has_orchestrator = mine.iter().any(|p| p.tab.role == "orchestrator");
+            let rollup_led = mine
+                .iter()
+                .filter_map(|p| p.tab.led)
+                .max_by_key(|led| led_severity(led));
+            let (nodes, unmapped) = group_into_nodes(mine.iter().map(|p| (p.phase.clone(), p.tab.clone())));
+            let is_meta = name == META_LANE;
+            DashboardProject {
+                name,
+                tab_count,
+                rollup_led,
+                has_orchestrator,
+                is_meta,
+                nodes,
+                unmapped,
+            }
+        })
+        .collect();
+
+    let lineage = build_lineage(
+        &projected
+            .iter()
+            .map(|p| (p.tab.id.clone(), p.tab.parent_tab_id.clone()))
+            .collect::<Vec<_>>(),
+    );
+
+    DashboardState {
+        nodes,
+        unmapped,
+        projects,
+        lineage,
+    }
 }
 
 #[derive(Clone)]
@@ -481,6 +698,14 @@ pub struct SnapshotTab {
     /// on. Surfaced on `/tabs` and as a hover tooltip on the GUI tab
     /// name. `None` ⇒ no context set.
     pub context: Option<std::sync::Arc<str>>,
+    /// The agent's stable workflow assignment (`"[<project>:]<phase>/<role>"`),
+    /// mirrored from the runtime tab. Unlike `context`, it's persisted and
+    /// hook-immune (see [`crate::TabState::assignment`]); the dashboard maps a
+    /// tab onto a phase node + project from this. `None` ⇒ unassigned.
+    pub assignment: Option<std::sync::Arc<str>>,
+    /// UUID of the spawning tab (`parent_tab_id`), mirrored from the runtime
+    /// tab. Drives the dashboard delegation lineage. `None` ⇒ a root tab.
+    pub parent_tab_id: Option<std::sync::Arc<str>>,
     /// PID of the tab's shell. The /catbus endpoints walk its
     /// descendant processes to find a catbus-agent (or fallback
     /// `claude` TUI) and resolve the session's transcript file.
@@ -655,6 +880,14 @@ pub struct TabSnapshot {
     /// `None` clears the tab's context. Same drain shape as
     /// `pending_bg_color_changes`.
     pub pending_context_changes: Vec<(String, Option<String>)>,
+    /// (`tab_id`, assignment-or-None) queued by `POST /tabs/by-id/{id}/assignment`.
+    /// Unlike `pending_context_changes`, the owner loop mirrors this onto the
+    /// runtime tab AND persists it (see the `persist()` in both binaries).
+    pub pending_assignment_changes: Vec<(String, Option<String>)>,
+    /// (`tab_id`, `parent_tab_id`-or-None) queued by `POST /tabs/by-id/{id}/parent`
+    /// (the delegate stamps a spawned tab's lineage). Mirrored + persisted like
+    /// `pending_assignment_changes`.
+    pub pending_parent_changes: Vec<(String, Option<String>)>,
     /// Tab ids whose per-tab share tokens (`share_token_rw`/`_ro`) the
     /// owner loop should clear, queued by `POST /tabs/rotate-tokens`.
     /// Clearing revokes every outstanding share link for that tab (it
@@ -1817,12 +2050,14 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
         }
         ok
     };
-    // Global dashboard share-token: one read-only token that authorises exactly
-    // the two dashboard read routes (`/dashboard` + `/dashboard/state`), via
-    // `?token=` (browser-friendly) or `Authorization: Bearer`, constant-time.
-    // ponytail: no RW/RO split — the dashboard never takes input; the day it
-    // accepts actions, that path needs a separate RW token.
-    let is_dashboard_token = !is_master && matches!(path.as_str(), "/dashboard" | "/dashboard/state") && {
+    // Global dashboard share-token — a READ-ONLY observability credential for the
+    // whole fleet (PO option B). It authorises, via `?token=` or `Bearer`
+    // (constant-time): the two dashboard routes (`/dashboard` + `/dashboard/state`),
+    // AND every tab's read-only viewer routes (same perimeter as a per-tab
+    // `share_token_ro`: view/output/stream, never input/inbox/files-POST → 403).
+    // This is what lets the dashboard's right-click open a tab viewer without a
+    // per-tab token. Computed once here; folded into the per-tab RO verdict below.
+    let dashboard_matches = !is_master && {
         let snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let ok = !snap.dashboard_share_token.is_empty()
             && constant_time_eq(
@@ -1834,6 +2069,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
         }
         ok
     };
+    let is_dashboard_token = dashboard_matches && matches!(path.as_str(), "/dashboard" | "/dashboard/state");
     if !is_master && !is_dashboard_token {
         let allowed = if let Some(p) = provided_token.as_deref()
             && let Some(rest) = path.strip_prefix("/tabs/by-id/")
@@ -1849,8 +2085,11 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 // timing how long the reject takes (audit #2).
                 let rw_match =
                     !t.share_token_rw.is_empty() && constant_time_eq(t.share_token_rw.as_bytes(), p.as_bytes());
-                let ro_match =
-                    !t.share_token_ro.is_empty() && constant_time_eq(t.share_token_ro.as_bytes(), p.as_bytes());
+                // The global dashboard token acts as a read-only share token on
+                // ANY tab (PO option B), so a match here grades exactly like an
+                // RO link: read routes pass, input/inbox/files-POST stay 403.
+                let ro_match = dashboard_matches
+                    || (!t.share_token_ro.is_empty() && constant_time_eq(t.share_token_ro.as_bytes(), p.as_bytes()));
                 // Mutating + privileged-read share-token actions
                 // require RW. The RO link is read-only by construction
                 // so:
@@ -1965,6 +2204,8 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                     schedule_rule: t.schedule.as_ref().map(|s| s.rule.clone()),
                     schedule_tz: t.schedule.as_ref().map(|s| s.tz.clone()),
                     context: t.context.as_deref().map(str::to_string),
+                    assignment: t.assignment.as_deref().map(str::to_string),
+                    parent_tab_id: t.parent_tab_id.as_deref().map(str::to_string),
                     net_disabled: t.net_disabled,
                     connections: t.connections,
                     tx_bytes: t.tx_bytes,
@@ -2108,7 +2349,10 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 .map(|t| DashboardTabInput {
                     id: t.id.to_string(),
                     name: t.name.to_string(),
+                    cwd: t.cwd.as_deref().map(str::to_string),
+                    assignment: t.assignment.as_deref().map(str::to_string),
                     context: t.context.as_deref().map(str::to_string),
+                    parent_tab_id: t.parent_tab_id.as_deref().map(str::to_string),
                     agent_state: t.agent_state.as_ref().map(|s| match s.state {
                         crate::AgentState::Thinking => "thinking",
                         crate::AgentState::Waiting => "waiting",
@@ -3653,6 +3897,79 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             let body = serde_json::to_string(&serde_json::json!({ "context": context_opt })).unwrap_or_default();
             respond_json(stream, 200, &body);
         }
+        ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/assignment") => {
+            // Set or clear this tab's stable workflow assignment
+            // (`"[<project>:]<phase>/<role>"`, set once via `set-assignment`).
+            // Body `{"assignment":"…"}` to set, `{"assignment":null}` or empty to
+            // clear. Mirrors /context, but the owner loop ALSO persists it — this
+            // field is hook-immune and survives a restart. RW/master token only.
+            let inner = &p["/tabs/by-id/".len()..p.len() - "/assignment".len()];
+            let assignment_opt: Option<String> = if body_bytes.is_empty() {
+                None
+            } else {
+                serde_json::from_slice::<serde_json::Value>(&body_bytes)
+                    .ok()
+                    .and_then(|v| v.get("assignment").cloned())
+                    .and_then(|c| {
+                        if c.is_null() {
+                            None
+                        } else {
+                            c.as_str().map(str::to_owned)
+                        }
+                    })
+            };
+            // Same length cap + whitespace-clear as /context.
+            let assignment_opt = assignment_opt
+                .map(|s| s.chars().take(2000).collect::<String>())
+                .filter(|s| !s.trim().is_empty());
+            let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(idx) = state.tabs.iter().position(|t| &*t.id == inner) else {
+                drop(state);
+                error_json(stream, 404, "tab not found");
+                return;
+            };
+            let tab_id = state.tabs[idx].id.to_string();
+            state.tabs[idx].assignment = assignment_opt.as_deref().map(std::sync::Arc::from);
+            state.pending_assignment_changes.push((tab_id, assignment_opt.clone()));
+            drop(state);
+            let body = serde_json::to_string(&serde_json::json!({ "assignment": assignment_opt })).unwrap_or_default();
+            respond_json(stream, 200, &body);
+        }
+        ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/parent") => {
+            // Stamp a spawned tab's lineage: `{"parent_tab_id":"<uuid>"}` (null /
+            // empty clears it). `dispatch --new` calls this on the freshly-created
+            // tab with its own `_TAB_ID`. Persisted like /assignment. Master token.
+            let inner = &p["/tabs/by-id/".len()..p.len() - "/parent".len()];
+            let parent_opt: Option<String> = if body_bytes.is_empty() {
+                None
+            } else {
+                serde_json::from_slice::<serde_json::Value>(&body_bytes)
+                    .ok()
+                    .and_then(|v| v.get("parent_tab_id").cloned())
+                    .and_then(|c| {
+                        if c.is_null() {
+                            None
+                        } else {
+                            c.as_str().map(str::to_owned)
+                        }
+                    })
+            };
+            let parent_opt = parent_opt
+                .map(|s| s.chars().take(128).collect::<String>())
+                .filter(|s| !s.trim().is_empty());
+            let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(idx) = state.tabs.iter().position(|t| &*t.id == inner) else {
+                drop(state);
+                error_json(stream, 404, "tab not found");
+                return;
+            };
+            let tab_id = state.tabs[idx].id.to_string();
+            state.tabs[idx].parent_tab_id = parent_opt.as_deref().map(std::sync::Arc::from);
+            state.pending_parent_changes.push((tab_id, parent_opt.clone()));
+            drop(state);
+            let body = serde_json::to_string(&serde_json::json!({ "parent_tab_id": parent_opt })).unwrap_or_default();
+            respond_json(stream, 200, &body);
+        }
         ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/input") => {
             let Some((key_raw, is_uuid)) = parse_tab_key(p, "/input") else {
                 error_json(stream, 404, "invalid tab key");
@@ -4518,6 +4835,8 @@ pub fn test_snapshot_tab(id: &str, name: &str) -> SnapshotTab {
         schedule: None,
         bg_color: "".into(),
         context: None,
+        assignment: None,
+        parent_tab_id: None,
         shell_pid: 0,
         agent_state: None,
         agent_session_id: None,
@@ -4554,6 +4873,8 @@ pub fn test_snapshot(tabs: Vec<SnapshotTab>) -> TabSnapshot {
         pending_net_allow_changes: vec![],
         pending_bg_color_changes: vec![],
         pending_context_changes: vec![],
+        pending_assignment_changes: vec![],
+        pending_parent_changes: vec![],
         pending_token_rotations: vec![],
         pending_schedule_changes: vec![],
         pending_new_tabs: 0,
@@ -4607,6 +4928,8 @@ mod tests {
             last_used_at: None,
             agent_session_id: None,
             context: None,
+            assignment: None,
+            parent_tab_id: None,
             viewers: 0,
             net_disabled: false,
             connections: 0,
@@ -4640,16 +4963,37 @@ mod tests {
         assert!(json.contains("\"tokens\":{\"input\":100,\"output\":50}"), "{json}");
     }
 
-    /// Build one dashboard input tab with just the fields the mapper reads.
-    fn dash_input(id: &str, context: Option<&str>, led: Option<&'static str>) -> DashboardTabInput {
+    /// A dashboard input tab whose phase/role come from `assignment` (the S0
+    /// field), no cwd. The 2nd arg is now the ASSIGNMENT, not the context.
+    fn dash_input(id: &str, assignment: Option<&str>, led: Option<&'static str>) -> DashboardTabInput {
         DashboardTabInput {
             id: id.to_string(),
             name: format!("tab-{id}"),
-            context: context.map(str::to_string),
+            cwd: None,
+            assignment: assignment.map(str::to_string),
+            context: None,
+            parent_tab_id: None,
             agent_state: None,
             led,
             tokens: None,
         }
+    }
+
+    /// Full builder for project-dimension tests: pick cwd + assignment.
+    fn dash_full(
+        id: &str,
+        cwd: Option<&str>,
+        assignment: Option<&str>,
+        led: Option<&'static str>,
+    ) -> DashboardTabInput {
+        DashboardTabInput {
+            cwd: cwd.map(str::to_string),
+            ..dash_input(id, assignment, led)
+        }
+    }
+
+    fn project<'a>(state: &'a DashboardState, name: &str) -> &'a DashboardProject {
+        state.projects.iter().find(|p| p.name == name).expect("project exists")
     }
 
     fn node<'a>(state: &'a DashboardState, id: &str) -> &'a DashboardNode {
@@ -4657,38 +5001,42 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_maps_context_phase_to_node() {
-        let state = build_dashboard_state(vec![dash_input(
-            "u1",
-            Some("build/implementer/slice-2-rust-state"),
-            Some("working"),
-        )]);
+    fn dashboard_maps_assignment_phase_to_node() {
+        // Phase + role now come from `assignment` (S0), never from `context`.
+        let mut input = dash_input("u1", Some("build/implementer"), Some("working"));
+        input.context = Some("looking at the parser".into()); // volatile subtitle
+        let state = build_dashboard_state(vec![input]);
         let build = node(&state, "build");
         assert_eq!(build.tabs.len(), 1);
         let tab = &build.tabs[0];
         assert_eq!(tab.role, "implementer");
-        assert_eq!(tab.item, "slice-2-rust-state");
+        assert_eq!(tab.item, "looking at the parser", "item is now the volatile context");
+        assert_eq!(tab.assignment.as_deref(), Some("build/implementer"));
         assert_eq!(tab.viewer_url, "/tabs/by-id/u1/view");
         assert!(state.unmapped.is_empty());
     }
 
     #[test]
-    fn dashboard_item_keeps_trailing_slashes() {
-        // Only the first two slashes split phase/role/item — the rest stays in item.
-        let state = build_dashboard_state(vec![dash_input("u1", Some("build/impl/a/b/c"), None)]);
-        assert_eq!(node(&state, "build").tabs[0].item, "a/b/c");
+    fn dashboard_role_ignores_volatile_context() {
+        // Even with a context that LOOKS like a phase/role, role comes from
+        // assignment — proving the S0 immunity survives into the mapper.
+        let mut input = dash_input("u1", Some("review/reviewer"), None);
+        input.context = Some("scope/planner/whatever".into());
+        let state = build_dashboard_state(vec![input]);
+        assert_eq!(node(&state, "review").tabs[0].role, "reviewer");
+        assert!(node(&state, "scope").tabs.is_empty(), "context must not drive mapping");
     }
 
     #[test]
-    fn dashboard_unmapped_for_unknown_or_missing_phase() {
+    fn dashboard_unmapped_for_unknown_or_missing_assignment() {
         let state = build_dashboard_state(vec![
-            dash_input("u1", Some("frobnicate/x/y"), Some("working")),
+            dash_input("u1", Some("frobnicate/x"), Some("working")),
             dash_input("u2", None, Some("idle")),
         ]);
         assert_eq!(
             state.unmapped.len(),
             2,
-            "unknown phase and no-context both fall to unmapped"
+            "unknown phase and no-assignment both fall to unmapped"
         );
         for n in &state.nodes {
             assert!(n.tabs.is_empty(), "node {} should be empty", n.id);
@@ -4752,9 +5100,198 @@ mod tests {
             })
         );
         let json = serde_json::to_string(&state).unwrap();
-        for key in ["\"rollupLed\"", "\"agentState\"", "\"viewerUrl\"", "\"unmapped\""] {
+        for key in [
+            "\"rollupLed\"",
+            "\"agentState\"",
+            "\"viewerUrl\"",
+            "\"unmapped\"",
+            "\"projects\"",
+            "\"tabCount\"",
+            "\"hasOrchestrator\"",
+            "\"isMeta\"",
+            "\"assignment\"",
+        ] {
             assert!(json.contains(key), "dashboard JSON must use {key}: {json}");
         }
+    }
+
+    #[test]
+    fn dashboard_groups_projects_by_cwd_and_override() {
+        // Two repos (by cwd), one meta specialist (no repo, meta role), one root
+        // tab (no repo, worker) → divers, and a meta specialist that serves a
+        // repo via the `<project>:` override.
+        let state = build_dashboard_state(vec![
+            dash_full(
+                "a",
+                Some("/home/u/Dev/kalpin-back"),
+                Some("build/implementer"),
+                Some("working"),
+            ),
+            dash_full(
+                "b",
+                Some("/home/u/Dev/kalpin-front"),
+                Some("review/reviewer"),
+                Some("idle"),
+            ),
+            dash_full("c", None, Some("plan/planner"), Some("working")), // meta lane
+            dash_full("d", Some("/home/u/Dev"), Some("build/worker"), Some("idle")), // dev root → divers
+            dash_full("e", None, Some("kalpin-back:review/auditor"), Some("error")), // override → kalpin-back
+        ]);
+        // Sorted alpha, méta + divers pinned last.
+        let names: Vec<&str> = state.projects.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["kalpin-back", "kalpin-front", "méta", "divers"]);
+        // kalpin-back has the cwd tab + the override guest (auditor).
+        assert_eq!(project(&state, "kalpin-back").tab_count, 2);
+        assert!(project(&state, "méta").is_meta);
+        assert!(!project(&state, "kalpin-back").is_meta);
+        // Override auditor (led error) drives kalpin-back's rollup.
+        assert_eq!(project(&state, "kalpin-back").rollup_led, Some("error"));
+        // The dev-root tab landed in divers, not a "Dev" project.
+        assert_eq!(project(&state, "divers").tab_count, 1);
+    }
+
+    #[test]
+    fn dashboard_project_subtree_scopes_nodes_and_has_orchestrator() {
+        let state = build_dashboard_state(vec![
+            dash_full("a", Some("/x/proj"), Some("build/implementer"), Some("working")),
+            dash_full("b", Some("/x/proj"), Some("scope/orchestrator"), Some("idle")),
+        ]);
+        let p = project(&state, "proj");
+        assert!(p.has_orchestrator, "an orchestrator role sets hasOrchestrator");
+        // Its 7-node subtree scopes tabs to their phase.
+        let build = p.nodes.iter().find(|n| n.id == "build").unwrap();
+        let scope = p.nodes.iter().find(|n| n.id == "scope").unwrap();
+        assert_eq!(build.tabs.len(), 1);
+        assert_eq!(scope.tabs.len(), 1);
+    }
+
+    #[test]
+    fn dashboard_unassigned_tab_is_unmapped_but_under_its_project() {
+        // No assignment → unmapped globally, but still shown under its cwd project.
+        let state = build_dashboard_state(vec![dash_full("a", Some("/x/kalpin-back"), None, Some("idle"))]);
+        assert_eq!(state.unmapped.len(), 1, "unassigned → global unmapped");
+        let p = project(&state, "kalpin-back");
+        assert_eq!(p.tab_count, 1);
+        assert_eq!(p.unmapped.len(), 1, "and in the project's own unmapped bucket");
+    }
+
+    #[test]
+    fn assignment_parse_and_project_helpers() {
+        assert_eq!(
+            parse_assignment("build/implementer"),
+            (None, "build".into(), "implementer".into())
+        );
+        assert_eq!(
+            parse_assignment("kalpin-back:review/reviewer"),
+            (Some("kalpin-back".into()), "review".into(), "reviewer".into())
+        );
+        // A ':' inside the role (after the first '/') is not an override.
+        assert_eq!(
+            parse_assignment("build/impl:er"),
+            (None, "build".into(), "impl:er".into())
+        );
+        // Override beats cwd; cwd basename beats lane; meta role → méta; else divers.
+        assert_eq!(project_of(Some("/x/repo"), Some("meta:build/x")), "meta");
+        assert_eq!(project_of(Some("/x/repo"), Some("build/x")), "repo");
+        assert_eq!(project_of(None, Some("plan/planner")), "méta");
+        assert_eq!(project_of(None, Some("build/worker")), "divers");
+        assert_eq!(project_of(Some("/home/u/dev"), Some("build/worker")), "divers");
+    }
+
+    #[test]
+    fn dashboard_url_for_role_routes_by_role() {
+        // worker → its project scope.
+        assert_eq!(
+            dashboard_url_for_role("implementer", "kalpin-back", "http://h:7890", "T"),
+            "http://h:7890/dashboard?project=kalpin-back&token=T"
+        );
+        // orchestrator → its team (= project in v1).
+        assert_eq!(
+            dashboard_url_for_role("orchestrator", "kalpin-front", "http://h:7890/", "T"),
+            "http://h:7890/dashboard?project=kalpin-front&token=T"
+        );
+        // tichef → global level 0.
+        assert_eq!(
+            dashboard_url_for_role("tichef", "kalpin-back", "http://h:7890", "T"),
+            "http://h:7890/dashboard?token=T"
+        );
+        // itinerant méta specialist → global.
+        assert_eq!(
+            dashboard_url_for_role("auditor", "méta", "http://h:7890", "T"),
+            "http://h:7890/dashboard?token=T"
+        );
+    }
+
+    #[test]
+    fn dashboard_altitude_from_role_class() {
+        assert_eq!(role_altitude("tichef"), 0);
+        assert_eq!(role_altitude("orchestrator"), 1);
+        assert_eq!(role_altitude("implementer"), 2);
+        assert_eq!(role_altitude(""), 2);
+        // Exposed per-tab in the built state.
+        let state = build_dashboard_state(vec![dash_input("u1", Some("scope/tichef"), None)]);
+        assert_eq!(node(&state, "scope").tabs[0].altitude, 0);
+    }
+
+    #[test]
+    fn dashboard_lineage_edges_no_cycle_unknown_parent_is_root() {
+        // b←a, c←b chain; d has an unknown parent (→ root, no edge); e is its own
+        // parent (self-cycle dropped). Duplicated a→? never double-counted.
+        let mk = |id: &str, parent: Option<&str>| DashboardTabInput {
+            parent_tab_id: parent.map(str::to_string),
+            ..dash_input(id, Some("build/worker"), None)
+        };
+        let state = build_dashboard_state(vec![
+            mk("a", None),
+            mk("b", Some("a")),
+            mk("c", Some("b")),
+            mk("d", Some("ghost")),
+            mk("e", Some("e")),
+        ]);
+        let mut edges: Vec<(&str, &str)> = state
+            .lineage
+            .iter()
+            .map(|e| (e.child.as_str(), e.parent.as_str()))
+            .collect();
+        edges.sort_unstable();
+        assert_eq!(
+            edges,
+            vec![("b", "a"), ("c", "b")],
+            "only real parent links; no cycle/unknown"
+        );
+    }
+
+    #[test]
+    fn set_parent_sets_and_exposes_lineage() {
+        let (port, state, token) = spawn_server();
+        let req_body = r#"{"parent_tab_id":"spawner-uuid"}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/tab-a/parent HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{req_body}",
+                req_body.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 200);
+        let (p, queued) = {
+            let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                s.tabs[0].parent_tab_id.clone(),
+                s.pending_parent_changes.last().cloned(),
+            )
+        };
+        assert_eq!(p.as_deref(), Some("spawner-uuid"));
+        assert_eq!(queued.unwrap().1.as_deref(), Some("spawner-uuid"));
+        state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .invalidate_tabs();
+        let tabs = request(port, &format!("GET /tabs?token={token} HTTP/1.1\r\n\r\n"));
+        assert!(
+            body(&tabs).contains("spawner-uuid"),
+            "parentTabId must surface on /tabs: {}",
+            body(&tabs)
+        );
     }
 
     /// Publish a dashboard share-token on the running server's snapshot.
@@ -4763,6 +5300,38 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .dashboard_share_token = tok.into();
+    }
+
+    #[test]
+    fn dashboard_token_grants_readonly_viewer_of_any_tab() {
+        // PO option B: the dashboard token is a fleet-wide READ-ONLY credential,
+        // so the dashboard's right-click can open any tab's viewer without a
+        // per-tab token — exactly the share_token_ro perimeter.
+        let (port, state, _master) = spawn_server();
+        set_dashboard_token(&state, "dash-obs");
+        // Read routes on ANY tab → 200.
+        for path in ["view", "output"] {
+            let resp = request(
+                port,
+                &format!("GET /tabs/by-id/tab-a/{path}?token=dash-obs HTTP/1.1\r\n\r\n"),
+            );
+            assert_eq!(status_code(&resp), 200, "dashboard token should read /{path}");
+        }
+        // input is a write (RW-only) → 403, like a read-only share token.
+        let resp = request(
+            port,
+            "POST /tabs/by-id/tab-a/input?token=dash-obs HTTP/1.1\r\nContent-Length: 0\r\n\r\n",
+        );
+        assert_eq!(status_code(&resp), 403, "dashboard token is read-only on input");
+        // POST /files (upload) is RW-only → 403.
+        let resp = request(
+            port,
+            "POST /tabs/by-id/tab-a/files?token=dash-obs HTTP/1.1\r\nContent-Length: 0\r\n\r\n",
+        );
+        assert_eq!(status_code(&resp), 403, "dashboard token can't upload");
+        // No token → 401 (unchanged).
+        let resp = request(port, "GET /tabs/by-id/tab-a/output HTTP/1.1\r\n\r\n");
+        assert_eq!(status_code(&resp), 401, "no token still 401s");
     }
 
     #[test]
@@ -5563,6 +6132,92 @@ mod tests {
             .last()
             .cloned();
         assert_eq!(last.unwrap().1, None);
+    }
+
+    #[test]
+    fn set_assignment_sets_and_persists_on_snapshot() {
+        let (port, state, token) = spawn_server();
+        let body = r#"{"assignment":"build/implementer"}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/tab-a/assignment HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 200);
+        let a = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).tabs[0]
+            .assignment
+            .clone();
+        assert_eq!(a.as_deref(), Some("build/implementer"));
+        // Queued for the owner loop to mirror onto the runtime tab + persist.
+        let last = state
+            .lock()
+            .expect("lock poisoned")
+            .pending_assignment_changes
+            .last()
+            .cloned();
+        assert_eq!(last.unwrap().1.as_deref(), Some("build/implementer"));
+    }
+
+    #[test]
+    fn assignment_is_immune_to_context_change() {
+        // The whole point of S0: a prompt fires the hook → set-context, which
+        // must NOT touch `assignment` (phase/role stays stable while the
+        // "5 words" subtitle churns).
+        let (port, state, token) = spawn_server();
+        let post = |path: &str, body: &str| {
+            request(
+                port,
+                &format!(
+                    "POST /tabs/by-id/tab-a/{path} HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len(),
+                ),
+            )
+        };
+        assert_eq!(
+            status_code(&post("assignment", r#"{"assignment":"review/reviewer"}"#)),
+            200
+        );
+        // Simulate the prompt hook overwriting context.
+        assert_eq!(status_code(&post("context", r#"{"context":"looking at PR #99"}"#)), 200);
+        let (a, c) = {
+            let snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            (snap.tabs[0].assignment.clone(), snap.tabs[0].context.clone())
+        };
+        assert_eq!(
+            a.as_deref(),
+            Some("review/reviewer"),
+            "assignment untouched by the hook"
+        );
+        assert_eq!(c.as_deref(), Some("looking at PR #99"), "context did change");
+    }
+
+    #[test]
+    fn assignment_is_exposed_in_tabs_json() {
+        let (port, state, token) = spawn_server();
+        let req_body = r#"{"assignment":"kalpin-back:review/reviewer"}"#;
+        let _ = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/tab-a/assignment HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{req_body}",
+                req_body.len(),
+            ),
+        );
+        // Mirror the snapshot mutation onto the SnapshotTab the /tabs handler reads.
+        state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .invalidate_tabs();
+        let resp = request(port, &format!("GET /tabs?token={token} HTTP/1.1\r\n\r\n"));
+        assert_eq!(status_code(&resp), 200);
+        // The override prefix is stored raw here (parsing is S1's job). /tabs is
+        // pretty-printed (`"assignment": "…"`), so match key + value loosely.
+        let b = body(&resp);
+        assert!(
+            b.contains("\"assignment\"") && b.contains("kalpin-back:review/reviewer"),
+            "assignment must surface on /tabs: {b}"
+        );
     }
 
     #[test]

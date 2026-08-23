@@ -3,7 +3,12 @@
 // No framework — just node:assert. Imports the real functions from dashboard.js
 // so this stays a check of shipped code, not a copy.
 import assert from "node:assert/strict";
-import { ledClass, nodeMap, CANONICAL_PHASES } from "./dashboard.js";
+import {
+  ledClass, nodeMap, CANONICAL_PHASES, resolveView, renderProjectCard,
+  readProjectParam, shortContext, nodeSubtitle,
+  isOrchestrator, roleAltitude, projectAltitude, lineageEdges,
+  viewerUrlWithToken,
+} from "./dashboard.js";
 
 // The five led states each map to their own distinct class.
 const cases = {
@@ -35,5 +40,135 @@ assert.equal(nodeMap({}).size, 0, "no nodes -> empty map");
 
 // The canonical skeleton is exactly the seven documented phases, in order.
 assert.deepEqual(CANONICAL_PHASES, ["scope", "plan", "build", "review", "verify", "sweep", "done"]);
+
+// --- resolveView: level-0 grid vs scoped/legacy diagram (S2/S3) ---
+// No projects[] (pre-S1 / legacy) -> the global diagram, whatever currentProject.
+{
+  const legacy = { nodes: [{ id: "build", rollupLed: "working", tabs: [] }], unmapped: [] };
+  const v = resolveView(legacy, null);
+  assert.equal(v.mode, "diagram");
+  assert.equal(v.scoped, false);
+  assert.equal(v.nodes.length, 1);
+  // A stray currentProject can't conjure a grid when the server sends no projects.
+  assert.equal(resolveView(legacy, "kalpin-back").mode, "diagram");
+}
+// projects[] present, none drilled -> grid, in server order (no re-sort).
+{
+  const state = {
+    projects: [
+      { name: "kalpin-back", tabCount: 2, rollupLed: "working", nodes: [{ id: "build", rollupLed: "working", tabs: [] }] },
+      { name: "méta", tabCount: 1, rollupLed: "idle", isMeta: true, nodes: [] },
+    ],
+    nodes: [], unmapped: [],
+  };
+  const grid = resolveView(state, null);
+  assert.equal(grid.mode, "grid");
+  assert.deepEqual(grid.projects.map((p) => p.name), ["kalpin-back", "méta"]);
+  // Drill into a known project -> scoped diagram with that project's nodes.
+  const drill = resolveView(state, "kalpin-back");
+  assert.equal(drill.mode, "diagram");
+  assert.equal(drill.scoped, true);
+  assert.equal(drill.nodes[0].id, "build");
+  // Unknown selected project -> empty scoped diagram, not an error/throw.
+  const unknown = resolveView(state, "nope");
+  assert.equal(unknown.mode, "diagram");
+  assert.equal(unknown.scoped, true);
+  assert.deepEqual(unknown.nodes, []);
+}
+
+// --- renderProjectCard: name, led class, count, meta + orchestrator markers ---
+{
+  const id = (s) => s; // identity escaper for the test
+  const card = renderProjectCard(
+    { name: "kalpin-back", tabCount: 3, rollupLed: "error", hasOrchestrator: true },
+    id
+  );
+  assert.match(card, /project-card led-error/, "card carries its led class");
+  assert.match(card, /data-project="kalpin-back"/, "card carries its project name for drill-in");
+  assert.match(card, /3 tabs/, "card shows the tab count (plural)");
+  assert.match(card, /orch-badge/, "card shows the orchestrator badge");
+  // meta lane + neutral led + singular count.
+  const metaCard = renderProjectCard({ name: "méta", tabCount: 1, rollupLed: null, isMeta: true }, id);
+  assert.match(metaCard, /project-card led-neutral meta/, "meta card is neutral + meta");
+  assert.match(metaCard, /1 tab</, "singular count has no plural s");
+  assert.doesNotMatch(metaCard, /orch-badge/, "no orchestrator badge when absent");
+}
+
+// --- readProjectParam: deep-link ?project= -> drilled project (S3) ---
+assert.equal(readProjectParam("?project=kalpin-back"), "kalpin-back");
+assert.equal(readProjectParam(""), null, "no query -> level 0");
+assert.equal(readProjectParam("?token=abc"), null, "other params -> level 0");
+assert.equal(readProjectParam("?project="), null, "empty value -> level 0");
+
+// --- shortContext / nodeSubtitle: node subtitles = context ~5 words (S4) ---
+assert.equal(shortContext("refactor the auth token flow now", 5), "refactor the auth token flow…", "clips to 5 words with ellipsis");
+assert.equal(shortContext("just three words here"), "just three words here", "under the cap -> verbatim");
+assert.equal(shortContext(""), "", "empty context -> empty");
+assert.equal(shortContext(null), "", "null context -> empty");
+// Empty node -> no subtitle.
+assert.equal(nodeSubtitle({ tabs: [] }), "");
+// One tab -> name · context.
+assert.equal(nodeSubtitle({ tabs: [{ name: "ta", context: "do a thing" }] }), "ta · do a thing");
+// Multiple tabs -> first + "+N".
+assert.match(nodeSubtitle({ tabs: [{ name: "a", context: "x" }, {}, {}] }), /\+2$/, "multi-tab node shows +N");
+
+// --- S5 orchestrator tint + card marker ---
+assert.equal(isOrchestrator("orchestrator"), true);
+assert.equal(isOrchestrator("Orchestrator"), true, "case-insensitive");
+assert.equal(isOrchestrator("worker"), false);
+assert.equal(isOrchestrator(null), false);
+{
+  const id = (s) => s;
+  const card = renderProjectCard({ name: "kalpin-back", tabCount: 2, rollupLed: "idle", hasOrchestrator: true }, id);
+  assert.match(card, /project-card led-idle orchestrator/, "orchestrator project card carries the tint class");
+  const plain = renderProjectCard({ name: "x", tabCount: 1, rollupLed: "idle" }, id);
+  assert.doesNotMatch(plain, /orchestrator/, "no tint without an orchestrator");
+}
+
+// --- S6 altitude bands ---
+assert.equal(roleAltitude("tichef"), 0);
+assert.equal(roleAltitude("orchestrator"), 1);
+assert.equal(roleAltitude("implementer"), 2, "workers/specialists at the bottom band");
+// Explicit altitude wins.
+assert.equal(projectAltitude({ altitude: 0, nodes: [] }), 0);
+// Otherwise: the most senior occupant sets the band.
+assert.equal(
+  projectAltitude({ nodes: [{ tabs: [{ role: "worker" }, { role: "orchestrator" }] }] }),
+  1,
+  "an orchestrator in the project lifts it to band 1"
+);
+assert.equal(projectAltitude({ nodes: [] }), 2, "empty project -> worker band");
+
+// --- S6 lineage edges (cross-project delegation only, deduped) ---
+{
+  const projects = [
+    { name: "méta", nodes: [{ tabs: [{ id: "orch1", role: "orchestrator" }] }], unmapped: [] },
+    { name: "kalpin-back", nodes: [{ tabs: [
+      { id: "w1", role: "worker", parentTabId: "orch1" },
+      { id: "w2", role: "worker", parentTabId: "orch1" }, // same parent+project -> deduped
+      { id: "w3", role: "worker", parentTabId: "w1" },    // intra-project -> not an inter-card edge
+    ] }], unmapped: [] },
+  ];
+  const edges = lineageEdges(projects);
+  assert.deepEqual(edges, [{ from: "méta", to: "kalpin-back" }], "one deduped cross-project delegation edge");
+  assert.deepEqual(lineageEdges([]), [], "no projects -> no edges");
+  assert.deepEqual(lineageEdges(null), [], "malformed input -> no edges");
+}
+
+// --- viewer open carries the page share-token (fix-viewer-token) ---
+// The right-click open must append the page token so the viewer routes (now
+// authorised by the read-only dashboard token) don't 401. Host stays relative.
+assert.equal(
+  viewerUrlWithToken("/tabs/by-id/abc/view", "dash-obs"),
+  "/tabs/by-id/abc/view?token=dash-obs",
+  "appends ?token= to a token-less viewer url"
+);
+assert.equal(
+  viewerUrlWithToken("/tabs/by-id/abc/view?ro=1", "d&x"),
+  "/tabs/by-id/abc/view?ro=1&token=d%26x",
+  "uses & when a query already exists, and encodes the token"
+);
+assert.equal(viewerUrlWithToken("/x/view", ""), "/x/view", "no token -> url unchanged");
+assert.equal(viewerUrlWithToken("", "t"), "", "no url -> empty");
 
 console.log("dashboard.test.mjs: OK");
