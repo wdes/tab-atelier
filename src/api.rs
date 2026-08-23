@@ -54,6 +54,12 @@ const VENDOR_TERM_SYMBOLS_WOFF2: &[u8] = include_bytes!("../assets/vendor/term-s
 /// next page load with no user intervention.
 const MAIN_CSS: &str = include_str!("../assets/main.css");
 const MAIN_JS: &str = include_str!("../assets/main.js");
+/// Harness dashboard control-panel app (see docs/dashboard.md). Served public
+/// (like the viewer assets) at `/dashboard` + `/assets/dashboard.{js,css}`; the
+/// page's JS polls the authed `/dashboard/state`. Owned by the web-app slice.
+const DASHBOARD_HTML: &str = include_str!("../assets/dashboard.html");
+const DASHBOARD_JS: &str = include_str!("../assets/dashboard.js");
+const DASHBOARD_CSS: &str = include_str!("../assets/dashboard.css");
 // Site icons + metadata served at the origin root (`/favicon.ico`, …). The
 // `.svg` reuses the app icon; the raster set is rendered from it. `robots.txt`
 // mirrors the `X-Robots-Tag: noindex` stance for crawlers that check it first.
@@ -1744,6 +1750,31 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 accept_gzip,
                 if_none_match.as_deref(),
                 &format!("Cache-Control: {cache}\r\n"),
+            );
+            return;
+        }
+    }
+
+    // Harness dashboard static app. Public like the viewer assets — the browser
+    // loads the page before its JS reads the token to poll the authed
+    // `/dashboard/state`. No `?version=` cache-buster on these yet, so no-cache
+    // rather than immutable. See docs/dashboard.md.
+    if method.as_str() == "GET" {
+        let asset: Option<(&[u8], &str)> = match path.as_str() {
+            "/dashboard" => Some((DASHBOARD_HTML.as_bytes(), "text/html; charset=utf-8")),
+            "/assets/dashboard.js" => Some((DASHBOARD_JS.as_bytes(), "application/javascript; charset=utf-8")),
+            "/assets/dashboard.css" => Some((DASHBOARD_CSS.as_bytes(), "text/css; charset=utf-8")),
+            _ => None,
+        };
+        if let Some((body, ctype)) = asset {
+            respond_with_etag(
+                stream,
+                200,
+                ctype,
+                body,
+                accept_gzip,
+                if_none_match.as_deref(),
+                "Cache-Control: no-cache\r\n",
             );
             return;
         }
@@ -6491,6 +6522,28 @@ mod tests {
             assert!(
                 std::str::from_utf8(&b).unwrap_or("").contains(expected_substr),
                 "{req_path} body should contain {expected_substr:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dashboard_app_serves_unauthenticated_with_right_types() {
+        let (port, _state, _token) = spawn_server();
+        // The dashboard page + its assets must serve WITHOUT a token (the browser
+        // loads the app before its JS reads the token to poll /dashboard/state),
+        // each with the content-type the browser needs to render it.
+        for (req_path, want_ctype) in [
+            ("/dashboard", "text/html; charset=utf-8"),
+            ("/assets/dashboard.js", "application/javascript; charset=utf-8"),
+            ("/assets/dashboard.css", "text/css; charset=utf-8"),
+        ] {
+            let raw = request_bytes(port, &format!("GET {req_path} HTTP/1.1\r\n\r\n"));
+            let (h, _b) = split_response(&raw);
+            assert!(h.starts_with("HTTP/1.1 200"), "{req_path} got: {h}");
+            assert_eq!(
+                header_value(&h, "content-type"),
+                Some(want_ctype),
+                "wrong type for {req_path}"
             );
         }
     }
