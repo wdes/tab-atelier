@@ -68,13 +68,19 @@ body {
 .node-label {
   text-anchor: middle;
   fill: var(--fg);
-  font-size: 16px;
+  font-size: 15px;
   font-weight: 600;
+}
+/* Live subtitle: occupant name + context (~5 words), truncated in JS. */
+.node-subtitle {
+  text-anchor: middle;
+  fill: var(--muted);
+  font-size: 10px;
 }
 .node-count {
   text-anchor: middle;
   fill: var(--muted);
-  font-size: 12px;
+  font-size: 11px;
 }
 .node:focus { outline: none; }
 .node:focus .node-box,
