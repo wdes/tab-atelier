@@ -273,9 +273,12 @@ async function main() {
     await entry.click({ button: "right" });
     await page.waitForFunction(() => (window.__opened || []).length > 0, null, { timeout: 3000 });
     const opened = await page.evaluate(() => window.__opened);
+    // The viewer URL now carries the page share-token (fix a821ec1:
+    // viewerUrlWithToken) so the token-authorised viewer routes don't 401 — so
+    // match the base and accept a ?token= suffix.
     ok(
-      "S4: right-click opened the tab's viewer URL",
-      opened.includes(`/tabs/by-id/${UUID_BUILD}/view`),
+      "S4: right-click opened the tab's viewer URL (with token)",
+      opened.some((u) => u.startsWith(`/tabs/by-id/${UUID_BUILD}/view`)),
       JSON.stringify(opened)
     );
   }

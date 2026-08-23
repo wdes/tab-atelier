@@ -1092,6 +1092,14 @@ pub struct TabState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_tab_id: Option<String>,
 
+    /// Re-home progress on a PREDECESSOR tab, set by `rehome-tab.sh` (+ the old
+    /// agent's own ACK) at each step of the bidirectional-proof loop: one of
+    /// `handoff-written` → `successor-ready` → `ack-sent` → `safe-to-close`.
+    /// Drives the tab's progress badge and gates the "close the predecessor"
+    /// action (enabled only at `safe-to-close`). Persisted; `None` ⇒ not rehoming.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rehome_status: Option<String>,
+
     /// Off-hours auto-lock. When set, the schedule's `(rule, tz)`
     /// pair feeds [`crate::schedule::effective_locked`] alongside the
     /// manual [`Self::locked`] flag. Outside the rule's open windows
@@ -1314,6 +1322,7 @@ impl Default for TabState {
             bg_color: None,
             assignment: None,
             parent_tab_id: None,
+            rehome_status: None,
             schedule: None,
             limits: TabResourceLimits::default(),
         }
@@ -3827,6 +3836,7 @@ mod tests {
                 name: "worker".into(),
                 assignment: Some("kalpin-back:review/reviewer".into()),
                 parent_tab_id: Some("spawner-uuid".into()),
+                rehome_status: Some("safe-to-close".into()),
                 ..Default::default()
             }],
             active: 0,
@@ -3842,12 +3852,17 @@ mod tests {
             json.contains(r#""parent_tab_id":"spawner-uuid""#),
             "parent_tab_id must persist too: {json}"
         );
+        assert!(
+            json.contains(r#""rehome_status":"safe-to-close""#),
+            "rehome_status must persist too: {json}"
+        );
         let restored: SavedState = serde_json::from_str(&json).unwrap();
         assert_eq!(
             restored.tabs[0].assignment.as_deref(),
             Some("kalpin-back:review/reviewer")
         );
         assert_eq!(restored.tabs[0].parent_tab_id.as_deref(), Some("spawner-uuid"));
+        assert_eq!(restored.tabs[0].rehome_status.as_deref(), Some("safe-to-close"));
 
         // None is skipped from the JSON, and old files (no field) load as None.
         let without = SavedState {

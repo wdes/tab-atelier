@@ -151,6 +151,8 @@ struct HeadlessTab {
     assignment: Option<Arc<str>>,
     /// UUID of the spawning tab (`parent_tab_id`). Persisted like `assignment`.
     parent_tab_id: Option<Arc<str>>,
+    /// Re-home progress on a predecessor tab. Persisted like `assignment`.
+    rehome_status: Option<Arc<str>>,
     pending_agent_resume: Option<String>,
     colors_enabled: bool,
     /// Raw PTY byte ring captured BEFORE alacritty's parser sees the
@@ -734,6 +736,7 @@ fn spawn_pty_tab(
         // since spawn_pty_tab is also used for fresh tabs (no assignment).
         assignment: None,
         parent_tab_id: None,
+        rehome_status: None,
         pending_agent_resume,
         colors_enabled,
         viewers: viewers_handle,
@@ -907,6 +910,7 @@ pub fn run() -> std::io::Result<()> {
                 t.limits = ts.limits.clone();
                 t.assignment = ts.assignment.as_deref().map(Arc::from);
                 t.parent_tab_id = ts.parent_tab_id.as_deref().map(Arc::from);
+                t.rehome_status = ts.rehome_status.as_deref().map(Arc::from);
                 t.pinned_cols = ts.pinned_cols;
                 t.pinned_rows = ts.pinned_rows;
                 #[cfg(target_os = "linux")]
@@ -988,6 +992,7 @@ pub fn run() -> std::io::Result<()> {
         pending_context_changes: Vec::new(),
         pending_assignment_changes: Vec::new(),
         pending_parent_changes: Vec::new(),
+        pending_rehome_changes: Vec::new(),
         pending_token_rotations: Vec::new(),
         pending_schedule_changes: Vec::new(),
         pending_new_tabs: 0,
@@ -1380,6 +1385,7 @@ fn refresh_snapshot(
             context: tab.context.clone(),
             assignment: tab.assignment.clone(),
             parent_tab_id: tab.parent_tab_id.clone(),
+            rehome_status: tab.rehome_status.clone(),
             shell_pid: tab.pid,
             agent_state: tab.agent_state.clone(),
             agent_session_id: tab.agent_session_id.clone(),
@@ -1612,6 +1618,7 @@ fn persist(
             bg_color: tab.bg_color.clone(),
             assignment: tab.assignment.as_deref().map(str::to_string),
             parent_tab_id: tab.parent_tab_id.as_deref().map(str::to_string),
+            rehome_status: tab.rehome_status.as_deref().map(str::to_string),
             limits: tab.limits.clone(),
             ..TabState::default()
         })
@@ -1882,6 +1889,7 @@ fn drain_pending(
     let context_changes: Vec<(String, Option<String>)> = s.pending_context_changes.drain(..).collect();
     let assignment_changes: Vec<(String, Option<String>)> = s.pending_assignment_changes.drain(..).collect();
     let parent_changes: Vec<(String, Option<String>)> = s.pending_parent_changes.drain(..).collect();
+    let rehome_changes: Vec<(String, Option<String>)> = s.pending_rehome_changes.drain(..).collect();
     let token_rotations: Vec<String> = s.pending_token_rotations.drain(..).collect();
     let schedule_changes: Vec<(String, Option<crate::schedule::TabSchedule>)> =
         s.pending_schedule_changes.drain(..).collect();
@@ -1909,6 +1917,7 @@ fn drain_pending(
         && context_changes.is_empty()
         && assignment_changes.is_empty()
         && parent_changes.is_empty()
+        && rehome_changes.is_empty()
         && token_rotations.is_empty()
         && schedule_changes.is_empty()
         && limit_changes.is_empty()
@@ -2010,6 +2019,12 @@ fn drain_pending(
     for (tab_id, parent) in parent_changes {
         if let Some(t) = tabs.iter_mut().find(|t| *t.id == tab_id) {
             t.parent_tab_id = parent.map(Arc::from);
+        }
+    }
+    // …and the re-home progress (`rehome_status`), persisted like assignment.
+    for (tab_id, rehome) in rehome_changes {
+        if let Some(t) = tabs.iter_mut().find(|t| *t.id == tab_id) {
+            t.rehome_status = rehome.map(Arc::from);
         }
     }
 

@@ -406,6 +406,17 @@ pub enum Commands {
         args: Vec<String>,
     },
 
+    /// Mark a predecessor tab's re-home progress (`rehome-tab.sh`): one of
+    /// `handoff-written` / `successor-ready` / `ack-sent` / `safe-to-close`.
+    ///
+    /// `safe-to-close` (posted by the old agent on its ACK) unlocks the GUI
+    /// "close the predecessor" action. `--tab <id>` targets another tab.
+    SetRehomeStatus {
+        /// Passed straight through to `cli::set_rehome::run`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Print the master API token, so the local API can be called
     /// without locating the `api.token` state file.
     Token,
@@ -811,6 +822,7 @@ pub fn dispatch(cli: Cli) -> bool {
         }
         Commands::SetContext { args } => crate::cli::client::run("set-context", &args),
         Commands::SetAssignment { args } => crate::cli::client::run("set-assignment", &args),
+        Commands::SetRehomeStatus { args } => crate::cli::client::run("set-rehome-status", &args),
         Commands::Token => crate::cli::client::run("token", &[]),
         Commands::RotateTokens => crate::cli::client::run("rotate-tokens", &[]),
         Commands::ResetMasterToken => crate::cli::client::run("reset-master-token", &[]),
@@ -1190,6 +1202,28 @@ mod tests {
         // --clear and --tab flow through as trailing args (handled by the runner).
         let cli = Cli::try_parse_from(["tab-atelier", "set-assignment", "--clear"]).expect("clear parses");
         assert!(matches!(cli.command, Some(Commands::SetAssignment { .. })));
+    }
+
+    /// `set-rehome-status` forwards its trailing args verbatim, including `--tab`
+    /// (rehome-tab.sh stamps another tab) and the state value.
+    #[test]
+    fn set_rehome_status_captures_trailing_args() {
+        let cli = Cli::try_parse_from(["tab-atelier", "set-rehome-status", "safe-to-close"]).expect("parses");
+        match cli.command {
+            Some(Commands::SetRehomeStatus { args }) => assert_eq!(args, vec!["safe-to-close".to_string()]),
+            other => panic!("expected SetRehomeStatus, got: {other:?}"),
+        }
+        let cli = Cli::try_parse_from(["tab-atelier", "set-rehome-status", "ack-sent", "--tab", "old-uuid"])
+            .expect("--tab parses");
+        match cli.command {
+            Some(Commands::SetRehomeStatus { args }) => {
+                assert_eq!(
+                    args,
+                    vec!["ack-sent".to_string(), "--tab".to_string(), "old-uuid".to_string()]
+                );
+            }
+            other => panic!("expected SetRehomeStatus, got: {other:?}"),
+        }
     }
 
     #[test]
