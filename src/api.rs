@@ -5694,6 +5694,159 @@ mod tests {
         }
     }
 
+    // ===================================================================
+    // Increment 6 — REFINER red tests (TDD). Builder: rust (S1 serving, S3
+    // services). RED (compile-fail) until the builder adds `DashboardTab.serving`,
+    // `service_of`, `group_services`, `DashboardService`, `DashboardState.services`
+    // and `Preferences.repo_families`.
+    // ===================================================================
+
+    // Find a projected tab by id anywhere in the global diagram (S1 helper).
+    fn find_tab(state: &DashboardState, id: &str) -> DashboardTab {
+        state
+            .nodes
+            .iter()
+            .flat_map(|n| n.tabs.iter())
+            .chain(state.unmapped.iter())
+            .find(|t| t.id == id)
+            .cloned()
+            .expect("tab in the built state")
+    }
+
+    // --- S1: `serving` = the assignment `<project>:` OVERRIDE. It flags a méta
+    //     that is serving a team (so NOT available); a méta with no override stays
+    //     `serving == null` in the méta lane. A `:` AFTER the first `/` is not an
+    //     override (parse boundary), so it produces no `serving`.
+    #[test]
+    fn dashboard_tab_serving_reflects_assignment_override() {
+        let state = build_dashboard_state(vec![
+            // méta serving kalpin-back (cwd is a work-root; project comes from override).
+            dash_full(
+                "a",
+                Some("/home/u/Dev"),
+                Some("kalpin-back:build/reviewer"),
+                Some("working"),
+            ),
+            dash_full("b", None, Some("plan/planner"), Some("idle")), // méta, no override
+            dash_full("c", Some("/x/proj"), Some("build/impl:er"), Some("idle")), // ':' after '/'
+        ]);
+        assert_eq!(
+            find_tab(&state, "a").serving.as_deref(),
+            Some("kalpin-back"),
+            "override -> serving = the served team"
+        );
+        assert!(
+            state.projects.iter().any(|p| p.name == "kalpin-back"),
+            "and the tab buckets under kalpin-back"
+        );
+        assert_eq!(
+            find_tab(&state, "b").serving,
+            None,
+            "no override -> serving null (stays méta)"
+        );
+        assert!(
+            state.projects.iter().any(|p| p.name == "méta"),
+            "b stays in the méta lane"
+        );
+        assert_eq!(find_tab(&state, "c").serving, None, "':' after '/' is not an override");
+        // camelCase + skipped when None.
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(
+            json.contains("\"serving\":\"kalpin-back\""),
+            "serving serialized when set: {json}"
+        );
+    }
+
+    // --- S3: `service_of(project, prefs)` resolves a repo to its service key:
+    //     explicit `repo_families` map wins, else the prefix before the first '-',
+    //     else the project's own name (mono, no '-').
+    #[test]
+    fn service_of_prefix_map_and_mono() {
+        let empty = crate::Preferences::default();
+        assert_eq!(service_of("kalpin-back", &empty), "kalpin", "prefix before first '-'");
+        assert_eq!(service_of("kalpin-front", &empty), "kalpin");
+        assert_eq!(service_of("mono", &empty), "mono", "no '-' -> own name");
+        let mapped = crate::Preferences {
+            repo_families: std::collections::BTreeMap::from([("louis".to_string(), "kalpin".to_string())]),
+            ..Default::default()
+        };
+        assert_eq!(
+            service_of("louis", &mapped),
+            "kalpin",
+            "explicit map wins over heuristic"
+        );
+    }
+
+    // --- S3: `group_services` wraps the projects into services. A shared prefix
+    //     (>=2 repos, or an explicit map) forms a named service; a lone repo stays
+    //     a mono service named after the repo. Rollup = worst led of its sub-repos;
+    //     services sorted; the flat `projects` is preserved (non-breaking).
+    #[test]
+    fn group_services_families_rollup_and_mono() {
+        // Heuristic: kalpin-back + kalpin-front -> service "kalpin" (2 repos);
+        // tab-atelier alone -> mono service "tab-atelier".
+        let state = build_dashboard_state(vec![
+            dash_full("a", Some("/x/kalpin-back"), Some("build/implementer"), Some("working")),
+            dash_full("b", Some("/x/kalpin-front"), Some("review/reviewer"), Some("error")),
+            dash_full("c", Some("/x/tab-atelier"), Some("build/implementer"), Some("idle")),
+        ]);
+        let services = group_services(&state.projects, &crate::Preferences::default());
+        let names: Vec<&str> = services.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["kalpin", "tab-atelier"], "services sorted, mono kept");
+        let kalpin = services.iter().find(|s| s.name == "kalpin").unwrap();
+        assert_eq!(kalpin.projects.len(), 2, "kalpin wraps its 2 sub-repos");
+        assert_eq!(kalpin.rollup_led, Some("error"), "service rollup = worst sub-repo led");
+        assert_eq!(
+            services
+                .iter()
+                .find(|s| s.name == "tab-atelier")
+                .unwrap()
+                .projects
+                .len(),
+            1,
+            "mono service"
+        );
+
+        // Explicit map: louis joins the kalpin service.
+        let mapped = build_dashboard_state(vec![
+            dash_full("a", Some("/x/kalpin-back"), Some("build/implementer"), Some("idle")),
+            dash_full("b", Some("/x/louis"), Some("build/implementer"), Some("idle")),
+        ]);
+        let prefs = crate::Preferences {
+            repo_families: std::collections::BTreeMap::from([("louis".to_string(), "kalpin".to_string())]),
+            ..Default::default()
+        };
+        let svc = group_services(&mapped.projects, &prefs);
+        assert_eq!(
+            svc.iter().find(|s| s.name == "kalpin").map(|s| s.projects.len()),
+            Some(2),
+            "louis joins kalpin via repo_families"
+        );
+    }
+
+    // --- S3: the built state EXPOSES `services` (default-prefs heuristic) while
+    //     KEEPING the flat `projects` (non-breaking). camelCase on the wire.
+    #[test]
+    fn dashboard_state_exposes_services_and_keeps_projects() {
+        let state = build_dashboard_state(vec![
+            dash_full("a", Some("/x/kalpin-back"), Some("build/implementer"), Some("working")),
+            dash_full("b", Some("/x/kalpin-front"), Some("review/reviewer"), Some("idle")),
+        ]);
+        assert!(
+            state
+                .services
+                .iter()
+                .any(|s| s.name == "kalpin" && s.projects.len() == 2),
+            "kalpin service wraps its 2 repos"
+        );
+        assert_eq!(state.projects.len(), 2, "flat projects preserved (non-breaking)");
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(
+            json.contains("\"services\""),
+            "state serializes a services array: {json}"
+        );
+    }
+
     #[test]
     fn set_parent_sets_and_exposes_lineage() {
         let (port, state, token) = spawn_server();
