@@ -240,6 +240,41 @@ paths:
         "400": { description: Unknown preset or invalid CIDR }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { description: Tab not found }
+  /tabs/by-id/{id}/ssh-agent:
+    post:
+      tags: [tabs]
+      summary: Give the tab its own ssh-agent
+      description: >
+        Enable or disable a per-tab `ssh-agent` so the tab holds a distinct
+        SSH identity (or none) from other tabs. `enabled:true` respawns the
+        shell with a dedicated `SSH_AUTH_SOCK`; an optional `key` path is
+        auto-loaded with `ssh-add` (must be passphrase-less — encrypted keys
+        are the user's job to `ssh-add` inside the tab). `enabled:false`
+        respawns without the socket and reaps the agent. The shell restarts to
+        apply, so the change is not instantaneous. Headless-daemon only — the
+        desktop GUI refuses with 501. Under the hardened systemd unit a `key`
+        path must be visible inside the daemon's mount namespace (e.g. under
+        `/var/lib/tab-atelier`).
+      parameters: [ { $ref: "#/components/parameters/id" } ]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                enabled: { type: boolean, default: true }
+                key: { type: string, nullable: true, example: "/var/lib/tab-atelier/id_ed25519" }
+      responses:
+        "200":
+          description: New state
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { ssh_agent: { type: boolean } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Tab not found }
+        "501": { description: Not supported on the desktop GUI (headless daemon only) }
   /tabs/by-id/{id}/view:
     get:
       tags: [tabs]

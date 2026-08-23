@@ -424,6 +424,11 @@ maintainer-scripts = "assets/headless-debian/"
 # `bubblewrap` provides `bwrap`, used to give a net-off tab its own empty
 # network namespace (`no_internet_command`); it runs unprivileged.
 depends = "$auto, libgcc-s1, adduser, init-system-helpers, nftables, bubblewrap"
+# `openssh-client` provides `ssh-agent`/`ssh-add` for the optional per-tab
+# ssh-agent feature (`tab-atelier-headless ssh-agent <tab>`). Only a
+# Recommends — a box that never uses per-tab agents doesn't need it, and the
+# feature degrades to a logged no-op when the binaries are absent.
+recommends = "openssh-client"
 # Mirror the default variant: the shipped preferences.json fallback
 # is a real conffile so admin edits survive `apt upgrade`. The Claude
 # Code system hooks live in a different /etc subdir; making it a
