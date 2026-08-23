@@ -233,6 +233,71 @@ body {
 .tab-tokens { grid-column: 2; grid-row: 2; color: var(--muted); font-size: 0.8rem; white-space: nowrap; }
 .popup-hint { margin-top: 0.4rem; font-size: 0.72rem; color: var(--muted); }
 
+/* Tooltip detail chips (finding b): assignment / cwd / rehome / RAM / CPU. */
+.tab-details {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  margin-top: 0.2rem;
+}
+.tab-details .td {
+  font-size: 0.68rem;
+  color: var(--muted);
+  padding: 0.05rem 0.35rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  white-space: nowrap;
+}
+.tab-details .td-rehome[data-status="safe-to-close"] { color: #1a7f37; border-color: #2da44e; }
+
+/* --- re-home links (Slice C) --- */
+.rehome { margin-top: 1rem; }
+.rehome h2 { font-size: 0.85rem; color: var(--muted); margin: 0 0 0.4rem; }
+.rehome ul { list-style: none; margin: 0; padding: 0; max-width: 560px; }
+.rehome-pair {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin-bottom: 0.3rem;
+}
+.rehome-pair.safe { border-color: #2da44e; }
+.rehome-old { color: var(--muted); }
+.rehome-new { font-weight: 600; }
+.rehome-arrow { color: var(--muted); }
+.rehome-status {
+  margin-left: auto;
+  font-size: 0.72rem;
+  padding: 0.1rem 0.4rem;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--fg) 8%, transparent);
+  color: var(--muted);
+  white-space: nowrap;
+}
+/* Colour the badge by lifecycle stage. */
+.rehome-status[data-status="handoff-written"] { color: #9a6700; background: #fff8c5; }
+.rehome-status[data-status="successor-ready"]  { color: #0969da; background: #ddf4ff; }
+.rehome-status[data-status="ack-sent"]         { color: #6639ba; background: #f0e8ff; }
+.rehome-status[data-status="safe-to-close"]    { color: #1a7f37; background: #dafbe1; }
+.rehome-progress { display: inline-flex; gap: 3px; }
+.rehome-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--neutral-stroke);
+}
+.rehome-dot.on { background: #57606a; }
+.rehome-dot.current { box-shadow: 0 0 0 2px color-mix(in srgb, var(--fg) 20%, transparent); }
+.rehome-pair.safe .rehome-dot.on { background: #2da44e; }
+@media (prefers-color-scheme: dark) {
+  .rehome-status[data-status="handoff-written"] { color: #d4a72c; background: #3b2e00; }
+  .rehome-status[data-status="successor-ready"]  { color: #54aeff; background: #0c2d4a; }
+  .rehome-status[data-status="ack-sent"]         { color: #d2a8ff; background: #2d2247; }
+  .rehome-status[data-status="safe-to-close"]    { color: #3fb950; background: #0f3d22; }
+  .rehome-dot.on { background: #9198a1; }
+}
+
 /* --- unmapped bucket --- */
 .unmapped { margin-top: 1rem; }
 .unmapped h2 { font-size: 0.85rem; color: var(--muted); margin: 0 0 0.4rem; }

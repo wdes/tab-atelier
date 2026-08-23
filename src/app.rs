@@ -219,6 +219,9 @@ struct Tab {
     assignment: Option<std::sync::Arc<str>>,
     /// UUID of the spawning tab (`parent_tab_id`). Persisted like `assignment`.
     parent_tab_id: Option<std::sync::Arc<str>>,
+    /// Re-home progress on a predecessor tab. Persisted like `assignment`;
+    /// drives the progress badge + gates the "close the predecessor" action.
+    rehome_status: Option<std::sync::Arc<str>>,
     /// One-shot resume command queued on tab restore — when the
     /// shell is up the next tick types `<command>\n` into the
     /// PTY, then clears this. Set in `insert_tab` from the
@@ -315,6 +318,7 @@ impl Tab {
             // Persisted: restore it so the tab keeps its phase/role across restarts.
             assignment: ts.assignment.as_deref().map(std::sync::Arc::from),
             parent_tab_id: ts.parent_tab_id.as_deref().map(std::sync::Arc::from),
+            rehome_status: ts.rehome_status.as_deref().map(std::sync::Arc::from),
             last_pushed_locked: None,
             pending_agent_resume,
             snap_cache: None,
@@ -1385,6 +1389,7 @@ impl AppState {
             pending_context_changes: Vec::new(),
             pending_assignment_changes: Vec::new(),
             pending_parent_changes: Vec::new(),
+            pending_rehome_changes: Vec::new(),
             pending_token_rotations: Vec::new(),
             pending_schedule_changes: Vec::new(),
             pending_new_tabs: 0,
@@ -1960,6 +1965,7 @@ impl AppState {
                     bg_color: tab.bg_color.clone(),
                     assignment: tab.assignment.as_deref().map(str::to_string),
                     parent_tab_id: tab.parent_tab_id.as_deref().map(str::to_string),
+                    rehome_status: tab.rehome_status.as_deref().map(str::to_string),
                     limits: tab.limits.clone(),
                     ..TabState::default()
                 }
@@ -2069,6 +2075,7 @@ impl AppState {
                 context: tab.context.clone(),
                 assignment: tab.assignment.clone(),
                 parent_tab_id: tab.parent_tab_id.clone(),
+                rehome_status: tab.rehome_status.clone(),
                 shell_pid,
                 agent_state: tab.agent_state.clone(),
                 agent_session_id: tab.agent_session_id.clone(),
@@ -2325,6 +2332,7 @@ impl AppState {
             let assignment_changes: Vec<(String, Option<String>)> =
                 snapshot.pending_assignment_changes.drain(..).collect();
             let parent_changes: Vec<(String, Option<String>)> = snapshot.pending_parent_changes.drain(..).collect();
+            let rehome_changes: Vec<(String, Option<String>)> = snapshot.pending_rehome_changes.drain(..).collect();
             let token_rotations: Vec<String> = snapshot.pending_token_rotations.drain(..).collect();
             let schedule_changes: Vec<(String, Option<crate::schedule::TabSchedule>)> =
                 snapshot.pending_schedule_changes.drain(..).collect();
@@ -2446,6 +2454,11 @@ impl AppState {
             for (tab_id, parent) in parent_changes {
                 if let Some(tab) = self.tabs.iter_mut().find(|t| *t.id == tab_id) {
                     tab.parent_tab_id = parent.map(std::sync::Arc::from);
+                }
+            }
+            for (tab_id, rehome) in rehome_changes {
+                if let Some(tab) = self.tabs.iter_mut().find(|t| *t.id == tab_id) {
+                    tab.rehome_status = rehome.map(std::sync::Arc::from);
                 }
             }
             // Schedule changes — None clears, Some sets. Mirrors the
@@ -3016,6 +3029,7 @@ impl AppState {
                     bg_color: tab.bg_color.clone(),
                     assignment: tab.assignment.as_deref().map(str::to_string),
                     parent_tab_id: tab.parent_tab_id.as_deref().map(str::to_string),
+                    rehome_status: tab.rehome_status.as_deref().map(str::to_string),
                     limits: tab.limits.clone(),
                     ..TabState::default()
                 }
@@ -3299,6 +3313,9 @@ impl AppState {
             // reads at a glance in the bar. Role comes from `assignment` (S0),
             // never the volatile `context`.
             let is_orchestrator = crate::api::role_of(tab.assignment.as_deref()) == "orchestrator";
+            // Re-home progress badge on a PREDECESSOR tab (S rehome): shows the
+            // stage, painted green at safe-to-close. `None` for non-rehoming tabs.
+            let rehome_badge = crate::api::rehome_badge(tab.rehome_status.as_deref());
             let drag_name = tab.name.clone();
             let tab_el = div()
                 .id(ElementId::Name(self.tab_el_ids[i].clone()))
@@ -3434,6 +3451,53 @@ impl AppState {
                 } else {
                     name.into_any_element()
                 });
+
+            // Re-home progress badge: neutral grey through the loop, green at
+            // safe-to-close (bidirectional proof done — the predecessor may close).
+            let tab_el = tab_el.when_some(rehome_badge, |el, (label, safe)| {
+                let (bg, fg) = if safe {
+                    (
+                        Hsla {
+                            h: 0.33,
+                            s: 0.5,
+                            l: 0.30,
+                            a: 1.0,
+                        },
+                        Hsla {
+                            h: 0.33,
+                            s: 0.6,
+                            l: 0.88,
+                            a: 1.0,
+                        },
+                    )
+                } else {
+                    (
+                        Hsla {
+                            h: 0.0,
+                            s: 0.0,
+                            l: 0.28,
+                            a: 1.0,
+                        },
+                        Hsla {
+                            h: 0.0,
+                            s: 0.0,
+                            l: 0.78,
+                            a: 1.0,
+                        },
+                    )
+                };
+                el.child(
+                    div()
+                        .ml(px(6.0))
+                        .px(px(5.0))
+                        .py(px(1.0))
+                        .rounded_sm()
+                        .bg(bg)
+                        .text_color(fg)
+                        .text_size(px(10.0))
+                        .child(format!("⇄ {label}")),
+                )
+            });
 
             #[cfg(feature = "energy")]
             let tab_el = tab_el.child(
@@ -3761,6 +3825,38 @@ impl AppState {
                             }),
                         )
                         .child(self.t().close),
+                );
+            }
+
+            // Re-home: "close the predecessor" — appears ONLY once the
+            // bidirectional proof is done (rehome_status == safe-to-close, posted
+            // by the old agent on its ACK). Closes the manual-closure gap without
+            // removing the human gate: the entry simply isn't there until it's
+            // proven safe, and clicking it IS the human's decision.
+            if self.tabs.len() > 1 && crate::api::rehome_safe_to_close(self.tabs[idx].rehome_status.as_deref()) {
+                let safe_fg = Hsla {
+                    h: 0.33,
+                    s: 0.6,
+                    l: 0.7,
+                    a: 1.0,
+                };
+                container = container.child(
+                    div()
+                        .id("menu-close-rehome")
+                        .px(px(12.0))
+                        .py(px(4.0))
+                        .cursor_pointer()
+                        .text_color(safe_fg)
+                        .hover(|s| s.bg(menu_hover))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                                this.close_tab(idx, cx);
+                                this.context_menu = None;
+                                cx.notify();
+                            }),
+                        )
+                        .child("✓ Fermer le prédécesseur re-home"),
                 );
             }
 
