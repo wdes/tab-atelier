@@ -29,6 +29,54 @@ export function nodeMap(state) {
   return map;
 }
 
+// Pure: decide what to render from (state, currentProject). Three modes:
+//   - "grid"    : level 0, the project cards (state.projects present, none drilled)
+//   - "diagram" : the 7-phase flow — scoped to a project when one is selected,
+//                 or the legacy GLOBAL diagram when the server predates the
+//                 project dimension (no state.projects). An unknown selected
+//                 project yields an empty scoped diagram, never an error.
+// Keeping this pure means the view choice is unit-testable without a DOM.
+export function resolveView(state, currentProject) {
+  const projects = state && Array.isArray(state.projects) ? state.projects : [];
+  if (!projects.length) {
+    // Pre-S1 / legacy contract: no project dimension -> the global diagram.
+    return {
+      mode: "diagram",
+      scoped: false,
+      nodes: (state && state.nodes) || [],
+      unmapped: (state && state.unmapped) || [],
+    };
+  }
+  if (currentProject == null) {
+    return { mode: "grid", projects };
+  }
+  const project = projects.find((p) => p && p.name === currentProject) || null;
+  return {
+    mode: "diagram",
+    scoped: true,
+    project,
+    nodes: project ? project.nodes || [] : [],
+    unmapped: project ? project.unmapped || [] : [],
+  };
+}
+
+// Pure: a project -> its level-0 card HTML. Rendered in server order (no re-sort)
+// so positions stay put across reloads. `esc` is injected so this stays free of
+// DOM globals and importable under Node (the self-check passes the same escaper).
+export function renderProjectCard(project, esc) {
+  const name = project && project.name != null ? String(project.name) : "?";
+  const led = ledClass(project && project.rollupLed);
+  const meta = project && project.isMeta ? " meta" : "";
+  const orch = project && project.hasOrchestrator
+    ? ` <span class="orch-badge" title="has an orchestrator">◆</span>`
+    : "";
+  const count = Number((project && project.tabCount) || 0);
+  return `<button class="project-card ${led}${meta}" data-project="${esc(name)}">
+    <span class="card-name">${esc(name)}${orch}</span>
+    <span class="card-count">${count} tab${count === 1 ? "" : "s"}</span>
+  </button>`;
+}
+
 const POLL_MS = 1500;
 const STATE_URL = "/dashboard/state";
 
@@ -43,6 +91,11 @@ const AUTH_HEADERS = TOKEN ? { Authorization: "Bearer " + TOKEN } : {};
 // Live snapshot the popup reads from, refreshed each poll.
 let currentNodes = new Map();
 let currentUnmapped = [];
+// The drilled-in project (null = level 0 / grid). Read from ?project= at boot.
+let currentProject = null;
+// Last state received, so a view switch (drill-in / back) can re-render without
+// waiting for the next poll.
+let currentState = null;
 
 function escapeHtml(s) {
   return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => (
@@ -72,8 +125,32 @@ function tabEntryHtml(tab) {
 // --- DOM wiring (defined always, executed only in a browser) ---
 
 function applyState(state) {
-  currentNodes = nodeMap(state);
-  currentUnmapped = state && Array.isArray(state.unmapped) ? state.unmapped : [];
+  currentState = state;
+  render();
+}
+
+// Render the current (state, currentProject) — called on every poll and on any
+// view switch (drill-in / back).
+function render() {
+  const view = resolveView(currentState, currentProject);
+  if (view.mode === "grid") renderGrid(view.projects);
+  else renderDiagram(view);
+  setViewChrome(view);
+}
+
+function renderGrid(projects) {
+  const grid = document.getElementById("project-grid");
+  if (!grid) return;
+  // Server order, no client re-sort -> stable positions across reloads.
+  grid.innerHTML = projects.map((p) => renderProjectCard(p, escapeHtml)).join("");
+  currentNodes = new Map();
+  currentUnmapped = [];
+  renderUnmapped();
+}
+
+function renderDiagram(view) {
+  currentNodes = nodeMap({ nodes: view.nodes });
+  currentUnmapped = Array.isArray(view.unmapped) ? view.unmapped : [];
 
   for (const phase of CANONICAL_PHASES) {
     const el = document.getElementById(`node-${phase}`);
@@ -87,6 +164,17 @@ function applyState(state) {
   }
 
   renderUnmapped();
+}
+
+// Show/hide the level-0 grid vs the level-1 diagram (+ back button).
+function setViewChrome(view) {
+  const grid = document.getElementById("project-grid");
+  const flow = document.getElementById("flow");
+  const back = document.getElementById("back-btn");
+  const isGrid = view.mode === "grid";
+  if (grid) grid.hidden = !isGrid;
+  if (flow) flow.hidden = isGrid;
+  if (back) back.hidden = !(view.mode === "diagram" && view.scoped);
 }
 
 function renderUnmapped() {
