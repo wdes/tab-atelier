@@ -49,6 +49,16 @@ fn main() {
         })
         .unwrap_or_else(|| "unknown".to_string());
 
+    // Optional downstream/fork build marker, injected via env so it never lives
+    // in a committed code path (keeps upstream clean while a fork build is
+    // self-identifying). Appended to BUILD_HASH, so it surfaces everywhere the
+    // hash does: `--version`, the viewer "update available" chip, and the
+    // `X-Build-Hash` header. e.g. `TAB_ATELIER_BUILD_SUFFIX=mx` -> `<hash>+mx`.
+    let identity = match std::env::var("TAB_ATELIER_BUILD_SUFFIX") {
+        Ok(suffix) if !suffix.trim().is_empty() => format!("{identity}+{}", suffix.trim()),
+        _ => identity,
+    };
+
     println!("cargo:rustc-env=BUILD_HASH={identity}");
 
     // Re-run the script when HEAD moves (commits on the current
@@ -65,4 +75,5 @@ fn main() {
     // fresh tarball unpack refreshes mtimes and the timestamp.
     println!("cargo:rerun-if-changed=.git/logs/HEAD");
     println!("cargo:rerun-if-env-changed=BUILD_HASH");
+    println!("cargo:rerun-if-env-changed=TAB_ATELIER_BUILD_SUFFIX");
 }
