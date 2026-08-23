@@ -454,31 +454,62 @@ fn parse_assignment(a: &str) -> (Option<String>, String, String) {
     (over.filter(|p| !p.is_empty()), phase, role)
 }
 
-/// The re-home lifecycle states on a predecessor tab, in progress order (used to
-/// validate `POST …/rehome`). The last, `safe-to-close`, is posted by the old
-/// agent itself on its ACK and gates the "close the predecessor" action.
-pub const REHOME_STATES: [&str; 4] = ["handoff-written", "successor-ready", "ack-sent", "safe-to-close"];
-
-/// True once a re-home's bidirectional proof is complete and the human may close
-/// the predecessor. The GUI's "close the predecessor" action enables only here;
-/// it never auto-closes — the human gate stays.
-#[must_use]
-pub fn rehome_safe_to_close(status: Option<&str>) -> bool {
-    status == Some("safe-to-close")
+/// One re-home lifecycle step: the wire slug + its French progress-badge label.
+pub struct RehomeStep {
+    pub slug: &'static str,
+    pub label: &'static str,
 }
 
-/// A re-home status → its progress-badge label + whether it's the final
-/// safe-to-close state (which the GUI paints green / uses to enable closing).
+/// THE single source of truth for the 4 re-home states, in progress order
+/// (audit Q3). Validation (`POST …/rehome`), the safe-to-close gate, and the
+/// badge all derive from this — adding a 5th state means editing only here. The
+/// last step is the terminal `safe-to-close`, posted by the old agent on its
+/// ACK, which gates the "close the predecessor" action. (`set_rehome.rs`'s
+/// `--help` / 400 text is kept in sync by `rehome_help_lists_every_state`.)
+pub const REHOME_STEPS: [RehomeStep; 4] = [
+    RehomeStep {
+        slug: "handoff-written",
+        label: "handoff écrit",
+    },
+    RehomeStep {
+        slug: "successor-ready",
+        label: "successeur prêt",
+    },
+    RehomeStep {
+        slug: "ack-sent",
+        label: "ACK envoyé",
+    },
+    RehomeStep {
+        slug: "safe-to-close",
+        label: "SAFE À FERMER",
+    },
+];
+
+/// Is `s` one of the canonical re-home states? Used to validate `POST …/rehome`.
+#[must_use]
+pub fn is_rehome_state(s: &str) -> bool {
+    REHOME_STEPS.iter().any(|st| st.slug == s)
+}
+
+/// True once a re-home's bidirectional proof is complete and the human may close
+/// the predecessor — i.e. the status is the terminal step. The GUI's "close the
+/// predecessor" action enables only here; it never auto-closes.
+#[must_use]
+pub fn rehome_safe_to_close(status: Option<&str>) -> bool {
+    status == REHOME_STEPS.last().map(|st| st.slug)
+}
+
+/// A re-home status → its progress-badge label + whether it's the terminal
+/// (safe-to-close) step, which the GUI paints green / uses to enable closing.
 /// `None` for a tab that isn't rehoming. Pure, so the mapping is unit-testable.
 #[must_use]
 pub fn rehome_badge(status: Option<&str>) -> Option<(&'static str, bool)> {
-    match status {
-        Some("handoff-written") => Some(("handoff écrit", false)),
-        Some("successor-ready") => Some(("successeur prêt", false)),
-        Some("ack-sent") => Some(("ACK envoyé", false)),
-        Some("safe-to-close") => Some(("SAFE À FERMER", true)),
-        _ => None,
-    }
+    let last = REHOME_STEPS.len() - 1;
+    REHOME_STEPS
+        .iter()
+        .enumerate()
+        .find(|(_, st)| Some(st.slug) == status)
+        .map(|(i, st)| (st.label, i == last))
 }
 
 /// Static altitude band from an agent role: 0 = tichef (top), 1 = orchestrator,
@@ -4093,7 +4124,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             };
             let rehome_opt = rehome_opt.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
             if let Some(s) = &rehome_opt
-                && !REHOME_STATES.contains(&s.as_str())
+                && !is_rehome_state(s)
             {
                 error_json(stream, 400, "invalid rehome_status");
                 return;
