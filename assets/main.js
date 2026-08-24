@@ -71,6 +71,21 @@
     const termEl = document.getElementById("term");
     term.open(termEl);
 
+    // Switch xterm to the Unicode 11 width tables (emoji = 2 cells). Without
+    // this the default Unicode 6 tables treat emoji as 1 cell while the server
+    // grid (alacritty) advanced the cursor by 2, so every emoji rendered
+    // clipped to half a cell and the columns desynced. Registered before any
+    // PTY bytes are written below. Guarded so a missing addon degrades to the
+    // old behaviour rather than throwing.
+    if (window.Unicode11Addon) {
+      try {
+        term.loadAddon(new window.Unicode11Addon());
+        term.unicode.activeVersion = "11";
+      } catch (e) {
+        console.warn("unicode11 addon failed to load:", e);
+      }
+    }
+
     // Mobile-keyboard incognito hints. xterm.js renders its input
     // path through a hidden helper textarea (.xterm-helper-textarea
     // — created by term.open above). Mobile soft keyboards (Gboard,

@@ -21,6 +21,11 @@ const VIEWER_HTML: &str = include_str!("../assets/web-viewer.html");
 /// `/assets/xterm-X.Y.Z.{js,css}` URLs that bypass token auth.
 const VENDOR_XTERM_JS: &str = include_str!("../assets/vendor/xterm-6.0.0/xterm.js");
 const VENDOR_XTERM_CSS: &str = include_str!("../assets/vendor/xterm-6.0.0/xterm.css");
+/// Vendored Unicode 11 width provider (self-contained port of
+/// `@xterm/addon-unicode11` at the xterm 6.0.0 tag). Loaded by the viewer so
+/// emoji count as 2 cells like the desktop terminal — without it xterm's
+/// default Unicode 6 tables clip every emoji to half a cell (columns desync).
+const VENDOR_XTERM_UNICODE11_JS: &str = include_str!("../assets/vendor/xterm-6.0.0/addon-unicode11.js");
 
 /// `xterm.js` ends with a `//# sourceMappingURL=xterm.js.map` pointer,
 /// but we don't ship the `.map` (and it isn't on the no-auth asset
@@ -1558,6 +1563,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
     if let (
         "GET",
         "/assets/xterm-6.0.0.js"
+        | "/assets/xterm-unicode11-6.0.0.js"
         | "/assets/xterm-6.0.0.css"
         | "/assets/main.js"
         | "/assets/main.css"
@@ -1567,6 +1573,10 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
         let (body, ctype): (&[u8], &str) = match path.as_str() {
             "/assets/xterm-6.0.0.js" => (
                 VENDOR_XTERM_JS_SERVED.as_bytes(),
+                "application/javascript; charset=utf-8",
+            ),
+            "/assets/xterm-unicode11-6.0.0.js" => (
+                VENDOR_XTERM_UNICODE11_JS.as_bytes(),
                 "application/javascript; charset=utf-8",
             ),
             "/assets/xterm-6.0.0.css" => (VENDOR_XTERM_CSS.as_bytes(), "text/css; charset=utf-8"),
@@ -6171,6 +6181,7 @@ mod tests {
                 "assets/xterm-6.0.0.css",
                 "assets/main.css?version=",
                 "assets/xterm-6.0.0.js",
+                "assets/xterm-unicode11-6.0.0.js",
                 "assets/main.js?version=",
             ] {
                 let want = format!("{want_prefix}{asset}");
@@ -6269,6 +6280,19 @@ mod tests {
         assert!(
             std::str::from_utf8(&b).unwrap_or("").contains("xterm.js"),
             "css body must reference xterm.js in its banner"
+        );
+
+        // Unicode 11 addon — same unauthenticated, immutable-cache contract.
+        let raw = request_bytes(port, "GET /assets/xterm-unicode11-6.0.0.js HTTP/1.1\r\n\r\n");
+        let (h, b) = split_response(&raw);
+        assert!(h.starts_with("HTTP/1.1 200"), "got: {h}");
+        assert_eq!(
+            header_value(&h, "content-type"),
+            Some("application/javascript; charset=utf-8"),
+        );
+        assert!(
+            std::str::from_utf8(&b).unwrap_or("").contains("Unicode11Addon"),
+            "unicode11 body must expose the Unicode11Addon global"
         );
     }
 

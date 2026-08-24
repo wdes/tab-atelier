@@ -85,6 +85,9 @@
   </div>
   <div id="toast"></div>
   <script src="__ASSET_PREFIX__assets/xterm-6.0.0.js"></script>
+  <!-- Unicode 11 width provider (emoji = 2 cells, matching the desktop
+       terminal). Must load before main.js so it can loadAddon() it. -->
+  <script src="__ASSET_PREFIX__assets/xterm-unicode11-6.0.0.js"></script>
   <!-- Bootstrap: only thing in /view that's tab-specific. main.js
        reads window.TAB and is otherwise identical across every
        tab + every browser load (= cacheable behind ?version=). -->
