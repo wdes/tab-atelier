@@ -534,3 +534,7 @@ body {
   background: color-mix(in srgb, var(--orchestrator-accent) 20%, transparent);
   color: var(--orchestrator-accent);
 }
+
+/* Org-chart working area: guarantees a little scroll room so the panned position
+   is preserved across a refresh (Inc7 S3). No-op once a real fleet overflows. */
+body.band-view { min-height: calc(100vh + 180px); }

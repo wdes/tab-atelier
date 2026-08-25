@@ -477,6 +477,8 @@ let currentNodes = new Map();
 let currentUnmapped = [];
 // Per-tab RAM/CPU from /tabs/usage, keyed by id (tooltip enrichment).
 let usageById = new Map();
+// Last band-chart model, for the flicker-free in-place patch (Inc7 S3).
+let prevBandModel = null;
 // The drilled-in project (null = level 0 / grid). Read from ?project= at boot.
 let currentProject = null;
 // Last state received, so a view switch (drill-in / back) can re-render without
@@ -538,6 +540,11 @@ function applyState(state) {
 // view switch (drill-in / back).
 function render() {
   const view = resolveView(currentState, currentProject);
+  // The org-chart reserves a minimum working area so it stays pannable (and its
+  // scroll position survives a refresh) — a no-op once a real fleet overflows.
+  if (typeof document !== "undefined") {
+    document.body.classList.toggle("band-view", view.mode === "grid" && hasTichef(currentState));
+  }
   if (view.mode === "grid") renderGrid();
   else renderDiagram(view);
   setViewChrome(view);
@@ -553,6 +560,27 @@ function bandHtml(label, inner) {
 function unassignedTabHtml(tab) {
   const t = tab || {};
   return `<div class="unassigned-tab" data-viewer="${escapeHtml(t.viewerUrl || "")}">${escapeHtml(t.name || "tab")}</div>`;
+}
+
+// Pure: the flicker-free refresh diff (Inc7 S3, Zoetrope borrow). Compares two
+// models by STABLE node id and returns the minimal op list: `add` for a new id,
+// `remove` for a gone id, `update` for a changed node, nothing for an unchanged
+// one. Callers patch the DOM in place from these ops (no clear-and-rebuild), so
+// node identity + selection + scroll + hover survive a poll. Malformed-safe.
+export function diffRender(prev, next) {
+  const prevNodes = prev && Array.isArray(prev.nodes) ? prev.nodes : [];
+  const nextNodes = next && Array.isArray(next.nodes) ? next.nodes : [];
+  const prevById = new Map(prevNodes.map((n) => [n && n.id, n]));
+  const nextById = new Map(nextNodes.map((n) => [n && n.id, n]));
+  const ops = [];
+  for (const n of nextNodes) {
+    if (!n) continue;
+    const p = prevById.get(n.id);
+    if (!p) ops.push({ op: "add", id: n.id, node: n });
+    else if (JSON.stringify(p) !== JSON.stringify(n)) ops.push({ op: "update", id: n.id, node: n });
+  }
+  for (const p of prevNodes) if (p && !nextById.has(p.id)) ops.push({ op: "remove", id: p.id });
+  return ops;
 }
 
 // --- Inc7 S1: compact 4-band org-chart ---
@@ -588,6 +616,46 @@ function orchChainHtml(orch) {
 
 function bandHtml7(id, label, inner) {
   return `<div class="band" data-band="${id}"><div class="band-label">${escapeHtml(label)}</div><div class="band-row">${inner}</div></div>`;
+}
+
+// The flat, stable-id model the S3 diff runs on: every band node with the fields
+// that affect its rendering (its led). Order-independent (keyed by id).
+function buildBandModel(state) {
+  const bl = bandLayout(state);
+  const nodes = [];
+  const push = (t) => { if (t && t.id) nodes.push({ id: t.id, led: t.led != null ? t.led : (t.rollupLed != null ? t.rollupLed : null) }); };
+  bl.meta.forEach(push);
+  for (const o of bl.orchestrators) { push(o.lead); for (const r of o.repos) r.workers.forEach(push); }
+  bl.workers.forEach(push);
+  bl.freelancers.forEach(push);
+  return { nodes };
+}
+
+// Patch one band node's led in place (no rebuild) — keeps its DOM identity,
+// selection and scroll (Inc7 S3).
+function patchBandNode(id, node) {
+  const el = document.querySelector(`.band-node[data-tab-id="${(typeof CSS !== "undefined" && CSS.escape) ? CSS.escape(id) : id}"]`);
+  if (!el) return;
+  for (const c of [...el.classList]) if (c.indexOf("led-") === 0) el.classList.remove(c);
+  el.classList.add(ledClass(node.led));
+}
+
+// Refresh the band chart flicker-free: rebuild only on a structural change
+// (add/remove) or when the chart isn't currently mounted; otherwise patch the
+// changed nodes in place (Inc7 S3).
+function renderBandOrPatch() {
+  const grid = document.getElementById("project-grid");
+  if (!grid) return;
+  const next = buildBandModel(currentState);
+  const mounted = !!grid.querySelector("[data-band]");
+  const ops = diffRender(prevBandModel, next);
+  const structural = ops.some((o) => o.op === "add" || o.op === "remove");
+  if (!prevBandModel || !mounted || structural) {
+    renderBandChart();
+  } else {
+    for (const op of ops) if (op.op === "update") patchBandNode(op.id, op.node);
+  }
+  prevBandModel = next;
 }
 
 // Full build of the 4-band chart (S1). S3 patches it in place between structural
@@ -685,9 +753,10 @@ function renderOrgChart() {
 function renderGrid() {
   const grid = document.getElementById("project-grid");
   if (!grid) return;
-  // Inc7: a coordinated fleet (tichef present) gets the 4-band compact org-chart.
+  // Inc7: a coordinated fleet (tichef present) gets the 4-band compact org-chart,
+  // refreshed flicker-free (in-place patch between structural changes).
   if (hasTichef(currentState)) {
-    renderBandChart();
+    renderBandOrPatch();
     return;
   }
   // Inc6: when the server exposes the service dimension, show the org-chart.
