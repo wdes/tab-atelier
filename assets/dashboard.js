@@ -1188,3 +1188,9 @@ if (typeof document !== "undefined") {
     bootstrap();
   }
 }
+
+// --- Coverage seam (audit #357 Phase A) — export internal pure helpers so the
+// characterization suite can lock their CURRENT behavior BEFORE the Q3-Q10
+// refactor. Additive only (function declarations, hoisted); the refactor keeps
+// these names or updates the tests. See assets/dashboard.characterization.test.mjs.
+export { projectTabs, serviceGrouping, metaTopHtml, teamMemberHtml, unassignedTabHtml, popupHtml, tabEntryHtml };
