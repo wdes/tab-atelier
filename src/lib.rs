@@ -707,6 +707,20 @@ pub fn build_agent_resume_command(kind: &str, session_id: &str, plan: Option<boo
                 Some("tab-atelier-headless brain".to_string())
             }
         }
+        // 🐊 aligator drains the swamp over the local API — a standalone tool
+        // with no session to resume, exactly like brain. On restart we relaunch
+        // it so the deliveries queued by the restart-watcher get drained (fixes
+        // the session-only death that dropped it to a shell). `session_id` unused.
+        "aligator" => {
+            #[cfg(feature = "gui")]
+            {
+                Some("tab-atelier aligator".to_string())
+            }
+            #[cfg(not(feature = "gui"))]
+            {
+                Some("tab-atelier-headless aligator".to_string())
+            }
+        }
         _ => None,
     }
 }
@@ -3376,6 +3390,20 @@ mod tests {
         assert_eq!(cmd, "tab-atelier brain");
         #[cfg(not(feature = "gui"))]
         assert_eq!(cmd, "tab-atelier-headless brain");
+    }
+
+    #[test]
+    fn aligator_resumes_by_relaunch_ignoring_session() {
+        // 🐊 aligator is session-less like brain — auto-resume relaunches it so a
+        // restart doesn't drop it to a shell (deliveries would stall). Session
+        // ignored; plan flag ignored. Nothing else about brain/catbus/claude moves.
+        let cmd = build_agent_resume_command("aligator", "", Some(true)).unwrap();
+        #[cfg(feature = "gui")]
+        assert_eq!(cmd, "tab-atelier aligator");
+        #[cfg(not(feature = "gui"))]
+        assert_eq!(cmd, "tab-atelier-headless aligator");
+        // Guardrail: an unknown kind is still None (no accidental broadening).
+        assert!(build_agent_resume_command("nope", "x", None).is_none());
     }
 
     #[test]
