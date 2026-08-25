@@ -226,7 +226,7 @@ export function lineageEdges(projects) {
       if (!t || !t.parentTabId) continue;
       const from = owner.get(t.parentTabId);
       if (!from || from === p.name) continue;
-      const key = `${from} ${p.name}`;
+      const key = `${from} ${p.name}`;
       if (seen.has(key)) continue;
       seen.add(key);
       edges.push({ from, to: p.name });
