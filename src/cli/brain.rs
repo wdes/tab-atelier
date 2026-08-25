@@ -390,17 +390,35 @@ fn should_nudge(stable_for: Duration, nudged_hash: Option<u64>, current_hash: u6
 const NUDGE_MIN_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Global throttle gate: may a nudge fire `now`? Yes when none has fired within
-/// [`NUDGE_MIN_INTERVAL`] — and then `now` is recorded as the last emission so
-/// the next is spaced out. `None` (never nudged) is always allowed. Pure +
-/// deterministic (injected `now`), so the anti-storm spacing is unit-testable.
-fn nudge_ready(last_nudge_at: &mut Option<Instant>, now: Instant) -> bool {
+/// `min_interval` — and then `now` is recorded as the last emission so the next
+/// is spaced out. `None` (never nudged) is always allowed. `min_interval` is
+/// [`NUDGE_MIN_INTERVAL`] normally and the longer [`nudge_interval`] heartbeat
+/// under a systemic breaker. Pure + deterministic (injected `now`), so the
+/// anti-storm spacing is unit-testable.
+fn nudge_ready(last_nudge_at: &mut Option<Instant>, now: Instant, min_interval: Duration) -> bool {
     if let Some(t) = *last_nudge_at
-        && now.duration_since(t) < NUDGE_MIN_INTERVAL
+        && now.duration_since(t) < min_interval
     {
         return false;
     }
     *last_nudge_at = Some(now);
     true
+}
+
+/// AXE B — fleet-wide nudge spacing for this tick.
+///
+/// Normal: [`NUDGE_MIN_INTERVAL`]. Under a **systemic** breaker (a likely API
+/// cap): the SINGLE round-robin nudge is spaced to a slow heartbeat /
+/// recovery-probe ([`CIRCUIT_BREAKER_COOLDOWN`] apart) — deliberately NOT silence
+/// (total suppression made brain look dead and hid recovery) and never a storm
+/// (still ≤1 nudge, just spaced). One nudge keeps brain visibly alive and
+/// auto-detects the moment the cap clears. Pure, so the policy is unit-testable.
+const fn nudge_interval(systemic: bool) -> Duration {
+    if systemic {
+        CIRCUIT_BREAKER_COOLDOWN
+    } else {
+        NUDGE_MIN_INTERVAL
+    }
 }
 
 /// Circuit-breaker threshold: MORE than this many tabs frozen at the same time
@@ -443,6 +461,31 @@ fn backoff_secs(streak: u32) -> u64 {
         .min(NUDGE_BACKOFF_MAX_SECS)
 }
 
+/// AXE A — wall-clock budget for one tick's per-tab `/output` scan.
+///
+/// The scan does one bounded (`share_link` 3 s timeout) GET per Claude tab,
+/// sequentially. Under a storm the daemon crawls, so N tabs times up-to-3 s is a
+/// multi-minute tick the PO perceived as a freeze. Past this budget the scan
+/// stops and resumes across the fleet next tick (see [`scan_order`] plus
+/// `scan_cursor`), so a tick is bounded INDEPENDENTLY of the tab count: even 50
+/// tabs on a slow daemon still return in about the budget. Lowering the per-GET
+/// timeout was rejected (tichef): it only moves the threshold. Worst-case block
+/// is roughly the budget plus one already-in-flight GET (≤ the 3 s timeout).
+const TICK_BUDGET: Duration = Duration::from_secs(6);
+
+/// The order to scan `n` tabs this tick: start at `cursor`, wrap around. So when
+/// the [`TICK_BUDGET`] truncates a scan, the next tick resumes on the tabs it
+/// didn't reach instead of always re-scanning the head — fair coverage across
+/// the fleet. Pure, so the wrap/rotation is unit-testable. Empty when `n == 0`.
+fn scan_order(n: usize, cursor: usize) -> impl Iterator<Item = usize> {
+    // Reduce the cursor to a start index ONCE (`cursor % n`), then rotate — so
+    // `(start + off) % n` is a true permutation of `0..n` for any cursor,
+    // including one near usize::MAX (a per-request `wrapping_add(off) % n` would
+    // wrap mid-sequence and repeat/skip indices).
+    let start = if n == 0 { 0 } else { cursor % n };
+    (0..n).map(move |off| (start + off) % n.max(1))
+}
+
 /// Round-robin pick from a slice. Advances `cursor` mod `len()` and
 /// returns the chosen element (a reference into the slice, since the
 /// caller still owns the Vec). `None` on empty input — caller treats
@@ -477,6 +520,7 @@ fn tick(
     cursor: &mut usize,
     last_nudge_at: &mut Option<Instant>,
     breaker_until: &mut Option<Instant>,
+    scan_cursor: &mut usize,
 ) -> Result<(), String> {
     let ep: Endpoint = discover_endpoint()?;
     let ag = agent();
@@ -493,30 +537,66 @@ fn tick(
 
     let now = Instant::now();
     let mut eligible: Vec<Eligible> = Vec::new();
-    let mut seen_ids: Vec<String> = Vec::new();
-    for tab in tabs.tabs {
-        if tab.id.is_empty() {
-            continue;
+
+    // Gate the whole per-tab scan on "Claude is mid-session here". Without it,
+    // brain polled /output on EVERY tab — shell tabs, log tailers, vim sessions —
+    // and anything whose scrollback happened to contain a needle (e.g. `git log`
+    // showing "ECONNRESET" in a commit message) would get an injected `continue`.
+    // Only tabs whose hook has reported a Claude session are legitimate targets.
+    // Filtered up front (cheap, no HTTP) so the budget below governs only the
+    // expensive /output GETs.
+    let claude_tabs: Vec<TabInfo> = tabs
+        .tabs
+        .into_iter()
+        .filter(|tab| {
+            !tab.id.is_empty()
+                && tab.agent_kind.as_deref() == Some("claude")
+                && !tab.agent_session_id.as_deref().unwrap_or("").is_empty()
+        })
+        .collect();
+    // `seen_ids` = ALL claude tabs (not just the ones scanned this tick) so a
+    // budget-deferred tab keeps its watch state instead of having its freeze
+    // clock reset every time the scan can't reach it.
+    let seen_ids: Vec<String> = claude_tabs.iter().map(|t| t.id.clone()).collect();
+
+    // AXE A — bounded, resumable scan. Walk the claude tabs from `scan_cursor`
+    // (round-robin order), STOP once TICK_BUDGET is spent, and resume next tick
+    // where we left off. This caps a tick's wall-clock independently of the tab
+    // count, killing the "brain frozen for minutes under a storm" symptom.
+    let n = claude_tabs.len();
+    let tick_start = Instant::now();
+    let mut scanned = 0usize;
+    for i in scan_order(n, *scan_cursor) {
+        if tick_start.elapsed() >= TICK_BUDGET {
+            println!(
+                "⛑ brain: tick budget {b}s reached after {scanned}/{n} tab(s) — deferring {rest} to next tick",
+                b = TICK_BUDGET.as_secs(),
+                rest = n - scanned,
+            );
+            break;
         }
-        // Gate the entire per-tab scan on "Claude is mid-session
-        // here". Without it, brain was polling /output on every tab
-        // — including shell tabs, log tailers, vim sessions — and
-        // anything whose scrollback happened to contain a needle
-        // (e.g. `git log` showing "ECONNRESET" in a commit message)
-        // would get an injected `continue\r`. Only tabs whose hook
-        // has reported a Claude session are legitimate targets.
-        if tab.agent_kind.as_deref() != Some("claude") || tab.agent_session_id.as_deref().unwrap_or("").is_empty() {
-            continue;
-        }
-        seen_ids.push(tab.id.clone());
-        let output = ag
+        let tab = &claude_tabs[i];
+        scanned += 1;
+        // A per-tab /output error (tab closed mid-tick, transient) must NOT abort
+        // the whole tick — that would strand every later tab AND keep re-hitting
+        // the same failing tab (scan_cursor wouldn't advance past it). Skip it;
+        // it still counts as scanned so the cursor moves on. (A daemon-wide outage
+        // already failed the /tabs GET above, before we got here.)
+        let output = match ag
             .get(format!("{}/tabs/by-id/{}/output", ep.url, tab.id))
             .header("Authorization", &auth)
             .call()
-            .map_err(|e| format!("GET output for {}: {e}", tab.id))?
-            .body_mut()
-            .read_to_string()
-            .map_err(|e| format!("read output for {}: {e}", tab.id))?;
+            .and_then(|mut r| r.body_mut().read_to_string())
+        {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!(
+                    "⛑ brain: GET output for {} failed: {e} — skipping this tab this tick",
+                    tab.id
+                );
+                continue;
+            }
+        };
 
         // Output-stability tracking — the core "is the agent working?"
         // gate. Update the per-tab watch: if the screen changed since
@@ -543,13 +623,9 @@ fn tick(
         // Two parallel signals — a literal needle match in the scrollback
         // OR an `agent_state: "error"` flag set via set-status. Pattern
         // wins on tie (its label is more specific).
-        let trigger: Option<Trigger> = if let Some(p) = scan_output(&output) {
-            Some(Trigger::Pattern(p))
-        } else if tab.agent_state.as_deref() == Some("error") {
-            Some(Trigger::AgentError)
-        } else {
-            None
-        };
+        let trigger: Option<Trigger> = scan_output(&output)
+            .map(Trigger::Pattern)
+            .or_else(|| (tab.agent_state.as_deref() == Some("error")).then_some(Trigger::AgentError));
         let Some(trigger) = trigger else {
             // No error on screen → recovered (or never errored). Clear
             // the backoff so the next episode starts fresh.
@@ -585,12 +661,15 @@ fn tick(
         }
 
         eligible.push(Eligible {
-            tab_id: tab.id,
-            tab_name: tab.name,
+            tab_id: tab.id.clone(),
+            tab_name: tab.name.clone(),
             trigger,
             output_hash: h,
         });
     }
+    // Resume next tick right after the last tab we reached, so a budget-truncated
+    // scan rotates over the whole fleet instead of always re-scanning the head.
+    *scan_cursor = scan_cursor.wrapping_add(scanned);
 
     // Drop watch state for tabs that vanished (closed / no longer a
     // Claude session) so the map stays bounded.
@@ -600,20 +679,23 @@ fn tick(
         return Ok(());
     }
 
-    // Count-based circuit breaker (before any send): MORE than
+    // AXE B — count-based circuit breaker, POLICY UPDATED. MORE than
     // CIRCUIT_BREAKER_THRESHOLD tabs frozen at once is systemic (a likely API
-    // cap), not N independent failures — nudging them all would feed the cap.
-    // Back off for CIRCUIT_BREAKER_COOLDOWN instead, without touching the
-    // throttle/cursor/watches, so every tab stays a candidate for when it clears.
-    if circuit_breaker_open(breaker_until, eligible.len(), now) {
+    // cap), not N independent failures. We NO LONGER go fully silent for the
+    // cooldown (that made brain look dead and hid the recovery moment). Instead
+    // we drop into HEARTBEAT mode: the SINGLE round-robin nudge still fires, just
+    // spaced to `nudge_interval(true)` — one gentle recovery-probe that can't
+    // storm the cap (still ≤1 nudge, and slower), keeps brain visibly alive, and
+    // auto-resumes normal cadence the instant the cap clears.
+    let systemic = circuit_breaker_open(breaker_until, eligible.len(), now);
+    if systemic {
         println!(
             "⛑ brain: {n} tabs frozen at once (> {thr}) — SYSTEMIC (likely API cap); \
-             backing off ~{cd}s instead of nudging",
+             heartbeat mode: one ~{cd}s round-robin probe nudge (not silence)",
             n = eligible.len(),
             thr = CIRCUIT_BREAKER_THRESHOLD,
             cd = CIRCUIT_BREAKER_COOLDOWN.as_secs(),
         );
-        return Ok(());
     }
 
     // Connectivity gate. If the box can't reach the open internet,
@@ -631,17 +713,20 @@ fn tick(
         return Ok(());
     }
 
-    // Global anti-storm throttle: at most one nudge every NUDGE_MIN_INTERVAL
-    // across ALL tabs. If a nudge fired <2 s ago, skip this tick's send WITHOUT
-    // advancing the cursor or touching any watch — every eligible tab stays a
-    // candidate and fires at the next 2 s slot. This turns "50 frozen tabs →
-    // burst of 50 continues" into "one every 2 s", so a restart / API cap can't
-    // spiral into a self-inflicted rate-limit.
-    if !nudge_ready(last_nudge_at, now) {
+    // Global anti-storm throttle: at most one nudge every `interval` across ALL
+    // tabs — NUDGE_MIN_INTERVAL normally, the longer heartbeat under a systemic
+    // breaker (AXE B). If a nudge fired within the window, skip this tick's send
+    // WITHOUT advancing the cursor or touching any watch — every eligible tab
+    // stays a candidate and fires at the next slot. This turns "50 frozen tabs →
+    // burst of 50 continues" into a spaced single nudge, so a restart / API cap
+    // can't spiral into a self-inflicted rate-limit.
+    let interval = nudge_interval(systemic);
+    if !nudge_ready(last_nudge_at, now, interval) {
         println!(
-            "⛑ brain: {n} eligible, throttled (≤1 nudge / {s}s fleet-wide) — next slot soon",
+            "⛑ brain: {n} eligible, throttled (≤1 nudge / {s}s{mode}) — next slot soon",
             n = eligible.len(),
-            s = NUDGE_MIN_INTERVAL.as_secs(),
+            s = interval.as_secs(),
+            mode = if systemic { " heartbeat" } else { " fleet-wide" },
         );
         return Ok(());
     }
@@ -778,6 +863,9 @@ pub fn run(args: &[String]) -> i32 {
     // Circuit-breaker cooldown deadline: `Some(t)` while backing off (see
     // circuit_breaker_open).
     let mut breaker_until: Option<Instant> = None;
+    // AXE A — persistent scan cursor: where the next tick's budget-bounded
+    // /output scan resumes (see scan_order / TICK_BUDGET).
+    let mut scan_cursor: usize = 0;
     loop {
         // Run the tick under catch_unwind so a panic anywhere in it (a
         // dependency edge case, a broken-pipe `println!`, …) is caught
@@ -791,6 +879,7 @@ pub fn run(args: &[String]) -> i32 {
                 &mut rr_cursor,
                 &mut last_nudge_at,
                 &mut breaker_until,
+                &mut scan_cursor,
             )
         }));
         match outcome {
@@ -824,40 +913,91 @@ mod tests {
     use super::*;
 
     #[test]
-    fn circuit_breaker_backs_off_on_systemic_freeze_not_a_few() {
+    fn circuit_breaker_throttles_to_a_heartbeat_not_silence() {
+        // AXE B — POLICY: a systemic freeze no longer silences brain. The
+        // detector (circuit_breaker_open) still trips + sticks for the cooldown,
+        // but "systemic" now means HEARTBEAT MODE: the single round-robin nudge
+        // still fires, just spaced to `nudge_interval(true)`. Locked here:
+        // breaker-open ⇒ still ≤1 nudge, NEVER 0-all-suppressed silence.
         let t0 = Instant::now();
-        // A few frozen tabs = independent failures → normal operation (no trip).
+        // Detection (unchanged): a few frozen tabs = independent failures.
         let mut b: Option<Instant> = None;
-        assert!(!circuit_breaker_open(&mut b, 2, t0), "2 frozen tabs → nudge normally");
+        assert!(!circuit_breaker_open(&mut b, 2, t0), "2 frozen → not systemic");
         assert!(
             !circuit_breaker_open(&mut b, CIRCUIT_BREAKER_THRESHOLD, t0),
-            "AT the threshold → still normal"
+            "AT the threshold → not systemic"
         );
         assert_eq!(b, None, "no cooldown armed below/at threshold");
-
-        // MORE than the threshold at once = SYSTEMIC → trip + back off (0 nudges).
+        // MORE than threshold = systemic → enters heartbeat mode + arms the
+        // sticky cooldown (which now bounds how long we stay in heartbeat).
         let over = CIRCUIT_BREAKER_THRESHOLD + 1;
-        assert!(
-            circuit_breaker_open(&mut b, over, t0),
-            "> threshold → breaker trips (suppress)"
-        );
-        assert!(b.is_some(), "cooldown armed");
-        // During the cooldown, ALL nudges are suppressed — even if the count drops.
+        assert!(circuit_breaker_open(&mut b, over, t0), "> threshold → systemic");
+        assert!(b.is_some(), "cooldown armed (heartbeat-mode duration)");
+        // Sticky: stays systemic through the cooldown even if the count drops.
         assert!(
             circuit_breaker_open(&mut b, 1, t0 + Duration::from_secs(5)),
-            "still cooling down → suppressed regardless of count"
+            "still systemic during cooldown, regardless of count"
         );
-        // Once the cooldown elapses and the spike is gone → back to normal.
+        // Clears once the cooldown elapses and the spike is gone.
         assert!(
             !circuit_breaker_open(&mut b, 2, t0 + CIRCUIT_BREAKER_COOLDOWN),
-            "after cooldown + count settled → nudge normally"
+            "after cooldown + settled → back to normal cadence"
         );
         assert_eq!(b, None, "cooldown cleared");
-        // If it's STILL systemic after the cooldown, it re-trips (keeps backing off).
+        // Still systemic after the cooldown → re-arms heartbeat (keeps probing).
         assert!(
             circuit_breaker_open(&mut b, over, t0 + CIRCUIT_BREAKER_COOLDOWN),
-            "still systemic after cooldown → re-trips"
+            "still systemic after cooldown → re-arms"
         );
+
+        // POLICY LOCK: systemic ⇒ a SPACED heartbeat, never silence.
+        assert_eq!(nudge_interval(false), NUDGE_MIN_INTERVAL, "normal spacing");
+        assert_eq!(
+            nudge_interval(true),
+            CIRCUIT_BREAKER_COOLDOWN,
+            "systemic → slower heartbeat spacing"
+        );
+        assert!(
+            nudge_interval(true) > nudge_interval(false),
+            "heartbeat is spaced MORE than normal (gentler probe)"
+        );
+        // The heartbeat still lets ONE nudge through — breaker-open ≠ 0 nudges.
+        let mut last: Option<Instant> = None;
+        assert!(
+            nudge_ready(&mut last, t0, nudge_interval(true)),
+            "systemic still fires ONE nudge (heartbeat/probe) — never total silence"
+        );
+        // …but spaced: a second within the heartbeat window is throttled (≤1, no storm).
+        assert!(
+            !nudge_ready(&mut last, t0 + Duration::from_secs(5), nudge_interval(true)),
+            "second within the heartbeat window is throttled — still ≤1 nudge"
+        );
+        assert!(
+            nudge_ready(&mut last, t0 + CIRCUIT_BREAKER_COOLDOWN, nudge_interval(true)),
+            "the next heartbeat fires after the interval — brain stays alive + auto-probes"
+        );
+    }
+
+    #[test]
+    fn scan_order_rotates_and_wraps_for_resumable_scans() {
+        // AXE A — a budget-truncated scan resumes across the fleet: starting at
+        // the cursor and wrapping, so later ticks reach the tail instead of
+        // always re-scanning the head.
+        assert_eq!(scan_order(3, 0).collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert_eq!(
+            scan_order(3, 4).collect::<Vec<_>>(),
+            vec![1, 2, 0],
+            "start at 4 % 3 = 1, wrap"
+        );
+        assert_eq!(
+            scan_order(0, 5).collect::<Vec<_>>(),
+            Vec::<usize>::new(),
+            "no tabs → nothing to scan"
+        );
+        // usize::MAX cursor must not panic (wrapping), and still covers all indices.
+        let mut got = scan_order(3, usize::MAX).collect::<Vec<_>>();
+        got.sort_unstable();
+        assert_eq!(got, vec![0, 1, 2], "wrap-around still covers every tab exactly once");
     }
 
     #[test]
@@ -867,32 +1007,33 @@ mod tests {
         // never in a burst that re-caps the API.
         let mut last: Option<Instant> = None;
         let t0 = Instant::now();
+        let iv = NUDGE_MIN_INTERVAL; // normal (non-systemic) spacing
         // First frozen tab fires immediately (nothing nudged yet).
-        assert!(nudge_ready(&mut last, t0), "first nudge always allowed");
+        assert!(nudge_ready(&mut last, t0, iv), "first nudge always allowed");
         // A SECOND frozen tab in the same instant is throttled — not simultaneous.
         assert!(
-            !nudge_ready(&mut last, t0),
+            !nudge_ready(&mut last, t0, iv),
             "a second nudge in the same window is skipped"
         );
         // Still throttled just under the interval.
         assert!(
-            !nudge_ready(&mut last, t0 + Duration::from_millis(1999)),
+            !nudge_ready(&mut last, t0 + Duration::from_millis(1999), iv),
             "still throttled just under {}s",
             NUDGE_MIN_INTERVAL.as_secs()
         );
         // Once the interval has elapsed since the last EMITTED nudge, the next fires.
         assert!(
-            nudge_ready(&mut last, t0 + NUDGE_MIN_INTERVAL),
+            nudge_ready(&mut last, t0 + NUDGE_MIN_INTERVAL, iv),
             "next nudge allowed ≥{}s after the previous one",
             NUDGE_MIN_INTERVAL.as_secs()
         );
         // …and firing re-arms the throttle, so the third waits another interval.
         assert!(
-            !nudge_ready(&mut last, t0 + NUDGE_MIN_INTERVAL),
+            !nudge_ready(&mut last, t0 + NUDGE_MIN_INTERVAL, iv),
             "throttle re-arms on each emission"
         );
         assert!(
-            nudge_ready(&mut last, t0 + NUDGE_MIN_INTERVAL * 2),
+            nudge_ready(&mut last, t0 + NUDGE_MIN_INTERVAL * 2, iv),
             "and the one after, a slot later"
         );
     }
