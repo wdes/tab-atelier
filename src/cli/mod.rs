@@ -5,6 +5,7 @@
 /// `tab-atelier claude [ARGS…]` — clear the grid + `exec claude` (a correct,
 /// no-fuss agent launcher; see the module docs).
 pub mod agent;
+pub mod aligator;
 pub mod bench;
 pub mod bench_lag;
 pub mod brain;

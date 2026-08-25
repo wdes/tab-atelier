@@ -51,6 +51,9 @@ pub fn dispatch(name: &str, rest: &[String]) -> Option<i32> {
         "dispatch" => delegate::run(rest),
         "remote" => remote::run(rest),
         "brain" => brain::run(rest),
+        // 🐊 aligator: deterministic input router + its swamp producer.
+        "aligator" => super::aligator::run(rest),
+        "swamp" => super::aligator::run_swamp(rest),
         "clarify" => super::clarify::run(rest),
         "schedule" => share_link::schedule(rest),
         "log" => logging::run(rest),
