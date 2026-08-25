@@ -252,6 +252,86 @@ export function overviewLayout(state) {
   return { order: ["META", "REPOS", "UNASSIGNED"], meta, repos, unassigned };
 }
 
+// Pure: the project a tab is assigned to. "project:phase/role" -> project;
+// a bare "phase/role" (no override) -> null.
+function assignmentProject(assignment) {
+  if (!assignment || typeof assignment !== "string") return null;
+  const colon = assignment.indexOf(":");
+  return colon > 0 ? assignment.slice(0, colon) : null;
+}
+
+// Meta-class roles: itinerant specialists that live in the Méta band unless they
+// join a team. tichef is meta too but pinned (handled first in resolveAltitude).
+function isMetaRole(role) {
+  const r = String(role || "").toLowerCase();
+  return r === "tichef" || r === "planner" || r === "refiner" || r === "auditor" || r === "scoper";
+}
+
+// Pure: a tab's dynamic altitude band (Inc7 S2). Encodes the 4 movements + the
+// tichef pin (docs/dashboard-increment-7.md "altitude dynamique"):
+//   - tichef -> always Méta (pinned, even while serving);
+//   - a meta specialist SERVING a team -> that team's band, marked reinforcement;
+//   - a solo meta specialist -> Méta;
+//   - an orchestrator -> Orchestrateurs;
+//   - any tab with an assignment -> Workers, under its team;
+//   - otherwise -> Freelancers.
+// Exported in S2; used internally by bandLayout (S1).
+function resolveAltitude(tab, state) {
+  const t = tab || {};
+  const role = String(t.role || "").toLowerCase();
+  if (role === "tichef") return { band: "meta" };
+  if (isMetaRole(role)) {
+    if (t.serving) return { band: "worker", team: t.serving, reinforcement: true };
+    const override = assignmentProject(t.assignment);
+    if (override) return { band: "worker", team: override, reinforcement: true };
+    return { band: "meta" };
+  }
+  if (role === "orchestrator") return { band: "orchestrator", team: assignmentProject(t.assignment) };
+  if (t.assignment) return { band: "worker", team: assignmentProject(t.assignment) };
+  return { band: "freelancer" };
+}
+
+// Pure: the 4-band compact org-chart model (Inc7 S1). Méta / Orchestrateurs (each
+// with its served repo(s) -> workers chain) / Workers (assigned but orphan) /
+// Freelancers (unassigned). Degrades cleanly (no services/assignment -> non-mapped
+// tabs land in Freelancers). Never throws.
+export function bandLayout(state) {
+  const s = state || {};
+  const projects = Array.isArray(s.projects) ? s.projects : [];
+  const unassigned = Array.isArray(s.unassigned) ? s.unassigned : [];
+  const allTabs = [];
+  for (const p of projects) for (const t of projectTabs(p)) allTabs.push(t);
+
+  const meta = allTabs.filter((t) => resolveAltitude(t, s).band === "meta");
+
+  const orchestrators = allTabs
+    .filter((t) => String(t && t.role || "").toLowerCase() === "orchestrator")
+    .map((lead) => {
+      const workers = allTabs.filter((t) => t && t.parentTabId === lead.id);
+      const leadProj = assignmentProject(lead.assignment);
+      const byRepo = new Map();
+      for (const w of workers) {
+        const repo = assignmentProject(w.assignment) || leadProj || lead.id;
+        if (!byRepo.has(repo)) byRepo.set(repo, []);
+        byRepo.get(repo).push(w);
+      }
+      if (!byRepo.size && leadProj) byRepo.set(leadProj, []);
+      const repos = [...byRepo.entries()].map(([repo, ws]) => ({ repo, workers: ws }));
+      return { lead, repos };
+    });
+
+  // Workers band = assigned workers NOT already shown under a chain (orphans).
+  const shown = new Set();
+  for (const o of orchestrators) for (const r of o.repos) for (const w of r.workers) shown.add(w.id);
+  const workers = allTabs.filter((t) => resolveAltitude(t, s).band === "worker" && !shown.has(t.id));
+
+  const freelancers = [...unassigned];
+  for (const t of allTabs) if (resolveAltitude(t, s).band === "freelancer" && !freelancers.includes(t)) freelancers.push(t);
+  for (const t of (Array.isArray(s.unmapped) ? s.unmapped : [])) if (!freelancers.includes(t)) freelancers.push(t);
+
+  return { meta, orchestrators, workers, freelancers };
+}
+
 // Pure: the service nesting (Inc6 S4). One entry per service, in order, wrapping
 // its sub-repos; a single-repo service is `mono` (not over-nested). Repo entries
 // are normalised to {name} whether the server sends strings or objects. Null-safe.
@@ -476,6 +556,60 @@ function unassignedTabHtml(tab) {
   return `<div class="unassigned-tab" data-viewer="${escapeHtml(t.viewerUrl || "")}">${escapeHtml(t.name || "tab")}</div>`;
 }
 
+// --- Inc7 S1: compact 4-band org-chart ---
+
+// Activation gate: a coordinated fleet (a tichef is present) gets the Inc7 4-band
+// org-chart; fixtures/states without a tichef keep the Inc5/Inc6 views.
+function hasTichef(state) {
+  const projects = Array.isArray(state && state.projects) ? state.projects : [];
+  for (const p of projects) for (const t of projectTabs(p)) {
+    if (String(t && t.role || "").toLowerCase() === "tichef") return true;
+  }
+  return false;
+}
+
+function bandNodeHtml(tab, cls) {
+  const t = tab || {};
+  const led = ledClass(t.led != null ? t.led : t.rollupLed);
+  return `<div class="band-node ${cls} ${led}" data-tab-id="${escapeHtml(t.id || "")}" data-viewer="${escapeHtml(t.viewerUrl || "")}" title="${escapeHtml(t.name || "")}">${escapeHtml(t.name || "tab")}</div>`;
+}
+
+// Orchestrator chain: lead -> served repo sub-nodes -> workers (parentTabId).
+function orchChainHtml(orch) {
+  const lead = orch.lead || {};
+  const repos = (orch.repos || [])
+    .map((r) => `<div class="band-repo" data-repo="${escapeHtml(r.repo)}"><div class="repo-name">${escapeHtml(r.repo)}</div><div class="repo-workers">${(r.workers || []).map((w) => bandNodeHtml(w, "worker")).join("")}</div></div>`)
+    .join("");
+  return `<div class="band-orch" data-orch="${escapeHtml(lead.id || "")}">${bandNodeHtml(lead, "lead")}<div class="orch-repos">${repos}</div></div>`;
+}
+
+function bandHtml7(id, label, inner) {
+  return `<div class="band" data-band="${id}"><div class="band-label">${escapeHtml(label)}</div><div class="band-row">${inner}</div></div>`;
+}
+
+// Full build of the 4-band chart (S1). S3 patches it in place between structural
+// changes; this rebuild runs on first render and on any add/remove.
+function renderBandChart() {
+  const grid = document.getElementById("project-grid");
+  if (!grid) return;
+  const bl = bandLayout(currentState);
+  const meta = bl.meta.map((t) => bandNodeHtml(t, "meta")).join("");
+  const orchs = bl.orchestrators.map(orchChainHtml).join("");
+  const workers = bl.workers.map((t) => bandNodeHtml(t, "worker")).join("");
+  const free = bl.freelancers.map((t) => bandNodeHtml(t, "freelancer")).join("");
+  grid.innerHTML =
+    bandHtml7("meta", "Méta", meta) +
+    bandHtml7("orchestrators", "Orchestrateurs", orchs) +
+    bandHtml7("workers", "Workers", workers) +
+    bandHtml7("freelancers", "Freelancers", free);
+  const layer = document.getElementById("lineage-layer");
+  if (layer) layer.innerHTML = "";
+  currentNodes = new Map();
+  currentUnmapped = [];
+  renderRehome([]);
+  renderUnmapped();
+}
+
 // --- Inc6 S2/S4: org-chart (méta on top / team lead + workers / serving joins) ---
 
 // Service grouping for the org-chart. S2 renders teams flat; S4 wires this to the
@@ -548,6 +682,11 @@ function renderOrgChart() {
 function renderGrid() {
   const grid = document.getElementById("project-grid");
   if (!grid) return;
+  // Inc7: a coordinated fleet (tichef present) gets the 4-band compact org-chart.
+  if (hasTichef(currentState)) {
+    renderBandChart();
+    return;
+  }
   // Inc6: when the server exposes the service dimension, show the org-chart.
   if (Array.isArray(currentState && currentState.services) && currentState.services.length) {
     renderOrgChart();
