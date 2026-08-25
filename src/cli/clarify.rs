@@ -116,15 +116,23 @@ pub fn parse_context_pct(screen: &str) -> Option<u8> {
     best
 }
 
+/// Is `name` a meta/daemon tab by NAME (brain/aligator/scribe/…)?
+///
+/// Case-insensitive substring — the name-only half of [`should_skip_rehome`],
+/// factored out so aligator's confused-deputy guard can reuse it WITHOUT also
+/// treating an orchestrator ROLE as meta (an orchestrator is a legit swamp
+/// target). Pure.
+#[must_use]
+pub fn is_meta_daemon_name(name: &str) -> bool {
+    let lname = name.to_ascii_lowercase();
+    SKIP_NAMES.iter().any(|d| lname.contains(d))
+}
+
 /// Should this tab be skipped by the AUTO re-home poller? A meta/daemon name or
 /// a meta/orchestrator role → yes (protect the tabs that run the show). Pure.
 #[must_use]
 pub fn should_skip_rehome(name: &str, assignment: Option<&str>) -> bool {
-    let lname = name.to_ascii_lowercase();
-    if SKIP_NAMES.iter().any(|d| lname.contains(d)) {
-        return true;
-    }
-    SKIP_ROLES.contains(&crate::api::role_of(assignment).as_str())
+    is_meta_daemon_name(name) || SKIP_ROLES.contains(&crate::api::role_of(assignment).as_str())
 }
 
 /// Args passed to `rehome-tab.sh` for an in-place refresh: same cwd / assignment
