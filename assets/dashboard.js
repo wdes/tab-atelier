@@ -526,6 +526,7 @@ function tabEntryHtml(tab, usage) {
     <span class="tab-state">${escapeHtml(tab.agentState || "—")}</span>
     <span class="tab-tokens">${escapeHtml(fmtTokens(tab.tokens))}</span>
     ${chips ? `<span class="tab-details">${chips}</span>` : ""}
+    ${taskChipsHtml(tab)}
   </li>`;
 }
 
@@ -562,6 +563,38 @@ function unassignedTabHtml(tab) {
   return `<div class="unassigned-tab" data-viewer="${escapeHtml(t.viewerUrl || "")}">${escapeHtml(t.name || "tab")}</div>`;
 }
 
+// Pure: the per-tab task/sub-agents render model (Inc7 S4-web). Reads the rust
+// S4 fields (camelCase on DashboardTab): currentTask (string) + subAgents[]
+// ({name, state}). Returns a chip list: one "task" chip (label = the task) then
+// one "subagent" chip per invoked Task() (carrying its name + state). A tab with
+// no transcript data -> [] (degrades cleanly). Null-safe.
+export function taskChips(tab) {
+  const t = tab || {};
+  const chips = [];
+  if (t.currentTask && String(t.currentTask).trim()) {
+    chips.push({ kind: "task", label: String(t.currentTask) });
+  }
+  for (const s of Array.isArray(t.subAgents) ? t.subAgents : []) {
+    if (!s) continue;
+    chips.push({ kind: "subagent", name: s.name, state: s.state, label: s.name });
+  }
+  return chips;
+}
+
+// Pure: the S4 chips of a tab -> compact HTML (empty when there are none).
+function taskChipsHtml(tab) {
+  const chips = taskChips(tab);
+  if (!chips.length) return "";
+  const items = chips
+    .map((c) =>
+      c.kind === "task"
+        ? `<span class="task-chip" title="current task">${escapeHtml(c.label)}</span>`
+        : `<span class="subagent-chip state-${escapeHtml(c.state || "")}" title="sub-agent ${escapeHtml(c.name || "")} — ${escapeHtml(c.state || "")}">${escapeHtml(c.name || "")}</span>`
+    )
+    .join("");
+  return `<span class="task-chips">${items}</span>`;
+}
+
 // Pure: the flicker-free refresh diff (Inc7 S3, Zoetrope borrow). Compares two
 // models by STABLE node id and returns the minimal op list: `add` for a new id,
 // `remove` for a gone id, `update` for a changed node, nothing for an unchanged
@@ -595,14 +628,21 @@ function hasTichef(state) {
   return false;
 }
 
+// Inner content of a band node: name + renfort badge (S2) + task/sub-agent chips
+// (S4). Factored so the S3 in-place patch can refresh it without recreating the
+// element (identity + scroll survive).
+function bandNodeInner(tab) {
+  const t = tab || {};
+  const alt = resolveAltitude(t, currentState);
+  const badge = alt.reinforcement ? ` <span class="renfort-badge" title="en renfort dans ${escapeHtml(alt.team || "")}">renfort</span>` : "";
+  return `${escapeHtml(t.name || "tab")}${badge}${taskChipsHtml(t)}`;
+}
+
 function bandNodeHtml(tab, cls) {
   const t = tab || {};
   const led = ledClass(t.led != null ? t.led : t.rollupLed);
-  // S2: a meta specialist placed in a team is a reinforcement (renfort).
-  const alt = resolveAltitude(t, currentState);
-  const reinf = alt.reinforcement ? " reinforcement" : "";
-  const badge = alt.reinforcement ? ` <span class="renfort-badge" title="en renfort dans ${escapeHtml(alt.team || "")}">renfort</span>` : "";
-  return `<div class="band-node ${cls} ${led}${reinf}" data-tab-id="${escapeHtml(t.id || "")}" data-viewer="${escapeHtml(t.viewerUrl || "")}" title="${escapeHtml(t.name || "")}">${escapeHtml(t.name || "tab")}${badge}</div>`;
+  const reinf = resolveAltitude(t, currentState).reinforcement ? " reinforcement" : "";
+  return `<div class="band-node ${cls} ${led}${reinf}" data-tab-id="${escapeHtml(t.id || "")}" data-viewer="${escapeHtml(t.viewerUrl || "")}" title="${escapeHtml(t.name || "")}">${bandNodeInner(t)}</div>`;
 }
 
 // Orchestrator chain: lead -> served repo sub-nodes -> workers (parentTabId).
@@ -618,12 +658,24 @@ function bandHtml7(id, label, inner) {
   return `<div class="band" data-band="${id}"><div class="band-label">${escapeHtml(label)}</div><div class="band-row">${inner}</div></div>`;
 }
 
+// Live tab objects keyed by id, refreshed each build so the in-place patch can
+// re-render a node's content (chips) from fresh data.
+let bandTabById = new Map();
+
 // The flat, stable-id model the S3 diff runs on: every band node with the fields
-// that affect its rendering (its led). Order-independent (keyed by id).
+// that affect its rendering — its led AND a task signature (S4 chips), so a task
+// change also produces an `update` op. Order-independent (keyed by id).
 function buildBandModel(state) {
   const bl = bandLayout(state);
   const nodes = [];
-  const push = (t) => { if (t && t.id) nodes.push({ id: t.id, led: t.led != null ? t.led : (t.rollupLed != null ? t.rollupLed : null) }); };
+  bandTabById = new Map();
+  const push = (t) => {
+    if (!t || !t.id) return;
+    bandTabById.set(t.id, t);
+    const led = t.led != null ? t.led : (t.rollupLed != null ? t.rollupLed : null);
+    const subs = Array.isArray(t.subAgents) ? t.subAgents.map((s) => s && `${s.name}:${s.state}`).join(",") : "";
+    nodes.push({ id: t.id, led, task: `${t.currentTask || ""}|${subs}` });
+  };
   bl.meta.forEach(push);
   for (const o of bl.orchestrators) { push(o.lead); for (const r of o.repos) r.workers.forEach(push); }
   bl.workers.forEach(push);
@@ -631,13 +683,16 @@ function buildBandModel(state) {
   return { nodes };
 }
 
-// Patch one band node's led in place (no rebuild) — keeps its DOM identity,
-// selection and scroll (Inc7 S3).
+// Patch one band node in place (no rebuild) — refresh its led class AND its inner
+// content (name + chips) from fresh data, keeping the SAME element so its identity,
+// selection and scroll survive (Inc7 S3).
 function patchBandNode(id, node) {
   const el = document.querySelector(`.band-node[data-tab-id="${(typeof CSS !== "undefined" && CSS.escape) ? CSS.escape(id) : id}"]`);
   if (!el) return;
   for (const c of [...el.classList]) if (c.indexOf("led-") === 0) el.classList.remove(c);
   el.classList.add(ledClass(node.led));
+  const tab = bandTabById.get(id);
+  if (tab) el.innerHTML = bandNodeInner(tab);
 }
 
 // Refresh the band chart flicker-free: rebuild only on a structural change
