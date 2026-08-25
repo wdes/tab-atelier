@@ -315,6 +315,158 @@ const WORK_ROOT_NAMES: [&str; 6] = ["dev", "src", "code", "projects", "repos", "
 const META_LANE: &str = "méta";
 const DIVERS_LANE: &str = "divers";
 
+// --- Inc7 S4: per-tab current task + Task() sub-agents ----------------------
+
+/// What a tab is doing now, distilled from its transcript for the dashboard.
+///
+/// `current_task` is the latest human-typed prompt; `sub_agents` is every
+/// `Task(...)` it spawned. Flattened onto [`DashboardTab`] as `currentTask` /
+/// `subAgents` for the web `taskChips`.
+#[derive(Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct TabActivity {
+    current_task: Option<String>,
+    sub_agents: Vec<SubAgent>,
+}
+
+/// One `Task()` sub-agent invocation: its `subagent_type` and lifecycle state.
+#[derive(Serialize, Clone)]
+struct SubAgent {
+    name: String,
+    /// `"running"` until a matching `tool_result` comes back, then `"completed"`.
+    state: String,
+}
+
+/// Distil [`TabActivity`] from a transcript's raw JSONL text — the same
+/// `~/.claude/projects/*.jsonl` the scribe reads (located via
+/// [`crate::catbus_agent::find_session`] at the call site; the parse itself
+/// stays here so the dashboard build works in headless too, where the
+/// catbus-gated scribe module isn't compiled).
+///
+/// Ponytail: best-effort — lines that don't deserialize are skipped and an
+/// empty/garbage transcript yields empty fields, never an error. The `Raw*`
+/// shapes mirror the scribe's private copies; unify if the scribe ever leaves
+/// its feature gate.
+// Only reachable via `tab_activity` (catbus) or the S4 unit tests; skipped in a
+// headless non-test lib build, where nothing calls it.
+#[cfg(any(feature = "catbus", test))]
+#[must_use]
+fn parse_tab_activity(jsonl: &str) -> TabActivity {
+    let mut act = TabActivity::default();
+    // tool_use id -> index in `sub_agents`, so a later tool_result flips state.
+    let mut by_id: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for line in jsonl.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(raw) = serde_json::from_str::<RawLine>(line) else {
+            continue;
+        };
+        let Some(msg) = raw.message else { continue };
+        match raw.r#type.as_str() {
+            "user" => match msg.content {
+                // A human-typed prompt is the current task (latest wins).
+                RawContent::String(s) if raw.prompt_source.as_deref() == Some("typed") => {
+                    act.current_task = Some(s);
+                }
+                // tool_result blocks close out the matching sub-agent.
+                RawContent::Blocks(blocks) => {
+                    for b in blocks {
+                        if b.r#type != "tool_result" {
+                            continue;
+                        }
+                        if let Some(i) = b.tool_use_id.and_then(|id| by_id.get(&id).copied()) {
+                            act.sub_agents[i].state = "completed".to_string();
+                        }
+                    }
+                }
+                RawContent::String(_) => {}
+            },
+            "assistant" => {
+                if let RawContent::Blocks(blocks) = msg.content {
+                    for b in blocks {
+                        if b.r#type != "tool_use" || b.name.as_deref() != Some("Task") {
+                            continue;
+                        }
+                        let name = b
+                            .input
+                            .as_ref()
+                            .and_then(|v| v.get("subagent_type"))
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("general-purpose")
+                            .to_string();
+                        let idx = act.sub_agents.len();
+                        act.sub_agents.push(SubAgent {
+                            name,
+                            state: "running".to_string(),
+                        });
+                        if let Some(id) = b.id {
+                            by_id.insert(id, idx);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    act
+}
+
+/// Locate a tab's transcript via the scribe's session discovery and distil its
+/// [`TabActivity`]. Ponytail: a `/proc` walk + full-file read per tab on every
+/// `/dashboard/state` poll — fine at flotte scale; cache off the scribe's sweep
+/// if it ever bites. Always empty when the catbus scribe is compiled out.
+#[cfg(feature = "catbus")]
+fn tab_activity(shell_pid: u32) -> TabActivity {
+    crate::catbus_agent::find_session(shell_pid)
+        .and_then(|s| std::fs::read_to_string(&s.file_path).ok())
+        .map(|txt| parse_tab_activity(&txt))
+        .unwrap_or_default()
+}
+
+#[cfg(not(feature = "catbus"))]
+fn tab_activity(_shell_pid: u32) -> TabActivity {
+    TabActivity::default()
+}
+
+// Raw transcript shapes — mirror the scribe's private copies; same gate as
+// `parse_tab_activity`, their only consumer.
+#[cfg(any(feature = "catbus", test))]
+#[derive(serde::Deserialize)]
+struct RawLine {
+    r#type: String,
+    message: Option<RawMessage>,
+    /// `"typed"` on a user line the human typed (vs a `tool_result` / reminder).
+    #[serde(rename = "promptSource")]
+    prompt_source: Option<String>,
+}
+
+#[cfg(any(feature = "catbus", test))]
+#[derive(serde::Deserialize)]
+struct RawMessage {
+    content: RawContent,
+}
+
+#[cfg(any(feature = "catbus", test))]
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum RawContent {
+    String(String),
+    Blocks(Vec<RawBlock>),
+}
+
+#[cfg(any(feature = "catbus", test))]
+#[derive(serde::Deserialize)]
+struct RawBlock {
+    r#type: String,
+    name: Option<String>,
+    input: Option<serde_json::Value>,
+    /// `tool_use` block id ↔ `tool_result` back-reference — paired to flip a
+    /// `Task()` sub-agent from "running" to "completed".
+    id: Option<String>,
+    tool_use_id: Option<String>,
+}
+
 /// One tab projected into the dashboard state: the same per-tab data as
 /// `/tabs/usage`, plus `role` (from `assignment`), the `context` subtitle, the
 /// raw `assignment`, and a ready-made `viewerUrl`. camelCase.
@@ -348,6 +500,11 @@ struct DashboardTab {
     led: Option<&'static str>,
     tokens: Option<crate::TokenUsage>,
     viewer_url: String,
+    /// S4: current task + `Task()` sub-agents, read from the tab's transcript.
+    /// Flattened → `currentTask` / `subAgents` sit on the tab for `taskChips`.
+    /// Empty (`currentTask:null`, `subAgents:[]`) when the tab has no transcript.
+    #[serde(flatten)]
+    activity: TabActivity,
 }
 
 /// A phase node with its occupants and the worst-severity led among them.
@@ -514,6 +671,9 @@ struct DashboardTabInput {
     agent_state: Option<&'static str>,
     led: Option<&'static str>,
     tokens: Option<crate::TokenUsage>,
+    /// S4 per-tab activity, read from the transcript at the call site (the pure
+    /// builder stays FS-free / unit-testable). Empty in tests and headless.
+    activity: TabActivity,
 }
 
 /// Rollup severity of a `led` slug — higher is worse. Mirrors [`crate::TabLed`]
@@ -726,6 +886,7 @@ fn build_dashboard_state(inputs: Vec<DashboardTabInput>) -> DashboardState {
                 led: t.led,
                 tokens: t.tokens,
                 viewer_url,
+                activity: t.activity,
             };
             Projected { project, phase, tab }
         })
@@ -2592,6 +2753,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                     }),
                     led: t.agent_led.map(crate::TabLed::slug),
                     tokens: t.tokens,
+                    activity: tab_activity(t.shell_pid),
                 })
                 .collect();
             drop(state);
@@ -5301,6 +5463,7 @@ mod tests {
             agent_state: None,
             led,
             tokens: None,
+            activity: TabActivity::default(),
         }
     }
 
