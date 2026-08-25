@@ -40,6 +40,13 @@ use serde::{Deserialize, Serialize};
 use crate::cli::share_link::{Endpoint, agent, discover_endpoint};
 
 const DEFAULT_INTERVAL_SECS: u64 = 5;
+/// Bounded retry budget for a TRANSIENT skip — a target that IS (or should
+/// become) an agent tab but the daemon hasn't detected live yet (startup /
+/// resume / the restart-injection window). At the default 5s interval this is
+/// ~30s of round-based backoff before the message is abandoned (and logged),
+/// so a still-booting orchestrator's swamped input isn't lost on the first
+/// round. A PERMANENT skip (daemon/shell) never retries — it's consumed at once.
+const MAX_SKIP_ATTEMPTS: u32 = 6;
 /// Delay before the submitting Enter, so the typed text is ingested as one
 /// paste before `\r` lands (see the dispatch paste-submit fix, #31/#32). A
 /// fixed floor here; a follow-up should reuse dispatch's settle poll.
@@ -60,10 +67,21 @@ pub struct SwampEntry {
     /// Who enqueued it, if given (audit / `--from`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
+    /// Delivery attempts already spent on this entry (transient-skip retries).
+    /// Absent/0 on a fresh enqueue; bumped each time it's re-queued for a target
+    /// not yet live. Omitted from the JSONL when 0 to keep legacy lines clean.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub attempts: u32,
 }
 
 const fn default_true() -> bool {
     true
+}
+
+// serde's `skip_serializing_if` mandates a `&T` predicate, hence the reference.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
 }
 
 fn state_file(name: &str) -> PathBuf {
@@ -99,6 +117,10 @@ pub fn encode_swamp_line(e: &SwampEntry) -> String {
 #[derive(Debug, Deserialize)]
 struct TabInfo {
     id: String,
+    /// Tab name — classifies meta/daemon targets (brain/aligator/scribe/…) as a
+    /// PERMANENT skip so we never retry-spam them.
+    #[serde(default)]
+    name: String,
     #[serde(default)]
     agent_kind: Option<String>,
     #[serde(default)]
@@ -110,17 +132,94 @@ struct TabsResponse {
     tabs: Vec<TabInfo>,
 }
 
-/// The confused-deputy guard: `uuid` must be a **live Claude agent tab**
-/// (`agent_kind == "claude"` AND a non-empty session id). Arbitrary text is
-/// only ever delivered to a tab that expects programmatic input — never a
-/// plain shell or a human terminal. Mirrors `brain`'s own target gate.
+/// A single tab is a **live Claude agent tab**: `agent_kind == "claude"` AND a
+/// non-empty session id. The confused-deputy delivery gate — arbitrary text goes
+/// only to a tab that expects programmatic input, never a shell/human terminal.
 #[must_use]
-fn is_deliverable(tabs: &[TabInfo], uuid: &str) -> bool {
-    tabs.iter().any(|t| {
-        t.id == uuid
-            && t.agent_kind.as_deref() == Some("claude")
-            && !t.agent_session_id.as_deref().unwrap_or("").is_empty()
-    })
+fn is_live_claude(t: &TabInfo) -> bool {
+    t.agent_kind.as_deref() == Some("claude") && !t.agent_session_id.as_deref().unwrap_or("").is_empty()
+}
+
+/// Why a swamp target was skipped this round — the fix for the restart-injection
+/// drop (a message to a not-yet-live tab was consumed on the first miss).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipKind {
+    /// The target IS (or should become) an agent tab but the daemon hasn't
+    /// detected it live yet — startup / resume / the restart window. Retry
+    /// bounded ([`MAX_SKIP_ATTEMPTS`]) before abandoning; do NOT drop on miss.
+    Transient,
+    /// The target is a meta/daemon tab (by name) or a plain persistent shell — it
+    /// will never be a valid delivery target. Consume now (confused-deputy).
+    Permanent,
+}
+
+/// The guard verdict for one target this round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Guard {
+    /// A live Claude tab — deliver.
+    Deliver,
+    /// Not deliverable this round — skip, transiently (retry) or permanently.
+    Skip(SkipKind),
+}
+
+/// Classify a swamp target: deliver, transient-skip (retry), or permanent-skip
+/// (consume). The caller chose `uuid` deliberately, so a target that merely
+/// isn't live YET (a Claude tab whose session hasn't re-attached after a
+/// restart, or a tab the daemon hasn't listed yet) is TRANSIENT — retried, not
+/// dropped. A meta/daemon name or a plain shell (no `agent_kind`) is PERMANENT.
+/// Tab names (case-insensitive substrings) that are meta/daemon tabs — a
+/// PERMANENT skip (never retry-spam a daemon). Kept LOCAL so this `PoC` stays
+/// self-contained; the harness fork shares the same list via `clarify`.
+const META_DAEMON_NAMES: [&str; 8] = [
+    "brain", "aligator", "scribe", "ange", "ford", "sage", "tichef", "watcher",
+];
+
+/// Is `name` a meta/daemon tab by NAME (brain/aligator/scribe/…)? Case-insensitive
+/// substring. Name-only on purpose: an orchestrator ROLE is a legit swamp target
+/// and must stay transient. Pure.
+#[must_use]
+fn is_meta_daemon_name(name: &str) -> bool {
+    let lname = name.to_ascii_lowercase();
+    META_DAEMON_NAMES.iter().any(|d| lname.contains(d))
+}
+
+/// Pure — the tab list is fetched in [`tick`].
+#[must_use]
+fn classify_target(tabs: &[TabInfo], uuid: &str) -> Guard {
+    let Some(t) = tabs.iter().find(|t| t.id == uuid) else {
+        // Ghost: a deliberately-targeted uuid the daemon doesn't list (yet) — a
+        // spawn/restart gap. Bounded retry, then abandon; never a silent drop.
+        return Guard::Skip(SkipKind::Transient);
+    };
+    if is_live_claude(t) {
+        return Guard::Deliver;
+    }
+    // A meta/daemon tab must never be retry-spammed (confused-deputy), even if it
+    // somehow carries an agent_kind. Name-only (an orchestrator ROLE is a legit
+    // target and stays transient).
+    if is_meta_daemon_name(&t.name) {
+        return Guard::Skip(SkipKind::Permanent);
+    }
+    // TRANSIENT = an agent tab (durable `agent_kind`) whose session hasn't
+    // attached YET — starting / resuming / the restart-injection window; it may
+    // still become a live Claude target, so retry. Anything else — a live
+    // NON-Claude agent (session up but wrong kind, never a Claude target) or a
+    // plain shell (no agent_kind) — is PERMANENT: consume now.
+    let starting_agent = t.agent_kind.is_some() && t.agent_session_id.as_deref().unwrap_or("").is_empty();
+    if starting_agent {
+        Guard::Skip(SkipKind::Transient)
+    } else {
+        Guard::Skip(SkipKind::Permanent)
+    }
+}
+
+/// Should a transient skip be retried, given the tries its entry already spent?
+///
+/// Keep re-queuing while under [`MAX_SKIP_ATTEMPTS`], else abandon. Pure boundary
+/// so the "N tries then give up" bound is unit-tested without a live daemon.
+#[must_use]
+pub const fn should_retry(attempts: u32) -> bool {
+    attempts + 1 < MAX_SKIP_ATTEMPTS
 }
 
 /// Clamp a persisted cursor to `[0, len]` — if the swamp was truncated or
@@ -207,35 +306,36 @@ pub enum Decision {
         input: String,
         submit: bool,
     },
-    /// Target isn't a live Claude tab — log + skip (guard tripped).
-    Skip { index: usize, tab: String },
+    /// Target isn't a live Claude tab — skip. `kind` decides whether `tick`
+    /// retries (transient) or consumes it (permanent).
+    Skip { index: usize, tab: String, kind: SkipKind },
 }
 
-/// Plan one round: decide deliver-vs-skip for every entry past `cursor`.
+/// Plan one round: classify every entry past `cursor` into deliver / skip.
 ///
 /// Pure — the HTTP calls (fetch `/tabs`, POST input) live in [`tick`]; this is
-/// the routing logic, unit-tested with a fake predicate. `index` is the entry's
-/// absolute position (the new cursor is the last index + 1).
+/// the routing logic, unit-tested with a fake classifier. `classify` returns the
+/// [`Guard`] verdict for a target uuid; `index` is the entry's absolute position.
 #[must_use]
-pub fn plan_round(entries: &[SwampEntry], cursor: usize, is_ok: impl Fn(&str) -> bool) -> Vec<Decision> {
+pub fn plan_round(entries: &[SwampEntry], cursor: usize, classify: impl Fn(&str) -> Guard) -> Vec<Decision> {
     let start = clamp_cursor(cursor, entries.len());
     entries[start..]
         .iter()
         .enumerate()
         .map(|(offset, e)| {
             let index = start + offset;
-            if is_ok(&e.tab) {
-                Decision::Deliver {
+            match classify(&e.tab) {
+                Guard::Deliver => Decision::Deliver {
                     index,
                     tab: e.tab.clone(),
                     input: e.input.clone(),
                     submit: e.submit,
-                }
-            } else {
-                Decision::Skip {
+                },
+                Guard::Skip(kind) => Decision::Skip {
                     index,
                     tab: e.tab.clone(),
-                }
+                    kind,
+                },
             }
         })
         .collect()
@@ -314,7 +414,7 @@ fn tick(cursor: &mut usize) -> Result<(), String> {
         .read_json()
         .map_err(|e| format!("parse /tabs: {e}"))?;
 
-    for decision in plan_round(&entries, *cursor, |uuid| is_deliverable(&tabs.tabs, uuid)) {
+    for decision in plan_round(&entries, *cursor, |uuid| classify_target(&tabs.tabs, uuid)) {
         match decision {
             Decision::Deliver {
                 index,
@@ -341,10 +441,45 @@ fn tick(cursor: &mut usize) -> Result<(), String> {
                     return Ok(());
                 }
             },
-            Decision::Skip { index, tab } => {
-                println!("🐊 aligator: SKIP {tab} — not a live Claude tab (confused-deputy guard)");
+            // Permanent: a daemon/shell target — consume it (confused-deputy).
+            Decision::Skip {
+                index,
+                tab,
+                kind: SkipKind::Permanent,
+            } => {
+                println!("🐊 aligator: SKIP {tab} — meta/daemon or plain shell (confused-deputy guard), consumed");
                 *cursor = index + 1;
                 write_cursor(*cursor);
+            }
+            // Transient: an agent tab not live YET. Consume THIS position but
+            // re-queue a copy (attempts+1) so it's retried a later round instead
+            // of dropped — the restart-injection fix. Advancing the cursor keeps
+            // the queue non-blocking (later live tabs still get delivered now);
+            // the re-appended copy is preserved by the end-of-round compaction.
+            Decision::Skip {
+                index,
+                tab,
+                kind: SkipKind::Transient,
+            } => {
+                let spent = entries[index].attempts;
+                *cursor = index + 1;
+                write_cursor(*cursor);
+                if should_retry(spent) {
+                    let mut retry = entries[index].clone();
+                    retry.attempts = spent + 1;
+                    match append_swamp_line(&swamp_path(), &retry) {
+                        Ok(()) => println!(
+                            "🐊 aligator: retry {tab} — not live yet (attempt {n}/{MAX_SKIP_ATTEMPTS})",
+                            n = spent + 1,
+                        ),
+                        // Re-queue write failed: better a dropped retry than a loop.
+                        Err(e) => eprintln!("🐊 aligator: re-queue {tab} failed: {e} — dropping"),
+                    }
+                } else {
+                    eprintln!(
+                        "🐊 aligator: ABANDON {tab} — still not a live Claude tab after {MAX_SKIP_ATTEMPTS} attempts; dropping message"
+                    );
+                }
             }
         }
     }
@@ -482,6 +617,7 @@ pub fn run_swamp(args: &[String]) -> i32 {
         input: parsed.input.clone(),
         submit: parsed.submit,
         from: parsed.from,
+        attempts: 0,
     };
     match append_swamp_line(&swamp_path(), &entry) {
         Ok(()) => {
@@ -505,8 +641,10 @@ mod tests {
     use super::*;
 
     fn tab(id: &str, kind: Option<&str>, session: Option<&str>) -> TabInfo {
+        // name defaults to the id — daemon-name tests pass id == "aligator" etc.
         TabInfo {
             id: id.into(),
+            name: id.into(),
             agent_kind: kind.map(Into::into),
             agent_session_id: session.map(Into::into),
         }
@@ -519,6 +657,7 @@ mod tests {
             input: input.into(),
             submit,
             from: None,
+            attempts: 0,
         }
     }
 
@@ -536,7 +675,7 @@ mod tests {
         assert_eq!(kept, entries[2..].to_vec());
         // (a) no re-delivery of delivered — a re-plan from the reset cursor never
         //     touches t0/t1 (they're gone from the compacted file).
-        let plan = plan_round(&kept, 0, |_| true);
+        let plan = plan_round(&kept, 0, |_| Guard::Deliver);
         let replanned: Vec<&str> = plan
             .iter()
             .filter_map(|d| match d {
@@ -566,17 +705,54 @@ mod tests {
 
     #[test]
     fn guard_delivers_only_to_live_claude_tabs() {
+        // The confused-deputy gate, expressed through the production classifier:
+        // ONLY a live Claude tab (claude + session) is a Deliver — everything else
+        // is a Skip. (The transient-vs-permanent split is asserted separately in
+        // `classify_target_splits_transient_from_permanent`.)
         let tabs = vec![
             tab("claude-live", Some("claude"), Some("sess-1")),
             tab("claude-nosession", Some("claude"), None),
             tab("shell", None, None),
             tab("catbus", Some("catbus"), Some("s2")),
         ];
-        assert!(is_deliverable(&tabs, "claude-live"));
-        assert!(!is_deliverable(&tabs, "claude-nosession"));
-        assert!(!is_deliverable(&tabs, "shell"));
-        assert!(!is_deliverable(&tabs, "catbus"));
-        assert!(!is_deliverable(&tabs, "ghost"));
+        assert_eq!(classify_target(&tabs, "claude-live"), Guard::Deliver);
+        assert!(matches!(classify_target(&tabs, "claude-nosession"), Guard::Skip(_)));
+        assert!(matches!(classify_target(&tabs, "shell"), Guard::Skip(_)));
+        assert!(matches!(classify_target(&tabs, "catbus"), Guard::Skip(_)));
+        assert!(matches!(classify_target(&tabs, "ghost"), Guard::Skip(_)));
+    }
+
+    #[test]
+    fn classify_target_splits_transient_from_permanent() {
+        let tabs = vec![
+            tab("claude-live", Some("claude"), Some("sess-1")),
+            // A Claude tab whose session hasn't re-attached — the restart-injection
+            // case: still becoming live → TRANSIENT (retry, don't drop).
+            tab("claude-booting", Some("claude"), None),
+            // A live NON-Claude agent (session up, wrong kind) — never a Claude
+            // target → PERMANENT.
+            tab("catbus-live", Some("catbus"), Some("s2")),
+            // A plain persistent shell (no agent_kind) → PERMANENT (confused-deputy).
+            tab("shell", None, None),
+            // A daemon by NAME, even mid-boot → PERMANENT (never retry-spam it).
+            tab("aligator", Some("claude"), None),
+        ];
+        assert_eq!(classify_target(&tabs, "claude-live"), Guard::Deliver);
+        assert_eq!(
+            classify_target(&tabs, "claude-booting"),
+            Guard::Skip(SkipKind::Transient),
+            "a resuming Claude tab is retried, not dropped (restart-injection fix)"
+        );
+        assert_eq!(classify_target(&tabs, "catbus-live"), Guard::Skip(SkipKind::Permanent));
+        assert_eq!(classify_target(&tabs, "shell"), Guard::Skip(SkipKind::Permanent));
+        assert_eq!(
+            classify_target(&tabs, "aligator"),
+            Guard::Skip(SkipKind::Permanent),
+            "a meta/daemon name is permanent even with agent_kind=claude"
+        );
+        // A deliberately-targeted uuid the daemon doesn't list yet (spawn/restart
+        // gap) is TRANSIENT — bounded retry, never a silent first-round drop.
+        assert_eq!(classify_target(&tabs, "ghost"), Guard::Skip(SkipKind::Transient));
     }
 
     #[test]
@@ -603,6 +779,7 @@ not json at all
             input: "run the tests".into(),
             submit: false,
             from: Some("bot-orc".into()),
+            attempts: 3, // a re-queued entry roundtrips its retry counter
         };
         let line = encode_swamp_line(&e);
         assert!(line.ends_with('\n'));
@@ -686,7 +863,14 @@ not json at all
             entry("shell", "rm -rf /", true), // 2: guard trips
             entry("claude", "again", false),  // 3: deliverable, no submit
         ];
-        let ok = |uuid: &str| uuid == "claude";
+        // Classifier: "claude" delivers; anything else is a permanent skip here.
+        let ok = |uuid: &str| {
+            if uuid == "claude" {
+                Guard::Deliver
+            } else {
+                Guard::Skip(SkipKind::Permanent)
+            }
+        };
         let plan = plan_round(&entries, 1, ok);
         assert_eq!(
             plan,
@@ -699,7 +883,8 @@ not json at all
                 },
                 Decision::Skip {
                     index: 2,
-                    tab: "shell".into()
+                    tab: "shell".into(),
+                    kind: SkipKind::Permanent
                 },
                 Decision::Deliver {
                     index: 3,
@@ -762,7 +947,7 @@ not json at all
         // is IGNORED (`let _ =`), so a dropped Enter leaves the entry consumed but
         // typed-yet-UNsubmitted, and it is NOT retried. Non-atomic by construction.
         let e = entry("claude", "run the tests", true);
-        let plan = plan_round(std::slice::from_ref(&e), 0, |_| true);
+        let plan = plan_round(std::slice::from_ref(&e), 0, |_| Guard::Deliver);
         match &plan[0] {
             Decision::Deliver { input, submit, .. } => {
                 assert_eq!(input, "run the tests", "input is the raw text — Enter is NOT appended");
@@ -781,25 +966,49 @@ not json at all
     }
 
     #[test]
-    fn skip_consumes_the_entry_it_is_not_retried() {
-        // CHARACTERIZATION + SUSPECTED DELIVERY GAP (documented, NOT fixed —
-        // escalated to tichef). When the confused-deputy guard trips (target isn't a
-        // live Claude tab THIS round), plan_round emits a Skip carrying the entry's
-        // index; tick then advances the cursor to index+1 and later compacts
-        // entries[cursor..]. So a Skipped entry is neither delivered NOR kept — it is
-        // DROPPED PERMANENTLY, never retried. A message swamped to a tab that is
-        // momentarily not-yet-a-live-Claude-tab (startup / transient) is thus lost on
-        // the first round. Correct for a real shell (safety), but a delivery hazard
-        // for a legit Claude tab not yet detected. Pinned here as the real behavior.
+    fn transient_skip_is_retried_bounded_permanent_skip_is_consumed() {
+        // FIXED (#35, restart-injection). A guard-tripped target is no longer
+        // uniformly dropped: `plan_round` now carries the skip's KIND, and `tick`
+        // treats the two kinds differently.
+        //
+        // TRANSIENT (a target still becoming a live Claude tab — startup / resume /
+        // the restart window): NOT dropped. `tick` re-queues a copy with
+        // attempts+1, so it's retried a later round, up to MAX_SKIP_ATTEMPTS, then
+        // abandoned (and logged). The `should_retry` boundary pins that bound.
         let e = entry("not-live-yet", "please run tests", true);
-        let plan = plan_round(std::slice::from_ref(&e), 0, |_| false); // guard trips
+        let plan = plan_round(std::slice::from_ref(&e), 0, |_| Guard::Skip(SkipKind::Transient));
         assert_eq!(
             plan,
             vec![Decision::Skip {
                 index: 0,
-                tab: "not-live-yet".into()
+                tab: "not-live-yet".into(),
+                kind: SkipKind::Transient,
             }],
-            "a guard-tripped target is Skipped (index carried) -> tick consumes it (drop, no retry)"
+            "a not-yet-live target is a TRANSIENT skip (tick re-queues it, not a drop)"
+        );
+        // Bounded retry: retried while under the cap, abandoned at it. With
+        // MAX_SKIP_ATTEMPTS = 6 the entry is tried 6 times (attempts 0..=5) then
+        // given up — no infinite loop, no permanent silent loss on a real tab.
+        for spent in 0..MAX_SKIP_ATTEMPTS - 1 {
+            assert!(should_retry(spent), "attempt {spent} is under the cap → retry");
+        }
+        assert!(
+            !should_retry(MAX_SKIP_ATTEMPTS - 1),
+            "the last attempt exhausts the budget → abandon (logged)"
+        );
+
+        // PERMANENT (a daemon/shell target): consumed at once, exactly as before —
+        // the confused-deputy safety property is unchanged.
+        let p = entry("some-shell", "rm -rf /", true);
+        let plan = plan_round(std::slice::from_ref(&p), 0, |_| Guard::Skip(SkipKind::Permanent));
+        assert_eq!(
+            plan,
+            vec![Decision::Skip {
+                index: 0,
+                tab: "some-shell".into(),
+                kind: SkipKind::Permanent,
+            }],
+            "a daemon/shell target is a PERMANENT skip (tick consumes it — safety)"
         );
     }
 }
