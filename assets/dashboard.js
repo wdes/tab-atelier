@@ -252,6 +252,85 @@ export function overviewLayout(state) {
   return { order: ["META", "REPOS", "UNASSIGNED"], meta, repos, unassigned };
 }
 
+// Pure: the project a tab is assigned to. "project:phase/role" -> project;
+// a bare "phase/role" (no override) -> null.
+function assignmentProject(assignment) {
+  if (!assignment || typeof assignment !== "string") return null;
+  const colon = assignment.indexOf(":");
+  return colon > 0 ? assignment.slice(0, colon) : null;
+}
+
+// Meta-class roles: itinerant specialists that live in the Méta band unless they
+// join a team. tichef is meta too but pinned (handled first in resolveAltitude).
+function isMetaRole(role) {
+  const r = String(role || "").toLowerCase();
+  return r === "tichef" || r === "planner" || r === "refiner" || r === "auditor" || r === "scoper";
+}
+
+// Pure: a tab's dynamic altitude band (Inc7 S2). Encodes the 4 movements + the
+// tichef pin (docs/dashboard-increment-7.md "altitude dynamique"):
+//   - tichef -> always Méta (pinned, even while serving);
+//   - a meta specialist SERVING a team -> that team's band, marked reinforcement;
+//   - a solo meta specialist -> Méta;
+//   - an orchestrator -> Orchestrateurs;
+//   - any tab with an assignment -> Workers, under its team;
+//   - otherwise -> Freelancers.
+export function resolveAltitude(tab, state) {
+  const t = tab || {};
+  const role = String(t.role || "").toLowerCase();
+  if (role === "tichef") return { band: "meta" };
+  if (isMetaRole(role)) {
+    if (t.serving) return { band: "worker", team: t.serving, reinforcement: true };
+    const override = assignmentProject(t.assignment);
+    if (override) return { band: "worker", team: override, reinforcement: true };
+    return { band: "meta" };
+  }
+  if (role === "orchestrator") return { band: "orchestrator", team: assignmentProject(t.assignment) };
+  if (t.assignment) return { band: "worker", team: assignmentProject(t.assignment) };
+  return { band: "freelancer" };
+}
+
+// Pure: the 4-band compact org-chart model (Inc7 S1). Méta / Orchestrateurs (each
+// with its served repo(s) -> workers chain) / Workers (assigned but orphan) /
+// Freelancers (unassigned). Degrades cleanly (no services/assignment -> non-mapped
+// tabs land in Freelancers). Never throws.
+export function bandLayout(state) {
+  const s = state || {};
+  const projects = Array.isArray(s.projects) ? s.projects : [];
+  const unassigned = Array.isArray(s.unassigned) ? s.unassigned : [];
+  const allTabs = [];
+  for (const p of projects) for (const t of projectTabs(p)) allTabs.push(t);
+
+  const meta = allTabs.filter((t) => resolveAltitude(t, s).band === "meta");
+
+  const orchestrators = allTabs
+    .filter((t) => String(t && t.role || "").toLowerCase() === "orchestrator")
+    .map((lead) => {
+      const workers = allTabs.filter((t) => t && t.parentTabId === lead.id);
+      const leadProj = assignmentProject(lead.assignment);
+      const byRepo = new Map();
+      for (const w of workers) {
+        const repo = assignmentProject(w.assignment) || leadProj || lead.id;
+        if (!byRepo.has(repo)) byRepo.set(repo, []);
+        byRepo.get(repo).push(w);
+      }
+      if (!byRepo.size && leadProj) byRepo.set(leadProj, []);
+      const repos = [...byRepo.entries()].map(([repo, ws]) => ({ repo, workers: ws }));
+      return { lead, repos };
+    });
+
+  // Workers band = assigned workers NOT already shown under a chain (orphans).
+  const shown = new Set();
+  for (const o of orchestrators) for (const r of o.repos) for (const w of r.workers) shown.add(w.id);
+  const workers = allTabs.filter((t) => resolveAltitude(t, s).band === "worker" && !shown.has(t.id));
+
+  const freelancers = [...unassigned];
+  for (const t of allTabs) if (resolveAltitude(t, s).band === "freelancer" && !freelancers.includes(t)) freelancers.push(t);
+  for (const t of (Array.isArray(s.unmapped) ? s.unmapped : [])) if (!freelancers.includes(t)) freelancers.push(t);
+
+  return { meta, orchestrators, workers, freelancers };
+}
+
 // Pure: the service nesting (Inc6 S4). One entry per service, in order, wrapping
 // its sub-repos; a single-repo service is `mono` (not over-nested). Repo entries
 // are normalised to {name} whether the server sends strings or objects. Null-safe.
@@ -398,6 +477,8 @@ let currentNodes = new Map();
 let currentUnmapped = [];
 // Per-tab RAM/CPU from /tabs/usage, keyed by id (tooltip enrichment).
 let usageById = new Map();
+// Last band-chart model, for the flicker-free in-place patch (Inc7 S3).
+let prevBandModel = null;
 // The drilled-in project (null = level 0 / grid). Read from ?project= at boot.
 let currentProject = null;
 // Last state received, so a view switch (drill-in / back) can re-render without
@@ -445,6 +526,7 @@ function tabEntryHtml(tab, usage) {
     <span class="tab-state">${escapeHtml(tab.agentState || "—")}</span>
     <span class="tab-tokens">${escapeHtml(fmtTokens(tab.tokens))}</span>
     ${chips ? `<span class="tab-details">${chips}</span>` : ""}
+    ${taskChipsHtml(tab)}
   </li>`;
 }
 
@@ -459,6 +541,11 @@ function applyState(state) {
 // view switch (drill-in / back).
 function render() {
   const view = resolveView(currentState, currentProject);
+  // The org-chart reserves a minimum working area so it stays pannable (and its
+  // scroll position survives a refresh) — a no-op once a real fleet overflows.
+  if (typeof document !== "undefined") {
+    document.body.classList.toggle("band-view", view.mode === "grid" && hasTichef(currentState));
+  }
   if (view.mode === "grid") renderGrid();
   else renderDiagram(view);
   setViewChrome(view);
@@ -474,6 +561,179 @@ function bandHtml(label, inner) {
 function unassignedTabHtml(tab) {
   const t = tab || {};
   return `<div class="unassigned-tab" data-viewer="${escapeHtml(t.viewerUrl || "")}">${escapeHtml(t.name || "tab")}</div>`;
+}
+
+// Pure: the per-tab task/sub-agents render model (Inc7 S4-web). Reads the rust
+// S4 fields (camelCase on DashboardTab): currentTask (string) + subAgents[]
+// ({name, state}). Returns a chip list: one "task" chip (label = the task) then
+// one "subagent" chip per invoked Task() (carrying its name + state). A tab with
+// no transcript data -> [] (degrades cleanly). Null-safe.
+export function taskChips(tab) {
+  const t = tab || {};
+  const chips = [];
+  if (t.currentTask && String(t.currentTask).trim()) {
+    chips.push({ kind: "task", label: String(t.currentTask) });
+  }
+  for (const s of Array.isArray(t.subAgents) ? t.subAgents : []) {
+    if (!s) continue;
+    chips.push({ kind: "subagent", name: s.name, state: s.state, label: s.name });
+  }
+  return chips;
+}
+
+// Pure: the S4 chips of a tab -> compact HTML (empty when there are none).
+function taskChipsHtml(tab) {
+  const chips = taskChips(tab);
+  if (!chips.length) return "";
+  const items = chips
+    .map((c) =>
+      c.kind === "task"
+        ? `<span class="task-chip" title="current task">${escapeHtml(c.label)}</span>`
+        : `<span class="subagent-chip state-${escapeHtml(c.state || "")}" title="sub-agent ${escapeHtml(c.name || "")} — ${escapeHtml(c.state || "")}">${escapeHtml(c.name || "")}</span>`
+    )
+    .join("");
+  return `<span class="task-chips">${items}</span>`;
+}
+
+// Pure: the flicker-free refresh diff (Inc7 S3, Zoetrope borrow). Compares two
+// models by STABLE node id and returns the minimal op list: `add` for a new id,
+// `remove` for a gone id, `update` for a changed node, nothing for an unchanged
+// one. Callers patch the DOM in place from these ops (no clear-and-rebuild), so
+// node identity + selection + scroll + hover survive a poll. Malformed-safe.
+export function diffRender(prev, next) {
+  const prevNodes = prev && Array.isArray(prev.nodes) ? prev.nodes : [];
+  const nextNodes = next && Array.isArray(next.nodes) ? next.nodes : [];
+  const prevById = new Map(prevNodes.map((n) => [n && n.id, n]));
+  const nextById = new Map(nextNodes.map((n) => [n && n.id, n]));
+  const ops = [];
+  for (const n of nextNodes) {
+    if (!n) continue;
+    const p = prevById.get(n.id);
+    if (!p) ops.push({ op: "add", id: n.id, node: n });
+    else if (JSON.stringify(p) !== JSON.stringify(n)) ops.push({ op: "update", id: n.id, node: n });
+  }
+  for (const p of prevNodes) if (p && !nextById.has(p.id)) ops.push({ op: "remove", id: p.id });
+  return ops;
+}
+
+// --- Inc7 S1: compact 4-band org-chart ---
+
+// Activation gate: a coordinated fleet (a tichef is present) gets the Inc7 4-band
+// org-chart; fixtures/states without a tichef keep the Inc5/Inc6 views.
+function hasTichef(state) {
+  const projects = Array.isArray(state && state.projects) ? state.projects : [];
+  for (const p of projects) for (const t of projectTabs(p)) {
+    if (String(t && t.role || "").toLowerCase() === "tichef") return true;
+  }
+  return false;
+}
+
+// Inner content of a band node: name + renfort badge (S2) + task/sub-agent chips
+// (S4). Factored so the S3 in-place patch can refresh it without recreating the
+// element (identity + scroll survive).
+function bandNodeInner(tab) {
+  const t = tab || {};
+  const alt = resolveAltitude(t, currentState);
+  const badge = alt.reinforcement ? ` <span class="renfort-badge" title="en renfort dans ${escapeHtml(alt.team || "")}">renfort</span>` : "";
+  return `${escapeHtml(t.name || "tab")}${badge}${taskChipsHtml(t)}`;
+}
+
+function bandNodeHtml(tab, cls) {
+  const t = tab || {};
+  const led = ledClass(t.led != null ? t.led : t.rollupLed);
+  const reinf = resolveAltitude(t, currentState).reinforcement ? " reinforcement" : "";
+  return `<div class="band-node ${cls} ${led}${reinf}" data-tab-id="${escapeHtml(t.id || "")}" data-viewer="${escapeHtml(t.viewerUrl || "")}" title="${escapeHtml(t.name || "")}">${bandNodeInner(t)}</div>`;
+}
+
+// Orchestrator chain: lead -> served repo sub-nodes -> workers (parentTabId).
+function orchChainHtml(orch) {
+  const lead = orch.lead || {};
+  const repos = (orch.repos || [])
+    .map((r) => `<div class="band-repo" data-repo="${escapeHtml(r.repo)}"><div class="repo-name">${escapeHtml(r.repo)}</div><div class="repo-workers">${(r.workers || []).map((w) => bandNodeHtml(w, "worker")).join("")}</div></div>`)
+    .join("");
+  return `<div class="band-orch" data-orch="${escapeHtml(lead.id || "")}">${bandNodeHtml(lead, "lead")}<div class="orch-repos">${repos}</div></div>`;
+}
+
+function bandHtml7(id, label, inner) {
+  return `<div class="band" data-band="${id}"><div class="band-label">${escapeHtml(label)}</div><div class="band-row">${inner}</div></div>`;
+}
+
+// Live tab objects keyed by id, refreshed each build so the in-place patch can
+// re-render a node's content (chips) from fresh data.
+let bandTabById = new Map();
+
+// The flat, stable-id model the S3 diff runs on: every band node with the fields
+// that affect its rendering — its led AND a task signature (S4 chips), so a task
+// change also produces an `update` op. Order-independent (keyed by id).
+function buildBandModel(state) {
+  const bl = bandLayout(state);
+  const nodes = [];
+  bandTabById = new Map();
+  const push = (t) => {
+    if (!t || !t.id) return;
+    bandTabById.set(t.id, t);
+    const led = t.led != null ? t.led : (t.rollupLed != null ? t.rollupLed : null);
+    const subs = Array.isArray(t.subAgents) ? t.subAgents.map((s) => s && `${s.name}:${s.state}`).join(",") : "";
+    nodes.push({ id: t.id, led, task: `${t.currentTask || ""}|${subs}` });
+  };
+  bl.meta.forEach(push);
+  for (const o of bl.orchestrators) { push(o.lead); for (const r of o.repos) r.workers.forEach(push); }
+  bl.workers.forEach(push);
+  bl.freelancers.forEach(push);
+  return { nodes };
+}
+
+// Patch one band node in place (no rebuild) — refresh its led class AND its inner
+// content (name + chips) from fresh data, keeping the SAME element so its identity,
+// selection and scroll survive (Inc7 S3).
+function patchBandNode(id, node) {
+  const el = document.querySelector(`.band-node[data-tab-id="${(typeof CSS !== "undefined" && CSS.escape) ? CSS.escape(id) : id}"]`);
+  if (!el) return;
+  for (const c of [...el.classList]) if (c.indexOf("led-") === 0) el.classList.remove(c);
+  el.classList.add(ledClass(node.led));
+  const tab = bandTabById.get(id);
+  if (tab) el.innerHTML = bandNodeInner(tab);
+}
+
+// Refresh the band chart flicker-free: rebuild only on a structural change
+// (add/remove) or when the chart isn't currently mounted; otherwise patch the
+// changed nodes in place (Inc7 S3).
+function renderBandOrPatch() {
+  const grid = document.getElementById("project-grid");
+  if (!grid) return;
+  const next = buildBandModel(currentState);
+  const mounted = !!grid.querySelector("[data-band]");
+  const ops = diffRender(prevBandModel, next);
+  const structural = ops.some((o) => o.op === "add" || o.op === "remove");
+  if (!prevBandModel || !mounted || structural) {
+    renderBandChart();
+  } else {
+    for (const op of ops) if (op.op === "update") patchBandNode(op.id, op.node);
+  }
+  prevBandModel = next;
+}
+
+// Full build of the 4-band chart (S1). S3 patches it in place between structural
+// changes; this rebuild runs on first render and on any add/remove.
+function renderBandChart() {
+  const grid = document.getElementById("project-grid");
+  if (!grid) return;
+  const bl = bandLayout(currentState);
+  const meta = bl.meta.map((t) => bandNodeHtml(t, "meta")).join("");
+  const orchs = bl.orchestrators.map(orchChainHtml).join("");
+  const workers = bl.workers.map((t) => bandNodeHtml(t, "worker")).join("");
+  const free = bl.freelancers.map((t) => bandNodeHtml(t, "freelancer")).join("");
+  grid.innerHTML =
+    bandHtml7("meta", "Méta", meta) +
+    bandHtml7("orchestrators", "Orchestrateurs", orchs) +
+    bandHtml7("workers", "Workers", workers) +
+    bandHtml7("freelancers", "Freelancers", free);
+  const layer = document.getElementById("lineage-layer");
+  if (layer) layer.innerHTML = "";
+  currentNodes = new Map();
+  currentUnmapped = [];
+  renderRehome([]);
+  renderUnmapped();
 }
 
 // --- Inc6 S2/S4: org-chart (méta on top / team lead + workers / serving joins) ---
@@ -548,6 +808,12 @@ function renderOrgChart() {
 function renderGrid() {
   const grid = document.getElementById("project-grid");
   if (!grid) return;
+  // Inc7: a coordinated fleet (tichef present) gets the 4-band compact org-chart,
+  // refreshed flicker-free (in-place patch between structural changes).
+  if (hasTichef(currentState)) {
+    renderBandOrPatch();
+    return;
+  }
   // Inc6: when the server exposes the service dimension, show the org-chart.
   if (Array.isArray(currentState && currentState.services) && currentState.services.length) {
     renderOrgChart();
