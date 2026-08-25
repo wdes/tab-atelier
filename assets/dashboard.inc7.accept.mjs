@@ -58,7 +58,8 @@ const bandState = (kbLed = "working") => ({
         pTab({ id: "w4", name: "ta-w4", role: "worker", parentTabId: "o2", assignment: "fx:build/worker", led: "idle" }),
       ] }], unmapped: [] },
     { name: "méta", isMeta: true, hasOrchestrator: false, orchestrators: [],
-      nodes: [], unmapped: [pTab({ id: "tc", name: "ta-tichef", role: "tichef", led: "idle" }), pTab({ id: "p", name: "ta-planner", role: "planner", led: "idle" })] },
+      // Live shape: the tichef's real role is "manager" (assignment meta/manager).
+      nodes: [], unmapped: [pTab({ id: "tc", name: "ta-tichef", role: "manager", assignment: "meta/manager", led: "idle" }), pTab({ id: "p", name: "ta-planner", role: "planner", led: "idle" })] },
   ],
 });
 
