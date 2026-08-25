@@ -23,6 +23,9 @@ impl Lang {
     pub const ALL: &[Self] = &[Self::En, Self::Fr];
 }
 
+// The i18n table defines EVERY UI label (EN/FR both fill all fields); some
+// aren't wired into a render site yet, so gui builds would flag them field-by-
+// field. Kept as a complete table — the allow covers the not-yet-wired labels.
 #[allow(dead_code)]
 pub struct Strings {
     pub terminal: &'static str,
