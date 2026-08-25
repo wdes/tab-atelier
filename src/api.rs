@@ -706,6 +706,9 @@ fn parse_assignment(a: &str) -> (Option<String>, String, String) {
 /// One re-home lifecycle step: the wire slug + its French progress-badge label.
 pub struct RehomeStep {
     pub slug: &'static str,
+    /// Read only by `rehome_badge` (a GUI-only consumer, app.rs); `REHOME_STEPS`
+    /// still sets it in both editions, so it's dead — not absent — in headless.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
     pub label: &'static str,
 }
 
@@ -743,6 +746,9 @@ pub fn is_rehome_state(s: &str) -> bool {
 /// True once a re-home's bidirectional proof is complete and the human may close
 /// the predecessor — i.e. the status is the terminal step. The GUI's "close the
 /// predecessor" action enables only here; it never auto-closes.
+// Prod consumer is GUI-only (app.rs); kept compiled + unit-tested in both
+// editions, so it's dead — not absent — in a headless build.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 #[must_use]
 pub fn rehome_safe_to_close(status: Option<&str>) -> bool {
     status == REHOME_STEPS.last().map(|st| st.slug)
@@ -751,6 +757,9 @@ pub fn rehome_safe_to_close(status: Option<&str>) -> bool {
 /// A re-home status → its progress-badge label + whether it's the terminal
 /// (safe-to-close) step, which the GUI paints green / uses to enable closing.
 /// `None` for a tab that isn't rehoming. Pure, so the mapping is unit-testable.
+// Prod consumer is GUI-only (app.rs); kept compiled + unit-tested in both
+// editions, so it's dead — not absent — in a headless build.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 #[must_use]
 pub fn rehome_badge(status: Option<&str>) -> Option<(&'static str, bool)> {
     let last = REHOME_STEPS.len() - 1;
@@ -780,6 +789,9 @@ pub fn role_of(assignment: Option<&str>) -> String {
 /// (S5). A **worker** or **orchestrator** drills into its project (team =
 /// project in v1); a **tichef** or an itinerant **méta** specialist opens the
 /// global level 0. Pure so the routing is unit-testable without gpui.
+// Prod consumer is GUI-only (the right-click menu, app.rs); kept compiled +
+// unit-tested in both editions, so it's dead — not absent — in headless.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub fn dashboard_url_for_role(role: &str, project: &str, base: &str, token: &str) -> String {
     let base = base.trim_end_matches('/');
     if role == "tichef" || project == META_LANE || project.is_empty() {
