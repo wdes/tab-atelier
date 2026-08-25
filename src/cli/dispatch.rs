@@ -491,9 +491,9 @@ pub enum Commands {
         interval: Option<u64>,
     },
 
-    /// 🐊 aligator (proof-of-concept, #35) — deterministic input router. Drains the swamp
-    /// queue and types each entry's input into its target Claude tab. Best
-    /// run as its own tab, like `brain`.
+    /// 🐊 aligator — deterministic input router. Drains the swamp queue and
+    /// types each entry's input into its target Claude tab. Best run as its own
+    /// tab, like `brain` — and auto-relaunched on restart the same way.
     Aligator {
         /// Drain once and exit (instead of looping forever).
         #[arg(long)]
