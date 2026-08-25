@@ -490,3 +490,77 @@ body {
   color: var(--led-error-stroke);
   border-color: var(--led-error-stroke);
 }
+
+/* --- Inc7 S1: compact 4-band org-chart --- */
+.band {
+  border-top: 1px dashed var(--border);
+  padding: 0.3rem 0 0.4rem;
+}
+.band:first-child { border-top: none; }
+.band-label {
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  margin-bottom: 0.2rem;
+}
+.band-row { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 0.35rem; }
+.band-node {
+  font-size: 0.72rem;
+  padding: 0.15rem 0.4rem;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--panel);
+  white-space: nowrap;
+  cursor: default;
+}
+.band-node.lead { font-weight: 600; box-shadow: inset 0.18rem 0 0 var(--orchestrator-accent); }
+/* Led tint on a compact node = a small left colour bar. */
+.band-node.led-working  { border-left: 3px solid var(--led-working-stroke); }
+.band-node.led-error    { border-left: 3px solid var(--led-error-stroke); }
+.band-node.led-idle     { border-left: 3px solid var(--led-idle-stroke); }
+.band-node.led-unreviewed { border-left: 3px solid var(--led-unreviewed-stroke); }
+.band-node.led-dead     { border-left: 3px solid var(--led-dead-stroke); }
+.band-orch { display: inline-flex; flex-direction: column; gap: 0.2rem; border: 1px solid var(--border); border-radius: 8px; padding: 0.3rem; }
+.orch-repos { display: flex; flex-wrap: wrap; gap: 0.3rem; padding-left: 0.4rem; border-left: 2px solid var(--border); }
+.band-repo { display: inline-flex; flex-direction: column; gap: 0.15rem; }
+.repo-name { font-size: 0.65rem; color: var(--muted); }
+.repo-workers { display: flex; flex-wrap: wrap; gap: 0.2rem; }
+/* A meta specialist on loan to a team (renfort). */
+.band-node.reinforcement { border-style: dashed; }
+.renfort-badge {
+  font-size: 0.6rem; text-transform: uppercase;
+  padding: 0 0.25rem; border-radius: 999px;
+  background: color-mix(in srgb, var(--orchestrator-accent) 20%, transparent);
+  color: var(--orchestrator-accent);
+}
+
+/* Org-chart working area: guarantees a little scroll room so the panned position
+   is preserved across a refresh (Inc7 S3). No-op once a real fleet overflows. */
+body.band-view { min-height: calc(100vh + 180px); }
+
+/* --- Inc7 S4-web: current task + invoked sub-agents chips (per tab) --- */
+.task-chips { display: inline-flex; flex-wrap: wrap; gap: 0.2rem; margin-top: 0.15rem; }
+.band-node .task-chips { display: flex; margin-top: 0.2rem; }
+.task-chip {
+  font-size: 0.62rem;
+  padding: 0.02rem 0.35rem;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--fg) 8%, transparent);
+  color: var(--muted);
+  max-width: 16ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.subagent-chip {
+  font-size: 0.6rem;
+  padding: 0.02rem 0.3rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.subagent-chip.state-running { border-color: var(--led-working-stroke); color: var(--led-working-stroke); }
+.subagent-chip.state-completed { border-color: var(--led-idle-stroke); color: var(--led-idle-stroke); }
+.subagent-chip.state-failed, .subagent-chip.state-error { border-color: var(--led-error-stroke); color: var(--led-error-stroke); }
