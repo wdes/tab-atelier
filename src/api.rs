@@ -5923,6 +5923,69 @@ mod tests {
         );
     }
 
+    // ===================================================================
+    // Increment 7 — REFINER red tests. Builder: rust (S4 plumbing). RED
+    // (compile-fail) until `parse_tab_activity` + `TabActivity`/`SubAgent` exist.
+    // ===================================================================
+
+    // --- S4: per-tab current task + invoked sub-agents, parsed from the tab's
+    //     transcript JSONL (same source the scribe reads: ~/.claude/projects/*.jsonl,
+    //     located via the tab's agent_session_id). `current_task` = the latest
+    //     human-typed prompt; `sub_agents` = each `Task(...)` tool_use, named by its
+    //     subagent_type, state "completed" once a matching tool_result comes back
+    //     else "running". Best-effort: a tab with no/garbage transcript -> empty,
+    //     never an error. camelCase on the wire (currentTask / subAgents).
+    #[test]
+    fn parse_tab_activity_extracts_current_task_and_sub_agents() {
+        let jsonl = concat!(
+            r#"{"type":"user","promptSource":"typed","message":{"role":"user","content":"first task"}}"#,
+            "\n",
+            // Task() #1 -> Explore, gets a tool_result later => completed.
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Task","input":{"subagent_type":"Explore","description":"search the code"}}]}}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"done"}]}}"#,
+            "\n",
+            // A later human-typed prompt => the current task.
+            r#"{"type":"user","promptSource":"typed","message":{"role":"user","content":"wire the parser now"}}"#,
+            "\n",
+            // Task() #2 -> code-reviewer, no tool_result yet => running.
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_2","name":"Task","input":{"subagent_type":"code-reviewer","description":"review the diff"}}]}}"#,
+            "\n",
+        );
+        let act = parse_tab_activity(jsonl);
+        assert_eq!(
+            act.current_task.as_deref(),
+            Some("wire the parser now"),
+            "current_task = latest human-typed prompt"
+        );
+        let subs: Vec<(&str, &str)> = act
+            .sub_agents
+            .iter()
+            .map(|s| (s.name.as_str(), s.state.as_str()))
+            .collect();
+        assert_eq!(
+            subs,
+            vec![("Explore", "completed"), ("code-reviewer", "running")],
+            "Task() invocations -> named sub-agents with completed/running state"
+        );
+        // camelCase serialization for the web consumer.
+        let json = serde_json::to_string(&act).unwrap();
+        assert!(json.contains("\"currentTask\""), "camelCase currentTask: {json}");
+        assert!(json.contains("\"subAgents\""), "camelCase subAgents: {json}");
+    }
+
+    #[test]
+    fn parse_tab_activity_is_best_effort_on_empty_or_garbage() {
+        // No transcript / empty -> empty fields, no panic.
+        let empty = parse_tab_activity("");
+        assert_eq!(empty.current_task, None);
+        assert!(empty.sub_agents.is_empty());
+        // Garbage / half-lines -> skipped, still no panic.
+        let garbage = parse_tab_activity("not json\n{broken\n{\"type\":\"user\"}\n");
+        assert_eq!(garbage.current_task, None);
+        assert!(garbage.sub_agents.is_empty());
+    }
+
     #[test]
     fn set_parent_sets_and_exposes_lineage() {
         let (port, state, token) = spawn_server();
