@@ -51,7 +51,7 @@ pub fn dispatch(name: &str, rest: &[String]) -> Option<i32> {
         "dispatch" => delegate::run(rest),
         "remote" => remote::run(rest),
         "brain" => brain::run(rest),
-        // 🐊 aligator (PoC #35): deterministic input router + its producer.
+        // 🐊 aligator: deterministic input router + its swamp producer.
         "aligator" => aligator::run(rest),
         "swamp" => aligator::run_swamp(rest),
         "clarify" => super::clarify::run(rest),

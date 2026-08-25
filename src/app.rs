@@ -3922,9 +3922,10 @@ impl AppState {
                     .child("\u{26d1}\u{fe0f} Brain"),
             );
 
-            // 🐊 Aligator (PoC #35) — same take-over-the-tab pattern as Brain.
-            // Inside the tab the user sees the router log; aligator drains the
-            // swamp queue and types each entry into its target Claude tab.
+            // 🐊 Aligator — deterministic input router (drains the swamp). Same
+            // take-over-the-tab pattern as Brain, and the SAME auto-restart fix:
+            // stamp agent_kind=aligator so the restore path relaunches it via
+            // `build_agent_resume_command` instead of dropping it to a shell.
             container = container.child(
                 div()
                     .id("menu-aligator")
@@ -3939,6 +3940,11 @@ impl AppState {
                                 .view
                                 .read(cx)
                                 .send_input_bytes(b"\x15tab-atelier aligator\n".to_vec());
+                            // Session-less, like brain — flag the kind so the
+                            // daemon auto-relaunches it on restart.
+                            this.tabs[idx].agent_kind = Some("aligator".into());
+                            this.tabs[idx].agent_session_id = None;
+                            this.tabs[idx].agent_plan_mode = None;
                             this.context_menu = None;
                             cx.notify();
                         }),
