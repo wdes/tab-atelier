@@ -158,6 +158,15 @@ fn refresh_storm_open(breaker_until: &mut Option<Instant>, saturated: usize, now
     false
 }
 
+/// Pure: is a tab still inside its per-tab re-home cooldown? `last` = the instant
+/// it was last re-homed (`None` = never). Within [`REHOME_COOLDOWN`] of `now` →
+/// `true` (skip it this tick). Extracted from the `watch_tick` inline guard so the
+/// boundary (strict `<`) is unit-testable. Pure.
+#[must_use]
+fn rehome_in_cooldown(last: Option<Instant>, now: Instant) -> bool {
+    matches!(last, Some(l) if now.duration_since(l) < REHOME_COOLDOWN)
+}
+
 /// Path to `rehome-tab.sh`: `$TAB_ATELIER_REHOME_SCRIPT`, else
 /// `~/Dev/Botmox/rehome-tab.sh`. ponytail: machine-specific default (the Kalpin
 /// poste) — override via env on other hosts.
@@ -248,9 +257,7 @@ fn watch_tick(
             continue;
         };
         // Guardrail: per-tab cooldown.
-        if let Some(last) = last_rehome.get(&tab.id)
-            && now.duration_since(*last) < REHOME_COOLDOWN
-        {
+        if rehome_in_cooldown(last_rehome.get(&tab.id).copied(), now) {
             continue;
         }
         // Read the screen + parse the context marker.
@@ -529,5 +536,117 @@ mod tests {
         // After the cooldown + spike gone → back to normal.
         assert!(!refresh_storm_open(&mut b, 2, t0 + REFRESH_STORM_COOLDOWN));
         assert_eq!(b, None);
+    }
+
+    // ===================================================================
+    // LOT 2 — characterization coverage (audit; locks CURRENT behavior).
+    // ===================================================================
+
+    #[test]
+    fn should_skip_rehome_full_name_and_role_matrix() {
+        // EVERY SKIP_NAMES entry (case-insensitive substring) -> skipped,
+        // regardless of assignment.
+        for n in SKIP_NAMES {
+            assert!(
+                should_skip_rehome(&format!("ta-{n}-1"), Some("build/implementer")),
+                "name '{n}' must skip"
+            );
+            assert!(
+                should_skip_rehome(&n.to_uppercase(), None),
+                "name '{n}' skip is case-insensitive + assignment-agnostic"
+            );
+        }
+        // EVERY SKIP_ROLES entry (from the assignment role) -> skipped, whatever the name.
+        for r in SKIP_ROLES {
+            assert!(
+                should_skip_rehome("plain-name", Some(&format!("build/{r}"))),
+                "role '{r}' must skip"
+            );
+        }
+        // assignment None -> role_of("") is "" (not a skip role) -> only a name can skip.
+        assert!(
+            !should_skip_rehome("worker-1", None),
+            "None assignment + mundane name -> NOT skipped"
+        );
+        // A plain worker with a mundane name -> NOT skipped.
+        assert!(!should_skip_rehome("team-back-worker", Some("build/implementer")));
+        assert!(!should_skip_rehome("m-reviewer", Some("review/reviewer")));
+    }
+
+    #[test]
+    fn parse_context_pct_bounds_and_multiplicity() {
+        // Clamp: a >100 value is capped at 100 (percents() does n.min(100)).
+        assert_eq!(parse_context_pct("150% context used"), Some(100));
+        // Inverted saturating floor: "0% context left" -> used 100.
+        assert_eq!(parse_context_pct("0% context left"), Some(100));
+        // "compact" alone (no "left") still inverts.
+        assert_eq!(parse_context_pct("auto-compact at 10% context"), Some(90));
+        // Multiple % on a context line -> the highest USED wins (not inverted here).
+        assert_eq!(parse_context_pct("context: 20% then 80% used"), Some(80));
+        // Case-insensitive needle; a non-context line's % is ignored.
+        assert_eq!(parse_context_pct("CONTEXT USED 42%\nDISK 99%"), Some(42));
+        // A '%' with no leading digits contributes nothing.
+        assert_eq!(parse_context_pct("context %"), None);
+    }
+
+    #[test]
+    fn rehome_in_cooldown_respects_strict_boundary() {
+        let now = Instant::now();
+        assert!(!rehome_in_cooldown(None, now), "never re-homed -> not cooling");
+        assert!(rehome_in_cooldown(Some(now), now), "just re-homed -> cooling");
+        assert!(
+            rehome_in_cooldown(Some(now.checked_sub(Duration::from_mins(1)).unwrap()), now),
+            "1min ago -> still cooling"
+        );
+        // Exactly at the cooldown edge is NOT cooling (strict `<`).
+        assert!(
+            !rehome_in_cooldown(Some(now.checked_sub(REHOME_COOLDOWN).unwrap()), now),
+            "exactly cooldown elapsed -> free"
+        );
+        assert!(
+            !rehome_in_cooldown(
+                Some(now.checked_sub(REHOME_COOLDOWN + Duration::from_secs(1)).unwrap()),
+                now
+            ),
+            "past cooldown -> free"
+        );
+    }
+
+    #[test]
+    fn refresh_storm_mid_cooldown_does_not_extend_the_deadline() {
+        let t0 = Instant::now();
+        let mut b: Option<Instant> = None;
+        assert!(
+            refresh_storm_open(&mut b, REFRESH_STORM_THRESHOLD + 1, t0),
+            "spike trips it"
+        );
+        let armed = b;
+        // A fresh spike mid-cooldown is suppressed but does NOT push the deadline out.
+        assert!(refresh_storm_open(
+            &mut b,
+            REFRESH_STORM_THRESHOLD + 5,
+            t0 + Duration::from_secs(1)
+        ));
+        assert_eq!(
+            b, armed,
+            "mid-cooldown re-entry keeps the original deadline (no extension)"
+        );
+    }
+
+    #[test]
+    fn dry_run_spawns_nothing_real_mode_attempts_spawn() {
+        // --dry-run returns Ok WITHOUT spawning — even a bogus script path (which
+        // would fail to spawn for real) succeeds, because nothing is launched.
+        let bogus = "/nonexistent/tab-atelier-rehome-does-not-exist";
+        assert!(
+            fire_rehome(bogus, "u", "/c", "a", "n", true).is_ok(),
+            "dry-run spawns nothing -> Ok"
+        );
+        // Real mode DOES attempt the spawn, so a bogus script errors — proving it
+        // was the dry-run flag (not a no-op script) that suppressed the launch above.
+        assert!(
+            fire_rehome(bogus, "u", "/c", "a", "n", false).is_err(),
+            "real mode attempts spawn -> Err on a bogus script"
+        );
     }
 }
