@@ -131,6 +131,18 @@ pub fn clamp_cursor(cursor: usize, len: usize) -> usize {
     cursor.min(len)
 }
 
+/// The entries a compaction KEEPS: the undelivered tail (`entries[cursor..]`).
+///
+/// The swamp file is rewritten to just these and the cursor reset to 0, so the
+/// file stays bounded AND a future cursor reset can't re-deliver already-
+/// delivered entries — there are none left to re-deliver. Pure, so the "no
+/// re-delivery / no loss / coherent cursor" invariants are unit-testable.
+#[must_use]
+pub fn compact(entries: &[SwampEntry], cursor: usize) -> Vec<SwampEntry> {
+    let start = clamp_cursor(cursor, entries.len());
+    entries[start..].to_vec()
+}
+
 /// Options parsed from `aligator [--once] [--interval SECS]`.
 #[derive(Debug, PartialEq, Eq)]
 pub struct RunOpts {
@@ -244,6 +256,29 @@ fn write_cursor(n: usize) {
     let _ = std::fs::write(&path, n.to_string());
 }
 
+/// Compact the swamp file after a fully-drained round: re-read it (to keep any
+/// entry a producer appended DURING the round), rewrite it atomically to just
+/// the undelivered tail past `*cursor`, then reset the cursor to 0. Bounds the
+/// file and removes the "cursor reset → re-deliver stale" hazard. `*cursor` is
+/// left at 0 to match the shortened file.
+///
+/// `ponytail:` a producer append landing in the tiny window between the re-read
+/// and the rename is lost — inherent to any read-modify-write on the append log
+/// without a lock; the window is a few syscalls wide. Upgrade = an flock.
+fn compact_swamp(cursor: &mut usize) {
+    let path = swamp_path();
+    let fresh = parse_swamp(&std::fs::read_to_string(&path).unwrap_or_default());
+    let kept = compact(&fresh, *cursor);
+    let body: String = kept.iter().map(encode_swamp_line).collect();
+    let tmp = path.with_extension("jsonl.tmp");
+    if std::fs::write(&tmp, &body).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
+        *cursor = 0;
+        write_cursor(0);
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
 fn send_input(ep: &Endpoint, uuid: &str, bytes: &[u8]) -> Result<(), String> {
     agent()
         .post(format!("{}/tabs/by-id/{uuid}/input", ep.url))
@@ -313,6 +348,10 @@ fn tick(cursor: &mut usize) -> Result<(), String> {
             }
         }
     }
+    // Round fully drained (a deliver failure returns early, before this): compact
+    // the swamp to its undelivered tail so it stays bounded and a future cursor
+    // reset can't re-deliver already-delivered entries.
+    compact_swamp(cursor);
     Ok(())
 }
 
@@ -481,6 +520,48 @@ mod tests {
             submit,
             from: None,
         }
+    }
+
+    #[test]
+    fn compact_keeps_undelivered_drops_delivered_and_is_cursor_coherent() {
+        let entries = vec![
+            entry("t0", "a", true), // 0 delivered
+            entry("t1", "b", true), // 1 delivered
+            entry("t2", "c", true), // 2 UNdelivered
+            entry("t3", "d", true), // 3 UNdelivered
+        ];
+        let cursor = 2; // delivered [0,1], undelivered [2,3]
+        let kept = compact(&entries, cursor);
+        // (b) no loss of undelivered — exactly the tail survives, in order.
+        assert_eq!(kept, entries[2..].to_vec());
+        // (a) no re-delivery of delivered — a re-plan from the reset cursor never
+        //     touches t0/t1 (they're gone from the compacted file).
+        let plan = plan_round(&kept, 0, |_| true);
+        let replanned: Vec<&str> = plan
+            .iter()
+            .filter_map(|d| match d {
+                Decision::Deliver { tab, .. } => Some(tab.as_str()),
+                Decision::Skip { .. } => None,
+            })
+            .collect();
+        assert_eq!(replanned, vec!["t2", "t3"], "only the undelivered are re-planned");
+        assert!(
+            !replanned.contains(&"t0") && !replanned.contains(&"t1"),
+            "delivered entries are never re-delivered after compaction"
+        );
+        // (c) coherent cursor — cursor 0 on the shortened file addresses the
+        //     first undelivered entry (t2); no off-by-one, nothing skipped.
+        assert_eq!(clamp_cursor(0, kept.len()), 0);
+        assert_eq!(kept.first().map(|e| e.tab.as_str()), Some("t2"));
+    }
+
+    #[test]
+    fn compact_of_fully_drained_round_is_empty_and_clamps() {
+        let entries = vec![entry("t0", "a", true), entry("t1", "b", true)];
+        // Everything delivered (cursor == len) → the compacted file is empty.
+        assert!(compact(&entries, 2).is_empty());
+        // A stale over-the-end cursor clamps instead of panicking on the slice.
+        assert!(compact(&entries, 99).is_empty());
     }
 
     #[test]
