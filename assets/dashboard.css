@@ -538,3 +538,29 @@ body {
 /* Org-chart working area: guarantees a little scroll room so the panned position
    is preserved across a refresh (Inc7 S3). No-op once a real fleet overflows. */
 body.band-view { min-height: calc(100vh + 180px); }
+
+/* --- Inc7 S4-web: current task + invoked sub-agents chips (per tab) --- */
+.task-chips { display: inline-flex; flex-wrap: wrap; gap: 0.2rem; margin-top: 0.15rem; }
+.band-node .task-chips { display: flex; margin-top: 0.2rem; }
+.task-chip {
+  font-size: 0.62rem;
+  padding: 0.02rem 0.35rem;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--fg) 8%, transparent);
+  color: var(--muted);
+  max-width: 16ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.subagent-chip {
+  font-size: 0.6rem;
+  padding: 0.02rem 0.3rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.subagent-chip.state-running { border-color: var(--led-working-stroke); color: var(--led-working-stroke); }
+.subagent-chip.state-completed { border-color: var(--led-idle-stroke); color: var(--led-idle-stroke); }
+.subagent-chip.state-failed, .subagent-chip.state-error { border-color: var(--led-error-stroke); color: var(--led-error-stroke); }
