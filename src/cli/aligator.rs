@@ -197,13 +197,30 @@ fn classify_target(tabs: &[TabInfo], uuid: &str) -> Guard {
     }
 }
 
-/// Should a transient skip be retried, given the tries its entry already spent?
+/// Should a transient skip / unconfirmed submission be retried, given the tries
+/// its entry already spent?
 ///
 /// Keep re-queuing while under [`MAX_SKIP_ATTEMPTS`], else abandon. Pure boundary
 /// so the "N tries then give up" bound is unit-tested without a live daemon.
+/// Shared budget: transient skips and ⏎-submit retries both spend `attempts`.
 #[must_use]
 pub const fn should_retry(attempts: u32) -> bool {
     attempts + 1 < MAX_SKIP_ATTEMPTS
+}
+
+/// The re-queue entry for an UNCONFIRMED ⏎ submission (gap 'a' fix).
+///
+/// The text already landed — only the newline needs retrying — so the copy has
+/// EMPTY input (never re-types the body), `submit = true`, and `attempts + 1`.
+/// Pure, so the "a ⏎ retry never re-types the text" invariant is unit-testable.
+#[must_use]
+fn submit_retry_entry(e: &SwampEntry) -> SwampEntry {
+    SwampEntry {
+        input: String::new(),
+        submit: true,
+        attempts: e.attempts + 1,
+        ..e.clone()
+    }
 }
 
 /// Clamp a persisted cursor to `[0, len]` — if the swamp was truncated or
@@ -405,26 +422,61 @@ fn tick(cursor: &mut usize) -> Result<(), String> {
                 tab,
                 input,
                 submit,
-            } => match send_input(&ep, &tab, input.as_bytes()) {
-                Ok(()) => {
-                    if submit {
-                        std::thread::sleep(SUBMIT_DELAY);
-                        let _ = send_input(&ep, &tab, b"\r");
-                    }
-                    println!(
-                        "🐊 aligator: {tab:<36} ← {n} byte(s){s}",
-                        n = input.len(),
-                        s = if submit { " + ⏎" } else { "" },
-                    );
-                    *cursor = index + 1;
-                    write_cursor(*cursor);
-                }
-                Err(e) => {
+            } => {
+                // 1. Type the text. Empty input = a re-queued submit-only ⏎ nudge
+                //    (see the gap-'a' fix below), so skip the POST entirely.
+                if !input.is_empty()
+                    && let Err(e) = send_input(&ep, &tab, input.as_bytes())
+                {
                     eprintln!("🐊 aligator: deliver failed for {tab}: {e}");
-                    // Leave the cursor before this entry: retry next round.
+                    // Nothing typed yet → leave the cursor before this entry;
+                    // retry the whole entry next round (no double-type).
                     return Ok(());
                 }
-            },
+                // 2. Submit the ⏎ ATOMICALLY w.r.t. the cursor (gap 'a' fix): the
+                //    entry is consumed only once the newline POST is CONFIRMED.
+                //    "Confirmed" = the input POST returned Ok — the daemon accepted
+                //    the `\r` byte into the tab's PTY. ponytail: best-effort — there
+                //    is no agent-side ack that the line was actually executed; this
+                //    is the most reliable signal the input API exposes, but it's no
+                //    longer fire-and-forget.
+                if submit {
+                    std::thread::sleep(SUBMIT_DELAY);
+                    if let Err(e) = send_input(&ep, &tab, b"\r") {
+                        // ⏎ unconfirmed: DON'T drop the nudge. Re-queue a submit-only
+                        // copy (empty text so the body isn't re-typed) with
+                        // attempts+1, bounded by should_retry, then abandon+log.
+                        // Advancing here mirrors the transient-skip re-queue: the
+                        // pending submission survives as a tail entry (kept by the
+                        // end-of-round compaction), later live tabs still deliver.
+                        let spent = entries[index].attempts;
+                        *cursor = index + 1;
+                        write_cursor(*cursor);
+                        if should_retry(spent) {
+                            match append_swamp_line(&swamp_path(), &submit_retry_entry(&entries[index])) {
+                                Ok(()) => eprintln!(
+                                    "🐊 aligator: ⏎ not confirmed for {tab}: {e} — re-queued (attempt {n}/{MAX_SKIP_ATTEMPTS})",
+                                    n = spent + 1,
+                                ),
+                                Err(w) => eprintln!("🐊 aligator: re-queue ⏎ for {tab} failed: {w} — dropping"),
+                            }
+                        } else {
+                            eprintln!(
+                                "🐊 aligator: ABANDON ⏎ for {tab} — submission unconfirmed after {MAX_SKIP_ATTEMPTS} attempts; dropping"
+                            );
+                        }
+                        continue;
+                    }
+                }
+                // 3. Delivered (text ok + ⏎ confirmed, or no submit asked): consume.
+                println!(
+                    "🐊 aligator: {tab:<36} ← {n} byte(s){s}",
+                    n = input.len(),
+                    s = if submit { " + ⏎" } else { "" },
+                );
+                *cursor = index + 1;
+                write_cursor(*cursor);
+            }
             // Permanent: a daemon/shell target — consume it (confused-deputy).
             Decision::Skip {
                 index,
@@ -920,32 +972,52 @@ not json at all
     }
 
     #[test]
-    fn deliver_submission_is_a_separate_ungated_step() {
-        // GAP (a) — DOCUMENTED, NOT FIXED. A Deliver types the text and, if `submit`,
-        // presses Enter as a SEPARATE POST after SUBMIT_DELAY (tick: send_input(text)
-        // then `let _ = send_input(b"\r")`). Two facts pinned here:
-        //  1. the delivered `input` is EXACTLY the entry text — Enter is never bundled
-        //     into it (no auto-appended "\r"), so submission is a distinct op;
-        //  2. SUBMIT_DELAY is a real (non-zero) settle gap between the two sends.
-        // In tick the cursor advances on the TEXT send's success and the Enter result
-        // is IGNORED (`let _ =`), so a dropped Enter leaves the entry consumed but
-        // typed-yet-UNsubmitted, and it is NOT retried. Non-atomic by construction.
+    fn submit_enter_is_atomic_unconfirmed_retries_bounded() {
+        // GAP (a) — FIXED. The ⏎ submission is now ATOMIC w.r.t. the cursor. tick
+        // types the text, then presses Enter as a SEPARATE POST after SUBMIT_DELAY,
+        // and advances the cursor ONLY once that POST is CONFIRMED (returns Ok — the
+        // daemon accepted the byte). If ⏎ isn't confirmed the entry is NOT dropped:
+        // a submit-only nudge is re-queued (bounded by should_retry /
+        // MAX_SKIP_ATTEMPTS) and abandoned+logged only once the budget is spent.
+        //
+        // Pinned facts:
+        //  1. the delivered `input` is EXACTLY the entry text — ⏎ is a distinct send,
+        //     never baked into `input`;
+        //  2. the ⏎-retry re-queue NEVER re-types the body (empty input), keeps
+        //     `submit`, and bumps `attempts` — so a retry is a pure newline;
+        //  3. the retry is bounded (shared budget with the skip-retry path);
+        //  4. SUBMIT_DELAY is a real (non-zero) settle gap between text and ⏎.
         let e = entry("claude", "run the tests", true);
         let plan = plan_round(std::slice::from_ref(&e), 0, |_| Guard::Deliver);
         match &plan[0] {
             Decision::Deliver { input, submit, .. } => {
-                assert_eq!(input, "run the tests", "input is the raw text — Enter is NOT appended");
-                assert!(
-                    !input.ends_with('\r'),
-                    "submission is a separate step, never baked into input"
-                );
+                assert_eq!(input, "run the tests", "input is the raw text — ⏎ is NOT appended");
+                assert!(!input.ends_with('\r'), "⏎ is a separate send, never baked into input");
                 assert!(*submit, "submit is carried as its own flag");
             }
             Decision::Skip { .. } => panic!("expected Deliver, got a Skip"),
         }
+        // (2) an unconfirmed ⏎ re-queues a pure newline, not the body again.
+        let retry = submit_retry_entry(&e);
+        assert_eq!(retry.input, "", "⏎ retry never re-types the body");
+        assert!(retry.submit, "⏎ retry still asks to submit");
+        assert_eq!(retry.attempts, 1, "⏎ retry bumps the attempt counter");
+        assert_eq!(retry.tab, "claude", "⏎ retry keeps the routing key");
+        assert_eq!(
+            submit_retry_entry(&retry).attempts,
+            2,
+            "chained ⏎ retries climb toward the cap"
+        );
+        // (3) bounded: retried while under the cap, abandoned at it.
+        assert!(should_retry(0), "first unconfirmed ⏎ is retried");
+        assert!(
+            !should_retry(MAX_SKIP_ATTEMPTS - 1),
+            "the last attempt exhausts the budget → abandon (logged)"
+        );
+        // (4) a real settle delay still separates text from ⏎.
         assert!(
             SUBMIT_DELAY > Duration::from_millis(0),
-            "a real settle delay separates text from Enter"
+            "a real settle delay separates text from ⏎"
         );
     }
 
