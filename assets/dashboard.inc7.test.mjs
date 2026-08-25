@@ -18,7 +18,10 @@ import * as dash from "./dashboard.js";
 assert.equal(typeof dash.bandLayout, "function", "S1 RED: export bandLayout(state) from dashboard.js");
 {
   const t = (o) => ({ agentState: "idle", ...o });
-  const tichef = t({ id: "tc", name: "ta-tichef", role: "tichef" });
+  // The REAL tichef on the live daemon has role "manager" (assignment
+  // "meta/manager"), living in a méta project's unmapped bucket. It still lands in
+  // the Méta band (isTichefRole recognises "manager" as well as the "tichef" alias).
+  const tichef = t({ id: "tc", name: "ta-tichef", role: "manager", assignment: "meta/manager" });
   const planner = t({ id: "p", name: "ta-planner", role: "planner", serving: null });
   const o1 = t({ id: "o1", name: "ta-kalpin-lead", role: "orchestrator", assignment: "kalpin-back:build/orchestrator" });
   const w1 = t({ id: "w1", name: "ta-w1", role: "implementer", parentTabId: "o1", assignment: "kalpin-back:build/implementer" });
@@ -55,7 +58,25 @@ assert.equal(typeof dash.bandLayout, "function", "S1 RED: export bandLayout(stat
   assert.doesNotThrow(() => dash.bandLayout(null), "null state must not throw");
   const legacy = dash.bandLayout({ nodes: [], unmapped: [{ id: "x", name: "n" }] });
   assert.ok(Array.isArray(legacy.freelancers), "fallback keeps a freelancers array");
+  // A live-shaped tichef (role "manager", in méta unmapped) lands in the Méta band.
+  const liveMeta = dash.bandLayout({
+    projects: [{ name: "méta", isMeta: true, nodes: [], unmapped: [{ id: "tc", role: "manager", assignment: "meta/manager" }] }],
+    unmapped: [{ id: "tc", role: "manager", assignment: "meta/manager" }], // daemon also lists it top-level
+  });
+  assert.deepEqual(liveMeta.meta.map((m) => m.id), ["tc"], "manager tichef in Méta, deduped (not duplicated across sources)");
+  assert.equal(liveMeta.freelancers.length, 0, "no duplicate tichef in Freelancers");
 }
+
+// ============================ hasTichef gate (root-cause fix) ============================
+// The REAL tichef has role "manager" and lives in state.unmapped (not under a
+// project) — the gate must recognise it there, or the 4-band view never triggers.
+assert.equal(typeof dash.hasTichef, "function", "export hasTichef(state) for the gate");
+assert.equal(dash.hasTichef({ unmapped: [{ id: "tc", role: "manager" }] }), true, "manager in TOP-LEVEL unmapped => gate on");
+assert.equal(dash.hasTichef({ projects: [{ unmapped: [{ role: "manager" }] }] }), true, "manager in a project's unmapped => gate on");
+assert.equal(dash.hasTichef({ projects: [{ nodes: [{ tabs: [{ role: "tichef" }] }] }] }), true, "'tichef' alias still recognised");
+assert.equal(dash.hasTichef({ unassigned: [{ role: "manager" }] }), true, "manager in unassigned => gate on");
+assert.equal(dash.hasTichef({ projects: [{ nodes: [{ tabs: [{ role: "orchestrator" }] }] }], unassigned: [{ role: "worker" }] }), false, "no tichef/manager => gate off");
+assert.equal(dash.hasTichef(null), false, "null state => gate off, no throw");
 
 // ============================ S2 — resolveAltitude ============================
 // The dynamic-altitude rules encoded in placement.

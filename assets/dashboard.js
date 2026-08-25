@@ -182,6 +182,15 @@ export function isOrchestrator(role) {
   return String(role || "").toLowerCase() === "orchestrator";
 }
 
+// The fleet's top-level coordinator. Its REAL role on the live daemon is
+// `manager` (assignment "meta/manager", a unique tab); `tichef` is kept as an
+// alias for fixtures. Recognised in all three places that pin the coordinator to
+// the Méta band: roleAltitude (band 0), resolveAltitude (pin), hasTichef (gate).
+function isTichefRole(role) {
+  const r = String(role || "").trim().toLowerCase();
+  return r === "tichef" || r === "manager";
+}
+
 // Pure: an agent ROLE -> its altitude band (0 = highest). Three bands per the
 // plan: tichef atop, orchestrators below, workers/specialists at the bottom.
 // Keyed strictly on the role, NOT the phase (tichef finding): a meta-lane
@@ -189,7 +198,7 @@ export function isOrchestrator(role) {
 // band, never the tichef band.
 export function roleAltitude(role) {
   const r = String(role || "").trim().toLowerCase();
-  if (r === "tichef") return 0;
+  if (isTichefRole(r)) return 0;
   if (r === "orchestrator") return 1;
   return 2;
 }
@@ -288,7 +297,7 @@ function isMetaRole(role) {
 export function resolveAltitude(tab) {
   const t = tab || {};
   const role = String(t.role || "").toLowerCase();
-  if (role === "tichef") return { band: "meta" };
+  if (isTichefRole(role)) return { band: "meta" };
   if (isMetaRole(role)) {
     if (t.serving) return { band: "worker", team: t.serving, reinforcement: true };
     const override = assignmentProject(t.assignment);
@@ -306,15 +315,25 @@ export function resolveAltitude(tab) {
 // tabs land in Freelancers). Never throws.
 export function bandLayout(state) {
   const s = state || {};
-  const unassigned = Array.isArray(s.unassigned) ? s.unassigned : [];
-  const allTabs = allProjectTabs(s);
+  // Dedup every tab by id across ALL sources: the live daemon lists an unmapped
+  // tab both at the top level AND inside a synthetic "divers" project, so without
+  // a dedup a tab would show in two bands at once. First occurrence wins.
+  const byId = new Map();
+  const collect = (arr) => { for (const t of arr || []) if (t && t.id && !byId.has(t.id)) byId.set(t.id, t); };
+  collect(allProjectTabs(s));
+  collect(Array.isArray(s.unmapped) ? s.unmapped : []);
+  collect(Array.isArray(s.unassigned) ? s.unassigned : []);
+  const allTabs = [...byId.values()];
 
   const meta = allTabs.filter((t) => resolveAltitude(t).band === "meta");
 
+  // An orchestrator is a LEAD (its own team), never a chain-worker under a parent,
+  // even when it was itself spawned by another orchestrator (parentTabId set).
+  const leadIds = new Set(allTabs.filter((t) => String(t && t.role || "").toLowerCase() === "orchestrator").map((t) => t.id));
   const orchestrators = allTabs
     .filter((t) => String(t && t.role || "").toLowerCase() === "orchestrator")
     .map((lead) => {
-      const workers = allTabs.filter((t) => t && t.parentTabId === lead.id);
+      const workers = allTabs.filter((t) => t && t.parentTabId === lead.id && t.id !== lead.id && !leadIds.has(t.id));
       const leadProj = assignmentProject(lead.assignment);
       const byRepo = new Map();
       for (const w of workers) {
@@ -327,14 +346,14 @@ export function bandLayout(state) {
       return { lead, repos };
     });
 
-  // Workers band = assigned workers NOT already shown under a chain (orphans).
-  const shown = new Set();
-  for (const o of orchestrators) for (const r of o.repos) for (const w of r.workers) shown.add(w.id);
-  const workers = allTabs.filter((t) => resolveAltitude(t).band === "worker" && !shown.has(t.id));
-
-  const freelancers = [...unassigned];
-  for (const t of allTabs) if (resolveAltitude(t).band === "freelancer" && !freelancers.includes(t)) freelancers.push(t);
-  for (const t of (Array.isArray(s.unmapped) ? s.unmapped : [])) if (!freelancers.includes(t)) freelancers.push(t);
+  // Assign each unique tab to exactly ONE band. Priority: meta -> chain (lead +
+  // its workers) -> orphan Workers -> everything else Freelancers.
+  const placed = new Set();
+  meta.forEach((t) => placed.add(t.id));
+  for (const o of orchestrators) { placed.add(o.lead.id); for (const r of o.repos) for (const w of r.workers) placed.add(w.id); }
+  const workers = allTabs.filter((t) => !placed.has(t.id) && resolveAltitude(t).band === "worker");
+  workers.forEach((t) => placed.add(t.id));
+  const freelancers = allTabs.filter((t) => !placed.has(t.id));
 
   return { meta, orchestrators, workers, freelancers };
 }
@@ -635,10 +654,17 @@ export function diffRender(prev, next) {
 
 // --- Inc7 S1: compact 4-band org-chart ---
 
-// Activation gate: a coordinated fleet (a tichef is present) gets the Inc7 4-band
-// org-chart; fixtures/states without a tichef keep the Inc5/Inc6 views.
-function hasTichef(state) {
-  return allProjectTabs(state).some((t) => String(t && t.role || "").toLowerCase() === "tichef");
+// Activation gate: a coordinated fleet (the tichef/manager is present) gets the
+// Inc7 4-band org-chart; states without it keep the Inc5/Inc6 views. The tichef
+// lives in state.unmapped (a méta tab, not under a project), so scan EVERY tab —
+// projects + top-level unmapped + unassigned — not just the project tabs.
+export function hasTichef(state) {
+  const s = state || {};
+  const loose = [
+    ...(Array.isArray(s.unmapped) ? s.unmapped : []),
+    ...(Array.isArray(s.unassigned) ? s.unassigned : []),
+  ];
+  return [...allProjectTabs(s), ...loose].some((t) => isTichefRole(t && t.role));
 }
 
 // Inner content of a band node: name + renfort badge (S2) + task/sub-agent chips
