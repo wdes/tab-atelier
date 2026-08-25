@@ -275,8 +275,7 @@ function isMetaRole(role) {
 //   - an orchestrator -> Orchestrateurs;
 //   - any tab with an assignment -> Workers, under its team;
 //   - otherwise -> Freelancers.
-// Exported in S2; used internally by bandLayout (S1).
-function resolveAltitude(tab, state) {
+export function resolveAltitude(tab, state) {
   const t = tab || {};
   const role = String(t.role || "").toLowerCase();
   if (role === "tichef") return { band: "meta" };
@@ -571,7 +570,11 @@ function hasTichef(state) {
 function bandNodeHtml(tab, cls) {
   const t = tab || {};
   const led = ledClass(t.led != null ? t.led : t.rollupLed);
-  return `<div class="band-node ${cls} ${led}" data-tab-id="${escapeHtml(t.id || "")}" data-viewer="${escapeHtml(t.viewerUrl || "")}" title="${escapeHtml(t.name || "")}">${escapeHtml(t.name || "tab")}</div>`;
+  // S2: a meta specialist placed in a team is a reinforcement (renfort).
+  const alt = resolveAltitude(t, currentState);
+  const reinf = alt.reinforcement ? " reinforcement" : "";
+  const badge = alt.reinforcement ? ` <span class="renfort-badge" title="en renfort dans ${escapeHtml(alt.team || "")}">renfort</span>` : "";
+  return `<div class="band-node ${cls} ${led}${reinf}" data-tab-id="${escapeHtml(t.id || "")}" data-viewer="${escapeHtml(t.viewerUrl || "")}" title="${escapeHtml(t.name || "")}">${escapeHtml(t.name || "tab")}${badge}</div>`;
 }
 
 // Orchestrator chain: lead -> served repo sub-nodes -> workers (parentTabId).
