@@ -3922,6 +3922,36 @@ impl AppState {
                     .child("\u{26d1}\u{fe0f} Brain"),
             );
 
+            // 🐊 Aligator — deterministic input router (drains the swamp). Same
+            // take-over-the-tab pattern as Brain, and the SAME auto-restart fix:
+            // stamp agent_kind=aligator so the restore path relaunches it via
+            // `build_agent_resume_command` instead of dropping it to a shell.
+            container = container.child(
+                div()
+                    .id("menu-aligator")
+                    .px(px(12.0))
+                    .py(px(4.0))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(menu_hover))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                            this.tabs[idx]
+                                .view
+                                .read(cx)
+                                .send_input_bytes(b"\x15tab-atelier aligator\n".to_vec());
+                            // Session-less, like brain — flag the kind so the
+                            // daemon auto-relaunches it on restart.
+                            this.tabs[idx].agent_kind = Some("aligator".into());
+                            this.tabs[idx].agent_session_id = None;
+                            this.tabs[idx].agent_plan_mode = None;
+                            this.context_menu = None;
+                            cx.notify();
+                        }),
+                    )
+                    .child("\u{1f40a} Aligator"),
+            );
+
             // 📊 Dashboard (S5) — opens the harness dashboard scoped to this
             // tab's team, role-aware: a worker/orchestrator drills into its
             // project, a tichef / méta specialist gets the global level 0. Role
