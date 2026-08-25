@@ -726,4 +726,80 @@ not json at all
         assert_eq!(parsed[1].tab, "t2");
         assert!(!parsed[1].submit);
     }
+
+    // ===================================================================
+    // LOT 2 — characterization of KNOWN GAPS (documented via a test, NOT fixed).
+    // ===================================================================
+
+    #[test]
+    fn compact_rmw_window_drops_a_concurrent_append() {
+        // GAP (b) — DOCUMENTED, NOT FIXED. compact_swamp() is a read-modify-write:
+        // it re-reads the swamp into a `snapshot`, keeps compact(snapshot, cursor),
+        // and renames the rewrite over the file. An entry a producer appends in the
+        // tiny window BETWEEN that re-read and the rename is absent from `snapshot`,
+        // hence absent from the kept tail, and the rename OVERWRITES it — lost. This
+        // pins that reality: compact() only ever sees the snapshot handed to it.
+        // (Upgrade = an flock around the RMW — see compact_swamp's ponytail.)
+        let snapshot = vec![entry("t0", "a", true), entry("t1", "b", true)]; // read at compaction start
+        let kept = compact(&snapshot, 2); // all delivered -> tail empty
+        assert!(kept.is_empty());
+        let concurrent = entry("t2", "c", true); // appended AFTER the snapshot read
+        assert!(
+            !kept.contains(&concurrent),
+            "a concurrently-appended entry is lost by the RMW window (gap b)"
+        );
+    }
+
+    #[test]
+    fn deliver_submission_is_a_separate_ungated_step() {
+        // GAP (a) — DOCUMENTED, NOT FIXED. A Deliver types the text and, if `submit`,
+        // presses Enter as a SEPARATE POST after SUBMIT_DELAY (tick: send_input(text)
+        // then `let _ = send_input(b"\r")`). Two facts pinned here:
+        //  1. the delivered `input` is EXACTLY the entry text — Enter is never bundled
+        //     into it (no auto-appended "\r"), so submission is a distinct op;
+        //  2. SUBMIT_DELAY is a real (non-zero) settle gap between the two sends.
+        // In tick the cursor advances on the TEXT send's success and the Enter result
+        // is IGNORED (`let _ =`), so a dropped Enter leaves the entry consumed but
+        // typed-yet-UNsubmitted, and it is NOT retried. Non-atomic by construction.
+        let e = entry("claude", "run the tests", true);
+        let plan = plan_round(std::slice::from_ref(&e), 0, |_| true);
+        match &plan[0] {
+            Decision::Deliver { input, submit, .. } => {
+                assert_eq!(input, "run the tests", "input is the raw text — Enter is NOT appended");
+                assert!(
+                    !input.ends_with('\r'),
+                    "submission is a separate step, never baked into input"
+                );
+                assert!(*submit, "submit is carried as its own flag");
+            }
+            Decision::Skip { .. } => panic!("expected Deliver, got a Skip"),
+        }
+        assert!(
+            SUBMIT_DELAY > Duration::from_millis(0),
+            "a real settle delay separates text from Enter"
+        );
+    }
+
+    #[test]
+    fn skip_consumes_the_entry_it_is_not_retried() {
+        // CHARACTERIZATION + SUSPECTED DELIVERY GAP (documented, NOT fixed —
+        // escalated to tichef). When the confused-deputy guard trips (target isn't a
+        // live Claude tab THIS round), plan_round emits a Skip carrying the entry's
+        // index; tick then advances the cursor to index+1 and later compacts
+        // entries[cursor..]. So a Skipped entry is neither delivered NOR kept — it is
+        // DROPPED PERMANENTLY, never retried. A message swamped to a tab that is
+        // momentarily not-yet-a-live-Claude-tab (startup / transient) is thus lost on
+        // the first round. Correct for a real shell (safety), but a delivery hazard
+        // for a legit Claude tab not yet detected. Pinned here as the real behavior.
+        let e = entry("not-live-yet", "please run tests", true);
+        let plan = plan_round(std::slice::from_ref(&e), 0, |_| false); // guard trips
+        assert_eq!(
+            plan,
+            vec![Decision::Skip {
+                index: 0,
+                tab: "not-live-yet".into()
+            }],
+            "a guard-tripped target is Skipped (index carried) -> tick consumes it (drop, no retry)"
+        );
+    }
 }
