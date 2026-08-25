@@ -202,6 +202,15 @@ function projectTabs(project) {
   return out;
 }
 
+// Every tab of every project in the state, flattened. (lineageEdges keeps its own
+// loop because it needs each tab's owning project name.)
+function allProjectTabs(state) {
+  const projects = Array.isArray(state && state.projects) ? state.projects : [];
+  const out = [];
+  for (const p of projects) for (const t of projectTabs(p)) out.push(t);
+  return out;
+}
+
 // Pure: a project's altitude band = the most senior agent working in it (lowest
 // roleAltitude). Derived from ROLE only — a server-provided `altitude` (which
 // may be phase-influenced) is deliberately NOT trusted here (tichef finding).
@@ -275,7 +284,8 @@ function isMetaRole(role) {
 //   - an orchestrator -> Orchestrateurs;
 //   - any tab with an assignment -> Workers, under its team;
 //   - otherwise -> Freelancers.
-export function resolveAltitude(tab, state) {
+// Depends only on the tab (no fleet state); callers may pass a 2nd arg, ignored.
+export function resolveAltitude(tab) {
   const t = tab || {};
   const role = String(t.role || "").toLowerCase();
   if (role === "tichef") return { band: "meta" };
@@ -296,12 +306,10 @@ export function resolveAltitude(tab, state) {
 // tabs land in Freelancers). Never throws.
 export function bandLayout(state) {
   const s = state || {};
-  const projects = Array.isArray(s.projects) ? s.projects : [];
   const unassigned = Array.isArray(s.unassigned) ? s.unassigned : [];
-  const allTabs = [];
-  for (const p of projects) for (const t of projectTabs(p)) allTabs.push(t);
+  const allTabs = allProjectTabs(s);
 
-  const meta = allTabs.filter((t) => resolveAltitude(t, s).band === "meta");
+  const meta = allTabs.filter((t) => resolveAltitude(t).band === "meta");
 
   const orchestrators = allTabs
     .filter((t) => String(t && t.role || "").toLowerCase() === "orchestrator")
@@ -322,10 +330,10 @@ export function bandLayout(state) {
   // Workers band = assigned workers NOT already shown under a chain (orphans).
   const shown = new Set();
   for (const o of orchestrators) for (const r of o.repos) for (const w of r.workers) shown.add(w.id);
-  const workers = allTabs.filter((t) => resolveAltitude(t, s).band === "worker" && !shown.has(t.id));
+  const workers = allTabs.filter((t) => resolveAltitude(t).band === "worker" && !shown.has(t.id));
 
   const freelancers = [...unassigned];
-  for (const t of allTabs) if (resolveAltitude(t, s).band === "freelancer" && !freelancers.includes(t)) freelancers.push(t);
+  for (const t of allTabs) if (resolveAltitude(t).band === "freelancer" && !freelancers.includes(t)) freelancers.push(t);
   for (const t of (Array.isArray(s.unmapped) ? s.unmapped : [])) if (!freelancers.includes(t)) freelancers.push(t);
 
   return { meta, orchestrators, workers, freelancers };
@@ -354,8 +362,7 @@ export function orgLayout(state) {
   const projects = Array.isArray(s.projects) ? s.projects : [];
   const metaProjects = projects.filter((p) => p && p.isMeta);
   const repos = projects.filter((p) => p && !p.isMeta);
-  const allTabs = [];
-  for (const p of projects) for (const t of projectTabs(p)) allTabs.push(t);
+  const allTabs = allProjectTabs(s);
   // Solo méta (not serving anyone) floats on top.
   const metaTop = [];
   for (const p of metaProjects) for (const t of projectTabs(p)) if (t && !t.serving) metaTop.push(t);
@@ -551,7 +558,18 @@ function render() {
   setViewChrome(view);
 }
 
-const BAND_LABELS = { 0: "tichef", 1: "orchestrators", 2: "workers" };
+// Band labels — single source. Two schemes coexist by design (see renderGrid's
+// three layers): ALTITUDE_LABELS drives the Inc5/I2 fallback altitude bands (EN,
+// matched by the I2 accept as `data-band-label`); INC7_BANDS drives the Inc7
+// 4-band org-chart (the `id` is load-bearing — matched via `data-band` — and the
+// FR `label` is display-only).
+const ALTITUDE_LABELS = { 0: "tichef", 1: "orchestrators", 2: "workers" };
+const INC7_BANDS = [
+  { id: "meta", label: "Méta" },
+  { id: "orchestrators", label: "Orchestrateurs" },
+  { id: "workers", label: "Workers" },
+  { id: "freelancers", label: "Freelancers" },
+];
 
 function bandHtml(label, inner) {
   return `<div class="altitude-band" data-band-label="${escapeHtml(label)}">${inner}</div>`;
@@ -559,8 +577,7 @@ function bandHtml(label, inner) {
 
 // An assignment-less tab in the UNASSIGNED band — legitimate, NOT an error (#90).
 function unassignedTabHtml(tab) {
-  const t = tab || {};
-  return `<div class="unassigned-tab" data-viewer="${escapeHtml(t.viewerUrl || "")}">${escapeHtml(t.name || "tab")}</div>`;
+  return tabDiv("unassigned-tab", tab, "tab");
 }
 
 // Pure: the per-tab task/sub-agents render model (Inc7 S4-web). Reads the rust
@@ -621,11 +638,7 @@ export function diffRender(prev, next) {
 // Activation gate: a coordinated fleet (a tichef is present) gets the Inc7 4-band
 // org-chart; fixtures/states without a tichef keep the Inc5/Inc6 views.
 function hasTichef(state) {
-  const projects = Array.isArray(state && state.projects) ? state.projects : [];
-  for (const p of projects) for (const t of projectTabs(p)) {
-    if (String(t && t.role || "").toLowerCase() === "tichef") return true;
-  }
-  return false;
+  return allProjectTabs(state).some((t) => String(t && t.role || "").toLowerCase() === "tichef");
 }
 
 // Inner content of a band node: name + renfort badge (S2) + task/sub-agent chips
@@ -633,7 +646,7 @@ function hasTichef(state) {
 // element (identity + scroll survive).
 function bandNodeInner(tab) {
   const t = tab || {};
-  const alt = resolveAltitude(t, currentState);
+  const alt = resolveAltitude(t);
   const badge = alt.reinforcement ? ` <span class="renfort-badge" title="en renfort dans ${escapeHtml(alt.team || "")}">renfort</span>` : "";
   return `${escapeHtml(t.name || "tab")}${badge}${taskChipsHtml(t)}`;
 }
@@ -641,7 +654,7 @@ function bandNodeInner(tab) {
 function bandNodeHtml(tab, cls) {
   const t = tab || {};
   const led = ledClass(t.led != null ? t.led : t.rollupLed);
-  const reinf = resolveAltitude(t, currentState).reinforcement ? " reinforcement" : "";
+  const reinf = resolveAltitude(t).reinforcement ? " reinforcement" : "";
   return `<div class="band-node ${cls} ${led}${reinf}" data-tab-id="${escapeHtml(t.id || "")}" data-viewer="${escapeHtml(t.viewerUrl || "")}" title="${escapeHtml(t.name || "")}">${bandNodeInner(t)}</div>`;
 }
 
@@ -664,8 +677,9 @@ let bandTabById = new Map();
 
 // The flat, stable-id model the S3 diff runs on: every band node with the fields
 // that affect its rendering — its led AND a task signature (S4 chips), so a task
-// change also produces an `update` op. Order-independent (keyed by id).
-function buildBandModel(state) {
+// change also produces an `update` op. Order-independent (keyed by id). Exported so
+// the Zoetrope invariant (task change => 1 update op) is directly testable (Q7).
+export function buildBandModel(state) {
   const bl = bandLayout(state);
   const nodes = [];
   bandTabById = new Map();
@@ -719,15 +733,13 @@ function renderBandChart() {
   const grid = document.getElementById("project-grid");
   if (!grid) return;
   const bl = bandLayout(currentState);
-  const meta = bl.meta.map((t) => bandNodeHtml(t, "meta")).join("");
-  const orchs = bl.orchestrators.map(orchChainHtml).join("");
-  const workers = bl.workers.map((t) => bandNodeHtml(t, "worker")).join("");
-  const free = bl.freelancers.map((t) => bandNodeHtml(t, "freelancer")).join("");
-  grid.innerHTML =
-    bandHtml7("meta", "Méta", meta) +
-    bandHtml7("orchestrators", "Orchestrateurs", orchs) +
-    bandHtml7("workers", "Workers", workers) +
-    bandHtml7("freelancers", "Freelancers", free);
+  const inner = {
+    meta: bl.meta.map((t) => bandNodeHtml(t, "meta")).join(""),
+    orchestrators: bl.orchestrators.map(orchChainHtml).join(""),
+    workers: bl.workers.map((t) => bandNodeHtml(t, "worker")).join(""),
+    freelancers: bl.freelancers.map((t) => bandNodeHtml(t, "freelancer")).join(""),
+  };
+  grid.innerHTML = INC7_BANDS.map((b) => bandHtml7(b.id, b.label, inner[b.id])).join("");
   const layer = document.getElementById("lineage-layer");
   if (layer) layer.innerHTML = "";
   currentNodes = new Map();
@@ -738,20 +750,26 @@ function renderBandChart() {
 
 // --- Inc6 S2/S4: org-chart (méta on top / team lead + workers / serving joins) ---
 
-// Service grouping for the org-chart. S2 renders teams flat; S4 wires this to the
-// exported serviceLayout so a family service wraps its sub-repo teams.
+// Service grouping for the org-chart: a family service wraps its sub-repo teams.
+// A thin alias over serviceLayout (kept as its own name for the call sites/tests).
 function serviceGrouping(state) {
-  return typeof serviceLayout === "function" ? serviceLayout(state) : [];
+  return serviceLayout(state);
+}
+
+// Shared shape for the compact org-chart tab boxes: a div carrying a class + the
+// viewer url + the (escaped) name with a fallback. metaTop / team-member /
+// unassigned only differ by their class and fallback name.
+function tabDiv(cls, tab, fallbackName) {
+  const t = tab || {};
+  return `<div class="${cls}" data-viewer="${escapeHtml(t.viewerUrl || "")}">${escapeHtml(t.name || fallbackName)}</div>`;
 }
 
 function metaTopHtml(tab) {
-  const t = tab || {};
-  return `<div class="meta-top-tab" data-viewer="${escapeHtml(t.viewerUrl || "")}">${escapeHtml(t.name || "méta")}</div>`;
+  return tabDiv("meta-top-tab", tab, "méta");
 }
 
 function teamMemberHtml(tab, cls) {
-  const t = tab || {};
-  return `<div class="${cls}" data-viewer="${escapeHtml(t.viewerUrl || "")}">${escapeHtml(t.name || "tab")}</div>`;
+  return tabDiv(cls, tab, "tab");
 }
 
 // One team = a repo's org sub-tree: orchestrator lead, workers below, and any
@@ -801,15 +819,19 @@ function renderOrgChart() {
   renderUnmapped();
 }
 
-// Level-0 overview (S6 reorg): META band on top, repos in the middle grouped by
-// altitude (orchestrators / workers — server order within a band, stable across
-// reloads), UNASSIGNED band at the bottom. Empty META/UNASSIGNED bands are
-// skipped, but META always renders first and UNASSIGNED always last.
+// Level-0 overview. THREE layers, tried in order (audit #357 Q2 — the fallbacks
+// are KEPT on purpose):
+//   1. tichef present   -> Inc7 4-band compact org-chart (renderBandChart).
+//   2. else + services   -> Inc6 org-chart (renderOrgChart).
+//   3. else (no tichef)  -> Inc6-S6 altitude overview (this function's body).
+// The no-tichef layers are the safety net for the transient window when the tichef
+// is being re-homed (its UUID changes, so `hasTichef` briefly reads false): the
+// dashboard degrades gracefully instead of blanking.
 function renderGrid() {
   const grid = document.getElementById("project-grid");
   if (!grid) return;
-  // Inc7: a coordinated fleet (tichef present) gets the 4-band compact org-chart,
-  // refreshed flicker-free (in-place patch between structural changes).
+  // Layer 1 — Inc7: a coordinated fleet (tichef present) gets the 4-band compact
+  // org-chart, refreshed flicker-free (in-place patch between structural changes).
   if (hasTichef(currentState)) {
     renderBandOrPatch();
     return;
@@ -831,7 +853,7 @@ function renderGrid() {
     bands.get(a).push(p);
   }
   for (const a of [...bands.keys()].sort((x, y) => x - y)) {
-    const label = BAND_LABELS[a] || `altitude ${a}`;
+    const label = ALTITUDE_LABELS[a] || `altitude ${a}`;
     parts.push(bandHtml(label, bands.get(a).map((p) => renderProjectCard(p, escapeHtml)).join("")));
   }
   if (layout.unassigned.length) {
@@ -970,29 +992,30 @@ function popupHtml(title, led, tabs) {
   );
 }
 
-function showPopupFor(phase, anchorEl) {
+// Shared popup open: cancel the hide timer, fill, show, anchor. No-op if there's
+// nothing to show (keeps the empty-popup guard both callers had).
+function openPopup(anchorEl, title, led, tabs) {
   const popup = document.getElementById("popup");
-  const node = currentNodes.get(phase);
-  if (!popup || !node || !node.tabs || !node.tabs.length) return;
+  if (!popup || !tabs || !tabs.length) return;
   clearTimeout(hideTimer);
-  popup.innerHTML = popupHtml(phase, node.rollupLed, node.tabs);
+  popup.innerHTML = popupHtml(title, led, tabs);
   popup.hidden = false;
   positionPopup(popup, anchorEl.getBoundingClientRect());
 }
 
+function showPopupFor(phase, anchorEl) {
+  const node = currentNodes.get(phase);
+  if (!node) return;
+  openPopup(anchorEl, phase, node.rollupLed, node.tabs);
+}
+
 // Hover a project CARD (level 0) -> tooltip listing its occupants with details.
 function showPopupForProject(name, anchorEl) {
-  const popup = document.getElementById("popup");
-  if (!popup || !currentState) return;
+  if (!currentState) return;
   const projects = Array.isArray(currentState.projects) ? currentState.projects : [];
   const project = projects.find((p) => p && p.name === name);
   if (!project) return;
-  const tabs = projectTabs(project);
-  if (!tabs.length) return;
-  clearTimeout(hideTimer);
-  popup.innerHTML = popupHtml(name, project.rollupLed, tabs);
-  popup.hidden = false;
-  positionPopup(popup, anchorEl.getBoundingClientRect());
+  openPopup(anchorEl, name, project.rollupLed, projectTabs(project));
 }
 
 function scheduleHide() {
