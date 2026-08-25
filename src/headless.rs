@@ -70,8 +70,6 @@ struct HeadlessTab {
     name: Arc<str>,
     term: Arc<FairMutex<Term<EventProxy>>>,
     notifier: EventLoopSender,
-    #[allow(dead_code)]
-    event_proxy: EventProxy,
     pid: u32,
     /// Wall-clock at which this tab's PTY was spawned in *this*
     /// process run. `prior_uptime` folds in time accumulated in
@@ -704,7 +702,6 @@ fn spawn_pty_tab(
         name: name.into(),
         term,
         notifier,
-        event_proxy: proxy,
         pid,
         created_at: Instant::now(),
         prior_uptime: Duration::from_secs_f64(prior_uptime_secs),

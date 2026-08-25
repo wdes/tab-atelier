@@ -362,14 +362,6 @@ impl PtyRing {
         self.base_offset
     }
 
-    /// Capacity in bytes — does not change after construction.
-    /// Same story as `base_offset` — currently unused outside tests.
-    #[allow(dead_code)]
-    #[must_use]
-    pub const fn capacity(&self) -> usize {
-        self.cap
-    }
-
     /// Copy bytes from `offset` onward into a fresh `Vec`. Clamped to
     /// the available window: when `offset < base_offset`, callers
     /// receive everything we still have (and `base_offset()` lets

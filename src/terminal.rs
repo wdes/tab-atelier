@@ -914,7 +914,6 @@ impl TerminalView {
         self.colors_enabled.get()
     }
 
-    #[allow(clippy::missing_const_for_fn)]
     pub fn set_colors_enabled(&self, enabled: bool) {
         self.colors_enabled.set(enabled);
     }
@@ -1134,15 +1133,6 @@ impl TerminalView {
 
     pub fn send_input_bytes(&self, bytes: Vec<u8>) {
         self.send_input(bytes);
-    }
-
-    // Lock-state read accessor — currently used by the right-click
-    // menu render to label the toggle, and reserved for any future
-    // call site that needs to peek at the gate (paste, hotkey
-    // dispatchers). Keep it even if the menu is the only caller.
-    #[allow(dead_code)]
-    pub fn is_locked(&self) -> bool {
-        self.locked.get()
     }
 
     /// Internal lock gate for local typing + paste. Driven by the
