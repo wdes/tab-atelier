@@ -2536,17 +2536,21 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             respond_json(stream, 200, r#"{"queued":"relay-config"}"#);
         }
         ("GET", "/env") => {
-            // The current GLOBAL tab-env map (the CLI `env list`).
-            let map = crate::tab_env_global();
-            match serde_json::to_string(&map) {
+            // The GLOBAL tab-env KEY NAMES (the CLI `env list`). Only names are
+            // returned — the values often hold secrets (API keys, tokens) and
+            // echoing them back over HTTP is a needless leak. Whoever set a var
+            // already knows its value.
+            let keys: Vec<String> = crate::tab_env_global().into_keys().collect();
+            match serde_json::to_string(&keys) {
                 Ok(j) => respond_json(stream, 200, &j),
                 Err(e) => error_json(stream, 500, &format!("serialize: {e}")),
             }
         }
         ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/env") => {
-            // Per-tab env map (`env list --tab <id>`). Mirrored from the runtime
-            // tab into the snapshot, so this reflects queued changes as soon as
-            // the next snapshot rebuild lands (same cadence as `/tabs`).
+            // Per-tab env KEY NAMES (`env list --tab <id>`). Names only, same
+            // no-secret-leak rationale as `GET /env` above. Mirrored from the
+            // runtime tab into the snapshot, so it reflects queued changes as
+            // soon as the next snapshot rebuild lands (same cadence as `/tabs`).
             let Some((key_raw, is_uuid)) = parse_tab_key(p, "/env") else {
                 error_json(stream, 404, "missing tab id");
                 return;
@@ -2557,9 +2561,10 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 error_json(stream, 404, "tab not found");
                 return;
             };
-            let map = snap.tabs[idx].tab_env.clone();
+            // BTreeMap ⇒ names come out sorted; keys only, no values.
+            let keys: Vec<String> = snap.tabs[idx].tab_env.keys().cloned().collect();
             drop(snap);
-            match serde_json::to_string(&map) {
+            match serde_json::to_string(&keys) {
                 Ok(j) => respond_json(stream, 200, &j),
                 Err(e) => error_json(stream, 500, &format!("serialize: {e}")),
             }
@@ -5641,12 +5646,12 @@ mod tests {
     }
 
     #[test]
-    fn env_list_per_tab_returns_overrides() {
+    fn env_list_per_tab_returns_key_names_not_values() {
         let (port, state, token) = spawn_server();
         {
             let mut s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            s.tabs[0].tab_env.insert("FOO".into(), "bar".into());
-            s.tabs[0].tab_env.insert("BAZ".into(), "qux".into());
+            s.tabs[0].tab_env.insert("FOO".into(), "s3cret".into());
+            s.tabs[0].tab_env.insert("BAZ".into(), "t0ken".into());
         }
         let resp = request(
             port,
@@ -5654,8 +5659,40 @@ mod tests {
         );
         assert_eq!(status_code(&resp), 200);
         let b = body(&resp);
-        assert!(b.contains("\"FOO\":\"bar\""), "body: {b}");
-        assert!(b.contains("\"BAZ\":\"qux\""), "body: {b}");
+        // Names present (sorted array), values NEVER echoed back.
+        assert_eq!(b.trim(), r#"["BAZ","FOO"]"#, "body: {b}");
+        assert!(
+            !b.contains("s3cret") && !b.contains("t0ken"),
+            "values must not leak: {b}"
+        );
+    }
+
+    #[test]
+    fn env_list_global_returns_key_names_not_values() {
+        let (port, _state, token) = spawn_server();
+        // Seed the global map, then list it — names only.
+        let set = r#"{"set":{"GLOBAL_SECRET":"hunter2"},"unset":[]}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /env HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{set}",
+                set.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 200);
+        // The POST only queues a drain; apply it directly to the global map so
+        // the GET has something to list (the drain runs in the main loop).
+        let mut g = std::collections::BTreeMap::new();
+        g.insert("GLOBAL_SECRET".to_string(), "hunter2".to_string());
+        crate::set_tab_env_global(g);
+        let resp = request(
+            port,
+            &format!("GET /env HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        assert_eq!(status_code(&resp), 200);
+        let b = body(&resp);
+        assert!(b.contains("GLOBAL_SECRET"), "name present: {b}");
+        assert!(!b.contains("hunter2"), "value must not leak: {b}");
     }
 
     #[test]
