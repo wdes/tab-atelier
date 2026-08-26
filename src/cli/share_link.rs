@@ -969,8 +969,8 @@ pub fn relay(action: &str, arg: Option<&str>) -> i32 {
 ///
 /// Sets/removes env vars injected into tabs' PTYs. `set`/`unset` POST a merge
 /// to `/env` (global) or `/tabs/<id>/env` (per-tab); `list` GETs the matching
-/// map (global, or a tab's overrides with `--tab`). Changes take effect on a
-/// tab's next (re)spawn.
+/// KEY NAMES (global, or a tab's overrides with `--tab`) — values are never
+/// returned, since they may be secrets. Changes take effect on next (re)spawn.
 #[must_use]
 pub fn env(action: &str, args: &[String], global: bool, tab: Option<&str>) -> i32 {
     let ep = match discover_endpoint() {
@@ -999,9 +999,11 @@ pub fn env(action: &str, args: &[String], global: bool, tab: Option<&str>) -> i3
             .call()
         {
             Ok(mut r) => {
-                let map: std::collections::BTreeMap<String, String> = r.body_mut().read_json().unwrap_or_default();
-                for (k, v) in map {
-                    println!("{k}={v}");
+                // Key NAMES only — the server never returns values (they may be
+                // secrets). Prints one `KEY` per line.
+                let keys: Vec<String> = r.body_mut().read_json().unwrap_or_default();
+                for k in keys {
+                    println!("{k}");
                 }
                 0
             }
