@@ -1397,6 +1397,7 @@ fn refresh_snapshot(
             // sidecar cache yet) — headless reports None here.
             resident_memory_bytes: crate::agent_probe::sample_tree(tab.pid).map(|s| s.rss_kb.saturating_mul(1024)),
             tokens: None,
+            tab_env: tab.tab_env.clone(),
         });
     }
     let mut snapshot = api_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
