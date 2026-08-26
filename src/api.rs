@@ -2536,21 +2536,21 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             respond_json(stream, 200, r#"{"queued":"relay-config"}"#);
         }
         ("GET", "/env") => {
-            // The GLOBAL tab-env KEY NAMES (the CLI `env list`). Only names are
-            // returned — the values often hold secrets (API keys, tokens) and
-            // echoing them back over HTTP is a needless leak. Whoever set a var
-            // already knows its value.
-            let keys: Vec<String> = crate::tab_env_global().into_keys().collect();
-            match serde_json::to_string(&keys) {
+            // The GLOBAL tab-env map (the CLI `env list`). Values are MASKED
+            // server-side (see `mask_env_value`): a secret never leaves the
+            // daemon; only boolean-ish flags (0/1/true/false) come through in
+            // the clear. Keeps the wire clean of API keys / tokens.
+            let map = mask_env_map(&crate::tab_env_global());
+            match serde_json::to_string(&map) {
                 Ok(j) => respond_json(stream, 200, &j),
                 Err(e) => error_json(stream, 500, &format!("serialize: {e}")),
             }
         }
         ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/env") => {
-            // Per-tab env KEY NAMES (`env list --tab <id>`). Names only, same
-            // no-secret-leak rationale as `GET /env` above. Mirrored from the
-            // runtime tab into the snapshot, so it reflects queued changes as
-            // soon as the next snapshot rebuild lands (same cadence as `/tabs`).
+            // Per-tab env map (`env list --tab <id>`), values masked the same way
+            // as `GET /env` above. Mirrored from the runtime tab into the
+            // snapshot, so it reflects queued changes as soon as the next
+            // snapshot rebuild lands (same cadence as `/tabs`).
             let Some((key_raw, is_uuid)) = parse_tab_key(p, "/env") else {
                 error_json(stream, 404, "missing tab id");
                 return;
@@ -2561,10 +2561,9 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 error_json(stream, 404, "tab not found");
                 return;
             };
-            // BTreeMap ⇒ names come out sorted; keys only, no values.
-            let keys: Vec<String> = snap.tabs[idx].tab_env.keys().cloned().collect();
+            let map = mask_env_map(&snap.tabs[idx].tab_env);
             drop(snap);
-            match serde_json::to_string(&keys) {
+            match serde_json::to_string(&map) {
                 Ok(j) => respond_json(stream, 200, &j),
                 Err(e) => error_json(stream, 500, &format!("serialize: {e}")),
             }
@@ -3722,6 +3721,28 @@ async fn handle_hyper_request(
     .await
     .unwrap_or_default();
     Ok(parse_h1_response(resp).map(BodyExt::boxed))
+}
+
+/// Mask a single env value for the `env list` API.
+///
+/// Boolean-ish flags (`0`/`1`/`true`/`false`, the last two case-insensitively)
+/// are not secrets and pass through in the clear so an operator can eyeball a
+/// feature toggle; everything else — API keys, tokens, connection strings — is
+/// replaced by `******` so the real value never leaves the daemon.
+fn mask_env_value(v: &str) -> &str {
+    if matches!(v, "0" | "1") || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("false") {
+        v
+    } else {
+        "******"
+    }
+}
+
+/// Apply [`mask_env_value`] across an env map, preserving key order (`BTreeMap`
+/// ⇒ sorted). The returned map is safe to serialize over the wire.
+fn mask_env_map(map: &std::collections::BTreeMap<String, String>) -> std::collections::BTreeMap<String, String> {
+    map.iter()
+        .map(|(k, v)| (k.clone(), mask_env_value(v).to_string()))
+        .collect()
 }
 
 /// Parse an env-change body: `{"set":{"K":"V"},"unset":["K"],"respawn":bool}`.
@@ -5646,12 +5667,14 @@ mod tests {
     }
 
     #[test]
-    fn env_list_per_tab_returns_key_names_not_values() {
+    fn env_list_per_tab_masks_secrets_but_shows_flags() {
         let (port, state, token) = spawn_server();
         {
             let mut s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            s.tabs[0].tab_env.insert("FOO".into(), "s3cret".into());
-            s.tabs[0].tab_env.insert("BAZ".into(), "t0ken".into());
+            s.tabs[0].tab_env.insert("API_KEY".into(), "s3cret".into());
+            s.tabs[0].tab_env.insert("DEBUG".into(), "1".into());
+            s.tabs[0].tab_env.insert("VERBOSE".into(), "true".into());
+            s.tabs[0].tab_env.insert("QUIET".into(), "FALSE".into());
         }
         let resp = request(
             port,
@@ -5659,31 +5682,23 @@ mod tests {
         );
         assert_eq!(status_code(&resp), 200);
         let b = body(&resp);
-        // Names present (sorted array), values NEVER echoed back.
-        assert_eq!(b.trim(), r#"["BAZ","FOO"]"#, "body: {b}");
-        assert!(
-            !b.contains("s3cret") && !b.contains("t0ken"),
-            "values must not leak: {b}"
-        );
+        // Secret masked; boolean-ish flags (incl. case-insensitive true/false)
+        // pass through; the raw secret never appears.
+        assert!(b.contains(r#""API_KEY":"******""#), "secret must be masked: {b}");
+        assert!(b.contains(r#""DEBUG":"1""#), "flag shown: {b}");
+        assert!(b.contains(r#""VERBOSE":"true""#), "flag shown: {b}");
+        assert!(b.contains(r#""QUIET":"FALSE""#), "case-insensitive flag shown: {b}");
+        assert!(!b.contains("s3cret"), "value must not leak: {b}");
     }
 
     #[test]
-    fn env_list_global_returns_key_names_not_values() {
+    fn env_list_global_masks_secrets_but_shows_flags() {
         let (port, _state, token) = spawn_server();
-        // Seed the global map, then list it — names only.
-        let set = r#"{"set":{"GLOBAL_SECRET":"hunter2"},"unset":[]}"#;
-        let resp = request(
-            port,
-            &format!(
-                "POST /env HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{set}",
-                set.len(),
-            ),
-        );
-        assert_eq!(status_code(&resp), 200);
-        // The POST only queues a drain; apply it directly to the global map so
-        // the GET has something to list (the drain runs in the main loop).
+        // Apply directly to the global map (the POST only queues a drain that
+        // runs in the main loop, absent from this test harness).
         let mut g = std::collections::BTreeMap::new();
         g.insert("GLOBAL_SECRET".to_string(), "hunter2".to_string());
+        g.insert("FEATURE_X".to_string(), "0".to_string());
         crate::set_tab_env_global(g);
         let resp = request(
             port,
@@ -5691,8 +5706,22 @@ mod tests {
         );
         assert_eq!(status_code(&resp), 200);
         let b = body(&resp);
-        assert!(b.contains("GLOBAL_SECRET"), "name present: {b}");
+        assert!(b.contains(r#""GLOBAL_SECRET":"******""#), "secret masked: {b}");
+        assert!(b.contains(r#""FEATURE_X":"0""#), "flag shown: {b}");
         assert!(!b.contains("hunter2"), "value must not leak: {b}");
+    }
+
+    #[test]
+    fn mask_env_value_covers_flags_and_secrets() {
+        assert_eq!(super::mask_env_value("0"), "0");
+        assert_eq!(super::mask_env_value("1"), "1");
+        assert_eq!(super::mask_env_value("true"), "true");
+        assert_eq!(super::mask_env_value("True"), "True");
+        assert_eq!(super::mask_env_value("FALSE"), "FALSE");
+        assert_eq!(super::mask_env_value("sk-abc123"), "******");
+        assert_eq!(super::mask_env_value("2"), "******");
+        assert_eq!(super::mask_env_value(""), "******");
+        assert_eq!(super::mask_env_value("truthy"), "******");
     }
 
     #[test]
