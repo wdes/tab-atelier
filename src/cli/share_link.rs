@@ -968,8 +968,9 @@ pub fn relay(action: &str, arg: Option<&str>) -> i32 {
 /// `env set KEY=VAL | env unset KEY | env list` (`--global` or `--tab <id>`).
 ///
 /// Sets/removes env vars injected into tabs' PTYs. `set`/`unset` POST a merge
-/// to `/env` (global) or `/tabs/<id>/env` (per-tab); `list` GETs the global map.
-/// Changes take effect on a tab's next (re)spawn.
+/// to `/env` (global) or `/tabs/<id>/env` (per-tab); `list` GETs the matching
+/// map (global, or a tab's overrides with `--tab`). Changes take effect on a
+/// tab's next (re)spawn.
 #[must_use]
 pub fn env(action: &str, args: &[String], global: bool, tab: Option<&str>) -> i32 {
     let ep = match discover_endpoint() {
@@ -980,12 +981,20 @@ pub fn env(action: &str, args: &[String], global: bool, tab: Option<&str>) -> i3
         }
     };
     if action == "list" {
-        if tab.is_some() {
-            eprintln!("env list: per-tab listing isn't supported — use --global (or read tabs.json)");
-            return 2;
-        }
+        // Global (`--global`, the default) lists the shared map; `--tab <id>`
+        // lists that tab's per-tab overrides. Same URL shape as set/unset.
+        let url = tab.map_or_else(
+            || format!("{}/env", ep.url),
+            |t| {
+                if t.parse::<usize>().is_ok() {
+                    format!("{}/tabs/{t}/env", ep.url)
+                } else {
+                    format!("{}/tabs/by-id/{t}/env", ep.url)
+                }
+            },
+        );
         match agent()
-            .get(format!("{}/env", ep.url))
+            .get(url)
             .header("Authorization", format!("Bearer {}", ep.token))
             .call()
         {

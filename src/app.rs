@@ -2106,6 +2106,7 @@ impl AppState {
                 tokens: tab.tokens_last_saved.get(),
                 #[cfg(not(feature = "catbus"))]
                 tokens: None,
+                tab_env: tab.tab_env.clone(),
             });
         }
 

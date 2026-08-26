@@ -441,6 +441,10 @@ pub struct SnapshotTab {
     /// catbus-agent `tokens.json` sidecar. `None` for non-agent tabs (or
     /// builds without `catbus`). Surfaced as `tokens: {input, output}`.
     pub tokens: Option<crate::TokenUsage>,
+    /// Per-tab env overrides (`env set --tab <id>`), mirrored from the runtime
+    /// tab so `GET /tabs/<id>/env` (the CLI `env list --tab`) can report them
+    /// without reading tabs.json off disk. Empty ⇒ no per-tab overrides.
+    pub tab_env: std::collections::BTreeMap<String, String>,
 }
 
 impl crate::schedule::LockState for SnapshotTab {
@@ -2539,6 +2543,27 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 Err(e) => error_json(stream, 500, &format!("serialize: {e}")),
             }
         }
+        ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/env") => {
+            // Per-tab env map (`env list --tab <id>`). Mirrored from the runtime
+            // tab into the snapshot, so this reflects queued changes as soon as
+            // the next snapshot rebuild lands (same cadence as `/tabs`).
+            let Some((key_raw, is_uuid)) = parse_tab_key(p, "/env") else {
+                error_json(stream, 404, "missing tab id");
+                return;
+            };
+            let snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(idx) = resolve_tab_idx(&snap, key_raw, is_uuid) else {
+                drop(snap);
+                error_json(stream, 404, "tab not found");
+                return;
+            };
+            let map = snap.tabs[idx].tab_env.clone();
+            drop(snap);
+            match serde_json::to_string(&map) {
+                Ok(j) => respond_json(stream, 200, &j),
+                Err(e) => error_json(stream, 500, &format!("serialize: {e}")),
+            }
+        }
         ("POST", "/env") => {
             // Global env change (`env set/unset --global`). Body:
             // {"set":{"K":"V"},"unset":["K"],"respawn":bool}.
@@ -4355,6 +4380,7 @@ pub fn test_snapshot_tab(id: &str, name: &str) -> SnapshotTab {
         dns_entries: Vec::new(),
         resident_memory_bytes: None,
         tokens: None,
+        tab_env: std::collections::BTreeMap::new(),
     }
 }
 
@@ -5612,6 +5638,34 @@ mod tests {
             s.pending_ssh_agent_changes.clone()
         };
         assert!(queued.is_empty(), "GUI must not queue a change it can't apply");
+    }
+
+    #[test]
+    fn env_list_per_tab_returns_overrides() {
+        let (port, state, token) = spawn_server();
+        {
+            let mut s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            s.tabs[0].tab_env.insert("FOO".into(), "bar".into());
+            s.tabs[0].tab_env.insert("BAZ".into(), "qux".into());
+        }
+        let resp = request(
+            port,
+            &format!("GET /tabs/by-id/tab-a/env HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        assert_eq!(status_code(&resp), 200);
+        let b = body(&resp);
+        assert!(b.contains("\"FOO\":\"bar\""), "body: {b}");
+        assert!(b.contains("\"BAZ\":\"qux\""), "body: {b}");
+    }
+
+    #[test]
+    fn env_list_per_tab_unknown_tab_404() {
+        let (port, _state, token) = spawn_server();
+        let resp = request(
+            port,
+            &format!("GET /tabs/by-id/does-not-exist/env HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        assert_eq!(status_code(&resp), 404);
     }
 
     #[test]
