@@ -286,6 +286,13 @@ pub fn kill_tab(tab_id: &str) -> bool {
 }
 
 #[cfg(not(feature = "gui"))]
+/// Parse a `cgroup.procs` blob (one pid per line) into pids, skipping blank /
+/// non-numeric lines and trailing whitespace. Pure — unit-tested.
+fn parse_cgroup_procs(text: &str) -> Vec<u32> {
+    text.lines().filter_map(|l| l.trim().parse::<u32>().ok()).collect()
+}
+
+#[cfg(not(feature = "gui"))]
 /// The pids currently in a tab's cgroup subtree (from `cgroup.procs`).
 fn tab_pids(tab_id: &str) -> Vec<u32> {
     let Some(Some(base)) = DELEGATED_BASE.get() else {
@@ -293,7 +300,7 @@ fn tab_pids(tab_id: &str) -> Vec<u32> {
     };
     let dir = base.join(format!("tab-{}", sanitize_id(tab_id)));
     std::fs::read_to_string(dir.join("cgroup.procs"))
-        .map(|s| s.lines().filter_map(|l| l.trim().parse::<u32>().ok()).collect())
+        .map(|s| parse_cgroup_procs(&s))
         .unwrap_or_default()
 }
 
@@ -407,5 +414,33 @@ mod tests {
             child = 3;
         }
         assert!(!unsafe_tab_pid(child), "a real tab child pid must be allowed");
+    }
+
+    #[cfg(not(feature = "gui"))]
+    #[test]
+    fn parse_cgroup_procs_skips_blank_and_garbage() {
+        // Real cgroup.procs: one pid per line, often a trailing newline.
+        assert_eq!(parse_cgroup_procs("42\n1337\n"), vec![42, 1337]);
+        // Blank lines, surrounding whitespace, and non-numeric lines are dropped
+        // (not fatal) — a half-read/racing file must not panic or mis-signal.
+        assert_eq!(parse_cgroup_procs("\n  7 \n\nnope\n\n9\n"), vec![7, 9]);
+        assert!(parse_cgroup_procs("").is_empty());
+        assert!(parse_cgroup_procs("\n\n").is_empty());
+        // Never signal pid 0 shows up as a value only if the kernel wrote it;
+        // parsing keeps it (the caller's guards handle 0), but garbage doesn't.
+        assert_eq!(parse_cgroup_procs("0\n-1\n2a\n3"), vec![0, 3]);
+    }
+
+    #[cfg(not(feature = "gui"))]
+    #[test]
+    fn tab_teardown_helpers_are_safe_without_a_delegated_cgroup() {
+        // In a unit-test process no cgroup subtree is delegated (`init()` never
+        // ran), so the shutdown helpers must be inert no-ops — never panic, and
+        // report "no procs" so the grace loop exits immediately and the SIGKILL
+        // fallback is harmless.
+        let id = "definitely-not-a-real-tab-uuid-xyz";
+        assert!(tab_pids(id).is_empty());
+        assert!(!tab_has_procs(id));
+        terminate_tab(id); // must not panic
     }
 }
