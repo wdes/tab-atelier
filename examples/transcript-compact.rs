@@ -119,34 +119,61 @@ fn solo_layers() -> Vec<(&'static str, tc::Config)> {
 fn report() {
     let tabs = live_tabs();
     println!(
-        "Dry-run over {} live-tab transcripts. NO files are modified.\n",
+        "Dry-run over {} live-tab transcripts. NO files are modified.",
         tabs.len()
     );
+    println!("(debug build — serde_json is unoptimized here; a --release build scans ~10× faster.)\n");
 
     let solos = solo_layers();
     let presets = tc::presets();
+    // One combined config list so each file is scanned in a SINGLE pass.
+    let all_cfgs: Vec<tc::Config> = solos
+        .iter()
+        .map(|(_, c)| *c)
+        .chain(presets.iter().map(|(_, c)| *c))
+        .collect();
+    let n_solo = solos.len();
     let mut solo_tot: Vec<u64> = vec![0; solos.len()];
     let mut preset_saved: Vec<u64> = vec![0; presets.len()];
     let mut orig_total = 0u64;
-    let balanced = presets[1].1;
     let mut per_tab: Vec<(u64, String, u64, u64)> = Vec::new();
 
-    // ONE parse per file; every config measured borrow-only (clone-safe, fast).
-    for (name, path) in &tabs {
+    let n = tabs.len();
+    let start = std::time::Instant::now();
+    let mut done_bytes = 0u64;
+    for (idx, (name, path)) in tabs.iter().enumerate() {
         let text = std::fs::read_to_string(path).unwrap_or_default();
+        done_bytes += text.len() as u64;
+        // Live progress on stderr (kept off stdout so a `> report.txt` stays clean).
+        eprint!(
+            "\r  [{:>2}/{n}] {:<24} {:>6}  ({:.0} MB/s)      ",
+            idx + 1,
+            &name.chars().take(24).collect::<String>(),
+            mb(text.len() as u64),
+            done_bytes as f64 / 1_048_576.0 / start.elapsed().as_secs_f64().max(0.001),
+        );
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+
         let records = tc::parse(&text);
         let orig_size = tc::size(&records);
         orig_total += orig_size;
 
-        for (i, (_, cfg)) in solos.iter().enumerate() {
-            solo_tot[i] += tc::measure(&records, cfg).total();
+        // Single pass scoring all solo + preset configs at once.
+        let stats = tc::measure_batch(&records, &all_cfgs);
+        for i in 0..n_solo {
+            solo_tot[i] += stats[i].total();
         }
-        for (i, (_, cfg)) in presets.iter().enumerate() {
-            preset_saved[i] += tc::measure(&records, cfg).total();
+        for i in 0..presets.len() {
+            preset_saved[i] += stats[n_solo + i].total();
         }
-        let bsaved = tc::measure(&records, &balanced).total();
+        let bsaved = stats[n_solo + 1].total(); // presets[1] == balanced
         per_tab.push((bsaved, name.clone(), orig_size, orig_size - bsaved));
     }
+    eprintln!(
+        "\r  scanned {n} tabs in {:.1}s{:<30}",
+        start.elapsed().as_secs_f64(),
+        ""
+    );
 
     // Resume-safety spot-check: run the REAL apply + validate (the mutating,
     // re-parenting path) on the 3 biggest tabs under the most aggressive preset.
@@ -156,8 +183,9 @@ fn report() {
     let mut spot = Vec::new();
     for (name, path) in biggest.iter().take(3) {
         let text = std::fs::read_to_string(path).unwrap_or_default();
-        let orig_uuids = tc::uuid_set(&tc::parse(&text));
-        let (out, _) = tc::apply(tc::parse(&text), &aggressive);
+        let records = tc::parse(&text); // parse once
+        let orig_uuids = tc::uuid_set(&records);
+        let (out, _) = tc::apply(records, &aggressive); // consumes it
         let probs = tc::validate(&orig_uuids, &out);
         spot.push((name.clone(), probs.first().cloned()));
     }
