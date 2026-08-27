@@ -9,12 +9,39 @@
 //! trim layers WOULD reclaim. Never writes a transcript — pure analysis.
 //!
 //!   cargo run --release --no-default-features --features headless \
-//!     --example transcript-compact -- [--report | --tab NAME | --examples NAME]
+//!     --example transcript-compact -- <report|space|tab NAME|examples NAME>
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use clap::{Parser, Subcommand};
 use tab_atelier::transcript_compact as tc;
+
+/// Dry-run analysis of Claude Code transcripts for tab-atelier's compactor.
+#[derive(Parser)]
+#[command(name = "transcript-compact", about, long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Per-layer + preset reclaim across every live tab (default).
+    Report,
+    /// Where the bytes go: breakdown by record/block/attachment kind, with samples.
+    Space,
+    /// Per-preset before/after for one tab.
+    Tab {
+        /// Tab name (as shown in the tab bar).
+        name: String,
+    },
+    /// Like `tab`, plus concrete examples of the items each layer touches.
+    Examples {
+        /// Tab name.
+        name: String,
+    },
+}
 
 fn home() -> PathBuf {
     std::env::var_os("HOME").map_or_else(|| PathBuf::from("/root"), PathBuf::from)
@@ -355,11 +382,142 @@ fn show_examples(text: &str) {
     }
 }
 
+/// Anatomy of the transcripts: where every byte lives, with real samples.
+fn anatomy() {
+    let tabs = live_tabs();
+    let mut by_type: HashMap<String, u64> = HashMap::new();
+    let mut by_block: HashMap<String, u64> = HashMap::new();
+    let mut by_attach: HashMap<String, u64> = HashMap::new();
+    let mut total = 0u64;
+    // Biggest single example of each kind: (size, one-line excerpt).
+    let mut big_think = (0u64, String::new());
+    let mut big_result = (0u64, String::new());
+    let mut big_tur = (0u64, String::new());
+    let mut big_text = (0u64, String::new());
+    let mut big_attach: HashMap<String, (u64, String)> = HashMap::new();
+
+    let n = tabs.len();
+    for (i, (_, path)) in tabs.iter().enumerate() {
+        eprint!("\r  scanning [{}/{n}]   ", i + 1);
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        for r in tc::parse(&text) {
+            let bytes = r.raw.len() as u64 + 1;
+            total += bytes;
+            let Some(v) = &r.value else { continue };
+            let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("?").to_string();
+            *by_type.entry(ty.clone()).or_insert(0) += bytes;
+
+            if ty == "attachment" {
+                let k = v
+                    .get("attachment")
+                    .and_then(|a| a.get("type"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("?");
+                *by_attach.entry(k.to_string()).or_insert(0) += bytes;
+                let e = big_attach.entry(k.to_string()).or_insert((0, String::new()));
+                if bytes > e.0 {
+                    *e = (bytes, excerpt(v, 100));
+                }
+            }
+            if let Some(tur) = v.get("toolUseResult") {
+                let n = serde_json::to_string(tur).map_or(0, |s| s.len()) as u64;
+                *by_block.entry("toolUseResult (metadata)".into()).or_insert(0) += n;
+                if n > big_tur.0 {
+                    big_tur = (n, excerpt(tur, 120));
+                }
+            }
+            if let Some(blocks) = v
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_array())
+            {
+                for b in blocks {
+                    let bt = b.get("type").and_then(|t| t.as_str()).unwrap_or("?");
+                    let n = serde_json::to_string(b).map_or(0, |s| s.len()) as u64;
+                    *by_block.entry(bt.to_string()).or_insert(0) += n;
+                    match bt {
+                        "thinking" if n > big_think.0 => {
+                            // Thinking blocks are dominated by the `signature`
+                            // (extended-thinking crypto blob), not the text.
+                            let t = b.get("thinking").and_then(|x| x.as_str()).unwrap_or("");
+                            let sig = b.get("signature").and_then(|x| x.as_str()).map_or(0, str::len);
+                            big_think = if t.is_empty() {
+                                (
+                                    n,
+                                    format!("<no text> + {sig} B `signature` (extended-thinking crypto blob)"),
+                                )
+                            } else {
+                                let head: String = t.chars().take(80).collect();
+                                (n, format!("{}… + {sig} B signature", head.replace('\n', " ")))
+                            };
+                        }
+                        "text" if n > big_text.0 => big_text = (n, field_excerpt(b, "text", 120)),
+                        "tool_result" if n > big_result.0 => {
+                            big_result = (n, b.get("content").map_or(String::new(), |c| excerpt(c, 120)));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    eprintln!("\r{:<40}", "");
+
+    println!("Transcript anatomy over {n} live tabs — total {}\n", mb(total));
+    print_table("bytes by record type", &by_type, total);
+    print_table("\nbytes by message content-block", &by_block, total);
+    print_table("\nbytes by attachment sub-kind", &by_attach, total);
+
+    println!("\n── biggest single items (real samples) ──");
+    println!("  thinking  {:>7}: “{}”", mb(big_think.0), big_think.1);
+    println!("  tool_result {:>5}: “{}”", mb(big_result.0), big_result.1);
+    println!("  toolUseResult {:>3}: {}", mb(big_tur.0), big_tur.1);
+    println!("  text      {:>7}: “{}”", mb(big_text.0), big_text.1);
+    let mut atts: Vec<_> = big_attach.into_iter().collect();
+    atts.sort_by_key(|b| std::cmp::Reverse(b.1.0));
+    for (kind, (sz, ex)) in atts.into_iter().take(4) {
+        println!("  attach:{kind:<16}{:>7}: {}", mb(sz), ex);
+    }
+}
+
+/// One-line excerpt of a JSON value's serialized form.
+fn excerpt(v: &serde_json::Value, n: usize) -> String {
+    let s = serde_json::to_string(v).unwrap_or_default();
+    let cut: String = s.chars().take(n).collect();
+    let out = cut.replace(['\n', '\r'], "⏎");
+    if s.len() > n { out + "…" } else { out }
+}
+
+/// Excerpt of a named string field (falls back to the whole block).
+fn field_excerpt(b: &serde_json::Value, field: &str, n: usize) -> String {
+    b.get(field).and_then(|t| t.as_str()).map_or_else(
+        || excerpt(b, n),
+        |s| {
+            let cut: String = s.chars().take(n).collect();
+            let out = cut.replace(['\n', '\r'], " ");
+            if s.len() > n { out + "…" } else { out }
+        },
+    )
+}
+
+fn print_table(title: &str, map: &HashMap<String, u64>, total: u64) {
+    println!("── {title} ──");
+    let mut rows: Vec<_> = map.iter().collect();
+    rows.sort_by_key(|(_, v)| std::cmp::Reverse(**v));
+    for (k, v) in rows {
+        if *v == 0 {
+            continue;
+        }
+        println!("  {k:<26}{:>8}  ({:4.1}%)", mb(*v), 100.0 * *v as f64 / total as f64);
+    }
+}
+
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.first().map(String::as_str) {
-        Some("--tab") => one_tab(args.get(1).map_or("", String::as_str), false),
-        Some("--examples") => one_tab(args.get(1).map_or("", String::as_str), true),
-        _ => report(),
+    match Cli::parse().cmd {
+        Some(Cmd::Space) => anatomy(),
+        Some(Cmd::Tab { name }) => one_tab(&name, false),
+        Some(Cmd::Examples { name }) => one_tab(&name, true),
+        Some(Cmd::Report) | None => report(),
     }
 }
