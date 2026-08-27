@@ -1,29 +1,5 @@
 Package: tab-atelier-headless
 Architecture: amd64
-Version: 0.5.0~nightly20260818.201651-1
-Priority: optional
-Section: x11
-Maintainer: William Desportes <williamdes@wdes.fr>
-Installed-Size: 17385
-Depends: adduser, bubblewrap, init-system-helpers, libc6 (>= 2.39), libgcc-s1, nftables
-Recommends: fonts-noto-color-emoji
-Conflicts: tab-atelier
-Replaces: tab-atelier
-Filename: pool/nightly/main/t/tab-atelier/tab-atelier-headless_0.5.0~nightly20260818.201651-1_amd64.deb
-Size: 4639712
-MD5sum: 8233452ef0be2e66f823e373037aeddb
-SHA1: bf7dc30799b723ec32fa5523796b29d8d8a33082
-SHA256: f53b1b07b748a055b5d535aca605eb7837df85f3b83d261e35048ddd2c47df51
-SHA512: 4920a1871c890779e7f51f5781d76051a2668008c8280b96f58ffb4df6eb6d1b74895d74bda7e09e770205df0f3258923b0f15f3cd8deef734aae5ede1eaf127
-Homepage: https://github.com/wdes/tab-atelier#readme
-Description: Guake-style drop-down terminal emulator for Linux (X11)
- Display-less companion to tab-atelier. Restores tabs from tabs.json, spawns
- their PTYs, and runs the same local HTTP/TLS API as the desktop GUI — without
- any X11 / gpui dependency. Designed for servers, CI runners, and remote shells
- where the web viewer should still see the same set of named tabs.
-
-Package: tab-atelier-headless
-Architecture: amd64
 Version: 0.5.0~nightly20260821.082414-1
 Priority: optional
 Section: x11
@@ -238,28 +214,29 @@ Description: Guake-style drop-down terminal emulator for Linux (X11)
  any X11 / gpui dependency. Designed for servers, CI runners, and remote shells
  where the web viewer should still see the same set of named tabs.
 
-Package: tab-atelier
+Package: tab-atelier-headless
 Architecture: amd64
-Version: 0.5.0~nightly20260818.201651-1
+Version: 0.5.0~nightly20260827.160004-1
 Priority: optional
 Section: x11
 Maintainer: William Desportes <williamdes@wdes.fr>
-Installed-Size: 33722
-Depends: fonts-dejavu-core, libc6 (>= 2.39), libfreetype6, libgcc-s1, libxcb1 (>= 1.12), libxkbcommon-x11-0 (>= 0.5.0), libxkbcommon0 (>= 0.5.0)
-Recommends: fonts-noto-color-emoji
-Conflicts: tab-atelier-headless
-Replaces: tab-atelier-headless
-Filename: pool/nightly/main/t/tab-atelier/tab-atelier_0.5.0~nightly20260818.201651-1_amd64.deb
-Size: 10562828
-MD5sum: 7e2ff71a1d00e41a2027e2f09d6cd62a
-SHA1: 723793b43aeec47144091a25f0e121c3106abd21
-SHA256: e9e8e716f4ee4ebd3aaca47b7a245c43acd82430c0cfdc5e5a89490b727342b7
-SHA512: 345e10caa036f5f571a26dd5fa4d2da49a3084281bdf4b2a8f506faefb203f75ee73fba6138215303cf8d9b7c5456606e12ffc8821a05d9dd454ee5ae9cbcbee
+Installed-Size: 17461
+Depends: adduser, bubblewrap, init-system-helpers, libc6 (>= 2.39), libgcc-s1, nftables
+Recommends: openssh-client
+Conflicts: tab-atelier
+Replaces: tab-atelier
+Filename: pool/nightly/main/t/tab-atelier/tab-atelier-headless_0.5.0~nightly20260827.160004-1_amd64.deb
+Size: 4664528
+MD5sum: f5ac5550b942cbece063f5a1ea938b41
+SHA1: 9410a071b0b242b9c5107a8204314effaaa8c3c5
+SHA256: 060d1fc7e8505f1d53002f1ca7aacf8c91fce7db73bd0417c099c6a9f304d74b
+SHA512: 4442efc6522d920fd4c9fd8462f9c02ef9fe16f43106c7b375827e4abf33d2a973b648862e077e719ca2fb96f2db1231985c628265b4d880d79694e97a705155
 Homepage: https://github.com/wdes/tab-atelier#readme
 Description: Guake-style drop-down terminal emulator for Linux (X11)
- A Guake-style drop-down terminal emulator built with alacritty_terminal and
- gpui. Features tabbed terminals, i18n (English/French), power monitoring,
- screenshots, remote control via QR code, and Wakatime integration.
+ Display-less companion to tab-atelier. Restores tabs from tabs.json, spawns
+ their PTYs, and runs the same local HTTP/TLS API as the desktop GUI — without
+ any X11 / gpui dependency. Designed for servers, CI runners, and remote shells
+ where the web viewer should still see the same set of named tabs.
 
 Package: tab-atelier
 Architecture: amd64
@@ -462,6 +439,29 @@ MD5sum: 9fce0cdf4e9aa72fc7ca31956c049d41
 SHA1: 819f39ff0f5315db87cee355f24e7093ba360c59
 SHA256: 07516f1cf24b87d007bc214bf3dd9206d37b2feed404a33c1e3dd5abbbccbe4a
 SHA512: 09aed6278d970716d4c5a9a904b2889fce800bf69e18a4bc14c5fb6f3f7378d9077e0de343ffbbc14a6b1c4cccffb731a759b3e0697cc60a199c19b66971e8a3
+Homepage: https://github.com/wdes/tab-atelier#readme
+Description: Guake-style drop-down terminal emulator for Linux (X11)
+ A Guake-style drop-down terminal emulator built with alacritty_terminal and
+ gpui. Features tabbed terminals, i18n (English/French), power monitoring,
+ screenshots, remote control via QR code, and Wakatime integration.
+
+Package: tab-atelier
+Architecture: amd64
+Version: 0.5.0~nightly20260827.160004-1
+Priority: optional
+Section: x11
+Maintainer: William Desportes <williamdes@wdes.fr>
+Installed-Size: 33776
+Depends: fonts-dejavu-core, libc6 (>= 2.39), libfreetype6, libgcc-s1, libxcb1 (>= 1.12), libxkbcommon-x11-0 (>= 0.5.0), libxkbcommon0 (>= 0.5.0)
+Recommends: fonts-noto-color-emoji
+Conflicts: tab-atelier-headless
+Replaces: tab-atelier-headless
+Filename: pool/nightly/main/t/tab-atelier/tab-atelier_0.5.0~nightly20260827.160004-1_amd64.deb
+Size: 10580284
+MD5sum: b4ee1e56a1f351b11f7682bb6a632f08
+SHA1: b90252c0f23e76b4be58112b3d198dd9a1e6d3d0
+SHA256: 5f6440541bf24814b0f50e3e64af37b05fe1511948057ec6e3e5d0e2ed105582
+SHA512: 1622a539820fe72209c040c3fc71f9962da73ac848132a40f4976d97f77dbd7e3c85249c557aacf0b5cb3e642811d2c6fe5f657291544602d22c75c906963b54
 Homepage: https://github.com/wdes/tab-atelier#readme
 Description: Guake-style drop-down terminal emulator for Linux (X11)
  A Guake-style drop-down terminal emulator built with alacritty_terminal and
