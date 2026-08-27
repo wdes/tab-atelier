@@ -437,6 +437,122 @@ pub fn measure(records: &[Record], cfg: &Config) -> Stats {
     stats
 }
 
+/// [`measure`] for many configs in a SINGLE pass.
+///
+/// Serializes each `thinking` / `toolUseResult` / `tool_result` block ONCE and
+/// scores every config from the cached lengths — so scanning N configs costs
+/// one serialization per block, not N. This is the scan the dry-run report uses
+/// (10 configs × 54 files) to stay fast in a debug build.
+#[must_use]
+pub fn measure_batch(records: &[Record], configs: &[Config]) -> Vec<Stats> {
+    let mut out = vec![Stats::default(); configs.len()];
+    let assistant_idx: Vec<usize> = records
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.value.as_ref().is_some_and(|v| rec_type(v) == "assistant"))
+        .map(|(i, _)| i)
+        .collect();
+    let cut = |keep: Option<usize>| -> Option<usize> {
+        keep.map(|k| {
+            if k == 0 {
+                usize::MAX
+            } else if assistant_idx.len() <= k {
+                0
+            } else {
+                assistant_idx[assistant_idx.len() - k]
+            }
+        })
+    };
+    let cuts_think: Vec<Option<usize>> = configs.iter().map(|c| cut(c.keep_thinking)).collect();
+    let cuts_img: Vec<Option<usize>> = configs.iter().map(|c| cut(c.keep_images)).collect();
+    // The distinct tool-caps across configs, so a tool_result is capped once per
+    // distinct threshold rather than once per config.
+    let mut caps: Vec<usize> = configs.iter().filter_map(|c| c.tool_cap).collect();
+    caps.sort_unstable();
+    caps.dedup();
+
+    for (i, r) in records.iter().enumerate() {
+        let Some(v) = &r.value else { continue };
+        let ty = rec_type(v);
+        let raw_bytes = r.raw.len() as u64 + 1;
+        let is_fh = FILE_HISTORY.contains(&ty);
+        let is_att = ty == "attachment";
+
+        // --- serialize-once, reusable per-record quantities ---
+        let dedup_size = if v.get("toolUseResult").is_some()
+            && v.get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(Value::as_array)
+                .is_some_and(|a| {
+                    a.iter()
+                        .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+                }) {
+            ser_len(v.get("toolUseResult").unwrap_or(&Value::Null))
+        } else {
+            0
+        };
+        let mut thinking_total = 0u64;
+        let mut image_total = 0u64;
+        let mut cap_removed: Vec<u64> = vec![0; caps.len()]; // parallel to `caps`
+        if let Some(blocks) = v
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_array)
+        {
+            for b in blocks {
+                match b.get("type").and_then(Value::as_str).unwrap_or("") {
+                    "thinking" => thinking_total += ser_len(b),
+                    "image" => {
+                        if let Some(d) = b.pointer("/source/data").and_then(Value::as_str) {
+                            image_total += d.len() as u64;
+                        }
+                    }
+                    "tool_result" => {
+                        if !caps.is_empty()
+                            && let Some(c) = b.get("content")
+                        {
+                            let ser = serde_json::to_string(c).unwrap_or_default();
+                            for (ci, &cap) in caps.iter().enumerate() {
+                                if ser.len() > cap {
+                                    cap_removed[ci] += cap_string(&ser, cap).1;
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // --- score each config from the cached quantities ---
+        for (ci, cfg) in configs.iter().enumerate() {
+            if (cfg.drop_file_history && is_fh) || (cfg.drop_attachments && is_att) {
+                if is_fh {
+                    out[ci].file_history += raw_bytes;
+                } else {
+                    out[ci].attachments += raw_bytes;
+                }
+                continue; // dropped for this config → no content edits counted
+            }
+            if cfg.dedup {
+                out[ci].dedup += dedup_size;
+            }
+            if cuts_think[ci].is_some_and(|c| i < c) {
+                out[ci].thinking += thinking_total;
+            }
+            if cuts_img[ci].is_some_and(|c| i < c) {
+                out[ci].images += image_total;
+            }
+            if let Some(cap) = cfg.tool_cap
+                && let Ok(idx) = caps.binary_search(&cap)
+            {
+                out[ci].cap += cap_removed[idx];
+            }
+        }
+    }
+    out
+}
+
 /// Diff-based integrity check: the problems a transform INTRODUCED.
 ///
 /// A dangling `parentUuid` is only a fault if that parent existed in the
@@ -563,6 +679,23 @@ mod tests {
         assert!(st.cap > 4000, "trimmed most of it: {}", st.cap);
         assert!(out[0].raw.contains("[trimmed"), "marker present");
         assert!(out[0].raw.len() < 1500);
+    }
+
+    #[test]
+    fn measure_batch_matches_individual_measure() {
+        let recs = parse(&sample());
+        let cfgs: Vec<Config> = presets().into_iter().map(|(_, c)| c).collect();
+        let batch = measure_batch(&recs, &cfgs);
+        for (i, c) in cfgs.iter().enumerate() {
+            let solo = measure(&recs, c);
+            assert_eq!(batch[i].total(), solo.total(), "preset {i} batch vs solo");
+            assert_eq!(batch[i].dedup, solo.dedup);
+            assert_eq!(batch[i].file_history, solo.file_history);
+            assert_eq!(batch[i].attachments, solo.attachments);
+            assert_eq!(batch[i].thinking, solo.thinking);
+            assert_eq!(batch[i].cap, solo.cap);
+            assert_eq!(batch[i].images, solo.images);
+        }
     }
 
     #[test]
