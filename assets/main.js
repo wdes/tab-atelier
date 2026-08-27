@@ -34,6 +34,13 @@
     const BASE = location.pathname.replace(/\/view\/?$/, "/");
 
     const term = new Terminal({
+      // REQUIRED for the Unicode 11 width addon below: xterm.js gates the
+      // `term.unicode` API (register a width provider, set activeVersion)
+      // behind `allowProposedApi`. Without this, `loadAddon(Unicode11Addon)`
+      // THROWS ("must set the allowProposedApi option"), the try/catch there
+      // swallows it, and emoji silently stay 1 cell wide — the whole reason
+      // the earlier emoji fix appeared not to work.
+      allowProposedApi: true,
       // convertEol MUST stay off. It was added for the old row-by-row
       // /output dump (each line a bare `\n`), but the viewer now replays
       // the raw PTY byte stream over the WebSocket (see `handleOut`).
