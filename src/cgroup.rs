@@ -286,6 +286,45 @@ pub fn kill_tab(tab_id: &str) -> bool {
 }
 
 #[cfg(not(feature = "gui"))]
+/// The pids currently in a tab's cgroup subtree (from `cgroup.procs`).
+fn tab_pids(tab_id: &str) -> Vec<u32> {
+    let Some(Some(base)) = DELEGATED_BASE.get() else {
+        return Vec::new();
+    };
+    let dir = base.join(format!("tab-{}", sanitize_id(tab_id)));
+    std::fs::read_to_string(dir.join("cgroup.procs"))
+        .map(|s| s.lines().filter_map(|l| l.trim().parse::<u32>().ok()).collect())
+        .unwrap_or_default()
+}
+
+#[cfg(not(feature = "gui"))]
+/// Whether a tab's cgroup subtree still has any live process.
+pub fn tab_has_procs(tab_id: &str) -> bool {
+    !tab_pids(tab_id).is_empty()
+}
+
+#[cfg(not(feature = "gui"))]
+/// SIGTERM every process in a tab's cgroup subtree (graceful stop).
+///
+/// Sent BEFORE the hard [`kill_tab`] SIGKILL so an agent like `claude` can
+/// flush its config — notably `~/.claude.json`, which a SIGKILL mid-write
+/// leaves truncated/corrupt — and exit cleanly. Best-effort; `unsafe`-free
+/// (shells to `kill(1)` like [`crate::kill_tab_pgroup`]).
+pub fn terminate_tab(tab_id: &str) {
+    let pids = tab_pids(tab_id);
+    if pids.is_empty() {
+        return;
+    }
+    let mut args = vec!["-s".to_string(), "TERM".to_string()];
+    args.extend(pids.iter().map(u32::to_string));
+    let _ = std::process::Command::new("kill")
+        .args(&args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+#[cfg(not(feature = "gui"))]
 /// On startup, kill + remove any `tab-*` cgroups left over from a PRIOR run.
 ///
 /// An unclean stop (crash, SIGKILL, or a `claude` that survived SIGHUP) leaves

@@ -51,6 +51,11 @@ const TICK_IDLE: Duration = Duration::from_millis(250);
 /// How long after the last API/WS activity the fast tick stays armed
 /// (covers think-pauses between keystrokes).
 const TICK_HOT: Duration = Duration::from_secs(2);
+/// Grace window on shutdown between SIGTERM-ing a tab's subtree and the hard
+/// SIGKILL — lets `claude` finish flushing `~/.claude.json` before it's killed
+/// (an interrupted write is what corrupted the file on restart). We exit as
+/// soon as every cgroup is empty, so this is only the cap for a hung agent.
+const SHUTDOWN_KILL_GRACE: Duration = Duration::from_secs(5);
 
 // Shared with the GUI — see `crate::tab_env_extras`,
 // `crate::api_url_for_local_clients`, and
@@ -1130,14 +1135,30 @@ pub fn run() -> std::io::Result<()> {
                 &mut last_state_hash,
                 true,
             );
+            // Graceful teardown. SIGHUP the PTY + SIGTERM the whole subtree, let
+            // agents flush and exit, THEN hard-SIGKILL survivors. An immediate
+            // `cgroup.kill` (SIGKILL) here used to catch `claude` mid-write to
+            // `~/.claude.json` and truncate it ("sometimes corrupt on restart");
+            // the grace window lets it finish. We still SIGKILL leftovers so a
+            // claude that ignores SIGTERM can't orphan and make the next start
+            // resume a duplicate.
             for tab in &tabs {
-                tab.shutdown();
-                // Kill the whole tree, not just SIGHUP the PTY — otherwise a
-                // claude that ignores SIGHUP orphans and the NEXT start
-                // resumes a duplicate. (systemd's cgroup kill covers a clean
-                // stop; this covers non-systemd runs + belt-and-suspenders.)
+                tab.shutdown(); // SIGHUP via PTY close
                 #[cfg(target_os = "linux")]
-                crate::cgroup::kill_tab(&tab.id);
+                crate::cgroup::terminate_tab(&tab.id); // SIGTERM the subtree
+            }
+            #[cfg(target_os = "linux")]
+            {
+                // Exit as soon as every tab's cgroup is empty; capped so a hung
+                // agent can't stall the stop (systemd's TimeoutStopSec, default
+                // 90s, comfortably covers this).
+                let deadline = std::time::Instant::now() + SHUTDOWN_KILL_GRACE;
+                while std::time::Instant::now() < deadline && tabs.iter().any(|t| crate::cgroup::tab_has_procs(&t.id)) {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                for tab in &tabs {
+                    crate::cgroup::kill_tab(&tab.id); // SIGKILL survivors + rmdir
+                }
             }
             return Ok(());
         }
