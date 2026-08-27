@@ -62,6 +62,7 @@ pub(crate) mod terminal;
 pub(crate) mod terminal_utils;
 pub(crate) mod theme;
 pub(crate) mod tracking;
+pub mod transcript_compact;
 #[cfg(all(windows, not(feature = "gui")))]
 pub mod win_service;
 
