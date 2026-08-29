@@ -39,6 +39,9 @@ async function wireRoutes(page, getState) {
 
 const pTab = (o) => ({ agentState: "idle", tokens: { input: 1, output: 1 }, ...o, viewerUrl: `/tabs/by-id/${o.id}/view` });
 const card = { specialty: "daemon", objective: "keep the fleet alive", currentTaskLog: ["boot", "tick"] };
+// A 60-word objective (starts with the phrase the S3-1 assertion matches) to exercise
+// the Inc9 (2) 'voir plus' toggle (clip at 50 words).
+const longObjective = "land the parser refactor " + Array.from({ length: 56 }, (_, i) => `detail${i}`).join(" ");
 // A fleet with the META-TRIO + two orchestrators (rounds on/off) + a carded worker.
 const s3State = () => ({
   nodes: [], unmapped: [], unassigned: [],
@@ -48,8 +51,9 @@ const s3State = () => ({
         pTab({ id: "o1", name: "ta-lead", role: "orchestrator", assignment: "kalpin-back:build/orchestrator", led: "idle",
                specialty: "kalpin lead", objective: "ship inc8", orchestrator: "free", roundsActive: { active: true, lastRoundAt: 111 } }),
         pTab({ id: "w1", name: "ta-w1", role: "implementer", parentTabId: "o1", assignment: "kalpin-back:build/implementer", led: "working",
-               specialty: "rust async internals", orchestrator: "o1", objective: "land the parser refactor",
+               specialty: "rust async internals", orchestrator: "o1", objective: longObjective, roundsActive: { active: true, lastRoundAt: 222 },
                currentTaskLog: ["read plan", "wire struct", "add test", "run tests", "fix lint", "review", "commit", "handoff"],
+               conventions: ["docs/style.md"], usageCount: 7, lastUsedAt: 1788000000,
                evaluations: [{ evaluator: "olympe", verdict: "ok" }], evalCriteria: ["no panics", "tests green"] }),
       ] }], unmapped: [] },
     { name: "fx", isMeta: false, hasOrchestrator: true, orchestrators: [{ id: "o2", name: "ta-fx-lead", childCount: 0 }],
@@ -101,6 +105,18 @@ async function main() {
     ok("S3-1: the card shows recent permalog tasks (bounded)", /handoff/.test(txt) && !/read plan/.test(txt), txt.slice(0, 120));
     ok("S3-1: the card shows evaluations when present", /olympe/.test(txt));
     ok("S3-1: the card shows evalCriteria", /no panics/.test(txt));
+    // ---- Inc9 (2): ALL card data + 'voir plus' past 50 words.
+    ok("Inc9-(2): the card shows conventions", /style\.md/.test(txt));
+    ok("Inc9-(2): the card shows usage (usageCount/lastUsedAt)", /used 7×/.test(txt));
+    ok("Inc9-(2): the card shows roundsActive", /roundsActive/.test(txt) && /active/.test(txt));
+    // The 60-word objective is clipped -> a 'voir plus' toggle; the last word is hidden until clicked.
+    ok("Inc9-(2): a >50-word field shows a 'voir plus' toggle", (await page.locator("#agent-card .ac-more").count()) >= 1);
+    ok("Inc9-(2): the clipped field hides its tail before expanding", !/detail55/.test(txt), "detail55 should be hidden pre-expand");
+    await page.locator("#agent-card .ac-more").first().click().catch(() => {});
+    await page.waitForTimeout(150);
+    const expanded = (await page.locator("#agent-card").textContent().catch(() => "")) || "";
+    ok("Inc9-(2): clicking 'voir plus' expands to the FULL text", /detail55/.test(expanded), "detail55 must appear after expand");
+    ok("Inc9-(2): the card stays open after 'voir plus' (not closed)", await page.locator("#agent-card").isVisible().catch(() => false));
   }
   // An ORCHESTRATOR gets a card too.
   await page.locator('[data-tab-id="o1"]').click({ button: "right" }).catch(() => {});
