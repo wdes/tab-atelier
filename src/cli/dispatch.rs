@@ -448,6 +448,11 @@ pub enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Inc8 fold agent card — declare the `.md` conventions (comma-separated).
+    SetConventions {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Inc8 S4 agent card — APPEND one evaluation record (JSON) to the bounded ring.
     SetEvaluation {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -904,6 +909,7 @@ pub fn dispatch(cli: Cli) -> bool {
         Commands::SetObjective { args } => crate::cli::client::run("set-objective", &args),
         Commands::SetCurrentTask { args } => crate::cli::client::run("set-current-task", &args),
         Commands::SetRoundsActive { args } => crate::cli::client::run("set-rounds-active", &args),
+        Commands::SetConventions { args } => crate::cli::client::run("set-conventions", &args),
         Commands::SetEvaluation { args } => crate::cli::client::run("set-evaluation", &args),
         Commands::BumpUsage { args } => crate::cli::client::run("bump-usage", &args),
         Commands::SetRehomeStatus { args } => crate::cli::client::run("set-rehome-status", &args),
