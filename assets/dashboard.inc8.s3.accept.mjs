@@ -136,6 +136,12 @@ async function main() {
     const expanded = (await page.locator("#agent-card").textContent().catch(() => "")) || "";
     ok("Inc9-(2): clicking 'voir plus' expands to the FULL text", /detail55/.test(expanded), "detail55 must appear after expand");
     ok("Inc9-(2): the card stays open after 'voir plus' (not closed)", await page.locator("#agent-card").isVisible().catch(() => false));
+    // Anti-dup (item 2): expanding replaces the whole clipped container, so the
+    // clipped prefix is NOT left duplicated before the full text, and no stray '…'.
+    const objExpanded = (await page.locator('#agent-card .ac-row[title^="objective"]').textContent().catch(() => "")) || "";
+    ok("Inc9-(2): expanded objective shows the prefix exactly once (no dup)",
+       (objExpanded.match(/land the parser refactor/g) || []).length === 1, `obj=${objExpanded.slice(0, 90)}`);
+    ok("Inc9-(2): no stray '…' left in the expanded objective", !objExpanded.includes("…"), `obj=${objExpanded.slice(0, 90)}`);
     // ---- Inc9 (3): open the agent's tab in the browser (remote viewer).
     ok("Inc9-(3): the card shows a ↗ open-tab button", (await page.locator("#agent-card .ac-open").count()) >= 1);
     await page.evaluate(() => { window.__opened = []; });
