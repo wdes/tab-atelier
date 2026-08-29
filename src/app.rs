@@ -217,6 +217,13 @@ struct Tab {
     /// Stable workflow assignment (`set-assignment`). Persisted (restored from
     /// `TabState`, written back in `persist()`) and hook-immune, unlike `context`.
     assignment: Option<std::sync::Arc<str>>,
+    /// Inc8 S1 agent-card fields — persisted + hook-immune, like `assignment`.
+    specialty: Option<std::sync::Arc<str>>,
+    orchestrator: Option<std::sync::Arc<str>>,
+    objective: Option<std::sync::Arc<str>>,
+    /// Bounded `current_task` permalog (see [`crate::append_current_task`]).
+    current_task: Vec<String>,
+    rounds_active: Option<crate::RoundsActive>,
     /// UUID of the spawning tab (`parent_tab_id`). Persisted like `assignment`.
     parent_tab_id: Option<std::sync::Arc<str>>,
     /// Re-home progress on a predecessor tab. Persisted like `assignment`;
@@ -317,6 +324,12 @@ impl Tab {
             context: None,
             // Persisted: restore it so the tab keeps its phase/role across restarts.
             assignment: ts.assignment.as_deref().map(std::sync::Arc::from),
+            // Inc8 S1 card fields — restored like `assignment`.
+            specialty: ts.specialty.as_deref().map(std::sync::Arc::from),
+            orchestrator: ts.orchestrator.as_deref().map(std::sync::Arc::from),
+            objective: ts.objective.as_deref().map(std::sync::Arc::from),
+            current_task: ts.current_task.clone(),
+            rounds_active: ts.rounds_active.clone(),
             parent_tab_id: ts.parent_tab_id.as_deref().map(std::sync::Arc::from),
             rehome_status: ts.rehome_status.as_deref().map(std::sync::Arc::from),
             last_pushed_locked: None,
@@ -1391,6 +1404,7 @@ impl AppState {
             pending_assignment_changes: Vec::new(),
             pending_parent_changes: Vec::new(),
             pending_rehome_changes: Vec::new(),
+            pending_card_changes: Vec::new(),
             pending_token_rotations: Vec::new(),
             pending_schedule_changes: Vec::new(),
             pending_new_tabs: 0,
@@ -1965,6 +1979,11 @@ impl AppState {
                     schedule: tab.schedule.clone(),
                     bg_color: tab.bg_color.clone(),
                     assignment: tab.assignment.as_deref().map(str::to_string),
+                    specialty: tab.specialty.as_deref().map(str::to_string),
+                    orchestrator: tab.orchestrator.as_deref().map(str::to_string),
+                    objective: tab.objective.as_deref().map(str::to_string),
+                    current_task: tab.current_task.clone(),
+                    rounds_active: tab.rounds_active.clone(),
                     parent_tab_id: tab.parent_tab_id.as_deref().map(str::to_string),
                     rehome_status: tab.rehome_status.as_deref().map(str::to_string),
                     limits: tab.limits.clone(),
@@ -2130,6 +2149,11 @@ impl AppState {
                 tokens: tab.tokens_last_saved.get(),
                 #[cfg(not(feature = "catbus"))]
                 tokens: None,
+                specialty: tab.specialty.clone(),
+                orchestrator: tab.orchestrator.clone(),
+                objective: tab.objective.clone(),
+                current_task: tab.current_task.clone(),
+                rounds_active: tab.rounds_active.clone(),
             });
         }
 
@@ -2332,6 +2356,7 @@ impl AppState {
             let context_changes: Vec<(String, Option<String>)> = snapshot.pending_context_changes.drain(..).collect();
             let assignment_changes: Vec<(String, Option<String>)> =
                 snapshot.pending_assignment_changes.drain(..).collect();
+            let card_changes: Vec<(String, crate::api::CardChange)> = snapshot.pending_card_changes.drain(..).collect();
             let parent_changes: Vec<(String, Option<String>)> = snapshot.pending_parent_changes.drain(..).collect();
             let rehome_changes: Vec<(String, Option<String>)> = snapshot.pending_rehome_changes.drain(..).collect();
             let token_rotations: Vec<String> = snapshot.pending_token_rotations.drain(..).collect();
@@ -2450,6 +2475,21 @@ impl AppState {
             for (tab_id, assignment) in assignment_changes {
                 if let Some(tab) = self.tabs.iter_mut().find(|t| *t.id == tab_id) {
                     tab.assignment = assignment.map(std::sync::Arc::from);
+                }
+            }
+            // Inc8 agent-card mutations — mirrored onto the runtime tab (persisted
+            // on the next tick like assignment). See `crate::api::CardChange`.
+            for (tab_id, change) in card_changes {
+                if let Some(tab) = self.tabs.iter_mut().find(|t| *t.id == tab_id) {
+                    match change {
+                        crate::api::CardChange::Specialty(v) => tab.specialty = v.map(std::sync::Arc::from),
+                        crate::api::CardChange::Orchestrator(v) => tab.orchestrator = v.map(std::sync::Arc::from),
+                        crate::api::CardChange::Objective(v) => tab.objective = v.map(std::sync::Arc::from),
+                        crate::api::CardChange::CurrentTaskAppend(p) => {
+                            crate::append_current_task(&mut tab.current_task, &p);
+                        }
+                        crate::api::CardChange::RoundsActive(ra) => tab.rounds_active = Some(ra),
+                    }
                 }
             }
             for (tab_id, parent) in parent_changes {
@@ -3029,6 +3069,11 @@ impl AppState {
                     locked: tab.locked,
                     bg_color: tab.bg_color.clone(),
                     assignment: tab.assignment.as_deref().map(str::to_string),
+                    specialty: tab.specialty.as_deref().map(str::to_string),
+                    orchestrator: tab.orchestrator.as_deref().map(str::to_string),
+                    objective: tab.objective.as_deref().map(str::to_string),
+                    current_task: tab.current_task.clone(),
+                    rounds_active: tab.rounds_active.clone(),
                     parent_tab_id: tab.parent_tab_id.as_deref().map(str::to_string),
                     rehome_status: tab.rehome_status.as_deref().map(str::to_string),
                     limits: tab.limits.clone(),
