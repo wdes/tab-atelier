@@ -19,7 +19,7 @@ assert.equal(typeof dash.agentCardView, "function", "Inc8-S3 RED: export agentCa
 {
   const log = ["read plan", "wire struct", "add test", "run tests", "fix lint", "review", "commit", "handoff"]; // 8 entries
   const tab = {
-    id: "w1", name: "ta-w1", role: "implementer",
+    id: "w1", name: "ta-w1", role: "implementer", assignment: "kalpin-back:build/implementer",
     specialty: "rust async internals", orchestrator: "o-uuid",
     objective: "land the parser refactor",
     currentTaskLog: log,
@@ -27,6 +27,7 @@ assert.equal(typeof dash.agentCardView, "function", "Inc8-S3 RED: export agentCa
     evalCriteria: ["no panics", "tests green"],
   };
   const card = dash.agentCardView(tab);
+  assert.equal(card.assignment, "kalpin-back:build/implementer", "Inc9-B: the card carries the assignment");
   assert.equal(card.specialty, "rust async internals");
   assert.equal(card.orchestrator, "o-uuid");
   assert.equal(card.free, false, "a uuid orchestrator is not free");
@@ -45,6 +46,7 @@ assert.equal(typeof dash.agentCardView, "function", "Inc8-S3 RED: export agentCa
 
   // Graceful: absent fields -> empty; evaluations/evalCriteria default to [].
   const empty = dash.agentCardView({});
+  assert.equal(empty.assignment, "", "no assignment -> empty string");
   assert.equal(empty.specialty, "");
   assert.equal(empty.objective, "");
   assert.deepEqual(empty.recentTasks, [], "no permalog -> no tasks");
