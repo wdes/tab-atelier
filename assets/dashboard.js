@@ -701,8 +701,13 @@ function unassignedTabHtml(tab) {
 export function taskChips(tab) {
   const t = tab || {};
   const chips = [];
-  if (t.currentTask && String(t.currentTask).trim()) {
-    chips.push({ kind: "task", label: String(t.currentTask) });
+  // currentTask may be a bounded permalog (array) — the pill shows the LATEST
+  // phrase (last entry), consistent with the card's normalization; a plain string
+  // is used as-is. CSS truncates the pill; the full phrase is on hover (title=).
+  const ct = t.currentTask;
+  const latest = Array.isArray(ct) ? (ct.length ? String(ct[ct.length - 1]) : "") : (ct ? String(ct) : "");
+  if (latest.trim()) {
+    chips.push({ kind: "task", label: latest });
   }
   for (const s of Array.isArray(t.subAgents) ? t.subAgents : []) {
     if (!s) continue;
@@ -718,7 +723,7 @@ function taskChipsHtml(tab) {
   const items = chips
     .map((c) =>
       c.kind === "task"
-        ? `<span class="task-chip" title="current task">${escapeHtml(c.label)}</span>`
+        ? `<span class="task-chip" title="current task : ${escapeHtml(c.label)}">${escapeHtml(c.label)}</span>`
         : `<span class="subagent-chip state-${escapeHtml(c.state || "")}" title="sub-agent ${escapeHtml(c.name || "")} — ${escapeHtml(c.state || "")}">${escapeHtml(c.name || "")}</span>`
     )
     .join("");
@@ -776,9 +781,11 @@ function bandNodeInner(tab) {
   // currentTask phrase + a 'libre' badge when the agent is free.
   const ac = agentCard(t);
   const free = ac.free ? ` <span class="free-badge">libre</span>` : "";
-  const obj = ac.objective ? `<span class="agent-objective">${escapeHtml(ac.objective)}</span>` : "";
-  const task = ac.currentTask ? `<span class="agent-task">${escapeHtml(ac.currentTask)}</span>` : "";
-  const inline = obj || task ? `<span class="agent-card-inline">${obj}${task}</span>` : "";
+  // Compact band: the objective is a short declared line (truncated 1-line via CSS,
+  // full text on hover). The currentTask is NOT dumped here — it lives only in the
+  // grey truncated `.task-chip` pill (hover-full) + the right-click card (full permalog).
+  const obj = ac.objective ? `<span class="agent-objective" title="${escapeHtml(ac.objective)}">${escapeHtml(ac.objective)}</span>` : "";
+  const inline = obj ? `<span class="agent-card-inline">${obj}</span>` : "";
   return `${escapeHtml(t.name || "tab")}${badge}${pill}${free}${inline}${taskChipsHtml(t)}`;
 }
 
