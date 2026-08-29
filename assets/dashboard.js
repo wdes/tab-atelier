@@ -392,6 +392,12 @@ export function resolveAltitude(tab) {
   const role = String(t.role || "").toLowerCase();
   if (isTichefRole(role)) return { band: "meta" };
   if (isMetaDaemon(t)) return { band: "meta" };
+  // A tab explicitly assigned to the meta lane ("meta/router" = aligator,
+  // "meta/brain", "meta/scribe", "meta/auditor"…) belongs to the Méta band —
+  // the trio daemons carry NO role and kind=None, so their `assignment` is the
+  // only reliable meta signal. Meta specialists REINFORCING a team use a
+  // "project:role" assignment (caught by the worker fallback below), never "meta/".
+  if (String(t.assignment || "").startsWith("meta/")) return { band: "meta" };
   if (isMetaRole(role)) {
     if (t.serving) return { band: "worker", team: t.serving, reinforcement: true };
     const override = assignmentProject(t.assignment);
