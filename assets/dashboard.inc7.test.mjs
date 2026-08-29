@@ -67,6 +67,24 @@ assert.equal(typeof dash.bandLayout, "function", "S1 RED: export bandLayout(stat
   assert.equal(liveMeta.freelancers.length, 0, "no duplicate tichef in Freelancers");
 }
 
+// ============ Inc8.2: nest-by-orchestrator-field fallback (declared living-card) ============
+// A worker with NO spawn lineage nests under the lead named by its DECLARED card
+// field `orchestrator` (set-orchestrator alone = single-source). When lineage IS
+// present it WINS — the worker never lands under two leads.
+{
+  const t = (o) => ({ agentState: "idle", ...o });
+  const lead = t({ id: "L", name: "ta-lead", role: "orchestrator", assignment: "repoA:build/orchestrator" });
+  const other = t({ id: "L2", name: "ta-lead2", role: "orchestrator", assignment: "repoB:build/orchestrator" });
+  const declaredOnly = t({ id: "d", name: "ta-declared", role: "worker", orchestrator: "L", assignment: "repoA:build/worker" }); // NO parentTabId
+  const lineageWins = t({ id: "g", name: "ta-lineage", role: "worker", parentTabId: "L", orchestrator: "L2", assignment: "repoA:build/worker" });
+  const bl = dash.bandLayout({ nodes: [], unmapped: [lead, other, declaredOnly, lineageWins], unassigned: [], projects: [] });
+  const underL = bl.orchestrators.find((o) => o.lead.id === "L").repos.flatMap((r) => r.workers.map((w) => w.id)).sort();
+  assert.deepEqual(underL, ["d", "g"], "Inc8.2: declared-only worker nests via the orchestrator field; the lineage worker stays under its parent");
+  const underL2 = bl.orchestrators.find((o) => o.lead.id === "L2").repos.flatMap((r) => r.workers.map((w) => w.id));
+  assert.equal(underL2.includes("g"), false, "Inc8.2: lineage WINS — a worker with parentTabId is NOT also placed under its declared-field lead");
+  assert.equal(bl.freelancers.some((f) => f.id === "d"), false, "Inc8.2: the declared-only worker is placed (not orphaned to Freelancers)");
+}
+
 // ============================ hasTichef gate (root-cause fix) ============================
 // The REAL tichef has role "manager" and lives in state.unmapped (not under a
 // project) — the gate must recognise it there, or the 4-band view never triggers.
