@@ -982,6 +982,42 @@ pub fn try_acquire_single_instance_lock() -> bool {
     true
 }
 
+/// Inc8 S1 — supervision-rounds status for an agent card.
+///
+/// Are cron rounds (watcher/sage) currently active, and when did the last one
+/// run. Posted via `set-rounds-active`; the S3 web renders it as a badge.
+/// camelCase on the wire.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RoundsActive {
+    pub active: bool,
+    /// Unix-millis of the last round tick. `None` until the first one lands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_round_at: Option<u64>,
+}
+
+/// Bound on the `current_task` permalog (G-b, tichef): the ring keeps only the
+/// last N entries so `TabState` / `/dashboard/state` can't grow without end.
+pub const CURRENT_TASK_LOG_MAX: usize = 50;
+
+/// Append one phrase to a `current_task` permalog (the `set-current-task` core).
+///
+/// Trims the phrase; an empty / whitespace-only phrase is a no-op so the long
+/// memory stays meaningful. Bounds the ring to [`CURRENT_TASK_LOG_MAX`]: once it
+/// overflows, the oldest entries are evicted (entry N+1 pushes out entry 1).
+/// Pure, so the append + eviction are unit-testable without a live tab.
+pub fn append_current_task(log: &mut Vec<String>, phrase: &str) {
+    let p = phrase.trim();
+    if p.is_empty() {
+        return;
+    }
+    log.push(p.to_string());
+    if log.len() > CURRENT_TASK_LOG_MAX {
+        let overflow = log.len() - CURRENT_TASK_LOG_MAX;
+        log.drain(0..overflow);
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct TabState {
     /// Stable per-tab UUID. Used by the local API
@@ -1100,6 +1136,31 @@ pub struct TabState {
     /// still shows under its project, in the `unmapped` bucket).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assignment: Option<String>,
+
+    // --- Inc8 S1: the "agent card" — siblings of `assignment`, persisted +
+    //     hook-immune, self-declared identity observable in /dashboard/state.
+    /// Hard-wired specialty / prompt focus (`set-specialty`). OVERWRITE. Omitted
+    /// when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub specialty: Option<String>,
+    /// The orchestrator this agent serves: a tab UUID, or the literal `"free"`
+    /// (unassigned → Freelancers band). `set-orchestrator`. OVERWRITE.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestrator: Option<String>,
+    /// The agent's current objective (`set-objective`). OVERWRITE. Omitted unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objective: Option<String>,
+    /// PERMALOG (`set-current-task`): append-only one-line phrases → a long,
+    /// token-free memory re-readable on demand. BOUNDED to the last
+    /// [`CURRENT_TASK_LOG_MAX`] entries ([`append_current_task`]) so it can't
+    /// grow `TabState` / `/dashboard/state` without bound (G-b). Omitted empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub current_task: Vec<String>,
+    /// Whether supervision ROUNDS (crons: watcher/sage) are active for this tab,
+    /// plus when the last round ran. Posted by the round crons via
+    /// `set-rounds-active`. Omitted when never set. (Badge render = S3, web.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rounds_active: Option<RoundsActive>,
 
     /// UUID of the tab that spawned this one (`dispatch --new` reads `_TAB_ID`
     /// and posts it). Drives the dashboard's delegation lineage / altitude.
@@ -1358,6 +1419,11 @@ impl Default for TabState {
             net_allow_cidrs: Vec::new(),
             bg_color: None,
             assignment: None,
+            specialty: None,
+            orchestrator: None,
+            objective: None,
+            current_task: Vec::new(),
+            rounds_active: None,
             parent_tab_id: None,
             rehome_status: None,
             schedule: None,
@@ -4007,6 +4073,71 @@ mod tests {
         append_current_task(&mut log, ""); // no-op
         append_current_task(&mut log, "run the tests");
         assert_eq!(log, vec!["read the plan", "wire the struct", "run the tests"]);
+    }
+
+    #[test]
+    fn current_task_permalog_is_bounded_evicting_oldest() {
+        // G-b (tichef): the permalog is a bounded ring — entry N+1 evicts the
+        // oldest, so TabState / /dashboard/state can't grow without end.
+        let mut log: Vec<String> = Vec::new();
+        for i in 0..CURRENT_TASK_LOG_MAX {
+            append_current_task(&mut log, &format!("phrase {i}"));
+        }
+        assert_eq!(log.len(), CURRENT_TASK_LOG_MAX, "fills exactly to the cap");
+        assert_eq!(log.first().map(String::as_str), Some("phrase 0"));
+        // One more past the cap → the oldest is evicted, length stays capped.
+        append_current_task(&mut log, "phrase overflow");
+        assert_eq!(log.len(), CURRENT_TASK_LOG_MAX, "stays bounded after overflow");
+        assert_eq!(log.first().map(String::as_str), Some("phrase 1"), "oldest evicted");
+        assert_eq!(
+            log.last().map(String::as_str),
+            Some("phrase overflow"),
+            "newest kept, in order"
+        );
+        assert!(!log.contains(&"phrase 0".to_string()), "evicted entry is gone");
+    }
+
+    #[test]
+    fn rounds_active_round_trips_in_tab_state() {
+        // The [ajout PO] roundsActive card field: a bool + optional lastRoundAt,
+        // persisted like the other card fields; camelCase on the wire; omitted
+        // when unset (old files load it as None).
+        let with = SavedState {
+            tabs: vec![TabState {
+                name: "orc".into(),
+                rounds_active: Some(RoundsActive {
+                    active: true,
+                    last_round_at: Some(1_724_000_000_000),
+                }),
+                ..Default::default()
+            }],
+            active: 0,
+            windowed: false,
+            dashboard_share_token: String::new(),
+        };
+        let json = serde_json::to_string(&with).unwrap();
+        assert!(
+            json.contains(r#""rounds_active":{"active":true,"lastRoundAt":1724000000000}"#),
+            "{json}"
+        );
+        let restored: SavedState = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            restored.tabs[0].rounds_active,
+            Some(RoundsActive {
+                active: true,
+                last_round_at: Some(1_724_000_000_000)
+            })
+        );
+        // active=false with no timestamp: lastRoundAt is omitted.
+        let inactive = serde_json::to_string(&RoundsActive {
+            active: false,
+            last_round_at: None,
+        })
+        .unwrap();
+        assert_eq!(inactive, r#"{"active":false}"#, "lastRoundAt omitted when None");
+        // Absent on an old file → None.
+        let old: SavedState = serde_json::from_str(r#"{"tabs":[{"name":"x"}],"active":0}"#).unwrap();
+        assert_eq!(old.tabs[0].rounds_active, None);
     }
 
     #[test]
