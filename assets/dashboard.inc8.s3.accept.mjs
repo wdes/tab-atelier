@@ -118,6 +118,8 @@ async function main() {
   ok("S3-1: right-click opens the agent-card view", cardVisible);
   if (cardVisible) {
     const txt = (await page.locator("#agent-card").textContent().catch(() => "")) || "";
+    // Inc9-B: the FULL fiche d'identité — assignment is now shown (was missing).
+    ok("Inc9-(B): the card shows the assignment", /kalpin-back:build\/implementer/.test(txt), txt.slice(0, 120));
     ok("S3-1: the card shows the specialty", /rust async internals/.test(txt), txt.slice(0, 80));
     ok("S3-1: the card shows the objective", /land the parser refactor/.test(txt));
     // Permalog is bounded -> the LAST entries show; the oldest ("read plan") is clipped.
@@ -161,6 +163,12 @@ async function main() {
   await page.waitForTimeout(300);
   const orchCard = (await page.locator("#agent-card").textContent().catch(() => "")) || "";
   ok("S3-1: an orchestrator gets a card too", /kalpin lead/.test(orchCard) || /ship inc8/.test(orchCard), orchCard.slice(0, 80));
+  // Inc9-B: the FULL fiche — o1 has NO evaluations/evalCriteria, yet the rows show
+  // (with a discreet "—"), and its assignment is present. Complete + predictable.
+  ok("Inc9-(B): the card always shows the assignment row", /assignment/.test(orchCard) && /kalpin-back:build\/orchestrator/.test(orchCard));
+  ok("Inc9-(B): empty evaluations still render a row", /evaluations/.test(orchCard));
+  ok("Inc9-(B): empty evalCriteria still render a row", /evalCriteria/.test(orchCard));
+  ok("Inc9-(B): an empty identity field shows a discreet '—'", (await page.locator("#agent-card .ac-empty").count()) >= 1);
 
   await browser.close();
   console.log(`\ndashboard.inc8.s3.accept.mjs — Increment 8 Slice 3 GUI acceptance`);
