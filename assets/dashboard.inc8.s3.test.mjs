@@ -69,6 +69,22 @@ assert.equal(typeof dash.roundsPill, "function", "Inc8-S3 RED: export roundsPill
   assert.match(dash.roundsPill(null).cls, /rounds-off/);
 }
 
+// ============================ Inc9 (2) — clipWords (detailed popup 'voir plus') ============================
+assert.equal(typeof dash.clipWords, "function", "Inc9-(2): export clipWords(text, max) from dashboard.js");
+{
+  const short = dash.clipWords("a b c", 50);
+  assert.equal(short.clipped, false, "≤ max words -> not clipped");
+  assert.equal(short.text, "a b c", "short text passes through verbatim");
+  const words = Array.from({ length: 60 }, (_, i) => `w${i}`).join(" ");
+  const long = dash.clipWords(words, 50);
+  assert.equal(long.clipped, true, "> max words -> clipped");
+  assert.match(long.text, /…$/, "clipped text ends with an ellipsis");
+  assert.equal(long.text.replace(/…$/, "").trim().split(/\s+/).length, 50, "clipped to exactly 50 words (ellipsis glued)");
+  assert.equal(long.full, words, "the FULL text is preserved for 'voir plus'");
+  assert.equal(dash.clipWords(null).clipped, false, "null -> not clipped, no throw");
+  assert.equal(dash.clipWords("").text, "", "empty -> empty");
+}
+
 // ============================ Rouge 3 — méta-trio in the Méta band ============================
 // The Méta band now holds the meta-TRIO: tichef (role "manager") + Brain + aligator
 // (daemons, orchestrator="meta", cards filled by the tichef). Live shape: daemons
