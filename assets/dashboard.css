@@ -605,6 +605,8 @@ body.band-view { min-height: calc(100vh + 180px); }
 .agent-card .ac-name { font-weight: 700; font-size: 1rem; margin-bottom: 0.5rem; padding-right: 1rem; }
 .agent-card .ac-row { margin: 0.2rem 0; }
 .agent-card .ac-key { color: var(--muted); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.03em; margin-top: 0.5rem; display: inline-block; }
+/* Inc9-B: a discreet "—" for an empty identity field (the fiche stays complete). */
+.agent-card .ac-empty { color: var(--muted); opacity: 0.6; }
 .agent-card .ac-free { color: var(--led-working-stroke); font-weight: 600; }
 .agent-card ul { margin: 0.15rem 0 0.3rem; padding-left: 1.1rem; }
 .agent-card .ac-log li { color: var(--fg); }
