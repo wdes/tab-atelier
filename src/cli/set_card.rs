@@ -14,7 +14,24 @@
 //! is a no-op); `set-rounds-active true|false` toggles the supervision-rounds
 //! status (the server stamps `lastRoundAt` when active).
 
-use super::tab_field::{Field, post};
+use super::tab_field::{self, Field, post};
+
+/// Resolve `(api_url, api_token, tab_id)` for a card CLI: the API env pair +
+/// the target tab (`tab` override, else `_TAB_ID`). `Err(0)` = silent no-op
+/// outside a tab (matches the `set-*` runner); `Err(1)` = no tab to target.
+fn resolve(name: &str, tab: Option<String>) -> Result<(String, String, String), i32> {
+    let Some((url, token)) = tab_field::api_env() else {
+        return Err(0); // outside a tab-atelier tab → silent no-op
+    };
+    if let Some(t) = &tab {
+        crate::cli::share_link::warn_if_index(t);
+    }
+    let Some(tab_id) = tab.or_else(|| std::env::var("_TAB_ID").ok()).filter(|s| !s.is_empty()) else {
+        eprintln!("{name}: TAB_ATELIER env present but _TAB_ID unset — pass --tab <id>");
+        return Err(1);
+    };
+    Ok((url, token, tab_id))
+}
 
 #[must_use]
 pub fn specialty(args: &[String]) -> i32 {
@@ -102,4 +119,94 @@ pub fn rounds_active(args: &[String]) -> i32 {
         },
         args,
     )
+}
+
+/// Inc8 S4 — `set-evaluation '<json>' [--tab <id>]`.
+///
+/// APPEND one evaluation record (schema tab-atelier-mx#4) to the tab's bounded
+/// ring. The `<json>` positional is validated as an `Evaluation` before it's
+/// `POSTed`, so a malformed record is caught client-side.
+#[must_use]
+pub fn evaluation(args: &[String]) -> i32 {
+    let parsed = match tab_field::parse("set-evaluation", args) {
+        Ok(p) => p,
+        Err((code, msg)) => {
+            eprintln!("{msg}");
+            return code;
+        }
+    };
+    let json = match parsed.action {
+        tab_field::Action::Set(v) => v,
+        tab_field::Action::Clear => {
+            eprintln!("set-evaluation: nothing to clear — it appends; pass a JSON record");
+            return 2;
+        }
+        tab_field::Action::Help => {
+            eprintln!(
+                "usage: tab-atelier set-evaluation [--tab <id>] '<json Evaluation record>'\n\
+                 APPEND one evaluation to the bounded ring. Record schema (camelCase):\n  \
+                 {{\"evaluator\":\"olympe\",\"at\":<ms>,\"taskRef\":\"…\",\"tokens\":{{\"input\":N,\"out\":N}},\n   \
+                  \"scores\":{{\"relevance\":8,\"errors\":1,\"omissions\":0}},\"verdict\":\"ok\",\"note\":\"…\"}}"
+            );
+            return 0;
+        }
+    };
+    if serde_json::from_str::<crate::Evaluation>(&json).is_err() {
+        eprintln!("set-evaluation: not a valid Evaluation record (see --help)");
+        return 2;
+    }
+    let (url, token, tab_id) = match resolve("set-evaluation", parsed.tab) {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
+    match tab_field::send(&url, &token, &tab_id, "evaluation", &json) {
+        Ok(_) => {
+            println!("✓ evaluation appended");
+            0
+        }
+        Err(e) => {
+            eprintln!("set-evaluation: {e}");
+            1
+        }
+    }
+}
+
+/// Inc8 S4 — `bump-usage [<tab>|--tab <id>]`: increment the tab's usage counter +
+/// stamp last-used (server-side). Defaults to the caller's own `_TAB_ID`.
+#[must_use]
+pub fn bump(args: &[String]) -> i32 {
+    let mut tab: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--tab" => {
+                i += 1;
+                tab = args.get(i).cloned();
+            }
+            "-h" | "--help" => {
+                eprintln!("usage: tab-atelier bump-usage [<tab-uuid>]  (defaults to _TAB_ID)");
+                return 0;
+            }
+            other if !other.starts_with("--") && tab.is_none() => tab = Some(other.to_string()),
+            other => {
+                eprintln!("bump-usage: unexpected argument: {other}");
+                return 2;
+            }
+        }
+        i += 1;
+    }
+    let (url, token, tab_id) = match resolve("bump-usage", tab) {
+        Ok(t) => t,
+        Err(code) => return code,
+    };
+    match tab_field::send(&url, &token, &tab_id, "bump-usage", "{}") {
+        Ok(_) => {
+            println!("✓ usage bumped");
+            0
+        }
+        Err(e) => {
+            eprintln!("bump-usage: {e}");
+            1
+        }
+    }
 }

@@ -67,6 +67,18 @@ pub(crate) fn agent() -> ureq::Agent {
         .into()
 }
 
+/// Inc8 S4 — best-effort `POST /bump-usage` for a tab: increment its usage
+/// counter + stamp last-used. Fire-and-forget (a failed bump must never break
+/// the caller's real work); used by brain on each `continue` and aligator on
+/// each swamp delivery to make "who's being nudged/fed" observable.
+pub(crate) fn bump_usage(ep: &Endpoint, uuid: &str) {
+    let _ = agent()
+        .post(format!("{}/tabs/by-id/{uuid}/bump-usage", ep.url))
+        .header("Authorization", format!("Bearer {}", ep.token))
+        .header("Content-Type", "application/json")
+        .send("{}");
+}
+
 pub(crate) fn fetch_tabs(ep: &Endpoint) -> Result<Vec<serde_json::Value>, String> {
     let mut resp = agent()
         .get(format!("{}/tabs", ep.url))
