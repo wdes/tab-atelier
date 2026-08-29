@@ -564,3 +564,83 @@ body.band-view { min-height: calc(100vh + 180px); }
 .subagent-chip.state-running { border-color: var(--led-working-stroke); color: var(--led-working-stroke); }
 .subagent-chip.state-completed { border-color: var(--led-idle-stroke); color: var(--led-idle-stroke); }
 .subagent-chip.state-failed, .subagent-chip.state-error { border-color: var(--led-error-stroke); color: var(--led-error-stroke); }
+
+/* --- Inc8 S3: rounds pill + agent-card view --- */
+.rounds-pill {
+  display: inline-block;
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  vertical-align: middle;
+  margin-left: 0.25rem;
+  border: 1px solid var(--border);
+}
+.rounds-pill.rounds-on { background: var(--led-working-stroke); border-color: var(--led-working-stroke); }
+.rounds-pill.rounds-off { background: var(--neutral-stroke); }
+
+.agent-card {
+  position: fixed;
+  top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 50;
+  min-width: 280px;
+  max-width: 460px;
+  max-height: 80vh;
+  overflow: auto;
+  background: var(--panel);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.35);
+  padding: 0.9rem 1rem;
+  font-size: 0.85rem;
+}
+.agent-card .ac-close {
+  position: absolute; top: 0.4rem; right: 0.5rem;
+  border: none; background: transparent; color: var(--muted);
+  font-size: 1.1rem; line-height: 1; cursor: pointer;
+}
+.agent-card .ac-name { font-weight: 700; font-size: 1rem; margin-bottom: 0.5rem; padding-right: 1rem; }
+.agent-card .ac-row { margin: 0.2rem 0; }
+.agent-card .ac-key { color: var(--muted); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.03em; margin-top: 0.5rem; display: inline-block; }
+.agent-card .ac-free { color: var(--led-working-stroke); font-weight: 600; }
+.agent-card ul { margin: 0.15rem 0 0.3rem; padding-left: 1.1rem; }
+.agent-card .ac-log li { color: var(--fg); }
+.agent-card .ac-evals li, .agent-card .ac-crit li { color: var(--muted); }
+
+/* --- Inc8 S1: inline agent-card bits on a band node --- */
+.free-badge {
+  font-size: 0.58rem; text-transform: uppercase; letter-spacing: 0.03em;
+  margin-left: 0.25rem; padding: 0 0.3rem; border-radius: 999px;
+  background: color-mix(in srgb, var(--led-working-stroke) 20%, transparent);
+  color: var(--led-working-stroke);
+}
+.agent-card-inline { display: block; margin-top: 0.15rem; font-size: 0.64rem; color: var(--muted); }
+.agent-card-inline .agent-objective { display: block; }
+.agent-card-inline .agent-task { display: block; font-style: italic; }
+
+/* --- Inc8 S4: card evaluations trigger indicator --- */
+.eval-trigger {
+  font-size: 0.62rem; padding: 0 0.35rem; border-radius: 999px;
+  color: var(--muted); border: 1px solid var(--border);
+}
+.eval-trigger.armed {
+  color: var(--led-error-stroke);
+  border-color: var(--led-error-stroke);
+  background: color-mix(in srgb, var(--led-error-stroke) 14%, transparent);
+  font-weight: 600;
+}
+.agent-card .ac-scores { color: var(--muted); font-size: 0.72rem; }
+
+/* --- Inc8 conventions fold + clipped-field tooltips --- */
+.conv-flag {
+  font-size: 0.62rem; padding: 0 0.35rem; border-radius: 999px;
+  color: var(--led-unreviewed-stroke);
+  border: 1px solid var(--led-unreviewed-stroke);
+  background: color-mix(in srgb, var(--led-unreviewed-stroke) 14%, transparent);
+  font-weight: 600;
+}
+.agent-card .ac-conv li { color: var(--muted); }
+/* Long fields clip with an ellipsis on the card; the full text lives in title="". */
+.agent-card .ac-row, .agent-card .ac-log li, .agent-card .ac-conv li {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%;
+}
