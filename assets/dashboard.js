@@ -217,6 +217,35 @@ export function roundsPill(tab) {
   return { active, cls: active ? "rounds-on" : "rounds-off" };
 }
 
+// Pure: the card's evaluations section (Inc8 S4). recent = the LAST 5 eval records
+// (newest-last), verdict = the newest record's verdict, and triggerArmed mirrors
+// the rust auto-improvement triggers — ARMED when either:
+//   - avg: total errors exceed the 1-error-per-1M-tokens budget, OR
+//   - burst: >= 3 errors within the last 1M tokens of evaluation.
+// Signal only (S5 acts on it). Reads evaluations[].{tokens:{in,out}, scores:{errors}}.
+// Null-safe; missing tokens/scores default to 0.
+export function evalSummary(tab) {
+  const evals = tab && Array.isArray(tab.evaluations) ? tab.evaluations : [];
+  const errsOf = (e) => Number((e && e.scores && e.scores.errors) || 0);
+  const toksOf = (e) => Number((e && e.tokens && e.tokens.in) || 0) + Number((e && e.tokens && e.tokens.out) || 0);
+  const totalErrors = evals.reduce((a, e) => a + errsOf(e), 0);
+  const totalTokens = evals.reduce((a, e) => a + toksOf(e), 0);
+  const avgArmed = totalTokens > 0 ? totalErrors * 1_000_000 > totalTokens : totalErrors > 0;
+  // Burst window: walk newest -> oldest, sum errors until the 1M-token window fills.
+  let cum = 0, burstErrors = 0;
+  for (let i = evals.length - 1; i >= 0; i--) {
+    burstErrors += errsOf(evals[i]);
+    cum += toksOf(evals[i]);
+    if (cum >= 1_000_000) break;
+  }
+  const last = evals.length ? evals[evals.length - 1] : null;
+  return {
+    recent: evals.slice(-5),
+    verdict: last && last.verdict != null ? String(last.verdict) : "",
+    triggerArmed: avgArmed || burstErrors >= 3,
+  };
+}
+
 // --- S5/S6: orchestrator tint + altitude bands + delegation lineage ---
 // These consume role / parentTabId / (optional) altitude fields exposed by the
 // Rust builder. ponytail: the altitude/lineage contract is provisional until the
@@ -1138,11 +1167,30 @@ function agentCardHtml(tab) {
   if (c.recentTasks.length) {
     rows.push(`<div class="ac-key">currentTask (permalog)</div><ul class="ac-log">${c.recentTasks.map((t) => `<li>${escapeHtml(t)}</li>`).join("")}</ul>`);
   }
-  if (c.evaluations.length) {
-    rows.push(`<div class="ac-key">evaluations</div><ul class="ac-evals">${c.evaluations.map((e) => `<li>${escapeHtml((e && e.evaluator) || "?")}: ${escapeHtml(String((e && e.verdict) != null ? e.verdict : ""))}</li>`).join("")}</ul>`);
+  // Inc8 S4: evaluations section — latest verdict + armed-trigger indicator + the
+  // last few eval records (evaluator / verdict / error score).
+  const es = evalSummary(tab);
+  if (es.verdict || es.recent.length) {
+    const trigger = es.triggerArmed
+      ? ` <span class="eval-trigger armed" data-trigger="armed" title="auto-improvement trigger armed (over the 1/1M error budget or a 3-error burst)">⚠ trigger armé</span>`
+      : ` <span class="eval-trigger" title="within budget">within budget</span>`;
+    if (es.verdict) rows.push(`<div class="ac-row"><span class="ac-key">verdict</span> ${escapeHtml(es.verdict)}${trigger}</div>`);
+    if (es.recent.length) {
+      rows.push(`<div class="ac-key">evaluations</div><ul class="ac-evals">${es.recent.map((e) => {
+        const errors = e && e.scores && e.scores.errors != null ? ` <span class="ac-scores">(err ${escapeHtml(String(e.scores.errors))})</span>` : "";
+        return `<li>${escapeHtml((e && e.evaluator) || "?")}: ${escapeHtml(String((e && e.verdict) != null ? e.verdict : ""))}${errors}</li>`;
+      }).join("")}</ul>`);
+    }
   }
   if (c.evalCriteria.length) {
     rows.push(`<div class="ac-key">evalCriteria</div><ul class="ac-crit">${c.evalCriteria.map((x) => `<li>${escapeHtml(String(x))}</li>`).join("")}</ul>`);
+  }
+  // Inc8 S4 (usage): show usageCount / lastUsedAt when the rust exposes them.
+  if (tab && (tab.usageCount != null || tab.lastUsedAt != null)) {
+    const parts = [];
+    if (tab.usageCount != null) parts.push(`used ${escapeHtml(String(tab.usageCount))}×`);
+    if (tab.lastUsedAt != null) parts.push(`last ${escapeHtml(String(tab.lastUsedAt))}`);
+    rows.push(`<div class="ac-row"><span class="ac-key">usage</span> ${parts.join(" · ")}</div>`);
   }
   const name = tab && tab.name ? tab.name : "agent";
   return `<button class="ac-close" title="close" aria-label="close">×</button><div class="ac-name">${escapeHtml(name)}</div>${rows.join("")}`;
