@@ -653,3 +653,9 @@ body.band-view { min-height: calc(100vh + 180px); }
   margin-left: 0.25rem; font-size: 0.9em; white-space: nowrap;
 }
 .agent-card .ac-more:hover { opacity: 0.8; }
+/* Inc9 (3): ↗ opens the agent's tab in the browser (remote viewer). */
+.agent-card .ac-open {
+  background: none; border: none; cursor: pointer; color: var(--led-working-stroke);
+  font-size: 0.95em; padding: 0 0.25rem; vertical-align: middle;
+}
+.agent-card .ac-open:hover { opacity: 0.8; }
