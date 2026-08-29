@@ -66,6 +66,9 @@ const s3State = () => ({
         pTab({ id: "tc", name: "ta-tichef", role: "manager", orchestrator: "meta", ...card }),
         pTab({ id: "brain", name: "⛑ brain", agent_kind: "brain", role: "", orchestrator: "meta", ...card }),
         pTab({ id: "alig", name: "🐊 aligator", agent_kind: "aligator", role: "", orchestrator: "meta", ...card }),
+        // Inc9 (4): on-demand supporters — must land in the Supporters band, NOT Méta.
+        pTab({ id: "jo", name: "Joséphine", role: "", assignment: "meta/guardian", ...card }),
+        pTab({ id: "scribe", name: "ta-scribe", role: "", assignment: "meta/scribe", ...card }),
       ] },
   ],
 });
@@ -84,6 +87,22 @@ async function main() {
     ok(`S3-3: the Méta band shows ${who}`, (await page.locator(`${metaBand} [data-tab-id="${id}"]`).count()) >= 1);
   }
   ok("S3-3: Brain is NOT in the Freelancers band", (await page.locator('[data-band="freelancers"] [data-tab-id="brain"]').count()) === 0);
+
+  // ---- Inc9 (4): the SUPPORTERS band, distinct from the 3 autonomous metas.
+  const supBand = '[data-band="supporters"]';
+  for (const [id, who] of [["jo", "Joséphine"], ["scribe", "ta-scribe"]]) {
+    ok(`Inc9-(4): the Supporters band shows ${who}`, (await page.locator(`${supBand} [data-tab-id="${id}"]`).count()) >= 1);
+    ok(`Inc9-(4): ${who} is NOT in the Méta band`, (await page.locator(`${metaBand} [data-tab-id="${id}"]`).count()) === 0);
+  }
+  // The 3 autonomous daemons stay in Méta, NOT in Supporters.
+  for (const id of ["tc", "brain", "alig"]) {
+    ok(`Inc9-(4): the meta daemon ${id} is NOT in the Supporters band`, (await page.locator(`${supBand} [data-tab-id="${id}"]`).count()) === 0);
+  }
+  ok("Inc9-(4): the Supporters band renders BETWEEN Méta and Orchestrateurs", await page.evaluate(() => {
+    const order = [...document.querySelectorAll(".band[data-band]")].map((b) => b.getAttribute("data-band"));
+    const m = order.indexOf("meta"), s = order.indexOf("supporters"), o = order.indexOf("orchestrators");
+    return m >= 0 && s === m + 1 && o === s + 1;
+  }));
 
   // ---- 2. roundsActive pill on the orchestrator cards.
   ok("S3-2: an active orchestrator shows the GREEN rounds pill",

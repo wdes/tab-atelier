@@ -52,8 +52,9 @@ import {
   assert.deepEqual(resolveAltitude({ role: "planner", serving: "kb" }), { band: "worker", team: "kb", reinforcement: true });
   // A meta specialist with an assignment OVERRIDE (no serving) -> same, team from the override.
   assert.deepEqual(resolveAltitude({ role: "refiner", assignment: "kb:plan/refiner" }), { band: "worker", team: "kb", reinforcement: true });
-  // A solo meta specialist -> Méta.
-  assert.deepEqual(resolveAltitude({ role: "auditor" }), { band: "meta" });
+  // Inc9 (4): a solo meta specialist (auditor) is an on-demand SUPPORTER now — its
+  // own band, NOT Méta (which is reserved for the 3 autonomous daemons).
+  assert.deepEqual(resolveAltitude({ role: "auditor" }), { band: "supporter" });
   // Orchestrator -> Orchestrateurs; team = override or null.
   assert.deepEqual(resolveAltitude({ role: "orchestrator", assignment: "kb:build/orchestrator" }), { band: "orchestrator", team: "kb" });
   assert.deepEqual(resolveAltitude({ role: "orchestrator", assignment: "build/orchestrator" }), { band: "orchestrator", team: null });
