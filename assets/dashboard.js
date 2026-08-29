@@ -213,6 +213,16 @@ export function agentCardView(tab) {
   };
 }
 
+// Pure: clip a text to `max` words (Inc9 (2) detailed popup). Returns the clipped
+// text, whether it overflowed, and the FULL text — so the popup renders a 'voir
+// plus' toggle only past the threshold. Null-safe; collapses runs of whitespace.
+export function clipWords(text, max = 50) {
+  const s = String(text == null ? "" : text);
+  const words = s.trim().split(/\s+/).filter(Boolean);
+  if (words.length <= max) return { text: s, clipped: false, full: s };
+  return { text: words.slice(0, max).join(" ") + "…", clipped: true, full: s };
+}
+
 // Pure: an orchestrator's supervision-rounds pill (Inc8 S3). GREEN when
 // roundsActive.active === true, GREY otherwise (absent/null-safe).
 export function roundsPill(tab) {
@@ -1201,15 +1211,24 @@ function openViewerFrom(target) {
 
 // Inc8 S3: build the agent-card HTML from the pure agentCardView model. Only the
 // present sections render (evaluations/evalCriteria are optional).
+// A possibly-long value rendered with a 'voir plus' toggle past 50 words (Inc9 (2)).
+// The FULL text rides in data-full so the delegated click handler swaps it in.
+function clippedHtml(value) {
+  const cw = clipWords(value);
+  if (!cw.clipped) return escapeHtml(cw.text);
+  return `${escapeHtml(cw.text)} <span class="ac-more" role="button" tabindex="0" data-full="${escapeHtml(cw.full)}">voir plus</span>`;
+}
+
 function agentCardHtml(tab) {
   const c = agentCardView(tab);
   const rows = [];
-  if (c.specialty) rows.push(`<div class="ac-row"><span class="ac-key">specialty</span> ${escapeHtml(c.specialty)}</div>`);
+  if (c.specialty) rows.push(`<div class="ac-row"><span class="ac-key">specialty</span> ${clippedHtml(c.specialty)}</div>`);
   rows.push(`<div class="ac-row"><span class="ac-key">orchestrator</span> ${escapeHtml(String(c.orchestrator || "—"))}${c.free ? ` <span class="ac-free">libre</span>` : ""}</div>`);
-  // Long fields are visually clipped -> a title="" carries the full text on hover.
-  if (c.objective) rows.push(`<div class="ac-row" title="objective : ${escapeHtml(c.objective)}"><span class="ac-key">objective</span> ${escapeHtml(c.objective)}</div>`);
+  // Long fields: clipped to 50 words with a 'voir plus' toggle (title="" keeps the
+  // full text on hover too).
+  if (c.objective) rows.push(`<div class="ac-row" title="objective : ${escapeHtml(c.objective)}"><span class="ac-key">objective</span> ${clippedHtml(c.objective)}</div>`);
   if (c.recentTasks.length) {
-    rows.push(`<div class="ac-key">currentTask (permalog)</div><ul class="ac-log">${c.recentTasks.map((t) => `<li title="Current task : ${escapeHtml(t)}">${escapeHtml(t)}</li>`).join("")}</ul>`);
+    rows.push(`<div class="ac-key">currentTask (permalog)</div><ul class="ac-log">${c.recentTasks.map((t) => `<li title="Current task : ${escapeHtml(t)}">${clippedHtml(t)}</li>`).join("")}</ul>`);
   }
   // Inc8 S4: evaluations section — latest verdict + armed-trigger indicator + the
   // last few eval records (evaluator / verdict / error score).
@@ -1227,7 +1246,7 @@ function agentCardHtml(tab) {
     }
   }
   if (c.evalCriteria.length) {
-    rows.push(`<div class="ac-key">evalCriteria</div><ul class="ac-crit">${c.evalCriteria.map((x) => `<li>${escapeHtml(String(x))}</li>`).join("")}</ul>`);
+    rows.push(`<div class="ac-key">evalCriteria</div><ul class="ac-crit">${c.evalCriteria.map((x) => `<li>${clippedHtml(String(x))}</li>`).join("")}</ul>`);
   }
   // Inc8 conventions fold: the declared .md files, or a FLAG when none are declared.
   const cv = conventionsCheck(tab);
@@ -1242,6 +1261,10 @@ function agentCardHtml(tab) {
     if (tab.usageCount != null) parts.push(`used ${escapeHtml(String(tab.usageCount))}×`);
     if (tab.lastUsedAt != null) parts.push(`last ${escapeHtml(String(tab.lastUsedAt))}`);
     rows.push(`<div class="ac-row"><span class="ac-key">usage</span> ${parts.join(" · ")}</div>`);
+  }
+  // Inc9 (2): supervision rounds (roundsActive) — active/idle, shown when present.
+  if (tab && tab.roundsActive != null) {
+    rows.push(`<div class="ac-row"><span class="ac-key">roundsActive</span> ${roundsPill(tab).active ? "active" : "idle"}</div>`);
   }
   const name = tab && tab.name ? tab.name : "agent";
   return `<button class="ac-close" title="close" aria-label="close">×</button><div class="ac-name">${escapeHtml(name)}</div>${rows.join("")}`;
@@ -1401,6 +1424,10 @@ function bootstrap() {
   document.addEventListener("click", (e) => {
     const el = document.getElementById("agent-card");
     if (!el || el.hidden) return;
+    // Inc9 (2): 'voir plus' expands the clipped field in place (safe text swap), and
+    // must NOT close the card — handle it before the close logic.
+    const more = e.target.closest && e.target.closest(".ac-more");
+    if (more) { more.replaceWith(document.createTextNode(more.dataset.full || "")); return; }
     if (e.target.closest(".ac-close") || !e.target.closest("#agent-card")) closeAgentCard();
   });
   document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeAgentCard(); });

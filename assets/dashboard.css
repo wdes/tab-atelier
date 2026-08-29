@@ -642,7 +642,14 @@ body.band-view { min-height: calc(100vh + 180px); }
   font-weight: 600;
 }
 .agent-card .ac-conv li { color: var(--muted); }
-/* Long fields clip with an ellipsis on the card; the full text lives in title="". */
+/* Popup = detail view: fields WRAP (all data visible). Very long values are
+   word-clipped to 50 words in JS with a 'voir plus' toggle (Inc9 (2)); title=""
+   still carries the full text on hover. */
 .agent-card .ac-row, .agent-card .ac-log li, .agent-card .ac-conv li {
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%;
+  overflow-wrap: anywhere; max-width: 100%;
 }
+.agent-card .ac-more {
+  color: var(--led-working-stroke); cursor: pointer; text-decoration: underline;
+  margin-left: 0.25rem; font-size: 0.9em; white-space: nowrap;
+}
+.agent-card .ac-more:hover { opacity: 0.8; }
