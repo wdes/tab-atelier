@@ -530,6 +530,10 @@ struct DashboardTab {
     /// Unix-millis of last use (`lastUsedAt`). Omitted when never set.
     #[serde(skip_serializing_if = "Option::is_none")]
     last_used_at: Option<u64>,
+    /// Inc8 fold — DECLARED conventions (`.md` list). Omitted when empty (the web
+    /// flags that emptiness; the daemon just omits it).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    conventions: Vec<String>,
     /// S4: current task + `Task()` sub-agents, read from the tab's transcript.
     /// Flattened → `currentTask` / `subAgents` sit on the tab for `taskChips`.
     /// Empty (`currentTask:null`, `subAgents:[]`) when the tab has no transcript.
@@ -714,6 +718,8 @@ struct DashboardTabInput {
     evaluations: Vec<crate::Evaluation>,
     usage_count: Option<u64>,
     last_used_at: Option<u64>,
+    // Inc8 fold: declared conventions (.md list).
+    conventions: Vec<String>,
 }
 
 /// Rollup severity of a `led` slug — higher is worse. Mirrors [`crate::TabLed`]
@@ -781,12 +787,13 @@ pub const REHOME_STEPS: [RehomeStep; 4] = [
 /// `…/objective`, `…/current-task`, `…/rounds-active`), return
 /// `(url-verb, json-body-key)`; else `None`. Drives the one generic card route.
 fn card_route_verb(p: &str) -> Option<(&'static str, &'static str)> {
-    const VERBS: [(&str, &str); 5] = [
+    const VERBS: [(&str, &str); 6] = [
         ("specialty", "specialty"),
         ("orchestrator", "orchestrator"),
         ("objective", "objective"),
         ("current-task", "current_task"),
         ("rounds-active", "rounds_active"),
+        ("conventions", "conventions"),
     ];
     VERBS
         .into_iter()
@@ -962,6 +969,7 @@ fn build_dashboard_state(inputs: Vec<DashboardTabInput>) -> DashboardState {
                 evaluations: t.evaluations,
                 usage_count: t.usage_count,
                 last_used_at: t.last_used_at,
+                conventions: t.conventions,
                 activity: t.activity,
             };
             Projected { project, phase, tab }
@@ -1236,6 +1244,8 @@ pub struct SnapshotTab {
     // Inc8 S4 (last_used_at already lives above as the MRU stamp).
     pub evaluations: Vec<crate::Evaluation>,
     pub usage_count: Option<u64>,
+    /// Inc8 fold — declared conventions (`.md` list).
+    pub conventions: Vec<String>,
 }
 
 impl crate::schedule::LockState for SnapshotTab {
@@ -1297,6 +1307,8 @@ pub enum CardChange {
     // Inc8 S4: append an evaluation record (bounded ring); bump usage (count+stamp).
     EvaluationAppend(crate::Evaluation),
     Usage(u64, u64),
+    // Inc8 fold: OVERWRITE the declared conventions (.md list).
+    Conventions(Vec<String>),
 }
 
 pub struct TabSnapshot {
@@ -2872,6 +2884,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                     evaluations: t.evaluations.clone(),
                     usage_count: t.usage_count,
                     last_used_at: t.last_used_at,
+                    conventions: t.conventions.clone(),
                 })
                 .collect();
             drop(state);
@@ -4629,6 +4642,12 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                     crate::append_current_task(&mut state.tabs[idx].current_task, &phrase);
                     CardChange::CurrentTaskAppend(phrase)
                 }
+                "conventions" => {
+                    // OVERWRITE the declared .md list (empty/None clears it).
+                    let list = raw.as_deref().map(crate::parse_conventions).unwrap_or_default();
+                    state.tabs[idx].conventions.clone_from(&list);
+                    CardChange::Conventions(list)
+                }
                 // rounds-active
                 _ => {
                     let active = raw.as_deref().is_some_and(|s| matches!(s.trim(), "true" | "1" | "on"));
@@ -5579,6 +5598,7 @@ pub fn test_snapshot_tab(id: &str, name: &str) -> SnapshotTab {
         rounds_active: None,
         evaluations: Vec::new(),
         usage_count: None,
+        conventions: Vec::new(),
     }
 }
 
@@ -5716,6 +5736,7 @@ mod tests {
             evaluations: Vec::new(),
             usage_count: None,
             last_used_at: None,
+            conventions: Vec::new(),
         }
     }
 
@@ -6500,6 +6521,34 @@ mod tests {
         assert!(
             !serde_json::to_string(&bare).unwrap().contains("\"conventions\""),
             "empty conventions skipped"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::significant_drop_tightening)] // short-lived test read of the snapshot lock
+    fn set_conventions_route_overwrites_the_declared_list() {
+        // The set-conventions ROUTE: the server parses the comma-list, OVERWRITES
+        // the tab's declared conventions, and queues a CardChange to persist.
+        let (port, state, token) = spawn_server();
+        let body = r#"{"conventions":"AGENTS.md, docs/dashboard.md ,"}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/tab-a/conventions HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 200, "{resp}");
+        let g = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tab = g.tabs.iter().find(|t| &*t.id == "tab-a").expect("tab-a");
+        assert_eq!(
+            tab.conventions,
+            vec!["AGENTS.md".to_string(), "docs/dashboard.md".to_string()],
+            "server parsed/trimmed/overwrote the declared list"
+        );
+        assert!(
+            g.pending_card_changes.iter().any(|(id, _)| id == "tab-a"),
+            "queued to persist"
         );
     }
 

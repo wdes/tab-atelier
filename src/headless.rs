@@ -165,6 +165,8 @@ struct HeadlessTab {
     /// Inc8 S4 — bounded evaluations ring + use counter (`last_used_at` is above).
     evaluations: Vec<crate::Evaluation>,
     usage_count: Option<u64>,
+    /// Inc8 fold — declared conventions (`.md` list).
+    conventions: Vec<String>,
     pending_agent_resume: Option<String>,
     colors_enabled: bool,
     /// Raw PTY byte ring captured BEFORE alacritty's parser sees the
@@ -767,6 +769,7 @@ fn spawn_pty_tab(
         rounds_active: None,
         evaluations: Vec::new(),
         usage_count: None,
+        conventions: Vec::new(),
         pending_agent_resume,
         colors_enabled,
         viewers: viewers_handle,
@@ -950,6 +953,7 @@ pub fn run() -> std::io::Result<()> {
                 t.evaluations.clone_from(&ts.evaluations);
                 t.usage_count = ts.usage_count;
                 t.last_used_at = ts.last_used_at;
+                t.conventions.clone_from(&ts.conventions);
                 t.pinned_cols = ts.pinned_cols;
                 t.pinned_rows = ts.pinned_rows;
                 #[cfg(target_os = "linux")]
@@ -1454,6 +1458,7 @@ fn refresh_snapshot(
             rounds_active: tab.rounds_active.clone(),
             evaluations: tab.evaluations.clone(),
             usage_count: tab.usage_count,
+            conventions: tab.conventions.clone(),
         });
     }
     let mut snapshot = api_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1674,6 +1679,7 @@ fn persist(
             evaluations: tab.evaluations.clone(),
             usage_count: tab.usage_count,
             last_used_at: tab.last_used_at,
+            conventions: tab.conventions.clone(),
             parent_tab_id: tab.parent_tab_id.as_deref().map(str::to_string),
             rehome_status: tab.rehome_status.as_deref().map(str::to_string),
             limits: tab.limits.clone(),
@@ -2132,6 +2138,7 @@ fn drain_pending(
                     t.usage_count = Some(count);
                     t.last_used_at = Some(stamp);
                 }
+                crate::api::CardChange::Conventions(list) => t.conventions = list,
             }
         }
     }
