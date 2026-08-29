@@ -208,6 +208,8 @@ export function agentCardView(tab) {
   const log = Array.isArray(t.currentTaskLog) ? t.currentTaskLog.map(String) : [];
   return {
     role: t.role || "",
+    // Inc9-B: assignment (projet:phase/role) = l'ancre d'identité stable (§17).
+    assignment: t.assignment ? String(t.assignment) : "",
     specialty: t.specialty ? String(t.specialty) : "",
     orchestrator: t.orchestrator != null ? t.orchestrator : "",
     free: t.orchestrator === "free",
@@ -1256,16 +1258,21 @@ function clippedHtml(value) {
 function agentCardHtml(tab) {
   const c = agentCardView(tab);
   const rows = [];
-  if (c.specialty) rows.push(`<div class="ac-row"><span class="ac-key">specialty</span> ${clippedHtml(c.specialty)}</div>`);
+  // Inc9-B: FULL fiche d'identité — les champs DÉCLARÉS sont TOUJOURS affichés
+  // (« — » quand vides) pour une carte complète et prévisible. `val` rend un champ
+  // texte (clippé 50 mots) ou un « — » discret.
+  const val = (s) => (s && String(s).trim() ? clippedHtml(s) : `<span class="ac-empty">—</span>`);
+  rows.push(`<div class="ac-row"><span class="ac-key">assignment</span> ${val(c.assignment)}</div>`);
+  rows.push(`<div class="ac-row"><span class="ac-key">specialty</span> ${val(c.specialty)}</div>`);
   rows.push(`<div class="ac-row"><span class="ac-key">orchestrator</span> ${escapeHtml(String(c.orchestrator || "—"))}${c.free ? ` <span class="ac-free">libre</span>` : ""}</div>`);
-  // Long fields: clipped to 50 words with a 'voir plus' toggle (title="" keeps the
-  // full text on hover too).
-  if (c.objective) rows.push(`<div class="ac-row" title="objective : ${escapeHtml(c.objective)}"><span class="ac-key">objective</span> ${clippedHtml(c.objective)}</div>`);
+  rows.push(`<div class="ac-row"${c.objective ? ` title="objective : ${escapeHtml(c.objective)}"` : ""}><span class="ac-key">objective</span> ${val(c.objective)}</div>`);
+  // currentTask permalog (déclaré) — les dernières entrées, ou « — (libre) ».
   if (c.recentTasks.length) {
     rows.push(`<div class="ac-key">currentTask (permalog)</div><ul class="ac-log">${c.recentTasks.map((t) => `<li title="Current task : ${escapeHtml(t)}">${clippedHtml(t)}</li>`).join("")}</ul>`);
+  } else {
+    rows.push(`<div class="ac-row"><span class="ac-key">currentTask</span> <span class="ac-empty">— (libre)</span></div>`);
   }
-  // Inc8 S4: evaluations section — latest verdict + armed-trigger indicator + the
-  // last few eval records (evaluator / verdict / error score).
+  // Inc8 S4: evaluations (verdict + trigger + records) — TOUJOURS, « — » si aucune.
   const es = evalSummary(tab);
   if (es.verdict || es.recent.length) {
     const trigger = es.triggerArmed
@@ -1278,9 +1285,14 @@ function agentCardHtml(tab) {
         return `<li>${escapeHtml((e && e.evaluator) || "?")}: ${escapeHtml(String((e && e.verdict) != null ? e.verdict : ""))}${errors}</li>`;
       }).join("")}</ul>`);
     }
+  } else {
+    rows.push(`<div class="ac-row"><span class="ac-key">evaluations</span> <span class="ac-empty">—</span></div>`);
   }
+  // evalCriteria — TOUJOURS, « — » si aucun.
   if (c.evalCriteria.length) {
     rows.push(`<div class="ac-key">evalCriteria</div><ul class="ac-crit">${c.evalCriteria.map((x) => `<li>${clippedHtml(String(x))}</li>`).join("")}</ul>`);
+  } else {
+    rows.push(`<div class="ac-row"><span class="ac-key">evalCriteria</span> <span class="ac-empty">—</span></div>`);
   }
   // Inc8 conventions fold: the declared .md files, or a FLAG when none are declared.
   const cv = conventionsCheck(tab);
@@ -1289,17 +1301,13 @@ function agentCardHtml(tab) {
   } else {
     rows.push(`<div class="ac-row conventions-missing" data-conventions="missing"><span class="ac-key">conventions</span> <span class="conv-flag">⚠ aucune convention déclarée</span></div>`);
   }
-  // Inc8 S4 (usage): show usageCount / lastUsedAt when the rust exposes them.
-  if (tab && (tab.usageCount != null || tab.lastUsedAt != null)) {
-    const parts = [];
-    if (tab.usageCount != null) parts.push(`used ${escapeHtml(String(tab.usageCount))}×`);
-    if (tab.lastUsedAt != null) parts.push(`last ${escapeHtml(String(tab.lastUsedAt))}`);
-    rows.push(`<div class="ac-row"><span class="ac-key">usage</span> ${parts.join(" · ")}</div>`);
-  }
-  // Inc9 (2): supervision rounds (roundsActive) — active/idle, shown when present.
-  if (tab && tab.roundsActive != null) {
-    rows.push(`<div class="ac-row"><span class="ac-key">roundsActive</span> ${roundsPill(tab).active ? "active" : "idle"}</div>`);
-  }
+  // usage (usageCount / lastUsedAt) — TOUJOURS, « — » si non exposé.
+  const usageParts = [];
+  if (tab && tab.usageCount != null) usageParts.push(`used ${escapeHtml(String(tab.usageCount))}×`);
+  if (tab && tab.lastUsedAt != null) usageParts.push(`last ${escapeHtml(String(tab.lastUsedAt))}`);
+  rows.push(`<div class="ac-row"><span class="ac-key">usage</span> ${usageParts.length ? usageParts.join(" · ") : `<span class="ac-empty">—</span>`}</div>`);
+  // roundsActive — TOUJOURS (active/idle pour un orchestrateur, « — » sinon).
+  rows.push(`<div class="ac-row"><span class="ac-key">roundsActive</span> ${tab && tab.roundsActive != null ? (roundsPill(tab).active ? "active" : "idle") : `<span class="ac-empty">—</span>`}</div>`);
   const name = tab && tab.name ? tab.name : "agent";
   // Inc9 (3): restore "open the agent's tab in the browser". The viewerUrl is
   // relative, so window.open resolves it against the CURRENT origin — when the
