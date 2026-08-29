@@ -71,6 +71,12 @@ TDD : parse/round-trip des champs (pur) + accept écran.
   Reproductible dans les deux cas (compteurs + lecture du permalog borné d'évals).
 - `evalCriteria` co-définis (agent + orchestrateur), **validés par Olympe** (nouvel agent neutre,
   ni Joséphine/trust ni le sage/handbook).
+- **[ajout PO] champ GÉNÉRIQUE d'observabilité** `usageCount` (int) + `lastUsedAt` (timestamp) —
+  versant **observé** de la carte (tout agent). Déterministe, expo camelCase (skip si None, zéro-reg).
+  Sous-commande légère **`bump-usage <tab>`** (incrémente + timestamp, miroir set-*). **WIRING (PO)** :
+  **brain** bump à CHAQUE `continue` émis (on saura enfin quand/combien de nudges) ; **aligator** bump
+  à CHAQUE livraison depuis la swamp. But : rendre l'activité des daemons **observable** + alimenter le
+  panneau « Dernières heures ». Enrichit aussi les cartes Brain/aligator (inc8-cards).
 
 ### S5 — Process de libération (state machine) + boucle auto-amélioration
 1. Travail terminé ? (libération orchestrateur + éval, pondérée par tokens).
