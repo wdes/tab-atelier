@@ -42,8 +42,10 @@ assert.equal(typeof dash.bandLayout, "function", "S1 RED: export bandLayout(stat
     unassigned: [u1, u2],
   };
   const bl = dash.bandLayout(state);
-  // Méta band: tichef + solo planner.
-  assert.deepEqual(bl.meta.map((x) => x.id).sort(), ["p", "tc"], "Méta band = tichef + solo méta");
+  // Inc9 (4): Méta band = the autonomous daemon (tichef) ONLY; the solo meta
+  // specialist (planner) is now an on-demand SUPPORTER, in its own band.
+  assert.deepEqual(bl.meta.map((x) => x.id).sort(), ["tc"], "Méta band = tichef (autonomous daemon)");
+  assert.deepEqual(bl.supporters.map((x) => x.id).sort(), ["p"], "Supporters band = the solo meta specialist");
   // Orchestrateurs band: 2 leads, each with its served-repo sub-nodes + workers.
   assert.equal(bl.orchestrators.length, 2, "two orchestrators");
   const kal = bl.orchestrators.find((o) => o.lead.id === "o1");
@@ -108,8 +110,9 @@ assert.equal(typeof dash.resolveAltitude, "function", "S2 RED: export resolveAlt
   assert.notEqual(r.band, "meta", "a serving méta leaves Méta");
   assert.equal(r.team, "kalpin-back", "…and joins the served team");
   assert.equal(r.reinforcement, true, "…marked as reinforcement (renfort)");
-  // A solo méta (no serving) stays in Méta.
-  assert.equal(dash.resolveAltitude({ role: "planner", serving: null }, state).band, "meta", "solo méta stays Méta");
+  // Inc9 (4): a solo méta specialist (no serving) is now a SUPPORTER (its own band),
+  // not Méta — Méta is reserved for the 3 autonomous daemons.
+  assert.equal(dash.resolveAltitude({ role: "planner", serving: null }, state).band, "supporter", "solo méta -> Supporter band");
   // Movement 2: a freelancer that RECEIVES an assignment climbs to worker under its team.
   const w = dash.resolveAltitude({ role: "implementer", assignment: "kalpin-back:build/implementer" }, state);
   assert.equal(w.band, "worker", "assigned worker climbs to Workers");
