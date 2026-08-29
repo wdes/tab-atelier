@@ -433,7 +433,15 @@ export function bandLayout(state) {
   const orchestrators = allTabs
     .filter((t) => String(t && t.role || "").toLowerCase() === "orchestrator")
     .map((lead) => {
-      const workers = allTabs.filter((t) => t && t.parentTabId === lead.id && t.id !== lead.id && !leadIds.has(t.id));
+      // Nesting source (Inc8.2): the spawn lineage `parentTabId` (persistent, wins
+      // when set) OR, as a fallback when a tab has NO lineage, the DECLARED card
+      // field `orchestrator` (set-orchestrator = single-source living-card). The
+      // fallback only fires when parentTabId is absent, so a tab never lands under
+      // two leads. Sentinel values ("free"/"meta") never equal a lead UUID.
+      const workers = allTabs.filter((t) => {
+        if (!t || t.id === lead.id || leadIds.has(t.id)) return false;
+        return t.parentTabId ? t.parentTabId === lead.id : t.orchestrator === lead.id;
+      });
       const leadProj = assignmentProject(lead.assignment);
       const byRepo = new Map();
       for (const w of workers) {
