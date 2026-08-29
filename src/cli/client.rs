@@ -26,7 +26,7 @@
 //! `dispatch` if headless should list it in `--help`).
 
 use super::{bench, bench_lag, brain, claude_hook, delegate, flags, logging, remote};
-use super::{set_assignment, set_context, set_font, set_rehome, set_status, share_link, team, tokens};
+use super::{set_assignment, set_card, set_context, set_font, set_rehome, set_status, share_link, team, tokens};
 
 /// Dispatch a client subcommand by name against raw `&[String]` args.
 ///
@@ -42,6 +42,12 @@ pub fn dispatch(name: &str, rest: &[String]) -> Option<i32> {
         "set-font" => set_font::run(rest),
         "set-context" => set_context::run(rest),
         "set-assignment" => set_assignment::run(rest),
+        // Inc8 S1 agent-card set-* (siblings of set-assignment).
+        "set-specialty" => set_card::specialty(rest),
+        "set-orchestrator" => set_card::orchestrator(rest),
+        "set-objective" => set_card::objective(rest),
+        "set-current-task" => set_card::current_task(rest),
+        "set-rounds-active" => set_card::rounds_active(rest),
         "set-rehome-status" => set_rehome::run(rest),
         "token" => tokens::show(rest),
         "rotate-tokens" => tokens::rotate(rest),

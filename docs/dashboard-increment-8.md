@@ -20,6 +20,12 @@ Champs additionnels au `TabState` (persistants, hook-immune, camelCase dans `/da
 - **[G-b, garde-fou tichef] BORNER le permalog** : `currentTask` = **ring des N dernières entrées**
   (défaut ~50, configurable) OU cap taille — sinon `TabState` + `/dashboard/state` gonflent sans fin
   (même leçon que la compaction aligator). L'entrée courante + un historique borné, exposé borné.
+- **[ajout PO] `roundsActive`** : indique si des **rondes (crons)** sont actives pour un orchestrateur —
+  bool + horodatage `lastRoundAt` (ou compteur). Posé déterministe via `set-rounds-active` (miroir des
+  `set-*`), exposé `/dashboard/state`. **Le champ + set-* + expo = S1** ; le rendu **pastille = S3**
+  (vert = rondes actives / gris = aucune). Wiring : les crons de ronde (watcher/sage) appellent
+  `set-rounds-active` à chaque tic (petite intégration S1/S2a). Sert l'inter-observabilité (voir
+  d'un coup d'œil qui est supervisé).
 - Sous-commandes `set-*` déterministes (miroir `set-assignment`) + expo dans `DashboardTab`.
 - **Fallback** : champs absents → vides, zéro régression Inc5/6/7.
 - Web : rendre `objective` / `currentTask` / badge **« libre »** (orchestrator=free) sur la carte.
@@ -44,29 +50,43 @@ TDD : parse/round-trip des champs (pur) + accept écran.
 ### S3 — Vue « carte d'agent » au clic droit + méta-trio [web]
 - **Clic droit sur un agent** → affiche sa **carte complète** (specialty, orchestrator, objective,
   currentTask, evaluations, evalCriteria). Orchestrateurs = carte aussi.
+- **Pastille `roundsActive`** [ajout PO] sur la carte de l'orchestrateur : **vert** = rondes actives /
+  **gris** = aucune (champ posé en S1).
 - **Méta = trio** : `tichef` (probabiliste) + **Brain** (déterministe anti-freeze) + **aligator**
   (assistant déterministe/gating). tichef remplit les cartes de Brain + aligator (daemons). Les
   afficher en Méta rend leur **statut GUI-visible + observable par les agents**.
 
 ### S4 — Évaluations + évaluateur « Olympe » [rust + web + nouvel agent]
-- `evaluations[]` (permalog d'évals) : `{ evaluator, at, taskRef, tokens:{in,out},
+- `evaluations[]` (permalog d'évals, **schéma VALIDÉ PO**) : `{ evaluator, at, taskRef, tokens:{in,out},
   scores:{relevance,errors,omissions}, verdict, note }`. Exposé `/dashboard/state`.
-- **Seuil** : max **1 erreur / 1 M tokens** (`errorRate = errors/(tokens.in+out)`). **2ᵉ erreur dans
-  la fenêtre → déclenche l'auto-amélioration** (S5).
-- **[G-c, garde-fou tichef] Fenêtre DÉTERMINISTE (reproductible)** : compteurs `(tokens, errors)`
-  **depuis le dernier reset** = spawn OU dernière auto-amélioration (aligné sur la RAZ de C.3.b).
-  Budget = **1 erreur par tranche de 1 M tokens entamée** dans l'époque ; déclenchement quand
-  `errors` dépasse le budget (à <1 M tokens : budget=1 → la 2ᵉ erreur déclenche). Pas de fenêtre
-  glissante (éviterait de stocker un stamp par erreur) — reset-époque, 2 compteurs, reproductible.
+- **Seuil** : max **1 erreur / 1 M tokens** — c'est une **moyenne** ; déclenche l'auto-amélioration (S5)
+  sur (a) dépassement de moyenne OU (b) **burst ≥3 erreurs dans le dernier 1 M** (cf G-c).
+- **[G-c + précision PO] DEUX déclencheurs déterministes (l'un OU l'autre)** :
+  - **(a) MOYENNE** (le seuil est une moyenne) : compteurs `(tokens, errors)` **depuis le dernier
+    reset** (spawn OU dernière auto-amélioration, aligné RAZ C.3.b). Budget = **1 err / 1 M tokens
+    entamé** ; déclenche quand `errors` dépasse le budget (à <1 M : budget=1 → 2ᵉ erreur déclenche).
+  - **(b) BURST** : **≥ 3 erreurs dans le dernier 1 M tokens** → auto-amélioration aussi. Fenêtre
+    glissante récente **lue depuis les records `evaluations[]`** (qui portent déjà `tokens.{in,out}`)
+    → pas de stockage neuf, reproductible.
+  Reproductible dans les deux cas (compteurs + lecture du permalog borné d'évals).
 - `evalCriteria` co-définis (agent + orchestrateur), **validés par Olympe** (nouvel agent neutre,
   ni Joséphine/trust ni le sage/handbook).
 
 ### S5 — Process de libération (state machine) + boucle auto-amélioration
 1. Travail terminé ? (libération orchestrateur + éval, pondérée par tokens).
 2. Docs de travail rangés ? (utiles / supprimer / conserver, coop orchestrateur).
-3. Auto-amélioration ? (coop MAS/tichef sur l'éval) → si oui : (a) consigner ancien prompt + éval,
-   (b) modifier `specialty` + RAZ évaluation.
-4. Handoff → auto-rehome → déclaration `free` → bande Freelancers.
+3. **Sur déclenchement (dès la 2ᵉ erreur / burst), l'orchestrateur DÉCIDE** — informé par la **taille
+   de la fenêtre de contexte** de l'agent (observée) :
+   - **REHOME d'abord** si le contexte est **gros/dégradé** → rafraîchit le contexte ; peut suffire
+     (erreurs dues à la dégradation, pas au prompt). Moins coûteux que réécrire le prompt. Puis ré-évaluer.
+     **[REUSE §18, tichef] Réutiliser `~/Dev/Botmox/rehome-tab.sh`** (chaîne complète handoff-written →
+     successor-ready → ack → safe-to-close, `--auto-close`, swap nom, set-parent, warning crons) avec
+     **assignment/name/cwd préservés** = l'agent renaît frais **sans perdre son identité** (specialty/
+     objective se re-posent via les `set-*` de la carte S1). **Aucun nouveau code rehome.**
+   - **AUTO-AMÉLIORATION** (coop MAS/tichef sur l'éval) si c'est un vrai problème de capacité/prompt :
+     (a) consigner ancien prompt + éval, (b) modifier `specialty` + RAZ évaluation.
+4. Handoff → auto-rehome → déclaration `free` → bande Freelancers. **[terrain tichef]** co-câbler la
+   state-machine de libération sur `rehome-tab.sh` **avec tichef (producteur)** à S5 — pas de réinvention.
 
 ## Ordre & intégration
 S1 (carte base) → **S2a (free-bot, sûr)** → S3 (clic droit + méta-trio) — cœur ; puis **S2b (hook
