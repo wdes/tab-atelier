@@ -88,4 +88,19 @@ assert.equal(typeof dash.roundsPill, "function", "Inc8-S3 RED: export roundsPill
   assert.equal(bl.freelancers.filter((t) => t.id === "brain" || t.id === "alig").length, 0, "daemons are not Freelancers");
 }
 
+// Inc8.1 (2): the LIVE shape — a trio daemon carries NEITHER orchestrator="meta"
+// NOR agent_kind: its ONLY meta signal is the `meta/…` assignment (aligator =
+// meta/router, kind=None). Regression guard: such a tab must land in the Méta band,
+// not leak into Workers (the bug the PO saw: aligator absent from Méta).
+{
+  const aligLive = { id: "alig2", name: "🐊 aligator", role: "", assignment: "meta/router" };
+  const scribeLive = { id: "scr", name: "ta-scribe", role: "", assignment: "meta/scribe" };
+  const bl = dash.bandLayout({ nodes: [], unmapped: [aligLive, scribeLive], unassigned: [], projects: [] });
+  assert.deepEqual(bl.meta.map((t) => t.id).sort(), ["alig2", "scr"], "Inc8.1: meta/* assignment -> Méta band (no orchestrator/kind needed)");
+  assert.equal(bl.workers.filter((t) => t.id === "alig2").length, 0, "Inc8.1: a meta/router tab does NOT leak into Workers");
+  // A meta specialist REINFORCING a team (project:role assignment) stays a worker.
+  assert.equal(dash.resolveAltitude({ role: "refiner", assignment: "kalpin-back:build/refiner" }).band, "worker",
+    "Inc8.1: a reinforcing specialist (project:role) is NOT pulled into Méta");
+}
+
 console.log("dashboard.inc8.s3.test.mjs: OK");
