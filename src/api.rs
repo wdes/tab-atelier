@@ -6357,6 +6357,50 @@ mod tests {
         assert!(!bj.contains("\"objective\""), "absent objective skipped: {bj}");
     }
 
+    // --- Inc8 S4 (REFINER red): evaluations[] + generic usage fields ride into
+    //     /dashboard/state on each DashboardTab, camelCase, skipped when empty/None.
+    //     RED (compile-fail) until the builder threads evaluations / usage_count /
+    //     last_used_at through DashboardTabInput -> DashboardTab.
+    #[test]
+    fn dashboard_tab_exposes_evaluations_and_usage_camelcase() {
+        let eval = crate::Evaluation {
+            evaluator: "olympe".into(),
+            at: 1000,
+            task_ref: Some("taskRef-1".into()),
+            tokens: crate::EvalTokens {
+                input: 400_000,
+                out: 100_000,
+            },
+            scores: crate::EvalScores {
+                relevance: 8,
+                errors: 1,
+                omissions: 0,
+            },
+            verdict: "ok".into(),
+            note: None,
+        };
+        let input = DashboardTabInput {
+            evaluations: vec![eval],
+            usage_count: Some(7),
+            last_used_at: Some(1_700_000_000_000),
+            ..dash_input("u1", Some("build/implementer"), Some("working"))
+        };
+        let state = build_dashboard_state(vec![input]);
+        let tab = &node(&state, "build").tabs[0];
+        assert_eq!(tab.evaluations.len(), 1);
+        assert_eq!(tab.usage_count, Some(7));
+        let json = serde_json::to_string(&state).unwrap();
+        // camelCase on the wire: evaluations[].taskRef, usageCount, lastUsedAt.
+        for k in ["\"evaluations\"", "\"taskRef\"", "\"usageCount\"", "\"lastUsedAt\""] {
+            assert!(json.contains(k), "camelCase card field {k}: {json}");
+        }
+        // Absent -> omitted, so old tabs stay clean.
+        let bare = build_dashboard_state(vec![dash_input("u2", Some("build/implementer"), None)]);
+        let bj = serde_json::to_string(&bare).unwrap();
+        assert!(!bj.contains("\"evaluations\""), "empty evaluations skipped: {bj}");
+        assert!(!bj.contains("\"usageCount\""), "None usageCount skipped: {bj}");
+    }
+
     #[test]
     fn dashboard_tab_exposes_current_task_log_bounded_and_rounds_active() {
         // My adds on top of the refiner reds: the self-declared permalog is
