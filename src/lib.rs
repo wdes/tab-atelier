@@ -4075,6 +4075,151 @@ mod tests {
         assert_eq!(log, vec!["read the plan", "wire the struct", "run the tests"]);
     }
 
+    // --- Inc8 S4 (REFINER red): the evaluations SCHEMA + auto-improvement TRIGGERS
+    //     (schema + signals only; the S5 loop is NOT here) + the generic usage
+    //     observability fields. RED (compile-fail) until the builder adds:
+    //       TabState.{evaluations: Vec<Evaluation>, usage_count, last_used_at},
+    //       Evaluation/EvalTokens/EvalScores, EVALUATIONS_MAX + append_evaluation,
+    //       avg_trigger / burst_trigger, bump_usage.
+
+    /// A synthetic evaluation record for the tests below.
+    fn ev(evaluator: &str, at: u64, errors: u64, tok_in: u64, tok_out: u64) -> Evaluation {
+        Evaluation {
+            evaluator: evaluator.into(),
+            at,
+            task_ref: Some("taskRef-1".into()),
+            tokens: EvalTokens {
+                input: tok_in,
+                out: tok_out,
+            },
+            scores: EvalScores {
+                relevance: 8,
+                errors,
+                omissions: 0,
+            },
+            verdict: "ok".into(),
+            note: None,
+        }
+    }
+
+    #[test]
+    fn evaluations_and_usage_round_trip() {
+        // evaluations[] is a BOUNDED ring (same G-b lesson as current_task);
+        // usage_count / last_used_at are generic observability fields. All persist
+        // to tabs.json; empty ring + None usage are omitted (old files load clean).
+        let evals = vec![ev("olympe", 1000, 1, 400_000, 100_000)];
+        let with = SavedState {
+            tabs: vec![TabState {
+                name: "worker".into(),
+                evaluations: evals.clone(),
+                usage_count: Some(7),
+                last_used_at: Some(1_700_000_000_000),
+                ..Default::default()
+            }],
+            active: 0,
+            windowed: false,
+            dashboard_share_token: String::new(),
+        };
+        let json = serde_json::to_string(&with).unwrap();
+        assert!(json.contains(r#""evaluations":[{"#), "evaluations persist: {json}");
+        assert!(
+            json.contains(r#""evaluator":"olympe""#),
+            "record fields persist: {json}"
+        );
+        assert!(json.contains(r#""usage_count":7"#), "usage_count persists: {json}");
+        assert!(
+            json.contains(r#""last_used_at":1700000000000"#),
+            "last_used_at persists: {json}"
+        );
+        let restored: SavedState = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.tabs[0].evaluations, evals);
+        assert_eq!(restored.tabs[0].usage_count, Some(7));
+        assert_eq!(restored.tabs[0].last_used_at, Some(1_700_000_000_000));
+
+        // Empty ring + None usage -> omitted; an old file loads them empty/None.
+        let without = SavedState {
+            tabs: vec![TabState {
+                name: "x".into(),
+                ..Default::default()
+            }],
+            active: 0,
+            windowed: false,
+            dashboard_share_token: String::new(),
+        };
+        let json = serde_json::to_string(&without).unwrap();
+        for k in ["evaluations", "usage_count", "last_used_at"] {
+            assert!(!json.contains(k), "empty {k} must be skipped: {json}");
+        }
+        let restored: SavedState = serde_json::from_str(r#"{"tabs":[{"name":"x"}],"active":0}"#).unwrap();
+        assert!(restored.tabs[0].evaluations.is_empty());
+        assert_eq!(restored.tabs[0].usage_count, None);
+    }
+
+    #[test]
+    fn append_evaluation_bounds_the_ring() {
+        // `set-evaluation` APPENDS one record; the ring keeps only the last
+        // EVALUATIONS_MAX (oldest evicted), like the current_task permalog.
+        let mut log: Vec<Evaluation> = Vec::new();
+        for i in 0..(EVALUATIONS_MAX + 10) {
+            append_evaluation(&mut log, ev("olympe", i as u64, 0, 10, 10));
+        }
+        assert_eq!(log.len(), EVALUATIONS_MAX, "ring bounded to EVALUATIONS_MAX");
+        // Oldest evicted: the surviving window is the last EVALUATIONS_MAX by `at`.
+        assert_eq!(log.first().unwrap().at, 10, "the first 10 were evicted");
+        assert_eq!(log.last().unwrap().at, (EVALUATIONS_MAX + 9) as u64);
+    }
+
+    #[test]
+    fn eval_avg_trigger_on_error_budget() {
+        // avg_trigger: errors exceed the 1-per-1M-tokens budget since the last reset.
+        // SIGNAL only (bool) — it executes nothing (the S5 action is separate).
+        // Exactly at budget (1 error / 1M tokens) does NOT trip.
+        assert!(
+            !avg_trigger(1_000_000, 1),
+            "1 error / 1M tokens is the budget, not over it"
+        );
+        assert!(avg_trigger(1_000_000, 2), "2 errors / 1M -> over budget");
+        assert!(avg_trigger(500_000, 1), "1 error / 500k -> over budget (rate 2/1M)");
+        assert!(!avg_trigger(2_000_000, 2), "2 errors / 2M is exactly the budget");
+        assert!(!avg_trigger(0, 0), "no work, no errors -> no trigger");
+    }
+
+    #[test]
+    fn eval_burst_trigger_three_errors_in_last_1m_tokens() {
+        // burst_trigger: >= 3 errors within the last 1M tokens, read from the
+        // evaluations records (newest-first, windowed by cumulative tokens).
+        // 3 recent records, 1 error each, well within 1M -> trips.
+        let hot = vec![
+            ev("o", 1, 1, 50_000, 50_000),
+            ev("o", 2, 1, 50_000, 50_000),
+            ev("o", 3, 1, 50_000, 50_000),
+        ];
+        assert!(burst_trigger(&hot), "3 errors inside the 1M window -> trigger");
+        // Only 2 errors -> no trip.
+        let two = vec![ev("o", 1, 1, 10, 10), ev("o", 2, 1, 10, 10)];
+        assert!(!burst_trigger(&two), "2 errors -> below the burst threshold");
+        // Old errors fall OUTSIDE the 1M window: 5 errors on the oldest record, but
+        // the three newest (0 errors) already fill the window -> excluded -> no trip.
+        let windowed = vec![
+            ev("o", 1, 5, 100_000, 0), // oldest, beyond the 1M window
+            ev("o", 2, 0, 400_000, 0),
+            ev("o", 3, 0, 400_000, 0),
+            ev("o", 4, 0, 400_000, 0), // newest
+        ];
+        assert!(
+            !burst_trigger(&windowed),
+            "errors older than the last 1M tokens are excluded"
+        );
+        assert!(!burst_trigger(&[]), "no records -> no trigger");
+    }
+
+    #[test]
+    fn bump_usage_increments_and_stamps() {
+        // bump-usage: +1 to the counter and stamp last-used (now injected -> pure).
+        assert_eq!(bump_usage(None, 1000), (1, 1000), "first use: 0 -> 1, stamped");
+        assert_eq!(bump_usage(Some(5), 2000), (6, 2000), "increments + re-stamps");
+    }
+
     #[test]
     fn current_task_permalog_is_bounded_evicting_oldest() {
         // G-b (tichef): the permalog is a bounded ring — entry N+1 evicts the
