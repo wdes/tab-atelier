@@ -46,7 +46,7 @@ const cardState = () => ({
       // Inc8 S1 agent-card fields on the tab:
       specialty: "rust async internals", orchestrator: "free",
       objective: "land the parser refactor",
-      currentTask: ["read the plan", "wire the struct", "run the tests"],
+      currentTaskLog: ["read the plan", "wire the struct", "run the tests"], // DECLARED permalog
     }),
   ],
   projects: [
@@ -54,7 +54,7 @@ const cardState = () => ({
       nodes: [{ id: "build", rollupLed: "working", tabs: [
         pTab({ id: "o1", name: "ta-lead", role: "orchestrator", assignment: "kalpin-back:build/orchestrator", led: "idle" }),
         pTab({ id: "w1", name: "ta-w1", role: "implementer", parentTabId: "o1", assignment: "kalpin-back:build/implementer", led: "working",
-               orchestrator: "o1", objective: "impl the struct", currentTask: ["wiring now"] }),
+               orchestrator: "o1", objective: "impl the struct", currentTaskLog: ["wiring now"] }),
       ] }], unmapped: [] },
     { name: "méta", isMeta: true, hasOrchestrator: false, orchestrators: [],
       nodes: [], unmapped: [pTab({ id: "tc", name: "ta-tichef", role: "manager", assignment: "meta/manager", led: "idle" })] },
@@ -73,20 +73,23 @@ async function main() {
   // Objective + latest currentTask are shown ON the card.
   const objText = await page.locator(`${free} .agent-objective`).first().textContent().catch(() => "");
   ok("Inc8-S1: the card shows the objective", /land the parser refactor/.test(objText || ""), `objective=${objText}`);
-  // The currentTask is NOT dumped inline anymore (kept the band compact): its latest
-  // permalog phrase shows in the grey `.task-chip` pill (truncated), full on hover (title=).
-  const taskChip = page.locator(`${free} .task-chip`).first();
-  const taskText = await taskChip.textContent().catch(() => "");
-  ok("Inc8-S1: the latest currentTask phrase shows in the grey pill", /run the tests/.test(taskText || ""), `task=${taskText}`);
-  const taskTitle = await taskChip.getAttribute("title").catch(() => "");
-  ok("Inc8-S1: the pill exposes the full task on hover (title)", /current task : .*run the tests/.test(taskTitle || ""), `title=${taskTitle}`);
+  // Inc9 (1): a FREE agent shows NO task pill (the 'libre' badge speaks for it) —
+  // the pill is fed by the DECLARED permalog, never the observed transcript, so a
+  // free/undeclared agent is clean (no broadcast bleed).
+  ok("Inc9-(1): a free agent shows NO task pill", (await page.locator(`${free} .task-chip`).count()) === 0);
   ok("Inc8-S1: the currentTask is NOT dumped as a full inline block", (await page.locator(`${free} .agent-task`).count()) === 0);
   // The 'libre' badge fires for orchestrator === "free".
   const badge = await page.locator(`${free} .free-badge`).first().textContent().catch(() => "");
   ok("Inc8-S1: a 'libre' badge is shown for a free agent", /libre/i.test(badge || ""), `badge=${badge}`);
 
-  // An OWNED worker (orchestrator = a uuid) does NOT get the 'libre' badge.
+  // An OWNED worker (orchestrator = a uuid): NO 'libre' badge, and its DECLARED task
+  // shows in the grey `.task-chip` pill (truncated), full on hover (title=).
   const owned = '[data-tab-id="w1"]';
+  const ownedChip = page.locator(`${owned} .task-chip`).first();
+  const ownedTask = await ownedChip.textContent().catch(() => "");
+  ok("Inc9-(1): an owned agent shows its DECLARED task in the pill", /wiring now/.test(ownedTask || ""), `task=${ownedTask}`);
+  const ownedTitle = await ownedChip.getAttribute("title").catch(() => "");
+  ok("Inc8-S1: the pill exposes the full task on hover (title)", /current task : .*wiring now/.test(ownedTitle || ""), `title=${ownedTitle}`);
   if ((await page.locator(owned).count()) >= 1) {
     ok("Inc8-S1: an owned agent has NO 'libre' badge", (await page.locator(`${owned} .free-badge`).count()) === 0);
   } else {

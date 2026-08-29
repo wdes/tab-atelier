@@ -22,9 +22,9 @@ const fleet = (extra) => ({
   projects: [
     { name: "kalpin-back", isMeta: false, orchestrators: [{ id: "o1", name: "lead", childCount: 1 }],
       nodes: [{ id: "build", rollupLed: "working", tabs: [
-        { id: "o1", name: "lead", role: "orchestrator", assignment: "kalpin-back:build/orchestrator", led: "idle", currentTask: "orchestrating" },
+        { id: "o1", name: "lead", role: "orchestrator", assignment: "kalpin-back:build/orchestrator", led: "idle", currentTaskLog: ["orchestrating"] },
         { id: "w1", name: "ta-w1", role: "implementer", parentTabId: "o1", assignment: "kalpin-back:build/implementer",
-          led: "working", currentTask: extra.task, subAgents: extra.subs || [] },
+          led: "working", currentTaskLog: [extra.task], subAgents: extra.subs || [] },
       ] }], unmapped: [] },
     { name: "méta", isMeta: true, orchestrators: [], nodes: [], unmapped: [{ id: "tc", name: "tichef", role: "tichef", led: "idle" }] },
   ],
