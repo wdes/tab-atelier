@@ -49,23 +49,31 @@ TDD : parse/round-trip des champs (pur) + accept écran.
   afficher en Méta rend leur **statut GUI-visible + observable par les agents**.
 
 ### S4 — Évaluations + évaluateur « Olympe » [rust + web + nouvel agent]
-- `evaluations[]` (permalog d'évals) : `{ evaluator, at, taskRef, tokens:{in,out},
+- `evaluations[]` (permalog d'évals, **schéma VALIDÉ PO**) : `{ evaluator, at, taskRef, tokens:{in,out},
   scores:{relevance,errors,omissions}, verdict, note }`. Exposé `/dashboard/state`.
-- **Seuil** : max **1 erreur / 1 M tokens** (`errorRate = errors/(tokens.in+out)`). **2ᵉ erreur dans
-  la fenêtre → déclenche l'auto-amélioration** (S5).
-- **[G-c, garde-fou tichef] Fenêtre DÉTERMINISTE (reproductible)** : compteurs `(tokens, errors)`
-  **depuis le dernier reset** = spawn OU dernière auto-amélioration (aligné sur la RAZ de C.3.b).
-  Budget = **1 erreur par tranche de 1 M tokens entamée** dans l'époque ; déclenchement quand
-  `errors` dépasse le budget (à <1 M tokens : budget=1 → la 2ᵉ erreur déclenche). Pas de fenêtre
-  glissante (éviterait de stocker un stamp par erreur) — reset-époque, 2 compteurs, reproductible.
+- **Seuil** : max **1 erreur / 1 M tokens** — c'est une **moyenne** ; déclenche l'auto-amélioration (S5)
+  sur (a) dépassement de moyenne OU (b) **burst ≥3 erreurs dans le dernier 1 M** (cf G-c).
+- **[G-c + précision PO] DEUX déclencheurs déterministes (l'un OU l'autre)** :
+  - **(a) MOYENNE** (le seuil est une moyenne) : compteurs `(tokens, errors)` **depuis le dernier
+    reset** (spawn OU dernière auto-amélioration, aligné RAZ C.3.b). Budget = **1 err / 1 M tokens
+    entamé** ; déclenche quand `errors` dépasse le budget (à <1 M : budget=1 → 2ᵉ erreur déclenche).
+  - **(b) BURST** : **≥ 3 erreurs dans le dernier 1 M tokens** → auto-amélioration aussi. Fenêtre
+    glissante récente **lue depuis les records `evaluations[]`** (qui portent déjà `tokens.{in,out}`)
+    → pas de stockage neuf, reproductible.
+  Reproductible dans les deux cas (compteurs + lecture du permalog borné d'évals).
 - `evalCriteria` co-définis (agent + orchestrateur), **validés par Olympe** (nouvel agent neutre,
   ni Joséphine/trust ni le sage/handbook).
 
 ### S5 — Process de libération (state machine) + boucle auto-amélioration
 1. Travail terminé ? (libération orchestrateur + éval, pondérée par tokens).
 2. Docs de travail rangés ? (utiles / supprimer / conserver, coop orchestrateur).
-3. Auto-amélioration ? (coop MAS/tichef sur l'éval) → si oui : (a) consigner ancien prompt + éval,
-   (b) modifier `specialty` + RAZ évaluation.
+3. **Sur déclenchement (dès la 2ᵉ erreur / burst), l'orchestrateur DÉCIDE** — informé par la **taille
+   de la fenêtre de contexte** de l'agent (observée) :
+   - **REHOME d'abord** (clarify/auto-rehome) si le contexte est **gros/dégradé** → rafraîchit le
+     contexte ; peut suffire (erreurs causées par la dégradation, pas par le prompt). Moins coûteux
+     que réécrire le prompt. Puis ré-évaluer.
+   - **AUTO-AMÉLIORATION** (coop MAS/tichef sur l'éval) si c'est un vrai problème de capacité/prompt :
+     (a) consigner ancien prompt + éval, (b) modifier `specialty` + RAZ évaluation.
 4. Handoff → auto-rehome → déclaration `free` → bande Freelancers.
 
 ## Ordre & intégration
