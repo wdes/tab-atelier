@@ -77,6 +77,13 @@ TDD : parse/round-trip des champs (pur) + accept écran.
   **brain** bump à CHAQUE `continue` émis (on saura enfin quand/combien de nudges) ; **aligator** bump
   à CHAQUE livraison depuis la swamp. But : rendre l'activité des daemons **observable** + alimenter le
   panneau « Dernières heures ». Enrichit aussi les cartes Brain/aligator (inc8-cards).
+- **[ajout PO — fold APRÈS S4-vert] champ `conventions`** (versant **déclaré**, pendant de `usage`) :
+  **liste libre** des `.md` de convention que l'agent DÉCLARE respecter (déclarés dans son prompt de
+  base). Pose déterministe `set-conventions <tab> "handbook.md,quiesce-no-thundering-herd.md,…"`
+  (miroir set-*), expo camelCase, rendu dans la carte + **flag si VIDE** (agent sans conventions
+  déclarées — cas Bot Orc fan-out). **Validation = `ta-convention-auditor`** (déjà en Méta) : croise
+  *déclaré* vs *existant* vs *comportement*. Design retenu : **liste libre** (write simple) + auditeur
+  pour la validation sémantique (pas d'enum couplé au write).
 
 ### S5 — Process de libération (state machine) + boucle auto-amélioration
 1. Travail terminé ? (libération orchestrateur + éval, pondérée par tokens).
