@@ -1243,7 +1243,9 @@ function openViewerFrom(target) {
 function clippedHtml(value) {
   const cw = clipWords(value);
   if (!cw.clipped) return escapeHtml(cw.text);
-  return `${escapeHtml(cw.text)} <span class="ac-more" role="button" tabindex="0" data-full="${escapeHtml(cw.full)}">voir plus</span>`;
+  // The clipped prefix AND the toggle live in one .ac-clip container carrying the
+  // full text, so expanding replaces the whole container — no duplicated prefix.
+  return `<span class="ac-clip" data-full="${escapeHtml(cw.full)}">${escapeHtml(cw.text)} <span class="ac-more" role="button" tabindex="0">voir plus</span></span>`;
 }
 
 function agentCardHtml(tab) {
@@ -1475,7 +1477,7 @@ function bootstrap() {
     // Inc9 (2): 'voir plus' expands the clipped field in place (safe text swap), and
     // must NOT close the card — handle it before the close logic.
     const more = e.target.closest && e.target.closest(".ac-more");
-    if (more) { more.replaceWith(document.createTextNode(more.dataset.full || "")); return; }
+    if (more) { const clip = more.closest(".ac-clip"); if (clip) clip.textContent = clip.dataset.full || ""; return; }
     if (e.target.closest(".ac-close") || !e.target.closest("#agent-card")) closeAgentCard();
   });
   document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeAgentCard(); });
