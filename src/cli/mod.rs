@@ -23,6 +23,7 @@ pub mod flags;
 pub mod logging;
 pub mod remote;
 pub mod set_assignment;
+pub mod set_card;
 pub mod set_context;
 pub mod set_font;
 pub mod set_rehome;

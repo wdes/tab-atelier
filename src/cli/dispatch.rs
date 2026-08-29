@@ -423,6 +423,32 @@ pub enum Commands {
         args: Vec<String>,
     },
 
+    /// Inc8 S1 agent card — hard-wired specialty (persisted, hook-immune).
+    SetSpecialty {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Inc8 S1 agent card — orchestrator served (a tab UUID or `free`).
+    SetOrchestrator {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Inc8 S1 agent card — current objective.
+    SetObjective {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Inc8 S1 agent card — APPEND one phrase to the bounded current-task permalog.
+    SetCurrentTask {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Inc8 S1 agent card — toggle supervision-rounds status (`true`/`false`).
+    SetRoundsActive {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Mark a predecessor tab's re-home progress (`rehome-tab.sh`): one of
     /// `handoff-written` / `successor-ready` / `ack-sent` / `safe-to-close`.
     ///
@@ -863,6 +889,11 @@ pub fn dispatch(cli: Cli) -> bool {
         }
         Commands::SetContext { args } => crate::cli::client::run("set-context", &args),
         Commands::SetAssignment { args } => crate::cli::client::run("set-assignment", &args),
+        Commands::SetSpecialty { args } => crate::cli::client::run("set-specialty", &args),
+        Commands::SetOrchestrator { args } => crate::cli::client::run("set-orchestrator", &args),
+        Commands::SetObjective { args } => crate::cli::client::run("set-objective", &args),
+        Commands::SetCurrentTask { args } => crate::cli::client::run("set-current-task", &args),
+        Commands::SetRoundsActive { args } => crate::cli::client::run("set-rounds-active", &args),
         Commands::SetRehomeStatus { args } => crate::cli::client::run("set-rehome-status", &args),
         Commands::Token => crate::cli::client::run("token", &[]),
         Commands::RotateTokens => crate::cli::client::run("rotate-tokens", &[]),
