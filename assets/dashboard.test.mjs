@@ -109,10 +109,15 @@ assert.equal(shortContext(""), "", "empty context -> empty");
 assert.equal(shortContext(null), "", "null context -> empty");
 // Empty node -> no subtitle.
 assert.equal(nodeSubtitle({ tabs: [] }), "");
-// One tab -> name · context.
-assert.equal(nodeSubtitle({ tabs: [{ name: "ta", context: "do a thing" }] }), "ta · do a thing");
+// Inc9-A: one tab -> name · DECLARED currentTask (currentTaskLog latest), NOT context.
+assert.equal(nodeSubtitle({ tabs: [{ name: "ta", currentTaskLog: ["do a thing"] }] }), "ta · do a thing");
 // Multiple tabs -> first + "+N".
-assert.match(nodeSubtitle({ tabs: [{ name: "a", context: "x" }, {}, {}] }), /\+2$/, "multi-tab node shows +N");
+assert.match(nodeSubtitle({ tabs: [{ name: "a", currentTaskLog: ["x"] }, {}, {}] }), /\+2$/, "multi-tab node shows +N");
+// Inc9-A: the OBSERVED context (a broadcast) does NOT surface — only the declared task.
+assert.equal(nodeSubtitle({ tabs: [{ name: "ta", context: "[[ ici MAS broadcast]]", item: "[[ ici MAS broadcast]]" }] }), "ta",
+  "a broadcast in context/item never bleeds into the subtitle (declared-only)");
+assert.equal(nodeSubtitle({ tabs: [{ name: "ta", currentTaskLog: ["real task"], context: "[[ broadcast ]]" }] }), "ta · real task",
+  "declared currentTask wins over observed context");
 
 // --- S5 orchestrator tint + card marker ---
 assert.equal(isOrchestrator("orchestrator"), true);
