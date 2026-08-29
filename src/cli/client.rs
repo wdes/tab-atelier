@@ -48,6 +48,7 @@ pub fn dispatch(name: &str, rest: &[String]) -> Option<i32> {
         "set-objective" => set_card::objective(rest),
         "set-current-task" => set_card::current_task(rest),
         "set-rounds-active" => set_card::rounds_active(rest),
+        "set-conventions" => set_card::conventions(rest),
         // Inc8 S4 agent-card: evaluations ring + generic usage bump.
         "set-evaluation" => set_card::evaluation(rest),
         "bump-usage" => set_card::bump(rest),

@@ -227,6 +227,8 @@ struct Tab {
     /// Inc8 S4 — bounded evaluations ring + use counter (`last_used_at` is above).
     evaluations: Vec<crate::Evaluation>,
     usage_count: Option<u64>,
+    /// Inc8 fold — declared conventions (`.md` list).
+    conventions: Vec<String>,
     /// UUID of the spawning tab (`parent_tab_id`). Persisted like `assignment`.
     parent_tab_id: Option<std::sync::Arc<str>>,
     /// Re-home progress on a predecessor tab. Persisted like `assignment`;
@@ -338,6 +340,7 @@ impl Tab {
             // Inc8 S4 — restored like the card fields (usage/recency survive restart).
             evaluations: ts.evaluations.clone(),
             usage_count: ts.usage_count,
+            conventions: ts.conventions.clone(),
             parent_tab_id: ts.parent_tab_id.as_deref().map(std::sync::Arc::from),
             rehome_status: ts.rehome_status.as_deref().map(std::sync::Arc::from),
             last_pushed_locked: None,
@@ -1995,6 +1998,7 @@ impl AppState {
                     evaluations: tab.evaluations.clone(),
                     usage_count: tab.usage_count,
                     last_used_at: tab.last_used_at,
+                    conventions: tab.conventions.clone(),
                     parent_tab_id: tab.parent_tab_id.as_deref().map(str::to_string),
                     rehome_status: tab.rehome_status.as_deref().map(str::to_string),
                     limits: tab.limits.clone(),
@@ -2167,6 +2171,7 @@ impl AppState {
                 rounds_active: tab.rounds_active.clone(),
                 evaluations: tab.evaluations.clone(),
                 usage_count: tab.usage_count,
+                conventions: tab.conventions.clone(),
             });
         }
 
@@ -2509,6 +2514,7 @@ impl AppState {
                             tab.usage_count = Some(count);
                             tab.last_used_at = Some(stamp);
                         }
+                        crate::api::CardChange::Conventions(list) => tab.conventions = list,
                     }
                 }
             }
@@ -3097,6 +3103,7 @@ impl AppState {
                     evaluations: tab.evaluations.clone(),
                     usage_count: tab.usage_count,
                     last_used_at: tab.last_used_at,
+                    conventions: tab.conventions.clone(),
                     parent_tab_id: tab.parent_tab_id.as_deref().map(str::to_string),
                     rehome_status: tab.rehome_status.as_deref().map(str::to_string),
                     limits: tab.limits.clone(),

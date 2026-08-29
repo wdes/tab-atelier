@@ -121,6 +121,30 @@ pub fn rounds_active(args: &[String]) -> i32 {
     )
 }
 
+/// Inc8 fold — `set-conventions [--tab <id>] "a.md,b.md"` | `--clear`.
+///
+/// OVERWRITE the tab's DECLARED conventions (the `.md` files it follows). The
+/// value is a comma-separated list; the server parses/trims it
+/// ([`crate::parse_conventions`]). Declared side only — the declared-vs-existing
+/// check is the convention-auditor's job.
+#[must_use]
+pub fn conventions(args: &[String]) -> i32 {
+    post(
+        &Field {
+            name: "set-conventions",
+            verb: "conventions",
+            json_field: "conventions",
+            set_msg: "✓ conventions set",
+            clear_msg: "✓ conventions cleared",
+            usage: "usage: tab-atelier set-conventions [--tab <id>] \"a.md,b.md\"  |  --clear\n\
+                    Declare the .md conventions this agent follows (comma-separated).\n\
+                    Persisted, hook-immune. Overwrites the list.",
+            status_err: |_| None,
+        },
+        args,
+    )
+}
+
 /// Inc8 S4 — `set-evaluation '<json>' [--tab <id>]`.
 ///
 /// APPEND one evaluation record (schema tab-atelier-mx#4) to the tab's bounded
