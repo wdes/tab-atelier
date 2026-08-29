@@ -6477,6 +6477,32 @@ mod tests {
         assert!(!bj.contains("\"usageCount\""), "None usageCount skipped: {bj}");
     }
 
+    // --- Inc8 FOLD (REFINER red): `conventions` (the DECLARED .md list) rides into
+    //     /dashboard/state on each DashboardTab, camelCase, skipped when empty. RED
+    //     until the builder threads conventions through DashboardTabInput -> DashboardTab.
+    #[test]
+    fn dashboard_tab_exposes_conventions_camelcase() {
+        let input = DashboardTabInput {
+            conventions: vec!["AGENTS.md".into(), "docs/dashboard.md".into()],
+            ..dash_input("u1", Some("build/implementer"), Some("working"))
+        };
+        let state = build_dashboard_state(vec![input]);
+        let tab = &node(&state, "build").tabs[0];
+        assert_eq!(
+            tab.conventions,
+            vec!["AGENTS.md".to_string(), "docs/dashboard.md".to_string()]
+        );
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(json.contains("\"conventions\""), "conventions on the wire: {json}");
+        // Absent -> omitted, so an agent with no declared conventions stays clean
+        // (the WEB flags that emptiness; the daemon just omits it).
+        let bare = build_dashboard_state(vec![dash_input("u2", Some("build/implementer"), None)]);
+        assert!(
+            !serde_json::to_string(&bare).unwrap().contains("\"conventions\""),
+            "empty conventions skipped"
+        );
+    }
+
     #[test]
     #[allow(clippy::significant_drop_tightening)] // short-lived test read of the snapshot lock
     fn bump_usage_helper_is_the_call_brain_and_aligator_make_on_their_paths() {

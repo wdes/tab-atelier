@@ -4329,6 +4329,70 @@ mod tests {
         assert_eq!(bump_usage(Some(5), 2000), (6, 2000), "increments + re-stamps");
     }
 
+    // --- Inc8 FOLD (REFINER red): `conventions` — the DECLARED side (the .md files
+    //     an agent declares it follows; usage is the OBSERVED side). A free Vec<String>;
+    //     the declared-vs-existing check is ta-convention-auditor's job, NOT here.
+    //     RED (compile-fail) until the builder adds TabState.conventions + parse_conventions.
+    #[test]
+    fn conventions_round_trip() {
+        let convs = vec!["AGENTS.md".to_string(), "docs/dashboard.md".to_string()];
+        let with = SavedState {
+            tabs: vec![TabState {
+                name: "worker".into(),
+                conventions: convs.clone(),
+                ..Default::default()
+            }],
+            active: 0,
+            windowed: false,
+            dashboard_share_token: String::new(),
+        };
+        let json = serde_json::to_string(&with).unwrap();
+        assert!(
+            json.contains(r#""conventions":["AGENTS.md","docs/dashboard.md"]"#),
+            "conventions persist in order: {json}"
+        );
+        let restored: SavedState = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.tabs[0].conventions, convs);
+        // Empty -> omitted; an old file loads it empty.
+        let without = SavedState {
+            tabs: vec![TabState {
+                name: "x".into(),
+                ..Default::default()
+            }],
+            active: 0,
+            windowed: false,
+            dashboard_share_token: String::new(),
+        };
+        assert!(
+            !serde_json::to_string(&without).unwrap().contains("conventions"),
+            "empty conventions skipped"
+        );
+        let restored: SavedState = serde_json::from_str(r#"{"tabs":[{"name":"x"}],"active":0}"#).unwrap();
+        assert!(restored.tabs[0].conventions.is_empty());
+    }
+
+    #[test]
+    fn parse_conventions_splits_trims_and_filters() {
+        // `set-conventions <tab> "a.md, b.md"` -> the declared list. Comma-split,
+        // each entry trimmed; empty entries (trailing comma / blanks) dropped.
+        assert_eq!(
+            parse_conventions("AGENTS.md,docs/dashboard.md"),
+            vec!["AGENTS.md", "docs/dashboard.md"]
+        );
+        assert_eq!(
+            parse_conventions("  AGENTS.md ,  CLAUDE.md  "),
+            vec!["AGENTS.md", "CLAUDE.md"],
+            "trimmed"
+        );
+        assert_eq!(
+            parse_conventions("a.md,,b.md,"),
+            vec!["a.md", "b.md"],
+            "empty entries dropped"
+        );
+        assert!(parse_conventions("").is_empty(), "empty string -> no conventions");
+        assert!(parse_conventions("   ,  ").is_empty(), "only-blanks -> no conventions");
+    }
+
     #[test]
     fn current_task_permalog_is_bounded_evicting_oldest() {
         // G-b (tichef): the permalog is a bounded ring — entry N+1 evicts the
