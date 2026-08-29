@@ -6161,6 +6161,38 @@ mod tests {
         assert!(garbage.sub_agents.is_empty());
     }
 
+    // --- Inc8 S1 (REFINER red): the self-declared agent-card fields ride into
+    //     /dashboard/state on each DashboardTab, camelCase, skipped when empty. RED
+    //     (compile-fail) until the builder threads specialty/orchestrator/objective
+    //     through DashboardTabInput -> DashboardTab.
+    //     NOTE (flagged to PO): the permalog `currentTask` exposure is INTENTIONALLY
+    //     not asserted here — the key already exists on DashboardTab from Inc7 S4
+    //     (transcript-derived TabActivity.current_task). Reconciling the self-declared
+    //     permalog with the transcript-derived field is a PO decision (see ping).
+    #[test]
+    fn dashboard_tab_exposes_agent_card_camelcase() {
+        let input = DashboardTabInput {
+            specialty: Some("rust async internals".into()),
+            orchestrator: Some("free".into()),
+            objective: Some("land the parser refactor".into()),
+            ..dash_input("u1", Some("build/implementer"), Some("working"))
+        };
+        let state = build_dashboard_state(vec![input]);
+        let tab = &node(&state, "build").tabs[0];
+        assert_eq!(tab.specialty.as_deref(), Some("rust async internals"));
+        assert_eq!(tab.orchestrator.as_deref(), Some("free"));
+        assert_eq!(tab.objective.as_deref(), Some("land the parser refactor"));
+        let json = serde_json::to_string(&state).unwrap();
+        for k in ["\"specialty\"", "\"orchestrator\"", "\"objective\""] {
+            assert!(json.contains(k), "camelCase card field {k}: {json}");
+        }
+        // Absent card fields are omitted (skip_serializing_if), so old tabs stay clean.
+        let bare = build_dashboard_state(vec![dash_input("u2", Some("build/implementer"), None)]);
+        let bj = serde_json::to_string(&bare).unwrap();
+        assert!(!bj.contains("\"specialty\""), "absent specialty skipped: {bj}");
+        assert!(!bj.contains("\"objective\""), "absent objective skipped: {bj}");
+    }
+
     #[test]
     fn set_parent_sets_and_exposes_lineage() {
         let (port, state, token) = spawn_server();
