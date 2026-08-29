@@ -130,6 +130,10 @@
        its viewer. Kept outside the SVG so it can overflow freely. -->
   <div id="popup" class="popup" role="tooltip" hidden></div>
 
+  <!-- Inc8 S3: full agent-card view, opened by right-clicking an agent node.
+       Populated by dashboard.js from agentCardView(tab). Escape / click-away closes. -->
+  <div id="agent-card" class="agent-card" role="dialog" aria-label="agent card" hidden></div>
+
   <script type="module" src="/assets/dashboard.js"></script>
 </body>
 </html>

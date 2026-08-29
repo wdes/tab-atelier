@@ -172,6 +172,51 @@ export function nodeSubtitle(node) {
   return tabs.length > 1 ? `${label} +${tabs.length - 1}` : label;
 }
 
+// Pure: the self-declared agent card (Inc8 S1). specialty / orchestrator /
+// objective / currentTask (the latest permalog phrase if it's an array, else the
+// string verbatim) + a `free` flag (orchestrator === "free" -> the 'libre' badge).
+// Absent fields -> "" / null / false, null-safe.
+export function agentCard(tab) {
+  const t = tab || {};
+  const ct = t.currentTask;
+  const currentTask = Array.isArray(ct) ? (ct.length ? String(ct[ct.length - 1]) : "") : (ct ? String(ct) : "");
+  const orchestrator = t.orchestrator != null ? t.orchestrator : null;
+  return {
+    specialty: t.specialty ? String(t.specialty) : "",
+    objective: t.objective ? String(t.objective) : "",
+    orchestrator,
+    free: orchestrator === "free",
+    currentTask,
+  };
+}
+
+// Pure: the full right-click agent-card view (Inc8 S3). Like agentCard but with a
+// BOUNDED permalog (recentTasks = the last 5 entries of currentTaskLog, in order),
+// evaluations + evalCriteria (default []). Orchestrators get a card too (no
+// exclusion). `free` = orchestrator === "free". Null-safe.
+export function agentCardView(tab) {
+  const t = tab || {};
+  const log = Array.isArray(t.currentTaskLog) ? t.currentTaskLog.map(String) : [];
+  return {
+    role: t.role || "",
+    specialty: t.specialty ? String(t.specialty) : "",
+    orchestrator: t.orchestrator != null ? t.orchestrator : "",
+    free: t.orchestrator === "free",
+    objective: t.objective ? String(t.objective) : "",
+    recentTasks: log.slice(-5),
+    evaluations: Array.isArray(t.evaluations) ? t.evaluations : [],
+    evalCriteria: Array.isArray(t.evalCriteria) ? t.evalCriteria : [],
+  };
+}
+
+// Pure: an orchestrator's supervision-rounds pill (Inc8 S3). GREEN when
+// roundsActive.active === true, GREY otherwise (absent/null-safe).
+export function roundsPill(tab) {
+  const ra = tab && tab.roundsActive;
+  const active = !!(ra && ra.active === true);
+  return { active, cls: active ? "rounds-on" : "rounds-off" };
+}
+
 // --- S5/S6: orchestrator tint + altitude bands + delegation lineage ---
 // These consume role / parentTabId / (optional) altitude fields exposed by the
 // Rust builder. ponytail: the altitude/lineage contract is provisional until the
@@ -285,6 +330,14 @@ function isMetaRole(role) {
   return r === "tichef" || r === "planner" || r === "refiner" || r === "auditor" || r === "scoper";
 }
 
+// Meta daemons of the trio (Brain + aligator) report to orchestrator "meta" and
+// have no role — pin them to the Méta band alongside the tichef (Inc8 S3).
+function isMetaDaemon(t) {
+  if (!t) return false;
+  const kind = String(t.agent_kind || "").toLowerCase();
+  return t.orchestrator === "meta" || kind === "brain" || kind === "aligator";
+}
+
 // Pure: a tab's dynamic altitude band (Inc7 S2). Encodes the 4 movements + the
 // tichef pin (docs/dashboard-increment-7.md "altitude dynamique"):
 //   - tichef -> always Méta (pinned, even while serving);
@@ -298,6 +351,7 @@ export function resolveAltitude(tab) {
   const t = tab || {};
   const role = String(t.role || "").toLowerCase();
   if (isTichefRole(role)) return { band: "meta" };
+  if (isMetaDaemon(t)) return { band: "meta" };
   if (isMetaRole(role)) {
     if (t.serving) return { band: "worker", team: t.serving, reinforcement: true };
     const override = assignmentProject(t.assignment);
@@ -674,7 +728,18 @@ function bandNodeInner(tab) {
   const t = tab || {};
   const alt = resolveAltitude(t);
   const badge = alt.reinforcement ? ` <span class="renfort-badge" title="en renfort dans ${escapeHtml(alt.team || "")}">renfort</span>` : "";
-  return `${escapeHtml(t.name || "tab")}${badge}${taskChipsHtml(t)}`;
+  // Inc8 S3: the supervision-rounds pill on an orchestrator node (green/grey).
+  const pill = isOrchestrator(t.role)
+    ? ` <span class="rounds-pill ${roundsPill(t).cls}" title="supervision rounds ${roundsPill(t).active ? "active" : "idle"}"></span>`
+    : "";
+  // Inc8 S1: the self-declared agent card rendered inline — objective + latest
+  // currentTask phrase + a 'libre' badge when the agent is free.
+  const ac = agentCard(t);
+  const free = ac.free ? ` <span class="free-badge">libre</span>` : "";
+  const obj = ac.objective ? `<span class="agent-objective">${escapeHtml(ac.objective)}</span>` : "";
+  const task = ac.currentTask ? `<span class="agent-task">${escapeHtml(ac.currentTask)}</span>` : "";
+  const inline = obj || task ? `<span class="agent-card-inline">${obj}${task}</span>` : "";
+  return `${escapeHtml(t.name || "tab")}${badge}${pill}${free}${inline}${taskChipsHtml(t)}`;
 }
 
 function bandNodeHtml(tab, cls) {
@@ -714,7 +779,11 @@ export function buildBandModel(state) {
     bandTabById.set(t.id, t);
     const led = t.led != null ? t.led : (t.rollupLed != null ? t.rollupLed : null);
     const subs = Array.isArray(t.subAgents) ? t.subAgents.map((s) => s && `${s.name}:${s.state}`).join(",") : "";
-    nodes.push({ id: t.id, led, task: `${t.currentTask || ""}|${subs}` });
+    // The rounds pill (S3) + inline card fields (S1) join the signature so they
+    // patch live without a rebuild.
+    const rounds = roundsPill(t).active ? "1" : "0";
+    const card = `${agentCard(t).objective}|${t.orchestrator || ""}`;
+    nodes.push({ id: t.id, led, task: `${t.currentTask || ""}|${subs}|r${rounds}|${card}` });
   };
   bl.meta.forEach(push);
   for (const o of bl.orchestrators) { push(o.lead); for (const r of o.repos) r.workers.forEach(push); }
@@ -1058,6 +1127,40 @@ function openViewerFrom(target) {
   return true;
 }
 
+// Inc8 S3: build the agent-card HTML from the pure agentCardView model. Only the
+// present sections render (evaluations/evalCriteria are optional).
+function agentCardHtml(tab) {
+  const c = agentCardView(tab);
+  const rows = [];
+  if (c.specialty) rows.push(`<div class="ac-row"><span class="ac-key">specialty</span> ${escapeHtml(c.specialty)}</div>`);
+  rows.push(`<div class="ac-row"><span class="ac-key">orchestrator</span> ${escapeHtml(String(c.orchestrator || "—"))}${c.free ? ` <span class="ac-free">libre</span>` : ""}</div>`);
+  if (c.objective) rows.push(`<div class="ac-row"><span class="ac-key">objective</span> ${escapeHtml(c.objective)}</div>`);
+  if (c.recentTasks.length) {
+    rows.push(`<div class="ac-key">currentTask (permalog)</div><ul class="ac-log">${c.recentTasks.map((t) => `<li>${escapeHtml(t)}</li>`).join("")}</ul>`);
+  }
+  if (c.evaluations.length) {
+    rows.push(`<div class="ac-key">evaluations</div><ul class="ac-evals">${c.evaluations.map((e) => `<li>${escapeHtml((e && e.evaluator) || "?")}: ${escapeHtml(String((e && e.verdict) != null ? e.verdict : ""))}</li>`).join("")}</ul>`);
+  }
+  if (c.evalCriteria.length) {
+    rows.push(`<div class="ac-key">evalCriteria</div><ul class="ac-crit">${c.evalCriteria.map((x) => `<li>${escapeHtml(String(x))}</li>`).join("")}</ul>`);
+  }
+  const name = tab && tab.name ? tab.name : "agent";
+  return `<button class="ac-close" title="close" aria-label="close">×</button><div class="ac-name">${escapeHtml(name)}</div>${rows.join("")}`;
+}
+
+function openAgentCard(id) {
+  const el = document.getElementById("agent-card");
+  const tab = bandTabById.get(id);
+  if (!el || !tab) return;
+  el.innerHTML = agentCardHtml(tab);
+  el.hidden = false;
+}
+
+function closeAgentCard() {
+  const el = document.getElementById("agent-card");
+  if (el) el.hidden = true;
+}
+
 async function poll() {
   const status = document.getElementById("status");
   const headers = { accept: "application/json", ...AUTH_HEADERS };
@@ -1188,10 +1291,20 @@ function bootstrap() {
     popup.addEventListener("mouseenter", () => clearTimeout(hideTimer));
     popup.addEventListener("mouseleave", scheduleHide);
   }
-  // Right-click a tab entry (in the popup or the unmapped list) -> its viewer.
+  // Right-click: on a band node (Inc7/Inc8) open its agent-card (Inc8 S3); on a
+  // popup tab entry open its viewer.
   document.addEventListener("contextmenu", (e) => {
+    const node = e.target.closest && e.target.closest(".band-node[data-tab-id]");
+    if (node && node.dataset.tabId) { openAgentCard(node.dataset.tabId); e.preventDefault(); return; }
     if (openViewerFrom(e.target)) e.preventDefault();
   });
+  // Close the agent-card: its × button, Escape, or a click outside it.
+  document.addEventListener("click", (e) => {
+    const el = document.getElementById("agent-card");
+    if (!el || el.hidden) return;
+    if (e.target.closest(".ac-close") || !e.target.closest("#agent-card")) closeAgentCard();
+  });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeAgentCard(); });
 
   // Drill into a project card (delegated — the grid is re-rendered each poll).
   const grid = document.getElementById("project-grid");
