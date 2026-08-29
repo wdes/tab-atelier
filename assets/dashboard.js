@@ -392,6 +392,30 @@ function isMetaDaemon(t) {
   return t.orchestrator === "meta" || kind === "brain" || kind === "aligator";
 }
 
+// Inc9 (4): the 3 AUTONOMOUS daemons that supervise EVERY agent — the TRUE Méta band:
+// tichef (meta/manager), Brain (meta/brain / kind brain), aligator (meta/router /
+// kind aligator). Everything else meta-class is an on-demand SUPPORTER, not a daemon.
+const CORE_META_ASSIGN = ["meta/manager", "meta/brain", "meta/router"];
+function isCoreMeta(t) {
+  if (!t) return false;
+  if (isTichefRole(String(t.role || "").toLowerCase())) return true;
+  const kind = String(t.agent_kind || "").toLowerCase();
+  if (kind === "brain" || kind === "aligator") return true;
+  return CORE_META_ASSIGN.includes(String(t.assignment || ""));
+}
+
+// Inc9 (4): a meta-class SUPPORTER — an on-demand specialist (guardian=Joséphine,
+// foreman=Henri Ford, sage, scribe, coverage, scout, auditor…) called by an
+// orchestrator/tichef for a precise task. Closer to a freelancer than a daemon, and
+// NOT one of the 3 autonomous daemons -> its OWN band, NOT under tichef (future:
+// multiple tichef). Signalled by a "meta/…" or "scope/…" lane assignment or a meta
+// role. A supporter REINFORCING a team (project:role / serving) still joins that team.
+function isSupporter(t) {
+  if (!t || isCoreMeta(t)) return false;
+  const a = String(t.assignment || "");
+  return a.startsWith("meta/") || a.startsWith("scope/") || isMetaRole(String(t.role || "").toLowerCase()) || isMetaDaemon(t);
+}
+
 // Pure: a tab's dynamic altitude band (Inc7 S2). Encodes the 4 movements + the
 // tichef pin (docs/dashboard-increment-7.md "altitude dynamique"):
 //   - tichef -> always Méta (pinned, even while serving);
@@ -404,19 +428,16 @@ function isMetaDaemon(t) {
 export function resolveAltitude(tab) {
   const t = tab || {};
   const role = String(t.role || "").toLowerCase();
-  if (isTichefRole(role)) return { band: "meta" };
-  if (isMetaDaemon(t)) return { band: "meta" };
-  // A tab explicitly assigned to the meta lane ("meta/router" = aligator,
-  // "meta/brain", "meta/scribe", "meta/auditor"…) belongs to the Méta band —
-  // the trio daemons carry NO role and kind=None, so their `assignment` is the
-  // only reliable meta signal. Meta specialists REINFORCING a team use a
-  // "project:role" assignment (caught by the worker fallback below), never "meta/".
-  if (String(t.assignment || "").startsWith("meta/")) return { band: "meta" };
-  if (isMetaRole(role)) {
+  // The 3 autonomous daemons (tichef/Brain/aligator) -> the TRUE Méta band (Inc9 (4)).
+  if (isCoreMeta(t)) return { band: "meta" };
+  // On-demand meta-class SUPPORTERS -> their own band, BETWEEN Méta and Orchestrateurs
+  // — UNLESS currently reinforcing a team (serving / a "project:role" assignment),
+  // which joins that team's Workers band, marked reinforcement (as before).
+  if (isSupporter(t)) {
     if (t.serving) return { band: "worker", team: t.serving, reinforcement: true };
     const override = assignmentProject(t.assignment);
     if (override) return { band: "worker", team: override, reinforcement: true };
-    return { band: "meta" };
+    return { band: "supporter" };
   }
   if (role === "orchestrator") return { band: "orchestrator", team: assignmentProject(t.assignment) };
   if (t.assignment) return { band: "worker", team: assignmentProject(t.assignment) };
@@ -440,6 +461,8 @@ export function bandLayout(state) {
   const allTabs = [...byId.values()];
 
   const meta = allTabs.filter((t) => resolveAltitude(t).band === "meta");
+  // Inc9 (4): the on-demand SUPPORTERS band (between Méta and Orchestrateurs).
+  const supporters = allTabs.filter((t) => resolveAltitude(t).band === "supporter");
 
   // An orchestrator is a LEAD (its own team), never a chain-worker under a parent,
   // even when it was itself spawned by another orchestrator (parentTabId set).
@@ -472,12 +495,13 @@ export function bandLayout(state) {
   // its workers) -> orphan Workers -> everything else Freelancers.
   const placed = new Set();
   meta.forEach((t) => placed.add(t.id));
+  supporters.forEach((t) => placed.add(t.id));
   for (const o of orchestrators) { placed.add(o.lead.id); for (const r of o.repos) for (const w of r.workers) placed.add(w.id); }
   const workers = allTabs.filter((t) => !placed.has(t.id) && resolveAltitude(t).band === "worker");
   workers.forEach((t) => placed.add(t.id));
   const freelancers = allTabs.filter((t) => !placed.has(t.id));
 
-  return { meta, orchestrators, workers, freelancers };
+  return { meta, supporters, orchestrators, workers, freelancers };
 }
 
 // Pure: the service nesting (Inc6 S4). One entry per service, in order, wrapping
@@ -707,6 +731,7 @@ function render() {
 const ALTITUDE_LABELS = { 0: "tichef", 1: "orchestrators", 2: "workers" };
 const INC7_BANDS = [
   { id: "meta", label: "Méta" },
+  { id: "supporters", label: "Supporters" },
   { id: "orchestrators", label: "Orchestrateurs" },
   { id: "workers", label: "Workers" },
   { id: "freelancers", label: "Freelancers" },
@@ -868,6 +893,7 @@ export function buildBandModel(state) {
     nodes.push({ id: t.id, led, task: `${ac.currentTask}|${subs}|r${rounds}|${card}` });
   };
   bl.meta.forEach(push);
+  bl.supporters.forEach(push);
   for (const o of bl.orchestrators) { push(o.lead); for (const r of o.repos) r.workers.forEach(push); }
   bl.workers.forEach(push);
   bl.freelancers.forEach(push);
@@ -912,6 +938,7 @@ function renderBandChart() {
   const bl = bandLayout(currentState);
   const inner = {
     meta: bl.meta.map((t) => bandNodeHtml(t, "meta")).join(""),
+    supporters: bl.supporters.map((t) => bandNodeHtml(t, "supporter")).join(""),
     orchestrators: bl.orchestrators.map(orchChainHtml).join(""),
     workers: bl.workers.map((t) => bandNodeHtml(t, "worker")).join(""),
     freelancers: bl.freelancers.map((t) => bandNodeHtml(t, "freelancer")).join(""),

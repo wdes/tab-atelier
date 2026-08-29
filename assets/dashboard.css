@@ -515,6 +515,9 @@ body {
   cursor: default;
 }
 .band-node.lead { font-weight: 600; box-shadow: inset 0.18rem 0 0 var(--orchestrator-accent); }
+/* Inc9 (4): supporter nodes — on-demand specialists, visually distinct from the 3
+   autonomous méta daemons (dashed outline, muted, like a freelancer they're close to). */
+.band-node.supporter { border-style: dashed; color: var(--muted); }
 /* Led tint on a compact node = a small left colour bar. */
 .band-node.led-working  { border-left: 3px solid var(--led-working-stroke); }
 .band-node.led-error    { border-left: 3px solid var(--led-error-stroke); }

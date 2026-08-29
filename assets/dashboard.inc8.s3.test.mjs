@@ -112,11 +112,41 @@ assert.equal(typeof dash.clipWords, "function", "Inc9-(2): export clipWords(text
   const aligLive = { id: "alig2", name: "🐊 aligator", role: "", assignment: "meta/router" };
   const scribeLive = { id: "scr", name: "ta-scribe", role: "", assignment: "meta/scribe" };
   const bl = dash.bandLayout({ nodes: [], unmapped: [aligLive, scribeLive], unassigned: [], projects: [] });
-  assert.deepEqual(bl.meta.map((t) => t.id).sort(), ["alig2", "scr"], "Inc8.1: meta/* assignment -> Méta band (no orchestrator/kind needed)");
+  // Inc9 (4): meta/router = one of the 3 autonomous daemons -> Méta; meta/scribe is
+  // an on-demand supporter -> Supporters band (NOT Méta, NOT Workers).
+  assert.deepEqual(bl.meta.map((t) => t.id).sort(), ["alig2"], "Inc8.1/9: meta/router (trio) -> Méta band");
+  assert.deepEqual(bl.supporters.map((t) => t.id).sort(), ["scr"], "Inc9 (4): meta/scribe -> Supporters band");
   assert.equal(bl.workers.filter((t) => t.id === "alig2").length, 0, "Inc8.1: a meta/router tab does NOT leak into Workers");
   // A meta specialist REINFORCING a team (project:role assignment) stays a worker.
   assert.equal(dash.resolveAltitude({ role: "refiner", assignment: "kalpin-back:build/refiner" }).band, "worker",
     "Inc8.1: a reinforcing specialist (project:role) is NOT pulled into Méta");
+}
+
+// Inc9 (4): the SUPPORTER band — the 3 autonomous daemons stay Méta; every other
+// meta-class agent (guardian/foreman/sage/scribe/coverage/scout/auditor) is an
+// on-demand SUPPORTER in its own band. Live assignments from the real fleet.
+{
+  const trio = [
+    { id: "tc", name: "tichef", assignment: "meta/manager" },
+    { id: "brn", name: "Brian", agent_kind: "brain", assignment: "meta/brain" },
+    { id: "alg", name: "aligator", assignment: "meta/router" },
+  ];
+  const supporters = [
+    { id: "jo", name: "Joséphine", assignment: "meta/guardian" },
+    { id: "hf", name: "Henri Ford", assignment: "meta/foreman" },
+    { id: "sg", name: "le sage", assignment: "meta/sage" },
+    { id: "sc", name: "ta-scribe", assignment: "meta/scribe" },
+    { id: "cv", name: "Bot Coverage", assignment: "meta/coverage" },
+    { id: "st", name: "Bot Scout", assignment: "meta/scout" },
+    { id: "au", name: "ta-convention-auditor", assignment: "scope/auditor" }, // NOT meta/*, still a supporter
+  ];
+  const bl = dash.bandLayout({ nodes: [], unmapped: [...trio, ...supporters], unassigned: [], projects: [] });
+  assert.deepEqual(bl.meta.map((t) => t.id).sort(), ["alg", "brn", "tc"], "Inc9 (4): Méta band = the 3 autonomous daemons ONLY");
+  assert.deepEqual(bl.supporters.map((t) => t.id).sort(), ["au", "cv", "hf", "jo", "sc", "sg", "st"],
+    "Inc9 (4): the 7 on-demand supporters land in the Supporters band");
+  // Supporters are NOT under tichef (no orchestrator chain) and NOT freelancers.
+  assert.equal(bl.freelancers.filter((t) => supporters.some((s) => s.id === t.id)).length, 0, "Inc9 (4): supporters are not Freelancers");
+  assert.equal(bl.workers.filter((t) => supporters.some((s) => s.id === t.id)).length, 0, "Inc9 (4): idle supporters are not Workers");
 }
 
 console.log("dashboard.inc8.s3.test.mjs: OK");
