@@ -246,6 +246,17 @@ export function evalSummary(tab) {
   };
 }
 
+// Pure: the card's declared-conventions section (Inc8 fold). Reads the wire field
+// `conventions` (a string[] of declared .md files). `missing` FLAGS an agent that
+// declared none (the free-bot-style "no conventions" check). The declared-vs-
+// existing SEMANTIC check is ta-convention-auditor's job, not the dashboard's.
+// Null-safe.
+export function conventionsCheck(tab) {
+  const conventions = tab && Array.isArray(tab.conventions) ? tab.conventions : [];
+  const declared = conventions.length > 0;
+  return { conventions, declared, missing: !declared };
+}
+
 // --- S5/S6: orchestrator tint + altitude bands + delegation lineage ---
 // These consume role / parentTabId / (optional) altitude fields exposed by the
 // Rust builder. ponytail: the altitude/lineage contract is provisional until the
@@ -1163,9 +1174,10 @@ function agentCardHtml(tab) {
   const rows = [];
   if (c.specialty) rows.push(`<div class="ac-row"><span class="ac-key">specialty</span> ${escapeHtml(c.specialty)}</div>`);
   rows.push(`<div class="ac-row"><span class="ac-key">orchestrator</span> ${escapeHtml(String(c.orchestrator || "—"))}${c.free ? ` <span class="ac-free">libre</span>` : ""}</div>`);
-  if (c.objective) rows.push(`<div class="ac-row"><span class="ac-key">objective</span> ${escapeHtml(c.objective)}</div>`);
+  // Long fields are visually clipped -> a title="" carries the full text on hover.
+  if (c.objective) rows.push(`<div class="ac-row" title="objective : ${escapeHtml(c.objective)}"><span class="ac-key">objective</span> ${escapeHtml(c.objective)}</div>`);
   if (c.recentTasks.length) {
-    rows.push(`<div class="ac-key">currentTask (permalog)</div><ul class="ac-log">${c.recentTasks.map((t) => `<li>${escapeHtml(t)}</li>`).join("")}</ul>`);
+    rows.push(`<div class="ac-key">currentTask (permalog)</div><ul class="ac-log">${c.recentTasks.map((t) => `<li title="Current task : ${escapeHtml(t)}">${escapeHtml(t)}</li>`).join("")}</ul>`);
   }
   // Inc8 S4: evaluations section — latest verdict + armed-trigger indicator + the
   // last few eval records (evaluator / verdict / error score).
@@ -1184,6 +1196,13 @@ function agentCardHtml(tab) {
   }
   if (c.evalCriteria.length) {
     rows.push(`<div class="ac-key">evalCriteria</div><ul class="ac-crit">${c.evalCriteria.map((x) => `<li>${escapeHtml(String(x))}</li>`).join("")}</ul>`);
+  }
+  // Inc8 conventions fold: the declared .md files, or a FLAG when none are declared.
+  const cv = conventionsCheck(tab);
+  if (cv.declared) {
+    rows.push(`<div class="ac-key">conventions</div><ul class="ac-conv">${cv.conventions.map((x) => `<li title="${escapeHtml(String(x))}">${escapeHtml(String(x))}</li>`).join("")}</ul>`);
+  } else {
+    rows.push(`<div class="ac-row conventions-missing" data-conventions="missing"><span class="ac-key">conventions</span> <span class="conv-flag">⚠ aucune convention déclarée</span></div>`);
   }
   // Inc8 S4 (usage): show usageCount / lastUsedAt when the rust exposes them.
   if (tab && (tab.usageCount != null || tab.lastUsedAt != null)) {
