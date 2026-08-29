@@ -178,8 +178,12 @@ export function nodeSubtitle(node) {
 // Absent fields -> "" / null / false, null-safe.
 export function agentCard(tab) {
   const t = tab || {};
-  const ct = t.currentTask;
-  const currentTask = Array.isArray(ct) ? (ct.length ? String(ct[ct.length - 1]) : "") : (ct ? String(ct) : "");
+  // currentTask = the latest DECLARED permalog phrase (`currentTaskLog`, written by
+  // append_current_task / set-current-task) — NOT the OBSERVED transcript field
+  // `currentTask` ("latest human-typed prompt"), which bleeds every dispatched /
+  // broadcast message onto its recipients (Inc9 (1) bug). Empty permalog -> "".
+  const log = Array.isArray(t.currentTaskLog) ? t.currentTaskLog : [];
+  const currentTask = log.length ? String(log[log.length - 1]) : "";
   const orchestrator = t.orchestrator != null ? t.orchestrator : null;
   return {
     specialty: t.specialty ? String(t.specialty) : "",
@@ -715,12 +719,16 @@ function unassignedTabHtml(tab) {
 export function taskChips(tab) {
   const t = tab || {};
   const chips = [];
-  // currentTask may be a bounded permalog (array) — the pill shows the LATEST
-  // phrase (last entry), consistent with the card's normalization; a plain string
-  // is used as-is. CSS truncates the pill; the full phrase is on hover (title=).
-  const ct = t.currentTask;
-  const latest = Array.isArray(ct) ? (ct.length ? String(ct[ct.length - 1]) : "") : (ct ? String(ct) : "");
-  if (latest.trim()) {
+  // The task pill = the LATEST DECLARED permalog phrase (`currentTaskLog`, via
+  // append_current_task) — NOT the OBSERVED transcript `currentTask` ("latest
+  // human-typed prompt"), which bleeds dispatched/broadcast messages onto every
+  // recipient (Inc9 (1) bug: many agents showed the same "[[ici MAS…]]" pill).
+  // A FREE agent shows NO task pill (the 'libre' badge speaks for it). Ponytail:
+  // the permalog is append-only, so a non-free agent that went idle without a new
+  // append keeps its last declared phrase — acceptable; the fix targets free + bleed.
+  const log = Array.isArray(t.currentTaskLog) ? t.currentTaskLog : [];
+  const latest = log.length ? String(log[log.length - 1]) : "";
+  if (t.orchestrator !== "free" && latest.trim()) {
     chips.push({ kind: "task", label: latest });
   }
   for (const s of Array.isArray(t.subAgents) ? t.subAgents : []) {
@@ -843,8 +851,11 @@ export function buildBandModel(state) {
     // The rounds pill (S3) + inline card fields (S1) join the signature so they
     // patch live without a rebuild.
     const rounds = roundsPill(t).active ? "1" : "0";
-    const card = `${agentCard(t).objective}|${t.orchestrator || ""}`;
-    nodes.push({ id: t.id, led, task: `${t.currentTask || ""}|${subs}|r${rounds}|${card}` });
+    const ac = agentCard(t);
+    const card = `${ac.objective}|${t.orchestrator || ""}`;
+    // Signature keys off the DECLARED task (what the pill shows), not the observed
+    // transcript prompt — so a broadcast no longer churns every recipient's node.
+    nodes.push({ id: t.id, led, task: `${ac.currentTask}|${subs}|r${rounds}|${card}` });
   };
   bl.meta.forEach(push);
   for (const o of bl.orchestrators) { push(o.lead); for (const r of o.repos) r.workers.forEach(push); }

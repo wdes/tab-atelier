@@ -149,12 +149,18 @@ assert.equal(typeof dash.diffRender, "function", "S3 RED: export diffRender(prev
 assert.equal(typeof dash.taskChips, "function", "S4 RED: export taskChips(tab) from dashboard.js");
 {
   const tab = {
-    id: "t1", name: "ta-x", currentTask: "wire the parser now",
+    id: "t1", name: "ta-x", currentTaskLog: ["wire the parser now"], // DECLARED permalog, not observed
     subAgents: [{ name: "Explore", state: "completed" }, { name: "code-reviewer", state: "running" }],
   };
   const chips = dash.taskChips(tab);
   assert.ok(Array.isArray(chips) && chips.length >= 3, "a task chip + one chip per sub-agent");
-  assert.ok(chips.some((c) => /wire the parser/.test(c.label || "")), "the current task is shown");
+  assert.ok(chips.some((c) => /wire the parser/.test(c.label || "")), "the declared current task is shown");
+  // Inc9 (1): a FREE agent shows NO task pill even with a declared permalog.
+  assert.equal(dash.taskChips({ id: "f", orchestrator: "free", currentTaskLog: ["old task"] }).filter((c) => c.kind === "task").length, 0,
+    "a free agent shows no task pill");
+  // Inc9 (1): the OBSERVED transcript currentTask does NOT produce a pill (no bleed).
+  assert.equal(dash.taskChips({ id: "b", currentTask: "[[ici MAS broadcast]]" }).filter((c) => c.kind === "task").length, 0,
+    "the observed transcript currentTask does not bleed into a pill");
   const running = chips.find((c) => c.name === "code-reviewer");
   assert.ok(running && running.state === "running", "a running sub-agent chip carries its state");
   const done = chips.find((c) => c.name === "Explore");
