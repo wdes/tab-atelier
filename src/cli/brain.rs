@@ -765,6 +765,10 @@ fn tick(
         .send(pick.trigger.action().as_bytes())
         .map_err(|e| format!("POST input for {}: {e}", pick.tab_id))?;
 
+    // Inc8 S4: the `continue` landed → bump the tab's usage (observability of who
+    // brain is nudging). Best-effort; a failed bump never fails the nudge.
+    crate::cli::share_link::bump_usage(&ep, &pick.tab_id);
+
     if deferred > 0 {
         println!(
             "⛑ brain: {name:<24} [{label}] → sent {action:?} ({deferred} other tab(s) deferred — round-robin)",

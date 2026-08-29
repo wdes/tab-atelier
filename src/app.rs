@@ -224,6 +224,9 @@ struct Tab {
     /// Bounded `current_task` permalog (see [`crate::append_current_task`]).
     current_task: Vec<String>,
     rounds_active: Option<crate::RoundsActive>,
+    /// Inc8 S4 — bounded evaluations ring + use counter (`last_used_at` is above).
+    evaluations: Vec<crate::Evaluation>,
+    usage_count: Option<u64>,
     /// UUID of the spawning tab (`parent_tab_id`). Persisted like `assignment`.
     parent_tab_id: Option<std::sync::Arc<str>>,
     /// Re-home progress on a predecessor tab. Persisted like `assignment`;
@@ -281,7 +284,9 @@ impl Tab {
             prior_uptime: std::time::Duration::from_secs_f64(ts.uptime_secs.unwrap_or(0.0)),
             active_duration: std::time::Duration::ZERO,
             last_activated: activated.then(std::time::Instant::now),
-            last_used_at: activated.then(crate::unix_millis),
+            // Inc8 S4: restore the persisted stamp so usage/recency survives a
+            // restart; fall back to "now" only for a freshly-activated tab.
+            last_used_at: ts.last_used_at.or_else(|| activated.then(crate::unix_millis)),
             // Boots un-flagged (grey): it only goes blue once its
             // agent WORKS while you're not looking. Restoring a tab
             // isn't "new work", so it must not flash blue on restart.
@@ -330,6 +335,9 @@ impl Tab {
             objective: ts.objective.as_deref().map(std::sync::Arc::from),
             current_task: ts.current_task.clone(),
             rounds_active: ts.rounds_active.clone(),
+            // Inc8 S4 — restored like the card fields (usage/recency survive restart).
+            evaluations: ts.evaluations.clone(),
+            usage_count: ts.usage_count,
             parent_tab_id: ts.parent_tab_id.as_deref().map(std::sync::Arc::from),
             rehome_status: ts.rehome_status.as_deref().map(std::sync::Arc::from),
             last_pushed_locked: None,
@@ -1984,6 +1992,9 @@ impl AppState {
                     objective: tab.objective.as_deref().map(str::to_string),
                     current_task: tab.current_task.clone(),
                     rounds_active: tab.rounds_active.clone(),
+                    evaluations: tab.evaluations.clone(),
+                    usage_count: tab.usage_count,
+                    last_used_at: tab.last_used_at,
                     parent_tab_id: tab.parent_tab_id.as_deref().map(str::to_string),
                     rehome_status: tab.rehome_status.as_deref().map(str::to_string),
                     limits: tab.limits.clone(),
@@ -2154,6 +2165,8 @@ impl AppState {
                 objective: tab.objective.clone(),
                 current_task: tab.current_task.clone(),
                 rounds_active: tab.rounds_active.clone(),
+                evaluations: tab.evaluations.clone(),
+                usage_count: tab.usage_count,
             });
         }
 
@@ -2489,6 +2502,13 @@ impl AppState {
                             crate::append_current_task(&mut tab.current_task, &p);
                         }
                         crate::api::CardChange::RoundsActive(ra) => tab.rounds_active = Some(ra),
+                        crate::api::CardChange::EvaluationAppend(ev) => {
+                            crate::append_evaluation(&mut tab.evaluations, ev);
+                        }
+                        crate::api::CardChange::Usage(count, stamp) => {
+                            tab.usage_count = Some(count);
+                            tab.last_used_at = Some(stamp);
+                        }
                     }
                 }
             }
@@ -3074,6 +3094,9 @@ impl AppState {
                     objective: tab.objective.as_deref().map(str::to_string),
                     current_task: tab.current_task.clone(),
                     rounds_active: tab.rounds_active.clone(),
+                    evaluations: tab.evaluations.clone(),
+                    usage_count: tab.usage_count,
+                    last_used_at: tab.last_used_at,
                     parent_tab_id: tab.parent_tab_id.as_deref().map(str::to_string),
                     rehome_status: tab.rehome_status.as_deref().map(str::to_string),
                     limits: tab.limits.clone(),

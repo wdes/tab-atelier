@@ -519,6 +519,17 @@ struct DashboardTab {
     /// Supervision-rounds status (`roundsActive`). Omitted when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     rounds_active: Option<crate::RoundsActive>,
+    // --- Inc8 S4: evaluations ring + generic usage observability.
+    /// The bounded evaluations ring (camelCase records, `taskRef` inside). Omitted
+    /// when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    evaluations: Vec<crate::Evaluation>,
+    /// Generic use counter (`usageCount`). Omitted when never used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage_count: Option<u64>,
+    /// Unix-millis of last use (`lastUsedAt`). Omitted when never set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_used_at: Option<u64>,
     /// S4: current task + `Task()` sub-agents, read from the tab's transcript.
     /// Flattened → `currentTask` / `subAgents` sit on the tab for `taskChips`.
     /// Empty (`currentTask:null`, `subAgents:[]`) when the tab has no transcript.
@@ -699,6 +710,10 @@ struct DashboardTabInput {
     objective: Option<String>,
     current_task: Vec<String>,
     rounds_active: Option<crate::RoundsActive>,
+    // Inc8 S4: evaluations ring + generic usage observability.
+    evaluations: Vec<crate::Evaluation>,
+    usage_count: Option<u64>,
+    last_used_at: Option<u64>,
 }
 
 /// Rollup severity of a `led` slug — higher is worse. Mirrors [`crate::TabLed`]
@@ -944,6 +959,9 @@ fn build_dashboard_state(inputs: Vec<DashboardTabInput>) -> DashboardState {
                 objective: t.objective,
                 current_task_log: t.current_task,
                 rounds_active: t.rounds_active,
+                evaluations: t.evaluations,
+                usage_count: t.usage_count,
+                last_used_at: t.last_used_at,
                 activity: t.activity,
             };
             Projected { project, phase, tab }
@@ -1215,6 +1233,9 @@ pub struct SnapshotTab {
     /// The bounded `current_task` permalog (see [`crate::append_current_task`]).
     pub current_task: Vec<String>,
     pub rounds_active: Option<crate::RoundsActive>,
+    // Inc8 S4 (last_used_at already lives above as the MRU stamp).
+    pub evaluations: Vec<crate::Evaluation>,
+    pub usage_count: Option<u64>,
 }
 
 impl crate::schedule::LockState for SnapshotTab {
@@ -1273,6 +1294,9 @@ pub enum CardChange {
     Objective(Option<String>),
     CurrentTaskAppend(String),
     RoundsActive(crate::RoundsActive),
+    // Inc8 S4: append an evaluation record (bounded ring); bump usage (count+stamp).
+    EvaluationAppend(crate::Evaluation),
+    Usage(u64, u64),
 }
 
 pub struct TabSnapshot {
@@ -2845,6 +2869,9 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                     objective: t.objective.as_deref().map(str::to_string),
                     current_task: t.current_task.clone(),
                     rounds_active: t.rounds_active.clone(),
+                    evaluations: t.evaluations.clone(),
+                    usage_count: t.usage_count,
+                    last_used_at: t.last_used_at,
                 })
                 .collect();
             drop(state);
@@ -4617,6 +4644,50 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             drop(state);
             respond_json(stream, 200, r#"{"ok":true}"#);
         }
+        // Inc8 S4: APPEND one evaluation record to the bounded ring. Body = the
+        // Evaluation JSON (schema tab-atelier-mx#4). Updates the SnapshotTab mirror
+        // + queues a CardChange the owner persists. Master token, like /assignment.
+        ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/evaluation") => {
+            let inner = &p["/tabs/by-id/".len()..p.len() - "/evaluation".len()];
+            let Ok(ev) = serde_json::from_slice::<crate::Evaluation>(&body_bytes) else {
+                error_json(stream, 400, "invalid evaluation record");
+                return;
+            };
+            let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(idx) = state.tabs.iter().position(|t| &*t.id == inner) else {
+                drop(state);
+                error_json(stream, 404, "tab not found");
+                return;
+            };
+            let tab_id = state.tabs[idx].id.to_string();
+            crate::append_evaluation(&mut state.tabs[idx].evaluations, ev.clone());
+            state
+                .pending_card_changes
+                .push((tab_id, CardChange::EvaluationAppend(ev)));
+            drop(state);
+            respond_json(stream, 200, r#"{"ok":true}"#);
+        }
+        // Inc8 S4: BUMP the usage counter + stamp last-used (brain on each
+        // `continue`, aligator on each swamp delivery). No body. Increments the
+        // SnapshotTab mirror + queues the resulting absolute (count, stamp).
+        ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/bump-usage") => {
+            let inner = &p["/tabs/by-id/".len()..p.len() - "/bump-usage".len()];
+            let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(idx) = state.tabs.iter().position(|t| &*t.id == inner) else {
+                drop(state);
+                error_json(stream, 404, "tab not found");
+                return;
+            };
+            let tab_id = state.tabs[idx].id.to_string();
+            let (count, stamp) = crate::bump_usage(state.tabs[idx].usage_count, crate::unix_millis());
+            state.tabs[idx].usage_count = Some(count);
+            state.tabs[idx].last_used_at = Some(stamp);
+            state
+                .pending_card_changes
+                .push((tab_id, CardChange::Usage(count, stamp)));
+            drop(state);
+            respond_json(stream, 200, &format!(r#"{{"usageCount":{count}}}"#));
+        }
         ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/input") => {
             let Some((key_raw, is_uuid)) = parse_tab_key(p, "/input") else {
                 error_json(stream, 404, "invalid tab key");
@@ -5506,6 +5577,8 @@ pub fn test_snapshot_tab(id: &str, name: &str) -> SnapshotTab {
         objective: None,
         current_task: Vec::new(),
         rounds_active: None,
+        evaluations: Vec::new(),
+        usage_count: None,
     }
 }
 
@@ -5640,6 +5713,9 @@ mod tests {
             objective: None,
             current_task: Vec::new(),
             rounds_active: None,
+            evaluations: Vec::new(),
+            usage_count: None,
+            last_used_at: None,
         }
     }
 
@@ -6399,6 +6475,68 @@ mod tests {
         let bj = serde_json::to_string(&bare).unwrap();
         assert!(!bj.contains("\"evaluations\""), "empty evaluations skipped: {bj}");
         assert!(!bj.contains("\"usageCount\""), "None usageCount skipped: {bj}");
+    }
+
+    #[test]
+    #[allow(clippy::significant_drop_tightening)] // short-lived test read of the snapshot lock
+    fn bump_usage_helper_is_the_call_brain_and_aligator_make_on_their_paths() {
+        // WIRING (Inc8 S4): brain bumps on each `continue`, aligator on each swamp
+        // delivery — both by calling `share_link::bump_usage(&ep, uuid)` on their
+        // success paths (one line right after the send). This drives that EXACT
+        // helper against a live server and proves it increments + stamps.
+        let (port, state, token) = spawn_server();
+        let ep = crate::cli::share_link::Endpoint {
+            url: format!("http://127.0.0.1:{port}"),
+            token,
+        };
+        // Read `(usage_count, last_used_at)` for tab-a under a tight lock.
+        let usage = |st: &Arc<Mutex<TabSnapshot>>| {
+            let g = st.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let tab = g.tabs.iter().find(|t| &*t.id == "tab-a").expect("tab-a");
+            (tab.usage_count, tab.last_used_at)
+        };
+        crate::cli::share_link::bump_usage(&ep, "tab-a");
+        let (count, stamp) = usage(&state);
+        assert_eq!(count, Some(1), "first bump: 0 -> 1");
+        assert!(stamp.is_some(), "bump stamps last-used");
+        // A second delivery/nudge bumps again — monotonic usage.
+        crate::cli::share_link::bump_usage(&ep, "tab-a");
+        assert_eq!(usage(&state).0, Some(2), "second bump increments");
+    }
+
+    #[test]
+    #[allow(clippy::significant_drop_tightening)] // short-lived test read of the snapshot lock
+    fn evaluation_route_appends_record_and_bump_route_increments() {
+        // The set-evaluation / bump-usage ROUTES end-to-end: appending an
+        // Evaluation lands in the tab's bounded ring, and bump-usage increments.
+        let (port, state, token) = spawn_server();
+        let ev = r#"{"evaluator":"olympe","at":1000,"tokens":{"input":400000,"out":100000},"scores":{"relevance":8,"errors":1,"omissions":0},"verdict":"ok"}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/tab-a/evaluation HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{ev}",
+                ev.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 200, "{resp}");
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/tab-a/bump-usage HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\n\r\n"
+            ),
+        );
+        assert_eq!(status_code(&resp), 200, "{resp}");
+        let g = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tab = g.tabs.iter().find(|t| &*t.id == "tab-a").expect("tab-a");
+        assert_eq!(tab.evaluations.len(), 1, "evaluation appended to the ring");
+        assert_eq!(tab.evaluations[0].evaluator, "olympe");
+        assert_eq!(tab.usage_count, Some(1), "bump-usage route increments");
+        assert!(tab.last_used_at.is_some());
+        // A CardChange was queued for the owner to persist (both routes).
+        assert!(
+            g.pending_card_changes.iter().any(|(id, _)| id == "tab-a"),
+            "card changes queued for persistence"
+        );
     }
 
     #[test]
