@@ -3939,6 +3939,76 @@ mod tests {
         assert_eq!(restored.tabs[0].assignment, None);
     }
 
+    // --- Inc8 S1 (REFINER red): the "agent card" fields — siblings of `assignment`,
+    //     persisted + hook-immune. RED (compile-fail) until the builder adds
+    //     TabState.{specialty, orchestrator, objective, current_task} + append_current_task.
+    #[test]
+    fn agent_card_fields_round_trip() {
+        // specialty/orchestrator/objective OVERWRITE; current_task is a PERMALOG
+        // (append-only phrases → long, token-free memory). All persist to tabs.json;
+        // absent/empty ones are omitted, and old files load them as empty.
+        let with = SavedState {
+            tabs: vec![TabState {
+                name: "worker".into(),
+                specialty: Some("rust async internals".into()),
+                orchestrator: Some("free".into()), // uuid OR the literal "free"
+                objective: Some("land the parser refactor".into()),
+                current_task: vec!["read the plan".into(), "wire the struct".into()],
+                ..Default::default()
+            }],
+            active: 0,
+            windowed: false,
+            dashboard_share_token: String::new(),
+        };
+        let json = serde_json::to_string(&with).unwrap();
+        assert!(json.contains(r#""specialty":"rust async internals""#), "{json}");
+        assert!(json.contains(r#""orchestrator":"free""#), "{json}");
+        assert!(json.contains(r#""objective":"land the parser refactor""#), "{json}");
+        assert!(
+            json.contains(r#""current_task":["read the plan","wire the struct"]"#),
+            "permalog persists in order: {json}"
+        );
+        let restored: SavedState = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.tabs[0].specialty.as_deref(), Some("rust async internals"));
+        assert_eq!(restored.tabs[0].orchestrator.as_deref(), Some("free"));
+        assert_eq!(restored.tabs[0].objective.as_deref(), Some("land the parser refactor"));
+        assert_eq!(
+            restored.tabs[0].current_task,
+            vec!["read the plan".to_string(), "wire the struct".to_string()]
+        );
+
+        // Absent -> omitted from JSON; an old file (no fields) loads as empty.
+        let without = SavedState {
+            tabs: vec![TabState {
+                name: "x".into(),
+                ..Default::default()
+            }],
+            active: 0,
+            windowed: false,
+            dashboard_share_token: String::new(),
+        };
+        let json = serde_json::to_string(&without).unwrap();
+        for k in ["specialty", "orchestrator", "objective", "current_task"] {
+            assert!(!json.contains(k), "empty {k} must be skipped: {json}");
+        }
+        let restored: SavedState = serde_json::from_str(r#"{"tabs":[{"name":"x"}],"active":0}"#).unwrap();
+        assert!(restored.tabs[0].current_task.is_empty(), "old file -> empty permalog");
+        assert_eq!(restored.tabs[0].specialty, None);
+    }
+
+    #[test]
+    fn current_task_permalog_appends_non_empty_phrases() {
+        // `set-current-task "<phrase>"` APPENDS one phrase to the permalog. Empty /
+        // whitespace-only phrases are no-ops so the long memory stays meaningful.
+        let mut log: Vec<String> = Vec::new();
+        append_current_task(&mut log, "read the plan");
+        append_current_task(&mut log, "  wire the struct  "); // trimmed
+        append_current_task(&mut log, "   "); // no-op
+        append_current_task(&mut log, ""); // no-op
+        append_current_task(&mut log, "run the tests");
+        assert_eq!(log, vec!["read the plan", "wire the struct", "run the tests"]);
+    }
+
     #[test]
     fn test_tab_state_uptime_energy_round_trip() {
         let state = SavedState {
