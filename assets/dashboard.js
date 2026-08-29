@@ -166,7 +166,12 @@ export function nodeSubtitle(node) {
   if (!tabs.length) return "";
   const first = tabs[0] || {};
   const name = first.name || "";
-  const ctx = shortContext(first.context || first.item);
+  // Inc9-A: the subtitle shows the DECLARED currentTask (currentTaskLog latest) —
+  // NOT the observed `context`/`item` (last prompt), which bled broadcasts onto the
+  // node. No declared task -> name only (consistent with the 'libre' pill: no
+  // observed fallback, so a dispatched/broadcast prompt never surfaces here).
+  const log = Array.isArray(first.currentTaskLog) ? first.currentTaskLog : [];
+  const ctx = shortContext(log.length ? String(log[log.length - 1]) : "");
   let label = ctx ? `${name} · ${ctx}` : name;
   if (label.length > 24) label = label.slice(0, 23) + "…";
   return tabs.length > 1 ? `${label} +${tabs.length - 1}` : label;
