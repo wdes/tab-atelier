@@ -69,12 +69,16 @@ TDD : parse/round-trip des champs (pur) + accept écran.
 2. Docs de travail rangés ? (utiles / supprimer / conserver, coop orchestrateur).
 3. **Sur déclenchement (dès la 2ᵉ erreur / burst), l'orchestrateur DÉCIDE** — informé par la **taille
    de la fenêtre de contexte** de l'agent (observée) :
-   - **REHOME d'abord** (clarify/auto-rehome) si le contexte est **gros/dégradé** → rafraîchit le
-     contexte ; peut suffire (erreurs causées par la dégradation, pas par le prompt). Moins coûteux
-     que réécrire le prompt. Puis ré-évaluer.
+   - **REHOME d'abord** si le contexte est **gros/dégradé** → rafraîchit le contexte ; peut suffire
+     (erreurs dues à la dégradation, pas au prompt). Moins coûteux que réécrire le prompt. Puis ré-évaluer.
+     **[REUSE §18, tichef] Réutiliser `~/Dev/Botmox/rehome-tab.sh`** (chaîne complète handoff-written →
+     successor-ready → ack → safe-to-close, `--auto-close`, swap nom, set-parent, warning crons) avec
+     **assignment/name/cwd préservés** = l'agent renaît frais **sans perdre son identité** (specialty/
+     objective se re-posent via les `set-*` de la carte S1). **Aucun nouveau code rehome.**
    - **AUTO-AMÉLIORATION** (coop MAS/tichef sur l'éval) si c'est un vrai problème de capacité/prompt :
      (a) consigner ancien prompt + éval, (b) modifier `specialty` + RAZ évaluation.
-4. Handoff → auto-rehome → déclaration `free` → bande Freelancers.
+4. Handoff → auto-rehome → déclaration `free` → bande Freelancers. **[terrain tichef]** co-câbler la
+   state-machine de libération sur `rehome-tab.sh` **avec tichef (producteur)** à S5 — pas de réinvention.
 
 ## Ordre & intégration
 S1 (carte base) → **S2a (free-bot, sûr)** → S3 (clic droit + méta-trio) — cœur ; puis **S2b (hook
