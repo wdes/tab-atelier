@@ -448,6 +448,16 @@ pub enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Inc8 S4 agent card — APPEND one evaluation record (JSON) to the bounded ring.
+    SetEvaluation {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Inc8 S4 — bump a tab's usage counter + stamp last-used.
+    BumpUsage {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 
     /// Mark a predecessor tab's re-home progress (`rehome-tab.sh`): one of
     /// `handoff-written` / `successor-ready` / `ack-sent` / `safe-to-close`.
@@ -894,6 +904,8 @@ pub fn dispatch(cli: Cli) -> bool {
         Commands::SetObjective { args } => crate::cli::client::run("set-objective", &args),
         Commands::SetCurrentTask { args } => crate::cli::client::run("set-current-task", &args),
         Commands::SetRoundsActive { args } => crate::cli::client::run("set-rounds-active", &args),
+        Commands::SetEvaluation { args } => crate::cli::client::run("set-evaluation", &args),
+        Commands::BumpUsage { args } => crate::cli::client::run("bump-usage", &args),
         Commands::SetRehomeStatus { args } => crate::cli::client::run("set-rehome-status", &args),
         Commands::Token => crate::cli::client::run("token", &[]),
         Commands::RotateTokens => crate::cli::client::run("rotate-tokens", &[]),

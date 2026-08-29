@@ -108,7 +108,7 @@ pub struct Field {
 }
 
 /// Read the `(url, token)` env pair, or `None` outside a tab (silent no-op).
-fn api_env() -> Option<(String, String)> {
+pub(crate) fn api_env() -> Option<(String, String)> {
     match (
         std::env::var("TAB_ATELIER_API_URL"),
         std::env::var("TAB_ATELIER_API_TOKEN"),

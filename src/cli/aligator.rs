@@ -469,6 +469,9 @@ fn tick(cursor: &mut usize) -> Result<(), String> {
                     }
                 }
                 // 3. Delivered (text ok + ⏎ confirmed, or no submit asked): consume.
+                //    Inc8 S4: bump the target's usage (observability — who's being
+                //    fed from the swamp). Best-effort; never blocks the consume.
+                crate::cli::share_link::bump_usage(&ep, &tab);
                 println!(
                     "🐊 aligator: {tab:<36} ← {n} byte(s){s}",
                     n = input.len(),

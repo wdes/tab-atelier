@@ -162,6 +162,9 @@ struct HeadlessTab {
     /// Bounded `current_task` permalog (see [`crate::append_current_task`]).
     current_task: Vec<String>,
     rounds_active: Option<crate::RoundsActive>,
+    /// Inc8 S4 — bounded evaluations ring + use counter (`last_used_at` is above).
+    evaluations: Vec<crate::Evaluation>,
+    usage_count: Option<u64>,
     pending_agent_resume: Option<String>,
     colors_enabled: bool,
     /// Raw PTY byte ring captured BEFORE alacritty's parser sees the
@@ -762,6 +765,8 @@ fn spawn_pty_tab(
         objective: None,
         current_task: Vec::new(),
         rounds_active: None,
+        evaluations: Vec::new(),
+        usage_count: None,
         pending_agent_resume,
         colors_enabled,
         viewers: viewers_handle,
@@ -942,6 +947,9 @@ pub fn run() -> std::io::Result<()> {
                 t.objective = ts.objective.as_deref().map(Arc::from);
                 t.current_task.clone_from(&ts.current_task);
                 t.rounds_active.clone_from(&ts.rounds_active);
+                t.evaluations.clone_from(&ts.evaluations);
+                t.usage_count = ts.usage_count;
+                t.last_used_at = ts.last_used_at;
                 t.pinned_cols = ts.pinned_cols;
                 t.pinned_rows = ts.pinned_rows;
                 #[cfg(target_os = "linux")]
@@ -1444,6 +1452,8 @@ fn refresh_snapshot(
             objective: tab.objective.clone(),
             current_task: tab.current_task.clone(),
             rounds_active: tab.rounds_active.clone(),
+            evaluations: tab.evaluations.clone(),
+            usage_count: tab.usage_count,
         });
     }
     let mut snapshot = api_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1661,6 +1671,9 @@ fn persist(
             objective: tab.objective.as_deref().map(str::to_string),
             current_task: tab.current_task.clone(),
             rounds_active: tab.rounds_active.clone(),
+            evaluations: tab.evaluations.clone(),
+            usage_count: tab.usage_count,
+            last_used_at: tab.last_used_at,
             parent_tab_id: tab.parent_tab_id.as_deref().map(str::to_string),
             rehome_status: tab.rehome_status.as_deref().map(str::to_string),
             limits: tab.limits.clone(),
@@ -2112,6 +2125,13 @@ fn drain_pending(
                     crate::append_current_task(&mut t.current_task, &p);
                 }
                 crate::api::CardChange::RoundsActive(ra) => t.rounds_active = Some(ra),
+                crate::api::CardChange::EvaluationAppend(ev) => {
+                    crate::append_evaluation(&mut t.evaluations, ev);
+                }
+                crate::api::CardChange::Usage(count, stamp) => {
+                    t.usage_count = Some(count);
+                    t.last_used_at = Some(stamp);
+                }
             }
         }
     }
