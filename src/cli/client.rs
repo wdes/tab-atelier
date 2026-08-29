@@ -26,7 +26,7 @@
 //! `dispatch` if headless should list it in `--help`).
 
 use super::{bench, bench_lag, brain, claude_hook, delegate, flags, logging, remote};
-use super::{set_context, set_font, set_status, share_link, team, tokens};
+use super::{set_assignment, set_context, set_font, set_rehome, set_status, share_link, team, tokens};
 
 /// Dispatch a client subcommand by name against raw `&[String]` args.
 ///
@@ -41,6 +41,8 @@ pub fn dispatch(name: &str, rest: &[String]) -> Option<i32> {
         "set-status" => set_status::run(rest),
         "set-font" => set_font::run(rest),
         "set-context" => set_context::run(rest),
+        "set-assignment" => set_assignment::run(rest),
+        "set-rehome-status" => set_rehome::run(rest),
         "token" => tokens::show(rest),
         "rotate-tokens" => tokens::rotate(rest),
         "reset-master-token" => tokens::reset_master(rest),
@@ -49,6 +51,10 @@ pub fn dispatch(name: &str, rest: &[String]) -> Option<i32> {
         "dispatch" => delegate::run(rest),
         "remote" => remote::run(rest),
         "brain" => brain::run(rest),
+        // 🐊 aligator: deterministic input router + its swamp producer.
+        "aligator" => super::aligator::run(rest),
+        "swamp" => super::aligator::run_swamp(rest),
+        "clarify" => super::clarify::run(rest),
         "schedule" => share_link::schedule(rest),
         "log" => logging::run(rest),
         "flags" => flags::run(rest),

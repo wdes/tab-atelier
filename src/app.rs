@@ -214,6 +214,14 @@ struct Tab {
     /// the PR/task it's on). Shown as a hover tooltip on the tab name.
     /// In-memory; set via the API + drained from the snapshot.
     context: Option<std::sync::Arc<str>>,
+    /// Stable workflow assignment (`set-assignment`). Persisted (restored from
+    /// `TabState`, written back in `persist()`) and hook-immune, unlike `context`.
+    assignment: Option<std::sync::Arc<str>>,
+    /// UUID of the spawning tab (`parent_tab_id`). Persisted like `assignment`.
+    parent_tab_id: Option<std::sync::Arc<str>>,
+    /// Re-home progress on a predecessor tab. Persisted like `assignment`;
+    /// drives the progress badge + gates the "close the predecessor" action.
+    rehome_status: Option<std::sync::Arc<str>>,
     /// One-shot resume command queued on tab restore — when the
     /// shell is up the next tick types `<command>\n` into the
     /// PTY, then clears this. Set in `insert_tab` from the
@@ -307,6 +315,10 @@ impl Tab {
             schedule: ts.schedule.clone(),
             bg_color: ts.bg_color.clone(),
             context: None,
+            // Persisted: restore it so the tab keeps its phase/role across restarts.
+            assignment: ts.assignment.as_deref().map(std::sync::Arc::from),
+            parent_tab_id: ts.parent_tab_id.as_deref().map(std::sync::Arc::from),
+            rehome_status: ts.rehome_status.as_deref().map(std::sync::Arc::from),
             last_pushed_locked: None,
             pending_agent_resume,
             snap_cache: None,
@@ -902,7 +914,7 @@ impl AppState {
         #[cfg(target_os = "linux")]
         crate::cgroup::init(true);
 
-        let (tabs, active, restored_windowed) = if let Some(mut saved) =
+        let (tabs, active, restored_windowed, restored_dashboard_token) = if let Some(mut saved) =
             load_state_with_outputs(&platform::config_base_dir(), &platform::state_base_dir())
         {
             info!("restoring {} tab(s) from saved state", saved.tabs.len());
@@ -1053,7 +1065,7 @@ impl AppState {
             }
             let active = saved.active.min(tabs.len() - 1);
             tabs[active].activate();
-            (tabs, active, saved.windowed)
+            (tabs, active, saved.windowed, saved.dashboard_share_token)
         } else {
             let fc = font_config.clone();
             let br = browser.clone();
@@ -1078,7 +1090,12 @@ impl AppState {
                 name: locale::strings(lang).terminal.to_owned(),
                 ..TabState::default()
             };
-            (vec![Tab::from_state(view, &seed, None, None, None, true)], 0, false)
+            (
+                vec![Tab::from_state(view, &seed, None, None, None, true)],
+                0,
+                false,
+                String::new(),
+            )
         };
         if restored_windowed {
             window.toggle_fullscreen();
@@ -1359,6 +1376,9 @@ impl AppState {
             // is rejected by the auth gate's non-empty guard, so the brief
             // pre-start window can't authorise anyone.
             master_token: String::new(),
+            // Restored from tabs.json so a shared /dashboard link keeps working
+            // across restarts; empty until first minted.
+            dashboard_share_token: restored_dashboard_token.as_str().into(),
             active: 0,
             #[cfg(feature = "energy")]
             power: Vec::new(),
@@ -1373,6 +1393,9 @@ impl AppState {
             pending_ssh_agent_changes: Vec::new(),
             pending_bg_color_changes: Vec::new(),
             pending_context_changes: Vec::new(),
+            pending_assignment_changes: Vec::new(),
+            pending_parent_changes: Vec::new(),
+            pending_rehome_changes: Vec::new(),
             pending_token_rotations: Vec::new(),
             pending_schedule_changes: Vec::new(),
             pending_new_tabs: 0,
@@ -1946,6 +1969,9 @@ impl AppState {
                     locked: tab.locked,
                     schedule: tab.schedule.clone(),
                     bg_color: tab.bg_color.clone(),
+                    assignment: tab.assignment.as_deref().map(str::to_string),
+                    parent_tab_id: tab.parent_tab_id.as_deref().map(str::to_string),
+                    rehome_status: tab.rehome_status.as_deref().map(str::to_string),
                     limits: tab.limits.clone(),
                     ..TabState::default()
                 }
@@ -2053,6 +2079,9 @@ impl AppState {
                 schedule: ts.schedule.clone(),
                 bg_color,
                 context: tab.context.clone(),
+                assignment: tab.assignment.clone(),
+                parent_tab_id: tab.parent_tab_id.clone(),
+                rehome_status: tab.rehome_status.clone(),
                 shell_pid,
                 agent_state: tab.agent_state.clone(),
                 agent_session_id: tab.agent_session_id.clone(),
@@ -2111,10 +2140,19 @@ impl AppState {
         }
 
         let read_only = crate::read_only();
+        // Persist the global dashboard share-token (lives on the API snapshot,
+        // like the master token) so a shared /dashboard link survives a restart.
+        let dashboard_share_token = self
+            .api_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .dashboard_share_token
+            .to_string();
         let saved = SavedState {
             tabs,
             active: self.active,
             windowed: self.windowed,
+            dashboard_share_token,
         };
         // Skip the write+rotate when the serialized content is identical to
         // last tick — the common case once the user stops poking the UI.
@@ -2298,6 +2336,10 @@ impl AppState {
             let net_changes: Vec<(String, bool)> = snapshot.pending_net_changes.drain(..).collect();
             let bg_color_changes: Vec<(String, Option<String>)> = snapshot.pending_bg_color_changes.drain(..).collect();
             let context_changes: Vec<(String, Option<String>)> = snapshot.pending_context_changes.drain(..).collect();
+            let assignment_changes: Vec<(String, Option<String>)> =
+                snapshot.pending_assignment_changes.drain(..).collect();
+            let parent_changes: Vec<(String, Option<String>)> = snapshot.pending_parent_changes.drain(..).collect();
+            let rehome_changes: Vec<(String, Option<String>)> = snapshot.pending_rehome_changes.drain(..).collect();
             let token_rotations: Vec<String> = snapshot.pending_token_rotations.drain(..).collect();
             let schedule_changes: Vec<(String, Option<crate::schedule::TabSchedule>)> =
                 snapshot.pending_schedule_changes.drain(..).collect();
@@ -2407,6 +2449,23 @@ impl AppState {
             for (tab_id, context) in context_changes {
                 if let Some(tab) = self.tabs.iter_mut().find(|t| *t.id == tab_id) {
                     tab.context = context.map(std::sync::Arc::from);
+                }
+            }
+            // Assignment changes — mirrored onto the runtime Tab so the next
+            // persist() writes them to tabs.json (they survive a restart).
+            for (tab_id, assignment) in assignment_changes {
+                if let Some(tab) = self.tabs.iter_mut().find(|t| *t.id == tab_id) {
+                    tab.assignment = assignment.map(std::sync::Arc::from);
+                }
+            }
+            for (tab_id, parent) in parent_changes {
+                if let Some(tab) = self.tabs.iter_mut().find(|t| *t.id == tab_id) {
+                    tab.parent_tab_id = parent.map(std::sync::Arc::from);
+                }
+            }
+            for (tab_id, rehome) in rehome_changes {
+                if let Some(tab) = self.tabs.iter_mut().find(|t| *t.id == tab_id) {
+                    tab.rehome_status = rehome.map(std::sync::Arc::from);
                 }
             }
             // Schedule changes — None clears, Some sets. Mirrors the
@@ -2975,6 +3034,9 @@ impl AppState {
                     share_token_ro: tab.share_token_ro.to_string(),
                     locked: tab.locked,
                     bg_color: tab.bg_color.clone(),
+                    assignment: tab.assignment.as_deref().map(str::to_string),
+                    parent_tab_id: tab.parent_tab_id.as_deref().map(str::to_string),
+                    rehome_status: tab.rehome_status.as_deref().map(str::to_string),
                     limits: tab.limits.clone(),
                     ..TabState::default()
                 }
@@ -2984,12 +3046,19 @@ impl AppState {
             // Drain queued periodic writes FIRST so none of them can land
             // after (and clobber) the final synchronous state below.
             self.state_writer.flush();
+            let dashboard_share_token = self
+                .api_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .dashboard_share_token
+                .to_string();
             save_state(
                 &platform::config_base_dir(),
                 &SavedState {
                     tabs,
                     active: self.active,
                     windowed: self.windowed,
+                    dashboard_share_token,
                 },
             );
             for tab in &self.tabs {
@@ -3247,6 +3316,13 @@ impl AppState {
             #[cfg(feature = "energy")]
             let power_label = watts.get(i).map(power::TabPower::label).unwrap_or_default();
 
+            // S5: an orchestrator tab gets a lighter background tint so its role
+            // reads at a glance in the bar. Role comes from `assignment` (S0),
+            // never the volatile `context`.
+            let is_orchestrator = crate::api::role_of(tab.assignment.as_deref()) == "orchestrator";
+            // Re-home progress badge on a PREDECESSOR tab (S rehome): shows the
+            // stage, painted green at safe-to-close. `None` for non-rehoming tabs.
+            let rehome_badge = crate::api::rehome_badge(tab.rehome_status.as_deref());
             let drag_name = tab.name.clone();
             let tab_el = div()
                 .id(ElementId::Name(self.tab_el_ids[i].clone()))
@@ -3269,12 +3345,22 @@ impl AppState {
                 .border_l_1()
                 .border_t_1()
                 .border_b_1()
-                .bg(if blink_red {
-                    tab_blink_bg
-                } else if is_active {
-                    tab_active_bg
-                } else {
-                    tab_bg
+                .bg({
+                    let base = if blink_red {
+                        tab_blink_bg
+                    } else if is_active {
+                        tab_active_bg
+                    } else {
+                        tab_bg
+                    };
+                    if is_orchestrator {
+                        Hsla {
+                            l: (base.l + 0.12).min(1.0),
+                            ..base
+                        }
+                    } else {
+                        base
+                    }
                 })
                 .border_r_1()
                 .border_color(tab_border)
@@ -3372,6 +3458,53 @@ impl AppState {
                 } else {
                     name.into_any_element()
                 });
+
+            // Re-home progress badge: neutral grey through the loop, green at
+            // safe-to-close (bidirectional proof done — the predecessor may close).
+            let tab_el = tab_el.when_some(rehome_badge, |el, (label, safe)| {
+                let (bg, fg) = if safe {
+                    (
+                        Hsla {
+                            h: 0.33,
+                            s: 0.5,
+                            l: 0.30,
+                            a: 1.0,
+                        },
+                        Hsla {
+                            h: 0.33,
+                            s: 0.6,
+                            l: 0.88,
+                            a: 1.0,
+                        },
+                    )
+                } else {
+                    (
+                        Hsla {
+                            h: 0.0,
+                            s: 0.0,
+                            l: 0.28,
+                            a: 1.0,
+                        },
+                        Hsla {
+                            h: 0.0,
+                            s: 0.0,
+                            l: 0.78,
+                            a: 1.0,
+                        },
+                    )
+                };
+                el.child(
+                    div()
+                        .ml(px(6.0))
+                        .px(px(5.0))
+                        .py(px(1.0))
+                        .rounded_sm()
+                        .bg(bg)
+                        .text_color(fg)
+                        .text_size(px(10.0))
+                        .child(format!("⇄ {label}")),
+                )
+            });
 
             #[cfg(feature = "energy")]
             let tab_el = tab_el.child(
@@ -3702,6 +3835,38 @@ impl AppState {
                 );
             }
 
+            // Re-home: "close the predecessor" — appears ONLY once the
+            // bidirectional proof is done (rehome_status == safe-to-close, posted
+            // by the old agent on its ACK). Closes the manual-closure gap without
+            // removing the human gate: the entry simply isn't there until it's
+            // proven safe, and clicking it IS the human's decision.
+            if self.tabs.len() > 1 && crate::api::rehome_safe_to_close(self.tabs[idx].rehome_status.as_deref()) {
+                let safe_fg = Hsla {
+                    h: 0.33,
+                    s: 0.6,
+                    l: 0.7,
+                    a: 1.0,
+                };
+                container = container.child(
+                    div()
+                        .id("menu-close-rehome")
+                        .px(px(12.0))
+                        .py(px(4.0))
+                        .cursor_pointer()
+                        .text_color(safe_fg)
+                        .hover(|s| s.bg(menu_hover))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                                this.close_tab(idx, cx);
+                                this.context_menu = None;
+                                cx.notify();
+                            }),
+                        )
+                        .child("✓ Fermer le prédécesseur re-home"),
+                );
+            }
+
             // Drop catbus-agent into this tab's shell. Ctrl-U clears any
             // half-typed input, then `catbus-agent\n` runs it. No exec —
             // the shell stays alive underneath, so exiting catbus returns
@@ -3762,6 +3927,84 @@ impl AppState {
                     )
                     .child("\u{26d1}\u{fe0f} Brain"),
             );
+
+            // 🐊 Aligator — deterministic input router (drains the swamp). Same
+            // take-over-the-tab pattern as Brain, and the SAME auto-restart fix:
+            // stamp agent_kind=aligator so the restore path relaunches it via
+            // `build_agent_resume_command` instead of dropping it to a shell.
+            container = container.child(
+                div()
+                    .id("menu-aligator")
+                    .px(px(12.0))
+                    .py(px(4.0))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(menu_hover))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                            this.tabs[idx]
+                                .view
+                                .read(cx)
+                                .send_input_bytes(b"\x15tab-atelier aligator\n".to_vec());
+                            // Session-less, like brain — flag the kind so the
+                            // daemon auto-relaunches it on restart.
+                            this.tabs[idx].agent_kind = Some("aligator".into());
+                            this.tabs[idx].agent_session_id = None;
+                            this.tabs[idx].agent_plan_mode = None;
+                            this.context_menu = None;
+                            cx.notify();
+                        }),
+                    )
+                    .child("\u{1f40a} Aligator"),
+            );
+
+            // 📊 Dashboard (S5) — opens the harness dashboard scoped to this
+            // tab's team, role-aware: a worker/orchestrator drills into its
+            // project, a tichef / méta specialist gets the global level 0. Role
+            // + project come from `assignment` (S0), never the volatile context.
+            // The URL carries the GLOBAL read-only dashboard share token (minted
+            // lazily) so it also works from a remote browser.
+            {
+                let port = port_of(&self.api_addr, crate::DEFAULT_API_PORT);
+                let share_base = self.share_url_base.trim_end_matches('/').to_string();
+                container = container.child(
+                    div()
+                        .id("menu-dashboard")
+                        .px(px(12.0))
+                        .py(px(4.0))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(menu_hover))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                                let token = {
+                                    let mut snap =
+                                        this.api_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                                    if snap.dashboard_share_token.is_empty() {
+                                        snap.dashboard_share_token = crate::mint_share_token().into();
+                                    }
+                                    snap.dashboard_share_token.to_string()
+                                };
+                                let role = crate::api::role_of(this.tabs[idx].assignment.as_deref());
+                                let project = crate::api::project_of(
+                                    this.tabs[idx].last_known_cwd_string.as_deref(),
+                                    this.tabs[idx].assignment.as_deref(),
+                                );
+                                let base = if share_base.is_empty() {
+                                    format!("http://{}:{port}", crate::api::local_ip())
+                                } else {
+                                    share_base.clone()
+                                };
+                                let url = crate::api::dashboard_url_for_role(&role, &project, &base, &token);
+                                let browser = this.browser.borrow().clone();
+                                platform::open_url(&url, browser.as_deref());
+                                this.context_menu = None;
+                                cx.notify();
+                            }),
+                        )
+                        .child("\u{1F4CA} Dashboard"),
+                );
+            }
 
             let colors_enabled = self.tabs[idx].view.read(cx).colors_enabled();
             let toggle_label = if colors_enabled {
@@ -5792,6 +6035,9 @@ impl AppState {
                                                         relay_endpoint_id: on_disk_prefs.relay_endpoint_id,
                                                         relay_egress: on_disk_prefs.relay_egress,
                                                         tab_env: on_disk_prefs.tab_env,
+                                                        // Dashboard repo→service map — CLI/config managed,
+                                                        // not in this dialog; carry the on-disk value through.
+                                                        repo_families: on_disk_prefs.repo_families,
                                                         hotkeys: this.hotkeys.clone(),
                                                         browser,
                                                         code_editor: editor,

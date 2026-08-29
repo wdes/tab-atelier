@@ -75,8 +75,6 @@ struct HeadlessTab {
     name: Arc<str>,
     term: Arc<FairMutex<Term<EventProxy>>>,
     notifier: EventLoopSender,
-    #[allow(dead_code)]
-    event_proxy: EventProxy,
     pid: u32,
     /// Wall-clock at which this tab's PTY was spawned in *this*
     /// process run. `prior_uptime` folds in time accumulated in
@@ -155,6 +153,13 @@ struct HeadlessTab {
     /// Free-text context the in-tab agent set via `set-context`.
     /// In-memory only (not persisted); reflected on `/tabs`.
     context: Option<Arc<str>>,
+    /// Stable workflow assignment (`set-assignment`). Persisted (unlike
+    /// `context`) — restored from `TabState` and written back in `persist()`.
+    assignment: Option<Arc<str>>,
+    /// UUID of the spawning tab (`parent_tab_id`). Persisted like `assignment`.
+    parent_tab_id: Option<Arc<str>>,
+    /// Re-home progress on a predecessor tab. Persisted like `assignment`.
+    rehome_status: Option<Arc<str>>,
     pending_agent_resume: Option<String>,
     colors_enabled: bool,
     /// Raw PTY byte ring captured BEFORE alacritty's parser sees the
@@ -702,7 +707,6 @@ fn spawn_pty_tab(
         name: name.into(),
         term,
         notifier,
-        event_proxy: proxy,
         pid,
         created_at: Instant::now(),
         prior_uptime: Duration::from_secs_f64(prior_uptime_secs),
@@ -745,6 +749,11 @@ fn spawn_pty_tab(
         tx_bytes: 0,
         tx_denied_bytes: 0,
         context: None,
+        // Restored from the saved TabState at the call site (like `limits`),
+        // since spawn_pty_tab is also used for fresh tabs (no assignment).
+        assignment: None,
+        parent_tab_id: None,
+        rehome_status: None,
         pending_agent_resume,
         colors_enabled,
         viewers: viewers_handle,
@@ -849,6 +858,9 @@ pub fn run() -> std::io::Result<()> {
     let mut tabs: Vec<HeadlessTab> = Vec::new();
     let mut active: usize = 0;
     let mut windowed = false;
+    // Restored global dashboard share-token (empty until minted). Published onto
+    // the API snapshot below so a shared `/dashboard` link survives a restart.
+    let mut dashboard_token = String::new();
 
     let saved_state = load_state_with_outputs(&platform::config_base_dir(), &platform::state_base_dir());
     // Set up cgroup delegation once, before any tab spawns. Always attempted
@@ -867,6 +879,7 @@ pub fn run() -> std::io::Result<()> {
     if let Some(saved) = saved_state {
         info!("restoring {} tab(s) from saved state", saved.tabs.len());
         windowed = saved.windowed;
+        dashboard_token.clone_from(&saved.dashboard_share_token);
         for ts in &saved.tabs {
             let cwd = ts.cwd.as_ref().map(PathBuf::from);
             let env = tab_env_extras(&ts.id, &api_url_for_pty, &api_token, &ts.tab_env);
@@ -913,6 +926,9 @@ pub fn run() -> std::io::Result<()> {
                 ts.ssh_agent.clone(),
             ) {
                 t.limits = ts.limits.clone();
+                t.assignment = ts.assignment.as_deref().map(Arc::from);
+                t.parent_tab_id = ts.parent_tab_id.as_deref().map(Arc::from);
+                t.rehome_status = ts.rehome_status.as_deref().map(Arc::from);
                 t.pinned_cols = ts.pinned_cols;
                 t.pinned_rows = ts.pinned_rows;
                 #[cfg(target_os = "linux")]
@@ -979,6 +995,7 @@ pub fn run() -> std::io::Result<()> {
     let api_state = Arc::new(Mutex::new(api::TabSnapshot {
         tabs: Vec::<api::SnapshotTab>::new(),
         master_token: String::new(),
+        dashboard_share_token: dashboard_token.as_str().into(),
         active,
         #[cfg(feature = "energy")]
         power: Vec::new(),
@@ -993,6 +1010,9 @@ pub fn run() -> std::io::Result<()> {
         pending_ssh_agent_changes: Vec::new(),
         pending_bg_color_changes: Vec::new(),
         pending_context_changes: Vec::new(),
+        pending_assignment_changes: Vec::new(),
+        pending_parent_changes: Vec::new(),
+        pending_rehome_changes: Vec::new(),
         pending_token_rotations: Vec::new(),
         pending_schedule_changes: Vec::new(),
         pending_new_tabs: 0,
@@ -1399,6 +1419,9 @@ fn refresh_snapshot(
             schedule: tab.schedule.clone(),
             bg_color: crate::effective_tab_bg(tab.bg_color.as_deref(), Some(global_bg)).into(),
             context: tab.context.clone(),
+            assignment: tab.assignment.clone(),
+            parent_tab_id: tab.parent_tab_id.clone(),
+            rehome_status: tab.rehome_status.clone(),
             shell_pid: tab.pid,
             agent_state: tab.agent_state.clone(),
             agent_session_id: tab.agent_session_id.clone(),
@@ -1562,10 +1585,10 @@ fn persist(
     tabs: &mut [HeadlessTab],
     active: usize,
     state_writer: &crate::StateWriter,
-    // Snapshot writeback moved to refresh_snapshot; this is kept on
-    // the signature for forward compat (callers shouldn't have to
-    // change). _-prefixed to silence unused-warning.
-    _api_state: &Arc<Mutex<api::TabSnapshot>>,
+    // Snapshot writeback moved to refresh_snapshot; still read here to
+    // persist the global dashboard share-token (lives on the snapshot, like
+    // the master token) into tabs.json so a shared link survives a restart.
+    api_state: &Arc<Mutex<api::TabSnapshot>>,
     #[cfg(feature = "energy")] power_pids: &Arc<Mutex<Vec<u32>>>,
     #[cfg(feature = "energy")] power_watts: &Arc<Mutex<Vec<crate::power::TabPower>>>,
     #[cfg(feature = "energy")] _battery_percent: &Arc<Mutex<Option<u8>>>,
@@ -1630,6 +1653,9 @@ fn persist(
             net_allow_cidrs: tab.net_allow.cidrs.clone(),
             schedule: tab.schedule.clone(),
             bg_color: tab.bg_color.clone(),
+            assignment: tab.assignment.as_deref().map(str::to_string),
+            parent_tab_id: tab.parent_tab_id.as_deref().map(str::to_string),
+            rehome_status: tab.rehome_status.as_deref().map(str::to_string),
             limits: tab.limits.clone(),
             ssh_agent: tab.ssh_agent.clone(),
             ..TabState::default()
@@ -1643,6 +1669,11 @@ fn persist(
         tabs: tab_states,
         active,
         windowed: false,
+        dashboard_share_token: api_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .dashboard_share_token
+            .to_string(),
     };
     // The string serialized for the hash IS what gets written, so the
     // dirty path doesn't serialize the same value a second time.
@@ -1901,6 +1932,9 @@ fn drain_pending(
         s.pending_ssh_agent_changes.drain(..).collect();
     let bg_color_changes: Vec<(String, Option<String>)> = s.pending_bg_color_changes.drain(..).collect();
     let context_changes: Vec<(String, Option<String>)> = s.pending_context_changes.drain(..).collect();
+    let assignment_changes: Vec<(String, Option<String>)> = s.pending_assignment_changes.drain(..).collect();
+    let parent_changes: Vec<(String, Option<String>)> = s.pending_parent_changes.drain(..).collect();
+    let rehome_changes: Vec<(String, Option<String>)> = s.pending_rehome_changes.drain(..).collect();
     let token_rotations: Vec<String> = s.pending_token_rotations.drain(..).collect();
     let schedule_changes: Vec<(String, Option<crate::schedule::TabSchedule>)> =
         s.pending_schedule_changes.drain(..).collect();
@@ -1927,6 +1961,9 @@ fn drain_pending(
         && ssh_agent_changes.is_empty()
         && bg_color_changes.is_empty()
         && context_changes.is_empty()
+        && assignment_changes.is_empty()
+        && parent_changes.is_empty()
+        && rehome_changes.is_empty()
         && token_rotations.is_empty()
         && schedule_changes.is_empty()
         && limit_changes.is_empty()
@@ -2044,6 +2081,24 @@ fn drain_pending(
     for (tab_id, context) in context_changes {
         if let Some(t) = tabs.iter_mut().find(|t| *t.id == tab_id) {
             t.context = context.map(Arc::from);
+        }
+    }
+    // …and the per-tab assignment (persisted on the next tick, unlike context).
+    for (tab_id, assignment) in assignment_changes {
+        if let Some(t) = tabs.iter_mut().find(|t| *t.id == tab_id) {
+            t.assignment = assignment.map(Arc::from);
+        }
+    }
+    // …and the spawn lineage (`parent_tab_id`), persisted like assignment.
+    for (tab_id, parent) in parent_changes {
+        if let Some(t) = tabs.iter_mut().find(|t| *t.id == tab_id) {
+            t.parent_tab_id = parent.map(Arc::from);
+        }
+    }
+    // …and the re-home progress (`rehome_status`), persisted like assignment.
+    for (tab_id, rehome) in rehome_changes {
+        if let Some(t) = tabs.iter_mut().find(|t| *t.id == tab_id) {
+            t.rehome_status = rehome.map(Arc::from);
         }
     }
 

@@ -5,9 +5,11 @@
 /// `tab-atelier claude [ARGS…]` — clear the grid + `exec claude` (a correct,
 /// no-fuss agent launcher; see the module docs).
 pub mod agent;
+pub mod aligator;
 pub mod bench;
 pub mod bench_lag;
 pub mod brain;
+pub mod clarify;
 pub mod claude_hook;
 /// The single shared client-subcommand router used by both the GUI
 /// (`src/main.rs`) and the headless daemon ([`dispatch`]).
@@ -20,14 +22,17 @@ pub mod flags;
 /// applied on next launch) without wrangling env vars.
 pub mod logging;
 pub mod remote;
+pub mod set_assignment;
 pub mod set_context;
 pub mod set_font;
+pub mod set_rehome;
 pub mod set_status;
 /// Headless-side basic-action subcommands.
 ///
 /// share-link, add, close, rename, lock, unlock, input, output. Named
 /// after the first one added; see the module docstring for details.
 pub mod share_link;
+pub mod tab_field;
 /// `tab-atelier peers / note / notes / handoff` — Claude-to-Claude teamwork
 /// verbs (dispatch handles send-a-prompt-and-wait; this is the rest).
 pub mod team;

@@ -77,10 +77,31 @@ pub(crate) fn fetch_tabs(ep: &Endpoint) -> Result<Vec<serde_json::Value>, String
     Ok(v.get("tabs").and_then(|t| t.as_array()).cloned().unwrap_or_default())
 }
 
+/// A bare tab INDEX (all ASCII digits) — the unstable addressing form. A UUID
+/// (hex + dashes) or a name is not. Pure, so the guardrail is unit-testable.
+#[must_use]
+pub(crate) fn is_bare_index(target: &str) -> bool {
+    !target.is_empty() && target.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Governance guardrail (G2): a non-blocking stderr nudge when a tab is targeted
+/// by its INDEX instead of its UUID. The index drifts as tabs open/close, so a
+/// script / handoff pinned to it silently retargets after a restart — the index
+/// is still accepted, this only points at the stable handle.
+pub(crate) fn warn_if_index(target: &str) {
+    if is_bare_index(target) {
+        eprintln!(
+            "warning: tab '{target}' is an INDEX — unstable across restarts; \
+             prefer the UUID (tabs --json .id)"
+        );
+    }
+}
+
 /// Resolve a CLI key argument ("0", "3", "<uuid>") to (index, uuid).
 /// We need both because some routes are index-based (rename, close)
 /// and some are uuid-based (view/output/input via /by-id/).
 pub(crate) fn resolve(ep: &Endpoint, key: &str) -> Result<(usize, String), String> {
+    warn_if_index(key);
     let tabs = fetch_tabs(ep)?;
     let pick = key.parse::<usize>().map_or_else(
         |_| {
@@ -105,6 +126,12 @@ pub(crate) fn resolve(ep: &Endpoint, key: &str) -> Result<(usize, String), Strin
     Ok((idx, id))
 }
 
+/// Build the global read-only dashboard share URL. Split out so the URL shape
+/// (`/dashboard?token=…`) is unit-testable without a live daemon.
+fn dashboard_share_url(ip: &str, port: u16, token: &str) -> String {
+    format!("http://{ip}:{port}/dashboard?token={token}")
+}
+
 fn http_port(ep: &Endpoint) -> u16 {
     ep.url
         .rsplit_once(':')
@@ -119,11 +146,13 @@ fn http_port(ep: &Endpoint) -> u16 {
 pub fn run(args: &[String]) -> i32 {
     let mut key: Option<String> = None;
     let mut ro = false;
+    let mut dashboard = false;
     for a in args {
         match a.as_str() {
             "--ro" | "-r" => ro = true,
+            "--dashboard" => dashboard = true,
             "--help" | "-h" => {
-                eprintln!("usage: tab-atelier-headless share-link <tab-index-or-uuid> [--ro]");
+                eprintln!("usage: tab-atelier-headless share-link <tab-index-or-uuid> [--ro] | --dashboard");
                 return 0;
             }
             _ if key.is_none() => key = Some(a.clone()),
@@ -133,16 +162,49 @@ pub fn run(args: &[String]) -> i32 {
             }
         }
     }
-    let Some(key) = key else {
-        eprintln!("usage: tab-atelier-headless share-link <tab-index-or-uuid> [--ro]");
-        return 2;
-    };
     let ep = match discover_endpoint() {
         Ok(e) => e,
         Err(e) => {
             eprintln!("share-link: {e}");
             return 1;
         }
+    };
+    let ip = crate::api::local_ip();
+    let port = http_port(&ep);
+    // The dashboard is global + read-only: one share URL, no tab and no `--ro`
+    // variant. Ask the daemon for its (lazily-minted) global dashboard token —
+    // scoped to `/dashboard` only, unlike the per-tab link's master token.
+    if dashboard {
+        if key.is_some() || ro {
+            eprintln!("share-link --dashboard: takes no tab and no --ro (the dashboard is global + read-only)");
+            return 2;
+        }
+        let token = match agent()
+            .get(format!("{}/dashboard/share-token", ep.url))
+            .header("Authorization", format!("Bearer {}", ep.token))
+            .call()
+        {
+            Ok(mut r) => r
+                .body_mut()
+                .read_json::<serde_json::Value>()
+                .ok()
+                .and_then(|v| v.get("token").and_then(|t| t.as_str().map(str::to_string))),
+            Err(e) => {
+                eprintln!("share-link --dashboard: {e}");
+                return 1;
+            }
+        };
+        let Some(token) = token.filter(|t| !t.is_empty()) else {
+            eprintln!("share-link --dashboard: daemon returned no token");
+            return 1;
+        };
+        println!("{}", dashboard_share_url(&ip, port, &token));
+        eprintln!("(read-only dashboard share token — revoke with `rotate-tokens`)");
+        return 0;
+    }
+    let Some(key) = key else {
+        eprintln!("usage: tab-atelier-headless share-link <tab-index-or-uuid> [--ro] | --dashboard");
+        return 2;
     };
     let (_, uuid) = match resolve(&ep, &key) {
         Ok(p) => p,
@@ -151,8 +213,6 @@ pub fn run(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let ip = crate::api::local_ip();
-    let port = http_port(&ep);
     let suffix = if ro { "&ro=1" } else { "" };
     println!("http://{ip}:{port}/tabs/by-id/{uuid}/view?token={}{suffix}", ep.token);
     eprintln!("(uses master token — full API access for the recipient until rotated)");
@@ -2163,4 +2223,33 @@ pub fn tabs(args: &[String]) -> i32 {
         }
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{dashboard_share_url, is_bare_index};
+
+    #[test]
+    fn is_bare_index_flags_integers_not_uuids() {
+        // Bare integers → an index (the guardrail warns).
+        assert!(is_bare_index("0"));
+        assert!(is_bare_index("3"));
+        assert!(is_bare_index("42"));
+        // A UUID / name / empty → silent (not an index).
+        assert!(!is_bare_index("180ae3fb-1c55-4a2d-8bd3-de8ef1ffebf0"));
+        assert!(!is_bare_index("m-invoice"));
+        assert!(!is_bare_index("3a")); // hex-ish, not all digits
+        assert!(!is_bare_index(""));
+    }
+
+    #[test]
+    fn dashboard_url_has_token_query() {
+        let url = dashboard_share_url("192.168.1.42", 7890, "deadbeef");
+        assert_eq!(url, "http://192.168.1.42:7890/dashboard?token=deadbeef");
+        // The shape the `--dashboard` flag promises: the dashboard route + a token.
+        assert!(
+            url.contains("/dashboard?token="),
+            "must carry the dashboard token: {url}"
+        );
+    }
 }

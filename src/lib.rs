@@ -707,6 +707,20 @@ pub fn build_agent_resume_command(kind: &str, session_id: &str, plan: Option<boo
                 Some("tab-atelier-headless brain".to_string())
             }
         }
+        // 🐊 aligator drains the swamp over the local API — a standalone tool
+        // with no session to resume, exactly like brain. On restart we relaunch
+        // it so the deliveries queued by the restart-watcher get drained (fixes
+        // the session-only death that dropped it to a shell). `session_id` unused.
+        "aligator" => {
+            #[cfg(feature = "gui")]
+            {
+                Some("tab-atelier aligator".to_string())
+            }
+            #[cfg(not(feature = "gui"))]
+            {
+                Some("tab-atelier-headless aligator".to_string())
+            }
+        }
         _ => None,
     }
 }
@@ -1078,6 +1092,29 @@ pub struct TabState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bg_color: Option<String>,
 
+    /// The agent's stable place in the workflow: `"[<project>:]<phase>/<role>"`,
+    /// set once via `tab-atelier set-assignment`. Unlike [`Self`]'s in-RAM
+    /// `context` (rewritten every prompt by the `UserPromptSubmit` hook and never
+    /// persisted), this is **hook-immune and persisted** — it's what maps a tab
+    /// onto a dashboard phase node and a project. `None` ⇒ unassigned (the tab
+    /// still shows under its project, in the `unmapped` bucket).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignment: Option<String>,
+
+    /// UUID of the tab that spawned this one (`dispatch --new` reads `_TAB_ID`
+    /// and posts it). Drives the dashboard's delegation lineage / altitude.
+    /// Persisted like `assignment`; `None` ⇒ a root tab (not spawned).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_tab_id: Option<String>,
+
+    /// Re-home progress on a PREDECESSOR tab, set by `rehome-tab.sh` (+ the old
+    /// agent's own ACK) at each step of the bidirectional-proof loop: one of
+    /// `handoff-written` → `successor-ready` → `ack-sent` → `safe-to-close`.
+    /// Drives the tab's progress badge and gates the "close the predecessor"
+    /// action (enabled only at `safe-to-close`). Persisted; `None` ⇒ not rehoming.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rehome_status: Option<String>,
+
     /// Off-hours auto-lock. When set, the schedule's `(rule, tz)`
     /// pair feeds [`crate::schedule::effective_locked`] alongside the
     /// manual [`Self::locked`] flag. Outside the rule's open windows
@@ -1320,6 +1357,9 @@ impl Default for TabState {
             net_allow_domains: Vec::new(),
             net_allow_cidrs: Vec::new(),
             bg_color: None,
+            assignment: None,
+            parent_tab_id: None,
+            rehome_status: None,
             schedule: None,
             limits: TabResourceLimits::default(),
             ssh_agent: None,
@@ -1519,6 +1559,14 @@ pub struct SavedState {
     /// `false` so an unchanged session stays out of the serialized file.
     #[serde(default, skip_serializing_if = "is_false")]
     pub windowed: bool,
+    /// Global read-only share token for the harness dashboard (`GET
+    /// /dashboard`). Unlike the per-tab `share_token_rw/ro`, this one is not
+    /// scoped to a tab — the dashboard is a global, read-only view. Minted
+    /// lazily on the first share-URL request and persisted here so a shared
+    /// link survives a daemon restart. Empty ⇒ never minted (default);
+    /// skipped from JSON so old files stay clean.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub dashboard_share_token: String,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -2053,6 +2101,13 @@ pub struct Preferences {
     /// Mirrored into [`crate::TAB_ENV_GLOBAL`] at startup.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub tab_env: std::collections::BTreeMap<String, String>,
+
+    /// Explicit repo → service-family map for the dashboard (Increment 6 S3):
+    /// e.g. `{"louis": "kalpin"}` folds the `louis` repo into the `kalpin`
+    /// service. Wins over the `prefix-before-first-'-'` heuristic. Empty ⇒
+    /// heuristic only.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub repo_families: std::collections::BTreeMap<String, String>,
     #[serde(
         default,
         deserialize_with = "deserialize_hotkeys",
@@ -3338,6 +3393,20 @@ mod tests {
     }
 
     #[test]
+    fn aligator_resumes_by_relaunch_ignoring_session() {
+        // 🐊 aligator is session-less like brain — auto-resume relaunches it so a
+        // restart doesn't drop it to a shell (deliveries would stall). Session
+        // ignored; plan flag ignored. Nothing else about brain/catbus/claude moves.
+        let cmd = build_agent_resume_command("aligator", "", Some(true)).unwrap();
+        #[cfg(feature = "gui")]
+        assert_eq!(cmd, "tab-atelier aligator");
+        #[cfg(not(feature = "gui"))]
+        assert_eq!(cmd, "tab-atelier-headless aligator");
+        // Guardrail: an unknown kind is still None (no accidental broadening).
+        assert!(build_agent_resume_command("nope", "x", None).is_none());
+    }
+
+    #[test]
     fn wrap_exec_command_prefixes_tracer_when_present() {
         // No tracer, no frames, no title → the plain suffix's exec line.
         assert_eq!(
@@ -3774,6 +3843,7 @@ mod tests {
             ],
             active: 1,
             windowed: false,
+            dashboard_share_token: String::new(),
         };
         let json = serde_json::to_string(&state).unwrap();
         let restored: SavedState = serde_json::from_str(&json).unwrap();
@@ -3801,6 +3871,7 @@ mod tests {
             }],
             active: 0,
             windowed: false,
+            dashboard_share_token: String::new(),
         };
         let json = serde_json::to_string(&state).unwrap();
         assert!(
@@ -3813,6 +3884,129 @@ mod tests {
         // Missing field deserializes to the default (true).
         let restored: SavedState = serde_json::from_str(r#"{"tabs":[{"name":"x","cwd":null}],"active":0}"#).unwrap();
         assert!(restored.tabs[0].colors_enabled);
+    }
+
+    #[test]
+    fn test_tab_state_assignment_round_trip() {
+        // assignment IS persisted (unlike the RAM-only `context`, which isn't
+        // even a TabState field): survives a round-trip, omitted when None.
+        let with = SavedState {
+            tabs: vec![TabState {
+                name: "worker".into(),
+                assignment: Some("kalpin-back:review/reviewer".into()),
+                parent_tab_id: Some("spawner-uuid".into()),
+                rehome_status: Some("safe-to-close".into()),
+                ..Default::default()
+            }],
+            active: 0,
+            windowed: false,
+            dashboard_share_token: String::new(),
+        };
+        let json = serde_json::to_string(&with).unwrap();
+        assert!(
+            json.contains(r#""assignment":"kalpin-back:review/reviewer""#),
+            "assignment must persist: {json}"
+        );
+        assert!(
+            json.contains(r#""parent_tab_id":"spawner-uuid""#),
+            "parent_tab_id must persist too: {json}"
+        );
+        assert!(
+            json.contains(r#""rehome_status":"safe-to-close""#),
+            "rehome_status must persist too: {json}"
+        );
+        let restored: SavedState = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            restored.tabs[0].assignment.as_deref(),
+            Some("kalpin-back:review/reviewer")
+        );
+        assert_eq!(restored.tabs[0].parent_tab_id.as_deref(), Some("spawner-uuid"));
+        assert_eq!(restored.tabs[0].rehome_status.as_deref(), Some("safe-to-close"));
+
+        // None is skipped from the JSON, and old files (no field) load as None.
+        let without = SavedState {
+            tabs: vec![TabState {
+                name: "x".into(),
+                ..Default::default()
+            }],
+            active: 0,
+            windowed: false,
+            dashboard_share_token: String::new(),
+        };
+        let json = serde_json::to_string(&without).unwrap();
+        assert!(!json.contains("assignment"), "None assignment must be skipped: {json}");
+        let restored: SavedState = serde_json::from_str(r#"{"tabs":[{"name":"x","cwd":null}],"active":0}"#).unwrap();
+        assert_eq!(restored.tabs[0].assignment, None);
+    }
+
+    // --- Inc8 S1 (REFINER red): the "agent card" fields — siblings of `assignment`,
+    //     persisted + hook-immune. RED (compile-fail) until the builder adds
+    //     TabState.{specialty, orchestrator, objective, current_task} + append_current_task.
+    #[test]
+    fn agent_card_fields_round_trip() {
+        // specialty/orchestrator/objective OVERWRITE; current_task is a PERMALOG
+        // (append-only phrases → long, token-free memory). All persist to tabs.json;
+        // absent/empty ones are omitted, and old files load them as empty.
+        let with = SavedState {
+            tabs: vec![TabState {
+                name: "worker".into(),
+                specialty: Some("rust async internals".into()),
+                orchestrator: Some("free".into()), // uuid OR the literal "free"
+                objective: Some("land the parser refactor".into()),
+                current_task: vec!["read the plan".into(), "wire the struct".into()],
+                ..Default::default()
+            }],
+            active: 0,
+            windowed: false,
+            dashboard_share_token: String::new(),
+        };
+        let json = serde_json::to_string(&with).unwrap();
+        assert!(json.contains(r#""specialty":"rust async internals""#), "{json}");
+        assert!(json.contains(r#""orchestrator":"free""#), "{json}");
+        assert!(json.contains(r#""objective":"land the parser refactor""#), "{json}");
+        assert!(
+            json.contains(r#""current_task":["read the plan","wire the struct"]"#),
+            "permalog persists in order: {json}"
+        );
+        let restored: SavedState = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.tabs[0].specialty.as_deref(), Some("rust async internals"));
+        assert_eq!(restored.tabs[0].orchestrator.as_deref(), Some("free"));
+        assert_eq!(restored.tabs[0].objective.as_deref(), Some("land the parser refactor"));
+        assert_eq!(
+            restored.tabs[0].current_task,
+            vec!["read the plan".to_string(), "wire the struct".to_string()]
+        );
+
+        // Absent -> omitted from JSON; an old file (no fields) loads as empty.
+        let without = SavedState {
+            tabs: vec![TabState {
+                name: "x".into(),
+                ..Default::default()
+            }],
+            active: 0,
+            windowed: false,
+            dashboard_share_token: String::new(),
+        };
+        let json = serde_json::to_string(&without).unwrap();
+        for k in ["specialty", "orchestrator", "objective", "current_task"] {
+            assert!(!json.contains(k), "empty {k} must be skipped: {json}");
+        }
+        let restored: SavedState = serde_json::from_str(r#"{"tabs":[{"name":"x"}],"active":0}"#).unwrap();
+        assert!(restored.tabs[0].current_task.is_empty(), "old file -> empty permalog");
+        assert_eq!(restored.tabs[0].specialty, None);
+    }
+
+    #[test]
+    fn current_task_permalog_appends_non_empty_phrases() {
+        // `set-current-task "<phrase>"` APPENDS one phrase to the permalog. Empty /
+        // whitespace-only phrases are no-ops so the long memory stays meaningful.
+        let mut log: Vec<String> = Vec::new();
+        append_current_task(&mut log, "read the plan");
+        append_current_task(&mut log, "  wire the struct  "); // trimmed
+        append_current_task(&mut log, "   "); // no-op
+        append_current_task(&mut log, ""); // no-op
+        append_current_task(&mut log, "run the tests");
+        assert_eq!(log, vec!["read the plan", "wire the struct", "run the tests"]);
     }
 
     #[test]
@@ -3830,6 +4024,7 @@ mod tests {
             }],
             active: 0,
             windowed: false,
+            dashboard_share_token: String::new(),
         };
         let json = serde_json::to_string(&state).unwrap();
         let restored: SavedState = serde_json::from_str(&json).unwrap();
@@ -3851,6 +4046,7 @@ mod tests {
             tabs: vec![],
             active: 0,
             windowed: false,
+            dashboard_share_token: String::new(),
         };
         let json = serde_json::to_string(&state).unwrap();
         let restored: SavedState = serde_json::from_str(&json).unwrap();
@@ -3936,6 +4132,7 @@ mod tests {
             }],
             active: 0,
             windowed: false,
+            dashboard_share_token: String::new(),
         };
 
         save_state(&dir, &mk("v1"));
@@ -3979,6 +4176,7 @@ mod tests {
             }],
             active: 0,
             windowed: false,
+            dashboard_share_token: String::new(),
         };
         std::fs::write(sd.join("tabs.json"), "broken json").unwrap();
         std::fs::write(sd.join("tabs.json.bak"), serde_json::to_string(&good).unwrap()).unwrap();
@@ -4020,6 +4218,7 @@ mod tests {
             ],
             active: 1,
             windowed: false,
+            dashboard_share_token: String::new(),
         };
         save_state(&dir, &state);
         let loaded = load_state_from(&dir).expect("should load saved state");
@@ -4058,6 +4257,7 @@ mod tests {
                 tabs: vec![mk("one"), mk("two"), mk("three")],
                 active: 0,
                 windowed: false,
+                dashboard_share_token: String::new(),
             },
         );
         save_tab_output(&dir, "one", "hello from one");
@@ -4273,6 +4473,7 @@ mod tests {
             }],
             active: 0,
             windowed: false,
+            dashboard_share_token: String::new(),
         };
         save_state(&dir, &state);
         assert!(dir.join(format!("{APP_DIR}/tabs.json")).exists());
@@ -4512,6 +4713,7 @@ mod tests {
             }],
             active: 999,
             windowed: false,
+            dashboard_share_token: String::new(),
         };
         let json = serde_json::to_string_pretty(&state).unwrap();
         std::fs::write(sd.join("tabs.json"), json).unwrap();

@@ -161,6 +161,9 @@ pub fn run_peek(args: &[String]) -> i32 {
 /// When no tab matches `key`, or when several tabs share the name `key` (which
 /// index to use is then the caller's to disambiguate).
 pub fn resolve_target<'a>(tabs: &'a [TabView], key: &str) -> Result<&'a TabView, String> {
+    // G2 guardrail: nudge toward the stable UUID when addressed by index (peek /
+    // handoff). Non-blocking — the index still resolves below.
+    crate::cli::share_link::warn_if_index(key);
     let named: Vec<&TabView> = tabs.iter().filter(|t| t.name == key).collect();
     match named.as_slice() {
         [one] => return Ok(one),
@@ -263,6 +266,39 @@ fn blackboard_path() -> PathBuf {
     crate::platform::state_base_dir()
         .join("tab-atelier")
         .join("blackboard.jsonl")
+}
+
+/// The one-line `dispatches`-topic message for a dispatch (PO Q1c).
+///
+/// Makes who-dispatched-what-to-whom visible beyond the private tab input. `to`
+/// is the target uuid/key; the prompt is clipped to ~80 chars with an ellipsis.
+#[must_use]
+pub fn dispatch_note_msg(to: &str, prompt: &str) -> String {
+    let snippet: String = prompt.chars().take(80).collect();
+    let ellipsis = if prompt.chars().count() > 80 { "…" } else { "" };
+    format!("→ {to}: {snippet}{ellipsis}")
+}
+
+/// Best-effort blackboard append that never prints and never fails the caller.
+///
+/// Mirrors a dispatch onto the `dispatches` topic. A racing write stays
+/// line-atomic (append mode); any IO error is silently dropped.
+pub fn note_best_effort(topic: Option<String>, from: Option<String>, msg: &str) {
+    use std::io::Write as _;
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let n = Note {
+        ts,
+        from,
+        topic,
+        msg: msg.to_string(),
+    };
+    let path = blackboard_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = f.write_all(encode_note_line(&n).as_bytes());
+    }
 }
 
 /// One note as a JSONL line (trailing newline included). Never panics — the
@@ -500,6 +536,28 @@ mod tests {
             context: None,
             locked: false,
         }
+    }
+
+    #[test]
+    fn dispatch_note_msg_clips_prompt_to_80_chars() {
+        // Short prompt → verbatim, target first.
+        assert_eq!(dispatch_note_msg("u1", "fix the parser"), "→ u1: fix the parser");
+        // Long prompt → first 80 chars + ellipsis.
+        let long = "x".repeat(200);
+        let msg = dispatch_note_msg("u1", &long);
+        assert!(msg.ends_with('…'), "long prompt gets an ellipsis: {msg}");
+        // "→ u1: " + 80 x's + "…"
+        assert_eq!(
+            msg.chars().filter(|&c| c == 'x').count(),
+            80,
+            "clipped to 80 chars: {msg}"
+        );
+        // Exactly 80 → no ellipsis.
+        let exactly = "y".repeat(80);
+        assert!(
+            !dispatch_note_msg("u1", &exactly).ends_with('…'),
+            "exactly 80 → no ellipsis"
+        );
     }
 
     #[test]
