@@ -982,6 +982,148 @@ pub fn try_acquire_single_instance_lock() -> bool {
     true
 }
 
+/// Inc8 S1 — supervision-rounds status for an agent card.
+///
+/// Are cron rounds (watcher/sage) currently active, and when did the last one
+/// run. Posted via `set-rounds-active`; the S3 web renders it as a badge.
+/// camelCase on the wire.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RoundsActive {
+    pub active: bool,
+    /// Unix-millis of the last round tick. `None` until the first one lands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_round_at: Option<u64>,
+}
+
+/// Bound on the `current_task` permalog (G-b, tichef): the ring keeps only the
+/// last N entries so `TabState` / `/dashboard/state` can't grow without end.
+pub const CURRENT_TASK_LOG_MAX: usize = 50;
+
+/// Append one phrase to a `current_task` permalog (the `set-current-task` core).
+///
+/// Trims the phrase; an empty / whitespace-only phrase is a no-op so the long
+/// memory stays meaningful. Bounds the ring to [`CURRENT_TASK_LOG_MAX`]: once it
+/// overflows, the oldest entries are evicted (entry N+1 pushes out entry 1).
+/// Pure, so the append + eviction are unit-testable without a live tab.
+pub fn append_current_task(log: &mut Vec<String>, phrase: &str) {
+    let p = phrase.trim();
+    if p.is_empty() {
+        return;
+    }
+    log.push(p.to_string());
+    if log.len() > CURRENT_TASK_LOG_MAX {
+        let overflow = log.len() - CURRENT_TASK_LOG_MAX;
+        log.drain(0..overflow);
+    }
+}
+
+// --- Inc8 S4: evaluations schema + auto-improvement TRIGGERS (SCHEMA + SIGNALS
+//     only; the S5 loop lives elsewhere) + generic usage observability.
+
+/// Token cost of the evaluated task (`tokens.{in,out}` on the wire).
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct EvalTokens {
+    pub input: u64,
+    pub out: u64,
+}
+
+/// The three-axis quality score of one evaluation. `errors` is the one the
+/// auto-improvement triggers weigh (see [`avg_trigger`] / [`burst_trigger`]).
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct EvalScores {
+    pub relevance: u32,
+    pub errors: u64,
+    pub omissions: u32,
+}
+
+/// One evaluation record (schema validated by the PO, design tab-atelier-mx#4):
+/// who evaluated, when, which task, its token cost, the scores, a verdict + note.
+/// camelCase on the wire (`taskRef`).
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Evaluation {
+    pub evaluator: String,
+    pub at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_ref: Option<String>,
+    pub tokens: EvalTokens,
+    pub scores: EvalScores,
+    pub verdict: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// Bound on the `evaluations` ring (same G-b lesson as `current_task`): keep only
+/// the last N records so `TabState` / `/dashboard/state` can't grow without end.
+pub const EVALUATIONS_MAX: usize = 50;
+
+/// Append one evaluation record to the bounded ring; the oldest is evicted once
+/// it overflows [`EVALUATIONS_MAX`]. The `set-evaluation` core. Pure + testable.
+pub fn append_evaluation(log: &mut Vec<Evaluation>, ev: Evaluation) {
+    log.push(ev);
+    if log.len() > EVALUATIONS_MAX {
+        let overflow = log.len() - EVALUATIONS_MAX;
+        log.drain(0..overflow);
+    }
+}
+
+/// AVERAGE auto-improvement trigger (S4 SIGNAL, executes nothing).
+///
+/// The S5 action is separate. The budget is **1 error per 1M tokens** since the
+/// last reset; this SIGNALS `true` once `errors_total` exceeds it, i.e. rate >
+/// 1/1M. Exactly at the budget (1 err/1M, 2 err/2M) does NOT trip. Pure —
+/// `errors * 1M` uses saturating math so a pathological count can't overflow.
+#[must_use]
+pub const fn avg_trigger(tokens_total: u64, errors_total: u64) -> bool {
+    errors_total.saturating_mul(1_000_000) > tokens_total
+}
+
+/// BURST auto-improvement trigger (S4 SIGNAL only).
+///
+/// SIGNALS `true` when ≥ 3 errors fall within the last 1M tokens, read
+/// newest-first from the bounded `evaluations` ring: walk records from newest,
+/// summing their errors while the cumulative token cost stays under 1M — errors
+/// older than that window are excluded. Reproducible from the records alone (no
+/// new state). Pure.
+#[must_use]
+pub fn burst_trigger(records: &[Evaluation]) -> bool {
+    const WINDOW: u64 = 1_000_000;
+    let mut cum: u64 = 0;
+    let mut errors: u64 = 0;
+    for r in records.iter().rev() {
+        if cum >= WINDOW {
+            break;
+        }
+        errors += r.scores.errors;
+        cum += r.tokens.input.saturating_add(r.tokens.out);
+    }
+    errors >= 3
+}
+
+/// The `bump-usage` core: increment the usage counter + stamp last-used.
+///
+/// `None` → first use → 1. Returns `(new_count, stamp)`. `now` is injected so the
+/// increment + timestamp are unit-testable without a clock.
+#[must_use]
+pub fn bump_usage(current: Option<u64>, now: u64) -> (u64, u64) {
+    (current.unwrap_or(0).saturating_add(1), now)
+}
+
+/// The `set-conventions` core: parse a comma-separated `.md` list.
+///
+/// Comma-split, each entry trimmed; empty entries (a trailing comma, blanks) are
+/// dropped. This is the DECLARED side only — the declared-vs-existing check is the
+/// convention-auditor's job, not here. Pure + unit-testable.
+#[must_use]
+pub fn parse_conventions(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(String::from)
+        .collect()
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct TabState {
     /// Stable per-tab UUID. Used by the local API
@@ -1100,6 +1242,51 @@ pub struct TabState {
     /// still shows under its project, in the `unmapped` bucket).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assignment: Option<String>,
+
+    // --- Inc8 S1: the "agent card" — siblings of `assignment`, persisted +
+    //     hook-immune, self-declared identity observable in /dashboard/state.
+    /// Hard-wired specialty / prompt focus (`set-specialty`). OVERWRITE. Omitted
+    /// when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub specialty: Option<String>,
+    /// The orchestrator this agent serves: a tab UUID, or the literal `"free"`
+    /// (unassigned → Freelancers band). `set-orchestrator`. OVERWRITE.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestrator: Option<String>,
+    /// The agent's current objective (`set-objective`). OVERWRITE. Omitted unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objective: Option<String>,
+    /// PERMALOG (`set-current-task`): append-only one-line phrases → a long,
+    /// token-free memory re-readable on demand. BOUNDED to the last
+    /// [`CURRENT_TASK_LOG_MAX`] entries ([`append_current_task`]) so it can't
+    /// grow `TabState` / `/dashboard/state` without bound (G-b). Omitted empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub current_task: Vec<String>,
+    /// Whether supervision ROUNDS (crons: watcher/sage) are active for this tab,
+    /// plus when the last round ran. Posted by the round crons via
+    /// `set-rounds-active`. Omitted when never set. (Badge render = S3, web.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rounds_active: Option<RoundsActive>,
+    // --- Inc8 S4: evaluations ring + generic usage observability (persisted).
+    /// Bounded ring of evaluation records ([`append_evaluation`], schema fed to
+    /// the S5 auto-improvement TRIGGERS — [`avg_trigger`]/[`burst_trigger`] —
+    /// which only SIGNAL here). Omitted when empty; old files load empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evaluations: Vec<Evaluation>,
+    /// Generic use counter — bumped by `bump-usage` (brain on each `continue`,
+    /// aligator on each swamp delivery). Omitted when never used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_count: Option<u64>,
+    /// Unix-millis of the last use (`bump-usage` stamp; also the MRU timestamp).
+    /// Persisted (S4) so usage/recency survive a restart. Omitted when never set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<u64>,
+    /// Inc8 fold — the DECLARED conventions: the `.md` files this agent declares
+    /// it follows (`set-conventions`). The declared side of observability (usage
+    /// is the observed side); the declared-vs-existing check is the
+    /// convention-auditor's, not here. Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conventions: Vec<String>,
 
     /// UUID of the tab that spawned this one (`dispatch --new` reads `_TAB_ID`
     /// and posts it). Drives the dashboard's delegation lineage / altitude.
@@ -1358,6 +1545,15 @@ impl Default for TabState {
             net_allow_cidrs: Vec::new(),
             bg_color: None,
             assignment: None,
+            specialty: None,
+            orchestrator: None,
+            objective: None,
+            current_task: Vec::new(),
+            rounds_active: None,
+            evaluations: Vec::new(),
+            usage_count: None,
+            last_used_at: None,
+            conventions: Vec::new(),
             parent_tab_id: None,
             rehome_status: None,
             schedule: None,
@@ -3937,6 +4133,350 @@ mod tests {
         assert!(!json.contains("assignment"), "None assignment must be skipped: {json}");
         let restored: SavedState = serde_json::from_str(r#"{"tabs":[{"name":"x","cwd":null}],"active":0}"#).unwrap();
         assert_eq!(restored.tabs[0].assignment, None);
+    }
+
+    // --- Inc8 S1 (REFINER red): the "agent card" fields — siblings of `assignment`,
+    //     persisted + hook-immune. RED (compile-fail) until the builder adds
+    //     TabState.{specialty, orchestrator, objective, current_task} + append_current_task.
+    #[test]
+    fn agent_card_fields_round_trip() {
+        // specialty/orchestrator/objective OVERWRITE; current_task is a PERMALOG
+        // (append-only phrases → long, token-free memory). All persist to tabs.json;
+        // absent/empty ones are omitted, and old files load them as empty.
+        let with = SavedState {
+            tabs: vec![TabState {
+                name: "worker".into(),
+                specialty: Some("rust async internals".into()),
+                orchestrator: Some("free".into()), // uuid OR the literal "free"
+                objective: Some("land the parser refactor".into()),
+                current_task: vec!["read the plan".into(), "wire the struct".into()],
+                ..Default::default()
+            }],
+            active: 0,
+            windowed: false,
+            dashboard_share_token: String::new(),
+        };
+        let json = serde_json::to_string(&with).unwrap();
+        assert!(json.contains(r#""specialty":"rust async internals""#), "{json}");
+        assert!(json.contains(r#""orchestrator":"free""#), "{json}");
+        assert!(json.contains(r#""objective":"land the parser refactor""#), "{json}");
+        assert!(
+            json.contains(r#""current_task":["read the plan","wire the struct"]"#),
+            "permalog persists in order: {json}"
+        );
+        let restored: SavedState = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.tabs[0].specialty.as_deref(), Some("rust async internals"));
+        assert_eq!(restored.tabs[0].orchestrator.as_deref(), Some("free"));
+        assert_eq!(restored.tabs[0].objective.as_deref(), Some("land the parser refactor"));
+        assert_eq!(
+            restored.tabs[0].current_task,
+            vec!["read the plan".to_string(), "wire the struct".to_string()]
+        );
+
+        // Absent -> omitted from JSON; an old file (no fields) loads as empty.
+        let without = SavedState {
+            tabs: vec![TabState {
+                name: "x".into(),
+                ..Default::default()
+            }],
+            active: 0,
+            windowed: false,
+            dashboard_share_token: String::new(),
+        };
+        let json = serde_json::to_string(&without).unwrap();
+        for k in ["specialty", "orchestrator", "objective", "current_task"] {
+            assert!(!json.contains(k), "empty {k} must be skipped: {json}");
+        }
+        let restored: SavedState = serde_json::from_str(r#"{"tabs":[{"name":"x"}],"active":0}"#).unwrap();
+        assert!(restored.tabs[0].current_task.is_empty(), "old file -> empty permalog");
+        assert_eq!(restored.tabs[0].specialty, None);
+    }
+
+    #[test]
+    fn current_task_permalog_appends_non_empty_phrases() {
+        // `set-current-task "<phrase>"` APPENDS one phrase to the permalog. Empty /
+        // whitespace-only phrases are no-ops so the long memory stays meaningful.
+        let mut log: Vec<String> = Vec::new();
+        append_current_task(&mut log, "read the plan");
+        append_current_task(&mut log, "  wire the struct  "); // trimmed
+        append_current_task(&mut log, "   "); // no-op
+        append_current_task(&mut log, ""); // no-op
+        append_current_task(&mut log, "run the tests");
+        assert_eq!(log, vec!["read the plan", "wire the struct", "run the tests"]);
+    }
+
+    // --- Inc8 S4 (REFINER red): the evaluations SCHEMA + auto-improvement TRIGGERS
+    //     (schema + signals only; the S5 loop is NOT here) + the generic usage
+    //     observability fields. RED (compile-fail) until the builder adds:
+    //       TabState.{evaluations: Vec<Evaluation>, usage_count, last_used_at},
+    //       Evaluation/EvalTokens/EvalScores, EVALUATIONS_MAX + append_evaluation,
+    //       avg_trigger / burst_trigger, bump_usage.
+
+    /// A synthetic evaluation record for the tests below.
+    fn ev(evaluator: &str, at: u64, errors: u64, tok_in: u64, tok_out: u64) -> Evaluation {
+        Evaluation {
+            evaluator: evaluator.into(),
+            at,
+            task_ref: Some("taskRef-1".into()),
+            tokens: EvalTokens {
+                input: tok_in,
+                out: tok_out,
+            },
+            scores: EvalScores {
+                relevance: 8,
+                errors,
+                omissions: 0,
+            },
+            verdict: "ok".into(),
+            note: None,
+        }
+    }
+
+    #[test]
+    fn evaluations_and_usage_round_trip() {
+        // evaluations[] is a BOUNDED ring (same G-b lesson as current_task);
+        // usage_count / last_used_at are generic observability fields. All persist
+        // to tabs.json; empty ring + None usage are omitted (old files load clean).
+        let evals = vec![ev("olympe", 1000, 1, 400_000, 100_000)];
+        let with = SavedState {
+            tabs: vec![TabState {
+                name: "worker".into(),
+                evaluations: evals.clone(),
+                usage_count: Some(7),
+                last_used_at: Some(1_700_000_000_000),
+                ..Default::default()
+            }],
+            active: 0,
+            windowed: false,
+            dashboard_share_token: String::new(),
+        };
+        let json = serde_json::to_string(&with).unwrap();
+        assert!(json.contains(r#""evaluations":[{"#), "evaluations persist: {json}");
+        assert!(
+            json.contains(r#""evaluator":"olympe""#),
+            "record fields persist: {json}"
+        );
+        assert!(json.contains(r#""usage_count":7"#), "usage_count persists: {json}");
+        assert!(
+            json.contains(r#""last_used_at":1700000000000"#),
+            "last_used_at persists: {json}"
+        );
+        let restored: SavedState = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.tabs[0].evaluations, evals);
+        assert_eq!(restored.tabs[0].usage_count, Some(7));
+        assert_eq!(restored.tabs[0].last_used_at, Some(1_700_000_000_000));
+
+        // Empty ring + None usage -> omitted; an old file loads them empty/None.
+        let without = SavedState {
+            tabs: vec![TabState {
+                name: "x".into(),
+                ..Default::default()
+            }],
+            active: 0,
+            windowed: false,
+            dashboard_share_token: String::new(),
+        };
+        let json = serde_json::to_string(&without).unwrap();
+        for k in ["evaluations", "usage_count", "last_used_at"] {
+            assert!(!json.contains(k), "empty {k} must be skipped: {json}");
+        }
+        let restored: SavedState = serde_json::from_str(r#"{"tabs":[{"name":"x"}],"active":0}"#).unwrap();
+        assert!(restored.tabs[0].evaluations.is_empty());
+        assert_eq!(restored.tabs[0].usage_count, None);
+    }
+
+    #[test]
+    fn append_evaluation_bounds_the_ring() {
+        // `set-evaluation` APPENDS one record; the ring keeps only the last
+        // EVALUATIONS_MAX (oldest evicted), like the current_task permalog.
+        let mut log: Vec<Evaluation> = Vec::new();
+        for i in 0..(EVALUATIONS_MAX + 10) {
+            append_evaluation(&mut log, ev("olympe", i as u64, 0, 10, 10));
+        }
+        assert_eq!(log.len(), EVALUATIONS_MAX, "ring bounded to EVALUATIONS_MAX");
+        // Oldest evicted: the surviving window is the last EVALUATIONS_MAX by `at`.
+        assert_eq!(log.first().unwrap().at, 10, "the first 10 were evicted");
+        assert_eq!(log.last().unwrap().at, (EVALUATIONS_MAX + 9) as u64);
+    }
+
+    #[test]
+    fn eval_avg_trigger_on_error_budget() {
+        // avg_trigger: errors exceed the 1-per-1M-tokens budget since the last reset.
+        // SIGNAL only (bool) — it executes nothing (the S5 action is separate).
+        // Exactly at budget (1 error / 1M tokens) does NOT trip.
+        assert!(
+            !avg_trigger(1_000_000, 1),
+            "1 error / 1M tokens is the budget, not over it"
+        );
+        assert!(avg_trigger(1_000_000, 2), "2 errors / 1M -> over budget");
+        assert!(avg_trigger(500_000, 1), "1 error / 500k -> over budget (rate 2/1M)");
+        assert!(!avg_trigger(2_000_000, 2), "2 errors / 2M is exactly the budget");
+        assert!(!avg_trigger(0, 0), "no work, no errors -> no trigger");
+    }
+
+    #[test]
+    fn eval_burst_trigger_three_errors_in_last_1m_tokens() {
+        // burst_trigger: >= 3 errors within the last 1M tokens, read from the
+        // evaluations records (newest-first, windowed by cumulative tokens).
+        // 3 recent records, 1 error each, well within 1M -> trips.
+        let hot = vec![
+            ev("o", 1, 1, 50_000, 50_000),
+            ev("o", 2, 1, 50_000, 50_000),
+            ev("o", 3, 1, 50_000, 50_000),
+        ];
+        assert!(burst_trigger(&hot), "3 errors inside the 1M window -> trigger");
+        // Only 2 errors -> no trip.
+        let two = vec![ev("o", 1, 1, 10, 10), ev("o", 2, 1, 10, 10)];
+        assert!(!burst_trigger(&two), "2 errors -> below the burst threshold");
+        // Old errors fall OUTSIDE the 1M window: 5 errors on the oldest record, but
+        // the three newest (0 errors) already fill the window -> excluded -> no trip.
+        let windowed = vec![
+            ev("o", 1, 5, 100_000, 0), // oldest, beyond the 1M window
+            ev("o", 2, 0, 400_000, 0),
+            ev("o", 3, 0, 400_000, 0),
+            ev("o", 4, 0, 400_000, 0), // newest
+        ];
+        assert!(
+            !burst_trigger(&windowed),
+            "errors older than the last 1M tokens are excluded"
+        );
+        assert!(!burst_trigger(&[]), "no records -> no trigger");
+    }
+
+    #[test]
+    fn bump_usage_increments_and_stamps() {
+        // bump-usage: +1 to the counter and stamp last-used (now injected -> pure).
+        assert_eq!(bump_usage(None, 1000), (1, 1000), "first use: 0 -> 1, stamped");
+        assert_eq!(bump_usage(Some(5), 2000), (6, 2000), "increments + re-stamps");
+    }
+
+    // --- Inc8 FOLD (REFINER red): `conventions` — the DECLARED side (the .md files
+    //     an agent declares it follows; usage is the OBSERVED side). A free Vec<String>;
+    //     the declared-vs-existing check is ta-convention-auditor's job, NOT here.
+    //     RED (compile-fail) until the builder adds TabState.conventions + parse_conventions.
+    #[test]
+    fn conventions_round_trip() {
+        let convs = vec!["AGENTS.md".to_string(), "docs/dashboard.md".to_string()];
+        let with = SavedState {
+            tabs: vec![TabState {
+                name: "worker".into(),
+                conventions: convs.clone(),
+                ..Default::default()
+            }],
+            active: 0,
+            windowed: false,
+            dashboard_share_token: String::new(),
+        };
+        let json = serde_json::to_string(&with).unwrap();
+        assert!(
+            json.contains(r#""conventions":["AGENTS.md","docs/dashboard.md"]"#),
+            "conventions persist in order: {json}"
+        );
+        let restored: SavedState = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.tabs[0].conventions, convs);
+        // Empty -> omitted; an old file loads it empty.
+        let without = SavedState {
+            tabs: vec![TabState {
+                name: "x".into(),
+                ..Default::default()
+            }],
+            active: 0,
+            windowed: false,
+            dashboard_share_token: String::new(),
+        };
+        assert!(
+            !serde_json::to_string(&without).unwrap().contains("conventions"),
+            "empty conventions skipped"
+        );
+        let restored: SavedState = serde_json::from_str(r#"{"tabs":[{"name":"x"}],"active":0}"#).unwrap();
+        assert!(restored.tabs[0].conventions.is_empty());
+    }
+
+    #[test]
+    fn parse_conventions_splits_trims_and_filters() {
+        // `set-conventions <tab> "a.md, b.md"` -> the declared list. Comma-split,
+        // each entry trimmed; empty entries (trailing comma / blanks) dropped.
+        assert_eq!(
+            parse_conventions("AGENTS.md,docs/dashboard.md"),
+            vec!["AGENTS.md", "docs/dashboard.md"]
+        );
+        assert_eq!(
+            parse_conventions("  AGENTS.md ,  CLAUDE.md  "),
+            vec!["AGENTS.md", "CLAUDE.md"],
+            "trimmed"
+        );
+        assert_eq!(
+            parse_conventions("a.md,,b.md,"),
+            vec!["a.md", "b.md"],
+            "empty entries dropped"
+        );
+        assert!(parse_conventions("").is_empty(), "empty string -> no conventions");
+        assert!(parse_conventions("   ,  ").is_empty(), "only-blanks -> no conventions");
+    }
+
+    #[test]
+    fn current_task_permalog_is_bounded_evicting_oldest() {
+        // G-b (tichef): the permalog is a bounded ring — entry N+1 evicts the
+        // oldest, so TabState / /dashboard/state can't grow without end.
+        let mut log: Vec<String> = Vec::new();
+        for i in 0..CURRENT_TASK_LOG_MAX {
+            append_current_task(&mut log, &format!("phrase {i}"));
+        }
+        assert_eq!(log.len(), CURRENT_TASK_LOG_MAX, "fills exactly to the cap");
+        assert_eq!(log.first().map(String::as_str), Some("phrase 0"));
+        // One more past the cap → the oldest is evicted, length stays capped.
+        append_current_task(&mut log, "phrase overflow");
+        assert_eq!(log.len(), CURRENT_TASK_LOG_MAX, "stays bounded after overflow");
+        assert_eq!(log.first().map(String::as_str), Some("phrase 1"), "oldest evicted");
+        assert_eq!(
+            log.last().map(String::as_str),
+            Some("phrase overflow"),
+            "newest kept, in order"
+        );
+        assert!(!log.contains(&"phrase 0".to_string()), "evicted entry is gone");
+    }
+
+    #[test]
+    fn rounds_active_round_trips_in_tab_state() {
+        // The [ajout PO] roundsActive card field: a bool + optional lastRoundAt,
+        // persisted like the other card fields; camelCase on the wire; omitted
+        // when unset (old files load it as None).
+        let with = SavedState {
+            tabs: vec![TabState {
+                name: "orc".into(),
+                rounds_active: Some(RoundsActive {
+                    active: true,
+                    last_round_at: Some(1_724_000_000_000),
+                }),
+                ..Default::default()
+            }],
+            active: 0,
+            windowed: false,
+            dashboard_share_token: String::new(),
+        };
+        let json = serde_json::to_string(&with).unwrap();
+        assert!(
+            json.contains(r#""rounds_active":{"active":true,"lastRoundAt":1724000000000}"#),
+            "{json}"
+        );
+        let restored: SavedState = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            restored.tabs[0].rounds_active,
+            Some(RoundsActive {
+                active: true,
+                last_round_at: Some(1_724_000_000_000)
+            })
+        );
+        // active=false with no timestamp: lastRoundAt is omitted.
+        let inactive = serde_json::to_string(&RoundsActive {
+            active: false,
+            last_round_at: None,
+        })
+        .unwrap();
+        assert_eq!(inactive, r#"{"active":false}"#, "lastRoundAt omitted when None");
+        // Absent on an old file → None.
+        let old: SavedState = serde_json::from_str(r#"{"tabs":[{"name":"x"}],"active":0}"#).unwrap();
+        assert_eq!(old.tabs[0].rounds_active, None);
     }
 
     #[test]

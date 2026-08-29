@@ -155,6 +155,18 @@ struct HeadlessTab {
     parent_tab_id: Option<Arc<str>>,
     /// Re-home progress on a predecessor tab. Persisted like `assignment`.
     rehome_status: Option<Arc<str>>,
+    /// Inc8 S1 agent-card fields — persisted + hook-immune, like `assignment`.
+    specialty: Option<Arc<str>>,
+    orchestrator: Option<Arc<str>>,
+    objective: Option<Arc<str>>,
+    /// Bounded `current_task` permalog (see [`crate::append_current_task`]).
+    current_task: Vec<String>,
+    rounds_active: Option<crate::RoundsActive>,
+    /// Inc8 S4 — bounded evaluations ring + use counter (`last_used_at` is above).
+    evaluations: Vec<crate::Evaluation>,
+    usage_count: Option<u64>,
+    /// Inc8 fold — declared conventions (`.md` list).
+    conventions: Vec<String>,
     pending_agent_resume: Option<String>,
     colors_enabled: bool,
     /// Raw PTY byte ring captured BEFORE alacritty's parser sees the
@@ -749,6 +761,15 @@ fn spawn_pty_tab(
         assignment: None,
         parent_tab_id: None,
         rehome_status: None,
+        // Card fields restored from TabState at the call site (like `assignment`).
+        specialty: None,
+        orchestrator: None,
+        objective: None,
+        current_task: Vec::new(),
+        rounds_active: None,
+        evaluations: Vec::new(),
+        usage_count: None,
+        conventions: Vec::new(),
         pending_agent_resume,
         colors_enabled,
         viewers: viewers_handle,
@@ -924,6 +945,15 @@ pub fn run() -> std::io::Result<()> {
                 t.assignment = ts.assignment.as_deref().map(Arc::from);
                 t.parent_tab_id = ts.parent_tab_id.as_deref().map(Arc::from);
                 t.rehome_status = ts.rehome_status.as_deref().map(Arc::from);
+                t.specialty = ts.specialty.as_deref().map(Arc::from);
+                t.orchestrator = ts.orchestrator.as_deref().map(Arc::from);
+                t.objective = ts.objective.as_deref().map(Arc::from);
+                t.current_task.clone_from(&ts.current_task);
+                t.rounds_active.clone_from(&ts.rounds_active);
+                t.evaluations.clone_from(&ts.evaluations);
+                t.usage_count = ts.usage_count;
+                t.last_used_at = ts.last_used_at;
+                t.conventions.clone_from(&ts.conventions);
                 t.pinned_cols = ts.pinned_cols;
                 t.pinned_rows = ts.pinned_rows;
                 #[cfg(target_os = "linux")]
@@ -1008,6 +1038,7 @@ pub fn run() -> std::io::Result<()> {
         pending_assignment_changes: Vec::new(),
         pending_parent_changes: Vec::new(),
         pending_rehome_changes: Vec::new(),
+        pending_card_changes: Vec::new(),
         pending_token_rotations: Vec::new(),
         pending_schedule_changes: Vec::new(),
         pending_new_tabs: 0,
@@ -1420,6 +1451,14 @@ fn refresh_snapshot(
             // sidecar cache yet) — headless reports None here.
             resident_memory_bytes: crate::agent_probe::sample_tree(tab.pid).map(|s| s.rss_kb.saturating_mul(1024)),
             tokens: None,
+            specialty: tab.specialty.clone(),
+            orchestrator: tab.orchestrator.clone(),
+            objective: tab.objective.clone(),
+            current_task: tab.current_task.clone(),
+            rounds_active: tab.rounds_active.clone(),
+            evaluations: tab.evaluations.clone(),
+            usage_count: tab.usage_count,
+            conventions: tab.conventions.clone(),
         });
     }
     let mut snapshot = api_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1632,6 +1671,15 @@ fn persist(
             schedule: tab.schedule.clone(),
             bg_color: tab.bg_color.clone(),
             assignment: tab.assignment.as_deref().map(str::to_string),
+            specialty: tab.specialty.as_deref().map(str::to_string),
+            orchestrator: tab.orchestrator.as_deref().map(str::to_string),
+            objective: tab.objective.as_deref().map(str::to_string),
+            current_task: tab.current_task.clone(),
+            rounds_active: tab.rounds_active.clone(),
+            evaluations: tab.evaluations.clone(),
+            usage_count: tab.usage_count,
+            last_used_at: tab.last_used_at,
+            conventions: tab.conventions.clone(),
             parent_tab_id: tab.parent_tab_id.as_deref().map(str::to_string),
             rehome_status: tab.rehome_status.as_deref().map(str::to_string),
             limits: tab.limits.clone(),
@@ -1911,6 +1959,7 @@ fn drain_pending(
     let bg_color_changes: Vec<(String, Option<String>)> = s.pending_bg_color_changes.drain(..).collect();
     let context_changes: Vec<(String, Option<String>)> = s.pending_context_changes.drain(..).collect();
     let assignment_changes: Vec<(String, Option<String>)> = s.pending_assignment_changes.drain(..).collect();
+    let card_changes: Vec<(String, crate::api::CardChange)> = s.pending_card_changes.drain(..).collect();
     let parent_changes: Vec<(String, Option<String>)> = s.pending_parent_changes.drain(..).collect();
     let rehome_changes: Vec<(String, Option<String>)> = s.pending_rehome_changes.drain(..).collect();
     let token_rotations: Vec<String> = s.pending_token_rotations.drain(..).collect();
@@ -1940,6 +1989,7 @@ fn drain_pending(
         && bg_color_changes.is_empty()
         && context_changes.is_empty()
         && assignment_changes.is_empty()
+        && card_changes.is_empty()
         && parent_changes.is_empty()
         && rehome_changes.is_empty()
         && token_rotations.is_empty()
@@ -2065,6 +2115,31 @@ fn drain_pending(
     for (tab_id, assignment) in assignment_changes {
         if let Some(t) = tabs.iter_mut().find(|t| *t.id == tab_id) {
             t.assignment = assignment.map(Arc::from);
+        }
+    }
+    // …and the Inc8 agent-card mutations (persisted like assignment). Overwrite
+    // fields set/clear; current-task APPENDS to the bounded permalog; rounds-active
+    // sets the supervision status. (The snapshot mirror was already updated in the
+    // route; this writes the runtime tab so the next persist tick hits tabs.json.)
+    for (tab_id, change) in card_changes {
+        if let Some(t) = tabs.iter_mut().find(|t| *t.id == tab_id) {
+            match change {
+                crate::api::CardChange::Specialty(v) => t.specialty = v.map(Arc::from),
+                crate::api::CardChange::Orchestrator(v) => t.orchestrator = v.map(Arc::from),
+                crate::api::CardChange::Objective(v) => t.objective = v.map(Arc::from),
+                crate::api::CardChange::CurrentTaskAppend(p) => {
+                    crate::append_current_task(&mut t.current_task, &p);
+                }
+                crate::api::CardChange::RoundsActive(ra) => t.rounds_active = Some(ra),
+                crate::api::CardChange::EvaluationAppend(ev) => {
+                    crate::append_evaluation(&mut t.evaluations, ev);
+                }
+                crate::api::CardChange::Usage(count, stamp) => {
+                    t.usage_count = Some(count);
+                    t.last_used_at = Some(stamp);
+                }
+                crate::api::CardChange::Conventions(list) => t.conventions = list,
+            }
         }
     }
     // …and the spawn lineage (`parent_tab_id`), persisted like assignment.

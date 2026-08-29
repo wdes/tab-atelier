@@ -500,6 +500,40 @@ struct DashboardTab {
     led: Option<&'static str>,
     tokens: Option<crate::TokenUsage>,
     viewer_url: String,
+    // --- Inc8 S1: the self-declared agent card (observable by peers + the web).
+    /// Hard-wired specialty / prompt focus. Omitted when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    specialty: Option<String>,
+    /// Orchestrator served (tab UUID or the literal `"free"`). Omitted when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    orchestrator: Option<String>,
+    /// Current objective. Omitted when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    objective: Option<String>,
+    /// The self-declared `current_task` PERMALOG (bounded ring). Exposed as
+    /// `currentTaskLog` — a DISTINCT key from Inc7 S4's transcript-derived
+    /// `currentTask` (observed) so the two don't collide; the declared↔observed
+    /// reconciliation into one field is a later PO decision. Omitted when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    current_task_log: Vec<String>,
+    /// Supervision-rounds status (`roundsActive`). Omitted when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rounds_active: Option<crate::RoundsActive>,
+    // --- Inc8 S4: evaluations ring + generic usage observability.
+    /// The bounded evaluations ring (camelCase records, `taskRef` inside). Omitted
+    /// when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    evaluations: Vec<crate::Evaluation>,
+    /// Generic use counter (`usageCount`). Omitted when never used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage_count: Option<u64>,
+    /// Unix-millis of last use (`lastUsedAt`). Omitted when never set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_used_at: Option<u64>,
+    /// Inc8 fold — DECLARED conventions (`.md` list). Omitted when empty (the web
+    /// flags that emptiness; the daemon just omits it).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    conventions: Vec<String>,
     /// S4: current task + `Task()` sub-agents, read from the tab's transcript.
     /// Flattened → `currentTask` / `subAgents` sit on the tab for `taskChips`.
     /// Empty (`currentTask:null`, `subAgents:[]`) when the tab has no transcript.
@@ -674,6 +708,18 @@ struct DashboardTabInput {
     /// S4 per-tab activity, read from the transcript at the call site (the pure
     /// builder stays FS-free / unit-testable). Empty in tests and headless.
     activity: TabActivity,
+    // Inc8 S1 agent-card fields (self-declared), threaded through to DashboardTab.
+    specialty: Option<String>,
+    orchestrator: Option<String>,
+    objective: Option<String>,
+    current_task: Vec<String>,
+    rounds_active: Option<crate::RoundsActive>,
+    // Inc8 S4: evaluations ring + generic usage observability.
+    evaluations: Vec<crate::Evaluation>,
+    usage_count: Option<u64>,
+    last_used_at: Option<u64>,
+    // Inc8 fold: declared conventions (.md list).
+    conventions: Vec<String>,
 }
 
 /// Rollup severity of a `led` slug — higher is worse. Mirrors [`crate::TabLed`]
@@ -736,6 +782,23 @@ pub const REHOME_STEPS: [RehomeStep; 4] = [
         label: "SAFE À FERMER",
     },
 ];
+
+/// Inc8 S1 — if `p` is a card `set-*` route (`…/specialty`, `…/orchestrator`,
+/// `…/objective`, `…/current-task`, `…/rounds-active`), return
+/// `(url-verb, json-body-key)`; else `None`. Drives the one generic card route.
+fn card_route_verb(p: &str) -> Option<(&'static str, &'static str)> {
+    const VERBS: [(&str, &str); 6] = [
+        ("specialty", "specialty"),
+        ("orchestrator", "orchestrator"),
+        ("objective", "objective"),
+        ("current-task", "current_task"),
+        ("rounds-active", "rounds_active"),
+        ("conventions", "conventions"),
+    ];
+    VERBS
+        .into_iter()
+        .find(|(v, _)| p.strip_suffix(v).is_some_and(|pre| pre.ends_with('/')))
+}
 
 /// Is `s` one of the canonical re-home states? Used to validate `POST …/rehome`.
 #[must_use]
@@ -898,6 +961,15 @@ fn build_dashboard_state(inputs: Vec<DashboardTabInput>) -> DashboardState {
                 led: t.led,
                 tokens: t.tokens,
                 viewer_url,
+                specialty: t.specialty,
+                orchestrator: t.orchestrator,
+                objective: t.objective,
+                current_task_log: t.current_task,
+                rounds_active: t.rounds_active,
+                evaluations: t.evaluations,
+                usage_count: t.usage_count,
+                last_used_at: t.last_used_at,
+                conventions: t.conventions,
                 activity: t.activity,
             };
             Projected { project, phase, tab }
@@ -1162,6 +1234,18 @@ pub struct SnapshotTab {
     /// catbus-agent `tokens.json` sidecar. `None` for non-agent tabs (or
     /// builds without `catbus`). Surfaced as `tokens: {input, output}`.
     pub tokens: Option<crate::TokenUsage>,
+    // --- Inc8 S1 agent card, mirrored from the persisted TabState (hook-immune).
+    pub specialty: Option<std::sync::Arc<str>>,
+    pub orchestrator: Option<std::sync::Arc<str>>,
+    pub objective: Option<std::sync::Arc<str>>,
+    /// The bounded `current_task` permalog (see [`crate::append_current_task`]).
+    pub current_task: Vec<String>,
+    pub rounds_active: Option<crate::RoundsActive>,
+    // Inc8 S4 (last_used_at already lives above as the MRU stamp).
+    pub evaluations: Vec<crate::Evaluation>,
+    pub usage_count: Option<u64>,
+    /// Inc8 fold — declared conventions (`.md` list).
+    pub conventions: Vec<String>,
 }
 
 impl crate::schedule::LockState for SnapshotTab {
@@ -1205,6 +1289,26 @@ pub struct EnvChange {
     pub tab: Option<String>,
     pub set: std::collections::BTreeMap<String, String>,
     pub unset: Vec<String>,
+}
+
+/// Inc8 S1 — one queued agent-card mutation for the owner loop to apply + persist.
+///
+/// Overwrite variants carry `Option<String>` (`None` = clear); `CurrentTaskAppend`
+/// appends one phrase to the bounded permalog ([`crate::append_current_task`]);
+/// `RoundsActive` sets the supervision-rounds status. One enum keeps the owner
+/// drain a single pass (vs a queue per field).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CardChange {
+    Specialty(Option<String>),
+    Orchestrator(Option<String>),
+    Objective(Option<String>),
+    CurrentTaskAppend(String),
+    RoundsActive(crate::RoundsActive),
+    // Inc8 S4: append an evaluation record (bounded ring); bump usage (count+stamp).
+    EvaluationAppend(crate::Evaluation),
+    Usage(u64, u64),
+    // Inc8 fold: OVERWRITE the declared conventions (.md list).
+    Conventions(Vec<String>),
 }
 
 pub struct TabSnapshot {
@@ -1283,6 +1387,12 @@ pub struct TabSnapshot {
     /// (rehome-tab.sh + the old agent's ACK). Mirrored + persisted like
     /// `pending_assignment_changes`.
     pub pending_rehome_changes: Vec<(String, Option<String>)>,
+    /// Inc8 S1 — (`tab_id`, agent-card change) queued by the `set-*` card routes
+    /// (`/specialty`, `/orchestrator`, `/objective`, `/current-task`,
+    /// `/rounds-active`). ONE generic queue (vs a vec per field) so the owner
+    /// loop drains + persists all card mutations in a single pass. Mirrored +
+    /// persisted like `pending_assignment_changes`.
+    pub pending_card_changes: Vec<(String, CardChange)>,
     /// Tab ids whose per-tab share tokens (`share_token_rw`/`_ro`) the
     /// owner loop should clear, queued by `POST /tabs/rotate-tokens`.
     /// Clearing revokes every outstanding share link for that tab (it
@@ -2766,6 +2876,15 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                     led: t.agent_led.map(crate::TabLed::slug),
                     tokens: t.tokens,
                     activity: tab_activity(t.shell_pid),
+                    specialty: t.specialty.as_deref().map(str::to_string),
+                    orchestrator: t.orchestrator.as_deref().map(str::to_string),
+                    objective: t.objective.as_deref().map(str::to_string),
+                    current_task: t.current_task.clone(),
+                    rounds_active: t.rounds_active.clone(),
+                    evaluations: t.evaluations.clone(),
+                    usage_count: t.usage_count,
+                    last_used_at: t.last_used_at,
+                    conventions: t.conventions.clone(),
                 })
                 .collect();
             drop(state);
@@ -4464,6 +4583,130 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             let body = serde_json::to_string(&serde_json::json!({ "rehome_status": rehome_opt })).unwrap_or_default();
             respond_json(stream, 200, &body);
         }
+        // --- Inc8 S1: the agent-card set-* routes. ONE generic handler for the
+        //     five verbs — specialty/orchestrator/objective OVERWRITE (null/empty
+        //     clears), current-task APPENDS to the bounded permalog (empty = no-op),
+        //     rounds-active toggles supervision status (stamps last_round_at when
+        //     active). Each updates the SnapshotTab mirror (so /tabs +
+        //     /dashboard/state reflect at once) AND queues a CardChange the owner
+        //     loop persists to tabs.json. Persisted like /assignment. Master token.
+        ("POST", p) if p.starts_with("/tabs/by-id/") && card_route_verb(p).is_some() => {
+            let (verb, json_key) = card_route_verb(p).unwrap_or(("", ""));
+            let inner = &p["/tabs/by-id/".len()..p.len() - verb.len() - 1];
+            let raw: Option<String> = if body_bytes.is_empty() {
+                None
+            } else {
+                serde_json::from_slice::<serde_json::Value>(&body_bytes)
+                    .ok()
+                    .and_then(|v| v.get(json_key).cloned())
+                    .and_then(|c| {
+                        if c.is_null() {
+                            None
+                        } else {
+                            c.as_str().map(str::to_owned)
+                        }
+                    })
+            };
+            // Same length cap as /assignment / /context.
+            let raw = raw.map(|s| s.chars().take(2000).collect::<String>());
+            let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(idx) = state.tabs.iter().position(|t| &*t.id == inner) else {
+                drop(state);
+                error_json(stream, 404, "tab not found");
+                return;
+            };
+            let tab_id = state.tabs[idx].id.to_string();
+            let change = match verb {
+                "specialty" => {
+                    let v = raw.filter(|s| !s.trim().is_empty());
+                    state.tabs[idx].specialty = v.as_deref().map(std::sync::Arc::from);
+                    CardChange::Specialty(v)
+                }
+                "orchestrator" => {
+                    let v = raw.filter(|s| !s.trim().is_empty());
+                    state.tabs[idx].orchestrator = v.as_deref().map(std::sync::Arc::from);
+                    CardChange::Orchestrator(v)
+                }
+                "objective" => {
+                    let v = raw.filter(|s| !s.trim().is_empty());
+                    state.tabs[idx].objective = v.as_deref().map(std::sync::Arc::from);
+                    CardChange::Objective(v)
+                }
+                "current-task" => {
+                    let Some(phrase) = raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else {
+                        // Empty phrase → no-op (the permalog stays meaningful).
+                        drop(state);
+                        respond_json(stream, 200, r#"{"currentTask":"noop"}"#);
+                        return;
+                    };
+                    crate::append_current_task(&mut state.tabs[idx].current_task, &phrase);
+                    CardChange::CurrentTaskAppend(phrase)
+                }
+                "conventions" => {
+                    // OVERWRITE the declared .md list (empty/None clears it).
+                    let list = raw.as_deref().map(crate::parse_conventions).unwrap_or_default();
+                    state.tabs[idx].conventions.clone_from(&list);
+                    CardChange::Conventions(list)
+                }
+                // rounds-active
+                _ => {
+                    let active = raw.as_deref().is_some_and(|s| matches!(s.trim(), "true" | "1" | "on"));
+                    let ra = crate::RoundsActive {
+                        active,
+                        last_round_at: active.then(crate::unix_millis),
+                    };
+                    state.tabs[idx].rounds_active = Some(ra.clone());
+                    CardChange::RoundsActive(ra)
+                }
+            };
+            state.pending_card_changes.push((tab_id, change));
+            drop(state);
+            respond_json(stream, 200, r#"{"ok":true}"#);
+        }
+        // Inc8 S4: APPEND one evaluation record to the bounded ring. Body = the
+        // Evaluation JSON (schema tab-atelier-mx#4). Updates the SnapshotTab mirror
+        // + queues a CardChange the owner persists. Master token, like /assignment.
+        ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/evaluation") => {
+            let inner = &p["/tabs/by-id/".len()..p.len() - "/evaluation".len()];
+            let Ok(ev) = serde_json::from_slice::<crate::Evaluation>(&body_bytes) else {
+                error_json(stream, 400, "invalid evaluation record");
+                return;
+            };
+            let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(idx) = state.tabs.iter().position(|t| &*t.id == inner) else {
+                drop(state);
+                error_json(stream, 404, "tab not found");
+                return;
+            };
+            let tab_id = state.tabs[idx].id.to_string();
+            crate::append_evaluation(&mut state.tabs[idx].evaluations, ev.clone());
+            state
+                .pending_card_changes
+                .push((tab_id, CardChange::EvaluationAppend(ev)));
+            drop(state);
+            respond_json(stream, 200, r#"{"ok":true}"#);
+        }
+        // Inc8 S4: BUMP the usage counter + stamp last-used (brain on each
+        // `continue`, aligator on each swamp delivery). No body. Increments the
+        // SnapshotTab mirror + queues the resulting absolute (count, stamp).
+        ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/bump-usage") => {
+            let inner = &p["/tabs/by-id/".len()..p.len() - "/bump-usage".len()];
+            let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(idx) = state.tabs.iter().position(|t| &*t.id == inner) else {
+                drop(state);
+                error_json(stream, 404, "tab not found");
+                return;
+            };
+            let tab_id = state.tabs[idx].id.to_string();
+            let (count, stamp) = crate::bump_usage(state.tabs[idx].usage_count, crate::unix_millis());
+            state.tabs[idx].usage_count = Some(count);
+            state.tabs[idx].last_used_at = Some(stamp);
+            state
+                .pending_card_changes
+                .push((tab_id, CardChange::Usage(count, stamp)));
+            drop(state);
+            respond_json(stream, 200, &format!(r#"{{"usageCount":{count}}}"#));
+        }
         ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/input") => {
             let Some((key_raw, is_uuid)) = parse_tab_key(p, "/input") else {
                 error_json(stream, 404, "invalid tab key");
@@ -5348,6 +5591,14 @@ pub fn test_snapshot_tab(id: &str, name: &str) -> SnapshotTab {
         dns_entries: Vec::new(),
         resident_memory_bytes: None,
         tokens: None,
+        specialty: None,
+        orchestrator: None,
+        objective: None,
+        current_task: Vec::new(),
+        rounds_active: None,
+        evaluations: Vec::new(),
+        usage_count: None,
+        conventions: Vec::new(),
     }
 }
 
@@ -5372,6 +5623,7 @@ pub fn test_snapshot(tabs: Vec<SnapshotTab>) -> TabSnapshot {
         pending_assignment_changes: vec![],
         pending_parent_changes: vec![],
         pending_rehome_changes: vec![],
+        pending_card_changes: vec![],
         pending_token_rotations: vec![],
         pending_schedule_changes: vec![],
         pending_new_tabs: 0,
@@ -5476,6 +5728,15 @@ mod tests {
             led,
             tokens: None,
             activity: TabActivity::default(),
+            specialty: None,
+            orchestrator: None,
+            objective: None,
+            current_task: Vec::new(),
+            rounds_active: None,
+            evaluations: Vec::new(),
+            usage_count: None,
+            last_used_at: None,
+            conventions: Vec::new(),
         }
     }
 
@@ -6159,6 +6420,246 @@ mod tests {
         let garbage = parse_tab_activity("not json\n{broken\n{\"type\":\"user\"}\n");
         assert_eq!(garbage.current_task, None);
         assert!(garbage.sub_agents.is_empty());
+    }
+
+    // --- Inc8 S1 (REFINER red): the self-declared agent-card fields ride into
+    //     /dashboard/state on each DashboardTab, camelCase, skipped when empty. RED
+    //     (compile-fail) until the builder threads specialty/orchestrator/objective
+    //     through DashboardTabInput -> DashboardTab.
+    //     NOTE (flagged to PO): the permalog `currentTask` exposure is INTENTIONALLY
+    //     not asserted here — the key already exists on DashboardTab from Inc7 S4
+    //     (transcript-derived TabActivity.current_task). Reconciling the self-declared
+    //     permalog with the transcript-derived field is a PO decision (see ping).
+    #[test]
+    fn dashboard_tab_exposes_agent_card_camelcase() {
+        let input = DashboardTabInput {
+            specialty: Some("rust async internals".into()),
+            orchestrator: Some("free".into()),
+            objective: Some("land the parser refactor".into()),
+            ..dash_input("u1", Some("build/implementer"), Some("working"))
+        };
+        let state = build_dashboard_state(vec![input]);
+        let tab = &node(&state, "build").tabs[0];
+        assert_eq!(tab.specialty.as_deref(), Some("rust async internals"));
+        assert_eq!(tab.orchestrator.as_deref(), Some("free"));
+        assert_eq!(tab.objective.as_deref(), Some("land the parser refactor"));
+        let json = serde_json::to_string(&state).unwrap();
+        for k in ["\"specialty\"", "\"orchestrator\"", "\"objective\""] {
+            assert!(json.contains(k), "camelCase card field {k}: {json}");
+        }
+        // Absent card fields are omitted (skip_serializing_if), so old tabs stay clean.
+        let bare = build_dashboard_state(vec![dash_input("u2", Some("build/implementer"), None)]);
+        let bj = serde_json::to_string(&bare).unwrap();
+        assert!(!bj.contains("\"specialty\""), "absent specialty skipped: {bj}");
+        assert!(!bj.contains("\"objective\""), "absent objective skipped: {bj}");
+    }
+
+    // --- Inc8 S4 (REFINER red): evaluations[] + generic usage fields ride into
+    //     /dashboard/state on each DashboardTab, camelCase, skipped when empty/None.
+    //     RED (compile-fail) until the builder threads evaluations / usage_count /
+    //     last_used_at through DashboardTabInput -> DashboardTab.
+    #[test]
+    fn dashboard_tab_exposes_evaluations_and_usage_camelcase() {
+        let eval = crate::Evaluation {
+            evaluator: "olympe".into(),
+            at: 1000,
+            task_ref: Some("taskRef-1".into()),
+            tokens: crate::EvalTokens {
+                input: 400_000,
+                out: 100_000,
+            },
+            scores: crate::EvalScores {
+                relevance: 8,
+                errors: 1,
+                omissions: 0,
+            },
+            verdict: "ok".into(),
+            note: None,
+        };
+        let input = DashboardTabInput {
+            evaluations: vec![eval],
+            usage_count: Some(7),
+            last_used_at: Some(1_700_000_000_000),
+            ..dash_input("u1", Some("build/implementer"), Some("working"))
+        };
+        let state = build_dashboard_state(vec![input]);
+        let tab = &node(&state, "build").tabs[0];
+        assert_eq!(tab.evaluations.len(), 1);
+        assert_eq!(tab.usage_count, Some(7));
+        let json = serde_json::to_string(&state).unwrap();
+        // camelCase on the wire: evaluations[].taskRef, usageCount, lastUsedAt.
+        for k in ["\"evaluations\"", "\"taskRef\"", "\"usageCount\"", "\"lastUsedAt\""] {
+            assert!(json.contains(k), "camelCase card field {k}: {json}");
+        }
+        // Absent -> omitted, so old tabs stay clean.
+        let bare = build_dashboard_state(vec![dash_input("u2", Some("build/implementer"), None)]);
+        let bj = serde_json::to_string(&bare).unwrap();
+        assert!(!bj.contains("\"evaluations\""), "empty evaluations skipped: {bj}");
+        assert!(!bj.contains("\"usageCount\""), "None usageCount skipped: {bj}");
+    }
+
+    // --- Inc8 FOLD (REFINER red): `conventions` (the DECLARED .md list) rides into
+    //     /dashboard/state on each DashboardTab, camelCase, skipped when empty. RED
+    //     until the builder threads conventions through DashboardTabInput -> DashboardTab.
+    #[test]
+    fn dashboard_tab_exposes_conventions_camelcase() {
+        let input = DashboardTabInput {
+            conventions: vec!["AGENTS.md".into(), "docs/dashboard.md".into()],
+            ..dash_input("u1", Some("build/implementer"), Some("working"))
+        };
+        let state = build_dashboard_state(vec![input]);
+        let tab = &node(&state, "build").tabs[0];
+        assert_eq!(
+            tab.conventions,
+            vec!["AGENTS.md".to_string(), "docs/dashboard.md".to_string()]
+        );
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(json.contains("\"conventions\""), "conventions on the wire: {json}");
+        // Absent -> omitted, so an agent with no declared conventions stays clean
+        // (the WEB flags that emptiness; the daemon just omits it).
+        let bare = build_dashboard_state(vec![dash_input("u2", Some("build/implementer"), None)]);
+        assert!(
+            !serde_json::to_string(&bare).unwrap().contains("\"conventions\""),
+            "empty conventions skipped"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::significant_drop_tightening)] // short-lived test read of the snapshot lock
+    fn set_conventions_route_overwrites_the_declared_list() {
+        // The set-conventions ROUTE: the server parses the comma-list, OVERWRITES
+        // the tab's declared conventions, and queues a CardChange to persist.
+        let (port, state, token) = spawn_server();
+        let body = r#"{"conventions":"AGENTS.md, docs/dashboard.md ,"}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/tab-a/conventions HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 200, "{resp}");
+        let g = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tab = g.tabs.iter().find(|t| &*t.id == "tab-a").expect("tab-a");
+        assert_eq!(
+            tab.conventions,
+            vec!["AGENTS.md".to_string(), "docs/dashboard.md".to_string()],
+            "server parsed/trimmed/overwrote the declared list"
+        );
+        assert!(
+            g.pending_card_changes.iter().any(|(id, _)| id == "tab-a"),
+            "queued to persist"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::significant_drop_tightening)] // short-lived test read of the snapshot lock
+    fn bump_usage_helper_is_the_call_brain_and_aligator_make_on_their_paths() {
+        // WIRING (Inc8 S4): brain bumps on each `continue`, aligator on each swamp
+        // delivery — both by calling `share_link::bump_usage(&ep, uuid)` on their
+        // success paths (one line right after the send). This drives that EXACT
+        // helper against a live server and proves it increments + stamps.
+        let (port, state, token) = spawn_server();
+        let ep = crate::cli::share_link::Endpoint {
+            url: format!("http://127.0.0.1:{port}"),
+            token,
+        };
+        // Read `(usage_count, last_used_at)` for tab-a under a tight lock.
+        let usage = |st: &Arc<Mutex<TabSnapshot>>| {
+            let g = st.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let tab = g.tabs.iter().find(|t| &*t.id == "tab-a").expect("tab-a");
+            (tab.usage_count, tab.last_used_at)
+        };
+        crate::cli::share_link::bump_usage(&ep, "tab-a");
+        let (count, stamp) = usage(&state);
+        assert_eq!(count, Some(1), "first bump: 0 -> 1");
+        assert!(stamp.is_some(), "bump stamps last-used");
+        // A second delivery/nudge bumps again — monotonic usage.
+        crate::cli::share_link::bump_usage(&ep, "tab-a");
+        assert_eq!(usage(&state).0, Some(2), "second bump increments");
+    }
+
+    #[test]
+    #[allow(clippy::significant_drop_tightening)] // short-lived test read of the snapshot lock
+    fn evaluation_route_appends_record_and_bump_route_increments() {
+        // The set-evaluation / bump-usage ROUTES end-to-end: appending an
+        // Evaluation lands in the tab's bounded ring, and bump-usage increments.
+        let (port, state, token) = spawn_server();
+        let ev = r#"{"evaluator":"olympe","at":1000,"tokens":{"input":400000,"out":100000},"scores":{"relevance":8,"errors":1,"omissions":0},"verdict":"ok"}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/tab-a/evaluation HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{ev}",
+                ev.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 200, "{resp}");
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/tab-a/bump-usage HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\n\r\n"
+            ),
+        );
+        assert_eq!(status_code(&resp), 200, "{resp}");
+        let g = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tab = g.tabs.iter().find(|t| &*t.id == "tab-a").expect("tab-a");
+        assert_eq!(tab.evaluations.len(), 1, "evaluation appended to the ring");
+        assert_eq!(tab.evaluations[0].evaluator, "olympe");
+        assert_eq!(tab.usage_count, Some(1), "bump-usage route increments");
+        assert!(tab.last_used_at.is_some());
+        // A CardChange was queued for the owner to persist (both routes).
+        assert!(
+            g.pending_card_changes.iter().any(|(id, _)| id == "tab-a"),
+            "card changes queued for persistence"
+        );
+    }
+
+    #[test]
+    fn dashboard_tab_exposes_current_task_log_bounded_and_rounds_active() {
+        // My adds on top of the refiner reds: the self-declared permalog is
+        // exposed as `currentTaskLog` (a DISTINCT camelCase key from Inc7 S4's
+        // transcript-derived `currentTask`, so they don't collide), BOUNDED to
+        // the ring the input already carries; and `roundsActive` rides along.
+        let mut log: Vec<String> = Vec::new();
+        for i in 0..(crate::CURRENT_TASK_LOG_MAX + 5) {
+            crate::append_current_task(&mut log, &format!("step {i}"));
+        }
+        let input = DashboardTabInput {
+            current_task: log,
+            rounds_active: Some(crate::RoundsActive {
+                active: true,
+                last_round_at: Some(1_724_000_000_000),
+            }),
+            ..dash_input("u1", Some("build/implementer"), Some("working"))
+        };
+        let state = build_dashboard_state(vec![input]);
+        let tab = &node(&state, "build").tabs[0];
+        // Exposed bounded (the input ring was already capped by append_current_task).
+        assert_eq!(
+            tab.current_task_log.len(),
+            crate::CURRENT_TASK_LOG_MAX,
+            "exposure is bounded"
+        );
+        assert_eq!(tab.current_task_log.last().map(String::as_str), Some("step 54"));
+        assert!(!tab.current_task_log.contains(&"step 0".to_string()), "oldest evicted");
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(json.contains("\"currentTaskLog\""), "camelCase currentTaskLog: {json}");
+        assert!(json.contains("\"roundsActive\""), "camelCase roundsActive: {json}");
+        assert!(
+            json.contains("\"lastRoundAt\":1724000000000"),
+            "roundsActive inner camelCase: {json}"
+        );
+        // Inc7 S4's transcript `currentTask` key is untouched (no collision): the
+        // permalog rides on the distinct `currentTaskLog` key.
+        assert!(
+            json.contains("\"currentTask\""),
+            "Inc7 S4 currentTask still present: {json}"
+        );
+        // Absent card → both keys omitted.
+        let bare = build_dashboard_state(vec![dash_input("u2", Some("build/implementer"), None)]);
+        let bj = serde_json::to_string(&bare).unwrap();
+        assert!(!bj.contains("\"currentTaskLog\""), "absent permalog skipped: {bj}");
+        assert!(!bj.contains("\"roundsActive\""), "absent roundsActive skipped: {bj}");
     }
 
     #[test]
