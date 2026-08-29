@@ -1110,6 +1110,20 @@ pub fn bump_usage(current: Option<u64>, now: u64) -> (u64, u64) {
     (current.unwrap_or(0).saturating_add(1), now)
 }
 
+/// The `set-conventions` core: parse a comma-separated `.md` list.
+///
+/// Comma-split, each entry trimmed; empty entries (a trailing comma, blanks) are
+/// dropped. This is the DECLARED side only — the declared-vs-existing check is the
+/// convention-auditor's job, not here. Pure + unit-testable.
+#[must_use]
+pub fn parse_conventions(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(String::from)
+        .collect()
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct TabState {
     /// Stable per-tab UUID. Used by the local API
@@ -1267,6 +1281,12 @@ pub struct TabState {
     /// Persisted (S4) so usage/recency survive a restart. Omitted when never set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_used_at: Option<u64>,
+    /// Inc8 fold — the DECLARED conventions: the `.md` files this agent declares
+    /// it follows (`set-conventions`). The declared side of observability (usage
+    /// is the observed side); the declared-vs-existing check is the
+    /// convention-auditor's, not here. Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conventions: Vec<String>,
 
     /// UUID of the tab that spawned this one (`dispatch --new` reads `_TAB_ID`
     /// and posts it). Drives the dashboard's delegation lineage / altitude.
@@ -1533,6 +1553,7 @@ impl Default for TabState {
             evaluations: Vec::new(),
             usage_count: None,
             last_used_at: None,
+            conventions: Vec::new(),
             parent_tab_id: None,
             rehome_status: None,
             schedule: None,
