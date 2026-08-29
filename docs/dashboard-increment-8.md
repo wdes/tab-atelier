@@ -20,6 +20,12 @@ Champs additionnels au `TabState` (persistants, hook-immune, camelCase dans `/da
 - **[G-b, garde-fou tichef] BORNER le permalog** : `currentTask` = **ring des N dernières entrées**
   (défaut ~50, configurable) OU cap taille — sinon `TabState` + `/dashboard/state` gonflent sans fin
   (même leçon que la compaction aligator). L'entrée courante + un historique borné, exposé borné.
+- **[ajout PO] `roundsActive`** : indique si des **rondes (crons)** sont actives pour un orchestrateur —
+  bool + horodatage `lastRoundAt` (ou compteur). Posé déterministe via `set-rounds-active` (miroir des
+  `set-*`), exposé `/dashboard/state`. **Le champ + set-* + expo = S1** ; le rendu **pastille = S3**
+  (vert = rondes actives / gris = aucune). Wiring : les crons de ronde (watcher/sage) appellent
+  `set-rounds-active` à chaque tic (petite intégration S1/S2a). Sert l'inter-observabilité (voir
+  d'un coup d'œil qui est supervisé).
 - Sous-commandes `set-*` déterministes (miroir `set-assignment`) + expo dans `DashboardTab`.
 - **Fallback** : champs absents → vides, zéro régression Inc5/6/7.
 - Web : rendre `objective` / `currentTask` / badge **« libre »** (orchestrator=free) sur la carte.
@@ -44,6 +50,8 @@ TDD : parse/round-trip des champs (pur) + accept écran.
 ### S3 — Vue « carte d'agent » au clic droit + méta-trio [web]
 - **Clic droit sur un agent** → affiche sa **carte complète** (specialty, orchestrator, objective,
   currentTask, evaluations, evalCriteria). Orchestrateurs = carte aussi.
+- **Pastille `roundsActive`** [ajout PO] sur la carte de l'orchestrateur : **vert** = rondes actives /
+  **gris** = aucune (champ posé en S1).
 - **Méta = trio** : `tichef` (probabiliste) + **Brain** (déterministe anti-freeze) + **aligator**
   (assistant déterministe/gating). tichef remplit les cartes de Brain + aligator (daemons). Les
   afficher en Méta rend leur **statut GUI-visible + observable par les agents**.
