@@ -1018,6 +1018,98 @@ pub fn append_current_task(log: &mut Vec<String>, phrase: &str) {
     }
 }
 
+// --- Inc8 S4: evaluations schema + auto-improvement TRIGGERS (SCHEMA + SIGNALS
+//     only; the S5 loop lives elsewhere) + generic usage observability.
+
+/// Token cost of the evaluated task (`tokens.{in,out}` on the wire).
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct EvalTokens {
+    pub input: u64,
+    pub out: u64,
+}
+
+/// The three-axis quality score of one evaluation. `errors` is the one the
+/// auto-improvement triggers weigh (see [`avg_trigger`] / [`burst_trigger`]).
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct EvalScores {
+    pub relevance: u32,
+    pub errors: u64,
+    pub omissions: u32,
+}
+
+/// One evaluation record (schema validated by the PO, design tab-atelier-mx#4):
+/// who evaluated, when, which task, its token cost, the scores, a verdict + note.
+/// camelCase on the wire (`taskRef`).
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Evaluation {
+    pub evaluator: String,
+    pub at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_ref: Option<String>,
+    pub tokens: EvalTokens,
+    pub scores: EvalScores,
+    pub verdict: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// Bound on the `evaluations` ring (same G-b lesson as `current_task`): keep only
+/// the last N records so `TabState` / `/dashboard/state` can't grow without end.
+pub const EVALUATIONS_MAX: usize = 50;
+
+/// Append one evaluation record to the bounded ring; the oldest is evicted once
+/// it overflows [`EVALUATIONS_MAX`]. The `set-evaluation` core. Pure + testable.
+pub fn append_evaluation(log: &mut Vec<Evaluation>, ev: Evaluation) {
+    log.push(ev);
+    if log.len() > EVALUATIONS_MAX {
+        let overflow = log.len() - EVALUATIONS_MAX;
+        log.drain(0..overflow);
+    }
+}
+
+/// AVERAGE auto-improvement trigger (S4 SIGNAL, executes nothing).
+///
+/// The S5 action is separate. The budget is **1 error per 1M tokens** since the
+/// last reset; this SIGNALS `true` once `errors_total` exceeds it, i.e. rate >
+/// 1/1M. Exactly at the budget (1 err/1M, 2 err/2M) does NOT trip. Pure —
+/// `errors * 1M` uses saturating math so a pathological count can't overflow.
+#[must_use]
+pub const fn avg_trigger(tokens_total: u64, errors_total: u64) -> bool {
+    errors_total.saturating_mul(1_000_000) > tokens_total
+}
+
+/// BURST auto-improvement trigger (S4 SIGNAL only).
+///
+/// SIGNALS `true` when ≥ 3 errors fall within the last 1M tokens, read
+/// newest-first from the bounded `evaluations` ring: walk records from newest,
+/// summing their errors while the cumulative token cost stays under 1M — errors
+/// older than that window are excluded. Reproducible from the records alone (no
+/// new state). Pure.
+#[must_use]
+pub fn burst_trigger(records: &[Evaluation]) -> bool {
+    const WINDOW: u64 = 1_000_000;
+    let mut cum: u64 = 0;
+    let mut errors: u64 = 0;
+    for r in records.iter().rev() {
+        if cum >= WINDOW {
+            break;
+        }
+        errors += r.scores.errors;
+        cum += r.tokens.input.saturating_add(r.tokens.out);
+    }
+    errors >= 3
+}
+
+/// The `bump-usage` core: increment the usage counter + stamp last-used.
+///
+/// `None` → first use → 1. Returns `(new_count, stamp)`. `now` is injected so the
+/// increment + timestamp are unit-testable without a clock.
+#[must_use]
+pub fn bump_usage(current: Option<u64>, now: u64) -> (u64, u64) {
+    (current.unwrap_or(0).saturating_add(1), now)
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct TabState {
     /// Stable per-tab UUID. Used by the local API
@@ -1161,6 +1253,20 @@ pub struct TabState {
     /// `set-rounds-active`. Omitted when never set. (Badge render = S3, web.)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rounds_active: Option<RoundsActive>,
+    // --- Inc8 S4: evaluations ring + generic usage observability (persisted).
+    /// Bounded ring of evaluation records ([`append_evaluation`], schema fed to
+    /// the S5 auto-improvement TRIGGERS — [`avg_trigger`]/[`burst_trigger`] —
+    /// which only SIGNAL here). Omitted when empty; old files load empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evaluations: Vec<Evaluation>,
+    /// Generic use counter — bumped by `bump-usage` (brain on each `continue`,
+    /// aligator on each swamp delivery). Omitted when never used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_count: Option<u64>,
+    /// Unix-millis of the last use (`bump-usage` stamp; also the MRU timestamp).
+    /// Persisted (S4) so usage/recency survive a restart. Omitted when never set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<u64>,
 
     /// UUID of the tab that spawned this one (`dispatch --new` reads `_TAB_ID`
     /// and posts it). Drives the dashboard's delegation lineage / altitude.
@@ -1424,6 +1530,9 @@ impl Default for TabState {
             objective: None,
             current_task: Vec::new(),
             rounds_active: None,
+            evaluations: Vec::new(),
+            usage_count: None,
+            last_used_at: None,
             parent_tab_id: None,
             rehome_status: None,
             schedule: None,
