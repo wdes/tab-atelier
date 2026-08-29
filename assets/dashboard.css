@@ -617,3 +617,16 @@ body.band-view { min-height: calc(100vh + 180px); }
 .agent-card-inline { display: block; margin-top: 0.15rem; font-size: 0.64rem; color: var(--muted); }
 .agent-card-inline .agent-objective { display: block; }
 .agent-card-inline .agent-task { display: block; font-style: italic; }
+
+/* --- Inc8 S4: card evaluations trigger indicator --- */
+.eval-trigger {
+  font-size: 0.62rem; padding: 0 0.35rem; border-radius: 999px;
+  color: var(--muted); border: 1px solid var(--border);
+}
+.eval-trigger.armed {
+  color: var(--led-error-stroke);
+  border-color: var(--led-error-stroke);
+  background: color-mix(in srgb, var(--led-error-stroke) 14%, transparent);
+  font-weight: 600;
+}
+.agent-card .ac-scores { color: var(--muted); font-size: 0.72rem; }
