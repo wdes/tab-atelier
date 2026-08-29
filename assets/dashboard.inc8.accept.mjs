@@ -73,8 +73,14 @@ async function main() {
   // Objective + latest currentTask are shown ON the card.
   const objText = await page.locator(`${free} .agent-objective`).first().textContent().catch(() => "");
   ok("Inc8-S1: the card shows the objective", /land the parser refactor/.test(objText || ""), `objective=${objText}`);
-  const taskText = await page.locator(`${free} .agent-task`).first().textContent().catch(() => "");
-  ok("Inc8-S1: the card shows the latest currentTask phrase", /run the tests/.test(taskText || ""), `task=${taskText}`);
+  // The currentTask is NOT dumped inline anymore (kept the band compact): its latest
+  // permalog phrase shows in the grey `.task-chip` pill (truncated), full on hover (title=).
+  const taskChip = page.locator(`${free} .task-chip`).first();
+  const taskText = await taskChip.textContent().catch(() => "");
+  ok("Inc8-S1: the latest currentTask phrase shows in the grey pill", /run the tests/.test(taskText || ""), `task=${taskText}`);
+  const taskTitle = await taskChip.getAttribute("title").catch(() => "");
+  ok("Inc8-S1: the pill exposes the full task on hover (title)", /current task : .*run the tests/.test(taskTitle || ""), `title=${taskTitle}`);
+  ok("Inc8-S1: the currentTask is NOT dumped as a full inline block", (await page.locator(`${free} .agent-task`).count()) === 0);
   // The 'libre' badge fires for orchestrator === "free".
   const badge = await page.locator(`${free} .free-badge`).first().textContent().catch(() => "");
   ok("Inc8-S1: a 'libre' badge is shown for a free agent", /libre/i.test(badge || ""), `badge=${badge}`);

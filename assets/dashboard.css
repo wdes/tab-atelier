@@ -615,8 +615,10 @@ body.band-view { min-height: calc(100vh + 180px); }
   color: var(--led-working-stroke);
 }
 .agent-card-inline { display: block; margin-top: 0.15rem; font-size: 0.64rem; color: var(--muted); }
-.agent-card-inline .agent-objective { display: block; }
-.agent-card-inline .agent-task { display: block; font-style: italic; }
+/* Objective = one compact line (ellipsis), full text on hover (title=). The
+   currentTask is no longer rendered inline — it lives in the `.task-chip` pill
+   (hover-full) + the right-click card. Keeps the band an at-a-glance overview. */
+.agent-card-inline .agent-objective { display: block; max-width: 22ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* --- Inc8 S4: card evaluations trigger indicator --- */
 .eval-trigger {
