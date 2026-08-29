@@ -17,18 +17,29 @@ Champs additionnels au `TabState` (persistants, hook-immune, camelCase dans `/da
 - `specialty` (prompt/spécialité inscrit dans le dur), `orchestrator` (uuid ou `free`),
   `objective` (objectif courant), `currentTask` (**permalog** : une phrase, appendée → mémoire longue
   token-free relisible à la demande).
+- **[G-b, garde-fou tichef] BORNER le permalog** : `currentTask` = **ring des N dernières entrées**
+  (défaut ~50, configurable) OU cap taille — sinon `TabState` + `/dashboard/state` gonflent sans fin
+  (même leçon que la compaction aligator). L'entrée courante + un historique borné, exposé borné.
 - Sous-commandes `set-*` déterministes (miroir `set-assignment`) + expo dans `DashboardTab`.
 - **Fallback** : champs absents → vides, zéro régression Inc5/6/7.
 - Web : rendre `objective` / `currentTask` / badge **« libre »** (orchestrator=free) sur la carte.
 TDD : parse/round-trip des champs (pur) + accept écran.
 
-### S2 — `free-bot` + enforcement déterministe [bash + hook]
+### S2a — `free-bot.sh` (sûr) [bash]
 - **`~/Dev/Botmox/free-bot.sh`** (modèle `spawn-bot.sh`, déterministe, 0 token agent) : pose/relâche
   l'assignment + les champs carte ; `free-bot <uuid> free` → déclare libre, retour bande Freelancers.
-- **Hook BLOQUANT** (modèle G1 pre-push) : refuse une action d'agent sans assignment (one-time,
-  quasi gratuit). PAS de nudge (récurrent, coûteux).
 - **Check de fraîcheur** : FLAGGE sur le dashboard (lecture déterministe, **token-free**) un
   objectif/tâche périmé — PAS de dispatch auto (réservé au jugement de l'orchestrateur).
+
+### S2b — Hook BLOQUANT (slice à RISQUE, gate séparé) [hook]
+> **[G-a, garde-fou tichef — CRITIQUE]** La slice la plus dangereuse : un hook fail-CLOSED sur SON
+> PROPRE bug = **freeze flotte entière** (on sort à peine du brain-freeze). Exigences NON négociables :
+- **(1) FAIL-OPEN sur sa propre erreur** : si le check d'assignment lui-même échoue → **laisse passer**,
+  ne bloque JAMAIS sur un bug interne. (défaut = autoriser.)
+- **(2) Opt-out env** : une var (modèle `KALPIN_ROOT_SESSION` block→ask) désarme/adoucit le hook.
+- **(3) Scope PRÉCIS** : refuser une **action d'agent sans assignment**, PAS chaque appel d'outil.
+- Modèle G1 pre-push (one-time, quasi gratuit). PAS de nudge (récurrent, coûteux).
+- **Gate séparé** : ne pas merger S2b sans validation explicite (tichef/PO) — risque flotte.
 
 ### S3 — Vue « carte d'agent » au clic droit + méta-trio [web]
 - **Clic droit sur un agent** → affiche sa **carte complète** (specialty, orchestrator, objective,
@@ -42,6 +53,11 @@ TDD : parse/round-trip des champs (pur) + accept écran.
   scores:{relevance,errors,omissions}, verdict, note }`. Exposé `/dashboard/state`.
 - **Seuil** : max **1 erreur / 1 M tokens** (`errorRate = errors/(tokens.in+out)`). **2ᵉ erreur dans
   la fenêtre → déclenche l'auto-amélioration** (S5).
+- **[G-c, garde-fou tichef] Fenêtre DÉTERMINISTE (reproductible)** : compteurs `(tokens, errors)`
+  **depuis le dernier reset** = spawn OU dernière auto-amélioration (aligné sur la RAZ de C.3.b).
+  Budget = **1 erreur par tranche de 1 M tokens entamée** dans l'époque ; déclenchement quand
+  `errors` dépasse le budget (à <1 M tokens : budget=1 → la 2ᵉ erreur déclenche). Pas de fenêtre
+  glissante (éviterait de stocker un stamp par erreur) — reset-époque, 2 compteurs, reproductible.
 - `evalCriteria` co-définis (agent + orchestrateur), **validés par Olympe** (nouvel agent neutre,
   ni Joséphine/trust ni le sage/handbook).
 
@@ -53,7 +69,8 @@ TDD : parse/round-trip des champs (pur) + accept écran.
 4. Handoff → auto-rehome → déclaration `free` → bande Freelancers.
 
 ## Ordre & intégration
-S1 (carte base) → S2 (free-bot + hook) → S3 (clic droit + méta-trio) — cœur ; puis S4 (évals + Olympe),
-S5 (libération). Web sur `feat/hd-web` (resync d'abord), rust sur `feat/harness-dashboard`. TDD strict
-(coverage-first). Non-régression Inc5/6/7 verte. Intégration = merge `feat/hd-web` → `feat/harness-dashboard`,
-puis `mx/live` au déploiement.
+S1 (carte base) → **S2a (free-bot, sûr)** → S3 (clic droit + méta-trio) — cœur ; puis **S2b (hook
+bloquant, gate séparé — risque flotte, G-a)**, S4 (évals + Olympe), S5 (libération). Web sur
+`feat/hd-web` (resync d'abord), rust sur `feat/harness-dashboard`. TDD strict (coverage-first).
+Non-régression Inc5/6/7 verte. Intégration = merge `feat/hd-web` → `feat/harness-dashboard`, puis
+`mx/live` au déploiement. **S2b ne merge pas sans validation explicite tichef/PO.**
