@@ -117,6 +117,19 @@ async function main() {
     const expanded = (await page.locator("#agent-card").textContent().catch(() => "")) || "";
     ok("Inc9-(2): clicking 'voir plus' expands to the FULL text", /detail55/.test(expanded), "detail55 must appear after expand");
     ok("Inc9-(2): the card stays open after 'voir plus' (not closed)", await page.locator("#agent-card").isVisible().catch(() => false));
+    // ---- Inc9 (3): open the agent's tab in the browser (remote viewer).
+    ok("Inc9-(3): the card shows a ↗ open-tab button", (await page.locator("#agent-card .ac-open").count()) >= 1);
+    await page.evaluate(() => { window.__opened = []; });
+    await page.locator("#agent-card .ac-open").first().click().catch(() => {});
+    await page.waitForTimeout(120);
+    const openedByBtn = await page.evaluate(() => window.__opened.slice());
+    ok("Inc9-(3): clicking ↗ opens the agent's viewer URL in a new tab", openedByBtn.some((u) => /\/tabs\/by-id\/w1\/view/.test(u)), `opened=${JSON.stringify(openedByBtn)}`);
+    // Right-click on a FREE ZONE of the card (the name area, not a button) also opens it.
+    await page.evaluate(() => { window.__opened = []; });
+    await page.locator("#agent-card .ac-name").click({ button: "right" }).catch(() => {});
+    await page.waitForTimeout(120);
+    const openedByRclick = await page.evaluate(() => window.__opened.slice());
+    ok("Inc9-(3): right-click on the card free zone opens the remote tab", openedByRclick.some((u) => /\/tabs\/by-id\/w1\/view/.test(u)), `opened=${JSON.stringify(openedByRclick)}`);
   }
   // An ORCHESTRATOR gets a card too.
   await page.locator('[data-tab-id="o1"]').click({ button: "right" }).catch(() => {});

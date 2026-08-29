@@ -1267,7 +1267,14 @@ function agentCardHtml(tab) {
     rows.push(`<div class="ac-row"><span class="ac-key">roundsActive</span> ${roundsPill(tab).active ? "active" : "idle"}</div>`);
   }
   const name = tab && tab.name ? tab.name : "agent";
-  return `<button class="ac-close" title="close" aria-label="close">×</button><div class="ac-name">${escapeHtml(name)}</div>${rows.join("")}`;
+  // Inc9 (3): restore "open the agent's tab in the browser". The viewerUrl is
+  // relative, so window.open resolves it against the CURRENT origin — when the
+  // dashboard is viewed over the LAN/remote share URL, that IS the remote link.
+  const viewer = tab && tab.viewerUrl ? tab.viewerUrl : "";
+  const openLink = viewer
+    ? ` <button class="ac-open" data-viewer="${escapeHtml(viewer)}" title="ouvrir l'onglet dans le navigateur (lien distant)" aria-label="ouvrir l'onglet dans le navigateur">↗</button>`
+    : "";
+  return `<button class="ac-close" title="close" aria-label="close">×</button><div class="ac-name">${escapeHtml(name)}${openLink}</div>${rows.join("")}`;
 }
 
 function openAgentCard(id) {
@@ -1275,6 +1282,10 @@ function openAgentCard(id) {
   const tab = bandTabById.get(id);
   if (!el || !tab) return;
   el.innerHTML = agentCardHtml(tab);
+  // Inc9 (3): carry the tab's viewer URL on the popup root so a right-click on a
+  // FREE ZONE of the card opens the remote tab (via the contextmenu → openViewerFrom
+  // path); the visible ↗ button is the discoverable equivalent.
+  if (tab.viewerUrl) el.dataset.viewer = tab.viewerUrl; else delete el.dataset.viewer;
   el.hidden = false;
 }
 
@@ -1418,12 +1429,22 @@ function bootstrap() {
   document.addEventListener("contextmenu", (e) => {
     const node = e.target.closest && e.target.closest(".band-node[data-tab-id]");
     if (node && node.dataset.tabId) { openAgentCard(node.dataset.tabId); e.preventDefault(); return; }
+    // Inc9 (3): right-click on a FREE ZONE of the open agent-card (not its buttons)
+    // opens the agent's tab in the browser (remote viewer).
+    const card = e.target.closest && e.target.closest("#agent-card[data-viewer]");
+    if (card && !(e.target.closest && e.target.closest(".ac-close, .ac-more, .ac-open"))) {
+      const u = card.getAttribute("data-viewer");
+      if (u) { window.open(viewerUrlWithToken(u, TOKEN), "_blank", "noopener"); e.preventDefault(); return; }
+    }
     if (openViewerFrom(e.target)) e.preventDefault();
   });
   // Close the agent-card: its × button, Escape, or a click outside it.
   document.addEventListener("click", (e) => {
     const el = document.getElementById("agent-card");
     if (!el || el.hidden) return;
+    // Inc9 (3): the ↗ button opens the agent's tab in a new browser (remote viewer).
+    const open = e.target.closest && e.target.closest(".ac-open");
+    if (open) { const u = open.getAttribute("data-viewer"); if (u) window.open(viewerUrlWithToken(u, TOKEN), "_blank", "noopener"); return; }
     // Inc9 (2): 'voir plus' expands the clipped field in place (safe text swap), and
     // must NOT close the card — handle it before the close logic.
     const more = e.target.closest && e.target.closest(".ac-more");
