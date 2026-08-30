@@ -151,4 +151,22 @@ assert.equal(typeof dash.clipWords, "function", "Inc9-(2): export clipWords(text
   assert.equal(bl.workers.filter((t) => supporters.some((s) => s.id === t.id)).length, 0, "Inc9 (4): idle supporters are not Workers");
 }
 
+// Inc9 (précédence supporter > parentTabId) : un supporter fleet-wide qui a une ARÊTE
+// parent (dispatch-dérivée) vers un orchestrateur doit RESTER en bande Supporters, PAS
+// nicher comme son worker. + Olympe (review/evaluator) est un supporter.
+{
+  assert.equal(dash.resolveAltitude({ assignment: "review/evaluator" }).band, "supporter",
+    "Inc9: review/evaluator (Olympe) -> Supporters band");
+  const lead = { id: "L", name: "ta-lead", role: "orchestrator", assignment: "repoA:build/orchestrator" };
+  // supporters AVEC une arête parent (parentTabId=L) et/ou orchestrator=L vers le lead :
+  const supWithParent = { id: "jo", name: "Joséphine", assignment: "meta/guardian", parentTabId: "L" };
+  const supWithOrch = { id: "ol", name: "Olympe", assignment: "review/evaluator", orchestrator: "L" };
+  const realWorker = { id: "w", name: "ta-w", role: "implementer", assignment: "repoA:build/impl", parentTabId: "L" };
+  const bl = dash.bandLayout({ nodes: [], unmapped: [lead, supWithParent, supWithOrch, realWorker], unassigned: [], projects: [] });
+  assert.deepEqual(bl.supporters.map((t) => t.id).sort(), ["jo", "ol"],
+    "Inc9: les supporters à arête parent restent en Supporters band");
+  const underL = bl.orchestrators.find((o) => o.lead.id === "L").repos.flatMap((r) => r.workers.map((x) => x.id));
+  assert.deepEqual(underL, ["w"], "Inc9: seul le VRAI worker niche sous le lead (les supporters ont précédence)");
+}
+
 console.log("dashboard.inc8.s3.test.mjs: OK");
