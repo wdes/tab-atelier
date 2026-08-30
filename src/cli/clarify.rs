@@ -62,6 +62,12 @@ struct TabInfo {
     agent_kind: Option<String>,
     #[serde(default)]
     agent_session_id: Option<String>,
+    /// Inc9 hot-swap cross-guard: true while this tab is mid-adoption in a binary
+    /// hot-swap handoff (from `/tabs` `inHandoff`). The auto-rehome poller must
+    /// leave it alone — re-homing spawns a fresh agent and would double-launch
+    /// the one the handoff is keeping alive.
+    #[serde(default, rename = "inHandoff")]
+    in_handoff: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -133,6 +139,14 @@ pub fn is_meta_daemon_name(name: &str) -> bool {
 #[must_use]
 pub fn should_skip_rehome(name: &str, assignment: Option<&str>) -> bool {
     is_meta_daemon_name(name) || SKIP_ROLES.contains(&crate::api::role_of(assignment).as_str())
+}
+
+/// The AUTO re-home poller's per-tab skip decision (post-`seen`): leave the tab
+/// alone if it's mid-hot-swap-adoption (Inc9 cross-guard — re-homing would
+/// double-launch the agent the handoff is keeping alive) OR it's a meta/daemon/
+/// orchestrator tab ([`should_skip_rehome`]). Pure, so both guards are testable.
+fn rehome_skip(tab: &TabInfo) -> bool {
+    tab.in_handoff || should_skip_rehome(&tab.name, tab.assignment.as_deref())
 }
 
 /// Args passed to `rehome-tab.sh` for an in-place refresh: same cwd / assignment
@@ -256,8 +270,9 @@ fn watch_tick(
             continue;
         }
         seen.push(tab.id.clone());
-        // Guardrail: never auto-refresh a meta/daemon/orchestrator tab.
-        if should_skip_rehome(&tab.name, tab.assignment.as_deref()) {
+        // Leave the tab alone if it's mid-hot-swap-adoption (Inc9 cross-guard) OR
+        // it's a meta/daemon/orchestrator tab (never auto-refreshed).
+        if rehome_skip(&tab) {
             continue;
         }
         // In-place re-home needs both a repo cwd and an assignment to re-seed.
@@ -492,6 +507,36 @@ mod tests {
         // A plain worker with a mundane name → NOT skipped.
         assert!(!should_skip_rehome("team-back-worker", Some("build/implementer")));
         assert!(!should_skip_rehome("m-invoice", Some("review/reviewer")));
+    }
+
+    #[test]
+    fn auto_rehome_leaves_a_tab_in_hotswap_handoff_alone() {
+        // Inc9 cross-guard (hot-swap × clarify): a tab mid-adoption in a binary
+        // handoff carries `inHandoff:true` on /tabs. The auto-rehome poller must
+        // leave it alone — re-homing spawns a fresh agent and would double-launch
+        // the one the handoff is keeping alive. rehome_skip() gates that.
+        let normal: TabInfo = serde_json::from_str(
+            r#"{"id":"t1","name":"team-back-worker","assignment":"build/implementer","agent_kind":"claude","agent_session_id":"s1"}"#,
+        )
+        .unwrap();
+        assert!(
+            !rehome_skip(&normal),
+            "a plain worker (not in handoff) is a rehome candidate"
+        );
+        let adopting: TabInfo = serde_json::from_str(
+            r#"{"id":"t1","name":"team-back-worker","assignment":"build/implementer","agent_kind":"claude","agent_session_id":"s1","inHandoff":true}"#,
+        )
+        .unwrap();
+        assert!(adopting.in_handoff, "inHandoff wire field parsed");
+        assert!(
+            rehome_skip(&adopting),
+            "a tab mid-hot-swap-handoff is left ALONE by auto-rehome"
+        );
+        // The meta/daemon guard is unchanged and still folded in.
+        let daemon: TabInfo =
+            serde_json::from_str(r#"{"id":"t2","name":"aligator","agent_kind":"claude","agent_session_id":"s2"}"#)
+                .unwrap();
+        assert!(rehome_skip(&daemon), "meta/daemon still skipped");
     }
 
     #[test]
