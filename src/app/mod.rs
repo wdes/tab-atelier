@@ -2263,7 +2263,6 @@ impl AppState {
         .detach();
     }
 
-
     /// Summon one more random pet onto the screen (repeated calls grow the herd).
     /// Loads a baked sprite sheet + animation XML from `/usr/share/tab-atelier/pets/`
     /// (dev: `./assets/pets/`). No-op if no pets are installed.
@@ -2272,8 +2271,6 @@ impl AppState {
         let vp = window.viewport_size();
         self.pet.summon(f32::from(vp.width), f32::from(vp.height));
     }
-
-
 
     /// Switch to tab `idx`: deactivate the current tab, activate the target,
     /// focus its terminal, and flush any deferred scrollback restore. Shared by
@@ -2304,11 +2301,6 @@ impl AppState {
         self.tabs[self.active].view.read(cx).focus_handle(cx).focus(window);
         cx.notify();
     }
-
-
-
-
-
 
     /// Gather the QR modal's inputs: interface IPs (one `ip` subprocess
     /// call), the deep-link QR bitmap, and the clickable URL. Called once
@@ -2342,11 +2334,7 @@ impl AppState {
             qr_dark,
         })
     }
-
-
-
 }
-
 
 // Shared with the headless binary — see `crate::tab_env_extras`,
 // `crate::api_url_for_local_clients`, and
