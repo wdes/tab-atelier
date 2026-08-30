@@ -251,6 +251,27 @@ struct TabInfo {
     /// non-agent tabs so existing consumers don't see a new field.
     #[serde(skip_serializing_if = "Option::is_none")]
     tokens: Option<crate::TokenUsage>,
+    // --- Inc9 brick 1: the agent CARD on `tabs --json` (same values + same
+    //     camelCase keys as /dashboard/state) so an agent/tool can reread ITS OWN
+    //     card without the aggregated state. Sourced from TabState via SnapshotTab.
+    //     Omitted when empty/None (a card-less tab stays clean). `lastUsedAt` is
+    //     already exposed above as `last_used_at`; `evalCriteria` doesn't exist yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    specialty: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    orchestrator: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    objective: Option<String>,
+    #[serde(rename = "currentTaskLog", skip_serializing_if = "Vec::is_empty")]
+    current_task_log: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    conventions: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    evaluations: Vec<crate::Evaluation>,
+    #[serde(rename = "roundsActive", skip_serializing_if = "Option::is_none")]
+    rounds_active: Option<crate::RoundsActive>,
+    #[serde(rename = "usageCount", skip_serializing_if = "Option::is_none")]
+    usage_count: Option<u64>,
 }
 
 /// One DNS-entries-view row for the `/tabs` response.
@@ -2731,6 +2752,15 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                         .collect(),
                     resident_memory_bytes: t.resident_memory_bytes,
                     tokens: t.tokens,
+                    // Inc9 brick 1 — the agent card, mirrored from the SnapshotTab.
+                    specialty: t.specialty.as_deref().map(str::to_string),
+                    orchestrator: t.orchestrator.as_deref().map(str::to_string),
+                    objective: t.objective.as_deref().map(str::to_string),
+                    current_task_log: t.current_task.clone(),
+                    conventions: t.conventions.clone(),
+                    evaluations: t.evaluations.clone(),
+                    rounds_active: t.rounds_active.clone(),
+                    usage_count: t.usage_count,
                 })
                 .collect();
             #[cfg(feature = "energy")]
@@ -5691,6 +5721,14 @@ mod tests {
             dns: vec![],
             resident_memory_bytes: None,
             tokens: None,
+            specialty: None,
+            orchestrator: None,
+            objective: None,
+            current_task_log: Vec::new(),
+            conventions: Vec::new(),
+            evaluations: Vec::new(),
+            rounds_active: None,
+            usage_count: None,
         }
     }
 
@@ -6660,6 +6698,67 @@ mod tests {
         let bj = serde_json::to_string(&bare).unwrap();
         assert!(!bj.contains("\"currentTaskLog\""), "absent permalog skipped: {bj}");
         assert!(!bj.contains("\"roundsActive\""), "absent roundsActive skipped: {bj}");
+    }
+
+    #[test]
+    #[allow(clippy::significant_drop_tightening)] // short-lived test mutation of the snapshot lock
+    fn tabs_json_exposes_the_agent_card() {
+        // Inc9 brick 1: an agent/tool must be able to reread ITS OWN card from
+        // `tabs --json` (= GET /tabs) without the aggregated /dashboard/state. The
+        // card rides on each TabInfo with the SAME camelCase keys as the dashboard.
+        let (port, state, token) = spawn_server();
+        {
+            let mut s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let t = s.tabs.iter_mut().find(|t| &*t.id == "tab-a").expect("tab-a");
+            t.specialty = Some("rust async internals".into());
+            t.orchestrator = Some("free".into());
+            t.objective = Some("land the parser refactor".into());
+            t.current_task = vec!["read the plan".into(), "wire the struct".into()];
+            t.conventions = vec!["AGENTS.md".into()];
+            t.evaluations = vec![crate::Evaluation {
+                evaluator: "olympe".into(),
+                at: 1000,
+                task_ref: Some("taskRef-1".into()),
+                tokens: crate::EvalTokens { input: 10, out: 10 },
+                scores: crate::EvalScores {
+                    relevance: 8,
+                    errors: 0,
+                    omissions: 0,
+                },
+                verdict: "ok".into(),
+                note: None,
+            }];
+            t.rounds_active = Some(crate::RoundsActive {
+                active: true,
+                last_round_at: Some(1000),
+            });
+            t.usage_count = Some(3);
+            s.invalidate_tabs();
+        }
+        let tabs = request(port, &format!("GET /tabs?token={token} HTTP/1.1\r\n\r\n"));
+        let b = body(&tabs);
+        // The card is present with camelCase keys matching /dashboard/state.
+        for k in [
+            "\"specialty\"",
+            "\"orchestrator\"",
+            "\"objective\"",
+            "\"currentTaskLog\"",
+            "\"conventions\"",
+            "\"evaluations\"",
+            "\"taskRef\"",
+            "\"roundsActive\"",
+            "\"usageCount\"",
+        ] {
+            assert!(b.contains(k), "card field {k} must surface on tabs --json: {b}");
+        }
+        assert!(b.contains("land the parser refactor"), "value carried: {b}");
+        assert!(b.contains("\"usageCount\": 3"), "usageCount value: {b}");
+        assert!(b.contains("wire the struct"), "permalog entries carried: {b}");
+        // Non-regression: the existing always-present fields are still there.
+        for k in ["\"index\"", "\"id\"", "\"name\"", "\"active\""] {
+            assert!(b.contains(k), "existing field {k} kept: {b}");
+        }
+        assert!(b.contains("tab-a"), "the tab id value is still present: {b}");
     }
 
     #[test]
