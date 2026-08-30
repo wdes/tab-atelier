@@ -233,6 +233,11 @@ struct Tab {
     /// compaction (brutal drop). Transient (recomputed from the screen each tick).
     last_context_pct: std::cell::Cell<Option<u8>>,
     last_compaction_at: std::cell::Cell<Option<u64>>,
+    /// Daemon-liveness probe, cached by the 2 s persist loop (the tab-strip dot
+    /// renders every frame and must NOT walk `/proc` there). Raw probe result
+    /// (`None` = detection impossible → optimistic; `Some(false)` = down;
+    /// `Some(true)` = up); mapped by `daemon_alive_from_probe`. Transient.
+    daemon_probe: std::cell::Cell<Option<bool>>,
     /// UUID of the spawning tab (`parent_tab_id`). Persisted like `assignment`.
     parent_tab_id: Option<std::sync::Arc<str>>,
     /// Re-home progress on a predecessor tab. Persisted like `assignment`;
@@ -347,6 +352,7 @@ impl Tab {
             conventions: ts.conventions.clone(),
             last_context_pct: std::cell::Cell::new(None),
             last_compaction_at: std::cell::Cell::new(None),
+            daemon_probe: std::cell::Cell::new(None),
             parent_tab_id: ts.parent_tab_id.as_deref().map(std::sync::Arc::from),
             rehome_status: ts.rehome_status.as_deref().map(std::sync::Arc::from),
             last_pushed_locked: None,
@@ -2115,6 +2121,15 @@ impl AppState {
             // the snapshot below.
             let rss_bytes = crate::agent_probe::sample_tree(shell_pid).map(|s| s.rss_kb.saturating_mul(1024));
             tab.rss_bytes.set(rss_bytes);
+            // Daemon-liveness probe (brain/aligator) at the same 2 s cadence,
+            // cached so the per-frame tab-strip dot and the /dashboard snapshot
+            // both read it without walking /proc. Only daemons pay the walk.
+            if matches!(tab.agent_kind.as_deref(), Some("brain" | "aligator")) {
+                tab.daemon_probe.set(crate::agent_probe::subtree_has_daemon(
+                    shell_pid,
+                    tab.agent_kind.as_deref().unwrap_or(""),
+                ));
+            }
             // Fold in the ring's viewer-attach timestamp: a viewer (browser /
             // mobile remote) opening the tab stamped it at connect time, so the
             // open is recorded reliably even if the view already closed — a
@@ -2162,14 +2177,19 @@ impl AppState {
                     #[cfg(not(feature = "catbus"))]
                     let (agent_alive, full_sweep_ran) = (true, false);
                     let recent_output = tab.last_output_at.is_some_and(|t| t.elapsed() < STREAMING_LED_WINDOW);
+                    // Daemon LED (brain/aligator): real liveness from the cached
+                    // /proc-subtree probe (set just above) — up=green, down=red.
+                    let is_daemon = matches!(tab.agent_kind.as_deref(), Some("brain" | "aligator"));
+                    let daemon_alive = crate::daemon_alive_from_probe(tab.daemon_probe.get());
                     crate::compute_tab_led(
                         tab.agent_state.as_ref().map(|s| s.state),
                         tab.agent_kind.is_some(),
-                        tab.agent_kind.as_deref() == Some("brain"),
+                        is_daemon,
                         agent_alive,
                         full_sweep_ran,
                         tab.unreviewed_work,
                         recent_output,
+                        daemon_alive,
                     )
                 },
                 last_used_at: tab.last_used_at,
@@ -3458,14 +3478,19 @@ impl AppState {
             // output (a `--resume`d session streams a reply with no thinking
             // hook) — see the block comment above for each color's meaning.
             let recent_output = tab.last_output_at.is_some_and(|t| t.elapsed() < STREAMING_LED_WINDOW);
+            // Daemon dot (brain/aligator): real liveness from the probe the 2 s
+            // persist loop cached — no /proc walk in this per-frame render.
+            let is_daemon = matches!(tab.agent_kind.as_deref(), Some("brain" | "aligator"));
+            let daemon_alive = crate::daemon_alive_from_probe(tab.daemon_probe.get());
             let agent_led = crate::compute_tab_led(
                 tab.agent_state.as_ref().map(|s| s.state),
                 session_attached,
-                tab.agent_kind.as_deref() == Some("brain"),
+                is_daemon,
                 agent_alive,
                 full_sweep_ran,
                 tab.unreviewed_work,
                 recent_output,
+                daemon_alive,
             )
             .map(|led| {
                 let (r, g, b) = led.rgb();
@@ -7140,26 +7165,69 @@ mod tests {
     fn agent_led_hidden_for_a_dead_session_with_nothing_to_review() {
         use crate::{AgentState, TabLed, compute_tab_led};
         // Live agent running, session attached, nothing to review → grey Idle.
+        // (non-daemon: is_daemon=false, daemon_alive ignored.)
         assert_eq!(
-            compute_tab_led(None, true, false, true, false, false, false),
+            compute_tab_led(None, true, false, true, false, false, false, true),
             Some(TabLed::Idle)
         );
         // A transient state always shows (a hook just fired) even if not alive.
         assert_eq!(
-            compute_tab_led(Some(AgentState::Waiting), true, false, false, false, false, false),
+            compute_tab_led(Some(AgentState::Waiting), true, false, false, false, false, false, true),
             Some(TabLed::Idle)
         );
         // The reported bug: durable anchor attached, but the agent never
         // restarted and nothing to review, no state — and no sweep has yet run,
         // so it isn't claimed dead either → NO LED.
-        assert_eq!(compute_tab_led(None, true, false, false, false, false, false), None);
+        assert_eq!(
+            compute_tab_led(None, true, false, false, false, false, false, true),
+            None
+        );
         // Once a full sweep confirms the process is gone → dim-red Dead dot.
         assert_eq!(
-            compute_tab_led(None, true, false, false, true, false, false),
+            compute_tab_led(None, true, false, false, true, false, false, true),
             Some(TabLed::Dead)
         );
         // No session at all → never.
-        assert_eq!(compute_tab_led(None, false, false, true, false, false, false), None);
+        assert_eq!(
+            compute_tab_led(None, false, false, true, false, false, false, true),
+            None
+        );
+    }
+
+    #[test]
+    fn daemon_led_is_up_down_from_real_process_liveness() {
+        use crate::{TabLed, compute_tab_led};
+        // A daemon (brain/aligator) LED reflects REAL process liveness and is
+        // ALWAYS visible — up=Working (green), down=Dead (red). is_daemon=true,
+        // last arg = daemon_alive. The agent-session inputs are irrelevant here.
+        // brain: alive → Working, dead → Dead.
+        assert_eq!(
+            compute_tab_led(None, true, true, false, false, false, false, true),
+            Some(TabLed::Working),
+            "a live brain daemon is green, not falsely dead"
+        );
+        assert_eq!(
+            compute_tab_led(None, true, true, false, true, false, false, false),
+            Some(TabLed::Dead),
+            "a stopped brain daemon is red"
+        );
+        // aligator: alive → Working (the reported bug — it was red while running),
+        // dead → Dead. Same palette as everything else.
+        assert_eq!(
+            compute_tab_led(None, true, true, false, true, false, false, true),
+            Some(TabLed::Working),
+            "a live aligator daemon is green (fixes the false-red)"
+        );
+        assert_eq!(
+            compute_tab_led(None, false, true, false, false, false, false, false),
+            Some(TabLed::Dead),
+            "a stopped aligator daemon is red — always visible, never None"
+        );
+        // A daemon is NEVER hidden (up or down), regardless of session inputs.
+        assert!(
+            compute_tab_led(None, false, true, false, false, false, false, true).is_some(),
+            "a daemon always shows a dot"
+        );
     }
 
     #[test]

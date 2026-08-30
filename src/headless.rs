@@ -1590,14 +1590,24 @@ fn refresh_snapshot(
             let recent_output = tab
                 .last_output_at
                 .is_some_and(|t| t.elapsed() < crate::STREAMING_LED_WINDOW);
+            // Daemon LED (brain/aligator): real process liveness from the tab's
+            // /proc subtree — up=green, down=red. Fail-safe: an unreadable probe
+            // (None) stays optimistically alive (see daemon_alive_from_probe).
+            let is_daemon = matches!(tab.agent_kind.as_deref(), Some("brain" | "aligator"));
+            let daemon_alive = crate::daemon_alive_from_probe(
+                is_daemon
+                    .then(|| crate::agent_probe::subtree_has_daemon(tab.pid, tab.agent_kind.as_deref().unwrap_or("")))
+                    .flatten(),
+            );
             crate::compute_tab_led(
                 tab.agent_state.as_ref().map(|s| s.state),
                 tab.agent_kind.is_some(),
-                tab.agent_kind.as_deref() == Some("brain"),
+                is_daemon,
                 agent_alive,
                 full_sweep_ran,
                 tab.unreviewed_work,
                 recent_output,
+                daemon_alive,
             )
         };
         api_tabs.push(api::SnapshotTab {
