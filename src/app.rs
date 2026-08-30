@@ -1440,6 +1440,30 @@ impl AppState {
             );
         }
 
+        // The window can be re-shown or re-focused by the OS/compositor, not
+        // just by our Guake hotkey — e.g. you drove the active tab from the
+        // phone (web viewer) with the desktop backgrounded, then tab/click
+        // back to it. The reveal handler only fires on the hotkey, and gpui
+        // can keep a hidden window "fresh" enough that render()'s 2 s
+        // full-rebuild backstop doesn't fire, so the desktop would repaint the
+        // frame from when we last left it (stale — the grid advanced on the
+        // phone but the damage-reuse path never saw it). Void the active tab's
+        // render caches every time the window GAINS focus so the first frame
+        // rebuilds every row from the live grid.
+        cx.observe_window_activation(window, |app, window, cx| {
+            if !window.is_window_active() {
+                return;
+            }
+            let view = app.tabs.get(app.active).map(|t| t.view.clone());
+            if let Some(view) = view {
+                view.update(cx, |v, vcx| {
+                    v.release_render_caches();
+                    vcx.notify();
+                });
+            }
+        })
+        .detach();
+
         Self {
             tabs,
             active,
