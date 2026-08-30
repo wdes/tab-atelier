@@ -233,10 +233,24 @@ mod tests {
             deny_status(&authorize(&s, "POST", "/tabs/by-id/tab-a/input", Some("ro-tok"))),
             Some(403)
         );
-        // RO token is also refused on inbox enumeration (RW-only privileged read).
+        // RO token is also refused on inbox enumeration + file UPLOAD (RW-only).
         assert_eq!(
             deny_status(&authorize(&s, "GET", "/tabs/by-id/tab-a/inbox", Some("ro-tok"))),
             Some(403)
+        );
+        assert_eq!(
+            deny_status(&authorize(&s, "POST", "/tabs/by-id/tab-a/files", Some("ro-tok"))),
+            Some(403),
+            "RO share token cannot upload (POST /files needs RW)"
+        );
+        // An empty share token authorises nothing (never matches a real token).
+        assert_eq!(
+            deny_status(&authorize(&s, "GET", "/tabs/by-id/tab-a/view", Some(""))),
+            Some(401)
+        );
+        assert_eq!(
+            deny_status(&authorize(&s, "GET", "/tabs/by-id/tab-a/view", None)),
+            Some(401)
         );
         // A share token only works on ITS tab / the share routes — an unknown
         // uuid or a non-share route → 401.
