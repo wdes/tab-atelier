@@ -420,7 +420,11 @@ function isCoreMeta(t) {
 function isSupporter(t) {
   if (!t || isCoreMeta(t)) return false;
   const a = String(t.assignment || "");
-  return a.startsWith("meta/") || a.startsWith("scope/") || isMetaRole(String(t.role || "").toLowerCase()) || isMetaDaemon(t);
+  // Lanes de supporters fleet-wide (assignment "lane/role" SANS préfixe projet). "review/"
+  // capte le reviewer dédié (Olympe = review/evaluator) ; un "projet:review/auditor" (worker
+  // de projet, ex. ta-quality-auditor) commence par "projet:", donc n'est PAS capté ici.
+  return a.startsWith("meta/") || a.startsWith("scope/") || a.startsWith("review/")
+    || isMetaRole(String(t.role || "").toLowerCase()) || isMetaDaemon(t);
 }
 
 // Pure: a tab's dynamic altitude band (Inc7 S2). Encodes the 4 movements + the
@@ -484,6 +488,11 @@ export function bandLayout(state) {
       // two leads. Sentinel values ("free"/"meta") never equal a lead UUID.
       const workers = allTabs.filter((t) => {
         if (!t || t.id === lead.id || leadIds.has(t.id)) return false;
+        // Inc9 : le statut SUPPORTER/META a PRÉCÉDENCE sur le nesting parentTabId/orchestrator.
+        // Un supporter fleet-wide (meta/scope/review non-daemon) reste en bande Supporters MÊME
+        // s'il a une arête parent dispatch-dérivée -> il ne nest jamais comme worker d'un lead.
+        const b = resolveAltitude(t).band;
+        if (b === "supporter" || b === "meta") return false;
         return t.parentTabId ? t.parentTabId === lead.id : t.orchestrator === lead.id;
       });
       const leadProj = assignmentProject(lead.assignment);
