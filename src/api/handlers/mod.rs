@@ -12,6 +12,7 @@
 //! access an ancestor's private items.
 
 pub(super) mod admin;
+pub(super) mod cards;
 #[cfg(feature = "catbus")]
 pub(super) mod catbus;
 pub(super) mod dashboard;
