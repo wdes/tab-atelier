@@ -3182,146 +3182,15 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             let body = serde_json::to_string(&serde_json::json!({"queued": "new"})).unwrap_or_default();
             respond_json(stream, 200, &body);
         }
-        ("POST", "/limits/default") => {
-            // Set or clear the GLOBAL default resource limits (the CLI
-            // `limit --all`). Same JSON body as the per-tab route. The owner
-            // updates its live `default_tab_limits`, persists preferences.json,
-            // and re-applies the cgroup to every tab (tabs without their own
-            // override + all future tabs pick it up with no restart).
-            let parsed: serde_json::Value = match serde_json::from_slice(&body_bytes) {
-                Ok(v) => v,
-                Err(e) => {
-                    error_json(stream, 400, &format!("invalid JSON body: {e}"));
-                    return;
-                }
-            };
-            let clear = parsed
-                .get("clear")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-            let over = crate::TabResourceLimits {
-                memory_max: parsed.get("memory_max").and_then(|v| v.as_str()).map(str::to_owned),
-                cpu_quota_percent: parsed
-                    .get("cpu_quota_percent")
-                    .and_then(serde_json::Value::as_u64)
-                    .and_then(|n| u32::try_from(n).ok()),
-                tasks_max: parsed.get("tasks_max").and_then(serde_json::Value::as_u64),
-            };
-            if !clear && over.is_empty() {
-                error_json(
-                    stream,
-                    400,
-                    "provide memory_max / cpu_quota_percent / tasks_max, or clear:true",
-                );
-                return;
-            }
-            if !over.memory_max_valid() {
-                error_json(
-                    stream,
-                    400,
-                    "memory_max must be a byte count or K/M/G/T value (e.g. \"8G\")",
-                );
-                return;
-            }
-            let mut snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            snap.pending_default_limits = Some((over, clear));
-            drop(snap);
-            respond_json(stream, 200, r#"{"queued":"default-limits"}"#);
-        }
-        ("POST", "/claude-only") => {
-            // Toggle forced Claude-only mode live (the CLI `claude-only on|off`).
-            // Body: {"on": true|false}. The owner mirrors it onto CLAUDE_ONLY +
-            // its struct field and persists, so new tabs launch claude (auto
-            // mode) or a shell with no restart.
-            let parsed: serde_json::Value = match serde_json::from_slice(&body_bytes) {
-                Ok(v) => v,
-                Err(e) => {
-                    error_json(stream, 400, &format!("invalid JSON body: {e}"));
-                    return;
-                }
-            };
-            let Some(on) = parsed.get("on").and_then(serde_json::Value::as_bool) else {
-                error_json(stream, 400, r#"provide {"on": true|false}"#);
-                return;
-            };
-            let mut snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            snap.pending_claude_only = Some(on);
-            drop(snap);
-            respond_json(stream, 200, r#"{"queued":"claude-only"}"#);
-        }
-        ("POST", "/relay-mode") => {
-            // Toggle relay mode live (the CLI `relay on|off`). Body:
-            // {"on": true|false}. The owner mirrors it onto RELAY_MODE + its
-            // struct field and persists; claude tabs spawned after route their
-            // Anthropic calls through the configured remote.
-            let parsed: serde_json::Value = match serde_json::from_slice(&body_bytes) {
-                Ok(v) => v,
-                Err(e) => {
-                    error_json(stream, 400, &format!("invalid JSON body: {e}"));
-                    return;
-                }
-            };
-            let Some(on) = parsed.get("on").and_then(serde_json::Value::as_bool) else {
-                error_json(stream, 400, r#"provide {"on": true|false}"#);
-                return;
-            };
-            let mut snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            snap.pending_relay_mode = Some(on);
-            drop(snap);
-            respond_json(stream, 200, r#"{"queued":"relay-mode"}"#);
-        }
-        ("GET", "/relay-config") => {
-            // Current relay config (the CLI `relay status`).
-            let (egress, target) = (crate::relay_egress(), crate::relay_target());
-            let body = serde_json::json!({
-                "mode": crate::relay_mode(),
-                "egress": egress,
-                "target": target.map(|t| t.url),
-            })
-            .to_string();
-            respond_json(stream, 200, &body);
-        }
-        ("POST", "/relay-config") => {
-            // Set the relay endpoint and/or egress role (`relay via` / `relay
-            // egress`). Body: {"endpoint":"<label|id|"">","egress":bool} — any
-            // subset. The owner resolves the endpoint, persists, and re-installs.
-            let parsed: serde_json::Value = match serde_json::from_slice(&body_bytes) {
-                Ok(v) => v,
-                Err(e) => {
-                    error_json(stream, 400, &format!("invalid JSON body: {e}"));
-                    return;
-                }
-            };
-            let change = RelayConfigChange {
-                endpoint: parsed.get("endpoint").and_then(|v| v.as_str()).map(str::to_owned),
-                egress: parsed.get("egress").and_then(serde_json::Value::as_bool),
-            };
-            let mut snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            snap.pending_relay_config = Some(change);
-            drop(snap);
-            respond_json(stream, 200, r#"{"queued":"relay-config"}"#);
-        }
-        ("GET", "/env") => {
-            // The current GLOBAL tab-env map (the CLI `env list`).
-            let map = crate::tab_env_global();
-            match serde_json::to_string(&map) {
-                Ok(j) => respond_json(stream, 200, &j),
-                Err(e) => error_json(stream, 500, &format!("serialize: {e}")),
-            }
-        }
-        ("POST", "/env") => {
-            // Global env change (`env set/unset --global`). Body:
-            // {"set":{"K":"V"},"unset":["K"],"respawn":bool}.
-            match parse_env_body(&body_bytes) {
-                Ok(change) => {
-                    let mut snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    snap.pending_env_changes.push(change);
-                    drop(snap);
-                    respond_json(stream, 200, r#"{"queued":"env"}"#);
-                }
-                Err(e) => error_json(stream, 400, &e),
-            }
-        }
+        // Admin resource → api/handlers/admin.rs (master-token only, enforced by
+        // the gate). Global limits / claude-only / relay / env / token rotation.
+        ("POST", "/limits/default") => handlers::admin::default_limits(stream, state, &body_bytes),
+        ("POST", "/claude-only") => handlers::admin::claude_only(stream, state, &body_bytes),
+        ("POST", "/relay-mode") => handlers::admin::relay_mode(stream, state, &body_bytes),
+        ("GET", "/relay-config") => handlers::admin::relay_config_get(stream),
+        ("POST", "/relay-config") => handlers::admin::relay_config_set(stream, state, &body_bytes),
+        ("GET", "/env") => handlers::admin::env_get(stream),
+        ("POST", "/env") => handlers::admin::env_set(stream, state, &body_bytes),
         ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/env") => {
             // Per-tab env change (`env set/unset --tab <id>`).
             let Some((key_raw, is_uuid)) = parse_tab_key(p, "/env") else {
@@ -4112,44 +3981,9 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             );
             respond_json(stream, 200, &body.to_string());
         }
-        ("POST", "/tabs/rotate-tokens") => {
-            // Revoke every tab's per-tab share tokens so all outstanding
-            // share links 401. Cleared on the snapshot immediately
-            // (instant effect) and queued so the owner loop clears the
-            // runtime Tab + persists; a fresh token is minted on the next
-            // "Remote control" / `share-link`. Master token only — this
-            // path isn't in the share-token allowlist, so a share token
-            // never authorises here.
-            let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut revoked = 0usize;
-            for t in &mut state.tabs {
-                if t.share_token_rw.is_empty() && t.share_token_ro.is_empty() {
-                    continue;
-                }
-                t.share_token_rw = "".into();
-                t.share_token_ro = "".into();
-                revoked += 1;
-            }
-            let ids: Vec<String> = state.tabs.iter().map(|t| t.id.to_string()).collect();
-            state.pending_token_rotations.extend(ids);
-            // Also revoke the global dashboard share-token: any outstanding
-            // `/dashboard?token=…` link 401s until re-minted. Cleared on the
-            // snapshot immediately; the next persist tick writes the empty token
-            // to tabs.json.
-            let dashboard_revoked = !state.dashboard_share_token.is_empty();
-            if dashboard_revoked {
-                state.dashboard_share_token = "".into();
-            }
-            state.invalidate_tabs();
-            drop(state);
-            respond_json(
-                stream,
-                200,
-                &format!(r#"{{"revoked":{revoked},"dashboard_revoked":{dashboard_revoked}}}"#),
-            );
-        }
+        ("POST", "/tabs/rotate-tokens") => handlers::admin::rotate_tokens(stream, state),
         ("POST", "/upgrade") => {
-            // Hot-swap upgrade: re-exec the (freshly installed) binary at
+            // Hot-swap upgrade (#23): re-exec the (freshly installed) binary at
             // our own install path while every tab's live PTY is handed
             // across the exec — the shells, and whatever runs in them,
             // never notice (see src/hotswap.rs). Master token only (not
@@ -4157,7 +3991,8 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             // the is_mutating gate above. The swap happens on the owner
             // loop's next tick, after this response has flushed — expect
             // the API to drop for a moment while the new binary boots and
-            // re-binds.
+            // re-binds. NOT peeled (the refactor never saw it): kept inline
+            // as it's unique to this fork's fabric+#23 context.
             #[cfg(unix)]
             {
                 if !crate::hotswap::reexec_target_ok() {
@@ -4178,27 +4013,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             #[cfg(not(unix))]
             error_json(stream, 501, "hot swap is not supported on this platform");
         }
-        ("POST", "/master-token/reset") => {
-            // Hot-swap the master API token: generate a fresh one, persist
-            // it to api.token (so `tab-atelier token` and saved configs
-            // re-read it), and publish it onto the snapshot the auth gate
-            // validates against. Every link / client carrying the OLD
-            // master token 401s on its next request. Master token only
-            // (this path isn't in the share-token allowlist).
-            let new = generate_token();
-            let dir = crate::platform::state_base_dir().join(crate::APP_DIR);
-            let _ = std::fs::create_dir_all(&dir);
-            if let Err(e) = write_private_file(&dir.join("api.token"), new.as_bytes()) {
-                error_json(stream, 500, &format!("could not persist token: {e}"));
-                return;
-            }
-            state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .master_token
-                .clone_from(&new);
-            respond_json(stream, 200, &format!(r#"{{"token":"{new}"}}"#));
-        }
+        ("POST", "/master-token/reset") => handlers::admin::master_token_reset(stream, state),
         ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/bg-color") => {
             // Set or clear the per-tab background color override.
             // Master token only. Body: {"color": "#RRGGBB"} to set,
