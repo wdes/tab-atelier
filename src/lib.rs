@@ -1727,26 +1727,38 @@ impl TabLed {
 ///
 /// - `agent_state`: transient hook state, if any.
 /// - `session_attached`: a durable agent kind is set (`agent_kind.is_some()`).
-/// - `is_brain`: the attached kind is the auto-injector `"brain"` (exempt from
-///   the dead check — it has no long-lived process).
+/// - `is_daemon`: the attached kind is a daemon (`"brain"` | `"aligator"`) — a
+///   long-lived process with no tracked agent session. Its LED comes straight
+///   from `daemon_alive`, always visible (up=`Working`, down=`Dead`).
 /// - `agent_alive`: the agent process is present (catbus liveness). Pass `true`
 ///   where liveness isn't tracked, so `Dead` never triggers.
 /// - `full_sweep_ran`: at least one liveness sweep has completed (avoids a
 ///   false `Dead` before the first probe).
 /// - `unreviewed_work`: agent worked then stopped and hasn't been reviewed.
 /// - `recent_output`: fresh PTY output within the streaming window.
+/// - `daemon_alive`: real process liveness for a daemon tab (see
+///   [`daemon_alive_from_probe`] for the fail-safe mapping). Ignored unless
+///   `is_daemon`.
 #[must_use]
-#[allow(clippy::fn_params_excessive_bools)]
+#[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
 pub const fn compute_tab_led(
     agent_state: Option<AgentState>,
     session_attached: bool,
-    is_brain: bool,
+    is_daemon: bool,
     agent_alive: bool,
     full_sweep_ran: bool,
     unreviewed_work: bool,
     recent_output: bool,
+    daemon_alive: bool,
 ) -> Option<TabLed> {
-    let agent_dead = session_attached && !agent_alive && !is_brain && full_sweep_ran;
+    // A daemon (brain/aligator) has a long-lived process but no tracked agent
+    // session/pid, so the generic dead-check can't see it (that's why aligator
+    // showed false-red). Its dot reflects REAL process liveness and is ALWAYS
+    // visible: up=Working (green), down=Dead (red) — same palette as the rest.
+    if is_daemon {
+        return Some(if daemon_alive { TabLed::Working } else { TabLed::Dead });
+    }
+    let agent_dead = session_attached && !agent_alive && full_sweep_ran;
     // Visibility gate (app.rs::agent_led_visible): dead, or a transient state
     // exists, or a session is attached and it's alive-or-unreviewed.
     let visible = agent_dead || agent_state.is_some() || (session_attached && (agent_alive || unreviewed_work));
@@ -1765,6 +1777,23 @@ pub const fn compute_tab_led(
     } else {
         TabLed::Idle
     })
+}
+
+/// Map a daemon-liveness probe to `compute_tab_led`'s `daemon_alive`, with the
+/// fail-safe rule that keeps the LED both HONEST and stable:
+/// - `None` — detection was **impossible** (`/proc` unreadable, a read glitch,
+///   the probe hasn't run) → optimistically **alive** (green), so a transient
+///   probe gap never falsely reddens a running daemon (anti-flapping).
+/// - `Some(false)` — detection **ran** and found NO daemon process → **dead**
+///   (red). A definitive negative: this is the whole point — a genuinely-down
+///   aligator must be visibly red so it can be revived.
+/// - `Some(true)` — the daemon process is present → **alive** (green).
+#[must_use]
+pub const fn daemon_alive_from_probe(probe: Option<bool>) -> bool {
+    match probe {
+        Some(alive) => alive,
+        None => true, // detection impossible → optimistic, never a false red
+    }
 }
 
 const fn default_true() -> bool {
@@ -3660,6 +3689,25 @@ mod tests {
         // Unknown kind → None (no accidental broadening), with or without a session.
         assert!(restore_resume_command(Some("nope"), Some("x"), None).is_none());
         assert!(restore_resume_command(None, None, None).is_none());
+    }
+
+    #[test]
+    fn daemon_alive_from_probe_distinguishes_down_from_undetectable() {
+        // The critical fail-safe distinction (daemon-led):
+        // - detection RAN and found nothing → genuinely DOWN → false → Dead/red.
+        //   This is the whole point: a down aligator MUST be visibly red.
+        assert!(
+            !daemon_alive_from_probe(Some(false)),
+            "process absent (detection ran) → dead/red, not masked"
+        );
+        // - detection IMPOSSIBLE (/proc unreadable, probe gap) → optimistic alive,
+        //   so a running daemon never falsely flaps to red.
+        assert!(
+            daemon_alive_from_probe(None),
+            "undetectable → optimistic alive (anti-flapping), never a false red"
+        );
+        // - process present → alive.
+        assert!(daemon_alive_from_probe(Some(true)), "process present → alive");
     }
 
     #[test]
