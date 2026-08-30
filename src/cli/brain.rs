@@ -355,6 +355,10 @@ struct TabWatch {
     next_nudge_at: Option<Instant>,
     /// Error label of the last nudge; a different label resets the streak.
     last_label: Option<&'static str>,
+    /// When this session last showed an Anthropic-side API-storm error
+    /// ([`is_api_storm_label`]). Feeds the level-(b) storm detector
+    /// ([`api_error_sessions`]); `None` = never (or aged past the window).
+    last_api_error_at: Option<Instant>,
 }
 
 /// FNV-1a hash of a tab's `/output`. Process-local only (never
@@ -449,6 +453,44 @@ fn circuit_breaker_open(breaker_until: &mut Option<Instant>, eligible_count: usi
         return true;
     }
     false
+}
+
+/// Level-(b) API-STORM threshold (rate-limit finding #5): this many DISTINCT
+/// sessions showing an Anthropic-side API error within [`STORM_ERROR_WINDOW`] is a
+/// systemic storm — the shared opus token-bucket is saturating.
+const STORM_ERROR_THRESHOLD: usize = 5;
+/// Sliding window for the storm count. Its own slide IS the "until calm" detector:
+/// no separate cooldown — once the errors age out, the freeze lifts by itself.
+const STORM_ERROR_WINDOW: Duration = Duration::from_mins(1);
+
+/// Is `label` an Anthropic-side API-capacity error — the storm signature (the
+/// shared opus bucket saturating: 429/overloaded/rate-limited/5xx, or an active
+/// retry banner)? Distinct from LOCAL network faults (connection-refused /
+/// econnreset / etimedout), which are per-box, not an org-wide storm. Pure.
+fn is_api_storm_label(label: &str) -> bool {
+    matches!(
+        label,
+        "anthropic-529" | "anthropic-rate-limited" | "anthropic-503" | "anthropic-5xx" | "api-retry-waiting"
+    )
+}
+
+/// Count DISTINCT sessions whose last API-storm error was within
+/// [`STORM_ERROR_WINDOW`] of `now`. Pure over the watch map + injected `now`, so
+/// the sliding window is unit-testable.
+fn api_error_sessions(watches: &HashMap<String, TabWatch>, now: Instant) -> usize {
+    watches
+        .values()
+        .filter(|w| matches!(w.last_api_error_at, Some(t) if now.saturating_duration_since(t) < STORM_ERROR_WINDOW))
+        .count()
+}
+
+/// Level-(b) decision: FULL FREEZE — send NOTHING this tick, not even the
+/// level-(a) heartbeat — when the distinct API-error session count reaches the
+/// storm threshold. A `continue` during a 429 plateau only re-feeds the herd
+/// that's backing off. Pure; the window slide (see [`api_error_sessions`]) lifts
+/// the freeze once the agents recover, so no cooldown is needed.
+const fn storm_freeze(api_error_sessions: usize) -> bool {
+    api_error_sessions >= STORM_ERROR_THRESHOLD
 }
 
 /// Seconds to wait before the next nudge after `streak` consecutive
@@ -611,6 +653,7 @@ fn tick(
             nudge_streak: 0,
             next_nudge_at: None,
             last_label: None,
+            last_api_error_at: None,
         });
         if watch.last_hash != h {
             watch.last_hash = h;
@@ -635,6 +678,13 @@ fn tick(
             continue;
         };
         let label = trigger.label();
+
+        // Level-(b) storm signal: stamp this session's last API-storm error time
+        // for EVERY api-erroring tab (frozen or not — a live 429/retry screen isn't
+        // frozen yet but still counts toward the storm). Feeds `api_error_sessions`.
+        if matches!(trigger, Trigger::Pattern(_)) && is_api_storm_label(label) {
+            watch.last_api_error_at = Some(now);
+        }
 
         // Frozen long enough AND not already nudged at this exact screen?
         // (An active auto-retry countdown keeps the screen moving, so it
@@ -674,6 +724,23 @@ fn tick(
     // Drop watch state for tabs that vanished (closed / no longer a
     // Claude session) so the map stays bounded.
     watches.retain(|id, _| seen_ids.iter().any(|s| s == id));
+
+    // Level (b) — API-STORM FULL FREEZE (rate-limit finding #5). When >=
+    // STORM_ERROR_THRESHOLD distinct sessions hit an Anthropic API error within
+    // the last minute, the opus bucket is storming: send NOTHING this tick — not
+    // even the level-(a) heartbeat — so we don't re-poke agents that are backing
+    // off (a `continue` on a 429 plateau only deepens it). The sliding window
+    // lifts the freeze on its own once the errors age out (the agents recover).
+    let storm_sessions = api_error_sessions(watches, now);
+    if storm_freeze(storm_sessions) {
+        println!(
+            "⛑ brain: {storm_sessions} sessions in API error within {w}s (>= {thr}) — SYSTEMIC STORM; \
+             FULL FREEZE this tick (0 nudge, not even the heartbeat) until it clears",
+            w = STORM_ERROR_WINDOW.as_secs(),
+            thr = STORM_ERROR_THRESHOLD,
+        );
+        return Ok(());
+    }
 
     if eligible.is_empty() {
         return Ok(());
@@ -980,6 +1047,76 @@ mod tests {
             nudge_ready(&mut last, t0 + CIRCUIT_BREAKER_COOLDOWN, nudge_interval(true)),
             "the next heartbeat fires after the interval — brain stays alive + auto-probes"
         );
+    }
+
+    #[test]
+    fn two_level_breaker_full_freezes_on_api_storm_but_heartbeats_when_mild() {
+        // Rate-limit finding #5 — the breaker now has TWO levels:
+        //  (a) MILD (few sessions stuck): unchanged — the spaced 1-nudge heartbeat.
+        //  (b) SYSTEMIC (>= 5 DISTINCT sessions in API error within 60s): FULL
+        //      FREEZE — 0 nudge, NOT EVEN the heartbeat — so a `continue` doesn't
+        //      re-feed a herd that's backing off. The sliding window is the "calm"
+        //      detector: once the errors age out, the freeze lifts on its own.
+        let t0 = Instant::now();
+        let errored_at = |at: Instant| TabWatch {
+            last_hash: 0,
+            stable_since: at,
+            nudged_hash: None,
+            nudge_streak: 0,
+            next_nudge_at: None,
+            last_label: None,
+            last_api_error_at: Some(at),
+        };
+
+        // (b) >= threshold distinct sessions in error within the window -> FREEZE.
+        let mut storm: HashMap<String, TabWatch> = HashMap::new();
+        for i in 0..STORM_ERROR_THRESHOLD {
+            storm.insert(format!("t{i}"), errored_at(t0));
+        }
+        assert_eq!(api_error_sessions(&storm, t0), STORM_ERROR_THRESHOLD);
+        assert!(
+            storm_freeze(api_error_sessions(&storm, t0)),
+            "storm -> FULL FREEZE (0 nudge)"
+        );
+
+        // Return to calm: errors age past the 60s window -> count drops -> resume.
+        let calm = t0 + STORM_ERROR_WINDOW + Duration::from_secs(1);
+        assert_eq!(
+            api_error_sessions(&storm, calm),
+            0,
+            "errors older than the window don't count"
+        );
+        assert!(
+            !storm_freeze(api_error_sessions(&storm, calm)),
+            "window cleared -> no longer frozen"
+        );
+
+        // (a) below the threshold -> NOT a full freeze; the mild heartbeat still
+        //     governs and fires exactly ONE spaced nudge (never total silence).
+        let mut mild: HashMap<String, TabWatch> = HashMap::new();
+        for i in 0..(STORM_ERROR_THRESHOLD - 1) {
+            mild.insert(format!("t{i}"), errored_at(t0));
+        }
+        assert!(
+            !storm_freeze(api_error_sessions(&mild, t0)),
+            "4 < 5 -> mild, no full freeze"
+        );
+        let mut last: Option<Instant> = None;
+        assert!(
+            nudge_ready(&mut last, t0, nudge_interval(true)),
+            "mild level still fires the level-(a) heartbeat nudge"
+        );
+
+        // The storm signal is API-capacity errors only — LOCAL network faults and
+        // the generic agent-error flag don't inflate the storm count.
+        assert!(is_api_storm_label("anthropic-529"), "429/overloaded counts");
+        assert!(is_api_storm_label("anthropic-rate-limited"), "rate-limited counts");
+        assert!(is_api_storm_label("api-retry-waiting"), "active retry banner counts");
+        assert!(
+            !is_api_storm_label("connection-refused"),
+            "local network fault does NOT"
+        );
+        assert!(!is_api_storm_label("agent-state-error"), "generic error flag does NOT");
     }
 
     #[test]
