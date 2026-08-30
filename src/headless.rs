@@ -17,7 +17,7 @@
 
 #![cfg(not(feature = "gui"))]
 
-use crate::{api_url_for_local_clients, build_agent_resume_command, tab_env_extras};
+use crate::{api_url_for_local_clients, tab_env_extras};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -799,10 +799,14 @@ fn spawn_pty_tab(
     // above (agent_direct) — otherwise the exec'd agent + a typed `--resume`
     // would double-launch. Never into a hot-swap-adopted shell either: its
     // agent is still running.
-    let pending_agent_resume = match (&agent_kind, &agent_session_id) {
-        _ if agent_direct.is_some() || crate::read_only() || was_adopted => None,
-        (Some(kind), Some(sid)) => build_agent_resume_command(kind, sid, agent_plan_mode),
-        _ => None,
+    let pending_agent_resume = if agent_direct.is_some() || crate::read_only() || was_adopted {
+        None
+    } else {
+        // Shared restore-match (brain/aligator session-less, else session-
+        // carrying) — the SAME source of truth the GUI restore path uses, so a
+        // session-less aligator is relaunched here too (previously this match had
+        // no session-less arm and dropped it to a shell).
+        crate::restore_resume_command(agent_kind.as_deref(), agent_session_id.as_deref(), agent_plan_mode)
     };
 
     let last_known_cwd_string = cwd.as_ref().map(|p| p.to_string_lossy().into());

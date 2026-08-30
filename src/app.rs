@@ -26,7 +26,7 @@ use crate::{
 use crate::save_tab_energy;
 #[cfg(feature = "catbus")]
 use crate::save_tab_tokens;
-use crate::{api_url_for_local_clients, build_agent_resume_command, tab_env_extras};
+use crate::{api_url_for_local_clients, restore_resume_command, tab_env_extras};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Application, AsyncApp, ClickEvent, ClipboardItem, Context, Div, ElementId, Entity, FocusHandle,
@@ -1060,13 +1060,13 @@ impl AppState {
                 {
                     None
                 } else {
-                    match (ts.agent_kind.as_deref(), ts.agent_session_id.as_deref()) {
-                        // Brain has no session — it re-attaches over the API.
-                        // Relaunch it whenever the tab is flagged as one.
-                        (Some("brain"), _) => build_agent_resume_command("brain", "", ts.agent_plan_mode),
-                        (Some(kind), Some(sid)) => build_agent_resume_command(kind, sid, ts.agent_plan_mode),
-                        _ => None,
-                    }
+                    // Shared restore-match (brain/aligator session-less, else
+                    // session-carrying) — one source of truth with headless.
+                    restore_resume_command(
+                        ts.agent_kind.as_deref(),
+                        ts.agent_session_id.as_deref(),
+                        ts.agent_plan_mode,
+                    )
                 };
                 tabs.push(Tab::from_state(
                     view,
