@@ -664,3 +664,18 @@ body.band-view { min-height: calc(100vh + 180px); }
   font-size: 0.95em; padding: 0 0.25rem; vertical-align: middle;
 }
 .agent-card .ac-open:hover { opacity: 0.8; }
+
+/* --- Inc9 b2: context-usage pill (green <70 / amber 70-90 / red >90) --- */
+.ctx-pill {
+  font-size: 0.58rem; padding: 0 0.3rem; border-radius: 999px;
+  border: 1px solid var(--border); white-space: nowrap; vertical-align: middle;
+}
+.ctx-pill.ctx-ok   { color: var(--led-working-stroke);    border-color: var(--led-working-stroke);    background: color-mix(in srgb, var(--led-working-stroke) 12%, transparent); }
+.ctx-pill.ctx-warn { color: var(--led-unreviewed-stroke); border-color: var(--led-unreviewed-stroke); background: color-mix(in srgb, var(--led-unreviewed-stroke) 14%, transparent); }
+.ctx-pill.ctx-crit { color: var(--led-error-stroke);      border-color: var(--led-error-stroke);      background: color-mix(in srgb, var(--led-error-stroke) 14%, transparent); font-weight: 600; }
+
+/* --- Inc9 b3: discreet recent-compaction badge --- */
+.compact-badge {
+  font-size: 0.62rem; margin-left: 0.15rem; color: var(--muted);
+  vertical-align: middle;
+}
