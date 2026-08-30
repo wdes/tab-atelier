@@ -52,6 +52,40 @@ const MAX_SKIP_ATTEMPTS: u32 = 6;
 /// fixed floor here; a follow-up should reuse dispatch's settle poll.
 const SUBMIT_DELAY: Duration = Duration::from_millis(400);
 
+/// RS1 drain-priority class.
+///
+/// **Declaration order == drain order** (Block first): a round is stable-sorted
+/// by this before the FIFO tie-break, so `block`/`verdict` land ahead of
+/// `status`. `Directive` is the default so a legacy entry (no `priority` field)
+/// keeps its FIFO slot among other legacy entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Priority {
+    /// An unblock/blocker nudge — drains first.
+    Block,
+    /// A supervisor verdict — ahead of routine traffic.
+    Verdict,
+    /// Routine directive — the neutral default (legacy FIFO position).
+    #[default]
+    Directive,
+    /// Low-urgency status — drains last.
+    Status,
+}
+
+impl Priority {
+    /// Parse the `--priority` flag value (case-insensitive). `None` → caller errors.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "block" => Some(Self::Block),
+            "verdict" => Some(Self::Verdict),
+            "directive" => Some(Self::Directive),
+            "status" => Some(Self::Status),
+            _ => None,
+        }
+    }
+}
+
 /// One swamp entry — a request to type `input` into tab `tab`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwampEntry {
@@ -72,10 +106,25 @@ pub struct SwampEntry {
     /// not yet live. Omitted from the JSONL when 0 to keep legacy lines clean.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub attempts: u32,
+    /// RS1 drain priority. Omitted from the JSONL when default (`directive`) so
+    /// legacy lines stay byte-clean and a round with no explicit priority drains
+    /// FIFO.
+    #[serde(default, skip_serializing_if = "is_default_priority")]
+    pub priority: Priority,
+    /// RS1 idempotency key. A later entry whose key was already delivered is
+    /// dropped (dedup). `None` = unkeyed → always FIFO, never deduped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedup_key: Option<String>,
 }
 
 const fn default_true() -> bool {
     true
+}
+
+// serde's `skip_serializing_if` mandates a `&T` predicate, hence the reference.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_default_priority(p: &Priority) -> bool {
+    matches!(p, Priority::Directive)
 }
 
 // serde's `skip_serializing_if` mandates a `&T` predicate, hence the reference.
@@ -310,6 +359,10 @@ pub enum Decision {
     /// Target isn't a live Claude tab — skip. `kind` decides whether `tick`
     /// retries (transient) or consumes it (permanent).
     Skip { index: usize, tab: String, kind: SkipKind },
+    /// RS1 dedup — the entry's `dedup_key` was already delivered; consume WITHOUT
+    /// re-delivering (idempotency). Distinct from `Skip`: never retried, no
+    /// re-queue. Only ever downgraded from a `Deliver` (the gate still wins).
+    Drop { index: usize, tab: String, key: String },
 }
 
 /// Plan one round: classify every entry past `cursor` into deliver / skip.
@@ -340,6 +393,185 @@ pub fn plan_round(entries: &[SwampEntry], cursor: usize, classify: impl Fn(&str)
             }
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// RS1 — drain heuristics (fabric v2). All PURE + unit-tested; each active only
+// when its signal is present, else a no-op that leaves the drain byte-identical
+// to the legacy FIFO (invariant a) and fails open to it (invariant b).
+// ---------------------------------------------------------------------------
+
+/// Max deliveries to a single target within one round before the rest wait for
+/// the next round (rate-limit window). ponytail: the window is one round; a
+/// cross-round token-bucket + jitter (cf. api-ratelimit-analysis) is the upgrade.
+const RATE_LIMIT_PER_ROUND: usize = 3;
+
+/// Does the round carry ANY RS1 signal (a non-default priority or a dedup key)?
+///
+/// A round of purely-legacy entries returns false → the heuristic layer is
+/// skipped entirely → byte-identical FIFO (invariant a).
+#[must_use]
+pub fn round_has_rs1_signal(candidates: &[SwampEntry]) -> bool {
+    candidates
+        .iter()
+        .any(|e| !matches!(e.priority, Priority::Directive) || e.dedup_key.is_some())
+}
+
+/// RS1 dedup predicate: is `key` one already delivered? An unkeyed entry
+/// (`None`) is never a duplicate — it always drains FIFO.
+#[must_use]
+#[allow(clippy::implicit_hasher)] // callers use the default hasher
+pub fn is_duplicate(key: Option<&str>, delivered: &std::collections::HashSet<String>) -> bool {
+    key.is_some_and(|k| delivered.contains(k))
+}
+
+/// RS1 priority order: stable-sort candidate INDICES so higher-urgency classes
+/// drain first, FIFO within a class. All-default input → identity `[0,1,2,…]`
+/// (byte-identical FIFO — invariant a). Pure.
+#[must_use]
+pub fn priority_order(candidates: &[SwampEntry]) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..candidates.len()).collect();
+    // `sort_by_key` is stable → equal priority keeps the FIFO (index) order.
+    idx.sort_by_key(|&i| candidates[i].priority);
+    idx
+}
+
+/// RS1 rate-limit: has `target` already hit its per-round cap? Pure — the caller
+/// tracks the running count.
+#[must_use]
+pub const fn rate_limited(delivered_to_target: usize, limit: usize) -> bool {
+    delivered_to_target >= limit
+}
+
+/// RS1 anti-ping-pong: would delivering to `target` continue an A→B→A oscillation?
+///
+/// True when the last two deliveries were `(target, other)` — i.e. `target` is
+/// bouncing back right after a hop to a different tab. `recent` = delivery
+/// targets in order, most-recent last. Pure.
+#[must_use]
+pub fn is_ping_pong(target: &str, recent: &[String]) -> bool {
+    let n = recent.len();
+    n >= 2 && recent[n - 2] == target && recent[n - 1] != target
+}
+
+/// RS1 delivery-heuristics pass: post-process a FIFO plan into the drained plan.
+///
+/// Priority ordering is applied UPSTREAM (the candidates are pre-sorted by
+/// [`priority_order`] before planning), so this only *downgrades* `Deliver`s:
+/// dedup → [`Decision::Drop`]; rate-limit / ping-pong → `Skip(Transient)` (defer
+/// & re-queue via the existing path). A `Skip` is never promoted — the
+/// confused-deputy gate always wins (invariant c). With no dedup ledger and no
+/// rate/ping-pong trip the plan passes through unchanged (invariant a/b).
+#[must_use]
+#[allow(clippy::implicit_hasher)] // callers use the default hasher
+pub fn apply_delivery_heuristics(
+    plan: Vec<Decision>,
+    entries: &[SwampEntry],
+    delivered: &std::collections::HashSet<String>,
+    rate_limit: usize,
+) -> Vec<Decision> {
+    // Gate: a round with no RS1 signal is left byte-identical (invariant a) — the
+    // target-based heuristics (rate-limit/ping-pong) are opt-in, so a pure legacy
+    // flood still drains FIFO. ponytail: to regulate legacy floods, a producer
+    // tags the entries (priority/dedup) → the round opts into the layer.
+    if !round_has_rs1_signal(entries) {
+        return plan;
+    }
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut recent: Vec<String> = Vec::new();
+    plan.into_iter()
+        .map(|d| match d {
+            Decision::Deliver {
+                index,
+                tab,
+                input,
+                submit,
+            } => {
+                let key = entries.get(index).and_then(|e| e.dedup_key.as_deref());
+                if is_duplicate(key, delivered) {
+                    return Decision::Drop {
+                        index,
+                        tab,
+                        key: key.unwrap_or_default().to_string(),
+                    };
+                }
+                let already = counts.get(&tab).copied().unwrap_or(0);
+                if rate_limited(already, rate_limit) || is_ping_pong(&tab, &recent) {
+                    // Defer to a later round — reuse the transient re-queue path.
+                    return Decision::Skip {
+                        index,
+                        tab,
+                        kind: SkipKind::Transient,
+                    };
+                }
+                *counts.entry(tab.clone()).or_insert(0) += 1;
+                recent.push(tab.clone());
+                Decision::Deliver {
+                    index,
+                    tab,
+                    input,
+                    submit,
+                }
+            }
+            // A Skip/Drop is never upgraded — the gate wins (invariant c).
+            other => other,
+        })
+        .collect()
+}
+
+/// Physically reorder the undelivered swamp tail by [`priority_order`] (stable)
+/// so the cursor still advances monotonically while higher-priority entries drain
+/// first. Rewrites the file to `prefix ++ reordered-tail` (reusing the atomic
+/// tmp+rename of [`compact_swamp`]) ONLY when the order changes; an already-sorted
+/// tail is left untouched. Best-effort: a write failure returns the ORIGINAL
+/// order (fail-open — invariant b). Returns the (possibly reordered) entry vec.
+fn prioritize_tail(path: &Path, entries: Vec<SwampEntry>, cursor: usize) -> Vec<SwampEntry> {
+    let start = clamp_cursor(cursor, entries.len());
+    let order = priority_order(&entries[start..]);
+    if order.iter().enumerate().all(|(i, &j)| i == j) {
+        return entries; // already in priority order → no rewrite
+    }
+    let mut reordered = entries[..start].to_vec();
+    reordered.extend(order.iter().map(|&j| entries[start + j].clone()));
+    let body: String = reordered.iter().map(encode_swamp_line).collect();
+    let tmp = path.with_extension("jsonl.tmp");
+    if std::fs::write(&tmp, &body).is_ok() && std::fs::rename(&tmp, path).is_ok() {
+        reordered
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+        entries // fail-open: keep the original FIFO order
+    }
+}
+
+/// The dedup ledger path (delivered keys, one per line — like the cursor file).
+fn dedup_path() -> PathBuf {
+    state_file("aligator.dedup")
+}
+
+/// Load the delivered-dedup-key ledger (missing/unreadable → empty; fail-open).
+fn load_delivered(path: &Path) -> std::collections::HashSet<String> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+/// Record a delivered dedup key (append; best-effort — a failure just risks a
+/// future re-delivery, never a crash). ponytail: append-only → grows unbounded;
+/// upgrade = prune alongside the swamp compaction.
+fn record_delivered(path: &Path, key: &str) {
+    if key.is_empty() {
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{key}");
+    }
 }
 
 fn read_cursor() -> usize {
@@ -434,8 +666,34 @@ fn tick(cursor: &mut usize) -> Result<(), String> {
         .read_json()
         .map_err(|e| format!("parse /tabs: {e}"))?;
 
-    for decision in plan_round(&entries, *cursor, |uuid| classify_target(&tabs.tabs, uuid)) {
+    // RS1 fabric v2: when the round carries any priority/dedup signal, drain
+    // through the heuristic layer — priority-reorder the tail (cursor stays
+    // monotonic), then dedup / rate-limit / anti-ping-pong the plan. A purely-
+    // legacy round skips the whole layer → byte-identical FIFO (invariant a); any
+    // failure in the layer falls back to the bare FIFO plan (invariant b).
+    let has_signal = round_has_rs1_signal(&entries[clamp_cursor(*cursor, entries.len())..]);
+    let entries = if has_signal {
+        prioritize_tail(&swamp_path(), entries, *cursor)
+    } else {
+        entries
+    };
+    let fifo = plan_round(&entries, *cursor, |uuid| classify_target(&tabs.tabs, uuid));
+    let plan = if has_signal {
+        apply_delivery_heuristics(fifo, &entries, &load_delivered(&dedup_path()), RATE_LIMIT_PER_ROUND)
+    } else {
+        fifo
+    };
+    for decision in plan {
         match decision {
+            // RS1 dedup: the key was already delivered — consume WITHOUT re-typing
+            // (idempotency). Record the key (idempotent) so a later duplicate is
+            // dropped too. Never re-queued (distinct from a transient skip).
+            Decision::Drop { index, tab, key } => {
+                println!("🐊 aligator: DEDUP {tab} — key '{key}' already delivered, dropped");
+                record_delivered(&dedup_path(), &key);
+                *cursor = index + 1;
+                write_cursor(*cursor);
+            }
             Decision::Deliver {
                 index,
                 tab,
@@ -491,6 +749,11 @@ fn tick(cursor: &mut usize) -> Result<(), String> {
                 //    Inc8 S4: bump the target's usage (observability — who's being
                 //    fed from the swamp). Best-effort; never blocks the consume.
                 crate::cli::share_link::bump_usage(&ep, &tab);
+                // RS1: record this entry's dedup_key so a later duplicate is
+                // dropped (idempotency). No-op for an unkeyed (legacy) entry.
+                if let Some(k) = entries[index].dedup_key.as_deref() {
+                    record_delivered(&dedup_path(), k);
+                }
                 println!(
                     "🐊 aligator: {tab:<36} ← {n} byte(s){s}",
                     n = input.len(),
@@ -618,25 +881,42 @@ pub struct SwampArgs {
     pub input: String,
     pub submit: bool,
     pub from: Option<String>,
+    /// RS1 drain priority (`--priority`), default `directive`.
+    pub priority: Priority,
+    /// RS1 idempotency key (`--dedup-key`), `None` when unset.
+    pub dedup_key: Option<String>,
 }
 
-/// Pure arg parser for `swamp <tab> "<text>" [--no-submit] [--from NAME]`.
+/// Pure arg parser for
+/// `swamp <tab> "<text>" [--no-submit] [--from NAME] [--priority P] [--dedup-key K]`.
 ///
 /// # Errors
-/// `Err(0)` on `-h`/`--help` (usage printed), `Err(2)` on a missing
-/// tab/text or an unexpected extra argument.
+/// `Err(0)` on `-h`/`--help` (usage printed), `Err(2)` on a missing tab/text, an
+/// unexpected extra argument, or an unknown `--priority` value.
 pub fn parse_swamp_args(args: &[String]) -> Result<SwampArgs, i32> {
     let mut tab: Option<String> = None;
     let mut input: Option<String> = None;
     let mut submit = true;
     let mut from: Option<String> = None;
+    let mut priority = Priority::default();
+    let mut dedup_key: Option<String> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--no-submit" => submit = false,
             "--from" => from = it.next().cloned(),
+            "--priority" => {
+                let Some(p) = it.next().and_then(|v| Priority::parse(v)) else {
+                    eprintln!("swamp: --priority expects block|verdict|directive|status");
+                    return Err(2);
+                };
+                priority = p;
+            }
+            "--dedup-key" => dedup_key = it.next().cloned(),
             "-h" | "--help" => {
-                eprintln!("usage: tab-atelier swamp <tab-uuid> \"<text>\" [--no-submit] [--from NAME]");
+                eprintln!(
+                    "usage: tab-atelier swamp <tab-uuid> \"<text>\" [--no-submit] [--from NAME] [--priority block|verdict|directive|status] [--dedup-key KEY]"
+                );
                 return Err(0);
             }
             other if tab.is_none() => tab = Some(other.to_string()),
@@ -653,6 +933,8 @@ pub fn parse_swamp_args(args: &[String]) -> Result<SwampArgs, i32> {
             input,
             submit,
             from,
+            priority,
+            dedup_key,
         })
     } else {
         eprintln!("swamp: usage: tab-atelier swamp <tab-uuid> \"<text>\" [--no-submit]");
@@ -691,6 +973,8 @@ pub fn run_swamp(args: &[String]) -> i32 {
         submit: parsed.submit,
         from: parsed.from,
         attempts: 0,
+        priority: parsed.priority,
+        dedup_key: parsed.dedup_key,
     };
     match append_swamp_line(&swamp_path(), &entry) {
         Ok(()) => {
@@ -731,6 +1015,17 @@ mod tests {
             submit,
             from: None,
             attempts: 0,
+            priority: Priority::default(),
+            dedup_key: None,
+        }
+    }
+
+    /// Like [`entry`] but with an explicit priority + dedup key (RS1 tests).
+    fn tagged(tab: &str, priority: Priority, dedup_key: Option<&str>) -> SwampEntry {
+        SwampEntry {
+            priority,
+            dedup_key: dedup_key.map(Into::into),
+            ..entry(tab, "x", true)
         }
     }
 
@@ -753,7 +1048,7 @@ mod tests {
             .iter()
             .filter_map(|d| match d {
                 Decision::Deliver { tab, .. } => Some(tab.as_str()),
-                Decision::Skip { .. } => None,
+                Decision::Skip { .. } | Decision::Drop { .. } => None,
             })
             .collect();
         assert_eq!(replanned, vec!["t2", "t3"], "only the undelivered are re-planned");
@@ -853,6 +1148,8 @@ not json at all
             submit: false,
             from: Some("bot-orc".into()),
             attempts: 3, // a re-queued entry roundtrips its retry counter
+            priority: Priority::Block,
+            dedup_key: Some("verdict-42".into()),
         };
         let line = encode_swamp_line(&e);
         assert!(line.ends_with('\n'));
@@ -903,16 +1200,22 @@ not json at all
                 input: "hello".into(),
                 submit: true,
                 from: None,
+                priority: Priority::default(),
+                dedup_key: None,
             }
         );
-        // Flags in any position.
+        // Flags in any position, incl. RS1 --priority / --dedup-key.
         assert_eq!(
             parse_swamp_args(&[
                 "--no-submit".into(),
                 "uuid".into(),
                 "hi".into(),
                 "--from".into(),
-                "bot".into()
+                "bot".into(),
+                "--priority".into(),
+                "block".into(),
+                "--dedup-key".into(),
+                "k1".into()
             ])
             .unwrap(),
             SwampArgs {
@@ -920,12 +1223,22 @@ not json at all
                 input: "hi".into(),
                 submit: false,
                 from: Some("bot".into()),
+                priority: Priority::Block,
+                dedup_key: Some("k1".into()),
             }
         );
         // Missing text → 2; extra positional → 2; help → 0.
         assert_eq!(parse_swamp_args(&["only-tab".into()]), Err(2));
         assert_eq!(parse_swamp_args(&["a".into(), "b".into(), "c".into()]), Err(2));
         assert_eq!(parse_swamp_args(&["-h".into()]), Err(0));
+        // An unknown --priority value → exit 2 (no silent default).
+        assert_eq!(
+            parse_swamp_args(&["u".into(), "t".into(), "--priority".into(), "bogus".into()]),
+            Err(2)
+        );
+        // RS1 flags default cleanly (case-insensitive priority parse).
+        assert_eq!(Priority::parse("VERDICT"), Some(Priority::Verdict));
+        assert_eq!(Priority::parse("nope"), None);
     }
 
     #[test]
@@ -1027,6 +1340,7 @@ not json at all
         let e = entry("claude", "run the tests", true);
         let plan = plan_round(std::slice::from_ref(&e), 0, |_| Guard::Deliver);
         match &plan[0] {
+            Decision::Drop { .. } => panic!("expected Deliver, got a Drop"),
             Decision::Deliver { input, submit, .. } => {
                 assert_eq!(input, "run the tests", "input is the raw text — ⏎ is NOT appended");
                 assert!(!input.ends_with('\r'), "⏎ is a separate send, never baked into input");
@@ -1119,5 +1433,172 @@ not json at all
         assert!(self_announce(None).is_none(), "no _TAB_ID → no announce");
         assert!(self_announce(Some("")).is_none(), "empty _TAB_ID → no announce");
         assert!(self_announce(Some("   ")).is_none(), "blank _TAB_ID → no announce");
+    }
+
+    // ---- RS1 fabric v2 — drain heuristics + invariants -------------------
+
+    /// Build a deliverable FIFO plan (every target delivers) over `entries`.
+    fn deliver_plan(entries: &[SwampEntry]) -> Vec<Decision> {
+        plan_round(entries, 0, |_| Guard::Deliver)
+    }
+
+    /// The target uuids of the `Deliver` decisions, in plan order.
+    fn delivered_tabs(plan: &[Decision]) -> Vec<String> {
+        plan.iter()
+            .filter_map(|d| match d {
+                Decision::Deliver { tab, .. } => Some(tab.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn empty_ledger() -> std::collections::HashSet<String> {
+        std::collections::HashSet::new()
+    }
+
+    #[test]
+    fn invariant_a_legacy_round_is_byte_identical_fifo() {
+        // A round with NO priority/dedup signal must drain EXACTLY as today: the
+        // heuristic layer is skipped (round_has_rs1_signal=false), priority_order
+        // is the identity, and apply_delivery_heuristics is a pass-through.
+        let entries = vec![entry("a", "1", true), entry("b", "2", true), entry("a", "3", true)];
+        assert!(!round_has_rs1_signal(&entries), "no fields → no RS1 signal");
+        assert_eq!(priority_order(&entries), vec![0, 1, 2], "all-default → identity order");
+        let fifo = deliver_plan(&entries);
+        let after = apply_delivery_heuristics(fifo.clone(), &entries, &empty_ledger(), RATE_LIMIT_PER_ROUND);
+        assert_eq!(after, fifo, "legacy round passes through unchanged (FIFO identical)");
+    }
+
+    #[test]
+    fn invariant_b_fail_open_empty_state_keeps_the_fifo_plan() {
+        // Fail-open: with an empty ledger and no rate/ping-pong trip, every FIFO
+        // Deliver survives — the layer never blocks a legit delivery.
+        let entries = vec![
+            tagged("a", Priority::Block, Some("k1")),
+            tagged("b", Priority::Status, None),
+        ];
+        let fifo = deliver_plan(&entries);
+        let after = apply_delivery_heuristics(fifo, &entries, &empty_ledger(), RATE_LIMIT_PER_ROUND);
+        assert_eq!(
+            delivered_tabs(&after),
+            vec!["a", "b"],
+            "nothing dropped/deferred when state is clean"
+        );
+    }
+
+    #[test]
+    fn invariant_c_gate_wins_over_heuristics() {
+        // A gated target (not a live Claude tab) stays a Skip even with a high
+        // priority + a dedup key — heuristics only DOWNGRADE Delivers, never
+        // promote a Skip. Aligator's confused-deputy gate is intact.
+        let entries = vec![tagged("shell", Priority::Block, Some("k1"))];
+        let gated = plan_round(&entries, 0, |_| Guard::Skip(SkipKind::Permanent));
+        let after = apply_delivery_heuristics(gated, &entries, &empty_ledger(), RATE_LIMIT_PER_ROUND);
+        assert!(
+            matches!(
+                after.as_slice(),
+                [Decision::Skip {
+                    kind: SkipKind::Permanent,
+                    ..
+                }]
+            ),
+            "gated target stays a permanent skip regardless of priority/dedup: {after:?}"
+        );
+    }
+
+    #[test]
+    fn dedup_drops_an_already_delivered_key() {
+        assert!(!is_duplicate(None, &empty_ledger()), "unkeyed is never a duplicate");
+        let mut ledger = empty_ledger();
+        ledger.insert("k1".to_string());
+        assert!(is_duplicate(Some("k1"), &ledger));
+        assert!(!is_duplicate(Some("k2"), &ledger));
+        // In a plan: the entry whose key is already delivered becomes a Drop; the
+        // fresh-keyed one still delivers.
+        let entries = vec![
+            tagged("a", Priority::Directive, Some("k1")), // already delivered
+            tagged("b", Priority::Directive, Some("k2")), // fresh
+        ];
+        let after = apply_delivery_heuristics(deliver_plan(&entries), &entries, &ledger, RATE_LIMIT_PER_ROUND);
+        assert!(matches!(after[0], Decision::Drop { .. }), "dup key → Drop: {after:?}");
+        assert_eq!(delivered_tabs(&after), vec!["b"], "only the fresh-keyed entry delivers");
+    }
+
+    #[test]
+    fn rate_limit_bounds_a_burst_to_one_target() {
+        assert!(!rate_limited(2, 3));
+        assert!(rate_limited(3, 3), "at the cap → limited");
+        // 5 entries to the same tab, cap 3 → first 3 deliver, the rest defer
+        // (Skip Transient, re-queued next round). Tagged Block so the round opts
+        // into the RS1 layer (target-based heuristics are opt-in, invariant a).
+        let entries: Vec<SwampEntry> = (0..5).map(|_| tagged("hot", Priority::Block, None)).collect();
+        let after = apply_delivery_heuristics(deliver_plan(&entries), &entries, &empty_ledger(), 3);
+        assert_eq!(delivered_tabs(&after).len(), 3, "burst capped at the rate limit");
+        let deferred = after
+            .iter()
+            .filter(|d| {
+                matches!(
+                    d,
+                    Decision::Skip {
+                        kind: SkipKind::Transient,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(deferred, 2, "the surplus is deferred, not dropped");
+    }
+
+    #[test]
+    fn ping_pong_oscillation_is_broken() {
+        assert!(
+            is_ping_pong("A", &["A".into(), "B".into()]),
+            "A after (A,B) = oscillation"
+        );
+        assert!(!is_ping_pong("A", &["A".into()]), "one hop is not a ping-pong");
+        assert!(
+            !is_ping_pong("C", &["A".into(), "B".into()]),
+            "a new target is not bouncing back"
+        );
+        // A → B → A → B: the 3rd (A) and 4th (B) are the returns that get deferred.
+        // Tagged Block (same class → stable identity order) so the round opts into
+        // the RS1 layer without perturbing the A,B,A,B sequence.
+        let entries = vec![
+            tagged("A", Priority::Block, None),
+            tagged("B", Priority::Block, None),
+            tagged("A", Priority::Block, None),
+            tagged("B", Priority::Block, None),
+        ];
+        let after = apply_delivery_heuristics(deliver_plan(&entries), &entries, &empty_ledger(), 99);
+        // The bounce-back to A (index 2) is deferred → the A↔B loop is broken; A is
+        // delivered exactly once (its return blocked).
+        assert!(
+            matches!(
+                after[2],
+                Decision::Skip {
+                    kind: SkipKind::Transient,
+                    ..
+                }
+            ),
+            "the return to A is deferred (loop broken): {after:?}"
+        );
+        let a_delivered = delivered_tabs(&after).iter().filter(|t| *t == "A").count();
+        assert_eq!(a_delivered, 1, "A delivered once — its bounce-back is broken");
+    }
+
+    #[test]
+    fn priority_orders_block_verdict_before_status_stable_within_class() {
+        // block/verdict drain before directive/status; FIFO within a class.
+        let entries = vec![
+            tagged("s1", Priority::Status, None),
+            tagged("b1", Priority::Block, None),
+            tagged("d1", Priority::Directive, None),
+            tagged("b2", Priority::Block, None),
+            tagged("v1", Priority::Verdict, None),
+        ];
+        let order = priority_order(&entries);
+        let ordered: Vec<&str> = order.iter().map(|&i| entries[i].tab.as_str()).collect();
+        // Block (b1,b2 in FIFO) → Verdict (v1) → Directive (d1) → Status (s1).
+        assert_eq!(ordered, vec!["b1", "b2", "v1", "d1", "s1"]);
     }
 }
