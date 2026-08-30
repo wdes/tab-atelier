@@ -279,6 +279,15 @@ struct TabInfo {
     /// double-launch its agent. Omitted (false) in the normal case.
     #[serde(rename = "inHandoff", skip_serializing_if = "std::ops::Not::not")]
     in_handoff: bool,
+    /// Inc9 b2 — context-window % used (0-100). Omitted when no marker on screen.
+    /// `SNAKE_CASE` on the wire (`context_pct`) — the b2/b3 web JS reads it snake,
+    /// like `agent_kind`/`parent_tab_id`; a camelCase rename would read `undefined`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_pct: Option<u8>,
+    /// Inc9 b3 — a compaction/rehome (brutal context-% drop) landed recently.
+    /// `SNAKE_CASE` (`recently_compacted`). Omitted (false) in the common case.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    recently_compacted: bool,
 }
 
 /// One DNS-entries-view row for the `/tabs` response.
@@ -562,6 +571,16 @@ struct DashboardTab {
     /// flags that emptiness; the daemon just omits it).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     conventions: Vec<String>,
+    /// Inc9 b2 — context-window % used (0-100). Forced `SNAKE_CASE` (`context_pct`)
+    /// via an explicit rename (this struct is `rename_all = "camelCase"`), because
+    /// the b2/b3 web JS reads it snake — a camelCase key would read `undefined`.
+    /// Omitted when no marker on screen.
+    #[serde(rename = "context_pct", skip_serializing_if = "Option::is_none")]
+    context_pct: Option<u8>,
+    /// Inc9 b3 — a compaction/rehome (brutal context-% drop) landed recently.
+    /// Forced `SNAKE_CASE` (`recently_compacted`) for the same reason. Omitted false.
+    #[serde(rename = "recently_compacted", skip_serializing_if = "std::ops::Not::not")]
+    recently_compacted: bool,
     /// S4: current task + `Task()` sub-agents, read from the tab's transcript.
     /// Flattened → `currentTask` / `subAgents` sit on the tab for `taskChips`.
     /// Empty (`currentTask:null`, `subAgents:[]`) when the tab has no transcript.
@@ -748,6 +767,9 @@ struct DashboardTabInput {
     last_used_at: Option<u64>,
     // Inc8 fold: declared conventions (.md list).
     conventions: Vec<String>,
+    // Inc9 b2/b3: context-% + whether a compaction landed recently.
+    context_pct: Option<u8>,
+    recently_compacted: bool,
 }
 
 /// Rollup severity of a `led` slug — higher is worse. Mirrors [`crate::TabLed`]
@@ -998,6 +1020,8 @@ fn build_dashboard_state(inputs: Vec<DashboardTabInput>) -> DashboardState {
                 usage_count: t.usage_count,
                 last_used_at: t.last_used_at,
                 conventions: t.conventions,
+                context_pct: t.context_pct,
+                recently_compacted: t.recently_compacted,
                 activity: t.activity,
             };
             Projected { project, phase, tab }
@@ -1274,6 +1298,12 @@ pub struct SnapshotTab {
     pub usage_count: Option<u64>,
     /// Inc8 fold — declared conventions (`.md` list).
     pub conventions: Vec<String>,
+    /// Inc9 b2 — context-window % used (0-100) parsed from the tab's screen
+    /// (`clarify::parse_context_pct`); `None` when no context marker is on screen.
+    pub context_pct: Option<u8>,
+    /// Inc9 b3 — unix-millis of the last detected compaction/rehome (a brutal
+    /// context-% drop). `None` = never; drives `recently_compacted` on the wire.
+    pub last_compaction_at: Option<u64>,
 }
 
 impl crate::schedule::LockState for SnapshotTab {
@@ -2771,6 +2801,13 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                     // Inc9 cross-guard: a hot-swap handoff is in progress → tell
                     // external daemons (brain/clarify) to leave every tab alone.
                     in_handoff: crate::hotswap::frozen(),
+                    // Inc9 b2/b3 — context-% + recent-compaction (derived from the
+                    // stamp at read time so it expires on its own).
+                    context_pct: t.context_pct,
+                    recently_compacted: crate::cli::clarify::recently_compacted(
+                        t.last_compaction_at,
+                        crate::unix_millis(),
+                    ),
                 })
                 .collect();
             #[cfg(feature = "energy")]
@@ -2925,6 +2962,11 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                     usage_count: t.usage_count,
                     last_used_at: t.last_used_at,
                     conventions: t.conventions.clone(),
+                    context_pct: t.context_pct,
+                    recently_compacted: crate::cli::clarify::recently_compacted(
+                        t.last_compaction_at,
+                        crate::unix_millis(),
+                    ),
                 })
                 .collect();
             drop(state);
@@ -5669,6 +5711,8 @@ pub fn test_snapshot_tab(id: &str, name: &str) -> SnapshotTab {
         evaluations: Vec::new(),
         usage_count: None,
         conventions: Vec::new(),
+        context_pct: None,
+        last_compaction_at: None,
     }
 }
 
@@ -5770,6 +5814,8 @@ mod tests {
             rounds_active: None,
             usage_count: None,
             in_handoff: false,
+            context_pct: None,
+            recently_compacted: false,
         }
     }
 
@@ -5835,6 +5881,8 @@ mod tests {
             usage_count: None,
             last_used_at: None,
             conventions: Vec::new(),
+            context_pct: None,
+            recently_compacted: false,
         }
     }
 
@@ -6819,6 +6867,41 @@ mod tests {
             assert!(b.contains(k), "existing field {k} kept: {b}");
         }
         assert!(b.contains("tab-a"), "the tab id value is still present: {b}");
+    }
+
+    // --- Inc9 b2/b3: context_pct + recently_compacted MUST surface on BOTH
+    //     `tabs --json` (GET /tabs) and /dashboard/state in SNAKE_CASE — the web
+    //     JS reads them snake; a camelCase key = silent undefined (the S5 in→input
+    //     trap). This test is the wire-contract proof: it fails if either key
+    //     drifts to camelCase.
+    #[test]
+    fn context_pct_and_recently_compacted_are_snake_case_on_the_wire() {
+        let (port, state, token) = spawn_server();
+        {
+            let mut s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let t = s.tabs.iter_mut().find(|t| &*t.id == "tab-a").expect("tab-a");
+            t.context_pct = Some(42);
+            // Stamp NOW so recently_compacted derives to true at read time.
+            t.last_compaction_at = Some(crate::unix_millis());
+            s.invalidate_tabs();
+        }
+        for route in ["/tabs", "/dashboard/state"] {
+            let resp = request(port, &format!("GET {route}?token={token} HTTP/1.1\r\n\r\n"));
+            let b = body(&resp);
+            assert!(
+                b.contains("\"context_pct\": 42"),
+                "{route}: context_pct must be snake_case with value 42: {b}"
+            );
+            assert!(
+                b.contains("\"recently_compacted\": true"),
+                "{route}: recently_compacted must be snake_case = true: {b}"
+            );
+            // The camelCase variants are the silent-death trap — must NEVER appear.
+            assert!(
+                !b.contains("contextPct") && !b.contains("recentlyCompacted"),
+                "{route}: no camelCase drift on these two fields: {b}"
+            );
+        }
     }
 
     #[test]
