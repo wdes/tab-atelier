@@ -11,4 +11,6 @@
 //! shared types) via explicit `use super::super::…` paths — a child module may
 //! access an ancestor's private items.
 
+#[cfg(feature = "catbus")]
+pub(super) mod catbus;
 pub(super) mod dashboard;
