@@ -380,6 +380,25 @@ fn compact_swamp(cursor: &mut usize) {
     }
 }
 
+/// Aligator's startup self-announce decision + payload. A programmatically
+/// launched aligator (the restart-watcher types `tab-atelier aligator` into a
+/// shell) lands on a tab with `agent_kind = None`, so the daemon never
+/// resurrects it on restart — unlike a menu-launched brain, which the menu
+/// stamps `agent_kind = "brain"`. Posting `agentKind:"aligator"` on our own tab
+/// closes that gap.
+///
+/// Given the `_TAB_ID` env value, returns `Some((tab_id, body))` inside a tab or
+/// `None` outside one (silent no-op — a shell rc running aligator out of a tab
+/// mustn't error). Session-less on purpose: aligator holds no agent session, so
+/// the body omits `sessionId` and never clobbers one. Pure — the HTTP is the
+/// caller's, kept best-effort.
+#[must_use]
+fn self_announce(tab_id: Option<&str>) -> Option<(String, String)> {
+    let tab_id = tab_id.map(str::trim).filter(|s| !s.is_empty())?;
+    let body = serde_json::json!({ "state": "thinking", "agentKind": "aligator" }).to_string();
+    Some((tab_id.to_string(), body))
+}
+
 fn send_input(ep: &Endpoint, uuid: &str, bytes: &[u8]) -> Result<(), String> {
     agent()
         .post(format!("{}/tabs/by-id/{uuid}/input", ep.url))
@@ -550,6 +569,21 @@ pub fn run(args: &[String]) -> i32 {
         swamp = swamp_path().display(),
         interval = opts.interval,
     );
+
+    // Durability: announce our own agent_kind on our tab so the daemon's
+    // restart-watcher resurrects us on restart (a programmatic launch leaves
+    // agent_kind=None otherwise; the GUI menu stamps brain, never aligator).
+    // Best-effort — a missing endpoint or a network failure must NEVER stop the
+    // drain (same discipline as brain). Runs once at startup, before the loop.
+    if let Some((tab_id, body)) = self_announce(std::env::var("_TAB_ID").ok().as_deref())
+        && let Ok(ep) = discover_endpoint()
+    {
+        let _ = agent()
+            .post(format!("{}/tabs/by-id/{tab_id}/status", ep.url))
+            .header("Authorization", format!("Bearer {}", ep.token))
+            .header("Content-Type", "application/json")
+            .send(body.as_str());
+    }
 
     let mut cursor = read_cursor();
     loop {
@@ -1069,5 +1103,21 @@ not json at all
             }],
             "a daemon/shell target is a PERMANENT skip (tick consumes it — safety)"
         );
+    }
+
+    #[test]
+    fn self_announce_tags_agent_kind_aligator_inside_a_tab_only() {
+        // Inside a tab (_TAB_ID set): announce, body carries state + the agent_kind
+        // the daemon's restart-watcher keys on to resurrect us on restart.
+        let (tab, body) = self_announce(Some("uuid-123")).expect("inside a tab → announce");
+        assert_eq!(tab, "uuid-123");
+        assert!(body.contains("\"agentKind\":\"aligator\""), "tags agent_kind: {body}");
+        assert!(body.contains("\"state\":\"thinking\""), "sets a live state: {body}");
+        // Session-less: aligator never claims an agent session (don't clobber one).
+        assert!(!body.contains("sessionId"), "session-less: {body}");
+        // Outside a tab (_TAB_ID unset / empty / blank) → silent no-op (None).
+        assert!(self_announce(None).is_none(), "no _TAB_ID → no announce");
+        assert!(self_announce(Some("")).is_none(), "empty _TAB_ID → no announce");
+        assert!(self_announce(Some("   ")).is_none(), "blank _TAB_ID → no announce");
     }
 }
