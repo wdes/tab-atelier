@@ -218,6 +218,63 @@ pub fn sample_tree(root_pid: u32) -> Option<ProcSample> {
     seen_root.then_some(acc)
 }
 
+/// Is this cmdline a `tab-atelier[-headless] <kind>` daemon invocation?
+///
+/// NUL-separated `/proc/<pid>/cmdline`, `kind` = `brain` | `aligator`. argv[0]'s
+/// basename is the tab-atelier binary and argv[1] is the subcommand. Pure —
+/// tested without `/proc`.
+#[must_use]
+pub fn cmdline_is_daemon(cmdline: &str, kind: &str) -> bool {
+    let args: Vec<&str> = cmdline.split('\0').filter(|s| !s.is_empty()).collect();
+    let is_bin = args.first().is_some_and(|a0| {
+        let base = a0.rsplit('/').next().unwrap_or(a0);
+        base == "tab-atelier" || base == "tab-atelier-headless"
+    });
+    is_bin && args.get(1).is_some_and(|sub| *sub == kind)
+}
+
+/// Does the tab's `/proc` subtree contain a running daemon?
+///
+/// Looks for `tab-atelier[-headless] <kind>` in the subtree rooted at
+/// `root_pid`, reusing the same BFS as [`sample_tree`] and reading each
+/// descendant's `cmdline`. Scoped to this tab's subtree, so it never matches
+/// another tab's daemon.
+///
+/// - `Some(true)` — the daemon process is present (alive).
+/// - `Some(false)` — the subtree was walked but holds no such process (the
+///   daemon is genuinely DOWN → the caller reddens it).
+/// - `None` — the root itself is unreadable (`/proc` gone): detection was
+///   impossible, so the caller stays optimistic (no false red).
+#[must_use]
+pub fn subtree_has_daemon(root_pid: u32, kind: &str) -> Option<bool> {
+    use std::fmt::Write as _;
+    let mut path = String::with_capacity(48);
+    let mut queue = vec![root_pid];
+    let mut seen_root = false;
+    while let Some(pid) = queue.pop() {
+        path.clear();
+        let _ = write!(path, "/proc/{pid}/stat");
+        if std::fs::read_to_string(&path).is_err() {
+            continue; // a descendant vanished mid-walk — skip it
+        }
+        seen_root = true;
+        path.clear();
+        let _ = write!(path, "/proc/{pid}/cmdline");
+        if let Ok(raw) = std::fs::read_to_string(&path)
+            && cmdline_is_daemon(&raw, kind)
+        {
+            return Some(true);
+        }
+        path.clear();
+        let _ = write!(path, "/proc/{pid}/task/{pid}/children");
+        if let Ok(children) = std::fs::read_to_string(&path) {
+            queue.extend(children.split_ascii_whitespace().filter_map(|s| s.parse::<u32>().ok()));
+        }
+    }
+    // Root readable but no daemon found → definitive DOWN; root unreadable → None.
+    seen_root.then_some(false)
+}
+
 /// Extract `(utime+stime, num_threads)` from a `/proc/<pid>/stat` line.
 ///
 /// The `comm` field (2nd) can contain spaces and parens, so we key off
@@ -570,6 +627,20 @@ fn unix_secs(t: SystemTime) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cmdline_is_daemon_matches_the_binary_and_subcommand() {
+        // `/proc/<pid>/cmdline` is NUL-separated argv. A daemon = tab-atelier
+        // binary + the kind as argv[1].
+        assert!(cmdline_is_daemon("tab-atelier\0aligator\0", "aligator"));
+        assert!(cmdline_is_daemon("/usr/bin/tab-atelier\0brain\0", "brain"));
+        assert!(cmdline_is_daemon("tab-atelier-headless\0aligator", "aligator"));
+        // Wrong kind, wrong binary, or the kind not in the subcommand slot → no.
+        assert!(!cmdline_is_daemon("tab-atelier\0brain\0", "aligator"));
+        assert!(!cmdline_is_daemon("bash\0-i\0-c\0aligator", "aligator"));
+        assert!(!cmdline_is_daemon("tab-atelier\0swamp\0uuid\0aligator", "aligator"));
+        assert!(!cmdline_is_daemon("", "aligator"));
+    }
 
     #[test]
     fn parses_stat_with_parens_in_comm() {
