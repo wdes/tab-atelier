@@ -726,6 +726,34 @@ pub fn build_agent_resume_command(kind: &str, session_id: &str, plan: Option<boo
     }
 }
 
+/// Pick the auto-resume command for a **restored** tab from its persisted
+/// (`agent_kind`, `session_id`, `plan_mode`).
+///
+/// The arm-selection the GUI (`app.rs`) and headless (`headless.rs`) restore
+/// paths share. Extracted so the session-less arm (brain OR aligator) lives in
+/// ONE place: both are standalone tools that re-attach over the local API and
+/// hold no session, so a missing session still relaunches them (aligator
+/// otherwise fell into the `None` catch-all and never came back after a
+/// restart). A session-carrying agent (claude/catbus) needs its `Some` session;
+/// anything else — including a session-less unknown kind — yields `None`.
+///
+/// The `agent_launch.is_some() || read_only()` guard stays in the callers: it's
+/// about the tab's *launch mode*, not its persisted identity.
+#[must_use]
+pub fn restore_resume_command(
+    agent_kind: Option<&str>,
+    session_id: Option<&str>,
+    plan: Option<bool>,
+) -> Option<String> {
+    match (agent_kind, session_id) {
+        // Session-less standalone tools: relaunch on restart, session ignored.
+        (Some(kind @ ("brain" | "aligator")), _) => build_agent_resume_command(kind, "", plan),
+        // Session-carrying agents: resume the persisted session.
+        (Some(kind), Some(sid)) => build_agent_resume_command(kind, sid, plan),
+        _ => None,
+    }
+}
+
 /// Extra shell args that make a restored agent tab **launch the agent
 /// directly** instead of dropping to a shell and typing the resume command.
 ///
@@ -3601,6 +3629,37 @@ mod tests {
         assert_eq!(cmd, "tab-atelier-headless aligator");
         // Guardrail: an unknown kind is still None (no accidental broadening).
         assert!(build_agent_resume_command("nope", "x", None).is_none());
+    }
+
+    #[test]
+    fn restore_resume_command_covers_the_session_less_and_session_arms() {
+        // This exercises the RESTORE MATCH (the daemon side), not just the
+        // build_agent_resume_command leaf: it's the arm selection that dropped
+        // aligator. Session-less standalone tools relaunch even with no session —
+        // aligator was the REGRESSING case (fell into the None catch-all).
+        let ali = restore_resume_command(Some("aligator"), None, None).expect("aligator relaunches");
+        let brain = restore_resume_command(Some("brain"), None, None).expect("brain relaunches");
+        #[cfg(feature = "gui")]
+        {
+            assert_eq!(ali, "tab-atelier aligator");
+            assert_eq!(brain, "tab-atelier brain");
+        }
+        #[cfg(not(feature = "gui"))]
+        {
+            assert_eq!(ali, "tab-atelier-headless aligator");
+            assert_eq!(brain, "tab-atelier-headless brain");
+        }
+        // Session-carrying agents resume their session.
+        let claude = restore_resume_command(Some("claude"), Some("abc-123"), None).expect("claude resumes");
+        assert_eq!(claude, "claude --resume abc-123");
+        // A session-carrying agent with NO persisted session can't resume → None.
+        assert!(
+            restore_resume_command(Some("claude"), None, None).is_none(),
+            "claude without a session → None (nothing to resume)"
+        );
+        // Unknown kind → None (no accidental broadening), with or without a session.
+        assert!(restore_resume_command(Some("nope"), Some("x"), None).is_none());
+        assert!(restore_resume_command(None, None, None).is_none());
     }
 
     #[test]
