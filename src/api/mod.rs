@@ -2,6 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+mod auth;
+
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -2578,128 +2580,20 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
     }
 
     let provided_token = auth_token.or(query_token);
-    // Permission gate, in order:
-    //
-    // 1. Master token (`api.token`) — full access to every route, no
-    //    scoping. Same as before.
-    // 2. Per-tab share token, recognised only on `/tabs/by-id/{uuid}/...`.
-    //    Two flavours: `share_token_rw` and `share_token_ro`. RW grants
-    //    everything (read + input); RO grants read endpoints but is
-    //    refused on `/input` with 403, so a recipient cannot promote
-    //    a read-only link to interactive by editing `&ro=1` out of
-    //    the URL (the *token* is the wrong type for `/input`).
-    //
-    // Auth happens before route dispatch, so the inner match arms
-    // don't need to re-check; if execution reaches them, this gate
-    // has already accepted the request at the right level.
-    let mut share_token_authorised = false;
-    // The master token lives on the shared snapshot (not the per-connection
-    // `_token` clone) so `POST /master-token/reset` can hot-swap it. The
-    // non-empty guard means an as-yet-uninitialised master ("") never
-    // authorises a token-less request.
-    // Compare under the lock (no per-request token clone) and bump the
-    // activity signal in the SAME lock scope on success — this gate used
-    // to take the global mutex twice per master-token request (once to
-    // clone the token, once more for `touch()` after the gate).
-    let is_master = {
-        let snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let ok = !snap.master_token.is_empty()
-            && constant_time_eq(
-                provided_token.as_deref().unwrap_or("").as_bytes(),
-                snap.master_token.as_bytes(),
-            );
-        if ok {
-            snap.touch();
-        }
-        ok
-    };
-    // Global dashboard share-token — a READ-ONLY observability credential for the
-    // whole fleet (PO option B). It authorises, via `?token=` or `Bearer`
-    // (constant-time): the two dashboard routes (`/dashboard` + `/dashboard/state`),
-    // AND every tab's read-only viewer routes (same perimeter as a per-tab
-    // `share_token_ro`: view/output/stream, never input/inbox/files-POST → 403).
-    // This is what lets the dashboard's right-click open a tab viewer without a
-    // per-tab token. Computed once here; folded into the per-tab RO verdict below.
-    let dashboard_matches = !is_master && {
-        let snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let ok = !snap.dashboard_share_token.is_empty()
-            && constant_time_eq(
-                provided_token.as_deref().unwrap_or("").as_bytes(),
-                snap.dashboard_share_token.as_bytes(),
-            );
-        if ok {
-            snap.touch();
-        }
-        ok
-    };
-    let is_dashboard_token =
-        dashboard_matches && matches!(path.as_str(), "/dashboard" | "/dashboard/state" | "/dashboard/activity");
-    if !is_master && !is_dashboard_token {
-        let allowed = if let Some(p) = provided_token.as_deref()
-            && let Some(rest) = path.strip_prefix("/tabs/by-id/")
-            && let Some((uuid, action)) = rest.split_once('/')
-            && matches!(
-                action,
-                "view" | "output" | "stream" | "input" | "files" | "outbox" | "inbox"
-            ) {
-            let state_g = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let verdict = state_g.tabs.iter().find(|t| &*t.id == uuid).and_then(|t| {
-                // Constant-time per-byte comparison so a brute-force
-                // probe can't shave bits off the search space by
-                // timing how long the reject takes (audit #2).
-                let rw_match =
-                    !t.share_token_rw.is_empty() && constant_time_eq(t.share_token_rw.as_bytes(), p.as_bytes());
-                // The global dashboard token acts as a read-only share token on
-                // ANY tab (PO option B), so a match here grades exactly like an
-                // RO link: read routes pass, input/inbox/files-POST stay 403.
-                let ro_match = dashboard_matches
-                    || (!t.share_token_ro.is_empty() && constant_time_eq(t.share_token_ro.as_bytes(), p.as_bytes()));
-                // Mutating + privileged-read share-token actions
-                // require RW. The RO link is read-only by construction
-                // so:
-                //   - POST /files (upload): RW only — already enforced
-                //   - GET  /inbox        : RW only — RO recipients
-                //                          shouldn't enumerate what
-                //                          other RW users uploaded
-                //   - POST /input        : RW only
-                let needs_rw = matches!(action, "input" | "inbox") || (action == "files" && method.as_str() == "POST");
-                if needs_rw {
-                    if rw_match {
-                        Some(true)
-                    } else if ro_match {
-                        Some(false)
-                    } else {
-                        None
-                    }
-                } else if rw_match || ro_match {
-                    Some(true)
-                } else {
-                    None
-                }
-            });
-            if verdict == Some(true) {
-                state_g.touch();
-            }
-            verdict
-        } else {
-            None
-        };
-        match allowed {
-            Some(true) => {
-                share_token_authorised = true;
-            }
-            Some(false) => {
-                error_negotiated(stream, 403, "share token is read-only", wants_html);
-                return;
-            }
-            None => {
+    // Auth GATE (extracted to `auth::authorize`) — runs BEFORE dispatch, so the
+    // inner match arms never re-check: master token, global dashboard share-token,
+    // or a per-tab RW/RO share token. On reject the caller writes the same
+    // content-negotiated error and closes; a 401 keeps its debug log.
+    match auth::authorize(state, &method, &path, provided_token.as_deref()) {
+        auth::Gate::Allow => {}
+        auth::Gate::Deny { status, msg } => {
+            if status == 401 {
                 debug!("API: 401 unauthorized request to {path}");
-                error_negotiated(stream, 401, "invalid or missing token", wants_html);
-                return;
             }
+            error_negotiated(stream, status, msg, wants_html);
+            return;
         }
     }
-    let _ = share_token_authorised;
 
     // The activity-signal bump ("a real client is talking to us" — keeps
     // the GUI input drain / headless main loop on their fast tick) now
