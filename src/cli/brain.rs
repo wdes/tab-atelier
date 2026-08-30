@@ -287,6 +287,21 @@ struct TabInfo {
     /// currently in a session doesn't get auto-`continue`ed.
     #[serde(default)]
     agent_session_id: Option<String>,
+    /// Inc9 hot-swap cross-guard: true while this tab is mid-adoption in a binary
+    /// hot-swap handoff (from `/tabs` `inHandoff`). Brain must NOT nudge it — a
+    /// `continue` racing the handoff could double-launch the agent.
+    #[serde(default, rename = "inHandoff")]
+    in_handoff: bool,
+}
+
+/// Is this tab a legitimate brain target? A live Claude session (kind + session)
+/// that is NOT mid-hot-swap-handoff. Pure, so the "leave an adopted tab alone"
+/// guard (Inc9) is unit-testable alongside the existing claude-only gate.
+fn is_watchable(tab: &TabInfo) -> bool {
+    !tab.id.is_empty()
+        && tab.agent_kind.as_deref() == Some("claude")
+        && !tab.agent_session_id.as_deref().unwrap_or("").is_empty()
+        && !tab.in_handoff
 }
 
 #[derive(Debug, Deserialize)]
@@ -587,15 +602,7 @@ fn tick(
     // Only tabs whose hook has reported a Claude session are legitimate targets.
     // Filtered up front (cheap, no HTTP) so the budget below governs only the
     // expensive /output GETs.
-    let claude_tabs: Vec<TabInfo> = tabs
-        .tabs
-        .into_iter()
-        .filter(|tab| {
-            !tab.id.is_empty()
-                && tab.agent_kind.as_deref() == Some("claude")
-                && !tab.agent_session_id.as_deref().unwrap_or("").is_empty()
-        })
-        .collect();
+    let claude_tabs: Vec<TabInfo> = tabs.tabs.into_iter().filter(is_watchable).collect();
     // `seen_ids` = ALL claude tabs (not just the ones scanned this tick) so a
     // budget-deferred tab keeps its watch state instead of having its freeze
     // clock reset every time the scan can't reach it.
@@ -1117,6 +1124,31 @@ mod tests {
             "local network fault does NOT"
         );
         assert!(!is_api_storm_label("agent-state-error"), "generic error flag does NOT");
+    }
+
+    #[test]
+    fn brain_leaves_a_tab_in_hotswap_handoff_alone() {
+        // Inc9 cross-guard (hot-swap × brain): a tab mid-adoption in a binary
+        // handoff carries `inHandoff:true` on /tabs. Brain must NOT nudge it — a
+        // `continue` racing the handoff could double-launch the still-live agent.
+        // A live Claude tab NOT in handoff is watchable; the same tab in handoff
+        // is not. The `inHandoff` wire field (camelCase) deserializes correctly.
+        let live: TabInfo =
+            serde_json::from_str(r#"{"id":"t1","name":"worker","agent_kind":"claude","agent_session_id":"s1"}"#)
+                .unwrap();
+        assert!(
+            is_watchable(&live),
+            "a live Claude tab (not in handoff) is a brain target"
+        );
+        let adopting: TabInfo = serde_json::from_str(
+            r#"{"id":"t1","name":"worker","agent_kind":"claude","agent_session_id":"s1","inHandoff":true}"#,
+        )
+        .unwrap();
+        assert!(adopting.in_handoff, "inHandoff wire field parsed");
+        assert!(
+            !is_watchable(&adopting),
+            "a tab mid-hot-swap-handoff is left ALONE by brain (no nudge)"
+        );
     }
 
     #[test]

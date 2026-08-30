@@ -272,6 +272,13 @@ struct TabInfo {
     rounds_active: Option<crate::RoundsActive>,
     #[serde(rename = "usageCount", skip_serializing_if = "Option::is_none")]
     usage_count: Option<u64>,
+    /// Inc9 hot-swap cross-guard: true while a binary hot-swap handoff is in
+    /// progress ([`crate::hotswap::frozen`]). External daemons (brain nudges,
+    /// clarify auto-rehome) MUST leave a tab alone while this is set — nudging /
+    /// re-homing a tab whose PTY is mid-adoption would race the handoff and could
+    /// double-launch its agent. Omitted (false) in the normal case.
+    #[serde(rename = "inHandoff", skip_serializing_if = "std::ops::Not::not")]
+    in_handoff: bool,
 }
 
 /// One DNS-entries-view row for the `/tabs` response.
@@ -2761,6 +2768,9 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                     evaluations: t.evaluations.clone(),
                     rounds_active: t.rounds_active.clone(),
                     usage_count: t.usage_count,
+                    // Inc9 cross-guard: a hot-swap handoff is in progress → tell
+                    // external daemons (brain/clarify) to leave every tab alone.
+                    in_handoff: crate::hotswap::frozen(),
                 })
                 .collect();
             #[cfg(feature = "energy")]
@@ -5759,6 +5769,7 @@ mod tests {
             evaluations: Vec::new(),
             rounds_active: None,
             usage_count: None,
+            in_handoff: false,
         }
     }
 
@@ -5779,6 +5790,25 @@ mod tests {
         let json = serde_json::to_string(&t).unwrap();
         assert!(json.contains("\"resident_memory_bytes\":4096"), "{json}");
         assert!(json.contains("\"tokens\":{\"input\":100,\"output\":50}"), "{json}");
+    }
+
+    #[test]
+    fn tabinfo_in_handoff_is_the_wire_contract_for_the_hotswap_cross_guard() {
+        // Inc9 hot-swap cross-guard: `/tabs` carries `inHandoff` (camelCase) while
+        // a binary hot-swap handoff parks a tab, so external daemons (brain nudge,
+        // clarify auto-rehome) can leave it alone. Omitted (false) in the common
+        // case so existing consumers never see the new key.
+        let clean = serde_json::to_string(&tab_info_fixture()).unwrap();
+        assert!(!clean.contains("inHandoff"), "omitted when not handing off: {clean}");
+        let handing_off = TabInfo {
+            in_handoff: true,
+            ..tab_info_fixture()
+        };
+        let json = serde_json::to_string(&handing_off).unwrap();
+        assert!(
+            json.contains("\"inHandoff\":true"),
+            "camelCase inHandoff on /tabs: {json}"
+        );
     }
 
     /// A dashboard input tab whose phase/role come from `assignment` (the S0
