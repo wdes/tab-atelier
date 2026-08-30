@@ -116,6 +116,34 @@ pub fn parse_context_pct(screen: &str) -> Option<u8> {
     best
 }
 
+// --- Inc9 b3: compaction/rehome detection from the context-% signal. ---------
+
+/// Context-% at/above which a tab counts as "high" for compaction detection.
+pub const COMPACTION_HIGH_PCT: u8 = 85;
+/// Context-% at/below which, right after a high reading, signals a compaction.
+pub const COMPACTION_LOW_PCT: u8 = 30;
+/// How long `recently_compacted` stays true after the drop (unix-millis window).
+pub const COMPACTION_RECENT_WINDOW_MS: u64 = 60_000;
+
+/// Did a compaction/rehome just happen — a BRUTAL context-% drop between two
+/// readings (was high `>= COMPACTION_HIGH_PCT`, now low `<= COMPACTION_LOW_PCT`)?
+///
+/// Both readings must be present (a tab with no context marker on screen — `None`
+/// — can't signal a drop). Pure, so the window/thresholds are unit-testable.
+#[must_use]
+pub const fn detect_compaction(prev: Option<u8>, cur: Option<u8>) -> bool {
+    matches!((prev, cur), (Some(p), Some(c)) if p >= COMPACTION_HIGH_PCT && c <= COMPACTION_LOW_PCT)
+}
+
+/// Is a compaction "recent" (within [`COMPACTION_RECENT_WINDOW_MS`] of `now`)?
+///
+/// `last` = the unix-millis stamp of the last detected drop (`None` = never).
+/// Pure (injected `now`) so the expiry window is unit-testable.
+#[must_use]
+pub fn recently_compacted(last: Option<u64>, now: u64) -> bool {
+    last.is_some_and(|t| now.saturating_sub(t) < COMPACTION_RECENT_WINDOW_MS)
+}
+
 /// Is `name` a meta/daemon tab by NAME (brain/aligator/scribe/…)?
 ///
 /// Case-insensitive substring — the name-only half of [`should_skip_rehome`],
@@ -478,6 +506,40 @@ mod tests {
         // No context marker → None (a stray % elsewhere is ignored).
         assert_eq!(parse_context_pct("CPU 40% MEM 20%"), None);
         assert_eq!(parse_context_pct(""), None);
+    }
+
+    #[test]
+    fn detect_compaction_on_a_brutal_context_drop() {
+        // Inc9 b3: a compaction/rehome shows as a BRUTAL context-% drop between two
+        // readings — was high (>= 85), now low (<= 30).
+        assert!(detect_compaction(Some(92), Some(8)), "92% → 8% = compaction");
+        assert!(
+            detect_compaction(Some(COMPACTION_HIGH_PCT), Some(COMPACTION_LOW_PCT)),
+            "boundary inclusive"
+        );
+        // Not a drop: gentle decline, or high→still-high, or low start.
+        assert!(!detect_compaction(Some(90), Some(60)), "90→60 is not a compaction");
+        assert!(!detect_compaction(Some(70), Some(5)), "prev wasn't high enough");
+        assert!(!detect_compaction(Some(88), Some(40)), "cur didn't drop low enough");
+        // Missing readings never signal (a tab with no context marker on screen).
+        assert!(!detect_compaction(None, Some(5)));
+        assert!(!detect_compaction(Some(92), None));
+        assert!(!detect_compaction(None, None));
+    }
+
+    #[test]
+    fn recently_compacted_expires_after_the_window() {
+        let t0 = 1_700_000_000_000u64;
+        assert!(recently_compacted(Some(t0), t0), "just now → recent");
+        assert!(
+            recently_compacted(Some(t0), t0 + COMPACTION_RECENT_WINDOW_MS - 1),
+            "just under the window → still recent"
+        );
+        assert!(
+            !recently_compacted(Some(t0), t0 + COMPACTION_RECENT_WINDOW_MS),
+            "at the window edge → no longer recent"
+        );
+        assert!(!recently_compacted(None, t0), "never compacted → not recent");
     }
 
     #[test]

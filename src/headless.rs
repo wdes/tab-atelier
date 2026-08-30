@@ -167,6 +167,11 @@ struct HeadlessTab {
     usage_count: Option<u64>,
     /// Inc8 fold — declared conventions (`.md` list).
     conventions: Vec<String>,
+    /// Inc9 b3 — last context-% reading (to spot a brutal drop) + the unix-millis
+    /// of the last detected compaction. Transient (recomputed from the screen each
+    /// tick), not persisted to tabs.json.
+    last_context_pct: Option<u8>,
+    last_compaction_at: Option<u64>,
     pending_agent_resume: Option<String>,
     colors_enabled: bool,
     /// Raw PTY byte ring captured BEFORE alacritty's parser sees the
@@ -770,6 +775,8 @@ fn spawn_pty_tab(
         evaluations: Vec::new(),
         usage_count: None,
         conventions: Vec::new(),
+        last_context_pct: None,
+        last_compaction_at: None,
         pending_agent_resume,
         colors_enabled,
         viewers: viewers_handle,
@@ -1373,6 +1380,16 @@ fn refresh_snapshot(
         // fields (uptime, lock, agent state, …) are cheap and rebuilt
         // every tick so changes there still surface immediately.
         let grid = tab.cached_grid();
+        // Inc9 b2/b3: context-% used (from the screen) + brutal-drop detection. A
+        // high→low drop between two ticks = a compaction/rehome just landed; stamp
+        // it so `recently_compacted` surfaces for ~a minute.
+        let ctx_pct = crate::cli::clarify::parse_context_pct(&grid.output);
+        if crate::cli::clarify::detect_compaction(tab.last_context_pct, ctx_pct) {
+            tab.last_compaction_at = Some(crate::unix_millis());
+        }
+        if ctx_pct.is_some() {
+            tab.last_context_pct = ctx_pct;
+        }
         // Stamp the green-LED "last output" clock when the ring grew (mirrors
         // the GUI's persist stamp) — the source of the `working` window.
         let ring_len = tab.ring_len();
@@ -1459,6 +1476,8 @@ fn refresh_snapshot(
             evaluations: tab.evaluations.clone(),
             usage_count: tab.usage_count,
             conventions: tab.conventions.clone(),
+            context_pct: ctx_pct,
+            last_compaction_at: tab.last_compaction_at,
         });
     }
     let mut snapshot = api_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);

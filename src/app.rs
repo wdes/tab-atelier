@@ -229,6 +229,10 @@ struct Tab {
     usage_count: Option<u64>,
     /// Inc8 fold — declared conventions (`.md` list).
     conventions: Vec<String>,
+    /// Inc9 b3 — last context-% reading + unix-millis of the last detected
+    /// compaction (brutal drop). Transient (recomputed from the screen each tick).
+    last_context_pct: std::cell::Cell<Option<u8>>,
+    last_compaction_at: std::cell::Cell<Option<u64>>,
     /// UUID of the spawning tab (`parent_tab_id`). Persisted like `assignment`.
     parent_tab_id: Option<std::sync::Arc<str>>,
     /// Re-home progress on a predecessor tab. Persisted like `assignment`;
@@ -341,6 +345,8 @@ impl Tab {
             evaluations: ts.evaluations.clone(),
             usage_count: ts.usage_count,
             conventions: ts.conventions.clone(),
+            last_context_pct: std::cell::Cell::new(None),
+            last_compaction_at: std::cell::Cell::new(None),
             parent_tab_id: ts.parent_tab_id.as_deref().map(std::sync::Arc::from),
             rehome_status: ts.rehome_status.as_deref().map(std::sync::Arc::from),
             last_pushed_locked: None,
@@ -2073,6 +2079,15 @@ impl AppState {
             let Some(grid) = tab.snap_cache.clone() else {
                 continue;
             };
+            // Inc9 b2/b3: context-% used from the screen + brutal-drop (compaction)
+            // detection between ticks. Cell fields → updatable through `&tab`.
+            let ctx_pct = crate::cli::clarify::parse_context_pct(&grid.output);
+            if crate::cli::clarify::detect_compaction(tab.last_context_pct.get(), ctx_pct) {
+                tab.last_compaction_at.set(Some(crate::unix_millis()));
+            }
+            if ctx_pct.is_some() {
+                tab.last_context_pct.set(ctx_pct);
+            }
             let bg_color = crate::effective_tab_bg(tab.bg_color.as_deref(), self.tab_bg_global.as_deref()).into();
             // Per-tab RSS (#28 S1/S5): one /proc-subtree walk at the 2 s persist
             // cadence, cached on the tab for the tab-bar gauge and mirrored to
@@ -2172,6 +2187,10 @@ impl AppState {
                 evaluations: tab.evaluations.clone(),
                 usage_count: tab.usage_count,
                 conventions: tab.conventions.clone(),
+                // Inc9 b2/b3: computed just above from the screen (used %) and
+                // the cross-tick brutal-drop stamp (compaction/rehome).
+                context_pct: ctx_pct,
+                last_compaction_at: tab.last_compaction_at.get(),
             });
         }
 
