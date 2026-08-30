@@ -65,7 +65,12 @@ impl Write for MemAdapter {
 /// path from the request line, headers (Authorization, Content-Length,
 /// Accept-Encoding, If-None-Match), and then a body of `Content-Length`
 /// bytes — everything else hyper sent is dropped.
-pub(in crate::api) fn format_h1_request(method: &str, uri: &str, headers: &hyper::HeaderMap, body_len: usize) -> Vec<u8> {
+pub(in crate::api) fn format_h1_request(
+    method: &str,
+    uri: &str,
+    headers: &hyper::HeaderMap,
+    body_len: usize,
+) -> Vec<u8> {
     let mut buf = Vec::with_capacity(512);
     let _ = write!(&mut buf, "{method} {uri} HTTP/1.1\r\n");
     for (name, value) in headers {
@@ -190,7 +195,6 @@ async fn handle_hyper_request(
     .unwrap_or_default();
     Ok(parse_h1_response(resp).map(BodyExt::boxed))
 }
-
 
 /// A small buffered relay response (errors / 401s), boxed to match [`RespBody`].
 fn relay_status(code: u16, msg: &str) -> Response<RespBody> {
@@ -356,8 +360,13 @@ async fn handle_relay(req: Request<Incoming>, master_token: &str) -> Response<Re
 /// Pick the right hyper connection driver for the negotiated ALPN.
 /// Called from both the plain (no ALPN, default to h1) and TLS
 /// (ALPN-negotiated) listener paths.
-pub(in crate::api) async fn serve_connection<I>(io: I, h2: bool, state: Arc<Mutex<TabSnapshot>>, token: String, read_only: bool)
-where
+pub(in crate::api) async fn serve_connection<I>(
+    io: I,
+    h2: bool,
+    state: Arc<Mutex<TabSnapshot>>,
+    token: String,
+    read_only: bool,
+) where
     I: hyper::rt::Read + hyper::rt::Write + Send + Unpin + 'static,
 {
     let svc = service_fn(move |req| handle_hyper_request(req, state.clone(), token.clone(), read_only));
