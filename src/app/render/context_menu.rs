@@ -1007,5 +1007,4 @@ impl AppState {
                 .into_any_element(),
         )
     }
-
 }

@@ -8,7 +8,12 @@
 use super::super::*;
 
 impl AppState {
-    pub(in crate::app) fn render_tab_bar(&mut self, battery: Option<u8>, _window: &mut Window, cx: &mut Context<Self>) -> Stateful<Div> {
+    pub(in crate::app) fn render_tab_bar(
+        &mut self,
+        battery: Option<u8>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
         let battery_critical = battery.is_some_and(|b| b < 10);
         let blink_red = battery_critical && self.blink_on;
 
@@ -442,5 +447,4 @@ impl AppState {
 
         bar.child(plus_btn)
     }
-
 }
