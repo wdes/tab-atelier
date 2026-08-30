@@ -12,15 +12,15 @@ use log::{debug, error, info};
 
 use crate::tracking::USER_AGENT;
 
-const VIEWER_HTML: &str = include_str!("../assets/web-viewer.html");
+const VIEWER_HTML: &str = include_str!("../../assets/web-viewer.html");
 
 /// Vendored xterm.js + xterm.css at a pinned version. Embedded into
 /// the binary so the share viewer renders in fully offline
 /// deployments (firecracker VMs, air-gapped hosts, anywhere CDN
 /// fetches to `unpkg.com` would fail). Served at version-pinned
 /// `/assets/xterm-X.Y.Z.{js,css}` URLs that bypass token auth.
-const VENDOR_XTERM_JS: &str = include_str!("../assets/vendor/xterm-6.0.0/xterm.js");
-const VENDOR_XTERM_CSS: &str = include_str!("../assets/vendor/xterm-6.0.0/xterm.css");
+const VENDOR_XTERM_JS: &str = include_str!("../../assets/vendor/xterm-6.0.0/xterm.js");
+const VENDOR_XTERM_CSS: &str = include_str!("../../assets/vendor/xterm-6.0.0/xterm.css");
 
 /// `xterm.js` ends with a `//# sourceMappingURL=xterm.js.map` pointer,
 /// but we don't ship the `.map` (and it isn't on the no-auth asset
@@ -44,7 +44,7 @@ static VENDOR_XTERM_JS_SERVED: std::sync::LazyLock<String> = std::sync::LazyLock
 /// User-visible fix: the `⏵⏵` play triangle (U+23F5) Claude Code
 /// puts in its mode footer renders as a clean mono glyph instead of
 /// the blurry symbols-font fallback Android picks for that codepoint.
-const VENDOR_TERM_SYMBOLS_WOFF2: &[u8] = include_bytes!("../assets/vendor/term-symbols.woff2");
+const VENDOR_TERM_SYMBOLS_WOFF2: &[u8] = include_bytes!("../../assets/vendor/term-symbols.woff2");
 
 /// Our own viewer CSS + JS, extracted from web-viewer.html so they
 /// can be cached aggressively by the browser. The HTML references
@@ -52,30 +52,30 @@ const VENDOR_TERM_SYMBOLS_WOFF2: &[u8] = include_bytes!("../assets/vendor/term-s
 /// string acts as the cache buster — a new deb publishes new
 /// content under a new URL, and the browser fetches it on the very
 /// next page load with no user intervention.
-const MAIN_CSS: &str = include_str!("../assets/main.css");
-const MAIN_JS: &str = include_str!("../assets/main.js");
+const MAIN_CSS: &str = include_str!("../../assets/main.css");
+const MAIN_JS: &str = include_str!("../../assets/main.js");
 /// Harness dashboard control-panel app (see docs/dashboard.md). Served public
 /// (like the viewer assets) at `/dashboard` + `/assets/dashboard.{js,css}`; the
 /// page's JS polls the authed `/dashboard/state`. Owned by the web-app slice.
-const DASHBOARD_HTML: &str = include_str!("../assets/dashboard.html");
-const DASHBOARD_JS: &str = include_str!("../assets/dashboard.js");
-const DASHBOARD_CSS: &str = include_str!("../assets/dashboard.css");
+const DASHBOARD_HTML: &str = include_str!("../../assets/dashboard.html");
+const DASHBOARD_JS: &str = include_str!("../../assets/dashboard.js");
+const DASHBOARD_CSS: &str = include_str!("../../assets/dashboard.css");
 // Site icons + metadata served at the origin root (`/favicon.ico`, …). The
 // `.svg` reuses the app icon; the raster set is rendered from it. `robots.txt`
 // mirrors the `X-Robots-Tag: noindex` stance for crawlers that check it first.
-const FAVICON_ICO: &[u8] = include_bytes!("../assets/icons/favicon.ico");
-const FAVICON_PNG_16: &[u8] = include_bytes!("../assets/icons/favicon-16x16.png");
-const FAVICON_PNG_32: &[u8] = include_bytes!("../assets/icons/favicon-32x32.png");
-const APPLE_TOUCH_ICON: &[u8] = include_bytes!("../assets/icons/apple-touch-icon.png");
-const ICON_PNG_192: &[u8] = include_bytes!("../assets/icons/icon-192.png");
-const ICON_PNG_512: &[u8] = include_bytes!("../assets/icons/icon-512.png");
-const FAVICON_SVG: &str = include_str!("../assets/tab-atelier.svg");
-const SITE_WEBMANIFEST: &str = include_str!("../assets/site.webmanifest");
-const ROBOTS_TXT: &str = include_str!("../assets/robots.txt");
+const FAVICON_ICO: &[u8] = include_bytes!("../../assets/icons/favicon.ico");
+const FAVICON_PNG_16: &[u8] = include_bytes!("../../assets/icons/favicon-16x16.png");
+const FAVICON_PNG_32: &[u8] = include_bytes!("../../assets/icons/favicon-32x32.png");
+const APPLE_TOUCH_ICON: &[u8] = include_bytes!("../../assets/icons/apple-touch-icon.png");
+const ICON_PNG_192: &[u8] = include_bytes!("../../assets/icons/icon-192.png");
+const ICON_PNG_512: &[u8] = include_bytes!("../../assets/icons/icon-512.png");
+const FAVICON_SVG: &str = include_str!("../../assets/tab-atelier.svg");
+const SITE_WEBMANIFEST: &str = include_str!("../../assets/site.webmanifest");
+const ROBOTS_TXT: &str = include_str!("../../assets/robots.txt");
 /// `OpenAPI` 3.1 description of this API, embedded as a fallback. The
 /// canonical copy is the `.deb` docs file (see [`openapi_spec`]); this
 /// build-time embed only backs uninstalled (dev / `cargo run`) runs.
-const OPENAPI_YAML: &str = include_str!("../assets/openapi.yaml");
+const OPENAPI_YAML: &str = include_str!("../../assets/openapi.yaml");
 
 /// The `OpenAPI` spec to serve at `GET /openapi.yaml`, with the
 /// `version: 0.0.0` placeholder rewritten to the running build's version.
