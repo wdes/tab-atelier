@@ -4159,6 +4159,219 @@ mod tests {
         assert_eq!(restored.active, 1);
     }
 
+    // ===================================================================
+    // persist() characterization net (Slice 2 step 2A) — freezes the CURRENT
+    // observable behaviour of the tabs.json serialization persist() emits, so a
+    // later decomposition (step 2B) can't drift it. persist() itself is a gpui
+    // Context method (not unit-testable without a live app); it builds a
+    // Vec<TabState> and writes it via save_state — so these tests exercise that
+    // exact save→load contract with a tmpdir, no logic change.
+    // ===================================================================
+
+    /// GATE B (aligator/brain PROD durability): the daemon-kind + session-less
+    /// fields `persist()` writes are what the restore path reads to relaunch a
+    /// daemon NATIVELY at restart. Freeze that they survive a save→load round
+    /// trip byte-faithfully AND that the loaded state drives a relaunch.
+    #[test]
+    fn persist_roundtrips_daemon_durability_fields_for_native_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = SavedState {
+            tabs: vec![
+                // aligator: session-LESS (the regressing case) — kind set, no session.
+                TabState {
+                    name: "aligator".into(),
+                    agent_kind: Some("aligator".into()),
+                    agent_session_id: None,
+                    agent_plan_mode: None,
+                    ..Default::default()
+                },
+                // brain: session-less too.
+                TabState {
+                    name: "brain".into(),
+                    agent_kind: Some("brain".into()),
+                    agent_session_id: None,
+                    ..Default::default()
+                },
+                // claude: session-CARRYING — kind + a real session uuid + plan mode.
+                TabState {
+                    name: "worker".into(),
+                    agent_kind: Some("claude".into()),
+                    agent_session_id: Some("sess-abc-123".into()),
+                    agent_plan_mode: Some(true),
+                    ..Default::default()
+                },
+            ],
+            active: 0,
+            windowed: false,
+            dashboard_share_token: String::new(),
+        };
+        save_state(dir.path(), &state);
+        let loaded = load_state_from(dir.path()).expect("tabs.json loads back");
+        assert_eq!(loaded.tabs.len(), 3);
+        // aligator: kind survives, session stays None → restore relaunches it.
+        assert_eq!(loaded.tabs[0].agent_kind.as_deref(), Some("aligator"));
+        assert_eq!(loaded.tabs[0].agent_session_id, None);
+        assert_eq!(
+            restore_resume_command(
+                loaded.tabs[0].agent_kind.as_deref(),
+                loaded.tabs[0].agent_session_id.as_deref(),
+                None
+            ),
+            Some(
+                if cfg!(feature = "gui") {
+                    "tab-atelier aligator"
+                } else {
+                    "tab-atelier-headless aligator"
+                }
+                .into()
+            ),
+            "a persisted session-less aligator relaunches on restart (native durability)"
+        );
+        // brain: same.
+        assert_eq!(loaded.tabs[1].agent_kind.as_deref(), Some("brain"));
+        assert_eq!(loaded.tabs[1].agent_session_id, None);
+        // claude: kind + session + plan mode all survive → resume its session.
+        assert_eq!(loaded.tabs[2].agent_kind.as_deref(), Some("claude"));
+        assert_eq!(loaded.tabs[2].agent_session_id.as_deref(), Some("sess-abc-123"));
+        assert_eq!(loaded.tabs[2].agent_plan_mode, Some(true));
+    }
+
+    /// The durable JSON keys restore reads MUST stay these exact `snake_case`
+    /// names — a rename would silently break native relaunch (the b3-style trap).
+    #[test]
+    fn persist_durable_json_keys_are_the_snake_case_names_restore_reads() {
+        let state = SavedState {
+            tabs: vec![TabState {
+                name: "aligator".into(),
+                agent_kind: Some("aligator".into()),
+                agent_session_id: Some("s1".into()),
+                agent_plan_mode: Some(false),
+                ..Default::default()
+            }],
+            active: 0,
+            windowed: false,
+            dashboard_share_token: String::new(),
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(
+            json.contains("\"agent_kind\":\"aligator\""),
+            "snake_case agent_kind on the wire: {json}"
+        );
+        assert!(
+            json.contains("\"agent_session_id\":\"s1\""),
+            "snake_case agent_session_id: {json}"
+        );
+        assert!(
+            json.contains("\"agent_plan_mode\":false"),
+            "snake_case agent_plan_mode: {json}"
+        );
+        assert!(
+            !json.contains("agentKind") && !json.contains("agentSessionId"),
+            "no camelCase drift: {json}"
+        );
+    }
+
+    /// Data-loss invariant: a maximally-populated `TabState` survives save→load
+    /// with EVERY durable field intact — freezes the full persist output so a
+    /// 2B decomposition that drops a field fails loudly.
+    #[test]
+    fn persist_roundtrips_every_durable_tab_state_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let tab = TabState {
+            id: "uuid-1".into(),
+            name: "full".into(),
+            cwd: Some("/work/proj".into()),
+            colors_enabled: false,
+            net_disabled: true,
+            tokens: Some(TokenUsage { input: 10, output: 20 }),
+            agent_kind: Some("claude".into()),
+            agent_session_id: Some("sess-9".into()),
+            agent_plan_mode: Some(true),
+            tab_env: std::collections::BTreeMap::from([("K".into(), "V".into())]),
+            pinned_cols: Some(120),
+            pinned_rows: Some(40),
+            share_token_rw: "rw-secret".into(),
+            share_token_ro: "ro-secret".into(),
+            locked: true,
+            schedule: Some(crate::schedule::TabSchedule::new("Mo-Fr 09:00-18:00", "Europe/Paris").unwrap()),
+            bg_color: Some("#123456".into()),
+            assignment: Some("proj:build/implementer".into()),
+            specialty: Some("rust".into()),
+            orchestrator: Some("free".into()),
+            objective: Some("land the split".into()),
+            current_task: vec!["read".into(), "wire".into()],
+            rounds_active: Some(RoundsActive {
+                active: true,
+                last_round_at: Some(1000),
+            }),
+            usage_count: Some(7),
+            last_used_at: Some(1_700_000_000_000),
+            conventions: vec!["AGENTS.md".into()],
+            parent_tab_id: Some("spawner-uuid".into()),
+            rehome_status: Some("handoff-written".into()),
+            ..Default::default()
+        };
+        let state = SavedState {
+            tabs: vec![tab],
+            active: 0,
+            windowed: true,
+            dashboard_share_token: "dash-tok".into(),
+        };
+        save_state(dir.path(), &state);
+        let loaded = load_state_from(dir.path()).expect("loads");
+        let g = &loaded.tabs[0];
+        assert_eq!(g.id, "uuid-1");
+        assert_eq!(g.cwd.as_deref(), Some("/work/proj"));
+        assert!(!g.colors_enabled);
+        assert!(g.net_disabled);
+        assert_eq!(g.tokens, Some(TokenUsage { input: 10, output: 20 }));
+        assert_eq!(g.agent_plan_mode, Some(true));
+        assert_eq!(g.tab_env.get("K").map(String::as_str), Some("V"));
+        assert_eq!((g.pinned_cols, g.pinned_rows), (Some(120), Some(40)));
+        assert_eq!(
+            (g.share_token_rw.as_str(), g.share_token_ro.as_str()),
+            ("rw-secret", "ro-secret")
+        );
+        assert!(g.locked);
+        assert_eq!(g.schedule.as_ref().map(|s| s.rule.as_str()), Some("Mo-Fr 09:00-18:00"));
+        assert_eq!(g.bg_color.as_deref(), Some("#123456"));
+        assert_eq!(g.assignment.as_deref(), Some("proj:build/implementer"));
+        assert_eq!(g.specialty.as_deref(), Some("rust"));
+        assert_eq!(g.orchestrator.as_deref(), Some("free"));
+        assert_eq!(g.objective.as_deref(), Some("land the split"));
+        assert_eq!(g.current_task, vec!["read".to_string(), "wire".to_string()]);
+        assert_eq!(g.rounds_active.as_ref().map(|r| r.active), Some(true));
+        assert_eq!(g.usage_count, Some(7));
+        assert_eq!(g.last_used_at, Some(1_700_000_000_000));
+        assert_eq!(g.conventions, vec!["AGENTS.md".to_string()]);
+        assert_eq!(g.parent_tab_id.as_deref(), Some("spawner-uuid"));
+        assert_eq!(g.rehome_status.as_deref(), Some("handoff-written"));
+        assert_eq!(loaded.active, 0);
+        assert!(loaded.windowed);
+        assert_eq!(loaded.dashboard_share_token, "dash-tok");
+    }
+
+    /// Transient `agent_state` (`#[serde(skip)]`, a UI-only hook hint) is NEVER
+    /// written — `persist()` must not leak the volatile indicator into tabs.json.
+    #[test]
+    fn persist_omits_transient_agent_state_from_json() {
+        let tab = TabState {
+            name: "t".into(),
+            agent_state: Some(AgentStateSnapshot {
+                state: AgentState::Thinking,
+                label: Some("busy".into()),
+                updated_at: std::time::Instant::now(),
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&tab).unwrap();
+        assert!(
+            !json.contains("agent_state"),
+            "transient state must not be persisted: {json}"
+        );
+        assert!(!json.contains("\"busy\""), "the transient label must not leak: {json}");
+    }
+
     #[test]
     fn test_tab_state_colors_enabled_round_trip() {
         // false survives a round-trip; true is omitted from the JSON.
