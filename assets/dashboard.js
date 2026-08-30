@@ -238,6 +238,23 @@ export function roundsPill(tab) {
   return { active, cls: active ? "rounds-on" : "rounds-off" };
 }
 
+// Pure: the context-usage pill (Inc9 b2). Reads `context_pct` (Option 0-100).
+// Colour by threshold: green <70, amber 70-90, red >90. Returns null when the
+// field is absent/not a number -> the caller renders no pill. Null-safe.
+export function contextPill(tab) {
+  const v = tab && tab.context_pct;
+  if (typeof v !== "number" || Number.isNaN(v)) return null;
+  const pct = Math.round(v);
+  const cls = pct > 90 ? "ctx-crit" : pct >= 70 ? "ctx-warn" : "ctx-ok";
+  return { pct, cls, label: `${pct}% ctx` };
+}
+
+// Pure: the recent-compaction badge (Inc9 b3). Shows when `recently_compacted`
+// is true. Null-safe; absent/false -> not shown.
+export function compactionBadge(tab) {
+  return { show: !!(tab && tab.recently_compacted === true) };
+}
+
 // Pure: the card's evaluations section (Inc8 S4). recent = the LAST 5 eval records
 // (newest-last), verdict = the newest record's verdict, and triggerArmed mirrors
 // the rust auto-improvement triggers — ARMED when either:
@@ -859,7 +876,12 @@ function bandNodeInner(tab) {
   // grey truncated `.task-chip` pill (hover-full) + the right-click card (full permalog).
   const obj = ac.objective ? `<span class="agent-objective" title="${escapeHtml(ac.objective)}">${escapeHtml(ac.objective)}</span>` : "";
   const inline = obj ? `<span class="agent-card-inline">${obj}</span>` : "";
-  return `${escapeHtml(t.name || "tab")}${badge}${pill}${free}${inline}${taskChipsHtml(t)}`;
+  // Inc9 b2: context-usage pill (green/amber/red), nothing when context_pct absent.
+  const cp = contextPill(t);
+  const ctx = cp ? ` <span class="ctx-pill ${cp.cls}" title="context usage ${cp.pct}%">${escapeHtml(cp.label)}</span>` : "";
+  // Inc9 b3: discreet compaction badge when the tab was recently compacted.
+  const comp = compactionBadge(t).show ? ` <span class="compact-badge" title="contexte compacté récemment">⟳</span>` : "";
+  return `${escapeHtml(t.name || "tab")}${badge}${pill}${free}${ctx}${comp}${inline}${taskChipsHtml(t)}`;
 }
 
 function bandNodeHtml(tab, cls) {
@@ -904,9 +926,13 @@ export function buildBandModel(state) {
     const rounds = roundsPill(t).active ? "1" : "0";
     const ac = agentCard(t);
     const card = `${ac.objective}|${t.orchestrator || ""}`;
+    // Inc9 b2/b3: the context pill + compaction badge join the signature so they
+    // patch live (flicker-free) when context_pct / recently_compacted change.
+    const cp = contextPill(t);
+    const ctx = `${cp ? cp.pct + cp.cls : ""}|${compactionBadge(t).show ? "1" : "0"}`;
     // Signature keys off the DECLARED task (what the pill shows), not the observed
     // transcript prompt — so a broadcast no longer churns every recipient's node.
-    nodes.push({ id: t.id, led, task: `${ac.currentTask}|${subs}|r${rounds}|${card}` });
+    nodes.push({ id: t.id, led, task: `${ac.currentTask}|${subs}|r${rounds}|${card}|${ctx}` });
   };
   bl.meta.forEach(push);
   bl.supporters.forEach(push);
