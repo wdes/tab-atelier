@@ -125,3 +125,125 @@ pub(super) fn authorize(
         },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn is_allow(g: &Gate) -> bool {
+        matches!(g, Gate::Allow)
+    }
+    fn deny_status(g: &Gate) -> Option<u16> {
+        match g {
+            Gate::Deny { status, .. } => Some(*status),
+            Gate::Allow => None,
+        }
+    }
+
+    /// A snapshot with a master token, a dashboard obs token, and one tab
+    /// carrying both a RW and a RO per-tab share token.
+    fn fixture() -> Arc<Mutex<TabSnapshot>> {
+        let mut tab = super::super::test_snapshot_tab("tab-a", "shell");
+        tab.share_token_rw = "rw-tok".into();
+        tab.share_token_ro = "ro-tok".into();
+        let mut snap = super::super::test_snapshot(vec![tab]);
+        snap.master_token = "master-secret".into();
+        snap.dashboard_share_token = "dash-secret".into();
+        Arc::new(Mutex::new(snap))
+    }
+
+    #[test]
+    fn master_token_valid_invalid_absent() {
+        let s = fixture();
+        // Valid master → full access, even on a mutating per-tab route.
+        assert!(is_allow(&authorize(&s, "GET", "/tabs", Some("master-secret"))));
+        assert!(is_allow(&authorize(
+            &s,
+            "POST",
+            "/tabs/by-id/tab-a/input",
+            Some("master-secret")
+        )));
+        // Wrong token / no token on a gated route → 401.
+        assert_eq!(deny_status(&authorize(&s, "GET", "/tabs", Some("nope"))), Some(401));
+        assert_eq!(deny_status(&authorize(&s, "GET", "/tabs", None)), Some(401));
+        // An empty master ("") must never authorise a token-less request.
+        {
+            let s2 = fixture();
+            s2.lock().unwrap().master_token = String::new();
+            assert_eq!(deny_status(&authorize(&s2, "GET", "/tabs", None)), Some(401));
+            assert_eq!(deny_status(&authorize(&s2, "GET", "/tabs", Some(""))), Some(401));
+        }
+    }
+
+    #[test]
+    fn dashboard_obs_token_is_read_only_across_the_fleet() {
+        let s = fixture();
+        // Authorises the dashboard routes...
+        assert!(is_allow(&authorize(&s, "GET", "/dashboard", Some("dash-secret"))));
+        assert!(is_allow(&authorize(&s, "GET", "/dashboard/state", Some("dash-secret"))));
+        // ...and any tab's READ routes (acts as a per-tab RO link)...
+        assert!(is_allow(&authorize(
+            &s,
+            "GET",
+            "/tabs/by-id/tab-a/view",
+            Some("dash-secret")
+        )));
+        assert!(is_allow(&authorize(
+            &s,
+            "GET",
+            "/tabs/by-id/tab-a/output",
+            Some("dash-secret")
+        )));
+        // ...but is REFUSED (403, read-only) on input — no promotion to interactive.
+        assert_eq!(
+            deny_status(&authorize(&s, "POST", "/tabs/by-id/tab-a/input", Some("dash-secret"))),
+            Some(403)
+        );
+        // A dashboard token on a NON-dashboard, NON-tab-scoped route → 401.
+        assert_eq!(
+            deny_status(&authorize(&s, "GET", "/tabs", Some("dash-secret"))),
+            Some(401)
+        );
+    }
+
+    #[test]
+    fn per_tab_rw_vs_ro_scope() {
+        let s = fixture();
+        // RW token: reads AND input pass.
+        assert!(is_allow(&authorize(
+            &s,
+            "GET",
+            "/tabs/by-id/tab-a/view",
+            Some("rw-tok")
+        )));
+        assert!(is_allow(&authorize(
+            &s,
+            "POST",
+            "/tabs/by-id/tab-a/input",
+            Some("rw-tok")
+        )));
+        // RO token: reads pass, input is refused with 403 (not 401).
+        assert!(is_allow(&authorize(
+            &s,
+            "GET",
+            "/tabs/by-id/tab-a/view",
+            Some("ro-tok")
+        )));
+        assert_eq!(
+            deny_status(&authorize(&s, "POST", "/tabs/by-id/tab-a/input", Some("ro-tok"))),
+            Some(403)
+        );
+        // RO token is also refused on inbox enumeration (RW-only privileged read).
+        assert_eq!(
+            deny_status(&authorize(&s, "GET", "/tabs/by-id/tab-a/inbox", Some("ro-tok"))),
+            Some(403)
+        );
+        // A share token only works on ITS tab / the share routes — an unknown
+        // uuid or a non-share route → 401.
+        assert_eq!(
+            deny_status(&authorize(&s, "GET", "/tabs/by-id/other/view", Some("rw-tok"))),
+            Some(401)
+        );
+        assert_eq!(deny_status(&authorize(&s, "GET", "/tabs", Some("rw-tok"))), Some(401));
+    }
+}
