@@ -313,7 +313,7 @@ pub enum Commands {
 
     /// Set/unset/list env vars injected into tabs' PTYs (applies on next spawn).
     ///
-    /// `env set KEY=VAL --global`, `env unset KEY --tab 3`, `env list --global`.
+    /// `env set KEY=VAL --global`, `env unset KEY --tab 3`, `env list --tab 3`.
     Env {
         /// `set`, `unset`, or `list`.
         #[arg(value_parser = ["set", "unset", "list"])]

@@ -156,7 +156,10 @@ impl Render for AppState {
                 // bubbling. Handle every switcher key and return so nothing
                 // below (alt+tab / ctrl+shift+t) also fires.
                 if this.tab_switcher.is_some() {
-                    let len = this.tab_switcher.as_ref().map_or(0, |s| s.order.len());
+                    // Bounds / selection track the FILTERED list, not the full
+                    // captured order, so ↑↓/Enter/cycle operate on what's shown.
+                    let filtered = this.switcher_filtered();
+                    let len = filtered.len();
                     match ks.key.as_str() {
                         "escape" => this.close_tab_switcher(window, cx),
                         "up" => {
@@ -181,17 +184,34 @@ impl Render for AppState {
                             cx.notify();
                         }
                         "enter" => {
-                            let pick = this
-                                .tab_switcher
-                                .as_ref()
-                                .and_then(|s| s.order.get(s.selected).copied());
+                            let pick = filtered
+                                .get(this.tab_switcher.as_ref().map_or(0, |s| s.selected))
+                                .copied();
                             this.tab_switcher = None;
                             match pick {
                                 Some(idx) => this.select_tab(idx, window, cx),
                                 None => this.close_tab_switcher(window, cx),
                             }
                         }
-                        _ => {}
+                        "backspace" => {
+                            if let Some(s) = this.tab_switcher.as_mut() {
+                                s.query.pop();
+                                s.selected = 0;
+                            }
+                            cx.notify();
+                        }
+                        // Any printable character narrows the filter. `key_char`
+                        // is None for the arrows/enter/ctrl-chords above, so a
+                        // bare Ctrl+P cycles rather than typing 'p'.
+                        _ => {
+                            if let Some(ch) = ks.key_char.as_ref().filter(|c| !c.is_empty() && !ks.modifiers.control)
+                                && let Some(s) = this.tab_switcher.as_mut()
+                            {
+                                s.query.push_str(ch);
+                                s.selected = 0;
+                                cx.notify();
+                            }
+                        }
                     }
                     return;
                 }

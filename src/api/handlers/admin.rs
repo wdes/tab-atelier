@@ -126,9 +126,33 @@ pub(in crate::api) fn relay_config_set<S: Write>(stream: &mut S, state: &Arc<Mut
     respond_json(stream, 200, r#"{"queued":"relay-config"}"#);
 }
 
-/// `GET /env` — the current GLOBAL tab-env map (`env list`).
+/// `GET /env` — the GLOBAL tab-env map (`env list`). Values are MASKED server-side
+/// (upstream #40): a secret never leaves the daemon, only boolean-ish flags come
+/// through in the clear.
 pub(in crate::api) fn env_get<S: Write>(stream: &mut S) {
-    let map = crate::tab_env_global();
+    let map = super::super::mask_env_map(&crate::tab_env_global());
+    match serde_json::to_string(&map) {
+        Ok(j) => respond_json(stream, 200, &j),
+        Err(e) => error_json(stream, 500, &format!("serialize: {e}")),
+    }
+}
+
+/// `GET /tabs/{id}/env` — the PER-TAB env map (`env list --tab <id>`), masked the
+/// same way as `GET /env`. Mirrored from the runtime tab into the snapshot (upstream
+/// #40, ported into the split).
+pub(in crate::api) fn env_get_tab<S: Write>(stream: &mut S, state: &Arc<Mutex<TabSnapshot>>, p: &str) {
+    let Some((key_raw, is_uuid)) = super::super::parse_tab_key(p, "/env") else {
+        error_json(stream, 404, "missing tab id");
+        return;
+    };
+    let snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(idx) = super::super::resolve_tab_idx(&snap, key_raw, is_uuid) else {
+        drop(snap);
+        error_json(stream, 404, "tab not found");
+        return;
+    };
+    let map = super::super::mask_env_map(&snap.tabs[idx].tab_env);
+    drop(snap);
     match serde_json::to_string(&map) {
         Ok(j) => respond_json(stream, 200, &j),
         Err(e) => error_json(stream, 500, &format!("serialize: {e}")),

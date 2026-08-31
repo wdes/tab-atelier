@@ -405,6 +405,13 @@ impl Tab {
     fn flush_pending_agent_resume(&mut self, cx: &mut gpui::App) {
         if let Some(cmd) = self.pending_agent_resume.take() {
             let view = self.view.read(cx);
+            // Wipe the local render NOW (grid + scrollback + frame cache) so the
+            // restored previous-session output is gone before the agent resumes and
+            // paints — otherwise its fresh UI lands over the stale frame and only the
+            // rows it redraws look right. The shell-side `AGENT_LAUNCH_CLEAR` still
+            // runs, but only once the shell executes it; this makes the screen clean
+            // instantly. (Upstream #40 alt-screen fix.)
+            view.wipe_output();
             view.send_input_bytes(vec![0x15]); // Ctrl-U
             // Clear the grid first so the previous run's tail (e.g. the
             // `claude --resume …` exit line) doesn't linger under the resumed
@@ -498,9 +505,14 @@ struct TabSwitcher {
     /// Tab indices in most-recently-visited order (the current active tab is
     /// excluded — you're already on it), captured when the modal opens.
     order: Vec<usize>,
-    /// Highlighted row into `order`. Starts at 0 (the previous tab) so a bare
-    /// Ctrl+P → Enter jumps straight back to where you just were.
+    /// Highlighted row into the *filtered* order (see
+    /// [`AppState::switcher_filtered`]). Starts at 0 (the previous tab) so a bare
+    /// Ctrl+P → Enter jumps straight back to where you just were; reset to 0
+    /// whenever `query` changes.
     selected: usize,
+    /// Live filter text — type to narrow the list by tab name (case-insensitive
+    /// substring, SQL `LIKE '%query%'`). Empty ⇒ show the whole MRU order.
+    query: String,
 }
 
 /// Everything `render_qr_modal` needs, computed once when the modal opens
@@ -1498,6 +1510,27 @@ impl AppState {
                 &crate::TabResourceLimits::resolve(&tab.limits, &default_limits),
             );
         }
+
+        // The window can be re-shown or re-focused by the OS/compositor, not just by
+        // our Guake hotkey — e.g. you drove the active tab from the phone (web viewer)
+        // with the desktop backgrounded, then tab/click back to it. The reveal handler
+        // only fires on the hotkey, and gpui can keep a hidden window "fresh" enough
+        // that render()'s 2 s full-rebuild backstop doesn't fire, so the desktop would
+        // repaint the stale frame. Void the active tab's render caches every time the
+        // window GAINS focus so the first frame rebuilds every row. (Upstream #40.)
+        cx.observe_window_activation(window, |app, window, cx| {
+            if !window.is_window_active() {
+                return;
+            }
+            let view = app.tabs.get(app.active).map(|t| t.view.clone());
+            if let Some(view) = view {
+                view.update(cx, |v, vcx| {
+                    v.release_render_caches();
+                    vcx.notify();
+                });
+            }
+        })
+        .detach();
 
         Self {
             tabs,
