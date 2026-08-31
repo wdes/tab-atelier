@@ -49,6 +49,35 @@ fn body_lease_ms(body: &[u8]) -> u64 {
         .map_or(DEFAULT_LEASE_MS, |s| s.saturating_mul(1000))
 }
 
+/// A non-empty string field from the JSON body, else `None`.
+fn body_str(body: &[u8], key: &str) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get(key).and_then(|c| c.as_str()).map(str::to_string))
+        .filter(|s| !s.is_empty())
+}
+
+/// The caller's ROLE for the S3 capacity gate: the body `role` override
+/// (`--as <role>`) if given, else the role read off the caller's CARD — the
+/// assignment role (`role_of`) or, failing that, the specialty. Resolved from the
+/// snapshot by the caller's tab-id (`claimed_by`). Empty when the tab has no card
+/// (then it can only claim un-restricted tasks). Capacity ≠ ownership: this never
+/// touches `claimed_by`.
+fn resolve_role(snap: &TabSnapshot, tab_id: &str, body: &[u8]) -> String {
+    if let Some(r) = body_str(body, "role") {
+        return r;
+    }
+    let Some(tab) = snap.tabs.iter().find(|t| &*t.id == tab_id) else {
+        return String::new();
+    };
+    let role = crate::api::role_of(tab.assignment.as_deref());
+    if role.is_empty() {
+        tab.specialty.as_deref().unwrap_or_default().to_string()
+    } else {
+        role
+    }
+}
+
 /// `POST /task/{queue}/push` — enqueue `{payload, priority?}`. Returns 201 {id}.
 pub(in crate::api) fn push<S: Write>(stream: &mut S, state: &Arc<Mutex<TabSnapshot>>, queue: &str, body_bytes: &[u8]) {
     let parsed: serde_json::Value = match serde_json::from_slice(body_bytes) {
@@ -76,6 +105,8 @@ pub(in crate::api) fn push<S: Write>(stream: &mut S, state: &Arc<Mutex<TabSnapsh
         state: TaskState::Queued,
         claimed_by: None,
         lease_until: None,
+        // S3 — an optional `to` role requirement; absent/empty = claimable by all.
+        to: body_str(body_bytes, "to"),
     };
     // Serialize the append under the snapshot lock too, so a push racing a
     // compacting claim can't be dropped by the claim's rewrite window.
@@ -101,8 +132,12 @@ pub(in crate::api) fn claim<S: Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
     // a failed write returns None → 204, the on-disk task stays claimable, so a
     // persist fault can't silently double-claim.
     let guard = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // S3 capacity gate: resolve the caller's ROLE (body override or its card) — a
+    // `--to <role>` task is only claimable by a matching role. Ownership stays on
+    // `claimer` (the tab-id); role never touches it.
+    let caller_role = resolve_role(&guard, &claimer, body_bytes);
     let entries = parse_tasks(&std::fs::read_to_string(&path).unwrap_or_default());
-    let claimed = perform_claim(entries, now, &claimer, lease_ms, |kept| {
+    let claimed = perform_claim(entries, now, &claimer, &caller_role, lease_ms, |kept| {
         write_tasks_atomic(&path, kept).inspect_err(|e| {
             log::error!("task claim: persist failed for queue {queue}: {e} — not handing out the task");
         })
