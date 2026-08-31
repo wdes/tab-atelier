@@ -51,8 +51,28 @@ pub struct TaskEntry {
     pub state: TaskState,
 }
 
-fn tasks_dir() -> PathBuf {
+/// The directory holding the per-queue files. Honors `TAB_ATELIER_TASKS_DIR`
+/// (a test seam so integration tests isolate onto a tmpdir); production uses
+/// `<state>/tab-atelier/tasks`.
+#[must_use]
+pub fn tasks_dir() -> PathBuf {
+    if let Ok(d) = std::env::var("TAB_ATELIER_TASKS_DIR") {
+        return PathBuf::from(d);
+    }
     crate::platform::state_base_dir().join("tab-atelier").join("tasks")
+}
+
+/// Every queue file currently on disk (`*.jsonl` under [`tasks_dir`]). Used by
+/// `done`, which addresses a task by id alone and must find its queue.
+#[must_use]
+pub fn queue_files() -> Vec<PathBuf> {
+    let Ok(rd) = std::fs::read_dir(tasks_dir()) else {
+        return Vec::new();
+    };
+    rd.filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
+        .collect()
 }
 
 /// The append-only file for one queue. Queue names are sanitised to a single
@@ -178,6 +198,133 @@ pub fn write_tasks_atomic(path: &Path, entries: &[TaskEntry]) -> std::io::Result
     let tmp = path.with_extension("jsonl.tmp");
     std::fs::write(&tmp, &body)?;
     std::fs::rename(&tmp, path)
+}
+
+// ---------------------------------------------------------------------------
+// CLI (thin HTTP client): `task <push|claim|done>` POSTs to the local daemon so
+// the CLAIM is serialized behind the API (the whole point). Reuses the endpoint
+// discovery + ureq agent aligator/share_link already use.
+// ---------------------------------------------------------------------------
+
+/// `tab-atelier task <push|claim|done> …` — the producer/consumer CLI.
+#[must_use]
+pub fn run(args: &[String]) -> i32 {
+    match args.first().map(String::as_str) {
+        Some("push") => run_push(&args[1..]),
+        Some("claim") => run_claim(&args[1..]),
+        Some("done") => run_done(&args[1..]),
+        _ => {
+            eprintln!(
+                "usage:\n  tab-atelier task push --queue <q> [--priority N] \"<payload>\"\n  \
+                 tab-atelier task claim --queue <q>\n  tab-atelier task done <task-id>"
+            );
+            2
+        }
+    }
+}
+
+/// POST to `<api>/task/<path>` with a Bearer + JSON body, returning
+/// `(status, body)` or an error string. Reuses `share_link`'s endpoint + agent.
+fn post_task(path: &str, body: &str) -> Result<(u16, String), String> {
+    let ep = crate::cli::share_link::discover_endpoint()?;
+    let mut resp = crate::cli::share_link::agent()
+        .post(format!("{}/task/{path}", ep.url))
+        .header("Authorization", format!("Bearer {}", ep.token))
+        .header("Content-Type", "application/json")
+        .send(body)
+        .map_err(|e| format!("POST /task/{path}: {e}"))?;
+    let status = resp.status().as_u16();
+    let text = resp.body_mut().read_to_string().unwrap_or_default();
+    Ok((status, text))
+}
+
+/// `--queue <q>` extractor shared by push/claim.
+fn arg_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .map(String::as_str)
+}
+
+fn run_push(args: &[String]) -> i32 {
+    let Some(queue) = arg_value(args, "--queue") else {
+        eprintln!("task push: --queue <q> required");
+        return 2;
+    };
+    let priority: u8 = arg_value(args, "--priority").and_then(|s| s.parse().ok()).unwrap_or(0);
+    // Payload = the first positional (non-flag, not consumed by a flag).
+    let mut skip = false;
+    let payload = args.iter().find(|a| {
+        if skip {
+            skip = false;
+            return false;
+        }
+        if a.starts_with("--") {
+            skip = matches!(a.as_str(), "--queue" | "--priority");
+            return false;
+        }
+        true
+    });
+    let Some(payload) = payload else {
+        eprintln!("task push: a \"<payload>\" is required");
+        return 2;
+    };
+    let body = serde_json::json!({ "payload": payload, "priority": priority }).to_string();
+    match post_task(&format!("{queue}/push"), &body) {
+        Ok((201, text)) => {
+            println!("{text}");
+            0
+        }
+        Ok((code, text)) => {
+            eprintln!("task push: HTTP {code}: {text}");
+            1
+        }
+        Err(e) => {
+            eprintln!("task push: {e}");
+            1
+        }
+    }
+}
+
+fn run_claim(args: &[String]) -> i32 {
+    let Some(queue) = arg_value(args, "--queue") else {
+        eprintln!("task claim: --queue <q> required");
+        return 2;
+    };
+    match post_task(&format!("{queue}/claim"), "") {
+        // 200 → a task; print {id,payload}. 204 → empty queue; print nothing.
+        Ok((200, text)) => {
+            println!("{text}");
+            0
+        }
+        Ok((204, _)) => 0,
+        Ok((code, text)) => {
+            eprintln!("task claim: HTTP {code}: {text}");
+            1
+        }
+        Err(e) => {
+            eprintln!("task claim: {e}");
+            1
+        }
+    }
+}
+
+fn run_done(args: &[String]) -> i32 {
+    let Some(id) = args.iter().find(|a| !a.starts_with("--")) else {
+        eprintln!("task done: a <task-id> is required");
+        return 2;
+    };
+    match post_task(&format!("{id}/done"), "") {
+        Ok((200, _)) => 0,
+        Ok((code, text)) => {
+            eprintln!("task done: HTTP {code}: {text}");
+            1
+        }
+        Err(e) => {
+            eprintln!("task done: {e}");
+            1
+        }
+    }
 }
 
 #[cfg(test)]
