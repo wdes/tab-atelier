@@ -166,6 +166,26 @@ pub fn compact_tasks(entries: &[TaskEntry]) -> Vec<TaskEntry> {
     entries.iter().filter(|e| e.state != TaskState::Done).cloned().collect()
 }
 
+/// The claim window's read-modify-write, PURE.
+///
+/// Claim the next task AND compact (prune `Done`) in the SAME pass — aligator's
+/// parity: it compacts at the drain, we compact at the claim, so the file stays
+/// BOUNDED instead of accumulating `done` entries without limit (and S2's
+/// heartbeats would only make that worse). Exactly-once is preserved: a pruned
+/// `done` is gone from the file, so it can never re-appear in a later claim.
+///
+/// Returns `(claimed, kept, changed)`: the claimed task (if any), the entries to
+/// persist, and whether anything changed (so the caller can skip a no-op write).
+#[must_use]
+pub fn claim_and_compact(mut entries: Vec<TaskEntry>) -> (Option<TaskEntry>, Vec<TaskEntry>, bool) {
+    let before = entries.len();
+    let claimed = claim_next(&mut entries);
+    let kept = compact_tasks(&entries);
+    // A write is needed if we claimed (a state flipped) or pruned any done entry.
+    let changed = claimed.is_some() || kept.len() != before;
+    (claimed, kept, changed)
+}
+
 /// Append one task line to a queue file (create + append, line-atomic like the
 /// swamp producer). Path-injectable so it's testable against a temp file.
 ///
@@ -183,10 +203,13 @@ pub fn append_task_line(path: &Path, entry: &TaskEntry) -> std::io::Result<()> {
 /// Rewrite a queue file to exactly `entries`, atomically (tmp + rename), like
 /// `compact_swamp`. Used by the claim/done read-modify-write and by compaction.
 ///
-/// `ponytail:` a producer append landing between the caller's read and this
-/// rewrite is lost — the same tiny read-modify-write window `compact_swamp`
-/// documents; the daemon lock keeps CLAIMS mutually exclusive, and an flock is
-/// the upgrade path for the producer race.
+/// Unlike aligator's swamp — where an EXTERNAL `tab-atelier swamp` producer
+/// appends concurrently, so `compact_swamp` warns a racing append can be lost —
+/// EVERY task writer (push AND claim AND done) runs under the daemon's snapshot
+/// lock, so there is no concurrent writer to race this read-modify-write: the
+/// producer race is CLOSED here. ponytail: that holds only while the daemon is
+/// the sole writer; if an external writer is ever added (a CLI writing the file
+/// directly, or a second process), an flock is the upgrade path.
 ///
 /// # Errors
 /// Propagates any create-dir / write / rename I/O error.
@@ -416,6 +439,43 @@ mod tests {
         // parse ∘ encode is the identity on a line.
         let e = &q[0];
         assert_eq!(parse_tasks(&encode_task_line(e)), vec![e.clone()], "jsonl roundtrip");
+    }
+
+    // S1.1: the claim window COMPACTS (aligator parity) → the file stays BOUNDED:
+    // accumulated `done` entries are pruned at each claim, the newly-claimed task
+    // survives, and a pruned `done` never re-appears (exactly-once).
+    #[test]
+    fn claim_compacts_done_so_the_file_stays_bounded() {
+        let entries = vec![
+            task("d1", 0, TaskState::Done), // stale done → must be pruned
+            task("q1", 0, TaskState::Queued),
+            task("d2", 0, TaskState::Done), // stale done → must be pruned
+        ];
+        let (claimed, kept, changed) = claim_and_compact(entries);
+        assert!(changed, "a claim + a prune → a write is needed");
+        assert_eq!(
+            claimed.as_ref().map(|t| t.id.as_str()),
+            Some("q1"),
+            "the queued task is claimed"
+        );
+        // The two done entries are gone; only the now-claimed q1 survives → bounded.
+        let kept_ids: Vec<&str> = kept.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(kept_ids, vec!["q1"], "done entries pruned at the claim window");
+        assert!(
+            kept.iter().all(|e| e.state != TaskState::Done),
+            "no done entry persists"
+        );
+        assert_eq!(
+            kept[0].state,
+            TaskState::Claimed,
+            "the claimed task survives as claimed"
+        );
+        // Claiming again on the bounded file finds nothing (q1 already claimed),
+        // and compaction with all-done-pruned already happened → still bounded.
+        let (again, kept2, changed2) = claim_and_compact(kept);
+        assert!(again.is_none(), "nothing left to claim");
+        assert!(!changed2, "no claim + nothing to prune → no write");
+        assert_eq!(kept2.len(), 1, "file stays bounded (the single claimed task)");
     }
 
     #[test]
