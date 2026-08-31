@@ -14,7 +14,7 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use crate::cli::task::{
-    TaskEntry, TaskState, claim_next, mark_done, parse_tasks, queue_files, queue_path, write_tasks_atomic,
+    TaskEntry, TaskState, claim_and_compact, mark_done, parse_tasks, queue_files, queue_path, write_tasks_atomic,
 };
 
 use super::super::{TabSnapshot, error_json, respond_json};
@@ -62,10 +62,12 @@ pub(in crate::api) fn claim<S: Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
     let path = queue_path(queue);
     // The whole read-modify-write runs under the snapshot mutex → the CAS.
     let guard = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut entries = parse_tasks(&std::fs::read_to_string(&path).unwrap_or_default());
-    let claimed = claim_next(&mut entries);
-    if claimed.is_some() {
-        let _ = write_tasks_atomic(&path, &entries);
+    let entries = parse_tasks(&std::fs::read_to_string(&path).unwrap_or_default());
+    // Aligator parity: claim AND compact (prune done) in the same window so the
+    // file stays bounded — otherwise done entries accumulate without limit.
+    let (claimed, kept, changed) = claim_and_compact(entries);
+    if changed {
+        let _ = write_tasks_atomic(&path, &kept);
     }
     drop(guard);
     match claimed {
@@ -81,6 +83,11 @@ pub(in crate::api) fn claim<S: Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
 
 /// `POST /task/{id}/done` — complete a task by id (idempotent). Scans the queue
 /// files to find the id's queue (S1 addresses by id alone). Always 200.
+///
+/// S2 NOTE (not built now): `done` scans ALL queue files while holding the main
+/// snapshot lock — fine at S1 scale, but under contention (many queues, or S2's
+/// frequent heartbeats also taking the lock) a DEDICATED task mutex would keep
+/// this off the daemon's hot path. Deferred to S2 with lease/beat.
 pub(in crate::api) fn done<S: Write>(stream: &mut S, state: &Arc<Mutex<TabSnapshot>>, id: &str) {
     let guard = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut flipped = false;
