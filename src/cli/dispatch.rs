@@ -462,6 +462,32 @@ pub enum Commands {
         interval: Option<u64>,
     },
 
+    /// 🐊 aligator (proof-of-concept, #35) — deterministic input router. Drains the swamp
+    /// queue and types each entry's input into its target Claude tab. Best
+    /// run as its own tab, like `brain`.
+    Aligator {
+        /// Drain once and exit (instead of looping forever).
+        #[arg(long)]
+        once: bool,
+        /// Seconds between rounds. Default 5.
+        #[arg(long)]
+        interval: Option<u64>,
+    },
+
+    /// Enqueue input for 🐊 aligator to deliver: type `<text>` into `<tab>`.
+    Swamp {
+        /// Target tab UUID.
+        tab: String,
+        /// Text to type into the tab's input.
+        text: String,
+        /// Don't press Enter after the text.
+        #[arg(long)]
+        no_submit: bool,
+        /// Producer name recorded in the entry (audit).
+        #[arg(long)]
+        from: Option<String>,
+    },
+
     /// Off-hours auto-lock — OSM `opening_hours` rule + IANA timezone.
     ///
     /// Set: `schedule <tab> "Mo-Fr 09:00-18:00" --tz Europe/Paris`.
@@ -836,6 +862,33 @@ pub fn dispatch(cli: Cli) -> bool {
                 args.push(s.to_string());
             }
             crate::cli::client::run("brain", &args)
+        }
+        Commands::Aligator { once, interval } => {
+            let mut args: Vec<String> = Vec::new();
+            if once {
+                args.push("--once".into());
+            }
+            if let Some(s) = interval {
+                args.push("--interval".into());
+                args.push(s.to_string());
+            }
+            crate::cli::client::run("aligator", &args)
+        }
+        Commands::Swamp {
+            tab,
+            text,
+            no_submit,
+            from,
+        } => {
+            let mut args: Vec<String> = vec![tab, text];
+            if no_submit {
+                args.push("--no-submit".into());
+            }
+            if let Some(f) = from {
+                args.push("--from".into());
+                args.push(f);
+            }
+            crate::cli::client::run("swamp", &args)
         }
         Commands::Schedule { tab, rule, tz, clear } => {
             let mut args: Vec<String> = vec![tab];
