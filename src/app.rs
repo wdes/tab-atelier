@@ -353,6 +353,13 @@ impl Tab {
     fn flush_pending_agent_resume(&mut self, cx: &mut gpui::App) {
         if let Some(cmd) = self.pending_agent_resume.take() {
             let view = self.view.read(cx);
+            // Wipe the local render NOW (grid + scrollback + frame cache) so the
+            // restored previous-session output is gone before the agent resumes
+            // and paints — otherwise its fresh UI lands over the stale frame and
+            // only the rows it redraws look right. The shell-side
+            // `AGENT_LAUNCH_CLEAR` below still runs, but it only takes effect
+            // once the shell executes it; this makes the screen clean instantly.
+            view.wipe_output();
             view.send_input_bytes(vec![0x15]); // Ctrl-U
             // Clear the grid first so the previous run's tail (e.g. the
             // `claude --resume …` exit line) doesn't linger under the resumed
