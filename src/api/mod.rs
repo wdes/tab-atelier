@@ -3865,8 +3865,10 @@ mod tests {
         // writing the response.
         let req = add_close_header(req);
         let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+        // 5 s (was 2 s) so a spawn_server test that races the parallel suite for
+        // CPU doesn't spuriously time out mid-response (task-concurrency flake).
         stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .unwrap();
         stream.write_all(req.as_bytes()).unwrap();
         let mut buf = String::new();

@@ -13,9 +13,7 @@
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
-use crate::cli::task::{
-    TaskEntry, TaskState, claim_and_compact, mark_done, parse_tasks, queue_files, queue_path, write_tasks_atomic,
-};
+use crate::cli::task::{TaskEntry, TaskState, mark_done, parse_tasks, queue_files, queue_path, write_tasks_atomic};
 
 use super::super::{TabSnapshot, error_json, respond_json};
 
@@ -60,15 +58,18 @@ pub(in crate::api) fn push<S: Write>(stream: &mut S, state: &Arc<Mutex<TabSnapsh
 /// when one is claimed, 204 (empty) when the queue holds nothing claimable.
 pub(in crate::api) fn claim<S: Write>(stream: &mut S, state: &Arc<Mutex<TabSnapshot>>, queue: &str) {
     let path = queue_path(queue);
-    // The whole read-modify-write runs under the snapshot mutex → the CAS.
+    // The whole read-modify-write runs under the snapshot mutex → the CAS. A
+    // claim is WON only if the state change is DURABLY persisted: perform_claim
+    // hands the task out ONLY when the write succeeds. If the write fails (fs
+    // fault), it returns None → 204, the file still shows the task queued → it
+    // stays claimable, so a persist failure can't silently double-claim.
     let guard = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let entries = parse_tasks(&std::fs::read_to_string(&path).unwrap_or_default());
-    // Aligator parity: claim AND compact (prune done) in the same window so the
-    // file stays bounded — otherwise done entries accumulate without limit.
-    let (claimed, kept, changed) = claim_and_compact(entries);
-    if changed {
-        let _ = write_tasks_atomic(&path, &kept);
-    }
+    let claimed = crate::cli::task::perform_claim(entries, |kept| {
+        write_tasks_atomic(&path, kept).inspect_err(|e| {
+            log::error!("task claim: persist failed for queue {queue}: {e} — not handing out the task");
+        })
+    });
     drop(guard);
     match claimed {
         Some(t) => {
