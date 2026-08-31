@@ -91,6 +91,9 @@ pub(in crate::api) fn state<S: Write>(
     // S4 task read-model: derive every queue's current state READ-ONLY (FS read
     // here so the pure builder stays FS-free). Nothing is mutated / compacted.
     dashboard.tasks = crate::cli::task::read_all_queue_views(crate::unix_millis());
+    // RB2 retired read-model: a SEPARATE SOURCE read from catalog.jsonl (a retired
+    // agent is absent from the live snapshot), folded latest-per-slug. READ-ONLY.
+    dashboard.retired = crate::cli::catalog::read_retired();
     let body = serde_json::to_string_pretty(&dashboard).unwrap_or_default();
     respond_with_etag(
         stream,

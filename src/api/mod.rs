@@ -665,8 +665,9 @@ fn build_dashboard_state(inputs: Vec<DashboardTabInput>) -> DashboardState {
         services,
         lineage,
         unassigned,
-        // Filled by the handler from the FS (S4); the pure builder stays FS-free.
+        // Filled by the handler from the FS (S4/RB2); the pure builder stays FS-free.
         tasks: Vec::new(),
+        retired: Vec::new(),
     }
 }
 
@@ -2114,6 +2115,8 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             let queue = &p["/task/".len()..p.len() - "/list".len()];
             handlers::task::list(stream, state, queue);
         }
+        // RB2 read-model: the retired-agent catalogue. READ-ONLY (GET).
+        ("GET", "/catalog/list") => handlers::catalog::list(stream),
         (_, "/" | "/tabs") => {
             error_json(stream, 405, "method not allowed");
         }
@@ -6408,5 +6411,26 @@ mod tests {
             dash.contains(r#""claimedBy": "peer-x""#),
             "claimed@peer-x on the dashboard\n{dash}"
         );
+    }
+
+    // RB2: the retired read-model is exposed READ-ONLY over the API — `GET
+    // /catalog/list` returns a `retired` section, and `/dashboard/state` carries
+    // the same `retired` section as a SEPARATE source. (Content/fold is proven in
+    // the pure `rb2_read_retired_*` test; here we lock the wiring + read-only-ness.)
+    #[test]
+    fn rb2_catalog_list_and_dashboard_expose_retired_via_api() {
+        let (port, _state, token) = spawn_server();
+        let get = |path: &str| format!("GET /{path}?token={token} HTTP/1.1\r\n\r\n");
+
+        let listed = request(port, &get("catalog/list"));
+        assert_eq!(status_code(&listed), 200, "catalog list → 200\n{listed}");
+        assert!(listed.contains(r#""retired""#), "catalog list returns a retired section");
+        // READ-ONLY: repeated reads are byte-identical (a list never mutates state).
+        let again = request(port, &get("catalog/list"));
+        assert_eq!(body_of(&listed), body_of(&again), "catalog list is read-only");
+
+        let dash = request(port, &get("dashboard/state"));
+        assert_eq!(status_code(&dash), 200, "dashboard/state → 200");
+        assert!(dash.contains(r#""retired""#), "dashboard exposes the retired section (separate source)");
     }
 }

@@ -432,6 +432,11 @@ pub struct DashboardState {
     /// derived READ-ONLY at read time (queued / claimed@peer / done). Filled at
     /// the handler (FS read there); empty from the pure builder / in tests.
     pub(crate) tasks: Vec<crate::cli::task::TaskQueueView>,
+    /// agent-lifecycle (RB2) read-model: retired agent cards, a SEPARATE SOURCE
+    /// read from catalog.jsonl at serve-time (a retired agent is absent from the
+    /// live snapshot, so this is NOT a filter of it), folded latest-per-slug.
+    /// READ-ONLY / INERT. Filled at the handler; empty from the pure builder.
+    pub(crate) retired: Vec<crate::cli::catalog::CatalogCard>,
 }
 
 /// Minimal per-tab projection the dashboard builder consumes, so the
