@@ -49,6 +49,41 @@ Copies the file into the target tab's `inbox/` (the same place web uploads land)
 so its agent can pick it up. Target resolved by name/index/UUID; an ambiguous
 name errors with the candidate indexes.
 
+## Label a tab — `set-meta`
+
+A small key/value map that lives on the tab, survives a restart, and comes back
+on `tabs --json` — so an agent can re-read who it is after a compaction, and a
+supervisor can see the whole fleet's roles in one call.
+
+```
+tab-atelier set-meta role reviewer          # on my own tab
+tab-atelier set-meta project kalpin-back
+tab-atelier set-meta role --clear
+tab-atelier set-meta --tab 3 role builder   # on someone else's
+tab-atelier tabs --json | jq '.tabs[] | {name, meta}'
+```
+
+**We assign no meaning to any key.** An orchestration layer on top brings its
+own vocabulary (`role`, `phase`, `objective`, whatever it needs) without the tab
+model growing a field per idea. Keys are `[a-z0-9_-]`, up to 16 per tab; values
+up to 256 chars. Unlike `env set --tab`, nothing here reaches the PTY, and
+unlike `set-context` (one free-text line, shown as the tab's tooltip) it's
+structured and multi-valued.
+
+## Run a daemon as a tab — `--daemon`
+
+`⛑ brain` is a tab-atelier subcommand running as its own tab. Anything else
+shaped like it — a queue drainer, a context watcher — announces itself the same
+way, and the daemon then comes back on its own after a restart:
+
+```
+tab-atelier set-status thinking --kind mywatcher --daemon
+```
+
+Restore relaunches `tab-atelier <kind>` for a flagged tab instead of dropping to
+a shell. The kind must be a plain lowercase verb; the flag is what elects the
+tab, so a stray `--kind` alone never turns into a command line.
+
 ## Safety
 
 - Only `dispatch` to a tab that's at a prompt (`peers` shows `idle`/`waiting`),

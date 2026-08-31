@@ -682,6 +682,50 @@ pub fn fresh_claude_launch_suffix() -> Vec<String> {
     ]
 }
 
+/// Our own CLI binary name — the two editions ship different ones (the debs
+/// conflict, so each carries only its own on PATH).
+#[must_use]
+pub const fn cli_binary_name() -> &'static str {
+    #[cfg(feature = "gui")]
+    {
+        "tab-atelier"
+    }
+    #[cfg(not(feature = "gui"))]
+    {
+        "tab-atelier-headless"
+    }
+}
+
+/// Is `kind` a **session-less daemon** tab rather than a resumable agent?
+///
+/// That's one of our own CLI subcommands run as a tab — `⛑ brain`, and
+/// whatever watcher a harness registers with `set-status --kind <verb>`.
+///
+/// Charset-gated to a plain lowercase verb so [`build_agent_resume_command`]
+/// can only ever reconstruct OUR binary running one of its own subcommands —
+/// no spaces, no shell metacharacters, and an unknown verb simply exits 2.
+#[must_use]
+pub fn is_daemon_kind(kind: &str) -> bool {
+    !matches!(kind, "catbus" | "claude")
+        && (2..=24).contains(&kind.len())
+        && kind.starts_with(|c: char| c.is_ascii_lowercase())
+        && kind.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+}
+
+/// The restore command for a **session-less daemon tab**: our own binary
+/// running the subcommand named by `kind`.
+///
+/// Only ever called for a tab that declared itself one (`set-status --kind
+/// <verb> --daemon`, persisted as [`TabState::agent_daemon`]) — an
+/// unrecognised `agent_kind` on its own still restores to a plain shell.
+/// The charset gate means the reconstructed command is always OUR binary plus
+/// one subcommand: no spaces, no shell metacharacters, and an unknown verb
+/// simply exits 2.
+#[must_use]
+pub fn daemon_relaunch_command(kind: &str) -> Option<String> {
+    is_daemon_kind(kind).then(|| format!("{} {kind}", cli_binary_name()))
+}
+
 /// Translate a persisted (`agent_kind`, `session_id`, `plan_mode`) into
 /// the shell command to type for auto-resume. Returns None when the
 /// `agent_kind` isn't one we know how to drive.
@@ -694,20 +738,11 @@ pub fn build_agent_resume_command(kind: &str, session_id: &str, plan: Option<boo
         }
         "claude" => Some(format!("claude --resume {session_id}")),
         // The ⛑ brain watchdog has no session to resume — it's a standalone
-        // tool that re-attaches to every OTHER tab over the local API. On
-        // restart we just relaunch it. `session_id` is unused. The binary
-        // differs by edition (the two debs conflict, so each ships only its
-        // own name on PATH).
-        "brain" => {
-            #[cfg(feature = "gui")]
-            {
-                Some("tab-atelier brain".to_string())
-            }
-            #[cfg(not(feature = "gui"))]
-            {
-                Some("tab-atelier-headless brain".to_string())
-            }
-        }
+        // tool that re-attaches to every OTHER tab over the local API, so
+        // restore just relaunches it. `session_id` is unused. Brain predates
+        // the `agent_daemon` flag, hence the name here; any other daemon goes
+        // through [`daemon_relaunch_command`].
+        "brain" => daemon_relaunch_command("brain"),
         _ => None,
     }
 }
@@ -1022,11 +1057,30 @@ pub struct TabState {
     /// brings the tab back into the same mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_plan_mode: Option<bool>,
+    /// Durable — this tab IS a session-less daemon (`set-status --kind <verb>
+    /// --daemon`): one of our own subcommands run as a tab, like `⛑ brain`.
+    /// Restore relaunches it via [`daemon_relaunch_command`] instead of
+    /// dropping to a shell. Set by the daemon itself at startup, so an
+    /// unrecognised `agent_kind` alone never becomes a command line.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub agent_daemon: bool,
     /// Per-tab env vars injected into this tab's PTY (`env set --tab <id>`),
     /// layered ON TOP of the global `tab_env` (per-tab wins). Applied on the
     /// next spawn/respawn of the tab.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub tab_env: std::collections::BTreeMap<String, String>,
+
+    /// Free-form durable labels set from inside the tab
+    /// (`tab-atelier set-meta <key> <value>`) and surfaced on `/tabs`.
+    ///
+    /// Unlike [`Self::tab_env`] it never reaches the PTY and is never masked:
+    /// it's labelling, not configuration — a role, a project phase, a
+    /// harness's own bookkeeping. We assign no meaning to any key; that's the
+    /// point, so an orchestration layer can carry its vocabulary without us
+    /// growing a field per idea. Bounded by [`META_MAX_KEYS`] /
+    /// [`META_KEY_MAX`] / [`META_VALUE_MAX`].
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub meta: std::collections::BTreeMap<String, String>,
 
     /// Fixed grid size the tab is PINNED to (`tab-atelier resize <tab> --cols N
     /// --rows M`), overriding window-driven sizing so a web viewer isn't
@@ -1275,6 +1329,59 @@ pub fn system_total_ram_bytes() -> Option<u64> {
 /// black; legible foreground contrast on most monitors.
 pub const DEFAULT_TAB_BG_COLOR: &str = "#002451";
 
+/// Cap on how many [`TabState::meta`] keys one tab can carry. Small on
+/// purpose: this is labelling, not storage — anything bigger belongs in a
+/// file the agent owns.
+pub const META_MAX_KEYS: usize = 16;
+/// Cap on a meta key's length.
+pub const META_KEY_MAX: usize = 32;
+/// Cap on a meta value's length, in chars.
+pub const META_VALUE_MAX: usize = 256;
+
+/// Validate one `set-meta` pair, returning the normalised `(key, value)`.
+///
+/// Keys are lower-cased and restricted to `[a-z0-9_-]` so they stay usable as
+/// JSON object keys and as header/CSS-safe identifiers downstream; values are
+/// trimmed of control characters (they'd corrupt a header line or a log) and
+/// length-capped. An empty value is rejected — a key is deleted by sending a
+/// null value on the wire, not by blanking it.
+///
+/// # Errors
+/// A human-readable message naming the rule that failed.
+pub fn sanitize_meta(key: &str, value: &str) -> Result<(String, String), String> {
+    let key = key.trim().to_ascii_lowercase();
+    if key.is_empty() || key.len() > META_KEY_MAX {
+        return Err(format!("meta key must be 1..={META_KEY_MAX} chars"));
+    }
+    if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return Err("meta key allows only [a-z0-9_-]".to_string());
+    }
+    let value: String = value.trim().chars().filter(|c| !c.is_control()).collect();
+    if value.is_empty() {
+        return Err("meta value is empty — pass --clear to remove the key".to_string());
+    }
+    if value.chars().count() > META_VALUE_MAX {
+        return Err(format!("meta value must be at most {META_VALUE_MAX} chars"));
+    }
+    Ok((key, value))
+}
+
+/// Apply one validated meta change: `Some(v)` sets, `None` removes.
+///
+/// Refuses to grow past [`META_MAX_KEYS`] (updating an existing key always
+/// works), so the persisted map stays bounded whatever the API allowed.
+pub fn apply_meta_change(map: &mut std::collections::BTreeMap<String, String>, key: &str, value: Option<String>) {
+    match value {
+        Some(v) if map.len() < META_MAX_KEYS || map.contains_key(key) => {
+            map.insert(key.to_string(), v);
+        }
+        Some(_) => {}
+        None => {
+            map.remove(key);
+        }
+    }
+}
+
 /// Resolve the effective background color for a tab: per-tab override
 /// → global pref → Tomorrow Night Blue.
 #[must_use]
@@ -1317,7 +1424,9 @@ impl Default for TabState {
             agent_session_id: None,
             agent_kind: None,
             agent_plan_mode: None,
+            agent_daemon: false,
             tab_env: std::collections::BTreeMap::new(),
+            meta: std::collections::BTreeMap::new(),
             pinned_cols: None,
             pinned_rows: None,
             share_token_rw: String::new(),
@@ -3343,6 +3452,70 @@ mod tests {
         assert_eq!(cmd, "tab-atelier brain");
         #[cfg(not(feature = "gui"))]
         assert_eq!(cmd, "tab-atelier-headless brain");
+    }
+
+    #[test]
+    fn a_flagged_daemon_relaunches_as_our_own_subcommand() {
+        // A harness registers its watcher with `set-status --kind <verb>
+        // --daemon`; restore relaunches it the way it relaunches brain, with
+        // no match arm per creature.
+        assert_eq!(
+            daemon_relaunch_command("aligator").unwrap(),
+            format!("{} aligator", cli_binary_name())
+        );
+        // The FLAG elects a daemon — an unrecognised kind on its own still
+        // restores to a plain shell, so a stray `set-status --kind foo` can
+        // never become a command line at restore.
+        assert!(build_agent_resume_command("aligator", "", None).is_none());
+        assert!(build_agent_resume_command("bash", "x", None).is_none());
+        // Session agents keep their own resume shape, and are never daemons.
+        assert_eq!(
+            build_agent_resume_command("claude", "sess-1", None).unwrap(),
+            "claude --resume sess-1"
+        );
+        assert!(!is_daemon_kind("claude") && !is_daemon_kind("catbus"));
+        // Even flagged, anything that isn't a plain lowercase verb is refused:
+        // the relaunch is always OUR binary plus one subcommand, leaving no
+        // room for an argument, a separator or a substitution.
+        for bad in ["rm -rf /", "brain;reboot", "Brain", "$(id)", "b", &"x".repeat(25)] {
+            assert!(!is_daemon_kind(bad), "{bad} must not be a daemon kind");
+            assert!(daemon_relaunch_command(bad).is_none());
+        }
+    }
+
+    #[test]
+    fn meta_keys_are_normalised_and_bounded() {
+        assert_eq!(
+            sanitize_meta(" Role ", "  reviewer  ").unwrap(),
+            ("role".to_string(), "reviewer".to_string())
+        );
+        // Control characters would corrupt a header line or a log — stripped.
+        assert_eq!(sanitize_meta("k", "a\r\nb").unwrap().1, "ab");
+        assert!(sanitize_meta("", "v").is_err());
+        assert!(sanitize_meta("has space", "v").is_err());
+        assert!(sanitize_meta("k", "   ").is_err(), "empty value → use --clear");
+        assert!(sanitize_meta(&"k".repeat(META_KEY_MAX + 1), "v").is_err());
+        assert!(sanitize_meta("k", &"v".repeat(META_VALUE_MAX + 1)).is_err());
+        assert!(sanitize_meta("k", &"é".repeat(META_VALUE_MAX)).is_ok(), "cap is chars");
+    }
+
+    #[test]
+    fn meta_map_stays_bounded_whatever_the_api_allowed() {
+        let mut map = std::collections::BTreeMap::new();
+        for i in 0..META_MAX_KEYS {
+            apply_meta_change(&mut map, &format!("k{i}"), Some("v".into()));
+        }
+        assert_eq!(map.len(), META_MAX_KEYS);
+        // A new key on a full map is dropped, so tabs.json can't grow without
+        // bound even if a racing writer slipped past the API's check.
+        apply_meta_change(&mut map, "overflow", Some("v".into()));
+        assert_eq!(map.len(), META_MAX_KEYS);
+        assert!(!map.contains_key("overflow"));
+        // Updating an existing key always works, and None removes.
+        apply_meta_change(&mut map, "k0", Some("v2".into()));
+        assert_eq!(map.get("k0").map(String::as_str), Some("v2"));
+        apply_meta_change(&mut map, "k0", None);
+        assert_eq!(map.len(), META_MAX_KEYS - 1);
     }
 
     #[test]

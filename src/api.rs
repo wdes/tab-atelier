@@ -202,6 +202,12 @@ struct TabInfo {
     /// PR/task it's on. Omitted when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     context: Option<String>,
+    /// Free-form durable labels the tab set for itself via `set-meta`. We
+    /// assign no meaning to the keys — an orchestration layer carries its own
+    /// vocabulary here (role, phase, whatever) without us growing a field per
+    /// idea. Omitted when empty.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    meta: std::collections::BTreeMap<String, String>,
     /// Number of WS viewers (browser share-link / `remote attach`)
     /// currently watching this tab. Omitted when zero.
     #[serde(skip_serializing_if = "is_zero")]
@@ -445,6 +451,9 @@ pub struct SnapshotTab {
     /// tab so `GET /tabs/<id>/env` (the CLI `env list --tab`) can report them
     /// without reading tabs.json off disk. Empty ⇒ no per-tab overrides.
     pub tab_env: std::collections::BTreeMap<String, String>,
+    /// Free-form durable labels (`set-meta`), mirrored from the runtime tab so
+    /// `/tabs` can serve them. Empty ⇒ none set.
+    pub meta: std::collections::BTreeMap<String, String>,
 }
 
 impl crate::schedule::LockState for SnapshotTab {
@@ -468,6 +477,8 @@ pub struct PendingStatusUpdate {
     pub session_id: Option<String>,
     pub agent_kind: Option<String>,
     pub plan_mode: Option<bool>,
+    /// `--daemon`: this tab is a session-less daemon to relaunch on restart.
+    pub daemon: Option<bool>,
 }
 
 /// A queued relay-config change (the CLI `relay via <ep>` / `relay egress`).
@@ -488,6 +499,15 @@ pub struct EnvChange {
     pub tab: Option<String>,
     pub set: std::collections::BTreeMap<String, String>,
     pub unset: Vec<String>,
+}
+
+/// One `POST /tabs/by-id/{id}/meta` change, drained by the main loop onto the
+/// tab's [`crate::TabState::meta`]. `value: None` removes the key.
+#[derive(Clone, Debug)]
+pub struct MetaChange {
+    pub tab_id: String,
+    pub key: String,
+    pub value: Option<String>,
 }
 
 pub struct TabSnapshot {
@@ -595,6 +615,9 @@ pub struct TabSnapshot {
     /// `POST /tabs/by-id/<id>/env` (per-tab). Drained by the owner, which merges
     /// them into the global/per-tab map, persists, and respawns if asked.
     pub pending_env_changes: Vec<EnvChange>,
+    /// Meta-label changes queued by `POST /tabs/by-id/<id>/meta`, drained onto
+    /// the tab's durable `meta` map by the owner.
+    pub pending_meta_changes: Vec<MetaChange>,
     /// Relay endpoint/egress change queued by `POST /relay-config`.
     pub pending_relay_config: Option<RelayConfigChange>,
     /// (tab index, new name) pairs queued by `POST /tabs/{idx}/rename`.
@@ -1818,6 +1841,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                     schedule_rule: t.schedule.as_ref().map(|s| s.rule.clone()),
                     schedule_tz: t.schedule.as_ref().map(|s| s.tz.clone()),
                     context: t.context.as_deref().map(str::to_string),
+                    meta: t.meta.clone(),
                     net_disabled: t.net_disabled,
                     connections: t.connections,
                     tx_bytes: t.tx_bytes,
@@ -2608,6 +2632,60 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 }
             }
         }
+        ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/meta") => {
+            // Set or clear one free-form durable label on a tab (`set-meta`).
+            // Body: {"key":"role","value":"reviewer"} to set,
+            // {"key":"role","value":null} to remove. Keys/values are validated
+            // by `crate::sanitize_meta`; the map is capped at META_MAX_KEYS so
+            // a chatty producer can't grow tabs.json without bound.
+            let Some((key_raw, is_uuid)) = parse_tab_key(p, "/meta") else {
+                error_json(stream, 404, "missing tab id");
+                return;
+            };
+            let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or(serde_json::Value::Null);
+            let Some(key) = parsed.get("key").and_then(|v| v.as_str()) else {
+                error_json(stream, 400, "expected {\"key\":\"…\",\"value\":\"…\"|null}");
+                return;
+            };
+            // A null (or absent) value removes the key; anything else must
+            // validate as a value.
+            let raw_value = parsed.get("value").and_then(|v| v.as_str());
+            let (key, value) = match raw_value {
+                Some(v) => match crate::sanitize_meta(key, v) {
+                    Ok((k, v)) => (k, Some(v)),
+                    Err(e) => {
+                        error_json(stream, 400, &e);
+                        return;
+                    }
+                },
+                // Validate the key alone by round-tripping a dummy value.
+                None => match crate::sanitize_meta(key, "x") {
+                    Ok((k, _)) => (k, None),
+                    Err(e) => {
+                        error_json(stream, 400, &e);
+                        return;
+                    }
+                },
+            };
+            let mut snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(idx) = resolve_tab_idx(&snap, key_raw, is_uuid) else {
+                drop(snap);
+                error_json(stream, 404, "tab not found");
+                return;
+            };
+            let full = value.is_some()
+                && snap.tabs[idx].meta.len() >= crate::META_MAX_KEYS
+                && !snap.tabs[idx].meta.contains_key(&key);
+            if full {
+                drop(snap);
+                error_json(stream, 400, &format!("meta is full ({} keys)", crate::META_MAX_KEYS));
+                return;
+            }
+            let tab_id = snap.tabs[idx].id.to_string();
+            snap.pending_meta_changes.push(MetaChange { tab_id, key, value });
+            drop(snap);
+            respond_json(stream, 200, r#"{"queued":"meta"}"#);
+        }
         ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/resize") => {
             // Pin (or clear) a tab's fixed grid size (the CLI `resize`). Body:
             // {"cols":N,"rows":M} pins to that size (both >= 2 / >= 1), or
@@ -2788,6 +2866,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                         session_id: None,
                         agent_kind: None,
                         plan_mode: None,
+                        daemon: None,
                     });
                     drop(snap);
                     respond_json(stream, 200, r#"{"cleared":true}"#);
@@ -2811,6 +2890,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 .and_then(|v| v.as_str())
                 .map(std::string::ToString::to_string);
             let plan_mode = parsed.get("planMode").and_then(serde_json::Value::as_bool);
+            let daemon = parsed.get("daemon").and_then(serde_json::Value::as_bool);
             let mut snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let Some(t) = snap.tabs.iter().find(|t| &*t.id == tab_id) else {
                 drop(snap);
@@ -2830,6 +2910,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 session_id,
                 agent_kind,
                 plan_mode,
+                daemon,
             });
             drop(snap);
             respond_json(stream, 200, r#"{"ok":true}"#);
@@ -4407,6 +4488,7 @@ pub fn test_snapshot_tab(id: &str, name: &str) -> SnapshotTab {
         resident_memory_bytes: None,
         tokens: None,
         tab_env: std::collections::BTreeMap::new(),
+        meta: std::collections::BTreeMap::new(),
     }
 }
 
@@ -4438,6 +4520,7 @@ pub fn test_snapshot(tabs: Vec<SnapshotTab>) -> TabSnapshot {
         pending_claude_only: None,
         pending_relay_mode: None,
         pending_env_changes: Vec::new(),
+        pending_meta_changes: Vec::new(),
         pending_relay_config: None,
         pending_renames: vec![],
         pending_status_updates: vec![],
@@ -4480,6 +4563,7 @@ mod tests {
             last_used_at: None,
             agent_session_id: None,
             context: None,
+            meta: std::collections::BTreeMap::new(),
             viewers: 0,
             net_disabled: false,
             connections: 0,
@@ -5217,6 +5301,73 @@ mod tests {
             .pending_renames
             .clone();
         assert_eq!(pending, vec![(0_usize, "renamed".into())]);
+    }
+
+    #[test]
+    fn set_meta_queues_a_set_then_a_clear() {
+        let (port, state, token) = spawn_server();
+        let post = |body: &str| {
+            request(
+                port,
+                &format!(
+                    "POST /tabs/by-id/tab-a/meta HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len(),
+                ),
+            )
+        };
+        assert_eq!(status_code(&post(r#"{"key":"Role","value":" reviewer "}"#)), 200);
+        let last = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending_meta_changes
+            .last()
+            .cloned()
+            .expect("queued");
+        // Key lower-cased, value trimmed — normalisation happens server-side.
+        assert_eq!((last.key.as_str(), last.value.as_deref()), ("role", Some("reviewer")));
+        // A null value is the delete form.
+        assert_eq!(status_code(&post(r#"{"key":"role","value":null}"#)), 200);
+        let last = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending_meta_changes
+            .last()
+            .cloned()
+            .expect("queued");
+        assert_eq!((last.key.as_str(), last.value), ("role", None));
+        // A key outside [a-z0-9_-] is refused before it reaches the queue.
+        assert_eq!(status_code(&post(r#"{"key":"role!","value":"x"}"#)), 400);
+        assert_eq!(
+            state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pending_meta_changes
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn set_meta_refuses_to_grow_past_the_key_cap() {
+        let (port, state, token) = spawn_server();
+        let mut s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for i in 0..crate::META_MAX_KEYS {
+            s.tabs[0].meta.insert(format!("k{i}"), "v".into());
+        }
+        drop(s);
+        let post = |body: &str| {
+            request(
+                port,
+                &format!(
+                    "POST /tabs/by-id/tab-a/meta HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len(),
+                ),
+            )
+        };
+        // A NEW key on a full map is refused …
+        assert_eq!(status_code(&post(r#"{"key":"extra","value":"v"}"#)), 400);
+        // … while updating one that's already there still works.
+        assert_eq!(status_code(&post(r#"{"key":"k0","value":"v2"}"#)), 200);
     }
 
     #[test]
@@ -7008,6 +7159,41 @@ mod tests {
         );
         assert_eq!(status_code(&resp), 200);
         assert!(body(&resp).contains(crate::DEFAULT_TAB_BG_COLOR));
+    }
+
+    #[test]
+    fn status_carries_the_daemon_flag() {
+        // `set-status --kind <verb> --daemon` is how a session-less daemon
+        // (brain and whatever a harness adds) elects itself for relaunch at
+        // restart. Without the flag the kind alone must not carry that meaning.
+        let (port, state, token) = spawn_server();
+        let post = |body: &str| {
+            request(
+                port,
+                &format!(
+                    "POST /tabs/by-id/tab-a/status HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len(),
+                ),
+            )
+        };
+        assert_eq!(
+            status_code(&post(r#"{"state":"thinking","agentKind":"aligator","daemon":true}"#)),
+            200
+        );
+        let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let upd = s.pending_status_updates.last().unwrap();
+        let (kind, daemon) = (upd.agent_kind.clone(), upd.daemon);
+        drop(s);
+        assert_eq!(kind.as_deref(), Some("aligator"));
+        assert_eq!(daemon, Some(true));
+        assert_eq!(
+            status_code(&post(r#"{"state":"thinking","agentKind":"aligator"}"#)),
+            200
+        );
+        let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let daemon = s.pending_status_updates.last().unwrap().daemon;
+        drop(s);
+        assert_eq!(daemon, None, "absent flag leaves the tab's setting untouched");
     }
 
     #[test]

@@ -30,6 +30,7 @@ pub fn run(args: &[String]) -> i32 {
     let mut session: Option<String> = None;
     let mut kind: Option<String> = None;
     let mut plan: Option<bool> = None;
+    let mut daemon = false;
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -46,6 +47,10 @@ pub fn run(args: &[String]) -> i32 {
                 i += 1;
                 kind = args.get(i).cloned();
             }
+            // A session-less daemon (`brain`-shaped: a `tab-atelier <verb>` run
+            // as its own tab) — restore relaunches the verb instead of dropping
+            // to a shell. Announced by the daemon itself at startup.
+            "--daemon" => daemon = true,
             "--plan" => plan = Some(true),
             "--no-plan" => plan = Some(false),
             other if state.is_none() && !other.starts_with("--") => {
@@ -61,7 +66,7 @@ pub fn run(args: &[String]) -> i32 {
 
     let Some(state) = state else {
         eprintln!(
-            "usage: tab-atelier set-status <idle|thinking|waiting|error> [--label …] [--session UUID] [--kind catbus|claude] [--plan|--no-plan]"
+            "usage: tab-atelier set-status <idle|thinking|waiting|error> [--label …] [--session UUID] [--kind catbus|claude|<daemon>] [--daemon] [--plan|--no-plan]"
         );
         return 2;
     };
@@ -79,6 +84,9 @@ pub fn run(args: &[String]) -> i32 {
     }
     if let Some(v) = plan {
         body.insert("planMode".into(), serde_json::Value::Bool(v));
+    }
+    if daemon {
+        body.insert("daemon".into(), serde_json::Value::Bool(true));
     }
     let body = serde_json::Value::Object(body).to_string();
 

@@ -179,10 +179,14 @@ struct Tab {
     /// at last save. Restored along with the session so the tab
     /// comes back in the same mode.
     agent_plan_mode: Option<bool>,
+    /// Mirrors `TabState::agent_daemon` — this tab is a session-less daemon.
+    agent_daemon: bool,
     /// Per-tab env vars (`env set --tab <id>`), injected on this tab's spawn.
     /// Mirrors `TabState::tab_env`.
     #[allow(clippy::struct_field_names)] // consistent name across TabState/HeadlessTab
     tab_env: std::collections::BTreeMap<String, String>,
+    /// Free-form durable labels (`set-meta`); mirrors `TabState::meta`.
+    meta: std::collections::BTreeMap<String, String>,
     /// Per-tab share secrets. Minted lazily by the right-click
     /// share-link menu and persisted to tabs.json so URLs survive
     /// restarts. Empty until first share.
@@ -303,7 +307,9 @@ impl Tab {
             agent_session_id: ts.agent_session_id.as_deref().map(std::sync::Arc::from),
             agent_kind: ts.agent_kind.as_deref().map(std::sync::Arc::from),
             agent_plan_mode: ts.agent_plan_mode,
+            agent_daemon: ts.agent_daemon,
             tab_env: ts.tab_env.clone(),
+            meta: ts.meta.clone(),
             share_token_rw: ts.share_token_rw.as_str().into(),
             share_token_ro: ts.share_token_ro.as_str().into(),
             locked: ts.locked,
@@ -1019,8 +1025,10 @@ impl AppState {
                     None
                 } else {
                     match (ts.agent_kind.as_deref(), ts.agent_session_id.as_deref()) {
-                        // Brain has no session — it re-attaches over the API.
-                        // Relaunch it whenever the tab is flagged as one.
+                        // A daemon tab has no session — it re-attaches over the
+                        // API — so relaunch its own subcommand. `brain` predates
+                        // the flag and stays recognised by kind alone.
+                        (Some(kind), _) if ts.agent_daemon => crate::daemon_relaunch_command(kind),
                         (Some("brain"), _) => build_agent_resume_command("brain", "", ts.agent_plan_mode),
                         (Some(kind), Some(sid)) => build_agent_resume_command(kind, sid, ts.agent_plan_mode),
                         _ => None,
@@ -1393,6 +1401,7 @@ impl AppState {
             pending_claude_only: None,
             pending_relay_mode: None,
             pending_env_changes: Vec::new(),
+            pending_meta_changes: Vec::new(),
             pending_relay_config: None,
             pending_renames: Vec::new(),
             pending_status_updates: Vec::new(),
@@ -1973,7 +1982,9 @@ impl AppState {
                     agent_session_id: tab.agent_session_id.as_deref().map(str::to_string),
                     agent_kind: tab.agent_kind.as_deref().map(str::to_string),
                     agent_plan_mode: tab.agent_plan_mode,
+                    agent_daemon: tab.agent_daemon,
                     tab_env: tab.tab_env.clone(),
+                    meta: tab.meta.clone(),
                     pinned_cols: tab.pinned_cols,
                     pinned_rows: tab.pinned_rows,
                     share_token_rw: tab.share_token_rw.to_string(),
@@ -2143,6 +2154,7 @@ impl AppState {
                 #[cfg(not(feature = "catbus"))]
                 tokens: None,
                 tab_env: tab.tab_env.clone(),
+                meta: tab.meta.clone(),
             });
         }
 
@@ -2345,6 +2357,7 @@ impl AppState {
             let relay_mode_change: Option<bool> = snapshot.pending_relay_mode.take();
             let relay_config_change = snapshot.pending_relay_config.take();
             let env_changes: Vec<crate::api::EnvChange> = snapshot.pending_env_changes.drain(..).collect();
+            let meta_changes: Vec<crate::api::MetaChange> = snapshot.pending_meta_changes.drain(..).collect();
             drop(snapshot);
             // Relay-mode toggle from the CLI/API (`relay on|off`).
             if let Some(on) = relay_mode_change {
@@ -2381,6 +2394,13 @@ impl AppState {
                         prefs.tab_env = g;
                         save_preferences(&platform::config_dir(), &prefs);
                     }
+                }
+            }
+            // Free-form durable labels (`set-meta`) onto the runtime Tab —
+            // persisted on the next tick like every other durable field.
+            for ch in meta_changes {
+                if let Some(tab) = self.tabs.iter_mut().find(|t| *t.id == ch.tab_id) {
+                    crate::apply_meta_change(&mut tab.meta, &ch.key, ch.value);
                 }
             }
             // Forced Claude-only toggle from the CLI/API (`claude-only on|off`).
@@ -2551,6 +2571,9 @@ impl AppState {
                     }
                     if upd.plan_mode.is_some() {
                         tab.agent_plan_mode = upd.plan_mode;
+                    }
+                    if let Some(d) = upd.daemon {
+                        tab.agent_daemon = d;
                     }
                 }
             }
@@ -3005,7 +3028,9 @@ impl AppState {
                     agent_session_id: tab.agent_session_id.as_deref().map(str::to_string),
                     agent_kind: tab.agent_kind.as_deref().map(str::to_string),
                     agent_plan_mode: tab.agent_plan_mode,
+                    agent_daemon: tab.agent_daemon,
                     tab_env: tab.tab_env.clone(),
+                    meta: tab.meta.clone(),
                     pinned_cols: tab.pinned_cols,
                     pinned_rows: tab.pinned_rows,
                     share_token_rw: tab.share_token_rw.to_string(),
