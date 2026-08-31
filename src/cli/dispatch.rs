@@ -520,6 +520,13 @@ pub enum Commands {
         args: Vec<String>,
     },
 
+    /// task primitive (#11): typed queue with an atomic claim. Passthrough to `cli::task::run`.
+    Task {
+        /// Passed straight through to `cli::task::run`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Launch `claude` cleanly: clear the grid, then `exec claude ARGS…`.
     ///
     /// A no-fuss agent launcher — every argument passes through, so
@@ -931,6 +938,7 @@ pub fn dispatch(cli: Cli) -> bool {
         Commands::ClaudeHook { event } => crate::cli::client::run("claude-hook", &[event]),
         Commands::Remote { args } => crate::cli::client::run("remote", &args),
         Commands::Dispatch { args } => crate::cli::client::run("dispatch", &args),
+        Commands::Task { args } => crate::cli::client::run("task", &args),
         Commands::Peers { all } => {
             let args: Vec<String> = if all { vec!["--all".into()] } else { vec![] };
             crate::cli::client::run("peers", &args)
@@ -1222,9 +1230,39 @@ mod tests {
                 "resize fixed size",
             ),
             (&["tab-atelier-headless", "resize", "0", "--clear"], "resize --clear"),
+            // task primitive (#11) — the passthrough clap must ACCEPT before it
+            // reaches cli::task::run (the gap that let `tab-atelier task …` 404 at
+            // the clap layer while the server route worked).
+            (
+                &["tab-atelier-headless", "task", "push", "--queue", "q", "hello"],
+                "task push",
+            ),
+            (&["tab-atelier-headless", "task", "claim", "--queue", "q"], "task claim"),
+            (&["tab-atelier-headless", "task", "done", "some-id"], "task done"),
+            (&["tab-atelier-headless", "task", "list", "--queue", "q"], "task list"),
         ];
         for (argv, label) in cases {
             let _ = Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("parse failed for {label}: {e}"));
+        }
+    }
+
+    // Stronger than the round-trip above: prove the clap PATH resolves to the
+    // `Task` variant AND captures the trailing args verbatim — so the passthrough
+    // to `cli::task::run` gets exactly what the user typed (hyphenated flags
+    // included). This is the case whose absence let the `task` clap gap ship.
+    #[test]
+    fn task_subcommand_routes_to_the_task_variant_with_verbatim_args() {
+        let cli = Cli::try_parse_from(["tab-atelier-headless", "task", "push", "--queue", "q", "hello"])
+            .expect("`task` must parse (clap gap regression)");
+        match cli.command {
+            Some(Commands::Task { args }) => {
+                assert_eq!(
+                    args,
+                    vec!["push", "--queue", "q", "hello"],
+                    "the trailing args reach cli::task::run verbatim, hyphen flags included"
+                );
+            }
+            other => panic!("`task …` routed to the wrong variant: {other:?}"),
         }
     }
 
