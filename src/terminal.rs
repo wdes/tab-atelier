@@ -272,6 +272,10 @@ pub struct TerminalView {
     scrollbar_dragging: Rc<Cell<bool>>,
     scroll_acc: Rc<Cell<f32>>,
     pub theme: ThemeName,
+    /// Per-tab background override (`#RRGGBB` resolved to a colour) — the
+    /// project tint from a folder rule, or the tab's own `bg-color`. `None` ⇒
+    /// the theme's `term_bg`. Copied into the element each `render`.
+    bg_override: Option<u32>,
     /// Shape of the cursor quad drawn over the active cell. Copied into the
     /// element each `render` (like `theme`) and read at paint time.
     cursor_style: CursorStyle,
@@ -794,6 +798,7 @@ impl TerminalView {
             scrollbar_dragging: Rc::new(Cell::new(false)),
             scroll_acc: Rc::new(Cell::new(0.0)),
             theme: ThemeName::default(),
+            bg_override: None,
             cursor_style: CursorStyle::default(),
             font_config,
             browser,
@@ -967,6 +972,12 @@ impl TerminalView {
     pub fn set_theme(&mut self, theme: ThemeName) {
         self.theme = theme;
         self.event_proxy.set_theme(theme);
+    }
+
+    /// Override the terminal background (the project tint), or clear it back
+    /// to the theme's. Takes effect on the next paint.
+    pub const fn set_bg_override(&mut self, rgb: Option<u32>) {
+        self.bg_override = rgb;
     }
 
     /// Set the cursor shape (block / slim bar / underline). Takes effect on
@@ -1998,6 +2009,7 @@ impl Render for TerminalView {
                 line_cache: self.line_cache.clone(),
                 line_cache_scratch: self.line_cache_scratch.clone(),
                 theme: self.theme,
+                bg_override: self.bg_override,
                 cursor_style: self.cursor_style,
                 font_config: self.font_config.clone(),
                 detected_urls: self.detected_urls.clone(),
@@ -2034,6 +2046,7 @@ struct TerminalElement {
     line_cache: Rc<RefCell<HashMap<i32, CachedLine>>>,
     line_cache_scratch: Rc<RefCell<HashMap<i32, CachedLine>>>,
     theme: ThemeName,
+    bg_override: Option<u32>,
     cursor_style: CursorStyle,
     font_config: FontConfig,
     detected_urls: Rc<RefCell<Vec<DetectedUrl>>>,
@@ -2968,7 +2981,9 @@ impl Element for TerminalElement {
             // frame. Per-cell bg quads (below) skip default-bg cells —
             // without this base, anything left in the framebuffer from the
             // last redraw (other windows, scrolled-off rows) shows through.
-            let term_bg = theme::theme(self.theme).term_bg_hsla();
+            let term_bg = self
+                .bg_override
+                .map_or_else(|| theme::theme(self.theme).term_bg_hsla(), |c| gpui::rgb(c).into());
             window.paint_quad(fill(bounds, term_bg));
 
             // Paint backgrounds, with vertically-contiguous identical

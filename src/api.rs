@@ -208,6 +208,10 @@ struct TabInfo {
     /// idea. Omitted when empty.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     meta: std::collections::BTreeMap<String, String>,
+    /// Short tag drawn on the tab (per-tab override or the folder rule for its
+    /// cwd). Omitted when the tab has none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    badge: Option<String>,
     /// Number of WS viewers (browser share-link / `remote attach`)
     /// currently watching this tab. Omitted when zero.
     #[serde(skip_serializing_if = "is_zero")]
@@ -369,6 +373,10 @@ pub struct SnapshotTab {
     /// viewer via `X-Tab-Bg` on /output + `__TAB_BG__` template
     /// substitution on /view.
     pub bg_color: std::sync::Arc<str>,
+    /// Effective badge (per-tab override or folder rule; `None` ⇒ none), the
+    /// short tag the desktop draws on the tab. Surfaced on `/tabs` so the
+    /// mobile remote and the CLI list render the same identity.
+    pub badge: Option<std::sync::Arc<str>>,
     /// Free-text context an in-tab agent set for itself via
     /// `tab-atelier set-context "…"` — e.g. the PR/issue it's working
     /// on. Surfaced on `/tabs` and as a hover tooltip on the GUI tab
@@ -618,6 +626,9 @@ pub struct TabSnapshot {
     /// Meta-label changes queued by `POST /tabs/by-id/<id>/meta`, drained onto
     /// the tab's durable `meta` map by the owner.
     pub pending_meta_changes: Vec<MetaChange>,
+    /// (tab id, badge) queued by `POST /tabs/by-id/<id>/badge`; `None` clears
+    /// the per-tab override so the tab falls back to its folder rule.
+    pub pending_badge_changes: Vec<(String, Option<String>)>,
     /// Relay endpoint/egress change queued by `POST /relay-config`.
     pub pending_relay_config: Option<RelayConfigChange>,
     /// (tab index, new name) pairs queued by `POST /tabs/{idx}/rename`.
@@ -1842,6 +1853,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                     schedule_tz: t.schedule.as_ref().map(|s| s.tz.clone()),
                     context: t.context.as_deref().map(str::to_string),
                     meta: t.meta.clone(),
+                    badge: t.badge.as_deref().map(str::to_string),
                     net_disabled: t.net_disabled,
                     connections: t.connections,
                     tx_bytes: t.tx_bytes,
@@ -3547,6 +3559,47 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             .unwrap_or_default();
             respond_json(stream, 200, &body);
         }
+        ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/badge") => {
+            // Set or clear this tab's badge override — the short tag the
+            // desktop draws on the tab. Body: {"badge":"KAL"} to set,
+            // {"badge":null} to clear (the tab falls back to the folder rule
+            // for its cwd). Master token only, like /bg-color.
+            let inner = &p["/tabs/by-id/".len()..p.len() - "/badge".len()];
+            let parsed = serde_json::from_slice::<serde_json::Value>(&body_bytes).ok();
+            let Some(field) = parsed.as_ref().and_then(|v| v.get("badge")) else {
+                error_json(stream, 400, "missing {\"badge\": \"…\"} or {\"badge\": null}");
+                return;
+            };
+            let badge_opt = if field.is_null() {
+                None
+            } else {
+                let Some(raw) = field.as_str() else {
+                    error_json(stream, 400, "badge must be a string or null");
+                    return;
+                };
+                match crate::sanitize_badge(raw) {
+                    Ok(b) => Some(b),
+                    Err(e) => {
+                        error_json(stream, 400, &e);
+                        return;
+                    }
+                }
+            };
+            let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(idx) = state.tabs.iter().position(|t| &*t.id == inner) else {
+                drop(state);
+                error_json(stream, 404, "tab not found");
+                return;
+            };
+            let tab_id = state.tabs[idx].id.to_string();
+            // Reflect immediately so the next /tabs poll already shows it; the
+            // persist tick syncs the runtime tab.
+            state.tabs[idx].badge = badge_opt.as_deref().map(Into::into);
+            state.pending_badge_changes.push((tab_id, badge_opt.clone()));
+            drop(state);
+            let body = serde_json::to_string(&serde_json::json!({ "badge": badge_opt })).unwrap_or_default();
+            respond_json(stream, 200, &body);
+        }
         ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/context") => {
             // Set or clear this tab's free-text context (the PR/task an
             // in-tab agent is working on). Body: {"context":"…"} to set,
@@ -4489,6 +4542,7 @@ pub fn test_snapshot_tab(id: &str, name: &str) -> SnapshotTab {
         tokens: None,
         tab_env: std::collections::BTreeMap::new(),
         meta: std::collections::BTreeMap::new(),
+        badge: None,
     }
 }
 
@@ -4521,6 +4575,7 @@ pub fn test_snapshot(tabs: Vec<SnapshotTab>) -> TabSnapshot {
         pending_relay_mode: None,
         pending_env_changes: Vec::new(),
         pending_meta_changes: Vec::new(),
+        pending_badge_changes: Vec::new(),
         pending_relay_config: None,
         pending_renames: vec![],
         pending_status_updates: vec![],
@@ -4564,6 +4619,7 @@ mod tests {
             agent_session_id: None,
             context: None,
             meta: std::collections::BTreeMap::new(),
+            badge: None,
             viewers: 0,
             net_disabled: false,
             connections: 0,

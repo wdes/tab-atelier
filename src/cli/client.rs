@@ -42,6 +42,7 @@ pub fn dispatch(name: &str, rest: &[String]) -> Option<i32> {
         "set-font" => set_font::run(rest),
         "set-context" => set_context::run(rest),
         "set-meta" => set_meta::run(rest),
+        "style" => super::style::run(rest),
         "token" => tokens::show(rest),
         "rotate-tokens" => tokens::rotate(rest),
         "reset-master-token" => tokens::reset_master(rest),

@@ -29,6 +29,7 @@ pub mod set_status;
 /// share-link, add, close, rename, lock, unlock, input, output. Named
 /// after the first one added; see the module docstring for details.
 pub mod share_link;
+pub mod style;
 /// `tab-atelier peers / note / notes / handoff` — Claude-to-Claude teamwork
 /// verbs (dispatch handles send-a-prompt-and-wait; this is the rest).
 pub mod team;

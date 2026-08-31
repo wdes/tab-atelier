@@ -214,6 +214,12 @@ struct Tab {
     /// the global `Preferences::tab_bg_color`, which itself falls
     /// back to Tomorrow Night Blue.
     bg_color: Option<String>,
+    /// Per-tab badge override; mirrors `TabState::badge`.
+    badge: Option<String>,
+    /// Tint last pushed into the view, so the resolve loop only touches the
+    /// terminal when the project colour actually changed (a `cd` into another
+    /// project, or an edited rule).
+    applied_tint: std::cell::Cell<Option<u32>>,
     /// Free-text context the in-tab agent set via `set-context` (e.g.
     /// the PR/task it's on). Shown as a hover tooltip on the tab name.
     /// In-memory; set via the API + drained from the snapshot.
@@ -315,6 +321,8 @@ impl Tab {
             locked: ts.locked,
             schedule: ts.schedule.clone(),
             bg_color: ts.bg_color.clone(),
+            badge: ts.badge.clone(),
+            applied_tint: std::cell::Cell::new(None),
             context: None,
             last_pushed_locked: None,
             pending_agent_resume,
@@ -1368,6 +1376,7 @@ impl AppState {
             prefs.api_tls_client_ca_path.clone().map(std::path::PathBuf::from);
         let share_url_base = prefs.share_url_base.unwrap_or_default();
         let tab_bg_global = prefs.tab_bg_color;
+        crate::set_folder_styles(prefs.folder_styles.clone());
         let remote_endpoints = prefs.remote_endpoints;
         info!("API server starting on {api_addr} (TLS {api_tls_addr})");
         let activity_signal = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1402,6 +1411,7 @@ impl AppState {
             pending_relay_mode: None,
             pending_env_changes: Vec::new(),
             pending_meta_changes: Vec::new(),
+            pending_badge_changes: Vec::new(),
             pending_relay_config: None,
             pending_renames: Vec::new(),
             pending_status_updates: Vec::new(),
@@ -1992,6 +2002,7 @@ impl AppState {
                     locked: tab.locked,
                     schedule: tab.schedule.clone(),
                     bg_color: tab.bg_color.clone(),
+                    badge: tab.badge.clone(),
                     limits: tab.limits.clone(),
                     ..TabState::default()
                 }
@@ -2064,7 +2075,26 @@ impl AppState {
             let Some(grid) = tab.snap_cache.clone() else {
                 continue;
             };
-            let bg_color = crate::effective_tab_bg(tab.bg_color.as_deref(), self.tab_bg_global.as_deref()).into();
+            let folder = crate::folder_style_for(crate::folder_styles(), tab.last_known_cwd_string.as_deref());
+            let bg_color = crate::effective_tab_bg(
+                tab.bg_color.as_deref(),
+                folder.and_then(|f| f.color.as_deref()),
+                self.tab_bg_global.as_deref(),
+            )
+            .into();
+            let badge = crate::effective_tab_badge(tab.badge.as_deref(), folder.and_then(|f| f.badge.as_deref()))
+                .map(Into::into);
+            // Paint the project tint into the terminal itself, once per change
+            // — a tab that `cd`s into another project re-derives it here.
+            let tint = crate::effective_tab_tint(tab.bg_color.as_deref(), folder.and_then(|f| f.color.as_deref()))
+                .and_then(crate::parse_hex_rgb);
+            if tab.applied_tint.get() != tint {
+                tab.applied_tint.set(tint);
+                tab.view.update(cx, |v, vcx| {
+                    v.set_bg_override(tint);
+                    vcx.notify();
+                });
+            }
             // Per-tab RSS (#28 S1/S5): one /proc-subtree walk at the 2 s persist
             // cadence, cached on the tab for the tab-bar gauge and mirrored to
             // the snapshot below.
@@ -2099,6 +2129,7 @@ impl AppState {
                 locked: ts.locked,
                 schedule: ts.schedule.clone(),
                 bg_color,
+                badge,
                 context: tab.context.clone(),
                 shell_pid,
                 agent_state: tab.agent_state.clone(),
@@ -2345,6 +2376,7 @@ impl AppState {
             let lock_changes: Vec<(String, bool)> = snapshot.pending_lock_changes.drain(..).collect();
             let net_changes: Vec<(String, bool)> = snapshot.pending_net_changes.drain(..).collect();
             let bg_color_changes: Vec<(String, Option<String>)> = snapshot.pending_bg_color_changes.drain(..).collect();
+            let badge_changes: Vec<(String, Option<String>)> = snapshot.pending_badge_changes.drain(..).collect();
             let context_changes: Vec<(String, Option<String>)> = snapshot.pending_context_changes.drain(..).collect();
             let token_rotations: Vec<String> = snapshot.pending_token_rotations.drain(..).collect();
             let schedule_changes: Vec<(String, Option<crate::schedule::TabSchedule>)> =
@@ -2449,6 +2481,11 @@ impl AppState {
             for (tab_id, color) in bg_color_changes {
                 if let Some(tab) = self.tabs.iter_mut().find(|t| *t.id == tab_id) {
                     tab.bg_color = color;
+                }
+            }
+            for (tab_id, badge) in badge_changes {
+                if let Some(tab) = self.tabs.iter_mut().find(|t| *t.id == tab_id) {
+                    tab.badge = badge;
                 }
             }
             // Revoke per-tab share tokens on the runtime Tab so the
@@ -3037,6 +3074,7 @@ impl AppState {
                     share_token_ro: tab.share_token_ro.to_string(),
                     locked: tab.locked,
                     bg_color: tab.bg_color.clone(),
+                    badge: tab.badge.clone(),
                     limits: tab.limits.clone(),
                     ..TabState::default()
                 }
@@ -3309,6 +3347,24 @@ impl AppState {
             #[cfg(feature = "energy")]
             let power_label = watts.get(i).map(power::TabPower::label).unwrap_or_default();
 
+            // Project identity: the folder rule for this tab's cwd, unless the
+            // tab overrides it. Same resolution the snapshot + terminal use.
+            let folder = crate::folder_style_for(crate::folder_styles(), tab.last_known_cwd_string.as_deref());
+            let badge_chip = crate::effective_tab_badge(tab.badge.as_deref(), folder.and_then(|f| f.badge.as_deref()))
+                .map(|text| {
+                    let tint =
+                        crate::effective_tab_tint(tab.bg_color.as_deref(), folder.and_then(|f| f.color.as_deref()))
+                            .and_then(crate::parse_hex_rgb);
+                    div()
+                        .flex_none()
+                        .px(px(4.0))
+                        .mr(px(5.0))
+                        .rounded_sm()
+                        .text_size(px(10.0))
+                        .bg(tint.map_or(tab_border, |c| Hsla::from(gpui::rgb(c))))
+                        .child(text.to_string())
+                });
+
             let drag_name = tab.name.clone();
             let tab_el = div()
                 .id(ElementId::Name(self.tab_el_ids[i].clone()))
@@ -3427,6 +3483,7 @@ impl AppState {
                     this.move_tab(dragged.idx, i, window, cx);
                 }))
                 .when_some(agent_led, ParentElement::child)
+                .when_some(badge_chip, ParentElement::child)
                 .child(if self.screenshot_censor {
                     // Solid opaque bar over the name — an irreversible redaction
                     // (the text is never drawn), not a reversible blur.
@@ -5878,6 +5935,7 @@ impl AppState {
                                                         pty_cols: None,
                                                         pty_rows: None,
                                                         tab_bg_color: this.tab_bg_global.clone(),
+                                                        folder_styles: on_disk_prefs.folder_styles,
                                                         // Headless-only: default allowlist for new
                                                         // tabs, set via the CLI. Preserve on-disk.
                                                         default_net_allow_presets: on_disk_prefs
