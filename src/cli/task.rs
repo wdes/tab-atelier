@@ -200,6 +200,32 @@ pub fn append_task_line(path: &Path, entry: &TaskEntry) -> std::io::Result<()> {
     f.write_all(encode_task_line(entry).as_bytes())
 }
 
+/// Perform one claim window: select+compact, then persist via `persist` — and
+/// hand the task out ONLY if that persist SUCCEEDED.
+///
+/// The exactly-once-under-fs-failure guard (Olympe's catch). `persist` is a
+/// closure (the caller injects `write_tasks_atomic`; tests inject a failing
+/// write) applied to the entries to keep. A claim is **won** only when a task was
+/// claimed AND `persist` returned `Ok`. If persist FAILS → return `None`: the
+/// on-disk file is unchanged (the claim was only in the in-memory copy), so the
+/// task is still `queued` → still claimable; a later claim retries once the fs
+/// recovers. NOT handing out a task is safe; handing one out without a durable
+/// claim record would let another claimer re-take the still-`queued` entry = a
+/// silent DOUBLE-CLAIM. (A claim always sets `changed`, so it always passes the
+/// persist gate.)
+#[must_use]
+pub fn perform_claim<F>(entries: Vec<TaskEntry>, persist: F) -> Option<TaskEntry>
+where
+    F: FnOnce(&[TaskEntry]) -> std::io::Result<()>,
+{
+    let (claimed, kept, changed) = claim_and_compact(entries);
+    if changed && persist(&kept).is_err() {
+        // Persist failed → do NOT hand out the task (it stays claimable on disk).
+        return None;
+    }
+    claimed
+}
+
 /// Rewrite a queue file to exactly `entries`, atomically (tmp + rename), like
 /// `compact_swamp`. Used by the claim/done read-modify-write and by compaction.
 ///
@@ -476,6 +502,41 @@ mod tests {
         assert!(again.is_none(), "nothing left to claim");
         assert!(!changed2, "no claim + nothing to prune → no write");
         assert_eq!(kept2.len(), 1, "file stays bounded (the single claimed task)");
+    }
+
+    // S1.2 (Olympe catch): a claim whose PERSIST fails is NOT won — exactly-once
+    // must not break silently under an fs fault. If the write fails, the task
+    // stays claimable (queued on disk), and a later claim wins it.
+    #[test]
+    fn claim_not_won_if_persist_fails_so_task_stays_claimable() {
+        let entries = vec![task("q1", 0, TaskState::Queued)];
+        // Persist FAILS (fs fault) → the claim returns empty, NOT the task.
+        let got = perform_claim(entries.clone(), |_| Err(std::io::Error::other("disk full")));
+        assert!(
+            got.is_none(),
+            "a claim whose persist fails is not won — empty, never the task"
+        );
+        // The caller's source is untouched (perform_claim took a copy), so on a
+        // real re-read the task is still `queued` → still claimable. Prove the
+        // retry: a SUCCEEDING persist now wins the same task.
+        let mut persisted: Option<Vec<TaskEntry>> = None;
+        let got2 = perform_claim(entries, |kept| {
+            persisted = Some(kept.to_vec());
+            Ok(())
+        });
+        assert_eq!(
+            got2.map(|t| t.id),
+            Some("q1".into()),
+            "the task stays claimable — a later claim wins it"
+        );
+        // And the durably-persisted state has it CLAIMED (the win is recorded).
+        let saved = persisted.expect("persist ran on the successful retry");
+        assert_eq!(saved.len(), 1);
+        assert_eq!(
+            saved[0].state,
+            TaskState::Claimed,
+            "the won claim is what gets persisted"
+        );
     }
 
     #[test]
