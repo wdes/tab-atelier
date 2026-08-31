@@ -42,6 +42,18 @@ const SCOPE_TAIL_BYTES: usize = 4096;
 const NUDGE_BACKOFF_BASE_SECS: u64 = 60;
 /// Backoff ceiling — a long outage still gets a retry roughly every 15 min.
 const NUDGE_BACKOFF_MAX_SECS: u64 = 900;
+/// Wall-clock ceiling on the per-tab scan of one tick. Kept below
+/// [`DEFAULT_INTERVAL_SECS`] so a large fleet can't make a cycle outrun the
+/// poll interval; the scan resumes at `scan_cursor` on the next tick. Worst
+/// case is the budget plus one already-in-flight `/output` GET (3 s, the
+/// `share_link` agent's global timeout).
+const TICK_BUDGET: Duration = Duration::from_secs(4);
+/// More than this many eligible tabs stuck on an Anthropic-capacity error
+/// means the fleet is capped upstream, not individually wedged.
+const CIRCUIT_BREAKER_THRESHOLD: usize = 5;
+/// Nudge spacing while the fleet is capped, and how long that verdict stays
+/// sticky so a spike doesn't flap the cadence.
+const CIRCUIT_BREAKER_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// Captive-portal-style connectivity probe.
 ///
@@ -357,6 +369,22 @@ struct TabWatch {
     last_label: Option<&'static str>,
 }
 
+impl TabWatch {
+    /// `last_hash` starts at 0 so the first [`evaluate_tab`] call always takes
+    /// the "output changed" branch — which re-stamps `stable_since` to the same
+    /// `now` it was built with, so the freeze clock still starts here.
+    const fn new(now: Instant) -> Self {
+        Self {
+            last_hash: 0,
+            stable_since: now,
+            nudged_hash: None,
+            nudge_streak: 0,
+            next_nudge_at: None,
+            last_label: None,
+        }
+    }
+}
+
 /// FNV-1a hash of a tab's `/output`. Process-local only (never
 /// persisted) so any stable hash function works; FNV is allocation-
 /// free and fast enough for a few-KB string per tick.
@@ -389,6 +417,125 @@ fn backoff_secs(streak: u32) -> u64 {
         .min(NUDGE_BACKOFF_MAX_SECS)
 }
 
+/// Pure per-tab decision for one tick: folds this tick's `output` into
+/// `watch` and returns the trigger to nudge on, or `None`. All HTTP stays in
+/// [`Brain::tick`], so the whole gate chain — stability clock, trigger
+/// detection, recovery reset, [`should_nudge`], backoff — is testable over
+/// many simulated ticks with an injected `now`.
+fn evaluate_tab(watch: &mut TabWatch, output: &str, agent_state: Option<&str>, now: Instant) -> Option<Trigger> {
+    // Output-stability tracking — the core "is the agent working?" gate. A
+    // changed screen means the agent is producing output → it's alive → reset
+    // the clock. An unchanged one accumulates frozen time.
+    let h = hash_output(output);
+    if watch.last_hash != h {
+        watch.last_hash = h;
+        watch.stable_since = now;
+    }
+
+    // Identify the trigger for EVERY tab (not just frozen ones) so a recovered
+    // tab is the reset point for the backoff. Two parallel signals — a literal
+    // needle in the scrollback OR an `agent_state: "error"` flag set via
+    // set-status. Pattern wins on tie (its label is more specific).
+    let trigger = scan_output(output)
+        .map(Trigger::Pattern)
+        .or_else(|| (agent_state == Some("error")).then_some(Trigger::AgentError));
+    let Some(trigger) = trigger else {
+        // No error on screen → recovered (or never errored). Clear the backoff
+        // so the next episode starts fresh.
+        watch.nudge_streak = 0;
+        watch.next_nudge_at = None;
+        watch.last_label = None;
+        return None;
+    };
+
+    // Frozen long enough AND not already nudged at this exact screen? (An
+    // active auto-retry countdown keeps the screen moving, so it never freezes
+    // STABLE_SECS and never reaches here.)
+    if !should_nudge(now.duration_since(watch.stable_since), watch.nudged_hash, h) {
+        return None;
+    }
+
+    // Exponential backoff while the SAME error keeps recurring, so brain
+    // doesn't hammer a transient outage. A different label resets the streak
+    // (applied on send).
+    if watch.last_label == Some(trigger.label())
+        && let Some(at) = watch.next_nudge_at
+        && now < at
+    {
+        return None;
+    }
+
+    Some(trigger)
+}
+
+/// True when the fleet looks capped upstream rather than individually wedged:
+/// more than [`CIRCUIT_BREAKER_THRESHOLD`] of THIS TICK's eligible tabs are
+/// stuck on an Anthropic-capacity error. Sticky for [`CIRCUIT_BREAKER_COOLDOWN`]
+/// so a spike doesn't flap the cadence.
+///
+/// Deliberately stateless per tick apart from that stickiness: deriving it from
+/// `eligible` — which already means "frozen, unnudged at this screen, past
+/// backoff" — makes recovery automatic. Recovered tabs leave `eligible`, the
+/// count drops, normal cadence resumes. A time-stamped sliding window cannot do
+/// that, because a frozen screen re-stamps the window faster than it can age
+/// out and brain goes silent forever.
+fn systemic_api_freeze(eligible: &[Eligible], breaker_until: &mut Option<Instant>, now: Instant) -> bool {
+    let capped = eligible
+        .iter()
+        .filter(|e| is_api_storm_label(e.trigger.label()))
+        .count();
+    if capped > CIRCUIT_BREAKER_THRESHOLD {
+        *breaker_until = Some(now + CIRCUIT_BREAKER_COOLDOWN);
+        return true;
+    }
+    match *breaker_until {
+        Some(until) if now < until => true,
+        Some(_) => {
+            *breaker_until = None;
+            false
+        }
+        None => false,
+    }
+}
+
+/// Anthropic-side capacity errors — the ones that hit the whole fleet at once.
+/// Local per-box faults (connection refused, TCP resets) are excluded: those
+/// are independent failures, not a shared cap.
+///
+/// `api-retry-waiting` is excluded too. "will retry in" is Claude Code's
+/// healthy self-retry banner (see [`PATTERNS`]); counting it would let five
+/// recovering tabs throttle the fleet.
+fn is_api_storm_label(label: &str) -> bool {
+    matches!(
+        label,
+        "anthropic-529" | "anthropic-rate-limited" | "anthropic-503" | "anthropic-5xx"
+    )
+}
+
+/// One-per-`min_interval` gate: returns true and stamps `last_at` when the
+/// interval has elapsed (or nothing has been sent yet), false otherwise. Used
+/// only for the systemic heartbeat — normal cadence is already spaced by the
+/// round-robin's one-send-per-tick.
+fn nudge_ready(last_at: &mut Option<Instant>, now: Instant, min_interval: Duration) -> bool {
+    if let Some(at) = *last_at
+        && now.duration_since(at) < min_interval
+    {
+        return false;
+    }
+    *last_at = Some(now);
+    true
+}
+
+/// Indices `0..n` starting at `cursor % n` and wrapping — the scan order for a
+/// budget-truncated tick that resumes where the previous one stopped.
+fn scan_order(n: usize, cursor: usize) -> Vec<usize> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let start = cursor % n;
+    (0..n).map(|i| (start + i) % n).collect()
+}
+
 /// Round-robin pick from a slice. Advances `cursor` mod `len()` and
 /// returns the chosen element (a reference into the slice, since the
 /// caller still owns the Vec). `None` on empty input — caller treats
@@ -405,210 +552,205 @@ fn pick_round_robin<'a, T>(items: &'a [T], cursor: &mut usize) -> Option<&'a T> 
     items.get(idx)
 }
 
-/// Polled at every interval. Re-derives the endpoint each tick so
-/// a daemon restart (different token, same URL) just resumes
-/// silently on the next loop.
-///
-/// Round-robin send model — at most ONE `continue` per tick. If
-/// five tabs are all stuck on the same connectivity error, sending
-/// to all five simultaneously dogpiles whatever was wrong (rate
-/// limit, transient 5xx) and we'd just collect five fresh failures.
-/// Instead: collect all eligible tabs, pick one via the cursor,
-/// fire only that one. The next tick (~5 s later) picks the next
-/// one, and so on. Cooldown per (tab, pattern) still applies; the
-/// round-robin just spaces out which one fires when.
-fn tick(
-    watches: &mut HashMap<String, TabWatch>,
-    probe: &mut ConnectivityProbe,
-    cursor: &mut usize,
-) -> Result<(), String> {
-    let ep: Endpoint = discover_endpoint()?;
-    let ag = agent();
-    let auth = format!("Bearer {}", ep.token);
+/// Everything that survives between ticks.
+#[derive(Default)]
+struct Brain {
+    watches: HashMap<String, TabWatch>,
+    probe: ConnectivityProbe,
+    /// Which eligible tab gets this tick's single nudge.
+    rr_cursor: usize,
+    /// Where the last [`TICK_BUDGET`]-truncated scan stopped.
+    scan_cursor: usize,
+    breaker_until: Option<Instant>,
+    last_nudge_at: Option<Instant>,
+    /// Last systemic verdict, so entering/leaving is logged once instead of
+    /// every tick.
+    systemic: bool,
+}
 
-    let tabs: TabsResponse = ag
-        .get(format!("{}/tabs", ep.url))
-        .header("Authorization", &auth)
-        .call()
-        .map_err(|e| format!("GET /tabs: {e}"))?
-        .body_mut()
-        .read_json()
-        .map_err(|e| format!("parse /tabs: {e}"))?;
+impl Brain {
+    /// Polled at every interval. Re-derives the endpoint each tick so
+    /// a daemon restart (different token, same URL) just resumes
+    /// silently on the next loop.
+    ///
+    /// Round-robin send model — at most ONE `continue` per tick. If
+    /// five tabs are all stuck on the same connectivity error, sending
+    /// to all five simultaneously dogpiles whatever was wrong (rate
+    /// limit, transient 5xx) and we'd just collect five fresh failures.
+    /// Instead: collect all eligible tabs, pick one via the cursor,
+    /// fire only that one. The next tick (~5 s later) picks the next
+    /// one, and so on. Backoff per (tab, label) still applies; the
+    /// round-robin just spaces out which one fires when.
+    fn tick(&mut self) -> Result<(), String> {
+        let ep: Endpoint = discover_endpoint()?;
+        let ag = agent();
+        let auth = format!("Bearer {}", ep.token);
 
-    let now = Instant::now();
-    let mut eligible: Vec<Eligible> = Vec::new();
-    let mut seen_ids: Vec<String> = Vec::new();
-    for tab in tabs.tabs {
-        if tab.id.is_empty() {
-            continue;
-        }
-        // Gate the entire per-tab scan on "Claude is mid-session
-        // here". Without it, brain was polling /output on every tab
-        // — including shell tabs, log tailers, vim sessions — and
-        // anything whose scrollback happened to contain a needle
-        // (e.g. `git log` showing "ECONNRESET" in a commit message)
-        // would get an injected `continue\r`. Only tabs whose hook
-        // has reported a Claude session are legitimate targets.
-        if tab.agent_kind.as_deref() != Some("claude") || tab.agent_session_id.as_deref().unwrap_or("").is_empty() {
-            continue;
-        }
-        seen_ids.push(tab.id.clone());
-        let output = ag
-            .get(format!("{}/tabs/by-id/{}/output", ep.url, tab.id))
+        let tabs: TabsResponse = ag
+            .get(format!("{}/tabs", ep.url))
             .header("Authorization", &auth)
             .call()
-            .map_err(|e| format!("GET output for {}: {e}", tab.id))?
+            .map_err(|e| format!("GET /tabs: {e}"))?
             .body_mut()
-            .read_to_string()
-            .map_err(|e| format!("read output for {}: {e}", tab.id))?;
+            .read_json()
+            .map_err(|e| format!("parse /tabs: {e}"))?;
 
-        // Output-stability tracking — the core "is the agent working?"
-        // gate. Update the per-tab watch: if the screen changed since
-        // last tick, reset the stability clock (the agent is producing
-        // output → it's alive → leave it alone). If it's the same,
-        // accumulate frozen time.
-        let h = hash_output(&output);
-        let watch = watches.entry(tab.id.clone()).or_insert(TabWatch {
-            last_hash: h,
-            stable_since: now,
-            nudged_hash: None,
-            nudge_streak: 0,
-            next_nudge_at: None,
-            last_label: None,
-        });
-        if watch.last_hash != h {
-            watch.last_hash = h;
-            watch.stable_since = now;
+        // Gate the entire per-tab scan on "Claude is mid-session here".
+        // Without it, brain polls /output on every tab — shell tabs, log
+        // tailers, vim sessions — and anything whose scrollback happens to
+        // contain a needle (e.g. `git log` showing "ECONNRESET" in a commit
+        // message) would get an injected `continue\r`. Only tabs whose hook
+        // has reported a Claude session are legitimate targets. Filtering up
+        // front is free (no HTTP) and gives the scan its index space.
+        let claude: Vec<TabInfo> = tabs
+            .tabs
+            .into_iter()
+            .filter(|t| {
+                !t.id.is_empty()
+                    && t.agent_kind.as_deref() == Some("claude")
+                    && !t.agent_session_id.as_deref().unwrap_or("").is_empty()
+            })
+            .collect();
+
+        // Drop watch state for tabs that vanished (closed / no longer a Claude
+        // session) so the map stays bounded. Built from ALL Claude tabs, not
+        // just the ones this tick had budget for — a budget-deferred tab must
+        // keep its watch, or its freeze clock restarts every time it's skipped
+        // and it can never reach STABLE_SECS.
+        self.watches.retain(|id, _| claude.iter().any(|t| &t.id == id));
+
+        let started = Instant::now();
+        let now = started;
+        let mut eligible: Vec<Eligible> = Vec::new();
+        let mut scanned = 0usize;
+        for idx in scan_order(claude.len(), self.scan_cursor) {
+            let tab = &claude[idx];
+            scanned += 1;
+            let output = match ag
+                .get(format!("{}/tabs/by-id/{}/output", ep.url, tab.id))
+                .header("Authorization", &auth)
+                .call()
+                .map_err(|e| format!("GET output for {}: {e}", tab.id))
+                .and_then(|mut r| {
+                    r.body_mut()
+                        .read_to_string()
+                        .map_err(|e| format!("read output for {}: {e}", tab.id))
+                }) {
+                Ok(o) => o,
+                // One tab closing mid-tick must not strand every tab after it.
+                Err(e) => {
+                    eprintln!("⛑ brain: {e}");
+                    continue;
+                }
+            };
+
+            let watch = self.watches.entry(tab.id.clone()).or_insert_with(|| TabWatch::new(now));
+            if let Some(trigger) = evaluate_tab(watch, &output, tab.agent_state.as_deref(), now) {
+                eligible.push(Eligible {
+                    tab_id: tab.id.clone(),
+                    tab_name: tab.name.clone(),
+                    trigger,
+                    output_hash: watch.last_hash,
+                });
+            }
+
+            if started.elapsed() >= TICK_BUDGET {
+                break;
+            }
         }
-        let stable_for = now.duration_since(watch.stable_since);
+        self.scan_cursor = self.scan_cursor.wrapping_add(scanned);
 
-        // Identify the error trigger for EVERY claude tab (not just frozen
-        // ones) so a recovered tab is the reset point for the backoff.
-        // Two parallel signals — a literal needle match in the scrollback
-        // OR an `agent_state: "error"` flag set via set-status. Pattern
-        // wins on tie (its label is more specific).
-        let trigger: Option<Trigger> = if let Some(p) = scan_output(&output) {
-            Some(Trigger::Pattern(p))
-        } else if tab.agent_state.as_deref() == Some("error") {
-            Some(Trigger::AgentError)
-        } else {
-            None
-        };
-        let Some(trigger) = trigger else {
-            // No error on screen → recovered (or never errored). Clear
-            // the backoff so the next episode starts fresh.
-            watch.nudge_streak = 0;
-            watch.next_nudge_at = None;
-            watch.last_label = None;
-            continue;
-        };
-        let label = trigger.label();
-
-        // Frozen long enough AND not already nudged at this exact screen?
-        // (An active auto-retry countdown keeps the screen moving, so it
-        // never freezes STABLE_SECS and never reaches here.)
-        if !should_nudge(stable_for, watch.nudged_hash, h) {
-            continue;
+        // Fleet capped upstream → drop to a heartbeat. Spaced, never silent:
+        // total suppression makes brain look dead and hides the moment the
+        // capacity comes back. Evaluated before the empty-set return so a quiet
+        // fleet — the actual recovery — is what releases the breaker.
+        let systemic = systemic_api_freeze(&eligible, &mut self.breaker_until, now);
+        if systemic != self.systemic {
+            self.systemic = systemic;
+            if systemic {
+                println!(
+                    "⛑ brain: fleet capped upstream ({n} tab(s) on Anthropic capacity errors) — one nudge per {s}s",
+                    n = eligible.len(),
+                    s = CIRCUIT_BREAKER_COOLDOWN.as_secs(),
+                );
+            } else {
+                println!("⛑ brain: upstream capacity recovered — normal cadence");
+            }
         }
 
-        // Exponential backoff: while the SAME error keeps recurring, wait
-        // progressively longer between nudges so brain doesn't hammer a
-        // transient outage (repeated `529 Overloaded`, rate limits). A
-        // different error label resets the streak (applied on send).
-        if watch.last_label == Some(label)
-            && let Some(at) = watch.next_nudge_at
-            && now < at
-        {
-            let wait = at.duration_since(now).as_secs();
+        if eligible.is_empty() {
+            return Ok(());
+        }
+
+        // Connectivity gate. If the box can't reach the open internet,
+        // sending `continue` would just trigger the same error again and
+        // burn a backoff step for nothing. Skip the send AND skip updating
+        // the backoff / round-robin cursor so the next tick (~5 s)
+        // re-probes and fires as soon as the network's back. One probe
+        // covers the whole eligible set; the result is cached for
+        // `PROBE_TTL` so tabs share it.
+        if !self.probe.is_online() {
             println!(
-                "⛑ brain: {name:<24} [{label}] backing off — next nudge in ~{wait}s (streak {streak})",
-                name = tab.name,
-                streak = watch.nudge_streak,
+                "⛑ brain: {n} tab(s) flagged but suppressed (no internet — probe failed)",
+                n = eligible.len(),
             );
-            continue;
+            return Ok(());
         }
 
-        eligible.push(Eligible {
-            tab_id: tab.id,
-            tab_name: tab.name,
-            trigger,
-            output_hash: h,
-        });
-    }
+        if systemic && !nudge_ready(&mut self.last_nudge_at, now, CIRCUIT_BREAKER_COOLDOWN) {
+            return Ok(());
+        }
 
-    // Drop watch state for tabs that vanished (closed / no longer a
-    // Claude session) so the map stays bounded.
-    watches.retain(|id, _| seen_ids.iter().any(|s| s == id));
-
-    if eligible.is_empty() {
-        return Ok(());
-    }
-
-    // Connectivity gate. If the box can't reach the open internet,
-    // sending `continue` would just trigger the same error again and
-    // burn a cooldown for nothing. Skip the send AND skip updating
-    // the cooldown / round-robin cursor so the next tick (~5 s)
-    // re-probes and fires as soon as the network's back. One probe
-    // covers the whole eligible set; the result is cached for
-    // `PROBE_TTL` so tabs share it.
-    if !probe.is_online() {
-        println!(
-            "⛑ brain: {n} tab(s) flagged but suppressed (no internet — probe failed)",
-            n = eligible.len(),
-        );
-        return Ok(());
-    }
-
-    // Round-robin: pick one from the eligible set. Cursor advances
-    // on every successful tick (online + at least one eligible), so
-    // the next tick walks past this tab to its neighbours. Single
-    // stuck tab → it always wins; multiple → rotation.
-    let Some(pick) = pick_round_robin(&eligible, cursor) else {
-        return Ok(());
-    };
-    let deferred = eligible.len() - 1;
-    // Record the frozen-output hash so this exact screen won't be
-    // nudged again until the agent's output changes (work resumed,
-    // or it re-stuck on something new). Replaces the old time-based
-    // cooldown — a state guard, not a clock.
-    if let Some(w) = watches.get_mut(&pick.tab_id) {
-        w.nudged_hash = Some(pick.output_hash);
-        // Advance the exponential backoff for this error episode: same
-        // label → grow the streak (longer wait next time); new label →
-        // restart at 1. The gate above suppresses nudges until then.
-        let label = pick.trigger.label();
-        w.nudge_streak = if w.last_label == Some(label) {
-            w.nudge_streak + 1
-        } else {
-            1
+        // Round-robin: pick one from the eligible set. Cursor advances
+        // on every successful tick (online + at least one eligible), so
+        // the next tick walks past this tab to its neighbours. Single
+        // stuck tab → it always wins; multiple → rotation.
+        let Some(pick) = pick_round_robin(&eligible, &mut self.rr_cursor) else {
+            return Ok(());
         };
-        w.last_label = Some(label);
-        w.next_nudge_at = Some(now + Duration::from_secs(backoff_secs(w.nudge_streak)));
-    }
+        let deferred = eligible.len() - 1;
+        // Record the frozen-output hash so this exact screen won't be
+        // nudged again until the agent's output changes (work resumed,
+        // or it re-stuck on something new). A state guard, not a clock.
+        if let Some(w) = self.watches.get_mut(&pick.tab_id) {
+            w.nudged_hash = Some(pick.output_hash);
+            // Advance the exponential backoff for this error episode: same
+            // label → grow the streak (longer wait next time); new label →
+            // restart at 1.
+            let label = pick.trigger.label();
+            w.nudge_streak = if w.last_label == Some(label) {
+                w.nudge_streak + 1
+            } else {
+                1
+            };
+            w.last_label = Some(label);
+            w.next_nudge_at = Some(now + Duration::from_secs(backoff_secs(w.nudge_streak)));
+        }
 
-    let _ = ag
-        .post(format!("{}/tabs/by-id/{}/input", ep.url, pick.tab_id))
-        .header("Authorization", &auth)
-        .header("Content-Type", "application/octet-stream")
-        .send(pick.trigger.action().as_bytes())
-        .map_err(|e| format!("POST input for {}: {e}", pick.tab_id))?;
+        let _ = ag
+            .post(format!("{}/tabs/by-id/{}/input", ep.url, pick.tab_id))
+            .header("Authorization", &auth)
+            .header("Content-Type", "application/octet-stream")
+            .send(pick.trigger.action().as_bytes())
+            .map_err(|e| format!("POST input for {}: {e}", pick.tab_id))?;
 
-    if deferred > 0 {
-        println!(
-            "⛑ brain: {name:<24} [{label}] → sent {action:?} ({deferred} other tab(s) deferred — round-robin)",
-            name = pick.tab_name,
-            label = pick.trigger.label(),
-            action = pick.trigger.action(),
-        );
-    } else {
-        println!(
-            "⛑ brain: {name:<24} [{label}] → sent {action:?}",
-            name = pick.tab_name,
-            label = pick.trigger.label(),
-            action = pick.trigger.action(),
-        );
+        if deferred > 0 {
+            println!(
+                "⛑ brain: {name:<24} [{label}] → sent {action:?} ({deferred} other tab(s) deferred — round-robin)",
+                name = pick.tab_name,
+                label = pick.trigger.label(),
+                action = pick.trigger.action(),
+            );
+        } else {
+            println!(
+                "⛑ brain: {name:<24} [{label}] → sent {action:?}",
+                name = pick.tab_name,
+                label = pick.trigger.label(),
+                action = pick.trigger.action(),
+            );
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 /// Append a line to `brain-crash.log` in the state dir. Used when a
@@ -655,8 +797,19 @@ pub fn run(args: &[String]) -> i32 {
                      Patterns: {n} known signatures (Anthropic API connectivity).\n\
                      Connectivity probe (Google generate_204 + Cloudflare 1.1.1.1) gates\n\
                      every send; offline → suppress, retry on next tick when back online.\n\
-                     Round-robin: at most one send per tick across all eligible tabs.",
+                     Round-robin: at most one send per tick across all eligible tabs.\n\
+                     Repeat nudges for the SAME error back off exponentially, {b}s → {m}s.\n\
+                     When more than {t} eligible tabs are stuck on an Anthropic capacity\n\
+                     error (529 / 503 / 5xx / rate-limited) the fleet is capped upstream,\n\
+                     so sends drop to one every {c}s until it recovers — spaced, never\n\
+                     silent. Each tick scans for at most {budget}s and resumes where it\n\
+                     stopped, so a large fleet can't outrun the poll interval.",
                     n = PATTERNS.len(),
+                    b = NUDGE_BACKOFF_BASE_SECS,
+                    m = NUDGE_BACKOFF_MAX_SECS,
+                    t = CIRCUIT_BREAKER_THRESHOLD,
+                    c = CIRCUIT_BREAKER_COOLDOWN.as_secs(),
+                    budget = TICK_BUDGET.as_secs(),
                 );
                 return 0;
             }
@@ -676,18 +829,14 @@ pub fn run(args: &[String]) -> i32 {
         n = PATTERNS.len()
     );
 
-    let mut watches: HashMap<String, TabWatch> = HashMap::new();
-    let mut probe = ConnectivityProbe::default();
-    let mut rr_cursor: usize = 0;
+    let mut brain = Brain::default();
     loop {
         // Run the tick under catch_unwind so a panic anywhere in it (a
         // dependency edge case, a broken-pipe `println!`, …) is caught
         // and logged instead of silently killing brain. The &mut state
         // is AssertUnwindSafe: a panic mid-tick may leave the watch map
         // slightly stale, which the next tick re-syncs from the daemon.
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            tick(&mut watches, &mut probe, &mut rr_cursor)
-        }));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| brain.tick()));
         match outcome {
             Ok(Ok(())) => {}
             // Most likely a transient daemon-restart window; next tick succeeds.
@@ -717,6 +866,23 @@ pub fn run(args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pattern_for(label: &str) -> &'static Pattern {
+        PATTERNS.iter().find(|p| p.label == label).expect("known label")
+    }
+
+    fn eligible_with(i: usize, label: &str) -> Eligible {
+        Eligible {
+            tab_id: format!("tab-{i}"),
+            tab_name: format!("claude-{i}"),
+            trigger: Trigger::Pattern(pattern_for(label)),
+            output_hash: hash_output(&i.to_string()),
+        }
+    }
+
+    fn eligible_529(i: usize) -> Eligible {
+        eligible_with(i, "anthropic-529")
+    }
 
     #[test]
     fn scan_finds_the_canonical_anthropic_unreachable_string() {
@@ -991,6 +1157,240 @@ mod tests {
         // Output changed since the nudge (different hash) → the agent
         // reacted / re-stuck on something new → eligible again.
         assert!(should_nudge(Duration::from_secs(STABLE_SECS), Some(42), 99));
+    }
+
+    #[test]
+    fn frozen_api_fleet_still_gets_heartbeat_nudges() {
+        // 8 tabs frozen on `529 Overloaded`, screens byte-identical every tick
+        // — the population the breaker exists for. A time-windowed storm
+        // detector deadlocks here: the unchanged screen re-stamps the window
+        // every tick, so it can never age out and brain goes silent forever.
+        // Systemic mode must throttle to a heartbeat, never to zero.
+        let t0 = Instant::now();
+        let eligible: Vec<Eligible> = (0..8).map(eligible_529).collect();
+        let (mut breaker, mut last_nudge, mut cursor) = (None, None, 0usize);
+        let mut sent = 0;
+        // 5 simulated minutes at the default 5s tick.
+        for tick in 0..60 {
+            let now = t0 + Duration::from_secs(tick * DEFAULT_INTERVAL_SECS);
+            let systemic = systemic_api_freeze(&eligible, &mut breaker, now);
+            assert!(systemic, "8 > threshold stays systemic while nothing recovers");
+            if nudge_ready(&mut last_nudge, now, CIRCUIT_BREAKER_COOLDOWN) {
+                assert!(pick_round_robin(&eligible, &mut cursor).is_some());
+                sent += 1;
+            }
+        }
+        assert!(sent > 0, "SILENT FOREVER — the deadlock this design avoids");
+        // ~1 per cooldown over 300s, and never a burst.
+        assert!((9..=11).contains(&sent), "heartbeat cadence, got {sent}");
+    }
+
+    #[test]
+    fn systemic_freeze_needs_more_than_threshold_and_is_sticky() {
+        let t0 = Instant::now();
+        let mut breaker = None;
+        // Below the threshold → not systemic, nothing armed.
+        let few: Vec<Eligible> = (0..2).map(eligible_529).collect();
+        assert!(!systemic_api_freeze(&few, &mut breaker, t0));
+        assert!(breaker.is_none());
+        // AT the threshold → still not systemic (strictly more is required).
+        let at: Vec<Eligible> = (0..CIRCUIT_BREAKER_THRESHOLD).map(eligible_529).collect();
+        assert!(!systemic_api_freeze(&at, &mut breaker, t0));
+        assert!(breaker.is_none());
+        // Above → systemic, cooldown armed.
+        let many: Vec<Eligible> = (0..=CIRCUIT_BREAKER_THRESHOLD).map(eligible_529).collect();
+        assert!(systemic_api_freeze(&many, &mut breaker, t0));
+        assert!(breaker.is_some());
+        // Sticky through the cooldown even as the count collapses, so a spike
+        // doesn't flap the cadence.
+        assert!(systemic_api_freeze(&few, &mut breaker, t0 + Duration::from_secs(5)));
+        assert!(systemic_api_freeze(
+            &[],
+            &mut breaker,
+            (t0 + CIRCUIT_BREAKER_COOLDOWN)
+                .checked_sub(Duration::from_secs(1))
+                .unwrap()
+        ));
+        // Elapsed → clears itself.
+        assert!(!systemic_api_freeze(&few, &mut breaker, t0 + CIRCUIT_BREAKER_COOLDOWN));
+        assert!(breaker.is_none());
+        // Still over after clearing → re-arms.
+        assert!(systemic_api_freeze(&many, &mut breaker, t0 + CIRCUIT_BREAKER_COOLDOWN));
+    }
+
+    #[test]
+    fn only_anthropic_capacity_errors_trip_the_breaker() {
+        let t0 = Instant::now();
+        let mut breaker = None;
+        // 8 tabs all on a LOCAL fault — independent failures, not a fleet-wide
+        // cap. Throttling them would be counting eligible tabs, not storms.
+        let local: Vec<Eligible> = (0..8).map(|i| eligible_with(i, "connection-refused")).collect();
+        assert!(!systemic_api_freeze(&local, &mut breaker, t0));
+        // Mixed 3 API + 5 local → only 3 count, still below threshold.
+        let mixed: Vec<Eligible> = (0..3)
+            .map(eligible_529)
+            .chain((3..8).map(|i| eligible_with(i, "tcp-reset")))
+            .collect();
+        assert!(!systemic_api_freeze(&mixed, &mut breaker, t0));
+        assert!(breaker.is_none());
+    }
+
+    #[test]
+    fn storm_labels_cover_capacity_errors_but_not_the_healthy_retry_banner() {
+        assert!(is_api_storm_label("anthropic-529"));
+        assert!(is_api_storm_label("anthropic-rate-limited"));
+        assert!(is_api_storm_label("anthropic-503"));
+        assert!(is_api_storm_label("anthropic-5xx"));
+        // "will retry in" is Claude Code's own healthy self-retry banner (see
+        // the api-retry-waiting Pattern above): a live countdown means the tab
+        // is RECOVERING. Counting it would let five recovering tabs throttle
+        // the whole fleet.
+        assert!(!is_api_storm_label("api-retry-waiting"));
+        assert!(!is_api_storm_label("connection-refused"));
+        assert!(!is_api_storm_label("agent-state-error"));
+    }
+
+    #[test]
+    fn recovery_resumes_normal_cadence() {
+        // The self-clearing property: once the tabs recover they leave
+        // `eligible`, so the count drops on its own and the heartbeat gate is
+        // out of the send path entirely.
+        let t0 = Instant::now();
+        let mut breaker = None;
+        let many: Vec<Eligible> = (0..8).map(eligible_529).collect();
+        assert!(systemic_api_freeze(&many, &mut breaker, t0));
+        assert!(!systemic_api_freeze(&[], &mut breaker, t0 + CIRCUIT_BREAKER_COOLDOWN));
+        assert!(breaker.is_none());
+    }
+
+    #[test]
+    fn heartbeat_gate_spaces_nudges_without_silencing_them() {
+        let t0 = Instant::now();
+        let mut last = None;
+        // First nudge of an episode fires immediately.
+        assert!(nudge_ready(&mut last, t0, CIRCUIT_BREAKER_COOLDOWN));
+        // Next tick, well inside the window → refused.
+        assert!(!nudge_ready(
+            &mut last,
+            t0 + Duration::from_secs(5),
+            CIRCUIT_BREAKER_COOLDOWN
+        ));
+        // Window elapsed → fires again. Exactly one per cooldown, never zero.
+        assert!(nudge_ready(
+            &mut last,
+            t0 + CIRCUIT_BREAKER_COOLDOWN,
+            CIRCUIT_BREAKER_COOLDOWN
+        ));
+    }
+
+    #[test]
+    fn evaluate_tab_nudges_a_frozen_screen_once_then_suppresses_it() {
+        let t0 = Instant::now();
+        let mut watch = TabWatch::new(t0);
+        let frozen = "● API Error: 529 Overloaded. This is a server-side issue\n❯ continue";
+        let mut nudges = 0;
+        for tick in 0..60 {
+            let now = t0 + Duration::from_secs(tick * DEFAULT_INTERVAL_SECS);
+            if let Some(t) = evaluate_tab(&mut watch, frozen, None, now) {
+                assert_eq!(t.label(), "anthropic-529");
+                nudges += 1;
+                // What tick() records on send.
+                watch.nudged_hash = Some(watch.last_hash);
+            }
+        }
+        // Recovery needs the OUTPUT to change — which is why a fleet-wide time
+        // window can't be the release condition.
+        assert_eq!(nudges, 1, "one nudge per frozen screen, then silence");
+    }
+
+    #[test]
+    fn evaluate_tab_never_nudges_moving_output() {
+        // A LIVE auto-retry countdown: matches a pattern every tick, but each
+        // change resets the freeze clock, so it's never eligible.
+        let t0 = Instant::now();
+        let mut watch = TabWatch::new(t0);
+        for tick in 0..60 {
+            let now = t0 + Duration::from_secs(tick * DEFAULT_INTERVAL_SECS);
+            let out = format!(
+                "✻ Waiting for API response · will retry in 1m {}s · check your network",
+                59 - tick
+            );
+            assert!(
+                evaluate_tab(&mut watch, &out, None, now).is_none(),
+                "moving screen at tick {tick}"
+            );
+        }
+    }
+
+    #[test]
+    fn evaluate_tab_recovery_clears_backoff_state() {
+        let t0 = Instant::now();
+        let mut watch = TabWatch::new(t0);
+        watch.nudge_streak = 3;
+        watch.last_label = Some("anthropic-529");
+        watch.next_nudge_at = Some(t0 + Duration::from_mins(4));
+        assert!(evaluate_tab(&mut watch, "$ ls\nfoo bar\n$ ", None, t0).is_none());
+        assert_eq!(watch.nudge_streak, 0);
+        assert_eq!(watch.last_label, None);
+        assert_eq!(watch.next_nudge_at, None);
+    }
+
+    #[test]
+    fn budget_deferred_ticks_do_not_reset_the_freeze_clock() {
+        // TICK_BUDGET truncation means a tab can be skipped for several ticks.
+        // Its watch must survive untouched, or the freeze clock restarts every
+        // time and the tab can never reach STABLE_SECS.
+        let t0 = Instant::now();
+        let mut watch = TabWatch::new(t0);
+        let frozen = "⎿  API Error: Unable to connect to API (ConnectionRefused)\n❯ continue";
+        assert!(evaluate_tab(&mut watch, frozen, None, t0).is_none());
+        let started_at = watch.stable_since;
+        // Skipped for 6 ticks, then scanned again with the same screen.
+        let later = t0 + Duration::from_secs(30);
+        assert!(evaluate_tab(&mut watch, frozen, None, later).is_some());
+        assert_eq!(watch.stable_since, started_at, "freeze clock untouched by deferral");
+    }
+
+    #[test]
+    fn scan_order_rotates_and_wraps_for_resumable_scans() {
+        assert!(scan_order(0, 3).is_empty());
+        assert_eq!(scan_order(3, 0), vec![0, 1, 2]);
+        assert_eq!(scan_order(3, 1), vec![1, 2, 0]);
+        assert_eq!(scan_order(3, 4), vec![1, 2, 0]);
+        // usize::MAX % 3 == 0 — must not panic on the wrapped cursor.
+        assert_eq!(scan_order(3, usize::MAX), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn truncated_scans_still_cover_the_whole_fleet() {
+        // 10 tabs, budget only allows 3 per tick → every tab must be visited
+        // within a few ticks. This is the fairness claim the cursor makes.
+        let mut cursor = 0usize;
+        let mut visited = [false; 10];
+        for _ in 0..4 {
+            let scanned = 3;
+            for idx in scan_order(10, cursor).into_iter().take(scanned) {
+                visited[idx] = true;
+            }
+            cursor = cursor.wrapping_add(scanned);
+        }
+        assert!(visited.iter().all(|v| *v), "every tab scanned within 4 ticks");
+    }
+
+    #[test]
+    fn a_budget_deferred_tab_keeps_its_watch() {
+        // seen_ids covers ALL Claude tabs, not just the scanned ones, so the
+        // retain that drops closed tabs doesn't wipe deferred ones.
+        let t0 = Instant::now();
+        let all: Vec<String> = (0..10).map(|i| format!("tab-{i}")).collect();
+        let mut watches: HashMap<String, TabWatch> = all.iter().map(|id| (id.clone(), TabWatch::new(t0))).collect();
+        // Only the first 3 were scanned this tick; the retain is built from all 10.
+        watches.retain(|id, _| all.iter().any(|s| s == id));
+        assert_eq!(watches.len(), 10);
+        // A tab that really went away is still dropped.
+        let survivors: Vec<String> = all[..9].to_vec();
+        watches.retain(|id, _| survivors.iter().any(|s| s == id));
+        assert_eq!(watches.len(), 9);
     }
 
     #[test]
