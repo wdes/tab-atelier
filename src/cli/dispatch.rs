@@ -417,6 +417,18 @@ pub enum Commands {
         args: Vec<String>,
     },
 
+    /// Per-project (or per-tab) colour + badge: `style --folder <dir> --color …`.
+    ///
+    /// A folder rule styles every tab whose cwd is inside it, so tabs opened in
+    /// a project pick it up — including new ones, which inherit the cwd.
+    /// `--tab <id>` sets an override that wins over the rule; `--list` shows
+    /// the configured rules.
+    Style {
+        /// Passed straight through to `cli::style::run`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Print the master API token, so the local API can be called
     /// without locating the `api.token` state file.
     Token,
@@ -788,6 +800,7 @@ pub fn dispatch(cli: Cli) -> bool {
         }
         Commands::SetContext { args } => crate::cli::client::run("set-context", &args),
         Commands::SetMeta { args } => crate::cli::client::run("set-meta", &args),
+        Commands::Style { args } => crate::cli::client::run("style", &args),
         Commands::Token => crate::cli::client::run("token", &[]),
         Commands::RotateTokens => crate::cli::client::run("rotate-tokens", &[]),
         Commands::ResetMasterToken => crate::cli::client::run("reset-master-token", &[]),

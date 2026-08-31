@@ -116,6 +116,8 @@ struct HeadlessTab {
     agent_plan_mode: Option<bool>,
     /// Mirrors `TabState::agent_daemon` — this tab is a session-less daemon.
     agent_daemon: bool,
+    /// Per-tab badge override; mirrors `TabState::badge`.
+    badge: Option<String>,
     /// Per-tab env vars (`env set --tab <id>`); mirrors `TabState::tab_env`.
     tab_env: std::collections::BTreeMap<String, String>,
     /// Free-form durable labels (`set-meta`); mirrors `TabState::meta`.
@@ -730,6 +732,7 @@ fn spawn_pty_tab(
         last_known_cwd_string,
         tab_env,
         agent_daemon: false,
+        badge: None,
         meta: std::collections::BTreeMap::new(),
         agent_state: None,
         agent_session_id: agent_session_id.map(Arc::from),
@@ -816,6 +819,7 @@ pub fn run() -> std::io::Result<()> {
     }
     crate::install_relay_config(&prefs);
     crate::set_tab_env_global(prefs.tab_env.clone());
+    crate::set_folder_styles(prefs.folder_styles.clone());
 
     // Latch the cleared-env opt-in for every tab spawn this process does.
     if prefs.clear_env.unwrap_or(false) {
@@ -925,6 +929,7 @@ pub fn run() -> std::io::Result<()> {
                 t.limits = ts.limits.clone();
                 t.meta = ts.meta.clone();
                 t.agent_daemon = ts.agent_daemon;
+                t.badge.clone_from(&ts.badge);
                 // A flagged daemon tab relaunches its own subcommand, whatever
                 // the kind — that's how a harness's watcher survives a restart
                 // without us knowing its name.
@@ -1031,6 +1036,7 @@ pub fn run() -> std::io::Result<()> {
         pending_relay_mode: None,
         pending_env_changes: Vec::new(),
         pending_meta_changes: Vec::new(),
+        pending_badge_changes: Vec::new(),
         pending_relay_config: None,
         pending_renames: Vec::new(),
         pending_status_updates: Vec::new(),
@@ -1408,6 +1414,7 @@ fn refresh_snapshot(
                 recent_output,
             )
         };
+        let folder = crate::folder_style_for(crate::folder_styles(), tab.last_known_cwd_string.as_deref());
         api_tabs.push(api::SnapshotTab {
             id: tab.id.clone(),
             name: tab.name.clone(),
@@ -1425,7 +1432,14 @@ fn refresh_snapshot(
             share_token_ro: tab.share_token_ro.clone(),
             locked: tab.locked,
             schedule: tab.schedule.clone(),
-            bg_color: crate::effective_tab_bg(tab.bg_color.as_deref(), Some(global_bg)).into(),
+            bg_color: crate::effective_tab_bg(
+                tab.bg_color.as_deref(),
+                folder.and_then(|f| f.color.as_deref()),
+                Some(global_bg),
+            )
+            .into(),
+            badge: crate::effective_tab_badge(tab.badge.as_deref(), folder.and_then(|f| f.badge.as_deref()))
+                .map(Into::into),
             context: tab.context.clone(),
             shell_pid: tab.pid,
             agent_state: tab.agent_state.clone(),
@@ -1661,6 +1675,7 @@ fn persist(
             net_allow_cidrs: tab.net_allow.cidrs.clone(),
             schedule: tab.schedule.clone(),
             bg_color: tab.bg_color.clone(),
+            badge: tab.badge.clone(),
             limits: tab.limits.clone(),
             ssh_agent: tab.ssh_agent.clone(),
             meta: tab.meta.clone(),
@@ -1932,6 +1947,7 @@ fn drain_pending(
     let ssh_agent_changes: Vec<(String, Option<crate::SshAgentConfig>)> =
         s.pending_ssh_agent_changes.drain(..).collect();
     let bg_color_changes: Vec<(String, Option<String>)> = s.pending_bg_color_changes.drain(..).collect();
+    let badge_changes: Vec<(String, Option<String>)> = s.pending_badge_changes.drain(..).collect();
     let context_changes: Vec<(String, Option<String>)> = s.pending_context_changes.drain(..).collect();
     let token_rotations: Vec<String> = s.pending_token_rotations.drain(..).collect();
     let schedule_changes: Vec<(String, Option<crate::schedule::TabSchedule>)> =
@@ -2071,6 +2087,11 @@ fn drain_pending(
     for (tab_id, color) in bg_color_changes {
         if let Some(t) = tabs.iter_mut().find(|t| *t.id == tab_id) {
             t.bg_color = color;
+        }
+    }
+    for (tab_id, badge) in badge_changes {
+        if let Some(t) = tabs.iter_mut().find(|t| *t.id == tab_id) {
+            t.badge = badge;
         }
     }
     // …and the per-tab agent context.

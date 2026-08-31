@@ -248,6 +248,24 @@ pub fn tab_env_global() -> std::collections::BTreeMap<String, String> {
     TAB_ENV_GLOBAL.read().map(|g| g.clone()).unwrap_or_default()
 }
 
+/// Per-folder tab styles from the `folder_styles` preference, resolved on
+/// every tab spawn / snapshot. Set once at startup, like the other
+/// preference-backed globals; editing the preference takes effect on the next
+/// daemon start (same contract as `bg-color --global`).
+static FOLDER_STYLES: OnceLock<std::collections::BTreeMap<String, FolderStyle>> = OnceLock::new();
+
+/// Install the user's `folder_styles` for this process. First set wins.
+pub fn set_folder_styles(styles: std::collections::BTreeMap<String, FolderStyle>) {
+    let _ = FOLDER_STYLES.set(styles);
+}
+
+/// The configured per-folder styles, or an empty map when none are set.
+#[must_use]
+pub fn folder_styles() -> &'static std::collections::BTreeMap<String, FolderStyle> {
+    static EMPTY: std::collections::BTreeMap<String, FolderStyle> = std::collections::BTreeMap::new();
+    FOLDER_STYLES.get().unwrap_or(&EMPTY)
+}
+
 /// User-defined `key=value` pairs from the `clear_env_vars` preference,
 /// layered into every cleared-env tab (see [`minimal_pty_env`]). Set
 /// once at startup; reads after that are lock-free. Empty until set.
@@ -1138,6 +1156,10 @@ pub struct TabState {
     /// <hex>` (CLI). Skipped from JSON when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bg_color: Option<String>,
+    /// Per-tab badge override — a short tag drawn on the tab. `None` ⇒ the
+    /// tab shows its folder rule's badge, if any. See [`effective_tab_badge`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub badge: Option<String>,
 
     /// Off-hours auto-lock. When set, the schedule's `(rule, tz)`
     /// pair feeds [`crate::schedule::effective_locked`] alongside the
@@ -1382,11 +1404,94 @@ pub fn apply_meta_change(map: &mut std::collections::BTreeMap<String, String>, k
     }
 }
 
-/// Resolve the effective background color for a tab: per-tab override
-/// → global pref → Tomorrow Night Blue.
+/// Visual identity attached to a project directory.
+///
+/// Every tab whose cwd is inside it picks these up. Because a new tab inherits
+/// the active tab's cwd, this is also what makes a project's colour survive
+/// Ctrl+Shift+T — no settings are copied from tab to tab, they're re-derived
+/// from the folder.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FolderStyle {
+    /// `#RRGGBB` background for tabs in this folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    /// Short label shown on the tab (a project tag, an emoji).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub badge: Option<String>,
+}
+
+/// Cap on a badge's length, in chars — it shares the tab strip with the name.
+pub const BADGE_MAX: usize = 6;
+
+/// Validate a badge: trimmed, control characters stripped, length-capped.
+///
+/// # Errors
+/// A human-readable message when it's empty or too long.
+pub fn sanitize_badge(badge: &str) -> Result<String, String> {
+    let badge: String = badge.trim().chars().filter(|c| !c.is_control()).collect();
+    if badge.is_empty() {
+        return Err("badge is empty — pass `clear` to remove it".to_string());
+    }
+    if badge.chars().count() > BADGE_MAX {
+        return Err(format!("badge must be at most {BADGE_MAX} chars"));
+    }
+    Ok(badge)
+}
+
+/// The folder rule that applies to `cwd`: the longest configured path that is
+/// `cwd` itself or one of its ancestors. `None` when no rule matches.
+///
+/// Longest-match so a rule on a sub-project (`~/Dev/app/frontend`) refines the
+/// one on its parent (`~/Dev/app`) instead of fighting it.
 #[must_use]
-pub fn effective_tab_bg<'a>(per_tab: Option<&'a str>, global: Option<&'a str>) -> &'a str {
-    per_tab.or(global).unwrap_or(DEFAULT_TAB_BG_COLOR)
+pub fn folder_style_for<'a>(
+    styles: &'a std::collections::BTreeMap<String, FolderStyle>,
+    cwd: Option<&str>,
+) -> Option<&'a FolderStyle> {
+    let cwd = cwd?.trim_end_matches('/');
+    styles
+        .iter()
+        .filter(|(dir, _)| {
+            let dir = dir.trim_end_matches('/');
+            cwd == dir || (!dir.is_empty() && cwd.starts_with(dir) && cwd.as_bytes().get(dir.len()) == Some(&b'/'))
+        })
+        .max_by_key(|(dir, _)| dir.trim_end_matches('/').len())
+        .map(|(_, style)| style)
+}
+
+/// Resolve the effective background color for a tab: per-tab override
+/// → folder rule → global pref → Tomorrow Night Blue.
+#[must_use]
+pub fn effective_tab_bg<'a>(per_tab: Option<&'a str>, folder: Option<&'a str>, global: Option<&'a str>) -> &'a str {
+    per_tab.or(folder).or(global).unwrap_or(DEFAULT_TAB_BG_COLOR)
+}
+
+/// Resolve the effective badge for a tab: per-tab override → folder rule.
+/// `None` ⇒ the tab shows no badge.
+#[must_use]
+pub fn effective_tab_badge<'a>(per_tab: Option<&'a str>, folder: Option<&'a str>) -> Option<&'a str> {
+    per_tab.or(folder)
+}
+
+/// The tab's *explicit* tint — per-tab override, else its folder rule.
+///
+/// Unlike [`effective_tab_bg`] this never falls back to a default: `None`
+/// means "never styled", which is what the desktop needs in order to leave the
+/// theme's background alone.
+#[must_use]
+pub fn effective_tab_tint<'a>(per_tab: Option<&'a str>, folder: Option<&'a str>) -> Option<&'a str> {
+    per_tab.or(folder)
+}
+
+/// Parse `#RRGGBB` into a packed `0xRRGGBB`. `None` for anything else — the
+/// same shape the API validator accepts, so a stored colour always renders.
+#[must_use]
+pub fn parse_hex_rgb(s: &str) -> Option<u32> {
+    let hex = s.strip_prefix('#')?;
+    if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    u32::from_str_radix(hex, 16).ok()
 }
 
 #[must_use]
@@ -1437,6 +1542,7 @@ impl Default for TabState {
             net_allow_domains: Vec::new(),
             net_allow_cidrs: Vec::new(),
             bg_color: None,
+            badge: None,
             schedule: None,
             limits: TabResourceLimits::default(),
             ssh_agent: None,
@@ -2228,6 +2334,11 @@ pub struct Preferences {
     /// on the eyes than pure black.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tab_bg_color: Option<String>,
+    /// Per-project visual identity: absolute path → colour/badge for every tab
+    /// whose cwd is inside it. Mirrored into [`crate::FOLDER_STYLES`] at
+    /// startup; a per-tab override still wins. See [`folder_style_for`].
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub folder_styles: std::collections::BTreeMap<String, FolderStyle>,
 
     /// Default network allowlist applied to **newly created** tabs
     /// (presets / domains / CIDRs). Empty ⇒ new tabs start unrestricted.
@@ -3480,6 +3591,75 @@ mod tests {
         for bad in ["rm -rf /", "brain;reboot", "Brain", "$(id)", "b", &"x".repeat(25)] {
             assert!(!is_daemon_kind(bad), "{bad} must not be a daemon kind");
             assert!(daemon_relaunch_command(bad).is_none());
+        }
+    }
+
+    #[test]
+    fn folder_rules_resolve_by_longest_match() {
+        let mut styles = std::collections::BTreeMap::new();
+        styles.insert(
+            "/home/w/Dev/app".to_string(),
+            FolderStyle {
+                color: Some("#111111".into()),
+                badge: Some("APP".into()),
+            },
+        );
+        styles.insert(
+            "/home/w/Dev/app/frontend".to_string(),
+            FolderStyle {
+                color: Some("#222222".into()),
+                badge: None,
+            },
+        );
+        let style_of = |cwd| folder_style_for(&styles, Some(cwd));
+        // The rule applies to the folder itself and everything under it.
+        assert_eq!(style_of("/home/w/Dev/app").unwrap().color.as_deref(), Some("#111111"));
+        assert_eq!(
+            style_of("/home/w/Dev/app/src/deep").unwrap().color.as_deref(),
+            Some("#111111")
+        );
+        // A sub-project refines its parent instead of fighting it.
+        assert_eq!(
+            style_of("/home/w/Dev/app/frontend/src").unwrap().color.as_deref(),
+            Some("#222222")
+        );
+        // Prefix match must respect path components: `app-legacy` is NOT `app`.
+        assert!(style_of("/home/w/Dev/app-legacy").is_none());
+        assert!(style_of("/home/w/Dev").is_none());
+        assert!(folder_style_for(&styles, None).is_none());
+    }
+
+    #[test]
+    fn tab_style_resolves_per_tab_then_folder_then_global() {
+        // Background always resolves to something paintable …
+        assert_eq!(
+            effective_tab_bg(Some("#aaa111"), Some("#bbb222"), Some("#ccc333")),
+            "#aaa111"
+        );
+        assert_eq!(effective_tab_bg(None, Some("#bbb222"), Some("#ccc333")), "#bbb222");
+        assert_eq!(effective_tab_bg(None, None, Some("#ccc333")), "#ccc333");
+        assert_eq!(effective_tab_bg(None, None, None), DEFAULT_TAB_BG_COLOR);
+        // … while the desktop tint stays None until something styles the tab,
+        // so an unstyled tab keeps the theme's background.
+        assert_eq!(effective_tab_tint(None, Some("#bbb222")), Some("#bbb222"));
+        assert_eq!(effective_tab_tint(Some("#aaa111"), Some("#bbb222")), Some("#aaa111"));
+        assert_eq!(effective_tab_tint(None, None), None);
+        assert_eq!(effective_tab_badge(None, Some("APP")), Some("APP"));
+        assert_eq!(effective_tab_badge(Some("ME"), Some("APP")), Some("ME"));
+        assert_eq!(effective_tab_badge(None, None), None);
+    }
+
+    #[test]
+    fn badges_and_colors_are_validated() {
+        assert_eq!(sanitize_badge("  KAL "), Ok("KAL".to_string()));
+        assert_eq!(sanitize_badge("a\r\nb"), Ok("ab".to_string()));
+        assert!(sanitize_badge("   ").is_err());
+        assert!(sanitize_badge(&"x".repeat(BADGE_MAX + 1)).is_err());
+        assert!(sanitize_badge("🐊").is_ok(), "an emoji is one char");
+        assert_eq!(parse_hex_rgb("#7a1f2b"), Some(0x7a_1f_2b));
+        assert_eq!(parse_hex_rgb("#FFFFFF"), Some(0xff_ff_ff));
+        for bad in ["7a1f2b", "#7a1f2", "#7a1f2bb", "#gggggg", "", "#"] {
+            assert!(parse_hex_rgb(bad).is_none(), "{bad} must not parse");
         }
     }
 
