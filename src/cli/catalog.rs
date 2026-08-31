@@ -120,6 +120,34 @@ impl CatalogCard {
         }
     }
 
+    /// Copy the durable card off a live [`crate::api::SnapshotTab`] — the LIVE
+    /// retire path (RB-wire). Same field set as [`from_tab_state`], sourced from
+    /// the daemon's in-memory snapshot instead of a persisted `TabState`.
+    ///
+    /// [`from_tab_state`]: CatalogCard::from_tab_state
+    #[must_use]
+    pub fn from_snapshot(t: &crate::api::SnapshotTab, after_action: Option<String>, retired_at: u64) -> Self {
+        let s = |a: &Option<std::sync::Arc<str>>| a.as_deref().map(str::to_string);
+        Self {
+            id: t.id.to_string(),
+            slug: card_slug(t.assignment.as_deref(), t.specialty.as_deref()),
+            name: Some(t.name.to_string()).filter(|s| !s.is_empty()),
+            assignment: s(&t.assignment),
+            specialty: s(&t.specialty),
+            orchestrator: s(&t.orchestrator),
+            objective: s(&t.objective),
+            current_task_log: t.current_task.clone(),
+            conventions: t.conventions.clone(),
+            evaluations: t.evaluations.clone(),
+            usage_count: t.usage_count,
+            last_used_at: t.last_used_at,
+            session_id: s(&t.agent_session_id),
+            agent_kind: s(&t.agent_kind),
+            last_mission: after_action.filter(|s| !s.trim().is_empty()),
+            retired_at,
+        }
+    }
+
     /// The persist-gate predicate: is this RE-READ archive complete enough to close?
     ///
     /// The record must be non-empty (a real `id` = the card is there) AND, WHEN the
