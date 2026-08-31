@@ -25,7 +25,7 @@
 //! Adding a client command is now one arm here (+ one `clap` variant in
 //! `dispatch` if headless should list it in `--help`).
 
-use super::{aligator, bench, bench_lag, brain, claude_hook, delegate, flags, logging, remote, task};
+use super::{aligator, bench, bench_lag, brain, catalog, claude_hook, delegate, flags, logging, remote, task};
 use super::{
     set_assignment, set_card, set_context, set_font, set_rehome, set_status, share_link, team, tokens, upgrade,
 };
@@ -71,6 +71,8 @@ pub fn dispatch(name: &str, rest: &[String]) -> Option<i32> {
         "swamp" => aligator::run_swamp(rest),
         // task primitive (#11): typed queue with an atomic claim.
         "task" => task::run(rest),
+        // agent-lifecycle (RB2): the retired-agent catalogue read-model.
+        "catalog" => catalog::run(rest),
         "clarify" => super::clarify::run(rest),
         "schedule" => share_link::schedule(rest),
         "log" => logging::run(rest),

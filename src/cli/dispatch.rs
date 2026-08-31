@@ -527,6 +527,13 @@ pub enum Commands {
         args: Vec<String>,
     },
 
+    /// agent-lifecycle (RB2): the retired-agent catalogue read-model (`catalog list`).
+    Catalog {
+        /// Passed straight through to `cli::catalog::run`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Launch `claude` cleanly: clear the grid, then `exec claude ARGS…`.
     ///
     /// A no-fuss agent launcher — every argument passes through, so
@@ -939,6 +946,7 @@ pub fn dispatch(cli: Cli) -> bool {
         Commands::Remote { args } => crate::cli::client::run("remote", &args),
         Commands::Dispatch { args } => crate::cli::client::run("dispatch", &args),
         Commands::Task { args } => crate::cli::client::run("task", &args),
+        Commands::Catalog { args } => crate::cli::client::run("catalog", &args),
         Commands::Peers { all } => {
             let args: Vec<String> = if all { vec!["--all".into()] } else { vec![] };
             crate::cli::client::run("peers", &args)
@@ -1240,6 +1248,7 @@ mod tests {
             (&["tab-atelier-headless", "task", "claim", "--queue", "q"], "task claim"),
             (&["tab-atelier-headless", "task", "done", "some-id"], "task done"),
             (&["tab-atelier-headless", "task", "list", "--queue", "q"], "task list"),
+            (&["tab-atelier-headless", "catalog", "list"], "catalog list"),
         ];
         for (argv, label) in cases {
             let _ = Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("parse failed for {label}: {e}"));

@@ -281,6 +281,25 @@ pub fn read_back(path: &Path, id: &str) -> Option<CatalogCard> {
     parse_catalog(&body).into_iter().rev().find(|c| c.id == id)
 }
 
+/// The RETIRED read-model (RB2) over a catalogue file.
+///
+/// Every archived card, folded latest-per-slug + usageCount aggregated (RC1).
+/// Path-injectable; a missing file reads as empty. READ-ONLY — a retired card is
+/// INERT (only the card fields; no lease/status/claimed@peer, the S4 discipline).
+/// Nothing is written or compacted.
+#[must_use]
+pub fn read_retired_at(path: &Path) -> Vec<CatalogCard> {
+    let body = std::fs::read_to_string(path).unwrap_or_default();
+    dedup_by_slug(&parse_catalog(&body))
+}
+
+/// [`read_retired_at`] against the live [`catalog_path`] — the `retired` section of
+/// `GET /dashboard/state` + `tab-atelier catalog list` (RB2). READ-ONLY.
+#[must_use]
+pub fn read_retired() -> Vec<CatalogCard> {
+    read_retired_at(&catalog_path())
+}
+
 /// Remove tab `id` from a loaded [`crate::SavedState`] — the pure de-register.
 ///
 /// After this, a restore loop iterating `saved.tabs` never sees the id → no tab,
@@ -357,6 +376,52 @@ where
         return RetireOutcome::CloseFailed;
     }
     RetireOutcome::Retired
+}
+
+// ---------------------------------------------------------------------------
+// CLI (thin HTTP client): `catalog list` GETs the RB2 read-model from the daemon.
+// ---------------------------------------------------------------------------
+
+/// `tab-atelier catalog <list>` — the retired-agent catalogue CLI (RB2).
+#[must_use]
+pub fn run(args: &[String]) -> i32 {
+    if args.first().map(String::as_str) == Some("list") {
+        run_list()
+    } else {
+        eprintln!("usage:\n  tab-atelier catalog list");
+        2
+    }
+}
+
+/// `catalog list` — GET the retired read-model and print it. READ-ONLY.
+fn run_list() -> i32 {
+    let ep = match crate::cli::share_link::discover_endpoint() {
+        Ok(ep) => ep,
+        Err(e) => {
+            eprintln!("catalog list: {e}");
+            return 1;
+        }
+    };
+    let mut resp = match crate::cli::share_link::agent()
+        .get(format!("{}/catalog/list", ep.url))
+        .header("Authorization", format!("Bearer {}", ep.token))
+        .call()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("catalog list: {e}");
+            return 1;
+        }
+    };
+    let status = resp.status().as_u16();
+    let text = resp.body_mut().read_to_string().unwrap_or_default();
+    if status == 200 {
+        println!("{text}");
+        0
+    } else {
+        eprintln!("catalog list: HTTP {status}: {text}");
+        1
+    }
 }
 
 #[cfg(test)]
@@ -804,5 +869,47 @@ mod tests {
         assert_eq!(builder.usage_count, Some(8), "usageCount aggregated across retraits (3+5)");
         let reviewer = folded.iter().find(|c| c.slug == "reviewer").expect("reviewer row");
         assert_eq!(reviewer.usage_count, Some(2));
+    }
+
+    // ----- RB2: the retired read-model -----------------------------------------
+
+    // RB2: read_retired folds the catalogue latest-per-slug (N retraits of a
+    // profile → ONE row, no spam), keeps every card field, aggregates usageCount,
+    // and is READ-ONLY / INERT — a retired card carries NO lease/status/claimed@peer.
+    #[test]
+    fn rb2_read_retired_folds_by_slug_keeps_fields_and_is_inert() {
+        let cat = TmpCatalog::new();
+        // two retraits of the SAME profile (builder) + one reviewer.
+        let mut b1 = CatalogCard::from_tab_state(&maximal_tab_state("id1"), 100);
+        b1.usage_count = Some(3);
+        let mut b2 = CatalogCard::from_tab_state(&maximal_tab_state("id2"), 200);
+        b2.usage_count = Some(5);
+        let mut rev = CatalogCard::from_tab_state(&maximal_tab_state("id3"), 150);
+        rev.assignment = Some("x/reviewer".into());
+        rev.specialty = None;
+        rev.slug = card_slug(rev.assignment.as_deref(), rev.specialty.as_deref());
+        append_catalog_line(cat.path(), &b1).unwrap();
+        append_catalog_line(cat.path(), &b2).unwrap();
+        append_catalog_line(cat.path(), &rev).unwrap();
+
+        let retired = read_retired_at(cat.path());
+        assert_eq!(retired.len(), 2, "N retraits of a profile fold to ONE row (no spam)");
+        let builder = retired
+            .iter()
+            .find(|c| c.slug == "builder-rust-daemon-internals")
+            .expect("builder profile present");
+        assert_eq!(builder.id, "id2", "the LATEST retirement wins the row");
+        assert_eq!(builder.usage_count, Some(8), "usageCount aggregated (3+5)");
+        // Every card field is present on the retired card.
+        assert_eq!(builder.assignment.as_deref(), Some("tab-atelier:agent-lifecycle/builder"));
+        assert_eq!(builder.objective.as_deref(), Some("ship RB1"));
+        assert_eq!(builder.session_id.as_deref(), Some("sess-abc"));
+        assert_eq!(builder.evaluations.len(), 1, "the evaluation ring survives");
+        // READ-ONLY / INERT: the serialized retired card carries no live-state key.
+        let json = serde_json::to_string(builder).unwrap();
+        for forbidden in ["lease", "\"status\"", "claimedBy", "\"state\""] {
+            assert!(!json.contains(forbidden), "a retired card is inert (no {forbidden}): {json}");
+        }
+        assert!(retired.iter().any(|c| c.slug == "reviewer"), "the reviewer profile is its own row");
     }
 }
