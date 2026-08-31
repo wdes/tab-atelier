@@ -665,6 +665,8 @@ fn build_dashboard_state(inputs: Vec<DashboardTabInput>) -> DashboardState {
         services,
         lineage,
         unassigned,
+        // Filled by the handler from the FS (S4); the pure builder stays FS-free.
+        tasks: Vec::new(),
     }
 }
 
@@ -2107,6 +2109,11 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             let id = &p["/task/".len()..p.len() - "/done".len()];
             handlers::task::done(stream, state, id, &body_bytes);
         }
+        // S4 read-model: the queue's derived state. READ-ONLY (GET), mutates nothing.
+        ("GET", p) if p.starts_with("/task/") && p.ends_with("/list") => {
+            let queue = &p["/task/".len()..p.len() - "/list".len()];
+            handlers::task::list(stream, state, queue);
+        }
         (_, "/" | "/tabs") => {
             error_json(stream, 405, "method not allowed");
         }
@@ -2216,6 +2223,13 @@ pub fn test_snapshot(tabs: Vec<SnapshotTab>) -> TabSnapshot {
         master_token: String::new(),
         dashboard_share_token: "".into(),
     }
+}
+
+/// The body (after the blank line) of a raw HTTP response — for comparing two
+/// read-only reads without the volatile status line / headers.
+#[cfg(test)]
+fn body_of(resp: &str) -> &str {
+    resp.split_once("\r\n\r\n").map_or("", |(_, b)| b)
 }
 
 #[cfg(test)]
@@ -6329,5 +6343,70 @@ mod tests {
         );
         assert_eq!(status_code(&won), 200, "card-derived builder role claims → 200\n{won}");
         assert!(won.contains("build-it"), "the claimer receives the payload");
+    }
+
+    // task #11 S4 acceptance #6 (read-model, over the API): `GET /task/{q}/list`
+    // and the `/dashboard/state` `tasks` section faithfully reflect queued →
+    // claimed@peer, READ-ONLY. A claim mutates state; `list` only reports it.
+    #[test]
+    fn task_read_model_reflects_state_via_api_and_dashboard() {
+        let queue = crate::default_tab_id();
+        let _cleanup = QueueCleanup(crate::cli::task::queue_path(&queue));
+        let (port, _state, token) = spawn_server();
+
+        let post = |path: &str, body: &str| {
+            format!(
+                "POST /{path}?token={token} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let get = |path: &str| format!("GET /{path}?token={token} HTTP/1.1\r\n\r\n");
+
+        // push a task → the read-model shows it queued.
+        assert_eq!(
+            status_code(&request(
+                port,
+                &post(&format!("task/{queue}/push"), r#"{"payload":"work"}"#)
+            )),
+            201,
+            "push → 201"
+        );
+        let listed = request(port, &get(&format!("task/{queue}/list")));
+        assert_eq!(status_code(&listed), 200, "list → 200");
+        assert!(
+            listed.contains(r#""state":"queued""#),
+            "queued before any claim\n{listed}"
+        );
+        assert!(!listed.contains(r#""claimedBy""#), "no claimant while queued\n{listed}");
+
+        // claim it → the read-model now shows claimed@<peer>, READ-ONLY.
+        let won = request(
+            port,
+            &post(&format!("task/{queue}/claim"), r#"{"claimed_by":"peer-x"}"#),
+        );
+        assert_eq!(status_code(&won), 200, "claim → 200");
+        let listed = request(port, &get(&format!("task/{queue}/list")));
+        assert!(
+            listed.contains(r#""state":"claimed""#),
+            "claimed after the claim\n{listed}"
+        );
+        assert!(listed.contains(r#""claimedBy":"peer-x""#), "claimed@peer-x\n{listed}");
+        // list is idempotent / read-only: a second list reads identically.
+        let again = request(port, &get(&format!("task/{queue}/list")));
+        assert_eq!(
+            body_of(&listed),
+            body_of(&again),
+            "list is read-only — repeated reads are identical"
+        );
+
+        // The dashboard exposes the same read-model in its `tasks` section.
+        let dash = request(port, &get("dashboard/state"));
+        assert_eq!(status_code(&dash), 200, "dashboard/state → 200");
+        assert!(dash.contains(r#""tasks""#), "dashboard exposes a tasks section");
+        assert!(dash.contains(&queue), "the queue appears in the dashboard tasks");
+        assert!(
+            dash.contains(r#""claimedBy": "peer-x""#),
+            "claimed@peer-x on the dashboard\n{dash}"
+        );
     }
 }

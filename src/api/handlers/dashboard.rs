@@ -87,7 +87,11 @@ pub(in crate::api) fn state<S: Write>(
         })
         .collect();
     drop(snap);
-    let body = serde_json::to_string_pretty(&build_dashboard_state(inputs)).unwrap_or_default();
+    let mut dashboard = build_dashboard_state(inputs);
+    // S4 task read-model: derive every queue's current state READ-ONLY (FS read
+    // here so the pure builder stays FS-free). Nothing is mutated / compacted.
+    dashboard.tasks = crate::cli::task::read_all_queue_views(crate::unix_millis());
+    let body = serde_json::to_string_pretty(&dashboard).unwrap_or_default();
     respond_with_etag(
         stream,
         200,

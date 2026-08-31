@@ -428,6 +428,10 @@ pub struct DashboardState {
     /// Tabs with NO `assignment` at all (S5, #90) — legitimately un-placed,
     /// sorted by id. Distinct from `unmapped` (assigned but an unknown phase).
     pub(crate) unassigned: Vec<DashboardTab>,
+    /// task primitive (#11 S4) read-model: every task queue's current state,
+    /// derived READ-ONLY at read time (queued / claimed@peer / done). Filled at
+    /// the handler (FS read there); empty from the pure builder / in tests.
+    pub(crate) tasks: Vec<crate::cli::task::TaskQueueView>,
 }
 
 /// Minimal per-tab projection the dashboard builder consumes, so the
