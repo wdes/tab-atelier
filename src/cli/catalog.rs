@@ -43,6 +43,12 @@ use serde::{Deserialize, Serialize};
 pub struct CatalogCard {
     /// The tab uuid — the record id.
     pub id: String,
+    /// The canonical catalogue KEY (RC1): `kebab(<role>[-<domain>])` derived from
+    /// the card (assignment role + specialty), suffix-free. Stable + reusable
+    /// across N instances of a profile — the fold-by-slug key (RB2). Distinct from
+    /// `id` (the record) and `name` (freeform). See [`canonical_slug`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub slug: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -80,6 +86,9 @@ impl CatalogCard {
     pub fn from_tab_state(t: &crate::TabState, retired_at: u64) -> Self {
         Self {
             id: t.id.clone(),
+            // RC1: the canonical slug is derived from the CARD (role + specialty),
+            // not the freeform name or the tab-id.
+            slug: card_slug(t.assignment.as_deref(), t.specialty.as_deref()),
             name: Some(t.name.clone()).filter(|s| !s.is_empty()),
             assignment: t.assignment.clone(),
             specialty: t.specialty.clone(),
@@ -105,6 +114,117 @@ impl CatalogCard {
     pub const fn is_complete(&self, had_session: bool) -> bool {
         !self.id.is_empty() && (!had_session || self.session_id.is_some())
     }
+}
+
+// ---------------------------------------------------------------------------
+// RC1 — canonical slug at the catalogue write.
+//
+// The slug is a stable, reusable KEY for a PROFILE (one template, N instances),
+// derived from the CARD (assignment role + specialty), NOT the freeform name nor
+// the tab-id. Suffix-free by construction (the analogue of bash
+// `clean_rehome_name`), so an already-suffixed source never double-suffixes.
+// ---------------------------------------------------------------------------
+
+/// Kebab-case one component: ASCII-lowercase, every run of non-alphanumerics → a
+/// single `-`, leading/trailing `-` trimmed.
+fn kebab(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_dash = true; // seeds true → leading separators are trimmed
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    out
+}
+
+/// Strip a trailing instance suffix `-<n>` (all-digits) so the slug is suffix-free
+/// by construction — the numeric analogue of `clean_rehome_name`. Idempotent on
+/// stacked suffixes (`builder-2-3` → `builder`).
+fn strip_instance_suffix(mut s: &str) -> &str {
+    while let Some((head, tail)) = s.rsplit_once('-') {
+        if !tail.is_empty() && !head.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) {
+            s = head;
+        } else {
+            break;
+        }
+    }
+    s
+}
+
+/// The canonical catalogue SLUG for a card: `kebab(<role>[-<domain>])`, suffix-free.
+///
+/// `role` (from the assignment, via `role_of`) is the base; `domain` (from the
+/// specialty) refines it when present. An empty role falls back to `"agent"`. The
+/// role component is stripped of any instance suffix so `builder-2` → `builder`.
+#[must_use]
+pub fn canonical_slug(role: &str, domain: Option<&str>) -> String {
+    let role_k = strip_instance_suffix(&kebab(role)).to_string();
+    let role_k = if role_k.is_empty() { "agent".to_string() } else { role_k };
+    match domain.map(kebab).filter(|d| !d.is_empty()) {
+        Some(d) => format!("{role_k}-{d}"),
+        None => role_k,
+    }
+}
+
+/// The RC1 write key: derive the slug straight off a card's assignment + specialty
+/// (role from `role_of(assignment)`, domain from the specialty).
+#[must_use]
+pub fn card_slug(assignment: Option<&str>, specialty: Option<&str>) -> String {
+    canonical_slug(&crate::api::role_of(assignment), specialty)
+}
+
+/// Number a LIVE instance of `slug`, suffix-free.
+///
+/// The bare `<slug>` when free among `existing`, else the smallest free
+/// `<slug>-<n>` (n ≥ 2). Distinguishes instances of the same profile without ever
+/// double-suffixing (the base is already suffix-free).
+#[must_use]
+pub fn next_instance(slug: &str, existing: &[String]) -> String {
+    if !existing.iter().any(|e| e == slug) {
+        return slug.to_string();
+    }
+    (2u32..=u32::MAX)
+        .map(|n| format!("{slug}-{n}"))
+        .find(|cand| !existing.iter().any(|e| e == cand))
+        .unwrap_or_else(|| slug.to_string())
+}
+
+/// Fold a catalogue to ONE row per slug: the LATEST `retired_at` wins, and
+/// `usage_count` is AGGREGATED (summed) across every retirement of that profile.
+///
+/// N retraits of the same profile collapse to a single presentation row (RB2's
+/// read-model consumes this) instead of spamming the list. Rows are returned
+/// sorted by slug for a stable presentation.
+#[must_use]
+pub fn dedup_by_slug(cards: &[CatalogCard]) -> Vec<CatalogCard> {
+    use std::collections::BTreeMap;
+    let mut latest: BTreeMap<String, CatalogCard> = BTreeMap::new();
+    let mut usage_total: BTreeMap<String, u64> = BTreeMap::new();
+    for c in cards {
+        *usage_total.entry(c.slug.clone()).or_default() += c.usage_count.unwrap_or(0);
+        match latest.get(&c.slug) {
+            Some(prev) if prev.retired_at >= c.retired_at => {}
+            _ => {
+                latest.insert(c.slug.clone(), c.clone());
+            }
+        }
+    }
+    latest
+        .into_values()
+        .map(|mut c| {
+            let total = usage_total[&c.slug];
+            c.usage_count = (total > 0).then_some(total);
+            c
+        })
+        .collect()
 }
 
 /// The catalogue file: `<state>/tab-atelier/catalog.jsonl`. Honors
@@ -328,26 +448,22 @@ mod tests {
     }
 
     fn card(id: &str, session: Option<&str>) -> CatalogCard {
+        let assignment = Some("x/builder".to_string());
         CatalogCard {
             id: id.into(),
+            slug: card_slug(assignment.as_deref(), None),
+            name: None,
+            assignment,
+            specialty: None,
+            orchestrator: None,
+            objective: None,
+            current_task_log: vec![],
+            conventions: vec![],
+            evaluations: vec![],
+            usage_count: None,
+            last_used_at: None,
             session_id: session.map(str::to_string),
-            assignment: Some("x/builder".into()),
             retired_at: RETIRED_AT,
-            ..CatalogCard {
-                id: String::new(),
-                name: None,
-                assignment: None,
-                specialty: None,
-                orchestrator: None,
-                objective: None,
-                current_task_log: vec![],
-                conventions: vec![],
-                evaluations: vec![],
-                usage_count: None,
-                last_used_at: None,
-                session_id: None,
-                retired_at: 0,
-            }
         }
     }
 
@@ -600,5 +716,93 @@ mod tests {
         let back = read_back(cat.path(), "a").expect("found");
         assert_eq!(back.retired_at, 2, "latest append wins on read-back");
         assert_eq!(back.specialty.as_deref(), Some("newer"));
+    }
+
+    // ----- RC1: canonical slug at the catalogue write ---------------------------
+
+    // RC1: the slug is kebab(<role>[-<domain>]), suffix-free — role alone,
+    // role+domain, an already-suffixed source stripped, empty→agent.
+    #[test]
+    fn rc1_canonical_slug_is_kebab_role_domain_suffix_free() {
+        // role alone.
+        assert_eq!(canonical_slug("builder", None), "builder");
+        assert_eq!(canonical_slug("Code Reviewer", None), "code-reviewer", "kebab + lowercase");
+        // role + domain (from specialty).
+        assert_eq!(canonical_slug("builder", Some("rust daemon")), "builder-rust-daemon");
+        assert_eq!(
+            canonical_slug("reviewer", Some("SQL / DB")),
+            "reviewer-sql-db",
+            "non-alnum runs collapse to one dash"
+        );
+        // an already-suffixed source is stripped (suffix-free by construction).
+        assert_eq!(canonical_slug("builder-2", None), "builder", "instance suffix stripped");
+        assert_eq!(canonical_slug("builder-2-3", None), "builder", "stacked suffixes stripped");
+        // empty role → the "agent" fallback (never an empty slug).
+        assert_eq!(canonical_slug("", None), "agent");
+        assert_eq!(canonical_slug("  ", Some("payments")), "agent-payments");
+    }
+
+    // RC1: derived straight off a card's assignment (role) + specialty (domain).
+    #[test]
+    fn rc1_card_slug_derives_from_assignment_and_specialty() {
+        assert_eq!(card_slug(Some("build/builder"), None), "builder", "role from the assignment");
+        assert_eq!(
+            card_slug(Some("kalpin-back:review/reviewer"), Some("postgres")),
+            "reviewer-postgres",
+            "override ignored, role + specialty domain"
+        );
+        assert_eq!(card_slug(None, None), "agent", "no assignment → agent");
+        // The slug lands on the card at write time (from_tab_state).
+        let card = CatalogCard::from_tab_state(&maximal_tab_state("t"), RETIRED_AT);
+        assert_eq!(card.slug, "builder-rust-daemon-internals", "slug computed from the card");
+    }
+
+    // RC1: live instances of a profile are numbered <slug>-<n>, suffix-free —
+    // the bare slug when free, else the smallest free -<n> (n ≥ 2).
+    #[test]
+    fn rc1_next_instance_numbers_collisions() {
+        assert_eq!(next_instance("builder", &[]), "builder", "free → bare slug");
+        let existing = vec!["builder".to_string()];
+        assert_eq!(next_instance("builder", &existing), "builder-2", "first collision → -2");
+        let existing = vec!["builder".to_string(), "builder-2".to_string()];
+        assert_eq!(next_instance("builder", &existing), "builder-3", "next free -n");
+        // A gap is filled by the smallest free index, never double-suffixing.
+        let existing = vec!["builder".to_string(), "builder-3".to_string()];
+        assert_eq!(next_instance("builder", &existing), "builder-2", "smallest free index");
+    }
+
+    // RC1: dedup+aggregate by slug — N retraits of a profile collapse to ONE row
+    // (latest retired_at wins), usageCount summed. A profile doesn't spam the list.
+    #[test]
+    fn rc1_dedup_by_slug_folds_latest_and_aggregates_usage() {
+        let mk = |id: &str, slug: &str, retired: u64, usage: u64| CatalogCard {
+            id: id.into(),
+            slug: slug.into(),
+            usage_count: Some(usage),
+            objective: Some(format!("obj-{id}")),
+            retired_at: retired,
+            name: None,
+            assignment: None,
+            specialty: None,
+            orchestrator: None,
+            current_task_log: vec![],
+            conventions: vec![],
+            evaluations: vec![],
+            last_used_at: None,
+            session_id: None,
+        };
+        let cards = vec![
+            mk("id1", "builder", 100, 3), // older builder
+            mk("id2", "builder", 200, 5), // newer builder → wins
+            mk("id3", "reviewer", 150, 2),
+        ];
+        let folded = dedup_by_slug(&cards);
+        assert_eq!(folded.len(), 2, "two profiles → two rows (builder folded)");
+        let builder = folded.iter().find(|c| c.slug == "builder").expect("builder row");
+        assert_eq!(builder.id, "id2", "the LATEST retirement wins the row");
+        assert_eq!(builder.objective.as_deref(), Some("obj-id2"), "latest card's fields");
+        assert_eq!(builder.usage_count, Some(8), "usageCount aggregated across retraits (3+5)");
+        let reviewer = folded.iter().find(|c| c.slug == "reviewer").expect("reviewer row");
+        assert_eq!(reviewer.usage_count, Some(2));
     }
 }
