@@ -17,3 +17,4 @@ pub(super) mod cards;
 pub(super) mod catbus;
 pub(super) mod dashboard;
 pub(super) mod tabs;
+pub(super) mod task;

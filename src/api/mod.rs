@@ -1491,6 +1491,8 @@ fn respond_with_etag_precomputed<W: Write>(
 fn respond_json<W: Write>(stream: &mut W, status: u16, body: &str) {
     let reason = match status {
         200 => "OK",
+        201 => "Created",
+        204 => "No Content",
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
@@ -2086,6 +2088,20 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
         }
         ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/input") => {
             handlers::tabs::input(stream, state, p, body_bytes);
+        }
+        // Task primitive (#11) S1 → api/handlers/task.rs. Master-token only
+        // (not in any share-token allowlist, enforced by the gate upstream).
+        ("POST", p) if p.starts_with("/task/") && p.ends_with("/push") => {
+            let queue = &p["/task/".len()..p.len() - "/push".len()];
+            handlers::task::push(stream, state, queue, &body_bytes);
+        }
+        ("POST", p) if p.starts_with("/task/") && p.ends_with("/claim") => {
+            let queue = &p["/task/".len()..p.len() - "/claim".len()];
+            handlers::task::claim(stream, state, queue);
+        }
+        ("POST", p) if p.starts_with("/task/") && p.ends_with("/done") => {
+            let id = &p["/task/".len()..p.len() - "/done".len()];
+            handlers::task::done(stream, state, id);
         }
         (_, "/" | "/tabs") => {
             error_json(stream, 405, "method not allowed");
@@ -6105,5 +6121,69 @@ mod tests {
             s.pending_status_updates.last().unwrap().label.clone()
         };
         assert_eq!(label.as_deref(), Some("__clear__"));
+    }
+
+    /// Removes a task queue file on drop so the concurrency test never leaves
+    /// state behind (it writes to the real tasks dir under a unique queue name).
+    struct QueueCleanup(std::path::PathBuf);
+    impl Drop for QueueCleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+            let _ = std::fs::remove_file(self.0.with_extension("jsonl.tmp"));
+        }
+    }
+
+    // task #11 S1 acceptance #1 (THE proof): two CONCURRENT claims over the API,
+    // on a one-task queue → the daemon serializes them under the snapshot lock
+    // (single-writer CAS) → EXACTLY ONE gets 200 {id,payload}, the other 204.
+    // Plus #4 exactly-once: a done task never re-appears in a later claim.
+    #[test]
+    fn task_claim_is_exclusive_under_concurrency_and_exactly_once_via_api() {
+        // Unique queue name → no collision with real queues / parallel tests.
+        let queue = crate::default_tab_id();
+        let _cleanup = QueueCleanup(crate::cli::task::queue_path(&queue));
+        let (port, _state, token) = spawn_server();
+
+        // push one task.
+        let payload = r#"{"payload":"do-the-thing","priority":0}"#;
+        let push = format!(
+            "POST /task/{queue}/push?token={token} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{payload}",
+            payload.len()
+        );
+        assert_eq!(status_code(&request(port, &push)), 201, "push returns 201 Created");
+
+        // Fire two claims from two threads at once.
+        let claim = format!("POST /task/{queue}/claim?token={token} HTTP/1.1\r\nContent-Length: 0\r\n\r\n");
+        let (c1, c2) = (claim.clone(), claim.clone());
+        let h1 = std::thread::spawn(move || request(port, &c1));
+        let h2 = std::thread::spawn(move || request(port, &c2));
+        let (r1, r2) = (h1.join().unwrap(), h2.join().unwrap());
+        let (s1, s2) = (status_code(&r1), status_code(&r2));
+
+        let wins = [s1, s2].iter().filter(|&&s| s == 200).count();
+        let empties = [s1, s2].iter().filter(|&&s| s == 204).count();
+        assert_eq!(
+            (wins, empties),
+            (1, 1),
+            "EXACTLY one claimer wins, the other gets 204 — never both. s1={s1} s2={s2}\n{r1}\n---\n{r2}"
+        );
+
+        // #4 exactly-once: complete the claimed task, then a claim finds nothing.
+        let winner = if s1 == 200 { &r1 } else { &r2 };
+        let id = winner
+            .split("\"id\":\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .expect("winner carries the claimed id");
+        let done = format!("POST /task/{id}/done?token={token} HTTP/1.1\r\nContent-Length: 0\r\n\r\n");
+        assert_eq!(status_code(&request(port, &done)), 200, "done → 200 idempotent");
+        // A repeat done on the same id is still 200 (idempotent, no stale-409 in S1).
+        assert_eq!(status_code(&request(port, &done)), 200, "repeat done stays 200");
+        // The done task never re-appears — the queue is now empty.
+        assert_eq!(
+            status_code(&request(port, &claim)),
+            204,
+            "a done task never re-appears in a later claim (exactly-once)"
+        );
     }
 }
