@@ -9,6 +9,8 @@ pub mod aligator;
 pub mod bench;
 pub mod bench_lag;
 pub mod brain;
+/// The retired-agent card catalogue + persist-gated de-register (RB1).
+pub mod catalog;
 pub mod clarify;
 pub mod claude_hook;
 /// The single shared client-subcommand router used by both the GUI
