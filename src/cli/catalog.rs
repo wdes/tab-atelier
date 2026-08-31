@@ -74,6 +74,11 @@ pub struct CatalogCard {
     /// EXISTING session is a bug the persist-gate refuses (see `is_complete`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// RB3 GATE #1 — the AFTER-ACTION (`set-last-mission`), the agent's closing
+    /// summary written at `handoff-written` and archived with the card BEFORE the
+    /// close. The one field new to RB3. `None` when the agent posted no after-action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_mission: Option<String>,
     /// Unix-millis the card was archived (retired).
     pub retired_at: u64,
 }
@@ -82,8 +87,13 @@ impl CatalogCard {
     /// Copy the durable card off a persisted [`crate::TabState`] at retire time —
     /// the "copy of the `build_snapshot` card DTO" (zero new serialization: same
     /// fields, same types).
+    ///
+    /// `after_action` is the RB3 GATE #1 `lastMission`: the agent's closing summary,
+    /// captured in the after-action flow (the retire script, at `handoff-written`)
+    /// and stamped on the card so it's archived BEFORE the close. A retire-time
+    /// input, not a persisted card field — same guarantee, no state plumbing.
     #[must_use]
-    pub fn from_tab_state(t: &crate::TabState, retired_at: u64) -> Self {
+    pub fn from_tab_state(t: &crate::TabState, after_action: Option<String>, retired_at: u64) -> Self {
         Self {
             id: t.id.clone(),
             // RC1: the canonical slug is derived from the CARD (role + specialty),
@@ -100,6 +110,7 @@ impl CatalogCard {
             usage_count: t.usage_count,
             last_used_at: t.last_used_at,
             session_id: t.agent_session_id.clone(),
+            last_mission: after_action.filter(|s| !s.trim().is_empty()),
             retired_at,
         }
     }
@@ -315,6 +326,28 @@ pub fn remove_tab_from_saved(saved: &mut crate::SavedState, id: &str) -> bool {
     removed
 }
 
+/// The REAL de-register seam (RB3 GATE #2): ATOMICALLY persist tabs.json without `id`.
+///
+/// Load → [`remove_tab_from_saved`] → atomic save (tmp + rename + fsync, via
+/// [`crate::save_state_serialized`]). The caller runs this under the daemon
+/// single-writer lock and BEFORE the irreversible close, so the crash window
+/// RB1-A3 is closed: a crash can never leave the forbidden {closed BUT still in
+/// tabs.json}. `Err(NotFound)` when the id wasn't registered (nothing to close).
+///
+/// # Errors
+/// `NotFound` if no tabs.json / the id isn't in it (idempotent — nothing to do).
+pub fn deregister_atomic(config_base: &Path, id: &str) -> std::io::Result<()> {
+    let Some(mut saved) = crate::load_state_from(config_base) else {
+        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no tabs.json"));
+    };
+    if !remove_tab_from_saved(&mut saved, id) {
+        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "tab not registered"));
+    }
+    let json = serde_json::to_string_pretty(&saved).unwrap_or_default();
+    crate::save_state_serialized(config_base, &json);
+    Ok(())
+}
+
 /// The verdict of a retire attempt (RB1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetireOutcome {
@@ -345,6 +378,7 @@ pub enum RetireOutcome {
 /// durable de-register, so a failure never leaves {closed BUT still registered}.
 pub fn perform_retire<Wc, Rb, Dr, Sd>(
     card: &CatalogCard,
+    ack_safe_to_close: bool,
     had_session: bool,
     write_catalog: Wc,
     read_back: Rb,
@@ -357,6 +391,12 @@ where
     Dr: FnOnce() -> std::io::Result<()>,
     Sd: FnOnce() -> std::io::Result<()>,
 {
+    // GATE 3a (RB3 fail-safe, cumulative + INDEPENDENT of the archive gate): no
+    // `safe-to-close` ACK → NO close, the tab is kept. The daemon is the fence,
+    // not just the script.
+    if !ack_safe_to_close {
+        return RetireOutcome::Incomplete("no safe-to-close ACK — RETIRE INCOMPLET, tab kept");
+    }
     // 1. Archive the card.
     if write_catalog(card).is_err() {
         return RetireOutcome::Incomplete("archive write failed — tab kept");
@@ -481,7 +521,7 @@ mod tests {
     fn round_trip_is_byte_complete() {
         let cat = TmpCatalog::new();
         let ts = maximal_tab_state("tab-max");
-        let card = CatalogCard::from_tab_state(&ts, RETIRED_AT);
+        let card = CatalogCard::from_tab_state(&ts, None, RETIRED_AT);
         append_catalog_line(cat.path(), &card).expect("archive");
         let back = read_back(cat.path(), "tab-max").expect("read-back non-empty");
         assert_eq!(back, card, "every durable field round-trips byte-complete");
@@ -528,6 +568,7 @@ mod tests {
             usage_count: None,
             last_used_at: None,
             session_id: session.map(str::to_string),
+            last_mission: None,
             retired_at: RETIRED_AT,
         }
     }
@@ -541,6 +582,7 @@ mod tests {
         let c = card("t1", Some("sess-1"));
         let out = perform_retire(
             &c,
+            true, // ack safe-to-close (RB3 gate 3a)
             true,
             |card| {
                 m.log.borrow_mut().push("write");
@@ -577,6 +619,7 @@ mod tests {
         let c = card("t1", Some("sess-1"));
         let out = perform_retire(
             &c,
+            true, // ack safe-to-close (RB3 gate 3a)
             true,
             |_card| {
                 m.log.borrow_mut().push("write");
@@ -612,6 +655,7 @@ mod tests {
         let c = card("t1", Some("sess-xyz"));
         let out = perform_retire(
             &c,
+            true, // ack safe-to-close (RB3 gate 3a)
             true,
             |card| {
                 *m.archived.borrow_mut() = Some(card.clone());
@@ -637,6 +681,7 @@ mod tests {
         let lost = card("t2", None);
         let out2 = perform_retire(
             &lost,
+            true, // ack safe-to-close (RB3 gate 3a)
             true, // the tab HAD a session…
             |_c| Ok(()),
             |_id| Some(lost.clone()), // …but the archive lost it → None
@@ -649,6 +694,7 @@ mod tests {
         let sessionless = card("t3", None);
         let out3 = perform_retire(
             &sessionless,
+            true, // ack safe-to-close (RB3 gate 3a)
             false,
             |_c| Ok(()),
             |_id| Some(sessionless.clone()),
@@ -667,6 +713,7 @@ mod tests {
         let c = card("t1", None);
         let out = perform_retire(
             &c,
+            true, // ack safe-to-close (RB3 gate 3a)
             false,
             |_c| Err(std::io::Error::other("disk full")),
             |_id| {
@@ -691,6 +738,7 @@ mod tests {
         let c2 = card("t2", None);
         let out2 = perform_retire(
             &c2,
+            true, // ack safe-to-close (RB3 gate 3a)
             false,
             |_c| Ok(()),
             |_id| Some(c2.clone()),
@@ -710,8 +758,8 @@ mod tests {
     #[test]
     fn retire_does_not_touch_a_neighbours_card() {
         let cat = TmpCatalog::new();
-        let x = CatalogCard::from_tab_state(&maximal_tab_state("tab-x"), RETIRED_AT);
-        let y = CatalogCard::from_tab_state(&maximal_tab_state("tab-y"), RETIRED_AT);
+        let x = CatalogCard::from_tab_state(&maximal_tab_state("tab-x"), None, RETIRED_AT);
+        let y = CatalogCard::from_tab_state(&maximal_tab_state("tab-y"), None, RETIRED_AT);
         append_catalog_line(cat.path(), &x).unwrap();
         append_catalog_line(cat.path(), &y).unwrap();
         // Read-back of Y is intact after X was archived alongside it.
@@ -818,7 +866,7 @@ mod tests {
         );
         assert_eq!(card_slug(None, None), "agent", "no assignment → agent");
         // The slug lands on the card at write time (from_tab_state).
-        let card = CatalogCard::from_tab_state(&maximal_tab_state("t"), RETIRED_AT);
+        let card = CatalogCard::from_tab_state(&maximal_tab_state("t"), None, RETIRED_AT);
         assert_eq!(card.slug, "builder-rust-daemon-internals", "slug computed from the card");
     }
 
@@ -855,6 +903,7 @@ mod tests {
             evaluations: vec![],
             last_used_at: None,
             session_id: None,
+            last_mission: None,
         };
         let cards = vec![
             mk("id1", "builder", 100, 3), // older builder
@@ -880,11 +929,11 @@ mod tests {
     fn rb2_read_retired_folds_by_slug_keeps_fields_and_is_inert() {
         let cat = TmpCatalog::new();
         // two retraits of the SAME profile (builder) + one reviewer.
-        let mut b1 = CatalogCard::from_tab_state(&maximal_tab_state("id1"), 100);
+        let mut b1 = CatalogCard::from_tab_state(&maximal_tab_state("id1"), None, 100);
         b1.usage_count = Some(3);
-        let mut b2 = CatalogCard::from_tab_state(&maximal_tab_state("id2"), 200);
+        let mut b2 = CatalogCard::from_tab_state(&maximal_tab_state("id2"), None, 200);
         b2.usage_count = Some(5);
-        let mut rev = CatalogCard::from_tab_state(&maximal_tab_state("id3"), 150);
+        let mut rev = CatalogCard::from_tab_state(&maximal_tab_state("id3"), None, 150);
         rev.assignment = Some("x/reviewer".into());
         rev.specialty = None;
         rev.slug = card_slug(rev.assignment.as_deref(), rev.specialty.as_deref());
@@ -911,5 +960,167 @@ mod tests {
             assert!(!json.contains(forbidden), "a retired card is inert (no {forbidden}): {json}");
         }
         assert!(retired.iter().any(|c| c.slug == "reviewer"), "the reviewer profile is its own row");
+    }
+
+    // ----- RB3: the retire script's daemon-side gates ---------------------------
+
+    // RB3 GATE 3a (fail-safe, INDEPENDENT of the archive gate): no `safe-to-close`
+    // ACK → NO close, the tab is kept + the noisy flag. Nothing else even runs.
+    #[test]
+    fn rb3_gate_3a_no_ack_safe_to_close_never_closes() {
+        let m = Mocks::new();
+        let c = card("t1", Some("sess-1"));
+        let out = perform_retire(
+            &c,
+            false, // NO safe-to-close ACK (gate 3a)
+            true,
+            |_c| {
+                m.log.borrow_mut().push("write");
+                Ok(())
+            },
+            |_id| {
+                m.log.borrow_mut().push("read-back");
+                Some(c.clone())
+            },
+            || {
+                m.log.borrow_mut().push("deregister");
+                Ok(())
+            },
+            || {
+                m.log.borrow_mut().push("shutdown");
+                Ok(())
+            },
+        );
+        assert!(matches!(out, RetireOutcome::Incomplete(_)), "no ACK → Incomplete");
+        assert!(m.log.borrow().is_empty(), "no ACK → NOTHING runs (no archive, no close)");
+    }
+
+    // RB3: the two gates are CUMULATIVE + INDEPENDENT — each blocks the close on
+    // its own. (3a) ACK missing while archive OK → blocked. (3b) archive missing
+    // while ACK OK → blocked. Only BOTH present → close.
+    #[test]
+    fn rb3_gates_3a_and_3b_block_independently() {
+        let c = card("t1", None);
+        // 3a fails (no ACK), 3b would pass (read-back ok) → blocked, no close.
+        let out_no_ack = perform_retire(
+            &c,
+            false,
+            false,
+            |_c| Ok(()),
+            |_id| Some(c.clone()),
+            || Ok(()),
+            || panic!("must not close: no ACK"),
+        );
+        assert!(matches!(out_no_ack, RetireOutcome::Incomplete(_)), "3a blocks");
+        // 3a passes (ACK), 3b fails (empty read-back) → blocked, no close.
+        let out_no_archive = perform_retire(
+            &c,
+            true,
+            false,
+            |_c| Ok(()),
+            |_id| None, // read-back empty
+            || Ok(()),
+            || panic!("must not close: archive not verified"),
+        );
+        assert!(matches!(out_no_archive, RetireOutcome::Incomplete(_)), "3b blocks");
+        // Both present → close.
+        let out_ok = perform_retire(&c, true, false, |_c| Ok(()), |_id| Some(c.clone()), || Ok(()), || Ok(()));
+        assert_eq!(out_ok, RetireOutcome::Retired, "both gates satisfied → close");
+    }
+
+    // RB3 GATE #1: the after-action (lastMission) is stamped on the card and
+    // ARCHIVED before the close — captured in the after-action flow, written at
+    // archive time (write_catalog), before any de-register/shutdown.
+    #[test]
+    fn rb3_last_mission_is_archived_before_close() {
+        let after = Some("shipped RB3; handed off cleanly".to_string());
+        let card = CatalogCard::from_tab_state(&maximal_tab_state("t"), after.clone(), RETIRED_AT);
+        assert_eq!(card.last_mission, after, "the after-action lands on the card");
+
+        let seen_at_write = RefCell::new(None);
+        let out = perform_retire(
+            &card,
+            true,
+            true,
+            |c| {
+                *seen_at_write.borrow_mut() = c.last_mission.clone();
+                Ok(())
+            },
+            |_id| Some(card.clone()),
+            || Ok(()),
+            || {
+                // At close, the archived card already carried the after-action.
+                assert_eq!(*seen_at_write.borrow(), after, "lastMission archived BEFORE close");
+                Ok(())
+            },
+        );
+        assert_eq!(out, RetireOutcome::Retired);
+        // A blank after-action is dropped (no empty lastMission).
+        let blank = CatalogCard::from_tab_state(&maximal_tab_state("t"), Some("   ".into()), RETIRED_AT);
+        assert!(blank.last_mission.is_none(), "a blank after-action archives as None");
+    }
+
+    // RB3 GATE #2 (crash window RB1-A3): `shutdown` runs LAST, after the durable
+    // de-register. Injecting a crash AT the close (shutdown Err) can never leave
+    // {closed BUT still in tabs.json} — the id was already removed+persisted.
+    #[test]
+    fn rb3_crash_between_deregister_and_close_never_leaves_a_ghost() {
+        let c = card("gone", None);
+        // The de-register persists an in-memory "saved state" WITHOUT the id.
+        let saved: RefCell<Vec<String>> = RefCell::new(vec!["gone".into(), "keep".into()]);
+        let out = perform_retire(
+            &c,
+            true,
+            false,
+            |_c| Ok(()),
+            |_id| Some(c.clone()),
+            || {
+                saved.borrow_mut().retain(|id| id != "gone"); // durable remove BEFORE close
+                Ok(())
+            },
+            || Err(std::io::Error::other("CRASH at close")), // the close crashes
+        );
+        assert_eq!(out, RetireOutcome::CloseFailed, "a crash at close → not Retired");
+        // The invariant: the id is ALREADY gone from the persisted state — never a
+        // ghost {closed BUT still registered}. Re-retire is replayable.
+        assert!(!saved.borrow().contains(&"gone".to_string()), "de-registered BEFORE the crash — no ghost");
+        assert!(saved.borrow().contains(&"keep".to_string()), "the neighbour is untouched");
+    }
+
+    // RB3 GATE #2 real seam: deregister_atomic loads, removes, and ATOMICALLY
+    // re-persists tabs.json (tmp+rename) — the id is gone on reload, neighbours
+    // stay; an absent id is a NotFound no-op (idempotent).
+    #[test]
+    fn rb3_deregister_atomic_persists_removal() {
+        // A unique temp config base so we never touch the real state dir.
+        let base = std::env::temp_dir().join(format!("tab-dereg-{}", crate::default_tab_id()));
+        let _cleanup = scopeguard_remove(&base);
+        // Seed a tabs.json with two tabs via the real atomic writer.
+        let saved = crate::SavedState {
+            tabs: vec![maximal_tab_state("gone"), maximal_tab_state("keep")],
+            active: 0,
+            windowed: false,
+            dashboard_share_token: String::new(),
+        };
+        crate::save_state_serialized(&base, &serde_json::to_string(&saved).unwrap());
+
+        // De-register "gone" atomically → reload shows it gone, "keep" stays.
+        deregister_atomic(&base, "gone").expect("de-register persists");
+        let reloaded = crate::load_state_from(&base).expect("reload");
+        assert!(!reloaded.tabs.iter().any(|t| t.id == "gone"), "id gone from tabs.json (atomic)");
+        assert!(reloaded.tabs.iter().any(|t| t.id == "keep"), "neighbour persisted");
+        // Re-de-register is a NotFound no-op (idempotent, never resurrects).
+        assert!(deregister_atomic(&base, "gone").is_err(), "absent id → NotFound no-op");
+    }
+
+    /// A tiny RAII cleanup for the temp config dir (no external crate).
+    fn scopeguard_remove(dir: &Path) -> impl Drop {
+        struct Rm(PathBuf);
+        impl Drop for Rm {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        Rm(dir.to_path_buf())
     }
 }
