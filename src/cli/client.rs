@@ -73,6 +73,8 @@ pub fn dispatch(name: &str, rest: &[String]) -> Option<i32> {
         "task" => task::run(rest),
         // agent-lifecycle (RB2): the retired-agent catalogue read-model.
         "catalog" => catalog::run(rest),
+        // agent-lifecycle (RB4): re-seed a fresh tab from a retired card.
+        "spawn" => catalog::spawn_run(rest),
         "clarify" => super::clarify::run(rest),
         "schedule" => share_link::schedule(rest),
         "log" => logging::run(rest),

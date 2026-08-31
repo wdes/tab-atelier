@@ -74,6 +74,10 @@ pub struct CatalogCard {
     /// EXISTING session is a bug the persist-gate refuses (see `is_complete`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// The archived agent kind (`claude`/`catbus`/…) — paired with `session_id` to
+    /// rebuild a `--resume` command (RB4). `None` for a session-less profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_kind: Option<String>,
     /// RB3 GATE #1 — the AFTER-ACTION (`set-last-mission`), the agent's closing
     /// summary written at `handoff-written` and archived with the card BEFORE the
     /// close. The one field new to RB3. `None` when the agent posted no after-action.
@@ -110,6 +114,7 @@ impl CatalogCard {
             usage_count: t.usage_count,
             last_used_at: t.last_used_at,
             session_id: t.agent_session_id.clone(),
+            agent_kind: t.agent_kind.clone(),
             last_mission: after_action.filter(|s| !s.trim().is_empty()),
             retired_at,
         }
@@ -311,6 +316,78 @@ pub fn read_retired() -> Vec<CatalogCard> {
     read_retired_at(&catalog_path())
 }
 
+// ---------------------------------------------------------------------------
+// RB4 — spawn --from-card <id|slug>: re-seed a card from the catalogue, closing
+// the loop catalogue → spawn → work → retire → catalogue.
+// ---------------------------------------------------------------------------
+
+/// Resolve a catalogue card by KEY — an exact `id` first, then the canonical
+/// `slug` (latest, since [`read_retired`] already folded latest-per-slug). `None`
+/// when neither matches.
+#[must_use]
+pub fn resolve_card<'a>(cards: &'a [CatalogCard], key: &str) -> Option<&'a CatalogCard> {
+    cards
+        .iter()
+        .find(|c| c.id == key)
+        .or_else(|| cards.iter().find(|c| c.slug == key))
+}
+
+/// How a `--from-card` spawn brings the agent back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeMode {
+    /// FRESH + inject memory — the DEFAULT and the dead-session FALLBACK: clean,
+    /// light, zero-risk. The common path.
+    Fresh,
+    /// Opt-in `--resume`: reattach the archived session via its rebuilt command.
+    /// Only when the session is present AND alive; otherwise we fall back to
+    /// [`Fresh`](ResumeMode::Fresh) — a `--resume` NEVER blocks or errors a spawn.
+    Resume { command: String },
+}
+
+/// The re-seed plan for `spawn --from-card` (RB4): the card fields to re-post on
+/// the new tab + the bumped usage count + the resume decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReseedPlan {
+    pub specialty: Option<String>,
+    pub assignment: Option<String>,
+    pub conventions: Vec<String>,
+    pub objective: Option<String>,
+    /// The profile's usage count, BUMPED by this spawn (RB4 acceptance 2).
+    pub usage_count: u64,
+    pub resume: ResumeMode,
+}
+
+/// The resume decision for a `--from-card` spawn (RB4).
+///
+/// DEFAULT (`want_resume == false`) → [`ResumeMode::Fresh`] (+ inject memory).
+/// `--resume` reattaches the archived session ONLY when it's present AND `alive`
+/// AND a resume command can be rebuilt ([`crate::restore_resume_command`]);
+/// otherwise it FALLS BACK to `Fresh` — a dead/absent session never errors a spawn.
+#[must_use]
+pub fn resume_mode(card: &CatalogCard, want_resume: bool, session_alive: bool) -> ResumeMode {
+    if !want_resume || !session_alive {
+        return ResumeMode::Fresh;
+    }
+    // Opt-in + alive: rebuild the resume command from the archived kind+sid; a
+    // session-carrying kind with no usable session falls back to fresh.
+    crate::restore_resume_command(card.agent_kind.as_deref(), card.session_id.as_deref(), None)
+        .map_or(ResumeMode::Fresh, |command| ResumeMode::Resume { command })
+}
+
+/// Build the [`ReseedPlan`] for `spawn --from-card` (RB4): re-post the 4 card
+/// fields, bump the usage count, and decide resume-vs-fresh (fallback-safe).
+#[must_use]
+pub fn reseed_plan(card: &CatalogCard, want_resume: bool, session_alive: bool) -> ReseedPlan {
+    ReseedPlan {
+        specialty: card.specialty.clone(),
+        assignment: card.assignment.clone(),
+        conventions: card.conventions.clone(),
+        objective: card.objective.clone(),
+        usage_count: card.usage_count.unwrap_or(0).saturating_add(1),
+        resume: resume_mode(card, want_resume, session_alive),
+    }
+}
+
 /// Remove tab `id` from a loaded [`crate::SavedState`] — the pure de-register.
 ///
 /// After this, a restore loop iterating `saved.tabs` never sees the id → no tab,
@@ -431,6 +508,53 @@ pub fn run(args: &[String]) -> i32 {
         eprintln!("usage:\n  tab-atelier catalog list");
         2
     }
+}
+
+/// `tab-atelier spawn --from-card <id|slug> [--resume]` (RB4).
+///
+/// Resolve a retired card and EMIT its re-seed plan (the 4 card fields + bumped
+/// usageCount + the resume decision) as JSON, for a spawner (spawn-bot.sh) to
+/// apply on a fresh tab.
+///
+/// The DEFAULT is fresh + inject memory; `--resume` reattaches the archived
+/// session, with an automatic fall-back to fresh when the session is dead/absent
+/// (the spawner verifies liveness and never lets `--resume` block a spawn).
+#[must_use]
+pub fn spawn_run(args: &[String]) -> i32 {
+    let Some(key) = arg_after(args, "--from-card") else {
+        eprintln!("usage:\n  tab-atelier spawn --from-card <id|slug> [--resume]");
+        return 2;
+    };
+    let want_resume = args.iter().any(|a| a == "--resume");
+    let cards = read_retired();
+    let Some(card) = resolve_card(&cards, key) else {
+        eprintln!("spawn: no catalogue card matches '{key}' (id or slug)");
+        return 1;
+    };
+    // The spawner verifies session liveness and falls back to fresh; the plan is
+    // built optimistically for a requested resume.
+    let plan = reseed_plan(card, want_resume, want_resume);
+    let resume = match &plan.resume {
+        ResumeMode::Fresh => serde_json::json!({ "mode": "fresh" }),
+        ResumeMode::Resume { command } => serde_json::json!({ "mode": "resume", "command": command }),
+    };
+    let out = serde_json::json!({
+        "slug": card.slug,
+        "id": card.id,
+        "specialty": plan.specialty,
+        "assignment": plan.assignment,
+        "conventions": plan.conventions,
+        "objective": plan.objective,
+        "usageCount": plan.usage_count,
+        "resume": resume,
+    });
+    println!("{}", serde_json::to_string(&out).unwrap_or_default());
+    0
+}
+
+/// The value after `flag` in `args` (`--from-card <value>`).
+fn arg_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).map(String::as_str)
 }
 
 /// `catalog list` — GET the retired read-model and print it. READ-ONLY.
@@ -568,6 +692,7 @@ mod tests {
             usage_count: None,
             last_used_at: None,
             session_id: session.map(str::to_string),
+            agent_kind: None,
             last_mission: None,
             retired_at: RETIRED_AT,
         }
@@ -903,6 +1028,7 @@ mod tests {
             evaluations: vec![],
             last_used_at: None,
             session_id: None,
+            agent_kind: None,
             last_mission: None,
         };
         let cards = vec![
@@ -1122,5 +1248,89 @@ mod tests {
             }
         }
         Rm(dir.to_path_buf())
+    }
+
+    // ----- RB4: spawn --from-card -----------------------------------------------
+
+    // RB4: resolve a card by id OR by slug (id wins), None when neither matches.
+    #[test]
+    fn rb4_resolve_card_by_id_or_slug() {
+        let c = CatalogCard::from_tab_state(&maximal_tab_state("the-id"), None, RETIRED_AT);
+        let cards = vec![c];
+        assert_eq!(resolve_card(&cards, "the-id").map(|c| &c.id), Some(&"the-id".to_string()), "by id");
+        assert_eq!(
+            resolve_card(&cards, "builder-rust-daemon-internals").map(|c| &c.id),
+            Some(&"the-id".to_string()),
+            "by slug"
+        );
+        assert!(resolve_card(&cards, "nope").is_none(), "no match → None");
+    }
+
+    // RB4 acceptance (1)+(2): the plan re-seeds the 4 card fields (specialty,
+    // assignment, conventions, objective) and BUMPS usageCount.
+    #[test]
+    fn rb4_reseed_plan_reposts_four_fields_and_bumps_usage() {
+        let card = CatalogCard::from_tab_state(&maximal_tab_state("t"), None, RETIRED_AT);
+        // maximal has usage_count Some(7).
+        let plan = reseed_plan(&card, false, false);
+        assert_eq!(plan.specialty.as_deref(), Some("rust daemon internals"), "specialty re-posted");
+        assert_eq!(
+            plan.assignment.as_deref(),
+            Some("tab-atelier:agent-lifecycle/builder"),
+            "assignment re-posted"
+        );
+        assert_eq!(plan.conventions, vec!["CONVENTIONS.md", "memory/index.md"], "conventions re-posted");
+        assert_eq!(plan.objective.as_deref(), Some("ship RB1"), "objective re-posted");
+        assert_eq!(plan.usage_count, 8, "usageCount bumped 7 → 8");
+    }
+
+    // RB4 acceptance (3): the DEFAULT is fresh + inject memory (no --resume).
+    #[test]
+    fn rb4_default_is_fresh() {
+        let card = CatalogCard::from_tab_state(&maximal_tab_state("t"), None, RETIRED_AT);
+        assert_eq!(
+            reseed_plan(&card, false, true).resume,
+            ResumeMode::Fresh,
+            "default (no --resume) → fresh + memory, even with a live session"
+        );
+    }
+
+    // RB4 acceptance (4): --resume is opt-in — reattaches the ARCHIVED session via
+    // its rebuilt command when present + alive.
+    #[test]
+    fn rb4_resume_opt_in_reattaches_the_archived_session() {
+        let card = CatalogCard::from_tab_state(&maximal_tab_state("t"), None, RETIRED_AT);
+        // maximal has agent_kind "claude" + session "sess-abc".
+        let mode = reseed_plan(&card, true, true).resume;
+        match mode {
+            ResumeMode::Resume { command } => {
+                assert!(command.contains("sess-abc"), "the resume command carries the archived session id");
+            }
+            ResumeMode::Fresh => panic!("--resume with a live archived session must resume"),
+        }
+    }
+
+    // RB4 acceptance (5) — the CRITICAL red: --resume with a DEAD/absent session →
+    // AUTOMATIC fallback to fresh + memory, NEVER a hard error. `--resume` must
+    // never block a spawn.
+    #[test]
+    fn rb4_dead_or_absent_session_falls_back_to_fresh() {
+        // (a) session present but DEAD (alive=false) → fresh fallback.
+        let live = CatalogCard::from_tab_state(&maximal_tab_state("t"), None, RETIRED_AT);
+        assert_eq!(
+            reseed_plan(&live, true, false).resume,
+            ResumeMode::Fresh,
+            "--resume + dead session → fresh fallback, no error"
+        );
+        // (b) session-less profile (no session_id) → fresh fallback even with --resume.
+        let mut ts = maximal_tab_state("t2");
+        ts.agent_session_id = None;
+        ts.agent_kind = None;
+        let sessionless = CatalogCard::from_tab_state(&ts, None, RETIRED_AT);
+        assert_eq!(
+            reseed_plan(&sessionless, true, true).resume,
+            ResumeMode::Fresh,
+            "--resume + no archived session → fresh fallback, no error"
+        );
     }
 }

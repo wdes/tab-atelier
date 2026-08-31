@@ -534,6 +534,14 @@ pub enum Commands {
         args: Vec<String>,
     },
 
+    /// agent-lifecycle (RB4): re-seed a fresh tab from a retired card
+    /// (`spawn --from-card <id|slug> [--resume]`).
+    Spawn {
+        /// Passed straight through to `cli::catalog::spawn_run`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Launch `claude` cleanly: clear the grid, then `exec claude ARGS…`.
     ///
     /// A no-fuss agent launcher — every argument passes through, so
@@ -947,6 +955,7 @@ pub fn dispatch(cli: Cli) -> bool {
         Commands::Dispatch { args } => crate::cli::client::run("dispatch", &args),
         Commands::Task { args } => crate::cli::client::run("task", &args),
         Commands::Catalog { args } => crate::cli::client::run("catalog", &args),
+        Commands::Spawn { args } => crate::cli::client::run("spawn", &args),
         Commands::Peers { all } => {
             let args: Vec<String> = if all { vec!["--all".into()] } else { vec![] };
             crate::cli::client::run("peers", &args)
@@ -1249,6 +1258,7 @@ mod tests {
             (&["tab-atelier-headless", "task", "done", "some-id"], "task done"),
             (&["tab-atelier-headless", "task", "list", "--queue", "q"], "task list"),
             (&["tab-atelier-headless", "catalog", "list"], "catalog list"),
+            (&["tab-atelier-headless", "spawn", "--from-card", "builder", "--resume"], "spawn --from-card"),
         ];
         for (argv, label) in cases {
             let _ = Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("parse failed for {label}: {e}"));
