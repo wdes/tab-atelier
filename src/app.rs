@@ -266,7 +266,10 @@ impl Tab {
             prior_uptime: std::time::Duration::from_secs_f64(ts.uptime_secs.unwrap_or(0.0)),
             active_duration: std::time::Duration::ZERO,
             last_activated: activated.then(std::time::Instant::now),
-            last_used_at: activated.then(crate::unix_millis),
+            // Restore the persisted MRU stamp so Ctrl+P ordering survives a
+            // restart; a fresh tab (no persisted value) falls back to "now" if
+            // it boots active, else stays unstamped until first focus.
+            last_used_at: ts.last_used_at.or_else(|| activated.then(crate::unix_millis)),
             // Boots un-flagged (grey): it only goes blue once its
             // agent WORKS while you're not looking. Restoring a tab
             // isn't "new work", so it must not flash blue on restart.
@@ -1964,6 +1967,7 @@ impl AppState {
                     id: tab.id.to_string(),
                     name: tab.name.to_string(),
                     cwd,
+                    last_used_at: tab.last_used_at,
                     colors_enabled: tab.view.read(cx).colors_enabled(),
                     net_disabled: tab.view.read(cx).net_disabled(),
                     agent_session_id: tab.agent_session_id.as_deref().map(str::to_string),
@@ -2055,13 +2059,14 @@ impl AppState {
             // the snapshot below.
             let rss_bytes = crate::agent_probe::sample_tree(shell_pid).map(|s| s.rss_kb.saturating_mul(1024));
             tab.rss_bytes.set(rss_bytes);
-            // Fold in the ring's viewer-attach timestamp: a viewer (browser /
-            // mobile remote) opening the tab stamped it at connect time, so the
-            // open is recorded reliably even if the view already closed — a
-            // polled viewer_count edge missed those. Monotonic: only advances.
-            let attached = pty_ring.lock().map_or(0, |r| r.viewer_attached_at_millis());
-            if attached > tab.last_used_at.unwrap_or(0) {
-                tab.last_used_at = Some(attached);
+            // Fold in the ring's viewer-focus timestamp: a viewer (browser /
+            // mobile remote) stamps this on an explicit `TAG_FOCUS` frame (the
+            // user focused the tab) — NOT on a bare connect/reconnect — so
+            // mobile focus records "used now" without a background reconnect
+            // floating the tab up the MRU. Monotonic: only advances.
+            let focused = pty_ring.lock().map_or(0, |r| r.viewer_attached_at_millis());
+            if focused > tab.last_used_at.unwrap_or(0) {
+                tab.last_used_at = Some(focused);
             }
             api_tabs.push(api::SnapshotTab {
                 id: tab.id.clone(),
@@ -2994,6 +2999,7 @@ impl AppState {
                     id: tab.id.to_string(),
                     name: tab.name.to_string(),
                     cwd,
+                    last_used_at: tab.last_used_at,
                     colors_enabled: tab.view.read(cx).colors_enabled(),
                     net_disabled: tab.view.read(cx).net_disabled(),
                     agent_session_id: tab.agent_session_id.as_deref().map(str::to_string),

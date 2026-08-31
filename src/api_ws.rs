@@ -75,6 +75,12 @@ const TAG_RESIZE: u8 = 0x04;
 const TAG_ACTIVATE: u8 = 0x07;
 const TAG_RENAME: u8 = 0x08;
 const TAG_CLOSE: u8 = 0x09;
+/// C→S: the viewer FOCUSED this tab (page became visible/focused, or was just
+/// opened while visible). This — not the bare WS connect — is what stamps the
+/// tab as "used now" for the MRU ordering, so a phone that merely reconnects in
+/// the background (screen wake, network blip) no longer floats the tab to the
+/// top. Payload-less; accepted from RO viewers too (focus isn't a mutation).
+const TAG_FOCUS: u8 = 0x0B;
 /// Same semantics as [`TAG_OUT`] but the payload is gzip-compressed.
 /// The client inflates, then advances its ring offset by the
 /// *decompressed* length (so reconnect `since=` stays correct). Used
@@ -751,10 +757,11 @@ async fn run_pump(
         };
         (r.notifier(), r.viewers_handle(), r.viewer_attached_handle())
     };
-    // Stamp "this tab was viewed now" the instant the WS connects, so the
-    // daemon's MRU ordering records the open even if the view closes before
-    // the next 2 s snapshot tick (a polled viewer_count edge would miss it).
-    attached_at.store(crate::unix_millis(), std::sync::atomic::Ordering::Relaxed);
+    // NB: the bare WS connect deliberately does NOT stamp the MRU timestamp
+    // anymore — a phone reconnecting in the background (screen wake, network
+    // blip) would otherwise keep floating the tab to the top of the "last
+    // used" order. The stamp is driven by an explicit `TAG_FOCUS` frame the
+    // client sends when the user actually focuses the tab (see the pump loop).
     // Count this connection as a viewer for its whole lifetime. The
     // guard's Drop decrements on every exit path (clean close, error,
     // task cancel), so a crashed viewer can't leak a phantom count.
@@ -833,7 +840,14 @@ async fn run_pump(
                 let Some(Ok(msg)) = msg else { return; };
                 match msg {
                     Message::Binary(b) => {
-                        if let Err(close) = handle_inbound(&b, authz, read_only_process, &state, &uuid, &mut ime_dedup) {
+                        // Focus is metadata, not a tab mutation: handle it here,
+                        // ahead of the RO/mutation gate, so an RO viewer focusing
+                        // the tab stamps the MRU without being disconnected.
+                        if b.first() == Some(&TAG_FOCUS) {
+                            attached_at.store(crate::unix_millis(), std::sync::atomic::Ordering::Relaxed);
+                        } else if let Err(close) =
+                            handle_inbound(&b, authz, read_only_process, &state, &uuid, &mut ime_dedup)
+                        {
                             let _ = sink.send(Message::Close(Some(close))).await;
                             return;
                         }
