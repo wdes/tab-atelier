@@ -31,6 +31,9 @@ enum Cmd {
     Report,
     /// Where the bytes go: breakdown by record/block/attachment kind, with samples.
     Space,
+    /// Post-compaction reality: bytes/blocks AFTER the last `compact_boundary`
+    /// (what actually feeds the API) vs the pre-boundary scrollback.
+    Boundary,
     /// Per-preset before/after for one tab.
     Tab {
         /// Tab name (as shown in the tab bar).
@@ -513,9 +516,139 @@ fn print_table(title: &str, map: &HashMap<String, u64>, total: u64) {
     }
 }
 
+/// True for the `system`/`compact_boundary` record Claude Code writes when it
+/// summarizes — everything before it is scrollback, not sent to the API.
+fn is_boundary(v: &serde_json::Value) -> bool {
+    v.get("type").and_then(|t| t.as_str()) == Some("system")
+        && v.get("subtype").and_then(|t| t.as_str()) == Some("compact_boundary")
+}
+
+/// Post-compaction reality: for each tab, how much lives AFTER the last
+/// `compact_boundary` (what feeds the API) vs before it (scrollback only).
+fn boundaries() {
+    let tabs = live_tabs();
+    let n = tabs.len();
+    let (mut total, mut post_total, mut pre_total) = (0u64, 0u64, 0u64);
+    let mut with_b = 0u32;
+    let mut post_blocks: HashMap<String, u64> = HashMap::new();
+    // (post_bytes, name, has_boundary, total, pre_tokens, post_tokens)
+    let mut rows: Vec<(u64, String, bool, u64, i64, i64)> = Vec::new();
+
+    for (i, (name, path)) in tabs.iter().enumerate() {
+        eprint!("\r  scanning [{}/{n}]   ", i + 1);
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let records = tc::parse(&text);
+
+        // Last boundary index + its token metadata.
+        let mut last_b: Option<usize> = None;
+        let (mut pre_tok, mut post_tok) = (-1i64, -1i64);
+        for (idx, r) in records.iter().enumerate() {
+            if let Some(v) = &r.value
+                && is_boundary(v)
+            {
+                last_b = Some(idx);
+                let m = v.get("compactMetadata");
+                pre_tok = m
+                    .and_then(|m| m.get("preTokens"))
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(-1);
+                post_tok = m
+                    .and_then(|m| m.get("postTokens"))
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(-1);
+            }
+        }
+        let file_bytes: u64 = records.iter().map(|r| r.raw.len() as u64 + 1).sum();
+        let cut = last_b.map_or(0, |b| b); // records[cut..] is post-boundary
+        let post_bytes: u64 = records[cut..].iter().map(|r| r.raw.len() as u64 + 1).sum();
+        total += file_bytes;
+        post_total += post_bytes;
+        pre_total += file_bytes - post_bytes;
+        if last_b.is_some() {
+            with_b += 1;
+        }
+
+        // Post-boundary content-block breakdown (what the API-relevant region holds).
+        for r in &records[cut..] {
+            let Some(v) = &r.value else { continue };
+            if let Some(tur) = v.get("toolUseResult") {
+                *post_blocks
+                    .entry("toolUseResult (metadata, not sent)".into())
+                    .or_insert(0) += serde_json::to_string(tur).map_or(0, |s| s.len()) as u64;
+            }
+            if let Some(blocks) = v
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_array())
+            {
+                for b in blocks {
+                    let bt = b.get("type").and_then(|t| t.as_str()).unwrap_or("?");
+                    *post_blocks.entry(bt.to_string()).or_insert(0) +=
+                        serde_json::to_string(b).map_or(0, |s| s.len()) as u64;
+                }
+            }
+        }
+        rows.push((
+            post_bytes,
+            name.clone(),
+            last_b.is_some(),
+            file_bytes,
+            pre_tok,
+            post_tok,
+        ));
+    }
+    eprintln!("\r{:<40}", "");
+
+    println!("Post-compaction anatomy over {n} live tabs.\n");
+    println!("  tabs WITH a compact_boundary: {with_b} / {n}   (the rest replay the whole file)");
+    println!("  total on disk:        {}", mb(total));
+    println!(
+        "  PRE-boundary (scrollback, NOT sent):  {}  ({:.0}%)",
+        mb(pre_total),
+        100.0 * pre_total as f64 / total as f64
+    );
+    println!(
+        "  POST-boundary (feeds the API):        {}  ({:.0}%)",
+        mb(post_total),
+        100.0 * post_total as f64 / total as f64
+    );
+
+    print_table("\npost-boundary bytes by content-block", &post_blocks, post_total);
+
+    rows.sort_by_key(|r| std::cmp::Reverse(r.0));
+    println!("\n── tabs by POST-boundary size (what a resume actually replays) ──");
+    println!(
+        "  {:<20}{:>9}{:>9}  {:<9} compaction",
+        "tab", "total", "post", "boundary?"
+    );
+    for (post, name, has, tot, pretok, posttok) in rows.iter().take(14) {
+        let ratio = if *pretok > 0 && *posttok >= 0 {
+            format!("{}→{} tok", human_k(*pretok), human_k(*posttok))
+        } else {
+            String::new()
+        };
+        println!(
+            "  {name:<20}{:>9}{:>9}  {:<9}{ratio}",
+            mb(*tot),
+            mb(*post),
+            if *has { "yes" } else { "NO (full)" }
+        );
+    }
+}
+
+fn human_k(t: i64) -> String {
+    if t >= 1000 {
+        format!("{:.0}K", t as f64 / 1000.0)
+    } else {
+        t.to_string()
+    }
+}
+
 fn main() {
     match Cli::parse().cmd {
         Some(Cmd::Space) => anatomy(),
+        Some(Cmd::Boundary) => boundaries(),
         Some(Cmd::Tab { name }) => one_tab(&name, false),
         Some(Cmd::Examples { name }) => one_tab(&name, true),
         Some(Cmd::Report) | None => report(),
