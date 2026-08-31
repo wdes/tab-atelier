@@ -6268,4 +6268,66 @@ mod tests {
             "the owner completes → 200"
         );
     }
+
+    // task #11 S3 acceptance #5 (capacity, over the API): a `--to builder` task is
+    // refused (204) to a mismatched role and granted (200) to a matching one —
+    // both the body `role` override AND the role read off the caller's CARD
+    // (assignment). Ownership (claimed_by = tab-id) is untouched by the role.
+    #[test]
+    fn task_capacity_to_gates_the_claim_by_role_via_api() {
+        let queue = crate::default_tab_id();
+        let _cleanup = QueueCleanup(crate::cli::task::queue_path(&queue));
+        let (port, state, token) = spawn_server();
+
+        // Seed a tab whose CARD assignment role is `builder` — the daemon resolves
+        // a claimer's role off its card when no `role` override is sent.
+        {
+            let mut g = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut tab = test_snapshot_tab("tab-bld", "builder-tab");
+            tab.assignment = Some("build/builder".into());
+            g.tabs.push(tab);
+        }
+
+        let post = |path: &str, body: &str| {
+            format!(
+                "POST /{path}?token={token} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        };
+
+        // push a builder-only task.
+        assert_eq!(
+            status_code(&request(
+                port,
+                &post(
+                    &format!("task/{queue}/push"),
+                    r#"{"payload":"build-it","to":"builder"}"#
+                )
+            )),
+            201,
+            "push --to builder → 201"
+        );
+
+        // A reviewer (role override) can't claim it → 204, and it stays queued.
+        assert_eq!(
+            status_code(&request(
+                port,
+                &post(
+                    &format!("task/{queue}/claim"),
+                    r#"{"claimed_by":"tab-rev","role":"reviewer"}"#
+                )
+            )),
+            204,
+            "a mismatched role is refused → 204"
+        );
+
+        // The builder tab claims with NO role override → the daemon reads `builder`
+        // off its card assignment and the gate opens → 200, ownership = its tab-id.
+        let won = request(
+            port,
+            &post(&format!("task/{queue}/claim"), r#"{"claimed_by":"tab-bld"}"#),
+        );
+        assert_eq!(status_code(&won), 200, "card-derived builder role claims → 200\n{won}");
+        assert!(won.contains("build-it"), "the claimer receives the payload");
+    }
 }
