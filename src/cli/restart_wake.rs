@@ -120,6 +120,58 @@ where
     }
 }
 
+/// The daemon-startup restart-wake, SHARED by both editions (headless + gui) so
+/// they can't drift — the gui daemon had silently skipped the emission before.
+///
+/// Gates on `read_only` (skip → `None`), snapshots the orchestrator roster from
+/// `tabs`, and emits best-effort via the injected `note`/`swamp` seams. Returns
+/// the [`WakeReport`] (or `None` when skipped). Both `src/headless.rs::run` and
+/// `src/app/mod.rs::run` call THIS — the single wiring the tests exercise.
+pub fn emit_startup_wake<'a, N, S>(
+    read_only: bool,
+    tabs: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
+    build: &str,
+    now: u64,
+    note: N,
+    swamp: S,
+) -> Option<WakeReport>
+where
+    N: FnOnce(&str, &str, &str),
+    S: FnMut(&str, &str) -> std::io::Result<()>,
+{
+    if read_only {
+        return None; // advertises "changes nothing" — no emission (RA1b acceptance d)
+    }
+    let roster = orchestrator_roster(tabs);
+    Some(emit_restart_wake(build, now, &roster, note, swamp))
+}
+
+/// The REAL note seam (durable pull fallback) — one line so both editions share it.
+pub fn real_note(topic: &str, from: &str, msg: &str) {
+    crate::cli::team::note_best_effort(Some(topic.to_string()), Some(from.to_string()), msg);
+}
+
+/// The REAL swamp-wake push seam: enqueue a non-intrusive `Status` marker toward an
+/// orchestrator, deduped per build. One definition so headless + gui can't drift.
+///
+/// # Errors
+/// Propagates the append I/O error (the caller counts it, best-effort).
+pub fn real_swamp_push(now: u64, build: &str, orch: &str, msg: &str) -> std::io::Result<()> {
+    let entry = crate::cli::aligator::SwampEntry {
+        ts: now / 1000,
+        tab: orch.to_string(),
+        input: msg.to_string(),
+        // A non-intrusive marker (not auto-submitted); the orchestrator's loop
+        // picks it up. ponytail: a true-submit nudge is a tuning knob.
+        submit: false,
+        from: Some("daemon".to_string()),
+        attempts: 0,
+        priority: crate::cli::aligator::Priority::Status,
+        dedup_key: Some(format!("restart-wake-{build}")),
+    };
+    crate::cli::aligator::append_swamp_line(&crate::cli::aligator::swamp_path(), &entry)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,5 +301,76 @@ mod tests {
             ],
             "each orchestrator gets the exact pinned wake marker"
         );
+    }
+
+    // ----- RA1b: the SHARED startup wiring both editions (headless + gui) run ---
+
+    // RA1b acceptance (d): read-only → the startup wake is SKIPPED entirely (no
+    // roster snapshot, no emission). The gate both daemon editions share.
+    #[test]
+    fn ra1b_read_only_skips_the_startup_wake() {
+        let tabs = [("t-orch", Some("build/orchestrator"))];
+        let mut swamp_calls = 0usize;
+        let out = emit_startup_wake(
+            true, // read-only
+            tabs.iter().map(|(i, a)| (*i, *a)),
+            "b1",
+            42,
+            |_t, _f, _m| panic!("read-only must not post a note"),
+            |_orch, _msg| {
+                swamp_calls += 1;
+                Ok(())
+            },
+        );
+        assert!(out.is_none(), "read-only → no emission (None)");
+        assert_eq!(swamp_calls, 0, "no swamp push in read-only");
+    }
+
+    // RA1b acceptance (a): the SHARED path (the one the GUI now calls) DOES emit —
+    // roster filtered to orchestrators, note posted, swamp pushed. This is the
+    // GUI-path coverage the headless-only RA1 tests missed (lesson #13).
+    #[test]
+    fn ra1b_startup_wake_emits_via_the_shared_path() {
+        let tabs = [
+            ("t-orch", Some("build/orchestrator")),
+            ("t-bld", Some("build/builder")), // filtered out
+            ("t-mgr", Some("meta/manager")),
+        ];
+        let note = RefCell::new(None);
+        let pushed = RefCell::new(Vec::<String>::new());
+        let out = emit_startup_wake(
+            false,
+            tabs.iter().map(|(i, a)| (*i, *a)),
+            "b1",
+            7,
+            |topic, _f, msg| *note.borrow_mut() = Some((topic.to_string(), msg.to_string())),
+            |orch, _msg| {
+                pushed.borrow_mut().push(orch.to_string());
+                Ok(())
+            },
+        )
+        .expect("not read-only → Some(report)");
+        assert_eq!(out.pushed, 2, "both orchestrators woken (builder filtered out)");
+        assert_eq!(*pushed.borrow(), vec!["t-orch", "t-mgr"], "only orchestrators pushed");
+        assert_eq!(note.borrow().as_ref().map(|(t, _)| t.as_str()), Some("ops"), "ops note posted");
+    }
+
+    // RA1b acceptance (c): a failing emission on the shared path NEVER propagates —
+    // the report counts the failure and startup continues (no panic/block).
+    #[test]
+    fn ra1b_shared_path_failure_never_blocks_startup() {
+        let tabs = [("t-orch", Some("meta/manager"))];
+        let out = emit_startup_wake(
+            false,
+            tabs.iter().map(|(i, a)| (*i, *a)),
+            "b1",
+            7,
+            |_t, _f, _m| {},
+            |_orch, _msg| Err(std::io::Error::other("swamp write failed")),
+        )
+        .expect("emission attempted");
+        assert_eq!(out.failed, 1, "the failure is counted…");
+        assert_eq!(out.pushed, 0, "…not delivered");
+        assert!(out.note_posted, "…and startup continues (returned, no panic)");
     }
 }

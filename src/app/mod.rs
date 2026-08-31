@@ -1482,6 +1482,29 @@ impl AppState {
             api_tls_client_ca,
         );
 
+        // RA1b — restart-wake on the GUI daemon (the binary that actually runs in
+        // prod, and was silently skipping RA1). SHARED wiring with the headless
+        // daemon via `emit_startup_wake` so they can't drift: SEPARATE channel from
+        // self_announce (agentKind untouched), BEST-EFFORT / non-blocking, skipped
+        // in read-only. Tested on the shared path (ra1b_* tests).
+        {
+            let now = crate::unix_millis();
+            let build = env!("BUILD_HASH");
+            if let Some(report) = crate::cli::restart_wake::emit_startup_wake(
+                api_read_only,
+                tabs.iter().map(|t| (&*t.id, t.assignment.as_deref())),
+                build,
+                now,
+                crate::cli::restart_wake::real_note,
+                |orch, msg| crate::cli::restart_wake::real_swamp_push(now, build, orch, msg),
+            ) {
+                log::info!(
+                    "RA1 restart-wake (gui): build={build} pushed={} failed={}",
+                    report.pushed, report.failed
+                );
+            }
+        }
+
         #[cfg(feature = "energy")]
         let power_pids: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
         #[cfg(feature = "energy")]
