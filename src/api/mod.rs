@@ -2078,6 +2078,10 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
         ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/rehome") => {
             handlers::cards::rehome(stream, state, p, &body_bytes);
         }
+        // RB-wire: the LIVE retire write path — archive the card + de-register + close.
+        ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/retire") => {
+            handlers::catalog::retire(stream, state, &body_bytes, p);
+        }
         // The generic agent-card set-* verbs (specialty/orchestrator/objective/
         // current-task/conventions/rounds-active), verb resolved by card_route_verb.
         ("POST", p) if p.starts_with("/tabs/by-id/") && card_route_verb(p).is_some() => {
@@ -6432,5 +6436,91 @@ mod tests {
         let dash = request(port, &get("dashboard/state"));
         assert_eq!(status_code(&dash), 200, "dashboard/state → 200");
         assert!(dash.contains(r#""retired""#), "dashboard exposes the retired section (separate source)");
+    }
+
+    /// Removes the given ids' entries from the REAL catalog.jsonl on drop (the
+    /// RB-wire live test writes there; disposable UUIDs never collide with real
+    /// cards, so filtering them out preserves any real data).
+    struct CatalogCleanup(Vec<String>);
+    impl Drop for CatalogCleanup {
+        fn drop(&mut self) {
+            let path = crate::cli::catalog::catalog_path();
+            let Ok(body) = std::fs::read_to_string(&path) else { return };
+            let kept: Vec<crate::cli::catalog::CatalogCard> = crate::cli::catalog::parse_catalog(&body)
+                .into_iter()
+                .filter(|c| !self.0.contains(&c.id))
+                .collect();
+            if kept.is_empty() {
+                let _ = std::fs::remove_file(&path);
+            } else {
+                let out: String = kept.iter().map(crate::cli::catalog::encode_catalog_line).collect();
+                let _ = std::fs::write(&path, out);
+            }
+        }
+    }
+
+    // RB-wire: the LIVE retire WRITE path (built≠wired gap #3) — a REAL integration
+    // test (NOT a mock): POST /retire on a DISPOSABLE tab → the card is ARCHIVED to
+    // the REAL catalog.jsonl (verified by read-back) AND the close is queued
+    // (de-register effected). Fail-closed gate 3a (no safe-to-close ACK → no
+    // archive, no close). Reuses the RB3 gates on the live path.
+    #[test]
+    fn rbwire_live_retire_archives_for_real_and_triggers_close() {
+        let (port, state, token) = spawn_server();
+        let post = |path: &str, body: &str| {
+            format!(
+                "POST /{path}?token={token} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        };
+
+        // A disposable tab (created on purpose, not a real agent) AT safe-to-close.
+        let ready = crate::default_tab_id();
+        let mut tab = test_snapshot_tab(&ready, "disposable-ready");
+        tab.rehome_status = Some("safe-to-close".into());
+        tab.agent_session_id = Some("sess-disposable".into());
+        tab.assignment = Some("build/builder".into());
+        // A second disposable tab NOT yet safe-to-close (gate 3a should refuse it).
+        let notready = crate::default_tab_id();
+        let mut tab2 = test_snapshot_tab(&notready, "disposable-notready");
+        tab2.rehome_status = Some("handoff-written".into());
+        tab2.assignment = Some("build/builder".into());
+        {
+            let mut g = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            g.tabs.push(tab);
+            g.tabs.push(tab2);
+        }
+        let _cleanup = CatalogCleanup(vec![ready.clone(), notready.clone()]);
+
+        // (3a fail-closed) the not-ready tab → 409, NOT archived, NOT closed.
+        let refused = request(port, &post(&format!("tabs/by-id/{notready}/retire"), "{}"));
+        assert_eq!(status_code(&refused), 409, "no safe-to-close ACK → 409 RETIRE INCOMPLET\n{refused}");
+        assert!(
+            crate::cli::catalog::read_back(&crate::cli::catalog::catalog_path(), &notready).is_none(),
+            "a refused retire archives NOTHING"
+        );
+
+        // The ready tab → 200, ARCHIVED for real, close queued.
+        let done = request(
+            port,
+            &post(&format!("tabs/by-id/{ready}/retire"), r#"{"after_action":"shipped, handed off"}"#),
+        );
+        assert_eq!(status_code(&done), 200, "safe-to-close + archive verified → 200\n{done}");
+        // The card is REALLY in catalog.jsonl (read-back the real file, not a mock).
+        let archived = crate::cli::catalog::read_back(&crate::cli::catalog::catalog_path(), &ready)
+            .expect("the card was archived to the REAL catalog.jsonl");
+        assert_eq!(archived.slug, "builder", "the archived card carries the derived slug");
+        assert_eq!(archived.session_id.as_deref(), Some("sess-disposable"), "session archived");
+        assert_eq!(archived.last_mission.as_deref(), Some("shipped, handed off"), "after-action archived");
+        // De-register EFFECTED: the tab's close is queued (the owner loop kills it).
+        {
+            let g = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let ready_idx = g.tabs.iter().position(|t| t.id.as_ref() == ready.as_str());
+            let notready_idx = g.tabs.iter().position(|t| t.id.as_ref() == notready.as_str());
+            let closes = g.pending_closes.clone();
+            drop(g);
+            assert!(ready_idx.is_some_and(|i| closes.contains(&i)), "the retire queued the tab's close");
+            assert!(notready_idx.is_some_and(|i| !closes.contains(&i)), "the refused tab is kept (not closed)");
+        }
     }
 }

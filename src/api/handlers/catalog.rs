@@ -2,11 +2,13 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `catalog` route handler (RB2): the retired-agent read-model.
+//! `catalog` route handlers: the retired-agent read-model (RB2) + the LIVE retire
+//! write path (RB-wire).
 
 use std::io::Write;
+use std::sync::{Arc, Mutex};
 
-use super::super::respond_json;
+use super::super::{TabSnapshot, error_json, parse_tab_key, resolve_tab_idx, respond_json};
 
 /// `GET /catalog/list` — the RETIRED read-model (RB2): every archived card,
 /// folded latest-per-slug + usageCount aggregated (RC1). READ-ONLY — a retired
@@ -16,4 +18,75 @@ pub(in crate::api) fn list<S: Write>(stream: &mut S) {
     let retired = crate::cli::catalog::read_retired();
     let body = serde_json::to_string(&serde_json::json!({ "retired": retired })).unwrap_or_default();
     respond_json(stream, 200, &body);
+}
+
+/// `POST /tabs/by-id/{id}/retire` — the LIVE retire WRITE path (RB-wire): the trigger
+/// that finally calls `perform_retire` with REAL seams, closing the built≠wired gap.
+///
+/// Gated fail-closed (RB3): (3a) the tab must be at `rehome_status == safe-to-close`,
+/// and (3b) the card is ARCHIVED to catalog.jsonl then RE-READ (read-back) before any
+/// close. On a complete archive the tab is de-registered (`deregister_atomic`, a
+/// no-op if it wasn't persisted yet) and its close is queued (the owner loop kills
+/// the PTY). Otherwise 409 `RETIRE INCOMPLET` and the tab is KEPT. Body: optional
+/// `{after_action}` (the RB3 lastMission).
+pub(in crate::api) fn retire<S: Write>(stream: &mut S, state: &Arc<Mutex<TabSnapshot>>, p: &[u8], path: &str) {
+    use crate::cli::catalog::{
+        CatalogCard, RetireOutcome, append_catalog_line, catalog_path, deregister_atomic, perform_retire, read_back,
+    };
+
+    let Some((key_raw, is_uuid)) = parse_tab_key(path, "/retire") else {
+        error_json(stream, 404, "invalid tab key");
+        return;
+    };
+    let after_action = serde_json::from_slice::<serde_json::Value>(p)
+        .ok()
+        .and_then(|v| v.get("after_action").and_then(|a| a.as_str()).map(str::to_string));
+    let now = crate::unix_millis();
+
+    let mut guard = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(idx) = resolve_tab_idx(&guard, key_raw, is_uuid) else {
+        drop(guard);
+        error_json(stream, 404, "tab not found");
+        return;
+    };
+    // Snapshot the gate inputs + build the card, then the tab borrow ends.
+    let tab = &guard.tabs[idx];
+    let ack = tab.rehome_status.as_deref() == Some("safe-to-close");
+    let had_session = tab.agent_session_id.is_some();
+    let id = tab.id.to_string();
+    let card = CatalogCard::from_snapshot(tab, after_action, now);
+
+    let cat = catalog_path();
+    let config_base = crate::platform::config_base_dir();
+    let outcome = perform_retire(
+        &card,
+        ack,
+        had_session,
+        |c| append_catalog_line(&cat, c), // REAL archive to catalog.jsonl
+        |rid| read_back(&cat, rid),       // REAL read-back (proof, not "I wrote it")
+        || match deregister_atomic(&config_base, &id) {
+            // Durable removal from tabs.json; a snapshot-only tab isn't persisted
+            // yet → NotFound is a no-op (nothing to de-register), not a failure.
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        },
+        || Ok(()), // the irreversible PTY close is queued below (owner loop)
+    );
+
+    match outcome {
+        RetireOutcome::Retired => {
+            guard.pending_closes.push(idx); // the owner loop kills the PTY + persists
+            drop(guard);
+            respond_json(stream, 200, &format!(r#"{{"retired":"{id}"}}"#));
+        }
+        RetireOutcome::Incomplete(flag) => {
+            drop(guard);
+            error_json(stream, 409, flag); // RETIRE INCOMPLET — tab kept
+        }
+        RetireOutcome::CloseFailed => {
+            drop(guard);
+            error_json(stream, 500, "retire: de-register failed — tab kept");
+        }
+    }
 }
