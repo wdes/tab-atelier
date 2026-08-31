@@ -941,6 +941,7 @@
     //   tag 0x02 out      S→C  raw PTY bytes
     //   tag 0x03 meta     S→C  JSON state delta
     //   tag 0x04 resize   C→S  JSON {cols, rows}
+    //   tag 0x0b focus    C→S  payload-less; user focused the tab (MRU stamp)
     //
     // Reconnect: the client tracks `ringOffset` (= total bytes
     // received since session start) and on disconnect reconnects with
@@ -1236,6 +1237,22 @@
       return out;
     }
 
+    // Tell the server the user FOCUSED this tab (tag 0x0b, payload-less), which
+    // is what updates the "last used" / MRU ordering. Sent only when we're
+    // actually looking at the tab (page visible), so a background reconnect
+    // (phone screen wakes, network blip) does NOT bump the tab up the order.
+    function sendFocus() {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      if (document.visibilityState === "hidden") return;
+      try { ws.send(encodeFrame(0x0b, new Uint8Array(0))); } catch { /* swallow */ }
+    }
+    // Register once (these definitions run a single time per page load; only
+    // connect() re-runs on reconnect). A tab shown or window refocused = focus.
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") sendFocus();
+    });
+    window.addEventListener("focus", sendFocus);
+
     function connect() {
       // Clear any pending reconnect timer — we're connecting now.
       if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
@@ -1254,6 +1271,9 @@
         reconnectAttempt = 0;
         status.textContent = `${TAB_NAME} · connected`;
         document.body.classList.remove("ws-down");
+        // Opening the tab while looking at it counts as focus; a background
+        // reconnect (page hidden) is suppressed inside sendFocus().
+        sendFocus();
       };
       ws.onmessage = (ev) => {
         if (!(ev.data instanceof ArrayBuffer)) return; // ignore text frames
@@ -1276,7 +1296,7 @@
             console.warn("bad meta frame:", e);
           }
         }
-        // 0x01 in / 0x04 resize / 0x07-0x09 are C→S only — ignore.
+        // 0x01 in / 0x04 resize / 0x07-0x09 / 0x0b focus are C→S only — ignore.
       };
       ws.onerror = () => {
         // Defer the user-visible "offline" until onclose so we don't

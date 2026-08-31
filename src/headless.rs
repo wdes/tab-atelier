@@ -915,6 +915,10 @@ pub fn run() -> std::io::Result<()> {
                 t.limits = ts.limits.clone();
                 t.pinned_cols = ts.pinned_cols;
                 t.pinned_rows = ts.pinned_rows;
+                // Restore the persisted MRU stamp so Ctrl+P / mobile ordering
+                // survives a daemon restart (the active tab re-stamps to now
+                // via activate() below, which is correct — it IS in use).
+                t.last_used_at = ts.last_used_at;
                 #[cfg(target_os = "linux")]
                 crate::cgroup::apply(
                     &t.id,
@@ -1350,14 +1354,14 @@ fn refresh_snapshot(
             tab.led_last_ring = ring_len;
             tab.last_output_at = Some(Instant::now());
         }
-        // Fold in the ring's viewer-attach timestamp: a viewer (browser
-        // share-link / mobile remote) opening the tab stamped it at connect
-        // time, so this records the open reliably even if the view already
-        // closed — a polled viewer_count edge would have missed it. Monotonic:
-        // only advances last_used_at, never rewinds.
-        let attached = tab.viewer_attached_at.load(std::sync::atomic::Ordering::Relaxed);
-        if attached > tab.last_used_at.unwrap_or(0) {
-            tab.last_used_at = Some(attached);
+        // Fold in the ring's viewer-focus timestamp: a viewer (browser
+        // share-link / mobile remote) stamps this when the user FOCUSES the tab
+        // (an explicit `TAG_FOCUS` frame — not a bare connect/reconnect), so
+        // mobile focus reliably records "used now" even if the view closes
+        // before the next tick. Monotonic: only advances, never rewinds.
+        let focused = tab.viewer_attached_at.load(std::sync::atomic::Ordering::Relaxed);
+        if focused > tab.last_used_at.unwrap_or(0) {
+            tab.last_used_at = Some(focused);
         }
         let agent_led = {
             #[cfg(feature = "catbus")]
@@ -1614,6 +1618,7 @@ fn persist(
             id: tab.id.to_string(),
             name: tab.name.to_string(),
             cwd: tab.last_known_cwd_string.as_deref().map(str::to_string),
+            last_used_at: tab.last_used_at,
             colors_enabled: tab.colors_enabled,
             agent_session_id: tab.agent_session_id.as_deref().map(str::to_string),
             agent_kind: tab.agent_kind.as_deref().map(str::to_string),
