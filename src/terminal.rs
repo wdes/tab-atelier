@@ -505,6 +505,32 @@ fn alt_scroll_bytes(lines: i32) -> Vec<u8> {
     out
 }
 
+/// Encode wheel notches as mouse-wheel button events for an app that opted
+/// into mouse reporting (Claude Code's fullscreen mode, vim/tmux with mouse,
+/// …). Wheel up = button 4 (code 64), wheel down = button 5 (code 65); one
+/// press event per line (the wheel has no release). SGR (1006) form when the
+/// app requested it, else the legacy X10 form. `col`/`row` are 0-based cell
+/// coordinates; both encodings want 1-based.
+///
+/// Positive `lines` ⇒ older content ⇒ wheel up, matching [`alt_scroll_bytes`].
+fn mouse_wheel_bytes(lines: i32, col: usize, row: usize, sgr: bool) -> Vec<u8> {
+    let code: u32 = if lines > 0 { 64 } else { 65 };
+    let n = lines.unsigned_abs() as usize;
+    // 1-based. The legacy form packs each coordinate into `32 + value` in one
+    // byte, so it can only address 223 cells — clamp to keep the byte valid.
+    let c = (col + 1).clamp(1, 223);
+    let r = (row + 1).clamp(1, 223);
+    let mut out = Vec::new();
+    for _ in 0..n {
+        if sgr {
+            out.extend_from_slice(format!("\x1b[<{code};{c};{r}M").as_bytes());
+        } else {
+            out.extend_from_slice(&[0x1b, b'[', b'M', 32 + code as u8, 32 + c as u8, 32 + r as u8]);
+        }
+    }
+    out
+}
+
 impl TerminalView {
     /// Bare-spawn helper, used by the unit tests. Production spawn
     /// sites all go through `new_with_colors_and_env` because they
@@ -1186,6 +1212,25 @@ impl TerminalView {
         term.grid_mut().scroll_display(Scroll::Bottom);
     }
 
+    /// Hard-wipe the on-screen render: clear the visible grid AND the
+    /// scrollback, home the cursor, and drop the frame cache so the next
+    /// paint rebuilds from an empty grid. Fed straight to the parser (not the
+    /// PTY), so it takes effect immediately — used right before an agent is
+    /// resumed so its fresh UI paints onto a clean screen instead of over the
+    /// restored previous-session scrollback (which otherwise lingers above /
+    /// through the resumed frame until it happens to overwrite those rows).
+    pub fn wipe_output(&self) {
+        {
+            let mut parser: vte::ansi::Processor = vte::ansi::Processor::new();
+            let mut term = self.term.lock();
+            // ED 3 (scrollback) + cursor home + ED 2 (screen) — same sequence
+            // as `crate::AGENT_LAUNCH_CLEAR`, applied locally and immediately.
+            parser.advance(&mut *term, b"\x1b[3J\x1b[H\x1b[2J");
+            term.grid_mut().scroll_display(Scroll::Bottom);
+        }
+        self.release_render_caches();
+    }
+
     /// Turn whatever's on the clipboard (text or image) into a string
     /// the shell can usefully receive. Image entries are written to a
     /// fresh file under `$TMPDIR/tab-atelier-paste-…` and the path is
@@ -1753,9 +1798,28 @@ impl Render for TerminalView {
                         // the guard drops — TermMode is bitflags-derived
                         // and so is Copy.
                         let mode = *this.term.lock().mode();
-                        let alt_scroll =
-                            mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL) && !ev.modifiers.shift;
-                        if alt_scroll {
+                        // Shift is the escape hatch: always reach the terminal's
+                        // OWN scrollback, even while a mouse-aware TUI is up.
+                        if ev.modifiers.shift {
+                            this.scroll(lines);
+                        } else if mode.contains(TermMode::MOUSE_REPORT_CLICK) {
+                            // The app requested mouse reporting → forward the
+                            // wheel as mouse-wheel button events so it scrolls
+                            // its own view (Claude Code fullscreen, vim, tmux).
+                            let origin = this.content_origin.get();
+                            let (gp, _) = this.pixel_to_grid(ev.position, origin);
+                            let bytes = mouse_wheel_bytes(
+                                lines,
+                                gp.column.0,
+                                gp.line.0.max(0) as usize,
+                                mode.contains(TermMode::SGR_MOUSE),
+                            );
+                            this.send_input(bytes);
+                        } else if mode.contains(TermMode::ALT_SCREEN) {
+                            // Alt-screen (fullscreen TUI) has no local scrollback,
+                            // so a viewport scroll is a no-op — forward as arrow
+                            // keys. Previously gated on ALTERNATE_SCROLL; dropped
+                            // so any fullscreen app (new Claude Code) still scrolls.
                             this.send_input(alt_scroll_bytes(lines));
                         } else {
                             this.scroll(lines);
@@ -3138,6 +3202,26 @@ mod tests {
     use crate::term_export::sgr_color;
     use gpui::TestAppContext;
     use vte::ansi::{Color, NamedColor};
+
+    #[test]
+    fn mouse_wheel_bytes_sgr_and_legacy() {
+        // Wheel up (older content) = button 64; SGR form is 1-based col;row.
+        assert_eq!(mouse_wheel_bytes(1, 4, 9, true), b"\x1b[<64;5;10M".to_vec());
+        // Wheel down = button 65.
+        assert_eq!(mouse_wheel_bytes(-1, 0, 0, true), b"\x1b[<65;1;1M".to_vec());
+        // Multiple notches → one event each.
+        assert_eq!(mouse_wheel_bytes(2, 0, 0, true), b"\x1b[<64;1;1M\x1b[<64;1;1M".to_vec());
+        // Legacy X10: ESC [ M, then 32+code, 32+col, 32+row (all 1-based).
+        assert_eq!(
+            mouse_wheel_bytes(1, 0, 0, false),
+            vec![0x1b, b'[', b'M', 32 + 64, 33, 33]
+        );
+        // Coordinates clamp to the 223-cell ceiling the legacy byte can hold.
+        assert_eq!(
+            mouse_wheel_bytes(-1, 999, 999, false),
+            vec![0x1b, b'[', b'M', 32 + 65, 255, 255]
+        );
+    }
 
     #[test]
     fn first_prompt_cleanup_is_ctrl_l_for_shells_only() {
