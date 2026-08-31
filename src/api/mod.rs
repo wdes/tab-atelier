@@ -2097,11 +2097,15 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
         }
         ("POST", p) if p.starts_with("/task/") && p.ends_with("/claim") => {
             let queue = &p["/task/".len()..p.len() - "/claim".len()];
-            handlers::task::claim(stream, state, queue);
+            handlers::task::claim(stream, state, queue, &body_bytes);
+        }
+        ("POST", p) if p.starts_with("/task/") && p.ends_with("/beat") => {
+            let id = &p["/task/".len()..p.len() - "/beat".len()];
+            handlers::task::beat(stream, state, id, &body_bytes);
         }
         ("POST", p) if p.starts_with("/task/") && p.ends_with("/done") => {
             let id = &p["/task/".len()..p.len() - "/done".len()];
-            handlers::task::done(stream, state, id);
+            handlers::task::done(stream, state, id, &body_bytes);
         }
         (_, "/" | "/tabs") => {
             error_json(stream, 405, "method not allowed");
@@ -6186,6 +6190,82 @@ mod tests {
             status_code(&request(port, &claim)),
             204,
             "a done task never re-appears in a later claim (exactly-once)"
+        );
+    }
+
+    // task #11 S2: the lease/beat/stale-done HTTP surface. Ownership-based (no
+    // wall-clock race): only the current claimer may beat or done; a wrong
+    // claimer is refused (beat 409, done 409 stale). Acceptance #3 (beat renews)
+    // and the stale-409 half of #2, proven end-to-end over the API.
+    #[test]
+    fn task_beat_and_stale_done_enforce_ownership_via_api() {
+        let queue = crate::default_tab_id();
+        let _cleanup = QueueCleanup(crate::cli::task::queue_path(&queue));
+        let (port, _state, token) = spawn_server();
+
+        // A POST with a JSON body, Content-Length set for us.
+        let post = |path: &str, body: &str| {
+            format!(
+                "POST /{path}?token={token} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        };
+
+        // push one task, then claim it as peer-a.
+        assert_eq!(
+            status_code(&request(
+                port,
+                &post(&format!("task/{queue}/push"), r#"{"payload":"work"}"#)
+            )),
+            201,
+            "push → 201"
+        );
+        let claim_a = request(
+            port,
+            &post(&format!("task/{queue}/claim"), r#"{"claimed_by":"peer-a"}"#),
+        );
+        assert_eq!(status_code(&claim_a), 200, "peer-a claims → 200");
+        let id = claim_a
+            .split("\"id\":\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .expect("claim carries the id")
+            .to_string();
+
+        // peer-a renews its lease → 200; a non-owner's beat is refused → 409.
+        assert_eq!(
+            status_code(&request(
+                port,
+                &post(&format!("task/{id}/beat"), r#"{"claimed_by":"peer-a"}"#)
+            )),
+            200,
+            "the owner beats → 200"
+        );
+        assert_eq!(
+            status_code(&request(
+                port,
+                &post(&format!("task/{id}/beat"), r#"{"claimed_by":"peer-b"}"#)
+            )),
+            409,
+            "a non-owner's beat → 409"
+        );
+
+        // A done from the wrong claimer is stale → 409; the owner then completes → 200.
+        assert_eq!(
+            status_code(&request(
+                port,
+                &post(&format!("task/{id}/done"), r#"{"claimed_by":"peer-b"}"#)
+            )),
+            409,
+            "a stale done (wrong claimer) → 409"
+        );
+        assert_eq!(
+            status_code(&request(
+                port,
+                &post(&format!("task/{id}/done"), r#"{"claimed_by":"peer-a"}"#)
+            )),
+            200,
+            "the owner completes → 200"
         );
     }
 }

@@ -49,7 +49,20 @@ pub struct TaskEntry {
     pub priority: u8,
     /// Lifecycle state.
     pub state: TaskState,
+    /// S2 — who currently holds the claim (`None` while `Queued`). `beat`/`done`
+    /// prove ownership against this. Omitted from the JSONL while unclaimed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_by: Option<String>,
+    /// S2 — unix-millis the claim's lease expires at (`None` while `Queued`).
+    /// Past it (no `beat`), the task is reclaimable → orphan recovery. Omitted
+    /// while unclaimed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_until: Option<u64>,
 }
+
+/// Default lease if `--lease` isn't given: ~35 min, generalising the
+/// heartbeat/TTL of `triage-tickets` (H=15 min / TTL=35 min).
+pub const DEFAULT_LEASE_MS: u64 = 35 * 60 * 1000;
 
 /// The directory holding the per-queue files. Honors `TAB_ATELIER_TASKS_DIR`
 /// (a test seam so integration tests isolate onto a tmpdir); production uses
@@ -109,18 +122,34 @@ pub fn encode_task_line(e: &TaskEntry) -> String {
     serde_json::to_string(e).unwrap_or_else(|_| "{}".to_string()) + "\n"
 }
 
-/// The index of the next task to claim.
+/// Is this entry claimable at `now`?
 ///
-/// The first `Queued` entry, ordered by priority DESC then FIFO (oldest `ts`
-/// first, then file order for a stable tie-break). `None` when the queue holds no
-/// claimable task. Pure — the atomic serialization is the caller's (the daemon
-/// lock); this is just the choice.
+/// `Queued`, OR `Claimed` with an EXPIRED (or missing) lease — the S2 orphan
+/// reclamation: a peer that claimed then died (no `beat` within the TTL) has its
+/// task freed for another idle peer. A fresh claim (`lease_until` in the future)
+/// is NOT claimable. Pure.
 #[must_use]
-pub fn select_next_claim(entries: &[TaskEntry]) -> Option<usize> {
+pub fn is_claimable(e: &TaskEntry, now: u64) -> bool {
+    match e.state {
+        TaskState::Queued => true,
+        // A claim with no lease (legacy / never leased) or an expired one is an
+        // orphan → reclaimable. A live lease (`lease_until >= now`) is not.
+        TaskState::Claimed => e.lease_until.is_none_or(|l| l < now),
+        TaskState::Done => false,
+    }
+}
+
+/// The index of the next task to claim at `now`.
+///
+/// The first [`is_claimable`] entry, ordered by priority DESC then FIFO (oldest
+/// `ts` first, then file order for a stable tie-break). `None` when nothing is
+/// claimable. Pure — the atomic serialization is the caller's (the daemon lock).
+#[must_use]
+pub fn select_next_claim(entries: &[TaskEntry], now: u64) -> Option<usize> {
     entries
         .iter()
         .enumerate()
-        .filter(|(_, e)| e.state == TaskState::Queued)
+        .filter(|(_, e)| is_claimable(e, now))
         .min_by(|(ia, a), (ib, b)| {
             b.priority
                 .cmp(&a.priority) // higher priority first
@@ -130,32 +159,92 @@ pub fn select_next_claim(entries: &[TaskEntry]) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
-/// Claim the next task.
+/// Claim the next task for `claimer` at `now` with a `lease_ms` lease.
 ///
-/// Flip the selected `Queued` entry to `Claimed` and return a clone. `None` when
-/// nothing is claimable. Run under the daemon lock, two concurrent claims
-/// serialize → the second sees the first's entry already `Claimed` → exactly one
-/// wins.
+/// Flip the selected claimable entry (queued OR expired-claim = orphan) to
+/// `Claimed`, stamp `claimed_by = claimer` and `lease_until = now + lease_ms`,
+/// and return a clone. `None` when nothing is claimable. Under the daemon lock,
+/// two concurrent claims serialize → exactly one wins.
 #[must_use]
-pub fn claim_next(entries: &mut [TaskEntry]) -> Option<TaskEntry> {
-    let idx = select_next_claim(entries)?;
+pub fn claim_next(entries: &mut [TaskEntry], now: u64, claimer: &str, lease_ms: u64) -> Option<TaskEntry> {
+    let idx = select_next_claim(entries, now)?;
     entries[idx].state = TaskState::Claimed;
+    entries[idx].claimed_by = Some(claimer.to_string());
+    entries[idx].lease_until = Some(now.saturating_add(lease_ms));
     Some(entries[idx].clone())
 }
 
-/// Mark the task `id` `Done`.
+/// The verdict of a `done` attempt (S2, lease-aware).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoneOutcome {
+    /// Flipped a live-lease claim held by the caller → `Done` (200).
+    Completed,
+    /// Already `Done` (a repeat by the same claimer) → idempotent 200.
+    AlreadyDone,
+    /// The caller isn't the current claimer, or its lease expired / the task was
+    /// re-claimed → refuse (409). A late `done` from an orphaned claimer.
+    Stale,
+    /// No such id (the queue never held it / it was compacted) → treated as 200
+    /// idempotent by the caller (nothing to complete, nothing stale to protect).
+    NotFound,
+}
+
+/// Complete task `id` on behalf of `claimer` at `now` (S2, lease-checked).
 ///
-/// Returns `true` if it flipped a not-yet-done task, `false` if the id is unknown
-/// or already done (idempotent — a repeat `done` is a no-op, not an error; S1 has
-/// no lease so no stale-409).
-pub fn mark_done(entries: &mut [TaskEntry], id: &str) -> bool {
-    if let Some(e) = entries.iter_mut().find(|e| e.id == id) {
-        let flipped = e.state != TaskState::Done;
-        e.state = TaskState::Done;
-        flipped
-    } else {
-        false
+/// A `done` is honoured ONLY while the caller still holds a VALID lease:
+/// `claimed_by == claimer` AND `lease_until >= now`. Otherwise it's [`Stale`] —
+/// a late `done` from a claimer whose lease expired (and whose task may have
+/// been re-claimed) can't complete work another peer now owns. An already-`Done`
+/// task by the same claimer is idempotent.
+///
+/// [`Stale`]: DoneOutcome::Stale
+#[must_use]
+pub fn done_task(entries: &mut [TaskEntry], id: &str, claimer: &str, now: u64) -> DoneOutcome {
+    let Some(e) = entries.iter_mut().find(|e| e.id == id) else {
+        return DoneOutcome::NotFound;
+    };
+    match e.state {
+        // Idempotent only for the claimer that actually completed it.
+        TaskState::Done => {
+            if e.claimed_by.as_deref() == Some(claimer) {
+                DoneOutcome::AlreadyDone
+            } else {
+                DoneOutcome::Stale
+            }
+        }
+        TaskState::Claimed => {
+            let owns = e.claimed_by.as_deref() == Some(claimer);
+            let live = e.lease_until.is_some_and(|l| l >= now);
+            if owns && live {
+                e.state = TaskState::Done;
+                DoneOutcome::Completed
+            } else {
+                // Wrong claimer, expired lease, or re-claimed → stale.
+                DoneOutcome::Stale
+            }
+        }
+        // A queued task was never claimed by anyone → a done for it is stale.
+        TaskState::Queued => DoneOutcome::Stale,
     }
+}
+
+/// Renew the lease on task `id` for `claimer` at `now` (S2 heartbeat).
+///
+/// Only the CURRENT claimer (`claimed_by == claimer`) of a still-`Claimed` task
+/// can `beat`; it pushes `lease_until` to `now + lease_ms`, keeping the claim
+/// alive past the TTL so it isn't reclaimed. Returns `true` on success, `false`
+/// if the id is unknown, not claimed, or held by someone else (already
+/// reclaimed). Pure.
+#[must_use]
+pub fn beat_task(entries: &mut [TaskEntry], id: &str, claimer: &str, now: u64, lease_ms: u64) -> bool {
+    if let Some(e) = entries.iter_mut().find(|e| e.id == id)
+        && e.state == TaskState::Claimed
+        && e.claimed_by.as_deref() == Some(claimer)
+    {
+        e.lease_until = Some(now.saturating_add(lease_ms));
+        return true;
+    }
+    false
 }
 
 /// Entries a compaction KEEPS: everything not `Done`. The `Done` entries are
@@ -177,9 +266,14 @@ pub fn compact_tasks(entries: &[TaskEntry]) -> Vec<TaskEntry> {
 /// Returns `(claimed, kept, changed)`: the claimed task (if any), the entries to
 /// persist, and whether anything changed (so the caller can skip a no-op write).
 #[must_use]
-pub fn claim_and_compact(mut entries: Vec<TaskEntry>) -> (Option<TaskEntry>, Vec<TaskEntry>, bool) {
+pub fn claim_and_compact(
+    mut entries: Vec<TaskEntry>,
+    now: u64,
+    claimer: &str,
+    lease_ms: u64,
+) -> (Option<TaskEntry>, Vec<TaskEntry>, bool) {
     let before = entries.len();
-    let claimed = claim_next(&mut entries);
+    let claimed = claim_next(&mut entries, now, claimer, lease_ms);
     let kept = compact_tasks(&entries);
     // A write is needed if we claimed (a state flipped) or pruned any done entry.
     let changed = claimed.is_some() || kept.len() != before;
@@ -214,11 +308,17 @@ pub fn append_task_line(path: &Path, entry: &TaskEntry) -> std::io::Result<()> {
 /// silent DOUBLE-CLAIM. (A claim always sets `changed`, so it always passes the
 /// persist gate.)
 #[must_use]
-pub fn perform_claim<F>(entries: Vec<TaskEntry>, persist: F) -> Option<TaskEntry>
+pub fn perform_claim<F>(
+    entries: Vec<TaskEntry>,
+    now: u64,
+    claimer: &str,
+    lease_ms: u64,
+    persist: F,
+) -> Option<TaskEntry>
 where
     F: FnOnce(&[TaskEntry]) -> std::io::Result<()>,
 {
-    let (claimed, kept, changed) = claim_and_compact(entries);
+    let (claimed, kept, changed) = claim_and_compact(entries, now, claimer, lease_ms);
     if changed && persist(&kept).is_err() {
         // Persist failed → do NOT hand out the task (it stays claimable on disk).
         return None;
@@ -255,21 +355,35 @@ pub fn write_tasks_atomic(path: &Path, entries: &[TaskEntry]) -> std::io::Result
 // discovery + ureq agent aligator/share_link already use.
 // ---------------------------------------------------------------------------
 
-/// `tab-atelier task <push|claim|done> …` — the producer/consumer CLI.
+/// `tab-atelier task <push|claim|beat|done> …` — the producer/consumer CLI.
 #[must_use]
 pub fn run(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
         Some("push") => run_push(&args[1..]),
         Some("claim") => run_claim(&args[1..]),
+        Some("beat") => run_beat(&args[1..]),
         Some("done") => run_done(&args[1..]),
         _ => {
             eprintln!(
                 "usage:\n  tab-atelier task push --queue <q> [--priority N] \"<payload>\"\n  \
-                 tab-atelier task claim --queue <q>\n  tab-atelier task done <task-id>"
+                 tab-atelier task claim --queue <q> [--as <id>] [--lease <secs>]\n  \
+                 tab-atelier task beat <task-id> [--as <id>] [--lease <secs>]\n  \
+                 tab-atelier task done <task-id> [--as <id>]"
             );
             2
         }
     }
+}
+
+/// The caller's claim identity: `--as <id>`, else env `_TAB_ID` (the tab the
+/// daemon injects), else `"anon"`. Ownership of a claim (beat/done) is proven
+/// against this, so a worker beats/completes only its own tasks.
+fn caller_id(args: &[String]) -> String {
+    arg_value(args, "--as")
+        .map(str::to_string)
+        .or_else(|| std::env::var("_TAB_ID").ok())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "anon".to_string())
 }
 
 /// POST to `<api>/task/<path>` with a Bearer + JSON body, returning
@@ -340,8 +454,12 @@ fn run_claim(args: &[String]) -> i32 {
         eprintln!("task claim: --queue <q> required");
         return 2;
     };
-    match post_task(&format!("{queue}/claim"), "") {
-        // 200 → a task; print {id,payload}. 204 → empty queue; print nothing.
+    let mut body = serde_json::json!({ "claimed_by": caller_id(args) });
+    if let Some(secs) = arg_value(args, "--lease").and_then(|s| s.parse::<u64>().ok()) {
+        body["lease_secs"] = secs.into();
+    }
+    match post_task(&format!("{queue}/claim"), &body.to_string()) {
+        // 200 → a task; print {id,payload,lease_until}. 204 → empty; print nothing.
         Ok((200, text)) => {
             println!("{text}");
             0
@@ -358,12 +476,58 @@ fn run_claim(args: &[String]) -> i32 {
     }
 }
 
+/// The `<task-id>` positional shared by beat/done — the first non-flag arg that
+/// isn't the value consumed by `--as`/`--lease`.
+fn task_id_arg(args: &[String]) -> Option<&str> {
+    let mut skip = false;
+    args.iter()
+        .find(|a| {
+            if skip {
+                skip = false;
+                return false;
+            }
+            if a.starts_with("--") {
+                skip = matches!(a.as_str(), "--as" | "--lease");
+                return false;
+            }
+            true
+        })
+        .map(String::as_str)
+}
+
+fn run_beat(args: &[String]) -> i32 {
+    let Some(id) = task_id_arg(args) else {
+        eprintln!("task beat: a <task-id> is required");
+        return 2;
+    };
+    let mut body = serde_json::json!({ "claimed_by": caller_id(args) });
+    if let Some(secs) = arg_value(args, "--lease").and_then(|s| s.parse::<u64>().ok()) {
+        body["lease_secs"] = secs.into();
+    }
+    match post_task(&format!("{id}/beat"), &body.to_string()) {
+        // 200 → renewed (prints {lease_until}). 409 → lease lost / not the owner.
+        Ok((200, text)) => {
+            println!("{text}");
+            0
+        }
+        Ok((code, text)) => {
+            eprintln!("task beat: HTTP {code}: {text}");
+            1
+        }
+        Err(e) => {
+            eprintln!("task beat: {e}");
+            1
+        }
+    }
+}
+
 fn run_done(args: &[String]) -> i32 {
-    let Some(id) = args.iter().find(|a| !a.starts_with("--")) else {
+    let Some(id) = task_id_arg(args) else {
         eprintln!("task done: a <task-id> is required");
         return 2;
     };
-    match post_task(&format!("{id}/done"), "") {
+    let body = serde_json::json!({ "claimed_by": caller_id(args) }).to_string();
+    match post_task(&format!("{id}/done"), &body) {
         Ok((200, _)) => 0,
         Ok((code, text)) => {
             eprintln!("task done: HTTP {code}: {text}");
@@ -380,6 +544,9 @@ fn run_done(args: &[String]) -> i32 {
 mod tests {
     use super::*;
 
+    const NOW: u64 = 1_000_000; // a fixed "now" (unix-millis) for deterministic leases
+    const LEASE: u64 = 35 * 60 * 1000; // 35 min
+
     fn task(id: &str, priority: u8, state: TaskState) -> TaskEntry {
         TaskEntry {
             ts: 0,
@@ -388,6 +555,8 @@ mod tests {
             payload: format!("payload-{id}"),
             priority,
             state,
+            claimed_by: None,
+            lease_until: None,
         }
     }
 
@@ -395,31 +564,113 @@ mod tests {
     // one-task queue → EXACTLY ONE gets it. The daemon serializes concurrent
     // claims (single-writer under the lock), so "concurrent" == "sequential
     // claim_next on the same, mutating vec": the 2nd sees the entry already
-    // Claimed → empty. Never both.
+    // Claimed (live lease) → empty. Never both.
     #[test]
     fn claim_is_exclusive_under_concurrency() {
         let mut q = vec![task("t1", 0, TaskState::Queued)];
-        let a = claim_next(&mut q);
-        let b = claim_next(&mut q); // the serialized second claimer
+        let a = claim_next(&mut q, NOW, "peer-a", LEASE);
+        let b = claim_next(&mut q, NOW, "peer-b", LEASE); // the serialized second claimer
         assert_eq!(a.as_ref().map(|t| t.id.as_str()), Some("t1"), "one claimer wins");
         assert!(b.is_none(), "the other claimer gets nothing — never both");
         assert_eq!(q[0].state, TaskState::Claimed, "the task is claimed exactly once");
+        assert_eq!(
+            q[0].claimed_by.as_deref(),
+            Some("peer-a"),
+            "claimed_by records the winner"
+        );
+        assert_eq!(q[0].lease_until, Some(NOW + LEASE), "the claim stamps a lease");
     }
 
     // Acceptance #4: a `done` task NEVER re-appears in a later claim.
     #[test]
     fn done_task_never_reappears() {
         let mut q = vec![task("t1", 0, TaskState::Queued)];
-        let claimed = claim_next(&mut q).expect("claimed");
-        assert!(mark_done(&mut q, &claimed.id), "done flips claimed → done");
+        let claimed = claim_next(&mut q, NOW, "peer-a", LEASE).expect("claimed");
+        assert_eq!(
+            done_task(&mut q, &claimed.id, "peer-a", NOW),
+            DoneOutcome::Completed,
+            "owner completes it"
+        );
         // Compaction prunes the done entry (bounded file), and a claim after it
         // finds nothing — the done task is gone for good.
         let q = compact_tasks(&q);
         assert!(q.is_empty(), "done task pruned at compaction");
         let mut q = q;
-        assert!(claim_next(&mut q).is_none(), "a done task never re-appears in a claim");
-        // Idempotent: a repeat done on an unknown/gone id is a no-op, not an error.
-        assert!(!mark_done(&mut q, "t1"), "repeat done on a pruned id → no-op");
+        assert!(
+            claim_next(&mut q, NOW, "peer-b", LEASE).is_none(),
+            "a done task never re-appears in a claim"
+        );
+        // A done for a pruned/unknown id → NotFound (caller treats as idempotent 200).
+        assert_eq!(
+            done_task(&mut q, "t1", "peer-a", NOW),
+            DoneOutcome::NotFound,
+            "done on a gone id → NotFound"
+        );
+    }
+
+    // Acceptance #2: orphan reclamation + stale-done. A claim whose lease EXPIRES
+    // (no `beat` within the TTL) becomes claimable again → an idle peer reclaims
+    // it; a late `done` from the original, now-orphaned claimer is refused (Stale
+    // → the handler maps it to 409).
+    #[test]
+    fn expired_lease_is_reclaimed_and_late_done_is_stale() {
+        const SHORT: u64 = 1000; // a 1s lease, to expire it deterministically
+        let mut q = vec![task("t1", 0, TaskState::Queued)];
+        let first = claim_next(&mut q, NOW, "peer-a", SHORT).expect("peer-a claims");
+        assert_eq!(q[0].claimed_by.as_deref(), Some("peer-a"));
+        // Before the lease expires, the task is NOT claimable (a live claim).
+        assert!(!is_claimable(&q[0], NOW), "a live lease is not reclaimable");
+        // Past the lease (no beat) → orphan → claimable again.
+        let now2 = NOW + SHORT + 1;
+        assert!(is_claimable(&q[0], now2), "an expired lease is reclaimable");
+        let second = claim_next(&mut q, now2, "peer-b", LEASE).expect("peer-b reclaims the orphan");
+        assert_eq!(second.id, first.id, "same task, reclaimed by another peer");
+        assert_eq!(q[0].claimed_by.as_deref(), Some("peer-b"), "peer-b now owns it");
+        // The original, orphaned claimer's late `done` can't complete work peer-b
+        // now owns → Stale.
+        assert_eq!(
+            done_task(&mut q, &first.id, "peer-a", now2),
+            DoneOutcome::Stale,
+            "a late done from the orphaned claimer is stale"
+        );
+        // The live owner (peer-b) still completes it.
+        assert_eq!(
+            done_task(&mut q, &first.id, "peer-b", now2),
+            DoneOutcome::Completed,
+            "the live owner completes it"
+        );
+    }
+
+    // Acceptance #3: a `beat` keeps a claim alive past the ORIGINAL TTL — no
+    // untimely reclamation. Only the owner can beat; a non-owner (or an unknown
+    // id) is a no-op.
+    #[test]
+    fn beat_keeps_the_claim_alive_past_the_original_lease() {
+        const SHORT: u64 = 1000;
+        let mut q = vec![task("t1", 0, TaskState::Queued)];
+        claim_next(&mut q, NOW, "peer-a", SHORT).expect("peer-a claims");
+        // Renew before expiry → the lease pushes to a later window.
+        let mid = NOW + SHORT / 2;
+        assert!(
+            beat_task(&mut q, "t1", "peer-a", mid, LEASE),
+            "the owner renews its lease"
+        );
+        assert_eq!(q[0].lease_until, Some(mid + LEASE), "the lease is pushed forward");
+        // A `now` past the ORIGINAL lease but within the renewed one → NOT reclaimable.
+        let past_original = NOW + SHORT + 1;
+        assert!(
+            !is_claimable(&q[0], past_original),
+            "the renewed lease keeps the claim alive past the original TTL"
+        );
+        // A non-owner cannot beat (it doesn't hold the claim), nor can an unknown id.
+        assert!(
+            !beat_task(&mut q, "t1", "peer-b", past_original, LEASE),
+            "a non-owner's beat is refused"
+        );
+        assert!(
+            !beat_task(&mut q, "nope", "peer-a", past_original, LEASE),
+            "a beat on an unknown id is a no-op"
+        );
     }
 
     // Bonus characterization (like the aligator net): push N with mixed
@@ -446,15 +697,17 @@ mod tests {
             },
         ];
         // Priority 5 group drains first, oldest-ts first within it; then priority 0.
-        let order: Vec<String> = std::iter::from_fn(|| claim_next(&mut q).map(|t| t.id)).collect();
+        let order: Vec<String> =
+            std::iter::from_fn(|| claim_next(&mut q, NOW, "peer-a", LEASE).map(|t| t.id)).collect();
         assert_eq!(
             order,
             vec!["hi-old", "hi-new", "low-old", "low-new"],
             "priority DESC then FIFO"
         );
-        // Complete two, compact → only the still-claimed tail survives (bounded).
-        assert!(mark_done(&mut q, "hi-old"));
-        assert!(mark_done(&mut q, "hi-new"));
+        // Complete two (the owner still holds a live lease), compact → only the
+        // still-claimed tail survives (bounded).
+        assert_eq!(done_task(&mut q, "hi-old", "peer-a", NOW), DoneOutcome::Completed);
+        assert_eq!(done_task(&mut q, "hi-new", "peer-a", NOW), DoneOutcome::Completed);
         let kept = compact_tasks(&q);
         let kept_ids: Vec<&str> = kept.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(kept_ids, vec!["low-old", "low-new"], "done pruned, rest kept in order");
@@ -477,7 +730,7 @@ mod tests {
             task("q1", 0, TaskState::Queued),
             task("d2", 0, TaskState::Done), // stale done → must be pruned
         ];
-        let (claimed, kept, changed) = claim_and_compact(entries);
+        let (claimed, kept, changed) = claim_and_compact(entries, NOW, "peer-a", LEASE);
         assert!(changed, "a claim + a prune → a write is needed");
         assert_eq!(
             claimed.as_ref().map(|t| t.id.as_str()),
@@ -498,7 +751,7 @@ mod tests {
         );
         // Claiming again on the bounded file finds nothing (q1 already claimed),
         // and compaction with all-done-pruned already happened → still bounded.
-        let (again, kept2, changed2) = claim_and_compact(kept);
+        let (again, kept2, changed2) = claim_and_compact(kept, NOW, "peer-a", LEASE);
         assert!(again.is_none(), "nothing left to claim");
         assert!(!changed2, "no claim + nothing to prune → no write");
         assert_eq!(kept2.len(), 1, "file stays bounded (the single claimed task)");
@@ -511,7 +764,9 @@ mod tests {
     fn claim_not_won_if_persist_fails_so_task_stays_claimable() {
         let entries = vec![task("q1", 0, TaskState::Queued)];
         // Persist FAILS (fs fault) → the claim returns empty, NOT the task.
-        let got = perform_claim(entries.clone(), |_| Err(std::io::Error::other("disk full")));
+        let got = perform_claim(entries.clone(), NOW, "peer-a", LEASE, |_| {
+            Err(std::io::Error::other("disk full"))
+        });
         assert!(
             got.is_none(),
             "a claim whose persist fails is not won — empty, never the task"
@@ -520,7 +775,7 @@ mod tests {
         // real re-read the task is still `queued` → still claimable. Prove the
         // retry: a SUCCEEDING persist now wins the same task.
         let mut persisted: Option<Vec<TaskEntry>> = None;
-        let got2 = perform_claim(entries, |kept| {
+        let got2 = perform_claim(entries, NOW, "peer-a", LEASE, |kept| {
             persisted = Some(kept.to_vec());
             Ok(())
         });
