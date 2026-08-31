@@ -4965,6 +4965,66 @@ mod tests {
         );
     }
 
+    /// The relay must be transparent to the upstream's status: a real upstream
+    /// error (429/500/529 …) is streamed through with its status + body, NOT
+    /// collapsed into an opaque synthetic 502 (`http_status_as_error(false)`).
+    /// Regression for the "502 relay: upstream: http status: 529" report, where
+    /// an overloaded Anthropic became an unactionable 502 with no Retry-After.
+    #[test]
+    fn relay_passes_upstream_error_status_through() {
+        use std::io::Write;
+        let _guard = RELAY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Mock "remote": reply 529 Overloaded with an explanatory JSON body.
+        let mock = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mock_port = mock.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = mock.accept() {
+                let _ = read_head(&mut sock);
+                let body = br#"{"type":"error","error":{"type":"overloaded_error"}}"#;
+                let _ = sock.write_all(
+                    format!(
+                        "HTTP/1.1 529 Overloaded\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+                let _ = sock.write_all(body);
+                let _ = sock.flush();
+            }
+        });
+
+        crate::set_relay_egress(false);
+        crate::set_relay_target(Some(crate::RelayTarget {
+            url: format!("http://127.0.0.1:{mock_port}"),
+            token: "remote-tok-123".to_owned(),
+            cf_access_client_id: String::new(),
+            cf_access_client_secret: String::new(),
+        }));
+
+        let (port, _state, master) = spawn_server();
+        let payload = "{}";
+        let req = format!(
+            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {master}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+            payload.len()
+        );
+        let resp = request(port, &req);
+
+        crate::set_relay_target(None);
+
+        assert_eq!(
+            status_code(&resp),
+            529,
+            "upstream status must pass through, got: {resp}"
+        );
+        assert!(
+            resp.contains("overloaded_error"),
+            "upstream error body must pass through, got: {resp}"
+        );
+    }
+
     #[test]
     fn generate_token_length() {
         let t = generate_token();
