@@ -125,6 +125,8 @@ Always pass `-p tab-atelier` — a bare `cargo deb` in this workspace can packag
 - **Browser viewer** — the daemon serves a per-tab [xterm.js](https://xtermjs.org/) terminal view (share-link URLs, `noindex`/`X-Robots-Tag` so a leaked link can't be crawled), with file up/download to each tab's sandboxed `inbox/` / `outbox/`
 - `tab-atelier set-status` CLI for in-tab tools (agents, hooks, scripts) to publish thinking/waiting/error state to the desktop LED
 - `tab-atelier remote …` — mirror tabs from another instance, attach a sidecar terminal, transfer files (sandboxed). See [Remote tabs](#remote-tabs)
+- **Anthropic API relay** — run Claude locally but route its API calls through a remote tab-atelier that reuses the remote's Claude login (no API key on the local box). See [Anthropic API relay](#anthropic-api-relay)
+- **Per-tab / global env vars** — inject env into tabs from the CLI (`tab-atelier env set …`). See [Environment variables](#environment-variables)
 - **Headless variant** ships as a separate `tab-atelier-headless.deb` (no gpui / x11rb / qrcode deps, 7.9 MB vs 12 MB) for servers — same HTTP API, no display required
 - Wakatime time tracking (reads API key from Zed settings)
 
@@ -317,6 +319,72 @@ The relay rotates its self-signed cert ~30 days before expiry (see `cert_needs_r
 ```
 
 The connection is allowed through (Phase 2 uses `disable_verification` on the wire) — the warning is the opt-in signal for the user to ack the rotation. Phase 3 will store the cert DER and switch to strict pinning, at which point the warning becomes a hard refuse-until-repinned.
+
+## Anthropic API relay
+
+Run **Claude Code + tab-atelier locally**, but have every Claude → Anthropic API call travel through **another tab-atelier** (a remote `tab-atelier-headless`), which makes the real outbound call **reusing the remote's own `claude` login** (OAuth in `~/.claude`). The local machine never holds an Anthropic credential and doesn't need to reach `api.anthropic.com` — only the remote does.
+
+When relay mode is on, every claude tab is spawned with:
+
+```
+ANTHROPIC_BASE_URL = http://127.0.0.1:7890/relay/anthropic   # the local relay route
+ANTHROPIC_API_KEY  = <the local instance's master token>     # a stand-in, validates the loopback
+```
+
+Claude POSTs to the loopback relay, which forwards to the remote's `/relay/anthropic/*` (bearer + optional CF-Access headers); the remote **egress** swaps the stand-in for its live Claude OAuth token (`Authorization: Bearer …` + `anthropic-version`/`anthropic-beta`) and streams the SSE response back end-to-end.
+
+**Setup**
+
+On the **remote** (already logged into `claude`, so `~/.claude/.credentials.json` exists):
+
+```sh
+tab-atelier relay egress on          # this host is the terminal hop → Anthropic
+tab-atelier-headless token           # grab its master token for the endpoint below
+```
+
+On the **local** machine:
+
+```sh
+tab-atelier remote add --label box --url https://<remote>:7891 --token <remote-token>
+tab-atelier relay via box            # relay through the `box` endpoint (by label or id)
+tab-atelier relay on                 # enable; `--relay` at launch also works
+tab-atelier relay status             # {"mode":true,"egress":false,"target":"https://<remote>:7891"}
+```
+
+New claude tabs now relay transparently. The full command:
+
+| Command | Effect |
+|---|---|
+| `relay on` / `relay off` | toggle relay mode |
+| `relay via <label\|id>` | pick the remote to relay through (`relay via ""` clears) |
+| `relay egress on\|off` | mark this host as the terminal hop to Anthropic |
+| `relay status` | print the live config (mode / egress / target) |
+
+All changes apply live (persisted + re-installed, no restart). The `relay_egress` role and `relay_endpoint_id` live in `preferences.json` but are set via the CLI above.
+
+**Smoke test** — verify the whole chain without launching Claude:
+
+```sh
+curl -N -H "x-api-key: $(tab-atelier token)" -H 'content-type: application/json' \
+  -d '{"model":"claude-sonnet-4-5","max_tokens":64,"stream":true,
+       "messages":[{"role":"user","content":"say hi"}]}' \
+  http://127.0.0.1:7890/relay/anthropic/v1/messages
+```
+
+`-N` disables curl buffering so you see the SSE `data:` frames stream in. Errors map to a stage: `401 relay: unauthorized` (wrong `x-api-key`), `502 relay not configured` (no `relay via`), `502 egress oauth: …` (remote can't read/refresh its Claude creds — re-`/login` there).
+
+## Environment variables
+
+Inject env vars into tabs' PTYs from the CLI — globally (all tabs) or per-tab:
+
+```sh
+tab-atelier env set FOO=bar --global      # every tab
+tab-atelier env set FOO=bar --tab 3       # one tab (index or UUID)
+tab-atelier env unset FOO --global
+tab-atelier env list --global             # print the global map
+```
+
+Precedence, lowest to highest: **global user env < per-tab env < functional vars** (`_TAB_ID`, `TAB_ATELIER_API_*`) **< relay injection**. Global vars persist in `preferences.json` (`tab_env`); per-tab vars persist per tab in `tabs.json` and are re-injected on respawn. Changes take effect on a tab's **next (re)spawn**.
 
 ## Agent state
 

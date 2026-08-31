@@ -1,0 +1,22 @@
+Merge origin/main (#40 Brain + env/viewer/transcript) into feat/harness-dashboard
+
+Reconciled the upstream merge against our api.rs->api/* and app.rs->app/* refactor
+(one-pass merge, no history rewrite, authorship preserved):
+
+- brain.rs: ADOPTED williamdes's upstream version (budgeted resumable scan +
+  heartbeat); re-posed the Inc8 S4 bump_usage (04a7957, 4 lines in tick()).
+- api.rs additions PORTED into the split (not the monolith): SnapshotTab.tab_env
+  (types.rs), mask_env_value/mask_env_map + GET /tabs/{id}/env (masked) + the
+  xterm-unicode11 asset, and the 5 upstream env/relay tests.
+- app.rs 148-line delta PORTED hunk-by-hunk into app/*: Ctrl+P switcher name
+  filter (TabSwitcher.query + switcher_filtered + render + key handling),
+  wipe_output on resume + observe_window_activation release_render_caches
+  (alt-screen/focus fixes), tab_env in the SnapshotTab build. Monolith deleted.
+- Auto-merge duplicate last_used_at (both sides added it) deduped in lib.rs +
+  headless.rs.
+- terminal/headless/lib/relay/share_link: standard merge.
+
+Both editions green: 706 gui / 568 headless lib. Clippy headless clean. No upstream
+work lost; the modular split is intact (no monolith re-created).
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>

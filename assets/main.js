@@ -34,6 +34,13 @@
     const BASE = location.pathname.replace(/\/view\/?$/, "/");
 
     const term = new Terminal({
+      // REQUIRED for the Unicode 11 width addon below: xterm.js gates the
+      // `term.unicode` API (register a width provider, set activeVersion)
+      // behind `allowProposedApi`. Without this, `loadAddon(Unicode11Addon)`
+      // THROWS ("must set the allowProposedApi option"), the try/catch there
+      // swallows it, and emoji silently stay 1 cell wide — the whole reason
+      // the earlier emoji fix appeared not to work.
+      allowProposedApi: true,
       // convertEol MUST stay off. It was added for the old row-by-row
       // /output dump (each line a bare `\n`), but the viewer now replays
       // the raw PTY byte stream over the WebSocket (see `handleOut`).
@@ -70,6 +77,21 @@
     });
     const termEl = document.getElementById("term");
     term.open(termEl);
+
+    // Switch xterm to the Unicode 11 width tables (emoji = 2 cells). Without
+    // this the default Unicode 6 tables treat emoji as 1 cell while the server
+    // grid (alacritty) advanced the cursor by 2, so every emoji rendered
+    // clipped to half a cell and the columns desynced. Registered before any
+    // PTY bytes are written below. Guarded so a missing addon degrades to the
+    // old behaviour rather than throwing.
+    if (window.Unicode11Addon) {
+      try {
+        term.loadAddon(new window.Unicode11Addon());
+        term.unicode.activeVersion = "11";
+      } catch (e) {
+        console.warn("unicode11 addon failed to load:", e);
+      }
+    }
 
     // Mobile-keyboard incognito hints. xterm.js renders its input
     // path through a hidden helper textarea (.xterm-helper-textarea
@@ -919,6 +941,7 @@
     //   tag 0x02 out      S→C  raw PTY bytes
     //   tag 0x03 meta     S→C  JSON state delta
     //   tag 0x04 resize   C→S  JSON {cols, rows}
+    //   tag 0x0b focus    C→S  payload-less; user focused the tab (MRU stamp)
     //
     // Reconnect: the client tracks `ringOffset` (= total bytes
     // received since session start) and on disconnect reconnects with
@@ -1214,6 +1237,22 @@
       return out;
     }
 
+    // Tell the server the user FOCUSED this tab (tag 0x0b, payload-less), which
+    // is what updates the "last used" / MRU ordering. Sent only when we're
+    // actually looking at the tab (page visible), so a background reconnect
+    // (phone screen wakes, network blip) does NOT bump the tab up the order.
+    function sendFocus() {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      if (document.visibilityState === "hidden") return;
+      try { ws.send(encodeFrame(0x0b, new Uint8Array(0))); } catch { /* swallow */ }
+    }
+    // Register once (these definitions run a single time per page load; only
+    // connect() re-runs on reconnect). A tab shown or window refocused = focus.
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") sendFocus();
+    });
+    window.addEventListener("focus", sendFocus);
+
     function connect() {
       // Clear any pending reconnect timer — we're connecting now.
       if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
@@ -1232,6 +1271,9 @@
         reconnectAttempt = 0;
         status.textContent = `${TAB_NAME} · connected`;
         document.body.classList.remove("ws-down");
+        // Opening the tab while looking at it counts as focus; a background
+        // reconnect (page hidden) is suppressed inside sendFocus().
+        sendFocus();
       };
       ws.onmessage = (ev) => {
         if (!(ev.data instanceof ArrayBuffer)) return; // ignore text frames
@@ -1254,7 +1296,7 @@
             console.warn("bad meta frame:", e);
           }
         }
-        // 0x01 in / 0x04 resize / 0x07-0x09 are C→S only — ignore.
+        // 0x01 in / 0x04 resize / 0x07-0x09 / 0x0b focus are C→S only — ignore.
       };
       ws.onerror = () => {
         // Defer the user-visible "offline" until onclose so we don't

@@ -31,6 +31,11 @@ const VIEWER_HTML: &str = include_str!("../../assets/web-viewer.html");
 /// `/assets/xterm-X.Y.Z.{js,css}` URLs that bypass token auth.
 const VENDOR_XTERM_JS: &str = include_str!("../../assets/vendor/xterm-6.0.0/xterm.js");
 const VENDOR_XTERM_CSS: &str = include_str!("../../assets/vendor/xterm-6.0.0/xterm.css");
+/// Vendored Unicode 11 width provider (self-contained port of
+/// `@xterm/addon-unicode11` at the xterm 6.0.0 tag). Loaded by the viewer so emoji
+/// count as 2 cells like the desktop terminal — without it xterm's default Unicode
+/// 6 tables clip every emoji to half a cell (columns desync). (Upstream #40.)
+const VENDOR_XTERM_UNICODE11_JS: &str = include_str!("../../assets/vendor/xterm-6.0.0/addon-unicode11.js");
 
 /// `xterm.js` ends with a `//# sourceMappingURL=xterm.js.map` pointer,
 /// but we don't ship the `.map` (and it isn't on the no-auth asset
@@ -376,6 +381,30 @@ fn card_route_verb(p: &str) -> Option<(&'static str, &'static str)> {
     VERBS
         .into_iter()
         .find(|(v, _)| p.strip_suffix(v).is_some_and(|pre| pre.ends_with('/')))
+}
+
+/// Mask a single env value for the `env list` API (upstream #40).
+///
+/// Boolean-ish flags (`0`/`1`/`true`/`false`, the last two case-insensitively) are
+/// not secrets and pass through in the clear so an operator can eyeball a feature
+/// toggle; everything else — API keys, tokens, connection strings — is replaced by
+/// `******` so the real value never leaves the daemon.
+fn mask_env_value(v: &str) -> &str {
+    if matches!(v, "0" | "1") || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("false") {
+        v
+    } else {
+        "******"
+    }
+}
+
+/// Apply [`mask_env_value`] across an env map, preserving key order (`BTreeMap` ⇒
+/// sorted). The returned map is safe to serialize over the wire.
+pub(in crate::api) fn mask_env_map(
+    map: &std::collections::BTreeMap<String, String>,
+) -> std::collections::BTreeMap<String, String> {
+    map.iter()
+        .map(|(k, v)| (k.clone(), mask_env_value(v).to_string()))
+        .collect()
 }
 
 /// Parse an env-change body: `{"set":{"K":"V"},"unset":["K"],"respawn":bool}`.
@@ -1770,6 +1799,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
     if let (
         "GET",
         "/assets/xterm-6.0.0.js"
+        | "/assets/xterm-unicode11-6.0.0.js"
         | "/assets/xterm-6.0.0.css"
         | "/assets/main.js"
         | "/assets/main.css"
@@ -1779,6 +1809,10 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
         let (body, ctype): (&[u8], &str) = match path.as_str() {
             "/assets/xterm-6.0.0.js" => (
                 VENDOR_XTERM_JS_SERVED.as_bytes(),
+                "application/javascript; charset=utf-8",
+            ),
+            "/assets/xterm-unicode11-6.0.0.js" => (
+                VENDOR_XTERM_UNICODE11_JS.as_bytes(),
                 "application/javascript; charset=utf-8",
             ),
             "/assets/xterm-6.0.0.css" => (VENDOR_XTERM_CSS.as_bytes(), "text/css; charset=utf-8"),
@@ -1965,6 +1999,10 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
         ("POST", "/relay-config") => handlers::admin::relay_config_set(stream, state, &body_bytes),
         ("GET", "/env") => handlers::admin::env_get(stream),
         ("POST", "/env") => handlers::admin::env_set(stream, state, &body_bytes),
+        // Upstream #40: per-tab env read (`env list --tab <id>`), masked.
+        ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/env") => {
+            handlers::admin::env_get_tab(stream, state, p);
+        }
         ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/env") => {
             handlers::tabs::env(stream, state, p, &body_bytes);
         }
@@ -2110,6 +2148,7 @@ pub fn test_snapshot_tab(id: &str, name: &str) -> SnapshotTab {
         dns_entries: Vec::new(),
         resident_memory_bytes: None,
         tokens: None,
+        tab_env: std::collections::BTreeMap::new(),
         specialty: None,
         orchestrator: None,
         objective: None,
@@ -5355,6 +5394,7 @@ mod tests {
                 "assets/xterm-6.0.0.css",
                 "assets/main.css?version=",
                 "assets/xterm-6.0.0.js",
+                "assets/xterm-unicode11-6.0.0.js",
                 "assets/main.js?version=",
             ] {
                 let want = format!("{want_prefix}{asset}");
@@ -5475,6 +5515,19 @@ mod tests {
         assert!(
             std::str::from_utf8(&b).unwrap_or("").contains("xterm.js"),
             "css body must reference xterm.js in its banner"
+        );
+
+        // Unicode 11 addon — same unauthenticated, immutable-cache contract.
+        let raw = request_bytes(port, "GET /assets/xterm-unicode11-6.0.0.js HTTP/1.1\r\n\r\n");
+        let (h, b) = split_response(&raw);
+        assert!(h.starts_with("HTTP/1.1 200"), "got: {h}");
+        assert_eq!(
+            header_value(&h, "content-type"),
+            Some("application/javascript; charset=utf-8"),
+        );
+        assert!(
+            std::str::from_utf8(&b).unwrap_or("").contains("Unicode11Addon"),
+            "unicode11 body must expose the Unicode11Addon global"
         );
     }
 
@@ -6054,5 +6107,128 @@ mod tests {
             s.pending_status_updates.last().unwrap().label.clone()
         };
         assert_eq!(label.as_deref(), Some("__clear__"));
+    }
+
+    #[test]
+    fn relay_passes_upstream_error_status_through() {
+        use std::io::Write;
+        let _guard = RELAY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Mock "remote": reply 529 Overloaded with an explanatory JSON body.
+        let mock = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mock_port = mock.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = mock.accept() {
+                let _ = read_head(&mut sock);
+                let body = br#"{"type":"error","error":{"type":"overloaded_error"}}"#;
+                let _ = sock.write_all(
+                    format!(
+                        "HTTP/1.1 529 Overloaded\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+                let _ = sock.write_all(body);
+                let _ = sock.flush();
+            }
+        });
+
+        crate::set_relay_egress(false);
+        crate::set_relay_target(Some(crate::RelayTarget {
+            url: format!("http://127.0.0.1:{mock_port}"),
+            token: "remote-tok-123".to_owned(),
+            cf_access_client_id: String::new(),
+            cf_access_client_secret: String::new(),
+        }));
+
+        let (port, _state, master) = spawn_server();
+        let payload = "{}";
+        let req = format!(
+            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {master}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+            payload.len()
+        );
+        let resp = request(port, &req);
+
+        crate::set_relay_target(None);
+
+        assert_eq!(
+            status_code(&resp),
+            529,
+            "upstream status must pass through, got: {resp}"
+        );
+        assert!(
+            resp.contains("overloaded_error"),
+            "upstream error body must pass through, got: {resp}"
+        );
+    }
+
+    #[test]
+    fn env_list_per_tab_masks_secrets_but_shows_flags() {
+        let (port, state, token) = spawn_server();
+        {
+            let mut s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            s.tabs[0].tab_env.insert("API_KEY".into(), "s3cret".into());
+            s.tabs[0].tab_env.insert("DEBUG".into(), "1".into());
+            s.tabs[0].tab_env.insert("VERBOSE".into(), "true".into());
+            s.tabs[0].tab_env.insert("QUIET".into(), "FALSE".into());
+        }
+        let resp = request(
+            port,
+            &format!("GET /tabs/by-id/tab-a/env HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        assert_eq!(status_code(&resp), 200);
+        let b = body(&resp);
+        // Secret masked; boolean-ish flags (incl. case-insensitive true/false)
+        // pass through; the raw secret never appears.
+        assert!(b.contains(r#""API_KEY":"******""#), "secret must be masked: {b}");
+        assert!(b.contains(r#""DEBUG":"1""#), "flag shown: {b}");
+        assert!(b.contains(r#""VERBOSE":"true""#), "flag shown: {b}");
+        assert!(b.contains(r#""QUIET":"FALSE""#), "case-insensitive flag shown: {b}");
+        assert!(!b.contains("s3cret"), "value must not leak: {b}");
+    }
+
+    #[test]
+    fn env_list_global_masks_secrets_but_shows_flags() {
+        let (port, _state, token) = spawn_server();
+        // Apply directly to the global map (the POST only queues a drain that
+        // runs in the main loop, absent from this test harness).
+        let mut g = std::collections::BTreeMap::new();
+        g.insert("GLOBAL_SECRET".to_string(), "hunter2".to_string());
+        g.insert("FEATURE_X".to_string(), "0".to_string());
+        crate::set_tab_env_global(g);
+        let resp = request(
+            port,
+            &format!("GET /env HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        assert_eq!(status_code(&resp), 200);
+        let b = body(&resp);
+        assert!(b.contains(r#""GLOBAL_SECRET":"******""#), "secret masked: {b}");
+        assert!(b.contains(r#""FEATURE_X":"0""#), "flag shown: {b}");
+        assert!(!b.contains("hunter2"), "value must not leak: {b}");
+    }
+
+    #[test]
+    fn mask_env_value_covers_flags_and_secrets() {
+        assert_eq!(super::mask_env_value("0"), "0");
+        assert_eq!(super::mask_env_value("1"), "1");
+        assert_eq!(super::mask_env_value("true"), "true");
+        assert_eq!(super::mask_env_value("True"), "True");
+        assert_eq!(super::mask_env_value("FALSE"), "FALSE");
+        assert_eq!(super::mask_env_value("sk-abc123"), "******");
+        assert_eq!(super::mask_env_value("2"), "******");
+        assert_eq!(super::mask_env_value(""), "******");
+        assert_eq!(super::mask_env_value("truthy"), "******");
+    }
+
+    #[test]
+    fn env_list_per_tab_unknown_tab_404() {
+        let (port, _state, token) = spawn_server();
+        let resp = request(
+            port,
+            &format!("GET /tabs/by-id/does-not-exist/env HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        assert_eq!(status_code(&resp), 404);
     }
 }

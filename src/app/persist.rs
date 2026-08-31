@@ -247,13 +247,14 @@ impl AppState {
                     tab.agent_kind.as_deref().unwrap_or(""),
                 ));
             }
-            // Fold in the ring's viewer-attach timestamp: a viewer (browser /
-            // mobile remote) opening the tab stamped it at connect time, so the
-            // open is recorded reliably even if the view already closed — a
-            // polled viewer_count edge missed those. Monotonic: only advances.
-            let attached = pty_ring.lock().map_or(0, |r| r.viewer_attached_at_millis());
-            if attached > tab.last_used_at.unwrap_or(0) {
-                tab.last_used_at = Some(attached);
+            // Fold in the ring's viewer-focus timestamp: a viewer (browser /
+            // mobile remote) stamps this on an explicit `TAG_FOCUS` frame (the
+            // user focused the tab) — NOT on a bare connect/reconnect — so
+            // mobile focus records "used now" without a background reconnect
+            // floating the tab up the MRU. Monotonic: only advances.
+            let focused = pty_ring.lock().map_or(0, |r| r.viewer_attached_at_millis());
+            if focused > tab.last_used_at.unwrap_or(0) {
+                tab.last_used_at = Some(focused);
             }
             api_tabs.push(api::SnapshotTab {
                 id: tab.id.clone(),
@@ -337,6 +338,8 @@ impl AppState {
                 tokens: tab.tokens_last_saved.get(),
                 #[cfg(not(feature = "catbus"))]
                 tokens: None,
+                // Upstream #40: expose per-tab env on the snapshot (masked at read).
+                tab_env: tab.tab_env.clone(),
                 specialty: tab.specialty.clone(),
                 orchestrator: tab.orchestrator.clone(),
                 objective: tab.objective.clone(),

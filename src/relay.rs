@@ -100,10 +100,18 @@ fn now_ms() -> u64 {
 /// **No global timeout** (LLM streams run for minutes) and **default `WebPKI`
 /// verification** (unlike the LAN self-signed remote agent). A connect timeout
 /// still bounds a dead upstream.
+///
+/// `http_status_as_error(false)`: a relay must be transparent to the upstream's
+/// status. ureq's default turns any non-2xx into `Err`, which would collapse a
+/// real upstream 429/500/529 (with its explanatory body) into an opaque
+/// synthetic 502 — the caller (Claude Code) then can't see the real reason or
+/// honour Retry-After. With this off, non-2xx comes back as `Ok(resp)` and we
+/// stream the true status + body through.
 #[must_use]
 pub fn relay_agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(10)))
+        .http_status_as_error(false)
         .user_agent(concat!("tab-atelier/", env!("CARGO_PKG_VERSION"), " (relay)"))
         .build()
         .new_agent()

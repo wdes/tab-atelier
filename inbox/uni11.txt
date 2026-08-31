@@ -1,0 +1,10 @@
+25:/// `@xterm/addon-unicode11` at the xterm 6.0.0 tag). Loaded by the viewer so
+28:const VENDOR_XTERM_UNICODE11_JS: &str = include_str!("../assets/vendor/xterm-6.0.0/addon-unicode11.js");
+1570:        | "/assets/xterm-unicode11-6.0.0.js"
+1582:            "/assets/xterm-unicode11-6.0.0.js" => (
+6336:    fn view_asset_refs_are_relative_to_mount_prefix() {
+6364:                "assets/xterm-unicode11-6.0.0.js",
+6397:    fn main_assets_serve_unauthenticated_with_immutable_cache() {
+6438:    fn vendor_xterm_assets_serve_unauthenticated_with_immutable_cache() {
+6466:        let raw = request_bytes(port, "GET /assets/xterm-unicode11-6.0.0.js HTTP/1.1\r\n\r\n");
+6475:            "unicode11 body must expose the Unicode11Addon global"

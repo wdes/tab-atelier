@@ -51,6 +51,11 @@ const TICK_IDLE: Duration = Duration::from_millis(250);
 /// How long after the last API/WS activity the fast tick stays armed
 /// (covers think-pauses between keystrokes).
 const TICK_HOT: Duration = Duration::from_secs(2);
+/// Grace window on shutdown between SIGTERM-ing a tab's subtree and the hard
+/// SIGKILL — lets `claude` finish flushing `~/.claude.json` before it's killed
+/// (an interrupted write is what corrupted the file on restart). We exit as
+/// soon as every cgroup is empty, so this is only the cap for a hung agent.
+const SHUTDOWN_KILL_GRACE: Duration = Duration::from_secs(5);
 
 // Shared with the GUI — see `crate::tab_env_extras`,
 // `crate::api_url_for_local_clients`, and
@@ -967,6 +972,10 @@ pub fn run() -> std::io::Result<()> {
                 t.conventions.clone_from(&ts.conventions);
                 t.pinned_cols = ts.pinned_cols;
                 t.pinned_rows = ts.pinned_rows;
+                // Restore the persisted MRU stamp so Ctrl+P / mobile ordering
+                // survives a daemon restart (the active tab re-stamps to now
+                // via activate() below, which is correct — it IS in use).
+                t.last_used_at = ts.last_used_at;
                 #[cfg(target_os = "linux")]
                 crate::cgroup::apply(
                     &t.id,
@@ -1192,14 +1201,30 @@ pub fn run() -> std::io::Result<()> {
                 &mut last_state_hash,
                 true,
             );
+            // Graceful teardown. SIGHUP the PTY + SIGTERM the whole subtree, let
+            // agents flush and exit, THEN hard-SIGKILL survivors. An immediate
+            // `cgroup.kill` (SIGKILL) here used to catch `claude` mid-write to
+            // `~/.claude.json` and truncate it ("sometimes corrupt on restart");
+            // the grace window lets it finish. We still SIGKILL leftovers so a
+            // claude that ignores SIGTERM can't orphan and make the next start
+            // resume a duplicate.
             for tab in &tabs {
-                tab.shutdown();
-                // Kill the whole tree, not just SIGHUP the PTY — otherwise a
-                // claude that ignores SIGHUP orphans and the NEXT start
-                // resumes a duplicate. (systemd's cgroup kill covers a clean
-                // stop; this covers non-systemd runs + belt-and-suspenders.)
+                tab.shutdown(); // SIGHUP via PTY close
                 #[cfg(target_os = "linux")]
-                crate::cgroup::kill_tab(&tab.id);
+                crate::cgroup::terminate_tab(&tab.id); // SIGTERM the subtree
+            }
+            #[cfg(target_os = "linux")]
+            {
+                // Exit as soon as every tab's cgroup is empty; capped so a hung
+                // agent can't stall the stop (systemd's TimeoutStopSec, default
+                // 90s, comfortably covers this).
+                let deadline = std::time::Instant::now() + SHUTDOWN_KILL_GRACE;
+                while std::time::Instant::now() < deadline && tabs.iter().any(|t| crate::cgroup::tab_has_procs(&t.id)) {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                for tab in &tabs {
+                    crate::cgroup::kill_tab(&tab.id); // SIGKILL survivors + rmdir
+                }
             }
             return Ok(());
         }
@@ -1401,14 +1426,14 @@ fn refresh_snapshot(
             tab.led_last_ring = ring_len;
             tab.last_output_at = Some(Instant::now());
         }
-        // Fold in the ring's viewer-attach timestamp: a viewer (browser
-        // share-link / mobile remote) opening the tab stamped it at connect
-        // time, so this records the open reliably even if the view already
-        // closed — a polled viewer_count edge would have missed it. Monotonic:
-        // only advances last_used_at, never rewinds.
-        let attached = tab.viewer_attached_at.load(std::sync::atomic::Ordering::Relaxed);
-        if attached > tab.last_used_at.unwrap_or(0) {
-            tab.last_used_at = Some(attached);
+        // Fold in the ring's viewer-focus timestamp: a viewer (browser
+        // share-link / mobile remote) stamps this when the user FOCUSES the tab
+        // (an explicit `TAG_FOCUS` frame — not a bare connect/reconnect), so
+        // mobile focus reliably records "used now" even if the view closes
+        // before the next tick. Monotonic: only advances, never rewinds.
+        let focused = tab.viewer_attached_at.load(std::sync::atomic::Ordering::Relaxed);
+        if focused > tab.last_used_at.unwrap_or(0) {
+            tab.last_used_at = Some(focused);
         }
         let agent_led = {
             #[cfg(feature = "catbus")]
@@ -1492,6 +1517,7 @@ fn refresh_snapshot(
             conventions: tab.conventions.clone(),
             context_pct: ctx_pct,
             last_compaction_at: tab.last_compaction_at,
+            tab_env: tab.tab_env.clone(),
         });
     }
     let mut snapshot = api_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1687,6 +1713,7 @@ fn persist(
             id: tab.id.to_string(),
             name: tab.name.to_string(),
             cwd: tab.last_known_cwd_string.as_deref().map(str::to_string),
+            last_used_at: tab.last_used_at,
             colors_enabled: tab.colors_enabled,
             agent_session_id: tab.agent_session_id.as_deref().map(str::to_string),
             agent_kind: tab.agent_kind.as_deref().map(str::to_string),
@@ -1711,7 +1738,6 @@ fn persist(
             rounds_active: tab.rounds_active.clone(),
             evaluations: tab.evaluations.clone(),
             usage_count: tab.usage_count,
-            last_used_at: tab.last_used_at,
             conventions: tab.conventions.clone(),
             parent_tab_id: tab.parent_tab_id.as_deref().map(str::to_string),
             rehome_status: tab.rehome_status.as_deref().map(str::to_string),

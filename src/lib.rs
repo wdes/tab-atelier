@@ -62,6 +62,7 @@ pub(crate) mod terminal;
 pub(crate) mod terminal_utils;
 pub(crate) mod theme;
 pub(crate) mod tracking;
+pub mod transcript_compact;
 #[cfg(all(windows, not(feature = "gui")))]
 pub mod win_service;
 
@@ -1164,6 +1165,12 @@ pub struct TabState {
     pub id: String,
     pub name: String,
     pub cwd: Option<String>,
+    /// Unix-millis of the last time this tab was genuinely used — desktop
+    /// focus, or an explicit web-viewer focus event. Drives the MRU (Ctrl+P /
+    /// mobile) ordering; persisted so the ordering survives a restart. Old
+    /// tabs.json files without it load as `None` and re-seed on first focus.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1305,10 +1312,6 @@ pub struct TabState {
     /// aligator on each swamp delivery). Omitted when never used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_count: Option<u64>,
-    /// Unix-millis of the last use (`bump-usage` stamp; also the MRU timestamp).
-    /// Persisted (S4) so usage/recency survive a restart. Omitted when never set.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_used_at: Option<u64>,
     /// Inc8 fold — the DECLARED conventions: the `.md` files this agent declares
     /// it follows (`set-conventions`). The declared side of observability (usage
     /// is the observed side); the declared-vs-existing check is the
@@ -1552,6 +1555,7 @@ impl Default for TabState {
             id: default_tab_id(),
             name: String::new(),
             cwd: None,
+            last_used_at: None,
             output: None,
             uptime_secs: None,
             energy_wh: None,
@@ -1580,7 +1584,6 @@ impl Default for TabState {
             rounds_active: None,
             evaluations: Vec::new(),
             usage_count: None,
-            last_used_at: None,
             conventions: Vec::new(),
             parent_tab_id: None,
             rehome_status: None,
@@ -4369,6 +4372,24 @@ mod tests {
             "transient state must not be persisted: {json}"
         );
         assert!(!json.contains("\"busy\""), "the transient label must not leak: {json}");
+    }
+
+    #[test]
+    fn tab_state_persists_last_used_at() {
+        // last_used_at must round-trip through tabs.json so the MRU (Ctrl+P /
+        // mobile) ordering survives a restart — the "persist on reboot" bug.
+        let ts = TabState {
+            name: "Agent".into(),
+            last_used_at: Some(1_788_000_000_000),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&ts).unwrap();
+        assert!(json.contains("last_used_at"), "field must serialize: {json}");
+        let back: TabState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.last_used_at, Some(1_788_000_000_000));
+        // An older tabs.json without the field loads as None (re-seeds on focus).
+        let legacy: TabState = serde_json::from_str(r#"{"id":"x","name":"Old","cwd":null}"#).unwrap();
+        assert_eq!(legacy.last_used_at, None);
     }
 
     #[test]

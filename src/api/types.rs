@@ -658,6 +658,11 @@ pub struct SnapshotTab {
     /// catbus-agent `tokens.json` sidecar. `None` for non-agent tabs (or
     /// builds without `catbus`). Surfaced as `tokens: {input, output}`.
     pub tokens: Option<crate::TokenUsage>,
+    /// Per-tab env overrides (`env set --tab <id>`), mirrored from the runtime
+    /// tab so `GET /tabs/<id>/env` (`env list --tab`) can report them without
+    /// reading tabs.json off disk. Empty ⇒ no per-tab overrides. (Ported from
+    /// upstream's monolith api.rs into the split during the #40 merge.)
+    pub tab_env: std::collections::BTreeMap<String, String>,
     // --- Inc8 S1 agent card, mirrored from the persisted TabState (hook-immune).
     pub specialty: Option<std::sync::Arc<str>>,
     pub orchestrator: Option<std::sync::Arc<str>>,
