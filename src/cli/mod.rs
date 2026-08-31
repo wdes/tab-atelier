@@ -24,6 +24,8 @@ pub mod flags;
 /// applied on next launch) without wrangling env vars.
 pub mod logging;
 pub mod remote;
+/// The daemon restart-wake emission (RA1, dual-channel, measured).
+pub mod restart_wake;
 pub mod set_assignment;
 pub mod set_card;
 pub mod set_context;

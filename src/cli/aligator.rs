@@ -137,7 +137,10 @@ fn state_file(name: &str) -> PathBuf {
     crate::platform::state_base_dir().join("tab-atelier").join(name)
 }
 
-fn swamp_path() -> PathBuf {
+/// The swamp producer file (`<state>/tab-atelier/swamp.jsonl`). `pub` so the
+/// daemon's RA1 restart-wake can enqueue an orchestrator wake onto the same queue.
+#[must_use]
+pub fn swamp_path() -> PathBuf {
     state_file("swamp.jsonl")
 }
 

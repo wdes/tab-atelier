@@ -1202,6 +1202,48 @@ pub fn run() -> std::io::Result<()> {
         api_tls_client_ca,
     );
 
+    // RA1 — restart-wake: now that the API is up and the tabs are restored, tell
+    // the fleet we're back on a SEPARATE channel from self_announce (the agentKind
+    // POST is untouched). BEST-EFFORT / non-blocking: a failed emission is counted,
+    // never propagated, so startup is never blocked or delayed. Skipped in
+    // read-only mode (advertises "changes nothing"). Reduces the restart→orchestrator
+    // latency from the cron watcher's 5-14 min to one aligator tour (target 5-10s).
+    if !read_only {
+        let now = crate::unix_millis();
+        let roster =
+            crate::cli::restart_wake::orchestrator_roster(tabs.iter().map(|t| (&*t.id, t.assignment.as_deref())));
+        let build = env!("BUILD_HASH");
+        let report = crate::cli::restart_wake::emit_restart_wake(
+            build,
+            now,
+            &roster,
+            |topic, from, msg| {
+                crate::cli::team::note_best_effort(Some(topic.to_string()), Some(from.to_string()), msg);
+            },
+            |orch, msg| {
+                let entry = crate::cli::aligator::SwampEntry {
+                    ts: now / 1000,
+                    tab: orch.to_string(),
+                    input: msg.to_string(),
+                    // A non-intrusive marker (not auto-submitted); the orchestrator's
+                    // loop picks it up. ponytail: a true-submit nudge is a tuning knob.
+                    submit: false,
+                    from: Some("daemon".to_string()),
+                    attempts: 0,
+                    priority: crate::cli::aligator::Priority::Status,
+                    dedup_key: Some(format!("restart-wake-{build}")),
+                };
+                crate::cli::aligator::append_swamp_line(&crate::cli::aligator::swamp_path(), &entry)
+            },
+        );
+        info!(
+            "RA1 restart-wake: build={build} orchestrators={} pushed={} failed={}",
+            roster.len(),
+            report.pushed,
+            report.failed
+        );
+    }
+
     #[cfg(feature = "energy")]
     let power_pids: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
     #[cfg(feature = "energy")]
