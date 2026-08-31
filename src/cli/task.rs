@@ -4,11 +4,11 @@
 
 //! `task` — a typed task queue with an ATOMIC claim (primitive #11, POC).
 //!
-//! Scope so far: the file+append backend (reused from aligator's swamp: append +
+//! Scope: the file+append backend (reused from aligator's swamp: append +
 //! compaction, `src/cli/aligator.rs`) + `push`/`claim`/`beat`/`done`, the atomic
 //! claim serialized behind the mono-process daemon (S1), lease/beat/orphan-
-//! reclaim (S2), and capacity `--to <role>` gating the claim (S3). NO read-model
-//! (S4).
+//! reclaim (S2), capacity `--to <role>` gating the claim (S3), and the read-only
+//! read-model `list` + `/dashboard/state` `tasks` section (S4). POC complete.
 //!
 //! **Founding insight** (design `issue-task-queue-lease.md`): the daemon is a
 //! single process, so a `claim` handled behind the API is a free compare-and-
@@ -30,6 +30,22 @@
 //! but once one wins, only its tab-id can `beat`/`done` it — the other (same
 //! role, different tab-id) is refused stale. Capacity gates the claim; tab-id
 //! gates the ownership.
+//!
+//! **Capacity is a HINT, not a FENCE (S3/S4)**: the role that gates the claim is
+//! SELF-DECLARED — `--as <role>`, or read off the caller's own card
+//! (assignment/specialty), which the caller set. So the capacity gate is
+//! BEST-EFFORT / advisory: it stops an *honest* mis-routed peer from grabbing
+//! work it isn't for; it does NOT stop a peer that lies about its role. It's a
+//! coordination hint (route work to the right kind of peer), NOT a security fence
+//! (authorisation). A true fence would need daemon-attested identity — out of
+//! scope for the POC (upgrade path if capability-authorisation is ever wanted).
+//!
+//! **Read-model (S4 — READ-ONLY)**: `task list` and the `/dashboard/state`
+//! `tasks` section project each task's CURRENT state (`queued` / `claimed@<peer>`
+//! / `done`) WITHOUT mutating anything — a claim whose lease has expired reads as
+//! `queued` (reclaimable), agreeing with [`is_claimable`], but nothing is
+//! rewritten: the fold to `queued` is derived at read time; the on-disk `Claimed`
+//! entry is untouched until a real claim reclaims it.
 //!
 //! This module holds the PURE backend (the data model, the selection/claim/done/
 //! compact logic, and parse/encode) so the atomic-case invariants are unit-tested
@@ -81,6 +97,97 @@ pub struct TaskEntry {
     /// which stays on `claimed_by` (the tab-id). Omitted when unrestricted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<String>,
+}
+
+/// A read-only projection of one task's CURRENT state (S4 read-model).
+///
+/// Derived at read time, never mutated: `state` folds an expired-lease claim back
+/// to `queued` (reclaimable), and `claimed_by`/`lease_until` show only while the
+/// claim is LIVE. Serialised camelCase for the dashboard / `task list`.
+#[derive(Serialize, Clone, PartialEq, Eq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskView {
+    pub id: String,
+    pub priority: u8,
+    /// The current effective state: `"queued"` | `"claimed"` | `"done"`.
+    pub state: &'static str,
+    /// The holding peer's tab-id while the claim is live (`claimed@<peer>`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claimed_by: Option<String>,
+    /// The live lease's expiry (unix-millis), while claimed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_until: Option<u64>,
+    /// The S3 capacity requirement (`--to <role>`), if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+}
+
+/// The read-model for one queue (S4): its name + each task's current view.
+#[derive(Serialize, Clone, PartialEq, Eq, Debug)]
+pub struct TaskQueueView {
+    pub queue: String,
+    pub tasks: Vec<TaskView>,
+}
+
+/// The task's CURRENT effective state at `now` (S4 read-model), folding an
+/// expired-lease claim back to `queued` (reclaimable — [`is_claimable`] agrees).
+/// Pure, read-only.
+#[must_use]
+pub fn effective_state(e: &TaskEntry, now: u64) -> &'static str {
+    match e.state {
+        TaskState::Done => "done",
+        // A live lease is genuinely claimed; queued and expired-orphan both read as
+        // queued (reclaimable — is_claimable agrees; nothing on disk is changed).
+        TaskState::Claimed if e.lease_until.is_some_and(|l| l >= now) => "claimed",
+        TaskState::Queued | TaskState::Claimed => "queued",
+    }
+}
+
+/// One task's read-only view at `now`. `claimed_by`/`lease_until` are shown only
+/// while the claim is LIVE — an expired orphan reads as a plain `queued` task.
+/// Pure.
+#[must_use]
+pub fn task_view(e: &TaskEntry, now: u64) -> TaskView {
+    let live = e.state == TaskState::Claimed && e.lease_until.is_some_and(|l| l >= now);
+    TaskView {
+        id: e.id.clone(),
+        priority: e.priority,
+        state: effective_state(e, now),
+        claimed_by: if live { e.claimed_by.clone() } else { None },
+        lease_until: if live { e.lease_until } else { None },
+        to: e.to.clone(),
+    }
+}
+
+/// The read-only view of a queue's entries at `now` (S4). Pure over the parsed
+/// entries; the FS read is the caller's (kept effect-free for unit tests).
+#[must_use]
+pub fn queue_view(queue: &str, entries: &[TaskEntry], now: u64) -> TaskQueueView {
+    TaskQueueView {
+        queue: queue.to_string(),
+        tasks: entries.iter().map(|e| task_view(e, now)).collect(),
+    }
+}
+
+/// Read EVERY queue file and project it to a read-only view at `now` (S4 — the
+/// `/dashboard/state` `tasks` section). READ-ONLY: it never writes or compacts.
+/// The queue name is the file stem.
+///
+/// ponytail: O(queues) FS reads per call, run on each `/dashboard/state` poll —
+/// fine at POC scale (a handful of small, bounded files). If queues ever
+/// proliferate, cache these off the daemon's snapshot instead.
+#[must_use]
+pub fn read_all_queue_views(now: u64) -> Vec<TaskQueueView> {
+    let mut views: Vec<TaskQueueView> = queue_files()
+        .iter()
+        .filter_map(|p| {
+            let queue = p.file_stem()?.to_string_lossy().to_string();
+            let entries = parse_tasks(&std::fs::read_to_string(p).unwrap_or_default());
+            Some(queue_view(&queue, &entries, now))
+        })
+        .collect();
+    views.sort_by(|a, b| a.queue.cmp(&b.queue)); // stable order for the dashboard
+    views
 }
 
 /// Default lease if `--lease` isn't given: ~35 min, generalising the
@@ -400,7 +507,7 @@ pub fn write_tasks_atomic(path: &Path, entries: &[TaskEntry]) -> std::io::Result
 // discovery + ureq agent aligator/share_link already use.
 // ---------------------------------------------------------------------------
 
-/// `tab-atelier task <push|claim|beat|done> …` — the producer/consumer CLI.
+/// `tab-atelier task <push|claim|beat|done|list> …` — the producer/consumer CLI.
 #[must_use]
 pub fn run(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
@@ -408,12 +515,14 @@ pub fn run(args: &[String]) -> i32 {
         Some("claim") => run_claim(&args[1..]),
         Some("beat") => run_beat(&args[1..]),
         Some("done") => run_done(&args[1..]),
+        Some("list") => run_list(&args[1..]),
         _ => {
             eprintln!(
                 "usage:\n  tab-atelier task push --queue <q> [--to <role>] [--priority N] \"<payload>\"\n  \
                  tab-atelier task claim --queue <q> [--as <role>] [--lease <secs>]\n  \
                  tab-atelier task beat <task-id> [--lease <secs>]\n  \
-                 tab-atelier task done <task-id>"
+                 tab-atelier task done <task-id>\n  \
+                 tab-atelier task list --queue <q>"
             );
             2
         }
@@ -441,6 +550,20 @@ fn post_task(path: &str, body: &str) -> Result<(u16, String), String> {
         .header("Content-Type", "application/json")
         .send(body)
         .map_err(|e| format!("POST /task/{path}: {e}"))?;
+    let status = resp.status().as_u16();
+    let text = resp.body_mut().read_to_string().unwrap_or_default();
+    Ok((status, text))
+}
+
+/// GET `<api>/task/<path>` with a Bearer, returning `(status, body)` — the
+/// read-only counterpart of [`post_task`], used by `task list`.
+fn get_task(path: &str) -> Result<(u16, String), String> {
+    let ep = crate::cli::share_link::discover_endpoint()?;
+    let mut resp = crate::cli::share_link::agent()
+        .get(format!("{}/task/{path}", ep.url))
+        .header("Authorization", format!("Bearer {}", ep.token))
+        .call()
+        .map_err(|e| format!("GET /task/{path}: {e}"))?;
     let status = resp.status().as_u16();
     let text = resp.body_mut().read_to_string().unwrap_or_default();
     Ok((status, text))
@@ -589,6 +712,29 @@ fn run_done(args: &[String]) -> i32 {
         }
         Err(e) => {
             eprintln!("task done: {e}");
+            1
+        }
+    }
+}
+
+/// `task list --queue <q>` — print the queue's read-model (S4). READ-ONLY: it
+/// GETs the derived view; it never claims, beats, or completes anything.
+fn run_list(args: &[String]) -> i32 {
+    let Some(queue) = arg_value(args, "--queue") else {
+        eprintln!("task list: --queue <q> required");
+        return 2;
+    };
+    match get_task(&format!("{queue}/list")) {
+        Ok((200, text)) => {
+            println!("{text}");
+            0
+        }
+        Ok((code, text)) => {
+            eprintln!("task list: HTTP {code}: {text}");
+            1
+        }
+        Err(e) => {
+            eprintln!("task list: {e}");
             1
         }
     }
@@ -823,6 +969,47 @@ mod tests {
             DoneOutcome::Completed,
             "the owner tab-id completes"
         );
+    }
+
+    // Acceptance #6: the read-model faithfully reflects each task's CURRENT state
+    // — queued / claimed@<peer> / done — WITHOUT mutating anything, and an expired
+    // lease reads as queued (reclaimable), matching is_claimable.
+    #[test]
+    fn read_model_reflects_current_state_read_only() {
+        let queued = task("q1", 0, TaskState::Queued);
+        // A live claim (lease in the future) → claimed@peer-a.
+        let mut live = task("c1", 0, TaskState::Claimed);
+        live.claimed_by = Some("peer-a".into());
+        live.lease_until = Some(NOW + LEASE);
+        // An EXPIRED claim (lease in the past) → reads as queued (reclaimable).
+        let mut expired = task("c2", 0, TaskState::Claimed);
+        expired.claimed_by = Some("peer-b".into());
+        expired.lease_until = Some(NOW - 1);
+        let done = task("d1", 0, TaskState::Done);
+        let entries = vec![queued, live, expired.clone(), done];
+
+        let view = queue_view("q", &entries, NOW);
+        assert_eq!(view.queue, "q");
+        let states: Vec<&str> = view.tasks.iter().map(|t| t.state).collect();
+        assert_eq!(
+            states,
+            vec!["queued", "claimed", "queued", "done"],
+            "expired lease folds to queued; live claim stays claimed"
+        );
+        // claimed@<peer> only for the LIVE claim; the expired orphan shows no peer.
+        assert_eq!(view.tasks[1].claimed_by.as_deref(), Some("peer-a"), "claimed@peer-a");
+        assert_eq!(view.tasks[1].lease_until, Some(NOW + LEASE), "live lease shown");
+        assert!(view.tasks[2].claimed_by.is_none(), "an expired orphan reads as un-held");
+        assert!(view.tasks[2].lease_until.is_none(), "no lease shown for the orphan");
+
+        // READ-ONLY: the source entries are untouched — the on-disk expired claim
+        // is still `Claimed` (the fold to queued is derived at read time only).
+        assert_eq!(entries[2], expired, "the read-model did not mutate the entry");
+        assert_eq!(entries[2].state, TaskState::Claimed, "still Claimed on disk");
+
+        // effective_state agrees with is_claimable on the reclaimable orphan.
+        assert!(is_claimable(&entries[2], NOW), "the orphan is claimable…");
+        assert_eq!(effective_state(&entries[2], NOW), "queued", "…and reads as queued");
     }
 
     // Bonus characterization (like the aligator net): push N with mixed

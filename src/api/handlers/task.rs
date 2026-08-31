@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `task` primitive (#11) route handlers: push / claim / beat / done.
+//! `task` primitive (#11) route handlers: push / claim / beat / done / list.
 //!
 //! The ATOMIC part: claim / beat / done do their file read-modify-write while
 //! holding the shared snapshot mutex — the daemon's single-writer serialization
@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::cli::task::{
     DEFAULT_LEASE_MS, DoneOutcome, TaskEntry, TaskState, beat_task, done_task, parse_tasks, perform_claim, queue_files,
-    queue_path, write_tasks_atomic,
+    queue_path, queue_view, write_tasks_atomic,
 };
 
 use super::super::{TabSnapshot, error_json, respond_json};
@@ -210,4 +210,21 @@ pub(in crate::api) fn done<S: Write>(stream: &mut S, state: &Arc<Mutex<TabSnapsh
         // Stale: the lease expired / the task was re-claimed / wrong claimer.
         DoneOutcome::Stale => error_json(stream, 409, "stale done — lease expired or task re-claimed"),
     }
+}
+
+/// `GET /task/{queue}/list` — the queue's READ-ONLY read-model (S4): each task's
+/// current state (`queued` / `claimed@<peer>` / `done`), an expired-lease claim
+/// folded to `queued` (reclaimable) at read time. Mutates NOTHING; a missing
+/// queue file reads as an empty list. Returns 200 with `{queue, tasks:[…]}`.
+pub(in crate::api) fn list<S: Write>(stream: &mut S, state: &Arc<Mutex<TabSnapshot>>, queue: &str) {
+    let now = crate::unix_millis();
+    // Read under the snapshot lock so the read-model can't observe a torn write.
+    // ponytail: the atomic tmp+rename already prevents torn reads, so this lock is
+    // stricter than strictly needed — kept for uniformity with the write paths;
+    // drop it if `list` ever contends the daemon's hot path.
+    let guard = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let entries = parse_tasks(&std::fs::read_to_string(queue_path(queue)).unwrap_or_default());
+    let view = queue_view(queue, &entries, now);
+    drop(guard);
+    respond_json(stream, 200, &serde_json::to_string(&view).unwrap_or_default());
 }
