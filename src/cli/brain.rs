@@ -1186,6 +1186,76 @@ mod tests {
     }
 
     #[test]
+    fn local_mass_freeze_drains_one_per_tick_instead_of_a_burst() {
+        // 50 tabs wedge on the same LOCAL fault in the same tick — the herd.
+        // There is no explicit fleet-wide simultaneous cap, and the breaker
+        // deliberately ignores local faults (they're independent failures, not a
+        // shared upstream cap). What bounds the herd is `pick_round_robin` — one
+        // send per tick whatever the eligible count — plus `nudged_hash`, which
+        // retires each frozen screen after its single nudge. Neither TICK_BUDGET
+        // (it bounds the SCAN, not the sends) nor `backoff_secs` (it only bites
+        // from a tab's SECOND nudge, which a frozen screen never reaches) is in
+        // this path. Offline is covered separately by the connectivity probe.
+        // The guarantee is SPACING, not volume: 50 nudges over 50 ticks. #40.
+        let t0 = Instant::now();
+        let frozen = "⎿  API Error: Unable to connect to API (ConnectionRefused)\n❯ continue";
+        let fleet = 50usize;
+        let mut watches: Vec<TabWatch> = (0..fleet).map(|_| TabWatch::new(t0)).collect();
+        let (mut breaker, mut cursor) = (None, 0usize);
+        let mut nudges = vec![0u32; fleet];
+        let mut nudge_ticks: Vec<u64> = Vec::new();
+        let mut peak_eligible = 0usize;
+
+        for tick in 0..120 {
+            let now = t0 + Duration::from_secs(tick * DEFAULT_INTERVAL_SECS);
+            let eligible: Vec<Eligible> = watches
+                .iter_mut()
+                .enumerate()
+                .filter_map(|(i, w)| {
+                    evaluate_tab(w, frozen, None, now).map(|trigger| Eligible {
+                        tab_id: format!("tab-{i}"),
+                        tab_name: format!("claude-{i}"),
+                        trigger,
+                        output_hash: w.last_hash,
+                    })
+                })
+                .collect();
+            peak_eligible = peak_eligible.max(eligible.len());
+            assert!(
+                !systemic_api_freeze(&eligible, &mut breaker, now),
+                "a local mass freeze must never read as an upstream cap"
+            );
+
+            let Some(pick) = pick_round_robin(&eligible, &mut cursor) else {
+                continue;
+            };
+            let i: usize = pick.tab_id.strip_prefix("tab-").unwrap().parse().unwrap();
+            nudges[i] += 1;
+            nudge_ticks.push(tick);
+            // Exactly what tick() records on send — including the backoff state,
+            // to show it isn't what bounds the drain.
+            let w = &mut watches[i];
+            w.nudged_hash = Some(w.last_hash);
+            w.nudge_streak = 1;
+            w.last_label = Some(pick.trigger.label());
+            w.next_nudge_at = Some(now + Duration::from_secs(backoff_secs(1)));
+        }
+
+        assert_eq!(peak_eligible, fleet, "the whole fleet really did freeze at once");
+        assert!(
+            nudges.iter().all(|n| *n == 1),
+            "every tab nudged exactly once — nudged_hash retires a frozen screen"
+        );
+        // One per tick, no gaps: the herd is spread across `fleet` ticks
+        // (~250s at the default interval) rather than fired in one burst.
+        assert_eq!(nudge_ticks.len(), fleet);
+        let (first, last) = (nudge_ticks[0], nudge_ticks[fleet - 1]);
+        assert_eq!(last - first, (fleet - 1) as u64, "one nudge per tick, never two");
+        // Nothing before the freeze gate opens at STABLE_SECS.
+        assert_eq!(first * DEFAULT_INTERVAL_SECS, STABLE_SECS);
+    }
+
+    #[test]
     fn systemic_freeze_needs_more_than_threshold_and_is_sticky() {
         let t0 = Instant::now();
         let mut breaker = None;
