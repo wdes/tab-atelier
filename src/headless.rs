@@ -114,8 +114,12 @@ struct HeadlessTab {
     agent_session_id: Option<Arc<str>>,
     agent_kind: Option<Arc<str>>,
     agent_plan_mode: Option<bool>,
+    /// Mirrors `TabState::agent_daemon` — this tab is a session-less daemon.
+    agent_daemon: bool,
     /// Per-tab env vars (`env set --tab <id>`); mirrors `TabState::tab_env`.
     tab_env: std::collections::BTreeMap<String, String>,
+    /// Free-form durable labels (`set-meta`); mirrors `TabState::meta`.
+    meta: std::collections::BTreeMap<String, String>,
     /// Pinned fixed grid size (`tab-atelier resize`); `None` = spawn default.
     /// Persisted to tabs.json so the size survives a restart.
     pinned_cols: Option<u16>,
@@ -685,6 +689,10 @@ fn spawn_pty_tab(
     // would double-launch.
     let pending_agent_resume = match (&agent_kind, &agent_session_id) {
         _ if agent_direct.is_some() || crate::read_only() => None,
+        // A session-less daemon has nothing to resume — just relaunch it. The
+        // GUI already did this for brain; headless didn't, so a restarted
+        // daemon tab came back as a bare shell.
+        (Some(kind), None) => build_agent_resume_command(kind, "", agent_plan_mode),
         (Some(kind), Some(sid)) => build_agent_resume_command(kind, sid, agent_plan_mode),
         _ => None,
     };
@@ -721,6 +729,8 @@ fn spawn_pty_tab(
         last_known_cwd: cwd,
         last_known_cwd_string,
         tab_env,
+        agent_daemon: false,
+        meta: std::collections::BTreeMap::new(),
         agent_state: None,
         agent_session_id: agent_session_id.map(Arc::from),
         agent_kind: agent_kind.map(Arc::from),
@@ -913,6 +923,19 @@ pub fn run() -> std::io::Result<()> {
                 ts.ssh_agent.clone(),
             ) {
                 t.limits = ts.limits.clone();
+                t.meta = ts.meta.clone();
+                t.agent_daemon = ts.agent_daemon;
+                // A flagged daemon tab relaunches its own subcommand, whatever
+                // the kind — that's how a harness's watcher survives a restart
+                // without us knowing its name.
+                if ts.agent_daemon
+                    && !crate::read_only()
+                    && let Some(kind) = ts.agent_kind.as_deref()
+                    && let Some(cmd) = crate::daemon_relaunch_command(kind)
+                {
+                    t.pending_restore = None;
+                    t.pending_agent_resume = Some(cmd);
+                }
                 t.pinned_cols = ts.pinned_cols;
                 t.pinned_rows = ts.pinned_rows;
                 // Restore the persisted MRU stamp so Ctrl+P / mobile ordering
@@ -1007,6 +1030,7 @@ pub fn run() -> std::io::Result<()> {
         pending_claude_only: None,
         pending_relay_mode: None,
         pending_env_changes: Vec::new(),
+        pending_meta_changes: Vec::new(),
         pending_relay_config: None,
         pending_renames: Vec::new(),
         pending_status_updates: Vec::new(),
@@ -1423,6 +1447,7 @@ fn refresh_snapshot(
             resident_memory_bytes: crate::agent_probe::sample_tree(tab.pid).map(|s| s.rss_kb.saturating_mul(1024)),
             tokens: None,
             tab_env: tab.tab_env.clone(),
+            meta: tab.meta.clone(),
         });
     }
     let mut snapshot = api_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1623,6 +1648,7 @@ fn persist(
             agent_session_id: tab.agent_session_id.as_deref().map(str::to_string),
             agent_kind: tab.agent_kind.as_deref().map(str::to_string),
             agent_plan_mode: tab.agent_plan_mode,
+            agent_daemon: tab.agent_daemon,
             tab_env: tab.tab_env.clone(),
             pinned_cols: tab.pinned_cols,
             pinned_rows: tab.pinned_rows,
@@ -1637,6 +1663,7 @@ fn persist(
             bg_color: tab.bg_color.clone(),
             limits: tab.limits.clone(),
             ssh_agent: tab.ssh_agent.clone(),
+            meta: tab.meta.clone(),
             ..TabState::default()
         })
         .collect();
@@ -1916,6 +1943,7 @@ fn drain_pending(
     let relay_mode_change: Option<bool> = s.pending_relay_mode.take();
     let relay_config_change = s.pending_relay_config.take();
     let env_changes: Vec<crate::api::EnvChange> = s.pending_env_changes.drain(..).collect();
+    let meta_changes: Vec<crate::api::MetaChange> = s.pending_meta_changes.drain(..).collect();
     let new_tabs = std::mem::take(&mut s.pending_new_tabs);
     let new_tab_cwds: std::collections::VecDeque<std::path::PathBuf> = std::mem::take(&mut s.pending_new_tab_cwds);
     drop(s);
@@ -2173,6 +2201,14 @@ fn drain_pending(
         }
     }
 
+    // Free-form durable labels (`set-meta`) onto the runtime tab — persisted
+    // on the next tick like every other durable field.
+    for ch in meta_changes {
+        if let Some(t) = tabs.iter_mut().find(|t| *t.id == ch.tab_id) {
+            crate::apply_meta_change(&mut t.meta, &ch.key, ch.value);
+        }
+    }
+
     // Status updates: write transient + durable agent fields.
     for upd in status_updates {
         let Some(tab) = tabs.iter_mut().find(|t| *t.id == upd.tab_id) else {
@@ -2197,6 +2233,9 @@ fn drain_pending(
             }
             if upd.plan_mode.is_some() {
                 tab.agent_plan_mode = upd.plan_mode;
+            }
+            if let Some(d) = upd.daemon {
+                tab.agent_daemon = d;
             }
         }
     }

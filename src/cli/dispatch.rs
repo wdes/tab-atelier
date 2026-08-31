@@ -405,6 +405,18 @@ pub enum Commands {
         args: Vec<String>,
     },
 
+    /// Attach a free-form durable label to a tab: `set-meta <key> <value>`.
+    ///
+    /// A small key/value map surfaced in `tabs --json` and on `/tabs`, for an
+    /// orchestration layer to carry its own vocabulary (role, phase, …). Never
+    /// reaches the PTY. `--tab <id>` targets another tab; `--clear` removes
+    /// the key.
+    SetMeta {
+        /// Passed straight through to `cli::set_meta::run`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Print the master API token, so the local API can be called
     /// without locating the `api.token` state file.
     Token,
@@ -775,6 +787,7 @@ pub fn dispatch(cli: Cli) -> bool {
             crate::cli::client::run("set-font", &args)
         }
         Commands::SetContext { args } => crate::cli::client::run("set-context", &args),
+        Commands::SetMeta { args } => crate::cli::client::run("set-meta", &args),
         Commands::Token => crate::cli::client::run("token", &[]),
         Commands::RotateTokens => crate::cli::client::run("rotate-tokens", &[]),
         Commands::ResetMasterToken => crate::cli::client::run("reset-master-token", &[]),
