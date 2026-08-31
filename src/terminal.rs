@@ -376,6 +376,14 @@ struct CachedFrame {
     /// have moved (a `scroll_display`) — the signal that makes shifted
     /// reuse safe for user scrolling.
     ring_len: u64,
+    /// Whether the grid was on the ALTERNATE screen (`\x1b[?1049h`, e.g.
+    /// Claude Code's fullscreen mode, vim, less) when this frame was built.
+    /// The alt screen is a *separate* grid with no scrollback, so it always
+    /// reports `history_size == 0` / `display_offset == 0` — identical to a
+    /// fresh primary screen. Without recording it, a primary↔alt toggle looks
+    /// like "same window" to [`Self::shift_for`] and reuses the OTHER screen's
+    /// rows, repainting only the damaged rows over a stale top.
+    alt_screen: bool,
     /// `Rc` so handing the rows to Phase 2 each frame is a refcount
     /// bump per row — the old `RawLine` deep clone (text + segments +
     /// runs for EVERY visible row) ran under the Term lock every paint.
@@ -408,8 +416,15 @@ impl CachedFrame {
         visible_lines: usize,
         history_size: usize,
         ring_len: u64,
+        alt_screen: bool,
     ) -> Option<i32> {
         if self.visible_cols != visible_cols || self.visible_lines != visible_lines {
+            return None;
+        }
+        // A primary↔alt screen switch swaps in an entirely different grid, but
+        // the alt screen's 0/0 offset+history can match a cached primary frame
+        // (and vice-versa). Never reuse across the switch — rebuild every row.
+        if self.alt_screen != alt_screen {
             return None;
         }
         if self.display_offset == display_offset && self.history_size == history_size {
@@ -2347,6 +2362,11 @@ impl Element for TerminalElement {
             // an animated redraw. SHOW_CURSOR is set by default and
             // cleared by `?25l`, restored by `?25h`.
             let cursor_visible = term.mode().contains(TermMode::SHOW_CURSOR);
+            // Which screen the grid is on. A primary↔alt toggle (Claude Code's
+            // fullscreen mode, vim, less) swaps the whole grid but can keep the
+            // same 0/0 offset+history, so the frame cache must not reuse across
+            // it — see [`CachedFrame::alt_screen`].
+            let alt_screen = term.mode().contains(TermMode::ALT_SCREEN);
 
             // Collect damage BEFORE we re-borrow the grid immutably
             // for the cell scan. `Term::damage()` returns either Full
@@ -2385,9 +2405,16 @@ impl Element for TerminalElement {
             // build loop below rebuilds them; un-damaged slots stay
             // populated and skip the rebuild entirely.
             let prev = self.prev_frame.borrow_mut().take();
-            let shift = prev
-                .as_ref()
-                .and_then(|p| p.shift_for(display_offset, visible_cols, visible_lines, history_size, ring_len));
+            let shift = prev.as_ref().and_then(|p| {
+                p.shift_for(
+                    display_offset,
+                    visible_cols,
+                    visible_lines,
+                    history_size,
+                    ring_len,
+                    alt_screen,
+                )
+            });
             let mut working: Vec<Option<Rc<RawLine>>> = match (prev, shift) {
                 (Some(p), Some(0)) => {
                     let mut v = p.lines;
@@ -2696,6 +2723,7 @@ impl Element for TerminalElement {
                 visible_lines,
                 history_size,
                 ring_len,
+                alt_screen,
                 lines: working,
             });
 
@@ -3156,6 +3184,7 @@ mod tests {
             visible_lines: 24,
             history_size,
             ring_len,
+            alt_screen: false,
             lines: Vec::new(),
         }
     }
@@ -3166,12 +3195,35 @@ mod tests {
     #[test]
     fn cached_frame_stationary_and_resize() {
         let f = frame(0, 100, 7);
-        assert_eq!(f.shift_for(0, 80, 24, 100, 7), Some(0));
+        assert_eq!(f.shift_for(0, 80, 24, 100, 7, false), Some(0));
         // Same window, output arrived in place (TUI redraw): still
         // index-stable; the damage rows handle the changed content.
-        assert_eq!(f.shift_for(0, 80, 24, 100, 9), Some(0));
-        assert_eq!(f.shift_for(0, 100, 24, 100, 7), None, "cols change (resize)");
-        assert_eq!(f.shift_for(0, 80, 50, 100, 7), None, "lines change (resize)");
+        assert_eq!(f.shift_for(0, 80, 24, 100, 9, false), Some(0));
+        assert_eq!(f.shift_for(0, 100, 24, 100, 7, false), None, "cols change (resize)");
+        assert_eq!(f.shift_for(0, 80, 50, 100, 7, false), None, "lines change (resize)");
+    }
+
+    /// A primary↔alt screen toggle (Claude Code fullscreen, vim, less) swaps
+    /// in a whole different grid, but the alt screen's 0/0 offset+history
+    /// matches a fresh primary frame — reuse would serve the OTHER screen's
+    /// rows and repaint only the damaged bottom over a stale top. Both
+    /// directions must rebuild; same-screen still reuses.
+    #[test]
+    fn cached_frame_alt_screen_switch_rebuilds() {
+        let primary = frame(0, 0, 7); // primary, 0/0 — indistinguishable from alt
+        assert_eq!(
+            primary.shift_for(0, 80, 24, 0, 7, true),
+            None,
+            "primary→alt must rebuild"
+        );
+        let mut alt = frame(0, 0, 7);
+        alt.alt_screen = true;
+        assert_eq!(alt.shift_for(0, 80, 24, 0, 7, false), None, "alt→primary must rebuild");
+        assert_eq!(
+            alt.shift_for(0, 80, 24, 0, 7, true),
+            Some(0),
+            "same alt screen still reuses"
+        );
     }
 
     /// Guards the stale-bg-bleed fix, now in shift form: when output
@@ -3184,9 +3236,9 @@ mod tests {
     #[test]
     fn cached_frame_stream_scroll_rebuilds() {
         let f = frame(0, 100, 7);
-        assert_eq!(f.shift_for(0, 80, 24, 101, 8), None, "history grew + output");
-        assert_eq!(f.shift_for(0, 80, 24, 0, 8), None, "\\x1b[3J history clear");
-        assert_eq!(f.shift_for(5, 80, 24, 100, 8), None, "user scroll during flood");
+        assert_eq!(f.shift_for(0, 80, 24, 101, 8, false), None, "history grew + output");
+        assert_eq!(f.shift_for(0, 80, 24, 0, 8, false), None, "\\x1b[3J history clear");
+        assert_eq!(f.shift_for(5, 80, 24, 100, 8, false), None, "user scroll during flood");
     }
 
     /// A pure user scroll — no PTY bytes since the cache was built —
@@ -3197,12 +3249,15 @@ mod tests {
     fn cached_frame_pure_scroll_shifts() {
         let f = frame(0, 100, 7);
         // Scrolling up 5 lines: content moves DOWN the screen.
-        assert_eq!(f.shift_for(5, 80, 24, 100, 7), Some(-5));
+        assert_eq!(f.shift_for(5, 80, 24, 100, 7, false), Some(-5));
         // And back toward the bottom from offset 5.
-        assert_eq!(frame(5, 100, 7).shift_for(2, 80, 24, 100, 7), Some(3));
+        assert_eq!(frame(5, 100, 7).shift_for(2, 80, 24, 100, 7, false), Some(3));
         // Scrolled all the way with a full 10k scrollback: still a
         // plain shift — history must never be truncated to avoid this.
-        assert_eq!(frame(0, 10_000, 7).shift_for(10_000, 80, 24, 10_000, 7), Some(-10_000));
+        assert_eq!(
+            frame(0, 10_000, 7).shift_for(10_000, 80, 24, 10_000, 7, false),
+            Some(-10_000)
+        );
     }
 
     /// The realignment itself: `None` slots are the rows the cell scan
