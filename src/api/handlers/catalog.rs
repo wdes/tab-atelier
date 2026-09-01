@@ -44,6 +44,9 @@ pub(in crate::api) fn retire<S: Write>(stream: &mut S, state: &Arc<Mutex<TabSnap
     #[derive(serde::Deserialize, Default)]
     struct RetireRequest {
         after_action: Option<String>,
+        /// SV1: the structured bilan (retrospective on the prompt). Supersedes
+        /// `after_action` as the closing record when present.
+        bilan: Option<crate::cli::catalog::Bilan>,
         #[serde(flatten)]
         stamp: crate::cli::catalog::V2Stamp,
     }
@@ -68,6 +71,12 @@ pub(in crate::api) fn retire<S: Write>(stream: &mut S, state: &Arc<Mutex<TabSnap
     let had_session = tab.agent_session_id.is_some();
     let id = tab.id.to_string();
     let mut card = CatalogCard::from_snapshot(tab, after_action, now);
+    // SV1: a structured bilan (retrospective on the prompt) supersedes the 1-line
+    // after-action as the closing record — captured here at archive time, BEFORE the
+    // close and before the éval (SV2). Empty / absent ⇒ the after-action stands.
+    if let Some(bilan) = req.bilan {
+        card = card.with_bilan(bilan);
+    }
     // SV3: an orchestrator that named a `skill` promotes this to a v2 record (profile
     // + per-mode telemetry). Absent ⇒ the card stays v1 (quarantined from the v2
     // read-model). The baseline (session_id/agent_kind) is untouched, A/B-isolated.

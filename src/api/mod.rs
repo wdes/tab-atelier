@@ -6614,4 +6614,44 @@ mod tests {
         let tr = sk["freshVsResume"]["tokensRatio"].as_f64().expect("tokens ratio derived");
         assert!((tr - 1000.0 / 3000.0).abs() < 1e-9, "tokens_ratio derived from the live records");
     }
+
+    // SV1: the LIVE path — a REAL integration test (NOT a mock). POST /retire with a
+    // structured bilan on a disposable tab → the 4-field bilan is ARCHIVED for real to
+    // catalog.jsonl (read-back verifies), and it REPLACES lastMission (a one-line
+    // digest is back-filled). Exercises the bilan capture on the wire, before close.
+    #[test]
+    fn sv1_live_retire_archives_the_structured_bilan() {
+        let _catalog_guard = real_catalog_test_guard(); // serialize real-catalog writers
+        let (port, state, token) = spawn_server();
+        let post = |path: &str, body: &str| {
+            format!("POST /{path}?token={token} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+        };
+
+        let id = crate::default_tab_id();
+        let mut tab = test_snapshot_tab(&id, "disposable-bilan");
+        tab.rehome_status = Some("safe-to-close".into());
+        tab.agent_session_id = Some("sess-bilan".into());
+        tab.assignment = Some("build/builder".into());
+        {
+            let mut g = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            g.tabs.push(tab);
+        }
+        let _cleanup = CatalogCleanup(vec![id.clone()]);
+
+        let body = r#"{"bilan":{"learned":["read-back gate is core"],"problems":["prompt missed the lease-beat"],"addDirectives":["beat the lease on long slices"],"dropDirectives":["drop the stale slug note"]}}"#;
+        let done = request(port, &post(&format!("tabs/by-id/{id}/retire"), body));
+        assert_eq!(status_code(&done), 200, "retire with a bilan → 200\n{done}");
+
+        // REAL archive: the structured 4-field bilan really landed in catalog.jsonl.
+        let back = crate::cli::catalog::read_back(&crate::cli::catalog::catalog_path(), &id)
+            .expect("the card was archived to the REAL catalog.jsonl");
+        let b = back.bilan.expect("the structured bilan was archived for real");
+        assert_eq!(b.learned, vec!["read-back gate is core"], "learned archived");
+        assert_eq!(b.problems, vec!["prompt missed the lease-beat"], "problems archived");
+        assert_eq!(b.add_directives, vec!["beat the lease on long slices"], "+directives archived");
+        assert_eq!(b.drop_directives, vec!["drop the stale slug note"], "−directives archived");
+        // Replaces lastMission: a one-line digest was back-filled for legacy readers.
+        let lm = back.last_mission.expect("the legacy lastMission slot is back-filled with a digest");
+        assert!(lm.contains("learned:") && lm.contains("+prompt:"), "digest present: {lm}");
+    }
 }
