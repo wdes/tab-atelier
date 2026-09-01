@@ -1414,7 +1414,7 @@ fn refresh_snapshot(
                 recent_output,
             )
         };
-        let folder = crate::folder_style_for(crate::folder_styles(), tab.last_known_cwd_string.as_deref());
+        let folder = crate::folder_style_of(tab.last_known_cwd_string.as_deref());
         api_tabs.push(api::SnapshotTab {
             id: tab.id.clone(),
             name: tab.name.clone(),
@@ -1432,14 +1432,8 @@ fn refresh_snapshot(
             share_token_ro: tab.share_token_ro.clone(),
             locked: tab.locked,
             schedule: tab.schedule.clone(),
-            bg_color: crate::effective_tab_bg(
-                tab.bg_color.as_deref(),
-                folder.and_then(|f| f.color.as_deref()),
-                Some(global_bg),
-            )
-            .into(),
-            badge: crate::effective_tab_badge(tab.badge.as_deref(), folder.and_then(|f| f.badge.as_deref()))
-                .map(Into::into),
+            bg_color: crate::effective_tab_bg(tab.bg_color.as_deref(), folder.color.as_deref(), Some(global_bg)).into(),
+            badge: crate::effective_tab_badge(tab.badge.as_deref(), folder.badge.as_deref()).map(Into::into),
             context: tab.context.clone(),
             shell_pid: tab.pid,
             agent_state: tab.agent_state.clone(),
@@ -1934,6 +1928,9 @@ fn drain_pending(
     default_limits: &mut crate::TabResourceLimits,
     default_net_allow: &crate::net_policy::AllowConfig,
 ) -> bool {
+    // Pick up an edited `style --folder` rule without a restart (see the GUI's
+    // `persist`): a stat per tick, parsed only when the file moved.
+    crate::refresh_folder_styles();
     let mut s = api_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut closes: Vec<usize> = s.pending_closes.drain(..).collect();
     let activate = s.pending_activate.take();

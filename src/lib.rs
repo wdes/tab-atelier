@@ -252,18 +252,55 @@ pub fn tab_env_global() -> std::collections::BTreeMap<String, String> {
 /// every tab spawn / snapshot. Set once at startup, like the other
 /// preference-backed globals; editing the preference takes effect on the next
 /// daemon start (same contract as `bg-color --global`).
-static FOLDER_STYLES: OnceLock<std::collections::BTreeMap<String, FolderStyle>> = OnceLock::new();
+static FOLDER_STYLES: std::sync::RwLock<std::collections::BTreeMap<String, FolderStyle>> =
+    std::sync::RwLock::new(std::collections::BTreeMap::new());
 
-/// Install the user's `folder_styles` for this process. First set wins.
+/// Replace the process's per-folder styles. Called at startup and again by
+/// [`refresh_folder_styles`] whenever the preference file changes.
 pub fn set_folder_styles(styles: std::collections::BTreeMap<String, FolderStyle>) {
-    let _ = FOLDER_STYLES.set(styles);
+    if let Ok(mut g) = FOLDER_STYLES.write() {
+        *g = styles;
+    }
 }
 
-/// The configured per-folder styles, or an empty map when none are set.
+/// The folder rule that applies to `cwd`, resolved and owned.
+///
+/// Owned rather than borrowed so the caller doesn't hold the lock: callers
+/// resolve once per tick and cache the result on the tab, so painting a frame
+/// never touches this.
 #[must_use]
-pub fn folder_styles() -> &'static std::collections::BTreeMap<String, FolderStyle> {
-    static EMPTY: std::collections::BTreeMap<String, FolderStyle> = std::collections::BTreeMap::new();
-    FOLDER_STYLES.get().unwrap_or(&EMPTY)
+pub fn folder_style_of(cwd: Option<&str>) -> FolderStyle {
+    FOLDER_STYLES
+        .read()
+        .ok()
+        .and_then(|g| folder_style_for(&g, cwd).cloned())
+        .unwrap_or_default()
+}
+
+/// mtime of the preference file at the last [`refresh_folder_styles`].
+static FOLDER_STYLES_MTIME: std::sync::Mutex<Option<std::time::SystemTime>> = std::sync::Mutex::new(None);
+
+/// Re-read `folder_styles` when preferences.json changed on disk.
+///
+/// Called from each edition's tick, so `style --folder` lands on a running
+/// desktop instead of waiting for a restart — which, with a few dozen tabs
+/// open, is not a thing anyone wants to do to try a colour. Only the mtime is
+/// stat'd on the common path; the file is parsed solely when it moved.
+pub fn refresh_folder_styles() {
+    let Ok(mtime) = std::fs::metadata(editable_preferences_path()).and_then(|m| m.modified()) else {
+        return;
+    };
+    let mut last = FOLDER_STYLES_MTIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if *last == Some(mtime) {
+        return;
+    }
+    *last = Some(mtime);
+    // Released before the parse + the styles write lock — nothing else needs
+    // to wait on the stamp while we read the file.
+    drop(last);
+    set_folder_styles(load_preferences(&platform::config_dir()).folder_styles);
 }
 
 /// User-defined `key=value` pairs from the `clear_env_vars` preference,
@@ -3661,6 +3698,38 @@ mod tests {
             assert!(!is_daemon_kind(bad), "{bad} must not be a daemon kind");
             assert!(daemon_relaunch_command(bad).is_none());
         }
+    }
+
+    #[test]
+    fn folder_styles_can_be_replaced_while_running() {
+        // The bug this encodes: the rules lived in a OnceLock, so editing a
+        // rule silently no-op'd until the app was restarted — with dozens of
+        // tabs open, nobody restarts to try a colour.
+        let rule = |color: &str| {
+            let mut m = std::collections::BTreeMap::new();
+            m.insert(
+                "/tmp/ta-style-test".to_string(),
+                FolderStyle {
+                    color: Some(color.to_string()),
+                    badge: Some("T".into()),
+                },
+            );
+            m
+        };
+        set_folder_styles(rule("#111111"));
+        assert_eq!(
+            folder_style_of(Some("/tmp/ta-style-test/sub")).color.as_deref(),
+            Some("#111111")
+        );
+        set_folder_styles(rule("#222222"));
+        assert_eq!(
+            folder_style_of(Some("/tmp/ta-style-test/sub")).color.as_deref(),
+            Some("#222222"),
+            "a re-set must win — a OnceLock would have kept the first"
+        );
+        // An unruled path resolves to the empty style, not the last rule.
+        assert_eq!(folder_style_of(Some("/tmp/elsewhere")), FolderStyle::default());
+        set_folder_styles(std::collections::BTreeMap::new());
     }
 
     #[test]
