@@ -499,11 +499,60 @@ pub fn is_noop_open(events: &[DecisionEvent], incoming: &DecisionEvent) -> bool 
     })
 }
 
+/// What a `push` did (`PD4b`) — for the CLI to report + for tests to assert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushOutcome {
+    /// The `open` was appended (new decision, or an open decision's content changed).
+    Appended,
+    /// No-op: an identical re-run on an already-open decision (PD4 idempotence).
+    NoopIdentical,
+    /// No-op: the decision is SETTLED (`tranched`/`archived`) — the routine producer
+    /// must NOT resurrect it. Only an explicit re-open does (`PD4b`). ⭐ the fix.
+    NoopSettled,
+    /// Explicit re-open: the settled/archived decision was resurrected (bundle restored
+    /// from the archive, then the `open` appended). The ONLY resurrection path.
+    Reopened,
+}
+
+/// `PD4b` — the routine-vs-explicit push core, PATH-INJECTED (testable real-fs).
+///
+/// `reopen == false` (the ROUTINE producer): NO-OP if the decision is SETTLED
+/// (`tranched`/`archived`) — a timer re-emitting `open` must never fight the PO's ruling
+/// / the PD3 sticky-archive — OR if it's an identical re-run of an already-open decision
+/// (PD4 idempotence). Otherwise append. `reopen == true` (EXPLICIT): bypass the no-ops,
+/// restore the archived bundle (`reopen_restore`), then append — the SOLE resurrection.
+///
+/// # Errors
+/// Propagates the restore / append I/O error.
+pub fn push_event(log: &Path, e: &DecisionEvent, reopen: bool) -> std::io::Result<PushOutcome> {
+    let existing: Vec<DecisionEvent> =
+        parse_decisions(&std::fs::read_to_string(log).unwrap_or_default()).into_iter().filter(|ev| ev.id == e.id).collect();
+    if reopen {
+        // PD3 reversibility, now the EXPLICIT path only: bring the bundle home first.
+        reopen_restore(log, &e.id)?;
+        append_line(log, e)?;
+        return Ok(PushOutcome::Reopened);
+    }
+    // ⭐ PD4b: never let the routine producer resurrect a SETTLED decision.
+    if matches!(state_of(&existing), DecisionState::Tranched | DecisionState::Archived) {
+        return Ok(PushOutcome::NoopSettled);
+    }
+    // PD4 idempotence: an identical re-run on an already-open decision.
+    if is_noop_open(&existing, e) {
+        return Ok(PushOutcome::NoopIdentical);
+    }
+    append_line(log, e)?;
+    Ok(PushOutcome::Appended)
+}
+
 fn push(args: &[String]) -> i32 {
     let Some(id) = arg_after(args, "--id").filter(|s| !s.trim().is_empty()) else {
         eprintln!("decision push: --id is required");
         return 2;
     };
+    // PD4b: the ROUTINE producer path is the default; `--reopen` is the EXPLICIT, sole
+    // resurrection path for a settled/archived decision.
+    let reopen = args.iter().any(|a| a == "--reopen");
     let files = arg_after(args, "--files")
         .map(|s| s.split(',').map(str::trim).filter(|x| !x.is_empty()).map(str::to_string).collect())
         .unwrap_or_default();
@@ -519,21 +568,18 @@ fn push(args: &[String]) -> i32 {
         files,
         ..Default::default()
     };
-    // PD4 IDEMPOTENCE (the DRY dedup every producer inherits): a re-run of the same open
-    // on an already-open decision is a NO-OP — don't grow the log / duplicate.
-    let path = decisions_path();
-    let existing: Vec<DecisionEvent> =
-        parse_decisions(&std::fs::read_to_string(&path).unwrap_or_default()).into_iter().filter(|ev| ev.id == e.id).collect();
-    if is_noop_open(&existing, &e) {
-        println!("{}", serde_json::json!({ "push": e.id, "noop": true }));
-        return 0;
+    match push_event(&decisions_path(), &e, reopen) {
+        Ok(outcome) => {
+            let noop = matches!(outcome, PushOutcome::NoopIdentical | PushOutcome::NoopSettled);
+            let verb = if reopen { "reopen" } else { "push" };
+            println!("{}", serde_json::json!({ verb: e.id, "outcome": format!("{outcome:?}"), "noop": noop }));
+            0
+        }
+        Err(err) => {
+            eprintln!("decision push: {err}");
+            1
+        }
     }
-    // PD3 reversibility: re-opening an ARCHIVED decision brings its bundle back from the
-    // archive before the `open` lands (best-effort; nothing is ever destroyed).
-    if let Err(err) = reopen_restore(&path, &e.id) {
-        eprintln!("decision push: restore of the archived bundle failed — {err}");
-    }
-    append_or_report("push", &e)
 }
 
 fn mark(args: &[String], kind: DecisionKind) -> i32 {
@@ -772,15 +818,54 @@ mod tests {
         let arch_ev = parse_decisions(&body).into_iter().rev().find(|e| e.id == "ra1c" && e.kind == DecisionKind::Archived).unwrap();
         assert_eq!(arch_ev.archived_path.as_deref(), Some(dir.as_str()), "archived_path = the month dir");
 
-        // ⭐ REVERSIBILITY: a re-open MOVES the bundle back to its original path (nothing
-        // is ever destroyed; a moved bundle can come home).
-        reopen_restore(log.path(), "ra1c").unwrap();
-        assert!(bundle.exists(), "re-open restored the bundle to its original outbox path");
+        // ⭐ REVERSIBILITY via the EXPLICIT re-open path (PD4b): `push_event(.., reopen=true)`
+        // restores the bundle AND appends the `open` — the SOLE resurrection path.
+        push_event(log.path(), &open("ra1c", "harness", "Deploy RA1c v2", 120), true).unwrap();
+        assert!(bundle.exists(), "explicit re-open restored the bundle to its original outbox path");
         assert!(!archived.exists(), "the archive copy moved back (no duplication)");
         assert_eq!(std::fs::read_to_string(&bundle).unwrap(), "the RA1c deploy bundle", "bytes intact after the round-trip");
-        // The explicit re-open event (as `push` appends after restore) -> state=open again.
-        append_line(log.path(), &open("ra1c", "harness", "Deploy RA1c v2", 120)).unwrap();
-        assert_eq!(read_decisions_at(log.path(), false).iter().find(|d| d.id == "ra1c").unwrap().state, DecisionState::Open);
+        let reopened = read_decisions_at(log.path(), false);
+        let d = reopened.iter().find(|d| d.id == "ra1c").expect("explicit re-open → back in the active list");
+        assert_eq!(d.state, DecisionState::Open, "explicit re-open resurrects to open");
+        assert_eq!(d.title.as_deref(), Some("Deploy RA1c v2"), "the re-open's content lands");
+    }
+
+    // PD4b ⭐ ANTI-RESURRECTION (the Olympe 🟡 bug, killed): a SETTLED decision
+    // (tranched → archived) re-pushed by the ROUTINE producer (push open, same id, no
+    // --reopen) STAYS archived (out of the active list) and its bundle is NOT restored.
+    // Only an EXPLICIT re-open resurrects.
+    #[test]
+    fn pd4b_routine_push_never_resurrects_a_settled_decision() {
+        let log = TmpLog::new();
+        let outbox = TmpOutbox::new();
+        let bundle = outbox.path().join("dep.md");
+        std::fs::write(&bundle, b"deploy bundle").unwrap();
+
+        // open → tranch → archive (the PO ruled + the bundle filed).
+        let mut o = open("dep", "harness", "Deploy", 100);
+        o.files = vec![bundle.to_string_lossy().into_owned()];
+        append_line(log.path(), &o).unwrap();
+        append_line(log.path(), &ev("dep", DecisionKind::Tranched, 110)).unwrap();
+        let ts = 1_756_700_000;
+        archive_decision(log.path(), outbox.path(), "dep", ts).unwrap();
+        assert!(!bundle.exists(), "bundle archived off the live outbox");
+        assert!(read_decisions_at(log.path(), false).iter().all(|d| d.id != "dep"), "settled → hidden from the active list");
+
+        // ⭐ the ROUTINE producer re-pushes the SAME open (a timer tick) → NO-OP settled.
+        let outcome = push_event(log.path(), &o, false).unwrap();
+        assert_eq!(outcome, PushOutcome::NoopSettled, "routine push on a settled decision is a no-op");
+        // It STAYS archived — no resurrection — and the bundle is NOT back on disk.
+        assert!(read_decisions_at(log.path(), false).iter().all(|d| d.id != "dep"), "still hidden after the routine re-push (not resurrected)");
+        assert_eq!(read_decisions_at(log.path(), true).iter().find(|d| d.id == "dep").unwrap().state, DecisionState::Archived, "stays archived");
+        assert!(!bundle.exists(), "the archived bundle was NOT resurrected on disk by the routine push");
+        // The routine re-push appended NOTHING (log did not grow).
+        let archived_events = parse_decisions(&std::fs::read_to_string(log.path()).unwrap()).into_iter().filter(|e| e.id == "dep").count();
+        assert_eq!(archived_events, 3, "open + tranched + archived — the routine re-push added no event");
+
+        // Only an EXPLICIT re-open resurrects (bundle back + state open).
+        push_event(log.path(), &o, true).unwrap();
+        assert!(bundle.exists(), "explicit re-open restores the bundle");
+        assert_eq!(read_decisions_at(log.path(), false).iter().find(|d| d.id == "dep").unwrap().state, DecisionState::Open, "explicit re-open → open");
     }
 
     // PD3b ⭐ ANTI-CLOBBER (the Olympe 🟡 bug, killed): TWO distinct decisions (A, B)
