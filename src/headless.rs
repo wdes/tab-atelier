@@ -106,6 +106,8 @@ struct HeadlessTab {
     agent_state: Option<AgentStateSnapshot>,
     agent_session_id: Option<Arc<str>>,
     agent_kind: Option<Arc<str>>,
+    /// SV4 — how this tab was born (`fresh`/`resume`); mirrors `TabState::spawn_mode`.
+    spawn_mode: Option<crate::cli::catalog::SpawnMode>,
     agent_plan_mode: Option<bool>,
     /// Per-tab env vars (`env set --tab <id>`); mirrors `TabState::tab_env`.
     tab_env: std::collections::BTreeMap<String, String>,
@@ -847,6 +849,9 @@ fn spawn_pty_tab(
         agent_state: None,
         agent_session_id: agent_session_id.map(Arc::from),
         agent_kind: agent_kind.map(Arc::from),
+        // SV4: defaults None; the restore site re-applies TabState.spawn_mode, and
+        // `spawn --from-skill` stamps it post-create via the set-spawn-mode verb.
+        spawn_mode: None,
         agent_plan_mode,
         last_output_at: None,
         led_last_ring: 0,
@@ -1076,6 +1081,7 @@ pub fn run() -> std::io::Result<()> {
                 t.specialty = ts.specialty.as_deref().map(Arc::from);
                 t.orchestrator = ts.orchestrator.as_deref().map(Arc::from);
                 t.objective = ts.objective.as_deref().map(Arc::from);
+                t.spawn_mode = ts.spawn_mode; // SV4: restore the A/B partition key
                 t.current_task.clone_from(&ts.current_task);
                 t.rounds_active.clone_from(&ts.rounds_active);
                 t.evaluations.clone_from(&ts.evaluations);
@@ -1659,6 +1665,7 @@ fn refresh_snapshot(
             agent_state: tab.agent_state.clone(),
             agent_session_id: tab.agent_session_id.clone(),
             agent_kind: tab.agent_kind.clone(),
+            spawn_mode: tab.spawn_mode,
             agent_led,
             last_used_at: tab.last_used_at,
             viewers: tab.viewer_count(),
@@ -1882,6 +1889,7 @@ fn persist(
             colors_enabled: tab.colors_enabled,
             agent_session_id: tab.agent_session_id.as_deref().map(str::to_string),
             agent_kind: tab.agent_kind.as_deref().map(str::to_string),
+            spawn_mode: tab.spawn_mode, // SV4: persist the A/B partition key
             agent_plan_mode: tab.agent_plan_mode,
             tab_env: tab.tab_env.clone(),
             pinned_cols: tab.pinned_cols,
@@ -2364,6 +2372,7 @@ fn drain_pending(
                     t.last_used_at = Some(stamp);
                 }
                 crate::api::CardChange::Conventions(list) => t.conventions = list,
+                crate::api::CardChange::SpawnMode(m) => t.spawn_mode = m,
             }
         }
     }

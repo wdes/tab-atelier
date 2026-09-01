@@ -587,8 +587,11 @@ impl CatalogCard {
             session_id: s(&t.agent_session_id),
             agent_kind: s(&t.agent_kind),
             last_mission: after_action.filter(|s| !s.trim().is_empty()),
+            // SV4: carry the tab's spawn_mode into the record (the A/B partition key,
+            // SV5). A V2Stamp `spawn_mode` can still override it via `with_v2`.
+            spawn_mode: t.spawn_mode,
             retired_at,
-            // v1 card: no v2 profile/telemetry (byte-identical to before).
+            // v1 card: no other v2 profile/telemetry (byte-identical to before).
             ..Default::default()
         }
     }
@@ -660,7 +663,10 @@ impl CatalogCard {
         self.prompt = stamp.prompt;
         self.tools = stamp.tools;
         self.patterns = stamp.patterns;
-        self.spawn_mode = stamp.spawn_mode;
+        // SV4: keep the spawn-time spawn_mode (from the tab) unless the stamp overrides.
+        if stamp.spawn_mode.is_some() {
+            self.spawn_mode = stamp.spawn_mode;
+        }
         self.outcome = stamp.outcome;
         self.tokens = stamp.tokens;
         self.cost = stamp.cost;
@@ -1054,6 +1060,107 @@ pub fn read_skill_profiles() -> Vec<SkillProfile> {
     read_skill_profiles_at(&catalog_path())
 }
 
+/// The RAW catalogue records (no fold) — used to look up an A/B baseline session for
+/// a skill, which the folded read-model deliberately drops. A missing file reads empty.
+#[must_use]
+pub fn read_catalog_cards() -> Vec<CatalogCard> {
+    let body = std::fs::read_to_string(catalog_path()).unwrap_or_default();
+    parse_catalog(&body)
+}
+
+// ---------------------------------------------------------------------------
+// SV4 — spawn --from-skill <name>: CREATE a real tab seeded from a skill's folded
+// profile. Default = fresh+adapt (profile prompt + task overlay); `--resume` = the
+// A/B baseline bench (reuse `restore_resume_command` on the baseline session). Both
+// stamp the correct `spawn_mode` on the new tab for the SV5 metrics. Matching is by
+// the proper skill NAME (SV5-nom), never a short-id/slug (the 🟡(ii) fix).
+// ---------------------------------------------------------------------------
+
+/// The fresh-spawn launcher: `claude` already in auto permission mode (mirrors
+/// spawn-bot.sh, so a fresh agent doesn't stall on per-tool approvals).
+pub const FRESH_LAUNCHER: &str = "claude --permission-mode auto";
+
+/// Resolve a folded skill profile by its proper NAME (SV5-nom).
+///
+/// Exact first, then case-insensitive. `None` when no skill matches. NEVER a short-id /
+/// slug — that was the 🟡(ii) bug; a spawn matches the human-given skill name.
+#[must_use]
+pub fn resolve_skill_profile<'a>(profiles: &'a [SkillProfile], name: &str) -> Option<&'a SkillProfile> {
+    profiles.iter().find(|p| p.skill == name).or_else(|| {
+        let n = name.to_lowercase();
+        profiles.iter().find(|p| p.skill.to_lowercase() == n)
+    })
+}
+
+/// The A/B BASELINE (`sessionId`, `agentKind`) for a skill.
+///
+/// The LATEST retired instance of that skill that carries a session. The read-model
+/// DROPS the baseline (A/B-isolated), so `--resume` looks it up on the instance records
+/// here. A missing `agent_kind` defaults to `"claude"`. `None` when there's no session.
+#[must_use]
+pub fn resolve_skill_baseline(cards: &[CatalogCard], skill: &str) -> Option<(String, String)> {
+    cards
+        .iter()
+        .filter(|c| c.is_v2() && c.has_skill() && c.fold_key() == skill && c.session_id.is_some())
+        .max_by_key(|c| c.retired_at)
+        .map(|c| {
+            (c.session_id.clone().unwrap_or_default(), c.agent_kind.clone().unwrap_or_else(|| "claude".to_string()))
+        })
+}
+
+/// How a `spawn --from-skill` launches + what card to seed on the new tab.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillSpawnPlan {
+    pub skill: String,
+    /// `Fresh` (default) or `Resume` — stamped on the created tab for the A/B (SV5).
+    pub spawn_mode: SpawnMode,
+    /// The launcher command to run in the new tab's shell.
+    pub cmd: String,
+    /// The prompt to send: fresh = distilled profile prompt + task overlay; resume =
+    /// the task overlay only (the resumed session already carries its context).
+    pub prompt: String,
+    pub specialty: Option<String>,
+    pub conventions: Vec<String>,
+}
+
+/// Build the spawn plan (PURE).
+///
+/// DEFAULT = fresh+adapt: the profile prompt + a `--task` overlay, `SpawnMode::Fresh`,
+/// the [`FRESH_LAUNCHER`]. `resume` = the baseline bench: reuse
+/// [`crate::restore_resume_command`] on the baseline session, `SpawnMode::Resume` —
+/// erroring if the skill has no baseline session to resume.
+///
+/// # Errors
+/// `--resume` with no baseline, or a kind with no resume command.
+pub fn plan_from_skill(
+    profile: &SkillProfile,
+    baseline: Option<(&str, &str)>,
+    task: Option<&str>,
+    resume: bool,
+) -> Result<SkillSpawnPlan, String> {
+    let overlay = |base: &str| match task.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(t) if base.is_empty() => format!("Task: {t}"),
+        Some(t) => format!("{base}\n\nTask: {t}"),
+        None => base.to_string(),
+    };
+    let (spawn_mode, cmd, prompt) = if resume {
+        let (sid, kind) = baseline.ok_or_else(|| format!("skill '{}' has no baseline session to --resume", profile.skill))?;
+        let cmd = crate::restore_resume_command(Some(kind), Some(sid), None)
+            .ok_or_else(|| format!("cannot build a resume command for agent kind '{kind}'"))?;
+        (SpawnMode::Resume, cmd, overlay(""))
+    } else {
+        (SpawnMode::Fresh, FRESH_LAUNCHER.to_string(), overlay(profile.prompt.as_deref().unwrap_or_default()))
+    };
+    Ok(SkillSpawnPlan {
+        skill: profile.skill.clone(),
+        spawn_mode,
+        cmd,
+        prompt,
+        specialty: profile.specialty.clone(),
+        conventions: profile.conventions.clone(),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // RB4 — spawn --from-card <id|slug>: re-seed a card from the catalogue, closing
 // the loop catalogue → spawn → work → retire → catalogue.
@@ -1259,8 +1366,12 @@ pub fn run(args: &[String]) -> i32 {
 /// (the spawner verifies liveness and never lets `--resume` block a spawn).
 #[must_use]
 pub fn spawn_run(args: &[String]) -> i32 {
+    // SV4: the new create-a-real-tab path, matched by proper skill NAME.
+    if let Some(name) = arg_after(args, "--from-skill") {
+        return spawn_from_skill_run(name, arg_after(args, "--task"), args.iter().any(|a| a == "--resume"));
+    }
     let Some(key) = arg_after(args, "--from-card") else {
-        eprintln!("usage:\n  tab-atelier spawn --from-card <id|slug> [--resume]");
+        eprintln!("usage:\n  tab-atelier spawn --from-skill <name> [--task <ctx>] [--resume]\n  tab-atelier spawn --from-card <id|slug> [--resume]");
         return 2;
     };
     let want_resume = args.iter().any(|a| a == "--resume");
@@ -1293,6 +1404,70 @@ pub fn spawn_run(args: &[String]) -> i32 {
 /// The value after `flag` in `args` (`--from-card <value>`).
 fn arg_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).map(String::as_str)
+}
+
+/// `tab-atelier spawn --from-skill <name> [--task <ctx>] [--resume]` (SV4).
+///
+/// Resolve the folded profile by its proper NAME, build the plan (default fresh+adapt,
+/// `--resume` = baseline bench), CREATE A REAL TAB (reusing the `dispatch --new` path,
+/// the 🟡(i) fix — not plan-only), and seed its card (`spawn-mode` + specialty +
+/// conventions) so the eventual retire records the right A/B `spawn_mode` (SV5).
+fn spawn_from_skill_run(name: &str, task: Option<&str>, resume: bool) -> i32 {
+    let profiles = read_skill_profiles();
+    let Some(profile) = resolve_skill_profile(&profiles, name) else {
+        eprintln!("spawn: no skill named '{name}' (matching is by proper name, not id/slug)");
+        return 1;
+    };
+    let baseline_owned = resume.then(|| resolve_skill_baseline(&read_catalog_cards(), &profile.skill)).flatten();
+    let baseline = baseline_owned.as_ref().map(|(s, k)| (s.as_str(), k.as_str()));
+    let plan = match plan_from_skill(profile, baseline, task, resume) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("spawn: {e}");
+            return 1;
+        }
+    };
+
+    let uuid = match crate::cli::delegate::spawn_tab(Some(&plan.skill), None, &plan.cmd, &plan.prompt) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("spawn: {e}");
+            return 1;
+        }
+    };
+
+    // Seed the new tab's card so its retire records the A/B partition + the profile.
+    let mode = match plan.spawn_mode {
+        SpawnMode::Fresh => "fresh",
+        SpawnMode::Resume => "resume",
+        SpawnMode::Origin => "origin",
+    };
+    seed_card_verb(&uuid, "spawn-mode", "spawn_mode", mode);
+    if let Some(sp) = &plan.specialty {
+        seed_card_verb(&uuid, "specialty", "specialty", sp);
+    }
+    if !plan.conventions.is_empty() {
+        seed_card_verb(&uuid, "conventions", "conventions", &plan.conventions.join(","));
+    }
+    println!("{}", serde_json::json!({ "spawned": uuid, "skill": plan.skill, "spawnMode": mode }));
+    0
+}
+
+/// Best-effort POST of one card verb on the freshly-spawned tab (`spawn-mode`,
+/// `specialty`, `conventions`). A seed failure is logged, never fatal — the tab exists.
+fn seed_card_verb(uuid: &str, verb: &str, key: &str, value: &str) {
+    let Ok(ep) = crate::cli::share_link::discover_endpoint() else {
+        return;
+    };
+    let body = serde_json::json!({ key: value }).to_string();
+    let r = crate::cli::share_link::agent()
+        .post(format!("{}/tabs/by-id/{uuid}/{verb}", ep.url))
+        .header("Authorization", format!("Bearer {}", ep.token))
+        .header("Content-Type", "application/json")
+        .send(body.as_bytes());
+    if r.is_err() {
+        eprintln!("spawn: seeding {verb} on {uuid} failed (best-effort)");
+    }
 }
 
 /// `catalog list` — GET the retired read-model and print it. READ-ONLY.
@@ -2508,5 +2683,78 @@ mod tests {
         let evaled = card.with_eval(result);
         assert_eq!(evaled.outcome, Some(Outcome::Problem), "the eval-derived outcome overrides the self-report");
         assert!(evaled.eval.is_some(), "the eval report is stored (FN1 verdicts + FN2 findings + trace)");
+    }
+
+    // ----- SV4: spawn --from-skill (the planner) --------------------------------
+
+    fn profile(skill: &str, prompt: &str) -> SkillProfile {
+        SkillProfile {
+            skill: skill.into(),
+            prompt: Some(prompt.into()),
+            specialty: Some("rust daemon".into()),
+            conventions: vec!["CONVENTIONS.md".into()],
+            ..Default::default()
+        }
+    }
+
+    // SV4 (🟡 ii fix): resolve by proper NAME (exact, then case-insensitive) — NEVER a
+    // slug / short-id.
+    #[test]
+    fn sv4_resolve_skill_profile_matches_by_name_not_slug() {
+        let profiles = vec![profile("Rustsmith", "p1"), profile("reviewer", "p2")];
+        assert_eq!(resolve_skill_profile(&profiles, "Rustsmith").map(|p| &p.skill), Some(&"Rustsmith".to_string()));
+        assert_eq!(
+            resolve_skill_profile(&profiles, "rustsmith").map(|p| &p.skill),
+            Some(&"Rustsmith".to_string()),
+            "case-insensitive by name"
+        );
+        assert!(resolve_skill_profile(&profiles, "builder-rust-daemon").is_none(), "a slug never matches (🟡 ii)");
+        assert!(resolve_skill_profile(&profiles, "nope").is_none());
+    }
+
+    // SV4 default = fresh+adapt: profile prompt + task overlay, SpawnMode::Fresh.
+    #[test]
+    fn sv4_plan_default_is_fresh_with_task_overlay() {
+        let p = profile("rustsmith", "be a lazy senior");
+        let plan = plan_from_skill(&p, None, Some("fix the flaky test"), false).unwrap();
+        assert_eq!(plan.spawn_mode, SpawnMode::Fresh);
+        assert_eq!(plan.cmd, FRESH_LAUNCHER, "fresh launcher");
+        assert!(plan.prompt.contains("be a lazy senior"), "the profile prompt is the base");
+        assert!(plan.prompt.contains("Task: fix the flaky test"), "the --task overlay is appended");
+        assert_eq!(plan.specialty.as_deref(), Some("rust daemon"), "card seed: specialty");
+        assert_eq!(plan.conventions, vec!["CONVENTIONS.md"], "card seed: conventions");
+        // No task → just the profile prompt (no overlay).
+        assert_eq!(plan_from_skill(&p, None, None, false).unwrap().prompt, "be a lazy senior");
+    }
+
+    // SV4 --resume = baseline bench: reuse restore_resume_command on baseline.sessionId.
+    #[test]
+    fn sv4_plan_resume_reuses_baseline_session() {
+        let p = profile("rustsmith", "base");
+        let plan = plan_from_skill(&p, Some(("sess-champion", "claude")), Some("bench task"), true).unwrap();
+        assert_eq!(plan.spawn_mode, SpawnMode::Resume);
+        assert!(plan.cmd.contains("sess-champion"), "the resume command carries baseline.sessionId: {}", plan.cmd);
+        assert!(plan.cmd.contains("resume"), "it's a --resume command: {}", plan.cmd);
+        // --resume with NO baseline → error (can't bench without a champion session).
+        assert!(plan_from_skill(&p, None, None, true).is_err(), "--resume needs a baseline");
+    }
+
+    // SV4: the A/B baseline (sessionId + kind) comes from the LATEST instance of the
+    // skill carrying a session; other skills' instances are ignored.
+    #[test]
+    fn sv4_resolve_skill_baseline_picks_latest_session_of_the_skill() {
+        let mut c1 = v2_card("i1", "rustsmith", SpawnMode::Fresh, Some(Outcome::Success), 100, None, None);
+        c1.session_id = Some("old-sess".into());
+        c1.agent_kind = Some("claude".into());
+        let mut c2 = v2_card("i2", "rustsmith", SpawnMode::Resume, Some(Outcome::Success), 200, None, None);
+        c2.session_id = Some("new-sess".into());
+        c2.agent_kind = Some("claude".into());
+        let mut other = v2_card("i3", "reviewer", SpawnMode::Fresh, None, 300, None, None);
+        other.session_id = Some("other-sess".into());
+        let cards = vec![c1, c2, other];
+        let (sid, kind) = resolve_skill_baseline(&cards, "rustsmith").expect("baseline");
+        assert_eq!(sid, "new-sess", "the LATEST instance's session wins");
+        assert_eq!(kind, "claude");
+        assert!(resolve_skill_baseline(&cards, "no-such-skill").is_none(), "no session → no baseline");
     }
 }

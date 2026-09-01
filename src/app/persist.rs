@@ -130,6 +130,7 @@ impl AppState {
                     net_disabled: tab.view.read(cx).net_disabled(),
                     agent_session_id: tab.agent_session_id.as_deref().map(str::to_string),
                     agent_kind: tab.agent_kind.as_deref().map(str::to_string),
+                    spawn_mode: tab.spawn_mode, // SV4: persist the A/B partition key
                     agent_plan_mode: tab.agent_plan_mode,
                     tab_env: tab.tab_env.clone(),
                     pinned_cols: tab.pinned_cols,
@@ -283,6 +284,7 @@ impl AppState {
                 agent_state: tab.agent_state.clone(),
                 agent_session_id: tab.agent_session_id.clone(),
                 agent_kind: tab.agent_kind.clone(),
+                spawn_mode: tab.spawn_mode,
                 // Derive the LED once here (same inputs the tab-strip renderer
                 // uses) so /tabs and the mobile remote match the desktop dot.
                 agent_led: {
@@ -704,6 +706,7 @@ impl AppState {
                             tab.last_used_at = Some(stamp);
                         }
                         crate::api::CardChange::Conventions(list) => tab.conventions = list,
+                        crate::api::CardChange::SpawnMode(m) => tab.spawn_mode = m,
                     }
                 }
             }
