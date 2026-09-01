@@ -118,22 +118,10 @@ pub fn run(args: &[String]) -> i32 {
     }
 }
 
-/// Read the preferences file the daemon reads, as raw JSON so unrelated keys
-/// round-trip untouched (same approach as `bg-color --global`).
-fn prefs_path() -> std::path::PathBuf {
-    let user = crate::platform::config_base_dir()
-        .join("tab-atelier")
-        .join("preferences.json");
-    let system = std::path::PathBuf::from("/etc/tab-atelier/preferences.json");
-    if user.exists() || !system.exists() {
-        user
-    } else {
-        system
-    }
-}
-
+/// Rules are read back as raw JSON so unrelated preference keys round-trip
+/// untouched when we write the file again.
 fn load_rules() -> std::collections::BTreeMap<String, crate::FolderStyle> {
-    std::fs::read_to_string(prefs_path())
+    std::fs::read_to_string(crate::editable_preferences_path())
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .and_then(|v| serde_json::from_value(v.get("folder_styles")?.clone()).ok())
@@ -184,7 +172,7 @@ fn set_folder(dir: &str, color: Option<&str>, badge: Option<&str>, clear: bool) 
         }
     }
 
-    let path = prefs_path();
+    let path = crate::editable_preferences_path();
     let mut doc: serde_json::Value = std::fs::read_to_string(&path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())

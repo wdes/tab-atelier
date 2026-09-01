@@ -1892,17 +1892,7 @@ fn is_valid_hex(s: &str) -> bool {
 /// drop the key if `color` is "clear"). Mirrors the in-place patching
 /// `ports`/`settings` does for the other prefs fields.
 fn write_global_bg(color: &str) -> i32 {
-    let user_path = crate::platform::config_base_dir()
-        .join("tab-atelier")
-        .join("preferences.json");
-    let system_path = std::path::PathBuf::from("/etc/tab-atelier/preferences.json");
-    let path = if user_path.exists() {
-        user_path
-    } else if system_path.exists() {
-        system_path
-    } else {
-        user_path
-    };
+    let path = crate::editable_preferences_path();
     let mut doc: serde_json::Value = if path.exists() {
         match std::fs::read_to_string(&path) {
             Ok(s) => serde_json::from_str(&s).unwrap_or_else(|_| serde_json::json!({})),
