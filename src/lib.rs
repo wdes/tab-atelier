@@ -3116,6 +3116,24 @@ pub fn keycode_label(keycode: u8) -> String {
         .map_or_else(|| format!("Key {keycode}"), |e| e.label.to_string())
 }
 
+/// The `preferences.json` a CLI verb should edit in place: the user's file,
+/// else the system one when only that exists.
+///
+/// Resolves the same way [`load_preferences`] reads, so an edit lands in the
+/// file the daemon will actually load. Note it is [`platform::config_dir`] —
+/// `config_base_dir()` is the *state* root (`~/.local`), and writing
+/// preferences there silently has no effect.
+#[must_use]
+pub fn editable_preferences_path() -> std::path::PathBuf {
+    let user = config_dir(&platform::config_dir()).join("preferences.json");
+    let system = std::path::PathBuf::from(SYSTEM_PREFERENCES_PATH);
+    if !user.exists() && system.exists() {
+        system
+    } else {
+        user
+    }
+}
+
 #[must_use]
 pub fn load_preferences(config_base: &std::path::Path) -> Preferences {
     let user_path = config_dir(config_base).join("preferences.json");
