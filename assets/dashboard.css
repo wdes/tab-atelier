@@ -771,3 +771,7 @@ body.band-view { min-height: calc(100vh + 180px); }
 .cat-edit-msg.err { color: var(--led-error-stroke); }
 .cat-tombstone { font-size: 0.62rem; text-transform: uppercase; color: var(--muted); border: 1px dashed var(--border); border-radius: 999px; padding: 0 0.35rem; }
 .cat-skill.cat-deleted .cat-name { color: var(--muted); text-decoration: line-through; }
+
+/* --- Catalogue #39 SC3-toggle: show-deleted control --- */
+.cat-deleted-toggle { font-size: 0.72rem; color: var(--muted); display: inline-flex; align-items: center; gap: 0.3rem; margin-left: 0.4rem; cursor: pointer; }
+.cat-deleted-toggle input { margin: 0; }

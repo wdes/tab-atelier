@@ -1530,9 +1530,12 @@ function catalogHtml(readModel) {
   const body = skills.length
     ? skills.map(catalogSkillHtml).join("")
     : `<div class="cat-empty">Aucun skill au catalogue.</div>`;
+  // SC3-toggle: "afficher les supprimés" -> re-fetch with ?includeDeleted so the
+  // tombstoned cards (deleted:true) show, making the Restore button reachable.
   return `<div class="cat-header">
       <span class="cat-title">Catalogue des skills</span>
       <span class="cat-count">${skills.length} skill${skills.length === 1 ? "" : "s"}</span>
+      <label class="cat-deleted-toggle"><input type="checkbox" class="cat-show-deleted"${catalogIncludeDeleted ? " checked" : ""}> afficher les supprimés</label>
       <button class="cat-refresh" title="rafraîchir">↻</button>
       <button class="cat-close" title="fermer" aria-label="fermer">×</button>
     </div>
@@ -1540,6 +1543,8 @@ function catalogHtml(readModel) {
 }
 
 let catalogOpen = false;
+// SC3-toggle: whether the current fetch asks the server for tombstoned skills.
+let catalogIncludeDeleted = false;
 
 async function openCatalog() {
   const el = document.getElementById("catalog-panel");
@@ -1548,7 +1553,8 @@ async function openCatalog() {
   el.innerHTML = `<div class="cat-header"><span class="cat-title">Catalogue des skills</span></div><div class="cat-loading">chargement…</div>`;
   el.hidden = false;
   try {
-    const res = await fetch(CATALOG_URL, { headers: { accept: "application/json", ...AUTH_HEADERS } });
+    const url = catalogIncludeDeleted ? `${CATALOG_URL}?includeDeleted=true` : CATALOG_URL;
+    const res = await fetch(url, { headers: { accept: "application/json", ...AUTH_HEADERS } });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     el.innerHTML = catalogHtml(await res.json());
   } catch (err) {
@@ -1770,7 +1776,7 @@ function bootstrap() {
 
   // Catalogue #39 SC2: open the cold catalog overlay on-demand (NOT in the poll).
   const catToggle = document.getElementById("catalog-toggle");
-  if (catToggle) catToggle.addEventListener("click", () => { openCatalog(); });
+  if (catToggle) catToggle.addEventListener("click", () => { catalogIncludeDeleted = false; openCatalog(); });
   const catPanel = document.getElementById("catalog-panel");
   if (catPanel) {
     catPanel.addEventListener("click", (e) => {
@@ -1780,6 +1786,10 @@ function bootstrap() {
       e.stopPropagation();
       if (e.target.closest(".cat-close")) { closeCatalog(); return; }
       if (e.target.closest(".cat-refresh")) { openCatalog(); return; }
+      // SC3-toggle: "afficher les supprimés" re-fetches with ?includeDeleted so the
+      // tombstoned cards (and their Restore button) become reachable.
+      const showDel = e.target.closest(".cat-show-deleted");
+      if (showDel) { catalogIncludeDeleted = !!showDel.checked; openCatalog(); return; }
       // SC3: edit-form controls (save/delete/restore) are async mutations.
       if (e.target.closest(".cat-save, .cat-delete, .cat-restore")) { handleCatalogEdit(e.target); return; }
       const head = e.target.closest(".cat-skill-head");
