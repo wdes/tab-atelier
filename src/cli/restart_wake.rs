@@ -300,7 +300,25 @@ pub fn push_swamp_input(
     priority: crate::cli::aligator::Priority,
     dedup_key: Option<String>,
 ) -> std::io::Result<()> {
-    let entry = crate::cli::aligator::SwampEntry {
+    let entry = swamp_entry(target, msg, submit, at_ms, priority, dedup_key);
+    crate::cli::aligator::append_swamp_line(&crate::cli::aligator::swamp_path(), &entry)
+}
+
+/// THE single `SwampEntry` constructor (`RA1c`) — from `daemon`, 0 attempts.
+///
+/// Every push (the restart-wake AND a future brain-relay) builds its entry HERE, so
+/// there is ONE shape and no hardcoded-vs-parameterised drift. PURE (no I/O), testable
+/// byte-for-byte.
+#[must_use]
+pub fn swamp_entry(
+    target: &str,
+    msg: &str,
+    submit: bool,
+    at_ms: u64,
+    priority: crate::cli::aligator::Priority,
+    dedup_key: Option<String>,
+) -> crate::cli::aligator::SwampEntry {
+    crate::cli::aligator::SwampEntry {
         ts: at_ms / 1000,
         tab: target.to_string(),
         input: msg.to_string(),
@@ -309,37 +327,27 @@ pub fn push_swamp_input(
         attempts: 0,
         priority,
         dedup_key,
-    };
-    crate::cli::aligator::append_swamp_line(&crate::cli::aligator::swamp_path(), &entry)
+    }
 }
 
-/// The restart-wake swamp entry (`RA1c`) — `submit = TRUE`, `Status` priority, deduped
-/// per build. PURE builder (no I/O) so the real entry is testable byte-for-byte.
+/// The REAL restart-wake push seam — the generic [`push_swamp_input`] brick ON THE LIVE
+/// PATH. One definition so headless + gui can't drift.
 ///
 /// ⭐ `RA1c`: `submit = TRUE` — the wake must TRIGGER the orchestrator's turn, not just
 /// deposit a marker. `RA1b`'s `submit=false` left an IDLE orchestrator stuck (the marker
 /// sat in the input, unsubmitted) → no functional wake. Now aligator presses Enter.
-#[must_use]
-pub fn wake_swamp_entry(orch: &str, msg: &str, at_ms: u64, build: &str) -> crate::cli::aligator::SwampEntry {
-    crate::cli::aligator::SwampEntry {
-        ts: at_ms / 1000,
-        tab: orch.to_string(),
-        input: msg.to_string(),
-        submit: true, // ⭐ the RA1c fix — trigger the turn, don't just deposit a marker.
-        from: Some("daemon".to_string()),
-        attempts: 0,
-        priority: crate::cli::aligator::Priority::Status,
-        dedup_key: Some(format!("restart-wake-{build}")),
-    }
-}
-
-/// The REAL restart-wake push seam: append the [`wake_swamp_entry`] to the live swamp.
-/// One definition so headless + gui can't drift.
 ///
 /// # Errors
 /// Propagates the append I/O error (the caller counts it, best-effort).
 pub fn real_swamp_push(now: u64, build: &str, orch: &str, msg: &str) -> std::io::Result<()> {
-    crate::cli::aligator::append_swamp_line(&crate::cli::aligator::swamp_path(), &wake_swamp_entry(orch, msg, now, build))
+    push_swamp_input(
+        orch,
+        msg,
+        true, // ⭐ the RA1c fix — trigger the turn, don't just deposit a marker.
+        now,
+        crate::cli::aligator::Priority::Status,
+        Some(format!("restart-wake-{build}")),
+    )
 }
 
 #[cfg(test)]
@@ -610,8 +618,8 @@ mod tests {
 
     // RA1c ⭐ (anti built≠wired): the REAL wake entry SUBMITS (submit=true) and
     // round-trips through the REAL swamp serialization (real-fs temp file, the actual
-    // `wake_swamp_entry` builder `real_swamp_push` uses + `append_swamp_line`/
-    // `parse_swamp`), delivered round-robin via `run_deferred_wake`.
+    // `swamp_entry` constructor `real_swamp_push`→`push_swamp_input` use +
+    // `append_swamp_line`/`parse_swamp`), delivered round-robin via `run_deferred_wake`.
     #[test]
     fn ra1c_real_wake_entry_submits_true_and_round_trips_on_real_fs() {
         use crate::cli::aligator::{Priority, append_swamp_line, parse_swamp};
@@ -631,7 +639,15 @@ mod tests {
             1000,
             WAKE_GAP_MS,
             || true, // ready
-            |stop| append_swamp_line(&tmp, &wake_swamp_entry(&stop.target, &msg, stop.at_ms, "deadbeef")),
+            // Deliver through the SINGLE constructor `swamp_entry` (the one
+            // `real_swamp_push`→`push_swamp_input` uses) to a temp swamp — real-fs,
+            // real serialization, no hardcoded mirror.
+            |stop| {
+                append_swamp_line(
+                    &tmp,
+                    &swamp_entry(&stop.target, &msg, true, stop.at_ms, Priority::Status, Some("restart-wake-deadbeef".into())),
+                )
+            },
             |_ms| {}, // no real sleep in the test
         );
         assert_eq!(n, 2, "both wakes delivered to the real swamp file");
@@ -654,22 +670,19 @@ mod tests {
     // submit flag (true = trigger the target's turn, the push-relay case; false = a
     // non-intrusive marker), reusable beyond the restart-wake.
     #[test]
-    fn ra1c_push_swamp_input_honours_the_submit_flag() {
-        // The wake builder (real path) is submit=true…
-        assert!(wake_swamp_entry("o1", "m", 0, "b").submit, "the restart-wake submits");
-        // …and the generic helper is a plain flag pass-through (brain-relay building
-        // block): a caller can push a non-intrusive marker (false) or a turn-trigger
-        // (true) with the same brick — proven by the entry the builder would append.
-        let submit_true = crate::cli::aligator::SwampEntry {
-            ts: 0,
-            tab: "target".into(),
-            input: "push".into(),
-            submit: true,
-            from: Some("daemon".into()),
-            attempts: 0,
-            priority: crate::cli::aligator::Priority::Status,
-            dedup_key: None,
-        };
-        assert!(submit_true.submit, "push_swamp_input(..., true, ...) → a turn-triggering push");
+    fn ra1c_swamp_entry_is_the_single_constructor_honouring_the_submit_flag() {
+        use crate::cli::aligator::Priority;
+        // The SINGLE constructor `push_swamp_input`/`real_swamp_push` build through — a
+        // plain flag pass-through (the brain-relay building block): true = trigger the
+        // target's turn (the push-relay case), false = a non-intrusive marker.
+        let turn = swamp_entry("target", "push", true, 0, Priority::Status, None);
+        assert!(turn.submit, "submit=true → a turn-triggering push");
+        assert_eq!(turn.from.as_deref(), Some("daemon"), "from=daemon");
+        let marker = swamp_entry("target", "note", false, 0, Priority::Status, None);
+        assert!(!marker.submit, "submit=false → a non-intrusive marker");
+        // The restart-wake's real args flow through this same constructor (submit=true,
+        // Status, deduped) — no hardcoded mirror.
+        let wake = swamp_entry("o1", "RESTART_DONE build=b at=1", true, 1, Priority::Status, Some("restart-wake-b".into()));
+        assert!(wake.submit && wake.dedup_key.as_deref() == Some("restart-wake-b"));
     }
 }
