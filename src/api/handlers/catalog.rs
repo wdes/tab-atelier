@@ -47,6 +47,9 @@ pub(in crate::api) fn retire<S: Write>(stream: &mut S, state: &Arc<Mutex<TabSnap
         /// SV1: the structured bilan (retrospective on the prompt). Supersedes
         /// `after_action` as the closing record when present.
         bilan: Option<crate::cli::catalog::Bilan>,
+        /// SV2: the éval-à-3 inputs (base prompt + the three votes). When present on a
+        /// v2 retire, the daemon runs the eval to DERIVE the outcome + resulting prompt.
+        eval: Option<crate::cli::catalog::EvalInput>,
         #[serde(flatten)]
         stamp: crate::cli::catalog::V2Stamp,
     }
@@ -82,6 +85,16 @@ pub(in crate::api) fn retire<S: Write>(stream: &mut S, state: &Arc<Mutex<TabSnap
     // read-model). The baseline (session_id/agent_kind) is untouched, A/B-isolated.
     if req.stamp.is_v2() {
         card = card.with_v2(req.stamp);
+        // SV2: run the a-priori éval-à-3 when the votes are supplied. The daemon
+        // derives the task LITERALS from the tab's PRECISE context (FN2 ENFORCED, not a
+        // trusted declared-clean set) and evaluates the archived bilan → the DERIVED
+        // outcome + the resulting (improved / statu-quo) prompt land on the record,
+        // overriding any self-report. CF1 then gates the close on a non-empty prompt.
+        if let Some(mut eval_in) = req.eval {
+            eval_in.task_literals = crate::cli::catalog::task_literals_of(&card);
+            eval_in.bilan = card.bilan.clone().unwrap_or_default();
+            card = card.with_eval(crate::cli::catalog::evaluate(&eval_in));
+        }
     }
 
     let cat = catalog_path();

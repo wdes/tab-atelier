@@ -48,12 +48,14 @@ pub enum SpawnMode {
     Origin,
 }
 
-/// The retire OUTCOME — v2 (SV3). Derived from the éval-à-3 (SV2), NOT a self-report;
-/// at this foundation layer it's whatever the orchestrator stamps at retire time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// The retire OUTCOME — v2. Derived from the éval-à-3 (SV2), NOT a self-report. The
+/// default is `Problem` — a conservative bar: nothing is a success until the eval says
+/// so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Outcome {
     Success,
+    #[default]
     Problem,
 }
 
@@ -147,6 +149,266 @@ impl Bilan {
         .collect::<Vec<_>>()
         .join(" · ")
     }
+}
+
+// ---------------------------------------------------------------------------
+// SV2 — the a-priori ÉVAL-À-3: agent(bilan) + orchestrator + Olympe converge on the
+// IMPROVED prompt (consensus) or keep the original (dissent → statu quo). The
+// `outcome` is DERIVED from the eval, never self-reported. Étage-1 anti-over-fit is
+// ENFORCED here (FN2): a mechanical ban on task LITERALS (E3b) + a test-nouvelle-tâche
+// (E3c: no ADDED directive may be task-specific, or the prompt wouldn't hold on a new
+// task). The per-directive general|task-specific verdict (FN1) is the EVAL's neutral
+// output, NOT part of the SV1 bilan.
+// ---------------------------------------------------------------------------
+
+/// One evaluator's vote in the éval-à-3 (agent / orchestrator / Olympe).
+///
+/// The default (both `false`) is a conservative abstention: a missing vote is a NO on
+/// the prompt (→ statu quo) and a NO on the run (→ problem). Silence never improves.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvalVote {
+    /// Approves adopting the improved prompt.
+    pub approve_prompt: bool,
+    /// Judges the instance's RUN a success (the outcome signal — NOT self-report:
+    /// each of the three evaluators votes, the outcome is derived from the majority).
+    pub run_ok: bool,
+}
+
+/// The three votes of the éval-à-3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvalVotes {
+    pub agent: EvalVote,
+    pub orchestrator: EvalVote,
+    pub olympe: EvalVote,
+}
+
+/// The inputs to the éval-à-3 (SV2), produced at retire before catalogage.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvalInput {
+    /// The base (current) prompt the eval may improve.
+    #[serde(default)]
+    pub base_prompt: String,
+    /// The agent's bilan (SV1) — its `add_directives` are the proposed prompt changes.
+    #[serde(default)]
+    pub bilan: Bilan,
+    /// The PRECISE task's concrete values that must NOT leak into the prompt (FN2 E3b).
+    /// The live path fills these from the tab's objective + current-task log.
+    #[serde(default)]
+    pub task_literals: Vec<String>,
+    /// The three evaluators' votes.
+    #[serde(default)]
+    pub votes: EvalVotes,
+}
+
+/// FN1: an ADDED directive's scope — the eval's neutral judgment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DirectiveScope {
+    /// Generalisable — holds on a new task. Eligible for the improved prompt.
+    General,
+    /// Task-specific — carries the past run's specifics; would over-fit the prompt.
+    TaskSpecific,
+}
+
+/// FN1: one added directive tagged with its scope (part of the EVAL output).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectiveVerdict {
+    pub directive: String,
+    pub scope: DirectiveScope,
+}
+
+/// The eval decision: adopt the improved prompt, or keep the original.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum EvalDecision {
+    /// Consensus + gates passed → the improved prompt is adopted.
+    Improved,
+    /// Dissent OR an anti-over-fit veto → the original prompt stands. The default: no
+    /// eval means no change.
+    #[default]
+    StatuQuo,
+}
+
+/// The éval-à-3 OUTPUT stored on the v2 record (FN1 verdicts + FN2 findings + the
+/// traced decision + the DERIVED outcome). The resulting prompt is applied to the
+/// card's `prompt`, not duplicated here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvalReport {
+    pub decision: EvalDecision,
+    /// The outcome DERIVED from the three `run_ok` votes (majority), not self-reported.
+    pub outcome: Outcome,
+    /// FN1: per-added-directive general|task-specific verdicts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub directive_verdicts: Vec<DirectiveVerdict>,
+    /// FN2 E3b: task literals that leaked into a proposed directive (a ban trigger).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub leaked_literals: Vec<String>,
+    /// FN2 E3c: added directives that are task-specific (fail the test-nouvelle-tâche).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub task_specific_directives: Vec<String>,
+    /// A human-readable trace of why the decision landed as it did.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rationale: Vec<String>,
+}
+
+/// The result of the éval-à-3: the [`EvalReport`] to store + the resulting prompt to
+/// apply to the record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvalResult {
+    pub report: EvalReport,
+    pub resulting_prompt: String,
+}
+
+/// A non-empty, non-whitespace literal is bannable. Punctuation-only / tiny tokens
+/// (from splitting) are ignored so the ban targets real task values, not noise.
+fn is_meaningful_literal(lit: &str) -> bool {
+    lit.trim().chars().filter(|c| c.is_alphanumeric()).count() >= 3
+}
+
+/// Run the a-priori éval-à-3 (SV2). PURE.
+///
+/// Given the base prompt, the agent's bilan, the task's literals, and the three votes,
+/// it decides improved-vs-statu-quo, derives the outcome, tags each directive (FN1),
+/// and enforces the anti-over-fit gate (FN2).
+///
+/// - **FN1** tags each ADD directive `General` / `TaskSpecific` — task-specific ⇔ it
+///   contains a task literal (a concrete past-run value).
+/// - **FN2 E3b (ban literals)**: any task literal appearing in a directive is leaked.
+/// - **FN2 E3c (test-nouvelle-tâche)**: any task-specific directive would not hold on a
+///   new task.
+/// - **Decision**: `Improved` iff all three approve AND no leak AND no task-specific
+///   directive; otherwise `StatuQuo` (the veto beats a rubber-stamp consensus).
+/// - **Outcome**: DERIVED from the three `run_ok` votes (majority), never self-report.
+#[must_use]
+pub fn evaluate(input: &EvalInput) -> EvalResult {
+    let literals: Vec<&str> = input.task_literals.iter().map(String::as_str).filter(|l| is_meaningful_literal(l)).collect();
+    let contains_literal = |text: &str| {
+        let hay = text.to_lowercase();
+        literals.iter().find(|l| hay.contains(&l.to_lowercase())).map(|l| (*l).to_string())
+    };
+
+    // FN1 + FN2 per ADD directive.
+    let mut verdicts = Vec::new();
+    let mut leaked = Vec::new();
+    let mut task_specific = Vec::new();
+    for d in &input.bilan.add_directives {
+        let hit = contains_literal(d);
+        if let Some(lit) = &hit {
+            if !leaked.iter().any(|l| l == lit) {
+                leaked.push(lit.clone());
+            }
+            task_specific.push(d.clone());
+        }
+        let scope = if hit.is_some() { DirectiveScope::TaskSpecific } else { DirectiveScope::General };
+        verdicts.push(DirectiveVerdict { directive: d.clone(), scope });
+    }
+
+    // Consensus of the three on the prompt change.
+    let approvals = [input.votes.agent, input.votes.orchestrator, input.votes.olympe]
+        .iter()
+        .filter(|v| v.approve_prompt)
+        .count();
+    let unanimous = approvals == 3;
+    let clean = leaked.is_empty() && task_specific.is_empty();
+
+    // Outcome DERIVED from the three run_ok votes (majority), never self-report.
+    let run_oks = [input.votes.agent, input.votes.orchestrator, input.votes.olympe]
+        .iter()
+        .filter(|v| v.run_ok)
+        .count();
+    let outcome = if run_oks >= 2 { Outcome::Success } else { Outcome::Problem };
+
+    let mut rationale = vec![format!(
+        "prompt approvals {approvals}/3; run_ok {run_oks}/3; leaked_literals {}; task_specific {}",
+        leaked.len(),
+        task_specific.len()
+    )];
+
+    let (decision, resulting_prompt) = if unanimous && clean {
+        rationale.push("consensus + anti-over-fit clean → improved prompt adopted".into());
+        (EvalDecision::Improved, apply_directives(&input.base_prompt, &input.bilan))
+    } else {
+        let why = if unanimous {
+            "anti-over-fit veto (leaked literals or task-specific directive)"
+        } else {
+            "dissent (not unanimous)"
+        };
+        rationale.push(format!("statu quo: {why} → original prompt kept"));
+        (EvalDecision::StatuQuo, input.base_prompt.clone())
+    };
+
+    EvalResult {
+        report: EvalReport { decision, outcome, directive_verdicts: verdicts, leaked_literals: leaked, task_specific_directives: task_specific, rationale },
+        resulting_prompt,
+    }
+}
+
+/// Apply the bilan's prompt directives to the base prompt: drop lines matching a
+/// `−consigne`, then append each `+consigne` as a new line. A minimal textual model of
+/// "the improved prompt" (the eval already vetted the additions).
+fn apply_directives(base: &str, bilan: &Bilan) -> String {
+    let mut lines: Vec<String> = base
+        .lines()
+        .filter(|l| !bilan.drop_directives.iter().any(|d| !d.trim().is_empty() && l.contains(d.trim())))
+        .map(str::to_string)
+        .collect();
+    for add in &bilan.add_directives {
+        if !add.trim().is_empty() {
+            lines.push(add.clone());
+        }
+    }
+    lines.join("\n")
+}
+
+/// Does a token look like a CONCRETE task value (not prose)? — a digit, a path/id
+/// separator, an internal/repeated uppercase (camelCase / ALLCAPS like `RB1`,
+/// `TabState`, `catalog.jsonl`, `#1990`). Plain lowercase prose words are NOT values.
+///
+/// ponytail: a heuristic proxy for "task literal", not a parser. It won't catch a
+/// bare lowercase project noun; the upgrade path is a real NER / stop-word model.
+fn looks_like_task_value(t: &str) -> bool {
+    let alnum = t.chars().filter(|c| c.is_alphanumeric()).count();
+    if alnum < 2 {
+        return false;
+    }
+    let uppers = t.chars().filter(char::is_ascii_uppercase).count();
+    let has_internal_upper = t.chars().skip(1).any(|c| c.is_ascii_uppercase());
+    t.chars().any(|c| c.is_ascii_digit())
+        || t.chars().any(|c| matches!(c, '-' | '_' | '/' | '#' | '@' | '.'))
+        || has_internal_upper
+        || uppers >= 2
+}
+
+/// Extract the PRECISE task's concrete literals from a card's `objective` +
+/// `current_task_log` (FN2 E3b).
+///
+/// These are the values the SV2 ban must keep out of the prompt. The daemon derives
+/// them itself so the anti-over-fit gate is ENFORCED, never a declared-clean set
+/// trusted from the orchestrator. Splits on whitespace + sentence
+/// punctuation only, so identifiers (`catalog.jsonl`, `sess-abc`) stay whole.
+#[must_use]
+pub fn task_literals_of(card: &CatalogCard) -> Vec<String> {
+    let mut lits: Vec<String> = Vec::new();
+    let mut harvest = |text: &str| {
+        for tok in text.split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | ':' | '(' | ')' | '"' | '\'' | '!' | '?')) {
+            let t = tok.trim().trim_end_matches('.');
+            if looks_like_task_value(t) && !lits.iter().any(|e| e == t) {
+                lits.push(t.to_string());
+            }
+        }
+    };
+    if let Some(o) = &card.objective {
+        harvest(o);
+    }
+    for l in &card.current_task_log {
+        harvest(l);
+    }
+    lits
 }
 
 /// A retired agent's CARD — a verbatim COPY of the durable `build_snapshot` fields
@@ -257,6 +519,11 @@ pub struct CatalogCard {
     /// `None`/`Some(1)` = a v1 legacy record (QUARANTINED from the v2 read-model).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_version: Option<u32>,
+    /// The éval-à-3 OUTPUT (SV2): the traced improved/statu-quo decision, the per-
+    /// directive general|task-specific verdicts (FN1), the anti-over-fit findings
+    /// (FN2), and the DERIVED outcome. `None` on a v1 / un-evaluated retire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eval: Option<EvalReport>,
     /// Unix-millis the card was archived (retired).
     pub retired_at: u64,
 }
@@ -328,13 +595,24 @@ impl CatalogCard {
 
     /// The persist-gate predicate: is this RE-READ archive complete enough to close?
     ///
-    /// The record must be non-empty (a real `id` = the card is there) AND, WHEN the
-    /// tab carried a live session (`had_session`), it must carry the archived
-    /// `session_id` — a lost existing session is an incomplete archive. A
-    /// session-less agent legitimately has `None` (fresh-only respawn).
+    /// A record must always carry a real `id`. Then the completeness bar depends on
+    /// the schema:
+    /// - **v1**: WHEN the tab carried a live session (`had_session`), the archive must
+    ///   carry the `session_id` — a lost existing session is an incomplete archive.
+    /// - **v2 (CF1, SV2)**: a profile is complete iff it has a NON-EMPTY `skill` AND a
+    ///   NON-EMPTY `prompt`. `session_id` is NOT required — the v2 baseline is
+    ///   A/B-isolated and optional. This is the WRITE gate: `perform_retire` refuses to
+    ///   close a v2 tab whose profile lacks skill+prompt, so a half-built profile can
+    ///   never die at close.
     #[must_use]
-    pub const fn is_complete(&self, had_session: bool) -> bool {
-        !self.id.is_empty() && (!had_session || self.session_id.is_some())
+    pub fn is_complete(&self, had_session: bool) -> bool {
+        if self.id.is_empty() {
+            return false;
+        }
+        if self.is_v2() {
+            return self.has_skill() && self.has_prompt();
+        }
+        !had_session || self.session_id.is_some()
     }
 
     /// A v2 record — folded into the skill read-model. `schema_version == Some(2)`.
@@ -342,6 +620,21 @@ impl CatalogCard {
     #[must_use]
     pub fn is_v2(&self) -> bool {
         self.schema_version == Some(2)
+    }
+
+    /// CF1 (SV2): does this record carry a NON-EMPTY `skill`? The v2 completeness bar —
+    /// a `schema_version:2` record without a skill is an incomplete profile (never
+    /// closed, quarantined from the read-model).
+    #[must_use]
+    pub fn has_skill(&self) -> bool {
+        self.skill.as_deref().is_some_and(|s| !s.trim().is_empty())
+    }
+
+    /// CF1 (SV2): does this record carry a NON-EMPTY `prompt`? The other half of the v2
+    /// completeness bar — a profile with no distilled prompt can't be re-seeded.
+    #[must_use]
+    pub fn has_prompt(&self) -> bool {
+        self.prompt.as_deref().is_some_and(|p| !p.trim().is_empty())
     }
 
     /// The v2 FOLD KEY (SV5-nom): the proper `skill` name, or — as a stable fallback
@@ -387,6 +680,19 @@ impl CatalogCard {
             self.last_mission = Some(bilan.one_line());
             self.bilan = Some(bilan);
         }
+        self
+    }
+
+    /// Apply an éval-à-3 [`EvalResult`] (SV2) to this v2 record: the DERIVED outcome
+    /// overrides any self-reported one, the resulting (improved or statu-quo) prompt
+    /// becomes the record's `prompt`, and the full eval report (FN1 verdicts + FN2
+    /// findings + decision + trace) is stored for audit. The eval OWNS the outcome and
+    /// the final prompt — that's what makes the outcome eval-derived, not self-report.
+    #[must_use]
+    pub fn with_eval(mut self, result: EvalResult) -> Self {
+        self.outcome = Some(result.report.outcome);
+        self.prompt = Some(result.resulting_prompt).filter(|p| !p.is_empty());
+        self.eval = Some(result.report);
         self
     }
 }
@@ -726,12 +1032,16 @@ impl SkillProfile {
 /// v2 records only (v1 quarantined), folded by skill name, sorted by skill for a
 /// stable presentation. Path-injectable; a missing file reads empty. READ-ONLY —
 /// nothing is written or compacted.
+///
+/// CF1 (SV2): only COMPLETE v2 profiles fold in — a `schema:2` record without a
+/// non-empty skill (an incomplete write that a `RETIRE INCOMPLET` kept on disk) is
+/// quarantined too, so the read-model never shows a half-built profile.
 #[must_use]
 pub fn read_skill_profiles_at(path: &Path) -> Vec<SkillProfile> {
     use std::collections::BTreeMap;
     let body = std::fs::read_to_string(path).unwrap_or_default();
     let mut by_skill: BTreeMap<String, Vec<CatalogCard>> = BTreeMap::new();
-    for c in parse_catalog(&body).into_iter().filter(CatalogCard::is_v2) {
+    for c in parse_catalog(&body).into_iter().filter(|c| c.is_v2() && c.has_skill()) {
         by_skill.entry(c.fold_key()).or_default().push(c);
     }
     by_skill.into_iter().map(|(skill, group)| SkillProfile::fold(skill, &group)).collect()
@@ -2052,5 +2362,151 @@ mod tests {
             .with_bilan(Bilan::default());
         assert!(card.bilan.is_none(), "an empty bilan records nothing");
         assert_eq!(card.last_mission.as_deref(), Some("legacy 1-line"), "the legacy after-action still stands");
+    }
+
+    // ----- SV2: the a-priori éval-à-3 + CF1 -------------------------------------
+
+    fn vote(approve: bool, run_ok: bool) -> EvalVote {
+        EvalVote { approve_prompt: approve, run_ok }
+    }
+
+    // SV2 acceptance: consensus + anti-over-fit clean → the prompt is IMPROVED (the
+    // +directive is applied), the decision is traced, and the outcome is DERIVED from
+    // the three run_ok votes (majority), never self-reported.
+    #[test]
+    fn sv2_consensus_clean_improves_prompt_and_derives_outcome() {
+        let input = EvalInput {
+            base_prompt: "be a lazy senior".into(),
+            bilan: Bilan { add_directives: vec!["always state the invariant up front".into()], ..Default::default() },
+            task_literals: vec![], // clean
+            votes: EvalVotes { agent: vote(true, true), orchestrator: vote(true, true), olympe: vote(true, false) },
+        };
+        let r = evaluate(&input);
+        assert_eq!(r.report.decision, EvalDecision::Improved, "unanimous approve + clean → improved");
+        assert!(r.resulting_prompt.contains("always state the invariant up front"), "the +directive is in the prompt");
+        assert!(r.resulting_prompt.contains("be a lazy senior"), "the base prompt is kept");
+        assert_eq!(r.report.outcome, Outcome::Success, "2/3 run_ok → success (DERIVED, not self-report)");
+        assert!(!r.report.rationale.is_empty(), "the decision is traced");
+        // FN1: the general directive is tagged General in the eval output.
+        assert_eq!(r.report.directive_verdicts.len(), 1);
+        assert_eq!(r.report.directive_verdicts[0].scope, DirectiveScope::General);
+    }
+
+    // SV2 acceptance: dissent (not unanimous) → STATU QUO (original prompt kept),
+    // traced; outcome derived from run_ok minority → problem.
+    #[test]
+    fn sv2_dissent_keeps_statu_quo_traced() {
+        let input = EvalInput {
+            base_prompt: "base".into(),
+            bilan: Bilan { add_directives: vec!["a general directive".into()], ..Default::default() },
+            votes: EvalVotes { agent: vote(true, true), orchestrator: vote(false, false), olympe: vote(true, false) },
+            ..Default::default()
+        };
+        let r = evaluate(&input);
+        assert_eq!(r.report.decision, EvalDecision::StatuQuo, "not unanimous → statu quo");
+        assert_eq!(r.resulting_prompt, "base", "the original prompt is kept");
+        assert!(r.report.rationale.iter().any(|s| s.contains("dissent")), "dissent is traced");
+        assert_eq!(r.report.outcome, Outcome::Problem, "1/3 run_ok → problem (derived)");
+    }
+
+    // SV2 acceptance (FN2 + FN1): the anti-over-fit VETO beats a rubber-stamp
+    // consensus — a directive leaking a task literal → statu quo, the literal flagged
+    // (E3b), the directive fails the test-nouvelle-tâche (E3c) and is tagged
+    // TaskSpecific in the eval output (FN1).
+    #[test]
+    fn sv2_anti_over_fit_vetoes_leaked_literal_even_on_consensus() {
+        let input = EvalInput {
+            base_prompt: "base".into(),
+            bilan: Bilan {
+                add_directives: vec!["keep the persist-gate invariant".into(), "remember to ship RB1 first".into()],
+                ..Default::default()
+            },
+            task_literals: vec!["RB1".into(), "catalog.jsonl".into()],
+            votes: EvalVotes { agent: vote(true, true), orchestrator: vote(true, true), olympe: vote(true, true) },
+        };
+        let r = evaluate(&input);
+        assert_eq!(r.report.decision, EvalDecision::StatuQuo, "leaked literal vetoes the improvement");
+        assert_eq!(r.resulting_prompt, "base", "over-fit → the original prompt is kept");
+        assert!(r.report.leaked_literals.iter().any(|l| l == "RB1"), "the leaked literal is flagged (E3b)");
+        assert!(
+            r.report.task_specific_directives.iter().any(|d| d.contains("RB1")),
+            "the leaking directive fails the test-nouvelle-tâche (E3c)"
+        );
+        // FN1: per-directive verdicts live in the eval OUTPUT (not the bilan).
+        let general = r.report.directive_verdicts.iter().find(|v| v.directive.contains("persist-gate")).unwrap();
+        assert_eq!(general.scope, DirectiveScope::General, "the clean directive is general");
+        let specific = r.report.directive_verdicts.iter().find(|v| v.directive.contains("RB1")).unwrap();
+        assert_eq!(specific.scope, DirectiveScope::TaskSpecific, "the leaking directive is task-specific");
+    }
+
+    // SV2 (FN2 source): task literals are derived from the PRECISE context
+    // (objective + task log) — concrete values, not prose words.
+    #[test]
+    fn sv2_task_literals_extracted_from_precise_context_not_prose() {
+        let card = CatalogCard::from_tab_state(&maximal_tab_state("t"), None, RETIRED_AT);
+        // maximal: objective "ship RB1", current_task ["step one", "step two"].
+        let lits = task_literals_of(&card);
+        assert!(lits.iter().any(|l| l == "RB1"), "RB1 (has a digit) is a task literal");
+        assert!(!lits.iter().any(|l| l == "ship" || l == "step" || l == "one"), "prose words are not literals");
+        // Identifier-shaped values are caught WHOLE (not split on . or camelCase).
+        let mut card2 = card;
+        card2.objective = Some("wire catalog.jsonl and TabState".into());
+        card2.current_task_log = vec![];
+        let lits2 = task_literals_of(&card2);
+        assert!(lits2.contains(&"catalog.jsonl".to_string()), "path id caught whole");
+        assert!(lits2.contains(&"TabState".to_string()), "camelCase id caught");
+        assert!(!lits2.contains(&"wire".to_string()) && !lits2.contains(&"and".to_string()), "prose skipped");
+    }
+
+    // CF1 (SV2, Olympe's guard): a v2 profile is INCOMPLETE without a non-empty skill
+    // AND prompt; session_id is OPTIONAL in v2. The WRITE gate (perform_retire) refuses
+    // to close an incomplete v2 profile — it can never die at close.
+    #[test]
+    fn sv2_cf1_v2_needs_skill_and_prompt_session_optional_and_gates_the_close() {
+        // schema:2 but NO skill → incomplete.
+        let mut noskill = v2_card("t", "builder", SpawnMode::Fresh, None, RETIRED_AT, None, None);
+        noskill.skill = None;
+        noskill.prompt = Some("p".into());
+        assert!(noskill.is_v2() && !noskill.has_skill());
+        assert!(!noskill.is_complete(true), "CF1: v2 without a skill is incomplete");
+        // schema:2 + skill but NO prompt → incomplete.
+        let mut noprompt = v2_card("t", "builder", SpawnMode::Fresh, None, RETIRED_AT, None, None);
+        noprompt.prompt = None;
+        assert!(!noprompt.is_complete(false), "CF1: v2 without a prompt is incomplete");
+        // schema:2 + skill + prompt, NO session, had_session=true → COMPLETE (session
+        // is OPTIONAL in v2: the baseline is A/B-isolated, not a completeness bar).
+        let mut full = v2_card("t", "builder", SpawnMode::Fresh, None, RETIRED_AT, None, None);
+        full.prompt = Some("distilled".into());
+        full.session_id = None;
+        assert!(full.is_complete(true), "CF1: v2 with skill+prompt is complete even had_session + no session_id");
+        // The WRITE gate refuses to close the incomplete v2 profile.
+        let out = perform_retire(
+            &noprompt,
+            true,
+            false,
+            |_c| Ok(()),
+            |_id| Some(noprompt.clone()),
+            || Ok(()),
+            || panic!("must not close an incomplete v2 profile (no prompt)"),
+        );
+        assert!(matches!(out, RetireOutcome::Incomplete(_)), "CF1: a v2 retire never closes without skill+prompt");
+    }
+
+    // SV2: the eval-DERIVED outcome OVERRIDES a self-reported one; the full eval report
+    // (FN1 verdicts + FN2 findings + trace) is stored on the record.
+    #[test]
+    fn sv2_eval_derived_outcome_overrides_self_report() {
+        // A v2 card self-reporting Success…
+        let card = v2_card("t", "builder", SpawnMode::Fresh, Some(Outcome::Success), RETIRED_AT, None, None);
+        assert_eq!(card.outcome, Some(Outcome::Success), "self-reported success");
+        // …but the eval derives Problem (1/3 run_ok) → the record's outcome is DERIVED.
+        let result = evaluate(&EvalInput {
+            base_prompt: "p".into(),
+            votes: EvalVotes { agent: vote(false, false), orchestrator: vote(false, true), olympe: vote(false, false) },
+            ..Default::default()
+        });
+        let evaled = card.with_eval(result);
+        assert_eq!(evaled.outcome, Some(Outcome::Problem), "the eval-derived outcome overrides the self-report");
+        assert!(evaled.eval.is_some(), "the eval report is stored (FN1 verdicts + FN2 findings + trace)");
     }
 }
