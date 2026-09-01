@@ -55,6 +55,20 @@ pub struct DecisionEvent {
     /// PD3: where the bundle was moved on archive. PD1 models the field; the move is PD3.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_path: Option<String>,
+    /// `PD3b`: the EXPLICIT (original → archived) move pairs recorded at archive time.
+    /// `reopen_restore` reads THIS mapping to move each file back — never re-derives by
+    /// basename (which collides across decisions sharing a filename). `archived`-only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub moves: Vec<ArchivedMove>,
+}
+
+/// ``PD3b``: one archived file's EXPLICIT round-trip mapping — where it came from and where
+/// it now lives. Stored on the `archived` event so a re-open restores it exactly, with
+/// zero basename guessing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchivedMove {
+    pub original: String,
+    pub archived: String,
 }
 
 /// The event TYPE. `Open`/`Update` carry content; `Open`/`Read`/`Tranched`/`Archived`
@@ -314,16 +328,17 @@ fn move_file(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::fs::remove_file(src)
 }
 
-/// Move each existing file of `files` into `<outbox>/_archive/AAAA-MM/`.
+/// Move each existing file of `files` into `<outbox>/_archive/AAAA-MM/<id>/`.
 ///
-/// Returns the `(original, archived)` path pairs actually moved. `mkdir -p` the month
-/// dir; a missing source is skipped (idempotent — re-archiving a moved bundle is a
-/// no-op). NEVER deletes.
+/// ``PD3b``: the per-decision `<id>` sub-dir NAMESPACES the archive, so two decisions that
+/// archive the same basename (`plan.md`) in the same month no longer clobber each other
+/// on disk. Returns the `(original, archived)` pairs actually moved. `mkdir -p` the id
+/// dir; a missing source is skipped (idempotent). NEVER deletes.
 ///
 /// # Errors
 /// Propagates a create-dir / move I/O error.
-pub fn archive_files(outbox: &Path, files: &[String], unix_secs: u64) -> std::io::Result<Vec<(String, String)>> {
-    let dir = outbox.join("_archive").join(archive_month(unix_secs));
+pub fn archive_files(outbox: &Path, id: &str, files: &[String], unix_secs: u64) -> std::io::Result<Vec<(String, String)>> {
+    let dir = outbox.join("_archive").join(archive_month(unix_secs)).join(id);
     let mut moved = Vec::new();
     for f in files {
         let src = resolve(f);
@@ -339,20 +354,32 @@ pub fn archive_files(outbox: &Path, files: &[String], unix_secs: u64) -> std::io
     Ok(moved)
 }
 
-/// Move a decision's archived files BACK to their originals (reversibility).
+/// Move a decision's archived files BACK to their originals (reversibility), from the
+/// EXPLICIT stored mapping (``PD3b``) — never a basename re-derivation.
 ///
-/// For each `(original, archived)` pair, `mkdir -p` the original's parent and move the
-/// file back. A missing archived file is skipped. NEVER deletes.
+/// For each `ArchivedMove`, `mkdir -p` the original's parent and move the archived file
+/// back. A missing archived file is skipped. NEVER deletes.
+///
+/// 🟡(b) guard: if the original was RE-CREATED between archive and restore, we do NOT
+/// overwrite it with the older archived copy (that would lose the newer bytes) — we
+/// leave the archived copy in place and skip. Reversibility must never destroy a newer
+/// original. (ponytail: the two live side by side; a future merge/compare is out of
+/// scope — the invariant that matters, no byte lost, holds.)
 ///
 /// # Errors
 /// Propagates a create-dir / move I/O error.
-pub fn restore_files(pairs: &[(String, String)]) -> std::io::Result<()> {
-    for (original, archived) in pairs {
+pub fn restore_files(pairs: &[ArchivedMove]) -> std::io::Result<()> {
+    for ArchivedMove { original, archived } in pairs {
         let src = resolve(archived);
         if !src.exists() {
             continue;
         }
         let dst = resolve(original);
+        if dst.exists() {
+            // 🟡(b): a newer original exists — don't clobber it with the archived copy.
+            eprintln!("decision restore: original '{original}' already exists — archived copy kept, not overwritten");
+            continue;
+        }
         if let Some(parent) = dst.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -361,23 +388,10 @@ pub fn restore_files(pairs: &[(String, String)]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Pair each content file with its archived counterpart (matched by file name), so a
-/// re-open can move the bundle back exactly where the content expects it.
-fn archived_pairs(events: &[DecisionEvent]) -> Vec<(String, String)> {
-    let (Some(content), Some(archived)) =
-        (events.iter().rfind(|e| e.kind.is_content()), events.iter().rev().find(|e| e.kind == DecisionKind::Archived))
-    else {
-        return Vec::new();
-    };
-    content
-        .files
-        .iter()
-        .filter_map(|orig| {
-            let base = Path::new(orig).file_name()?;
-            let arch = archived.files.iter().find(|a| Path::new(a).file_name() == Some(base))?;
-            Some((orig.clone(), arch.clone()))
-        })
-        .collect()
+/// The EXPLICIT (original → archived) mapping stored on the LATEST `archived` event
+/// (``PD3b``) — what `reopen_restore` moves back, with zero basename guessing.
+fn archived_moves(events: &[DecisionEvent]) -> Vec<ArchivedMove> {
+    events.iter().rev().find(|e| e.kind == DecisionKind::Archived).map(|e| e.moves.clone()).unwrap_or_default()
 }
 
 /// PD3: archive a ruled decision — move its bundles then append the `archived` event.
@@ -394,14 +408,22 @@ pub fn archive_decision(log: &Path, outbox: &Path, id: &str, unix_secs: u64) -> 
     let body = std::fs::read_to_string(log).unwrap_or_default();
     let events: Vec<DecisionEvent> = parse_decisions(&body).into_iter().filter(|e| e.id == id).collect();
     let files = events.iter().rfind(|e| e.kind.is_content()).map(|e| e.files.clone()).unwrap_or_default();
-    let moved = archive_files(outbox, &files, unix_secs)?;
-    let dir = outbox.join("_archive").join(archive_month(unix_secs)).to_string_lossy().into_owned();
+    // PD3b: namespace the move by `id`. ponytail 🟡(a): move-then-append is NOT
+    // crash-atomic — a crash between the moves and the append leaves the files in the
+    // id dir but the log un-updated. NO byte is lost (nothing is deleted; the files are
+    // in `_archive/<month>/<id>/`), so it's recoverable, not data-loss; the upgrade path
+    // is an intent record (append a `moving` marker first) or a reconciliation sweep.
+    let moved = archive_files(outbox, id, &files, unix_secs)?;
+    let dir = outbox.join("_archive").join(archive_month(unix_secs)).join(id).to_string_lossy().into_owned();
     let archived = DecisionEvent {
         id: id.to_string(),
         kind: DecisionKind::Archived,
         at: unix_secs,
-        files: moved.into_iter().map(|(_, new)| new).collect(),
+        // Panel links point at the archived copies…
+        files: moved.iter().map(|(_, new)| new.clone()).collect(),
         archived_path: Some(dir.clone()),
+        // …and the EXPLICIT mapping restores them exactly (PD3b — no basename guessing).
+        moves: moved.into_iter().map(|(original, archived)| ArchivedMove { original, archived }).collect(),
         ..Default::default()
     };
     append_line(log, &archived)?;
@@ -422,7 +444,8 @@ pub fn reopen_restore(log: &Path, id: &str) -> std::io::Result<()> {
     if state_of(&events) != DecisionState::Archived {
         return Ok(());
     }
-    restore_files(&archived_pairs(&events))
+    // PD3b: restore from the EXPLICIT stored mapping, never a basename re-derivation.
+    restore_files(&archived_moves(&events))
 }
 
 // ---------------------------------------------------------------------------
@@ -701,8 +724,9 @@ mod tests {
         // The file REALLY moved: the original is gone, the archive copy exists (bytes kept).
         assert!(!bundle.exists(), "the original bundle left the live outbox");
         let month = archive_month(ts);
-        let archived = outbox.path().join("_archive").join(&month).join("ra1c-deploy.md");
-        assert!(archived.exists(), "the bundle now lives in _archive/{month}");
+        // PD3b: namespaced by the decision id → `_archive/<month>/<id>/<basename>`.
+        let archived = outbox.path().join("_archive").join(&month).join("ra1c").join("ra1c-deploy.md");
+        assert!(archived.exists(), "the bundle now lives in _archive/{month}/ra1c");
         assert_eq!(std::fs::read_to_string(&archived).unwrap(), "the RA1c deploy bundle", "bytes preserved by the move");
 
         // The read-model: archived, hidden by default; the view's files point at the
@@ -727,6 +751,80 @@ mod tests {
         // The explicit re-open event (as `push` appends after restore) -> state=open again.
         append_line(log.path(), &open("ra1c", "harness", "Deploy RA1c v2", 120)).unwrap();
         assert_eq!(read_decisions_at(log.path(), false).iter().find(|d| d.id == "ra1c").unwrap().state, DecisionState::Open);
+    }
+
+    // PD3b ⭐ ANTI-CLOBBER (the Olympe 🟡 bug, killed): TWO distinct decisions (A, B)
+    // each archive a file NAMED `plan.md` in the SAME month. Before PD3b they'd both
+    // land at `_archive/<month>/plan.md` → the 2nd move clobbered the 1st (DATA LOSS)
+    // and restore returned the WRONG bytes. Now the per-id sub-dir isolates them AND
+    // restore reads the EXPLICIT mapping — each decision gets back ITS OWN bytes.
+    #[test]
+    fn pd3b_two_decisions_same_basename_same_month_no_clobber() {
+        let log = TmpLog::new();
+        let outbox = TmpOutbox::new();
+        let ts = 1_756_700_000; // same month for BOTH → the collision window
+        let month = archive_month(ts);
+
+        // Two REAL, DISTINCT `plan.md` files with DIFFERENT bytes, one per decision.
+        let sub_a = outbox.path().join("proj-a");
+        let sub_b = outbox.path().join("proj-b");
+        std::fs::create_dir_all(&sub_a).unwrap();
+        std::fs::create_dir_all(&sub_b).unwrap();
+        let plan_a = sub_a.join("plan.md");
+        let plan_b = sub_b.join("plan.md");
+        std::fs::write(&plan_a, b"PLAN OF DECISION A").unwrap();
+        std::fs::write(&plan_b, b"PLAN OF DECISION B").unwrap();
+
+        for (id, plan) in [("dec-a", &plan_a), ("dec-b", &plan_b)] {
+            let mut o = open(id, "harness", id, 100);
+            o.files = vec![plan.to_string_lossy().into_owned()];
+            append_line(log.path(), &o).unwrap();
+            append_line(log.path(), &ev(id, DecisionKind::Tranched, 105)).unwrap();
+            archive_decision(log.path(), outbox.path(), id, ts).unwrap();
+        }
+
+        // NO CLOBBER: both archives coexist, each under its own id namespace, each SES octets.
+        let arch_a = outbox.path().join("_archive").join(&month).join("dec-a").join("plan.md");
+        let arch_b = outbox.path().join("_archive").join(&month).join("dec-b").join("plan.md");
+        assert!(arch_a.exists() && arch_b.exists(), "both archived plan.md coexist (namespaced by id)");
+        assert_eq!(std::fs::read_to_string(&arch_a).unwrap(), "PLAN OF DECISION A", "A's archive holds A's bytes");
+        assert_eq!(std::fs::read_to_string(&arch_b).unwrap(), "PLAN OF DECISION B", "B's archive holds B's bytes");
+
+        // RESTORE via the EXPLICIT mapping: each decision gets back ITS OWN bytes.
+        reopen_restore(log.path(), "dec-a").unwrap();
+        reopen_restore(log.path(), "dec-b").unwrap();
+        assert_eq!(std::fs::read_to_string(&plan_a).unwrap(), "PLAN OF DECISION A", "restore(A) → A's bytes at A's original");
+        assert_eq!(std::fs::read_to_string(&plan_b).unwrap(), "PLAN OF DECISION B", "restore(B) → B's bytes at B's original");
+
+        // The archived events carry the EXPLICIT (original → archived) mapping (not a
+        // basename re-derivation) — the mechanism that makes the above robust.
+        let events = parse_decisions(&std::fs::read_to_string(log.path()).unwrap());
+        let a_moves = archived_moves(&events.iter().filter(|e| e.id == "dec-a").cloned().collect::<Vec<_>>());
+        assert_eq!(a_moves.len(), 1);
+        assert_eq!(a_moves[0].original, plan_a.to_string_lossy());
+        assert!(a_moves[0].archived.ends_with("dec-a/plan.md"), "A's mapping points at A's namespaced archive");
+    }
+
+    // PD3b 🟡(b) guard: a restore does NOT overwrite an original that was RE-CREATED
+    // between archive and restore (that newer file's bytes must survive).
+    #[test]
+    fn pd3b_restore_never_clobbers_a_recreated_original() {
+        let outbox = TmpOutbox::new();
+        let arch_dir = outbox.path().join("_archive").join("2025-08").join("d");
+        std::fs::create_dir_all(&arch_dir).unwrap();
+        let archived = arch_dir.join("plan.md");
+        std::fs::write(&archived, b"OLD archived bytes").unwrap();
+        let original = outbox.path().join("plan.md");
+        std::fs::write(&original, b"NEW recreated bytes").unwrap(); // recreated after archive
+
+        restore_files(&[ArchivedMove {
+            original: original.to_string_lossy().into_owned(),
+            archived: archived.to_string_lossy().into_owned(),
+        }])
+        .unwrap();
+        // The NEWER original is untouched; the archived copy stays put (nothing lost).
+        assert_eq!(std::fs::read_to_string(&original).unwrap(), "NEW recreated bytes", "recreated original preserved");
+        assert!(archived.exists(), "the archived copy is kept, not force-moved over the newer file");
     }
 
     // PD1: the CONTENT axis = latest open|update wins (append order), independent of the
