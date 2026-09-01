@@ -20,7 +20,16 @@ case "$file" in
 *) exit 0 ;;
 esac
 
-cd "${CLAUDE_PROJECT_DIR:-.}" || exit 0
+# Worktree-aware: lint the worktree that OWNS the edited file, not the
+# session's launch dir ($CLAUDE_PROJECT_DIR). An agent editing a stacked
+# feature branch checked out in another worktree must lint THAT tree —
+# otherwise the gate reports stale errors from an unrelated checkout (and
+# the `rel` package mapping below misfires because the file lives outside
+# $PWD). Fall back to $CLAUDE_PROJECT_DIR when the file isn't under a git
+# worktree. An agent editing its own worktree resolves to the same dir as
+# before, so existing sessions are unaffected.
+root=$(git -C "$(dirname "$file")" rev-parse --show-toplevel 2>/dev/null) || root="${CLAUDE_PROJECT_DIR:-.}"
+cd "$root" || exit 0
 
 # Map the edited file to the workspace package that owns it. The root
 # package is linted with CI's headless feature set so the hook works in
