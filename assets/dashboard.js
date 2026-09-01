@@ -360,6 +360,28 @@ export function byModeMetricsModel(skill) {
   };
 }
 
+// Pure: the SC3 edit form -> {ok, body}|{ok:false, error}. CLIENT CF1 guard (double
+// garde with the server 409): the prompt must stay non-empty. conventions accept an
+// array or a newline-separated string (blank lines dropped). promptVersion rides as
+// the optimistic-concurrency token when present.
+export function editBody(form) {
+  const f = form || {};
+  const prompt = f.prompt != null ? String(f.prompt) : "";
+  if (!prompt.trim()) return { ok: false, error: "le prompt ne peut pas être vide (CF1)" };
+  const body = { prompt };
+  if (f.specialty != null) body.specialty = String(f.specialty);
+  if (f.conventions != null) {
+    body.conventions = Array.isArray(f.conventions)
+      ? f.conventions.map(String).map((x) => x.trim()).filter(Boolean)
+      : String(f.conventions).split(/\r?\n/).map((x) => x.trim()).filter(Boolean);
+  }
+  if (f.promptVersion != null && f.promptVersion !== "") {
+    const pv = Number(f.promptVersion);
+    if (!Number.isNaN(pv)) body.promptVersion = pv;
+  }
+  return { ok: true, body };
+}
+
 // --- S5/S6: orchestrator tint + altitude bands + delegation lineage ---
 // These consume role / parentTabId / (optional) altitude fields exposed by the
 // Rust builder. ponytail: the altitude/lineage contract is provisional until the
@@ -1472,10 +1494,25 @@ function metricsTableHtml(skill) {
 // (profile + metrics). The long prompt reuses the 'voir plus' fold (clippedHtml).
 function catalogSkillHtml(skill) {
   const p = skillProfileModel(skill);
+  const deleted = !!(skill && (skill.deleted === true || skill.tombstoned === true));
   const list = (label, xs) => (xs.length ? `<div class="cat-field"><span class="cat-key">${label}</span> ${xs.map((x) => `<span class="cat-tag">${escapeHtml(x)}</span>`).join(" ")}</div>` : "");
   const ver = p.promptVersion != null ? ` <span class="cat-ver">v${escapeHtml(String(p.promptVersion))}</span>` : "";
-  return `<div class="cat-skill" data-skill="${escapeHtml(p.name)}">
-    <button class="cat-skill-head" aria-expanded="false"><span class="cat-caret">▸</span> <span class="cat-name">${escapeHtml(p.name)}</span>${ver}</button>
+  const pvAttr = p.promptVersion != null ? escapeHtml(String(p.promptVersion)) : "";
+  // SC3: the edit form (specialty / prompt / conventions) + delete / restore.
+  const editForm = `<form class="cat-edit" data-skill="${escapeHtml(p.name)}" data-prompt-version="${pvAttr}">
+      <div class="cat-edit-row"><label>specialty</label><input class="cat-edit-specialty" type="text" value="${escapeHtml(p.specialty)}"></div>
+      <div class="cat-edit-row"><label>prompt</label><textarea class="cat-edit-prompt" rows="4">${escapeHtml(p.prompt)}</textarea></div>
+      <div class="cat-edit-row"><label>conventions<br><small>(un .md par ligne)</small></label><textarea class="cat-edit-conventions" rows="2">${escapeHtml(p.conventions.join("\n"))}</textarea></div>
+      <div class="cat-edit-actions">
+        <button type="button" class="cat-save">Enregistrer</button>
+        ${deleted
+          ? `<button type="button" class="cat-restore" data-skill="${escapeHtml(p.name)}">Restaurer</button>`
+          : `<button type="button" class="cat-delete" data-skill="${escapeHtml(p.name)}">Supprimer</button>`}
+        <span class="cat-edit-msg" role="status"></span>
+      </div>
+    </form>`;
+  return `<div class="cat-skill${deleted ? " cat-deleted" : ""}" data-skill="${escapeHtml(p.name)}">
+    <button class="cat-skill-head" aria-expanded="false"><span class="cat-caret">▸</span> <span class="cat-name">${escapeHtml(p.name)}</span>${ver}${deleted ? ` <span class="cat-tombstone">supprimé</span>` : ""}</button>
     <div class="cat-skill-body" hidden>
       ${p.specialty ? `<div class="cat-field"><span class="cat-key">specialty</span> ${escapeHtml(p.specialty)}</div>` : ""}
       ${p.prompt ? `<div class="cat-field"><span class="cat-key">prompt</span> <span class="cat-prompt">${clippedHtml(p.prompt)}</span></div>` : ""}
@@ -1483,6 +1520,7 @@ function catalogSkillHtml(skill) {
       ${list("tools", p.tools)}
       ${list("patterns", p.patterns)}
       ${metricsTableHtml(skill)}
+      ${editForm}
     </div>
   </div>`;
 }
@@ -1521,6 +1559,54 @@ async function openCatalog() {
 function closeCatalog() {
   const el = document.getElementById("catalog-panel");
   if (el) { el.hidden = true; catalogOpen = false; }
+}
+
+// SC3: a catalog mutation (edit/delete/restore) with the page token. Returns the
+// Response so the caller can read 2xx (refresh) vs 409 (show the server error).
+function catalogPost(skill, verb, body) {
+  return fetch(`/catalog/${encodeURIComponent(skill)}/${verb}`, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json", ...AUTH_HEADERS },
+    body: JSON.stringify(body || {}),
+  });
+}
+
+// Handle a click on a SC3 edit-form control (save/delete/restore). Returns true if
+// it handled the target. Async: refreshes the read-model after a 2xx (server = the
+// source of truth, no optimistic mutation).
+async function handleCatalogEdit(target) {
+  const save = target.closest && target.closest(".cat-save");
+  if (save) {
+    const form = save.closest(".cat-edit");
+    const msg = form.querySelector(".cat-edit-msg");
+    const built = editBody({
+      prompt: form.querySelector(".cat-edit-prompt").value,
+      specialty: form.querySelector(".cat-edit-specialty").value,
+      conventions: form.querySelector(".cat-edit-conventions").value,
+      promptVersion: form.dataset.promptVersion,
+    });
+    if (!built.ok) { msg.textContent = built.error; msg.className = "cat-edit-msg err"; return true; }
+    try {
+      const res = await catalogPost(form.dataset.skill, "edit", built.body);
+      if (res.ok) { openCatalog(); }
+      else { const t = (await res.text().catch(() => "")) || `HTTP ${res.status}`; msg.textContent = `erreur ${res.status} : ${t}`; msg.className = "cat-edit-msg err"; }
+    } catch (err) { msg.textContent = `erreur réseau : ${err.message}`; msg.className = "cat-edit-msg err"; }
+    return true;
+  }
+  const del = target.closest && target.closest(".cat-delete");
+  if (del) {
+    const skill = del.dataset.skill;
+    // STICKY deletion — restaurable only via an explicit Restore (strong confirm).
+    if (typeof confirm === "function" && !confirm(`Supprimer « ${skill} » du catalogue ?\n\nSuppression STICKY — restaurable UNIQUEMENT via l'action Restore explicite.`)) return true;
+    try { const res = await catalogPost(skill, "delete", {}); if (res.ok) openCatalog(); } catch { /* ignore */ }
+    return true;
+  }
+  const restore = target.closest && target.closest(".cat-restore");
+  if (restore) {
+    try { const res = await catalogPost(restore.dataset.skill, "restore", {}); if (res.ok) openCatalog(); } catch { /* ignore */ }
+    return true;
+  }
+  return false;
 }
 
 async function poll() {
@@ -1694,6 +1780,8 @@ function bootstrap() {
       e.stopPropagation();
       if (e.target.closest(".cat-close")) { closeCatalog(); return; }
       if (e.target.closest(".cat-refresh")) { openCatalog(); return; }
+      // SC3: edit-form controls (save/delete/restore) are async mutations.
+      if (e.target.closest(".cat-save, .cat-delete, .cat-restore")) { handleCatalogEdit(e.target); return; }
       const head = e.target.closest(".cat-skill-head");
       if (head) {
         const body = head.parentElement && head.parentElement.querySelector(".cat-skill-body");
