@@ -95,7 +95,11 @@ pub enum DecisionState {
 }
 
 /// One folded decision in the read-model (PD1): the latest content + the derived state.
+///
+/// Served `rename_all = "camelCase"` (`why_gated` → `whyGated`) so the read-model the
+/// KIOSK panel consumes matches the catalogue's camelCase contract (PD2).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DecisionView {
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -196,7 +200,17 @@ fn state_of(events: &[DecisionEvent]) -> DecisionState {
 /// there's no content event (no `open`/`update` → nothing to show).
 fn fold_one(id: &str, events: &[DecisionEvent]) -> Option<DecisionView> {
     let content = events.iter().rfind(|e| e.kind.is_content())?;
-    let verdict = events.iter().rev().find(|e| e.kind == DecisionKind::Tranched).and_then(|e| e.verdict.clone());
+    // The verdict rides the view ONLY within the CURRENT cycle: surface it iff the
+    // latest `Tranched` is AFTER the latest `Open` (append order). A re-`open` starts a
+    // fresh cycle, so a pre-archive verdict is stale and MUST NOT ride a re-opened
+    // (state=Open) decision — that would show a verdict on an Open item, semantically
+    // bancal (Olympe micro-note #2792, verdict-staleness). A never-opened id (bare
+    // event) keeps the last tranched verdict.
+    let last_open = events.iter().rposition(|e| e.kind == DecisionKind::Open);
+    let last_tranched = events.iter().rposition(|e| e.kind == DecisionKind::Tranched);
+    let verdict = last_tranched
+        .filter(|&t| last_open.is_none_or(|o| t > o))
+        .and_then(|t| events[t].verdict.clone());
     Some(DecisionView {
         id: id.to_string(),
         project: content.project.clone(),
@@ -417,6 +431,41 @@ mod tests {
         let a = serde_json::to_string(&read_decisions_at(log.path(), true)).unwrap();
         let b = serde_json::to_string(&read_decisions_at(log.path(), true)).unwrap();
         assert_eq!(a, b, "the fold is deterministic");
+    }
+
+    // PD2 (Olympe #2792 verdict-staleness): a verdict belongs to the CYCLE it was ruled
+    // in. After a re-open (state=Open), a pre-archive Tranched verdict MUST NOT ride the
+    // view — an Open decision showing a verdict is semantically bancal.
+    #[test]
+    fn pd2_reopen_after_tranch_drops_the_stale_verdict() {
+        let log = TmpLog::new();
+        append_line(log.path(), &open("d", "harness", "v1", 1)).unwrap();
+        let mut tr = ev("d", DecisionKind::Tranched, 2);
+        tr.verdict = Some("GO".into());
+        append_line(log.path(), &tr).unwrap();
+        // Same cycle: state=Tranched, the verdict rides the view.
+        let ruled = read_decisions_at(log.path(), false);
+        let d = ruled.iter().find(|x| x.id == "d").unwrap();
+        assert_eq!(d.state, DecisionState::Tranched);
+        assert_eq!(d.verdict.as_deref(), Some("GO"), "verdict shows within its cycle");
+
+        // Archive then re-open → a NEW cycle. The old GO is stale.
+        append_line(log.path(), &ev("d", DecisionKind::Archived, 3)).unwrap();
+        append_line(log.path(), &open("d", "harness", "v2", 4)).unwrap();
+        let reopened = read_decisions_at(log.path(), false);
+        let d = reopened.iter().find(|x| x.id == "d").expect("re-opened → visible");
+        assert_eq!(d.state, DecisionState::Open, "re-open resets the state");
+        assert_eq!(d.verdict, None, "a pre-archive verdict does NOT ride a re-opened decision");
+
+        // Ruling the NEW cycle surfaces its OWN verdict (the mechanism still works).
+        let mut tr2 = ev("d", DecisionKind::Tranched, 5);
+        tr2.verdict = Some("NO-GO".into());
+        append_line(log.path(), &tr2).unwrap();
+        assert_eq!(
+            read_decisions_at(log.path(), false).iter().find(|x| x.id == "d").unwrap().verdict.as_deref(),
+            Some("NO-GO"),
+            "the new cycle's verdict surfaces"
+        );
     }
 
     // PD1: the CONTENT axis = latest open|update wins (append order), independent of the

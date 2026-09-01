@@ -1668,8 +1668,17 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
     };
     let raw_path = parts[1].to_string();
 
-    let (path, query_token, query_lines, query_since, query_crc, query_name, query_path, query_include_deleted) =
-        if let Some((p, q)) = raw_path.split_once('?') {
+    let (
+        path,
+        query_token,
+        query_lines,
+        query_since,
+        query_crc,
+        query_name,
+        query_path,
+        query_include_deleted,
+        query_include_archived,
+    ) = if let Some((p, q)) = raw_path.split_once('?') {
             let qt = q
                 .split('&')
                 .find_map(|pair| pair.strip_prefix("token="))
@@ -1693,9 +1702,14 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             let qid = q
                 .split('&')
                 .any(|pair| matches!(pair, "includeDeleted" | "includeDeleted=true" | "includeDeleted=1"));
-            (p.to_string(), qt, ql, qs, qc, qn, qp, qid)
+            // PD2 (#kiosk): `?includeArchived[=true|1]` surfaces archived decisions
+            // (`state:archived`) in the KIOSK panel; the default hides them.
+            let qia = q
+                .split('&')
+                .any(|pair| matches!(pair, "includeArchived" | "includeArchived=true" | "includeArchived=1"));
+            (p.to_string(), qt, ql, qs, qc, qn, qp, qid, qia)
         } else {
-            (raw_path, None, None, None, None, None, None, false)
+            (raw_path, None, None, None, None, None, None, false, false)
         };
     // Strip a trailing slash so a path like `/tabs/.../view/` (added
     // by some reverse proxies / Cloudflare Tunnel normalisation)
@@ -2137,6 +2151,13 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
         // RB2 read-model: the retired-agent catalogue. READ-ONLY (GET). SC1b:
         // `?includeDeleted` also surfaces tombstoned skills (marked `deleted:true`).
         ("GET", "/catalog/list") => handlers::catalog::list(stream, query_include_deleted),
+        // PD2 (#kiosk): the KIOSK cross-project decision panel. `POST /decisions/{id}/
+        // {read|tranch}` transits state (event-sourced APPEND under the daemon lock,
+        // read-back gated); `GET /decisions[?includeArchived]` is the folded read-model.
+        ("POST", p) if p.starts_with("/decisions/") && (p.ends_with("/read") || p.ends_with("/tranch")) => {
+            handlers::decisions::mutate(stream, state, p, &body_bytes);
+        }
+        ("GET", "/decisions") => handlers::decisions::list(stream, query_include_archived),
         (_, "/" | "/tabs") => {
             error_json(stream, 405, "method not allowed");
         }
@@ -6961,6 +6982,107 @@ mod tests {
         // CF1 (borne 4): an edit to an empty prompt → 409, catalogue unchanged.
         let bad = request(port, &post(&format!("catalog/{skill}/edit"), r#"{"prompt":"   "}"#));
         assert_eq!(status_code(&bad), 409, "edit to empty prompt → 409 (CF1)\n{bad}");
+    }
+
+    /// GET /decisions[…] → the `decisions` array (the PD2 read-model), for the KIOSK
+    /// live tests. `extra` is an optional query fragment (e.g. `&includeArchived=true`).
+    fn decisions_list(port: u16, token: &str, extra: &str) -> Vec<serde_json::Value> {
+        let listed = request(port, &format!("GET /decisions?token={token}{extra} HTTP/1.1\r\n\r\n"));
+        let json: serde_json::Value = serde_json::from_str(body_of(&listed)).expect("decisions list json");
+        json["decisions"].as_array().cloned().unwrap_or_default()
+    }
+
+    /// Removes the given decision ids from the REAL decisions.jsonl on drop (the KIOSK
+    /// live test appends there; disposable ids never collide with real decisions).
+    struct DecisionsCleanup(Vec<String>);
+    impl Drop for DecisionsCleanup {
+        fn drop(&mut self) {
+            let path = crate::cli::decision::decisions_path();
+            let Ok(body) = std::fs::read_to_string(&path) else { return };
+            let kept: Vec<crate::cli::decision::DecisionEvent> = crate::cli::decision::parse_decisions(&body)
+                .into_iter()
+                .filter(|e| !self.0.contains(&e.id))
+                .collect();
+            if kept.is_empty() {
+                let _ = std::fs::remove_file(&path);
+            } else {
+                let out: String = kept.iter().map(crate::cli::decision::encode_line).collect();
+                let _ = std::fs::write(&path, out);
+            }
+        }
+    }
+
+    // PD2 (#kiosk): the LIVE KIOSK routes — a REAL integration test (real-fs, real
+    // routes, NO mock). Seeds an `open` decision, then: GET renders it server-verbatim
+    // (camelCase, state=open) → POST /read transits state → POST /tranch WITHOUT a
+    // verdict is rejected (400) → WITH a verdict transits + surfaces the verdict →
+    // ?includeArchived plumbs the fold's visibility filter.
+    #[test]
+    fn pd2_live_decisions_read_tranch_and_include_archived() {
+        use crate::cli::decision::{DecisionEvent, DecisionKind, append_line, decisions_path};
+        let _guard = real_catalog_test_guard(); // serialize real cold-source writers
+        let (port, _state, token) = spawn_server();
+        let post = |path: &str, body: &str| {
+            format!("POST /{path}?token={token} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+        };
+        let run = crate::default_tab_id();
+        let id = format!("pd2-{}", &run[..8.min(run.len())]);
+        let _cleanup = DecisionsCleanup(vec![id.clone()]);
+
+        // Seed a real `open` decision (the orchestrator's `decision push` in production).
+        let seed = DecisionEvent {
+            id: id.clone(),
+            kind: DecisionKind::Open,
+            at: 1,
+            project: Some("harness".into()),
+            title: Some("Deploy X".into()),
+            why_gated: Some("restart = gate PO".into()),
+            reco: Some("GO".into()),
+            files: vec!["~/Dev/outbox/x.md".into()],
+            ..Default::default()
+        };
+        append_line(&decisions_path(), &seed).unwrap();
+
+        // GET → the decision renders VERBATIM (camelCase `whyGated`, state=open, files).
+        let d = decisions_list(port, &token, "");
+        let seen = d.iter().find(|x| x["id"] == serde_json::json!(id)).expect("seeded decision visible");
+        assert_eq!(seen["state"], serde_json::json!("open"), "state=open");
+        assert_eq!(seen["project"], serde_json::json!("harness"), "transverse project field");
+        assert_eq!(seen["whyGated"], serde_json::json!("restart = gate PO"), "camelCase whyGated served");
+        assert!(seen["files"].as_array().is_some_and(|f| f.len() == 1), "files[] rendered for links");
+        assert!(seen.get("verdict").is_none(), "no verdict before a ruling");
+
+        // POST /read → 200 + state transits to read.
+        let r = request(port, &post(&format!("decisions/{id}/read"), "{}"));
+        assert_eq!(status_code(&r), 200, "read → 200\n{r}");
+        assert_eq!(
+            decisions_list(port, &token, "").iter().find(|x| x["id"] == serde_json::json!(id)).unwrap()["state"],
+            serde_json::json!("read"),
+            "read marks the decision read"
+        );
+
+        // POST /tranch WITHOUT a verdict → 400 (a ruling without a verdict is meaningless).
+        let bad = request(port, &post(&format!("decisions/{id}/tranch"), "{}"));
+        assert_eq!(status_code(&bad), 400, "tranch without verdict → 400\n{bad}");
+
+        // POST /tranch WITH a verdict → 200 + state=tranched + the verdict surfaces.
+        let t = request(port, &post(&format!("decisions/{id}/tranch"), r#"{"verdict":"GO","by":"PO"}"#));
+        assert_eq!(status_code(&t), 200, "tranch → 200\n{t}");
+        let ruled = decisions_list(port, &token, "");
+        let d2 = ruled.iter().find(|x| x["id"] == serde_json::json!(id)).unwrap();
+        assert_eq!(d2["state"], serde_json::json!("tranched"), "tranch transits state");
+        assert_eq!(d2["verdict"], serde_json::json!("GO"), "the verdict rides the read-model");
+
+        // ?includeArchived plumbs the visibility filter: archive (models PD3) → hidden by
+        // default, surfaced with the flag.
+        append_line(&decisions_path(), &DecisionEvent { id: id.clone(), kind: DecisionKind::Archived, at: 9, ..Default::default() }).unwrap();
+        assert!(
+            !decisions_list(port, &token, "").iter().any(|x| x["id"] == serde_json::json!(id)),
+            "archived decision hidden from the default read-model"
+        );
+        let all = decisions_list(port, &token, "&includeArchived=true");
+        let arch = all.iter().find(|x| x["id"] == serde_json::json!(id)).expect("surfaced with ?includeArchived");
+        assert_eq!(arch["state"], serde_json::json!("archived"), "surfaced with state=archived");
     }
 
     // SC1 borne 3: concurrent EDITs never lose an update — each read-modify-append

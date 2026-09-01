@@ -71,8 +71,11 @@ pub(super) fn authorize(
     // The read-only dashboard token also reads the catalogue read-model on-demand
     // (SC1 #39): the VUE is a separate cold source (RB2), fetched off the live poll.
     // Only the GET list — the POST mutations stay master-token-only.
+    // PD2 (#kiosk): the read-only dashboard token also reads the KIOSK decision
+    // read-model on-demand (`GET /decisions`), a separate cold source like the
+    // catalogue. The POST read/tranch mutations stay master-token-only.
     let is_dashboard_token = dashboard_matches
-        && matches!(path, "/dashboard" | "/dashboard/state" | "/dashboard/activity" | "/catalog/list");
+        && matches!(path, "/dashboard" | "/dashboard/state" | "/dashboard/activity" | "/catalog/list" | "/decisions");
     if is_master || is_dashboard_token {
         return Gate::Allow;
     }
