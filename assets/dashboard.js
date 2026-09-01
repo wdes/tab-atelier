@@ -1615,6 +1615,166 @@ async function handleCatalogEdit(target) {
   return false;
 }
 
+// ===== KIOSK #kiosk (PD2): the cross-project pending-decisions panel =====
+// Same ossature as the catalogue: a topbar button opens a cold overlay fetched
+// on-demand (NOT in the 1.5s poll — a separate cold source). The server read-model is
+// rendered VERBATIM: state / verdict / visibility are the fold's call, no JS re-gate.
+const DECISIONS_URL = "/decisions";
+let kioskOpen = false;
+let kioskIncludeArchived = false;
+
+// The server read-model -> the decisions array (tolerate {decisions:[…]} or a bare array).
+export function kioskView(readModel) {
+  if (readModel && Array.isArray(readModel.decisions)) return readModel.decisions;
+  return Array.isArray(readModel) ? readModel : [];
+}
+
+// state -> a short human label (visual vocabulary distinct from the living-cards).
+const DECISION_STATE_LABEL = { open: "à trancher", read: "lu", tranched: "tranché", archived: "archivé" };
+// open first, then the read->tranched->archived progression.
+const DECISION_STATE_ORDER = { open: 0, read: 1, tranched: 2, archived: 3 };
+
+// One decision card: the 2-notch checkbox (Lu -> Tranché) in the head, the digest lines
+// (title / why-gated / reco / effort), the file links, and a short verdict field. The
+// checkboxes reflect the SERVER state (no optimistic UI); once reached, a notch is
+// checked+disabled (state only progresses; there is no un-read / un-tranch route here).
+export function decisionCardHtml(d) {
+  const state = String(d.state || "open");
+  const isRead = state === "read" || state === "tranched" || state === "archived";
+  const isTranched = state === "tranched" || state === "archived";
+  const id = escapeHtml(String(d.id || ""));
+  const line = (label, val) => (val ? `<div class="kk-field"><span class="kk-key">${label}</span> ${escapeHtml(String(val))}</div>` : "");
+  const files = Array.isArray(d.files) ? d.files : [];
+  // ponytail: the href is the raw outbox path — the PO clicks to read the bundle. A
+  // later slice can route it through an outbox file-server; here it's a reachable anchor.
+  const links = files.length
+    ? `<div class="kk-files">${files.map((f) => `<a class="kk-file" href="${escapeHtml(String(f))}" target="_blank" rel="noopener">${escapeHtml(String(f))}</a>`).join("")}</div>`
+    : "";
+  return `<div class="kk-card kk-state-${escapeHtml(state)}" data-id="${id}" data-state="${escapeHtml(state)}">
+    <div class="kk-head">
+      <label class="kk-check"><input type="checkbox" class="kk-lu"${isRead ? " checked disabled" : ""}> Lu</label>
+      <label class="kk-check"><input type="checkbox" class="kk-tranche"${isTranched ? " checked disabled" : ""}> Tranché</label>
+      <span class="kk-title">${escapeHtml(String(d.title || d.id || ""))}</span>
+      <span class="kk-state-tag">${escapeHtml(DECISION_STATE_LABEL[state] || state)}</span>
+    </div>
+    ${line("pourquoi gaté", d.whyGated)}
+    ${line("reco", d.reco)}
+    ${line("effort", d.effort)}
+    ${links}
+    <div class="kk-rule">
+      <input type="text" class="kk-verdict-input" placeholder="verdict court…" value="${escapeHtml(String(d.verdict || ""))}"${isTranched ? " disabled" : ""}>
+      ${d.verdict ? `<span class="kk-verdict">verdict : ${escapeHtml(String(d.verdict))}</span>` : ""}
+      <span class="kk-msg" role="status"></span>
+    </div>
+  </div>`;
+}
+
+export function kioskHtml(readModel) {
+  const decisions = kioskView(readModel);
+  // Group by project (transverse); within a group, open first.
+  const byProject = new Map();
+  for (const d of decisions) {
+    const p = d.project || "—";
+    if (!byProject.has(p)) byProject.set(p, []);
+    byProject.get(p).push(d);
+  }
+  const groups = [...byProject.keys()].sort().map((p) => {
+    const cards = byProject.get(p).slice()
+      .sort((a, b) => (DECISION_STATE_ORDER[a.state] ?? 9) - (DECISION_STATE_ORDER[b.state] ?? 9))
+      .map(decisionCardHtml).join("");
+    return `<div class="kk-group"><h3 class="kk-project">${escapeHtml(String(p))}</h3>${cards}</div>`;
+  }).join("");
+  const openCount = decisions.filter((d) => d.state === "open").length;
+  const body = decisions.length ? groups : `<div class="kk-empty">Aucune décision en attente.</div>`;
+  return `<div class="kk-header">
+      <span class="kk-panel-title">Décisions en attente</span>
+      <span class="kk-count">${openCount} à trancher</span>
+      <label class="kk-archived-toggle"><input type="checkbox" class="kk-show-archived"${kioskIncludeArchived ? " checked" : ""}> afficher les archivées</label>
+      <button class="kk-refresh" title="rafraîchir">↻</button>
+      <button class="kk-close" title="fermer" aria-label="fermer">×</button>
+    </div>
+    <div class="kk-list">${body}</div>`;
+}
+
+// The badge = nb of OPEN decisions, from any decisions fetch (never the 1.5s poll —
+// cold source). Hidden at zero. The open count is toggle-invariant (open !== archived).
+function renderKioskBadge(decisions) {
+  const badge = document.getElementById("kiosk-badge");
+  if (!badge) return;
+  const n = decisions.filter((d) => d && d.state === "open").length;
+  badge.textContent = String(n);
+  badge.hidden = n === 0;
+}
+
+function fetchDecisions() {
+  const url = kioskIncludeArchived ? `${DECISIONS_URL}?includeArchived=true` : DECISIONS_URL;
+  return fetch(url, { headers: { accept: "application/json", ...AUTH_HEADERS } }).then((res) => {
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  });
+}
+
+async function refreshKioskBadge() {
+  try { renderKioskBadge(kioskView(await fetchDecisions())); } catch { /* keep last */ }
+}
+
+async function openKiosk() {
+  const el = document.getElementById("kiosk-panel");
+  if (!el) return;
+  kioskOpen = true;
+  el.innerHTML = `<div class="kk-header"><span class="kk-panel-title">Décisions en attente</span></div><div class="kk-loading">chargement…</div>`;
+  el.hidden = false;
+  try {
+    const model = await fetchDecisions();
+    el.innerHTML = kioskHtml(model);
+    renderKioskBadge(kioskView(model));
+  } catch (err) {
+    el.innerHTML = `<div class="kk-header"><span class="kk-panel-title">Décisions en attente</span><button class="kk-close" title="fermer" aria-label="fermer">×</button></div><div class="kk-error">décisions indisponibles (${escapeHtml(err.message)})</div>`;
+  }
+}
+
+function closeKiosk() {
+  const el = document.getElementById("kiosk-panel");
+  if (el) { el.hidden = true; kioskOpen = false; }
+}
+
+// A KIOSK mutation (read/tranch) with the page token. Returns the Response.
+function decisionPost(id, verb, body) {
+  return fetch(`/decisions/${encodeURIComponent(id)}/${verb}`, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json", ...AUTH_HEADERS },
+    body: JSON.stringify(body || {}),
+  });
+}
+
+// Handle a click on a Lu / Tranché checkbox. The SERVER decides the new state; we
+// re-fetch after a 2xx (no optimistic mutation). Returns true if it handled the target.
+async function handleKioskAction(target) {
+  const card = target.closest && target.closest(".kk-card");
+  if (!card) return false;
+  const id = card.dataset.id;
+  const msg = card.querySelector(".kk-msg");
+  const fail = (t) => { if (msg) { msg.textContent = t; msg.className = "kk-msg err"; } };
+  if (target.closest(".kk-lu")) {
+    try { const res = await decisionPost(id, "read", {}); if (res.ok) openKiosk(); else fail(`erreur ${res.status}`); }
+    catch (err) { fail(`réseau : ${err.message}`); }
+    return true;
+  }
+  if (target.closest(".kk-tranche")) {
+    const verdict = (card.querySelector(".kk-verdict-input")?.value || "").trim();
+    if (!verdict) {
+      // The server enforces this too (400) — the client hint just avoids a round-trip.
+      if (target.checked) target.checked = false; // revert the optimistic check
+      fail("un verdict est requis pour trancher");
+      return true;
+    }
+    try { const res = await decisionPost(id, "tranch", { verdict }); if (res.ok) openKiosk(); else fail(`erreur ${res.status}`); }
+    catch (err) { fail(`réseau : ${err.message}`); }
+    return true;
+  }
+  return false;
+}
+
 async function poll() {
   const status = document.getElementById("status");
   const headers = { accept: "application/json", ...AUTH_HEADERS };
@@ -1812,6 +1972,31 @@ function bootstrap() {
     if (e.target.closest("#catalog-panel") || e.target.closest("#catalog-toggle")) return;
     closeCatalog();
   });
+
+  // KIOSK PD2 (#kiosk): open the cold decisions overlay on-demand (NOT in the poll).
+  const kioskToggle = document.getElementById("kiosk-toggle");
+  if (kioskToggle) kioskToggle.addEventListener("click", () => { kioskIncludeArchived = false; openKiosk(); });
+  const kioskPanel = document.getElementById("kiosk-panel");
+  if (kioskPanel) {
+    kioskPanel.addEventListener("click", (e) => {
+      // In-panel: stop the document outside-click handler from seeing it (openKiosk
+      // replaces innerHTML synchronously, detaching e.target — same trap as the catalogue).
+      e.stopPropagation();
+      if (e.target.closest(".kk-close")) { closeKiosk(); return; }
+      if (e.target.closest(".kk-refresh")) { openKiosk(); return; }
+      const showArch = e.target.closest(".kk-show-archived");
+      if (showArch) { kioskIncludeArchived = !!showArch.checked; openKiosk(); return; }
+      if (e.target.closest(".kk-lu, .kk-tranche")) { handleKioskAction(e.target); return; }
+    });
+  }
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeKiosk(); });
+  document.addEventListener("click", (e) => {
+    if (!kioskOpen) return;
+    if (e.target.closest("#kiosk-panel") || e.target.closest("#kiosk-toggle")) return;
+    closeKiosk();
+  });
+  // Seed the badge once at load (on-demand; the 1.5s poll stays clean of this cold source).
+  refreshKioskBadge();
 
   // Drill into a project card (delegated — the grid is re-rendered each poll).
   const grid = document.getElementById("project-grid");
