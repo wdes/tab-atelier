@@ -295,6 +295,80 @@ export function conventionsCheck(tab) {
   return { conventions, declared, missing: !declared };
 }
 
+// --- Catalogue #39 SC2: read-only view over the catalog read-model ---
+// The catalogue is a COLD source, separate from the live poll (RB2): fetched
+// on-demand into a dedicated overlay, never in the 1.5s loop.
+
+// Below this many samples per mode, a fresh-vs-resume comparison has no verdict
+// (borne 6: InsufficientSample explicit, never a pass/fail). Both modes need it.
+export const MIN_SAMPLE = 5;
+
+// Pure: the read-model's skills -> a deterministic list (sorted by proper name).
+// The read-model already excludes tombstoned skills (fold axis-visibility). Null-safe.
+export function catalogView(readModel) {
+  const skills = readModel && Array.isArray(readModel.skills) ? readModel.skills : [];
+  return skills
+    .filter((s) => s && s.name != null)
+    .slice()
+    .sort((a, b) => String(a.name).localeCompare(String(b.name)));
+}
+
+// Pure: a skill's profile fold -> normalised render fields. Absent -> ""/[]/null.
+export function skillProfileModel(skill) {
+  const s = skill || {};
+  const arr = (x) => (Array.isArray(x) ? x.map(String) : []);
+  return {
+    name: s.name != null ? String(s.name) : "",
+    prompt: s.prompt != null ? String(s.prompt) : "",
+    specialty: s.specialty != null ? String(s.specialty) : "",
+    conventions: arr(s.conventions),
+    tools: arr(s.tools),
+    patterns: arr(s.patterns),
+    promptVersion: s.promptVersion != null ? s.promptVersion : null,
+  };
+}
+
+// Normalise a directional verdict (accepts CamelCase / snake / spaced), else null.
+function normalizeVerdict(raw) {
+  const s = String(raw == null ? "" : raw).toLowerCase().replace(/[_\s-]/g, "");
+  if (s === "freshfavored") return "FreshFavored";
+  if (s === "resumefavored") return "ResumeFavored";
+  if (s === "inconclusive") return "Inconclusive";
+  if (s === "insufficientsample") return "InsufficientSample";
+  return null;
+}
+
+// Pure: the byMode metrics table model (borne 6). Returns the two mode rows plus a
+// DIRECTIONAL fresh_vs_resume verdict + sample size n. When either mode has fewer
+// than `minSample` data points the verdict is "InsufficientSample" (explicit, no
+// pass/fail). Prefers the server-derived fresh_vs_resume; derives a DIRECTION from
+// success rates only as a fallback — never a per-task binary verdict. Null-safe.
+export function byModeMetricsModel(skill, minSample = MIN_SAMPLE) {
+  const bm = (skill && skill.metrics && skill.metrics.byMode) || {};
+  const norm = (m) => ({
+    success: Number((m && m.success) || 0),
+    problem: Number((m && m.problem) || 0),
+    tokensAvg: Number((m && m.tokensAvg) || 0),
+    costAvg: Number((m && m.costAvg) || 0),
+    n: Number((m && m.n) || 0),
+  });
+  const fresh = norm(bm.fresh);
+  const resume = norm(bm.resume);
+  const insufficient = fresh.n < minSample || resume.n < minSample;
+  let verdict;
+  if (insufficient) {
+    verdict = "InsufficientSample";
+  } else {
+    verdict = normalizeVerdict(skill && skill.fresh_vs_resume);
+    if (!verdict) {
+      const rate = (m) => (m.success + m.problem ? m.success / (m.success + m.problem) : 0);
+      const d = rate(fresh) - rate(resume);
+      verdict = Math.abs(d) < 0.05 ? "Inconclusive" : d > 0 ? "FreshFavored" : "ResumeFavored";
+    }
+  }
+  return { fresh, resume, n: fresh.n + resume.n, nFresh: fresh.n, nResume: resume.n, insufficient, verdict };
+}
+
 // --- S5/S6: orchestrator tint + altitude bands + delegation lineage ---
 // These consume role / parentTabId / (optional) altitude fields exposed by the
 // Rust builder. ponytail: the altitude/lineage contract is provisional until the
@@ -1371,6 +1445,92 @@ function closeAgentCard() {
   if (el) el.hidden = true;
 }
 
+// --- Catalogue #39 SC2: on-demand overlay over the catalog read-model ---
+// The read-only catalog GET (camelCase, same token as the dashboard). Path to be
+// confirmed with SC1/ta-rust; a 1-line change if it differs.
+const CATALOG_URL = "/catalog";
+
+// The directional verdict -> {cls, label}. Never pass/fail: the class encodes the
+// DIRECTION (or the explicit insufficient-sample case), not a binary verdict.
+function verdictBadge(m) {
+  const map = {
+    FreshFavored: { cls: "fvr-fresh", label: "fresh favorisé" },
+    ResumeFavored: { cls: "fvr-resume", label: "resume favorisé" },
+    Inconclusive: { cls: "fvr-inconclusive", label: "non concluant" },
+    InsufficientSample: { cls: "fvr-insufficient", label: "échantillon trop petit, pas de verdict" },
+  };
+  const v = map[m.verdict] || map.Inconclusive;
+  const n = m.insufficient ? `n=${m.n} (< ${MIN_SAMPLE}/mode)` : `n=${m.n}`;
+  return `<span class="fvr-verdict ${v.cls}" data-verdict="${escapeHtml(m.verdict)}">${escapeHtml(v.label)} · ${escapeHtml(n)}</span>`;
+}
+
+// The fresh-vs-resume metrics table for a skill (borne 6).
+function metricsTableHtml(skill) {
+  const m = byModeMetricsModel(skill);
+  const row = (label, mode) =>
+    `<tr><th scope="row">${label}</th><td>${mode.success}</td><td>${mode.problem}</td><td>${mode.tokensAvg}</td><td>${mode.costAvg}</td><td>${mode.n}</td></tr>`;
+  return `<div class="cat-metrics">
+    <table class="metrics-table"><thead><tr><th></th><th>success</th><th>problem</th><th>tokensAvg</th><th>costAvg</th><th>n</th></tr></thead>
+    <tbody>${row("fresh", m.fresh)}${row("resume", m.resume)}</tbody></table>
+    <div class="fvr-line">fresh_vs_resume : ${verdictBadge(m)}</div>
+  </div>`;
+}
+
+// One skill row: a header (proper name + version) that toggles a collapsible body
+// (profile + metrics). The long prompt reuses the 'voir plus' fold (clippedHtml).
+function catalogSkillHtml(skill) {
+  const p = skillProfileModel(skill);
+  const list = (label, xs) => (xs.length ? `<div class="cat-field"><span class="cat-key">${label}</span> ${xs.map((x) => `<span class="cat-tag">${escapeHtml(x)}</span>`).join(" ")}</div>` : "");
+  const ver = p.promptVersion != null ? ` <span class="cat-ver">v${escapeHtml(String(p.promptVersion))}</span>` : "";
+  return `<div class="cat-skill" data-skill="${escapeHtml(p.name)}">
+    <button class="cat-skill-head" aria-expanded="false"><span class="cat-caret">▸</span> <span class="cat-name">${escapeHtml(p.name)}</span>${ver}</button>
+    <div class="cat-skill-body" hidden>
+      ${p.specialty ? `<div class="cat-field"><span class="cat-key">specialty</span> ${escapeHtml(p.specialty)}</div>` : ""}
+      ${p.prompt ? `<div class="cat-field"><span class="cat-key">prompt</span> <span class="cat-prompt">${clippedHtml(p.prompt)}</span></div>` : ""}
+      ${list("conventions", p.conventions)}
+      ${list("tools", p.tools)}
+      ${list("patterns", p.patterns)}
+      ${metricsTableHtml(skill)}
+    </div>
+  </div>`;
+}
+
+function catalogHtml(readModel) {
+  const skills = catalogView(readModel);
+  const body = skills.length
+    ? skills.map(catalogSkillHtml).join("")
+    : `<div class="cat-empty">Aucun skill au catalogue.</div>`;
+  return `<div class="cat-header">
+      <span class="cat-title">Catalogue des skills</span>
+      <span class="cat-count">${skills.length} skill${skills.length === 1 ? "" : "s"}</span>
+      <button class="cat-refresh" title="rafraîchir">↻</button>
+      <button class="cat-close" title="fermer" aria-label="fermer">×</button>
+    </div>
+    <div class="cat-list">${body}</div>`;
+}
+
+let catalogOpen = false;
+
+async function openCatalog() {
+  const el = document.getElementById("catalog-panel");
+  if (!el) return;
+  catalogOpen = true;
+  el.innerHTML = `<div class="cat-header"><span class="cat-title">Catalogue des skills</span></div><div class="cat-loading">chargement…</div>`;
+  el.hidden = false;
+  try {
+    const res = await fetch(CATALOG_URL, { headers: { accept: "application/json", ...AUTH_HEADERS } });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    el.innerHTML = catalogHtml(await res.json());
+  } catch (err) {
+    el.innerHTML = `<div class="cat-header"><span class="cat-title">Catalogue des skills</span><button class="cat-close" title="fermer" aria-label="fermer">×</button></div><div class="cat-error">catalogue indisponible (${escapeHtml(err.message)})</div>`;
+  }
+}
+
+function closeCatalog() {
+  const el = document.getElementById("catalog-panel");
+  if (el) { el.hidden = true; catalogOpen = false; }
+}
+
 async function poll() {
   const status = document.getElementById("status");
   const headers = { accept: "application/json", ...AUTH_HEADERS };
@@ -1529,6 +1689,39 @@ function bootstrap() {
     if (e.target.closest(".ac-close") || !e.target.closest("#agent-card")) closeAgentCard();
   });
   document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeAgentCard(); });
+
+  // Catalogue #39 SC2: open the cold catalog overlay on-demand (NOT in the poll).
+  const catToggle = document.getElementById("catalog-toggle");
+  if (catToggle) catToggle.addEventListener("click", () => { openCatalog(); });
+  const catPanel = document.getElementById("catalog-panel");
+  if (catPanel) {
+    catPanel.addEventListener("click", (e) => {
+      // Handled in-panel: never let the document outside-click handler see it (a
+      // refresh replaces innerHTML synchronously, which would detach e.target and
+      // fool the outside-click guard into closing the panel).
+      e.stopPropagation();
+      if (e.target.closest(".cat-close")) { closeCatalog(); return; }
+      if (e.target.closest(".cat-refresh")) { openCatalog(); return; }
+      const head = e.target.closest(".cat-skill-head");
+      if (head) {
+        const body = head.parentElement && head.parentElement.querySelector(".cat-skill-body");
+        const caret = head.querySelector(".cat-caret");
+        if (body) {
+          const willShow = body.hidden;
+          body.hidden = !willShow;
+          head.setAttribute("aria-expanded", willShow ? "true" : "false");
+          if (caret) caret.textContent = willShow ? "▾" : "▸";
+        }
+      }
+    });
+  }
+  // Close the catalog on Escape or a click outside it (but not the toggle button).
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeCatalog(); });
+  document.addEventListener("click", (e) => {
+    if (!catalogOpen) return;
+    if (e.target.closest("#catalog-panel") || e.target.closest("#catalog-toggle")) return;
+    closeCatalog();
+  });
 
   // Drill into a project card (delegated — the grid is re-rendered each poll).
   const grid = document.getElementById("project-grid");
