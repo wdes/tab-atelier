@@ -14,11 +14,17 @@ use super::super::{TabSnapshot, error_json, parse_tab_key, resolve_tab_idx, resp
 /// folded latest-per-slug + usageCount aggregated (RC1). READ-ONLY — a retired
 /// card is INERT (only card fields; no lease/status/claimed@peer). A missing
 /// catalogue reads as an empty list. Returns 200 `{retired:[…]}`.
-pub(in crate::api) fn list<S: Write>(stream: &mut S) {
+pub(in crate::api) fn list<S: Write>(stream: &mut S, include_deleted: bool) {
     let retired = crate::cli::catalog::read_retired();
     // SV3: the v2 SKILL read-model alongside the legacy slug-folded `retired` list —
     // v2 records only (v1 quarantined), folded by skill name with derived metrics.
-    let skills = crate::cli::catalog::read_skill_profiles();
+    // SC1b (#39): `?includeDeleted` ALSO surfaces tombstoned skills (marked
+    // `deleted:true`) so the Restore action is reachable; the default still hides them.
+    let skills = if include_deleted {
+        crate::cli::catalog::read_skill_profiles_all()
+    } else {
+        crate::cli::catalog::read_skill_profiles()
+    };
     let body =
         serde_json::to_string(&serde_json::json!({ "retired": retired, "skills": skills })).unwrap_or_default();
     respond_json(stream, 200, &body);

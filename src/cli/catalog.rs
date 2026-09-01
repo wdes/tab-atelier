@@ -1112,6 +1112,17 @@ pub struct SkillProfile {
     pub retired_at: u64,
     pub metrics: Metrics,
     pub fresh_vs_resume: FreshVsResume,
+    /// `SC1b` (#39) — `true` only for a TOMBSTONED skill surfaced via
+    /// `?includeDeleted`. Skipped when `false`, so the normal read-model shape (which
+    /// never lists deleted skills anyway) is byte-unchanged — the frozen contract holds.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub deleted: bool,
+}
+
+/// serde `skip_serializing_if` for a `bool` field that should vanish when `false`.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl SkillProfile {
@@ -1142,6 +1153,8 @@ impl SkillProfile {
             retired_at: latest.retired_at,
             metrics: Metrics { by_mode: ByMode { fresh, resume } },
             fresh_vs_resume,
+            // Visible by default; `read_skill_profiles_all_at` flips this for tombstones.
+            deleted: false,
         }
     }
 }
@@ -1190,6 +1203,36 @@ fn is_visible(records: &[CatalogCard]) -> bool {
 #[must_use]
 pub fn read_skill_profiles() -> Vec<SkillProfile> {
     read_skill_profiles_at(&catalog_path())
+}
+
+/// `SC1b` (#39) — the read-model INCLUDING tombstoned skills, each marked `deleted:true`.
+///
+/// Same fold as [`read_skill_profiles_at`] but WITHOUT the visibility filter: a
+/// tombstoned skill folds too, with `deleted = true`, so the dashboard can reach the
+/// Restore action (`?includeDeleted`). Visible skills are byte-identical (`deleted`
+/// skipped). Path-injectable; READ-ONLY.
+#[must_use]
+pub fn read_skill_profiles_all_at(path: &Path) -> Vec<SkillProfile> {
+    use std::collections::BTreeMap;
+    let body = std::fs::read_to_string(path).unwrap_or_default();
+    let mut by_skill: BTreeMap<String, Vec<CatalogCard>> = BTreeMap::new();
+    for c in parse_catalog(&body).into_iter().filter(|c| c.is_v2() && c.has_skill()) {
+        by_skill.entry(c.fold_key()).or_default().push(c);
+    }
+    by_skill
+        .into_iter()
+        .map(|(skill, group)| {
+            let deleted = !is_visible(&group);
+            SkillProfile { deleted, ..SkillProfile::fold(skill, &group) }
+        })
+        .collect()
+}
+
+/// [`read_skill_profiles_all_at`] against the live [`catalog_path`] — the
+/// `GET /catalog/list?includeDeleted` read-model. READ-ONLY.
+#[must_use]
+pub fn read_skill_profiles_all() -> Vec<SkillProfile> {
+    read_skill_profiles_all_at(&catalog_path())
 }
 
 // ---------------------------------------------------------------------------
@@ -3210,5 +3253,37 @@ mod tests {
         assert!(plan_edit(Some(&latest), "rustsmith", &ok, 100).is_ok(), "matching version → ok");
         // No such skill → NotFound.
         assert_eq!(plan_edit(None, "ghost", &body, 100), Err(EditError::NotFound));
+    }
+
+    // SC1b (#39): the default read-model HIDES tombstoned skills; `read_all` surfaces
+    // them with `deleted:true` (real camelCase marker), visible ones with `deleted`
+    // skipped (frozen contract unchanged).
+    #[test]
+    fn sc1b_read_all_marks_deleted_and_default_hides_them() {
+        let cat = TmpCatalog::new();
+        append_catalog_line(cat.path(), &content_rec("v1", "visible", 1)).unwrap();
+        append_catalog_line(cat.path(), &content_rec("d1", "gone", 1)).unwrap();
+        append_catalog_line(cat.path(), &visibility_record("gone", RecordKind::Delete, 2)).unwrap();
+
+        // Default: only the visible skill, never marked deleted.
+        let vis = read_skill_profiles_at(cat.path());
+        assert_eq!(vis.len(), 1, "default hides the tombstoned skill");
+        assert_eq!(vis[0].skill, "visible");
+        assert!(!vis[0].deleted);
+
+        // include-deleted: BOTH, the tombstoned one flagged.
+        let all = read_skill_profiles_all_at(cat.path());
+        assert_eq!(all.len(), 2, "include-deleted surfaces the tombstone too");
+        let gone = all.iter().find(|p| p.skill == "gone").expect("tombstone present");
+        assert!(gone.deleted, "the tombstoned skill is marked deleted:true");
+        // Its profile still folds (the Restore UI shows it).
+        assert_eq!(gone.prompt.as_deref(), Some("p1"));
+        let v = all.iter().find(|p| p.skill == "visible").expect("visible present");
+        assert!(!v.deleted);
+
+        // Serialization: `deleted:true` on the tombstone; the key is ABSENT on visible
+        // (the frozen contract shape is unchanged for live cards).
+        assert!(serde_json::to_string(gone).unwrap().contains(r#""deleted":true"#), "camelCase marker present");
+        assert!(!serde_json::to_string(v).unwrap().contains("deleted"), "no marker on a visible card");
     }
 }

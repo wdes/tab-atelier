@@ -1668,7 +1668,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
     };
     let raw_path = parts[1].to_string();
 
-    let (path, query_token, query_lines, query_since, query_crc, query_name, query_path) =
+    let (path, query_token, query_lines, query_since, query_crc, query_name, query_path, query_include_deleted) =
         if let Some((p, q)) = raw_path.split_once('?') {
             let qt = q
                 .split('&')
@@ -1688,9 +1688,14 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 .and_then(|s| u32::from_str_radix(s, 16).ok());
             let qn = q.split('&').find_map(|pair| pair.strip_prefix("name=")).map(url_decode);
             let qp = q.split('&').find_map(|pair| pair.strip_prefix("path=")).map(url_decode);
-            (p.to_string(), qt, ql, qs, qc, qn, qp)
+            // SC1b (#39): `?includeDeleted[=true|1]` surfaces tombstoned catalogue cards
+            // (with `deleted:true`) so the dashboard can reach the Restore action.
+            let qid = q
+                .split('&')
+                .any(|pair| matches!(pair, "includeDeleted" | "includeDeleted=true" | "includeDeleted=1"));
+            (p.to_string(), qt, ql, qs, qc, qn, qp, qid)
         } else {
-            (raw_path, None, None, None, None, None, None)
+            (raw_path, None, None, None, None, None, None, false)
         };
     // Strip a trailing slash so a path like `/tabs/.../view/` (added
     // by some reverse proxies / Cloudflare Tunnel normalisation)
@@ -2129,8 +2134,9 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
         {
             handlers::catalog::mutate(stream, state, p, &body_bytes);
         }
-        // RB2 read-model: the retired-agent catalogue. READ-ONLY (GET).
-        ("GET", "/catalog/list") => handlers::catalog::list(stream),
+        // RB2 read-model: the retired-agent catalogue. READ-ONLY (GET). SC1b:
+        // `?includeDeleted` also surfaces tombstoned skills (marked `deleted:true`).
+        ("GET", "/catalog/list") => handlers::catalog::list(stream, query_include_deleted),
         (_, "/" | "/tabs") => {
             error_json(stream, 405, "method not allowed");
         }
@@ -7009,5 +7015,65 @@ mod tests {
             .collect();
         assert_eq!(versions.len(), n + 1, "every edit got a distinct version (no lost update): {versions:?}");
         assert_eq!(versions.iter().max().copied(), Some((n + 1) as u32), "versions are a dense 1..=N+1 chain");
+    }
+
+    /// GET /catalog/list with an extra query (SC1b) → the `skills` array.
+    fn catalog_skills_q(port: u16, token: &str, extra: &str) -> Vec<serde_json::Value> {
+        let listed = request(port, &format!("GET /catalog/list?token={token}&{extra} HTTP/1.1\r\n\r\n"));
+        let json: serde_json::Value = serde_json::from_str(body_of(&listed)).expect("catalog list json");
+        json["skills"].as_array().cloned().unwrap_or_default()
+    }
+
+    // SC1b (#39): the LIVE include-deleted path — a REAL integration test. delete →
+    // the default list HIDES the skill, but `?includeDeleted` surfaces it with
+    // `deleted:true` (so Restore is reachable) → restore → visible in the default list
+    // again, and the deleted marker is gone.
+    #[test]
+    fn sc1b_live_include_deleted_surfaces_tombstone_then_restore() {
+        use crate::cli::catalog::{SpawnMode, catalog_path};
+        let _guard = real_catalog_test_guard();
+        let (port, _state, token) = spawn_server();
+        let post = |path: &str, body: &str| {
+            format!("POST /{path}?token={token} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+        };
+        let run = crate::default_tab_id();
+        let skill = format!("sc1b-{}", &run[..8.min(run.len())]);
+        let _cleanup = CatalogSkillCleanup(skill.clone());
+
+        let seed = crate::cli::catalog::CatalogCard {
+            skill: Some(skill.clone()),
+            prompt: Some("base".into()),
+            prompt_version: Some(1),
+            schema_version: Some(2),
+            spawn_mode: Some(SpawnMode::Fresh),
+            outcome: Some(crate::cli::catalog::Outcome::Success),
+            retired_at: 1,
+            ..Default::default()
+        };
+        crate::cli::catalog::append_catalog_line(&catalog_path(), &seed).unwrap();
+
+        // delete → tombstoned.
+        assert_eq!(status_code(&request(port, &post(&format!("catalog/{skill}/delete"), "{}"))), 200);
+
+        // Default list HIDES it…
+        assert!(
+            !catalog_skills(port, &token).iter().any(|s| s["skill"] == serde_json::json!(skill)),
+            "default list hides the tombstoned skill"
+        );
+        // …but ?includeDeleted surfaces it WITH deleted:true (Restore is reachable).
+        let all = catalog_skills_q(port, &token, "includeDeleted=true");
+        let s = all.iter().find(|s| s["skill"] == serde_json::json!(skill)).expect("include-deleted surfaces it");
+        assert_eq!(s["deleted"], serde_json::json!(true), "the tombstone carries deleted:true (camelCase)");
+        assert_eq!(s["prompt"], serde_json::json!("base"), "its profile is folded (Restore UI shows it)");
+
+        // RESTORE → visible in the DEFAULT list again, marker gone.
+        assert_eq!(status_code(&request(port, &post(&format!("catalog/{skill}/restore"), "{}"))), 200);
+        assert!(
+            catalog_skills(port, &token).iter().any(|s| s["skill"] == serde_json::json!(skill)),
+            "restore brings the skill back to the default list"
+        );
+        let all2 = catalog_skills_q(port, &token, "includeDeleted=true");
+        let s2 = all2.iter().find(|s| s["skill"] == serde_json::json!(skill)).expect("present");
+        assert!(s2.get("deleted").is_none(), "a restored skill no longer carries the deleted marker");
     }
 }
