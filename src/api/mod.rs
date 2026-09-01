@@ -6654,4 +6654,94 @@ mod tests {
         let lm = back.last_mission.expect("the legacy lastMission slot is back-filled with a digest");
         assert!(lm.contains("learned:") && lm.contains("+prompt:"), "digest present: {lm}");
     }
+
+    // SV2: the LIVE éval-à-3 — a REAL integration test (NOT a mock). POST /retire with
+    // a v2 stamp + eval votes on two disposable tabs: (clean) consensus improves the
+    // prompt and the outcome is DERIVED on the wire; (leak) a directive echoing the
+    // tab's PRECISE objective literal is vetoed by the daemon (which derives the
+    // literal itself — FN2 enforced server-side, not trusted) → statu quo.
+    #[test]
+    fn sv2_live_retire_runs_eval_derives_outcome_and_enforces_anti_over_fit() {
+        let _catalog_guard = real_catalog_test_guard();
+        let (port, state, token) = spawn_server();
+        let post = |path: &str, body: &str| {
+            format!("POST /{path}?token={token} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+        };
+        let run = crate::default_tab_id();
+        let clean_skill = format!("sv2clean-{}", &run[..8.min(run.len())]);
+        let leak_skill = format!("sv2leak-{}", &run[..8.min(run.len())]);
+
+        let clean_id = crate::default_tab_id();
+        let mut t1 = test_snapshot_tab(&clean_id, "disposable-eval-clean");
+        t1.rehome_status = Some("safe-to-close".into());
+        t1.assignment = Some("build/builder".into());
+        // The leak tab's PRECISE objective carries a concrete literal "RB1".
+        let leak_id = crate::default_tab_id();
+        let mut t2 = test_snapshot_tab(&leak_id, "disposable-eval-leak");
+        t2.rehome_status = Some("safe-to-close".into());
+        t2.assignment = Some("build/builder".into());
+        t2.objective = Some("ship RB1 to prod".into());
+        {
+            let mut g = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            g.tabs.push(t1);
+            g.tabs.push(t2);
+        }
+        let _cleanup = CatalogCleanup(vec![clean_id.clone(), leak_id.clone()]);
+
+        // Clean retire: unanimous approve, run_ok 2/3, a GENERAL directive.
+        let b1 = format!(
+            r#"{{"skill":"{clean_skill}","prompt":"base prompt","spawnMode":"fresh","bilan":{{"addDirectives":["always state the invariant up front"]}},"eval":{{"basePrompt":"base prompt","votes":{{"agent":{{"approvePrompt":true,"runOk":true}},"orchestrator":{{"approvePrompt":true,"runOk":true}},"olympe":{{"approvePrompt":true,"runOk":false}}}}}}}}"#
+        );
+        let r1 = request(port, &post(&format!("tabs/by-id/{clean_id}/retire"), &b1));
+        assert_eq!(status_code(&r1), 200, "clean v2 eval retire → 200 (CF1 satisfied)\n{r1}");
+        let c = crate::cli::catalog::read_back(&crate::cli::catalog::catalog_path(), &clean_id).expect("archived");
+        let ev = c.eval.expect("the eval report is stored on the record");
+        assert_eq!(ev.decision, crate::cli::catalog::EvalDecision::Improved, "consensus + clean → improved");
+        assert_eq!(ev.outcome, crate::cli::catalog::Outcome::Success, "2/3 run_ok → success DERIVED on the wire");
+        assert!(c.prompt.unwrap_or_default().contains("always state the invariant"), "the improved prompt landed");
+
+        // Leak retire: the directive echoes the tab's objective literal "RB1"; the
+        // daemon derives "RB1" from the PRECISE context and vetoes → statu quo.
+        let b2 = format!(
+            r#"{{"skill":"{leak_skill}","prompt":"base2","spawnMode":"fresh","bilan":{{"addDirectives":["remember to ship RB1 first"]}},"eval":{{"basePrompt":"base2","votes":{{"agent":{{"approvePrompt":true,"runOk":true}},"orchestrator":{{"approvePrompt":true,"runOk":true}},"olympe":{{"approvePrompt":true,"runOk":true}}}}}}}}"#
+        );
+        let r2 = request(port, &post(&format!("tabs/by-id/{leak_id}/retire"), &b2));
+        assert_eq!(status_code(&r2), 200, "leak retire archives (CF1 ok: skill+prompt present)\n{r2}");
+        let c2 = crate::cli::catalog::read_back(&crate::cli::catalog::catalog_path(), &leak_id).expect("archived");
+        let ev2 = c2.eval.expect("the eval report is stored");
+        assert_eq!(ev2.decision, crate::cli::catalog::EvalDecision::StatuQuo, "server-derived literal vetoes the change");
+        assert!(ev2.leaked_literals.iter().any(|l| l == "RB1"), "the daemon derived + flagged the literal (FN2 enforced)");
+        assert_eq!(c2.prompt.as_deref(), Some("base2"), "statu quo: the original prompt stands on the record");
+    }
+
+    // CF1 on the wire (Olympe's guard): a v2 retire with a skill but NO prompt is an
+    // incomplete profile → 409 RETIRE INCOMPLET, and the tab is KEPT (never closed).
+    #[test]
+    fn sv2_cf1_live_v2_without_prompt_never_closes() {
+        let _catalog_guard = real_catalog_test_guard();
+        let (port, state, token) = spawn_server();
+        let post = |path: &str, body: &str| {
+            format!("POST /{path}?token={token} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+        };
+        let id = crate::default_tab_id();
+        let mut tab = test_snapshot_tab(&id, "disposable-cf1");
+        tab.rehome_status = Some("safe-to-close".into());
+        tab.assignment = Some("build/builder".into());
+        {
+            let mut g = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            g.tabs.push(tab);
+        }
+        let _cleanup = CatalogCleanup(vec![id.clone()]);
+
+        // A v2 retire (skill named) but with NO prompt → CF1 fails.
+        let body = r#"{"skill":"builder","spawnMode":"fresh"}"#;
+        let resp = request(port, &post(&format!("tabs/by-id/{id}/retire"), body));
+        assert_eq!(status_code(&resp), 409, "CF1: a v2 profile without a prompt never closes\n{resp}");
+        // The tab is KEPT — its close was never queued.
+        let g = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let idx = g.tabs.iter().position(|t| t.id.as_ref() == id.as_str());
+        let closes = g.pending_closes.clone();
+        drop(g);
+        assert!(idx.is_some_and(|i| !closes.contains(&i)), "the incomplete v2 tab is kept (not closed)");
+    }
 }
