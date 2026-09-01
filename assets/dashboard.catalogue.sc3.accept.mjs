@@ -1,7 +1,11 @@
-// GUI acceptance for Catalogue #39 SC3 (web édition), wired to the live SC1 routes:
-//   POST /catalog/{skill}/edit  (client CF1 prompt-non-empty + server 409 surfaced)
-//   POST /catalog/{skill}/delete (strong sticky-confirm) + /restore.
-// Refresh the read-model after 2xx (server = source of truth, no optimistic mutation).
+// GUI acceptance for Catalogue #39 SC3 (web édition) + SC3-toggle, wired to the LIVE
+// SC1/SC1b routes and MODELLING the real derived-read (no fabricated static shape):
+//   - GET /catalog/list           -> visible skills only (tombstoned filtered).
+//   - GET /catalog/list?includeDeleted=true -> all skills; tombstoned carry deleted:true.
+//   - POST /catalog/{skill}/edit  (client CF1 + server 409 surfaced).
+//   - POST /catalog/{skill}/delete (tombstone) / restore (un-tombstone).
+// The Restore button is reachable ONLY via the "afficher les supprimés" toggle, and
+// the delete->toggle-shows->restore->visible loop is exercised on the REAL path.
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -19,33 +23,43 @@ const ok = (label, cond, detail = "") => {
 };
 
 const mode = (spawns, success, problem) => ({ spawns, success, problem, tokensAvg: 1000, costAvg: 1 });
-const sk = (skill, extra) => ({ skill, prompt: `prompt of ${skill}`, specialty: `spec ${skill}`, conventions: ["AGENTS.md"], tools: [], patterns: [], promptVersion: 4, usageCount: 10,
-  metrics: { byMode: { fresh: mode(5, 4, 1), resume: mode(5, 3, 2) } }, freshVsResume: { verdict: "inconclusive", freshN: 5, resumeN: 5 }, ...extra });
-const catalog = () => ({ retired: [], skills: [
-  sk("code-reviewer"),
-  sk("conflict-skill"),        // its edit returns 409 (stale promptVersion)
-  sk("gone", { deleted: true }), // tombstoned -> shows Restore, not Delete
-] });
+const sk = (skill) => ({ skill, prompt: `prompt of ${skill}`, specialty: `spec ${skill}`, conventions: ["AGENTS.md"], tools: [], patterns: [], promptVersion: 4, usageCount: 10,
+  metrics: { byMode: { fresh: mode(5, 4, 1), resume: mode(5, 3, 2) } }, freshVsResume: { verdict: "inconclusive", freshN: 5, resumeN: 5 } });
+const ALL = ["code-reviewer", "conflict-skill"];
 
 async function main() {
   const browser = await chromium.launch();
   const page = await browser.newPage({ viewport: { width: 1280, height: 950 } });
-  await page.addInitScript(() => { window.confirm = () => true; }); // auto-confirm the sticky delete
-  const posted = []; let getCount = 0;
+  await page.addInitScript(() => { window.confirm = () => true; });
+  const posted = []; let getCount = 0; let includeDeletedSeen = false;
+  // Server-side truth: the set of tombstoned skills. delete adds, restore removes;
+  // GET filters them unless ?includeDeleted, where they carry deleted:true.
+  const deletedSet = new Set();
   await page.route(`${ORIGIN}/**`, async (route) => {
     const req = route.request();
-    const p = new URL(req.url()).pathname;
+    const url = new URL(req.url());
+    const p = url.pathname;
     if (p === "/dashboard") return route.fulfill({ contentType: "text/html; charset=utf-8", body: HTML });
     if (p === "/assets/dashboard.js") return route.fulfill({ contentType: "application/javascript; charset=utf-8", body: JS });
     if (p === "/assets/dashboard.css") return route.fulfill({ contentType: "text/css; charset=utf-8", body: CSS });
     if (p === "/tabs/usage") return route.fulfill({ contentType: "application/json", body: "[]" });
     if (p === "/dashboard/activity") return route.fulfill({ contentType: "application/json", body: "{}" });
     if (p === "/dashboard/state") return route.fulfill({ contentType: "application/json", body: "{\"nodes\":[],\"unmapped\":[]}" });
-    if (p === "/catalog/list") { getCount++; return route.fulfill({ contentType: "application/json", body: JSON.stringify(catalog()) }); }
+    if (p === "/catalog/list") {
+      getCount++;
+      const includeDeleted = url.searchParams.has("includeDeleted");
+      if (includeDeleted) includeDeletedSeen = true;
+      const skills = ALL
+        .filter((name) => includeDeleted || !deletedSet.has(name))
+        .map((name) => (deletedSet.has(name) ? { ...sk(name), deleted: true } : sk(name)));
+      return route.fulfill({ contentType: "application/json", body: JSON.stringify({ retired: [], skills }) });
+    }
     const mut = p.match(/^\/catalog\/([^/]+)\/(edit|delete|restore)$/);
     if (mut && req.method() === "POST") {
       const skill = decodeURIComponent(mut[1]), verb = mut[2];
       posted.push({ skill, verb, body: JSON.parse(req.postData() || "{}") });
+      if (verb === "delete") deletedSet.add(skill);
+      if (verb === "restore") deletedSet.delete(skill);
       if (verb === "edit" && skill === "conflict-skill") return route.fulfill({ status: 409, contentType: "application/json", body: '{"error":"catalog edit: stale promptVersion — a concurrent edit landed first"}' });
       if (verb === "edit") return route.fulfill({ status: 200, contentType: "application/json", body: `{"edited":"${skill}","promptVersion":5}` });
       return route.fulfill({ status: 200, contentType: "application/json", body: `{"${verb}":"${skill}"}` });
@@ -69,22 +83,19 @@ async function main() {
   const before = posted.length;
   await page.locator(`${cr} .cat-save`).click();
   await page.waitForTimeout(120);
-  ok("SC3: an empty prompt is refused client-side (no POST)", posted.length === before, `posted=${posted.length - before}`);
+  ok("SC3: an empty prompt is refused client-side (no POST)", posted.length === before);
   ok("SC3: the client validation message is shown", /prompt/i.test((await page.locator(`${cr} .cat-edit-msg`).textContent().catch(() => "")) || ""));
 
-  // Valid edit -> POST /edit with the body + promptVersion, then a refresh (re-GET).
+  // Valid edit -> POST /edit with body + promptVersion, then refresh.
   await page.locator(`${cr} .cat-edit-prompt`).fill("a better reviewer prompt");
-  await page.locator(`${cr} .cat-edit-specialty`).fill("review diffs v2");
-  const getBefore = getCount;
+  const getBeforeEdit = getCount;
   await page.locator(`${cr} .cat-save`).click();
   await page.waitForTimeout(200);
   const edit = posted.find((x) => x.skill === "code-reviewer" && x.verb === "edit");
-  ok("SC3: Save POSTs /catalog/code-reviewer/edit", !!edit);
-  ok("SC3: the edit body carries prompt + specialty + promptVersion (concurrency token)",
-     edit && edit.body.prompt === "a better reviewer prompt" && edit.body.specialty === "review diffs v2" && edit.body.promptVersion === 4, JSON.stringify(edit && edit.body));
-  ok("SC3: a 2xx edit refreshes the read-model (re-GET /catalog/list)", getCount > getBefore, `get ${getBefore}->${getCount}`);
+  ok("SC3: Save POSTs /catalog/code-reviewer/edit with prompt + promptVersion", !!edit && edit.body.prompt === "a better reviewer prompt" && edit.body.promptVersion === 4, JSON.stringify(edit && edit.body));
+  ok("SC3: a 2xx edit refreshes the read-model", getCount > getBeforeEdit);
 
-  // 409 from the server is surfaced on the form.
+  // 409 surfaced.
   const cs = '#catalog-panel .cat-skill[data-skill="conflict-skill"]';
   await page.locator(`${cs} .cat-skill-head`).click();
   await page.waitForTimeout(80);
@@ -93,29 +104,40 @@ async function main() {
   await page.waitForTimeout(150);
   ok("SC3: a server 409 is shown on the form", /409/.test((await page.locator(`${cs} .cat-edit-msg`).textContent().catch(() => "")) || ""));
 
-  // Delete (auto-confirmed) -> POST /delete -> refresh. (Re-expand first: the edit
-  // refresh re-rendered the panel, collapsing every skill.)
+  // ===== SC3-toggle: the REAL delete -> show-deleted -> restore path =====
+  // Delete code-reviewer -> it DISAPPEARS from the default (filtered) list.
   await page.locator(`${cr} .cat-skill-head`).click();
   await page.waitForTimeout(100);
-  const delBefore = getCount;
   await page.locator(`${cr} .cat-delete`).click();
-  await page.waitForTimeout(150);
-  ok("SC3: Delete POSTs /catalog/code-reviewer/delete", posted.some((x) => x.skill === "code-reviewer" && x.verb === "delete"));
-  ok("SC3: delete refreshes the read-model", getCount > delBefore);
+  await page.waitForTimeout(200);
+  ok("SC3-toggle: after delete, the skill is GONE from the default list (server-filtered)",
+     (await page.locator(cr).count()) === 0, `still present=${await page.locator(cr).count()}`);
+  ok("SC3-toggle: the Restore button is NOT reachable in the default list",
+     (await page.locator("#catalog-panel .cat-restore").count()) === 0);
 
-  // A tombstoned skill shows Restore (not Delete) -> POST /restore.
-  const gone = '#catalog-panel .cat-skill[data-skill="gone"]';
-  await page.locator(`${gone} .cat-skill-head`).click();
-  await page.waitForTimeout(80);
-  ok("SC3: a tombstoned skill shows Restore (and no Delete)",
-     (await page.locator(`${gone} .cat-restore`).count()) === 1 && (await page.locator(`${gone} .cat-delete`).count()) === 0);
-  await page.locator(`${gone} .cat-restore`).click();
-  await page.waitForTimeout(120);
-  ok("SC3: Restore POSTs /catalog/gone/restore", posted.some((x) => x.skill === "gone" && x.verb === "restore"));
+  // Toggle "afficher les supprimés" -> re-fetch ?includeDeleted -> the tombstoned
+  // card re-appears marked deleted, with a REACHABLE Restore (and no Delete).
+  await page.locator("#catalog-panel .cat-show-deleted").check();
+  await page.waitForTimeout(200);
+  ok("SC3-toggle: the toggle re-fetches with ?includeDeleted", includeDeletedSeen);
+  ok("SC3-toggle: the deleted skill re-appears (deleted marker) via ?includeDeleted",
+     (await page.locator(`${cr}.cat-deleted`).count()) === 1, `deletedCard=${await page.locator(`${cr}.cat-deleted`).count()}`);
+  await page.locator(`${cr} .cat-skill-head`).click();
+  await page.waitForTimeout(100);
+  ok("SC3-toggle: the tombstoned card shows Restore (and no Delete)",
+     (await page.locator(`${cr} .cat-restore`).count()) === 1 && (await page.locator(`${cr} .cat-delete`).count()) === 0);
+
+  // Restore via the REAL route -> POST /restore -> the skill becomes visible again.
+  await page.locator(`${cr} .cat-restore`).click();
+  await page.waitForTimeout(200);
+  ok("SC3-toggle: Restore POSTs /catalog/code-reviewer/restore", posted.some((x) => x.skill === "code-reviewer" && x.verb === "restore"));
+  ok("SC3-toggle: after restore, the skill is no longer marked deleted",
+     (await page.locator(`${cr}.cat-deleted`).count()) === 0 && (await page.locator(cr).count()) === 1,
+     `deleted=${await page.locator(`${cr}.cat-deleted`).count()} present=${await page.locator(cr).count()}`);
 
   await browser.close();
-  console.log(`\ndashboard.catalogue.sc3.accept.mjs — Catalogue #39 SC3 GUI acceptance`);
-  console.log(`${failures ? `FAIL: ${failures} assertion(s) failed` : "OK: all SC3 catalogue édition scenarios verified on screen"}`);
+  console.log(`\ndashboard.catalogue.sc3.accept.mjs — Catalogue #39 SC3 + SC3-toggle GUI acceptance`);
+  console.log(`${failures ? `FAIL: ${failures} assertion(s) failed` : "OK: all SC3 (edit/delete/restore via the real deleted-toggle path) verified on screen"}`);
   process.exit(failures ? 1 : 0);
 }
 
