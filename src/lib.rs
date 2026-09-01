@@ -765,6 +765,36 @@ pub fn build_agent_resume_command(kind: &str, session_id: &str, plan: Option<boo
     }
 }
 
+/// How a (re)spawn brings an agent tab back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentRelaunch {
+    /// Cleared-env mode can drive the shell command line, so the tab's process
+    /// IS the agent (`… -i -c 'exec claude --resume <id>'`).
+    Exec,
+    /// Otherwise the shell is forked normally and the resume command is typed
+    /// in once it prompts (`pending_agent_resume`).
+    Typed,
+    /// Not an agent tab, or read-only: leave the plain shell alone.
+    None,
+}
+
+/// Decide how a respawn relaunches an agent tab.
+///
+/// Exactly one of exec/typed, never both (that double-launches the session) and
+/// never neither — "neither" is what silently turned a colours or net toggle on
+/// a claude tab into a bare shell. Read-only never resumes: `claude --resume`
+/// against a live session rotates the user's session ids.
+#[must_use]
+pub const fn agent_relaunch_mode(has_session: bool, cleared_env: bool, read_only: bool) -> AgentRelaunch {
+    if !has_session || read_only {
+        AgentRelaunch::None
+    } else if cleared_env {
+        AgentRelaunch::Exec
+    } else {
+        AgentRelaunch::Typed
+    }
+}
+
 /// Extra shell args that make a restored agent tab **launch the agent
 /// directly** instead of dropping to a shell and typing the resume command.
 ///
@@ -3563,6 +3593,27 @@ mod tests {
         assert_eq!(cmd, "tab-atelier brain");
         #[cfg(not(feature = "gui"))]
         assert_eq!(cmd, "tab-atelier-headless brain");
+    }
+
+    #[test]
+    fn a_respawned_agent_tab_is_always_relaunched_exactly_one_way() {
+        use AgentRelaunch::{Exec, None as NoRelaunch, Typed};
+        // The bug this encodes: a colours / net toggle re-forked the shell and
+        // did NEITHER, so an agent tab came back as a bare shell.
+        assert_eq!(agent_relaunch_mode(true, true, false), Exec);
+        assert_eq!(agent_relaunch_mode(true, false, false), Typed);
+        // Doing both would double-launch the session, so the two are exclusive
+        // by construction — one enum, not two independent flags.
+        assert_ne!(
+            agent_relaunch_mode(true, true, false),
+            agent_relaunch_mode(true, false, false)
+        );
+        // A plain shell tab stays a plain shell.
+        assert_eq!(agent_relaunch_mode(false, true, false), NoRelaunch);
+        assert_eq!(agent_relaunch_mode(false, false, false), NoRelaunch);
+        // Read-only never resumes, whatever the env mode.
+        assert_eq!(agent_relaunch_mode(true, true, true), NoRelaunch);
+        assert_eq!(agent_relaunch_mode(true, false, true), NoRelaunch);
     }
 
     #[test]

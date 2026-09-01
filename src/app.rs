@@ -947,6 +947,9 @@ impl AppState {
                 let ce = code_editor.clone();
                 let colors = ts.colors_enabled;
                 let env = tab_env_extras(&ts.id, &api_url_for_pty, &api_token, &ts.tab_env);
+                // Kept for the net-off respawn below, which re-forks the shell
+                // and needs the same env the view is built with.
+                let env_for_respawn = ts.net_disabled.then(|| env.clone());
                 // Launch the agent directly (exec) when we can drive the
                 // shell command (cleared-env mode); otherwise fall back to
                 // typing the resume in (`pending_agent_resume` below).
@@ -1020,9 +1023,13 @@ impl AppState {
                 // installed, so a persisted net-off tab doesn't boot
                 // into a dead shell on a host without bubblewrap.
                 if ts.net_disabled && crate::bwrap_available() {
+                    let relaunch = agent_launch.clone();
+                    let env = env_for_respawn.unwrap_or_default();
                     view.update(cx, |v, _| {
                         v.set_net_disabled(true);
-                        v.respawn(cwd.as_deref());
+                        // Same inputs the view was just built with — otherwise
+                        // the jailed re-fork loses the API env and the agent.
+                        v.respawn(cwd.as_deref(), &env, relaunch);
                     });
                 }
                 // Auto-resume: if this tab had an agent session and kind
@@ -2470,12 +2477,19 @@ impl AppState {
             // than `respawn_tab_with_history`; refocus isn't needed for a
             // background toggle.
             for (tab_id, disabled) in net_changes {
-                if let Some(tab) = self.tabs.iter_mut().find(|t| *t.id == tab_id) {
-                    let cwd = platform::process_cwd(tab.view.read(cx).pid()).or_else(|| std::env::current_dir().ok());
-                    tab.view.update(cx, |v, _| {
-                        v.set_net_disabled(disabled);
-                        v.respawn(cwd.as_deref());
-                    });
+                let Some(idx) = self.tabs.iter().position(|t| *t.id == tab_id) else {
+                    continue;
+                };
+                let cwd =
+                    platform::process_cwd(self.tabs[idx].view.read(cx).pid()).or_else(|| std::env::current_dir().ok());
+                let (env, agent_launch) = self.respawn_inputs(idx);
+                let relaunch = agent_launch.clone();
+                self.tabs[idx].view.update(cx, |v, _| {
+                    v.set_net_disabled(disabled);
+                    v.respawn(cwd.as_deref(), &env, relaunch);
+                });
+                if agent_launch.is_none() {
+                    self.queue_typed_resume(idx);
                 }
             }
             for (tab_id, color) in bg_color_changes {
@@ -2853,29 +2867,9 @@ impl AppState {
         let ce = self.code_editor.clone();
         let tn = self.theme_name;
         let cs = self.cursor_style;
-        let env = tab_env_extras(
-            &self.tabs[idx].id,
-            &api_url_for_local_clients(&self.api_addr),
-            &self.api_token,
-            &self.tabs[idx].tab_env,
-        );
         // Respawning an agent tab → relaunch the agent directly (exec), same as
-        // a restore, so it comes back as claude rather than a bare shell. Never
-        // in read-only mode — see the restore path: resuming a live session
-        // corrupts the user's session ids.
-        let agent_launch = if crate::clear_env() && !crate::read_only() {
-            match (&self.tabs[idx].agent_kind, &self.tabs[idx].agent_session_id) {
-                (Some(k), Some(s)) => {
-                    // Name the agent process after the tab (see the restore path).
-                    let title =
-                        crate::shell_supports_exec_a(&crate::clear_env_shell_path()).then_some(&*self.tabs[idx].name);
-                    crate::agent_launch_shell_suffix_instrumented(k, s, self.tabs[idx].agent_plan_mode, title)
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
+        // a restore, so it comes back as claude rather than a bare shell.
+        let (env, agent_launch) = self.respawn_inputs(idx);
         let view = cx.new(|cx| {
             let mut tv = TerminalView::new_with_colors_and_env(
                 cwd.as_deref(),
@@ -2964,19 +2958,61 @@ impl AppState {
                 self.respawn_tab(idx, window, cx);
                 // clear-env respawn already exec's the agent; otherwise queue the
                 // typed `--resume` so the agent comes back in the fresh shell too.
-                if !crate::clear_env() {
-                    let kind = self.tabs[idx].agent_kind.as_deref().map(str::to_string);
-                    let sid = self.tabs[idx].agent_session_id.as_deref().map(str::to_string);
-                    let plan = self.tabs[idx].agent_plan_mode;
-                    if let (Some(k), Some(s)) = (kind, sid) {
-                        self.tabs[idx].pending_agent_resume = crate::build_agent_resume_command(&k, &s, plan);
-                    }
-                }
+                self.queue_typed_resume(idx);
             }
         }
         #[cfg(not(feature = "catbus"))]
         {
             let _ = (window, cx);
+        }
+    }
+
+    /// The per-tab PTY inputs any (re)spawn needs so the tab comes back as
+    /// itself: the API env the in-tab CLI and the Claude hooks read, and — under
+    /// cleared env — the `exec <agent> --resume …` suffix. Without the second
+    /// one a respawned agent tab drops to a bare shell; without the first, a
+    /// relaunched agent's hooks silently no-op. Never resumes in read-only mode
+    /// (see the restore path: it would rotate the user's session ids).
+    fn respawn_inputs(&self, idx: usize) -> (std::collections::HashMap<String, String>, Option<Vec<String>>) {
+        let tab = &self.tabs[idx];
+        let env = tab_env_extras(
+            &tab.id,
+            &api_url_for_local_clients(&self.api_addr),
+            &self.api_token,
+            &tab.tab_env,
+        );
+        let session = tab.agent_kind.as_deref().zip(tab.agent_session_id.as_deref());
+        let agent_launch = match crate::agent_relaunch_mode(session.is_some(), crate::clear_env(), crate::read_only()) {
+            crate::AgentRelaunch::Exec => session.and_then(|(k, s)| {
+                // Name the agent process after the tab (see the restore path).
+                let title = crate::shell_supports_exec_a(&crate::clear_env_shell_path()).then_some(&*tab.name);
+                crate::agent_launch_shell_suffix_instrumented(k, s, tab.agent_plan_mode, title)
+            }),
+            crate::AgentRelaunch::Typed | crate::AgentRelaunch::None => None,
+        };
+        (env, agent_launch)
+    }
+
+    /// The typed resume for a respawn that couldn't exec the agent (non-cleared
+    /// env). Queued on the tab and sent by [`Tab::flush_pending_agent_resume`]
+    /// once the fresh shell prints its prompt.
+    fn queue_typed_resume(&mut self, idx: usize) {
+        let (kind, sid, plan) = {
+            let tab = &self.tabs[idx];
+            (
+                tab.agent_kind.as_deref().map(str::to_string),
+                tab.agent_session_id.as_deref().map(str::to_string),
+                tab.agent_plan_mode,
+            )
+        };
+        let has_session = kind.is_some() && sid.is_some();
+        if crate::agent_relaunch_mode(has_session, crate::clear_env(), crate::read_only())
+            != crate::AgentRelaunch::Typed
+        {
+            return;
+        }
+        if let (Some(k), Some(s)) = (kind, sid) {
+            self.tabs[idx].pending_agent_resume = crate::build_agent_resume_command(&k, &s, plan);
         }
     }
 
@@ -2986,9 +3022,15 @@ impl AppState {
         }
         let old_pid = self.tabs[idx].view.read(cx).pid();
         let cwd = platform::process_cwd(old_pid).or_else(|| Some(std::env::current_dir().unwrap_or_default()));
+        // A colours / net toggle re-forks the shell; an agent tab must come back
+        // as its agent, not as a bare shell.
+        let (env, agent_launch) = self.respawn_inputs(idx);
         self.tabs[idx].view.update(cx, |view, _| {
-            view.respawn(cwd.as_deref());
+            view.respawn(cwd.as_deref(), &env, agent_launch.clone());
         });
+        if agent_launch.is_none() {
+            self.queue_typed_resume(idx);
+        }
         #[cfg(target_os = "linux")]
         self.apply_tab_limits(idx, cx);
         self.tabs[idx].created_at = std::time::Instant::now();
