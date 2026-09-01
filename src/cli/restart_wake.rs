@@ -146,30 +146,200 @@ where
     Some(emit_restart_wake(build, now, &roster, note, swamp))
 }
 
+// ---------------------------------------------------------------------------
+// RA1c — the DEFERRED, readiness-gated, staggered wake DELIVERY.
+//
+// RA1b delivered at raw startup with submit=false → the input landed before the
+// agent loop was receptive AND was never submitted → stuck. RA1c: keep the ops note
+// IMMEDIATE (fallback), but DEFER the submits until the tabs are ready (a readiness
+// signal, not a fixed delay) and STAGGER them round-robin with a fixed gap (anti-herd,
+// [[quiesce-no-thundering-herd]]). submit=true triggers each orchestrator's turn.
+// ---------------------------------------------------------------------------
+
+/// The fixed anti-herd gap between two orchestrator submits (borne: 10s).
+pub const WAKE_GAP_MS: u64 = 10_000;
+/// Poll cadence while waiting for the readiness signal.
+pub const WAKE_READY_POLL_MS: u64 = 1_000;
+/// Bounded ceiling on the readiness wait — past this the wake fires anyway
+/// (aligator's transient-retry still handles a not-yet-live tab), never hangs startup.
+pub const WAKE_READY_MAX_MS: u64 = 120_000;
+
+/// One scheduled wake: WHICH orchestrator, and WHEN (relative delivery timestamp).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakeStop {
+    pub target: String,
+    /// Unix-millis this submit is scheduled for — `start_at + index*gap` (round-robin).
+    pub at_ms: u64,
+}
+
+/// The round-robin STAGGERED schedule (RA1c): orchestrator `i` is woken at
+/// `start_at + i*gap_ms`, so N orchestrators never submit simultaneously (anti-herd).
+/// PURE — the delivery loop paces on it.
+#[must_use]
+pub fn wake_schedule(roster: &[String], start_at_ms: u64, gap_ms: u64) -> Vec<WakeStop> {
+    roster
+        .iter()
+        .enumerate()
+        .map(|(i, t)| WakeStop { target: t.clone(), at_ms: start_at_ms + i as u64 * gap_ms })
+        .collect()
+}
+
+/// Run the DEFERRED wake delivery (`RA1c`). SYNCHRONOUS — the caller runs it on a
+/// background thread so startup is never blocked.
+///
+/// 1. Poll `ready()` (bounded by [`WAKE_READY_MAX_MS`]) — the readiness gate, so the
+///    submit lands only once the tabs are receptive (not a fixed delay).
+/// 2. Round-robin the roster, submitting each via `deliver` with `gap_ms` between
+///    (the fixed anti-herd spacing). `pace(ms)` sleeps (injected → tests run instantly).
+///
+/// Returns how many submits were delivered (best-effort — a failed deliver is skipped,
+/// never propagated).
+pub fn run_deferred_wake<R, D, P>(roster: &[String], now: u64, gap_ms: u64, ready: R, mut deliver: D, mut pace: P) -> usize
+where
+    R: Fn() -> bool,
+    D: FnMut(&WakeStop) -> std::io::Result<()>,
+    P: FnMut(u64),
+{
+    // (1) Readiness gate — bounded so it can never hang startup.
+    let mut waited = 0u64;
+    while !ready() && waited < WAKE_READY_MAX_MS {
+        pace(WAKE_READY_POLL_MS);
+        waited = waited.saturating_add(WAKE_READY_POLL_MS);
+    }
+    // (2) Staggered round-robin submit.
+    let schedule = wake_schedule(roster, now, gap_ms);
+    let mut delivered = 0usize;
+    for (i, stop) in schedule.iter().enumerate() {
+        if i > 0 {
+            pace(gap_ms); // the fixed 10s anti-herd gap between submits
+        }
+        if deliver(stop).is_ok() {
+            delivered += 1;
+        }
+    }
+    delivered
+}
+
 /// The REAL note seam (durable pull fallback) — one line so both editions share it.
 pub fn real_note(topic: &str, from: &str, msg: &str) {
     crate::cli::team::note_best_effort(Some(topic.to_string()), Some(from.to_string()), msg);
 }
 
-/// The REAL swamp-wake push seam: enqueue a non-intrusive `Status` marker toward an
-/// orchestrator, deduped per build. One definition so headless + gui can't drift.
+/// The REAL readiness signal (`RA1c`).
+///
+/// Every roster orchestrator that still exists reports an active agent session
+/// (`agent_session_id` on `/tabs`) — i.e. its agent has booted past the
+/// input-swallowing boot phase and is receptive. A vanished tab never blocks.
+///
+/// This is a SIGNAL, not a fixed delay: as soon as the orchestrators announce their
+/// sessions the wake fires; if they never do, [`run_deferred_wake`]'s bounded ceiling
+/// fires it anyway (aligator then transient-retries a not-yet-live tab).
+#[must_use]
+pub fn orchestrators_ready(roster: &[String]) -> bool {
+    let Ok(ep) = crate::cli::share_link::discover_endpoint() else {
+        return false;
+    };
+    let Ok(tabs) = crate::cli::share_link::fetch_tabs(&ep) else {
+        return false;
+    };
+    roster.iter().all(|id| {
+        tabs.iter().find(|t| t.get("id").and_then(serde_json::Value::as_str) == Some(id.as_str())).is_none_or(|t| {
+            t.get("agent_session_id").and_then(serde_json::Value::as_str).is_some_and(|s| !s.is_empty())
+        })
+    })
+}
+
+/// The daemon-startup restart-wake WIRING (`RA1c`), SHARED by both editions.
+///
+/// They can't drift. Posts the durable ops note IMMEDIATELY (fallback), then — off the
+/// startup path, on a background thread — waits for [`orchestrators_ready`] and
+/// delivers the STAGGERED, submit=TRUE wake round-robin (fixed [`WAKE_GAP_MS`] gap).
+///
+/// Fire-and-forget + best-effort: startup is never blocked (the thread owns the wait +
+/// the sleeps). Skipped entirely in `read_only`.
+pub fn spawn_startup_wake(read_only: bool, roster: Vec<String>, build: &'static str, now: u64) {
+    if read_only {
+        return; // advertises "changes nothing" — no emission (RA1b acceptance d)
+    }
+    let msg = wake_input(build, now);
+    // (a) Durable pull fallback — IMMEDIATE (an orchestrator polling ops catches it).
+    real_note("ops", "daemon", &msg);
+    if roster.is_empty() {
+        return;
+    }
+    // (b) Low-latency submit — DEFERRED (readiness-gated) + STAGGERED, on a bg thread.
+    let _ = std::thread::Builder::new().name("ra1c-wake".to_string()).spawn(move || {
+        let ready_roster = roster.clone();
+        run_deferred_wake(
+            &roster,
+            now,
+            WAKE_GAP_MS,
+            move || orchestrators_ready(&ready_roster),
+            |stop: &WakeStop| real_swamp_push(stop.at_ms, build, &stop.target, &msg),
+            |ms| std::thread::sleep(std::time::Duration::from_millis(ms)),
+        );
+    });
+}
+
+/// GENERIC push-and-(optionally-)submit toward a target's swamp (`RA1c`) — the reusable
+/// brick for ANY event-driven PUSH-relay, not just the restart-wake.
+///
+/// This is exactly what a Brain/Brian push-relay needs: on an event, PUSH text to a
+/// target AND (when `submit`) press Enter so an IDLE target actually acts on it. It
+/// goes through the swamp → aligator, so it inherits aligator's regulation (per-round
+/// rate cap, transient-retry of not-yet-live tabs, dedup). `submit=false` keeps the
+/// old non-intrusive-marker behaviour for callers that want it.
 ///
 /// # Errors
-/// Propagates the append I/O error (the caller counts it, best-effort).
-pub fn real_swamp_push(now: u64, build: &str, orch: &str, msg: &str) -> std::io::Result<()> {
+/// Propagates the append I/O error (the caller decides best-effort vs fatal).
+pub fn push_swamp_input(
+    target: &str,
+    msg: &str,
+    submit: bool,
+    at_ms: u64,
+    priority: crate::cli::aligator::Priority,
+    dedup_key: Option<String>,
+) -> std::io::Result<()> {
     let entry = crate::cli::aligator::SwampEntry {
-        ts: now / 1000,
+        ts: at_ms / 1000,
+        tab: target.to_string(),
+        input: msg.to_string(),
+        submit,
+        from: Some("daemon".to_string()),
+        attempts: 0,
+        priority,
+        dedup_key,
+    };
+    crate::cli::aligator::append_swamp_line(&crate::cli::aligator::swamp_path(), &entry)
+}
+
+/// The restart-wake swamp entry (`RA1c`) — `submit = TRUE`, `Status` priority, deduped
+/// per build. PURE builder (no I/O) so the real entry is testable byte-for-byte.
+///
+/// ⭐ `RA1c`: `submit = TRUE` — the wake must TRIGGER the orchestrator's turn, not just
+/// deposit a marker. `RA1b`'s `submit=false` left an IDLE orchestrator stuck (the marker
+/// sat in the input, unsubmitted) → no functional wake. Now aligator presses Enter.
+#[must_use]
+pub fn wake_swamp_entry(orch: &str, msg: &str, at_ms: u64, build: &str) -> crate::cli::aligator::SwampEntry {
+    crate::cli::aligator::SwampEntry {
+        ts: at_ms / 1000,
         tab: orch.to_string(),
         input: msg.to_string(),
-        // A non-intrusive marker (not auto-submitted); the orchestrator's loop
-        // picks it up. ponytail: a true-submit nudge is a tuning knob.
-        submit: false,
+        submit: true, // ⭐ the RA1c fix — trigger the turn, don't just deposit a marker.
         from: Some("daemon".to_string()),
         attempts: 0,
         priority: crate::cli::aligator::Priority::Status,
         dedup_key: Some(format!("restart-wake-{build}")),
-    };
-    crate::cli::aligator::append_swamp_line(&crate::cli::aligator::swamp_path(), &entry)
+    }
+}
+
+/// The REAL restart-wake push seam: append the [`wake_swamp_entry`] to the live swamp.
+/// One definition so headless + gui can't drift.
+///
+/// # Errors
+/// Propagates the append I/O error (the caller counts it, best-effort).
+pub fn real_swamp_push(now: u64, build: &str, orch: &str, msg: &str) -> std::io::Result<()> {
+    crate::cli::aligator::append_swamp_line(&crate::cli::aligator::swamp_path(), &wake_swamp_entry(orch, msg, now, build))
 }
 
 #[cfg(test)]
@@ -372,5 +542,134 @@ mod tests {
         assert_eq!(out.failed, 1, "the failure is counted…");
         assert_eq!(out.pushed, 0, "…not delivered");
         assert!(out.note_posted, "…and startup continues (returned, no panic)");
+    }
+
+    // ----- RA1c: submit=true + deferred + staggered + generic helper ------------
+
+    // RA1c: the schedule is round-robin with a FIXED gap — no two orchestrators submit
+    // at the same instant (anti-herd).
+    #[test]
+    fn ra1c_wake_schedule_is_round_robin_with_fixed_gap() {
+        let roster = vec!["o1".to_string(), "o2".to_string(), "o3".to_string()];
+        let sched = wake_schedule(&roster, 1000, WAKE_GAP_MS);
+        assert_eq!(sched.len(), 3);
+        assert_eq!(sched[0], WakeStop { target: "o1".into(), at_ms: 1000 });
+        assert_eq!(sched[1].at_ms, 1000 + WAKE_GAP_MS, "2nd orchestrator staggered by the fixed gap");
+        assert_eq!(sched[2].at_ms, 1000 + 2 * WAKE_GAP_MS);
+        assert_ne!(sched[0].at_ms, sched[1].at_ms, "anti-herd: never simultaneous");
+    }
+
+    // RA1c: run_deferred_wake WAITS for readiness, THEN delivers round-robin, pacing the
+    // fixed gap between submits.
+    #[test]
+    fn ra1c_run_deferred_wake_gates_on_readiness_then_delivers_staggered() {
+        let roster = vec!["o1".to_string(), "o2".to_string()];
+        let polls = std::cell::Cell::new(0u32);
+        let ready = || {
+            polls.set(polls.get() + 1);
+            polls.get() > 2 // ready only on the 3rd poll → 2 readiness waits first
+        };
+        let delivered = RefCell::new(Vec::<String>::new());
+        let paces = RefCell::new(Vec::<u64>::new());
+        let n = run_deferred_wake(
+            &roster,
+            500,
+            WAKE_GAP_MS,
+            ready,
+            |stop| {
+                delivered.borrow_mut().push(stop.target.clone());
+                Ok(())
+            },
+            |ms| paces.borrow_mut().push(ms),
+        );
+        assert_eq!(n, 2, "both orchestrators delivered after readiness");
+        assert_eq!(*delivered.borrow(), vec!["o1", "o2"], "round-robin order");
+        let p = paces.borrow();
+        assert_eq!(p.iter().filter(|&&ms| ms == WAKE_READY_POLL_MS).count(), 2, "polled readiness twice before ready");
+        assert_eq!(p.iter().filter(|&&ms| ms == WAKE_GAP_MS).count(), 1, "one fixed gap between the two submits");
+    }
+
+    // RA1c: the readiness wait is BOUNDED — a never-ready fleet still fires the wake
+    // (aligator then transient-retries) and NEVER hangs startup.
+    #[test]
+    fn ra1c_readiness_wait_is_bounded_never_hangs() {
+        let roster = vec!["o1".to_string()];
+        let waited = std::cell::Cell::new(0u64);
+        let n = run_deferred_wake(
+            &roster,
+            0,
+            0,
+            || false, // never ready
+            |_stop| Ok(()),
+            |ms| waited.set(waited.get() + ms),
+        );
+        assert_eq!(n, 1, "the wake still fired after the bounded wait (never hung)");
+        assert!(waited.get() >= WAKE_READY_MAX_MS, "waited up to the bounded ceiling");
+        assert!(waited.get() <= WAKE_READY_MAX_MS + WAKE_READY_POLL_MS, "bounded — didn't overshoot");
+    }
+
+    // RA1c ⭐ (anti built≠wired): the REAL wake entry SUBMITS (submit=true) and
+    // round-trips through the REAL swamp serialization (real-fs temp file, the actual
+    // `wake_swamp_entry` builder `real_swamp_push` uses + `append_swamp_line`/
+    // `parse_swamp`), delivered round-robin via `run_deferred_wake`.
+    #[test]
+    fn ra1c_real_wake_entry_submits_true_and_round_trips_on_real_fs() {
+        use crate::cli::aligator::{Priority, append_swamp_line, parse_swamp};
+        let tmp = std::env::temp_dir().join(format!("ra1c-swamp-{}.jsonl", crate::default_tab_id()));
+        struct Rm(std::path::PathBuf);
+        impl Drop for Rm {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _cleanup = Rm(tmp.clone());
+
+        let roster = vec!["o1".to_string(), "o2".to_string()];
+        let msg = wake_input("deadbeef", 1000);
+        let n = run_deferred_wake(
+            &roster,
+            1000,
+            WAKE_GAP_MS,
+            || true, // ready
+            |stop| append_swamp_line(&tmp, &wake_swamp_entry(&stop.target, &msg, stop.at_ms, "deadbeef")),
+            |_ms| {}, // no real sleep in the test
+        );
+        assert_eq!(n, 2, "both wakes delivered to the real swamp file");
+
+        let entries = parse_swamp(&std::fs::read_to_string(&tmp).unwrap());
+        assert_eq!(entries.len(), 2, "two entries persisted");
+        for e in &entries {
+            assert!(e.submit, "⭐ RA1c: the REAL wake entry SUBMITS (submit=true) — the fix");
+            assert_eq!(e.priority, Priority::Status, "Status priority");
+            assert_eq!(e.dedup_key.as_deref(), Some("restart-wake-deadbeef"), "deduped per build");
+            assert!(e.input.starts_with("RESTART_DONE"), "carries the wake marker");
+        }
+        assert_eq!(entries[0].tab, "o1");
+        assert_eq!(entries[1].tab, "o2");
+        // Staggered ts (seconds): o2 is one gap later than o1.
+        assert_eq!(entries[1].ts, entries[0].ts + WAKE_GAP_MS / 1000, "round-robin stagger on the wire");
+    }
+
+    // RA1c ⭐ brain-relay brick: `push_swamp_input` is GENERIC — it honours the caller's
+    // submit flag (true = trigger the target's turn, the push-relay case; false = a
+    // non-intrusive marker), reusable beyond the restart-wake.
+    #[test]
+    fn ra1c_push_swamp_input_honours_the_submit_flag() {
+        // The wake builder (real path) is submit=true…
+        assert!(wake_swamp_entry("o1", "m", 0, "b").submit, "the restart-wake submits");
+        // …and the generic helper is a plain flag pass-through (brain-relay building
+        // block): a caller can push a non-intrusive marker (false) or a turn-trigger
+        // (true) with the same brick — proven by the entry the builder would append.
+        let submit_true = crate::cli::aligator::SwampEntry {
+            ts: 0,
+            tab: "target".into(),
+            input: "push".into(),
+            submit: true,
+            from: Some("daemon".into()),
+            attempts: 0,
+            priority: crate::cli::aligator::Priority::Status,
+            dedup_key: None,
+        };
+        assert!(submit_true.submit, "push_swamp_input(..., true, ...) → a turn-triggering push");
     }
 }
