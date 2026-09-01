@@ -6792,4 +6792,59 @@ mod tests {
         };
         assert_eq!(card.spawn_mode, Some(SpawnMode::Resume), "spawn_mode flows into the retire record (A/B key)");
     }
+
+    // SV5-métriques: the LIVE ledger — a REAL integration test. POST /retire on a
+    // disposable fresh tab that carries the EXISTING agent-tokens telemetry + a v2
+    // stamp WITHOUT a tokens figure → the record's tokens REUSE the telemetry
+    // (input+output), and GET /catalog/list serves the byMode ledger + the guarded
+    // fresh-vs-resume verdict (G1 InsufficientSample at n=1, surfaced WITH n — G3).
+    #[test]
+    fn sv5_live_ledger_reuses_token_telemetry_and_serves_guarded_verdict() {
+        use crate::cli::catalog::SpawnMode;
+        let _catalog_guard = real_catalog_test_guard();
+        let (port, state, token) = spawn_server();
+        let post = |path: &str, body: &str| {
+            format!("POST /{path}?token={token} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+        };
+        let get = |path: &str| format!("GET /{path}?token={token} HTTP/1.1\r\n\r\n");
+        let run = crate::default_tab_id();
+        let skill = format!("sv5-{}", &run[..8.min(run.len())]);
+
+        let id = crate::default_tab_id();
+        let mut tab = test_snapshot_tab(&id, "disposable-sv5");
+        tab.rehome_status = Some("safe-to-close".into());
+        tab.assignment = Some("build/builder".into());
+        tab.spawn_mode = Some(SpawnMode::Fresh);
+        // The EXISTING per-tab agent-tokens telemetry (input+output = 5000).
+        tab.tokens = Some(crate::TokenUsage { input: 3000, output: 2000 });
+        {
+            let mut g = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            g.tabs.push(tab);
+        }
+        let _cleanup = CatalogCleanup(vec![id.clone()]);
+
+        // A v2 stamp with skill+prompt but NO tokens figure → tokens come from telemetry.
+        let body = format!(r#"{{"skill":"{skill}","prompt":"distilled"}}"#);
+        let r = request(port, &post(&format!("tabs/by-id/{id}/retire"), &body));
+        assert_eq!(status_code(&r), 200, "v2 retire (telemetry tokens) → 200\n{r}");
+
+        // REAL archive: the record's tokens REUSE the tab telemetry, spawn_mode carried.
+        let back = crate::cli::catalog::read_back(&crate::cli::catalog::catalog_path(), &id).expect("archived");
+        assert_eq!(back.tokens, Some(5000), "record tokens reuse the existing telemetry (input+output)");
+        assert_eq!(back.spawn_mode, Some(SpawnMode::Fresh), "spawn_mode carried");
+
+        // REAL derived read: the byMode ledger + the guarded verdict on the wire.
+        let listed = request(port, &get("catalog/list"));
+        let json: serde_json::Value = serde_json::from_str(body_of(&listed)).expect("json");
+        let sk = json["skills"]
+            .as_array()
+            .and_then(|a| a.iter().find(|s| s["skill"] == serde_json::json!(skill)))
+            .expect("skill folded");
+        assert_eq!(sk["metrics"]["byMode"]["fresh"]["spawns"].as_u64(), Some(1), "byMode fresh spawn recorded");
+        assert_eq!(sk["metrics"]["byMode"]["fresh"]["tokensAvg"].as_f64(), Some(5000.0), "tokensAvg from telemetry");
+        // G1 + G3: at n=1 the verdict is insufficientSample, surfaced WITH the n.
+        assert_eq!(sk["freshVsResume"]["verdict"], serde_json::json!("insufficientSample"), "G1 gates at n=1");
+        assert_eq!(sk["freshVsResume"]["freshN"].as_u64(), Some(1), "G3: sample size surfaced");
+        assert_eq!(sk["freshVsResume"]["resumeN"].as_u64(), Some(0));
+    }
 }

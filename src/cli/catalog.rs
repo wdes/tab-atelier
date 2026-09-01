@@ -590,6 +590,10 @@ impl CatalogCard {
             // SV4: carry the tab's spawn_mode into the record (the A/B partition key,
             // SV5). A V2Stamp `spawn_mode` can still override it via `with_v2`.
             spawn_mode: t.spawn_mode,
+            // SV5: the A/B token telemetry REUSES the tab's existing agent-tokens
+            // counter (input+output) — zero new instrumentation. `with_v2` overrides
+            // only if the orchestrator stamps a different figure.
+            tokens: t.tokens.map(|u| u.input.saturating_add(u.output)),
             retired_at,
             // v1 card: no other v2 profile/telemetry (byte-identical to before).
             ..Default::default()
@@ -668,8 +672,14 @@ impl CatalogCard {
             self.spawn_mode = stamp.spawn_mode;
         }
         self.outcome = stamp.outcome;
-        self.tokens = stamp.tokens;
-        self.cost = stamp.cost;
+        // SV5: keep the telemetry-sourced tokens (from_snapshot) unless the stamp gives
+        // an explicit figure. Cost is stamp-only (no existing per-tab cost telemetry).
+        if stamp.tokens.is_some() {
+            self.tokens = stamp.tokens;
+        }
+        if stamp.cost.is_some() {
+            self.cost = stamp.cost;
+        }
         self.difficulty = stamp.difficulty;
         self.schema_version = Some(2);
         self
@@ -946,8 +956,41 @@ pub struct Metrics {
     pub by_mode: ByMode,
 }
 
-/// The fresh-vs-resume comparison — DERIVED at read, never stored. Each field is
-/// `None` when a side lacks the data to compute it (no judged instance / no telemetry).
+/// SV5 G1 — the minimum instances PER ARM before the A/B yields a directional verdict.
+///
+/// Below this, the verdict is [`AbVerdict::InsufficientSample`] (the raw deltas are
+/// still surfaced, but never interpreted).
+///
+/// ponytail: a heuristic floor for a dogfood-scale ledger, tunable — not a power
+/// analysis. The upgrade path is a proper significance test once N is large.
+pub const MIN_SAMPLE: u64 = 3;
+
+/// SV5 G1 — the dead-zone on the delivery delta: below this the arms are called
+/// [`AbVerdict::Inconclusive`] rather than favouring either. ponytail: heuristic.
+const DELIVERY_DEAD_ZONE: f64 = 0.15;
+
+/// The DIRECTIONAL A/B verdict (SV5 G3) — never a per-task pass/fail, always a trend
+/// surfaced WITH its sample size (`fresh_n`/`resume_n`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AbVerdict {
+    /// G1: an arm has fewer than [`MIN_SAMPLE`] instances → conclude NOTHING.
+    #[default]
+    InsufficientSample,
+    /// Enough data, but the delivery delta is within the dead-zone → no clear winner.
+    Inconclusive,
+    /// Fresh delivers better on this skill (directional).
+    FreshFavored,
+    /// Resume delivers better on this skill (directional).
+    ResumeFavored,
+}
+
+/// The fresh-vs-resume comparison — DERIVED at read, never stored (S4 discipline).
+///
+/// The raw `delivery_delta` / `tokens_ratio` / `cost_ratio` are `None` when a side
+/// lacks the data. SV5 adds a GUARDED, directional [`verdict`](Self::verdict) surfaced
+/// WITH its per-arm sample size (G3) — gated by [`MIN_SAMPLE`] (G1) and always computed
+/// WITHIN one skill's own instances (G2, structural: the read-model folds by skill).
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FreshVsResume {
@@ -957,6 +1000,11 @@ pub struct FreshVsResume {
     pub tokens_ratio: Option<f64>,
     /// `fresh.costAvg / resume.costAvg`.
     pub cost_ratio: Option<f64>,
+    /// SV5 G3 — the directional verdict (never pass/fail), guarded by G1.
+    pub verdict: AbVerdict,
+    /// SV5 G3 — the sample size the verdict rests on, always surfaced.
+    pub fresh_n: u64,
+    pub resume_n: u64,
 }
 
 impl FreshVsResume {
@@ -965,13 +1013,28 @@ impl FreshVsResume {
             (Some(a), Some(b)) if b != 0.0 => Some(a / b),
             _ => None,
         };
+        let delivery_delta = match (fresh.success_rate(), resume.success_rate()) {
+            (Some(f), Some(r)) => Some(f - r),
+            _ => None,
+        };
+        // G1 (min-sample) → G3 (directional, surfaced with n). G2 is structural: `fresh`
+        // and `resume` are this ONE skill's arms (the caller folded by skill).
+        let verdict = if fresh.spawns < MIN_SAMPLE || resume.spawns < MIN_SAMPLE {
+            AbVerdict::InsufficientSample
+        } else {
+            match delivery_delta {
+                Some(d) if d > DELIVERY_DEAD_ZONE => AbVerdict::FreshFavored,
+                Some(d) if d < -DELIVERY_DEAD_ZONE => AbVerdict::ResumeFavored,
+                _ => AbVerdict::Inconclusive,
+            }
+        };
         Self {
-            delivery_delta: match (fresh.success_rate(), resume.success_rate()) {
-                (Some(f), Some(r)) => Some(f - r),
-                _ => None,
-            },
+            delivery_delta,
             tokens_ratio: ratio(fresh.tokens_avg, resume.tokens_avg),
             cost_ratio: ratio(fresh.cost_avg, resume.cost_avg),
+            verdict,
+            fresh_n: fresh.spawns,
+            resume_n: resume.spawns,
         }
     }
 }
@@ -2756,5 +2819,102 @@ mod tests {
         assert_eq!(sid, "new-sess", "the LATEST instance's session wins");
         assert_eq!(kind, "claude");
         assert!(resolve_skill_baseline(&cards, "no-such-skill").is_none(), "no session → no baseline");
+    }
+
+    // ----- SV5-métriques: the byMode ledger + Olympe guards G1/G2/G3 ------------
+
+    /// Fill an arm with `n` outcomes for a skill (helper for the guard tests).
+    fn arm(skill: &str, mode: SpawnMode, outcome: Outcome, n: u64, base_at: u64) -> Vec<CatalogCard> {
+        (0..n)
+            .map(|i| {
+                v2_card(&format!("{skill}-{mode:?}-{i}"), skill, mode, Some(outcome), base_at + i, None, None)
+            })
+            .collect()
+    }
+
+    // SV5 G1: below MIN_SAMPLE in an arm → InsufficientSample (conclude NOTHING); the
+    // raw delta is still surfaced, but never interpreted.
+    #[test]
+    fn sv5_g1_min_sample_gates_the_verdict() {
+        let cat = TmpCatalog::new();
+        // fresh: 3 success ; resume: only 1 → resume_n < MIN_SAMPLE.
+        let mut cards = arm("s", SpawnMode::Fresh, Outcome::Success, MIN_SAMPLE, 1);
+        cards.extend(arm("s", SpawnMode::Resume, Outcome::Problem, 1, 100));
+        for c in &cards {
+            append_catalog_line(cat.path(), c).unwrap();
+        }
+        let fvr = &read_skill_profiles_at(cat.path())[0].fresh_vs_resume;
+        assert_eq!(fvr.verdict, AbVerdict::InsufficientSample, "resume arm under MIN → G1 gates the verdict");
+        // The raw delta is still computed + n surfaced (never hidden).
+        assert!(fvr.delivery_delta.is_some(), "raw delta still surfaced under G1");
+        assert_eq!((fvr.fresh_n, fvr.resume_n), (MIN_SAMPLE, 1), "sample sizes surfaced");
+    }
+
+    // SV5 G3: with n ≥ MIN in both arms the verdict is DIRECTIONAL (never a per-task
+    // pass/fail) and always carries its sample size.
+    #[test]
+    fn sv5_g3_directional_verdict_surfaced_with_n() {
+        let cat = TmpCatalog::new();
+        // fresh all success (rate 1.0) vs resume all problem (rate 0.0) → FreshFavored.
+        let mut cards = arm("s", SpawnMode::Fresh, Outcome::Success, MIN_SAMPLE, 1);
+        cards.extend(arm("s", SpawnMode::Resume, Outcome::Problem, MIN_SAMPLE, 100));
+        for c in &cards {
+            append_catalog_line(cat.path(), c).unwrap();
+        }
+        let fvr = &read_skill_profiles_at(cat.path())[0].fresh_vs_resume;
+        assert_eq!(fvr.verdict, AbVerdict::FreshFavored, "fresh 1.0 vs resume 0.0 → fresh favored");
+        assert_eq!((fvr.fresh_n, fvr.resume_n), (MIN_SAMPLE, MIN_SAMPLE), "n surfaced with the trend (G3)");
+
+        // Equal delivery (both success) → Inconclusive, NOT a false winner.
+        let cat2 = TmpCatalog::new();
+        let mut eq = arm("s", SpawnMode::Fresh, Outcome::Success, MIN_SAMPLE, 1);
+        eq.extend(arm("s", SpawnMode::Resume, Outcome::Success, MIN_SAMPLE, 100));
+        for c in &eq {
+            append_catalog_line(cat2.path(), c).unwrap();
+        }
+        assert_eq!(
+            read_skill_profiles_at(cat2.path())[0].fresh_vs_resume.verdict,
+            AbVerdict::Inconclusive,
+            "equal delivery within the dead-zone → inconclusive"
+        );
+    }
+
+    // SV5 G2: the verdict is WITHIN one skill — two skills with opposite A/B results
+    // are judged independently on their OWN arms (never cross-skill mixing).
+    #[test]
+    fn sv5_g2_verdict_is_within_skill_not_cross_skill() {
+        let cat = TmpCatalog::new();
+        // skill-a: fresh good / resume bad → FreshFavored.
+        let mut cards = arm("skill-a", SpawnMode::Fresh, Outcome::Success, MIN_SAMPLE, 1);
+        cards.extend(arm("skill-a", SpawnMode::Resume, Outcome::Problem, MIN_SAMPLE, 20));
+        // skill-b: the MIRROR — fresh bad / resume good → ResumeFavored.
+        cards.extend(arm("skill-b", SpawnMode::Fresh, Outcome::Problem, MIN_SAMPLE, 40));
+        cards.extend(arm("skill-b", SpawnMode::Resume, Outcome::Success, MIN_SAMPLE, 60));
+        for c in &cards {
+            append_catalog_line(cat.path(), c).unwrap();
+        }
+        let profiles = read_skill_profiles_at(cat.path());
+        let a = profiles.iter().find(|p| p.skill == "skill-a").expect("skill-a");
+        let b = profiles.iter().find(|p| p.skill == "skill-b").expect("skill-b");
+        // Within-skill: opposite verdicts. If arms mixed cross-skill they'd both cancel.
+        assert_eq!(a.fresh_vs_resume.verdict, AbVerdict::FreshFavored, "skill-a judged on its own arms");
+        assert_eq!(b.fresh_vs_resume.verdict, AbVerdict::ResumeFavored, "skill-b judged on its own arms");
+    }
+
+    // SV5: the A/B tokens REUSE the existing telemetry (from_snapshot) — a stamp
+    // without a tokens figure preserves it; an explicit stamp overrides.
+    #[test]
+    fn sv5_tokens_reuse_telemetry_and_stamp_can_override() {
+        // A record whose tokens came from the tab's agent-tokens telemetry (5000).
+        let card = v2_card("t", "builder", SpawnMode::Fresh, Some(Outcome::Success), 1, Some(5000), None);
+        let base_stamp = V2Stamp { skill: Some("builder".into()), prompt: Some("p".into()), ..Default::default() };
+        assert_eq!(
+            card.clone().with_v2(base_stamp).tokens,
+            Some(5000),
+            "telemetry tokens preserved when the stamp omits them"
+        );
+        let override_stamp =
+            V2Stamp { skill: Some("builder".into()), prompt: Some("p".into()), tokens: Some(9999), ..Default::default() };
+        assert_eq!(card.with_v2(override_stamp).tokens, Some(9999), "an explicit stamp figure overrides");
     }
 }
