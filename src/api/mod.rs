@@ -7012,11 +7012,11 @@ mod tests {
         }
     }
 
-    // PD2 (#kiosk): the LIVE KIOSK routes — a REAL integration test (real-fs, real
+    // PD2/PD3 (#kiosk): the LIVE KIOSK routes — a REAL integration test (real-fs, real
     // routes, NO mock). Seeds an `open` decision, then: GET renders it server-verbatim
     // (camelCase, state=open) → POST /read transits state → POST /tranch WITHOUT a
-    // verdict is rejected (400) → WITH a verdict transits + surfaces the verdict →
-    // ?includeArchived plumbs the fold's visibility filter.
+    // verdict is rejected (400) → WITH a verdict TRANCHES *and ARCHIVES* (PD3: the ruling
+    // triggers archiving) → hidden by default, surfaced with ?includeArchived + verdict.
     #[test]
     fn pd2_live_decisions_read_tranch_and_include_archived() {
         use crate::cli::decision::{DecisionEvent, DecisionKind, append_line, decisions_path};
@@ -7030,6 +7030,9 @@ mod tests {
         let _cleanup = DecisionsCleanup(vec![id.clone()]);
 
         // Seed a real `open` decision (the orchestrator's `decision push` in production).
+        // The bundle path is a GUARANTEED-nonexistent name so the PD3 archive step moves
+        // nothing (this test asserts the route wiring, not the physical move — that's
+        // proven real-fs in cli::decision's pd3_archive_… test with a temp outbox).
         let seed = DecisionEvent {
             id: id.clone(),
             kind: DecisionKind::Open,
@@ -7038,7 +7041,7 @@ mod tests {
             title: Some("Deploy X".into()),
             why_gated: Some("restart = gate PO".into()),
             reco: Some("GO".into()),
-            files: vec!["~/Dev/outbox/x.md".into()],
+            files: vec![format!("~/Dev/outbox/__kiosk-{id}-none.md")],
             ..Default::default()
         };
         append_line(&decisions_path(), &seed).unwrap();
@@ -7065,24 +7068,19 @@ mod tests {
         let bad = request(port, &post(&format!("decisions/{id}/tranch"), "{}"));
         assert_eq!(status_code(&bad), 400, "tranch without verdict → 400\n{bad}");
 
-        // POST /tranch WITH a verdict → 200 + state=tranched + the verdict surfaces.
+        // POST /tranch WITH a verdict → 200, and PD3 kicks in: the ruling ARCHIVES the
+        // decision (it leaves the active list). Hidden by default...
         let t = request(port, &post(&format!("decisions/{id}/tranch"), r#"{"verdict":"GO","by":"PO"}"#));
         assert_eq!(status_code(&t), 200, "tranch → 200\n{t}");
-        let ruled = decisions_list(port, &token, "");
-        let d2 = ruled.iter().find(|x| x["id"] == serde_json::json!(id)).unwrap();
-        assert_eq!(d2["state"], serde_json::json!("tranched"), "tranch transits state");
-        assert_eq!(d2["verdict"], serde_json::json!("GO"), "the verdict rides the read-model");
-
-        // ?includeArchived plumbs the visibility filter: archive (models PD3) → hidden by
-        // default, surfaced with the flag.
-        append_line(&decisions_path(), &DecisionEvent { id: id.clone(), kind: DecisionKind::Archived, at: 9, ..Default::default() }).unwrap();
         assert!(
             !decisions_list(port, &token, "").iter().any(|x| x["id"] == serde_json::json!(id)),
-            "archived decision hidden from the default read-model"
+            "a ruled decision is archived → hidden from the default read-model (PD3)"
         );
+        // ...surfaced (state=archived) with the verdict via ?includeArchived (same cycle).
         let all = decisions_list(port, &token, "&includeArchived=true");
         let arch = all.iter().find(|x| x["id"] == serde_json::json!(id)).expect("surfaced with ?includeArchived");
-        assert_eq!(arch["state"], serde_json::json!("archived"), "surfaced with state=archived");
+        assert_eq!(arch["state"], serde_json::json!("archived"), "tranch transits to archived (PD3)");
+        assert_eq!(arch["verdict"], serde_json::json!("GO"), "the verdict rides the archived read-model");
     }
 
     // SC1 borne 3: concurrent EDITs never lose an update — each read-modify-append

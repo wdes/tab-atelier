@@ -31,7 +31,7 @@ pub(in crate::api) fn list<S: Write>(stream: &mut S, include_archived: bool) {
 /// `{by}`. Archiving the `files[]` is PD3.
 pub(in crate::api) fn mutate<S: Write>(stream: &mut S, state: &Arc<Mutex<TabSnapshot>>, p: &str, body_bytes: &[u8]) {
     use crate::cli::decision::{
-        DecisionEvent, DecisionKind, append_line, decisions_path, parse_decisions,
+        DecisionEvent, DecisionKind, append_line, archive_decision, decisions_path, outbox_base, parse_decisions,
     };
 
     #[derive(serde::Deserialize, Default)]
@@ -64,28 +64,35 @@ pub(in crate::api) fn mutate<S: Write>(stream: &mut S, state: &Arc<Mutex<TabSnap
         error_json(stream, 400, "decision tranch: a non-empty verdict is required");
         return;
     }
-    let ev = DecisionEvent {
-        id: id.clone(),
-        kind,
-        at: crate::unix_millis() / 1000,
-        by: body.by,
-        verdict,
-        ..Default::default()
-    };
+    let now = crate::unix_millis() / 1000;
+    let ev = DecisionEvent { id: id.clone(), kind, at: now, by: body.by, verdict, ..Default::default() };
     let path = decisions_path();
 
-    // Under the daemon lock: append → read-back. The gate confirms OUR event is the
-    // latest one for this id (a true read-back of the write), independent of the
-    // sticky-archive fold — so a mark on an archived decision still confirms the append
-    // landed rather than falsely 500-ing on an unchanged folded state.
+    // Under the daemon lock: append the state event, then (on tranch) ARCHIVE — the
+    // ruling triggers filing the bundle under _archive/AAAA-MM/ + appending the `archived`
+    // event (PD3), so the decision leaves the active list (reversible via a re-open). The
+    // read-back gate confirms the FINAL event landed for this id — `archived` after a
+    // tranch, else our own event — a true read-back independent of the folded state.
     let guard = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if append_line(&path, &ev).is_err() {
         drop(guard);
         error_json(stream, 500, "decision: append failed");
         return;
     }
+    let expected = if kind == DecisionKind::Tranched {
+        // The state transition is recorded even if no file moved; a hard move I/O error
+        // 500s (the `tranched` event stands — the ruling isn't lost).
+        if let Err(e) = archive_decision(&path, &outbox_base(), &id, now) {
+            drop(guard);
+            error_json(stream, 500, &format!("decision tranch: archive failed — {e}"));
+            return;
+        }
+        DecisionKind::Archived
+    } else {
+        kind
+    };
     let landed = std::fs::read_to_string(&path)
-        .is_ok_and(|body| parse_decisions(&body).iter().rev().find(|e| e.id == id).is_some_and(|e| e.kind == kind));
+        .is_ok_and(|body| parse_decisions(&body).iter().rev().find(|e| e.id == id).is_some_and(|e| e.kind == expected));
     drop(guard);
     if landed {
         respond_json(stream, 200, &format!(r#"{{"{verb}":"{id}"}}"#));

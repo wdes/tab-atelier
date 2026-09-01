@@ -211,6 +211,21 @@ fn fold_one(id: &str, events: &[DecisionEvent]) -> Option<DecisionView> {
     let verdict = last_tranched
         .filter(|&t| last_open.is_none_or(|o| t > o))
         .and_then(|t| events[t].verdict.clone());
+    let state = state_of(events);
+    // PD3: an archived decision's bundle has physically MOVED to `_archive/AAAA-MM/` —
+    // present the archived paths (recorded on the `archived` event) so the panel links
+    // stay valid; otherwise the content's (live) outbox paths.
+    let files = if state == DecisionState::Archived {
+        events
+            .iter()
+            .rev()
+            .find(|e| e.kind == DecisionKind::Archived)
+            .map(|e| e.files.clone())
+            .filter(|f| !f.is_empty())
+            .unwrap_or_else(|| content.files.clone())
+    } else {
+        content.files.clone()
+    };
     Some(DecisionView {
         id: id.to_string(),
         project: content.project.clone(),
@@ -218,8 +233,8 @@ fn fold_one(id: &str, events: &[DecisionEvent]) -> Option<DecisionView> {
         why_gated: content.why_gated.clone(),
         reco: content.reco.clone(),
         effort: content.effort.clone(),
-        files: content.files.clone(),
-        state: state_of(events),
+        files,
+        state,
         verdict,
         at: content.at,
     })
@@ -248,6 +263,166 @@ pub fn read_decisions_at(path: &Path, include_archived: bool) -> Vec<DecisionVie
 #[must_use]
 pub fn read_decisions(include_archived: bool) -> Vec<DecisionView> {
     read_decisions_at(&decisions_path(), include_archived)
+}
+
+// ---------------------------------------------------------------------------
+// PD3 — archiving: at `tranched → archived`, MOVE the decision's bundle files to
+// `<outbox>/_archive/AAAA-MM/` (monthly), reversibly. A re-open moves them back. NEVER
+// deletes — the anti-entassement discipline keeps the live outbox to the `vif` only,
+// without ever losing a byte. All fns are path-injected (outbox + log) so they're
+// testable against temp dirs (`std::env::set_var` is denied crate-wide).
+// ---------------------------------------------------------------------------
+
+/// The outbox base holding decision bundles. Honors `TAB_ATELIER_OUTBOX_PATH` (a
+/// test/ops full-path override), else `~/Dev/outbox`.
+#[must_use]
+pub fn outbox_base() -> PathBuf {
+    if let Ok(p) = std::env::var("TAB_ATELIER_OUTBOX_PATH") {
+        return PathBuf::from(p);
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(home).join("Dev").join("outbox")
+}
+
+/// Expand a leading `~/` to `$HOME` so a stored path resolves to a real file on disk.
+fn resolve(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        return PathBuf::from(home).join(rest);
+    }
+    PathBuf::from(path)
+}
+
+/// `AAAA-MM` (UTC) for a unix-seconds timestamp — the monthly archive bucket.
+#[must_use]
+fn archive_month(unix_secs: u64) -> String {
+    let secs = i64::try_from(unix_secs).unwrap_or(i64::MAX);
+    chrono::DateTime::from_timestamp(secs, 0)
+        .map_or_else(|| "unknown".to_string(), |dt| dt.format("%Y-%m").to_string())
+}
+
+/// Move a file, falling back to copy+remove when `rename` fails across devices. The
+/// original always ends up gone and its bytes present at `dst` (a move, not a delete).
+///
+/// # Errors
+/// Propagates the copy / remove I/O error when a cross-device rename fallback also fails.
+fn move_file(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if std::fs::rename(src, dst).is_ok() {
+        return Ok(());
+    }
+    std::fs::copy(src, dst)?;
+    std::fs::remove_file(src)
+}
+
+/// Move each existing file of `files` into `<outbox>/_archive/AAAA-MM/`.
+///
+/// Returns the `(original, archived)` path pairs actually moved. `mkdir -p` the month
+/// dir; a missing source is skipped (idempotent — re-archiving a moved bundle is a
+/// no-op). NEVER deletes.
+///
+/// # Errors
+/// Propagates a create-dir / move I/O error.
+pub fn archive_files(outbox: &Path, files: &[String], unix_secs: u64) -> std::io::Result<Vec<(String, String)>> {
+    let dir = outbox.join("_archive").join(archive_month(unix_secs));
+    let mut moved = Vec::new();
+    for f in files {
+        let src = resolve(f);
+        if !src.exists() {
+            continue;
+        }
+        let Some(name) = src.file_name() else { continue };
+        std::fs::create_dir_all(&dir)?;
+        let dst = dir.join(name);
+        move_file(&src, &dst)?;
+        moved.push((f.clone(), dst.to_string_lossy().into_owned()));
+    }
+    Ok(moved)
+}
+
+/// Move a decision's archived files BACK to their originals (reversibility).
+///
+/// For each `(original, archived)` pair, `mkdir -p` the original's parent and move the
+/// file back. A missing archived file is skipped. NEVER deletes.
+///
+/// # Errors
+/// Propagates a create-dir / move I/O error.
+pub fn restore_files(pairs: &[(String, String)]) -> std::io::Result<()> {
+    for (original, archived) in pairs {
+        let src = resolve(archived);
+        if !src.exists() {
+            continue;
+        }
+        let dst = resolve(original);
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        move_file(&src, &dst)?;
+    }
+    Ok(())
+}
+
+/// Pair each content file with its archived counterpart (matched by file name), so a
+/// re-open can move the bundle back exactly where the content expects it.
+fn archived_pairs(events: &[DecisionEvent]) -> Vec<(String, String)> {
+    let (Some(content), Some(archived)) =
+        (events.iter().rfind(|e| e.kind.is_content()), events.iter().rev().find(|e| e.kind == DecisionKind::Archived))
+    else {
+        return Vec::new();
+    };
+    content
+        .files
+        .iter()
+        .filter_map(|orig| {
+            let base = Path::new(orig).file_name()?;
+            let arch = archived.files.iter().find(|a| Path::new(a).file_name() == Some(base))?;
+            Some((orig.clone(), arch.clone()))
+        })
+        .collect()
+}
+
+/// PD3: archive a ruled decision — move its bundles then append the `archived` event.
+///
+/// Moves the content's bundle files to `<outbox>/_archive/AAAA-MM/` and appends the
+/// `archived` event (recording the moved paths + the month dir). The decision then
+/// leaves the active list; its panel links point at the archive. Appended even when
+/// nothing moved (empty / already-archived files) so the state transition is reliable.
+/// Returns the archive dir. Call right after a `tranched`.
+///
+/// # Errors
+/// Propagates a move / append I/O error.
+pub fn archive_decision(log: &Path, outbox: &Path, id: &str, unix_secs: u64) -> std::io::Result<String> {
+    let body = std::fs::read_to_string(log).unwrap_or_default();
+    let events: Vec<DecisionEvent> = parse_decisions(&body).into_iter().filter(|e| e.id == id).collect();
+    let files = events.iter().rfind(|e| e.kind.is_content()).map(|e| e.files.clone()).unwrap_or_default();
+    let moved = archive_files(outbox, &files, unix_secs)?;
+    let dir = outbox.join("_archive").join(archive_month(unix_secs)).to_string_lossy().into_owned();
+    let archived = DecisionEvent {
+        id: id.to_string(),
+        kind: DecisionKind::Archived,
+        at: unix_secs,
+        files: moved.into_iter().map(|(_, new)| new).collect(),
+        archived_path: Some(dir.clone()),
+        ..Default::default()
+    };
+    append_line(log, &archived)?;
+    Ok(dir)
+}
+
+/// PD3 reversibility: bring an archived decision's bundle back before a re-open.
+///
+/// If `id` is currently archived in `log`, move its archived files back to the original
+/// outbox locations. Best-effort; call right before appending a re-`open`. A non-archived
+/// id is a no-op.
+///
+/// # Errors
+/// Propagates a move I/O error while restoring.
+pub fn reopen_restore(log: &Path, id: &str) -> std::io::Result<()> {
+    let body = std::fs::read_to_string(log).unwrap_or_default();
+    let events: Vec<DecisionEvent> = parse_decisions(&body).into_iter().filter(|e| e.id == id).collect();
+    if state_of(&events) != DecisionState::Archived {
+        return Ok(());
+    }
+    restore_files(&archived_pairs(&events))
 }
 
 // ---------------------------------------------------------------------------
@@ -300,6 +475,11 @@ fn push(args: &[String]) -> i32 {
         files,
         ..Default::default()
     };
+    // PD3 reversibility: re-opening an ARCHIVED decision brings its bundle back from the
+    // archive before the `open` lands (best-effort; nothing is ever destroyed).
+    if let Err(err) = reopen_restore(&decisions_path(), &e.id) {
+        eprintln!("decision push: restore of the archived bundle failed — {err}");
+    }
     append_or_report("push", &e)
 }
 
@@ -320,7 +500,16 @@ fn mark(args: &[String], kind: DecisionKind) -> i32 {
         verdict: arg_after(args, "--verdict").map(str::to_string),
         ..Default::default()
     };
-    append_or_report(if kind == DecisionKind::Read { "read" } else { "tranch" }, &e)
+    let rc = append_or_report(if kind == DecisionKind::Read { "read" } else { "tranch" }, &e);
+    // PD3: a `tranch` triggers archiving — file the bundle under _archive/AAAA-MM/ and
+    // append the `archived` event (same as the HTTP route), so the CLI and UI agree.
+    if rc == 0
+        && kind == DecisionKind::Tranched
+        && let Err(err) = archive_decision(&decisions_path(), &outbox_base(), &e.id, e.at)
+    {
+        eprintln!("decision tranch: archive failed — {err}");
+    }
+    rc
 }
 
 fn append_or_report(verb: &str, e: &DecisionEvent) -> i32 {
@@ -466,6 +655,78 @@ mod tests {
             Some("NO-GO"),
             "the new cycle's verdict surfaces"
         );
+    }
+
+    /// A unique temp outbox dir with RAII cleanup (never touches the real ~/Dev/outbox).
+    struct TmpOutbox(PathBuf);
+    impl TmpOutbox {
+        fn new() -> Self {
+            let p = std::env::temp_dir().join(format!("kiosk-outbox-{}", crate::default_tab_id()));
+            std::fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for TmpOutbox {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    // PD3 ⭐ REAL-FS (anti built≠wired, NO mock): a REAL bundle file on disk is physically
+    // MOVED to `_archive/AAAA-MM/` at tranch→archive, the read-model points at the archive,
+    // and a re-open MOVES IT BACK (reversibility) — all proven on the actual filesystem.
+    #[test]
+    fn pd3_archive_moves_bundle_on_disk_and_reopen_restores() {
+        let log = TmpLog::new();
+        let outbox = TmpOutbox::new();
+        let bundle = outbox.path().join("ra1c-deploy.md");
+        std::fs::write(&bundle, b"the RA1c deploy bundle").unwrap();
+        let bundle_str = bundle.to_string_lossy().into_owned();
+
+        // push an open decision that references the REAL bundle, then rule it.
+        let mut o = open("ra1c", "harness", "Deploy RA1c", 100);
+        o.files = vec![bundle_str];
+        append_line(log.path(), &o).unwrap();
+        let mut tr = ev("ra1c", DecisionKind::Tranched, 110);
+        tr.verdict = Some("GO".into());
+        append_line(log.path(), &tr).unwrap();
+
+        // Archive (the tranch route's step): move the bundle to _archive/AAAA-MM/.
+        let ts = 1_756_700_000; // fixed timestamp -> deterministic AAAA-MM (2025-08)
+        let dir = archive_decision(log.path(), outbox.path(), "ra1c", ts).unwrap();
+
+        // The file REALLY moved: the original is gone, the archive copy exists (bytes kept).
+        assert!(!bundle.exists(), "the original bundle left the live outbox");
+        let month = archive_month(ts);
+        let archived = outbox.path().join("_archive").join(&month).join("ra1c-deploy.md");
+        assert!(archived.exists(), "the bundle now lives in _archive/{month}");
+        assert_eq!(std::fs::read_to_string(&archived).unwrap(), "the RA1c deploy bundle", "bytes preserved by the move");
+
+        // The read-model: archived, hidden by default; the view's files point at the
+        // archive (links stay valid) and the verdict rides the archived view (same cycle).
+        assert!(read_decisions_at(log.path(), false).iter().all(|d| d.id != "ra1c"), "archived hidden by default");
+        let all = read_decisions_at(log.path(), true);
+        let d = all.iter().find(|d| d.id == "ra1c").unwrap();
+        assert_eq!(d.state, DecisionState::Archived);
+        assert_eq!(d.files, vec![archived.to_string_lossy().into_owned()], "view.files points at the archive path");
+        assert_eq!(d.verdict.as_deref(), Some("GO"), "the verdict rides the archived view");
+        // The archived EVENT records archived_path = the month dir.
+        let body = std::fs::read_to_string(log.path()).unwrap();
+        let arch_ev = parse_decisions(&body).into_iter().rev().find(|e| e.id == "ra1c" && e.kind == DecisionKind::Archived).unwrap();
+        assert_eq!(arch_ev.archived_path.as_deref(), Some(dir.as_str()), "archived_path = the month dir");
+
+        // ⭐ REVERSIBILITY: a re-open MOVES the bundle back to its original path (nothing
+        // is ever destroyed; a moved bundle can come home).
+        reopen_restore(log.path(), "ra1c").unwrap();
+        assert!(bundle.exists(), "re-open restored the bundle to its original outbox path");
+        assert!(!archived.exists(), "the archive copy moved back (no duplication)");
+        assert_eq!(std::fs::read_to_string(&bundle).unwrap(), "the RA1c deploy bundle", "bytes intact after the round-trip");
+        // The explicit re-open event (as `push` appends after restore) -> state=open again.
+        append_line(log.path(), &open("ra1c", "harness", "Deploy RA1c v2", 120)).unwrap();
+        assert_eq!(read_decisions_at(log.path(), false).iter().find(|d| d.id == "ra1c").unwrap().state, DecisionState::Open);
     }
 
     // PD1: the CONTENT axis = latest open|update wins (append order), independent of the
