@@ -17,5 +17,6 @@ pub(super) mod cards;
 #[cfg(feature = "catbus")]
 pub(super) mod catbus;
 pub(super) mod dashboard;
+pub(super) mod decisions;
 pub(super) mod tabs;
 pub(super) mod task;
