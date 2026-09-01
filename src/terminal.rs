@@ -976,8 +976,10 @@ impl TerminalView {
 
     /// Override the terminal background (the project tint), or clear it back
     /// to the theme's. Takes effect on the next paint.
-    pub const fn set_bg_override(&mut self, rgb: Option<u32>) {
+    pub fn set_bg_override(&mut self, rgb: Option<u32>) {
         self.bg_override = rgb;
+        // The PTY side answers OSC colour queries off its own copy.
+        self.event_proxy.set_bg_override(rgb);
     }
 
     /// Set the cursor shape (block / slim bar / underline). Takes effect on
@@ -2394,7 +2396,10 @@ impl Element for TerminalElement {
             v[3].style = FontStyle::Italic;
             v
         };
-        let t = theme::theme(self.theme);
+        // Cells that resolve "the default background" (SGR 49, index 257, an
+        // inverse cell) must land on the tab's tint, not the theme's colour.
+        let t = theme::theme(self.theme).with_term_bg(self.bg_override);
+        let t = &t;
         let fg_default = t.term_fg_hsla();
 
         // Phase 1: read cell data under the lock — no shaping here.
@@ -3002,9 +3007,7 @@ impl Element for TerminalElement {
             // frame. Per-cell bg quads (below) skip default-bg cells —
             // without this base, anything left in the framebuffer from the
             // last redraw (other windows, scrolled-off rows) shows through.
-            let term_bg = self
-                .bg_override
-                .map_or_else(|| theme::theme(self.theme).term_bg_hsla(), |c| gpui::rgb(c).into());
+            let term_bg = theme::theme(self.theme).with_term_bg(self.bg_override).term_bg_hsla();
             window.paint_quad(fill(bounds, term_bg));
 
             // Paint backgrounds, with vertically-contiguous identical
