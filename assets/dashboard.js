@@ -295,22 +295,22 @@ export function conventionsCheck(tab) {
   return { conventions, declared, missing: !declared };
 }
 
-// --- Catalogue #39 SC2: read-only view over the catalog read-model ---
-// The catalogue is a COLD source, separate from the live poll (RB2): fetched
-// on-demand into a dedicated overlay, never in the 1.5s loop.
+// --- Catalogue #39 SC2 (reconciled to the live SC1 contract) ---
+// GET /catalog/list -> { retired, skills }. A skill's fold key is `skill`; metrics
+// are `metrics.byMode.{fresh,resume}{spawns,success,problem,tokensAvg,costAvg}`; the
+// A/B compare is an OBJECT `freshVsResume{verdict, freshN, resumeN, deliveryDelta,
+// tokensRatio}`. The RUST is the single source of the G1 guard (MIN_SAMPLE=3) — the
+// web renders the server verdict VERBATIM, never re-gates (no MIN_SAMPLE in JS).
+// The catalogue is a COLD source, fetched on-demand, never in the 1.5s poll (RB2).
 
-// Below this many samples per mode, a fresh-vs-resume comparison has no verdict
-// (borne 6: InsufficientSample explicit, never a pass/fail). Both modes need it.
-export const MIN_SAMPLE = 5;
-
-// Pure: the read-model's skills -> a deterministic list (sorted by proper name).
-// The read-model already excludes tombstoned skills (fold axis-visibility). Null-safe.
+// Pure: the read-model's skills -> a deterministic list (sorted by the fold key
+// `skill`). Tombstoned skills are already filtered server-side. Null-safe.
 export function catalogView(readModel) {
   const skills = readModel && Array.isArray(readModel.skills) ? readModel.skills : [];
   return skills
-    .filter((s) => s && s.name != null)
+    .filter((s) => s && s.skill != null)
     .slice()
-    .sort((a, b) => String(a.name).localeCompare(String(b.name)));
+    .sort((a, b) => String(a.skill).localeCompare(String(b.skill)));
 }
 
 // Pure: a skill's profile fold -> normalised render fields. Absent -> ""/[]/null.
@@ -318,55 +318,46 @@ export function skillProfileModel(skill) {
   const s = skill || {};
   const arr = (x) => (Array.isArray(x) ? x.map(String) : []);
   return {
-    name: s.name != null ? String(s.name) : "",
+    name: s.skill != null ? String(s.skill) : "",
     prompt: s.prompt != null ? String(s.prompt) : "",
     specialty: s.specialty != null ? String(s.specialty) : "",
     conventions: arr(s.conventions),
     tools: arr(s.tools),
     patterns: arr(s.patterns),
     promptVersion: s.promptVersion != null ? s.promptVersion : null,
+    usageCount: s.usageCount != null ? s.usageCount : null,
   };
 }
 
-// Normalise a directional verdict (accepts CamelCase / snake / spaced), else null.
-function normalizeVerdict(raw) {
-  const s = String(raw == null ? "" : raw).toLowerCase().replace(/[_\s-]/g, "");
-  if (s === "freshfavored") return "FreshFavored";
-  if (s === "resumefavored") return "ResumeFavored";
-  if (s === "inconclusive") return "Inconclusive";
-  if (s === "insufficientsample") return "InsufficientSample";
-  return null;
-}
-
-// Pure: the byMode metrics table model (borne 6). Returns the two mode rows plus a
-// DIRECTIONAL fresh_vs_resume verdict + sample size n. When either mode has fewer
-// than `minSample` data points the verdict is "InsufficientSample" (explicit, no
-// pass/fail). Prefers the server-derived fresh_vs_resume; derives a DIRECTION from
-// success rates only as a fallback — never a per-task binary verdict. Null-safe.
-export function byModeMetricsModel(skill, minSample = MIN_SAMPLE) {
+// Pure: the byMode metrics table model. The fresh_vs_resume VERDICT is the server's
+// (`freshVsResume.verdict`, camelCase: insufficientSample | inconclusive |
+// freshFavored | resumeFavored) rendered VERBATIM — the rust applies G1 (MIN_SAMPLE=3)
+// as the single source of truth, so there is NO JS re-gate. Per-arm sample sizes
+// (freshN/resumeN) are surfaced (G3). Never a per-task pass/fail. Null-safe.
+export function byModeMetricsModel(skill) {
   const bm = (skill && skill.metrics && skill.metrics.byMode) || {};
   const norm = (m) => ({
+    spawns: Number((m && m.spawns) || 0),
     success: Number((m && m.success) || 0),
     problem: Number((m && m.problem) || 0),
-    tokensAvg: Number((m && m.tokensAvg) || 0),
-    costAvg: Number((m && m.costAvg) || 0),
-    n: Number((m && m.n) || 0),
+    tokensAvg: m && m.tokensAvg != null ? Number(m.tokensAvg) : null,
+    costAvg: m && m.costAvg != null ? Number(m.costAvg) : null,
   });
-  const fresh = norm(bm.fresh);
-  const resume = norm(bm.resume);
-  const insufficient = fresh.n < minSample || resume.n < minSample;
-  let verdict;
-  if (insufficient) {
-    verdict = "InsufficientSample";
-  } else {
-    verdict = normalizeVerdict(skill && skill.fresh_vs_resume);
-    if (!verdict) {
-      const rate = (m) => (m.success + m.problem ? m.success / (m.success + m.problem) : 0);
-      const d = rate(fresh) - rate(resume);
-      verdict = Math.abs(d) < 0.05 ? "Inconclusive" : d > 0 ? "FreshFavored" : "ResumeFavored";
-    }
-  }
-  return { fresh, resume, n: fresh.n + resume.n, nFresh: fresh.n, nResume: resume.n, insufficient, verdict };
+  const fvr = (skill && skill.freshVsResume) || {};
+  const verdict = fvr.verdict != null ? String(fvr.verdict) : "insufficientSample";
+  const freshN = Number(fvr.freshN || 0);
+  const resumeN = Number(fvr.resumeN || 0);
+  return {
+    fresh: norm(bm.fresh),
+    resume: norm(bm.resume),
+    verdict,
+    freshN,
+    resumeN,
+    n: freshN + resumeN,
+    insufficient: verdict === "insufficientSample",
+    deliveryDelta: fvr.deliveryDelta != null ? Number(fvr.deliveryDelta) : null,
+    tokensRatio: fvr.tokensRatio != null ? Number(fvr.tokensRatio) : null,
+  };
 }
 
 // --- S5/S6: orchestrator tint + altitude bands + delegation lineage ---
@@ -1446,31 +1437,32 @@ function closeAgentCard() {
 }
 
 // --- Catalogue #39 SC2: on-demand overlay over the catalog read-model ---
-// The read-only catalog GET (camelCase, same token as the dashboard). Path to be
-// confirmed with SC1/ta-rust; a 1-line change if it differs.
-const CATALOG_URL = "/catalog";
+// The read-only catalog read-model (camelCase, same page token as the dashboard).
+const CATALOG_URL = "/catalog/list";
 
-// The directional verdict -> {cls, label}. Never pass/fail: the class encodes the
-// DIRECTION (or the explicit insufficient-sample case), not a binary verdict.
+// The server verdict (camelCase, VERBATIM) -> {cls, label}. Never pass/fail: the
+// class encodes the DIRECTION (or the explicit insufficient-sample case). The rust
+// owns the G1 guard — no JS threshold here.
 function verdictBadge(m) {
   const map = {
-    FreshFavored: { cls: "fvr-fresh", label: "fresh favorisé" },
-    ResumeFavored: { cls: "fvr-resume", label: "resume favorisé" },
-    Inconclusive: { cls: "fvr-inconclusive", label: "non concluant" },
-    InsufficientSample: { cls: "fvr-insufficient", label: "échantillon trop petit, pas de verdict" },
+    freshFavored: { cls: "fvr-fresh", label: "fresh favorisé" },
+    resumeFavored: { cls: "fvr-resume", label: "resume favorisé" },
+    inconclusive: { cls: "fvr-inconclusive", label: "non concluant" },
+    insufficientSample: { cls: "fvr-insufficient", label: "échantillon trop petit, pas de verdict" },
   };
-  const v = map[m.verdict] || map.Inconclusive;
-  const n = m.insufficient ? `n=${m.n} (< ${MIN_SAMPLE}/mode)` : `n=${m.n}`;
+  const v = map[m.verdict] || map.inconclusive;
+  const n = `fresh n=${m.freshN} · resume n=${m.resumeN}`;
   return `<span class="fvr-verdict ${v.cls}" data-verdict="${escapeHtml(m.verdict)}">${escapeHtml(v.label)} · ${escapeHtml(n)}</span>`;
 }
 
-// The fresh-vs-resume metrics table for a skill (borne 6).
+// The fresh-vs-resume metrics table for a skill (byMode ledger).
 function metricsTableHtml(skill) {
   const m = byModeMetricsModel(skill);
+  const num = (x) => (x == null ? "—" : x);
   const row = (label, mode) =>
-    `<tr><th scope="row">${label}</th><td>${mode.success}</td><td>${mode.problem}</td><td>${mode.tokensAvg}</td><td>${mode.costAvg}</td><td>${mode.n}</td></tr>`;
+    `<tr><th scope="row">${label}</th><td>${mode.spawns}</td><td>${mode.success}</td><td>${mode.problem}</td><td>${num(mode.tokensAvg)}</td><td>${num(mode.costAvg)}</td></tr>`;
   return `<div class="cat-metrics">
-    <table class="metrics-table"><thead><tr><th></th><th>success</th><th>problem</th><th>tokensAvg</th><th>costAvg</th><th>n</th></tr></thead>
+    <table class="metrics-table"><thead><tr><th></th><th>spawns</th><th>success</th><th>problem</th><th>tokensAvg</th><th>costAvg</th></tr></thead>
     <tbody>${row("fresh", m.fresh)}${row("resume", m.resume)}</tbody></table>
     <div class="fvr-line">fresh_vs_resume : ${verdictBadge(m)}</div>
   </div>`;
