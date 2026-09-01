@@ -68,8 +68,11 @@ pub(super) fn authorize(
         }
         ok
     };
-    let is_dashboard_token =
-        dashboard_matches && matches!(path, "/dashboard" | "/dashboard/state" | "/dashboard/activity");
+    // The read-only dashboard token also reads the catalogue read-model on-demand
+    // (SC1 #39): the VUE is a separate cold source (RB2), fetched off the live poll.
+    // Only the GET list — the POST mutations stay master-token-only.
+    let is_dashboard_token = dashboard_matches
+        && matches!(path, "/dashboard" | "/dashboard/state" | "/dashboard/activity" | "/catalog/list");
     if is_master || is_dashboard_token {
         return Gate::Allow;
     }

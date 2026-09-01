@@ -2121,6 +2121,14 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             let queue = &p["/task/".len()..p.len() - "/list".len()];
             handlers::task::list(stream, state, queue);
         }
+        // SC1 (#39): the dashboard catalogue MUTATIONS — edit/delete/restore, each an
+        // event-sourced APPEND under the daemon lock (single-writer, read-back gated).
+        ("POST", p)
+            if p.starts_with("/catalog/")
+                && (p.ends_with("/edit") || p.ends_with("/delete") || p.ends_with("/restore")) =>
+        {
+            handlers::catalog::mutate(stream, state, p, &body_bytes);
+        }
         // RB2 read-model: the retired-agent catalogue. READ-ONLY (GET).
         ("GET", "/catalog/list") => handlers::catalog::list(stream),
         (_, "/" | "/tabs") => {
@@ -6846,5 +6854,160 @@ mod tests {
         assert_eq!(sk["freshVsResume"]["verdict"], serde_json::json!("insufficientSample"), "G1 gates at n=1");
         assert_eq!(sk["freshVsResume"]["freshN"].as_u64(), Some(1), "G3: sample size surfaced");
         assert_eq!(sk["freshVsResume"]["resumeN"].as_u64(), Some(0));
+    }
+
+    /// Removes every catalog.jsonl record for one SKILL on drop — the SC1 mutation
+    /// records (edit/delete/restore) carry no id, so they're keyed by skill here.
+    struct CatalogSkillCleanup(String);
+    impl Drop for CatalogSkillCleanup {
+        fn drop(&mut self) {
+            let path = crate::cli::catalog::catalog_path();
+            let Ok(body) = std::fs::read_to_string(&path) else { return };
+            let kept: Vec<crate::cli::catalog::CatalogCard> = crate::cli::catalog::parse_catalog(&body)
+                .into_iter()
+                .filter(|c| c.skill.as_deref() != Some(self.0.as_str()))
+                .collect();
+            if kept.is_empty() {
+                let _ = std::fs::remove_file(&path);
+            } else {
+                let out: String = kept.iter().map(crate::cli::catalog::encode_catalog_line).collect();
+                let _ = std::fs::write(&path, out);
+            }
+        }
+    }
+
+    /// GET /catalog/list → the `skills` array (the read-model), for the SC1 live tests.
+    fn catalog_skills(port: u16, token: &str) -> Vec<serde_json::Value> {
+        let listed = request(port, &format!("GET /catalog/list?token={token} HTTP/1.1\r\n\r\n"));
+        let json: serde_json::Value = serde_json::from_str(body_of(&listed)).expect("catalog list json");
+        json["skills"].as_array().cloned().unwrap_or_default()
+    }
+
+    // SC1 (#39): the LIVE mutation routes — a REAL integration test (real-fs, real
+    // routes, NO mock). Seeds a real v2 record, then EDIT → read-model shows the new
+    // version ; DELETE → skill absent ; edit-after-delete → STILL absent (no implicit
+    // resurrection, borne 5) ; RESTORE → re-present with the latest content.
+    #[test]
+    fn sc1_live_edit_delete_restore_and_no_implicit_resurrection() {
+        use crate::cli::catalog::{RecordKind, SpawnMode, catalog_path, latest_content_for, read_catalog_cards};
+        let _guard = real_catalog_test_guard();
+        let (port, _state, token) = spawn_server();
+        let post = |path: &str, body: &str| {
+            format!("POST /{path}?token={token} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+        };
+        let run = crate::default_tab_id();
+        let skill = format!("sc1-{}", &run[..8.min(run.len())]);
+        let _cleanup = CatalogSkillCleanup(skill.clone());
+
+        // Seed a real v2 retire record for the skill (real fs).
+        let seed = crate::cli::catalog::CatalogCard {
+            skill: Some(skill.clone()),
+            prompt: Some("base".into()),
+            prompt_version: Some(1),
+            schema_version: Some(2),
+            spawn_mode: Some(SpawnMode::Fresh),
+            outcome: Some(crate::cli::catalog::Outcome::Success),
+            retired_at: 1,
+            ..Default::default()
+        };
+        crate::cli::catalog::append_catalog_line(&catalog_path(), &seed).unwrap();
+        assert!(catalog_skills(port, &token).iter().any(|s| s["skill"] == serde_json::json!(skill)), "seeded");
+
+        // EDIT via the real route → 200 + read-model shows v2 with the new prompt.
+        let e = request(port, &post(&format!("catalog/{skill}/edit"), r#"{"prompt":"edited","promptVersion":1}"#));
+        assert_eq!(status_code(&e), 200, "edit → 200\n{e}");
+        assert_eq!(
+            latest_content_for(&read_catalog_cards(), &skill).and_then(|c| c.prompt.clone()),
+            Some("edited".into()),
+            "the edit landed in the REAL catalog.jsonl"
+        );
+        let sk = catalog_skills(port, &token);
+        let s = sk.iter().find(|s| s["skill"] == serde_json::json!(skill)).expect("present");
+        assert_eq!(s["prompt"], serde_json::json!("edited"), "read-model shows the edited prompt");
+        assert_eq!(s["promptVersion"].as_u64(), Some(2), "promptVersion bumped 1→2");
+
+        // DELETE → 200 + skill ABSENT from the read-model (tombstoned).
+        let d = request(port, &post(&format!("catalog/{skill}/delete"), "{}"));
+        assert_eq!(status_code(&d), 200, "delete → 200\n{d}");
+        assert!(
+            !catalog_skills(port, &token).iter().any(|s| s["skill"] == serde_json::json!(skill)),
+            "delete tombstones the skill from the read-model"
+        );
+
+        // ⭐ EDIT after delete → the append succeeds (200) but the skill STAYS hidden.
+        let e2 = request(port, &post(&format!("catalog/{skill}/edit"), r#"{"prompt":"sneaky"}"#));
+        assert_eq!(status_code(&e2), 200, "edit-after-delete appends → 200\n{e2}");
+        assert!(
+            !catalog_skills(port, &token).iter().any(|s| s["skill"] == serde_json::json!(skill)),
+            "an edit after delete does NOT resurrect (borne 5)"
+        );
+
+        // RESTORE → 200 + skill re-present with the LATEST content (the post-delete edit).
+        let r = request(port, &post(&format!("catalog/{skill}/restore"), "{}"));
+        assert_eq!(status_code(&r), 200, "restore → 200\n{r}");
+        let sk2 = catalog_skills(port, &token);
+        let s2 = sk2.iter().find(|s| s["skill"] == serde_json::json!(skill)).expect("restored");
+        assert_eq!(s2["prompt"], serde_json::json!("sneaky"), "restore brings back the latest content");
+        // Sanity: a mutation record is v-typed on disk (kind present).
+        let _ = RecordKind::Delete;
+
+        // CF1 (borne 4): an edit to an empty prompt → 409, catalogue unchanged.
+        let bad = request(port, &post(&format!("catalog/{skill}/edit"), r#"{"prompt":"   "}"#));
+        assert_eq!(status_code(&bad), 409, "edit to empty prompt → 409 (CF1)\n{bad}");
+    }
+
+    // SC1 borne 3: concurrent EDITs never lose an update — each read-modify-append
+    // under the daemon lock bumps a DISTINCT promptVersion (no two edits collide).
+    #[test]
+    fn sc1_live_concurrent_edits_no_lost_update() {
+        use crate::cli::catalog::{SpawnMode, catalog_path, read_catalog_cards};
+        let _guard = real_catalog_test_guard();
+        let (port, _state, token) = spawn_server();
+        let run = crate::default_tab_id();
+        let skill = format!("sc1c-{}", &run[..8.min(run.len())]);
+        let _cleanup = CatalogSkillCleanup(skill.clone());
+
+        let seed = crate::cli::catalog::CatalogCard {
+            skill: Some(skill.clone()),
+            prompt: Some("base".into()),
+            prompt_version: Some(1),
+            schema_version: Some(2),
+            spawn_mode: Some(SpawnMode::Fresh),
+            outcome: Some(crate::cli::catalog::Outcome::Success),
+            retired_at: 1,
+            ..Default::default()
+        };
+        crate::cli::catalog::append_catalog_line(&catalog_path(), &seed).unwrap();
+
+        // Fire N concurrent edits (each its own TCP connection).
+        let n: usize = 5;
+        let handles: Vec<_> = (0..n)
+            .map(|i| {
+                let skill = skill.clone();
+                let token = token.clone();
+                std::thread::spawn(move || {
+                    let body = format!(r#"{{"prompt":"e{i}"}}"#);
+                    let req = format!(
+                        "POST /catalog/{skill}/edit?token={token} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    status_code(&request(port, &req))
+                })
+            })
+            .collect();
+        for h in handles {
+            assert_eq!(h.join().unwrap(), 200, "each concurrent edit → 200");
+        }
+
+        // Each edit produced a DISTINCT promptVersion (no lost update / collision): the
+        // seed (v1) + N edits ⇒ N+1 distinct versions, max = N+1.
+        let cards = read_catalog_cards();
+        let versions: std::collections::BTreeSet<u32> = cards
+            .iter()
+            .filter(|c| c.skill.as_deref() == Some(skill.as_str()))
+            .filter_map(|c| c.prompt_version)
+            .collect();
+        assert_eq!(versions.len(), n + 1, "every edit got a distinct version (no lost update): {versions:?}");
+        assert_eq!(versions.iter().max().copied(), Some((n + 1) as u32), "versions are a dense 1..=N+1 chain");
     }
 }

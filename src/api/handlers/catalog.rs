@@ -131,3 +131,99 @@ pub(in crate::api) fn retire<S: Write>(stream: &mut S, state: &Arc<Mutex<TabSnap
         }
     }
 }
+
+/// `POST /catalog/{skill}/{edit|delete|restore}` (SC1 #39) — the dashboard catalogue
+/// MUTATIONS. Each is an APPEND (event-sourced); the read-model fold derives the new
+/// state. The whole read-modify-append runs UNDER THE DAEMON LOCK (single-writer,
+/// atomic — borne 3, the same lock retire holds) + a read-back gate (append → re-read →
+/// confirm → 200, like `perform_retire`).
+///
+/// - `edit` — body `{specialty?, prompt?, conventions?, promptVersion?}`. Absent fields
+///   carry from the latest content; `promptVersion++`. CF1 (borne 4): a result with an
+///   empty skill/prompt → 409. A stale `promptVersion` → 409 (concurrent edit). No such
+///   skill → 404. Never touches visibility.
+/// - `delete` — append a tombstone (STICKY). `restore` — the EXPLICIT un-tombstone (the
+///   only resurrection). A delete/restore of a nonexistent skill is a 200 no-op.
+pub(in crate::api) fn mutate<S: Write>(stream: &mut S, state: &Arc<Mutex<TabSnapshot>>, p: &str, body_bytes: &[u8]) {
+    use crate::cli::catalog::{
+        EditBody, EditError, RecordKind, append_catalog_line, catalog_path, last_visibility_for, latest_content_for,
+        plan_edit, read_catalog_cards_at, skill_exists, visibility_record,
+    };
+
+    let Some((skill_enc, verb)) = p.strip_prefix("/catalog/").and_then(|rest| rest.rsplit_once('/')) else {
+        error_json(stream, 404, "bad catalog path");
+        return;
+    };
+    let skill = String::from_utf8_lossy(&crate::api_ws::percent_decode(skill_enc)).into_owned();
+    if skill.trim().is_empty() {
+        error_json(stream, 400, "empty skill name");
+        return;
+    }
+    let now = crate::unix_millis();
+    let cat = catalog_path();
+
+    // Under the daemon lock: read → modify → append → read-back, ATOMIC + single-writer
+    // (retire holds this same lock, so all catalogue writers serialise).
+    let guard = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let cards = read_catalog_cards_at(&cat);
+
+    match verb {
+        "edit" => {
+            let body: EditBody = serde_json::from_slice(body_bytes).unwrap_or_default();
+            match plan_edit(latest_content_for(&cards, &skill), &skill, &body, now) {
+                Ok(rec) => {
+                    let want = rec.prompt_version;
+                    if append_catalog_line(&cat, &rec).is_err() {
+                        drop(guard);
+                        error_json(stream, 500, "catalog edit: append failed");
+                        return;
+                    }
+                    // Read-back gate: the latest content now carries the bumped version.
+                    let landed = latest_content_for(&read_catalog_cards_at(&cat), &skill).and_then(|c| c.prompt_version);
+                    drop(guard);
+                    if landed == want {
+                        respond_json(stream, 200, &format!(r#"{{"edited":"{skill}","promptVersion":{}}}"#, want.unwrap_or(0)));
+                    } else {
+                        error_json(stream, 500, "catalog edit: read-back failed");
+                    }
+                }
+                Err(EditError::NotFound) => {
+                    drop(guard);
+                    error_json(stream, 404, "catalog edit: no such skill");
+                }
+                Err(EditError::EmptyProfile) => {
+                    drop(guard);
+                    error_json(stream, 409, "catalog edit: skill/prompt must stay non-empty (CF1)");
+                }
+                Err(EditError::Conflict) => {
+                    drop(guard);
+                    error_json(stream, 409, "catalog edit: stale promptVersion — a concurrent edit landed first");
+                }
+            }
+        }
+        verb @ ("delete" | "restore") => {
+            let kind = if verb == "delete" { RecordKind::Delete } else { RecordKind::Restore };
+            if !skill_exists(&cards, &skill) {
+                drop(guard);
+                respond_json(stream, 200, &format!(r#"{{"{verb}":"{skill}","noop":true}}"#));
+                return;
+            }
+            if append_catalog_line(&cat, &visibility_record(&skill, kind, now)).is_err() {
+                drop(guard);
+                error_json(stream, 500, "catalog visibility: append failed");
+                return;
+            }
+            let landed = last_visibility_for(&read_catalog_cards_at(&cat), &skill) == Some(kind);
+            drop(guard);
+            if landed {
+                respond_json(stream, 200, &format!(r#"{{"{verb}":"{skill}"}}"#));
+            } else {
+                error_json(stream, 500, "catalog visibility: read-back failed");
+            }
+        }
+        _ => {
+            drop(guard);
+            error_json(stream, 404, "unknown catalog verb");
+        }
+    }
+}

@@ -482,7 +482,7 @@ fn extract_since<B>(req: &Request<B>) -> u64 {
 /// Tokens today are 32 hex chars (every byte ≤ 0x66) so this never
 /// fires in practice, but it's a latent corruption waiting for the
 /// first non-ASCII byte routed through the decoder.
-fn percent_decode(s: &str) -> Vec<u8> {
+pub fn percent_decode(s: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(s.len());
     let bytes = s.as_bytes();
     let mut i = 0;
