@@ -50,6 +50,18 @@ no override and no rule means no badge.
 - **`GET /tabs`** — `badge`, plus the already-existing effective `bg_color`, so
   the share-link viewer and the Android remote render the same identity.
 
+## Open question — should Ctrl+P match on the badge?
+
+The MRU switcher filters on the tab name. Once projects carry a badge, typing
+`OS` or `MOUNCH` there is an obvious thing to reach for, and today it finds
+nothing unless the name happens to contain it.
+
+Undecided, and worth using the feature for a while first: a badge is short and
+shared by many tabs, so matching it would make one keystroke select 20 rows —
+useful as a filter ("show me the Onestaff tabs"), unhelpful if you were trying
+to jump to one tab. If it lands, the shape is probably to match name first and
+fall back to badge, so a name hit always outranks a project-wide one.
+
 ## Storage
 
 Folder rules live in `preferences.json` under `folder_styles` and are read at

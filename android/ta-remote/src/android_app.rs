@@ -295,6 +295,10 @@ struct ApiTab {
     /// same dot the desktop tab strip does.
     #[serde(default)]
     led: Option<String>,
+    /// Short project tag the desktop draws on the tab, resolved server-side
+    /// from the tab's folder rule (or its own override). Absent ⇒ no chip.
+    #[serde(default)]
+    badge: Option<String>,
     /// Unix-millis of the last time this tab was used (input / activate /
     /// viewer open), from the daemon. The list is ordered by this descending
     /// so the most-recently-used tabs float to the top. Absent ⇒ never used.
@@ -726,6 +730,7 @@ fn push_tabs(ui_weak: &Weak<AppWindow>, tabs: Vec<ApiTab>) {
                 let last_used = t.last_used_at.unwrap_or(0);
                 let row = TabRow {
                     name: SharedString::from(t.name.clone()),
+                    badge: SharedString::from(t.badge.unwrap_or_default()),
                     cwd: SharedString::from(t.cwd.unwrap_or_default()),
                     active: t.active,
                     cpu: SharedString::from(match t.watts {

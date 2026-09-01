@@ -36,6 +36,13 @@ pub struct EventProxy {
     /// into the parser thread.
     #[cfg(feature = "gui")]
     theme: Arc<Mutex<ThemeName>>,
+    /// Per-tab background tint (`#RRGGBB` packed), mirrored from
+    /// `TerminalView::set_bg_override`. An app that asks for the background
+    /// (OSC 11) must be told the colour we actually paint, or it computes its
+    /// own highlights against the theme's colour and they clash — which is
+    /// exactly what happens to Claude Code's submitted input line.
+    #[cfg(feature = "gui")]
+    bg_override: Arc<Mutex<Option<u32>>>,
     /// Flipped by `ChildExit` — alacritty's event loop already watches the PTY
     /// child, so the shell's death arrives as an event instead of a `/proc`
     /// poll. Shared with `TerminalView::exited`.
@@ -47,6 +54,13 @@ impl EventProxy {
     pub fn set_notifier(&self, sender: EventLoopSender) {
         if let Ok(mut slot) = self.notifier.lock() {
             *slot = Some(sender);
+        }
+    }
+
+    #[cfg(feature = "gui")]
+    pub fn set_bg_override(&self, rgb: Option<u32>) {
+        if let Ok(mut b) = self.bg_override.lock() {
+            *b = rgb;
         }
     }
 
@@ -77,7 +91,8 @@ impl EventListener for EventProxy {
             #[cfg(feature = "gui")]
             AlacrittyEvent::ColorRequest(index, formatter) => {
                 let theme = self.theme.lock().map_or_else(|_| ThemeName::default(), |t| *t);
-                formatter(crate::theme::theme(theme).color_index_to_rgb(index)).into_bytes()
+                let tint = self.bg_override.lock().map_or(None, |b| *b);
+                formatter(crate::theme::theme(theme).with_term_bg(tint).color_index_to_rgb(index)).into_bytes()
             }
             _ => return,
         };

@@ -15,6 +15,9 @@ import "../fonts/NotoEmoji.ttf";
 
 struct TabRow {
     name: string,
+    /// Project tag from the desktop's folder rules ("MOUNCH", "OS", …).
+    /// Empty ⇒ no chip, exactly like the desktop tab strip.
+    badge: string,
     cwd: string,
     active: bool,
     cpu: string,
@@ -240,6 +243,20 @@ component TabCard inherits Rectangle {
                             y: parent.height / 2 - 3.5px;
                             border-radius: 3.5px;
                             background: tab.led-color;
+                        }
+                        // Project tag, mirroring the desktop's chip so the same
+                        // tab reads the same on both surfaces.
+                        if tab.badge != "" : Rectangle {
+                            background: #2a2a2a;
+                            border-radius: 3px;
+                            height: 18px;
+                            width: badge-text.preferred-width + 8px;
+                            badge-text := Text {
+                                text: tab.badge;
+                                color: #b9b9b9;
+                                font-size: 11px;
+                                font-weight: 600;
+                            }
                         }
                         Text {
                             text: tab.name;
