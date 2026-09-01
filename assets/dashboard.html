@@ -16,6 +16,10 @@
     <!-- Catalogue #39 SC2: opens the cold catalog read-model in a separate overlay
          (a skill is NOT a live tab — distinct visual vocabulary). -->
     <button id="catalog-toggle" class="catalog-toggle" aria-controls="catalog-panel">Catalogue</button>
+    <!-- KIOSK PD2 (#kiosk): the cross-project PENDING-DECISIONS panel, a separate cold
+         source fetched on-demand (NOT in the live poll). The badge = nb of open
+         decisions; hidden when zero. -->
+    <button id="kiosk-toggle" class="kiosk-toggle" aria-controls="kiosk-panel">Kiosk<span id="kiosk-badge" class="kiosk-badge" hidden>0</span></button>
   </header>
 
   <main id="dashboard" aria-label="harness workflow">
@@ -140,6 +144,10 @@
   <!-- Catalogue #39 SC2: the cold catalog read-model, opened on-demand from the
        topbar button. Populated by dashboard.js from catalogView(readModel). -->
   <div id="catalog-panel" class="catalog-panel" role="dialog" aria-label="catalogue des skills" hidden></div>
+
+  <!-- KIOSK PD2 (#kiosk): the cross-project pending-decisions read-model, opened
+       on-demand from the topbar. Populated by dashboard.js from kioskView(readModel). -->
+  <div id="kiosk-panel" class="kiosk-panel" role="dialog" aria-label="décisions en attente" hidden></div>
 
   <script type="module" src="/assets/dashboard.js"></script>
 </body>
