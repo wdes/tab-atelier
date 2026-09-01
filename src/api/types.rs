@@ -437,6 +437,11 @@ pub struct DashboardState {
     /// live snapshot, so this is NOT a filter of it), folded latest-per-slug.
     /// READ-ONLY / INERT. Filled at the handler; empty from the pure builder.
     pub(crate) retired: Vec<crate::cli::catalog::CatalogCard>,
+    /// agent-lifecycle v2 (SV3) read-model: retired records folded BY SKILL NAME into
+    /// one mode-agnostic profile + per-mode metrics + a DERIVED fresh-vs-resume
+    /// compare. v2 records only (v1 quarantined). Filled at the handler; empty from
+    /// the pure builder. READ-ONLY.
+    pub(crate) skills: Vec<crate::cli::catalog::SkillProfile>,
 }
 
 /// Minimal per-tab projection the dashboard builder consumes, so the
