@@ -748,3 +748,26 @@ body.band-view { min-height: calc(100vh + 180px); }
 .fvr-verdict.fvr-inconclusive { color: var(--muted); }
 .fvr-verdict.fvr-insufficient { color: var(--muted); border-style: dashed; }
 .catalog-panel[hidden] { display: none; }
+
+/* --- Catalogue #39 SC3: edit form + delete/restore --- */
+.cat-edit { margin-top: 0.7rem; padding-top: 0.6rem; border-top: 1px dashed var(--border); }
+.cat-edit-row { display: flex; gap: 0.6rem; align-items: flex-start; margin-bottom: 0.4rem; }
+.cat-edit-row > label { flex: 0 0 6.5rem; font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.03em; color: var(--muted); padding-top: 0.25rem; }
+.cat-edit-row > label small { text-transform: none; letter-spacing: 0; }
+.cat-edit input, .cat-edit textarea {
+  flex: 1 1 auto; font: inherit; font-size: 0.82rem;
+  padding: 0.3rem 0.4rem; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--bg); color: var(--fg); resize: vertical;
+}
+.cat-edit-actions { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.2rem; }
+.cat-save, .cat-delete, .cat-restore {
+  font: inherit; font-size: 0.78rem; padding: 0.25rem 0.7rem; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--panel); color: var(--fg); cursor: pointer;
+}
+.cat-save { border-color: var(--led-working-stroke); color: var(--led-working-stroke); }
+.cat-delete { border-color: var(--led-error-stroke); color: var(--led-error-stroke); }
+.cat-restore { border-color: var(--led-idle-stroke); color: var(--led-idle-stroke); }
+.cat-edit-msg { font-size: 0.74rem; color: var(--muted); }
+.cat-edit-msg.err { color: var(--led-error-stroke); }
+.cat-tombstone { font-size: 0.62rem; text-transform: uppercase; color: var(--muted); border: 1px dashed var(--border); border-radius: 999px; padding: 0 0.35rem; }
+.cat-skill.cat-deleted .cat-name { color: var(--muted); text-decoration: line-through; }
