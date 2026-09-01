@@ -1216,19 +1216,13 @@ pub fn run() -> std::io::Result<()> {
     {
         let now = crate::unix_millis();
         let build = env!("BUILD_HASH");
-        if let Some(report) = crate::cli::restart_wake::emit_startup_wake(
-            read_only,
-            tabs.iter().map(|t| (&*t.id, t.assignment.as_deref())),
-            build,
-            now,
-            crate::cli::restart_wake::real_note,
-            |orch, msg| crate::cli::restart_wake::real_swamp_push(now, build, orch, msg),
-        ) {
-            info!(
-                "RA1 restart-wake: build={build} pushed={} failed={}",
-                report.pushed, report.failed
-            );
-        }
+        // RA1c: the ops note fires now; the submit=true wake is deferred + staggered on
+        // a bg thread (readiness-gated) so it triggers each orchestrator's turn without
+        // the boot-race / thundering-herd. Fire-and-forget; startup never blocks.
+        let roster =
+            crate::cli::restart_wake::orchestrator_roster(tabs.iter().map(|t| (&*t.id, t.assignment.as_deref())));
+        info!("RA1c restart-wake: build={build} roster={}", roster.len());
+        crate::cli::restart_wake::spawn_startup_wake(read_only, roster, build, now);
     }
 
     #[cfg(feature = "energy")]
