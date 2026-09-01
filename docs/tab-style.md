@@ -75,7 +75,8 @@ daemon start, like `bg-color --global`:
 }
 ```
 
-So editing rules needs a daemon restart to take effect; *using* them doesn't —
-tabs resolve against the loaded rules whenever they're created or move. Per-tab
-overrides go through the running daemon (`POST /tabs/by-id/<id>/bg-color` and
-`/badge`) and are persisted in `tabs.json` with the rest of the tab's state.
+An edit is picked up on the next tick — the daemon stats the file each tick and
+re-reads it only when the mtime moved, so a rule change lands on a running
+desktop without restarting it. Per-tab overrides go through the running daemon
+(`POST /tabs/by-id/<id>/bg-color` and `/badge`) and are persisted in `tabs.json`
+with the rest of the tab's state.

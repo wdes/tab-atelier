@@ -220,6 +220,10 @@ struct Tab {
     /// terminal when the project colour actually changed (a `cd` into another
     /// project, or an edited rule).
     applied_tint: std::cell::Cell<Option<u32>>,
+    /// Badge resolved for this tab (own override, else its folder rule),
+    /// refreshed on the persist tick. Cached so the tab strip renders from a
+    /// field instead of resolving a rule per tab per frame.
+    resolved_badge: Option<std::sync::Arc<str>>,
     /// Free-text context the in-tab agent set via `set-context` (e.g.
     /// the PR/task it's on). Shown as a hover tooltip on the tab name.
     /// In-memory; set via the API + drained from the snapshot.
@@ -323,6 +327,7 @@ impl Tab {
             bg_color: ts.bg_color.clone(),
             badge: ts.badge.clone(),
             applied_tint: std::cell::Cell::new(None),
+            resolved_badge: None,
             context: None,
             last_pushed_locked: None,
             pending_agent_resume,
@@ -1888,6 +1893,9 @@ impl AppState {
     }
 
     fn persist(&mut self, cx: &mut Context<Self>) {
+        // Pick up an edited `style --folder` rule without a restart; a stat per
+        // tick, parsed only when the file moved.
+        crate::refresh_folder_styles();
         if self.visible {
             let tab = &mut self.tabs[self.active];
             let idle = tab
@@ -2082,18 +2090,20 @@ impl AppState {
             let Some(grid) = tab.snap_cache.clone() else {
                 continue;
             };
-            let folder = crate::folder_style_for(crate::folder_styles(), tab.last_known_cwd_string.as_deref());
+            let folder = crate::folder_style_of(tab.last_known_cwd_string.as_deref());
             let bg_color = crate::effective_tab_bg(
                 tab.bg_color.as_deref(),
-                folder.and_then(|f| f.color.as_deref()),
+                folder.color.as_deref(),
                 self.tab_bg_global.as_deref(),
             )
             .into();
-            let badge = crate::effective_tab_badge(tab.badge.as_deref(), folder.and_then(|f| f.badge.as_deref()))
-                .map(Into::into);
+            let badge: Option<std::sync::Arc<str>> =
+                crate::effective_tab_badge(tab.badge.as_deref(), folder.badge.as_deref()).map(Into::into);
+            tab.resolved_badge.clone_from(&badge);
             // Paint the project tint into the terminal itself, once per change
-            // — a tab that `cd`s into another project re-derives it here.
-            let tint = crate::effective_tab_tint(tab.bg_color.as_deref(), folder.and_then(|f| f.color.as_deref()))
+            // — a tab that `cd`s into another project, or an edited rule, is
+            // re-derived here.
+            let tint = crate::effective_tab_tint(tab.bg_color.as_deref(), folder.color.as_deref())
                 .and_then(crate::parse_hex_rgb);
             if tab.applied_tint.get() != tint {
                 tab.applied_tint.set(tint);
@@ -3389,23 +3399,19 @@ impl AppState {
             #[cfg(feature = "energy")]
             let power_label = watts.get(i).map(power::TabPower::label).unwrap_or_default();
 
-            // Project identity: the folder rule for this tab's cwd, unless the
-            // tab overrides it. Same resolution the snapshot + terminal use.
-            let folder = crate::folder_style_for(crate::folder_styles(), tab.last_known_cwd_string.as_deref());
-            let badge_chip = crate::effective_tab_badge(tab.badge.as_deref(), folder.and_then(|f| f.badge.as_deref()))
-                .map(|text| {
-                    let tint =
-                        crate::effective_tab_tint(tab.bg_color.as_deref(), folder.and_then(|f| f.color.as_deref()))
-                            .and_then(crate::parse_hex_rgb);
-                    div()
-                        .flex_none()
-                        .px(px(4.0))
-                        .mr(px(5.0))
-                        .rounded_sm()
-                        .text_size(px(10.0))
-                        .bg(tint.map_or(tab_border, |c| Hsla::from(gpui::rgb(c))))
-                        .child(text.to_string())
-                });
+            // Project identity, resolved on the persist tick (see `persist`) so
+            // a frame never resolves a rule per tab.
+            let badge_chip = tab.resolved_badge.clone().map(|text| {
+                let tint = tab.applied_tint.get();
+                div()
+                    .flex_none()
+                    .px(px(4.0))
+                    .mr(px(5.0))
+                    .rounded_sm()
+                    .text_size(px(10.0))
+                    .bg(tint.map_or(tab_border, |c| Hsla::from(gpui::rgb(c))))
+                    .child(text.to_string())
+            });
 
             let drag_name = tab.name.clone();
             let tab_el = div()
