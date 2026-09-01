@@ -679,3 +679,72 @@ body.band-view { min-height: calc(100vh + 180px); }
   font-size: 0.62rem; margin-left: 0.15rem; color: var(--muted);
   vertical-align: middle;
 }
+
+/* --- Catalogue #39 SC2: topbar button + cold-source overlay (distinct from live cards) --- */
+.catalog-toggle {
+  margin-left: auto;
+  padding: 0.25rem 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--fg);
+  font: inherit; font-size: 0.82rem; cursor: pointer;
+}
+.catalog-toggle:hover { background: color-mix(in srgb, var(--fg) 6%, transparent); }
+
+.catalog-panel {
+  position: fixed;
+  top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 60;
+  width: min(760px, 94vw);
+  max-height: 86vh;
+  overflow: auto;
+  background: var(--panel);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
+}
+.catalog-panel .cat-header {
+  position: sticky; top: 0;
+  display: flex; align-items: center; gap: 0.6rem;
+  padding: 0.7rem 1rem;
+  background: var(--panel);
+  border-bottom: 2px solid var(--border);
+}
+.cat-title { font-weight: 700; font-size: 1rem; }
+.cat-count { color: var(--muted); font-size: 0.78rem; }
+.cat-refresh, .cat-close { margin-left: auto; border: none; background: transparent; color: var(--muted); font-size: 1rem; cursor: pointer; }
+.cat-refresh { margin-left: auto; } .cat-close { margin-left: 0.3rem; font-size: 1.2rem; }
+.cat-list { padding: 0.4rem 0.6rem 0.8rem; }
+.cat-loading, .cat-error, .cat-empty { padding: 1rem; color: var(--muted); }
+
+.cat-skill { border-bottom: 1px solid var(--border); }
+.cat-skill-head {
+  width: 100%; text-align: left; border: none; background: transparent;
+  color: var(--fg); font: inherit; padding: 0.55rem 0.4rem; cursor: pointer;
+  display: flex; align-items: center; gap: 0.4rem;
+}
+.cat-skill-head:hover { background: color-mix(in srgb, var(--fg) 5%, transparent); }
+.cat-caret { color: var(--muted); font-size: 0.75rem; width: 0.9rem; }
+.cat-name { font-weight: 600; }
+.cat-ver { color: var(--muted); font-size: 0.72rem; }
+.cat-skill-body { padding: 0.2rem 0.4rem 0.7rem 1.3rem; font-size: 0.84rem; }
+.cat-field { margin: 0.25rem 0; }
+.cat-key { color: var(--muted); font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.03em; margin-right: 0.3rem; }
+.cat-tag { font-size: 0.72rem; padding: 0.02rem 0.35rem; border: 1px solid var(--border); border-radius: 999px; color: var(--muted); white-space: nowrap; }
+.cat-prompt { white-space: pre-wrap; }
+
+.cat-metrics { margin-top: 0.5rem; }
+.metrics-table { border-collapse: collapse; font-size: 0.76rem; width: 100%; max-width: 460px; }
+.metrics-table th, .metrics-table td { border: 1px solid var(--border); padding: 0.15rem 0.4rem; text-align: right; }
+.metrics-table th[scope="row"], .metrics-table thead th:first-child { text-align: left; color: var(--muted); }
+.fvr-line { margin-top: 0.35rem; font-size: 0.78rem; color: var(--muted); }
+/* Verdict = DIRECTION only (never pass/fail): fresh=blue, resume=purple, else muted. */
+.fvr-verdict { font-size: 0.72rem; padding: 0.05rem 0.4rem; border-radius: 999px; border: 1px solid var(--border); }
+.fvr-verdict.fvr-fresh { color: var(--led-idle-stroke); border-color: var(--led-idle-stroke); background: color-mix(in srgb, var(--led-idle-stroke) 12%, transparent); }
+.fvr-verdict.fvr-resume { color: var(--orchestrator-accent); border-color: var(--orchestrator-accent); background: color-mix(in srgb, var(--orchestrator-accent) 12%, transparent); }
+.fvr-verdict.fvr-inconclusive { color: var(--muted); }
+.fvr-verdict.fvr-insufficient { color: var(--muted); border-style: dashed; }
+.catalog-panel[hidden] { display: none; }

@@ -13,6 +13,9 @@
   <header class="topbar">
     <h1>Harness</h1>
     <span id="status" class="status" aria-live="polite">connecting…</span>
+    <!-- Catalogue #39 SC2: opens the cold catalog read-model in a separate overlay
+         (a skill is NOT a live tab — distinct visual vocabulary). -->
+    <button id="catalog-toggle" class="catalog-toggle" aria-controls="catalog-panel">Catalogue</button>
   </header>
 
   <main id="dashboard" aria-label="harness workflow">
@@ -133,6 +136,10 @@
   <!-- Inc8 S3: full agent-card view, opened by right-clicking an agent node.
        Populated by dashboard.js from agentCardView(tab). Escape / click-away closes. -->
   <div id="agent-card" class="agent-card" role="dialog" aria-label="agent card" hidden></div>
+
+  <!-- Catalogue #39 SC2: the cold catalog read-model, opened on-demand from the
+       topbar button. Populated by dashboard.js from catalogView(readModel). -->
+  <div id="catalog-panel" class="catalog-panel" role="dialog" aria-label="catalogue des skills" hidden></div>
 
   <script type="module" src="/assets/dashboard.js"></script>
 </body>
