@@ -6780,10 +6780,11 @@ mod tests {
         };
         let created = request(port, &post("tabs", "{}"));
         assert_eq!(status_code(&created), 200, "POST /tabs → 200\n{created}");
-        {
+        let pending_new_tabs = {
             let g = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            assert_eq!(g.pending_new_tabs, before + 1, "spawn queues a real tab creation");
-        }
+            g.pending_new_tabs
+        };
+        assert_eq!(pending_new_tabs, before + 1, "spawn queues a real tab creation");
 
         // (b) A disposable tab: stamp spawn-mode=resume, verify it lands + flows to the
         // retire record via from_snapshot.
@@ -7017,7 +7018,7 @@ mod tests {
         assert_eq!(versions.iter().max().copied(), Some((n + 1) as u32), "versions are a dense 1..=N+1 chain");
     }
 
-    /// GET /catalog/list with an extra query (SC1b) → the `skills` array.
+    /// GET /catalog/list with an extra query (`SC1b`) → the `skills` array.
     fn catalog_skills_q(port: u16, token: &str, extra: &str) -> Vec<serde_json::Value> {
         let listed = request(port, &format!("GET /catalog/list?token={token}&{extra} HTTP/1.1\r\n\r\n"));
         let json: serde_json::Value = serde_json::from_str(body_of(&listed)).expect("catalog list json");
