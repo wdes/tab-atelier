@@ -3,9 +3,10 @@
 //   - GET /decisions                    -> visible decisions (archived filtered out).
 //   - GET /decisions?includeArchived=true -> all, archived carry state:archived.
 //   - POST /decisions/{id}/read         -> state open->read.
-//   - POST /decisions/{id}/tranch {verdict} -> state ->tranched (400 if verdict empty).
+//   - POST /decisions/{id}/tranch {verdict} -> PD3: state ->ARCHIVED + files moved to the
+//     archive (400 if verdict empty). The archived toggle shows the archived_path links.
 // Anti-built≠wired: the Kiosk button is REACHABLE in the topbar; the whole
-// open->read->tranch->toggle-archived loop is exercised on the REAL route path.
+// open->read->tranch->archive->toggle-archived loop is exercised on the REAL route path.
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -63,7 +64,9 @@ async function main() {
       if (verb === "read") { if (d) d.state = "read"; return route.fulfill({ status: 200, contentType: "application/json", body: `{"read":"${id}"}` }); }
       // tranch: the server rejects an empty verdict (400) — mirrors the real route.
       if (!body.verdict || !body.verdict.trim()) return route.fulfill({ status: 400, contentType: "application/json", body: '{"error":"verdict required"}' });
-      if (d) { d.state = "tranched"; d.verdict = body.verdict; }
+      // PD3: the ruling ARCHIVES the decision — state→archived + files MOVE to the archive
+      // (the fold serves the archived paths so the panel links stay valid).
+      if (d) { d.state = "archived"; d.verdict = body.verdict; d.files = (d.files || []).map((f) => `~/Dev/outbox/_archive/2026-09/${f.split("/").pop()}`); }
       return route.fulfill({ status: 200, contentType: "application/json", body: `{"tranch":"${id}"}` });
     }
     return route.fulfill({ status: 404, body: "" });
@@ -102,27 +105,34 @@ async function main() {
   ok("PD2: Tranché without a verdict is refused client-side (no POST)", posted.filter((x) => x.verb === "tranch").length === beforeTranch);
   ok("PD2: a 'verdict required' message is shown", /verdict/i.test((await page.locator(`${rc} .kk-msg`).textContent().catch(() => "")) || ""));
 
-  // Fill a verdict + check Tranché -> POST /tranch -> state=tranched, verdict surfaced.
+  // Fill a verdict + check Tranché -> POST /tranch -> PD3: the ruling ARCHIVES the
+  // decision, which LEAVES the active list (anti-entassement).
   await page.locator(`${rc} .kk-verdict-input`).fill("GO");
   await page.locator(`${rc} .kk-tranche`).click();
   await page.waitForTimeout(200);
   ok("PD2: Tranché with a verdict POSTs /decisions/ra1c/tranch {verdict}",
      posted.some((x) => x.id === "ra1c" && x.verb === "tranch" && x.body.verdict === "GO"));
-  ok("PD2: after tranch, the verdict is surfaced verbatim", /verdict : GO/.test((await page.locator(rc).textContent().catch(() => "")) || ""));
-  // The badge dropped: ra1c left 'open', only kb remains -> 1.
+  ok("PD3: after tranch, the ruled decision leaves the active list (archived)",
+     (await page.locator(rc).count()) === 0, `still present=${await page.locator(rc).count()}`);
+  // Badge = the remaining open count (ra1c was already read/non-open; kb stays) -> 1.
   await page.waitForFunction(() => document.getElementById("kiosk-badge")?.textContent === "1", null, { timeout: 4000 }).catch(() => {});
-  ok("PD2: the badge reflects the new open count (1)", (await page.locator("#kiosk-badge").textContent()) === "1", `badge=${await page.locator("#kiosk-badge").textContent()}`);
+  ok("PD2: the badge shows the remaining open count (1)", (await page.locator("#kiosk-badge").textContent()) === "1", `badge=${await page.locator("#kiosk-badge").textContent()}`);
 
-  // Toggle "afficher les archivées" -> ?includeArchived -> the archived decision surfaces.
+  // Toggle "afficher les archivées" -> ?includeArchived -> the archived decisions surface;
+  // the just-ruled one carries its verdict and its file link points at the ARCHIVE.
   await page.locator("#kiosk-panel .kk-show-archived").check();
   await page.waitForTimeout(200);
   ok("PD2: the toggle re-fetches with ?includeArchived", includeArchivedSeen);
-  ok("PD2: the archived decision surfaces via the toggle (state=archived)",
+  ok("PD3: the just-archived decision surfaces with its verdict verbatim",
+     /verdict : GO/.test((await page.locator(rc).textContent().catch(() => "")) || ""));
+  ok("PD3: the archived decision's file link points at the archive (_archive/AAAA-MM)",
+     ((await page.locator(`${rc} .kk-file`).getAttribute("href").catch(() => "")) || "").includes("/_archive/"));
+  ok("PD2: a previously-archived decision also surfaces (state=archived)",
      (await page.locator('#kiosk-panel .kk-card[data-id="old"].kk-state-archived').count()) === 1);
 
   await browser.close();
-  console.log(`\ndashboard.kiosk.accept.mjs — KIOSK #kiosk PD2 GUI acceptance`);
-  console.log(`${failures ? `FAIL: ${failures} assertion(s) failed` : "OK: all PD2 (topbar+badge, render, Lu/Tranché POST, archived toggle) verified on screen"}`);
+  console.log(`\ndashboard.kiosk.accept.mjs — KIOSK #kiosk PD2+PD3 GUI acceptance`);
+  console.log(`${failures ? `FAIL: ${failures} assertion(s) failed` : "OK: all PD2+PD3 (topbar+badge, render, Lu/Tranché POST, tranch→archive, archived_path links) verified on screen"}`);
   process.exit(failures ? 1 : 0);
 }
 
