@@ -32,13 +32,85 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// How an instance of a skill was BORN — the per-instance PARTITION key for the
+/// v2 metrics (SV3).
+///
+/// `Origin` is the hand-built genesis instance, EXCLUDED from the fresh-vs-resume
+/// A/B; only `Fresh` and `Resume` are the two benched arms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SpawnMode {
+    /// Spawned fresh from the distilled profile (+ task overlay) — the default arm.
+    Fresh,
+    /// Reattached the baseline session (`--resume`) — the A/B champion arm.
+    Resume,
+    /// The genesis instance (hand-built, no profile ancestor). Excluded from the A/B.
+    Origin,
+}
+
+/// The retire OUTCOME — v2 (SV3). Derived from the éval-à-3 (SV2), NOT a self-report;
+/// at this foundation layer it's whatever the orchestrator stamps at retire time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Outcome {
+    Success,
+    Problem,
+}
+
+/// The v2 stamp an orchestrator applies at retire time (SV3).
+///
+/// The distilled PROFILE fields (`skill` name + prompt/tools/patterns) plus this
+/// instance's per-mode telemetry (`spawn_mode`, `outcome`, `tokens`, `cost`).
+/// Everything is optional so a legacy (v1) retire — which carries none of it — stays
+/// byte-identical. The `specialty`/`conventions` profile fields already live on the
+/// card and are reused.
+///
+/// The proper `skill` NAME (SV5-nom) is produced by the agent's bilan + éval-à-3
+/// (SV1/SV2, later slices); this foundation accepts it as an input and falls back to
+/// the canonical slug when absent, so a record is always foldable.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct V2Stamp {
+    pub skill: Option<String>,
+    pub prompt_version: Option<u32>,
+    pub prompt: Option<String>,
+    #[serde(default)]
+    pub tools: Vec<String>,
+    #[serde(default)]
+    pub patterns: Vec<String>,
+    pub spawn_mode: Option<SpawnMode>,
+    pub outcome: Option<Outcome>,
+    pub tokens: Option<u64>,
+    pub cost: Option<f64>,
+    pub difficulty: Option<u8>,
+}
+
+impl V2Stamp {
+    /// Is this a v2 retire? The orchestrator opts in by naming a `skill`; without a
+    /// name the retire stays a v1 record (backward-compatible default).
+    #[must_use]
+    pub fn is_v2(&self) -> bool {
+        self.skill.as_ref().is_some_and(|s| !s.trim().is_empty())
+    }
+}
+
 /// A retired agent's CARD — a verbatim COPY of the durable `build_snapshot` fields
 /// (no new schema): the exact set that survives a restart on `TabState`.
 ///
 /// `id` (the tab uuid) is the record id; `retired_at` stamps the archive. Every
 /// field mirrors the card on `TabState`/`SnapshotTab`, so the round-trip is
 /// byte-complete (RB1 acceptance 1).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// **v2 (SV3)**: when `schema_version == Some(2)` the card also carries the distilled
+/// skill profile (`skill` name = fold key, `prompt`, `tools`, `patterns`, …) and this
+/// instance's per-mode telemetry (`spawn_mode`, `outcome`, `tokens`, `cost`). A v1
+/// card has none of these (fields skipped) → byte-identical to before. The `baseline`
+/// (invariant #2, A/B-isolated) is the existing top-level `session_id`/`agent_kind`,
+/// surfaced separately in the read-model and EXCLUDED from the skill fold.
+///
+/// (No `Eq`: the v2 `cost` is an `f64`. `PartialEq` is all the round-trip + fold code
+/// needs — the card is never a map key or set member.)
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CatalogCard {
     /// The tab uuid — the record id.
@@ -83,6 +155,44 @@ pub struct CatalogCard {
     /// close. The one field new to RB3. `None` when the agent posted no after-action.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_mission: Option<String>,
+    // ----- v2 (SV3) — all skipped when absent, so a v1 card is byte-identical -----
+    /// The PROPER SKILL NAME (SV5-nom): a short, stable name = the v2 FOLD KEY,
+    /// replacing the ugly whole-specialty slug. Carried by clones so N instances of a
+    /// skill fold to one profile. `None` on a v1 card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill: Option<String>,
+    /// Monotonic version of the distilled prompt for this skill (SV2 bumps it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_version: Option<u32>,
+    /// The DISTILLED prompt (generalised, precise context JETTISONED) — the profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// Profile: the tools this skill uses.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
+    /// Profile: reusable patterns the skill applies.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub patterns: Vec<String>,
+    /// PER-INSTANCE: how this instance was born — the metric PARTITION key. `Origin`
+    /// is excluded from the fresh-vs-resume A/B. `None` on a v1 card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_mode: Option<SpawnMode>,
+    /// PER-INSTANCE: the retire outcome (from the éval-à-3, not self-report).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<Outcome>,
+    /// PER-INSTANCE telemetry: tokens spent (reuses the agent-tokens signal).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<u64>,
+    /// PER-INSTANCE telemetry: cost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<f64>,
+    /// OPTIONAL difficulty affordance (orchestrator) — anti-confound stratification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub difficulty: Option<u8>,
+    /// Schema version. `Some(2)` = a v2 record (in the skill read-model);
+    /// `None`/`Some(1)` = a v1 legacy record (QUARANTINED from the v2 read-model).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<u32>,
     /// Unix-millis the card was archived (retired).
     pub retired_at: u64,
 }
@@ -117,6 +227,8 @@ impl CatalogCard {
             agent_kind: t.agent_kind.clone(),
             last_mission: after_action.filter(|s| !s.trim().is_empty()),
             retired_at,
+            // v1 card: no v2 profile/telemetry (byte-identical to before).
+            ..Default::default()
         }
     }
 
@@ -145,6 +257,8 @@ impl CatalogCard {
             agent_kind: s(&t.agent_kind),
             last_mission: after_action.filter(|s| !s.trim().is_empty()),
             retired_at,
+            // v1 card: no v2 profile/telemetry (byte-identical to before).
+            ..Default::default()
         }
     }
 
@@ -157,6 +271,45 @@ impl CatalogCard {
     #[must_use]
     pub const fn is_complete(&self, had_session: bool) -> bool {
         !self.id.is_empty() && (!had_session || self.session_id.is_some())
+    }
+
+    /// A v2 record — folded into the skill read-model. `schema_version == Some(2)`.
+    /// A v1/legacy card (`None`/`Some(1)`) is QUARANTINED from the v2 read-model.
+    #[must_use]
+    pub fn is_v2(&self) -> bool {
+        self.schema_version == Some(2)
+    }
+
+    /// The v2 FOLD KEY (SV5-nom): the proper `skill` name, or — as a stable fallback
+    /// until the agent's bilan names it (SV1/SV2) — the canonical `slug`, so a v2
+    /// record is always foldable. Never the freeform tab name nor the tab-id.
+    #[must_use]
+    pub fn fold_key(&self) -> String {
+        self.skill
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map_or_else(|| self.slug.clone(), str::to_string)
+    }
+
+    /// Promote this v1 card to a v2 record by stamping the orchestrator's [`V2Stamp`]
+    /// (SV3): the distilled profile plus this instance's per-mode telemetry. Sets
+    /// `schema_version` to 2. The baseline (`session_id`/`agent_kind`) is untouched —
+    /// it stays A/B-isolated.
+    #[must_use]
+    pub fn with_v2(mut self, stamp: V2Stamp) -> Self {
+        self.skill = stamp.skill.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        self.prompt_version = stamp.prompt_version;
+        self.prompt = stamp.prompt;
+        self.tools = stamp.tools;
+        self.patterns = stamp.patterns;
+        self.spawn_mode = stamp.spawn_mode;
+        self.outcome = stamp.outcome;
+        self.tokens = stamp.tokens;
+        self.cost = stamp.cost;
+        self.difficulty = stamp.difficulty;
+        self.schema_version = Some(2);
+        self
     }
 }
 
@@ -342,6 +495,175 @@ pub fn read_retired_at(path: &Path) -> Vec<CatalogCard> {
 #[must_use]
 pub fn read_retired() -> Vec<CatalogCard> {
     read_retired_at(&catalog_path())
+}
+
+// ---------------------------------------------------------------------------
+// SV3 — the v2 SKILL read-model: fold retired records BY SKILL NAME into one
+// mode-agnostic profile + per-mode metrics + a DERIVED fresh-vs-resume compare.
+//
+// The mode PARTITIONS the metrics, NOT the profile (1 skill = 1 skill however its
+// instances were born). `fresh_vs_resume` is DERIVED at read, never stored (the S4
+// read-only discipline). v1 records are QUARANTINED (filtered by `is_v2`).
+// ---------------------------------------------------------------------------
+
+/// Per-mode aggregate metrics for one arm of the A/B (`fresh` or `resume`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModeMetrics {
+    pub spawns: u64,
+    pub success: u64,
+    pub problem: u64,
+    /// Mean tokens over the arm's instances that reported tokens (`None` = none did).
+    pub tokens_avg: Option<f64>,
+    /// Mean cost over the arm's instances that reported cost.
+    pub cost_avg: Option<f64>,
+}
+
+impl ModeMetrics {
+    /// Aggregate the instances of `mode`. `Origin` is never an arm (excluded from A/B).
+    fn of(instances: &[CatalogCard], mode: SpawnMode) -> Self {
+        let arm: Vec<&CatalogCard> = instances.iter().filter(|c| c.spawn_mode == Some(mode)).collect();
+        let toks: Vec<u64> = arm.iter().filter_map(|c| c.tokens).collect();
+        let costs: Vec<f64> = arm.iter().filter_map(|c| c.cost).collect();
+        Self {
+            spawns: arm.len() as u64,
+            success: arm.iter().filter(|c| c.outcome == Some(Outcome::Success)).count() as u64,
+            problem: arm.iter().filter(|c| c.outcome == Some(Outcome::Problem)).count() as u64,
+            tokens_avg: (!toks.is_empty()).then(|| toks.iter().sum::<u64>() as f64 / toks.len() as f64),
+            cost_avg: (!costs.is_empty()).then(|| costs.iter().sum::<f64>() / costs.len() as f64),
+        }
+    }
+
+    /// Delivery = success / judged (success + problem). `None` when nothing was judged.
+    fn success_rate(&self) -> Option<f64> {
+        let judged = self.success + self.problem;
+        (judged > 0).then(|| self.success as f64 / judged as f64)
+    }
+}
+
+/// The two benched arms — the metric PARTITION. `origin` is excluded from both.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ByMode {
+    pub fresh: ModeMetrics,
+    pub resume: ModeMetrics,
+}
+
+/// `metrics.byMode` — the partitioned metrics wrapper (schema path `metrics.byMode.*`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Metrics {
+    pub by_mode: ByMode,
+}
+
+/// The fresh-vs-resume comparison — DERIVED at read, never stored. Each field is
+/// `None` when a side lacks the data to compute it (no judged instance / no telemetry).
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreshVsResume {
+    /// `fresh.success_rate − resume.success_rate` (positive ⇒ fresh delivers better).
+    pub delivery_delta: Option<f64>,
+    /// `fresh.tokensAvg / resume.tokensAvg`.
+    pub tokens_ratio: Option<f64>,
+    /// `fresh.costAvg / resume.costAvg`.
+    pub cost_ratio: Option<f64>,
+}
+
+impl FreshVsResume {
+    fn derive(fresh: &ModeMetrics, resume: &ModeMetrics) -> Self {
+        let ratio = |a: Option<f64>, b: Option<f64>| match (a, b) {
+            (Some(a), Some(b)) if b != 0.0 => Some(a / b),
+            _ => None,
+        };
+        Self {
+            delivery_delta: match (fresh.success_rate(), resume.success_rate()) {
+                (Some(f), Some(r)) => Some(f - r),
+                _ => None,
+            },
+            tokens_ratio: ratio(fresh.tokens_avg, resume.tokens_avg),
+            cost_ratio: ratio(fresh.cost_avg, resume.cost_avg),
+        }
+    }
+}
+
+/// One folded SKILL in the v2 read-model: the mode-agnostic profile (latest-wins) +
+/// partitioned metrics + the derived fresh-vs-resume compare.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillProfile {
+    /// The proper skill NAME — the fold key (SV5-nom).
+    pub skill: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_version: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub specialty: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub conventions: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub patterns: Vec<String>,
+    /// usageCount summed across every retirement of this skill (all modes).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage_count: Option<u64>,
+    /// The latest retirement's timestamp (the profile winner).
+    pub retired_at: u64,
+    pub metrics: Metrics,
+    pub fresh_vs_resume: FreshVsResume,
+}
+
+impl SkillProfile {
+    /// Fold one skill's instances: profile fields from the LATEST retirement (mode
+    /// AGNOSTIC), usageCount summed, metrics partitioned by mode, compare derived.
+    fn fold(skill: String, instances: &[CatalogCard]) -> Self {
+        // The profile winner = the latest retirement (mode-agnostic). A group is never
+        // empty (a `BTreeMap` entry always holds ≥1), but avoid a panicking `expect`.
+        let Some(latest) = instances.iter().max_by_key(|c| c.retired_at) else {
+            return Self { skill, ..Default::default() };
+        };
+        let usage_total: u64 = instances.iter().filter_map(|c| c.usage_count).sum();
+        let fresh = ModeMetrics::of(instances, SpawnMode::Fresh);
+        let resume = ModeMetrics::of(instances, SpawnMode::Resume);
+        let fresh_vs_resume = FreshVsResume::derive(&fresh, &resume);
+        Self {
+            skill,
+            prompt_version: latest.prompt_version,
+            prompt: latest.prompt.clone(),
+            specialty: latest.specialty.clone(),
+            conventions: latest.conventions.clone(),
+            tools: latest.tools.clone(),
+            patterns: latest.patterns.clone(),
+            usage_count: (usage_total > 0).then_some(usage_total),
+            retired_at: latest.retired_at,
+            metrics: Metrics { by_mode: ByMode { fresh, resume } },
+            fresh_vs_resume,
+        }
+    }
+}
+
+/// The v2 SKILL read-model over a catalogue file.
+///
+/// v2 records only (v1 quarantined), folded by skill name, sorted by skill for a
+/// stable presentation. Path-injectable; a missing file reads empty. READ-ONLY —
+/// nothing is written or compacted.
+#[must_use]
+pub fn read_skill_profiles_at(path: &Path) -> Vec<SkillProfile> {
+    use std::collections::BTreeMap;
+    let body = std::fs::read_to_string(path).unwrap_or_default();
+    let mut by_skill: BTreeMap<String, Vec<CatalogCard>> = BTreeMap::new();
+    for c in parse_catalog(&body).into_iter().filter(CatalogCard::is_v2) {
+        by_skill.entry(c.fold_key()).or_default().push(c);
+    }
+    by_skill.into_iter().map(|(skill, group)| SkillProfile::fold(skill, &group)).collect()
+}
+
+/// [`read_skill_profiles_at`] against the live [`catalog_path`] — the v2 `skills`
+/// read-model of `GET /catalog/list` + `/dashboard/state`. READ-ONLY.
+#[must_use]
+pub fn read_skill_profiles() -> Vec<SkillProfile> {
+    read_skill_profiles_at(&catalog_path())
 }
 
 // ---------------------------------------------------------------------------
@@ -723,6 +1045,7 @@ mod tests {
             agent_kind: None,
             last_mission: None,
             retired_at: RETIRED_AT,
+            ..Default::default()
         }
     }
 
@@ -1058,6 +1381,7 @@ mod tests {
             session_id: None,
             agent_kind: None,
             last_mission: None,
+            ..Default::default()
         };
         let cards = vec![
             mk("id1", "builder", 100, 3), // older builder
@@ -1360,5 +1684,200 @@ mod tests {
             ResumeMode::Fresh,
             "--resume + no archived session → fresh fallback, no error"
         );
+    }
+
+    // ----- SV3 + SV5-nom: the v2 skill schema + read-model ----------------------
+
+    /// A v2 record: a named skill + per-instance mode/outcome/telemetry. `..Default`
+    /// leaves the profile/baseline fields at their v1 defaults so each test sets only
+    /// what it exercises.
+    fn v2_card(
+        id: &str,
+        skill: &str,
+        mode: SpawnMode,
+        outcome: Option<Outcome>,
+        retired: u64,
+        tokens: Option<u64>,
+        cost: Option<f64>,
+    ) -> CatalogCard {
+        CatalogCard {
+            id: id.into(),
+            skill: Some(skill.into()),
+            spawn_mode: Some(mode),
+            outcome,
+            tokens,
+            cost,
+            schema_version: Some(2),
+            retired_at: retired,
+            ..Default::default()
+        }
+    }
+
+    // SV3 acceptance (1): a v2 record round-trips byte-complete through the REAL
+    // append + read-back — every profile + telemetry field survives.
+    #[test]
+    fn sv3_v2_record_round_trips_byte_complete() {
+        let cat = TmpCatalog::new();
+        let stamp = V2Stamp {
+            skill: Some("rustsmith".into()),
+            prompt_version: Some(3),
+            prompt: Some("distilled prompt, no literals".into()),
+            tools: vec!["cargo".into(), "grep".into()],
+            patterns: vec!["read-back gate".into()],
+            spawn_mode: Some(SpawnMode::Fresh),
+            outcome: Some(Outcome::Success),
+            tokens: Some(12_000),
+            cost: Some(0.42),
+            difficulty: Some(3),
+        };
+        let card = CatalogCard::from_tab_state(&maximal_tab_state("tab-v2"), None, RETIRED_AT).with_v2(stamp);
+        assert!(card.is_v2(), "stamped card is v2");
+        append_catalog_line(cat.path(), &card).expect("archive");
+        let back = read_back(cat.path(), "tab-v2").expect("read-back");
+        assert_eq!(back, card, "every v2 profile+telemetry field round-trips byte-complete");
+        assert_eq!(back.skill.as_deref(), Some("rustsmith"));
+        assert_eq!(back.prompt_version, Some(3));
+        assert_eq!(back.tools, vec!["cargo", "grep"]);
+        assert_eq!(back.patterns, vec!["read-back gate"]);
+        assert_eq!(back.spawn_mode, Some(SpawnMode::Fresh));
+        assert_eq!(back.outcome, Some(Outcome::Success));
+        assert_eq!(back.tokens, Some(12_000));
+        assert_eq!(back.cost, Some(0.42));
+        assert_eq!(back.difficulty, Some(3));
+        assert_eq!(back.schema_version, Some(2));
+        // Baseline stays on the card (invariant #2), A/B-isolated — NOT nested in skill.
+        assert_eq!(back.session_id.as_deref(), Some("sess-abc"), "baseline session archived");
+    }
+
+    // SV3: a v1 retire stays byte-identical — none of the v2 keys are emitted, so old
+    // records are untouched and are the QUARANTINE marker (no schemaVersion:2).
+    #[test]
+    fn sv3_v1_record_carries_no_v2_fields() {
+        let card = CatalogCard::from_tab_state(&maximal_tab_state("t"), None, RETIRED_AT);
+        assert!(!card.is_v2(), "a plain retire is v1");
+        let json = encode_catalog_line(&card);
+        // ("tokens" is skipped too, but the nested Evaluation carries its own
+        // token counts, so it's not a clean top-level discriminator — the keys
+        // below are unambiguous v2 markers absent from any v1 record.)
+        for absent in ["schemaVersion", "\"skill\"", "spawnMode", "\"prompt\"", "\"cost\"", "\"patterns\""] {
+            assert!(!json.contains(absent), "v1 record must not carry the v2 key {absent}: {json}");
+        }
+    }
+
+    // SV3 acceptance (2)+(5): the read-model folds by skill MODE-AGNOSTICALLY
+    // (latest-wins profile), aggregates usageCount, and QUARANTINES v1 records.
+    #[test]
+    fn sv3_read_model_folds_by_skill_mode_agnostic_and_quarantines_v1() {
+        let cat = TmpCatalog::new();
+        let mut a = v2_card("i1", "rustsmith", SpawnMode::Fresh, Some(Outcome::Success), 100, Some(1000), None);
+        a.usage_count = Some(2);
+        a.prompt = Some("older prompt".into());
+        a.prompt_version = Some(1);
+        let mut b = v2_card("i2", "rustsmith", SpawnMode::Resume, Some(Outcome::Problem), 200, Some(2000), None);
+        b.usage_count = Some(3);
+        b.prompt = Some("newer prompt".into());
+        b.prompt_version = Some(2);
+        b.specialty = Some("rust daemon".into());
+        // A v1 legacy record → QUARANTINED from the v2 read-model.
+        let v1 = CatalogCard::from_tab_state(&maximal_tab_state("legacy"), None, 300);
+        append_catalog_line(cat.path(), &a).unwrap();
+        append_catalog_line(cat.path(), &b).unwrap();
+        append_catalog_line(cat.path(), &v1).unwrap();
+
+        let profiles = read_skill_profiles_at(cat.path());
+        assert_eq!(profiles.len(), 1, "v1 quarantined → only the one v2 skill folds");
+        let p = &profiles[0];
+        assert_eq!(p.skill, "rustsmith");
+        // Profile = the LATEST retirement (mode-agnostic): b (retired 200) wins over a.
+        assert_eq!(p.prompt.as_deref(), Some("newer prompt"), "latest-wins profile");
+        assert_eq!(p.prompt_version, Some(2));
+        assert_eq!(p.specialty.as_deref(), Some("rust daemon"));
+        assert_eq!(p.usage_count, Some(5), "usageCount aggregated across modes (2+3)");
+    }
+
+    // SV3 acceptance (3): metrics are PARTITIONED by mode, and `origin` is EXCLUDED
+    // from the fresh-vs-resume A/B.
+    #[test]
+    fn sv3_metrics_partitioned_by_mode_origin_excluded() {
+        let cat = TmpCatalog::new();
+        let cards = [
+            v2_card("f1", "s", SpawnMode::Fresh, Some(Outcome::Success), 1, Some(100), Some(1.0)),
+            v2_card("f2", "s", SpawnMode::Fresh, Some(Outcome::Success), 2, Some(200), Some(2.0)),
+            v2_card("f3", "s", SpawnMode::Fresh, Some(Outcome::Problem), 3, Some(300), Some(3.0)),
+            v2_card("r1", "s", SpawnMode::Resume, Some(Outcome::Success), 4, Some(1000), Some(9.0)),
+            v2_card("o1", "s", SpawnMode::Origin, Some(Outcome::Success), 5, Some(9999), Some(99.0)),
+        ];
+        for c in &cards {
+            append_catalog_line(cat.path(), c).unwrap();
+        }
+        let p = &read_skill_profiles_at(cat.path())[0];
+        let f = &p.metrics.by_mode.fresh;
+        assert_eq!((f.spawns, f.success, f.problem), (3, 2, 1), "fresh arm counts");
+        assert_eq!(f.tokens_avg, Some(200.0), "fresh tokensAvg (100+200+300)/3");
+        let r = &p.metrics.by_mode.resume;
+        assert_eq!((r.spawns, r.success, r.problem), (1, 1, 0), "resume arm counts");
+        assert_eq!(r.tokens_avg, Some(1000.0));
+        // The origin instance (9999 tokens) never leaked into either A/B arm.
+        assert_ne!(f.tokens_avg, Some(9999.0), "origin excluded from fresh");
+        assert_ne!(r.tokens_avg, Some(9999.0), "origin excluded from resume");
+    }
+
+    // SV3 acceptance (4): fresh_vs_resume is DERIVED at read and NOT STORED.
+    #[test]
+    fn sv3_fresh_vs_resume_is_derived_not_stored() {
+        let cat = TmpCatalog::new();
+        // fresh: 2 success / 1 problem → rate 2/3 ; tokensAvg 200 ; costAvg 2.0
+        // resume: 1 success → rate 1.0 ; tokensAvg 1000 ; costAvg 10.0
+        let cards = [
+            v2_card("f1", "s", SpawnMode::Fresh, Some(Outcome::Success), 1, Some(100), Some(1.0)),
+            v2_card("f2", "s", SpawnMode::Fresh, Some(Outcome::Success), 2, Some(200), Some(2.0)),
+            v2_card("f3", "s", SpawnMode::Fresh, Some(Outcome::Problem), 3, Some(300), Some(3.0)),
+            v2_card("r1", "s", SpawnMode::Resume, Some(Outcome::Success), 4, Some(1000), Some(10.0)),
+        ];
+        for c in &cards {
+            append_catalog_line(cat.path(), c).unwrap();
+        }
+        let p = &read_skill_profiles_at(cat.path())[0];
+        let fvr = &p.fresh_vs_resume;
+        let dd = fvr.delivery_delta.expect("delta derivable");
+        assert!((dd - (2.0 / 3.0 - 1.0)).abs() < 1e-9, "delivery_delta = fresh_rate − resume_rate");
+        assert!((fvr.tokens_ratio.expect("tokens ratio") - 0.2).abs() < 1e-9, "tokens_ratio = 200/1000");
+        assert!((fvr.cost_ratio.expect("cost ratio") - 0.2).abs() < 1e-9, "cost_ratio = 2.0/10.0");
+        // NOT STORED: no derived read-model field is persisted on disk.
+        let body = std::fs::read_to_string(cat.path()).unwrap();
+        for forbidden in ["freshVsResume", "deliveryDelta", "tokensRatio", "costRatio", "byMode"] {
+            assert!(!body.contains(forbidden), "derived field must not be persisted: {forbidden}");
+        }
+    }
+
+    // SV5-nom: the proper NAME (not the slug) is the stable fold key — N clones with
+    // one name but different slugs/ids fold to ONE profile with aggregated metrics.
+    #[test]
+    fn sv5_proper_name_is_the_stable_fold_key_across_clones() {
+        let cat = TmpCatalog::new();
+        let mut c1 = v2_card("clone-1", "rustsmith", SpawnMode::Fresh, Some(Outcome::Success), 10, None, None);
+        c1.slug = "builder-rust".into();
+        c1.usage_count = Some(1);
+        let mut c2 = v2_card("clone-2", "rustsmith", SpawnMode::Resume, Some(Outcome::Success), 20, None, None);
+        c2.slug = "reviewer-sql".into(); // a DIFFERENT slug — proves name, not slug, folds
+        c2.usage_count = Some(1);
+        let mut c3 = v2_card("clone-3", "rustsmith", SpawnMode::Fresh, Some(Outcome::Problem), 30, None, None);
+        c3.slug = "totally-different".into();
+        c3.usage_count = Some(1);
+        for c in [&c1, &c2, &c3] {
+            append_catalog_line(cat.path(), c).unwrap();
+        }
+        let profiles = read_skill_profiles_at(cat.path());
+        assert_eq!(profiles.len(), 1, "N clones + one proper name → ONE profile (name, not slug, folds)");
+        let p = &profiles[0];
+        assert_eq!(p.skill, "rustsmith", "the proper name is the fold key");
+        assert_eq!(p.usage_count, Some(3), "clones' usageCount aggregate under the name");
+        assert_eq!(p.metrics.by_mode.fresh.spawns, 2, "two fresh clones");
+        assert_eq!(p.metrics.by_mode.resume.spawns, 1, "one resume clone");
+        // fold_key falls back to the slug ONLY when no proper name (stable default).
+        let mut nameless = v2_card("x", "", SpawnMode::Fresh, None, 1, None, None);
+        nameless.skill = None;
+        nameless.slug = "fallback-slug".into();
+        assert_eq!(nameless.fold_key(), "fallback-slug", "no proper name → stable slug fallback");
     }
 }

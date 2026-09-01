@@ -665,9 +665,10 @@ fn build_dashboard_state(inputs: Vec<DashboardTabInput>) -> DashboardState {
         services,
         lineage,
         unassigned,
-        // Filled by the handler from the FS (S4/RB2); the pure builder stays FS-free.
+        // Filled by the handler from the FS (S4/RB2/SV3); the pure builder stays FS-free.
         tasks: Vec::new(),
         retired: Vec::new(),
+        skills: Vec::new(),
     }
 }
 
@@ -6423,6 +6424,9 @@ mod tests {
     // the pure `rb2_read_retired_*` test; here we lock the wiring + read-only-ness.)
     #[test]
     fn rb2_catalog_list_and_dashboard_expose_retired_via_api() {
+        // Read-only-ness is asserted by comparing two consecutive reads byte-for-byte,
+        // so a concurrent real-catalog WRITER (rbwire / sv3-live) must not interleave.
+        let _catalog_guard = real_catalog_test_guard();
         let (port, _state, token) = spawn_server();
         let get = |path: &str| format!("GET /{path}?token={token} HTTP/1.1\r\n\r\n");
 
@@ -6436,6 +6440,14 @@ mod tests {
         let dash = request(port, &get("dashboard/state"));
         assert_eq!(status_code(&dash), 200, "dashboard/state → 200");
         assert!(dash.contains(r#""retired""#), "dashboard exposes the retired section (separate source)");
+    }
+
+    /// Serializes the tests that WRITE the real catalog.jsonl. They can't run in
+    /// parallel: [`CatalogCleanup`]'s read-filter-write can clobber a concurrent
+    /// test's just-appended line. Read-only catalog tests don't need this.
+    fn real_catalog_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Removes the given ids' entries from the REAL catalog.jsonl on drop (the
@@ -6466,6 +6478,7 @@ mod tests {
     // archive, no close). Reuses the RB3 gates on the live path.
     #[test]
     fn rbwire_live_retire_archives_for_real_and_triggers_close() {
+        let _catalog_guard = real_catalog_test_guard(); // serialize real-catalog writers
         let (port, state, token) = spawn_server();
         let post = |path: &str, body: &str| {
             format!(
@@ -6522,5 +6535,83 @@ mod tests {
             assert!(ready_idx.is_some_and(|i| closes.contains(&i)), "the retire queued the tab's close");
             assert!(notready_idx.is_some_and(|i| !closes.contains(&i)), "the refused tab is kept (not closed)");
         }
+    }
+
+    // SV3: the LIVE v2 path — a REAL integration test (NOT a mock). POST /retire with
+    // a v2 stamp on two disposable tabs (SAME skill, one fresh + one resume) → the v2
+    // records are ARCHIVED for real to catalog.jsonl, and GET /catalog/list serves the
+    // DERIVED skill read-model (folded by name, metrics partitioned byMode,
+    // fresh_vs_resume derived at read). Exercises write AND derived-read on the wire.
+    #[test]
+    fn sv3_live_retire_writes_v2_and_serves_derived_skill_read_model() {
+        let _catalog_guard = real_catalog_test_guard(); // serialize real-catalog writers
+        let (port, state, token) = spawn_server();
+        let post = |path: &str, body: &str| {
+            format!("POST /{path}?token={token} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+        };
+        let get = |path: &str| format!("GET /{path}?token={token} HTTP/1.1\r\n\r\n");
+
+        // A skill name unique to THIS run so the derived counts are isolated from any
+        // real catalogue data (the disposable ids are cleaned up on drop regardless).
+        let run = crate::default_tab_id();
+        let skill = format!("sv3test-{}", &run[..8.min(run.len())]);
+
+        let fresh_id = crate::default_tab_id();
+        let mut t1 = test_snapshot_tab(&fresh_id, "disposable-fresh");
+        t1.rehome_status = Some("safe-to-close".into());
+        t1.agent_session_id = Some("sess-fresh".into());
+        t1.assignment = Some("build/builder".into());
+        let resume_id = crate::default_tab_id();
+        let mut t2 = test_snapshot_tab(&resume_id, "disposable-resume");
+        t2.rehome_status = Some("safe-to-close".into());
+        t2.agent_session_id = Some("sess-resume".into());
+        t2.assignment = Some("build/builder".into());
+        {
+            let mut g = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            g.tabs.push(t1);
+            g.tabs.push(t2);
+        }
+        let _cleanup = CatalogCleanup(vec![fresh_id.clone(), resume_id.clone()]);
+
+        // Retire #1 — fresh + success + tokens 1000 (with profile fields).
+        let b1 = format!(
+            r#"{{"skill":"{skill}","promptVersion":2,"prompt":"distilled","spawnMode":"fresh","outcome":"success","tokens":1000,"tools":["cargo"],"patterns":["read-back"]}}"#
+        );
+        let r1 = request(port, &post(&format!("tabs/by-id/{fresh_id}/retire"), &b1));
+        assert_eq!(status_code(&r1), 200, "v2 fresh retire → 200\n{r1}");
+        // Retire #2 — resume + problem + tokens 3000.
+        let b2 = format!(
+            r#"{{"skill":"{skill}","promptVersion":2,"prompt":"distilled","spawnMode":"resume","outcome":"problem","tokens":3000}}"#
+        );
+        let r2 = request(port, &post(&format!("tabs/by-id/{resume_id}/retire"), &b2));
+        assert_eq!(status_code(&r2), 200, "v2 resume retire → 200\n{r2}");
+
+        // REAL archive: the fresh record really landed as a v2 record in catalog.jsonl.
+        let back = crate::cli::catalog::read_back(&crate::cli::catalog::catalog_path(), &fresh_id)
+            .expect("the v2 card was archived to the REAL catalog.jsonl");
+        assert_eq!(back.skill.as_deref(), Some(skill.as_str()), "v2 skill archived for real");
+        assert!(back.is_v2(), "record persisted as v2 (schemaVersion:2)");
+        assert_eq!(back.spawn_mode, Some(crate::cli::catalog::SpawnMode::Fresh));
+        assert_eq!(back.tokens, Some(1000), "per-instance telemetry archived");
+
+        // REAL derived read: GET /catalog/list serves the folded skill read-model.
+        let listed = request(port, &get("catalog/list"));
+        assert_eq!(status_code(&listed), 200, "catalog list → 200\n{listed}");
+        let json: serde_json::Value = serde_json::from_str(body_of(&listed)).expect("valid json");
+        let skills = json["skills"].as_array().expect("a skills section");
+        let sk = skills
+            .iter()
+            .find(|s| s["skill"] == serde_json::json!(skill))
+            .expect("the skill folded from the two live retires");
+        // ONE skill folded from the two live retires; metrics PARTITIONED by mode.
+        assert_eq!(sk["metrics"]["byMode"]["fresh"]["spawns"].as_u64(), Some(1), "fresh arm from the live write");
+        assert_eq!(sk["metrics"]["byMode"]["fresh"]["success"].as_u64(), Some(1));
+        assert_eq!(sk["metrics"]["byMode"]["resume"]["spawns"].as_u64(), Some(1));
+        assert_eq!(sk["metrics"]["byMode"]["resume"]["problem"].as_u64(), Some(1));
+        // fresh_vs_resume DERIVED at read: fresh 1/1=1.0 vs resume 0/1=0.0 → delta 1.0;
+        // tokens_ratio 1000/3000 — computed from the LIVE records, never stored.
+        assert_eq!(sk["freshVsResume"]["deliveryDelta"].as_f64(), Some(1.0), "delivery delta derived on the wire");
+        let tr = sk["freshVsResume"]["tokensRatio"].as_f64().expect("tokens ratio derived");
+        assert!((tr - 1000.0 / 3000.0).abs() < 1e-9, "tokens_ratio derived from the live records");
     }
 }

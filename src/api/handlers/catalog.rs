@@ -16,7 +16,11 @@ use super::super::{TabSnapshot, error_json, parse_tab_key, resolve_tab_idx, resp
 /// catalogue reads as an empty list. Returns 200 `{retired:[…]}`.
 pub(in crate::api) fn list<S: Write>(stream: &mut S) {
     let retired = crate::cli::catalog::read_retired();
-    let body = serde_json::to_string(&serde_json::json!({ "retired": retired })).unwrap_or_default();
+    // SV3: the v2 SKILL read-model alongside the legacy slug-folded `retired` list —
+    // v2 records only (v1 quarantined), folded by skill name with derived metrics.
+    let skills = crate::cli::catalog::read_skill_profiles();
+    let body =
+        serde_json::to_string(&serde_json::json!({ "retired": retired, "skills": skills })).unwrap_or_default();
     respond_json(stream, 200, &body);
 }
 
@@ -34,13 +38,22 @@ pub(in crate::api) fn retire<S: Write>(stream: &mut S, state: &Arc<Mutex<TabSnap
         CatalogCard, RetireOutcome, append_catalog_line, catalog_path, deregister_atomic, perform_retire, read_back,
     };
 
+    // Body: the optional RB3 `after_action` + the optional SV3 v2 stamp (the
+    // orchestrator's distilled profile + this instance's per-mode telemetry). No
+    // `skill` ⇒ a v1 record, byte-identical to before (RB-wire preserved).
+    #[derive(serde::Deserialize, Default)]
+    struct RetireRequest {
+        after_action: Option<String>,
+        #[serde(flatten)]
+        stamp: crate::cli::catalog::V2Stamp,
+    }
+
     let Some((key_raw, is_uuid)) = parse_tab_key(path, "/retire") else {
         error_json(stream, 404, "invalid tab key");
         return;
     };
-    let after_action = serde_json::from_slice::<serde_json::Value>(p)
-        .ok()
-        .and_then(|v| v.get("after_action").and_then(|a| a.as_str()).map(str::to_string));
+    let req: RetireRequest = serde_json::from_slice(p).unwrap_or_default();
+    let after_action = req.after_action;
     let now = crate::unix_millis();
 
     let mut guard = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -54,7 +67,13 @@ pub(in crate::api) fn retire<S: Write>(stream: &mut S, state: &Arc<Mutex<TabSnap
     let ack = tab.rehome_status.as_deref() == Some("safe-to-close");
     let had_session = tab.agent_session_id.is_some();
     let id = tab.id.to_string();
-    let card = CatalogCard::from_snapshot(tab, after_action, now);
+    let mut card = CatalogCard::from_snapshot(tab, after_action, now);
+    // SV3: an orchestrator that named a `skill` promotes this to a v2 record (profile
+    // + per-mode telemetry). Absent ⇒ the card stays v1 (quarantined from the v2
+    // read-model). The baseline (session_id/agent_kind) is untouched, A/B-isolated.
+    if req.stamp.is_v2() {
+        card = card.with_v2(req.stamp);
+    }
 
     let cat = catalog_path();
     let config_base = crate::platform::config_base_dir();

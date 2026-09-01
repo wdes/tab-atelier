@@ -94,6 +94,9 @@ pub(in crate::api) fn state<S: Write>(
     // RB2 retired read-model: a SEPARATE SOURCE read from catalog.jsonl (a retired
     // agent is absent from the live snapshot), folded latest-per-slug. READ-ONLY.
     dashboard.retired = crate::cli::catalog::read_retired();
+    // SV3 v2 skill read-model: same catalogue, folded BY SKILL NAME (v1 quarantined),
+    // metrics partitioned by mode + fresh-vs-resume DERIVED at read. READ-ONLY.
+    dashboard.skills = crate::cli::catalog::read_skill_profiles();
     let body = serde_json::to_string_pretty(&dashboard).unwrap_or_default();
     respond_with_etag(
         stream,
