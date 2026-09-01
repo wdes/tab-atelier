@@ -295,6 +295,93 @@ export function conventionsCheck(tab) {
   return { conventions, declared, missing: !declared };
 }
 
+// --- Catalogue #39 SC2 (reconciled to the live SC1 contract) ---
+// GET /catalog/list -> { retired, skills }. A skill's fold key is `skill`; metrics
+// are `metrics.byMode.{fresh,resume}{spawns,success,problem,tokensAvg,costAvg}`; the
+// A/B compare is an OBJECT `freshVsResume{verdict, freshN, resumeN, deliveryDelta,
+// tokensRatio}`. The RUST is the single source of the G1 guard (MIN_SAMPLE=3) — the
+// web renders the server verdict VERBATIM, never re-gates (no MIN_SAMPLE in JS).
+// The catalogue is a COLD source, fetched on-demand, never in the 1.5s poll (RB2).
+
+// Pure: the read-model's skills -> a deterministic list (sorted by the fold key
+// `skill`). Tombstoned skills are already filtered server-side. Null-safe.
+export function catalogView(readModel) {
+  const skills = readModel && Array.isArray(readModel.skills) ? readModel.skills : [];
+  return skills
+    .filter((s) => s && s.skill != null)
+    .slice()
+    .sort((a, b) => String(a.skill).localeCompare(String(b.skill)));
+}
+
+// Pure: a skill's profile fold -> normalised render fields. Absent -> ""/[]/null.
+export function skillProfileModel(skill) {
+  const s = skill || {};
+  const arr = (x) => (Array.isArray(x) ? x.map(String) : []);
+  return {
+    name: s.skill != null ? String(s.skill) : "",
+    prompt: s.prompt != null ? String(s.prompt) : "",
+    specialty: s.specialty != null ? String(s.specialty) : "",
+    conventions: arr(s.conventions),
+    tools: arr(s.tools),
+    patterns: arr(s.patterns),
+    promptVersion: s.promptVersion != null ? s.promptVersion : null,
+    usageCount: s.usageCount != null ? s.usageCount : null,
+  };
+}
+
+// Pure: the byMode metrics table model. The fresh_vs_resume VERDICT is the server's
+// (`freshVsResume.verdict`, camelCase: insufficientSample | inconclusive |
+// freshFavored | resumeFavored) rendered VERBATIM — the rust applies G1 (MIN_SAMPLE=3)
+// as the single source of truth, so there is NO JS re-gate. Per-arm sample sizes
+// (freshN/resumeN) are surfaced (G3). Never a per-task pass/fail. Null-safe.
+export function byModeMetricsModel(skill) {
+  const bm = (skill && skill.metrics && skill.metrics.byMode) || {};
+  const norm = (m) => ({
+    spawns: Number((m && m.spawns) || 0),
+    success: Number((m && m.success) || 0),
+    problem: Number((m && m.problem) || 0),
+    tokensAvg: m && m.tokensAvg != null ? Number(m.tokensAvg) : null,
+    costAvg: m && m.costAvg != null ? Number(m.costAvg) : null,
+  });
+  const fvr = (skill && skill.freshVsResume) || {};
+  const verdict = fvr.verdict != null ? String(fvr.verdict) : "insufficientSample";
+  const freshN = Number(fvr.freshN || 0);
+  const resumeN = Number(fvr.resumeN || 0);
+  return {
+    fresh: norm(bm.fresh),
+    resume: norm(bm.resume),
+    verdict,
+    freshN,
+    resumeN,
+    n: freshN + resumeN,
+    insufficient: verdict === "insufficientSample",
+    deliveryDelta: fvr.deliveryDelta != null ? Number(fvr.deliveryDelta) : null,
+    tokensRatio: fvr.tokensRatio != null ? Number(fvr.tokensRatio) : null,
+  };
+}
+
+// Pure: the SC3 edit form -> {ok, body}|{ok:false, error}. CLIENT CF1 guard (double
+// garde with the server 409): the prompt must stay non-empty. conventions accept an
+// array or a newline-separated string (blank lines dropped). promptVersion rides as
+// the optimistic-concurrency token when present.
+export function editBody(form) {
+  const f = form || {};
+  const prompt = f.prompt != null ? String(f.prompt) : "";
+  if (!prompt.trim()) return { ok: false, error: "le prompt ne peut pas être vide (CF1)" };
+  const body = { prompt };
+  if (f.specialty != null) body.specialty = String(f.specialty);
+  if (f.conventions != null) {
+    body.conventions = Array.isArray(f.conventions)
+      ? f.conventions.map(String).map((x) => x.trim()).filter(Boolean)
+      : String(f.conventions).split(/\r?\n/).map((x) => x.trim()).filter(Boolean);
+  }
+  if (f.promptVersion != null && f.promptVersion !== "") {
+    const pv = Number(f.promptVersion);
+    if (!Number.isNaN(pv)) body.promptVersion = pv;
+  }
+  return { ok: true, body };
+}
+
 // --- S5/S6: orchestrator tint + altitude bands + delegation lineage ---
 // These consume role / parentTabId / (optional) altitude fields exposed by the
 // Rust builder. ponytail: the altitude/lineage contract is provisional until the
@@ -1371,6 +1458,157 @@ function closeAgentCard() {
   if (el) el.hidden = true;
 }
 
+// --- Catalogue #39 SC2: on-demand overlay over the catalog read-model ---
+// The read-only catalog read-model (camelCase, same page token as the dashboard).
+const CATALOG_URL = "/catalog/list";
+
+// The server verdict (camelCase, VERBATIM) -> {cls, label}. Never pass/fail: the
+// class encodes the DIRECTION (or the explicit insufficient-sample case). The rust
+// owns the G1 guard — no JS threshold here.
+function verdictBadge(m) {
+  const map = {
+    freshFavored: { cls: "fvr-fresh", label: "fresh favorisé" },
+    resumeFavored: { cls: "fvr-resume", label: "resume favorisé" },
+    inconclusive: { cls: "fvr-inconclusive", label: "non concluant" },
+    insufficientSample: { cls: "fvr-insufficient", label: "échantillon trop petit, pas de verdict" },
+  };
+  const v = map[m.verdict] || map.inconclusive;
+  const n = `fresh n=${m.freshN} · resume n=${m.resumeN}`;
+  return `<span class="fvr-verdict ${v.cls}" data-verdict="${escapeHtml(m.verdict)}">${escapeHtml(v.label)} · ${escapeHtml(n)}</span>`;
+}
+
+// The fresh-vs-resume metrics table for a skill (byMode ledger).
+function metricsTableHtml(skill) {
+  const m = byModeMetricsModel(skill);
+  const num = (x) => (x == null ? "—" : x);
+  const row = (label, mode) =>
+    `<tr><th scope="row">${label}</th><td>${mode.spawns}</td><td>${mode.success}</td><td>${mode.problem}</td><td>${num(mode.tokensAvg)}</td><td>${num(mode.costAvg)}</td></tr>`;
+  return `<div class="cat-metrics">
+    <table class="metrics-table"><thead><tr><th></th><th>spawns</th><th>success</th><th>problem</th><th>tokensAvg</th><th>costAvg</th></tr></thead>
+    <tbody>${row("fresh", m.fresh)}${row("resume", m.resume)}</tbody></table>
+    <div class="fvr-line">fresh_vs_resume : ${verdictBadge(m)}</div>
+  </div>`;
+}
+
+// One skill row: a header (proper name + version) that toggles a collapsible body
+// (profile + metrics). The long prompt reuses the 'voir plus' fold (clippedHtml).
+function catalogSkillHtml(skill) {
+  const p = skillProfileModel(skill);
+  const deleted = !!(skill && (skill.deleted === true || skill.tombstoned === true));
+  const list = (label, xs) => (xs.length ? `<div class="cat-field"><span class="cat-key">${label}</span> ${xs.map((x) => `<span class="cat-tag">${escapeHtml(x)}</span>`).join(" ")}</div>` : "");
+  const ver = p.promptVersion != null ? ` <span class="cat-ver">v${escapeHtml(String(p.promptVersion))}</span>` : "";
+  const pvAttr = p.promptVersion != null ? escapeHtml(String(p.promptVersion)) : "";
+  // SC3: the edit form (specialty / prompt / conventions) + delete / restore.
+  const editForm = `<form class="cat-edit" data-skill="${escapeHtml(p.name)}" data-prompt-version="${pvAttr}">
+      <div class="cat-edit-row"><label>specialty</label><input class="cat-edit-specialty" type="text" value="${escapeHtml(p.specialty)}"></div>
+      <div class="cat-edit-row"><label>prompt</label><textarea class="cat-edit-prompt" rows="4">${escapeHtml(p.prompt)}</textarea></div>
+      <div class="cat-edit-row"><label>conventions<br><small>(un .md par ligne)</small></label><textarea class="cat-edit-conventions" rows="2">${escapeHtml(p.conventions.join("\n"))}</textarea></div>
+      <div class="cat-edit-actions">
+        <button type="button" class="cat-save">Enregistrer</button>
+        ${deleted
+          ? `<button type="button" class="cat-restore" data-skill="${escapeHtml(p.name)}">Restaurer</button>`
+          : `<button type="button" class="cat-delete" data-skill="${escapeHtml(p.name)}">Supprimer</button>`}
+        <span class="cat-edit-msg" role="status"></span>
+      </div>
+    </form>`;
+  return `<div class="cat-skill${deleted ? " cat-deleted" : ""}" data-skill="${escapeHtml(p.name)}">
+    <button class="cat-skill-head" aria-expanded="false"><span class="cat-caret">▸</span> <span class="cat-name">${escapeHtml(p.name)}</span>${ver}${deleted ? ` <span class="cat-tombstone">supprimé</span>` : ""}</button>
+    <div class="cat-skill-body" hidden>
+      ${p.specialty ? `<div class="cat-field"><span class="cat-key">specialty</span> ${escapeHtml(p.specialty)}</div>` : ""}
+      ${p.prompt ? `<div class="cat-field"><span class="cat-key">prompt</span> <span class="cat-prompt">${clippedHtml(p.prompt)}</span></div>` : ""}
+      ${list("conventions", p.conventions)}
+      ${list("tools", p.tools)}
+      ${list("patterns", p.patterns)}
+      ${metricsTableHtml(skill)}
+      ${editForm}
+    </div>
+  </div>`;
+}
+
+function catalogHtml(readModel) {
+  const skills = catalogView(readModel);
+  const body = skills.length
+    ? skills.map(catalogSkillHtml).join("")
+    : `<div class="cat-empty">Aucun skill au catalogue.</div>`;
+  return `<div class="cat-header">
+      <span class="cat-title">Catalogue des skills</span>
+      <span class="cat-count">${skills.length} skill${skills.length === 1 ? "" : "s"}</span>
+      <button class="cat-refresh" title="rafraîchir">↻</button>
+      <button class="cat-close" title="fermer" aria-label="fermer">×</button>
+    </div>
+    <div class="cat-list">${body}</div>`;
+}
+
+let catalogOpen = false;
+
+async function openCatalog() {
+  const el = document.getElementById("catalog-panel");
+  if (!el) return;
+  catalogOpen = true;
+  el.innerHTML = `<div class="cat-header"><span class="cat-title">Catalogue des skills</span></div><div class="cat-loading">chargement…</div>`;
+  el.hidden = false;
+  try {
+    const res = await fetch(CATALOG_URL, { headers: { accept: "application/json", ...AUTH_HEADERS } });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    el.innerHTML = catalogHtml(await res.json());
+  } catch (err) {
+    el.innerHTML = `<div class="cat-header"><span class="cat-title">Catalogue des skills</span><button class="cat-close" title="fermer" aria-label="fermer">×</button></div><div class="cat-error">catalogue indisponible (${escapeHtml(err.message)})</div>`;
+  }
+}
+
+function closeCatalog() {
+  const el = document.getElementById("catalog-panel");
+  if (el) { el.hidden = true; catalogOpen = false; }
+}
+
+// SC3: a catalog mutation (edit/delete/restore) with the page token. Returns the
+// Response so the caller can read 2xx (refresh) vs 409 (show the server error).
+function catalogPost(skill, verb, body) {
+  return fetch(`/catalog/${encodeURIComponent(skill)}/${verb}`, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json", ...AUTH_HEADERS },
+    body: JSON.stringify(body || {}),
+  });
+}
+
+// Handle a click on a SC3 edit-form control (save/delete/restore). Returns true if
+// it handled the target. Async: refreshes the read-model after a 2xx (server = the
+// source of truth, no optimistic mutation).
+async function handleCatalogEdit(target) {
+  const save = target.closest && target.closest(".cat-save");
+  if (save) {
+    const form = save.closest(".cat-edit");
+    const msg = form.querySelector(".cat-edit-msg");
+    const built = editBody({
+      prompt: form.querySelector(".cat-edit-prompt").value,
+      specialty: form.querySelector(".cat-edit-specialty").value,
+      conventions: form.querySelector(".cat-edit-conventions").value,
+      promptVersion: form.dataset.promptVersion,
+    });
+    if (!built.ok) { msg.textContent = built.error; msg.className = "cat-edit-msg err"; return true; }
+    try {
+      const res = await catalogPost(form.dataset.skill, "edit", built.body);
+      if (res.ok) { openCatalog(); }
+      else { const t = (await res.text().catch(() => "")) || `HTTP ${res.status}`; msg.textContent = `erreur ${res.status} : ${t}`; msg.className = "cat-edit-msg err"; }
+    } catch (err) { msg.textContent = `erreur réseau : ${err.message}`; msg.className = "cat-edit-msg err"; }
+    return true;
+  }
+  const del = target.closest && target.closest(".cat-delete");
+  if (del) {
+    const skill = del.dataset.skill;
+    // STICKY deletion — restaurable only via an explicit Restore (strong confirm).
+    if (typeof confirm === "function" && !confirm(`Supprimer « ${skill} » du catalogue ?\n\nSuppression STICKY — restaurable UNIQUEMENT via l'action Restore explicite.`)) return true;
+    try { const res = await catalogPost(skill, "delete", {}); if (res.ok) openCatalog(); } catch { /* ignore */ }
+    return true;
+  }
+  const restore = target.closest && target.closest(".cat-restore");
+  if (restore) {
+    try { const res = await catalogPost(restore.dataset.skill, "restore", {}); if (res.ok) openCatalog(); } catch { /* ignore */ }
+    return true;
+  }
+  return false;
+}
+
 async function poll() {
   const status = document.getElementById("status");
   const headers = { accept: "application/json", ...AUTH_HEADERS };
@@ -1529,6 +1767,41 @@ function bootstrap() {
     if (e.target.closest(".ac-close") || !e.target.closest("#agent-card")) closeAgentCard();
   });
   document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeAgentCard(); });
+
+  // Catalogue #39 SC2: open the cold catalog overlay on-demand (NOT in the poll).
+  const catToggle = document.getElementById("catalog-toggle");
+  if (catToggle) catToggle.addEventListener("click", () => { openCatalog(); });
+  const catPanel = document.getElementById("catalog-panel");
+  if (catPanel) {
+    catPanel.addEventListener("click", (e) => {
+      // Handled in-panel: never let the document outside-click handler see it (a
+      // refresh replaces innerHTML synchronously, which would detach e.target and
+      // fool the outside-click guard into closing the panel).
+      e.stopPropagation();
+      if (e.target.closest(".cat-close")) { closeCatalog(); return; }
+      if (e.target.closest(".cat-refresh")) { openCatalog(); return; }
+      // SC3: edit-form controls (save/delete/restore) are async mutations.
+      if (e.target.closest(".cat-save, .cat-delete, .cat-restore")) { handleCatalogEdit(e.target); return; }
+      const head = e.target.closest(".cat-skill-head");
+      if (head) {
+        const body = head.parentElement && head.parentElement.querySelector(".cat-skill-body");
+        const caret = head.querySelector(".cat-caret");
+        if (body) {
+          const willShow = body.hidden;
+          body.hidden = !willShow;
+          head.setAttribute("aria-expanded", willShow ? "true" : "false");
+          if (caret) caret.textContent = willShow ? "▾" : "▸";
+        }
+      }
+    });
+  }
+  // Close the catalog on Escape or a click outside it (but not the toggle button).
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeCatalog(); });
+  document.addEventListener("click", (e) => {
+    if (!catalogOpen) return;
+    if (e.target.closest("#catalog-panel") || e.target.closest("#catalog-toggle")) return;
+    closeCatalog();
+  });
 
   // Drill into a project card (delegated — the grid is re-rendered each poll).
   const grid = document.getElementById("project-grid");
