@@ -13,6 +13,8 @@ pub mod brain;
 pub mod catalog;
 pub mod clarify;
 pub mod claude_hook;
+/// The KIOSK cross-project decision log + fold (PD1).
+pub mod decision;
 /// The single shared client-subcommand router used by both the GUI
 /// (`src/main.rs`) and the headless daemon ([`dispatch`]).
 pub mod client;
