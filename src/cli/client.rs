@@ -75,6 +75,8 @@ pub fn dispatch(name: &str, rest: &[String]) -> Option<i32> {
         "catalog" => catalog::run(rest),
         // agent-lifecycle (RB4): re-seed a fresh tab from a retired card.
         "spawn" => catalog::spawn_run(rest),
+        // KIOSK (PD1): the cross-project decision log CLI.
+        "decision" => super::decision::run(rest),
         "clarify" => super::clarify::run(rest),
         "schedule" => share_link::schedule(rest),
         "log" => logging::run(rest),
