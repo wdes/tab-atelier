@@ -80,7 +80,14 @@ unsafe_code = "deny"
 [lints.clippy]
 all = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }
-nursery = { level = "deny", priority = -1 }
+# Nursery lints are UNSTABLE — clippy adds/changes them between toolchain
+# versions, so a hard `deny` makes the CI gate (`-D warnings`) fail on code
+# that was clean when written the moment a runner upgrades clippy (e.g.
+# `significant_drop_tightening` surfaced under 1.96 on untouched code). A CI
+# gate must be deterministic, so nursery is advisory-only: run
+# `cargo clippy -W clippy::nursery` locally for the signal. The STABLE groups
+# (all + pedantic) still `deny` and keep gating.
+nursery = { level = "allow", priority = -1 }
 # No panics in production: neither `.unwrap()` nor `.expect()`. Production code
 # must recover, degrade, or exit cleanly (a logged `std::process::exit(1)`)
 # instead of panicking with a backtrace. Tests opt back in via a crate-root
