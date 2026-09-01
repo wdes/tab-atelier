@@ -3,7 +3,8 @@
 # outbox-sweep.sh — KIOSK PD5: propose archiving ORPHAN outbox files (anti-entassement).
 #
 # Lists files in ~/Dev/outbox/ OLDER than N days (default 14, --days N) that are NOT
-# referenced by any OPEN decision in the log, and proposes archiving them. DRY-RUN by
+# referenced by any LIVE decision (open OR read) in the log, and proposes archiving
+# them. If the log can't be read the sweep ABORTS (fail-closed). DRY-RUN by
 # default (writes NOTHING — just lists the candidates); --apply moves them to
 # ~/Dev/outbox/_archive/AAAA-MM/ (consistent with PD3). NEVER `rm`s — always a move.
 #
@@ -42,14 +43,20 @@ done
 [ -d "$outbox" ] || { echo "outbox-sweep: no outbox at $outbox" >&2; exit 0; }
 command -v jq >/dev/null 2>&1 || { echo "outbox-sweep: jq not found" >&2; exit 3; }
 
-# The files to SPARE: every file referenced by an OPEN decision (state=open). A tilde is
-# expanded to $HOME so the comparison matches the on-disk path. Newline-separated set.
-spared="$(
-    "$tabatelier" decision list 2>/dev/null \
-        | jq -r '.[] | select(.state=="open") | .files[]?' \
-        | sed "s|^~/|$HOME/|" \
-        || true
-)"
+# The files to SPARE: every file referenced by a decision that is still LIVE — `open`
+# OR `read` (a read-but-not-yet-ruled decision still needs its bundle). Only tranched/
+# archived decisions release their files to the sweep.
+#
+# FAIL-CLOSED: if `decision list` can't be read, we do NOT know the reference set, so we
+# ABORT rather than sweep against an empty set (which would archive files a live decision
+# still needs). No `2>/dev/null`, no `|| true` — the error must surface and stop us.
+if ! decisions_json="$("$tabatelier" decision list)"; then
+    echo "outbox-sweep: 'decision list' failed — aborting (fail-closed: refusing to sweep against an unknown reference set)" >&2
+    exit 4
+fi
+spared="$(printf '%s' "$decisions_json" \
+    | jq -r '.[] | select(.state=="open" or .state=="read") | .files[]?' \
+    | sed "s|^~/|$HOME/|")"
 
 is_spared() {  # absolute path
     local f="$1"
@@ -62,7 +69,7 @@ has_keep() {  # a file whose FIRST line is `# keep` is never swept
 }
 
 # Candidate orphans: files under outbox (NOT under _archive/), older than N days, not
-# referenced by an open decision, not `# keep`.
+# referenced by a live (open/read) decision, not `# keep`.
 candidates=()
 while IFS= read -r -d '' f; do
     is_spared "$f" && continue
