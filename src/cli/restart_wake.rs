@@ -288,11 +288,13 @@ pub fn spawn_startup_wake(read_only: bool, roster: Vec<String>, build: &'static 
 /// target AND (when `submit`) press Enter so an IDLE target actually acts on it. It
 /// goes through the swamp → aligator, so it inherits aligator's regulation (per-round
 /// rate cap, transient-retry of not-yet-live tabs, dedup). `submit=false` keeps the
-/// old non-intrusive-marker behaviour for callers that want it.
+/// old non-intrusive-marker behaviour for callers that want it. PATH-INJECTABLE so the
+/// live seam is exercised against a temp swamp in tests (no dependence on the global).
 ///
 /// # Errors
 /// Propagates the append I/O error (the caller decides best-effort vs fatal).
 pub fn push_swamp_input(
+    path: &std::path::Path,
     target: &str,
     msg: &str,
     submit: bool,
@@ -301,7 +303,7 @@ pub fn push_swamp_input(
     dedup_key: Option<String>,
 ) -> std::io::Result<()> {
     let entry = swamp_entry(target, msg, submit, at_ms, priority, dedup_key);
-    crate::cli::aligator::append_swamp_line(&crate::cli::aligator::swamp_path(), &entry)
+    crate::cli::aligator::append_swamp_line(path, &entry)
 }
 
 /// THE single `SwampEntry` constructor (`RA1c`) — from `daemon`, 0 attempts.
@@ -330,17 +332,22 @@ pub fn swamp_entry(
     }
 }
 
-/// The REAL restart-wake push seam — the generic [`push_swamp_input`] brick ON THE LIVE
-/// PATH. One definition so headless + gui can't drift.
+/// The restart-wake push seam (`RA1c`), PATH-INJECTABLE.
+///
+/// Carries the LIVE hardcodes (submit=TRUE, `Status`, `restart-wake-{build}` dedup)
+/// through the generic [`push_swamp_input`] brick. One definition so headless + gui
+/// can't drift.
 ///
 /// ⭐ `RA1c`: `submit = TRUE` — the wake must TRIGGER the orchestrator's turn, not just
 /// deposit a marker. `RA1b`'s `submit=false` left an IDLE orchestrator stuck (the marker
-/// sat in the input, unsubmitted) → no functional wake. Now aligator presses Enter.
+/// sat in the input, unsubmitted) → no functional wake. Now aligator presses Enter. This
+/// `true` literal is guarded by the real-fs test that calls THIS seam (flip → red).
 ///
 /// # Errors
 /// Propagates the append I/O error (the caller counts it, best-effort).
-pub fn real_swamp_push(now: u64, build: &str, orch: &str, msg: &str) -> std::io::Result<()> {
+pub fn real_swamp_push_to(path: &std::path::Path, now: u64, build: &str, orch: &str, msg: &str) -> std::io::Result<()> {
     push_swamp_input(
+        path,
         orch,
         msg,
         true, // ⭐ the RA1c fix — trigger the turn, don't just deposit a marker.
@@ -348,6 +355,15 @@ pub fn real_swamp_push(now: u64, build: &str, orch: &str, msg: &str) -> std::io:
         crate::cli::aligator::Priority::Status,
         Some(format!("restart-wake-{build}")),
     )
+}
+
+/// The REAL restart-wake push seam ON THE LIVE PATH — [`real_swamp_push_to`] against the
+/// global [`swamp_path`](crate::cli::aligator::swamp_path). One definition (both editions).
+///
+/// # Errors
+/// Propagates the append I/O error (the caller counts it, best-effort).
+pub fn real_swamp_push(now: u64, build: &str, orch: &str, msg: &str) -> std::io::Result<()> {
+    real_swamp_push_to(&crate::cli::aligator::swamp_path(), now, build, orch, msg)
 }
 
 #[cfg(test)]
@@ -622,7 +638,7 @@ mod tests {
     // `append_swamp_line`/`parse_swamp`), delivered round-robin via `run_deferred_wake`.
     #[test]
     fn ra1c_real_wake_entry_submits_true_and_round_trips_on_real_fs() {
-        use crate::cli::aligator::{Priority, append_swamp_line, parse_swamp};
+        use crate::cli::aligator::{Priority, parse_swamp};
         let tmp = std::env::temp_dir().join(format!("ra1c-swamp-{}.jsonl", crate::default_tab_id()));
         struct Rm(std::path::PathBuf);
         impl Drop for Rm {
@@ -639,15 +655,10 @@ mod tests {
             1000,
             WAKE_GAP_MS,
             || true, // ready
-            // Deliver through the SINGLE constructor `swamp_entry` (the one
-            // `real_swamp_push`→`push_swamp_input` uses) to a temp swamp — real-fs,
-            // real serialization, no hardcoded mirror.
-            |stop| {
-                append_swamp_line(
-                    &tmp,
-                    &swamp_entry(&stop.target, &msg, true, stop.at_ms, Priority::Status, Some("restart-wake-deadbeef".into())),
-                )
-            },
+            // Deliver through the REAL, path-injectable seam `real_swamp_push_to` (the
+            // one `real_swamp_push` delegates to on the live path) against a temp swamp.
+            // Its `submit=true` LITERAL is now guarded here — no inline rebuild/mirror.
+            |stop| real_swamp_push_to(&tmp, stop.at_ms, "deadbeef", &stop.target, &msg),
             |_ms| {}, // no real sleep in the test
         );
         assert_eq!(n, 2, "both wakes delivered to the real swamp file");
