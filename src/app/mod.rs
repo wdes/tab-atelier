@@ -179,6 +179,9 @@ struct Tab {
     /// register without a code change. Used by the resume path
     /// to decide which command to type.
     agent_kind: Option<std::sync::Arc<str>>,
+    /// SV4 — how the tab was born (`fresh`/`resume`); mirrors `TabState::spawn_mode`,
+    /// carried into the retire record for the A/B metrics (SV5).
+    spawn_mode: Option<crate::cli::catalog::SpawnMode>,
     /// Durable: whether the agent was in plan / read-only mode
     /// at last save. Restored along with the session so the tab
     /// comes back in the same mode.
@@ -334,6 +337,7 @@ impl Tab {
             agent_state: None,
             agent_session_id: ts.agent_session_id.as_deref().map(std::sync::Arc::from),
             agent_kind: ts.agent_kind.as_deref().map(std::sync::Arc::from),
+            spawn_mode: ts.spawn_mode, // SV4: restore the A/B partition key
             agent_plan_mode: ts.agent_plan_mode,
             tab_env: ts.tab_env.clone(),
             share_token_rw: ts.share_token_rw.as_str().into(),

@@ -242,6 +242,23 @@ fn resolve_target(ep: &Endpoint, key: &str) -> Result<String, String> {
     }
 }
 
+/// Create a real tab running `<cmd> '<prompt>'` in a shell (SV4 reuse): the same
+/// proven path `dispatch --new` / spawn-bot.sh use. Returns the new tab uuid.
+///
+/// # Errors
+/// Propagates endpoint discovery + tab-creation failures.
+pub fn spawn_tab(name: Option<&str>, cwd: Option<&str>, cmd: &str, prompt: &str) -> Result<String, String> {
+    let ep = discover_endpoint()?;
+    let o = Opts {
+        new: true,
+        name: name.map(str::to_string),
+        cwd: cwd.map(str::to_string),
+        cmd: cmd.to_string(),
+        ..Opts::default()
+    };
+    spawn_agent_tab(&ep, &o, prompt)
+}
+
 /// Create a tab, identify it (by diffing the tab list), optionally
 /// rename it, and launch `<cmd> '<prompt>'` in its shell.
 fn spawn_agent_tab(ep: &Endpoint, o: &Opts, prompt: &str) -> Result<String, String> {

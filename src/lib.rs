@@ -1195,6 +1195,11 @@ pub struct TabState {
     /// Claude Code CLI). Free-form string for future agents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_kind: Option<String>,
+    /// SV4 — how this tab's agent was born (`fresh` / `resume`), stamped by
+    /// `spawn --from-skill` so the eventual retire record carries the right
+    /// `spawn_mode` for the A/B metrics (SV5). `None` on a hand-created / genesis tab.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_mode: Option<crate::cli::catalog::SpawnMode>,
     /// Durable — whether the agent was in plan / read-only mode at
     /// last save. Restored along with the session uuid so auto-resume
     /// brings the tab back into the same mode.
@@ -1561,6 +1566,7 @@ impl Default for TabState {
             agent_state: None,
             agent_session_id: None,
             agent_kind: None,
+            spawn_mode: None,
             agent_plan_mode: None,
             tab_env: std::collections::BTreeMap::new(),
             pinned_cols: None,

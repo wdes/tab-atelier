@@ -628,6 +628,10 @@ pub struct SnapshotTab {
     /// "session attached" semantic the desktop LED uses to render a
     /// steady grey dot when there's no transient state.
     pub agent_kind: Option<std::sync::Arc<str>>,
+    /// SV4 — how the tab was born (`fresh` / `resume`), mirrored from
+    /// `TabState.spawn_mode`. Read at retire (`from_snapshot`) into the record's
+    /// `spawn_mode` for the A/B metrics (SV5).
+    pub spawn_mode: Option<crate::cli::catalog::SpawnMode>,
     /// The fully-derived per-tab agent LED, computed once at snapshot-build
     /// time (GUI and headless) by [`crate::compute_tab_led`] so the `/tabs`
     /// `led` field, the CLI viewer and the mobile remote all render the exact
@@ -761,4 +765,6 @@ pub enum CardChange {
     Usage(u64, u64),
     // Inc8 fold: OVERWRITE the declared conventions (.md list).
     Conventions(Vec<String>),
+    // SV4: the tab's spawn_mode (fresh|resume), set by `spawn --from-skill`.
+    SpawnMode(Option<crate::cli::catalog::SpawnMode>),
 }

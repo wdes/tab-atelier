@@ -365,13 +365,14 @@ fn parse_assignment(a: &str) -> (Option<String>, String, String) {
 /// `…/objective`, `…/current-task`, `…/rounds-active`), return
 /// `(url-verb, json-body-key)`; else `None`. Drives the one generic card route.
 fn card_route_verb(p: &str) -> Option<(&'static str, &'static str)> {
-    const VERBS: [(&str, &str); 6] = [
+    const VERBS: [(&str, &str); 7] = [
         ("specialty", "specialty"),
         ("orchestrator", "orchestrator"),
         ("objective", "objective"),
         ("current-task", "current_task"),
         ("rounds-active", "rounds_active"),
         ("conventions", "conventions"),
+        ("spawn-mode", "spawn_mode"),
     ];
     VERBS
         .into_iter()
@@ -2164,6 +2165,7 @@ pub fn test_snapshot_tab(id: &str, name: &str) -> SnapshotTab {
         agent_state: None,
         agent_session_id: None,
         agent_kind: None,
+        spawn_mode: None,
         agent_led: None,
         last_used_at: None,
         viewers: 0,
@@ -6743,5 +6745,51 @@ mod tests {
         let closes = g.pending_closes.clone();
         drop(g);
         assert!(idx.is_some_and(|i| !closes.contains(&i)), "the incomplete v2 tab is kept (not closed)");
+    }
+
+    // SV4: the LIVE spawn seams — a REAL integration test, PRUDENT (no real agent is
+    // launched). (a) POST /tabs actually queues a tab creation (the 🟡 i fix: spawn
+    // CREATES a tab, not plan-only); (b) set-spawn-mode stamps the tab's spawn_mode,
+    // which from_snapshot carries into the retire record for the A/B (SV5).
+    #[test]
+    fn sv4_live_spawn_creates_tab_and_spawn_mode_flows_to_the_record() {
+        use crate::cli::catalog::SpawnMode;
+        let (port, state, token) = spawn_server();
+        let post = |path: &str, body: &str| {
+            format!("POST /{path}?token={token} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+        };
+
+        // (a) POST /tabs queues a REAL tab creation (not plan-only, the 🟡 i fix).
+        let before = {
+            let g = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            g.pending_new_tabs
+        };
+        let created = request(port, &post("tabs", "{}"));
+        assert_eq!(status_code(&created), 200, "POST /tabs → 200\n{created}");
+        {
+            let g = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(g.pending_new_tabs, before + 1, "spawn queues a real tab creation");
+        }
+
+        // (b) A disposable tab: stamp spawn-mode=resume, verify it lands + flows to the
+        // retire record via from_snapshot.
+        let id = crate::default_tab_id();
+        let mut tab = test_snapshot_tab(&id, "disposable-sv4");
+        tab.assignment = Some("build/builder".into());
+        {
+            let mut g = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            g.tabs.push(tab);
+        }
+        let r = request(port, &post(&format!("tabs/by-id/{id}/spawn-mode"), r#"{"spawn_mode":"resume"}"#));
+        assert_eq!(status_code(&r), 200, "set-spawn-mode → 200\n{r}");
+
+        let card = {
+            let g = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let idx = g.tabs.iter().position(|t| t.id.as_ref() == id.as_str()).expect("tab present");
+            assert_eq!(g.tabs[idx].spawn_mode, Some(SpawnMode::Resume), "spawn_mode stamped on the created tab");
+            // from_snapshot carries the tab's spawn_mode into the retire record.
+            crate::cli::catalog::CatalogCard::from_snapshot(&g.tabs[idx], None, 1)
+        };
+        assert_eq!(card.spawn_mode, Some(SpawnMode::Resume), "spawn_mode flows into the retire record (A/B key)");
     }
 }

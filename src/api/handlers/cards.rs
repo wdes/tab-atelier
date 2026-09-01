@@ -309,6 +309,18 @@ pub(in crate::api) fn card_verb<S: Write>(stream: &mut S, state: &Arc<Mutex<TabS
             state.tabs[idx].conventions.clone_from(&list);
             CardChange::Conventions(list)
         }
+        "spawn-mode" => {
+            // SV4: `fresh` / `resume` (anything else clears it). Stamped by
+            // `spawn --from-skill` so the retire record carries the A/B partition key.
+            let mode = match raw.as_deref().map(str::trim) {
+                Some("fresh") => Some(crate::cli::catalog::SpawnMode::Fresh),
+                Some("resume") => Some(crate::cli::catalog::SpawnMode::Resume),
+                Some("origin") => Some(crate::cli::catalog::SpawnMode::Origin),
+                _ => None,
+            };
+            state.tabs[idx].spawn_mode = mode;
+            CardChange::SpawnMode(mode)
+        }
         // rounds-active
         _ => {
             let active = raw.as_deref().is_some_and(|s| matches!(s.trim(), "true" | "1" | "on"));
