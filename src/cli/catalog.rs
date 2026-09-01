@@ -94,6 +94,61 @@ impl V2Stamp {
     }
 }
 
+/// The structured BILAN an agent produces at retire (SV1) — a RETROSPECTIVE ON ITS
+/// PROMPT, not on the precise task.
+///
+/// It replaces the 1-line `lastMission`: instead of "what I did", it captures what
+/// the agent learned about its ROLE/PROMPT and how the prompt should change — the raw
+/// material for the improved prompt (SV2) and the v2 record's profile (SV3). Every
+/// field is GENERALISABLE (about the base prompt/context), never the run's precise
+/// facts — those stay in `objective`/`current_task_log`, untouched. Written AT the
+/// retire, BEFORE the éval (SV2). All fields optional so a bilan is only as full as
+/// the agent made it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Bilan {
+    /// What the agent LEARNED about its role/prompt (generalisable, not task facts).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub learned: Vec<String>,
+    /// PROBLEMS with the base prompt/context that surfaced this run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub problems: Vec<String>,
+    /// Directives to ADD to the prompt (+consignes).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub add_directives: Vec<String>,
+    /// Directives to REMOVE from the prompt (−consignes).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drop_directives: Vec<String>,
+}
+
+impl Bilan {
+    /// A bilan with nothing in any of its four fields — treated as "no bilan".
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.learned.is_empty() && self.problems.is_empty() && self.add_directives.is_empty()
+            && self.drop_directives.is_empty()
+    }
+
+    /// A compact one-line summary — the back-fill for the legacy `lastMission` slot so
+    /// consumers that still read it get a readable digest of the structured bilan.
+    #[must_use]
+    pub fn one_line(&self) -> String {
+        let seg = |label: &str, items: &[String]| {
+            (!items.is_empty()).then(|| format!("{label}: {}", items.join("; ")))
+        };
+        [
+            seg("learned", &self.learned),
+            seg("problems", &self.problems),
+            seg("+prompt", &self.add_directives),
+            seg("−prompt", &self.drop_directives),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ")
+    }
+}
+
 /// A retired agent's CARD — a verbatim COPY of the durable `build_snapshot` fields
 /// (no new schema): the exact set that survives a restart on `TabState`.
 ///
@@ -153,8 +208,17 @@ pub struct CatalogCard {
     /// RB3 GATE #1 — the AFTER-ACTION (`set-last-mission`), the agent's closing
     /// summary written at `handoff-written` and archived with the card BEFORE the
     /// close. The one field new to RB3. `None` when the agent posted no after-action.
+    ///
+    /// SUPERSEDED by [`Self::bilan`] (SV1): when a structured bilan is supplied it
+    /// back-fills this with a one-line digest, so legacy readers keep working while the
+    /// bilan is the source of truth.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_mission: Option<String>,
+    /// The structured BILAN (SV1): the agent's retrospective ON ITS PROMPT, captured at
+    /// retire BEFORE the éval (SV2). Replaces the 1-line `last_mission` as the closing
+    /// record. `None` when the agent posted no bilan (v1 / legacy retire).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bilan: Option<Bilan>,
     // ----- v2 (SV3) — all skipped when absent, so a v1 card is byte-identical -----
     /// The PROPER SKILL NAME (SV5-nom): a short, stable name = the v2 FOLD KEY,
     /// replacing the ugly whole-specialty slug. Carried by clones so N instances of a
@@ -309,6 +373,20 @@ impl CatalogCard {
         self.cost = stamp.cost;
         self.difficulty = stamp.difficulty;
         self.schema_version = Some(2);
+        self
+    }
+
+    /// Attach the agent's structured [`Bilan`] (SV1) — the retrospective on its prompt,
+    /// captured at retire BEFORE the éval. It REPLACES the 1-line `last_mission` as the
+    /// closing record: the structured bilan is the source of truth, and `last_mission`
+    /// is back-filled with a one-line digest so legacy readers keep working. An empty
+    /// bilan is a no-op (nothing to record).
+    #[must_use]
+    pub fn with_bilan(mut self, bilan: Bilan) -> Self {
+        if !bilan.is_empty() {
+            self.last_mission = Some(bilan.one_line());
+            self.bilan = Some(bilan);
+        }
         self
     }
 }
@@ -1879,5 +1957,100 @@ mod tests {
         nameless.skill = None;
         nameless.slug = "fallback-slug".into();
         assert_eq!(nameless.fold_key(), "fallback-slug", "no proper name → stable slug fallback");
+    }
+
+    // ----- SV1: the structured bilan (retrospective on the prompt) --------------
+
+    fn sample_bilan() -> Bilan {
+        Bilan {
+            learned: vec!["read-back before close is the core gate".into()],
+            problems: vec!["the prompt lacked a lease-refresh reminder".into()],
+            add_directives: vec!["always beat the lease on long slices".into()],
+            drop_directives: vec!["drop the stale 'commit each file' note".into()],
+        }
+    }
+
+    // SV1 acceptance (1)+(4): the 4 bilan fields are captured, structured, and
+    // round-trip byte-complete; the bilan REPLACES lastMission (structured source +
+    // a one-line digest back-filled for legacy readers).
+    #[test]
+    fn sv1_bilan_four_fields_round_trip_and_replace_last_mission() {
+        let cat = TmpCatalog::new();
+        let bilan = sample_bilan();
+        let card = CatalogCard::from_tab_state(&maximal_tab_state("t"), None, RETIRED_AT).with_bilan(bilan.clone());
+        assert_eq!(card.bilan.as_ref(), Some(&bilan), "the structured 4-field bilan lands on the card");
+        // Replaces lastMission: last_mission is back-filled with a digest of the bilan.
+        let lm = card.last_mission.as_deref().expect("last_mission back-filled from the bilan");
+        assert!(
+            lm.contains("learned:") && lm.contains("problems:") && lm.contains("+prompt:") && lm.contains("−prompt:"),
+            "the digest covers all four bilan facets: {lm}"
+        );
+        // Round-trip byte-complete through the REAL append + read-back.
+        append_catalog_line(cat.path(), &card).unwrap();
+        let back = read_back(cat.path(), "t").expect("read-back");
+        let b = back.bilan.expect("all 4 bilan fields round-trip");
+        assert_eq!(b, bilan, "every bilan field survives byte-complete");
+        assert_eq!((b.learned.len(), b.problems.len(), b.add_directives.len(), b.drop_directives.len()), (1, 1, 1, 1));
+    }
+
+    // SV1 acceptance (2): the bilan is PROMPT-scoped (generalisable) — a distinct
+    // channel of directives-on-the-prompt, NOT the run's precise task context, which
+    // stays in `objective`/`current_task_log`, untouched.
+    #[test]
+    fn sv1_bilan_is_prompt_scoped_separate_from_precise_task_context() {
+        // maximal_tab_state carries PRECISE context: objective "ship RB1" + a task log.
+        let bilan = Bilan {
+            add_directives: vec!["state the persist-gate invariant up front".into()],
+            drop_directives: vec!["remove the outdated slug guidance".into()],
+            ..Default::default()
+        };
+        let card = CatalogCard::from_tab_state(&maximal_tab_state("t"), None, RETIRED_AT).with_bilan(bilan);
+        let b = card.bilan.as_ref().unwrap();
+        let joined =
+            [&b.learned[..], &b.problems[..], &b.add_directives[..], &b.drop_directives[..]].concat().join(" ");
+        // The bilan carries prompt directives, NOT the precise task facts.
+        assert!(!joined.contains("ship RB1"), "bilan does not carry the precise objective");
+        assert!(!joined.contains("step one"), "bilan does not carry the precise task log");
+        // The precise context lives in its own fields, untouched by the bilan.
+        assert_eq!(card.objective.as_deref(), Some("ship RB1"), "precise objective untouched");
+        assert_eq!(card.current_task_log, vec!["step one", "step two"], "precise task log untouched");
+    }
+
+    // SV1 acceptance (3): the bilan is archived AT retire, BEFORE the close (and thus
+    // before the éval SV2, which runs on the catalogued bilan) — captured at
+    // write_catalog time, before the shutdown seam.
+    #[test]
+    fn sv1_bilan_is_archived_before_close_and_before_eval() {
+        let bilan = sample_bilan();
+        let card = CatalogCard::from_tab_state(&maximal_tab_state("t"), None, RETIRED_AT).with_bilan(bilan.clone());
+        let seen_at_write = RefCell::new(None);
+        let out = perform_retire(
+            &card,
+            true,
+            true,
+            |c| {
+                *seen_at_write.borrow_mut() = c.bilan.clone();
+                Ok(())
+            },
+            |_id| Some(card.clone()),
+            || Ok(()),
+            || {
+                // At close, the archive already carried the structured bilan — written
+                // at archive time, before any post-archive (éval) step.
+                assert_eq!(*seen_at_write.borrow(), Some(bilan.clone()), "bilan archived BEFORE close/éval");
+                Ok(())
+            },
+        );
+        assert_eq!(out, RetireOutcome::Retired);
+    }
+
+    // SV1: an EMPTY bilan records nothing and never clobbers a legit legacy
+    // after-action — the replacement is opt-in and backward-compatible.
+    #[test]
+    fn sv1_empty_bilan_is_a_noop_and_after_action_stands() {
+        let card = CatalogCard::from_tab_state(&maximal_tab_state("t"), Some("legacy 1-line".into()), RETIRED_AT)
+            .with_bilan(Bilan::default());
+        assert!(card.bilan.is_none(), "an empty bilan records nothing");
+        assert_eq!(card.last_mission.as_deref(), Some("legacy 1-line"), "the legacy after-action still stands");
     }
 }
