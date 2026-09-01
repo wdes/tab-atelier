@@ -478,6 +478,27 @@ pub fn run(args: &[String]) -> i32 {
     }
 }
 
+/// PD4 idempotence predicate: is this incoming `open` a NO-OP re-run?
+///
+/// True iff the decision is ALREADY `open` AND the latest content equals the incoming
+/// (same project/title/why/reco/effort/files). A re-run of the same digest is then a
+/// no-op — the log doesn't grow. A re-open of a `read`/`tranched`/`archived` decision is
+/// NOT a no-op (it's a real state change), and a content change always appends. PURE.
+#[must_use]
+pub fn is_noop_open(events: &[DecisionEvent], incoming: &DecisionEvent) -> bool {
+    if state_of(events) != DecisionState::Open {
+        return false;
+    }
+    events.iter().rfind(|e| e.kind.is_content()).is_some_and(|c| {
+        c.project == incoming.project
+            && c.title == incoming.title
+            && c.why_gated == incoming.why_gated
+            && c.reco == incoming.reco
+            && c.effort == incoming.effort
+            && c.files == incoming.files
+    })
+}
+
 fn push(args: &[String]) -> i32 {
     let Some(id) = arg_after(args, "--id").filter(|s| !s.trim().is_empty()) else {
         eprintln!("decision push: --id is required");
@@ -498,9 +519,18 @@ fn push(args: &[String]) -> i32 {
         files,
         ..Default::default()
     };
+    // PD4 IDEMPOTENCE (the DRY dedup every producer inherits): a re-run of the same open
+    // on an already-open decision is a NO-OP — don't grow the log / duplicate.
+    let path = decisions_path();
+    let existing: Vec<DecisionEvent> =
+        parse_decisions(&std::fs::read_to_string(&path).unwrap_or_default()).into_iter().filter(|ev| ev.id == e.id).collect();
+    if is_noop_open(&existing, &e) {
+        println!("{}", serde_json::json!({ "push": e.id, "noop": true }));
+        return 0;
+    }
     // PD3 reversibility: re-opening an ARCHIVED decision brings its bundle back from the
     // archive before the `open` lands (best-effort; nothing is ever destroyed).
-    if let Err(err) = reopen_restore(&decisions_path(), &e.id) {
+    if let Err(err) = reopen_restore(&path, &e.id) {
         eprintln!("decision push: restore of the archived bundle failed — {err}");
     }
     append_or_report("push", &e)
@@ -844,5 +874,27 @@ mod tests {
         assert_eq!(d.title.as_deref(), Some("v2"), "latest content (update) wins");
         assert_eq!(d.reco.as_deref(), Some("updated reco"));
         assert_eq!(d.state, DecisionState::Read, "update does NOT touch the state axis");
+    }
+
+    // PD4: `is_noop_open` dedups ONLY an identical re-run on an already-open decision —
+    // the DRY idempotence every producer inherits.
+    #[test]
+    fn pd4_is_noop_open_dedups_an_identical_rerun_only() {
+        let o1 = open("d", "harness", "T", 1);
+        let same = open("d", "harness", "T", 2); // same content, different `at`
+        assert!(is_noop_open(std::slice::from_ref(&o1), &same), "identical re-run on an open decision → no-op (idempotent)");
+
+        // A content change → NOT a no-op (it must append the revision).
+        let changed = open("d", "harness", "T2", 2);
+        assert!(!is_noop_open(std::slice::from_ref(&o1), &changed), "changed content → appends");
+
+        // A re-open of a read/tranched/archived decision is a REAL state change.
+        assert!(!is_noop_open(&[o1.clone(), ev("d", DecisionKind::Read, 3)], &same), "re-open of a read decision is meaningful");
+        assert!(
+            !is_noop_open(&[o1, ev("d", DecisionKind::Archived, 3)], &same),
+            "re-open of an archived decision resurrects (not a no-op)"
+        );
+        // The first push (no prior content) is never a no-op.
+        assert!(!is_noop_open(&[], &same), "first push is never a no-op");
     }
 }
