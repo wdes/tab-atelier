@@ -1052,7 +1052,20 @@ impl TerminalView {
         self.net_disabled.set(disabled);
     }
 
-    pub fn respawn(&mut self, cwd: Option<&Path>) {
+    /// Re-fork this tab's shell in place, keeping the grid + scrollback.
+    ///
+    /// Takes the same per-tab inputs as the initial spawn so the tab comes back
+    /// as *itself*: `extra_env` carries `_TAB_ID` / `TAB_ATELIER_API_*` (without
+    /// them the in-tab CLI and the Claude hooks silently no-op), and
+    /// `agent_launch` re-execs the agent under cleared env instead of dropping
+    /// to a bare shell. Callers in non-cleared-env mode queue the typed resume
+    /// instead — see `flush_pending_agent_resume`.
+    pub fn respawn(
+        &mut self,
+        cwd: Option<&Path>,
+        extra_env: &HashMap<String, String>,
+        agent_launch: Option<Vec<String>>,
+    ) {
         if let Some(n) = self.notifier.as_ref() {
             let _ = n.send(Msg::Shutdown);
         }
@@ -1073,13 +1086,16 @@ impl TerminalView {
             cell_height: f32::from(cell.height) as u16,
         };
 
+        // The agent suffix is only honoured under cleared env (it's shell args,
+        // not env) — everywhere else the respawn forks a shell and the caller
+        // types the resume in.
+        let execs_agent = crate::clear_env() && agent_launch.is_some();
         let opts = if crate::clear_env() {
-            // Respawn carries no per-tab API extras (same as the
-            // inheriting branch below), so the cleared env is just the
-            // minimal allowlist + colours + telemetry opt-out.
-            let min_env =
-                crate::minimal_pty_env(self.colors_enabled.get(), crate::clear_env_user_vars(), &HashMap::new());
-            let (prog, args) = crate::clear_env_shell_command(&crate::clear_env_shell_path(), true, &min_env);
+            let min_env = crate::minimal_pty_env(self.colors_enabled.get(), crate::clear_env_user_vars(), extra_env);
+            let (prog, mut args) = crate::clear_env_shell_command(&crate::clear_env_shell_path(), true, &min_env);
+            if let Some(suffix) = agent_launch {
+                args.extend(suffix);
+            }
             let (prog, args) = if self.net_disabled.get() {
                 crate::no_internet_command(&prog, &args)
             } else {
@@ -1097,16 +1113,20 @@ impl TerminalView {
             // inside bubblewrap. bwrap inherits `env` and passes it to the
             // child (no --clearenv), so the colour/telemetry vars survive.
             let (prog, args) = crate::no_internet_command(&crate::clear_env_shell_path(), &["-l".to_string()]);
+            let mut env = crate::pty_env(self.colors_enabled.get());
+            env.extend(extra_env.clone());
             tty::Options {
                 shell: Some(tty::Shell::new(prog, args)),
                 working_directory: cwd.map(std::path::Path::to_path_buf),
-                env: crate::pty_env(self.colors_enabled.get()),
+                env,
                 ..Default::default()
             }
         } else {
+            let mut env = crate::pty_env(self.colors_enabled.get());
+            env.extend(extra_env.clone());
             tty::Options {
                 working_directory: cwd.map(std::path::Path::to_path_buf),
-                env: crate::pty_env(self.colors_enabled.get()),
+                env,
                 ..Default::default()
             }
         };
@@ -1149,8 +1169,9 @@ impl TerminalView {
         self.pid = pid;
         // Respawn keeps the old grid, so the re-forked shell's prompt would glue
         // onto it — same clean-line fix as `ensure_spawned` (raw PTY write, not a
-        // keystroke). Respawn always forks a shell.
-        if let Some(n) = &self.notifier {
+        // keystroke). An exec'd agent clears and redraws its own screen, so it
+        // neither needs nor wants the extra line.
+        if !execs_agent && let Some(n) = &self.notifier {
             let _ = n.send(Msg::Input(b"\r".to_vec().into()));
         }
         self.exited.store(false, std::sync::atomic::Ordering::Relaxed);
