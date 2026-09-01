@@ -59,6 +59,46 @@ pub enum Outcome {
     Problem,
 }
 
+/// SC1 (#39) — the catalogue is EVENT-SOURCED: every mutation is an append. `kind`
+/// discriminates the record TYPE so the read-model folds on TWO independent axes:
+/// - CONTENT (profile) = latest-append-wins over `{Retire, Edit}` records.
+/// - VISIBILITY = last-wins over `{Delete, Restore}` records ONLY.
+///
+/// `Retire` is the default → a record with no `kind` key (every v1 + SV1-SV5 record)
+/// reads as a retire, BYTE-IDENTICAL to before, so the v1 quarantine is untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RecordKind {
+    /// An agent retirement — a metric data-point + a profile snapshot. The default.
+    #[default]
+    Retire,
+    /// A profile EDIT (dashboard) — new prompt/specialty/conventions, `promptVersion++`.
+    /// Touches CONTENT, never VISIBILITY.
+    Edit,
+    /// A tombstone — hides the skill from the read-model (STICKY). Touches VISIBILITY.
+    Delete,
+    /// An explicit un-tombstone — the ONLY resurrection path. Touches VISIBILITY.
+    Restore,
+}
+
+impl RecordKind {
+    /// A retire record is the default; used to keep it out of the serialized JSON so
+    /// existing records stay byte-identical. (`&self` — serde `skip_serializing_if`
+    /// requires a `fn(&T)`.)
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    const fn is_retire(&self) -> bool {
+        matches!(self, Self::Retire)
+    }
+    /// A CONTENT record — carries profile fields (`Retire` or `Edit`).
+    const fn is_content(self) -> bool {
+        matches!(self, Self::Retire | Self::Edit)
+    }
+    /// A VISIBILITY record — flips the tombstone (`Delete` or `Restore`).
+    const fn is_visibility(self) -> bool {
+        matches!(self, Self::Delete | Self::Restore)
+    }
+}
+
 /// The v2 stamp an orchestrator applies at retire time (SV3).
 ///
 /// The distilled PROFILE fields (`skill` name + prompt/tools/patterns) plus this
@@ -524,7 +564,14 @@ pub struct CatalogCard {
     /// (FN2), and the DERIVED outcome. `None` on a v1 / un-evaluated retire.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eval: Option<EvalReport>,
-    /// Unix-millis the card was archived (retired).
+    /// SC1 (#39) — the event-sourced record TYPE. `Retire` (default) is skipped from
+    /// the JSON, so every existing record is byte-identical. `Edit`/`Delete`/`Restore`
+    /// are the dashboard mutation records.
+    #[serde(default, skip_serializing_if = "RecordKind::is_retire")]
+    pub kind: RecordKind,
+    /// Unix-millis the record was appended. For a retire it's the retire time; for an
+    /// edit/delete/restore it's the mutation time (audit only — the fold authority is
+    /// APPEND ORDER, not this timestamp).
     pub retired_at: u64,
 }
 
@@ -1068,17 +1115,20 @@ pub struct SkillProfile {
 }
 
 impl SkillProfile {
-    /// Fold one skill's instances: profile fields from the LATEST retirement (mode
-    /// AGNOSTIC), usageCount summed, metrics partitioned by mode, compare derived.
-    fn fold(skill: String, instances: &[CatalogCard]) -> Self {
-        // The profile winner = the latest retirement (mode-agnostic). A group is never
-        // empty (a `BTreeMap` entry always holds ≥1), but avoid a panicking `expect`.
-        let Some(latest) = instances.iter().max_by_key(|c| c.retired_at) else {
+    /// Fold one skill's records: the CONTENT axis (profile fields) = the LAST
+    /// `{Retire|Edit}` record in APPEND ORDER (SC1 — not a timestamp compare: an `Edit`
+    /// has no retire time and clocks skew; append order is the event-sourced authority,
+    /// like `read_back`'s `.rev()`). Metrics aggregate the retire data-points (mutation
+    /// records carry no `spawn_mode`, so they're inert for `byMode`).
+    fn fold(skill: String, records: &[CatalogCard]) -> Self {
+        // `records` is in append (file) order. The content winner is the LAST content
+        // record. A visible group always has ≥1 content record; guard anyway.
+        let Some(latest) = records.iter().rfind(|c| c.kind.is_content()) else {
             return Self { skill, ..Default::default() };
         };
-        let usage_total: u64 = instances.iter().filter_map(|c| c.usage_count).sum();
-        let fresh = ModeMetrics::of(instances, SpawnMode::Fresh);
-        let resume = ModeMetrics::of(instances, SpawnMode::Resume);
+        let usage_total: u64 = records.iter().filter_map(|c| c.usage_count).sum();
+        let fresh = ModeMetrics::of(records, SpawnMode::Fresh);
+        let resume = ModeMetrics::of(records, SpawnMode::Resume);
         let fresh_vs_resume = FreshVsResume::derive(&fresh, &resume);
         Self {
             skill,
@@ -1105,6 +1155,10 @@ impl SkillProfile {
 /// CF1 (SV2): only COMPLETE v2 profiles fold in — a `schema:2` record without a
 /// non-empty skill (an incomplete write that a `RETIRE INCOMPLET` kept on disk) is
 /// quarantined too, so the read-model never shows a half-built profile.
+///
+/// SC1 (#39) — the VISIBILITY axis: a skill whose LAST `{Delete|Restore}` record is a
+/// `Delete` is TOMBSTONED and filtered out (derived at read, never materialised). An
+/// `Edit` or a `Retire` never flips visibility — resurrection is a `Restore` only.
 #[must_use]
 pub fn read_skill_profiles_at(path: &Path) -> Vec<SkillProfile> {
     use std::collections::BTreeMap;
@@ -1113,7 +1167,22 @@ pub fn read_skill_profiles_at(path: &Path) -> Vec<SkillProfile> {
     for c in parse_catalog(&body).into_iter().filter(|c| c.is_v2() && c.has_skill()) {
         by_skill.entry(c.fold_key()).or_default().push(c);
     }
-    by_skill.into_iter().map(|(skill, group)| SkillProfile::fold(skill, &group)).collect()
+    by_skill
+        .into_iter()
+        .filter(|(_, group)| is_visible(group))
+        .map(|(skill, group)| SkillProfile::fold(skill, &group))
+        .collect()
+}
+
+/// SC1 VISIBILITY axis: a skill is visible unless its LAST visibility record
+/// (`Delete`/`Restore`, in append order) is a `Delete`. No visibility record ⇒ visible
+/// (the normal case). `records` is in append order.
+fn is_visible(records: &[CatalogCard]) -> bool {
+    records
+        .iter()
+        .rev()
+        .find(|c| c.kind.is_visibility())
+        .is_none_or(|c| c.kind != RecordKind::Delete)
 }
 
 /// [`read_skill_profiles_at`] against the live [`catalog_path`] — the v2 `skills`
@@ -1123,12 +1192,132 @@ pub fn read_skill_profiles() -> Vec<SkillProfile> {
     read_skill_profiles_at(&catalog_path())
 }
 
+// ---------------------------------------------------------------------------
+// SC1 (#39) — catalogue MUTATIONS (dashboard): edit / delete / restore. Each is an
+// APPEND (event-sourced): the fold above derives the new state. The route wraps these
+// PURE builders in a read-modify-append ATOMIC under the daemon lock + a read-back gate.
+//
+// ponytail (borne 1b): the file grows unbounded (one record per edit). The ceiling is
+// a COMPACTION pass — fold to latest-content-per-skill while KEEPING the last
+// visibility record (tombstone/restore) + the retire metric data-points — run at a low
+// cadence. Non-blocking (edits are rare, human-driven); the audit↔bounded-file tension
+// is deferred, not solved here.
+// ---------------------------------------------------------------------------
+
+/// The body of `POST /catalog/{skill}/edit`. Absent fields are carried from the latest
+/// content record; `prompt_version` is an OPTIONAL optimistic-concurrency token.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditBody {
+    pub specialty: Option<String>,
+    pub prompt: Option<String>,
+    pub conventions: Option<Vec<String>>,
+    /// The `promptVersion` the editor SAW. If it no longer matches the latest, a
+    /// concurrent edit landed first → [`EditError::Conflict`] (no lost update).
+    pub prompt_version: Option<u32>,
+}
+
+/// Why an edit was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditError {
+    /// No existing content record for the skill — nothing to edit.
+    NotFound,
+    /// The edit would leave skill or prompt empty (CF1 extended to edits — borne 4).
+    EmptyProfile,
+    /// The editor's `promptVersion` is stale — a concurrent edit already bumped it.
+    Conflict,
+}
+
+/// The LATEST content record (`Retire|Edit`) for `skill` in APPEND ORDER, or `None`.
+#[must_use]
+pub fn latest_content_for<'a>(records: &'a [CatalogCard], skill: &str) -> Option<&'a CatalogCard> {
+    records.iter().rfind(|c| c.has_skill() && c.fold_key() == skill && c.kind.is_content())
+}
+
+/// Does the catalogue hold ANY record for `skill`? (a `delete`/`restore` of a skill
+/// that never existed is a no-op.)
+#[must_use]
+pub fn skill_exists(records: &[CatalogCard], skill: &str) -> bool {
+    records.iter().any(|c| c.has_skill() && c.fold_key() == skill)
+}
+
+/// Plan an EDIT (SC1) — the PURE read-modify half.
+///
+/// Given the latest content record + the edit body, build the new `Edit` record
+/// (`promptVersion = latest+1`, absent fields carried from latest, tools/patterns
+/// carried) or reject. The append happens
+/// under the lock (see the route).
+///
+/// # Errors
+/// [`EditError::NotFound`] (no such skill), [`EditError::Conflict`] (stale version),
+/// [`EditError::EmptyProfile`] (CF1: skill/prompt would be empty).
+pub fn plan_edit(latest: Option<&CatalogCard>, skill: &str, body: &EditBody, now: u64) -> Result<CatalogCard, EditError> {
+    let latest = latest.ok_or(EditError::NotFound)?;
+    // Optimistic concurrency (borne 3): a stale expected version → refuse.
+    if body.prompt_version.is_some_and(|expected| latest.prompt_version.unwrap_or(0) != expected) {
+        return Err(EditError::Conflict);
+    }
+    // Absent fields carry from the latest content; an explicit empty is kept (and
+    // caught by CF1 below).
+    let prompt = body.prompt.clone().or_else(|| latest.prompt.clone());
+    let specialty = body.specialty.clone().or_else(|| latest.specialty.clone());
+    let conventions = body.conventions.clone().unwrap_or_else(|| latest.conventions.clone());
+    // CF1 extended (borne 4): the result must keep skill + prompt non-empty.
+    if skill.trim().is_empty() || prompt.as_deref().is_none_or(|p| p.trim().is_empty()) {
+        return Err(EditError::EmptyProfile);
+    }
+    Ok(CatalogCard {
+        skill: Some(skill.to_string()),
+        prompt,
+        specialty,
+        conventions,
+        tools: latest.tools.clone(),
+        patterns: latest.patterns.clone(),
+        prompt_version: Some(latest.prompt_version.unwrap_or(0).saturating_add(1)),
+        kind: RecordKind::Edit,
+        schema_version: Some(2),
+        retired_at: now,
+        ..Default::default()
+    })
+}
+
+/// Build a VISIBILITY record (`Delete`/`Restore`) for `skill` — no content, just the
+/// tombstone flip. The fold's visibility axis (last-wins) reads it.
+#[must_use]
+pub fn visibility_record(skill: &str, kind: RecordKind, now: u64) -> CatalogCard {
+    CatalogCard {
+        skill: Some(skill.to_string()),
+        kind,
+        schema_version: Some(2),
+        retired_at: now,
+        ..Default::default()
+    }
+}
+
 /// The RAW catalogue records (no fold) — used to look up an A/B baseline session for
 /// a skill, which the folded read-model deliberately drops. A missing file reads empty.
 #[must_use]
 pub fn read_catalog_cards() -> Vec<CatalogCard> {
-    let body = std::fs::read_to_string(catalog_path()).unwrap_or_default();
+    read_catalog_cards_at(&catalog_path())
+}
+
+/// [`read_catalog_cards`] against an explicit path — the SC1 mutation routes read +
+/// re-read (read-back gate) the same file under the lock. A missing file reads empty.
+#[must_use]
+pub fn read_catalog_cards_at(path: &Path) -> Vec<CatalogCard> {
+    let body = std::fs::read_to_string(path).unwrap_or_default();
     parse_catalog(&body)
+}
+
+/// The LAST visibility record's kind (`Delete`/`Restore`) for `skill` in append order —
+/// the SC1 read-back gate confirms a delete/restore landed. `None` if none exists.
+#[must_use]
+pub fn last_visibility_for(records: &[CatalogCard], skill: &str) -> Option<RecordKind> {
+    records
+        .iter()
+        .rev()
+        .find(|c| c.has_skill() && c.fold_key() == skill && c.kind.is_visibility())
+        .map(|c| c.kind)
 }
 
 // ---------------------------------------------------------------------------
@@ -2916,5 +3105,110 @@ mod tests {
         let override_stamp =
             V2Stamp { skill: Some("builder".into()), prompt: Some("p".into()), tokens: Some(9999), ..Default::default() };
         assert_eq!(card.with_v2(override_stamp).tokens, Some(9999), "an explicit stamp figure overrides");
+    }
+
+    // ----- SC1 (#39): catalogue mutations — event-sourced fold 2-axes -----------
+
+    /// A content record (retire) for `skill` at prompt version `ver` with prompt `pN`.
+    fn content_rec(id: &str, skill: &str, ver: u32) -> CatalogCard {
+        let mut c = v2_card(id, skill, SpawnMode::Fresh, Some(Outcome::Success), 1, None, None);
+        c.prompt = Some(format!("p{ver}"));
+        c.prompt_version = Some(ver);
+        c
+    }
+
+    // SC1: a retire record omits the `kind` key (byte-identical); an edit carries it.
+    #[test]
+    fn sc1_retire_record_omits_the_kind_key() {
+        let card = v2_card("t", "builder", SpawnMode::Fresh, Some(Outcome::Success), 1, None, None);
+        assert_eq!(card.kind, RecordKind::Retire, "default kind is retire");
+        let json = encode_catalog_line(&card);
+        assert!(!json.contains("\"kind\""), "a retire record omits the kind key (byte-identical): {json}");
+        let edit = CatalogCard { kind: RecordKind::Edit, skill: Some("x".into()), ..Default::default() };
+        assert!(encode_catalog_line(&edit).contains(r#""kind":"edit""#), "an edit carries kind:edit");
+    }
+
+    // SC1 CONTENT axis: the later-APPENDED record wins, NOT the later timestamp — an
+    // edit appended after a retire wins even with an older `retired_at`.
+    #[test]
+    fn sc1_content_is_latest_append_not_latest_timestamp() {
+        let cat = TmpCatalog::new();
+        let mut retire = content_rec("i1", "rustsmith", 1);
+        retire.retired_at = 999; // a LATER timestamp…
+        let edit = CatalogCard {
+            skill: Some("rustsmith".into()),
+            prompt: Some("edited prompt".into()),
+            prompt_version: Some(2),
+            kind: RecordKind::Edit,
+            schema_version: Some(2),
+            retired_at: 1, // …but an OLDER timestamp, appended AFTER.
+            ..Default::default()
+        };
+        append_catalog_line(cat.path(), &retire).unwrap();
+        append_catalog_line(cat.path(), &edit).unwrap();
+        let p = &read_skill_profiles_at(cat.path())[0];
+        assert_eq!(p.prompt.as_deref(), Some("edited prompt"), "the later-APPENDED edit wins (append order)");
+        assert_eq!(p.prompt_version, Some(2));
+    }
+
+    // SC1 VISIBILITY axis (borne 5, the ⭐ key test): delete tombstones (sticky); an
+    // edit after delete does NOT resurrect; a retire after delete does NOT resurrect;
+    // ONLY an explicit restore brings it back.
+    #[test]
+    fn sc1_delete_is_sticky_only_restore_resurrects() {
+        let cat = TmpCatalog::new();
+        append_catalog_line(cat.path(), &content_rec("i1", "s", 1)).unwrap();
+        assert_eq!(read_skill_profiles_at(cat.path()).len(), 1, "present before delete");
+
+        append_catalog_line(cat.path(), &visibility_record("s", RecordKind::Delete, 2)).unwrap();
+        assert!(read_skill_profiles_at(cat.path()).is_empty(), "delete tombstones the skill");
+
+        // ⭐ an EDIT after delete → still hidden (edit never touches visibility).
+        let mut edit = content_rec("x", "s", 2);
+        edit.kind = RecordKind::Edit;
+        append_catalog_line(cat.path(), &edit).unwrap();
+        assert!(read_skill_profiles_at(cat.path()).is_empty(), "edit after delete does NOT resurrect (borne 5)");
+
+        // ⭐ a normal RETIRE after delete (same skill name) → still hidden (the
+        // name-recurrence footgun is closed).
+        append_catalog_line(cat.path(), &content_rec("i2", "s", 3)).unwrap();
+        assert!(read_skill_profiles_at(cat.path()).is_empty(), "retire after delete does NOT resurrect");
+
+        // restore → visible again, with the LATEST content (the post-delete retire v3).
+        append_catalog_line(cat.path(), &visibility_record("s", RecordKind::Restore, 4)).unwrap();
+        let after = read_skill_profiles_at(cat.path());
+        assert_eq!(after.len(), 1, "restore is the ONLY resurrection path");
+        assert_eq!(after[0].prompt_version, Some(3), "restored with the latest content (append order)");
+    }
+
+    // SC1 plan_edit: absent fields carry from latest, version bumps, CF1 + optimistic
+    // concurrency gates, NotFound on a missing skill.
+    #[test]
+    fn sc1_plan_edit_carries_bumps_and_gates() {
+        let mut latest = content_rec("i1", "rustsmith", 4);
+        latest.prompt = Some("base prompt".into());
+        latest.specialty = Some("rust".into());
+        latest.conventions = vec!["A.md".into()];
+        latest.tools = vec!["cargo".into()];
+        // edit only specialty → prompt/conventions/tools carried; version 4→5.
+        let body = EditBody { specialty: Some("rust daemon".into()), ..Default::default() };
+        let rec = plan_edit(Some(&latest), "rustsmith", &body, 100).unwrap();
+        assert_eq!(rec.kind, RecordKind::Edit);
+        assert_eq!(rec.specialty.as_deref(), Some("rust daemon"), "specialty edited");
+        assert_eq!(rec.prompt.as_deref(), Some("base prompt"), "prompt carried from latest");
+        assert_eq!(rec.conventions, vec!["A.md"], "conventions carried");
+        assert_eq!(rec.tools, vec!["cargo"], "tools carried");
+        assert_eq!(rec.prompt_version, Some(5), "version bumped 4→5");
+        assert_eq!(rec.usage_count, None, "an edit is not a metric data-point");
+        // CF1 (borne 4): an explicit empty prompt → EmptyProfile.
+        let empty = EditBody { prompt: Some("  ".into()), ..Default::default() };
+        assert_eq!(plan_edit(Some(&latest), "rustsmith", &empty, 100), Err(EditError::EmptyProfile));
+        // Optimistic concurrency (borne 3): a stale expected version → Conflict.
+        let stale = EditBody { prompt: Some("new".into()), prompt_version: Some(3), ..Default::default() };
+        assert_eq!(plan_edit(Some(&latest), "rustsmith", &stale, 100), Err(EditError::Conflict));
+        let ok = EditBody { prompt: Some("new".into()), prompt_version: Some(4), ..Default::default() };
+        assert!(plan_edit(Some(&latest), "rustsmith", &ok, 100).is_ok(), "matching version → ok");
+        // No such skill → NotFound.
+        assert_eq!(plan_edit(None, "ghost", &body, 100), Err(EditError::NotFound));
     }
 }
