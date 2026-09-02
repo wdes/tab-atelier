@@ -9,9 +9,9 @@
 //! makes the identity survive Ctrl+Shift+T: nothing is copied from tab to tab,
 //! it's re-derived from the folder.
 //!
-//! Folder rules live in `preferences.json` (written here, read at daemon
-//! start, same contract as `bg-color --global`). Per-tab overrides go through
-//! the running daemon and win over the folder rule.
+//! Folder rules live in `preferences.json` (written here, re-read by the
+//! daemon on the next tick when the file's mtime moves). Per-tab overrides go
+//! through the running daemon and win over the folder rule.
 
 use super::share_link::{agent, discover_endpoint, resolve};
 
@@ -203,7 +203,7 @@ fn set_folder(dir: &str, color: Option<&str>, badge: Option<&str>, clear: bool) 
         eprintln!("style: write {}: {e}", path.display());
         return 1;
     }
-    println!("updated {} (restart the daemon to apply)", path.display());
+    println!("updated {} (applies within a tick)", path.display());
     0
 }
 
