@@ -25,7 +25,72 @@ tags:
     description: Tab list, I/O and per-tab state
   - name: tokens
     description: Master token + share-link token management
+  - name: dashboard
+    description: Aggregated fleet view, activity, and read-only share token
 paths:
+  /dashboard:
+    get:
+      tags: [dashboard]
+      summary: Dashboard app page (HTML)
+      description: >
+        The harness dashboard single-page app. Behind the auth gate (master or the
+        dashboard read-only share token); its static assets `/assets/dashboard.js`
+        and `/assets/dashboard.css` are served publicly.
+      responses:
+        "200": { description: HTML page, content: { text/html: {} } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /dashboard/state:
+    get:
+      tags: [dashboard]
+      summary: Aggregated, phase-grouped fleet view
+      description: >
+        Every tab mapped onto the 7 phase nodes via its `assignment`, grouped under
+        projects and repo-family services, with delegation lineage and the
+        self-declared agent card. Authorises with the master OR the read-only
+        dashboard share token.
+      responses:
+        "200":
+          description: Fleet aggregation
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  nodes: { type: array, items: { type: object } }
+                  unmapped: { type: array, items: { type: object } }
+                  projects: { type: array, items: { type: object } }
+                  services: { type: array, items: { type: object } }
+                  lineage: { type: array, items: { type: object } }
+                  unassigned: { type: array, items: { type: object } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /dashboard/activity:
+    get:
+      tags: [dashboard]
+      summary: Fleet activity passthrough
+      description: >
+        Verbatim passthrough of the activity scribe's `activity.json`; a graceful
+        empty object `{}` when absent or malformed (never a 404/500). Authorises
+        with the master OR the read-only dashboard share token.
+      responses:
+        "200": { description: Activity JSON, content: { application/json: {} } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /dashboard/share-token:
+    get:
+      tags: [dashboard]
+      summary: Mint/return the read-only dashboard share token
+      description: >
+        Returns the global read-only dashboard share token, minting it on first
+        use. MASTER ONLY — the dashboard share token itself never authorises this
+        route.
+      responses:
+        "200":
+          description: The share token
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { token: { type: string } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
   /tabs:
     get:
       tags: [tabs]

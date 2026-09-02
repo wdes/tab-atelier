@@ -15,6 +15,7 @@ mod cards;
 #[cfg(feature = "catbus")]
 mod catbus;
 mod claude_only;
+mod dashboard;
 mod env;
 mod files;
 mod input;
@@ -83,6 +84,11 @@ const VENDOR_TERM_SYMBOLS_WOFF2: &[u8] = include_bytes!("../assets/vendor/term-s
 /// next page load with no user intervention.
 const MAIN_CSS: &str = include_str!("../assets/main.css");
 const MAIN_JS: &str = include_str!("../assets/main.js");
+// The harness dashboard's own JS/CSS — served publicly at `/assets/dashboard.*`
+// (the `/dashboard` HTML page itself is behind the auth gate). Same cache-buster
+// story as `main.*`.
+const DASHBOARD_CSS: &str = include_str!("../assets/dashboard.css");
+const DASHBOARD_JS: &str = include_str!("../assets/dashboard.js");
 // Site icons + metadata served at the origin root (`/favicon.ico`, …). The
 // `.svg` reuses the app icon; the raster set is rendered from it. `robots.txt`
 // mirrors the `X-Robots-Tag: noindex` stance for crawlers that check it first.
@@ -679,6 +685,12 @@ pub struct TabSnapshot {
     /// token is persisted to `api.token`, and `tab-atelier token`
     /// re-reads the file. Initialised at server start.
     pub master_token: String,
+    /// Global read-only share token for the dashboard (`GET /dashboard` +
+    /// `/dashboard/state` + `/dashboard/activity`). Empty until minted on the
+    /// first `GET /dashboard/share-token` (master-only). A holder of this token
+    /// can READ the fleet view but nothing else — it is NOT in the per-tab
+    /// share-token set and never authorises a mutating or per-tab route.
+    pub dashboard_share_token: String,
     pub active: usize,
     #[cfg(feature = "energy")]
     pub power: Vec<crate::power::TabPower>,
@@ -1832,6 +1844,23 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 state_g.touch();
             }
             verdict
+        } else if let Some(p) = provided_token.as_deref()
+            && method.as_str() == "GET"
+            && matches!(path.as_str(), "/dashboard" | "/dashboard/state" | "/dashboard/activity")
+        {
+            // The global dashboard share-token authorises the READ-ONLY fleet
+            // view ONLY — never the `/dashboard/share-token` mint (master-only),
+            // never a per-tab or mutating route (method is pinned to GET here).
+            // Fail-closed: an empty (unminted) token authorises nobody, and a
+            // constant-time compare keeps a brute-force probe from timing bits.
+            let state_g = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let ok = !state_g.dashboard_share_token.is_empty()
+                && constant_time_eq(state_g.dashboard_share_token.as_bytes(), p.as_bytes());
+            if ok {
+                state_g.touch();
+            }
+            drop(state_g);
+            ok.then_some(true)
         } else {
             None
         };
@@ -1877,6 +1906,13 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
         // `raw_output` scrollback dumps, so it's cheap to poll ~1 s. Same
         // auth gate as `/tabs` (checked upstream of this match).
         ("GET", "/tabs/usage") => usage::run(stream, state, accept_gzip, if_none_match.as_deref()),
+        // The harness dashboard: the app page (behind auth; its `/assets/dashboard.*`
+        // stay public), the aggregated fleet view, the activity passthrough, and
+        // the master-only read-only share-token mint.
+        ("GET", "/dashboard") => dashboard::page(stream, accept_gzip, if_none_match.as_deref()),
+        ("GET", "/dashboard/state") => dashboard::state(stream, state, accept_gzip, if_none_match.as_deref()),
+        ("GET", "/dashboard/activity") => dashboard::activity(stream),
+        ("GET", "/dashboard/share-token") => dashboard::share_token(stream, state),
         #[cfg(feature = "catbus")]
         ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/catbus") => {
             catbus::session(stream, state, p);
@@ -2902,6 +2938,7 @@ pub fn test_snapshot(tabs: Vec<SnapshotTab>) -> TabSnapshot {
         activity_waker: std::sync::Arc::new((std::sync::Mutex::new(()), std::sync::Condvar::new())),
         generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         master_token: String::new(),
+        dashboard_share_token: String::new(),
     }
 }
 
@@ -4055,6 +4092,112 @@ mod tests {
             .master_token = String::new();
         let resp = request(port, "GET /tabs HTTP/1.1\r\n\r\n");
         assert_eq!(status_code(&resp), 401, "empty master rejects token-less request");
+    }
+
+    #[test]
+    fn dashboard_state_route_responds_and_aggregates() {
+        // Anti-built≠wired: the route must actually EXECUTE the aggregation and
+        // return the real fold — not merely answer 200. Inject a tab with an
+        // assignment and assert it lands on its phase node with the derived
+        // role/project/service, i.e. the pure builder ran end to end.
+        let (port, state, master) = spawn_server();
+        {
+            let mut snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut t = super::test_snapshot_tab("orch-1", "orchestrator");
+            t.assignment = Some("kalpin-back:build/orchestrator".into());
+            t.cwd = Some("/home/user/kalpin-back".into());
+            // A sibling repo so the `kalpin` service family (≥2 members) forms —
+            // a lone repo would collapse to a mono service under its own name.
+            let mut u = super::test_snapshot_tab("worker-2", "builder");
+            u.assignment = Some("kalpin-front:review/builder".into());
+            u.cwd = Some("/home/user/kalpin-front".into());
+            snap.tabs = vec![t, u];
+        }
+        let resp = request(
+            port,
+            &format!(
+                "GET /dashboard/state HTTP/1.1\r\nAuthorization: Bearer {master}\r\nAccept: application/json\r\n\r\n"
+            ),
+        );
+        assert_eq!(status_code(&resp), 200, "state route responds");
+        let v: serde_json::Value = serde_json::from_str(body(&resp)).expect("valid JSON body");
+        // The tab mapped onto the global `build` node (phase from its assignment).
+        let build = v["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["id"] == "build")
+            .expect("build node exists");
+        let occupant = &build["tabs"][0];
+        assert_eq!(occupant["id"], "orch-1", "tab reached the build node");
+        assert_eq!(occupant["role"], "orchestrator", "role derived from assignment");
+        assert_eq!(occupant["serving"], "kalpin-back", "project override read");
+        // A project bucket + a service family were derived (the fold ran, not a stub).
+        assert!(
+            v["projects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["name"] == "kalpin-back"),
+            "project bucket derived"
+        );
+        let kalpin = v["services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "kalpin")
+            .expect("kalpin service family derived from ≥2 sibling repos");
+        let members = kalpin["projects"].as_array().unwrap();
+        assert!(
+            members.iter().any(|p| p == "kalpin-back") && members.iter().any(|p| p == "kalpin-front"),
+            "both sibling repos grouped under the service"
+        );
+    }
+
+    #[test]
+    fn dashboard_state_requires_auth() {
+        let (port, _state, _master) = spawn_server();
+        let resp = request(
+            port,
+            "GET /dashboard/state HTTP/1.1\r\nAccept: application/json\r\n\r\n",
+        );
+        assert_eq!(status_code(&resp), 401, "no token → 401, fail-closed");
+    }
+
+    #[test]
+    fn dashboard_share_token_reads_view_but_not_mint() {
+        // The read-only dashboard share token authorises the fleet view but NOT
+        // the master-only mint route — and an empty (unminted) token authorises
+        // no one (fail-closed).
+        let (port, state, master) = spawn_server();
+        // Unminted (empty) dashboard token → a token-bearing read still 401s.
+        let resp = request(
+            port,
+            "GET /dashboard/state HTTP/1.1\r\nAuthorization: Bearer whatever\r\n\r\n",
+        );
+        assert_eq!(status_code(&resp), 401, "empty dashboard token rejects");
+        state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .dashboard_share_token = "dash-ro".into();
+        let resp = request(
+            port,
+            "GET /dashboard/state HTTP/1.1\r\nAuthorization: Bearer dash-ro\r\n\r\n",
+        );
+        assert_eq!(status_code(&resp), 200, "share token reads the fleet view");
+        // The mint route is master-only: the share token must NOT reach it.
+        let resp = request(
+            port,
+            "GET /dashboard/share-token HTTP/1.1\r\nAuthorization: Bearer dash-ro\r\n\r\n",
+        );
+        assert_eq!(status_code(&resp), 401, "share token can't mint (master-only)");
+        // Master mints + returns the token.
+        let resp = request(
+            port,
+            &format!("GET /dashboard/share-token HTTP/1.1\r\nAuthorization: Bearer {master}\r\n\r\n"),
+        );
+        assert_eq!(status_code(&resp), 200, "master mints the token");
+        assert!(body(&resp).contains("token"), "returns a token field");
     }
 
     #[test]
