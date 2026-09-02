@@ -12,6 +12,7 @@ use log::{debug, error, info};
 
 use crate::tracking::USER_AGENT;
 
+mod claude_only;
 mod env;
 mod meta;
 mod relay;
@@ -2503,27 +2504,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             drop(snap);
             respond_json(stream, 200, r#"{"queued":"default-limits"}"#);
         }
-        ("POST", "/claude-only") => {
-            // Toggle forced Claude-only mode live (the CLI `claude-only on|off`).
-            // Body: {"on": true|false}. The owner mirrors it onto CLAUDE_ONLY +
-            // its struct field and persists, so new tabs launch claude (auto
-            // mode) or a shell with no restart.
-            let parsed: serde_json::Value = match serde_json::from_slice(&body_bytes) {
-                Ok(v) => v,
-                Err(e) => {
-                    error_json(stream, 400, &format!("invalid JSON body: {e}"));
-                    return;
-                }
-            };
-            let Some(on) = parsed.get("on").and_then(serde_json::Value::as_bool) else {
-                error_json(stream, 400, r#"provide {"on": true|false}"#);
-                return;
-            };
-            let mut snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            snap.pending_claude_only = Some(on);
-            drop(snap);
-            respond_json(stream, 200, r#"{"queued":"claude-only"}"#);
-        }
+        ("POST", "/claude-only") => claude_only::set(stream, state, &body_bytes),
         ("POST", "/relay-mode") => relay::mode(stream, state, &body_bytes),
         ("GET", "/relay-config") => relay::config_get(stream),
         ("POST", "/relay-config") => relay::config_set(stream, state, &body_bytes),
