@@ -4,7 +4,7 @@
 // effort, files[], state(open|read|tranched|archived), verdict?, at } ] }.
 // The server owns state/verdict/visibility — the web renders VERBATIM (no re-gate).
 import assert from "node:assert/strict";
-import { kioskView, decisionCardHtml, kioskHtml } from "./dashboard.js";
+import { kioskView, decisionCardHtml, kioskHtml, renderDetail } from "./dashboard.js";
 
 // ============================ kioskView ============================
 {
@@ -73,4 +73,30 @@ import { kioskView, decisionCardHtml, kioskHtml } from "./dashboard.js";
   assert.match(kioskHtml({ decisions: [] }), /kk-empty/, "empty read-model -> empty state");
 }
 
-console.log("OK: kiosk render logic (view, card server-verbatim state, grouping/open-first, badge count)");
+// ============================ detail toggle — feature-detect + safe render ============================
+{
+  // detail present -> a (+) toggle + a hidden body carrying the rendered detail.
+  const withDetail = decisionCardHtml({ id: "r", state: "open", title: "t", detail: "**Enjeux** — x.\nOption A." });
+  assert.match(withDetail, /class="kk-detail-toggle"[^>]*aria-expanded="false"/, "detail present -> a collapsed toggle");
+  assert.match(withDetail, />\(\+\)</, "the toggle starts as (+)");
+  assert.match(withDetail, /class="kk-detail" hidden>/, "the detail body is hidden by default");
+  assert.match(withDetail, /<strong>Enjeux<\/strong>/, "**bold** rendered as <strong>");
+  assert.match(withDetail, /Option A\./, "the body carries the detail text");
+  assert.match(withDetail, /x\.<br>Option A\./, "newlines rendered as <br>");
+
+  // detail absent (or blank) -> NO toggle, NO body (graceful degradation, feature-detect).
+  const noDetail = decisionCardHtml({ id: "p", state: "open", title: "t" });
+  assert.ok(!/kk-detail-toggle/.test(noDetail), "no detail -> no toggle");
+  assert.ok(!/class="kk-detail"/.test(noDetail), "no detail -> no body");
+  const blankDetail = decisionCardHtml({ id: "b", state: "open", title: "t", detail: "   " });
+  assert.ok(!/kk-detail-toggle/.test(blankDetail), "blank detail -> no toggle (trimmed feature-detect)");
+
+  // renderDetail is XSS-safe: raw HTML in the payload is escaped before any markup is added.
+  const evil = renderDetail("<img src=x onerror=alert(1)>\n**b**");
+  assert.ok(!/<img/.test(evil), "raw HTML in detail is escaped (no injection)");
+  assert.match(evil, /&lt;img/, "the angle brackets are escaped");
+  assert.match(evil, /<strong>b<\/strong>/, "bold still rendered from the escaped text");
+  assert.match(evil, /<br>/, "newline still rendered");
+}
+
+console.log("OK: kiosk render logic (view, card server-verbatim state, grouping/open-first, badge count, detail toggle)");
