@@ -276,6 +276,12 @@ pub struct TerminalView {
     /// project tint from a folder rule, or the tab's own `bg-color`. `None` ⇒
     /// the theme's `term_bg`. Copied into the element each `render`.
     bg_override: Option<u32>,
+    /// This tab runs an agent whose fullscreen UI scrolls by page (Claude
+    /// Code), so a wheel notch on the alt screen becomes PgUp/PgDn instead of
+    /// wheel events or arrow keys, neither of which it acts on. Set from the
+    /// tab's durable `agent_kind`; `Cell` because the wheel handler reads it
+    /// through a shared reference.
+    alt_scroll_pages: Rc<Cell<bool>>,
     /// Shape of the cursor quad drawn over the active cell. Copied into the
     /// element each `render` (like `theme`) and read at paint time.
     cursor_style: CursorStyle,
@@ -496,6 +502,19 @@ fn expand_path_prefix(raw: &str) -> Option<std::path::PathBuf> {
     } else {
         let p = Path::new(raw);
         p.is_absolute().then(|| p.to_path_buf())
+    }
+}
+
+/// One `PageUp` / `PageDown` per wheel gesture, for a fullscreen app whose
+/// transcript scrolls by page and which answers to neither the wheel-button
+/// events nor the arrow keys — Claude Code, where PgUp/PgDn is what a user
+/// reaches for by hand. Magnitude is deliberately ignored: a notch is a page,
+/// the same as pressing the key once, rather than `lines` pages.
+fn page_scroll_bytes(lines: i32) -> Vec<u8> {
+    if lines > 0 {
+        b"\x1b[5~".to_vec()
+    } else {
+        b"\x1b[6~".to_vec()
     }
 }
 
@@ -799,6 +818,7 @@ impl TerminalView {
             scroll_acc: Rc::new(Cell::new(0.0)),
             theme: ThemeName::default(),
             bg_override: None,
+            alt_scroll_pages: Rc::new(Cell::new(false)),
             cursor_style: CursorStyle::default(),
             font_config,
             browser,
@@ -972,6 +992,12 @@ impl TerminalView {
     pub fn set_theme(&mut self, theme: ThemeName) {
         self.theme = theme;
         self.event_proxy.set_theme(theme);
+    }
+
+    /// Mark this tab as running a page-scrolling fullscreen agent (Claude
+    /// Code) so the wheel sends PgUp/PgDn on the alt screen.
+    pub fn set_alt_scroll_pages(&self, on: bool) {
+        self.alt_scroll_pages.set(on);
     }
 
     /// Override the terminal background (the project tint), or clear it back
@@ -1836,6 +1862,11 @@ impl Render for TerminalView {
                         // OWN scrollback, even while a mouse-aware TUI is up.
                         if ev.modifiers.shift {
                             this.scroll(lines);
+                        } else if this.alt_scroll_pages.get() && mode.contains(TermMode::ALT_SCREEN) {
+                            // Claude Code ignores both wheel-button events and
+                            // arrow keys; its transcript moves on PgUp/PgDn,
+                            // which is what users were pressing by hand.
+                            this.send_input(page_scroll_bytes(lines));
                         } else if mode.contains(TermMode::MOUSE_REPORT_CLICK) {
                             // The app requested mouse reporting → forward the
                             // wheel as mouse-wheel button events so it scrolls
@@ -3241,6 +3272,17 @@ mod tests {
     use crate::term_export::sgr_color;
     use gpui::TestAppContext;
     use vte::ansi::{Color, NamedColor};
+
+    #[test]
+    fn page_scroll_bytes_are_one_page_per_gesture() {
+        // A fullscreen agent that only answers PgUp/PgDn gets exactly one key
+        // per wheel gesture — `lines` scales the local scroll, not the number
+        // of pages, or a single notch would jump three screens.
+        assert_eq!(page_scroll_bytes(1), b"\x1b[5~".to_vec());
+        assert_eq!(page_scroll_bytes(3), b"\x1b[5~".to_vec());
+        assert_eq!(page_scroll_bytes(-1), b"\x1b[6~".to_vec());
+        assert_eq!(page_scroll_bytes(-9), b"\x1b[6~".to_vec());
+    }
 
     #[test]
     fn mouse_wheel_bytes_sgr_and_legacy() {
