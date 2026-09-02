@@ -2681,6 +2681,50 @@ pub fn test_snapshot_tab(id: &str, name: &str) -> SnapshotTab {
     }
 }
 
+/// Spawn the real API server on an ephemeral port over `state`, returning the
+/// port once it is accepting. Test-only: it lets the CLI verb tests drive the
+/// actual HTTP paths (`share_link`, `remote`, …) instead of mocking them.
+#[cfg(test)]
+pub fn spawn_test_server(state: &std::sync::Arc<std::sync::Mutex<TabSnapshot>>, read_only: bool) -> u16 {
+    // Hand a pre-bound std listener to a fresh tokio runtime so the caller
+    // knows the port without racing a rebind; the channel makes "accepting"
+    // observable so a request can't beat the loop.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let port = listener.local_addr().expect("addr").port();
+    let token = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .master_token
+        .clone();
+    let s = state.clone();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).expect("from_std");
+            let _ = ready_tx.send(());
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    continue;
+                };
+                let state = s.clone();
+                let token = token.clone();
+                tokio::spawn(async move {
+                    serve_connection(TokioIo::new(stream), false, state, token, read_only).await;
+                });
+            }
+        });
+    });
+    ready_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("server ready");
+    port
+}
+
 #[cfg(test)]
 pub fn test_snapshot(tabs: Vec<SnapshotTab>) -> TabSnapshot {
     TabSnapshot {
@@ -2969,13 +3013,6 @@ mod tests {
     }
 
     fn spawn_server_with_read_only(read_only: bool) -> (u16, Arc<Mutex<TabSnapshot>>, String) {
-        // Hand a pre-bound std listener to a fresh tokio runtime so
-        // the test can know the port without racing with rebind.
-        // A oneshot channel signals "listener is accepting" so the
-        // caller can't connect before the loop starts.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let port = listener.local_addr().unwrap().port();
         let state = test_state();
         let token = "test-secret-token".to_string();
         // Auth validates against the snapshot's master_token (live-swappable).
@@ -2983,30 +3020,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .master_token = token.clone();
-        let s = state.clone();
-        let t = token.clone();
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            rt.block_on(async move {
-                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-                let _ = ready_tx.send(());
-                loop {
-                    let Ok((stream, _)) = listener.accept().await else {
-                        continue;
-                    };
-                    let state = s.clone();
-                    let token = t.clone();
-                    tokio::spawn(async move {
-                        serve_connection(TokioIo::new(stream), false, state, token, read_only).await;
-                    });
-                }
-            });
-        });
-        ready_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        let port = super::spawn_test_server(&state, read_only);
         (port, state, token)
     }
 

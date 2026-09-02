@@ -1186,6 +1186,30 @@ mod tests {
     }
 
     #[test]
+    fn one_tick_over_a_live_api_finds_no_claude_tabs() {
+        // Drives the real tick against an in-process daemon: fetch /tabs,
+        // filter for Claude sessions, find none, leave every tab alone. The
+        // fixture's tabs have no agent_kind, which is exactly the "brain must
+        // not type into a shell" case.
+        crate::cli::share_link::with_test_server(|state| {
+            assert_eq!(run(&["--once".to_string()]), 0);
+            let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let typed = s.pending_input.len();
+            drop(s);
+            assert_eq!(typed, 0, "a non-agent tab must never be nudged");
+        });
+    }
+
+    #[test]
+    fn run_rejects_a_bad_interval_and_prints_help() {
+        assert_eq!(run(&["--help".to_string()]), 0);
+        assert_eq!(run(&["--interval".to_string()]), 2, "flag with no value");
+        assert_eq!(run(&["--interval".to_string(), "0".to_string()]), 2, "0s would spin");
+        assert_eq!(run(&["--interval".to_string(), "abc".to_string()]), 2);
+        assert_eq!(run(&["--nope".to_string()]), 2);
+    }
+
+    #[test]
     fn local_mass_freeze_drains_one_per_tick_instead_of_a_burst() {
         // 50 tabs wedge on the same LOCAL fault in the same tick — the herd.
         // There is no explicit fleet-wide simultaneous cap, and the breaker

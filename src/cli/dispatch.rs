@@ -634,10 +634,21 @@ pub enum Commands {
 /// inside the dispatched subcommand for code-path consistency.
 #[must_use]
 pub fn dispatch(cli: Cli) -> bool {
-    let Some(cmd) = cli.command else {
+    let Some(code) = command_exit_code(cli) else {
         return false;
     };
-    let code = match cmd {
+    std::process::exit(code);
+}
+
+/// The exit code a parsed subcommand should terminate with, or `None` when the
+/// line carried no subcommand (the caller then starts the daemon).
+///
+/// Split out of [`dispatch`], which can't be called from a test: it ends in
+/// `process::exit`, so it would take the test binary down with it — silently,
+/// and with a success code.
+fn command_exit_code(cli: Cli) -> Option<i32> {
+    let cmd = cli.command?;
+    Some(match cmd {
         Commands::Add { path, name } => {
             let mut args = vec![path.to_string_lossy().into_owned()];
             if let Some(n) = name {
@@ -908,14 +919,89 @@ pub fn dispatch(cli: Cli) -> bool {
             crate::cli::client::run("bench", &args)
         }
         Commands::BenchLag { url, samples } => crate::cli::bench_lag::run(&url, samples.unwrap_or(25)),
-    };
-    std::process::exit(code);
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    /// Drive whole command lines through `dispatch` against a real
+    /// in-process API server, so the mapping from a parsed variant to its verb
+    /// (and its argument order) is exercised rather than just the parse.
+    ///
+    /// Only non-destructive verbs: anything that patches the user's
+    /// preferences.json (`ports`, `net-default`, `bg-color --global`) would
+    /// edit the machine running the tests.
+    #[test]
+    fn dispatch_routes_each_command_to_its_verb() {
+        crate::cli::share_link::with_test_server(|state| {
+            let lines: &[&[&str]] = &[
+                &["tab-atelier-headless", "tabs"],
+                &["tab-atelier-headless", "tabs", "--json"],
+                &["tab-atelier-headless", "close", "1"],
+                &["tab-atelier-headless", "rename", "0", "renamed"],
+                &["tab-atelier-headless", "lock", "0"],
+                &["tab-atelier-headless", "unlock", "0"],
+                &["tab-atelier-headless", "net-off", "0"],
+                &["tab-atelier-headless", "net-on", "0"],
+                &["tab-atelier-headless", "share-link", "0"],
+                &["tab-atelier-headless", "share-link", "0", "--ro"],
+                &["tab-atelier-headless", "output", "0"],
+                &["tab-atelier-headless", "input", "0", "echo hi"],
+                &["tab-atelier-headless", "peers"],
+                &["tab-atelier-headless", "peers", "--all"],
+                &["tab-atelier-headless", "peek", "0"],
+                &["tab-atelier-headless", "stats", "0"],
+                &["tab-atelier-headless", "stats", "0", "--json"],
+                &["tab-atelier-headless", "resize", "0", "--cols", "100", "--rows", "40"],
+                &["tab-atelier-headless", "resize", "0", "--clear"],
+                &["tab-atelier-headless", "limit", "0", "--memory", "512M"],
+                &["tab-atelier-headless", "limit", "0", "--clear"],
+                &["tab-atelier-headless", "schedule", "0", "--clear"],
+                &["tab-atelier-headless", "env", "list"],
+                &["tab-atelier-headless", "env", "set", "K=V", "--global"],
+                &["tab-atelier-headless", "net-stats"],
+                &["tab-atelier-headless", "net-dns"],
+                &["tab-atelier-headless", "net-allow", "0", "--clear"],
+                &["tab-atelier-headless", "claude-only", "on"],
+                &["tab-atelier-headless", "relay", "status"],
+                &["tab-atelier-headless", "ssh-agent", "0", "--off"],
+                &["tab-atelier-headless", "style", "--list"],
+                &["tab-atelier-headless", "token"],
+            ];
+            for line in lines {
+                let cli = Cli::try_parse_from(*line).unwrap_or_else(|e| panic!("parse {line:?}: {e}"));
+                assert!(
+                    command_exit_code(cli).is_some(),
+                    "{line:?} must be handled as a subcommand"
+                );
+            }
+            // The verbs really reached the daemon, not just the match arm.
+            let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (closes, renames, locks, nets, inputs) = (
+                s.pending_closes.len(),
+                s.pending_renames.len(),
+                s.pending_lock_changes.len(),
+                s.pending_net_changes.len(),
+                s.pending_input.len(),
+            );
+            drop(s);
+            assert_eq!((closes, renames, locks, nets, inputs), (1, 1, 2, 2, 1));
+        });
+    }
+
+    #[test]
+    fn a_bare_invocation_is_not_a_subcommand() {
+        // `dispatch` returning false is what makes the binary fall through to
+        // starting the daemon, so a flags-only line must not be swallowed.
+        let cli = Cli::try_parse_from(["tab-atelier-headless"]).expect("parse");
+        assert!(command_exit_code(cli).is_none());
+        let cli = Cli::try_parse_from(["tab-atelier-headless", "--read-only"]).expect("parse");
+        assert!(cli.read_only);
+        assert!(command_exit_code(cli).is_none());
+    }
 
     /// Catches accidental subcommand drift: every variant must keep
     /// parsing from a representative command line.
