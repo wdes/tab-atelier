@@ -62,6 +62,9 @@ pub fn dispatch(name: &str, rest: &[String]) -> Option<i32> {
         "claude-hook" => claude_hook::run(rest),
         // Orchestration / teamwork.
         "dispatch" => delegate::run(rest),
+        // Skill-lifecycle: the retired-agent catalogue + spawn-from-skill/card.
+        "catalog" => super::catalog::run(rest),
+        "spawn" => super::catalog::spawn_run(rest),
         "remote" => remote::run(rest),
         "brain" => brain::run(rest),
         "schedule" => share_link::schedule(rest),

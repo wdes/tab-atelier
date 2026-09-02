@@ -25,6 +25,8 @@ tags:
     description: Tab list, I/O and per-tab state
   - name: tokens
     description: Master token + share-link token management
+  - name: catalog
+    description: Skill-lifecycle — retire an agent, the retired/skill read-model, catalogue mutations
 paths:
   /tabs:
     get:
@@ -314,6 +316,109 @@ paths:
       responses:
         "200": { description: OK, returns the new usageCount }
         "401": { $ref: "#/components/responses/Unauthorized" }
+  /tabs/by-id/{id}/retire:
+    post:
+      tags: [catalog]
+      summary: Retire an agent — archive its card to the catalogue, then close it
+      description: >
+        The LIVE retire write-path. Master token only. Gated fail-closed: the tab must
+        be at rehome_status == safe-to-close, the card is archived to catalog.jsonl and
+        RE-READ (read-back) before any close; an incomplete read-back → 409 and the tab
+        is KEPT. An optional v2 stamp (skill/prompt/telemetry) + éval-à-3 votes promote
+        the record to a distilled skill profile.
+      parameters: [ { $ref: "#/components/parameters/id" } ]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                after_action: { type: string }
+                bilan:
+                  type: object
+                  properties:
+                    learned: { type: array, items: { type: string } }
+                    problems: { type: array, items: { type: string } }
+                    addDirectives: { type: array, items: { type: string } }
+                    dropDirectives: { type: array, items: { type: string } }
+                skill: { type: string, description: names a v2 skill profile (opt-in) }
+                prompt: { type: string }
+                promptVersion: { type: integer }
+                tools: { type: array, items: { type: string } }
+                patterns: { type: array, items: { type: string } }
+                spawnMode: { type: string, enum: [fresh, resume, origin] }
+                outcome: { type: string, enum: [success, problem] }
+                tokens: { type: integer, format: int64 }
+                cost: { type: number }
+                eval:
+                  type: object
+                  description: éval-à-3 inputs; the daemon DERIVES the outcome + prompt
+                  properties:
+                    basePrompt: { type: string }
+                    votes: { type: object }
+      responses:
+        "200": { description: retired — card archived (read-back OK), close queued }
+        "409": { description: RETIRE INCOMPLET — gate failed, the tab is kept }
+        "404": { description: tab not found }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /catalog/list:
+    get:
+      tags: [catalog]
+      summary: The retired-agent read-model — folded retired cards + v2 skill profiles
+      description: >
+        Read-only. Master token only. Returns { retired:[…], skills:[…] }; the skills
+        are v2 records folded by skill name with per-mode (fresh/resume) metrics. By
+        default tombstoned skills are hidden.
+      parameters:
+        - name: includeDeleted
+          in: query
+          required: false
+          schema: { type: boolean }
+          description: also surface tombstoned skills (marked deleted:true) so Restore is reachable
+      responses:
+        "200": { description: "OK — retired[] + skills[] read-model" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /catalog/{skill}/edit:
+    post:
+      tags: [catalog]
+      summary: Edit a skill profile (append-only, promptVersion++)
+      description: Master token only. Absent fields carry from the latest content. CF1 keeps skill+prompt non-empty.
+      parameters: [ { $ref: "#/components/parameters/skill" } ]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                specialty: { type: string }
+                prompt: { type: string }
+                conventions: { type: array, items: { type: string } }
+                promptVersion: { type: integer, description: optimistic-concurrency token }
+      responses:
+        "200": { description: edited, returns the new promptVersion }
+        "404": { description: no such skill }
+        "409": { description: empty profile (CF1) or stale promptVersion (concurrent edit) }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /catalog/{skill}/delete:
+    post:
+      tags: [catalog]
+      summary: Tombstone a skill (STICKY — hidden until an explicit restore)
+      description: Master token only. Append a Delete visibility record. A delete of a nonexistent skill is a 200 no-op.
+      parameters: [ { $ref: "#/components/parameters/skill" } ]
+      responses:
+        "200": { description: deleted (or no-op) }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /catalog/{skill}/restore:
+    post:
+      tags: [catalog]
+      summary: Un-tombstone a skill (the only resurrection path)
+      description: Master token only. Append a Restore visibility record. A restore of a nonexistent skill is a 200 no-op.
+      parameters: [ { $ref: "#/components/parameters/skill" } ]
+      responses:
+        "200": { description: restored (or no-op) }
+        "401": { $ref: "#/components/responses/Unauthorized" }
   /tabs/by-id/{id}/bg-color:
     post:
       tags: [tabs]
@@ -520,6 +625,12 @@ components:
       required: true
       schema: { type: string, format: uuid }
       description: Stable per-tab UUID.
+    skill:
+      name: skill
+      in: path
+      required: true
+      schema: { type: string }
+      description: The proper skill name — the catalogue's v2 fold key.
   responses:
     Unauthorized:
       description: Invalid or missing token. HTML page for browsers (Accept text/html), JSON otherwise.

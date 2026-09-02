@@ -802,6 +802,24 @@ pub fn build_agent_resume_command(kind: &str, session_id: &str, plan: Option<boo
     }
 }
 
+/// Option-adapter over [`build_agent_resume_command`] for the catalogue `--resume` paths.
+///
+/// Used by `crate::cli::catalog`'s spawn paths: session-less standalone tools
+/// (`brain`/`aligator`) relaunch ignoring the session; session-carrying agents resume
+/// the persisted session. `None` for an unknown kind or a missing session.
+#[must_use]
+pub fn restore_resume_command(
+    agent_kind: Option<&str>,
+    session_id: Option<&str>,
+    plan: Option<bool>,
+) -> Option<String> {
+    match (agent_kind, session_id) {
+        (Some(kind @ ("brain" | "aligator")), _) => build_agent_resume_command(kind, "", plan),
+        (Some(kind), Some(sid)) => build_agent_resume_command(kind, sid, plan),
+        _ => None,
+    }
+}
+
 /// How a (re)spawn brings an agent tab back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentRelaunch {
