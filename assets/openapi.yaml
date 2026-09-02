@@ -25,6 +25,8 @@ tags:
     description: Tab list, I/O and per-tab state
   - name: tokens
     description: Master token + share-link token management
+  - name: relay
+    description: Relay-LLM mode toggle + endpoint/egress config (routes Anthropic calls through a remote)
 paths:
   /tabs:
     get:
@@ -330,6 +332,81 @@ paths:
               schema: { type: object, properties: { token: { type: string } } }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "500": { description: Could not persist token }
+  /relay-mode:
+    post:
+      tags: [relay]
+      summary: Toggle relay-LLM mode live
+      description: >
+        Enable/disable relay mode without a restart (the CLI `relay on|off`).
+        The owner mirrors it onto RELAY_MODE and persists; claude tabs spawned
+        afterwards route their Anthropic calls through the configured remote
+        endpoint. Master token only.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [on]
+              properties: { on: { type: boolean } }
+      responses:
+        "200":
+          description: Queued
+          content:
+            application/json:
+              schema: { type: object, properties: { queued: { type: string } } }
+        "400": { description: Body must be {"on":true|false} }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /relay-config:
+    get:
+      tags: [relay]
+      summary: Read relay config
+      description: >
+        Current relay mode, egress role and target endpoint URL (the CLI
+        `relay status`). Master token only.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Relay config
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  mode: { type: boolean }
+                  egress: { type: boolean }
+                  target: { type: string, nullable: true }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      tags: [relay]
+      summary: Set relay endpoint and/or egress role
+      description: >
+        Set the relay endpoint (`relay via <label|id>`; empty string clears)
+        and/or the egress role (`relay egress`). Any subset of the fields.
+        The owner resolves the endpoint against the saved remotes, persists
+        and re-installs. Master token only.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                endpoint: { type: string, description: "Remote label or id; empty string clears" }
+                egress: { type: boolean }
+      responses:
+        "200":
+          description: Queued
+          content:
+            application/json:
+              schema: { type: object, properties: { queued: { type: string } } }
+        "400": { description: Invalid JSON body }
+        "401": { $ref: "#/components/responses/Unauthorized" }
 components:
   securitySchemes:
     bearerAuth:
