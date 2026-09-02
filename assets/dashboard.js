@@ -1642,18 +1642,28 @@ export function decisionCardHtml(d) {
   const state = String(d.state || "open");
   const isRead = state === "read" || state === "tranched" || state === "archived";
   const isTranched = state === "tranched" || state === "archived";
+  // Bug2 UX guard: no page token -> the daemon rejects Lu/Tranché (read-only dashboard
+  // without the ruling scope). Disable the controls with a hint rather than fail silently.
+  const canRule = typeof TOKEN === "string" && TOKEN.length > 0;
   const id = escapeHtml(String(d.id || ""));
   const line = (label, val) => (val ? `<div class="kk-field"><span class="kk-key">${label}</span> ${escapeHtml(String(val))}</div>` : "");
   const files = Array.isArray(d.files) ? d.files : [];
-  // ponytail: the href is the raw outbox path — the PO clicks to read the bundle. A
-  // later slice can route it through an outbox file-server; here it's a reachable anchor.
+  // Bug1: link through the SANDBOXED bundle route WITH the page token (a raw outbox path
+  // 401s at the daemon). The server confines the path to the outbox + _archive subtree.
   const links = files.length
-    ? `<div class="kk-files">${files.map((f) => `<a class="kk-file" href="${escapeHtml(String(f))}" target="_blank" rel="noopener">${escapeHtml(String(f))}</a>`).join("")}</div>`
+    ? `<div class="kk-files">${files.map((f) => {
+        const href = `/decisions/file?path=${encodeURIComponent(String(f))}${canRule ? `&token=${encodeURIComponent(TOKEN)}` : ""}`;
+        return `<a class="kk-file" href="${escapeHtml(href)}" target="_blank" rel="noopener">${escapeHtml(String(f))}</a>`;
+      }).join("")}</div>`
     : "";
+  // Lu is the only actionable notch; Tranché is a STATE INDICATOR (always disabled) — the
+  // ruling action is the explicit "Trancher" button (Bug3), so submission is evident.
+  const luDisabled = isRead || !canRule;
+  const ruleDisabled = isTranched || !canRule;
   return `<div class="kk-card kk-state-${escapeHtml(state)}" data-id="${id}" data-state="${escapeHtml(state)}">
     <div class="kk-head">
-      <label class="kk-check"><input type="checkbox" class="kk-lu"${isRead ? " checked disabled" : ""}> Lu</label>
-      <label class="kk-check"><input type="checkbox" class="kk-tranche"${isTranched ? " checked disabled" : ""}> Tranché</label>
+      <label class="kk-check"><input type="checkbox" class="kk-lu"${isRead ? " checked" : ""}${luDisabled ? " disabled" : ""}> Lu</label>
+      <label class="kk-check"><input type="checkbox" class="kk-tranche" disabled${isTranched ? " checked" : ""}> Tranché</label>
       <span class="kk-title">${escapeHtml(String(d.title || d.id || ""))}</span>
       <span class="kk-state-tag">${escapeHtml(DECISION_STATE_LABEL[state] || state)}</span>
     </div>
@@ -1662,8 +1672,10 @@ export function decisionCardHtml(d) {
     ${line("effort", d.effort)}
     ${links}
     <div class="kk-rule">
-      <input type="text" class="kk-verdict-input" placeholder="verdict court…" value="${escapeHtml(String(d.verdict || ""))}"${isTranched ? " disabled" : ""}>
+      <input type="text" class="kk-verdict-input" placeholder="verdict court…" value="${escapeHtml(String(d.verdict || ""))}"${ruleDisabled ? " disabled" : ""}>
+      <button type="button" class="kk-send"${ruleDisabled ? " disabled" : ""}>Trancher</button>
       ${d.verdict ? `<span class="kk-verdict">verdict : ${escapeHtml(String(d.verdict))}</span>` : ""}
+      ${canRule ? "" : `<span class="kk-hint">lecture seule — ouvrez le dashboard avec un token pour trancher</span>`}
       <span class="kk-msg" role="status"></span>
     </div>
   </div>`;
@@ -1747,31 +1759,30 @@ function decisionPost(id, verb, body) {
   });
 }
 
-// Handle a click on a Lu / Tranché checkbox. The SERVER decides the new state; we
-// re-fetch after a 2xx (no optimistic mutation). Returns true if it handled the target.
+// Submit the ruling for a card: POST /tranch with the typed verdict (non-empty required —
+// the server 400s an empty one too). Driven by the explicit "Trancher" button + Enter.
+async function submitTranch(card) {
+  const msg = card.querySelector(".kk-msg");
+  const fail = (t) => { if (msg) { msg.textContent = t; msg.className = "kk-msg err"; } };
+  const verdict = (card.querySelector(".kk-verdict-input")?.value || "").trim();
+  if (!verdict) { fail("un verdict est requis pour trancher"); return; }
+  try { const res = await decisionPost(card.dataset.id, "tranch", { verdict }); if (res.ok) openKiosk(); else fail(`erreur ${res.status}`); }
+  catch (err) { fail(`réseau : ${err.message}`); }
+}
+
+// Handle a click on the Lu checkbox or the "Trancher" button. The SERVER decides the new
+// state; we re-fetch after a 2xx (no optimistic mutation). Returns true if handled.
 async function handleKioskAction(target) {
   const card = target.closest && target.closest(".kk-card");
   if (!card) return false;
-  const id = card.dataset.id;
-  const msg = card.querySelector(".kk-msg");
-  const fail = (t) => { if (msg) { msg.textContent = t; msg.className = "kk-msg err"; } };
   if (target.closest(".kk-lu")) {
-    try { const res = await decisionPost(id, "read", {}); if (res.ok) openKiosk(); else fail(`erreur ${res.status}`); }
+    const msg = card.querySelector(".kk-msg");
+    const fail = (t) => { if (msg) { msg.textContent = t; msg.className = "kk-msg err"; } };
+    try { const res = await decisionPost(card.dataset.id, "read", {}); if (res.ok) openKiosk(); else fail(`erreur ${res.status}`); }
     catch (err) { fail(`réseau : ${err.message}`); }
     return true;
   }
-  if (target.closest(".kk-tranche")) {
-    const verdict = (card.querySelector(".kk-verdict-input")?.value || "").trim();
-    if (!verdict) {
-      // The server enforces this too (400) — the client hint just avoids a round-trip.
-      if (target.checked) target.checked = false; // revert the optimistic check
-      fail("un verdict est requis pour trancher");
-      return true;
-    }
-    try { const res = await decisionPost(id, "tranch", { verdict }); if (res.ok) openKiosk(); else fail(`erreur ${res.status}`); }
-    catch (err) { fail(`réseau : ${err.message}`); }
-    return true;
-  }
+  if (target.closest(".kk-send")) { submitTranch(card); return true; }
   return false;
 }
 
@@ -1986,7 +1997,12 @@ function bootstrap() {
       if (e.target.closest(".kk-refresh")) { openKiosk(); return; }
       const showArch = e.target.closest(".kk-show-archived");
       if (showArch) { kioskIncludeArchived = !!showArch.checked; openKiosk(); return; }
-      if (e.target.closest(".kk-lu, .kk-tranche")) { handleKioskAction(e.target); return; }
+      if (e.target.closest(".kk-lu, .kk-send")) { handleKioskAction(e.target); return; }
+    });
+    // Bug3: Enter in the verdict field submits the ruling (as well as the "Trancher" button).
+    kioskPanel.addEventListener("keydown", (e) => {
+      const input = e.key === "Enter" && e.target.closest && e.target.closest(".kk-verdict-input");
+      if (input) { e.preventDefault(); const card = input.closest(".kk-card"); if (card) submitTranch(card); }
     });
   }
   document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeKiosk(); });

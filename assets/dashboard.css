@@ -842,6 +842,11 @@ body.band-view { min-height: calc(100vh + 180px); }
 .kk-file { font-size: 0.78rem; color: var(--led-idle-stroke); word-break: break-all; }
 .kk-rule { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.4rem; flex-wrap: wrap; }
 .kk-verdict-input { flex: 1 1 12rem; font: inherit; font-size: 0.8rem; padding: 0.25rem 0.4rem; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--fg); }
+.kk-verdict-input:disabled { opacity: 0.5; }
+/* Bug3: the explicit ruling action — makes verdict submission evident. */
+.kk-send { font: inherit; font-size: 0.78rem; padding: 0.25rem 0.7rem; border-radius: 6px; border: 1px solid var(--led-working-stroke); background: var(--panel); color: var(--led-working-stroke); cursor: pointer; }
+.kk-send:disabled { opacity: 0.5; cursor: not-allowed; }
 .kk-verdict { font-size: 0.76rem; color: var(--muted); }
+.kk-hint { font-size: 0.72rem; color: var(--muted); font-style: italic; }
 .kk-msg { font-size: 0.74rem; color: var(--muted); }
 .kk-msg.err { color: var(--led-error-stroke); }

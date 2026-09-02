@@ -1517,6 +1517,17 @@ fn respond_json<W: Write>(stream: &mut W, status: u16, body: &str) {
     );
 }
 
+/// Serve raw bytes with an explicit content-type (the KIOSK bundle route, #kiosk).
+fn respond_bytes<W: Write>(stream: &mut W, status: u16, content_type: &str, body: &[u8]) {
+    let reason = if status == 200 { "OK" } else { "Error" };
+    let _ = write!(
+        stream,
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n{ROBOTS_TAG}Content-Length: {}\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(body);
+}
+
 use crate::strip_ansi;
 
 fn error_json<W: Write>(stream: &mut W, status: u16, msg: &str) {
@@ -2158,6 +2169,9 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             handlers::decisions::mutate(stream, state, p, &body_bytes);
         }
         ("GET", "/decisions") => handlers::decisions::list(stream, query_include_archived),
+        // #kiosk bug1: serve a bundle's content, SANDBOXED to the outbox — the KIOSK
+        // links point here (with the page token) instead of at the raw path (which 401s).
+        ("GET", "/decisions/file") => handlers::decisions::file(stream, query_path.as_deref()),
         (_, "/" | "/tabs") => {
             error_json(stream, 405, "method not allowed");
         }
@@ -7081,6 +7095,52 @@ mod tests {
         let arch = all.iter().find(|x| x["id"] == serde_json::json!(id)).expect("surfaced with ?includeArchived");
         assert_eq!(arch["state"], serde_json::json!("archived"), "tranch transits to archived (PD3)");
         assert_eq!(arch["verdict"], serde_json::json!("GO"), "the verdict rides the archived read-model");
+    }
+
+    /// Removes a single file on drop (the KIOSK bundle-route test writes a real file into
+    /// the real outbox — a unique name never collides with real bundles).
+    struct OutboxFile(std::path::PathBuf);
+    impl Drop for OutboxFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    // #kiosk bug1 (LIVE route, real-fs): GET /decisions/file serves a bundle's content
+    // ONLY when it is inside the outbox sandbox, and the dashboard token is authorised to
+    // read it. Out-of-sandbox / missing / no-path are refused. A raw path never reaches
+    // the disk outside the outbox (the confinement is proven by /etc/passwd → 403).
+    #[test]
+    fn kiosk_decisions_file_route_is_sandboxed_and_dashboard_readable() {
+        use crate::cli::decision::outbox_base;
+        let (port, state, token) = spawn_server();
+        // The dashboard read-only token may READ a shown bundle (bug1 whitelist).
+        let dash = "dash-obs-kiosk".to_string();
+        state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).dashboard_share_token = dash.as_str().into();
+
+        // A REAL bundle inside the outbox (created + cleaned up; never touches real data).
+        let base = outbox_base();
+        std::fs::create_dir_all(&base).unwrap();
+        let run = crate::default_tab_id();
+        let file = base.join(format!("kiosk-selftest-{}.md", &run[..8.min(run.len())]));
+        std::fs::write(&file, b"SELF-TEST BUNDLE content").unwrap();
+        let _cleanup = OutboxFile(file.clone());
+        let fpath = file.to_string_lossy();
+
+        // In-sandbox + dashboard token → 200 + the content (bug1 fixed end-to-end).
+        let served = request(port, &format!("GET /decisions/file?path={fpath}&token={dash} HTTP/1.1\r\n\r\n"));
+        assert_eq!(status_code(&served), 200, "in-sandbox bundle served to the dashboard token\n{served}");
+        assert!(body_of(&served).contains("SELF-TEST BUNDLE content"), "the bundle content is served\n{served}");
+
+        // Out-of-sandbox path → 403, even with the MASTER token (the sandbox is absolute).
+        let escape = request(port, &format!("GET /decisions/file?path=/etc/passwd&token={token} HTTP/1.1\r\n\r\n"));
+        assert_eq!(status_code(&escape), 403, "a path outside the outbox is refused\n{escape}");
+
+        // Missing ?path → 400 ; a non-existent in-outbox file → 404.
+        let no_path = request(port, &format!("GET /decisions/file?token={token} HTTP/1.1\r\n\r\n"));
+        assert_eq!(status_code(&no_path), 400, "missing ?path → 400\n{no_path}");
+        let missing = request(port, &format!("GET /decisions/file?path={}&token={token} HTTP/1.1\r\n\r\n", base.join("nope-xyz.md").to_string_lossy()));
+        assert_eq!(status_code(&missing), 404, "a non-existent bundle → 404\n{missing}");
     }
 
     // SC1 borne 3: concurrent EDITs never lose an update — each read-modify-append

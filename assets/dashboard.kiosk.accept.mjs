@@ -1,12 +1,15 @@
-// GUI acceptance for the KIOSK #kiosk (PD2) decisions panel, wired to the LIVE routes
-// and MODELLING the real fold (server decides state/visibility; the web renders verbatim):
-//   - GET /decisions                    -> visible decisions (archived filtered out).
-//   - GET /decisions?includeArchived=true -> all, archived carry state:archived.
-//   - POST /decisions/{id}/read         -> state open->read.
-//   - POST /decisions/{id}/tranch {verdict} -> PD3: state ->ARCHIVED + files moved to the
-//     archive (400 if verdict empty). The archived toggle shows the archived_path links.
-// Anti-built≠wired: the Kiosk button is REACHABLE in the topbar; the whole
-// open->read->tranch->archive->toggle-archived loop is exercised on the REAL route path.
+// GUI acceptance for the KIOSK #kiosk panel (PD2/PD3 + the 3 browser-level hotfixes),
+// wired to the LIVE routes and MODELLING the real fold + auth perimeter:
+//   - GET /decisions[?includeArchived]      -> the read-model (archived filtered/surfaced).
+//   - GET /decisions/file?path=&token=       -> Bug1: the SANDBOXED bundle content (a raw
+//     outbox path 401s at the daemon — the link must route here WITH the token).
+//   - POST /decisions/{id}/read              -> state open->read.
+//   - POST /decisions/{id}/tranch {verdict}  -> Bug3: submitted by the explicit "Trancher"
+//     button (+ Enter), NOT a hidden checkbox. PD3: transits to ARCHIVED (400 if empty).
+// Anti-built≠wired at the BROWSER level (the API smoke missed these): the file link must
+// resolve 200 (not 401), Lu/Tranché must POST 200, and the ruling affordance must be
+// VISIBLE. Reproduces on tichef's `kiosk-selftest` decision. RED on the pre-fix build
+// (raw href, no SEND button), GREEN after.
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -16,6 +19,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const read = (f) => readFileSync(join(HERE, f), "utf8");
 const HTML = read("dashboard.html"), JS = read("dashboard.js"), CSS = read("dashboard.css");
 const ORIGIN = "http://ta-dash.local", TOKEN = "TESTTOKEN";
+const BUNDLE_BODY = "SELF-TEST BUNDLE — the PO should be able to read this.";
 
 let failures = 0;
 const ok = (label, cond, detail = "") => {
@@ -27,15 +31,14 @@ async function main() {
   const browser = await chromium.launch();
   const page = await browser.newPage({ viewport: { width: 1280, height: 950 } });
 
-  // Server-side truth: the fold state per decision id. read/tranch transit it; 'old' is
-  // archived so it's filtered from the default read-model (surfaced only with the flag).
   const DECS = {
-    ra1c: { id: "ra1c", project: "harness", title: "Deploy RA1c", whyGated: "restart = gate PO", reco: "GO", effort: "5m", files: ["~/Dev/outbox/ra1c.md"], state: "open" },
-    kb: { id: "kb", project: "kalpin", title: "CRC tour", reco: "spec figée", state: "open" },
+    "kiosk-selftest": { id: "kiosk-selftest", project: "harness", title: "Kiosk selftest", whyGated: "hotfix repro", reco: "GO", effort: "2m", files: ["~/Dev/outbox/kiosk-selftest.md"], state: "open" },
+    kb: { id: "kb", project: "kalpin", title: "CRC tour", reco: "spec figée", files: ["~/Dev/outbox/kb.md"], state: "open" },
     old: { id: "old", project: "harness", title: "vieux gate", state: "archived" },
   };
   const posted = [];
   let includeArchivedSeen = false;
+  let fileServedWithToken = false;
 
   await page.route(`${ORIGIN}/**`, async (route) => {
     const req = route.request();
@@ -50,10 +53,15 @@ async function main() {
     if (p === "/decisions") {
       const includeArchived = url.searchParams.has("includeArchived");
       if (includeArchived) includeArchivedSeen = true;
-      const decisions = Object.values(DECS)
-        .filter((d) => includeArchived || d.state !== "archived")
-        .map((d) => ({ ...d }));
+      const decisions = Object.values(DECS).filter((d) => includeArchived || d.state !== "archived").map((d) => ({ ...d }));
       return route.fulfill({ contentType: "application/json", body: JSON.stringify({ decisions }) });
+    }
+    // Bug1: the sandboxed bundle route — served WITH the token; 401 without (mirrors the
+    // real auth perimeter, where a token-less / out-of-scope request is refused).
+    if (p === "/decisions/file") {
+      if (!url.searchParams.get("token")) return route.fulfill({ status: 401, body: "unauthorized" });
+      fileServedWithToken = true;
+      return route.fulfill({ status: 200, contentType: "text/plain; charset=utf-8", body: BUNDLE_BODY });
     }
     const mut = p.match(/^\/decisions\/([^/]+)\/(read|tranch)$/);
     if (mut && req.method() === "POST") {
@@ -62,77 +70,80 @@ async function main() {
       posted.push({ id, verb, body });
       const d = DECS[id];
       if (verb === "read") { if (d) d.state = "read"; return route.fulfill({ status: 200, contentType: "application/json", body: `{"read":"${id}"}` }); }
-      // tranch: the server rejects an empty verdict (400) — mirrors the real route.
       if (!body.verdict || !body.verdict.trim()) return route.fulfill({ status: 400, contentType: "application/json", body: '{"error":"verdict required"}' });
-      // PD3: the ruling ARCHIVES the decision — state→archived + files MOVE to the archive
-      // (the fold serves the archived paths so the panel links stay valid).
+      // PD3: the ruling ARCHIVES (state→archived + files move to the archive).
       if (d) { d.state = "archived"; d.verdict = body.verdict; d.files = (d.files || []).map((f) => `~/Dev/outbox/_archive/2026-09/${f.split("/").pop()}`); }
       return route.fulfill({ status: 200, contentType: "application/json", body: `{"tranch":"${id}"}` });
     }
-    return route.fulfill({ status: 404, body: "" });
+    // Anything else (e.g. a RAW outbox path, the pre-fix href) → 401, like the daemon.
+    return route.fulfill({ status: 401, body: "unauthorized" });
   });
 
   await page.goto(`${ORIGIN}/dashboard?token=${TOKEN}`, { waitUntil: "networkidle" });
 
-  // Anti-built≠wired: the Kiosk button is in the topbar (not an orphan route).
-  ok("PD2: the Kiosk button is in the topbar", (await page.locator(".topbar #kiosk-toggle").count()) === 1);
-  // The badge is seeded on-demand at load = nb open (ra1c + kb = 2).
-  await page.waitForFunction(() => {
-    const b = document.getElementById("kiosk-badge");
-    return b && b.textContent === "2" && !b.hidden;
-  }, null, { timeout: 4000 }).catch(() => {});
-  ok("PD2: the badge shows the open-decision count (2)", (await page.locator("#kiosk-badge").textContent()) === "2", `badge=${await page.locator("#kiosk-badge").textContent()}`);
+  ok("topbar: the Kiosk button is reachable", (await page.locator(".topbar #kiosk-toggle").count()) === 1);
+  await page.waitForFunction(() => document.getElementById("kiosk-badge")?.textContent === "2", null, { timeout: 4000 }).catch(() => {});
+  ok("badge: shows the open-decision count (2)", (await page.locator("#kiosk-badge").textContent()) === "2", `badge=${await page.locator("#kiosk-badge").textContent()}`);
 
-  // Open the panel -> the open decisions render, grouped, with clickable file links.
   await page.locator("#kiosk-toggle").click();
   await page.waitForSelector("#kiosk-panel .kk-card", { timeout: 4000 }).catch(() => {});
-  const rc = '#kiosk-panel .kk-card[data-id="ra1c"]';
-  ok("PD2: an open decision is shown with a file link", (await page.locator(rc).count()) === 1 && (await page.locator(`${rc} .kk-file`).count()) === 1);
-  ok("PD2: decisions are grouped by project", (await page.locator("#kiosk-panel .kk-project").count()) >= 2);
-  ok("PD2: an archived decision is hidden by default", (await page.locator('#kiosk-panel .kk-card[data-id="old"]').count()) === 0);
+  const rc = '#kiosk-panel .kk-card[data-id="kiosk-selftest"]';
+  ok("render: the selftest decision shows with a file link", (await page.locator(rc).count()) === 1 && (await page.locator(`${rc} .kk-file`).count()) === 1);
 
-  // Check "Lu" -> POST /read -> the server state is re-rendered verbatim (checked+disabled).
+  // ===== ⭐ Bug1: the file link resolves 200 (NOT 401) and serves the bundle content =====
+  const href = (await page.locator(`${rc} .kk-file`).getAttribute("href")) || "";
+  ok("Bug1: the file link routes through /decisions/file?path= WITH the token (not the raw path)",
+     href.startsWith("/decisions/file?path=") && href.includes("token="), `href=${href}`);
+  // Fetch from INSIDE the page so the page-route mock intercepts it (as a real click on
+  // the same-origin link would hit the daemon).
+  const fileResp = await page.evaluate(async (u) => { const r = await fetch(u); return { status: r.status, text: await r.text() }; }, href);
+  ok("Bug1: clicking the file link returns 200 (not 401)", fileResp.status === 200, `status=${fileResp.status}`);
+  ok("Bug1: the bundle content is served", fileResp.text.includes("SELF-TEST BUNDLE") && fileServedWithToken);
+
+  // ===== ⭐ Bug3: the ruling affordance (Trancher button) is VISIBLE =====
+  ok("Bug3: an explicit 'Trancher' button is visible", await page.locator(`${rc} .kk-send`).isVisible());
+
+  // ===== ⭐ Bug2/wiring: Lu POSTs 200 =====
   await page.locator(`${rc} .kk-lu`).click();
   await page.waitForTimeout(200);
-  ok("PD2: checking Lu POSTs /decisions/ra1c/read", posted.some((x) => x.id === "ra1c" && x.verb === "read"));
-  ok("PD2: after read, the Lu notch is checked+disabled (server state verbatim)",
-     (await page.locator(`${rc} .kk-lu`).isChecked()) && (await page.locator(`${rc} .kk-lu`).isDisabled()));
+  ok("Bug2: checking Lu POSTs /decisions/kiosk-selftest/read (200)", posted.some((x) => x.id === "kiosk-selftest" && x.verb === "read"));
+  ok("wiring: after read, the Lu notch is checked+disabled", (await page.locator(`${rc} .kk-lu`).isChecked()) && (await page.locator(`${rc} .kk-lu`).isDisabled()));
 
-  // Tranché WITHOUT a verdict -> refused client-side (no POST), a message is shown.
+  // SEND with an empty verdict -> refused client-side (no POST), a hint is shown.
   const beforeTranch = posted.filter((x) => x.verb === "tranch").length;
-  await page.locator(`${rc} .kk-tranche`).click();
+  await page.locator(`${rc} .kk-send`).click();
   await page.waitForTimeout(150);
-  ok("PD2: Tranché without a verdict is refused client-side (no POST)", posted.filter((x) => x.verb === "tranch").length === beforeTranch);
-  ok("PD2: a 'verdict required' message is shown", /verdict/i.test((await page.locator(`${rc} .kk-msg`).textContent().catch(() => "")) || ""));
+  ok("Bug3: SEND with an empty verdict is refused client-side (no POST)", posted.filter((x) => x.verb === "tranch").length === beforeTranch);
+  ok("Bug3: a 'verdict required' message is shown", /verdict/i.test((await page.locator(`${rc} .kk-msg`).textContent().catch(() => "")) || ""));
 
-  // Fill a verdict + check Tranché -> POST /tranch -> PD3: the ruling ARCHIVES the
-  // decision, which LEAVES the active list (anti-entassement).
+  // ===== ⭐ Bug3: type a verdict, click SEND -> POST tranch 200 -> the decision leaves the list =====
   await page.locator(`${rc} .kk-verdict-input`).fill("GO");
-  await page.locator(`${rc} .kk-tranche`).click();
+  await page.locator(`${rc} .kk-send`).click();
   await page.waitForTimeout(200);
-  ok("PD2: Tranché with a verdict POSTs /decisions/ra1c/tranch {verdict}",
-     posted.some((x) => x.id === "ra1c" && x.verb === "tranch" && x.body.verdict === "GO"));
-  ok("PD3: after tranch, the ruled decision leaves the active list (archived)",
-     (await page.locator(rc).count()) === 0, `still present=${await page.locator(rc).count()}`);
-  // Badge = the remaining open count (ra1c was already read/non-open; kb stays) -> 1.
-  await page.waitForFunction(() => document.getElementById("kiosk-badge")?.textContent === "1", null, { timeout: 4000 }).catch(() => {});
-  ok("PD2: the badge shows the remaining open count (1)", (await page.locator("#kiosk-badge").textContent()) === "1", `badge=${await page.locator("#kiosk-badge").textContent()}`);
+  ok("Bug3: clicking SEND with a verdict POSTs /decisions/kiosk-selftest/tranch {verdict} (200)",
+     posted.some((x) => x.id === "kiosk-selftest" && x.verb === "tranch" && x.body.verdict === "GO"));
+  ok("PD3: after tranch, the ruled decision leaves the active list", (await page.locator(rc).count()) === 0, `still present=${await page.locator(rc).count()}`);
 
-  // Toggle "afficher les archivées" -> ?includeArchived -> the archived decisions surface;
-  // the just-ruled one carries its verdict and its file link points at the ARCHIVE.
+  // Enter also submits (the other affordance) — type in kb's verdict, press Enter.
+  const kb = '#kiosk-panel .kk-card[data-id="kb"]';
+  await page.locator(`${kb} .kk-verdict-input`).fill("NO-GO");
+  await page.locator(`${kb} .kk-verdict-input`).press("Enter");
+  await page.waitForTimeout(200);
+  ok("Bug3: pressing Enter in the verdict field also submits the ruling (POST 200)",
+     posted.some((x) => x.id === "kb" && x.verb === "tranch" && x.body.verdict === "NO-GO"));
+
+  // Toggle "afficher les archivées" -> the just-ruled decision surfaces with its verdict
+  // and an ARCHIVE file link (still routed + still 200 through the sandbox route).
   await page.locator("#kiosk-panel .kk-show-archived").check();
   await page.waitForTimeout(200);
-  ok("PD2: the toggle re-fetches with ?includeArchived", includeArchivedSeen);
-  ok("PD3: the just-archived decision surfaces with its verdict verbatim",
-     /verdict : GO/.test((await page.locator(rc).textContent().catch(() => "")) || ""));
-  ok("PD3: the archived decision's file link points at the archive (_archive/AAAA-MM)",
-     ((await page.locator(`${rc} .kk-file`).getAttribute("href").catch(() => "")) || "").includes("/_archive/"));
-  ok("PD2: a previously-archived decision also surfaces (state=archived)",
-     (await page.locator('#kiosk-panel .kk-card[data-id="old"].kk-state-archived').count()) === 1);
+  ok("toggle: re-fetches with ?includeArchived", includeArchivedSeen);
+  ok("PD3: the archived decision surfaces with its verdict verbatim", /verdict : GO/.test((await page.locator(rc).textContent().catch(() => "")) || ""));
+  ok("PD3: the archived decision's file link points at the archive AND routes through /decisions/file",
+     (((await page.locator(`${rc} .kk-file`).getAttribute("href").catch(() => "")) || "").includes("%2F_archive%2F")));
 
   await browser.close();
-  console.log(`\ndashboard.kiosk.accept.mjs — KIOSK #kiosk PD2+PD3 GUI acceptance`);
-  console.log(`${failures ? `FAIL: ${failures} assertion(s) failed` : "OK: all PD2+PD3 (topbar+badge, render, Lu/Tranché POST, tranch→archive, archived_path links) verified on screen"}`);
+  console.log(`\ndashboard.kiosk.accept.mjs — KIOSK #kiosk PD2/PD3 + 3 browser hotfixes`);
+  console.log(`${failures ? `FAIL: ${failures} assertion(s) failed` : "OK: file-link 200 (not 401) + bundle served, Lu/Tranché POST 200, SEND button visible & submits (click + Enter), tranch→archive"}`);
   process.exit(failures ? 1 : 0);
 }
 

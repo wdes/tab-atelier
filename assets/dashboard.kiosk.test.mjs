@@ -19,24 +19,30 @@ import { kioskView, decisionCardHtml, kioskHtml } from "./dashboard.js";
   const open = decisionCardHtml({ id: "d1", state: "open", title: "Deploy X", whyGated: "gate", reco: "GO", effort: "5m", files: ["~/o/x.md"] });
   assert.match(open, /data-state="open"/, "carries the server state");
   assert.match(open, /class="kk-lu"[^>]*>/, "Lu checkbox present");
-  assert.ok(!/class="kk-lu" checked/.test(open), "open -> Lu NOT checked");
-  assert.ok(!/class="kk-tranche" checked/.test(open), "open -> Tranché NOT checked");
+  assert.ok(!/class="kk-lu"[^>]*checked/.test(open), "open -> Lu NOT checked");
+  assert.match(open, /class="kk-tranche" disabled/, "Tranché is a disabled STATE indicator (action = the button)");
+  assert.match(open, /class="kk-send"/, "Bug3: an explicit 'Trancher' button is present");
   assert.match(open, /kk-key">pourquoi gaté<\/span> gate/, "why-gated line");
   assert.match(open, /kk-key">reco<\/span> GO/, "reco line");
   assert.match(open, /kk-key">effort<\/span> 5m/, "effort line");
-  assert.match(open, /<a class="kk-file" href="~\/o\/x.md"/, "file rendered as a clickable link");
+  // Bug1: the file link goes through the SANDBOXED route (?path=), NOT the raw outbox path.
+  assert.match(open, /<a class="kk-file" href="\/decisions\/file\?path=/, "file link routes through /decisions/file?path=");
+  assert.ok(!/href="~\/o\/x.md"/.test(open), "the raw outbox path is NOT used as the href (would 401)");
+  assert.match(open, /path=~%2Fo%2Fx.md/, "the path is URL-encoded in the query");
 
-  // read -> Lu checked+disabled (progression is one-way), Tranché still actionable.
+  // read -> Lu checked+disabled (progression is one-way).
   const read = decisionCardHtml({ id: "d2", state: "read", title: "t" });
-  assert.match(read, /class="kk-lu" checked disabled/, "read -> Lu checked+disabled");
-  assert.ok(!/class="kk-tranche" checked/.test(read), "read -> Tranché not yet checked");
+  assert.match(read, /class="kk-lu"[^>]*checked/, "read -> Lu checked");
+  assert.match(read, /class="kk-lu"[^>]*disabled/, "read -> Lu disabled");
+  assert.ok(!/class="kk-tranche"[^>]*checked/.test(read), "read -> Tranché indicator not yet checked");
 
-  // tranched -> both checked+disabled + verdict surfaced + input disabled.
+  // tranched -> Lu + Tranché indicators checked, verdict surfaced, rule controls disabled.
   const tr = decisionCardHtml({ id: "d3", state: "tranched", title: "t", verdict: "GO" });
-  assert.match(tr, /class="kk-lu" checked disabled/, "tranched -> Lu checked");
-  assert.match(tr, /class="kk-tranche" checked disabled/, "tranched -> Tranché checked");
+  assert.match(tr, /class="kk-lu"[^>]*checked/, "tranched -> Lu checked");
+  assert.match(tr, /class="kk-tranche" disabled checked/, "tranched -> Tranché indicator checked");
   assert.match(tr, /kk-verdict">verdict : GO/, "verdict surfaced verbatim");
   assert.match(tr, /kk-verdict-input"[^>]*disabled/, "verdict input disabled once ruled");
+  assert.match(tr, /class="kk-send" disabled/, "the Trancher button is disabled once ruled");
 
   // XSS: fields are escaped.
   const evil = decisionCardHtml({ id: "x", state: "open", title: "<script>", whyGated: "<b>" });
