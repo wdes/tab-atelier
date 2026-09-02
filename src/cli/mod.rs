@@ -34,6 +34,11 @@ pub mod set_status;
 pub mod share_link;
 pub mod style;
 pub mod tab_field;
+/// `tab-atelier task <push|claim|beat|done|list>` (primitive #11).
+///
+/// The typed task queue with an atomic claim: the pure backend + the thin HTTP
+/// client.
+pub mod task;
 /// `tab-atelier peers / note / notes / handoff` — Claude-to-Claude teamwork
 /// verbs (dispatch handles send-a-prompt-and-wait; this is the rest).
 pub mod team;

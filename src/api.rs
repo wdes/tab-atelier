@@ -32,6 +32,7 @@ mod ssh_agent;
 mod status;
 mod tab_props;
 mod tabs;
+mod task;
 mod tokens;
 mod usage;
 mod view;
@@ -644,11 +645,8 @@ pub fn is_rehome_state(s: &str) -> bool {
 /// Parse an assignment `"[<project>:]<phase>/<role>"` into
 /// `(project_override, phase, role)`. Pure string-splitting; the `<project>:`
 /// prefix (if any) is only recognised before the first `/`. Sole dependency of
-/// [`role_of`].
-// Foundation helper — consumed post-rebase by task/aligator (coordination MAS);
-// remove the allow when a consumer lands. `pub(crate)` so a downstream branch can
-// call it directly (project derivation) instead of re-declaring its own copy.
-#[allow(dead_code)]
+/// [`role_of`]. `pub(crate)` so a downstream branch can call it directly
+/// (project derivation) instead of re-declaring its own copy.
 pub fn parse_assignment(a: &str) -> (Option<String>, String, String) {
     let head_end = a.find('/').unwrap_or(a.len());
     let (over, rest) = a[..head_end].find(':').map_or((None, a), |colon| {
@@ -661,10 +659,8 @@ pub fn parse_assignment(a: &str) -> (Option<String>, String, String) {
 }
 
 /// The agent's role, derived from its `assignment` — never from the volatile
-/// `context`. `None`/empty ⇒ empty string.
-// Foundation helper — consumed post-rebase by task/aligator (coordination MAS);
-// remove the allow when a consumer lands.
-#[allow(dead_code)]
+/// `context`. `None`/empty ⇒ empty string. The `task` capacity gate reads this
+/// off a claimer's card to match a `--to <role>` task.
 #[must_use]
 pub fn role_of(assignment: Option<&str>) -> String {
     assignment.map(|a| parse_assignment(a).2).unwrap_or_default()
@@ -2007,6 +2003,29 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
         }
         ("POST", p) if p.starts_with("/tabs/by-id/") && card_route_verb(p).is_some() => {
             cards::card_verb(stream, state, p, &body_bytes);
+        }
+        // Task primitive (#11) — the pull-fabric routes. Master-token only (not in
+        // the share-token whitelist above), so a claim is serialized behind the
+        // daemon's single-writer lock.
+        ("POST", p) if p.starts_with("/task/") && p.ends_with("/push") => {
+            let queue = &p["/task/".len()..p.len() - "/push".len()];
+            task::push(stream, state, queue, &body_bytes);
+        }
+        ("POST", p) if p.starts_with("/task/") && p.ends_with("/claim") => {
+            let queue = &p["/task/".len()..p.len() - "/claim".len()];
+            task::claim(stream, state, queue, &body_bytes);
+        }
+        ("POST", p) if p.starts_with("/task/") && p.ends_with("/beat") => {
+            let id = &p["/task/".len()..p.len() - "/beat".len()];
+            task::beat(stream, state, id, &body_bytes);
+        }
+        ("POST", p) if p.starts_with("/task/") && p.ends_with("/done") => {
+            let id = &p["/task/".len()..p.len() - "/done".len()];
+            task::done(stream, state, id, &body_bytes);
+        }
+        ("GET", p) if p.starts_with("/task/") && p.ends_with("/list") => {
+            let queue = &p["/task/".len()..p.len() - "/list".len()];
+            task::list(stream, state, queue);
         }
         ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/input") => {
             input::run(stream, state, p, body_bytes);
