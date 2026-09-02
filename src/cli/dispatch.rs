@@ -550,6 +550,55 @@ pub enum Commands {
         interval: Option<u64>,
     },
 
+    /// 🐊 aligator — deterministic input router. Drains the swamp queue and
+    /// types each entry's input into its target Claude tab. Best run as its own
+    /// tab, like `brain` — and auto-relaunched on restart the same way.
+    Aligator {
+        /// Drain once and exit (instead of looping forever).
+        #[arg(long)]
+        once: bool,
+        /// Seconds between rounds. Default 5.
+        #[arg(long)]
+        interval: Option<u64>,
+    },
+
+    /// Enqueue input for 🐊 aligator to deliver: type `<text>` into `<tab>`.
+    Swamp {
+        /// Target tab UUID.
+        tab: String,
+        /// Text to type into the tab's input.
+        text: String,
+        /// Don't press Enter after the text.
+        #[arg(long)]
+        no_submit: bool,
+        /// Producer name recorded in the entry (audit).
+        #[arg(long)]
+        from: Option<String>,
+    },
+
+    /// `clarify` — controlled context refresh: re-home a saturated Claude tab
+    /// IN PLACE (same cwd/assignment/name) instead of opaque auto-compaction.
+    ///
+    /// `clarify <tab>` re-homes one tab now; `--watch` runs the poller that
+    /// fires at >90% context. Guardrails: per-tab cooldown, skips meta/daemon
+    /// tabs + orchestrators, count-based anti-storm breaker.
+    Clarify {
+        /// Tab to re-home now (index or UUID). Omit with `--watch`.
+        tab: Option<String>,
+        /// Run as a daemon poller instead of a one-shot.
+        #[arg(long)]
+        watch: bool,
+        /// Seconds between scans (daemon). Default 30.
+        #[arg(long)]
+        interval: Option<u64>,
+        /// Scan once and exit (daemon).
+        #[arg(long)]
+        once: bool,
+        /// Log the decision + the rehome-tab.sh command, spawn nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Off-hours auto-lock — OSM `opening_hours` rule + IANA timezone.
     ///
     /// Set: `schedule <tab> "Mo-Fr 09:00-18:00" --tz Europe/Paris`.
@@ -936,6 +985,59 @@ pub fn dispatch(cli: Cli) -> bool {
                 args.push(s.to_string());
             }
             crate::cli::client::run("brain", &args)
+        }
+        Commands::Aligator { once, interval } => {
+            let mut args: Vec<String> = Vec::new();
+            if once {
+                args.push("--once".into());
+            }
+            if let Some(s) = interval {
+                args.push("--interval".into());
+                args.push(s.to_string());
+            }
+            crate::cli::client::run("aligator", &args)
+        }
+        Commands::Swamp {
+            tab,
+            text,
+            no_submit,
+            from,
+        } => {
+            let mut args: Vec<String> = vec![tab, text];
+            if no_submit {
+                args.push("--no-submit".into());
+            }
+            if let Some(f) = from {
+                args.push("--from".into());
+                args.push(f);
+            }
+            crate::cli::client::run("swamp", &args)
+        }
+        Commands::Clarify {
+            tab,
+            watch,
+            interval,
+            once,
+            dry_run,
+        } => {
+            let mut args: Vec<String> = Vec::new();
+            if let Some(tab) = tab {
+                args.push(tab);
+            }
+            if watch {
+                args.push("--watch".into());
+            }
+            if once {
+                args.push("--once".into());
+            }
+            if dry_run {
+                args.push("--dry-run".into());
+            }
+            if let Some(s) = interval {
+                args.push("--interval".into());
+                args.push(s.to_string());
+            }
+            crate::cli::client::run("clarify", &args)
         }
         Commands::Schedule { tab, rule, tz, clear } => {
             let mut args: Vec<String> = vec![tab];
