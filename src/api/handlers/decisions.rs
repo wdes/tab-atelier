@@ -10,7 +10,46 @@
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
-use super::super::{TabSnapshot, error_json, respond_json};
+use super::super::{TabSnapshot, error_json, respond_bytes, respond_json};
+
+/// `GET /decisions/file?path=<abs>` — serve a decision bundle's CONTENT, SANDBOXED to
+/// `<outbox>` and its `_archive/` subtree (#kiosk).
+///
+/// The KIOSK panel links point here: a raw outbox path 401s at the daemon, so this route
+/// lets the PO READ a bundle we SHOW them. Every path is `~`-expanded then CANONICALIZED
+/// (collapsing `..` and symlinks) and must live under the canonicalized outbox — anything
+/// outside (the source tree, `~/.ssh`, `/etc/…`) is refused 403. Served as text/plain.
+/// READ-ONLY.
+pub(in crate::api) fn file<S: Write>(stream: &mut S, path_q: Option<&str>) {
+    let Some(raw) = path_q.filter(|s| !s.trim().is_empty()) else {
+        error_json(stream, 400, "decisions file: ?path= is required");
+        return;
+    };
+    let requested = raw.strip_prefix("~/").map_or_else(
+        || std::path::PathBuf::from(raw),
+        |rest| std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(rest),
+    );
+    // Canonicalize both sides so the sandbox check can't be walked out of (`..`, symlink).
+    // A non-existent file / unreadable outbox → 404 (never leak whether a path exists
+    // outside the sandbox — the confinement check runs on the canonical form first).
+    let (Ok(canon), Ok(base)) = (std::fs::canonicalize(&requested), std::fs::canonicalize(crate::cli::decision::outbox_base()))
+    else {
+        error_json(stream, 404, "decisions file: not found");
+        return;
+    };
+    if !canon.starts_with(&base) {
+        error_json(stream, 403, "decisions file: outside the outbox sandbox");
+        return;
+    }
+    if !canon.is_file() {
+        error_json(stream, 404, "decisions file: not a file");
+        return;
+    }
+    match std::fs::read(&canon) {
+        Ok(bytes) => respond_bytes(stream, 200, "text/plain; charset=utf-8", &bytes),
+        Err(_) => error_json(stream, 404, "decisions file: unreadable"),
+    }
+}
 
 /// `GET /decisions[?includeArchived]` — the folded cross-project decision read-model
 /// (PD1 fold, camelCase). READ-ONLY. `?includeArchived` surfaces archived decisions

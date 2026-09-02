@@ -71,11 +71,20 @@ pub(super) fn authorize(
     // The read-only dashboard token also reads the catalogue read-model on-demand
     // (SC1 #39): the VUE is a separate cold source (RB2), fetched off the live poll.
     // Only the GET list — the POST mutations stay master-token-only.
-    // PD2 (#kiosk): the read-only dashboard token also reads the KIOSK decision
-    // read-model on-demand (`GET /decisions`), a separate cold source like the
-    // catalogue. The POST read/tranch mutations stay master-token-only.
+    // PD2/PD3 (#kiosk): the read-only dashboard token reads the KIOSK decision read-model
+    // (`GET /decisions`) + a shown bundle's content (`GET /decisions/file`), separate cold
+    // sources. It may ALSO RULE from the panel — the Kiosk is the PO's decision inbox, so
+    // `POST /decisions/{id}/{read,tranch}` is in scope (tichef ruling, Option A). The scope
+    // is ULTRA-NARROW: ONLY those two decision mutations — never the catalogue mutations,
+    // never `/input`, never `/files`, never any other write (those stay master-only). Risk
+    // mitigated by reversibility (re-open) + low stakes.
     let is_dashboard_token = dashboard_matches
-        && matches!(path, "/dashboard" | "/dashboard/state" | "/dashboard/activity" | "/catalog/list" | "/decisions");
+        && (matches!(
+            path,
+            "/dashboard" | "/dashboard/state" | "/dashboard/activity" | "/catalog/list" | "/decisions" | "/decisions/file"
+        ) || (method == "POST"
+            && path.starts_with("/decisions/")
+            && (path.ends_with("/read") || path.ends_with("/tranch"))));
     if is_master || is_dashboard_token {
         return Gate::Allow;
     }
@@ -210,6 +219,29 @@ mod tests {
             deny_status(&authorize(&s, "GET", "/tabs", Some("dash-secret"))),
             Some(401)
         );
+    }
+
+    // #kiosk: the dashboard token is the PO's decision inbox — it may READ the decision
+    // read-model + a shown bundle, and RULE (read/tranch) — but its ruling scope is
+    // ULTRA-NARROW (Option A, tichef): decisions read/tranch ONLY, nothing else writes.
+    #[test]
+    fn dashboard_token_kiosk_perimeter_read_rule_but_nothing_else() {
+        let s = fixture();
+        // READ the decision read-model + a shown bundle.
+        assert!(is_allow(&authorize(&s, "GET", "/decisions", Some("dash-secret"))));
+        assert!(is_allow(&authorize(&s, "GET", "/decisions/file", Some("dash-secret"))));
+        // RULE from the panel: read + tranch (the Kiosk is the PO's inbox).
+        assert!(is_allow(&authorize(&s, "POST", "/decisions/ra1c/read", Some("dash-secret"))));
+        assert!(is_allow(&authorize(&s, "POST", "/decisions/ra1c/tranch", Some("dash-secret"))));
+        // SCOPE GUARD — everything else a dashboard token must STILL be refused:
+        // the catalogue mutations (401 — non-tab, non-whitelisted)...
+        assert_eq!(deny_status(&authorize(&s, "POST", "/catalog/skill-x/delete", Some("dash-secret"))), Some(401));
+        assert_eq!(deny_status(&authorize(&s, "POST", "/catalog/skill-x/edit", Some("dash-secret"))), Some(401));
+        // ...tab input (403 — read-only per-tab)...
+        assert_eq!(deny_status(&authorize(&s, "POST", "/tabs/by-id/tab-a/input", Some("dash-secret"))), Some(403));
+        // ...and a made-up decision write verb (401 — only read/tranch are in scope).
+        assert_eq!(deny_status(&authorize(&s, "POST", "/decisions/ra1c/delete", Some("dash-secret"))), Some(401));
+        assert_eq!(deny_status(&authorize(&s, "POST", "/decisions/ra1c/archive", Some("dash-secret"))), Some(401));
     }
 
     #[test]
