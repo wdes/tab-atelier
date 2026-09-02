@@ -90,6 +90,17 @@ pub(super) fn list<W: Write>(
                 .collect(),
             resident_memory_bytes: t.resident_memory_bytes,
             tokens: t.tokens,
+            assignment: t.assignment.as_deref().map(str::to_string),
+            parent_tab_id: t.parent_tab_id.as_deref().map(str::to_string),
+            rehome_status: t.rehome_status.as_deref().map(str::to_string),
+            specialty: t.specialty.as_deref().map(str::to_string),
+            orchestrator: t.orchestrator.as_deref().map(str::to_string),
+            objective: t.objective.as_deref().map(str::to_string),
+            current_task_log: t.current_task.clone(),
+            conventions: t.conventions.clone(),
+            evaluations: t.evaluations.clone(),
+            rounds_active: t.rounds_active.clone(),
+            usage_count: t.usage_count,
         })
         .collect();
     #[cfg(feature = "energy")]

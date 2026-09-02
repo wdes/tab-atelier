@@ -148,6 +148,172 @@ paths:
       responses:
         "200": { description: OK }
         "401": { $ref: "#/components/responses/Unauthorized" }
+  /tabs/by-id/{id}/assignment:
+    post:
+      tags: [tabs]
+      summary: Set/clear the stable workflow assignment (persisted, hook-immune)
+      parameters: [ { $ref: "#/components/parameters/id" } ]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: { assignment: { type: [string, "null"], maxLength: 2000, example: "build/implementer" } }
+      responses:
+        "200": { description: OK }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /tabs/by-id/{id}/parent:
+    post:
+      tags: [tabs]
+      summary: Stamp/clear a spawned tab's lineage (parent_tab_id)
+      parameters: [ { $ref: "#/components/parameters/id" } ]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: { parent_tab_id: { type: [string, "null"], maxLength: 128 } }
+      responses:
+        "200": { description: OK }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /tabs/by-id/{id}/rehome:
+    post:
+      tags: [tabs]
+      summary: Set/clear a predecessor tab's re-home progress
+      parameters: [ { $ref: "#/components/parameters/id" } ]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                rehome_status:
+                  type: [string, "null"]
+                  enum: [handoff-written, successor-ready, ack-sent, safe-to-close, null]
+      responses:
+        "200": { description: OK }
+        "400": { description: invalid rehome_status }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /tabs/by-id/{id}/specialty:
+    post:
+      tags: [tabs]
+      summary: Set/clear the agent-card specialty (persisted, hook-immune)
+      parameters: [ { $ref: "#/components/parameters/id" } ]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: { specialty: { type: [string, "null"], maxLength: 2000 } }
+      responses:
+        "200": { description: OK }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /tabs/by-id/{id}/orchestrator:
+    post:
+      tags: [tabs]
+      summary: Set/clear the orchestrator this agent serves (a tab UUID or "free")
+      parameters: [ { $ref: "#/components/parameters/id" } ]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: { orchestrator: { type: [string, "null"], maxLength: 2000 } }
+      responses:
+        "200": { description: OK }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /tabs/by-id/{id}/objective:
+    post:
+      tags: [tabs]
+      summary: Set/clear the agent-card objective (persisted, hook-immune)
+      parameters: [ { $ref: "#/components/parameters/id" } ]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: { objective: { type: [string, "null"], maxLength: 2000 } }
+      responses:
+        "200": { description: OK }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /tabs/by-id/{id}/current-task:
+    post:
+      tags: [tabs]
+      summary: APPEND one phrase to the bounded current-task permalog
+      parameters: [ { $ref: "#/components/parameters/id" } ]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: { current_task: { type: string, maxLength: 2000 } }
+      responses:
+        "200": { description: OK (empty phrase is a no-op) }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /tabs/by-id/{id}/rounds-active:
+    post:
+      tags: [tabs]
+      summary: Toggle supervision-rounds status (server stamps lastRoundAt when active)
+      parameters: [ { $ref: "#/components/parameters/id" } ]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: { rounds_active: { type: [string, "null"], example: "true" } }
+      responses:
+        "200": { description: OK }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /tabs/by-id/{id}/conventions:
+    post:
+      tags: [tabs]
+      summary: Overwrite the declared .md conventions (comma-separated)
+      parameters: [ { $ref: "#/components/parameters/id" } ]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: { conventions: { type: [string, "null"], example: "AGENTS.md,CLAUDE.md" } }
+      responses:
+        "200": { description: OK }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /tabs/by-id/{id}/evaluation:
+    post:
+      tags: [tabs]
+      summary: APPEND one evaluation record to the bounded ring
+      parameters: [ { $ref: "#/components/parameters/id" } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [evaluator, at, tokens, scores, verdict]
+              properties:
+                evaluator: { type: string }
+                at: { type: integer, format: int64 }
+                taskRef: { type: string }
+                tokens:
+                  type: object
+                  properties: { input: { type: integer }, out: { type: integer } }
+                scores:
+                  type: object
+                  properties: { relevance: { type: integer }, errors: { type: integer }, omissions: { type: integer } }
+                verdict: { type: string }
+                note: { type: string }
+      responses:
+        "200": { description: OK }
+        "400": { description: invalid evaluation record }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /tabs/by-id/{id}/bump-usage:
+    post:
+      tags: [tabs]
+      summary: Bump the tab's usage counter + stamp last-used
+      parameters: [ { $ref: "#/components/parameters/id" } ]
+      responses:
+        "200": { description: OK, returns the new usageCount }
+        "401": { $ref: "#/components/responses/Unauthorized" }
   /tabs/by-id/{id}/bg-color:
     post:
       tags: [tabs]

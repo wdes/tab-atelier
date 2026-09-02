@@ -1132,6 +1132,66 @@ pub struct Evaluation {
     pub note: Option<String>,
 }
 
+/// Bound on the `current_task` permalog: keep only the last N phrases so
+/// `TabState` / the snapshot can't grow without end (same lesson as the
+/// evaluations ring).
+pub const CURRENT_TASK_LOG_MAX: usize = 50;
+
+/// Append one phrase to a `current_task` permalog (the `set-current-task` core).
+///
+/// Trims the phrase; an empty / whitespace-only phrase is a no-op so the long
+/// memory stays meaningful. Bounds the ring to [`CURRENT_TASK_LOG_MAX`]: once it
+/// overflows, the oldest entries are evicted. Pure, so append + eviction are
+/// unit-testable without a live tab.
+pub fn append_current_task(log: &mut Vec<String>, phrase: &str) {
+    let p = phrase.trim();
+    if p.is_empty() {
+        return;
+    }
+    log.push(p.to_string());
+    if log.len() > CURRENT_TASK_LOG_MAX {
+        let overflow = log.len() - CURRENT_TASK_LOG_MAX;
+        log.drain(0..overflow);
+    }
+}
+
+/// Bound on the `evaluations` ring (same lesson as `current_task`): keep only the
+/// last N records so `TabState` can't grow without end.
+pub const EVALUATIONS_MAX: usize = 50;
+
+/// Append one evaluation record to the bounded ring; the oldest is evicted once
+/// it overflows [`EVALUATIONS_MAX`]. The `set-evaluation` core. Pure + testable.
+pub fn append_evaluation(log: &mut Vec<Evaluation>, ev: Evaluation) {
+    log.push(ev);
+    if log.len() > EVALUATIONS_MAX {
+        let overflow = log.len() - EVALUATIONS_MAX;
+        log.drain(0..overflow);
+    }
+}
+
+/// The `bump-usage` core: increment the usage counter + stamp last-used.
+///
+/// `None` → first use → 1. Returns `(new_count, stamp)`. `now` is injected so the
+/// increment + timestamp are unit-testable without a clock.
+#[must_use]
+pub fn bump_usage(current: Option<u64>, now: u64) -> (u64, u64) {
+    (current.unwrap_or(0).saturating_add(1), now)
+}
+
+/// The `set-conventions` core: parse a comma-separated `.md` list.
+///
+/// Comma-split, each entry trimmed; empty entries (a trailing comma, blanks) are
+/// dropped. This is the DECLARED side only — the declared-vs-existing check is the
+/// convention-auditor's job, not here. Pure + unit-testable.
+#[must_use]
+pub fn parse_conventions(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(String::from)
+        .collect()
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct TabState {
     /// Stable per-tab UUID. Used by the local API
