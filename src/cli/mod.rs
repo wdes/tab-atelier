@@ -12,6 +12,8 @@ pub mod claude_hook;
 /// The single shared client-subcommand router used by both the GUI
 /// (`src/main.rs`) and the headless daemon ([`dispatch`]).
 pub mod client;
+/// The KIOSK cross-project decision log + fold (PD1).
+pub mod decision;
 pub mod delegate;
 pub mod dispatch;
 /// `tab-atelier flags …` — toggle agent-instrumentation flags.

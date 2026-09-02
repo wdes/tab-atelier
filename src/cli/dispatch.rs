@@ -627,6 +627,14 @@ pub enum Commands {
         #[arg(long)]
         raw: bool,
     },
+
+    /// KIOSK (PD1): the cross-project decision log
+    /// (`decision push|read|tranch|list [--includeArchived]`).
+    Decision {
+        /// Passed straight through to `cli::decision::run`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 /// Returns true iff a subcommand was dispatched (caller should not
@@ -908,6 +916,7 @@ pub fn dispatch(cli: Cli) -> bool {
             crate::cli::client::run("bench", &args)
         }
         Commands::BenchLag { url, samples } => crate::cli::bench_lag::run(&url, samples.unwrap_or(25)),
+        Commands::Decision { args } => crate::cli::client::run("decision", &args),
     };
     std::process::exit(code);
 }
@@ -1040,6 +1049,22 @@ mod tests {
                 "resize fixed size",
             ),
             (&["tab-atelier-headless", "resize", "0", "--clear"], "resize --clear"),
+            (
+                &[
+                    "tab-atelier-headless",
+                    "decision",
+                    "push",
+                    "--id",
+                    "d",
+                    "--project",
+                    "harness",
+                ],
+                "decision push",
+            ),
+            (
+                &["tab-atelier-headless", "decision", "list", "--includeArchived"],
+                "decision list",
+            ),
         ];
         for (argv, label) in cases {
             let _ = Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("parse failed for {label}: {e}"));

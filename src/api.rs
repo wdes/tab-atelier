@@ -14,6 +14,7 @@ mod assets;
 #[cfg(feature = "catbus")]
 mod catbus;
 mod claude_only;
+mod decisions;
 mod env;
 mod files;
 mod input;
@@ -1364,6 +1365,17 @@ fn respond_json<W: Write>(stream: &mut W, status: u16, body: &str) {
     );
 }
 
+/// Serve raw bytes with an explicit content-type (the KIOSK bundle route, #kiosk).
+fn respond_bytes<W: Write>(stream: &mut W, status: u16, content_type: &str, body: &[u8]) {
+    let reason = if status == 200 { "OK" } else { "Error" };
+    let _ = write!(
+        stream,
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n{ROBOTS_TAG}Content-Length: {}\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(body);
+}
+
 use crate::strip_ansi;
 
 fn error_json<W: Write>(stream: &mut W, status: u16, msg: &str) {
@@ -1515,7 +1527,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
     };
     let raw_path = parts[1].to_string();
 
-    let (path, query_token, query_lines, query_since, query_crc, query_name, query_path) =
+    let (path, query_token, query_lines, query_since, query_crc, query_name, query_path, query_include_archived) =
         if let Some((p, q)) = raw_path.split_once('?') {
             let qt = q
                 .split('&')
@@ -1535,9 +1547,14 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
                 .and_then(|s| u32::from_str_radix(s, 16).ok());
             let qn = q.split('&').find_map(|pair| pair.strip_prefix("name=")).map(url_decode);
             let qp = q.split('&').find_map(|pair| pair.strip_prefix("path=")).map(url_decode);
-            (p.to_string(), qt, ql, qs, qc, qn, qp)
+            // #kiosk: `?includeArchived[=true|1]` surfaces archived decisions
+            // (`state:archived`) in the KIOSK read-model; the default hides them.
+            let qia = q
+                .split('&')
+                .any(|pair| matches!(pair, "includeArchived" | "includeArchived=true" | "includeArchived=1"));
+            (p.to_string(), qt, ql, qs, qc, qn, qp, qia)
         } else {
-            (raw_path, None, None, None, None, None, None)
+            (raw_path, None, None, None, None, None, None, false)
         };
     // Strip a trailing slash so a path like `/tabs/.../view/` (added
     // by some reverse proxies / Cloudflare Tunnel normalisation)
@@ -1730,6 +1747,14 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
         // `raw_output` scrollback dumps, so it's cheap to poll ~1 s. Same
         // auth gate as `/tabs` (checked upstream of this match).
         ("GET", "/tabs/usage") => usage::run(stream, state, accept_gzip, if_none_match.as_deref()),
+        // KIOSK (PD2): the cross-project decision read-model + the Lu/Tranché write path.
+        ("POST", p) if p.starts_with("/decisions/") && (p.ends_with("/read") || p.ends_with("/tranch")) => {
+            decisions::mutate(stream, state, p, &body_bytes);
+        }
+        ("GET", "/decisions") => decisions::list(stream, query_include_archived),
+        // #kiosk: serve a bundle's content, SANDBOXED to the outbox — the KIOSK links
+        // point here (with the page token) instead of at the raw path (which 401s).
+        ("GET", "/decisions/file") => decisions::file(stream, query_path.as_deref()),
         #[cfg(feature = "catbus")]
         ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/catbus") => {
             catbus::session(stream, state, p);
@@ -5416,5 +5441,130 @@ mod tests {
             s.pending_status_updates.last().unwrap().label.clone()
         };
         assert_eq!(label.as_deref(), Some("__clear__"));
+    }
+
+    /// Removes the given decision ids from the REAL decisions.jsonl on drop (this LIVE
+    /// route test appends there; disposable ids never collide with real decisions).
+    struct DecisionsCleanup(Vec<String>);
+    impl Drop for DecisionsCleanup {
+        fn drop(&mut self) {
+            let path = crate::cli::decision::decisions_path();
+            let Ok(body) = std::fs::read_to_string(&path) else {
+                return;
+            };
+            let kept: Vec<crate::cli::decision::DecisionEvent> = crate::cli::decision::parse_decisions(&body)
+                .into_iter()
+                .filter(|e| !self.0.contains(&e.id))
+                .collect();
+            if kept.is_empty() {
+                let _ = std::fs::remove_file(&path);
+            } else {
+                let out: String = kept.iter().map(crate::cli::decision::encode_line).collect();
+                let _ = std::fs::write(&path, out);
+            }
+        }
+    }
+
+    /// GET /decisions → the `decisions` array (the KIOSK read-model). `extra` is an
+    /// optional query fragment (e.g. `&includeArchived=true`).
+    fn decisions_list(port: u16, token: &str, extra: &str) -> Vec<serde_json::Value> {
+        let listed = request(port, &format!("GET /decisions?token={token}{extra} HTTP/1.1\r\n\r\n"));
+        let json: serde_json::Value = serde_json::from_str(body(&listed)).expect("decisions list json");
+        json["decisions"].as_array().cloned().unwrap_or_default()
+    }
+
+    // #kiosk (PD2/PD3) — anti built≠wired: the LIVE decision routes, a REAL integration
+    // test (real-fs, real routes, real auth via the master token, NO mock). Proves the
+    // handler RESPONDS and the file-based log is really read/written round-trip: seed an
+    // `open` decision → GET renders it verbatim (camelCase) → POST /read transits state →
+    // GET reflects it → POST /tranch WITHOUT a verdict is rejected (400) → WITH a verdict
+    // rules AND archives (PD3) → hidden by default, surfaced with ?includeArchived.
+    #[test]
+    fn kiosk_live_decisions_read_tranch_roundtrip() {
+        use crate::cli::decision::{DecisionEvent, DecisionKind, append_line, decisions_path};
+        let (port, _state, token) = spawn_server();
+        let post = |path: &str, body: &str| {
+            format!(
+                "POST /{path}?token={token} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let run = crate::default_tab_id();
+        let id = format!("kiosk-it-{}", &run[..8.min(run.len())]);
+        let _cleanup = DecisionsCleanup(vec![id.clone()]);
+
+        // Seed a real `open` decision. The bundle path is a GUARANTEED-nonexistent name so
+        // the PD3 archive step moves nothing (this asserts the route wiring, not the
+        // physical move — that's proven real-fs in cli::decision's pd3_* tests).
+        let seed = DecisionEvent {
+            id: id.clone(),
+            kind: DecisionKind::Open,
+            at: 1,
+            project: Some("harness".into()),
+            title: Some("Deploy X".into()),
+            why_gated: Some("restart = gate PO".into()),
+            reco: Some("GO".into()),
+            files: vec![format!("~/Dev/outbox/__kiosk-{id}-none.md")],
+            ..Default::default()
+        };
+        append_line(&decisions_path(), &seed).unwrap();
+
+        // GET → the decision renders VERBATIM (camelCase `whyGated`, state=open).
+        let seen = decisions_list(port, &token, "");
+        let d = seen
+            .iter()
+            .find(|x| x["id"] == serde_json::json!(id))
+            .expect("seeded decision visible");
+        assert_eq!(d["state"], serde_json::json!("open"), "state=open");
+        assert_eq!(
+            d["whyGated"],
+            serde_json::json!("restart = gate PO"),
+            "camelCase whyGated served"
+        );
+
+        // ⭐ POST /read → 200 AND GET reflects the transition (the file was read+written).
+        let r = request(port, &post(&format!("decisions/{id}/read"), "{}"));
+        assert_eq!(status_code(&r), 200, "read → 200 (handler responds)\n{r}");
+        assert_eq!(
+            decisions_list(port, &token, "")
+                .iter()
+                .find(|x| x["id"] == serde_json::json!(id))
+                .unwrap()["state"],
+            serde_json::json!("read"),
+            "GET reflects the POST /read (round-trip through the file-based log)"
+        );
+
+        // POST /tranch WITHOUT a verdict → 400 (a ruling without a verdict is meaningless).
+        let bad = request(port, &post(&format!("decisions/{id}/tranch"), "{}"));
+        assert_eq!(status_code(&bad), 400, "tranch without verdict → 400\n{bad}");
+
+        // POST /tranch WITH a verdict → 200; PD3 archives → hidden by default, surfaced
+        // (state=archived + verdict) with ?includeArchived.
+        let t = request(
+            port,
+            &post(&format!("decisions/{id}/tranch"), r#"{"verdict":"GO","by":"PO"}"#),
+        );
+        assert_eq!(status_code(&t), 200, "tranch → 200\n{t}");
+        assert!(
+            !decisions_list(port, &token, "")
+                .iter()
+                .any(|x| x["id"] == serde_json::json!(id)),
+            "a ruled decision is archived → hidden from the default read-model (PD3)"
+        );
+        let all = decisions_list(port, &token, "&includeArchived=true");
+        let arch = all
+            .iter()
+            .find(|x| x["id"] == serde_json::json!(id))
+            .expect("surfaced with ?includeArchived");
+        assert_eq!(
+            arch["state"],
+            serde_json::json!("archived"),
+            "tranch transits to archived (PD3)"
+        );
+        assert_eq!(
+            arch["verdict"],
+            serde_json::json!("GO"),
+            "the verdict rides the archived read-model"
+        );
     }
 }

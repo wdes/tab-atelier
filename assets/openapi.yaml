@@ -25,6 +25,8 @@ tags:
     description: Tab list, I/O and per-tab state
   - name: tokens
     description: Master token + share-link token management
+  - name: decisions
+    description: KIOSK cross-project decision log (read-model + Lu/Tranché ruling)
 paths:
   /tabs:
     get:
@@ -330,6 +332,100 @@ paths:
               schema: { type: object, properties: { token: { type: string } } }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "500": { description: Could not persist token }
+  /decisions:
+    get:
+      tags: [decisions]
+      summary: List pending cross-project decisions
+      description: >
+        The folded KIOSK read-model (event-sourced JSONL at
+        ~/.tab-atelier/decisions.jsonl). Read-only. Master token only.
+      parameters:
+        - name: includeArchived
+          in: query
+          schema: { type: boolean }
+          description: Surface archived (ruled) decisions too; the default hides them.
+      responses:
+        "200":
+          description: The folded decisions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  decisions:
+                    type: array
+                    items: { $ref: "#/components/schemas/Decision" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /decisions/file:
+    get:
+      tags: [decisions]
+      summary: Serve a decision bundle's content
+      description: >
+        Serves a bundle file as text/plain, SANDBOXED to the outbox (and its
+        _archive/ subtree): the path is ~-expanded then canonicalized and must
+        live under the outbox — anything outside is refused 403. Read-only.
+      parameters:
+        - name: path
+          in: query
+          required: true
+          schema: { type: string }
+          description: Absolute (or ~/) path to the bundle, confined to the outbox sandbox.
+      responses:
+        "200": { description: Bundle content, content: { text/plain: {} } }
+        "400": { description: "Missing ?path" }
+        "403": { description: Path outside the outbox sandbox }
+        "404": { description: Not found / not a file / unreadable }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /decisions/{id}/read:
+    post:
+      tags: [decisions]
+      summary: Mark a decision read (Lu)
+      description: Appends a `read` state event (event-sourced, read-back gated). Master token only.
+      parameters: [ { $ref: "#/components/parameters/decisionId" } ]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: { by: { type: string } }
+      responses:
+        "200":
+          description: Marked read
+          content:
+            application/json:
+              schema: { type: object, properties: { read: { type: string } } }
+        "400": { description: Empty decision id }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "500": { description: Append or read-back failed }
+  /decisions/{id}/tranch:
+    post:
+      tags: [decisions]
+      summary: Rule a decision (Tranché)
+      description: >
+        Appends a `tranched` state event then ARCHIVES the bundle (files moved
+        to _archive/AAAA-MM/, reversibly). A non-empty verdict is required.
+        Master token only.
+      parameters: [ { $ref: "#/components/parameters/decisionId" } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [verdict]
+              properties:
+                verdict: { type: string }
+                by: { type: string }
+      responses:
+        "200":
+          description: Ruled and archived
+          content:
+            application/json:
+              schema: { type: object, properties: { tranch: { type: string } } }
+        "400": { description: Empty id or missing verdict }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "500": { description: Append, archive, or read-back failed }
 components:
   securitySchemes:
     bearerAuth:
@@ -354,6 +450,12 @@ components:
       required: true
       schema: { type: string, format: uuid }
       description: Stable per-tab UUID.
+    decisionId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+      description: Decision id (groups the event-sourced events of one decision).
   responses:
     Unauthorized:
       description: Invalid or missing token. HTML page for browsers (Accept text/html), JSON otherwise.
@@ -369,6 +471,20 @@ components:
     Error:
       type: object
       properties: { error: { type: string } }
+    Decision:
+      type: object
+      description: One folded decision in the KIOSK read-model (latest content + derived state).
+      properties:
+        id: { type: string }
+        project: { type: string }
+        title: { type: string }
+        whyGated: { type: string }
+        reco: { type: string }
+        effort: { type: string }
+        files: { type: array, items: { type: string } }
+        state: { type: string, enum: [open, read, tranched, archived] }
+        verdict: { type: string }
+        at: { type: integer, description: Unix-seconds of the latest content event (the fold winner). }
     Tab:
       type: object
       properties:
