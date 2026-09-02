@@ -13,6 +13,7 @@ use log::{debug, error, info};
 use crate::tracking::USER_AGENT;
 
 mod env;
+mod relay;
 mod tab_props;
 
 const VIEWER_HTML: &str = include_str!("../assets/web-viewer.html");
@@ -2522,58 +2523,9 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             drop(snap);
             respond_json(stream, 200, r#"{"queued":"claude-only"}"#);
         }
-        ("POST", "/relay-mode") => {
-            // Toggle relay mode live (the CLI `relay on|off`). Body:
-            // {"on": true|false}. The owner mirrors it onto RELAY_MODE + its
-            // struct field and persists; claude tabs spawned after route their
-            // Anthropic calls through the configured remote.
-            let parsed: serde_json::Value = match serde_json::from_slice(&body_bytes) {
-                Ok(v) => v,
-                Err(e) => {
-                    error_json(stream, 400, &format!("invalid JSON body: {e}"));
-                    return;
-                }
-            };
-            let Some(on) = parsed.get("on").and_then(serde_json::Value::as_bool) else {
-                error_json(stream, 400, r#"provide {"on": true|false}"#);
-                return;
-            };
-            let mut snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            snap.pending_relay_mode = Some(on);
-            drop(snap);
-            respond_json(stream, 200, r#"{"queued":"relay-mode"}"#);
-        }
-        ("GET", "/relay-config") => {
-            // Current relay config (the CLI `relay status`).
-            let (egress, target) = (crate::relay_egress(), crate::relay_target());
-            let body = serde_json::json!({
-                "mode": crate::relay_mode(),
-                "egress": egress,
-                "target": target.map(|t| t.url),
-            })
-            .to_string();
-            respond_json(stream, 200, &body);
-        }
-        ("POST", "/relay-config") => {
-            // Set the relay endpoint and/or egress role (`relay via` / `relay
-            // egress`). Body: {"endpoint":"<label|id|"">","egress":bool} — any
-            // subset. The owner resolves the endpoint, persists, and re-installs.
-            let parsed: serde_json::Value = match serde_json::from_slice(&body_bytes) {
-                Ok(v) => v,
-                Err(e) => {
-                    error_json(stream, 400, &format!("invalid JSON body: {e}"));
-                    return;
-                }
-            };
-            let change = RelayConfigChange {
-                endpoint: parsed.get("endpoint").and_then(|v| v.as_str()).map(str::to_owned),
-                egress: parsed.get("egress").and_then(serde_json::Value::as_bool),
-            };
-            let mut snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            snap.pending_relay_config = Some(change);
-            drop(snap);
-            respond_json(stream, 200, r#"{"queued":"relay-config"}"#);
-        }
+        ("POST", "/relay-mode") => relay::mode(stream, state, &body_bytes),
+        ("GET", "/relay-config") => relay::config_get(stream),
+        ("POST", "/relay-config") => relay::config_set(stream, state, &body_bytes),
         ("GET", "/env") => env::list_global(stream),
         ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/env") => env::list_tab(stream, state, p),
         ("POST", "/env") => env::set_global(stream, state, &body_bytes),
