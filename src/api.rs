@@ -14,6 +14,7 @@ use crate::tracking::USER_AGENT;
 
 mod claude_only;
 mod env;
+mod input;
 mod limits;
 mod lock;
 mod meta;
@@ -3065,32 +3066,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             tab_props::context(stream, state, p, &body_bytes);
         }
         ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/input") => {
-            let Some((key_raw, is_uuid)) = parse_tab_key(p, "/input") else {
-                error_json(stream, 404, "invalid tab key");
-                return;
-            };
-            let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(idx) = resolve_tab_idx(&state, key_raw, is_uuid) {
-                // Refuse every write source — master token, share tokens, all
-                // routes — when the tab is locked. `effective_locked()`
-                // is the single source of truth: it covers BOTH the
-                // user-toggled manual lock AND the off-hours schedule,
-                // so a new gate can't accidentally honour only one.
-                if crate::schedule::LockState::effective_locked(&state.tabs[idx]) {
-                    drop(state);
-                    error_json(stream, 403, "tab is locked");
-                    return;
-                }
-                info!("API: sending {} bytes of input to tab {idx}", body_bytes.len());
-                let n = body_bytes.len();
-                state.pending_input.push((idx, body_bytes));
-                drop(state);
-                let resp = serde_json::to_string(&serde_json::json!({"sent": n})).unwrap_or_default();
-                respond_json(stream, 200, &resp);
-            } else {
-                drop(state);
-                error_json(stream, 404, "tab not found");
-            }
+            input::run(stream, state, p, body_bytes);
         }
         (_, "/" | "/tabs") => {
             error_json(stream, 405, "method not allowed");
