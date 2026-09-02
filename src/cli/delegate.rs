@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use crate::cli::share_link::{Endpoint, agent, discover_endpoint, fetch_tabs, resolve};
 
+#[derive(Debug, PartialEq, Eq)]
 struct Opts {
     target: Option<String>, // --to <tab>
     new: bool,              // --new
@@ -79,8 +80,14 @@ fn usage() {
     );
 }
 
-#[must_use]
-pub fn run(args: &[String]) -> i32 {
+/// Pure arg parser + the two "did you ask for something coherent" checks, so
+/// the branch table is testable without a daemon. Returns the options and the
+/// prompt, or an exit code with the message already printed.
+///
+/// # Errors
+/// `Err(0)` on `-h`/`--help`, `Err(2)` on an unknown flag, on passing neither
+/// or both of `--to`/`--new`, or on a missing prompt.
+fn parse_opts(args: &[String]) -> Result<(Opts, String), i32> {
     let mut o = Opts::default();
     let mut i = 0;
     while i < args.len() {
@@ -113,12 +120,12 @@ pub fn run(args: &[String]) -> i32 {
             }
             "-h" | "--help" => {
                 usage();
-                return 0;
+                return Err(0);
             }
             other if !other.starts_with('-') && o.prompt.is_none() => o.prompt = Some(other.to_owned()),
             other => {
                 eprintln!("dispatch: unexpected argument: {other}");
-                return 2;
+                return Err(2);
             }
         }
         i += 1;
@@ -126,11 +133,20 @@ pub fn run(args: &[String]) -> i32 {
 
     if o.new == o.target.is_some() {
         eprintln!("dispatch: pass exactly one of --to <tab> or --new (see --help)");
-        return 2;
+        return Err(2);
     }
     let Some(prompt) = o.prompt.clone() else {
         eprintln!("dispatch: a prompt is required (positional or --prompt)");
-        return 2;
+        return Err(2);
+    };
+    Ok((o, prompt))
+}
+
+#[must_use]
+pub fn run(args: &[String]) -> i32 {
+    let (o, prompt) = match parse_opts(args) {
+        Ok(v) => v,
+        Err(code) => return code,
     };
 
     let ep = match discover_endpoint() {
@@ -395,7 +411,77 @@ fn shell_single_quote(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{SUBMIT_DELAY_MAX, SUBMIT_DELAY_MIN, SUBMIT_SETTLE_POLL, SUBMIT_SETTLE_QUIET, shell_single_quote};
+    use super::{
+        SUBMIT_DELAY_MAX, SUBMIT_DELAY_MIN, SUBMIT_SETTLE_POLL, SUBMIT_SETTLE_QUIET, parse_opts, shell_single_quote,
+    };
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn parses_a_targeted_dispatch_with_its_defaults() {
+        let (o, prompt) = parse_opts(&args(&["--to", "3", "review this"])).expect("valid");
+        assert_eq!(o.target.as_deref(), Some("3"));
+        assert_eq!(prompt, "review this");
+        // Defaults that decide behaviour downstream: Enter is pressed, we
+        // don't wait, and `--new` would launch claude.
+        assert!(o.submit && !o.wait && !o.new);
+        assert_eq!((o.quiet, o.timeout, o.cmd.as_str()), (8, 300, "claude"));
+    }
+
+    #[test]
+    fn a_prompt_can_be_positional_or_flagged_and_only_the_first_wins() {
+        let (_, p) = parse_opts(&args(&["--to", "3", "--prompt", "flagged"])).expect("valid");
+        assert_eq!(p, "flagged");
+        // A second bare word is a mistake, not a silently-appended prompt —
+        // an unquoted multi-word prompt would otherwise dispatch its first
+        // word only.
+        assert_eq!(parse_opts(&args(&["--to", "3", "one", "two"])), Err(2));
+    }
+
+    #[test]
+    fn every_option_is_read_off_the_line() {
+        let (o, _) = parse_opts(&args(&[
+            "--new",
+            "--name",
+            "build",
+            "--cwd",
+            "/tmp",
+            "--cmd",
+            "claude -p",
+            "--wait",
+            "--no-submit",
+            "--quiet",
+            "3",
+            "--timeout",
+            "42",
+            "go",
+        ]))
+        .expect("valid");
+        assert!(o.new && o.wait && !o.submit);
+        assert_eq!(o.name.as_deref(), Some("build"));
+        assert_eq!(o.cwd.as_deref(), Some("/tmp"));
+        assert_eq!(o.cmd, "claude -p");
+        assert_eq!((o.quiet, o.timeout), (3, 42));
+        // A non-numeric --quiet/--timeout keeps the default rather than
+        // aborting: the dispatch still happens, just with sane waits.
+        let (o, _) = parse_opts(&args(&["--to", "1", "--quiet", "abc", "--timeout", "x", "go"])).expect("valid");
+        assert_eq!((o.quiet, o.timeout), (8, 300));
+    }
+
+    #[test]
+    fn target_and_prompt_are_both_required() {
+        // Exactly one destination: neither is a no-op, both is ambiguous.
+        assert_eq!(parse_opts(&args(&["go"])), Err(2));
+        assert_eq!(parse_opts(&args(&["--to", "3", "--new", "go"])), Err(2));
+        // A destination with nothing to say would type an empty line into
+        // someone else's agent.
+        assert_eq!(parse_opts(&args(&["--to", "3"])), Err(2));
+        assert_eq!(parse_opts(&args(&["--new"])), Err(2));
+        assert_eq!(parse_opts(&args(&["--to", "3", "--nope", "go"])), Err(2));
+        assert_eq!(parse_opts(&args(&["--help"])), Err(0));
+    }
 
     #[test]
     fn single_quotes_are_escaped() {
