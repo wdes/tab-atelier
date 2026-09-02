@@ -641,6 +641,35 @@ pub fn is_rehome_state(s: &str) -> bool {
     matches!(s, "handoff-written" | "successor-ready" | "ack-sent" | "safe-to-close")
 }
 
+/// Parse an assignment `"[<project>:]<phase>/<role>"` into
+/// `(project_override, phase, role)`. Pure string-splitting; the `<project>:`
+/// prefix (if any) is only recognised before the first `/`. Sole dependency of
+/// [`role_of`].
+// Foundation helper — consumed post-rebase by task/aligator (coordination MAS);
+// remove the allow when a consumer lands. `pub(crate)` so a downstream branch can
+// call it directly (project derivation) instead of re-declaring its own copy.
+#[allow(dead_code)]
+pub fn parse_assignment(a: &str) -> (Option<String>, String, String) {
+    let head_end = a.find('/').unwrap_or(a.len());
+    let (over, rest) = a[..head_end].find(':').map_or((None, a), |colon| {
+        (Some(a[..colon].trim().to_string()), &a[colon + 1..])
+    });
+    let mut parts = rest.splitn(2, '/');
+    let phase = parts.next().unwrap_or("").trim().to_string();
+    let role = parts.next().unwrap_or("").trim().to_string();
+    (over.filter(|p| !p.is_empty()), phase, role)
+}
+
+/// The agent's role, derived from its `assignment` — never from the volatile
+/// `context`. `None`/empty ⇒ empty string.
+// Foundation helper — consumed post-rebase by task/aligator (coordination MAS);
+// remove the allow when a consumer lands.
+#[allow(dead_code)]
+#[must_use]
+pub fn role_of(assignment: Option<&str>) -> String {
+    assignment.map(|a| parse_assignment(a).2).unwrap_or_default()
+}
+
 pub struct TabSnapshot {
     pub tabs: Vec<SnapshotTab>,
     /// The live master API token the auth gate validates against.
@@ -3911,6 +3940,16 @@ mod tests {
             ),
         );
         assert_eq!(status_code(&resp), 400);
+    }
+
+    /// `role_of` returns the `<role>` segment; the `<project>:` prefix is only
+    /// recognised before the first `/` (so it never eats into the role).
+    #[test]
+    fn role_of_extracts_role_after_optional_project() {
+        assert_eq!(super::role_of(Some("build/implementer")), "implementer");
+        assert_eq!(super::role_of(Some("kalpin-back:review/reviewer")), "reviewer");
+        assert_eq!(super::role_of(Some("orchestrator")), ""); // no `/` → no role
+        assert_eq!(super::role_of(None), "");
     }
 
     #[test]
