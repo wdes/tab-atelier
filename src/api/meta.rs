@@ -51,9 +51,8 @@ pub(super) fn set<W: Write>(stream: &mut W, state: &Arc<Mutex<TabSnapshot>>, p: 
         error_json(stream, 404, "tab not found");
         return;
     };
-    let full = value.is_some()
-        && snap.tabs[idx].meta.len() >= crate::META_MAX_KEYS
-        && !snap.tabs[idx].meta.contains_key(&key);
+    let full =
+        value.is_some() && snap.tabs[idx].meta.len() >= crate::META_MAX_KEYS && !snap.tabs[idx].meta.contains_key(&key);
     if full {
         drop(snap);
         error_json(stream, 400, &format!("meta is full ({} keys)", crate::META_MAX_KEYS));
