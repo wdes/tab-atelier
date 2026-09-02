@@ -1089,6 +1089,49 @@ pub fn try_acquire_single_instance_lock() -> bool {
     true
 }
 
+/// Are cron rounds (watcher/sage) currently active, and when did the last one
+/// run. Posted via `set-rounds-active`; the dashboard renders it as a badge.
+/// camelCase on the wire.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RoundsActive {
+    pub active: bool,
+    /// Unix-millis of the last round tick. `None` until the first one lands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_round_at: Option<u64>,
+}
+
+/// Token cost of the evaluated task.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct EvalTokens {
+    pub input: u64,
+    pub out: u64,
+}
+
+/// The three-axis quality score of one evaluation.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct EvalScores {
+    pub relevance: u32,
+    pub errors: u64,
+    pub omissions: u32,
+}
+
+/// One evaluation record: who evaluated, when, which task, its token cost, the
+/// scores, a verdict + note. camelCase on the wire (`taskRef`).
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Evaluation {
+    pub evaluator: String,
+    pub at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_ref: Option<String>,
+    pub tokens: EvalTokens,
+    pub scores: EvalScores,
+    pub verdict: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct TabState {
     /// Stable per-tab UUID. Used by the local API
@@ -1166,6 +1209,41 @@ pub struct TabState {
     /// [`META_KEY_MAX`] / [`META_VALUE_MAX`].
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub meta: std::collections::BTreeMap<String, String>,
+
+    /// The agent's stable place in the workflow (`set-assignment`): hook-immune
+    /// + persisted, unlike the volatile `context`. `None` ⇒ unassigned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignment: Option<String>,
+    /// Hard-wired specialty / prompt focus (`set-specialty`). OVERWRITE.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub specialty: Option<String>,
+    /// The orchestrator this agent serves: a tab UUID, or `"free"`. `set-orchestrator`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestrator: Option<String>,
+    /// The agent's current objective (`set-objective`). OVERWRITE.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objective: Option<String>,
+    /// PERMALOG (`set-current-task`): append-only one-line phrases, bounded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub current_task: Vec<String>,
+    /// Whether supervision ROUNDS are active + when the last one ran (`set-rounds-active`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rounds_active: Option<RoundsActive>,
+    /// Bounded ring of evaluation records.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evaluations: Vec<Evaluation>,
+    /// Generic use counter (`bump-usage`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_count: Option<u64>,
+    /// DECLARED conventions — the `.md` files this agent declares it follows (`set-conventions`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conventions: Vec<String>,
+    /// UUID of the tab that spawned this one (`dispatch --new`). Drives lineage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_tab_id: Option<String>,
+    /// Re-home progress on a PREDECESSOR tab (`rehome-tab.sh`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rehome_status: Option<String>,
 
     /// Fixed grid size the tab is PINNED to (`tab-atelier resize <tab> --cols N
     /// --rows M`), overriding window-driven sizing so a web viewer isn't
@@ -1610,6 +1688,17 @@ impl Default for TabState {
             net_allow_cidrs: Vec::new(),
             bg_color: None,
             badge: None,
+            assignment: None,
+            specialty: None,
+            orchestrator: None,
+            objective: None,
+            current_task: Vec::new(),
+            rounds_active: None,
+            evaluations: Vec::new(),
+            usage_count: None,
+            conventions: Vec::new(),
+            parent_tab_id: None,
+            rehome_status: None,
             schedule: None,
             limits: TabResourceLimits::default(),
             ssh_agent: None,
