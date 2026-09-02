@@ -16,6 +16,7 @@ mod claude_only;
 mod env;
 mod meta;
 mod relay;
+mod rename;
 mod tab_props;
 
 const VIEWER_HTML: &str = include_str!("../assets/web-viewer.html");
@@ -2622,31 +2623,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
             respond_json(stream, 200, r#"{"queued":"limits"}"#);
         }
         ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/rename") => {
-            let idx_str = &p["/tabs/".len()..p.len() - "/rename".len()];
-            if let Ok(idx) = idx_str.parse::<usize>() {
-                let body = &body_bytes;
-                let new_name = serde_json::from_slice::<serde_json::Value>(body).map_or_else(
-                    |_| String::from_utf8_lossy(body).trim().to_string(),
-                    |v| v.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string(),
-                );
-                if new_name.is_empty() {
-                    error_json(stream, 400, "missing or empty name");
-                    return;
-                }
-                let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                if idx < state.tabs.len() {
-                    info!("API: renaming tab {idx} to {new_name}");
-                    state.pending_renames.push((idx, new_name.clone()));
-                    drop(state);
-                    let body = serde_json::to_string(&serde_json::json!({"renamed": idx, "name": new_name}))
-                        .unwrap_or_default();
-                    respond_json(stream, 200, &body);
-                } else {
-                    error_json(stream, 404, "tab index out of range");
-                }
-            } else {
-                error_json(stream, 404, "invalid tab index");
-            }
+            rename::run(stream, state, p, &body_bytes);
         }
         // (Old `POST /tabs/<idx>/activate` route removed — that was
         // the Android ta-remote app's "tap a tab in the list to make
