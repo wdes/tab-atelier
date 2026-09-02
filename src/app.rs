@@ -2112,6 +2112,11 @@ impl AppState {
                     vcx.notify();
                 });
             }
+            // Claude Code's fullscreen transcript scrolls by page, so tell the
+            // view to translate the wheel into PgUp/PgDn for this tab.
+            tab.view
+                .read(cx)
+                .set_alt_scroll_pages(tab.agent_kind.as_deref() == Some("claude"));
             // Per-tab RSS (#28 S1/S5): one /proc-subtree walk at the 2 s persist
             // cadence, cached on the tab for the tab-bar gauge and mirrored to
             // the snapshot below.
