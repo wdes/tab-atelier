@@ -16,7 +16,7 @@ import { kioskView, decisionCardHtml, kioskHtml, renderDetail } from "./dashboar
 
 // ============================ decisionCardHtml — server state VERBATIM ============================
 {
-  const open = decisionCardHtml({ id: "d1", state: "open", title: "Deploy X", whyGated: "gate", reco: "GO", effort: "5m", files: ["~/o/x.md"] });
+  const open = decisionCardHtml({ id: "d1", state: "open", title: "Deploy X", whyGated: "gate", reco: "GO", effort: "5m", files: ["~/Dev/outbox/x.md"] });
   assert.match(open, /data-state="open"/, "carries the server state");
   assert.match(open, /class="kk-lu"[^>]*>/, "Lu checkbox present");
   assert.ok(!/class="kk-lu"[^>]*checked/.test(open), "open -> Lu NOT checked");
@@ -25,10 +25,10 @@ import { kioskView, decisionCardHtml, kioskHtml, renderDetail } from "./dashboar
   assert.match(open, /kk-key">pourquoi gaté<\/span> gate/, "why-gated line");
   assert.match(open, /kk-key">reco<\/span> GO/, "reco line");
   assert.match(open, /kk-key">effort<\/span> 5m/, "effort line");
-  // Bug1: the file link goes through the SANDBOXED route (?path=), NOT the raw outbox path.
-  assert.match(open, /<a class="kk-file" href="\/decisions\/file\?path=/, "file link routes through /decisions/file?path=");
-  assert.ok(!/href="~\/o\/x.md"/.test(open), "the raw outbox path is NOT used as the href (would 401)");
-  assert.match(open, /path=~%2Fo%2Fx.md/, "the path is URL-encoded in the query");
+  // Bug1: a SERVABLE DOC (.md under the outbox zone) links through the SANDBOXED route.
+  assert.match(open, /<a class="kk-file" href="\/decisions\/file\?path=/, "servable doc routes through /decisions/file?path=");
+  assert.ok(!/href="~\/Dev\/outbox\/x.md"/.test(open), "the raw outbox path is NOT used as the href (would 401)");
+  assert.match(open, /path=~%2FDev%2Foutbox%2Fx.md/, "the path is URL-encoded in the query");
 
   // read -> Lu checked+disabled (progression is one-way).
   const read = decisionCardHtml({ id: "d2", state: "read", title: "t" });
