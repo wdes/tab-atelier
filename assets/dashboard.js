@@ -1634,10 +1634,21 @@ const DECISION_STATE_LABEL = { open: "à trancher", read: "lu", tranched: "tranc
 // open first, then the read->tranched->archived progression.
 const DECISION_STATE_ORDER = { open: 0, read: 1, tranched: 2, archived: 3 };
 
+// Render a decision's long-form `detail` as SAFE simple-markdown for the toggle body:
+// escape EVERYTHING first (XSS), then re-introduce only <strong> (**bold**) and <br>
+// (line breaks). No raw HTML from the payload ever reaches the DOM.
+export function renderDetail(text) {
+  return escapeHtml(String(text == null ? "" : text))
+    .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/\r?\n/g, "<br>");
+}
+
 // One decision card: the 2-notch checkbox (Lu -> Tranché) in the head, the digest lines
 // (title / why-gated / reco / effort), the file links, and a short verdict field. The
 // checkboxes reflect the SERVER state (no optimistic UI); once reached, a notch is
 // checked+disabled (state only progresses; there is no un-read / un-tranch route here).
+// Kiosk detail-toggle: when the server ships a non-empty `detail`, a small (+)/(-) toggle
+// reveals the long-form body (collapsed by default). No `detail` → no toggle (feature-detect).
 export function decisionCardHtml(d) {
   const state = String(d.state || "open");
   const isRead = state === "read" || state === "tranched" || state === "archived";
@@ -1660,16 +1671,24 @@ export function decisionCardHtml(d) {
   // ruling action is the explicit "Trancher" button (Bug3), so submission is evident.
   const luDisabled = isRead || !canRule;
   const ruleDisabled = isTranched || !canRule;
+  // Feature-detect: the toggle exists ONLY when a non-empty `detail` was served (a
+  // detail-less decision degrades gracefully to no toggle, no empty body).
+  const hasDetail = typeof d.detail === "string" && d.detail.trim().length > 0;
+  const detailToggle = hasDetail
+    ? ` <button type="button" class="kk-detail-toggle" aria-expanded="false" title="déplier le détail">(+)</button>`
+    : "";
+  const detailBody = hasDetail ? `<div class="kk-detail" hidden>${renderDetail(d.detail)}</div>` : "";
   return `<div class="kk-card kk-state-${escapeHtml(state)}" data-id="${id}" data-state="${escapeHtml(state)}">
     <div class="kk-head">
       <label class="kk-check"><input type="checkbox" class="kk-lu"${isRead ? " checked" : ""}${luDisabled ? " disabled" : ""}> Lu</label>
       <label class="kk-check"><input type="checkbox" class="kk-tranche" disabled${isTranched ? " checked" : ""}> Tranché</label>
       <span class="kk-title">${escapeHtml(String(d.title || d.id || ""))}</span>
-      <span class="kk-state-tag">${escapeHtml(DECISION_STATE_LABEL[state] || state)}</span>
+      <span class="kk-state-tag">${escapeHtml(DECISION_STATE_LABEL[state] || state)}</span>${detailToggle}
     </div>
     ${line("pourquoi gaté", d.whyGated)}
     ${line("reco", d.reco)}
     ${line("effort", d.effort)}
+    ${detailBody}
     ${links}
     <div class="kk-rule">
       <input type="text" class="kk-verdict-input" placeholder="verdict court…" value="${escapeHtml(String(d.verdict || ""))}"${ruleDisabled ? " disabled" : ""}>
@@ -1679,6 +1698,16 @@ export function decisionCardHtml(d) {
       <span class="kk-msg" role="status"></span>
     </div>
   </div>`;
+}
+
+// Flip one card's detail toggle: (+) collapsed <-> (-) expanded. Purely local (no fetch).
+function toggleDetail(btn) {
+  const card = btn.closest && btn.closest(".kk-card");
+  const body = card && card.querySelector(".kk-detail");
+  const expanded = btn.getAttribute("aria-expanded") === "true";
+  btn.setAttribute("aria-expanded", String(!expanded));
+  btn.textContent = expanded ? "(+)" : "(-)";
+  if (body) body.hidden = expanded;
 }
 
 export function kioskHtml(readModel) {
@@ -1997,6 +2026,10 @@ function bootstrap() {
       if (e.target.closest(".kk-refresh")) { openKiosk(); return; }
       const showArch = e.target.closest(".kk-show-archived");
       if (showArch) { kioskIncludeArchived = !!showArch.checked; openKiosk(); return; }
+      // Detail toggle: a LOCAL UI flip (no server round-trip, no re-fetch — re-rendering
+      // would collapse it again). Expand/collapse the long-form body in place.
+      const dt = e.target.closest(".kk-detail-toggle");
+      if (dt) { toggleDetail(dt); return; }
       if (e.target.closest(".kk-lu, .kk-send")) { handleKioskAction(e.target); return; }
     });
     // Bug3: Enter in the verdict field submits the ruling (as well as the "Trancher" button).

@@ -45,6 +45,10 @@ pub struct DecisionEvent {
     pub reco: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// Long-form body (the résumé court is `title`; `detail` is the expandable
+    /// description the KIOSK toggle reveals). Optional — no `detail` → no toggle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<String>,
     // ----- state (read|tranched|archived) -----
@@ -126,6 +130,9 @@ pub struct DecisionView {
     pub reco: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// The long-form body the KIOSK toggle reveals (absent → no toggle).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<String>,
     pub state: DecisionState,
@@ -247,6 +254,7 @@ fn fold_one(id: &str, events: &[DecisionEvent]) -> Option<DecisionView> {
         why_gated: content.why_gated.clone(),
         reco: content.reco.clone(),
         effort: content.effort.clone(),
+        detail: content.detail.clone(),
         files,
         state,
         verdict,
@@ -468,7 +476,7 @@ pub fn run(args: &[String]) -> i32 {
         _ => {
             eprintln!(
                 "usage:\n  \
-                 tab-atelier decision push --id <id> --project <p> --title <t> [--why <w>] [--reco <r>] [--effort <e>] [--files a,b]\n  \
+                 tab-atelier decision push --id <id> --project <p> --title <t> [--why <w>] [--reco <r>] [--effort <e>] [--detail <body>] [--files a,b]\n  \
                  tab-atelier decision read --id <id> [--by <who>]\n  \
                  tab-atelier decision tranch --id <id> --verdict <v> [--by <who>]\n  \
                  tab-atelier decision list [--includeArchived]"
@@ -495,6 +503,7 @@ pub fn is_noop_open(events: &[DecisionEvent], incoming: &DecisionEvent) -> bool 
             && c.why_gated == incoming.why_gated
             && c.reco == incoming.reco
             && c.effort == incoming.effort
+            && c.detail == incoming.detail
             && c.files == incoming.files
     })
 }
@@ -565,6 +574,7 @@ fn push(args: &[String]) -> i32 {
         why_gated: arg_after(args, "--why").map(str::to_string),
         reco: arg_after(args, "--reco").map(str::to_string),
         effort: arg_after(args, "--effort").map(str::to_string),
+        detail: arg_after(args, "--detail").map(str::to_string),
         files,
         ..Default::default()
     };
@@ -981,5 +991,60 @@ mod tests {
         );
         // The first push (no prior content) is never a no-op.
         assert!(!is_noop_open(&[], &same), "first push is never a no-op");
+    }
+
+    // Kiosk detail-toggle ⭐ REAL-FS: the OPTIONAL `detail` (long-form body) rides the
+    // content axis to the view — present when pushed, ABSENT (→ no toggle) otherwise
+    // (rétro-compat), latest-content-wins, and part of the idempotence key.
+    #[test]
+    fn kiosk_detail_rides_the_fold_and_stays_optional() {
+        let log = TmpLog::new();
+        // A decision WITHOUT --detail → the view carries no detail (no toggle downstream).
+        append_line(log.path(), &open("plain", "harness", "no detail", 1)).unwrap();
+        // A decision WITH detail.
+        let mut o = open("rich", "harness", "with detail", 2);
+        o.detail = Some("Enjeux: …\nOptions: A / B\nReco: A".into());
+        append_line(log.path(), &o).unwrap();
+
+        let v = read_decisions_at(log.path(), false);
+        assert_eq!(
+            v.iter().find(|d| d.id == "plain").unwrap().detail,
+            None,
+            "no --detail → no detail on the view (rétro-compat, pas de toggle)"
+        );
+        let rich = v.iter().find(|d| d.id == "rich").unwrap();
+        assert!(rich.detail.as_deref().unwrap().contains("Options: A / B"), "detail rides the fold verbatim");
+
+        // The camelCase read-model serves `detail` (the key the panel feature-detects).
+        let json = serde_json::to_string(rich).unwrap();
+        assert!(json.contains("\"detail\":"), "the served read-model carries `detail`");
+        // And a plain decision's JSON omits it (skip_serializing_if) → the panel sees no toggle.
+        let plain_json = serde_json::to_string(v.iter().find(|d| d.id == "plain").unwrap()).unwrap();
+        assert!(!plain_json.contains("\"detail\""), "a detail-less decision omits the key entirely");
+
+        // Latest-content-wins on the detail axis (an `update` revises it).
+        let mut up = ev("rich", DecisionKind::Update, 3);
+        up.title = Some("with detail".into());
+        up.detail = Some("v2 corps étendu".into());
+        append_line(log.path(), &up).unwrap();
+        assert_eq!(
+            read_decisions_at(log.path(), false).iter().find(|d| d.id == "rich").unwrap().detail.as_deref(),
+            Some("v2 corps étendu"),
+            "latest content event's detail wins"
+        );
+
+        // Idempotence: same content but a NEW detail is NOT a no-op (it must append).
+        let base = open("k", "harness", "T", 1);
+        let mut with_detail = open("k", "harness", "T", 2);
+        with_detail.detail = Some("body".into());
+        assert!(!is_noop_open(std::slice::from_ref(&base), &with_detail), "adding a detail is a real content change");
+        assert!(
+            is_noop_open(std::slice::from_ref(&with_detail), &{
+                let mut c = with_detail.clone();
+                c.at = 9;
+                c
+            }),
+            "same detail re-run → no-op"
+        );
     }
 }
