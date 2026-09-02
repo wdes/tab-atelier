@@ -639,13 +639,13 @@ mod tests {
     #[test]
     fn ra1c_real_wake_entry_submits_true_and_round_trips_on_real_fs() {
         use crate::cli::aligator::{Priority, parse_swamp};
-        let tmp = std::env::temp_dir().join(format!("ra1c-swamp-{}.jsonl", crate::default_tab_id()));
         struct Rm(std::path::PathBuf);
         impl Drop for Rm {
             fn drop(&mut self) {
                 let _ = std::fs::remove_file(&self.0);
             }
         }
+        let tmp = std::env::temp_dir().join(format!("ra1c-swamp-{}.jsonl", crate::default_tab_id()));
         let _cleanup = Rm(tmp.clone());
 
         let roster = vec!["o1".to_string(), "o2".to_string()];
