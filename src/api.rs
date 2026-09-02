@@ -3744,6 +3744,69 @@ mod tests {
     }
 
     #[test]
+    fn relay_config_and_mode_round_trip() {
+        // The relay-LLM CONTROL routes must RESPOND, not merely compile:
+        // GET reads the live config, POST queues a change onto the owner.
+        // Nothing else covered these — the other relay tests hit the
+        // /anthropic egress proxy, a different code path (anti-built≠wired).
+        let (port, state, master) = spawn_server();
+
+        // GET /relay-config → 200 with the {mode,egress,target} shape.
+        let resp = request(
+            port,
+            &format!("GET /relay-config HTTP/1.1\r\nAuthorization: Bearer {master}\r\n\r\n"),
+        );
+        assert_eq!(status_code(&resp), 200, "relay config readable");
+        assert!(
+            resp.contains("\"mode\"") && resp.contains("\"egress\"") && resp.contains("\"target\""),
+            "config JSON shape: {resp}"
+        );
+
+        // POST /relay-mode {"on":true} → 200 queued + mirrored onto the snapshot.
+        let body = r#"{"on":true}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /relay-mode HTTP/1.1\r\nAuthorization: Bearer {master}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 200);
+        assert!(resp.contains("\"queued\""), "mode toggle queued");
+        assert_eq!(
+            state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pending_relay_mode,
+            Some(true),
+            "relay mode change queued onto the owner",
+        );
+
+        // POST /relay-config {"endpoint":"","egress":false} → 200 queued.
+        let body = r#"{"endpoint":"","egress":false}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /relay-config HTTP/1.1\r\nAuthorization: Bearer {master}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 200);
+        assert!(
+            state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pending_relay_config
+                .is_some(),
+            "relay config change queued onto the owner",
+        );
+
+        // Master-only: the control routes aren't in the share-token allowlist.
+        let resp = request(port, "GET /relay-config HTTP/1.1\r\n\r\n");
+        assert_eq!(status_code(&resp), 401, "relay config is master-only");
+    }
+
+    #[test]
     fn openapi_spec_served_publicly() {
         let (port, _, _) = spawn_server();
         // No token — the spec is public so tooling can fetch it.
@@ -3761,6 +3824,23 @@ mod tests {
             resp.contains("/tabs/rotate-tokens") && resp.contains("/master-token/reset"),
             "documents token endpoints"
         );
+    }
+
+    #[test]
+    fn openapi_embedded_documents_all_control_routes() {
+        // Assert on the EMBEDDED spec (source of truth for the shipped
+        // build), not the HTTP-served copy: openapi_spec() prefers an
+        // installed /usr/share/doc/*/openapi.yaml when present, so the
+        // served copy on a dev box with an old package is stale. This
+        // guards that every control route we wire has a contract entry.
+        for route in [
+            "/tabs/rotate-tokens",
+            "/master-token/reset",
+            "/relay-mode",
+            "/relay-config",
+        ] {
+            assert!(OPENAPI_YAML.contains(route), "openapi.yaml documents {route}");
+        }
     }
 
     #[test]
