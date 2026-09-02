@@ -8,9 +8,9 @@
 use std::io::Write;
 
 use super::{
-    APPLE_TOUCH_ICON, FAVICON_ICO, FAVICON_PNG_16, FAVICON_PNG_32, FAVICON_SVG, ICON_PNG_192, ICON_PNG_512, MAIN_CSS,
-    MAIN_JS, ROBOTS_TAG, ROBOTS_TXT, SITE_WEBMANIFEST, VENDOR_TERM_SYMBOLS_WOFF2, VENDOR_XTERM_CSS,
-    VENDOR_XTERM_JS_SERVED, VENDOR_XTERM_UNICODE11_JS, openapi_spec, respond_with_etag,
+    APPLE_TOUCH_ICON, DASHBOARD_CSS, DASHBOARD_JS, FAVICON_ICO, FAVICON_PNG_16, FAVICON_PNG_32, FAVICON_SVG,
+    ICON_PNG_192, ICON_PNG_512, MAIN_CSS, MAIN_JS, ROBOTS_TAG, ROBOTS_TXT, SITE_WEBMANIFEST, VENDOR_TERM_SYMBOLS_WOFF2,
+    VENDOR_XTERM_CSS, VENDOR_XTERM_JS_SERVED, VENDOR_XTERM_UNICODE11_JS, openapi_spec, respond_with_etag,
 };
 
 /// Serve a public static asset when `path` names one, returning `true` when a
@@ -58,10 +58,14 @@ pub(super) fn try_serve<W: Write>(
         | "/assets/xterm-6.0.0.css"
         | "/assets/main.js"
         | "/assets/main.css"
+        | "/assets/dashboard.js"
+        | "/assets/dashboard.css"
         | "/assets/term-symbols.woff2",
     ) = (method, path)
     {
         let (body, ctype): (&[u8], &str) = match path {
+            "/assets/dashboard.js" => (DASHBOARD_JS.as_bytes(), "application/javascript; charset=utf-8"),
+            "/assets/dashboard.css" => (DASHBOARD_CSS.as_bytes(), "text/css; charset=utf-8"),
             "/assets/xterm-6.0.0.js" => (
                 VENDOR_XTERM_JS_SERVED.as_bytes(),
                 "application/javascript; charset=utf-8",
