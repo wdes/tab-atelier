@@ -1019,7 +1019,7 @@ impl PetOverlay {
                 match (self.pets[i].pet.is_grazing(), over) {
                     (false, Some(_)) if self.pets[i].pet.is_walking() => self.pets[i].pet.start_grazing(),
                     (true, Some(gi)) => {
-                        self.grass[gi].amount -= dt_ms / 1000.0 * EAT_RATE;
+                        self.grass[gi].amount = (dt_ms / 1000.0).mul_add(-EAT_RATE, self.grass[gi].amount);
                         if self.grass[gi].amount <= 0.0 {
                             self.grass.remove(gi);
                             self.pets[i].pet.stop_grazing();
