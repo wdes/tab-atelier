@@ -13,6 +13,7 @@ use log::{debug, error, info};
 use crate::tracking::USER_AGENT;
 
 mod env;
+mod meta;
 mod relay;
 mod tab_props;
 
@@ -2531,58 +2532,7 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
         ("POST", "/env") => env::set_global(stream, state, &body_bytes),
         ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/env") => env::set_tab(stream, state, p, &body_bytes),
         ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/meta") => {
-            // Set or clear one free-form durable label on a tab (`set-meta`).
-            // Body: {"key":"role","value":"reviewer"} to set,
-            // {"key":"role","value":null} to remove. Keys/values are validated
-            // by `crate::sanitize_meta`; the map is capped at META_MAX_KEYS so
-            // a chatty producer can't grow tabs.json without bound.
-            let Some((key_raw, is_uuid)) = parse_tab_key(p, "/meta") else {
-                error_json(stream, 404, "missing tab id");
-                return;
-            };
-            let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or(serde_json::Value::Null);
-            let Some(key) = parsed.get("key").and_then(|v| v.as_str()) else {
-                error_json(stream, 400, "expected {\"key\":\"…\",\"value\":\"…\"|null}");
-                return;
-            };
-            // A null (or absent) value removes the key; anything else must
-            // validate as a value.
-            let raw_value = parsed.get("value").and_then(|v| v.as_str());
-            let (key, value) = match raw_value {
-                Some(v) => match crate::sanitize_meta(key, v) {
-                    Ok((k, v)) => (k, Some(v)),
-                    Err(e) => {
-                        error_json(stream, 400, &e);
-                        return;
-                    }
-                },
-                // Validate the key alone by round-tripping a dummy value.
-                None => match crate::sanitize_meta(key, "x") {
-                    Ok((k, _)) => (k, None),
-                    Err(e) => {
-                        error_json(stream, 400, &e);
-                        return;
-                    }
-                },
-            };
-            let mut snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(idx) = resolve_tab_idx(&snap, key_raw, is_uuid) else {
-                drop(snap);
-                error_json(stream, 404, "tab not found");
-                return;
-            };
-            let full = value.is_some()
-                && snap.tabs[idx].meta.len() >= crate::META_MAX_KEYS
-                && !snap.tabs[idx].meta.contains_key(&key);
-            if full {
-                drop(snap);
-                error_json(stream, 400, &format!("meta is full ({} keys)", crate::META_MAX_KEYS));
-                return;
-            }
-            let tab_id = snap.tabs[idx].id.to_string();
-            snap.pending_meta_changes.push(MetaChange { tab_id, key, value });
-            drop(snap);
-            respond_json(stream, 200, r#"{"queued":"meta"}"#);
+            meta::set(stream, state, p, &body_bytes);
         }
         ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/resize") => {
             // Pin (or clear) a tab's fixed grid size (the CLI `resize`). Body:
