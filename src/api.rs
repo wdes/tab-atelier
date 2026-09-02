@@ -23,6 +23,7 @@ mod rename;
 mod resize;
 mod schedule;
 mod tab_props;
+mod tokens;
 
 const VIEWER_HTML: &str = include_str!("../assets/web-viewer.html");
 
@@ -3011,51 +3012,8 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
         ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/schedule") => {
             schedule::run(stream, state, p, &body_bytes);
         }
-        ("POST", "/tabs/rotate-tokens") => {
-            // Revoke every tab's per-tab share tokens so all outstanding
-            // share links 401. Cleared on the snapshot immediately
-            // (instant effect) and queued so the owner loop clears the
-            // runtime Tab + persists; a fresh token is minted on the next
-            // "Remote control" / `share-link`. Master token only — this
-            // path isn't in the share-token allowlist, so a share token
-            // never authorises here.
-            let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut revoked = 0usize;
-            for t in &mut state.tabs {
-                if t.share_token_rw.is_empty() && t.share_token_ro.is_empty() {
-                    continue;
-                }
-                t.share_token_rw = "".into();
-                t.share_token_ro = "".into();
-                revoked += 1;
-            }
-            let ids: Vec<String> = state.tabs.iter().map(|t| t.id.to_string()).collect();
-            state.pending_token_rotations.extend(ids);
-            state.invalidate_tabs();
-            drop(state);
-            respond_json(stream, 200, &format!(r#"{{"revoked":{revoked}}}"#));
-        }
-        ("POST", "/master-token/reset") => {
-            // Hot-swap the master API token: generate a fresh one, persist
-            // it to api.token (so `tab-atelier token` and saved configs
-            // re-read it), and publish it onto the snapshot the auth gate
-            // validates against. Every link / client carrying the OLD
-            // master token 401s on its next request. Master token only
-            // (this path isn't in the share-token allowlist).
-            let new = generate_token();
-            let dir = crate::platform::state_base_dir().join(crate::APP_DIR);
-            let _ = std::fs::create_dir_all(&dir);
-            if let Err(e) = write_private_file(&dir.join("api.token"), new.as_bytes()) {
-                error_json(stream, 500, &format!("could not persist token: {e}"));
-                return;
-            }
-            state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .master_token
-                .clone_from(&new);
-            respond_json(stream, 200, &format!(r#"{{"token":"{new}"}}"#));
-        }
+        ("POST", "/tabs/rotate-tokens") => tokens::rotate(stream, state),
+        ("POST", "/master-token/reset") => tokens::reset_master(stream, state),
         ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/bg-color") => {
             tab_props::bg_color(stream, state, p, &body_bytes);
         }
