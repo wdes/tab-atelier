@@ -32,7 +32,11 @@ pub struct TabView {
     pub id: String,
     #[serde(default)]
     pub name: String,
-    #[serde(default)]
+    /// `#[serde(default)]` alone is not enough: it covers a MISSING field, and
+    /// `/tabs` sends `"cwd": null` for a tab whose cwd isn't known yet (fresh
+    /// tab, /proc read failed). Without this the whole listing fails to parse
+    /// and `peers` reports an error for the entire fleet.
+    #[serde(default, deserialize_with = "null_to_default")]
     pub cwd: String,
     /// "thinking" | "waiting" | "error" | absent. Absent ⇒ idle at a prompt.
     #[serde(default)]
@@ -60,6 +64,16 @@ impl TabView {
 }
 
 /// Fetch `/tabs` and deserialise into typed [`TabView`]s.
+/// Deserialize `null` as `T::default()` rather than failing. One tab missing
+/// an optional field must not sink the whole `/tabs` listing.
+fn null_to_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
 pub(crate) fn fetch_tab_views(ep: &Endpoint) -> Result<Vec<TabView>, String> {
     let raw = fetch_tabs(ep)?;
     raw.into_iter()
@@ -370,6 +384,12 @@ pub fn run_handoff(args: &[String]) -> i32 {
 /// `tab-atelier note [--topic T] [--from NAME] <msg>` — post to the blackboard.
 #[must_use]
 pub fn note(topic: Option<String>, from: Option<String>, msg: &str) -> i32 {
+    note_at(&blackboard_path(), topic, from, msg)
+}
+
+/// [`note`] against an explicit blackboard file.
+#[must_use]
+fn note_at(path: &Path, topic: Option<String>, from: Option<String>, msg: &str) -> i32 {
     use std::io::Write as _;
     let ts = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let n = Note {
@@ -378,12 +398,11 @@ pub fn note(topic: Option<String>, from: Option<String>, msg: &str) -> i32 {
         topic,
         msg: msg.to_string(),
     };
-    let path = blackboard_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     // Append mode: concurrent small writes from many tabs stay line-atomic.
-    match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    match std::fs::OpenOptions::new().create(true).append(true).open(path) {
         Ok(mut f) => {
             if let Err(e) = f.write_all(encode_note_line(&n).as_bytes()) {
                 eprintln!("note: write {}: {e}", path.display());
@@ -401,8 +420,13 @@ pub fn note(topic: Option<String>, from: Option<String>, msg: &str) -> i32 {
 /// `tab-atelier notes [--topic T] [--since N]` — read the blackboard.
 #[must_use]
 pub fn notes(topic: Option<&str>, since: Option<usize>) -> i32 {
-    let path = blackboard_path();
-    let body = std::fs::read_to_string(&path).unwrap_or_default();
+    notes_at(&blackboard_path(), topic, since)
+}
+
+/// [`notes`] against an explicit blackboard file.
+#[must_use]
+fn notes_at(path: &Path, topic: Option<&str>, since: Option<usize>) -> i32 {
+    let body = std::fs::read_to_string(path).unwrap_or_default();
     let all = parse_notes(&body);
     let sel = select_notes(&all, topic, since.unwrap_or(0));
     if sel.is_empty() {
@@ -487,6 +511,94 @@ pub fn handoff(file: &Path, tab: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn argv(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn a_tab_without_a_cwd_does_not_sink_the_whole_listing() {
+        // Regression: `/tabs` sends `"cwd": null` for a tab whose cwd isn't
+        // known yet, and serde's `default` only covers a MISSING key — so one
+        // such tab made `peers` fail for every tab.
+        let v: TabView =
+            serde_json::from_str(r#"{"index":0,"id":"a","name":"n","cwd":null}"#).expect("null cwd parses");
+        assert_eq!(v.cwd, "");
+        let v: TabView = serde_json::from_str(r#"{"index":0,"id":"a","name":"n"}"#).expect("missing cwd parses");
+        assert_eq!(v.cwd, "");
+    }
+
+    #[test]
+    fn the_blackboard_round_trips_through_a_file() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let path = tmp.path().join("blackboard.jsonl");
+        assert_eq!(
+            note_at(&path, Some("schema".into()), Some("api".into()), "users.email NOT NULL"),
+            0
+        );
+        assert_eq!(note_at(&path, None, None, "untopiced"), 0);
+        let body = std::fs::read_to_string(&path).expect("read");
+        let all = parse_notes(&body);
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].topic.as_deref(), Some("schema"));
+        assert_eq!(all[0].from.as_deref(), Some("api"));
+        assert!(all[0].ts > 0, "stamped at write");
+        // Reading is filtered, never destructive.
+        assert_eq!(notes_at(&path, None, None), 0);
+        assert_eq!(notes_at(&path, Some("schema"), None), 0);
+        assert_eq!(notes_at(&path, Some("nothing-here"), None), 0);
+        assert_eq!(notes_at(&path, None, Some(1)), 0, "--since skips read entries");
+        assert_eq!(parse_notes(&std::fs::read_to_string(&path).expect("read")).len(), 2);
+        // A missing file reads as empty rather than failing.
+        assert_eq!(notes_at(&tmp.path().join("absent.jsonl"), None, None), 0);
+        // The first note creates the file (and its parent) on demand.
+        let nested = tmp.path().join("deep/blackboard.jsonl");
+        assert_eq!(note_at(&nested, None, None, "hi"), 0);
+        assert!(nested.exists());
+    }
+
+    #[test]
+    fn note_and_notes_parse_their_flags() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let path = tmp.path().join("b.jsonl");
+        assert_eq!(note_at(&path, None, None, "msg"), 0);
+        // A message is required; flags alone are usage.
+        assert_eq!(run_note(&argv(&[])), 2);
+        assert_eq!(run_note(&argv(&["--topic", "t"])), 2);
+        // --since must be a number, or a typo would silently show everything.
+        assert_eq!(run_notes(&argv(&["--since", "abc"])), 2);
+        assert_eq!(run_notes(&argv(&["--since"])), 2);
+    }
+
+    #[test]
+    fn peer_and_peek_verbs_read_the_live_fleet() {
+        crate::cli::share_link::with_test_server(|_| {
+            assert_eq!(peers(false), 0);
+            assert_eq!(peers(true), 0, "--all");
+            assert_eq!(peek("0", 5, false), 0);
+            assert_eq!(peek("tab-b", 5, true), 0, "--raw");
+            assert_eq!(peek("nope", 5, false), 1);
+            assert_eq!(run_peek(&argv(&["0"])), 0);
+            assert_eq!(run_peek(&argv(&["0", "--lines", "3"])), 0);
+            assert_eq!(run_peek(&argv(&[])), 2, "a tab is required");
+            assert_eq!(run_peek(&argv(&["0", "--lines", "abc"])), 2);
+        });
+    }
+
+    #[test]
+    fn handoff_needs_a_real_file_and_a_real_tab() {
+        crate::cli::share_link::with_test_server(|_| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let f = tmp.path().join("report.md");
+            std::fs::write(&f, "hello").expect("write");
+            // The target tab must exist…
+            assert_eq!(handoff(&f, "nope"), 1);
+            // …and so must the file, before anything is uploaded.
+            assert_eq!(handoff(&tmp.path().join("absent.md"), "0"), 1);
+            assert_eq!(run_handoff(&argv(&[])), 2);
+            assert_eq!(run_handoff(&argv(&["only-one-arg"])), 2);
+        });
+    }
 
     fn tab(index: usize, name: &str, kind: Option<&str>, state: Option<&str>) -> TabView {
         TabView {

@@ -404,3 +404,41 @@ fn truncate(s: &str, n: usize) -> String {
     let head: String = s.chars().take(n.saturating_sub(1)).collect();
     format!("{head}…")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn the_subcommand_table_routes_or_explains_itself() {
+        // `list` only reads the preference file; every other verb either
+        // mutates it or needs a remote host, so this covers the routing and
+        // the two no-op paths without touching the machine.
+        assert_eq!(run(&argv(&["list"])), 0);
+        assert_eq!(run(&argv(&["--help"])), 0);
+        assert_eq!(run(&argv(&["help"])), 0);
+        assert_eq!(run(&argv(&[])), 2, "no subcommand is usage");
+        assert_eq!(run(&argv(&["not-a-verb"])), 2);
+        // Each mutating verb validates its own arguments first.
+        assert_eq!(run(&argv(&["add"])), 2);
+        assert_eq!(run(&argv(&["remove"])), 2);
+        assert_eq!(run(&argv(&["rm"])), 2);
+        assert_eq!(run(&argv(&["pin-cert"])), 2);
+        assert_eq!(run(&argv(&["re-pin"])), 2);
+    }
+
+    #[test]
+    fn truncate_keeps_the_table_aligned() {
+        assert_eq!(truncate("short", 10), "short");
+        assert_eq!(truncate("exactly-10", 10), "exactly-10");
+        let cut = truncate("a-very-long-endpoint-name", 10);
+        assert_eq!(cut.chars().count(), 10);
+        assert!(cut.ends_with('…'), "elided with an ellipsis, not a hard cut");
+        // Multi-byte input must not panic on a mid-char boundary.
+        assert!(truncate("héllo-wörld-ünicode", 8).chars().count() <= 8);
+    }
+}

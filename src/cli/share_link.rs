@@ -20,13 +20,35 @@
 
 use std::time::Duration;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Endpoint {
     pub(crate) url: String,
     pub(crate) token: String,
 }
 
+/// Endpoint injected by the CLI tests, which point the verbs at an
+/// in-process API server. Set through [`set_test_endpoint`]; `None` in every
+/// other build, where discovery goes through env + the token files below.
+#[cfg(test)]
+static TEST_ENDPOINT: std::sync::Mutex<Option<Endpoint>> = std::sync::Mutex::new(None);
+
+/// Point every verb at `ep` (or back at real discovery with `None`).
+#[cfg(test)]
+pub(crate) fn set_test_endpoint(ep: Option<Endpoint>) {
+    *TEST_ENDPOINT.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = ep;
+}
+
 pub(crate) fn discover_endpoint() -> Result<Endpoint, String> {
+    #[cfg(test)]
+    {
+        let injected = TEST_ENDPOINT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(ep) = injected {
+            return Ok(ep);
+        }
+    }
     if let (Ok(url), Ok(token)) = (
         std::env::var("TAB_ATELIER_API_URL"),
         std::env::var("TAB_ATELIER_API_TOKEN"),
@@ -2153,4 +2175,363 @@ pub fn tabs(args: &[String]) -> i32 {
         }
     }
     0
+}
+
+/// Serializes the injected endpoint, which is process-global.
+#[cfg(test)]
+static TEST_SERVER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Run `body` with every CLI verb pointed at a real in-process API server over
+/// a two-tab snapshot (`tab-a`/shell, `tab-b`/build), so a verb exercises its
+/// actual HTTP path instead of a mock. Shared by the CLI test modules.
+#[cfg(test)]
+pub(crate) fn with_test_server<T>(
+    body: impl FnOnce(&std::sync::Arc<std::sync::Mutex<crate::api::TabSnapshot>>) -> T,
+) -> T {
+    let guard = TEST_SERVER_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut a = crate::api::test_snapshot_tab("tab-a", "shell");
+    a.cwd = Some("/home/user".into());
+    a.output = "$ ls\nfoo bar baz".into();
+    let b = crate::api::test_snapshot_tab("tab-b", "build");
+    let state = std::sync::Arc::new(std::sync::Mutex::new(crate::api::test_snapshot(vec![a, b])));
+    state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .master_token = "test-secret-token".into();
+    let port = crate::api::spawn_test_server(&state, false);
+    set_test_endpoint(Some(Endpoint {
+        url: format!("http://127.0.0.1:{port}"),
+        token: "test-secret-token".into(),
+    }));
+    let out = body(&state);
+    set_test_endpoint(None);
+    drop(guard);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    fn with_server<T>(body: impl FnOnce(&std::sync::Arc<std::sync::Mutex<crate::api::TabSnapshot>>) -> T) -> T {
+        super::with_test_server(body)
+    }
+
+    #[test]
+    fn endpoint_comes_from_the_environment_first() {
+        with_server(|_| {
+            let ep = discover_endpoint().expect("env endpoint");
+            assert!(ep.url.starts_with("http://127.0.0.1:"));
+            assert_eq!(ep.token, "test-secret-token");
+            // The port the share URL advertises is the API's own.
+            assert_eq!(
+                http_port(&ep),
+                ep.url.rsplit(':').next().unwrap().parse::<u16>().unwrap()
+            );
+        });
+    }
+
+    #[test]
+    fn resolve_accepts_an_index_a_uuid_and_a_name() {
+        with_server(|_| {
+            let ep = discover_endpoint().expect("endpoint");
+            assert_eq!(resolve(&ep, "0").expect("by index").1, "tab-a");
+            assert_eq!(resolve(&ep, "tab-b").expect("by uuid").1, "tab-b");
+            // A key that matches nothing must fail rather than pick tab 0 —
+            // every mutating verb routes through here.
+            // Names are NOT resolvable here — index or uuid only, so a tab
+            // named "0" can never shadow tab index 0.
+            assert!(resolve(&ep, "shell").is_err());
+            assert!(resolve(&ep, "nope").is_err());
+            assert!(resolve(&ep, "99").is_err());
+            assert_eq!(fetch_tabs(&ep).expect("tabs").len(), 2);
+        });
+    }
+
+    #[test]
+    fn listing_verbs_render_the_fleet() {
+        with_server(|_| {
+            assert_eq!(tabs(&args(&[])), 0);
+            assert_eq!(tabs(&args(&["--json"])), 0);
+            assert_eq!(run(&args(&["0"])), 0, "share-link by index");
+            assert_eq!(run(&args(&["tab-b", "--ro"])), 0, "read-only link");
+            assert_eq!(run(&args(&["--help"])), 0);
+            assert_eq!(run(&args(&[])), 2, "no tab is usage");
+            assert_eq!(run(&args(&["0", "extra"])), 2);
+            assert_eq!(run(&args(&["nope"])), 1, "unknown tab");
+        });
+    }
+
+    #[test]
+    fn tab_lifecycle_verbs_queue_their_work() {
+        with_server(|state| {
+            // `add` queues the creation then polls for the tab to appear; with
+            // no daemon draining the queue it reports the timeout, having
+            // queued the work all the same.
+            assert_eq!(add(&args(&["/tmp", "newtab"])), 1);
+            assert_eq!(rename(&args(&["0", "renamed"])), 0);
+            assert_eq!(close(&args(&["1"])), 0);
+            let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(s.pending_new_tabs, 1);
+            assert_eq!(s.pending_renames, vec![(0, "renamed".to_string())]);
+            assert_eq!(s.pending_closes, vec![1]);
+            drop(s);
+            // Each verb validates its own arguments before reaching the API.
+            assert_eq!(add(&args(&[])), 2);
+            assert_eq!(rename(&args(&["0"])), 2);
+            assert_eq!(close(&args(&[])), 2);
+            assert_eq!(rename(&args(&["nope", "x"])), 1);
+        });
+    }
+
+    #[test]
+    fn lock_and_net_toggles_reach_the_daemon() {
+        with_server(|state| {
+            assert_eq!(lock(&args(&["0"])), 0);
+            assert_eq!(unlock(&args(&["0"])), 0);
+            let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let locks: Vec<bool> = s.pending_lock_changes.iter().map(|(_, on)| *on).collect();
+            assert_eq!(locks, vec![true, false]);
+            drop(s);
+            assert_eq!(lock(&args(&[])), 2);
+            assert_eq!(unlock(&args(&["nope"])), 1);
+        });
+    }
+
+    #[test]
+    fn per_tab_size_and_limits_are_validated_then_queued() {
+        with_server(|state| {
+            assert_eq!(resize("0", Some(100), Some(40), false), 0);
+            assert_eq!(resize("0", None, None, true), 0, "clear un-pins");
+            // A pin needs both axes, and a 0-column grid is not a grid.
+            assert_eq!(resize("0", Some(100), None, false), 2, "a pin needs both axes");
+            // 0x0 passes the client check and is refused by the server (400).
+            assert_eq!(resize("0", Some(0), Some(0), false), 1);
+            let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(s.pending_resizes.len(), 2);
+            assert_eq!(s.pending_resizes[0].1, Some((100, 40)));
+            assert_eq!(s.pending_resizes[1].1, None);
+            drop(s);
+            assert_eq!(limit("0", Some("512M"), Some(50), Some(100), false), 0);
+            assert_eq!(limit("0", None, None, None, true), 0);
+            // An unparseable size is refused by the server, which owns the
+            // cgroup semantics. A 0% cpu quota is NOT refused today — it would
+            // freeze the tab; recorded here as current behaviour, not intent.
+            assert_eq!(limit("0", Some("nonsense"), None, None, false), 1);
+            assert_eq!(limit("0", None, Some(0), None, false), 0);
+            // Asking for nothing at all is caught before any request.
+            assert_eq!(limit("0", None, None, None, false), 2);
+            assert_eq!(limit_cli(&args(&["0", "--memory", "1G"])), 0);
+            assert_eq!(limit_cli(&args(&[])), 2);
+        });
+    }
+
+    #[test]
+    fn output_and_input_verbs_move_bytes() {
+        with_server(|state| {
+            assert_eq!(output(&args(&["0"])), 0);
+            assert_eq!(output(&args(&["0", "--lines", "1"])), 0);
+            assert_eq!(send_input(&args(&["0", "echo hi"])), 0);
+            let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(s.pending_input.len(), 1, "input queued for the daemon");
+            drop(s);
+            assert_eq!(output(&args(&[])), 2);
+            assert_eq!(send_input(&args(&["0"])), 2);
+            assert_eq!(output(&args(&["nope"])), 1);
+        });
+    }
+
+    #[test]
+    fn stats_renders_both_shapes() {
+        with_server(|_| {
+            assert_eq!(stats("0", false), 0);
+            assert_eq!(stats("0", true), 0, "--json");
+            assert_eq!(stats("nope", false), 1);
+            assert_eq!(stats_cli(&args(&["0"])), 0);
+            assert_eq!(stats_cli(&args(&["0", "--json"])), 0);
+            assert_eq!(stats_cli(&args(&["--unknown"])), 2);
+        });
+    }
+
+    #[test]
+    fn bg_color_validates_before_it_writes() {
+        with_server(|state| {
+            assert_eq!(bg_color(&args(&["0", "#123456"])), 0);
+            assert_eq!(bg_color(&args(&["0", "clear"])), 0);
+            let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let colors: Vec<Option<String>> = s.pending_bg_color_changes.iter().map(|(_, c)| c.clone()).collect();
+            assert_eq!(colors, vec![Some("#123456".to_string()), None]);
+            drop(s);
+            // Anything that isn't #RRGGBB is refused client-side, so a typo
+            // can't reach the daemon or the preference file.
+            assert_eq!(bg_color(&args(&["0", "red"])), 2);
+            assert_eq!(bg_color(&args(&["0"])), 2);
+            assert_eq!(bg_color(&args(&["--help"])), 0);
+            assert!(is_valid_hex("#00ff99") && !is_valid_hex("00ff99") && !is_valid_hex("#00ff9"));
+        });
+    }
+
+    #[test]
+    fn schedule_round_trips_a_rule_and_refuses_a_bad_one() {
+        with_server(|state| {
+            assert_eq!(schedule(&args(&["0", "Mo-Fr 09:00-18:00", "--tz", "Europe/Paris"])), 0);
+            assert_eq!(schedule(&args(&["0", "--clear"])), 0);
+            let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(s.pending_schedule_changes.len(), 2);
+            assert!(s.pending_schedule_changes[0].1.is_some());
+            assert!(s.pending_schedule_changes[1].1.is_none(), "--clear removes it");
+            drop(s);
+            assert_ne!(schedule(&args(&["0", "not a rule at all"])), 0, "unparseable rule");
+            assert_ne!(schedule(&args(&["0", "24/7", "--tz", "Not/AZone"])), 0, "unknown tz");
+            assert_eq!(schedule(&args(&[])), 2);
+        });
+    }
+
+    #[test]
+    fn env_verb_reads_and_writes_both_scopes() {
+        with_server(|state| {
+            assert_eq!(env("set", &args(&["K=V"]), true, None), 0);
+            assert_eq!(env("set", &args(&["K=V"]), false, Some("0")), 0);
+            assert_eq!(env("unset", &args(&["K"]), true, None), 0);
+            assert_eq!(env("list", &[], true, None), 0);
+            assert_eq!(env("list", &[], false, Some("0")), 0);
+            let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(s.pending_env_changes.len(), 3);
+            drop(s);
+            // `set` needs KEY=VALUE — a bare key would otherwise be posted as
+            // an empty value and wipe the variable.
+            assert_eq!(env("set", &args(&["novalue"]), true, None), 2);
+            // An empty change is a no-op POST rather than an error.
+            assert_eq!(env("set", &[], true, None), 0);
+        });
+    }
+
+    #[test]
+    fn claude_only_toggle_is_explicit() {
+        with_server(|state| {
+            assert_eq!(claude_only(&args(&["on"])), 0);
+            assert_eq!(claude_only(&args(&["off"])), 0);
+            let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(s.pending_claude_only, Some(false), "last write wins");
+            drop(s);
+            assert_eq!(claude_only(&args(&["maybe"])), 2);
+            assert_eq!(claude_only(&args(&[])), 2);
+        });
+    }
+
+    #[test]
+    fn net_toggles_and_allowlists_reach_the_daemon() {
+        with_server(|state| {
+            assert_eq!(net_off(&args(&["0"])), 0);
+            assert_eq!(net_on(&args(&["0"])), 0);
+            let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let flags: Vec<bool> = s.pending_net_changes.iter().map(|(_, off)| *off).collect();
+            assert_eq!(flags, vec![true, false]);
+            drop(s);
+            assert_eq!(net_off(&args(&[])), 2);
+            assert_eq!(net_on(&args(&["nope"])), 1);
+            // Allowlist mode: presets/domains/cidrs are merged server-side.
+            assert_eq!(
+                net_allow("0", &["claude-code".into()], &[], &[], false, false, false),
+                0
+            );
+            assert_eq!(
+                net_allow("0", &[], &["example.com".into()], &[], false, true, false),
+                0,
+                "--add"
+            );
+            assert_eq!(net_allow("0", &[], &[], &["10.0.0.0/8".into()], false, false, false), 0);
+            assert_eq!(net_allow("0", &[], &[], &[], true, false, false), 0, "--clear");
+            // Junk in either list is caught before the request goes out.
+            assert_ne!(
+                net_allow("0", &["not-a-preset".into()], &[], &[], false, false, false),
+                0
+            );
+            assert_ne!(net_allow("0", &[], &[], &["not-a-cidr".into()], false, false, false), 0);
+        });
+    }
+
+    #[test]
+    fn net_reporting_verbs_render_without_a_tab_too() {
+        with_server(|_| {
+            assert_eq!(net_stats(Some("0")), 0);
+            assert_eq!(net_stats(None), 0, "whole fleet");
+            assert_eq!(net_dns(Some("0"), false), 0);
+            assert_eq!(net_dns(Some("0"), true), 0, "--denied");
+            assert_eq!(net_dns(None, false), 0);
+            assert_eq!(net_stats(Some("nope")), 1);
+            assert_eq!(net_dns(Some("nope"), false), 1);
+        });
+    }
+
+    #[test]
+    fn ssh_agent_and_default_limits_are_queued() {
+        with_server(|state| {
+            assert_eq!(ssh_agent("0", Some("/tmp/id_ed25519"), false), 0);
+            assert_eq!(ssh_agent("0", None, true), 0, "--off");
+            assert_eq!(ssh_agent("nope", None, true), 1);
+            let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(s.pending_ssh_agent_changes.len(), 2);
+            assert!(s.pending_ssh_agent_changes[1].1.is_none(), "--off clears it");
+            drop(s);
+            assert_eq!(limit_default(Some("1G"), Some(75), Some(200), false), 0);
+            assert_eq!(limit_default(None, None, None, true), 0, "--clear");
+            assert_eq!(limit_default(None, None, None, false), 2, "nothing to set");
+            let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let queued = s.pending_default_limits.is_some();
+            drop(s);
+            assert!(queued);
+        });
+    }
+
+    #[test]
+    fn relay_actions_are_validated_then_queued() {
+        with_server(|state| {
+            assert_eq!(relay("on", None), 0);
+            assert_eq!(relay("off", None), 0);
+            assert_eq!(relay("status", None), 0);
+            let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(s.pending_relay_mode, Some(false), "last write wins");
+            drop(s);
+            // An unknown action is usage…
+            assert_eq!(relay("nonsense", None), 2);
+            // …while `via` with no endpoint id is not rejected today, it just
+            // prints status. Recorded as current behaviour, not endorsed.
+            assert_eq!(relay("via", None), 0);
+        });
+    }
+
+    #[test]
+    fn preference_writing_verbs_refuse_bad_input_before_touching_the_file() {
+        // These two patch the user's real preferences.json, so only their
+        // reject paths are exercised — a passing case would edit the machine
+        // running the tests.
+        assert_eq!(ports(&args(&["--http", "not-a-port"])), 2);
+        assert_eq!(ports(&args(&["--unknown-flag"])), 2);
+        assert_eq!(bg_color(&args(&["--global", "not-a-hex"])), 2);
+    }
+
+    #[test]
+    fn formatting_helpers_stay_readable() {
+        assert_eq!(fmt_uptime(0), "0s");
+        assert_eq!(fmt_uptime(59), "59s");
+        assert_eq!(fmt_uptime(60), "1m 0s");
+        assert_eq!(fmt_uptime(3661), "1h 1m");
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(1023), "1023 B");
+        assert_eq!(human_bytes(1024), "1.0 KB");
+        assert_eq!(human_bytes(1024 * 1024 * 3 / 2), "1.5 MB");
+        assert_eq!(truncate("short", 10), "short");
+        assert_eq!(truncate("abcdefghij", 5).chars().count(), 5);
+        // The unescape used by `schedule`/`ports` input.
+        assert_eq!(unescape(r"a\nb"), "a\nb");
+        assert_eq!(unescape(r"tab\there"), "tab\there");
+        assert_eq!(unescape("plain"), "plain");
+    }
 }
