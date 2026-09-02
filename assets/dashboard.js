@@ -1643,6 +1643,48 @@ export function renderDetail(text) {
     .replace(/\r?\n/g, "<br>");
 }
 
+// FU2 (#kiosk): a decision's files[] mixes two very different kinds of reference —
+// they must NOT render the same way:
+//  - a SERVABLE DOC (a real .md under the served outbox zone, e.g. ~/Dev/outbox/x.md
+//    or an _archive copy) → the sandboxed /decisions/file viewer legitimately serves
+//    it (200). Keep the file-viewer link.
+//  - a CODE-SOURCE REF (auth.rs:76-78, src/cli/decision.rs:520, a bare source path,
+//    anything carrying a :line) → the viewer is anti-traversal-sandboxed and does NOT
+//    serve repo sources → it 404s ("decisions file: not found"). So NEVER link a source
+//    through /decisions/file. Point the reader at the code on its repo instead: a real
+//    web link when one is reliably constructible (the entry already IS an http(s) URL),
+//    else plain COPYABLE text `path:line` (the reader opens it in their editor). Never a
+//    404 link. ponytail 🟡: a per-project git-remote+branch map injected server-side
+//    would let us build github blob URLs from bare `src/…:line` refs too — deferred; a
+//    fabricated wrong-repo URL is worse than honest text, so a bare ref stays text.
+export function classifyDecisionFile(f) {
+  const raw = String(f == null ? "" : f).trim();
+  // Already a full web URL (e.g. a github/blob link stored in files[]) → link as-is.
+  if (/^https?:\/\//i.test(raw)) return { kind: "url", href: raw, label: raw };
+  // Servable doc = under the served outbox zone AND a doc extension (ignore any :line).
+  const bare = raw.replace(/:\d+(?:-\d+)?$/, "");
+  const inOutbox = raw.startsWith("~/Dev/outbox/") || /(?:^|\/)Dev\/outbox\//.test(raw);
+  const isDoc = /\.(?:md|markdown)$/i.test(bare);
+  if (inOutbox && isDoc) return { kind: "doc", path: raw, label: raw };
+  // Otherwise a code-source ref → copyable text, never the 404 viewer link.
+  return { kind: "code", label: raw };
+}
+
+// Render one files[] entry per its kind (FU2). `canRule` gates the viewer token, as
+// before. XSS-safe: every value is escaped before it reaches the DOM.
+export function decisionFileHtml(f, canRule) {
+  const c = classifyDecisionFile(f);
+  if (c.kind === "doc") {
+    const href = `/decisions/file?path=${encodeURIComponent(c.path)}${canRule ? `&token=${encodeURIComponent(TOKEN)}` : ""}`;
+    return `<a class="kk-file" href="${escapeHtml(href)}" target="_blank" rel="noopener">${escapeHtml(c.label)}</a>`;
+  }
+  if (c.kind === "url") {
+    return `<a class="kk-file kk-file-repo" href="${escapeHtml(c.href)}" target="_blank" rel="noopener">${escapeHtml(c.label)}</a>`;
+  }
+  // code ref → copyable text (NO href → NO /decisions/file, NO 404).
+  return `<span class="kk-file-ref" role="button" tabindex="0" title="référence de code — clic pour copier" data-copy="${escapeHtml(c.label)}">${escapeHtml(c.label)}</span>`;
+}
+
 // One decision card: the 2-notch checkbox (Lu -> Tranché) in the head, the digest lines
 // (title / why-gated / reco / effort), the file links, and a short verdict field. The
 // checkboxes reflect the SERVER state (no optimistic UI); once reached, a notch is
@@ -1659,13 +1701,12 @@ export function decisionCardHtml(d) {
   const id = escapeHtml(String(d.id || ""));
   const line = (label, val) => (val ? `<div class="kk-field"><span class="kk-key">${label}</span> ${escapeHtml(String(val))}</div>` : "");
   const files = Array.isArray(d.files) ? d.files : [];
-  // Bug1: link through the SANDBOXED bundle route WITH the page token (a raw outbox path
-  // 401s at the daemon). The server confines the path to the outbox + _archive subtree.
+  // FU2: render each entry per its kind — a servable doc keeps the SANDBOXED viewer link
+  // (Bug1: the raw outbox path 401s; the server confines it to the outbox + _archive
+  // subtree), a code-source ref points at the repo / falls back to copyable text (never a
+  // 404 /decisions/file link). See `classifyDecisionFile`.
   const links = files.length
-    ? `<div class="kk-files">${files.map((f) => {
-        const href = `/decisions/file?path=${encodeURIComponent(String(f))}${canRule ? `&token=${encodeURIComponent(TOKEN)}` : ""}`;
-        return `<a class="kk-file" href="${escapeHtml(href)}" target="_blank" rel="noopener">${escapeHtml(String(f))}</a>`;
-      }).join("")}</div>`
+    ? `<div class="kk-files">${files.map((f) => decisionFileHtml(f, canRule)).join("")}</div>`
     : "";
   // Lu is the only actionable notch; Tranché is a STATE INDICATOR (always disabled) — the
   // ruling action is the explicit "Trancher" button (Bug3), so submission is evident.
@@ -1698,6 +1739,22 @@ export function decisionCardHtml(d) {
       <span class="kk-msg" role="status"></span>
     </div>
   </div>`;
+}
+
+// FU2: copy a code-source ref's text to the clipboard (best-effort). Flashes a brief
+// "copié" affordance on the element's title; a browser without clipboard access no-ops.
+function copyDecisionFileRef(el) {
+  const text = (el && el.dataset && el.dataset.copy) || (el && el.textContent) || "";
+  if (!text) return;
+  try {
+    if (navigator && navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(() => {
+        const prev = el.getAttribute("title");
+        el.setAttribute("title", "copié ✓");
+        setTimeout(() => el.setAttribute("title", prev || ""), 1200);
+      }).catch(() => {});
+    }
+  } catch { /* no clipboard (older/embedded webview) — silent no-op */ }
 }
 
 // Flip one card's detail toggle: (+) collapsed <-> (-) expanded. Purely local (no fetch).
@@ -2030,12 +2087,19 @@ function bootstrap() {
       // would collapse it again). Expand/collapse the long-form body in place.
       const dt = e.target.closest(".kk-detail-toggle");
       if (dt) { toggleDetail(dt); return; }
+      // FU2: a code-source ref is copyable text (not a link) — click copies it so the
+      // reader can paste it into their editor. Best-effort (no clipboard → silent no-op).
+      const ref = e.target.closest(".kk-file-ref");
+      if (ref) { copyDecisionFileRef(ref); return; }
       if (e.target.closest(".kk-lu, .kk-send")) { handleKioskAction(e.target); return; }
     });
     // Bug3: Enter in the verdict field submits the ruling (as well as the "Trancher" button).
     kioskPanel.addEventListener("keydown", (e) => {
       const input = e.key === "Enter" && e.target.closest && e.target.closest(".kk-verdict-input");
-      if (input) { e.preventDefault(); const card = input.closest(".kk-card"); if (card) submitTranch(card); }
+      if (input) { e.preventDefault(); const card = input.closest(".kk-card"); if (card) submitTranch(card); return; }
+      // FU2 a11y: a code-source ref is a role=button — Enter/Space copies it.
+      const ref = (e.key === "Enter" || e.key === " ") && e.target.closest && e.target.closest(".kk-file-ref");
+      if (ref) { e.preventDefault(); copyDecisionFileRef(ref); }
     });
   }
   document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeKiosk(); });
