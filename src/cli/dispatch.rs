@@ -417,6 +417,70 @@ pub enum Commands {
         args: Vec<String>,
     },
 
+    /// Declare this tab's stable workflow assignment (`"[<project>:]<phase>/<role>"`).
+    ///
+    /// Persisted + hook-immune, unlike the volatile `set-context`.
+    SetAssignment {
+        /// Passed straight through to `cli::set_assignment::run`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Agent card — hard-wired specialty (persisted, hook-immune).
+    SetSpecialty {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Agent card — the orchestrator this tab serves (a tab UUID or `free`).
+    SetOrchestrator {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Agent card — this tab's current objective.
+    SetObjective {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Agent card — APPEND one phrase to the bounded current-task permalog.
+    SetCurrentTask {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Agent card — toggle supervision-rounds status (`true`/`false`).
+    SetRoundsActive {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Agent card — declare the `.md` conventions (comma-separated).
+    SetConventions {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Agent card — APPEND one evaluation record (JSON) to the bounded ring.
+    SetEvaluation {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Agent card — bump a tab's usage counter + stamp last-used.
+    BumpUsage {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Mark a predecessor tab's re-home progress (`rehome-tab.sh`).
+    SetRehomeStatus {
+        /// Passed straight through to `cli::set_rehome::run`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Per-project (or per-tab) colour + badge: `style --folder <dir> --color …`.
     ///
     /// A folder rule styles every tab whose cwd is inside it, so tabs opened in
@@ -800,6 +864,16 @@ pub fn dispatch(cli: Cli) -> bool {
         }
         Commands::SetContext { args } => crate::cli::client::run("set-context", &args),
         Commands::SetMeta { args } => crate::cli::client::run("set-meta", &args),
+        Commands::SetAssignment { args } => crate::cli::client::run("set-assignment", &args),
+        Commands::SetSpecialty { args } => crate::cli::client::run("set-specialty", &args),
+        Commands::SetOrchestrator { args } => crate::cli::client::run("set-orchestrator", &args),
+        Commands::SetObjective { args } => crate::cli::client::run("set-objective", &args),
+        Commands::SetCurrentTask { args } => crate::cli::client::run("set-current-task", &args),
+        Commands::SetRoundsActive { args } => crate::cli::client::run("set-rounds-active", &args),
+        Commands::SetConventions { args } => crate::cli::client::run("set-conventions", &args),
+        Commands::SetEvaluation { args } => crate::cli::client::run("set-evaluation", &args),
+        Commands::BumpUsage { args } => crate::cli::client::run("bump-usage", &args),
+        Commands::SetRehomeStatus { args } => crate::cli::client::run("set-rehome-status", &args),
         Commands::Style { args } => crate::cli::client::run("style", &args),
         Commands::Token => crate::cli::client::run("token", &[]),
         Commands::RotateTokens => crate::cli::client::run("rotate-tokens", &[]),

@@ -1089,6 +1089,109 @@ pub fn try_acquire_single_instance_lock() -> bool {
     true
 }
 
+/// Are cron rounds (watcher/sage) currently active, and when did the last one
+/// run. Posted via `set-rounds-active`; the dashboard renders it as a badge.
+/// camelCase on the wire.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RoundsActive {
+    pub active: bool,
+    /// Unix-millis of the last round tick. `None` until the first one lands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_round_at: Option<u64>,
+}
+
+/// Token cost of the evaluated task.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct EvalTokens {
+    pub input: u64,
+    pub out: u64,
+}
+
+/// The three-axis quality score of one evaluation.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct EvalScores {
+    pub relevance: u32,
+    pub errors: u64,
+    pub omissions: u32,
+}
+
+/// One evaluation record: who evaluated, when, which task, its token cost, the
+/// scores, a verdict + note. camelCase on the wire (`taskRef`).
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Evaluation {
+    pub evaluator: String,
+    pub at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_ref: Option<String>,
+    pub tokens: EvalTokens,
+    pub scores: EvalScores,
+    pub verdict: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// Bound on the `current_task` permalog: keep only the last N phrases so
+/// `TabState` / the snapshot can't grow without end (same lesson as the
+/// evaluations ring).
+pub const CURRENT_TASK_LOG_MAX: usize = 50;
+
+/// Append one phrase to a `current_task` permalog (the `set-current-task` core).
+///
+/// Trims the phrase; an empty / whitespace-only phrase is a no-op so the long
+/// memory stays meaningful. Bounds the ring to [`CURRENT_TASK_LOG_MAX`]: once it
+/// overflows, the oldest entries are evicted. Pure, so append + eviction are
+/// unit-testable without a live tab.
+pub fn append_current_task(log: &mut Vec<String>, phrase: &str) {
+    let p = phrase.trim();
+    if p.is_empty() {
+        return;
+    }
+    log.push(p.to_string());
+    if log.len() > CURRENT_TASK_LOG_MAX {
+        let overflow = log.len() - CURRENT_TASK_LOG_MAX;
+        log.drain(0..overflow);
+    }
+}
+
+/// Bound on the `evaluations` ring (same lesson as `current_task`): keep only the
+/// last N records so `TabState` can't grow without end.
+pub const EVALUATIONS_MAX: usize = 50;
+
+/// Append one evaluation record to the bounded ring; the oldest is evicted once
+/// it overflows [`EVALUATIONS_MAX`]. The `set-evaluation` core. Pure + testable.
+pub fn append_evaluation(log: &mut Vec<Evaluation>, ev: Evaluation) {
+    log.push(ev);
+    if log.len() > EVALUATIONS_MAX {
+        let overflow = log.len() - EVALUATIONS_MAX;
+        log.drain(0..overflow);
+    }
+}
+
+/// The `bump-usage` core: increment the usage counter + stamp last-used.
+///
+/// `None` → first use → 1. Returns `(new_count, stamp)`. `now` is injected so the
+/// increment + timestamp are unit-testable without a clock.
+#[must_use]
+pub fn bump_usage(current: Option<u64>, now: u64) -> (u64, u64) {
+    (current.unwrap_or(0).saturating_add(1), now)
+}
+
+/// The `set-conventions` core: parse a comma-separated `.md` list.
+///
+/// Comma-split, each entry trimmed; empty entries (a trailing comma, blanks) are
+/// dropped. This is the DECLARED side only — the declared-vs-existing check is the
+/// convention-auditor's job, not here. Pure + unit-testable.
+#[must_use]
+pub fn parse_conventions(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(String::from)
+        .collect()
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct TabState {
     /// Stable per-tab UUID. Used by the local API
@@ -1166,6 +1269,41 @@ pub struct TabState {
     /// [`META_KEY_MAX`] / [`META_VALUE_MAX`].
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub meta: std::collections::BTreeMap<String, String>,
+
+    /// The agent's stable place in the workflow (`set-assignment`): hook-immune
+    /// + persisted, unlike the volatile `context`. `None` ⇒ unassigned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignment: Option<String>,
+    /// Hard-wired specialty / prompt focus (`set-specialty`). OVERWRITE.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub specialty: Option<String>,
+    /// The orchestrator this agent serves: a tab UUID, or `"free"`. `set-orchestrator`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestrator: Option<String>,
+    /// The agent's current objective (`set-objective`). OVERWRITE.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objective: Option<String>,
+    /// PERMALOG (`set-current-task`): append-only one-line phrases, bounded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub current_task: Vec<String>,
+    /// Whether supervision ROUNDS are active + when the last one ran (`set-rounds-active`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rounds_active: Option<RoundsActive>,
+    /// Bounded ring of evaluation records.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evaluations: Vec<Evaluation>,
+    /// Generic use counter (`bump-usage`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_count: Option<u64>,
+    /// DECLARED conventions — the `.md` files this agent declares it follows (`set-conventions`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conventions: Vec<String>,
+    /// UUID of the tab that spawned this one (`dispatch --new`). Drives lineage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_tab_id: Option<String>,
+    /// Re-home progress on a PREDECESSOR tab (`rehome-tab.sh`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rehome_status: Option<String>,
 
     /// Fixed grid size the tab is PINNED to (`tab-atelier resize <tab> --cols N
     /// --rows M`), overriding window-driven sizing so a web viewer isn't
@@ -1610,6 +1748,17 @@ impl Default for TabState {
             net_allow_cidrs: Vec::new(),
             bg_color: None,
             badge: None,
+            assignment: None,
+            specialty: None,
+            orchestrator: None,
+            objective: None,
+            current_task: Vec::new(),
+            rounds_active: None,
+            evaluations: Vec::new(),
+            usage_count: None,
+            conventions: Vec::new(),
+            parent_tab_id: None,
+            rehome_status: None,
             schedule: None,
             limits: TabResourceLimits::default(),
             ssh_agent: None,

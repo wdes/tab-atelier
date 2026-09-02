@@ -20,9 +20,12 @@ pub mod flags;
 /// applied on next launch) without wrangling env vars.
 pub mod logging;
 pub mod remote;
+pub mod set_assignment;
+pub mod set_card;
 pub mod set_context;
 pub mod set_font;
 pub mod set_meta;
+pub mod set_rehome;
 pub mod set_status;
 /// Headless-side basic-action subcommands.
 ///
@@ -30,6 +33,7 @@ pub mod set_status;
 /// after the first one added; see the module docstring for details.
 pub mod share_link;
 pub mod style;
+pub mod tab_field;
 /// `tab-atelier peers / note / notes / handoff` — Claude-to-Claude teamwork
 /// verbs (dispatch handles send-a-prompt-and-wait; this is the rest).
 pub mod team;
