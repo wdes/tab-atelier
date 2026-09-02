@@ -11,6 +11,7 @@ use serde::Serialize;
 use log::{debug, error, info};
 
 mod assets;
+mod cards;
 #[cfg(feature = "catbus")]
 mod catbus;
 mod claude_only;
@@ -271,6 +272,33 @@ struct TabInfo {
     /// non-agent tabs so existing consumers don't see a new field.
     #[serde(skip_serializing_if = "Option::is_none")]
     tokens: Option<crate::TokenUsage>,
+    // --- Agent card on `/tabs`: the persisted, hook-immune fields so a tool can
+    //     reread its own card. Sourced from TabState via SnapshotTab. Omitted when
+    //     empty/None (a card-less tab stays clean). Snake-case on the wire like the
+    //     rest of TabInfo, except the three that predate this (currentTaskLog /
+    //     roundsActive / usageCount) which stay camelCase for existing consumers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    assignment: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_tab_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rehome_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    specialty: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    orchestrator: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    objective: Option<String>,
+    #[serde(rename = "currentTaskLog", skip_serializing_if = "Vec::is_empty")]
+    current_task_log: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    conventions: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    evaluations: Vec<crate::Evaluation>,
+    #[serde(rename = "roundsActive", skip_serializing_if = "Option::is_none")]
+    rounds_active: Option<crate::RoundsActive>,
+    #[serde(rename = "usageCount", skip_serializing_if = "Option::is_none")]
+    usage_count: Option<u64>,
 }
 
 /// One DNS-entries-view row for the `/tabs` response.
@@ -485,6 +513,34 @@ pub struct SnapshotTab {
     /// Free-form durable labels (`set-meta`), mirrored from the runtime tab so
     /// `/tabs` can serve them. Empty ⇒ none set.
     pub meta: std::collections::BTreeMap<String, String>,
+    // --- Agent card, mirrored from the persisted `TabState` (hook-immune). The
+    //     small strings are `Arc<str>` like the rest of the snapshot so a rebuild
+    //     clones a refcount, not bytes.
+    /// Stable workflow assignment (`set-assignment`, `"[<project>:]<phase>/<role>"`).
+    /// Persisted + hook-immune, unlike `context`. `None` ⇒ unassigned.
+    pub assignment: Option<std::sync::Arc<str>>,
+    /// UUID of the spawning tab (`parent_tab_id`) — the delegation lineage edge.
+    /// `None` ⇒ a root tab.
+    pub parent_tab_id: Option<std::sync::Arc<str>>,
+    /// Re-home progress on a predecessor tab (`handoff-written` → `safe-to-close`).
+    /// `None` ⇒ not rehoming.
+    pub rehome_status: Option<std::sync::Arc<str>>,
+    /// Hard-wired specialty / prompt focus (`set-specialty`).
+    pub specialty: Option<std::sync::Arc<str>>,
+    /// The orchestrator this agent serves: a tab UUID, or `"free"` (`set-orchestrator`).
+    pub orchestrator: Option<std::sync::Arc<str>>,
+    /// The agent's current objective (`set-objective`).
+    pub objective: Option<std::sync::Arc<str>>,
+    /// The bounded `current_task` permalog (see [`crate::append_current_task`]).
+    pub current_task: Vec<String>,
+    /// Supervision-rounds status + last-round stamp (`set-rounds-active`).
+    pub rounds_active: Option<crate::RoundsActive>,
+    /// Bounded ring of evaluation records (`set-evaluation`).
+    pub evaluations: Vec<crate::Evaluation>,
+    /// Generic use counter (`bump-usage`).
+    pub usage_count: Option<u64>,
+    /// Declared conventions — the `.md` files this agent follows (`set-conventions`).
+    pub conventions: Vec<String>,
 }
 
 impl crate::schedule::LockState for SnapshotTab {
@@ -539,6 +595,50 @@ pub struct MetaChange {
     pub tab_id: String,
     pub key: String,
     pub value: Option<String>,
+}
+
+/// One queued agent-card mutation for the owner loop to apply + persist.
+///
+/// Overwrite variants carry `Option<String>` (`None` = clear); `CurrentTaskAppend`
+/// appends one phrase to the bounded permalog ([`crate::append_current_task`]);
+/// `RoundsActive` sets the supervision-rounds status; `EvaluationAppend` pushes one
+/// record onto the bounded ring; `Usage` sets the counter + last-used stamp;
+/// `Conventions` OVERWRITES the declared `.md` list. One enum keeps the owner drain
+/// a single pass (vs a queue per field).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CardChange {
+    Specialty(Option<String>),
+    Orchestrator(Option<String>),
+    Objective(Option<String>),
+    CurrentTaskAppend(String),
+    RoundsActive(crate::RoundsActive),
+    EvaluationAppend(crate::Evaluation),
+    Usage(u64, u64),
+    Conventions(Vec<String>),
+}
+
+/// If `p` is a card `set-*` route (`…/specialty`, `…/orchestrator`, `…/objective`,
+/// `…/current-task`, `…/rounds-active`, `…/conventions`), return
+/// `(url-verb, json-body-key)`; else `None`. Drives the one generic card route.
+pub fn card_route_verb(p: &str) -> Option<(&'static str, &'static str)> {
+    const VERBS: [(&str, &str); 6] = [
+        ("specialty", "specialty"),
+        ("orchestrator", "orchestrator"),
+        ("objective", "objective"),
+        ("current-task", "current_task"),
+        ("rounds-active", "rounds_active"),
+        ("conventions", "conventions"),
+    ];
+    VERBS
+        .into_iter()
+        .find(|(v, _)| p.strip_suffix(v).is_some_and(|pre| pre.ends_with('/')))
+}
+
+/// Is `s` one of the canonical re-home states? Used to validate `POST …/rehome`.
+/// The four steps mirror `rehome-tab.sh`'s bidirectional-proof handshake.
+#[must_use]
+pub fn is_rehome_state(s: &str) -> bool {
+    matches!(s, "handoff-written" | "successor-ready" | "ack-sent" | "safe-to-close")
 }
 
 pub struct TabSnapshot {
@@ -598,6 +698,24 @@ pub struct TabSnapshot {
     /// `None` clears the tab's context. Same drain shape as
     /// `pending_bg_color_changes`.
     pub pending_context_changes: Vec<(String, Option<String>)>,
+    /// (`tab_id`, assignment-or-None) queued by `POST /tabs/by-id/{id}/assignment`.
+    /// Unlike `pending_context_changes`, the owner loop mirrors this onto the
+    /// runtime tab AND persists it (it lives on `TabState`).
+    pub pending_assignment_changes: Vec<(String, Option<String>)>,
+    /// (`tab_id`, `parent_tab_id`-or-None) queued by `POST /tabs/by-id/{id}/parent`
+    /// (the delegate stamps a spawned tab's lineage). Mirrored + persisted like
+    /// `pending_assignment_changes`.
+    pub pending_parent_changes: Vec<(String, Option<String>)>,
+    /// (`tab_id`, `rehome_status`-or-None) queued by `POST /tabs/by-id/{id}/rehome`
+    /// (rehome-tab.sh + the old agent's ACK). Mirrored + persisted like
+    /// `pending_assignment_changes`.
+    pub pending_rehome_changes: Vec<(String, Option<String>)>,
+    /// (`tab_id`, agent-card change) queued by the generic `set-*` card routes
+    /// (`/specialty`, `/orchestrator`, `/objective`, `/current-task`,
+    /// `/rounds-active`, `/conventions`, `/evaluation`, `/bump-usage`). ONE generic
+    /// queue (vs a vec per field) so the owner loop drains + persists all card
+    /// mutations in a single pass. Mirrored + persisted like `pending_assignment_changes`.
+    pub pending_card_changes: Vec<(String, CardChange)>,
     /// Tab ids whose per-tab share tokens (`share_token_rw`/`_ro`) the
     /// owner loop should clear, queued by `POST /tabs/rotate-tokens`.
     /// Clearing revokes every outstanding share link for that tab (it
@@ -1840,6 +1958,27 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
         ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/context") => {
             tab_props::context(stream, state, p, &body_bytes);
         }
+        // Agent-card setters (master token only, like /context). The generic
+        // `card_verb` arm handles the OVERWRITE/APPEND verbs resolved by
+        // `card_route_verb`; the rest carry field-specific validation.
+        ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/assignment") => {
+            cards::assignment(stream, state, p, &body_bytes);
+        }
+        ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/parent") => {
+            cards::parent(stream, state, p, &body_bytes);
+        }
+        ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/rehome") => {
+            cards::rehome(stream, state, p, &body_bytes);
+        }
+        ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/evaluation") => {
+            cards::evaluation(stream, state, p, &body_bytes);
+        }
+        ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/bump-usage") => {
+            cards::bump_usage(stream, state, p);
+        }
+        ("POST", p) if p.starts_with("/tabs/by-id/") && card_route_verb(p).is_some() => {
+            cards::card_verb(stream, state, p, &body_bytes);
+        }
         ("POST", p) if p.starts_with("/tabs/") && p.ends_with("/input") => {
             input::run(stream, state, p, body_bytes);
         }
@@ -2678,6 +2817,17 @@ pub fn test_snapshot_tab(id: &str, name: &str) -> SnapshotTab {
         tab_env: std::collections::BTreeMap::new(),
         meta: std::collections::BTreeMap::new(),
         badge: None,
+        assignment: None,
+        parent_tab_id: None,
+        rehome_status: None,
+        specialty: None,
+        orchestrator: None,
+        objective: None,
+        current_task: Vec::new(),
+        rounds_active: None,
+        evaluations: Vec::new(),
+        usage_count: None,
+        conventions: Vec::new(),
     }
 }
 
@@ -2699,6 +2849,10 @@ pub fn test_snapshot(tabs: Vec<SnapshotTab>) -> TabSnapshot {
         pending_ssh_agent_changes: vec![],
         pending_bg_color_changes: vec![],
         pending_context_changes: vec![],
+        pending_assignment_changes: vec![],
+        pending_parent_changes: vec![],
+        pending_rehome_changes: vec![],
+        pending_card_changes: vec![],
         pending_token_rotations: vec![],
         pending_schedule_changes: vec![],
         pending_new_tabs: 0,
@@ -2766,6 +2920,17 @@ mod tests {
             dns: vec![],
             resident_memory_bytes: None,
             tokens: None,
+            assignment: None,
+            parent_tab_id: None,
+            rehome_status: None,
+            specialty: None,
+            orchestrator: None,
+            objective: None,
+            current_task_log: vec![],
+            conventions: vec![],
+            evaluations: vec![],
+            rounds_active: None,
+            usage_count: None,
         }
     }
 
@@ -3636,6 +3801,116 @@ mod tests {
             "POST /tabs/by-id/tab-a/context HTTP/1.1\r\nContent-Length: 0\r\n\r\n",
         );
         assert_eq!(status_code(&resp), 401);
+    }
+
+    /// Round-trip proof (built == wired): POST /assignment → 200, the snapshot
+    /// mirror is set, the change is QUEUED for the owner-loop drain onto the
+    /// runtime tab, AND it comes back out on /tabs through the real tabs handler.
+    #[test]
+    fn set_assignment_roundtrips_to_tabs() {
+        let (port, state, token) = spawn_server();
+        let body = r#"{"assignment":"build/implementer"}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/tab-a/assignment HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 200);
+        // Snapshot mirror (what /tabs reads) is set.
+        let mirrored = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).tabs[0]
+            .assignment
+            .clone();
+        assert_eq!(mirrored.as_deref(), Some("build/implementer"));
+        // Queued for the drain → the runtime tab is updated + persisted next tick.
+        let queued = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending_assignment_changes
+            .last()
+            .and_then(|c| c.1.clone());
+        assert_eq!(queued.as_deref(), Some("build/implementer"));
+        let tabs = request(
+            port,
+            &format!("GET /tabs HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        assert_eq!(status_code(&tabs), 200);
+        assert!(
+            tabs.contains(r#""assignment": "build/implementer""#),
+            "assignment missing from /tabs: {tabs}"
+        );
+    }
+
+    /// The generic card verb APPENDS to the bounded permalog and surfaces on /tabs
+    /// under the camelCase `currentTaskLog` key.
+    #[test]
+    fn set_current_task_appends_and_surfaces() {
+        let (port, state, token) = spawn_server();
+        for phrase in ["first phrase", "second phrase"] {
+            let body = format!(r#"{{"current_task":"{phrase}"}}"#);
+            let resp = request(
+                port,
+                &format!(
+                    "POST /tabs/by-id/tab-a/current-task HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len(),
+                ),
+            );
+            assert_eq!(status_code(&resp), 200);
+        }
+        let log = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).tabs[0]
+            .current_task
+            .clone();
+        assert_eq!(log, vec!["first phrase", "second phrase"]);
+        let tabs = request(
+            port,
+            &format!("GET /tabs HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        assert!(
+            tabs.contains(r#""currentTaskLog""#),
+            "currentTaskLog missing from /tabs: {tabs}"
+        );
+    }
+
+    /// bump-usage increments the counter (starting from 1) and surfaces as
+    /// `usageCount` on /tabs.
+    #[test]
+    fn bump_usage_increments_and_surfaces() {
+        let (port, state, token) = spawn_server();
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/tab-a/bump-usage HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\n\r\n"
+            ),
+        );
+        assert_eq!(status_code(&resp), 200);
+        assert_eq!(
+            state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).tabs[0].usage_count,
+            Some(1)
+        );
+        let tabs = request(
+            port,
+            &format!("GET /tabs HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        assert!(
+            tabs.contains(r#""usageCount": 1"#),
+            "usageCount missing from /tabs: {tabs}"
+        );
+    }
+
+    /// A bogus re-home state is rejected 400 (server-side validation).
+    #[test]
+    fn set_rehome_rejects_unknown_state() {
+        let (port, _, token) = spawn_server();
+        let body = r#"{"rehome_status":"not-a-real-step"}"#;
+        let resp = request(
+            port,
+            &format!(
+                "POST /tabs/by-id/tab-a/rehome HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len(),
+            ),
+        );
+        assert_eq!(status_code(&resp), 400);
     }
 
     #[test]
