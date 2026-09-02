@@ -85,6 +85,8 @@ pub fn dispatch(name: &str, rest: &[String]) -> Option<i32> {
         "settings" | "ports" => share_link::ports(rest),
         "bench" => bench::run(rest),
         "bench-lag" => bench_lag::run_cli(rest),
+        // KIOSK (PD1): the cross-project decision log CLI.
+        "decision" => super::decision::run(rest),
         _ => return None,
     };
     Some(code)
