@@ -47,9 +47,25 @@ fn normalize_dir(dir: &str) -> Result<String, String> {
     }
 }
 
-#[must_use]
-#[allow(clippy::too_many_lines)] // one flat arg parse + three short branches
-pub fn run(args: &[String]) -> i32 {
+/// What one `style` invocation asks for, parsed off the command line.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct StyleArgs {
+    pub folder: Option<String>,
+    pub tab: Option<String>,
+    pub color: Option<String>,
+    pub badge: Option<String>,
+    pub clear: bool,
+    pub list: bool,
+}
+
+/// Pure arg parser + validation, so the branch table is testable without a
+/// preferences file or a running daemon.
+///
+/// # Errors
+/// `Err(0)` on `-h`/`--help` (usage printed), `Err(2)` on a missing value, an
+/// unknown flag, a colour that isn't `#RRGGBB`, or a badge that fails
+/// [`crate::sanitize_badge`].
+pub fn parse_style_args(args: &[String]) -> Result<StyleArgs, i32> {
     let (mut folder, mut tab, mut color, mut badge) = (None, None, None, None);
     let (mut clear, mut list) = (false, false);
     let mut i = 0;
@@ -70,18 +86,18 @@ pub fn run(args: &[String]) -> i32 {
             }
             "-h" | "--help" => {
                 usage();
-                return 0;
+                return Err(0);
             }
             other => {
                 eprintln!("style: unknown argument: {other}");
-                return 2;
+                return Err(2);
             }
         };
         if let Some(slot) = slot {
             i += 1;
             let Some(v) = args.get(i) else {
                 eprintln!("style: {flag} expects a value");
-                return 2;
+                return Err(2);
             };
             *slot = Some(v.clone());
         }
@@ -93,43 +109,68 @@ pub fn run(args: &[String]) -> i32 {
         && crate::parse_hex_rgb(c).is_none()
     {
         eprintln!("style: {c:?} is not #RRGGBB (or `clear`)");
-        return 2;
+        return Err(2);
     }
     if let Some(ref b) = badge
         && !b.eq_ignore_ascii_case("clear")
         && let Err(e) = crate::sanitize_badge(b)
     {
         eprintln!("style: {e}");
-        return 2;
+        return Err(2);
     }
+    if folder.is_some() && tab.is_some() {
+        eprintln!("style: pass --folder or --tab, not both");
+        return Err(2);
+    }
+    if !list && folder.is_none() && tab.is_none() {
+        usage();
+        return Err(2);
+    }
+    Ok(StyleArgs {
+        folder,
+        tab,
+        color,
+        badge,
+        clear,
+        list,
+    })
+}
 
-    match (list, folder, tab) {
-        (true, _, _) => list_rules(),
-        (_, Some(dir), None) => set_folder(&dir, color.as_deref(), badge.as_deref(), clear),
-        (_, None, Some(key)) => set_tab(&key, color.as_deref(), badge.as_deref(), clear),
-        (_, Some(_), Some(_)) => {
-            eprintln!("style: pass --folder or --tab, not both");
-            2
-        }
-        (_, None, None) => {
-            usage();
-            2
-        }
+#[must_use]
+pub fn run(args: &[String]) -> i32 {
+    let parsed = match parse_style_args(args) {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+    let path = crate::editable_preferences_path();
+    if parsed.list {
+        return list_rules(&path);
     }
+    if let Some(dir) = parsed.folder {
+        return set_folder(
+            &path,
+            &dir,
+            parsed.color.as_deref(),
+            parsed.badge.as_deref(),
+            parsed.clear,
+        );
+    }
+    let Some(key) = parsed.tab else { return 2 };
+    set_tab(&key, parsed.color.as_deref(), parsed.badge.as_deref(), parsed.clear)
 }
 
 /// Rules are read back as raw JSON so unrelated preference keys round-trip
 /// untouched when we write the file again.
-fn load_rules() -> std::collections::BTreeMap<String, crate::FolderStyle> {
-    std::fs::read_to_string(crate::editable_preferences_path())
+fn load_rules(path: &std::path::Path) -> std::collections::BTreeMap<String, crate::FolderStyle> {
+    std::fs::read_to_string(path)
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .and_then(|v| serde_json::from_value(v.get("folder_styles")?.clone()).ok())
         .unwrap_or_default()
 }
 
-fn list_rules() -> i32 {
-    let rules = load_rules();
+fn list_rules(path: &std::path::Path) -> i32 {
+    let rules = load_rules(path);
     if rules.is_empty() {
         println!("no folder styles set — try: tab-atelier style --folder <dir> --color '#7a1f2b' --badge TAG");
         return 0;
@@ -144,7 +185,7 @@ fn list_rules() -> i32 {
     0
 }
 
-fn set_folder(dir: &str, color: Option<&str>, badge: Option<&str>, clear: bool) -> i32 {
+fn set_folder(path: &std::path::Path, dir: &str, color: Option<&str>, badge: Option<&str>, clear: bool) -> i32 {
     let dir = match normalize_dir(dir) {
         Ok(d) => d,
         Err(e) => {
@@ -156,7 +197,7 @@ fn set_folder(dir: &str, color: Option<&str>, badge: Option<&str>, clear: bool) 
         eprintln!("style: nothing to set — pass --color and/or --badge, or --clear");
         return 2;
     }
-    let mut rules = load_rules();
+    let mut rules = load_rules(path);
     if clear {
         rules.remove(&dir);
     } else {
@@ -172,8 +213,7 @@ fn set_folder(dir: &str, color: Option<&str>, badge: Option<&str>, clear: bool) 
         }
     }
 
-    let path = crate::editable_preferences_path();
-    let mut doc: serde_json::Value = std::fs::read_to_string(&path)
+    let mut doc: serde_json::Value = std::fs::read_to_string(path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| serde_json::json!({}));
@@ -199,7 +239,7 @@ fn set_folder(dir: &str, color: Option<&str>, badge: Option<&str>, clear: bool) 
     {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Err(e) = std::fs::write(&path, serde_json::to_string_pretty(&doc).unwrap_or_default()) {
+    if let Err(e) = std::fs::write(path, serde_json::to_string_pretty(&doc).unwrap_or_default()) {
         eprintln!("style: write {}: {e}", path.display());
         return 1;
     }
@@ -259,4 +299,137 @@ fn set_tab(key: &str, color: Option<&str>, badge: Option<&str>, clear: bool) -> 
     }
     println!("✓ tab {uuid} restyled");
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn parses_every_flag_and_its_short_form() {
+        let a =
+            parse_style_args(&args(&["--folder", "/tmp/p", "--color", "#7a1f2b", "--badge", "KAL"])).expect("valid");
+        assert_eq!(a.folder.as_deref(), Some("/tmp/p"));
+        assert_eq!(a.color.as_deref(), Some("#7a1f2b"));
+        assert_eq!(a.badge.as_deref(), Some("KAL"));
+        assert!(!a.clear && !a.list);
+        let short = parse_style_args(&args(&["-f", "/tmp/p", "-c", "#000000", "-b", "K"])).expect("valid");
+        assert_eq!(
+            (short.folder.as_deref(), short.color.as_deref(), short.badge.as_deref()),
+            (Some("/tmp/p"), Some("#000000"), Some("K"))
+        );
+        assert!(parse_style_args(&args(&["--list"])).expect("valid").list);
+        let cleared = parse_style_args(&args(&["--tab", "3", "--clear"])).expect("valid");
+        assert!(cleared.clear && cleared.tab.as_deref() == Some("3"));
+    }
+
+    #[test]
+    fn rejects_bad_input_before_touching_anything() {
+        // `clear` is the one non-hex colour word accepted, so a typo can't be
+        // silently written into preferences.json.
+        assert_eq!(parse_style_args(&args(&["-f", "/tmp/p", "-c", "red"])), Err(2));
+        assert!(parse_style_args(&args(&["-f", "/tmp/p", "-c", "clear"])).is_ok());
+        assert!(parse_style_args(&args(&["-f", "/tmp/p", "-c", "CLEAR"])).is_ok());
+        assert_eq!(parse_style_args(&args(&["-f", "/tmp/p", "-b", "TOOLONGBADGE"])), Err(2));
+        assert_eq!(parse_style_args(&args(&["--folder"])), Err(2), "flag with no value");
+        assert_eq!(parse_style_args(&args(&["--nope"])), Err(2));
+        // A folder rule and a tab override are different targets.
+        assert_eq!(
+            parse_style_args(&args(&["-f", "/tmp/p", "-t", "3", "-c", "#000000"])),
+            Err(2)
+        );
+        // Nothing to do at all is usage, not a silent success.
+        assert_eq!(parse_style_args(&args(&[])), Err(2));
+        assert_eq!(parse_style_args(&args(&["--help"])), Err(0));
+    }
+
+    #[test]
+    fn normalize_dir_makes_a_matchable_absolute_path() {
+        // Rules match by cwd prefix, so a stored path must be absolute and
+        // free of a trailing slash or nothing would ever match it.
+        assert_eq!(normalize_dir("/tmp/").as_deref(), Ok("/tmp"));
+        assert_eq!(
+            normalize_dir("/nope/does-not-exist/").as_deref(),
+            Ok("/nope/does-not-exist")
+        );
+        let home = std::env::var("HOME").expect("HOME");
+        assert_eq!(normalize_dir("~/x").as_deref(), Ok(format!("{home}/x").as_str()));
+        assert!(normalize_dir("relative/path").is_err());
+    }
+
+    /// A preferences file with an unrelated key, to prove we never eat it.
+    fn seed_prefs(dir: &std::path::Path) -> std::path::PathBuf {
+        let p = dir.join("preferences.json");
+        std::fs::write(&p, r#"{"theme":"tomorrow-night-blue","opacity":95}"#).expect("seed");
+        p
+    }
+
+    #[test]
+    fn folder_rules_round_trip_without_disturbing_other_preferences() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let path = seed_prefs(tmp.path());
+        assert_eq!(set_folder(&path, "/tmp", Some("#123456"), Some("T"), false), 0);
+        let rules = load_rules(&path);
+        assert_eq!(rules["/tmp"].color.as_deref(), Some("#123456"));
+        assert_eq!(rules["/tmp"].badge.as_deref(), Some("T"));
+        // Editing one field leaves the other alone.
+        assert_eq!(set_folder(&path, "/tmp", None, Some("U"), false), 0);
+        let rules = load_rules(&path);
+        assert_eq!(rules["/tmp"].color.as_deref(), Some("#123456"), "colour survived");
+        assert_eq!(rules["/tmp"].badge.as_deref(), Some("U"));
+        // Unrelated preferences round-trip untouched — the whole reason this
+        // patches raw JSON instead of serialising a Preferences struct.
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+        assert_eq!(doc["theme"], "tomorrow-night-blue");
+        assert_eq!(doc["opacity"], 95);
+    }
+
+    #[test]
+    fn clearing_the_last_field_drops_the_rule_and_then_the_key() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let path = seed_prefs(tmp.path());
+        assert_eq!(set_folder(&path, "/tmp", Some("#123456"), Some("T"), false), 0);
+        // A rule with neither colour nor badge is not a rule.
+        assert_eq!(set_folder(&path, "/tmp", Some("clear"), Some("clear"), false), 0);
+        assert!(load_rules(&path).is_empty());
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+        assert!(doc.get("folder_styles").is_none(), "empty map removes the key");
+        // …and an explicit --clear removes just that folder.
+        assert_eq!(set_folder(&path, "/tmp", Some("#123456"), None, false), 0);
+        assert_eq!(set_folder(&path, "/usr", Some("#654321"), None, false), 0);
+        assert_eq!(set_folder(&path, "/tmp", None, None, true), 0);
+        let rules = load_rules(&path);
+        assert!(!rules.contains_key("/tmp") && rules.contains_key("/usr"));
+    }
+
+    #[test]
+    fn set_folder_refuses_a_write_with_nothing_to_write() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let path = seed_prefs(tmp.path());
+        assert_eq!(set_folder(&path, "/tmp", None, None, false), 2);
+        assert!(load_rules(&path).is_empty());
+        // A missing file is not an error — the first rule creates it.
+        let fresh = tmp.path().join("new.json");
+        assert_eq!(set_folder(&fresh, "/tmp", Some("#abcdef"), None, false), 0);
+        assert_eq!(load_rules(&fresh)["/tmp"].color.as_deref(), Some("#abcdef"));
+    }
+
+    #[test]
+    fn listing_is_read_only_and_survives_a_missing_file() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        assert_eq!(list_rules(&tmp.path().join("absent.json")), 0);
+        let path = seed_prefs(tmp.path());
+        assert_eq!(set_folder(&path, "/tmp", Some("#123456"), None, false), 0);
+        assert_eq!(list_rules(&path), 0);
+        // Garbage in the file must not panic the CLI, just yield no rules.
+        std::fs::write(&path, "not json at all").expect("write");
+        assert!(load_rules(&path).is_empty());
+        assert_eq!(list_rules(&path), 0);
+    }
 }
