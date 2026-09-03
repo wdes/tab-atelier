@@ -2315,6 +2315,7 @@ mod tests {
             schedule_rule: None,
             schedule_tz: None,
             preview: String::new(),
+            output_crc: 0,
             uptime_secs: 0.0,
             #[cfg(feature = "energy")]
             cpu_percent: 0.0,
