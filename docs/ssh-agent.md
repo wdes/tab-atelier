@@ -7,6 +7,10 @@ work reaches the same (or no) agent. With this feature the daemon owns a
 dedicated agent per opted-in tab and injects its `SSH_AUTH_SOCK` into that
 tab's shell.
 
+A proposal to invert this — the **viewer** holds the key and the daemon only
+routes agent traffic to it — is sketched in
+[ssh-agent-proxy.md](./ssh-agent-proxy.md).
+
 Managed feature: the daemon owns the agent's lifecycle (spawn, optional
 key load, reap). Headless-only — the desktop GUI's spawn path is not wired
 for it, so the GUI's `POST /tabs/by-id/{id}/ssh-agent` route refuses with
