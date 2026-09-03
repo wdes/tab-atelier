@@ -237,7 +237,7 @@ impl AppState {
             // Per-tab RSS (#28 S1/S5): one /proc-subtree walk at the 2 s persist
             // cadence, cached on the tab for the tab-bar gauge and mirrored to
             // the snapshot below.
-            let rss_bytes = crate::agent_probe::sample_tree(shell_pid).map(|s| s.rss_kb.saturating_mul(1024));
+            let rss_bytes = crate::agent_probe::sample_tree_cached(shell_pid).map(|s| s.rss_kb.saturating_mul(1024));
             tab.rss_bytes.set(rss_bytes);
             // Daemon-liveness probe (brain/aligator) at the same 2 s cadence,
             // cached so the per-frame tab-strip dot and the /dashboard snapshot
