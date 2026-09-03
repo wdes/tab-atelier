@@ -218,6 +218,73 @@ pub fn sample_tree(root_pid: u32) -> Option<ProcSample> {
     seen_root.then_some(acc)
 }
 
+/// How long a [`sample_tree`] result is reused per pid by
+/// [`sample_tree_cached`]. The persist / headless aggregation tick runs
+/// every 2 s and walks **every** tab's `/proc` subtree to read its RSS,
+/// so the walk cost grows with the tab count. Measured, this walk is
+/// cheap — ~0.2% of a core even with dozens of tabs — so this cache is
+/// HYGIENE (bounding an otherwise unbounded per-pid walk frequency), NOT
+/// the daemon's CPU lever. The sustained per-tab cost lives elsewhere
+/// (the persist tick's snapshot/CRC and the pollers' scrollback scan);
+/// see the `perf-brian-scrollback-scan` Kiosk decision. Reusing a walk
+/// younger than this caps the per-pid walk frequency at ~once per window
+/// instead of once per tick, independent of tab count.
+const SAMPLE_TREE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// [`sample_tree`] with a short per-pid TTL cache, for the frequent callers
+/// — the 2 s persist / headless aggregation tick that walks every tab's
+/// subtree only to surface its RSS gauge. See [`SAMPLE_TREE_CACHE_TTL`].
+///
+/// Callers that need fresh cumulative counters to diff into rates (the
+/// opt-in probe sampler, [`AgentProbe::observe`]) must keep calling
+/// [`sample_tree`] directly — a cached (stale-`dt`) sample would corrupt
+/// their delta computation.
+///
+/// ponytail: the RSS gauge is now up to one TTL (~10 s) stale, and a
+/// reused pid can briefly show the previous process's RSS — both cosmetic
+/// for a memory readout. Upgrade path: invalidate the entry on tab close.
+#[must_use]
+pub fn sample_tree_cached(root_pid: u32) -> Option<ProcSample> {
+    type Cache = HashMap<u32, (std::time::Instant, Option<ProcSample>)>;
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Cache>> = std::sync::OnceLock::new();
+    let lock = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut cache = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    ttl_cached(
+        &mut cache,
+        root_pid,
+        SAMPLE_TREE_CACHE_TTL,
+        std::time::Instant::now(),
+        || sample_tree(root_pid),
+    )
+}
+
+/// Read-through TTL cache: return the stored value for `key` if its entry
+/// is younger than `ttl` at `now`, else run `compute`, store it stamped
+/// `now`, evict every expired entry (keeps the map bounded as pids cycle),
+/// and return it. `now` is injected so the behaviour is testable without
+/// sleeping. Pure w.r.t. wall-clock.
+fn ttl_cached<K, V>(
+    cache: &mut HashMap<K, (std::time::Instant, V)>,
+    key: K,
+    ttl: std::time::Duration,
+    now: std::time::Instant,
+    compute: impl FnOnce() -> V,
+) -> V
+where
+    K: std::cmp::Eq + std::hash::Hash,
+    V: Clone,
+{
+    if let Some((at, v)) = cache.get(&key)
+        && now.saturating_duration_since(*at) < ttl
+    {
+        return v.clone();
+    }
+    let v = compute();
+    cache.retain(|_, (at, _)| now.saturating_duration_since(*at) < ttl);
+    cache.insert(key, (now, v.clone()));
+    v
+}
+
 /// Is this cmdline a `tab-atelier[-headless] <kind>` daemon invocation?
 ///
 /// NUL-separated `/proc/<pid>/cmdline`, `kind` = `brain` | `aligator`. argv[0]'s
@@ -627,6 +694,34 @@ fn unix_secs(t: SystemTime) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ttl_cached_hits_within_window_refreshes_after_expiry_and_prunes() {
+        use std::time::{Duration, Instant};
+        let ttl = Duration::from_secs(10);
+        let t0 = Instant::now();
+        // `compute` bumps this each real run; each call site takes a fresh
+        // closure (the param is `FnOnce`, consumed per call).
+        let calls = std::cell::Cell::new(0u32);
+        let bump = || {
+            calls.set(calls.get() + 1);
+            calls.get()
+        };
+        let mut cache: HashMap<u32, (Instant, u32)> = HashMap::new();
+        // A second, unrelated key populated at t0 — it must be pruned once
+        // it ages past the TTL, keeping the map bounded as pids cycle.
+        cache.insert(99, (t0, 42));
+
+        // Miss → compute.
+        assert_eq!(ttl_cached(&mut cache, 7, ttl, t0, bump), 1);
+        // Inside the window → hit, no recompute.
+        assert_eq!(ttl_cached(&mut cache, 7, ttl, t0 + Duration::from_secs(5), bump), 1);
+        assert_eq!(calls.get(), 1);
+        // Past the window → recompute, and the stale key 99 is evicted.
+        assert_eq!(ttl_cached(&mut cache, 7, ttl, t0 + Duration::from_secs(11), bump), 2);
+        assert_eq!(calls.get(), 2);
+        assert!(!cache.contains_key(&99), "expired entry should be pruned");
+    }
 
     #[test]
     fn cmdline_is_daemon_matches_the_binary_and_subcommand() {
