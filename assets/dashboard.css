@@ -841,6 +841,12 @@ body.band-view { min-height: calc(100vh + 180px); }
 .kk-detail-toggle { font: inherit; font-size: 0.78rem; line-height: 1; cursor: pointer; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--muted); padding: 0.05rem 0.35rem; }
 .kk-detail-toggle:hover { color: var(--fg); }
 .kk-detail { margin: 0.3rem 0; padding: 0.4rem 0.5rem; font-size: 0.82rem; line-height: 1.45; border-left: 2px solid var(--border); color: var(--fg); white-space: normal; overflow-wrap: anywhere; }
+/* Volet (a): a fenced code block in the detail body — the 📋 button floats top-right; the
+   code is monospace, scrollable, and never wraps into the button. */
+.kk-codeblock { position: relative; margin: 0.4rem 0; }
+.kk-code { margin: 0; padding: 0.45rem 0.55rem; padding-right: 2rem; font-family: var(--mono, monospace); font-size: 0.78rem; line-height: 1.4; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; overflow-x: auto; white-space: pre; color: var(--fg); }
+.kk-copy-code { position: absolute; top: 0.25rem; right: 0.25rem; font-size: 0.8rem; line-height: 1; cursor: copy; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); padding: 0.1rem 0.3rem; opacity: 0.6; }
+.kk-copy-code:hover, .kk-copy-code:focus { opacity: 1; outline: none; }
 .kk-files { margin: 0.3rem 0; display: flex; flex-direction: column; gap: 0.15rem; }
 .kk-file { font-size: 0.78rem; color: var(--led-idle-stroke); word-break: break-all; }
 /* FU2: a code-source ref is copyable TEXT (not a link) — monospace, subtly boxed,
