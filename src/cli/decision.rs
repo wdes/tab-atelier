@@ -780,7 +780,17 @@ fn compose(args: &[String]) -> i32 {
         return 2;
     };
     let reopen = args.iter().any(|a| a == "--reopen");
-    let files = args_after_all(args, "--files").into_iter().map(str::to_string).collect();
+    // A `--files` value may hold ONE ref OR several comma-joined (`a.md,b.rs:12`), and the flag
+    // itself is repeatable — mirror `push`'s comma-split so every ref becomes its OWN files[]
+    // entry. Otherwise a comma-joined value renders as a single concatenated 404 link and its
+    // .md loses doc-vs-code classification (the kiosk splits/classifies PER entry).
+    let files = args_after_all(args, "--files")
+        .into_iter()
+        .flat_map(|s| s.split(','))
+        .map(str::trim)
+        .filter(|x| !x.is_empty())
+        .map(str::to_string)
+        .collect();
     let detail = compose_detail(args);
     let e = DecisionEvent {
         id: id.to_string(),

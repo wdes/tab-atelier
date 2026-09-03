@@ -1634,11 +1634,20 @@ const DECISION_STATE_LABEL = { open: "à trancher", read: "lu", tranched: "tranc
 // open first, then the read->tranched->archived progression.
 const DECISION_STATE_ORDER = { open: 0, read: 1, tranched: 2, archived: 3 };
 
-// One prose segment: escape EVERYTHING (XSS) then re-introduce only <strong> (**bold**)
-// and <br> (line breaks). No raw HTML from the payload ever reaches the DOM.
+// One prose segment: escape EVERYTHING (XSS) then re-introduce only <strong> (**bold**),
+// clickable http(s) links, and <br> (line breaks). No raw HTML from the payload ever reaches
+// the DOM. `compose` folds --link into this prose (`**Lien** — https://…`) so a bare URL must
+// become a real <a href>, not inert text (the kiosk "link rendered as text" bug). XSS-safe: we
+// only wrap text that ALREADY passed escapeHtml, and `[^\s<]` can't contain a quote/bracket to
+// break out of the href attribute (escapeHtml turned any " into &quot;, < into &lt;).
 function renderProse(text) {
   return escapeHtml(text)
     .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/https?:\/\/[^\s<]+/g, (u) => {
+      const m = /^(.*?)([.,;:!?)\]]*)$/.exec(u); // don't swallow trailing punctuation
+      const url = m ? m[1] : u, tail = m ? m[2] : "";
+      return `<a href="${url}" target="_blank" rel="noopener">${url}</a>${tail}`;
+    })
     .replace(/\r?\n/g, "<br>");
 }
 
