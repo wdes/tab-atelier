@@ -1798,21 +1798,67 @@ export function decisionCardHtml(d) {
   </div>`;
 }
 
-// Copy an element's data-copy text (a code-source ref OR a fenced code block) to the
-// clipboard, best-effort. Flashes a brief "copié ✓" affordance on the element's title; a
-// browser without clipboard access no-ops. The payload is TEXT — never interpreted.
+// Legacy clipboard copy that works in a NON-SECURE context (http://<LAN-IP>, where the async
+// navigator.clipboard API is undefined): a temp <textarea>, select it, document.execCommand(
+// "copy"), remove it. Returns true on success. This is the path the dashboard actually takes in
+// prod — the secure navigator.clipboard branch below only runs on localhost/HTTPS.
+function legacyCopy(text) {
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    // Off-screen (not display:none, which would kill the selection execCommand needs).
+    ta.style.position = "fixed";
+    ta.style.top = "-9999px";
+    ta.style.left = "-9999px";
+    document.body.appendChild(ta);
+    ta.select();
+    ta.setSelectionRange(0, text.length);
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    return ok;
+  } catch { return false; }
+}
+
+let copyToastTimer;
+// Show a brief, visible "copié !" toast (feedback that works on every path — secure OR legacy).
+// Also keeps the inline title affordance for backwards-compat + screen-reader hint on the element.
+function showCopyToast(el) {
+  if (el && el.setAttribute) {
+    const prev = el.getAttribute("title");
+    el.setAttribute("title", "copié ✓");
+    setTimeout(() => el.setAttribute("title", prev || ""), 1200);
+  }
+  let toast = document.getElementById("kk-copy-toast");
+  if (!toast) {
+    toast = document.createElement("div");
+    toast.id = "kk-copy-toast";
+    toast.className = "kk-toast";
+    toast.setAttribute("role", "status");
+    toast.setAttribute("aria-live", "polite");
+    document.body.appendChild(toast);
+  }
+  toast.textContent = "copié !";
+  toast.classList.add("kk-toast-show");
+  clearTimeout(copyToastTimer);
+  copyToastTimer = setTimeout(() => toast.classList.remove("kk-toast-show"), 1400);
+}
+
+// Copy an element's data-copy text (a code-source ref OR a fenced code block) to the clipboard.
+// Secure-context (localhost/HTTPS) uses the async navigator.clipboard API; in the NON-SECURE
+// http-LAN deployment that API is undefined, so we MUST fall back to execCommand — otherwise the
+// click silently no-ops (the copy-button bug). On success a "copié !" toast confirms it. The
+// payload is TEXT — never interpreted.
 function copyToClipboard(el) {
   const text = (el && el.dataset && el.dataset.copy) || (el && el.textContent) || "";
   if (!text) return;
-  try {
-    if (navigator && navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(text).then(() => {
-        const prev = el.getAttribute("title");
-        el.setAttribute("title", "copié ✓");
-        setTimeout(() => el.setAttribute("title", prev || ""), 1200);
-      }).catch(() => {});
-    }
-  } catch { /* no clipboard (older/embedded webview) — silent no-op */ }
+  if (navigator && navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text)
+      .then(() => showCopyToast(el))
+      .catch(() => { if (legacyCopy(text)) showCopyToast(el); });
+    return;
+  }
+  if (legacyCopy(text)) showCopyToast(el);
 }
 
 // Flip one card's detail toggle: (+) collapsed <-> (-) expanded. Purely local (no fetch).
