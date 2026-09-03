@@ -776,6 +776,14 @@ let currentProject = null;
 // Last state received, so a view switch (drill-in / back) can re-render without
 // waiting for the next poll.
 let currentState = null;
+// Mesh view (fleet force-directed graph) — a LENS toggled orthogonally to drill-in,
+// persisted like the legend so it survives a refresh. Its live node/edge snapshots +
+// the force-solver handle live here; all populated only when the Mesh tab is active.
+const MESH_KEY = "ta-dash.mesh-view";
+let currentMeshView = false;
+let meshNodes = [];
+let meshEdges = [];
+let meshSim = null;
 
 function escapeHtml(s) {
   return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => (
@@ -832,6 +840,10 @@ function applyState(state) {
 // Render the current (state, currentProject) — called on every poll and on any
 // view switch (drill-in / back).
 function render() {
+  // Mesh lens: an ADDITIVE overlay — when active it renders the fleet graph and
+  // hides the existing chrome, leaving every existing view path untouched below.
+  if (currentMeshView) { renderMesh(currentState); setMeshChrome(true); return; }
+  setMeshChrome(false);
   const view = resolveView(currentState, currentProject);
   // The org-chart reserves a minimum working area so it stays pannable (and its
   // scroll position survives a refresh) — a no-op once a real fleet overflows.
@@ -2098,10 +2110,234 @@ function wireLegendToggle() {
   });
 }
 
+// --- Mesh view: fleet force-directed graph (additive lens) ---
+
+// Rayon par bande (resolveAltitude, 5 bandes) — méta le plus gros, worker le plus petit.
+const MESH_BAND_R = { meta: 16, supporter: 13, orchestrator: 13, worker: 8, freelancer: 8 };
+const MESH_SVG_NS = "http://www.w3.org/2000/svg";
+
+// Pure: /dashboard/state -> { nodes:[{id,tab,r}], edges:[{s,t}] } for the mesh.
+// Nodes = every tab deduped by id across the 3 sources (same dedup as bandLayout,
+// DUPLICATED locally on purpose — factoring it out of bandLayout would touch a
+// covered function). Edges = state.lineage[] (tab-level parent->child), kept only
+// when BOTH ends are known nodes. Exported so the check can assert it without a DOM.
+export function meshModel(state) {
+  const byId = new Map();
+  const collect = (arr) => { for (const t of arr || []) if (t && t.id && !byId.has(t.id)) byId.set(t.id, t); };
+  collect(allProjectTabs(state));
+  collect(Array.isArray(state && state.unmapped) ? state.unmapped : []);
+  collect(Array.isArray(state && state.unassigned) ? state.unassigned : []);
+  const nodes = [...byId.values()].map((t) => ({ id: t.id, tab: t, r: MESH_BAND_R[resolveAltitude(t).band] || 8 }));
+  const lineage = Array.isArray(state && state.lineage) ? state.lineage : [];
+  const edges = lineage
+    .filter((e) => e && byId.has(e.child) && byId.has(e.parent))
+    .map((e) => ({ s: e.parent, t: e.child }));
+  return { nodes, edges };
+}
+
+// Render the fleet mesh into #mesh-svg from the live state. Colour = ledClass (reuses
+// the existing led-* CSS vars), size = altitude band, edge = the existing .lineage-edge
+// class, click = viewerUrlWithToken (same-origin, page token). Refreshed by poll().
+function renderMesh(state) {
+  const svg = document.getElementById("mesh-svg");
+  if (!svg) return;
+  const model = meshModel(state);
+  const W = svg.clientWidth || 900, H = svg.clientHeight || 600;
+  // Keep positions across polls so the graph doesn't jump every 1.5s (anti-flicker).
+  const prev = new Map(meshNodes.map((n) => [n.id, n]));
+  meshNodes = model.nodes.map((n) => {
+    const p = prev.get(n.id);
+    return {
+      id: n.id, t: n.tab, r: n.r,
+      // ponytail: initial layout is a seeded ring (no Math.random — deterministic so
+      // the check is stable); the solver spreads it out from there.
+      x: p ? p.x : W / 2 + Math.cos(hashAngle(n.id)) * W * 0.3,
+      y: p ? p.y : H / 2 + Math.sin(hashAngle(n.id)) * H * 0.3,
+      vx: 0, vy: 0, fx: null, fy: null,
+    };
+  });
+  meshEdges = model.edges;
+  populateMeshTeams();
+  buildMeshDom();
+  applyMeshFilters();
+  startMeshSim(W, H);
+}
+
+// Deterministic angle in [0,2π) from a tab id (stable initial layout, no RNG).
+function hashAngle(id) {
+  let h = 0;
+  for (let i = 0; i < String(id).length; i++) h = (h * 31 + String(id).charCodeAt(i)) >>> 0;
+  return (h % 3600) / 3600 * Math.PI * 2;
+}
+
+// Force solver: repulsion (O(n²)) + edge spring + soft centering, cooling alpha.
+function startMeshSim(W, H) {
+  if (meshSim) cancelAnimationFrame(meshSim);
+  if (typeof requestAnimationFrame === "undefined") { positionMeshDom(); return; }
+  const idx = new Map(meshNodes.map((n, i) => [n.id, i]));
+  let alpha = 1;
+  function tick() {
+    // ponytail: O(n²) repulsion — fine at ~66 nodes; past ~300 switch to a grid/Barnes-Hut.
+    for (let i = 0; i < meshNodes.length; i++) for (let j = i + 1; j < meshNodes.length; j++) {
+      const a = meshNodes[i], b = meshNodes[j];
+      let dx = a.x - b.x, dy = a.y - b.y, d2 = dx * dx + dy * dy || 1;
+      const f = 1600 / d2, d = Math.sqrt(d2);
+      dx = dx / d * f; dy = dy / d * f;
+      a.vx += dx; a.vy += dy; b.vx -= dx; b.vy -= dy;
+    }
+    for (const e of meshEdges) {
+      const a = meshNodes[idx.get(e.s)], b = meshNodes[idx.get(e.t)];
+      if (!a || !b) continue;
+      let dx = b.x - a.x, dy = b.y - a.y, d = Math.sqrt(dx * dx + dy * dy) || 1;
+      const f = (d - 90) * 0.02; dx = dx / d * f; dy = dy / d * f;
+      a.vx += dx; a.vy += dy; b.vx -= dx; b.vy -= dy;
+    }
+    for (const n of meshNodes) {
+      n.vx += (W / 2 - n.x) * 0.002; n.vy += (H / 2 - n.y) * 0.002;
+      if (n.fx != null) { n.x = n.fx; n.y = n.fy; n.vx = n.vy = 0; continue; }
+      n.vx *= 0.85; n.vy *= 0.85; n.x += n.vx * alpha; n.y += n.vy * alpha;
+    }
+    positionMeshDom();
+    alpha *= 0.992;
+    if (alpha > 0.02) meshSim = requestAnimationFrame(tick);
+  }
+  meshSim = requestAnimationFrame(tick);
+}
+
+function buildMeshDom() {
+  const gE = document.getElementById("mesh-edges");
+  const gN = document.getElementById("mesh-nodes");
+  if (!gE || !gN) return;
+  gE.textContent = ""; gN.textContent = "";
+  for (const e of meshEdges) {
+    const l = document.createElementNS(MESH_SVG_NS, "line");
+    l.setAttribute("class", "lineage-edge");           // reuse the existing edge style
+    l.setAttribute("marker-end", "url(#mesh-arrow)");
+    l._e = e; gE.appendChild(l);
+  }
+  for (const n of meshNodes) {
+    const g = document.createElementNS(MESH_SVG_NS, "g");
+    g.setAttribute("class", `mesh-node ${ledClass(n.t.led != null ? n.t.led : n.t.rollupLed)}`);
+    g.setAttribute("data-tab-id", n.t.id || "");
+    g.setAttribute("data-viewer", n.t.viewerUrl || "");
+    const c = document.createElementNS(MESH_SVG_NS, "circle");
+    c.setAttribute("r", n.r);
+    const tx = document.createElementNS(MESH_SVG_NS, "text");
+    tx.setAttribute("x", n.r + 3); tx.setAttribute("y", 3);
+    tx.textContent = n.t.name || String(n.t.id || "").slice(0, 6);
+    g.append(c, tx);
+    g.addEventListener("mousemove", (ev) => showMeshTip(ev, n.t));
+    g.addEventListener("mouseleave", hideMeshTip);
+    g.addEventListener("click", () => {
+      const u = n.t.viewerUrl; if (u) window.open(viewerUrlWithToken(u, TOKEN), "_blank", "noopener");
+    });
+    meshDragify(g, n);
+    n._g = g; gN.appendChild(g);
+  }
+}
+
+function positionMeshDom() {
+  const gE = document.getElementById("mesh-edges");
+  if (!gE) return;
+  const idx = new Map(meshNodes.map((n) => [n.id, n]));
+  for (const l of gE.children) {
+    const a = idx.get(l._e.s), b = idx.get(l._e.t); if (!a || !b) continue;
+    let dx = b.x - a.x, dy = b.y - a.y, d = Math.sqrt(dx * dx + dy * dy) || 1;
+    l.setAttribute("x1", a.x); l.setAttribute("y1", a.y);
+    l.setAttribute("x2", b.x - dx / d * b.r); l.setAttribute("y2", b.y - dy / d * b.r);
+  }
+  for (const n of meshNodes) if (n._g) n._g.setAttribute("transform", `translate(${n.x},${n.y})`);
+}
+
+// Tooltip: reuse agentCard(tab) for name/objective plus role/serving/specialty.
+function showMeshTip(ev, tab) {
+  const tip = document.getElementById("mesh-tip"); if (!tip) return;
+  const ac = agentCard(tab);
+  const spec = (tab.specialty || "").slice(0, 180);
+  const row = (k, v) => (v != null && v !== "" ? `<span class="k">${escapeHtml(k)}:</span> ${escapeHtml(v)}<br>` : "");
+  tip.innerHTML = `<b>${escapeHtml(tab.name || tab.id)}</b><br>`
+    + row("led", tab.led) + row("rôle", tab.role) + row("équipe", tab.serving)
+    + row("objective", ac.objective)
+    + (spec ? `<span class="k">specialty:</span> ${escapeHtml(spec)}${(tab.specialty || "").length > 180 ? "…" : ""}` : "");
+  const wrap = document.getElementById("mesh").getBoundingClientRect();
+  tip.style.left = (ev.clientX - wrap.left + 14) + "px";
+  tip.style.top = (ev.clientY - wrap.top + 14) + "px";
+  tip.style.display = "block";
+}
+function hideMeshTip() { const t = document.getElementById("mesh-tip"); if (t) t.style.display = "none"; }
+
+// Filters: team (serving) / tier (altitude band) / hide-idle. Dim, not remove, to keep context.
+function populateMeshTeams() {
+  const sel = document.getElementById("mesh-f-team");
+  if (!sel) return;
+  const cur = sel.value;
+  const teams = [...new Set(meshNodes.map((n) => n.t.serving).filter(Boolean))].sort();
+  sel.length = 1; // keep the "(toutes)" option
+  for (const s of teams) { const o = document.createElement("option"); o.value = s; o.textContent = s; sel.appendChild(o); }
+  if (cur && teams.includes(cur)) sel.value = cur;
+}
+function applyMeshFilters() {
+  const team = valOf("mesh-f-team"), tier = valOf("mesh-f-tier"), hideIdle = checkedOf("mesh-f-idle");
+  const vis = new Map();
+  for (const n of meshNodes) {
+    let ok = true;
+    if (team && n.t.serving !== team) ok = false;
+    if (tier && resolveAltitude(n.t).band !== tier) ok = false;
+    if (hideIdle && n.t.led === "idle") ok = false;
+    vis.set(n.id, ok);
+    if (n._g) n._g.classList.toggle("mesh-dim", !ok);
+  }
+  const gE = document.getElementById("mesh-edges");
+  if (gE) for (const l of gE.children) l.classList.toggle("mesh-dim", !(vis.get(l._e.s) && vis.get(l._e.t)));
+}
+function valOf(id) { const e = document.getElementById(id); return e ? e.value : ""; }
+function checkedOf(id) { const e = document.getElementById(id); return e ? e.checked : false; }
+
+function meshDragify(g, n) {
+  let down = false;
+  g.addEventListener("mousedown", (e) => { down = true; n.fx = n.x; n.fy = n.y; e.preventDefault(); });
+  window.addEventListener("mousemove", (e) => {
+    if (!down) return;
+    const svg = document.getElementById("mesh-svg"); if (!svg) return;
+    const r = svg.getBoundingClientRect(); n.fx = e.clientX - r.left; n.fy = e.clientY - r.top;
+  });
+  window.addEventListener("mouseup", () => { if (down) { down = false; n.fx = n.fy = null; } });
+}
+
+// Symmetric to setViewChrome: show #mesh + hide grid/flow/back when on (and vice-versa).
+function setMeshChrome(on) {
+  const mesh = document.getElementById("mesh");
+  if (mesh) mesh.toggleAttribute("hidden", !on);
+  if (on) {
+    const wrap = document.getElementById("grid-wrap"); if (wrap) wrap.hidden = true;
+    const flow = document.getElementById("flow"); if (flow) flow.toggleAttribute("hidden", true); // <svg>: attr, not .hidden
+    const back = document.getElementById("back-btn"); if (back) back.hidden = true;
+  }
+  const toggle = document.getElementById("mesh-toggle");
+  if (toggle) { toggle.classList.toggle("active", on); toggle.setAttribute("aria-pressed", on ? "true" : "false"); }
+}
+
+// Wire the Mesh toggle + filters. Restores the persisted lens state (like the legend).
+function wireMeshToggle() {
+  const toggle = document.getElementById("mesh-toggle");
+  if (toggle) {
+    try { currentMeshView = localStorage.getItem(MESH_KEY) === "1"; } catch { /* ignore */ }
+    toggle.addEventListener("click", () => {
+      currentMeshView = !currentMeshView;
+      try { localStorage.setItem(MESH_KEY, currentMeshView ? "1" : "0"); } catch { /* ignore */ }
+      render();
+    });
+  }
+  for (const id of ["mesh-f-team", "mesh-f-tier", "mesh-f-idle"]) {
+    const e = document.getElementById(id); if (e) e.addEventListener("change", applyMeshFilters);
+  }
+}
+
 function bootstrap() {
   renderLegend();
   applyLegendVisibility();
   wireLegendToggle();
+  wireMeshToggle();
   // Hover popups on each phase node; a short hide delay lets the pointer travel
   // into the popup (where right-click lives) without it vanishing first.
   for (const el of document.querySelectorAll(".node")) {
@@ -2277,4 +2513,4 @@ if (typeof document !== "undefined") {
 // characterization suite can lock their CURRENT behavior BEFORE the Q3-Q10
 // refactor. Additive only (function declarations, hoisted); the refactor keeps
 // these names or updates the tests. See assets/dashboard.characterization.test.mjs.
-export { projectTabs, serviceGrouping, metaTopHtml, teamMemberHtml, unassignedTabHtml, popupHtml, tabEntryHtml };
+export { projectTabs, serviceGrouping, metaTopHtml, teamMemberHtml, unassignedTabHtml, popupHtml, tabEntryHtml, renderMesh };
