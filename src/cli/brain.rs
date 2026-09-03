@@ -1389,6 +1389,241 @@ mod tests {
     }
 
     #[test]
+    fn t1_golden_set_event_driven_matches_polling_exactly() {
+        // T1 (PORTEUR). Because output_crc = crc32(output), the wire crc changes IFF
+        // the screen changes — so the event-driven model (skip-fetch + cached needle
+        // + crc-driven freeze clock) reaches the SAME (frozen? , which-needle?)
+        // decision, TICK FOR TICK, as the old poll-every-tick model (hash + fresh
+        // scan). Not "a gel is nudged" but "EXACTLY the same tabs, same ticks".
+        //
+        // Each row is (elapsed_secs, screen_text). The crc stand-in bumps whenever
+        // the text changes — the real crc32 invariant, forced non-zero.
+        let scenario: &[(u64, &str)] = &[
+            (0, "working: building...\n"),   // screen moving → alive
+            (2, "working: compiling foo\n"), // changed → alive
+            (4, UNREACHABLE),                // error appears, screen now stuck here
+            (9, UNREACHABLE),                // frozen 5 s (< STABLE) — not yet
+            (24, UNREACHABLE),               // frozen 20 s (>= STABLE) — FROZEN + needle
+            (40, UNREACHABLE),               // still frozen on the same screen
+            (42, "recovered, all good\n$ "), // changed → clean → freeze clock resets
+            (62, "recovered, all good\n$ "), // frozen again but NO needle → never eligible
+        ];
+        let t0 = Instant::now();
+        let mut wn = fresh_watch(t0); // NEW event-driven model
+        let mut old_last_hash: Option<u64> = None; // OLD poll-every-tick reference
+        let mut old_stable = t0;
+        for &(secs, text) in scenario {
+            let now = t0 + Duration::from_secs(secs);
+            // NEW: crc changes iff text changes (forced non-zero so it's never the
+            // "unknown" fallback). The fetch closure only runs when NEW decides to.
+            let crc = (hash_output(text) as u32) | 1;
+            let (sf_new, trig_new) = assess(freeze_step(&mut wn, crc, false, now, || Some(text.to_string())));
+            let elig_new = sf_new >= Duration::from_secs(STABLE_SECS) && trig_new.is_some();
+            // OLD: fetch every tick, hash for stability, scan fresh for the needle.
+            let h = hash_output(text);
+            if old_last_hash != Some(h) {
+                old_last_hash = Some(h);
+                old_stable = now;
+            }
+            let sf_old = now.duration_since(old_stable);
+            let trig_old = scan_output(text).map(Trigger::Pattern);
+            let elig_old = sf_old >= Duration::from_secs(STABLE_SECS) && trig_old.is_some();
+            assert_eq!(elig_new, elig_old, "eligibility diverged at t+{secs}s");
+            assert_eq!(
+                trig_new.map(Trigger::label),
+                trig_old.map(Trigger::label),
+                "needle diverged at t+{secs}s"
+            );
+        }
+    }
+
+    #[test]
+    fn t2_a_clean_frozen_tab_is_never_nudged() {
+        // T2 false-positive. A tab frozen on a screen with NO error needle and no
+        // agent-error flag is legitimately quiet (idle at a prompt, a silent compile)
+        // — it must NEVER be nudged, however long it's frozen. (inHandoff tabs are
+        // excluded upstream by is_watchable, before freeze_step — see
+        // brain_leaves_a_tab_in_hotswap_handoff_alone.)
+        let t0 = Instant::now();
+        let mut w = fresh_watch(t0);
+        let (_, trig0) = assess(freeze_step(&mut w, 0x55, false, t0, || {
+            Some("$ cargo build\n   Compiling tab-atelier\n".to_string())
+        }));
+        assert!(trig0.is_none(), "a clean screen yields no trigger");
+        // 10 minutes later, same crc (frozen), still no needle, agent_error = false.
+        let (sf, trig) = assess(freeze_step(&mut w, 0x55, false, t0 + Duration::from_mins(10), || {
+            panic!("frozen clean tab must not be re-fetched")
+        }));
+        assert!(sf >= Duration::from_secs(STABLE_SECS), "it IS frozen a long time");
+        assert!(trig.is_none(), "…but with no needle/error it is never eligible");
+    }
+
+    #[test]
+    fn t3_storm_coalesces_to_the_latest_delta_and_freeze_stays_reliable() {
+        // T3. Under a storm a tab's screen churns fast. Option A coalesces
+        // structurally: the wire carries only the LATEST crc per tab, so brain always
+        // assesses the most RECENT delta, never a stale earlier one. Here a tab churns
+        // (retry banner) then FREEZES on a 529 — brain must nudge on the 529 (latest),
+        // not the earlier retry banner.
+        let t0 = Instant::now();
+        let mut w = fresh_watch(t0);
+        // Delta 1: a live retry banner (its own crc).
+        let (_, trig_a) = assess(freeze_step(&mut w, 0xA1, false, t0, || {
+            Some("✻ Waiting for API response · will retry in 1m 57s".to_string())
+        }));
+        assert!(
+            matches!(trig_a, Some(Trigger::Pattern(p)) if p.label == "api-retry-waiting"),
+            "first delta = retry banner"
+        );
+        // Delta 2 (latest): the screen moves to a 529 and STICKS there.
+        let (_, trig_b) = assess(freeze_step(&mut w, 0xB2, false, t0 + Duration::from_secs(1), || {
+            Some("● API Error: 529 Overloaded. This is a server-side issue, usually temporary".to_string())
+        }));
+        assert!(
+            matches!(trig_b, Some(Trigger::Pattern(p)) if p.label == "anthropic-529"),
+            "coalesced to the LATEST delta (529), not the stale retry banner"
+        );
+        // Frozen on the 529 for STABLE_SECS → eligible, still on the latest needle.
+        let (sf, trig_c) = assess(freeze_step(
+            &mut w,
+            0xB2,
+            false,
+            t0 + Duration::from_secs(STABLE_SECS + 2),
+            || panic!("frozen 529: must not re-fetch"),
+        ));
+        assert!(
+            sf >= Duration::from_secs(STABLE_SECS),
+            "freeze reliable off the latest delta"
+        );
+        assert!(
+            matches!(trig_c, Some(Trigger::Pattern(p)) if p.label == "anthropic-529"),
+            "nudge fires on the 529 that's actually stuck, not an earlier delta"
+        );
+    }
+
+    #[test]
+    fn t4_boot_seed_prevents_a_false_gel_burst_at_hotswap() {
+        // T4. At brain start / hot-swap a whole fleet may already be sitting frozen on
+        // an error. Seeding stable_since = now on first sight gives each a full
+        // STABLE_SECS grace, so NONE is instantly eligible — no burst of `continue`s
+        // the instant brain comes up. Only after real STABLE_SECS of continued freeze
+        // do they qualify (and the fleet-wide throttle then spaces them, one at a time).
+        let t0 = Instant::now();
+        let mut fleet: Vec<TabWatch> = (0..10).map(|_| fresh_watch(t0)).collect();
+        let mut eligible_at_boot = 0;
+        for (i, w) in fleet.iter_mut().enumerate() {
+            let crc = 0x1000 + i as u32;
+            let (sf, trig) = assess(freeze_step(w, crc, false, t0, || Some(UNREACHABLE.to_string())));
+            assert!(trig.is_some(), "the error IS detected at boot");
+            if should_nudge(sf, w.nudged_fp, w.last_fp.unwrap_or(0)) {
+                eligible_at_boot += 1;
+            }
+        }
+        assert_eq!(
+            eligible_at_boot, 0,
+            "T4: boot-seed → ZERO instant nudges (no false-gel burst)"
+        );
+        // After a real STABLE_SECS of the SAME frozen screen, they all qualify.
+        let later = t0 + Duration::from_secs(STABLE_SECS + 1);
+        let mut eligible_later = 0;
+        for (i, w) in fleet.iter_mut().enumerate() {
+            let crc = 0x1000 + i as u32;
+            let (sf, _) = assess(freeze_step(w, crc, false, later, || {
+                panic!("frozen: must not re-fetch")
+            }));
+            if should_nudge(sf, w.nudged_fp, w.last_fp.unwrap_or(0)) {
+                eligible_later += 1;
+            }
+        }
+        assert_eq!(
+            eligible_later, 10,
+            "after real STABLE_SECS the frozen fleet qualifies (throttle then spaces them)"
+        );
+    }
+
+    #[test]
+    fn s3_measure_event_driven_cuts_the_busy_scan_load() {
+        // S3 MEASUREMENT (built≠wired). Prove the event-driven path actually REMOVES
+        // per-tab work on the busy fleet — not just that it compiles. Model a busy
+        // fleet of FLEET tabs where DIRTY_PER_TICK stream (crc changes) each 5 s tick,
+        // over TICKS ticks. The old model fetch+scans EVERY tab EVERY tick (that N
+        // per-tab /output GETs is the ~47% busy driver the PO feels); the event-driven
+        // model, via freeze_step, fetches ONLY the tabs whose crc moved. We drive the
+        // REAL freeze_step and count the REAL fetch-closure invocations (= /output
+        // round-trips), plus time the real per-scan CPU (hash + scan on a ~4 KB
+        // screen) so the count converts to actual saved busy-time.
+        //
+        // Run `cargo test s3_measure -- --nocapture` to see the numbers.
+        const FLEET: usize = 30;
+        const DIRTY_PER_TICK: usize = 9; // ~30 % streaming at any instant = a busy fleet
+        const TICKS: usize = 200;
+
+        // A realistic ~4 KB agent screen with an error needle in the trailing window.
+        let mut screen = "● Running the build and watching for the connectivity flake\n".repeat(90);
+        screen.push_str(UNREACHABLE);
+        assert!(screen.len() > SCOPE_TAIL_BYTES, "screen spans the full scan window");
+
+        // Measured cost of ONE round-trip's Brian-side CPU (what a fetch+scan does):
+        // hash the output + scan it for a needle. This is the per-GET work the skip
+        // eliminates (on top of the HTTP round-trip + the daemon's snapshot clone/crc,
+        // which this unit test can't spin a daemon to time).
+        let cpu_probe_iters = 2_000u32;
+        let t = Instant::now();
+        let mut sink = 0u64;
+        for _ in 0..cpu_probe_iters {
+            sink ^= hash_output(&screen);
+            sink ^= scan_output(&screen).map_or(0, |p| p.needle.len() as u64);
+        }
+        let per_scan = t.elapsed() / cpu_probe_iters;
+        assert_ne!(sink, 1, "keep the optimiser honest"); // sink is observed
+
+        // Event-driven: drive freeze_step, count real fetch invocations.
+        let t0 = Instant::now();
+        let mut watches: Vec<TabWatch> = (0..FLEET).map(|_| fresh_watch(t0)).collect();
+        let mut crcs: Vec<u32> = (0..FLEET as u32).map(|i| (i | 1) << 1).collect();
+        let mut evt_fetches = 0usize;
+        for tick in 0..TICKS {
+            let now = t0 + Duration::from_secs((tick as u64) * 5);
+            // Rotate which tabs stream this tick (a moving hot-set).
+            for d in 0..DIRTY_PER_TICK {
+                let idx = (tick * DIRTY_PER_TICK + d) % FLEET;
+                crcs[idx] = crcs[idx].wrapping_add(2).max(2); // new, non-zero crc
+            }
+            for i in 0..FLEET {
+                let _ = freeze_step(&mut watches[i], crcs[i], false, now, || {
+                    evt_fetches += 1;
+                    Some(screen.clone())
+                });
+            }
+        }
+
+        // Poll-all baseline: every tab, every tick — what brain did before.
+        let poll_fetches = FLEET * TICKS;
+        let evt_busy = per_scan * evt_fetches as u32;
+        let poll_busy = per_scan * poll_fetches as u32;
+        let pct_cut = 100 - (evt_fetches * 100 / poll_fetches);
+        println!(
+            "S3 busy-scan measurement (FLEET={FLEET}, {DIRTY_PER_TICK}/tick dirty, {TICKS} ticks):\n  \
+             per-scan CPU : {per_scan:?}\n  \
+             poll-all     : {poll_fetches} /output round-trips  (~{poll_busy:?} scan-CPU)\n  \
+             event-driven : {evt_fetches} /output round-trips  (~{evt_busy:?} scan-CPU)\n  \
+             REDUCTION    : {pct_cut}% fewer round-trips on the busy fleet"
+        );
+
+        // The idle/unchanged tabs (FLEET - DIRTY_PER_TICK each tick) no longer cost a
+        // round-trip + scan. With ~30 % streaming that's a ~70 % cut — real busy-time
+        // off the daemon, deterministically. (first-sight adds FLEET fetches once.)
+        assert!(
+            evt_fetches <= DIRTY_PER_TICK * TICKS + FLEET,
+            "event-driven fetches only the dirty tabs (+ first-sight seed)"
+        );
+        assert!(
+            evt_fetches * 2 < poll_fetches,
+            "busy fleet: event-driven does <50% of poll-all's round-trips ({evt_fetches} vs {poll_fetches})"
+        );
+    }
+
+    #[test]
     fn scan_order_rotates_and_wraps_for_resumable_scans() {
         // AXE A — a budget-truncated scan resumes across the fleet: starting at
         // the cursor and wrapping, so later ticks reach the tail instead of
