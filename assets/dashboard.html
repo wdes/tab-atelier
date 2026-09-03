@@ -6,6 +6,10 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="robots" content="noindex, nofollow, noarchive">
+  <!-- Kiosk deploy seam: base for turning a decision's code-source ref (`src/…:line`) into a
+       clickable repo blob link. Override per deploy (fork/branch); empty disables (falls back
+       to honest copyable text). See classifyDecisionFile in dashboard.js. -->
+  <meta name="repo-blob-base" content="https://github.com/a-biskoazh/tab-atelier-mx/blob/mx/live">
   <title>Harness dashboard · tab-atelier</title>
   <link rel="stylesheet" href="/assets/dashboard.css">
 </head>

@@ -1643,20 +1643,46 @@ export function renderDetail(text) {
     .replace(/\r?\n/g, "<br>");
 }
 
-// FU2 (#kiosk): a decision's files[] mixes two very different kinds of reference —
-// they must NOT render the same way:
+// Kiosk deploy seam: base for turning a bare code-source ref into a clickable repo blob
+// link. The dashboard can't know the running checkout's remote/branch, so it reads a
+// <meta name="repo-blob-base"> (dashboard.html) with this default (the mx fork tip). An
+// empty value disables construction → the code ref degrades to honest copyable text.
+const REPO_BLOB_BASE = (function () {
+  const dflt = "https://github.com/a-biskoazh/tab-atelier-mx/blob/mx/live";
+  if (typeof document === "undefined") return dflt; // node (unit tests) → the default
+  const m = document.querySelector('meta[name="repo-blob-base"]');
+  const v = m && m.getAttribute("content");
+  return v == null ? dflt : v.trim(); // present-but-empty meta explicitly disables
+})();
+
+// Build a repo blob URL from a bare code-source ref (`path:line` / `path:start-end`):
+// <REPO_BLOB_BASE>/<path>#L<start>[-L<end>]. Encodes each path segment (keeps slashes),
+// drops a leading ./ or /. No base configured → "" so the caller falls back to text.
+export function codeRefBlobUrl(raw, base = REPO_BLOB_BASE) {
+  if (!base) return "";
+  const s = String(raw == null ? "" : raw).trim();
+  const m = /^(.*?):(\d+)(?:-(\d+))?$/.exec(s);
+  const path = (m ? m[1] : s).replace(/^\.?\//, "");
+  if (!path) return "";
+  const enc = path.split("/").map(encodeURIComponent).join("/");
+  const anchor = m ? `#L${m[2]}${m[3] ? `-L${m[3]}` : ""}` : "";
+  return `${base.replace(/\/$/, "")}/${enc}${anchor}`;
+}
+
+// FU2 (#kiosk) + follow-up fix: a decision's files[] mixes reference kinds that must NOT
+// render the same way — and NONE of them may render as dead text (the FU2 regression):
 //  - a SERVABLE DOC (a real .md under the served outbox zone, e.g. ~/Dev/outbox/x.md
 //    or an _archive copy) → the sandboxed /decisions/file viewer legitimately serves
 //    it (200). Keep the file-viewer link.
 //  - a CODE-SOURCE REF (auth.rs:76-78, src/cli/decision.rs:520, a bare source path,
 //    anything carrying a :line) → the viewer is anti-traversal-sandboxed and does NOT
-//    serve repo sources → it 404s ("decisions file: not found"). So NEVER link a source
-//    through /decisions/file. Point the reader at the code on its repo instead: a real
-//    web link when one is reliably constructible (the entry already IS an http(s) URL),
-//    else plain COPYABLE text `path:line` (the reader opens it in their editor). Never a
-//    404 link. ponytail 🟡: a per-project git-remote+branch map injected server-side
-//    would let us build github blob URLs from bare `src/…:line` refs too — deferred; a
-//    fabricated wrong-repo URL is worse than honest text, so a bare ref stays text.
+//    serve repo sources → it 404s. So NEVER a /decisions/file link. Instead build a real
+//    repo blob link (remote+branch from REPO_BLOB_BASE + path + #L anchor) so the reader
+//    CLICKS through to the source. Pointing at the repo beats a dead span: even a drifted
+//    line / bare path lands the reader in the right tree (GitHub's own file-finder). Only
+//    when no base is configured does it fall back to honest copyable text — never a 404.
+//  ponytail 🟡: a per-project server-injected remote+branch map would resolve bare
+//  `auth.rs` to its full path + pin the exact commit (no line drift) — deferred.
 export function classifyDecisionFile(f) {
   const raw = String(f == null ? "" : f).trim();
   // Already a full web URL (e.g. a github/blob link stored in files[]) → link as-is.
@@ -1666,12 +1692,14 @@ export function classifyDecisionFile(f) {
   const inOutbox = raw.startsWith("~/Dev/outbox/") || /(?:^|\/)Dev\/outbox\//.test(raw);
   const isDoc = /\.(?:md|markdown)$/i.test(bare);
   if (inOutbox && isDoc) return { kind: "doc", path: raw, label: raw };
-  // Otherwise a code-source ref → copyable text, never the 404 viewer link.
-  return { kind: "code", label: raw };
+  // Code-source ref → a clickable repo blob link when a base is configured (the default),
+  // else honest copyable text. Never the 404 viewer link.
+  const href = codeRefBlobUrl(raw);
+  return href ? { kind: "code", href, label: raw } : { kind: "code", label: raw };
 }
 
-// Render one files[] entry per its kind (FU2). `canRule` gates the viewer token, as
-// before. XSS-safe: every value is escaped before it reaches the DOM.
+// Render one files[] entry per its kind. `canRule` gates the viewer token, as before.
+// XSS-safe: every value is escaped before it reaches the DOM.
 export function decisionFileHtml(f, canRule) {
   const c = classifyDecisionFile(f);
   if (c.kind === "doc") {
@@ -1681,7 +1709,11 @@ export function decisionFileHtml(f, canRule) {
   if (c.kind === "url") {
     return `<a class="kk-file kk-file-repo" href="${escapeHtml(c.href)}" target="_blank" rel="noopener">${escapeHtml(c.label)}</a>`;
   }
-  // code ref → copyable text (NO href → NO /decisions/file, NO 404).
+  // Code ref: a clickable repo blob link (NO /decisions/file, NO 404). Falls back to
+  // copyable text only when no repo base is configured (c.href absent).
+  if (c.href) {
+    return `<a class="kk-file kk-file-repo" href="${escapeHtml(c.href)}" target="_blank" rel="noopener" title="ouvrir la source sur le repo">${escapeHtml(c.label)}</a>`;
+  }
   return `<span class="kk-file-ref" role="button" tabindex="0" title="référence de code — clic pour copier" data-copy="${escapeHtml(c.label)}">${escapeHtml(c.label)}</span>`;
 }
 
