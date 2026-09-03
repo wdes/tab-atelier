@@ -300,11 +300,6 @@ struct TabInfo {
     /// it" (crc32 of a real non-empty screen is never 0), so a version-skew
     /// window degrades safely to the old poll-everything behaviour, never to
     /// silently skipping a frozen tab.
-    // S1 only wires the field onto the struct (deserialized + round-trip tested);
-    // the read that drives the skip-scan / freeze-timestamp logic lands in S2,
-    // which drops this `allow`. Write-only-via-serde reads as dead in the non-test
-    // lib build until then.
-    #[allow(dead_code)]
     #[serde(default)]
     output_crc: u32,
 }
@@ -357,26 +352,46 @@ struct Eligible {
     tab_id: String,
     tab_name: String,
     trigger: Trigger,
-    /// Hash of the frozen `/output` that made this tab eligible.
-    /// Recorded into the tab's [`TabWatch::nudged_hash`] on send so
-    /// brain won't re-nudge the SAME frozen screen — only once the
-    /// output changes (agent reacted, or re-stuck on something new)
-    /// does the tab become eligible again.
-    output_hash: u64,
+    /// Stability fingerprint of the frozen screen that made this tab eligible
+    /// (the wire crc, or a hash of `/output` in the crc==0 fallback). Recorded
+    /// into the tab's [`TabWatch::nudged_fp`] on send so brain won't re-nudge the
+    /// SAME frozen screen — only once the output changes (agent reacted, or
+    /// re-stuck on something new) does the tab become eligible again.
+    output_fp: u64,
 }
 
 /// Per-tab watch state, keyed by tab id. Tracks output stability so
 /// brain can tell "frozen and stuck" from "actively working".
 struct TabWatch {
-    /// Hash of the last `/output` we saw for this tab.
-    last_hash: u64,
-    /// When the output first reached `last_hash`. `now - stable_since`
-    /// is how long the screen has been frozen.
+    /// crc32 of the tab's `/output` grid as last carried on the `/tabs` list —
+    /// the SKIP-FETCH key. Unchanged since our last poll (and non-zero) ⇒ the
+    /// screen is byte-identical ⇒ brain does NOT re-fetch/re-scan this tab's
+    /// `/output`. This is the event-driven signal: fetch cost ∝ output changes,
+    /// not #tabs × every tick.
+    last_crc: u32,
+    /// Stability fingerprint driving the freeze clock: the wire crc when the
+    /// daemon supplies one (`crc != 0`), else a hash of the fetched `/output`
+    /// (the `crc == 0` fallback — an older daemon without the field, or a
+    /// legitimately empty screen — so brain behaves exactly like the pre-event
+    /// poll-and-hash path). `None` until the first fetch.
+    last_fp: Option<u64>,
+    /// When the fingerprint last changed — the tab's "last activity" instant.
+    /// Brian's dead-man's-switch: `now - stable_since >= STABLE_SECS` ⇒ frozen
+    /// (a frozen tab emits no more dirtiness events, so its ABSENCE of change is
+    /// the freeze signal). Seeded to `now` on first sight (T4: no burst of
+    /// false-gels at hot-swap boot).
     stable_since: Instant,
-    /// Output hash at the moment we last sent `continue` to this tab,
+    /// T1 CACHE — the last needle [`scan_output`] found for this tab, captured on
+    /// the last fetch (a crc-change tick). A frozen tab is NOT re-fetched, but its
+    /// freeze-nudge eligibility needs the error that's stuck on the (byte-
+    /// identical) frozen screen; the cache stands in for a fresh scan, which would
+    /// return the same thing since the screen has not changed. `None` = no needle
+    /// on the last-seen screen.
+    cached_needle: Option<&'static Pattern>,
+    /// Stability fingerprint at the moment we last sent `continue` to this tab,
     /// or `None` if we've never nudged it (or its output changed since).
     /// Guards against re-nudging an unchanged frozen screen.
-    nudged_hash: Option<u64>,
+    nudged_fp: Option<u64>,
     /// Consecutive nudges for the current unresolved error episode —
     /// drives the exponential backoff. Reset to 0 when the tab recovers
     /// (no error trigger) or hits a different error.
@@ -411,6 +426,87 @@ fn hash_output(s: &str) -> u64 {
 /// AND we haven't already nudged this exact frozen screen.
 fn should_nudge(stable_for: Duration, nudged_hash: Option<u64>, current_hash: u64) -> bool {
     stable_for >= Duration::from_secs(STABLE_SECS) && nudged_hash != Some(current_hash)
+}
+
+/// One bounded `GET /tabs/by-id/<id>/output`. Returns the scrollback, or `None`
+/// on a transient error (tab closed mid-tick, …) — the caller leaves that tab for
+/// the next tick rather than aborting the whole sweep. Isolated so the tick loop's
+/// only HTTP for a per-tab scan is injectable (see [`freeze_step`]).
+fn fetch_output(ag: &ureq::Agent, ep: &Endpoint, auth: &str, tab_id: &str) -> Option<String> {
+    match ag
+        .get(format!("{}/tabs/by-id/{}/output", ep.url, tab_id))
+        .header("Authorization", auth)
+        .call()
+        .and_then(|mut r| r.body_mut().read_to_string())
+    {
+        Ok(s) => Some(s),
+        Err(e) => {
+            eprintln!("⛑ brain: GET output for {tab_id} failed: {e} — skipping this tab this tick");
+            None
+        }
+    }
+}
+
+/// Result of one tab's [`freeze_step`]. All variants are cheap Copy payloads.
+#[derive(Clone, Copy)]
+enum FreezeOutcome {
+    /// The `/output` fetch failed transiently — the caller leaves the tab's watch
+    /// state untouched and moves on (it still counts as scanned).
+    FetchFailed,
+    /// Freeze assessed: how long the screen has been frozen, and the active error
+    /// trigger this tick (`None` = nothing wrong / recovered).
+    Assessed {
+        stable_for: Duration,
+        trigger: Option<Trigger>,
+    },
+}
+
+/// Event-driven per-tab freeze bookkeeping — the core of Option C, extracted PURE
+/// (HTTP injected via `fetch`) so the golden-set equivalence (T1), false-positive
+/// (T2), storm (T3) and boot-seed (T4) checks drive it without a daemon.
+///
+/// `fetch` is invoked ONLY when the wire `crc` says the screen changed since the
+/// last poll — `crc != last_crc`, or `crc == 0` = "unknown" (an older daemon
+/// without the field, or a legitimately empty screen) → always fetch. That skip is
+/// the whole CPU win: a frozen tab (crc stuck) is fetched ZERO times after it
+/// froze. On a real change brain re-scans and CACHES the needle; on an unchanged
+/// crc it reuses the cache — equivalent, because the screen is byte-identical.
+///
+/// Mutates `watch` exactly as the tick loop needs: `last_crc` (skip key),
+/// `last_fp` (stability fingerprint: the crc, or a hash of `/output` in the crc==0
+/// fallback so this path matches the pre-event poll-and-hash behaviour),
+/// `stable_since` (freeze clock — reset when the fingerprint changes), and
+/// `cached_needle` (T1). A first-seen tab (`last_fp == None`) always fetches.
+fn freeze_step<F: FnOnce() -> Option<String>>(
+    watch: &mut TabWatch,
+    crc: u32,
+    agent_error: bool,
+    now: Instant,
+    fetch: F,
+) -> FreezeOutcome {
+    // Skip only a tab we've fetched before whose real (non-zero) crc is unchanged.
+    let skip_fetch = crc != 0 && watch.last_fp.is_some() && watch.last_crc == crc;
+    if !skip_fetch {
+        let Some(output) = fetch() else {
+            return FreezeOutcome::FetchFailed;
+        };
+        watch.last_crc = crc;
+        let fp = if crc != 0 { u64::from(crc) } else { hash_output(&output) };
+        if watch.last_fp != Some(fp) {
+            watch.last_fp = Some(fp);
+            watch.stable_since = now;
+        }
+        watch.cached_needle = scan_output(&output);
+    }
+    let stable_for = now.duration_since(watch.stable_since);
+    // Cached needle (== a fresh scan of the byte-identical screen) OR the
+    // agent_state=="error" flag, which rides the /tabs list so it needs no fetch.
+    // Pattern wins on tie (its label is more specific).
+    let trigger = watch
+        .cached_needle
+        .map(Trigger::Pattern)
+        .or_else(|| agent_error.then_some(Trigger::AgentError));
+    FreezeOutcome::Assessed { stable_for, trigger }
 }
 
 /// Global minimum spacing between nudges — anti thundering-herd / anti-runaway.
@@ -641,56 +737,37 @@ fn tick(
         }
         let tab = &claude_tabs[i];
         scanned += 1;
-        // A per-tab /output error (tab closed mid-tick, transient) must NOT abort
-        // the whole tick — that would strand every later tab AND keep re-hitting
-        // the same failing tab (scan_cursor wouldn't advance past it). Skip it;
-        // it still counts as scanned so the cursor moves on. (A daemon-wide outage
-        // already failed the /tabs GET above, before we got here.)
-        let output = match ag
-            .get(format!("{}/tabs/by-id/{}/output", ep.url, tab.id))
-            .header("Authorization", &auth)
-            .call()
-            .and_then(|mut r| r.body_mut().read_to_string())
-        {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!(
-                    "⛑ brain: GET output for {} failed: {e} — skipping this tab this tick",
-                    tab.id
-                );
-                continue;
-            }
-        };
+        let crc = tab.output_crc;
+        let agent_error = tab.agent_state.as_deref() == Some("error");
 
-        // Output-stability tracking — the core "is the agent working?"
-        // gate. Update the per-tab watch: if the screen changed since
-        // last tick, reset the stability clock (the agent is producing
-        // output → it's alive → leave it alone). If it's the same,
-        // accumulate frozen time.
-        let h = hash_output(&output);
-        let watch = watches.entry(tab.id.clone()).or_insert(TabWatch {
-            last_hash: h,
+        let watch = watches.entry(tab.id.clone()).or_insert_with(|| TabWatch {
+            last_crc: crc,
+            last_fp: None,
+            // T4 boot-seed: a first-seen tab is treated as "just active" (stable_since
+            // = now), so a tab ALREADY frozen when brain starts / hot-swaps in still
+            // gets a full STABLE_SECS grace instead of an instant false-gel.
             stable_since: now,
-            nudged_hash: None,
+            cached_needle: None,
+            nudged_fp: None,
             nudge_streak: 0,
             next_nudge_at: None,
             last_label: None,
             last_api_error_at: None,
         });
-        if watch.last_hash != h {
-            watch.last_hash = h;
-            watch.stable_since = now;
-        }
-        let stable_for = now.duration_since(watch.stable_since);
 
-        // Identify the error trigger for EVERY claude tab (not just frozen
-        // ones) so a recovered tab is the reset point for the backoff.
-        // Two parallel signals — a literal needle match in the scrollback
-        // OR an `agent_state: "error"` flag set via set-status. Pattern
-        // wins on tie (its label is more specific).
-        let trigger: Option<Trigger> = scan_output(&output)
-            .map(Trigger::Pattern)
-            .or_else(|| (tab.agent_state.as_deref() == Some("error")).then_some(Trigger::AgentError));
+        // Event-driven freeze bookkeeping (Option C core). `freeze_step` fetches
+        // /output ONLY when the wire crc says the screen changed — that skip is the
+        // whole CPU win — and reuses the cached needle otherwise. A transient fetch
+        // error leaves the tab untouched for next tick; it still counts as scanned
+        // so the cursor advances past it (a daemon-wide outage already failed the
+        // /tabs GET above, before we got here).
+        let (stable_for, trigger) =
+            match freeze_step(watch, crc, agent_error, now, || fetch_output(&ag, &ep, &auth, &tab.id)) {
+                FreezeOutcome::FetchFailed => continue,
+                FreezeOutcome::Assessed { stable_for, trigger } => (stable_for, trigger),
+            };
+        let fp = watch.last_fp.unwrap_or(0);
+
         let Some(trigger) = trigger else {
             // No error on screen → recovered (or never errored). Clear
             // the backoff so the next episode starts fresh.
@@ -703,7 +780,9 @@ fn tick(
 
         // Level-(b) storm signal: stamp this session's last API-storm error time
         // for EVERY api-erroring tab (frozen or not — a live 429/retry screen isn't
-        // frozen yet but still counts toward the storm). Feeds `api_error_sessions`.
+        // frozen yet but still counts toward the storm). Runs off `trigger` (cache-
+        // backed) each tick, so a tab frozen on a 529 keeps refreshing its storm
+        // timestamp exactly as the pre-event poll did — no storm-detector drift.
         if matches!(trigger, Trigger::Pattern(_)) && is_api_storm_label(label) {
             watch.last_api_error_at = Some(now);
         }
@@ -711,7 +790,7 @@ fn tick(
         // Frozen long enough AND not already nudged at this exact screen?
         // (An active auto-retry countdown keeps the screen moving, so it
         // never freezes STABLE_SECS and never reaches here.)
-        if !should_nudge(stable_for, watch.nudged_hash, h) {
+        if !should_nudge(stable_for, watch.nudged_fp, fp) {
             continue;
         }
 
@@ -736,7 +815,7 @@ fn tick(
             tab_id: tab.id.clone(),
             tab_name: tab.name.clone(),
             trigger,
-            output_hash: h,
+            output_fp: fp,
         });
     }
     // Resume next tick right after the last tab we reached, so a budget-truncated
@@ -833,7 +912,7 @@ fn tick(
     // or it re-stuck on something new). Replaces the old time-based
     // cooldown — a state guard, not a clock.
     if let Some(w) = watches.get_mut(&pick.tab_id) {
-        w.nudged_hash = Some(pick.output_hash);
+        w.nudged_fp = Some(pick.output_fp);
         // Advance the exponential backoff for this error episode: same
         // label → grow the streak (longer wait next time); new label →
         // restart at 1. The gate above suppresses nudges until then.
@@ -1081,9 +1160,11 @@ mod tests {
         //      detector: once the errors age out, the freeze lifts on its own.
         let t0 = Instant::now();
         let errored_at = |at: Instant| TabWatch {
-            last_hash: 0,
+            last_crc: 0,
+            last_fp: None,
             stable_since: at,
-            nudged_hash: None,
+            cached_needle: None,
+            nudged_fp: None,
             nudge_streak: 0,
             next_nudge_at: None,
             last_label: None,
@@ -1181,6 +1262,130 @@ mod tests {
         let old: TabInfo =
             serde_json::from_str(r#"{"id":"t1","name":"w","agent_kind":"claude","agent_session_id":"s1"}"#).unwrap();
         assert_eq!(old.output_crc, 0, "absent field defaults to 0 (old-daemon fallback)");
+    }
+
+    /// A fresh watch as the tick loop seeds one (T4 boot-seed: `stable_since` = now,
+    /// `last_fp` None so the first `freeze_step` always fetches).
+    fn fresh_watch(now: Instant) -> TabWatch {
+        TabWatch {
+            last_crc: 0,
+            last_fp: None,
+            stable_since: now,
+            cached_needle: None,
+            nudged_fp: None,
+            nudge_streak: 0,
+            next_nudge_at: None,
+            last_label: None,
+            last_api_error_at: None,
+        }
+    }
+
+    fn assess(o: FreezeOutcome) -> (Duration, Option<Trigger>) {
+        match o {
+            FreezeOutcome::Assessed { stable_for, trigger } => (stable_for, trigger),
+            FreezeOutcome::FetchFailed => panic!("expected Assessed, got FetchFailed"),
+        }
+    }
+
+    const UNREACHABLE: &str = "⎿  API Error: Unable to connect to API (ConnectionRefused)\n❯ continue";
+
+    #[test]
+    fn freeze_step_skips_unchanged_crc_and_reuses_cached_needle() {
+        // S2 core (the CPU win + T1 cache): an unchanged wire crc ⇒ NO /output
+        // fetch, yet the tab stays freeze-assessed off the CACHED needle, and its
+        // freeze clock keeps accruing. This is exactly the frozen-tab path: it
+        // emits no new event, so brain must nudge it WITHOUT re-polling it.
+        let t0 = Instant::now();
+        let mut w = fresh_watch(t0);
+        let fetches = std::cell::Cell::new(0);
+        // First sight (last_fp None) → fetch, scan, cache the unreachable needle.
+        let (stable0, trig0) = assess(freeze_step(&mut w, 0x1234, false, t0, || {
+            fetches.set(fetches.get() + 1);
+            Some(UNREACHABLE.to_string())
+        }));
+        assert_eq!(fetches.get(), 1, "first sight fetches");
+        assert_eq!(stable0, Duration::ZERO, "freeze clock starts at 0 on first fetch");
+        assert!(
+            matches!(trig0, Some(Trigger::Pattern(p)) if p.label == "anthropic-unreachable"),
+            "needle scanned + returned on the fetch tick"
+        );
+        // Next tick, SAME crc, 25 s later → MUST NOT fetch; cached needle still
+        // drives the trigger; stable_for has grown past STABLE_SECS (frozen).
+        let t1 = t0 + Duration::from_secs(25);
+        let (stable1, trig1) = assess(freeze_step(&mut w, 0x1234, false, t1, || {
+            fetches.set(fetches.get() + 1);
+            panic!("must not fetch an unchanged tab");
+        }));
+        assert_eq!(fetches.get(), 1, "unchanged crc → ZERO extra fetches (the whole point)");
+        assert!(
+            stable1 >= Duration::from_secs(STABLE_SECS),
+            "freeze clock accrued across the skip"
+        );
+        assert!(
+            matches!(trig1, Some(Trigger::Pattern(p)) if p.label == "anthropic-unreachable"),
+            "T1: the cached needle stands in for a fresh scan of the byte-identical screen"
+        );
+    }
+
+    #[test]
+    fn freeze_step_refetches_on_crc_change_and_resets_freeze_clock() {
+        // A changed crc = the screen moved = the agent is alive → re-fetch, re-scan,
+        // and reset the freeze clock (never nudge a working tab).
+        let t0 = Instant::now();
+        let mut w = fresh_watch(t0);
+        let _ = assess(freeze_step(&mut w, 0x1111, false, t0, || Some(UNREACHABLE.to_string())));
+        // crc changed → fetch a now-clean screen; freeze clock resets, needle clears.
+        let t1 = t0 + Duration::from_secs(25);
+        let (stable1, trig1) = assess(freeze_step(&mut w, 0x2222, false, t1, || {
+            Some("all good\n$ ".to_string())
+        }));
+        assert_eq!(stable1, Duration::ZERO, "crc change reset the freeze clock");
+        assert!(trig1.is_none(), "re-scan of the new clean screen clears the trigger");
+    }
+
+    #[test]
+    fn freeze_step_crc_zero_falls_back_to_output_hash() {
+        // crc == 0 (old daemon w/o the field, or an empty screen) = "unknown": brain
+        // must always fetch and drive the freeze clock off a HASH of the output —
+        // exactly the pre-event behaviour — never silently skip a possibly-frozen tab.
+        let t0 = Instant::now();
+        let mut w = fresh_watch(t0);
+        let fetches = std::cell::Cell::new(0);
+        let mut step = |now: Instant, text: &'static str| {
+            assess(freeze_step(&mut w, 0, false, now, || {
+                fetches.set(fetches.get() + 1);
+                Some(text.to_string())
+            }))
+        };
+        let (_, _) = step(t0, UNREACHABLE);
+        // Same text, crc still 0 → STILL fetches (can't skip on 0), and since the
+        // hash is unchanged the freeze clock accrues → frozen after STABLE_SECS.
+        let (stable1, trig1) = step(t0 + Duration::from_secs(25), UNREACHABLE);
+        assert_eq!(fetches.get(), 2, "crc==0 always fetches (no skip in the fallback)");
+        assert!(
+            stable1 >= Duration::from_secs(STABLE_SECS),
+            "identical output-hash accrues freeze"
+        );
+        assert!(
+            matches!(trig1, Some(Trigger::Pattern(_))),
+            "needle still detected in the fallback"
+        );
+    }
+
+    #[test]
+    fn freeze_step_fetch_failure_leaves_state_untouched() {
+        // A transient /output error must NOT corrupt the watch (no false freeze-reset,
+        // no cache wipe) — the tab is simply reassessed next tick.
+        let t0 = Instant::now();
+        let mut w = fresh_watch(t0);
+        let _ = assess(freeze_step(&mut w, 0x9, false, t0, || Some(UNREACHABLE.to_string())));
+        let fp_before = w.last_fp;
+        let since_before = w.stable_since;
+        // crc changed (would normally fetch) but the fetch fails → FetchFailed, state intact.
+        let out = freeze_step(&mut w, 0xA, false, t0 + Duration::from_secs(5), || None);
+        assert!(matches!(out, FreezeOutcome::FetchFailed), "fetch error → FetchFailed");
+        assert_eq!(w.last_fp, fp_before, "fingerprint untouched by a failed fetch");
+        assert_eq!(w.stable_since, since_before, "freeze clock untouched by a failed fetch");
     }
 
     #[test]
@@ -1431,13 +1636,13 @@ mod tests {
             tab_id: "tab-1".into(),
             tab_name: "shell".into(),
             trigger: Trigger::Pattern(pattern),
-            output_hash: 0,
+            output_fp: 0,
         };
         let a = Eligible {
             tab_id: "tab-1".into(),
             tab_name: "shell".into(),
             trigger: Trigger::AgentError,
-            output_hash: 0,
+            output_fp: 0,
         };
         assert_ne!(p.trigger.label(), a.trigger.label());
     }
