@@ -60,6 +60,9 @@ pub(in crate::api) fn list<S: Write>(
             cwd: t.cwd.as_deref().map(str::to_string),
             active: i == state.active,
             preview: strip_ansi(t.output.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("")),
+            // Dirtiness key for the out-of-process poller (brain): unchanged crc
+            // ⇒ the tab's screen is byte-identical ⇒ brain skips its /output scan.
+            output_crc: t.output_crc,
             uptime_secs: t.uptime_secs,
             #[cfg(feature = "energy")]
             cpu_percent: state.power.get(i).map_or(0.0, |p| p.cpu_percent),

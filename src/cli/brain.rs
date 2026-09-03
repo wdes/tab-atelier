@@ -292,6 +292,21 @@ struct TabInfo {
     /// `continue` racing the handoff could double-launch the agent.
     #[serde(default, rename = "inHandoff")]
     in_handoff: bool,
+    /// crc32 of the tab's 200-line `/output` grid, carried on the `/tabs` list
+    /// (the daemon's persist-tick dirtiness key). Brain's event-driven signal:
+    /// unchanged since the last poll ⇒ the screen is byte-identical ⇒ skip the
+    /// per-tab `/output` fetch+scan (S2). `#[serde(default)]` so an OLDER daemon
+    /// that predates the field deserializes to 0 — S2 treats 0 as "unknown, scan
+    /// it" (crc32 of a real non-empty screen is never 0), so a version-skew
+    /// window degrades safely to the old poll-everything behaviour, never to
+    /// silently skipping a frozen tab.
+    // S1 only wires the field onto the struct (deserialized + round-trip tested);
+    // the read that drives the skip-scan / freeze-timestamp logic lands in S2,
+    // which drops this `allow`. Write-only-via-serde reads as dead in the non-test
+    // lib build until then.
+    #[allow(dead_code)]
+    #[serde(default)]
+    output_crc: u32,
 }
 
 /// Is this tab a legitimate brain target? A live Claude session (kind + session)
@@ -1149,6 +1164,23 @@ mod tests {
             !is_watchable(&adopting),
             "a tab mid-hot-swap-handoff is left ALONE by brain (no nudge)"
         );
+    }
+
+    #[test]
+    fn output_crc_deserializes_from_tabs_and_defaults_for_old_daemon() {
+        // S1 — the event-driven dirtiness signal rides the /tabs list. A row from
+        // a NEW daemon carries `output_crc`; brain reads it to tell "screen changed
+        // since my last poll" without a per-tab /output fetch.
+        let fresh: TabInfo = serde_json::from_str(
+            r#"{"id":"t1","name":"w","agent_kind":"claude","agent_session_id":"s1","output_crc":3735928559}"#,
+        )
+        .unwrap();
+        assert_eq!(fresh.output_crc, 3_735_928_559, "crc read straight off the /tabs row");
+        // A row from an OLDER daemon (pre-field) must default to 0 — the version-skew
+        // window S2 treats as "unknown, scan it", never as a silently-skipped freeze.
+        let old: TabInfo =
+            serde_json::from_str(r#"{"id":"t1","name":"w","agent_kind":"claude","agent_session_id":"s1"}"#).unwrap();
+        assert_eq!(old.output_crc, 0, "absent field defaults to 0 (old-daemon fallback)");
     }
 
     #[test]

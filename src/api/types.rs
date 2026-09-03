@@ -46,6 +46,15 @@ pub struct TabInfo {
     /// to preview what's happening without fetching the full output.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub(crate) preview: String,
+    /// crc32 of the tab's cached 200-line `output` grid — the SAME dirtiness key
+    /// the persist tick gates on (`GridSnapshotCache::output_crc`). Exposed here
+    /// so an out-of-process poller (brain) can tell "this tab's screen changed
+    /// since my last poll" from the ONE `/tabs` GET it already makes, and skip the
+    /// per-tab `/output` fetch+scan for unchanged tabs — the event-driven signal
+    /// that kills brain's poll cost ∝ streaming. Always serialized (a value of 0
+    /// is a legitimate crc, so it must not be omittable) and unconditional (no
+    /// agent gating): brain keys freeze/dirty detection off it for every tab.
+    pub(crate) output_crc: u32,
     /// Cumulative time the tab has spent in the "active" state on the
     /// desktop. Lets the mobile remote show the same per-tab counter
     /// without needing its own activity tracker.
