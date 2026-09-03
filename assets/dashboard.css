@@ -879,3 +879,32 @@ body.band-view { min-height: calc(100vh + 180px); }
 .kk-hint { font-size: 0.72rem; color: var(--muted); font-style: italic; }
 .kk-msg { font-size: 0.74rem; color: var(--muted); }
 .kk-msg.err { color: var(--led-error-stroke); }
+
+/* --- Mesh view: fleet force-directed graph (additive lens) --- */
+/* The topbar toggle mirrors the catalogue/kiosk buttons; .active marks the lens on. */
+.mesh-toggle { cursor: pointer; }
+.mesh-toggle.active { background: var(--led-working-stroke); color: #fff; }
+.mesh { position: relative; }
+.mesh-filters { display: flex; gap: 12px; align-items: center; padding: 8px 4px; flex-wrap: wrap; color: var(--muted); font-size: 0.8rem; }
+.mesh-filters select { font: inherit; }
+.mesh-svg { width: 100%; height: 72vh; display: block; }
+.mesh-node circle { stroke-width: 1.5; cursor: pointer; }
+.mesh-node text {
+  fill: var(--fg); font-size: 10px; pointer-events: none;
+  paint-order: stroke; stroke: var(--bg); stroke-width: 3px; stroke-linejoin: round;
+}
+/* Node fill/stroke reuse the SAME led-* variables as the phase nodes + legend swatches,
+   so a mesh node matches its led everywhere (single source of colour). */
+.mesh-node.led-neutral circle    { fill: var(--neutral-fill);       stroke: var(--neutral-stroke); }
+.mesh-node.led-idle circle       { fill: var(--led-idle-fill);      stroke: var(--led-idle-stroke); }
+.mesh-node.led-unreviewed circle { fill: var(--led-unreviewed-fill); stroke: var(--led-unreviewed-stroke); }
+.mesh-node.led-working circle    { fill: var(--led-working-fill);   stroke: var(--led-working-stroke); }
+.mesh-node.led-error circle      { fill: var(--led-error-fill);     stroke: var(--led-error-stroke); }
+.mesh-node.led-dead circle       { fill: var(--led-dead-fill);      stroke: var(--led-dead-stroke); }
+.mesh-node.mesh-dim, .mesh-svg .lineage-edge.mesh-dim { opacity: 0.12; }
+.mesh-tip {
+  position: absolute; pointer-events: none; z-index: 10; max-width: 320px;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+  padding: 8px 10px; font-size: 0.78rem; display: none; box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+}
+.mesh-tip .k { color: var(--muted); }

@@ -24,6 +24,9 @@
          source fetched on-demand (NOT in the live poll). The badge = nb of open
          decisions; hidden when zero. -->
     <button id="kiosk-toggle" class="kiosk-toggle" aria-controls="kiosk-panel">Kiosk<span id="kiosk-badge" class="kiosk-badge" hidden>0</span></button>
+    <!-- Mesh view: a fleet-wide force-directed graph (delegation lineage), an ADDITIVE
+         lens over the SAME /dashboard/state. Toggles the existing views on/off. -->
+    <button id="mesh-toggle" class="mesh-toggle" aria-controls="mesh" aria-pressed="false">Mesh</button>
   </header>
 
   <main id="dashboard" aria-label="harness workflow">
@@ -41,6 +44,37 @@
       <svg id="lineage-layer" class="lineage-layer" aria-hidden="true"></svg>
       <section id="project-grid" class="project-grid" aria-label="projects"></section>
     </div>
+
+    <!-- Mesh view: fleet force-directed graph of the delegation lineage. Hidden
+         unless the Mesh toggle is on; rendered by dashboard.js from /dashboard/state
+         (nodes = every tab, edges = state.lineage parent->child). Same-origin, no CORS. -->
+    <section id="mesh" class="mesh" hidden aria-label="fleet mesh">
+      <div id="mesh-filters" class="mesh-filters">
+        <label>équipe <select id="mesh-f-team"><option value="">(toutes)</option></select></label>
+        <label>tier
+          <select id="mesh-f-tier">
+            <option value="">(tous)</option>
+            <option value="meta">méta</option>
+            <option value="supporter">supporter</option>
+            <option value="orchestrator">orchestrateur</option>
+            <option value="worker">worker</option>
+            <option value="freelancer">freelancer</option>
+          </select>
+        </label>
+        <label><input type="checkbox" id="mesh-f-idle"> masquer idle</label>
+      </div>
+      <svg id="mesh-svg" class="mesh-svg" role="img" aria-label="fleet delegation mesh">
+        <defs>
+          <marker id="mesh-arrow" viewBox="0 0 10 10" refX="9" refY="5"
+                  markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" class="lineage-arrow-head"/>
+          </marker>
+        </defs>
+        <g id="mesh-edges"></g>
+        <g id="mesh-nodes"></g>
+      </svg>
+      <div id="mesh-tip" class="mesh-tip"></div>
+    </section>
 
     <!-- Phase-flow skeleton: the seven canonical nodes of docs/dashboard.md,
          drawn left-to-right. Each <g id="node-<phase>"> is recoloured live by
