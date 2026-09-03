@@ -1634,13 +1634,38 @@ const DECISION_STATE_LABEL = { open: "à trancher", read: "lu", tranched: "tranc
 // open first, then the read->tranched->archived progression.
 const DECISION_STATE_ORDER = { open: 0, read: 1, tranched: 2, archived: 3 };
 
-// Render a decision's long-form `detail` as SAFE simple-markdown for the toggle body:
-// escape EVERYTHING first (XSS), then re-introduce only <strong> (**bold**) and <br>
-// (line breaks). No raw HTML from the payload ever reaches the DOM.
-export function renderDetail(text) {
-  return escapeHtml(String(text == null ? "" : text))
+// One prose segment: escape EVERYTHING (XSS) then re-introduce only <strong> (**bold**)
+// and <br> (line breaks). No raw HTML from the payload ever reaches the DOM.
+function renderProse(text) {
+  return escapeHtml(text)
     .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
     .replace(/\r?\n/g, "<br>");
+}
+
+// One fenced ```code``` block: a <pre> for the reader PLUS a 📋 button carrying the EXACT
+// raw block text in data-copy. Clicking it copies that text verbatim (see copyToClipboard).
+// XSS-safe: the code is escaped both in the <pre> and in the attribute, so the copied
+// payload is inert TEXT, never interpreted.
+function codeBlockHtml(raw) {
+  const esc = escapeHtml(raw);
+  return `<div class="kk-codeblock"><button type="button" class="kk-copy-code" aria-label="copier le bloc de code" title="copier" data-copy="${esc}">📋</button><pre class="kk-code"><code>${esc}</code></pre></div>`;
+}
+
+// Render a decision's long-form `detail` as SAFE simple-markdown for the toggle body. Fenced
+// ```code``` blocks become a copyable <pre> + 📋 button (volet a); everything else is prose.
+// Feature-detect: a detail with NO fence yields NO button — graceful degradation on plain prose.
+export function renderDetail(text) {
+  const src = String(text == null ? "" : text);
+  // ```[lang]\n …code… ``` — capture the inner text, tolerate an optional language tag.
+  const fence = /```[ \t]*[\w+.#-]*[ \t]*\r?\n([\s\S]*?)```/g;
+  let out = "", last = 0, m;
+  while ((m = fence.exec(src)) !== null) {
+    out += renderProse(src.slice(last, m.index));
+    out += codeBlockHtml(m[1].replace(/\r?\n$/, "")); // drop the newline before the closing fence
+    last = fence.lastIndex;
+  }
+  out += renderProse(src.slice(last));
+  return out;
 }
 
 // Kiosk deploy seam: base for turning a bare code-source ref into a clickable repo blob
@@ -1773,9 +1798,10 @@ export function decisionCardHtml(d) {
   </div>`;
 }
 
-// FU2: copy a code-source ref's text to the clipboard (best-effort). Flashes a brief
-// "copié" affordance on the element's title; a browser without clipboard access no-ops.
-function copyDecisionFileRef(el) {
+// Copy an element's data-copy text (a code-source ref OR a fenced code block) to the
+// clipboard, best-effort. Flashes a brief "copié ✓" affordance on the element's title; a
+// browser without clipboard access no-ops. The payload is TEXT — never interpreted.
+function copyToClipboard(el) {
   const text = (el && el.dataset && el.dataset.copy) || (el && el.textContent) || "";
   if (!text) return;
   try {
@@ -2119,10 +2145,14 @@ function bootstrap() {
       // would collapse it again). Expand/collapse the long-form body in place.
       const dt = e.target.closest(".kk-detail-toggle");
       if (dt) { toggleDetail(dt); return; }
-      // FU2: a code-source ref is copyable text (not a link) — click copies it so the
-      // reader can paste it into their editor. Best-effort (no clipboard → silent no-op).
+      // Volet (a): 📋 on a fenced code block copies its raw text (a real <button> — Enter/
+      // Space fire a click natively, so no separate keydown branch is needed for it).
+      const copyBtn = e.target.closest(".kk-copy-code");
+      if (copyBtn) { copyToClipboard(copyBtn); return; }
+      // FU2 / volet (b): a non-resolvable code-source ref is copyable text (not a link) —
+      // click copies it so the reader can paste it. Best-effort (no clipboard → silent no-op).
       const ref = e.target.closest(".kk-file-ref");
-      if (ref) { copyDecisionFileRef(ref); return; }
+      if (ref) { copyToClipboard(ref); return; }
       if (e.target.closest(".kk-lu, .kk-send")) { handleKioskAction(e.target); return; }
     });
     // Bug3: Enter in the verdict field submits the ruling (as well as the "Trancher" button).
@@ -2131,7 +2161,7 @@ function bootstrap() {
       if (input) { e.preventDefault(); const card = input.closest(".kk-card"); if (card) submitTranch(card); return; }
       // FU2 a11y: a code-source ref is a role=button — Enter/Space copies it.
       const ref = (e.key === "Enter" || e.key === " ") && e.target.closest && e.target.closest(".kk-file-ref");
-      if (ref) { e.preventDefault(); copyDecisionFileRef(ref); }
+      if (ref) { e.preventDefault(); copyToClipboard(ref); }
     });
   }
   document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeKiosk(); });
