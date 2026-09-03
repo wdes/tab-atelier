@@ -847,6 +847,20 @@ body.band-view { min-height: calc(100vh + 180px); }
 .kk-code { margin: 0; padding: 0.45rem 0.55rem; padding-right: 2rem; font-family: var(--mono, monospace); font-size: 0.78rem; line-height: 1.4; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; overflow-x: auto; white-space: pre; color: var(--fg); }
 .kk-copy-code { position: absolute; top: 0.25rem; right: 0.25rem; font-size: 0.8rem; line-height: 1; cursor: copy; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); padding: 0.1rem 0.3rem; opacity: 0.6; }
 .kk-copy-code:hover, .kk-copy-code:focus { opacity: 1; outline: none; }
+/* Copy confirmation toast — visible feedback on every copy path (secure OR http-LAN legacy). */
+.kk-toast {
+  position: fixed; bottom: 1.5rem; left: 50%;
+  transform: translateX(-50%) translateY(1rem);
+  z-index: 70;
+  background: var(--panel); color: var(--fg);
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 0.5rem 1rem; font-size: 0.85rem; font-weight: 600;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  opacity: 0; pointer-events: none;
+  transition: opacity 0.15s ease, transform 0.15s ease;
+}
+.kk-toast-show { opacity: 1; transform: translateX(-50%) translateY(0); }
+@media (prefers-reduced-motion: reduce) { .kk-toast { transition: opacity 0.15s ease; } }
 .kk-files { margin: 0.3rem 0; display: flex; flex-direction: column; gap: 0.15rem; }
 .kk-file { font-size: 0.78rem; color: var(--led-idle-stroke); word-break: break-all; }
 /* FU2: a code-source ref is copyable TEXT (not a link) — monospace, subtly boxed,
