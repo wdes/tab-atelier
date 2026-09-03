@@ -18,8 +18,8 @@ import { kioskView, decisionCardHtml, kioskHtml, renderDetail } from "./dashboar
 {
   const open = decisionCardHtml({ id: "d1", state: "open", title: "Deploy X", whyGated: "gate", reco: "GO", effort: "5m", files: ["~/Dev/outbox/x.md"] });
   assert.match(open, /data-state="open"/, "carries the server state");
-  assert.match(open, /class="kk-lu"[^>]*>/, "Lu checkbox present");
-  assert.ok(!/class="kk-lu"[^>]*checked/.test(open), "open -> Lu NOT checked");
+  // ⭐ Item 4 (#kiosk): the "Lu" mark-read checkbox is REMOVED — no kk-lu anywhere.
+  assert.ok(!/kk-lu/.test(open), "Lu checkbox removed (item 4)");
   assert.match(open, /class="kk-tranche" disabled/, "Tranché is a disabled STATE indicator (action = the button)");
   assert.match(open, /class="kk-send"/, "Bug3: an explicit 'Trancher' button is present");
   assert.match(open, /kk-key">pourquoi gaté<\/span> gate/, "why-gated line");
@@ -30,15 +30,25 @@ import { kioskView, decisionCardHtml, kioskHtml, renderDetail } from "./dashboar
   assert.ok(!/href="~\/Dev\/outbox\/x.md"/.test(open), "the raw outbox path is NOT used as the href (would 401)");
   assert.match(open, /path=~%2FDev%2Foutbox%2Fx.md/, "the path is URL-encoded in the query");
 
-  // read -> Lu checked+disabled (progression is one-way).
+  // ⭐ Item 2 (#kiosk): a `summary` renders in a kk-summary block UNDER the title, above the
+  // detail toggle; **bold** survives; absent summary -> no block (feature-detect); XSS-safe.
+  const summed = decisionCardHtml({ id: "s1", state: "open", title: "T gras", summary: "Ligne 1 **clé**\nLigne 2", detail: "**Enjeux** — x." });
+  assert.match(summed, /<div class="kk-summary">Ligne 1 <strong>clé<\/strong><br>Ligne 2<\/div>/, "summary rendered under title (bold + newline)");
+  const titleIdx = summed.indexOf('class="kk-title"'), sumIdx = summed.indexOf("kk-summary"), bodyIdx = summed.indexOf('class="kk-detail"');
+  assert.ok(titleIdx < sumIdx && sumIdx < bodyIdx, "order: titre gras -> résumé -> detail body");
+  assert.ok(!/kk-summary/.test(open), "no summary field -> no kk-summary block (feature-detect)");
+  const evilSum = decisionCardHtml({ id: "s2", state: "open", title: "t", summary: "<img src=x onerror=alert(1)>" });
+  assert.ok(!/<img/.test(evilSum), "summary is XSS-escaped");
+
+  // read -> the state tag shows "lu"; NO Lu checkbox (item 4).
   const read = decisionCardHtml({ id: "d2", state: "read", title: "t" });
-  assert.match(read, /class="kk-lu"[^>]*checked/, "read -> Lu checked");
-  assert.match(read, /class="kk-lu"[^>]*disabled/, "read -> Lu disabled");
+  assert.ok(!/kk-lu/.test(read), "read -> still no Lu checkbox");
+  assert.match(read, /kk-state-tag">lu</, "read state surfaced via the state tag");
   assert.ok(!/class="kk-tranche"[^>]*checked/.test(read), "read -> Tranché indicator not yet checked");
 
-  // tranched -> Lu + Tranché indicators checked, verdict surfaced, rule controls disabled.
+  // tranched -> Tranché indicator checked, verdict surfaced, rule controls disabled.
   const tr = decisionCardHtml({ id: "d3", state: "tranched", title: "t", verdict: "GO" });
-  assert.match(tr, /class="kk-lu"[^>]*checked/, "tranched -> Lu checked");
+  assert.ok(!/kk-lu/.test(tr), "tranched -> no Lu checkbox");
   assert.match(tr, /class="kk-tranche" disabled checked/, "tranched -> Tranché indicator checked");
   assert.match(tr, /kk-verdict">verdict : GO/, "verdict surfaced verbatim");
   assert.match(tr, /kk-verdict-input"[^>]*disabled/, "verdict input disabled once ruled");

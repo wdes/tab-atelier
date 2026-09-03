@@ -835,6 +835,8 @@ body.band-view { min-height: calc(100vh + 180px); }
 .kk-check { font-size: 0.76rem; color: var(--fg); display: inline-flex; align-items: center; gap: 0.25rem; cursor: pointer; }
 .kk-check input { margin: 0; }
 .kk-title { font-weight: 600; font-size: 0.9rem; }
+/* Item 2 (#kiosk): the 2-3 line summary under the bold title, above the toggle/detail. */
+.kk-summary { margin: 0.2rem 0 0.35rem; font-size: 0.84rem; line-height: 1.4; color: var(--fg); }
 .kk-state-tag { margin-left: auto; font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.03em; color: var(--muted); border: 1px solid var(--border); border-radius: 999px; padding: 0 0.4rem; }
 .kk-field { margin: 0.25rem 0; font-size: 0.82rem; }
 .kk-key { color: var(--muted); font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.03em; margin-right: 0.3rem; }

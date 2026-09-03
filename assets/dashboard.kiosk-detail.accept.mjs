@@ -81,8 +81,8 @@ async function main() {
   ok("state2: the detail-less card still renders (no regression)", (await page.locator(plain).count()) === 1);
   ok("state2: NO toggle when detail is absent (feature-detect)", (await page.locator(`${plain} .kk-detail-toggle`).count()) === 0);
   ok("state2: NO detail body when detail is absent", (await page.locator(`${plain} .kk-detail`).count()) === 0);
-  // Zero regression: the standard affordances (Lu checkbox, Trancher button) are intact.
-  ok("state2: the card's Lu + Trancher affordances are intact", (await page.locator(`${plain} .kk-lu`).count()) === 1 && (await page.locator(`${plain} .kk-send`).count()) === 1);
+  // Zero regression: the Trancher button is intact; the Lu checkbox was removed (item 4).
+  ok("state2: Trancher button intact, no Lu checkbox (item 4)", (await page.locator(`${plain} .kk-send`).count()) === 1 && (await page.locator(`${plain} .kk-lu`).count()) === 0);
 
   await browser.close();
   console.log(`\ndashboard.kiosk-detail.accept.mjs — KIOSK detail-toggle (2 états, browser path)`);

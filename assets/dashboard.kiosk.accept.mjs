@@ -103,11 +103,8 @@ async function main() {
   // ===== ⭐ Bug3: the ruling affordance (Trancher button) is VISIBLE =====
   ok("Bug3: an explicit 'Trancher' button is visible", await page.locator(`${rc} .kk-send`).isVisible());
 
-  // ===== ⭐ Bug2/wiring: Lu POSTs 200 =====
-  await page.locator(`${rc} .kk-lu`).click();
-  await page.waitForTimeout(200);
-  ok("Bug2: checking Lu POSTs /decisions/kiosk-selftest/read (200)", posted.some((x) => x.id === "kiosk-selftest" && x.verb === "read"));
-  ok("wiring: after read, the Lu notch is checked+disabled", (await page.locator(`${rc} .kk-lu`).isChecked()) && (await page.locator(`${rc} .kk-lu`).isDisabled()));
+  // ===== ⭐ Item 4 (#kiosk): the "Lu" mark-read notch is REMOVED from the panel =====
+  ok("item 4: no Lu checkbox in the card (removed)", (await page.locator(`${rc} .kk-lu`).count()) === 0);
 
   // SEND with an empty verdict -> refused client-side (no POST), a hint is shown.
   const beforeTranch = posted.filter((x) => x.verb === "tranch").length;

@@ -39,6 +39,10 @@ pub struct DecisionEvent {
     pub project: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// A 2-3 line résumé rendered UNDER the bold title, above the toggle (distinct from
+    /// `title` — NOT a rename). `compose` fills it; `push --summary` sets it directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub why_gated: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -129,6 +133,9 @@ pub struct DecisionView {
     pub project: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// The 2-3 line résumé shown under the title (NEW; distinct from `title`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub why_gated: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -256,6 +263,7 @@ fn fold_one(id: &str, events: &[DecisionEvent]) -> Option<DecisionView> {
         id: id.to_string(),
         project: content.project.clone(),
         title: content.title.clone(),
+        summary: content.summary.clone(),
         why_gated: content.why_gated.clone(),
         reco: content.reco.clone(),
         effort: content.effort.clone(),
@@ -608,19 +616,32 @@ fn arg_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).map(String::as_str)
 }
 
+/// Collect EVERY value following each occurrence of `flag` — a REPEATABLE option
+/// (`--options` / `--command` / `--files` in `compose`). Order-preserving. PURE.
+fn args_after_all<'a>(args: &'a [String], flag: &str) -> Vec<&'a str> {
+    args.iter()
+        .enumerate()
+        .filter(|(_, a)| a.as_str() == flag)
+        .filter_map(|(i, _)| args.get(i + 1))
+        .map(String::as_str)
+        .collect()
+}
+
 /// `tab-atelier decision <push|read|tranch|list>` (PD1). Append-only mutations +
 /// the folded read-model. No UI.
 #[must_use]
 pub fn run(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
         Some("push") => push(&args[1..]),
+        Some("compose") => compose(&args[1..]),
         Some("read") => mark(&args[1..], DecisionKind::Read),
         Some("tranch") => mark(&args[1..], DecisionKind::Tranched),
         Some("list") => list(&args[1..]),
         _ => {
             eprintln!(
                 "usage:\n  \
-                 tab-atelier decision push --id <id> --project <p> --title <t> [--why <w>] [--reco <r>] [--effort <e>] [--detail <body>] [--files a,b] [--from <pusher>]\n  \
+                 tab-atelier decision push --id <id> --project <p> --title <t> [--summary <s>] [--why <w>] [--reco <r>] [--effort <e>] [--detail <body>] [--files a,b] [--from <pusher>]\n  \
+                 tab-atelier decision compose --id <id> --title <t> [--summary <s>] [--from <x>] [--enjeux <e>] [--options \"A: …\"]… [--reco <r>] [--effort <e>] [--files <f>]… [--command <c>]… [--link <url>] [--reopen]\n  \
                  tab-atelier decision read --id <id> [--by <who>]\n  \
                  tab-atelier decision tranch --id <id> --verdict <v> [--by <who>]\n  \
                  tab-atelier decision list [--includeArchived]"
@@ -644,6 +665,7 @@ pub fn is_noop_open(events: &[DecisionEvent], incoming: &DecisionEvent) -> bool 
     events.iter().rfind(|e| e.kind.is_content()).is_some_and(|c| {
         c.project == incoming.project
             && c.title == incoming.title
+            && c.summary == incoming.summary
             && c.why_gated == incoming.why_gated
             && c.reco == incoming.reco
             && c.effort == incoming.effort
@@ -716,6 +738,7 @@ fn push(args: &[String]) -> i32 {
         at: crate::unix_millis() / 1000,
         project: arg_after(args, "--project").map(str::to_string),
         title: arg_after(args, "--title").map(str::to_string),
+        summary: arg_after(args, "--summary").map(str::to_string),
         why_gated: arg_after(args, "--why").map(str::to_string),
         reco: arg_after(args, "--reco").map(str::to_string),
         effort: arg_after(args, "--effort").map(str::to_string),
@@ -737,6 +760,81 @@ fn push(args: &[String]) -> i32 {
             1
         }
     }
+}
+
+/// `decision compose` — the DÉTERMINISTE high-level authoring path (design in
+/// `decision-compose-tool-design.md`). Named fields become a correctly-formatted `open`
+/// event so nobody has to remember the mapping. `--title` is the bold heading, `--summary`
+/// the NEW 2-3 line résumé under it, and the `detail` toggle body is assembled from
+/// `--enjeux`, repeatable `--options`, `--reco`, `--effort`, repeatable `--command` (each
+/// auto-fenced so the 📋 copy button appears), and `--link`. Repeatable `--files` become the
+/// clickable file links; `--reopen` resurrects a settled decision. Delegates to the SAME
+/// `push_event` primitive as `push` (zero divergence — `push` stays for scripts).
+fn compose(args: &[String]) -> i32 {
+    let Some(id) = arg_after(args, "--id").filter(|s| !s.trim().is_empty()) else {
+        eprintln!("decision compose: --id is required");
+        return 2;
+    };
+    let Some(title) = arg_after(args, "--title").filter(|s| !s.trim().is_empty()) else {
+        eprintln!("decision compose: --title is required");
+        return 2;
+    };
+    let reopen = args.iter().any(|a| a == "--reopen");
+    let files = args_after_all(args, "--files").into_iter().map(str::to_string).collect();
+    let detail = compose_detail(args);
+    let e = DecisionEvent {
+        id: id.to_string(),
+        kind: DecisionKind::Open,
+        at: crate::unix_millis() / 1000,
+        project: arg_after(args, "--project").map(str::to_string),
+        title: Some(title.to_string()),
+        summary: arg_after(args, "--summary").map(str::to_string),
+        detail: (!detail.is_empty()).then_some(detail),
+        files,
+        from: arg_after(args, "--from").map(str::to_string),
+        ..Default::default()
+    };
+    match push_event(&decisions_path(), &e, reopen) {
+        Ok(outcome) => {
+            let noop = matches!(outcome, PushOutcome::NoopIdentical | PushOutcome::NoopSettled);
+            let verb = if reopen { "reopen" } else { "compose" };
+            println!("{}", serde_json::json!({ verb: e.id, "outcome": format!("{outcome:?}"), "noop": noop }));
+            0
+        }
+        Err(err) => {
+            eprintln!("decision compose: {err}");
+            1
+        }
+    }
+}
+
+/// Assemble compose's structured flags into the `detail` body, in a FIXED order, as the
+/// SIMPLE-markdown the KIOSK toggle renders: `**bold**` section headers + newlines, and a
+/// fenced ```` ```sh ```` block per `--command` (so the 📋 copy button appears, 5f552e2).
+/// Empty when no structured flag is present (→ no toggle, feature-detect). PURE.
+fn compose_detail(args: &[String]) -> String {
+    let mut sections: Vec<String> = Vec::new();
+    if let Some(enjeux) = arg_after(args, "--enjeux").filter(|s| !s.trim().is_empty()) {
+        sections.push(format!("**Enjeux**\n{enjeux}"));
+    }
+    let options = args_after_all(args, "--options");
+    if !options.is_empty() {
+        let list = options.iter().map(|o| format!("- {o}")).collect::<Vec<_>>().join("\n");
+        sections.push(format!("**Options**\n{list}"));
+    }
+    if let Some(reco) = arg_after(args, "--reco").filter(|s| !s.trim().is_empty()) {
+        sections.push(format!("**Reco**\n{reco}"));
+    }
+    if let Some(effort) = arg_after(args, "--effort").filter(|s| !s.trim().is_empty()) {
+        sections.push(format!("**Effort**\n{effort}"));
+    }
+    for cmd in args_after_all(args, "--command") {
+        sections.push(format!("```sh\n{cmd}\n```"));
+    }
+    if let Some(link) = arg_after(args, "--link").filter(|s| !s.trim().is_empty()) {
+        sections.push(format!("**Lien** — {link}"));
+    }
+    sections.join("\n\n")
 }
 
 fn mark(args: &[String], kind: DecisionKind) -> i32 {
@@ -1364,5 +1462,55 @@ mod tests {
         assert!(!is_noop_open(std::slice::from_ref(&a), &b), "a different pusher is a real content change");
         let same = { let mut e = open("d", "harness", "T", 9); e.from = Some("A".into()); e };
         assert!(is_noop_open(std::slice::from_ref(&a), &same), "same pusher + content → still a no-op");
+    }
+
+    // Item 2 (#kiosk): the NEW `summary` field rides the content axis, folds into the view,
+    // and is part of the idempotence key (a summary change is a real content change).
+    #[test]
+    fn summary_rides_content_axis_and_is_part_of_idempotence() {
+        let log = TmpLog::new();
+        let mut o = open("d", "harness", "Titre gras", 1);
+        o.summary = Some("Un résumé 2-3 lignes\nsous le titre.".into());
+        append_line(log.path(), &o).unwrap();
+        let v = read_decisions_at(log.path(), false);
+        let d = v.iter().find(|d| d.id == "d").unwrap();
+        assert_eq!(d.title.as_deref(), Some("Titre gras"), "title kept (NOT renamed)");
+        assert_eq!(
+            d.summary.as_deref(),
+            Some("Un résumé 2-3 lignes\nsous le titre."),
+            "summary folds into the view, distinct from title"
+        );
+        let same = { let mut e = open("d", "harness", "Titre gras", 9); e.summary = o.summary.clone(); e };
+        assert!(is_noop_open(std::slice::from_ref(&o), &same), "same summary → no-op");
+        let changed = { let mut e = open("d", "harness", "Titre gras", 9); e.summary = Some("autre résumé".into()); e };
+        assert!(!is_noop_open(std::slice::from_ref(&o), &changed), "summary change → appends");
+    }
+
+    // Item 5 (#kiosk): `compose` assembles a DETERMINISTIC detail — fixed section order,
+    // each --command auto-fenced (so the Kiosk shows the 📋 copy button), options as a list.
+    #[test]
+    fn compose_detail_is_deterministic_and_fences_commands() {
+        let args: Vec<String> = [
+            "--enjeux", "perte upstream",
+            "--options", "A: PR maintenant",
+            "--options", "B: attendre",
+            "--reco", "A",
+            "--effort", "30 min",
+            "--command", "git push origin feat/x",
+            "--link", "https://ex/report",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+        let detail = compose_detail(&args);
+        let i_enjeux = detail.find("**Enjeux**").expect("enjeux section");
+        let i_options = detail.find("**Options**").expect("options section");
+        let i_reco = detail.find("**Reco**").expect("reco section");
+        let i_effort = detail.find("**Effort**").expect("effort section");
+        assert!(i_enjeux < i_options && i_options < i_reco && i_reco < i_effort, "deterministic order");
+        assert!(detail.contains("- A: PR maintenant") && detail.contains("- B: attendre"), "options list");
+        assert!(detail.contains("```sh\ngit push origin feat/x\n```"), "command auto-fenced verbatim");
+        assert!(detail.contains("**Lien** — https://ex/report"), "link in footer");
+        assert_eq!(compose_detail(&["--id".to_string(), "x".to_string()]), "", "no sections → empty detail");
     }
 }
