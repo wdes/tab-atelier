@@ -44,6 +44,8 @@ pub mod net_nft;
 pub mod net_policy;
 #[cfg(all(target_os = "linux", not(feature = "gui")))]
 pub mod net_resolver;
+/// Deterministic per-section duration instrumentation (`KALPIN_PERF_INSTRUMENT=1`).
+pub mod perf_instr;
 #[cfg(feature = "pets")]
 pub mod pet;
 pub(crate) mod platform;
