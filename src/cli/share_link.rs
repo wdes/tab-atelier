@@ -2428,26 +2428,39 @@ mod tests {
     #[test]
     fn net_toggles_and_allowlists_reach_the_daemon() {
         with_server(|state| {
-            assert_eq!(net_off(&args(&["0"])), 0);
+            // `net-off` is refused (412) on a host without bubblewrap;
+            // `net-on` always queues (no bwrap needed to un-jail).
+            let bwrap = crate::bwrap_available();
+            assert_eq!(net_off(&args(&["0"])), i32::from(!bwrap));
             assert_eq!(net_on(&args(&["0"])), 0);
             let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let flags: Vec<bool> = s.pending_net_changes.iter().map(|(_, off)| *off).collect();
-            assert_eq!(flags, vec![true, false]);
+            assert_eq!(flags, if bwrap { vec![true, false] } else { vec![false] });
             drop(s);
             assert_eq!(net_off(&args(&[])), 2);
             assert_eq!(net_on(&args(&["nope"])), 1);
             // Allowlist mode: presets/domains/cidrs are merged server-side.
-            assert_eq!(
+            // Headless-only — the GUI answers 501 (nftables enforcement needs
+            // CAP_NET_ADMIN it doesn't have), so there the verb must FAIL.
+            #[cfg(feature = "gui")]
+            assert_ne!(
                 net_allow("0", &["claude-code".into()], &[], &[], false, false, false),
                 0
             );
-            assert_eq!(
-                net_allow("0", &[], &["example.com".into()], &[], false, true, false),
-                0,
-                "--add"
-            );
-            assert_eq!(net_allow("0", &[], &[], &["10.0.0.0/8".into()], false, false, false), 0);
-            assert_eq!(net_allow("0", &[], &[], &[], true, false, false), 0, "--clear");
+            #[cfg(not(feature = "gui"))]
+            {
+                assert_eq!(
+                    net_allow("0", &["claude-code".into()], &[], &[], false, false, false),
+                    0
+                );
+                assert_eq!(
+                    net_allow("0", &[], &["example.com".into()], &[], false, true, false),
+                    0,
+                    "--add"
+                );
+                assert_eq!(net_allow("0", &[], &[], &["10.0.0.0/8".into()], false, false, false), 0);
+                assert_eq!(net_allow("0", &[], &[], &[], true, false, false), 0, "--clear");
+            }
             // Junk in either list is caught before the request goes out.
             assert_ne!(
                 net_allow("0", &["not-a-preset".into()], &[], &[], false, false, false),
@@ -2473,13 +2486,20 @@ mod tests {
     #[test]
     fn ssh_agent_and_default_limits_are_queued() {
         with_server(|state| {
-            assert_eq!(ssh_agent("0", Some("/tmp/id_ed25519"), false), 0);
-            assert_eq!(ssh_agent("0", None, true), 0, "--off");
-            assert_eq!(ssh_agent("nope", None, true), 1);
-            let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            assert_eq!(s.pending_ssh_agent_changes.len(), 2);
-            assert!(s.pending_ssh_agent_changes[1].1.is_none(), "--off clears it");
-            drop(s);
+            // Per-tab agents are headless-only — the GUI answers 501 and
+            // never drains the queue, so there the verb must FAIL.
+            #[cfg(feature = "gui")]
+            assert_ne!(ssh_agent("0", None, true), 0);
+            #[cfg(not(feature = "gui"))]
+            {
+                assert_eq!(ssh_agent("0", Some("/tmp/id_ed25519"), false), 0);
+                assert_eq!(ssh_agent("0", None, true), 0, "--off");
+                assert_eq!(ssh_agent("nope", None, true), 1);
+                let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                assert_eq!(s.pending_ssh_agent_changes.len(), 2);
+                assert!(s.pending_ssh_agent_changes[1].1.is_none(), "--off clears it");
+                drop(s);
+            }
             assert_eq!(limit_default(Some("1G"), Some(75), Some(200), false), 0);
             assert_eq!(limit_default(None, None, None, true), 0, "--clear");
             assert_eq!(limit_default(None, None, None, false), 2, "nothing to set");

@@ -988,7 +988,10 @@ mod tests {
                 s.pending_input.len(),
             );
             drop(s);
-            assert_eq!((closes, renames, locks, nets, inputs), (1, 1, 2, 2, 1));
+            // `net-off` is refused (412) on a host without bubblewrap, so
+            // only `net-on` queues there.
+            let nets_expected = 1 + usize::from(crate::bwrap_available());
+            assert_eq!((closes, renames, locks, nets, inputs), (1, 1, 2, nets_expected, 1));
         });
     }
 
