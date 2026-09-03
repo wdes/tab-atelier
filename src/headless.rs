@@ -51,6 +51,18 @@ const TICK_IDLE: Duration = Duration::from_millis(250);
 /// How long after the last API/WS activity the fast tick stays armed
 /// (covers think-pauses between keystrokes).
 const TICK_HOT: Duration = Duration::from_secs(2);
+/// Snapshot re-scan throttle. A tab that STREAMS advances its PTY ring every
+/// tick, so the cheap `ring_len` gate never skips it and the full
+/// `ansi_text_with_cursor(200)` + crc32 (`cached_grid`) used to run at the
+/// fast tick rate — the dominant per-streaming-tab cost (615 ms/window,
+/// instrumented). This caps that re-scan to at most once per window: a
+/// streaming tab reuses its memoised snapshot until the window elapses.
+/// Only the snapshot/preview (`/tabs`, `/dashboard/state`, persist,
+/// `output_crc`) is throttled — the live terminal stream (`ws_forward`) is
+/// untouched. Chosen ≪ Brian's ~20 s freeze threshold so an active tab always
+/// refreshes its `output_crc` well inside the window (no false freeze), while a
+/// truly idle tab is already skipped by the `ring_len` gate (zero re-scan).
+const SNAPSHOT_THROTTLE: Duration = Duration::from_millis(500);
 
 // Shared with the GUI — see `crate::tab_env_extras`,
 // `crate::api_url_for_local_clients`, and
@@ -189,6 +201,11 @@ struct HeadlessTab {
     /// that hasn't advanced means the grid is byte-for-byte identical
     /// and the previous scan can be reused. `None` until the first scan.
     snap_cache: Option<crate::term_export::GridSnapshotCache>,
+    /// Wall-clock of the last actual grid re-scan (ANSI + crc), the throttle
+    /// clock for [`SNAPSHOT_THROTTLE`]. Seeded to spawn time so the very first
+    /// snapshot is immediate (the `snap_cache: None` first-scan path bypasses
+    /// the throttle anyway, but seeding keeps the elapsed reading meaningful).
+    last_scan_at: Instant,
     /// Per-tab resource-limit overrides, carried so `persist()` writes
     /// them back to `tabs.json` instead of wiping them each tick.
     limits: crate::TabResourceLimits,
@@ -426,6 +443,7 @@ impl HeadlessTab {
         let ring_len = self.ring_total_len();
         let want_raw = self.viewer_count() > 0;
         let stale = self.snap_cache.as_ref().is_none_or(|c| c.ring_len != ring_len);
+        let has_cache = self.snap_cache.is_some();
         let needs_raw_backfill = want_raw
             && self
                 .snap_cache
@@ -441,16 +459,26 @@ impl HeadlessTab {
                 .map(crate::term_export::GridSnapshotCache::without_raw);
             self.snap_cache = dropped;
         }
-        // Reuse the cached scan when the ring hasn't advanced; the early return
+        // Reuse the memoised scan unless a re-scan is actually due — the cheap
+        // `ring_len` skip for idle tabs PLUS the throttle for streaming ones
+        // (see `should_rescan_snapshot` / `SNAPSHOT_THROTTLE`). The early return
         // ends the borrow so the miss path can re-borrow `self` mutably. Returns
         // owned (the sole caller cloned it anyway), so there's no infallible
         // `expect` on an always-Some cache.
-        if !stale
-            && !needs_raw_backfill
-            && let Some(c) = self.snap_cache.as_ref()
+        let since_last_scan = self.last_scan_at.elapsed();
+        if !should_rescan_snapshot(
+            has_cache,
+            stale,
+            needs_raw_backfill,
+            since_last_scan,
+            snapshot_throttle(),
+        ) && let Some(c) = self.snap_cache.as_ref()
         {
             return c.clone();
         }
+        // Only the miss/re-scan path is timed — cache-hit returns above are ~free.
+        // This `grid_scan` counter (ms + calls / window) is the S2 before/after proof.
+        let _perf = crate::perf_instr::time(crate::perf_instr::Section::GridScan);
         let (output, cursor) = self.ansi_text_with_cursor(Some(200));
         let (raw_output, raw_cursor) = if want_raw {
             self.raw_screen_text(Some(2000))
@@ -461,12 +489,52 @@ impl HeadlessTab {
         let grid =
             crate::term_export::GridSnapshotCache::new(ring_len, output, cursor, raw_output, raw_cursor, cols, rows);
         self.snap_cache = Some(grid.clone());
+        self.last_scan_at = Instant::now();
         grid
     }
 
     fn copy_all_history(&self) -> String {
         self.ansi_text_with_cursor(None).0
     }
+}
+
+/// Decide whether [`HeadlessTab::cached_grid`] must pay the expensive
+/// terminal→ANSI + crc32 scan, or can hand back the memoised snapshot. Pure so
+/// the throttle policy is unit-tested without a live PTY; wired into the sole
+/// caller above. Returns `true` = re-scan now.
+///
+/// * no cache yet (`!has_cache`) → re-scan — first-scan seeding, immediate, no boot lag.
+/// * viewer needs the raw dump backfilled → re-scan — a freshly-attached viewer wants scrollback now.
+/// * ring didn't advance (`!stale`) → reuse — the idle-tab O(1) `ring_len` skip.
+/// * ring advanced → re-scan only once `since_last_scan >= throttle`,
+///   coalescing a streaming tab's per-tick churn into ≤1 scan per window.
+///
+/// A truly frozen tab produces no output ⇒ `!stale` ⇒ never re-scans ⇒ its
+/// `output_crc` stays put (Brian's freeze detector still fires); an active tab
+/// re-scans every `throttle` ≪ Brian's threshold, so its crc keeps moving.
+fn should_rescan_snapshot(
+    has_cache: bool,
+    stale: bool,
+    needs_raw_backfill: bool,
+    since_last_scan: Duration,
+    throttle: Duration,
+) -> bool {
+    !has_cache || needs_raw_backfill || (stale && since_last_scan >= throttle)
+}
+
+/// Resolved snapshot throttle window. Defaults to [`SNAPSHOT_THROTTLE`];
+/// `KALPIN_SNAPSHOT_THROTTLE_MS` overrides it (read once). `0` disables the
+/// throttle — every stale tab re-scans, the pre-fix behaviour — so the S2
+/// before/after grid-scan measurement is a clean same-binary A/B.
+/// ponytail: env-tunable, no hot reload — a restart picks up a new value.
+fn snapshot_throttle() -> Duration {
+    static W: std::sync::LazyLock<Duration> = std::sync::LazyLock::new(|| {
+        std::env::var("KALPIN_SNAPSHOT_THROTTLE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map_or(SNAPSHOT_THROTTLE, Duration::from_millis)
+    });
+    *W
 }
 
 /// Wrap `pty` in the ring tap, start its event loop, and hook up the
@@ -897,6 +965,7 @@ fn spawn_pty_tab(
         ring_len_mirror,
         pty_ring,
         snap_cache: None,
+        last_scan_at: Instant::now(),
         limits: crate::TabResourceLimits::default(),
         #[cfg(feature = "catbus")]
         tokens_last_saved: None,
@@ -934,6 +1003,9 @@ pub fn run() -> std::io::Result<()> {
     }
 
     info!("starting {}", crate::version_line("tab-atelier-headless"));
+    // Deterministic perf breakdown to stderr every 10 s — inert unless
+    // `KALPIN_PERF_INSTRUMENT=1`. The S2 grid-scan before/after evidence.
+    crate::perf_instr::spawn_reporter();
 
     // Hot-swap handoff: when the previous daemon exec'd into us it left
     // `--handoff <manifest>` on argv, naming the live PTY fds it kept
@@ -1513,6 +1585,9 @@ fn refresh_snapshot(
     #[cfg(feature = "energy")] battery_percent: &Arc<Mutex<Option<u8>>>,
     client_hot: bool,
 ) {
+    // Times the whole refresh pass; `grid_scan` (per tab, in `cached_grid`) is a
+    // subset. The remainder ≈ the `SnapshotTab` build + snapshot writeback.
+    let _perf = crate::perf_instr::time(crate::perf_instr::Section::RefreshTotal);
     #[cfg(not(target_os = "linux"))]
     let _ = client_hot;
     // Connection metering (unprivileged /proc scan) + nftables byte
@@ -2769,4 +2844,165 @@ fn drain_pending(
         }
     }
     did_work
+}
+
+#[cfg(test)]
+mod throttle_tests {
+    //! S3 non-regression for the `cached_grid` snapshot throttle. All exercise
+    //! the pure decision `should_rescan_snapshot`, which the sole caller
+    //! (`HeadlessTab::cached_grid`) is wired to — so a green test here is a
+    //! green throttle on the running path.
+    use super::{SNAPSHOT_THROTTLE, should_rescan_snapshot};
+    use std::time::Duration;
+
+    /// Brian's dead-man's-switch (`src/cli/brain.rs` `STABLE_SECS`): a tab whose
+    /// `output_crc` hasn't moved for this long is declared frozen. The throttle
+    /// must stay well under it. Mirrored (the const is private to `brain.rs`).
+    const BRIAN_FREEZE: Duration = Duration::from_secs(20);
+
+    #[test]
+    fn first_scan_is_immediate() {
+        // (b) No cache yet → scan now regardless of the throttle clock, so the
+        // first snapshot never lags at boot (seeding).
+        assert!(should_rescan_snapshot(
+            false,
+            false,
+            false,
+            Duration::ZERO,
+            SNAPSHOT_THROTTLE
+        ));
+        assert!(should_rescan_snapshot(
+            false,
+            true,
+            false,
+            Duration::ZERO,
+            SNAPSHOT_THROTTLE
+        ));
+    }
+
+    #[test]
+    fn idle_tab_is_skipped() {
+        // (c) Ring didn't advance → reuse cache, even long past the window. This
+        // is the pre-existing cheap `ring_len` gate, untouched by the throttle.
+        assert!(!should_rescan_snapshot(
+            true,
+            false,
+            false,
+            SNAPSHOT_THROTTLE * 10,
+            SNAPSHOT_THROTTLE
+        ));
+    }
+
+    #[test]
+    fn streaming_tab_coalesced_within_window() {
+        // The win: ring advanced (stale) but inside the throttle window → reuse
+        // the cache instead of paying the ANSI+crc scan every tick.
+        assert!(!should_rescan_snapshot(
+            true,
+            true,
+            false,
+            SNAPSHOT_THROTTLE / 2,
+            SNAPSHOT_THROTTLE
+        ));
+        assert!(!should_rescan_snapshot(
+            true,
+            true,
+            false,
+            Duration::ZERO,
+            SNAPSHOT_THROTTLE
+        ));
+    }
+
+    #[test]
+    fn streaming_tab_rescans_after_window() {
+        // (c) The snapshot DOES refresh once the window elapses — no permanently
+        // frozen tile, and the throttled `output` is fresh enough for compaction
+        // detection (`detect_compaction` runs on `grid.output` each tick; the
+        // post-compaction low-context screen persists, so the drop is caught
+        // within one window).
+        assert!(should_rescan_snapshot(
+            true,
+            true,
+            false,
+            SNAPSHOT_THROTTLE,
+            SNAPSHOT_THROTTLE
+        ));
+        assert!(should_rescan_snapshot(
+            true,
+            true,
+            false,
+            SNAPSHOT_THROTTLE * 3,
+            SNAPSHOT_THROTTLE
+        ));
+    }
+
+    #[test]
+    fn viewer_backfill_bypasses_throttle() {
+        // A viewer just attached and the cache lacks raw scrollback → scan now;
+        // don't make them wait a throttle window for their first scrollback.
+        assert!(should_rescan_snapshot(
+            true,
+            false,
+            true,
+            Duration::ZERO,
+            SNAPSHOT_THROTTLE
+        ));
+        assert!(should_rescan_snapshot(
+            true,
+            true,
+            true,
+            Duration::ZERO,
+            SNAPSHOT_THROTTLE
+        ));
+    }
+
+    #[test]
+    fn brian_freeze_detection_survives_throttle() {
+        // (a) THE Olympe constraint. Two facts prove the throttle can't fool Brian.
+
+        // 1. The window sits far below Brian's freeze threshold, so an ACTIVE tab
+        //    (ring advancing → stale every tick) re-scans — and can refresh its
+        //    output_crc — many times inside one freeze window.
+        assert!(SNAPSHOT_THROTTLE < BRIAN_FREEZE);
+        let rescans_per_window = BRIAN_FREEZE.as_millis() / SNAPSHOT_THROTTLE.as_millis();
+        assert!(
+            rescans_per_window >= 10,
+            "throttle must give an active tab many crc refreshes per freeze window"
+        );
+
+        // Simulate an active tab polled every 100 ms across a full freeze window:
+        // it must trigger a re-scan (a crc-refresh opportunity) well before
+        // Brian's clock could reach STABLE_SECS.
+        let tick = Duration::from_millis(100);
+        let mut since_last_scan = Duration::ZERO;
+        let mut first_rescan_at: Option<Duration> = None;
+        let mut elapsed = Duration::ZERO;
+        while elapsed < BRIAN_FREEZE {
+            // stale = true every tick models a streaming/active tab.
+            if should_rescan_snapshot(true, true, false, since_last_scan, SNAPSHOT_THROTTLE) {
+                first_rescan_at.get_or_insert(elapsed);
+                since_last_scan = Duration::ZERO; // a scan happened → clock resets
+            } else {
+                since_last_scan += tick;
+            }
+            elapsed += tick;
+        }
+        let at = first_rescan_at.expect("an active tab must re-scan within the freeze window");
+        assert!(
+            at < BRIAN_FREEZE,
+            "crc refresh must land before Brian's freeze threshold"
+        );
+
+        // 2. A FROZEN tab (no output → ring never advances → stale = false) never
+        //    re-scans, so its output_crc stays put and the dead-man's-switch still
+        //    fires. The throttle changes nothing here — a frozen tab was already
+        //    skipped by the ring_len gate before this fix.
+        assert!(!should_rescan_snapshot(
+            true,
+            false,
+            false,
+            BRIAN_FREEZE * 2,
+            SNAPSHOT_THROTTLE
+        ));
+    }
 }
