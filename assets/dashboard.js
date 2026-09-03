@@ -1750,7 +1750,6 @@ export function decisionFileHtml(f, canRule) {
 // reveals the long-form body (collapsed by default). No `detail` → no toggle (feature-detect).
 export function decisionCardHtml(d) {
   const state = String(d.state || "open");
-  const isRead = state === "read" || state === "tranched" || state === "archived";
   const isTranched = state === "tranched" || state === "archived";
   // Bug2 UX guard: no page token -> the daemon rejects Lu/Tranché (read-only dashboard
   // without the ruling scope). Disable the controls with a hint rather than fail silently.
@@ -1765,9 +1764,10 @@ export function decisionCardHtml(d) {
   const links = files.length
     ? `<div class="kk-files">${files.map((f) => decisionFileHtml(f, canRule)).join("")}</div>`
     : "";
-  // Lu is the only actionable notch; Tranché is a STATE INDICATOR (always disabled) — the
-  // ruling action is the explicit "Trancher" button (Bug3), so submission is evident.
-  const luDisabled = isRead || !canRule;
+  // Item 4 (#kiosk): the "Lu" mark-read checkbox was removed (the state tag already shows
+  // "lu"/"à trancher", and ruling is the explicit Trancher button) — one less useless notch.
+  // Tranché stays as a STATE INDICATOR (always disabled). The read/passive state still folds
+  // server-side; the POST /decisions/<id>/read route is untouched for any other caller.
   const ruleDisabled = isTranched || !canRule;
   // Feature-detect: the toggle exists ONLY when a non-empty `detail` was served (a
   // detail-less decision degrades gracefully to no toggle, no empty body).
@@ -1776,13 +1776,18 @@ export function decisionCardHtml(d) {
     ? ` <button type="button" class="kk-detail-toggle" aria-expanded="false" title="déplier le détail">(+)</button>`
     : "";
   const detailBody = hasDetail ? `<div class="kk-detail" hidden>${renderDetail(d.detail)}</div>` : "";
+  // Item 2 (#kiosk): a NEW `summary` (2-3 lines) renders UNDER the bold title, above the
+  // toggle — the render structure is: titre gras → résumé → toggle (+)/(-) → detail. Absent
+  // summary → no block (feature-detect). renderProse escapes + keeps **bold** / newlines.
+  const hasSummary = typeof d.summary === "string" && d.summary.trim().length > 0;
+  const summaryBlock = hasSummary ? `<div class="kk-summary">${renderProse(d.summary)}</div>` : "";
   return `<div class="kk-card kk-state-${escapeHtml(state)}" data-id="${id}" data-state="${escapeHtml(state)}">
     <div class="kk-head">
-      <label class="kk-check"><input type="checkbox" class="kk-lu"${isRead ? " checked" : ""}${luDisabled ? " disabled" : ""}> Lu</label>
       <label class="kk-check"><input type="checkbox" class="kk-tranche" disabled${isTranched ? " checked" : ""}> Tranché</label>
       <span class="kk-title">${escapeHtml(String(d.title || d.id || ""))}</span>
       <span class="kk-state-tag">${escapeHtml(DECISION_STATE_LABEL[state] || state)}</span>${detailToggle}
     </div>
+    ${summaryBlock}
     ${line("pourquoi gaté", d.whyGated)}
     ${line("reco", d.reco)}
     ${line("effort", d.effort)}
@@ -1965,13 +1970,8 @@ async function submitTranch(card) {
 async function handleKioskAction(target) {
   const card = target.closest && target.closest(".kk-card");
   if (!card) return false;
-  if (target.closest(".kk-lu")) {
-    const msg = card.querySelector(".kk-msg");
-    const fail = (t) => { if (msg) { msg.textContent = t; msg.className = "kk-msg err"; } };
-    try { const res = await decisionPost(card.dataset.id, "read", {}); if (res.ok) openKiosk(); else fail(`erreur ${res.status}`); }
-    catch (err) { fail(`réseau : ${err.message}`); }
-    return true;
-  }
+  // Item 4 (#kiosk): the "Lu" mark-read action was removed from the panel — the only
+  // remaining Kiosk action is Trancher (the explicit ruling).
   if (target.closest(".kk-send")) { submitTranch(card); return true; }
   return false;
 }
@@ -2199,7 +2199,7 @@ function bootstrap() {
       // click copies it so the reader can paste it. Best-effort (no clipboard → silent no-op).
       const ref = e.target.closest(".kk-file-ref");
       if (ref) { copyToClipboard(ref); return; }
-      if (e.target.closest(".kk-lu, .kk-send")) { handleKioskAction(e.target); return; }
+      if (e.target.closest(".kk-send")) { handleKioskAction(e.target); return; }
     });
     // Bug3: Enter in the verdict field submits the ruling (as well as the "Trancher" button).
     kioskPanel.addEventListener("keydown", (e) => {
