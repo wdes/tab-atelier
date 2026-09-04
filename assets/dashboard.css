@@ -728,6 +728,9 @@ body.band-view { min-height: calc(100vh + 180px); }
 .cat-group-caret { display: inline-block; width: 1em; }
 .cat-group-count { color: var(--muted); font-weight: 400; }
 .cat-group-body[hidden] { display: none; }
+/* distilled agent cards surfaced in the "catégorie" mode: read-only, origin tag. */
+.cat-origin { color: var(--muted); font-size: 0.72rem; font-weight: 400; }
+.cat-skill.cat-readonly .cat-name { font-weight: 500; }
 
 .cat-skill { border-bottom: 1px solid var(--border); }
 .cat-skill-head {

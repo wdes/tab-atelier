@@ -313,14 +313,17 @@ export function catalogView(readModel) {
     .sort((a, b) => String(a.skill).localeCompare(String(b.skill)));
 }
 
-// The category-sort MODES (Option A): mechanical sort/group on a field ALREADY on the
-// read-model — pur-vue, zero core, deterministic. The SEMANTIC "category" source (group
-// by the distilled-profile `type`, B3) plugs in here as one more mode once its data
-// shape is pinned; the UI mechanism below is identical whichever source is chosen.
+// The category-sort MODES. Option A (name/usage/status) = mechanical sort/group on a
+// field ALREADY on the ACTIVE skills — pur-vue, zero core, deterministic. Option B3
+// "category" = data-backed SEMANTIC grouping by the `skill` a card was distilled from,
+// over the COMBINED active-templates + retired distilled-agent cards (`readModel.retired`,
+// already served by /catalog/list — still zero core). Upgrade path: when the distillation
+// emits a real `type`, re-point catGroupKey below from `skill` to `type` (zero UI rework).
 export const CATALOG_SORT_MODES = [
   { value: "name", label: "nom" },
   { value: "usage", label: "usage" },
   { value: "status", label: "statut" },
+  { value: "category", label: "catégorie" },
 ];
 
 // Pure: the skills folded into an ORDERED list of GROUPS `{label, count, skills}` for a
@@ -331,7 +334,9 @@ export function catalogGroups(readModel, mode = "name") {
   const live = skills.filter((s) => s && s.skill != null);
   const alpha = (a, b) => String(a.skill).localeCompare(String(b.skill));
   const usageOf = (s) => (s.usageCount != null ? Number(s.usageCount) : 0);
-  const isRetired = (s) => s.deleted === true || s.tombstoned === true || s.retiredAt != null;
+  // "deleted" = the SC3 soft-delete flag ONLY. NOT retiredAt: active templates carry a
+  // stale retiredAt timestamp, so it can't gate active-vs-deleted.
+  const isDeleted = (s) => s.deleted === true || s.tombstoned === true;
   const withCount = (g) => ({ ...g, count: g.skills.length });
 
   if (mode === "usage") {
@@ -349,9 +354,36 @@ export function catalogGroups(readModel, mode = "name") {
   }
   if (mode === "status") {
     return [
-      { label: "actifs", skills: live.filter((s) => !isRetired(s)).sort(alpha) },
-      { label: "supprimés", skills: live.filter(isRetired).sort(alpha) },
+      { label: "actifs", skills: live.filter((s) => !isDeleted(s)).sort(alpha) },
+      { label: "supprimés", skills: live.filter(isDeleted).sort(alpha) },
     ].filter((g) => g.skills.length).map(withCount);
+  }
+  if (mode === "category") {
+    // B3 (data-backed): group the COMBINED active templates + retired distilled-agent
+    // cards by the `skill` they were distilled from. `.retired` is already served by
+    // /catalog/list -> still pur-vue / zero core. Cards with no skill (one-off distilled
+    // agents) fall into "Divers", always last. Biggest cluster first, ties alpha.
+    const retired = readModel && Array.isArray(readModel.retired) ? readModel.retired : [];
+    const all = live.concat(retired.filter((s) => s && (s.skill != null || s.name != null)));
+    const catKey = (s) => (s.skill != null ? String(s.skill) : null); // <- swap to s.type once distillation emits it
+    const DIVERS = "Divers / non catégorisé";
+    const activeRef = new Set(live); // provenance: active templates head their cluster (retiredAt is set even on active)
+    const within = (a, b) =>
+      (activeRef.has(b) - activeRef.has(a)) ||
+      String(a.name || a.skill || "").localeCompare(String(b.name || b.skill || ""));
+    const byKey = new Map();
+    for (const s of all) {
+      const k = catKey(s) || DIVERS;
+      if (!byKey.has(k)) byKey.set(k, []);
+      byKey.get(k).push(s);
+    }
+    return [...byKey.entries()]
+      .map(([label, skills]) => ({ label, skills: skills.slice().sort(within) }))
+      .sort((a, b) =>
+        ((a.label === DIVERS) - (b.label === DIVERS)) ||
+        (b.skills.length - a.skills.length) ||
+        a.label.localeCompare(b.label))
+      .map(withCount);
   }
   // default "name": one flat, header-less group = the historical catalogView list.
   return [{ label: null, count: live.length, skills: catalogView(readModel) }];
@@ -1557,9 +1589,17 @@ function metricsTableHtml(skill) {
 
 // One skill row: a header (proper name + version) that toggles a collapsible body
 // (profile + metrics). The long prompt reuses the 'voir plus' fold (clippedHtml).
-function catalogSkillHtml(skill) {
+function catalogSkillHtml(skill, editable = true) {
   const p = skillProfileModel(skill);
   const deleted = !!(skill && (skill.deleted === true || skill.tombstoned === true));
+  // A distilled AGENT card carries a proper `name` (Colette, Ponytail…) and is surfaced
+  // read-only in the "catégorie" mode. `editable` is provenance-driven (in readModel.skills
+  // = an active skill-TEMPLATE, keeps the SC3 form) — NOT a field heuristic: even active
+  // templates carry a `retiredAt`, so that field can't gate editability. displayName falls
+  // back to the card's `name` for distilled/skill==null cards. Active view = unchanged.
+  const distilled = !!(skill && skill.name != null);
+  const displayName = distilled ? String(skill.name) : (p.name || "(sans nom)");
+  const origin = distilled && p.name ? ` <span class="cat-origin" title="distillé depuis">◦ ${escapeHtml(p.name)}</span>` : "";
   const list = (label, xs) => (xs.length ? `<div class="cat-field"><span class="cat-key">${label}</span> ${xs.map((x) => `<span class="cat-tag">${escapeHtml(x)}</span>`).join(" ")}</div>` : "");
   const ver = p.promptVersion != null ? ` <span class="cat-ver">v${escapeHtml(String(p.promptVersion))}</span>` : "";
   const pvAttr = p.promptVersion != null ? escapeHtml(String(p.promptVersion)) : "";
@@ -1576,8 +1616,8 @@ function catalogSkillHtml(skill) {
         <span class="cat-edit-msg" role="status"></span>
       </div>
     </form>`;
-  return `<div class="cat-skill${deleted ? " cat-deleted" : ""}" data-skill="${escapeHtml(p.name)}">
-    <button class="cat-skill-head" aria-expanded="false"><span class="cat-caret">▸</span> <span class="cat-name">${escapeHtml(p.name)}</span>${ver}${deleted ? ` <span class="cat-tombstone">supprimé</span>` : ""}</button>
+  return `<div class="cat-skill${deleted ? " cat-deleted" : ""}${editable ? "" : " cat-readonly"}" data-skill="${escapeHtml(p.name)}">
+    <button class="cat-skill-head" aria-expanded="false"><span class="cat-caret">▸</span> <span class="cat-name">${escapeHtml(displayName)}</span>${ver}${origin}${deleted ? ` <span class="cat-tombstone">supprimé</span>` : ""}</button>
     <div class="cat-skill-body" hidden>
       ${p.specialty ? `<div class="cat-field"><span class="cat-key">specialty</span> ${escapeHtml(p.specialty)}</div>` : ""}
       ${p.prompt ? `<div class="cat-field"><span class="cat-key">prompt</span> <span class="cat-prompt">${clippedHtml(p.prompt)}</span></div>` : ""}
@@ -1585,7 +1625,7 @@ function catalogSkillHtml(skill) {
       ${list("tools", p.tools)}
       ${list("patterns", p.patterns)}
       ${metricsTableHtml(skill)}
-      ${editForm}
+      ${editable ? editForm : ""}
     </div>
   </div>`;
 }
@@ -1594,12 +1634,18 @@ function catalogHtml(readModel) {
   const groups = catalogGroups(readModel, catalogMode);
   const total = groups.reduce((n, g) => n + g.count, 0);
   const grouped = groups.length > 1 || (groups[0] && groups[0].label != null);
+  // Editability is PROVENANCE-driven: a card is an editable skill-template iff it's in the
+  // active `readModel.skills` (object-ref set) — retired/distilled cards surfaced by the
+  // "catégorie" mode render read-only. In name/usage/statut modes every card is active ->
+  // editable=true -> the SC3 form is unchanged (non-breaking).
+  const activeSet = new Set(readModel && Array.isArray(readModel.skills) ? readModel.skills : []);
+  const card = (s) => catalogSkillHtml(s, activeSet.has(s));
   // A `label:null` group renders flat (name mode); a labelled group gets a collapsible
-  // header `▾ Label (n)` (usage/statut modes). Reuses catalogSkillHtml unchanged.
+  // header `▾ Label (n)` (usage/statut/catégorie modes).
   const groupHtml = (g) =>
     g.label == null
-      ? g.skills.map(catalogSkillHtml).join("")
-      : `<div class="cat-group"><button class="cat-group-head" aria-expanded="true"><span class="cat-group-caret">▾</span> <span class="cat-group-label">${escapeHtml(g.label)}</span> <span class="cat-group-count">(${g.count})</span></button><div class="cat-group-body">${g.skills.map(catalogSkillHtml).join("")}</div></div>`;
+      ? g.skills.map(card).join("")
+      : `<div class="cat-group"><button class="cat-group-head" aria-expanded="true"><span class="cat-group-caret">▾</span> <span class="cat-group-label">${escapeHtml(g.label)}</span> <span class="cat-group-count">(${g.count})</span></button><div class="cat-group-body">${g.skills.map(card).join("")}</div></div>`;
   const body = total
     ? groups.map(groupHtml).join("")
     : `<div class="cat-empty">Aucun skill au catalogue.</div>`;
