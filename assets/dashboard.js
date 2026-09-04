@@ -1997,26 +1997,36 @@ async function handleKioskAction(target) {
   return false;
 }
 
+// S1a: the ETag of the last /dashboard/state body we rendered. Sent back as
+// If-None-Match so an unchanged fleet returns 304 (no body, no re-render).
+let lastStateEtag = null;
+
 async function poll() {
   const status = document.getElementById("status");
   const headers = { accept: "application/json", ...AUTH_HEADERS };
+  const stateHeaders = lastStateEtag ? { ...headers, "If-None-Match": lastStateEtag } : headers;
   try {
     // /tabs/usage (RAM/CPU tooltip) and /dashboard/activity (S4 panel) are
     // best-effort side legs; their failure never breaks the dashboard — only the
     // state poll gates 'live'/'offline'.
     const [res, usageRes, actRes] = await Promise.all([
-      fetch(STATE_URL, { headers }),
+      fetch(STATE_URL, { headers: stateHeaders }),
       fetch(USAGE_URL, { headers }).catch(() => null),
       fetch(ACTIVITY_URL, { headers }).catch(() => null),
     ]);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
     if (usageRes && usageRes.ok) {
       try { usageById = usageMap(await usageRes.json()); } catch { /* keep last */ }
     }
     if (actRes && actRes.ok) {
       try { renderActivity(activityModel(await actRes.json())); } catch { /* keep last */ }
     }
-    applyState(await res.json());
+    // 304 → the fleet is byte-identical to what we already rendered: keep it and
+    // skip the re-parse/re-render entirely. Only a real 200 re-renders.
+    if (res.status !== 304) {
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      lastStateEtag = res.headers.get("ETag");
+      applyState(await res.json());
+    }
     if (status) status.textContent = "live";
     if (status) status.className = "status ok";
   } catch (err) {
