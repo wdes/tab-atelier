@@ -42,6 +42,13 @@ const SCOPE_TAIL_BYTES: usize = 4096;
 const NUDGE_BACKOFF_BASE_SECS: u64 = 60;
 /// Backoff ceiling — a long outage still gets a retry roughly every 15 min.
 const NUDGE_BACKOFF_MAX_SECS: u64 = 900;
+/// Auth-breaker back-off base/ceiling. On a 401/403 from the daemon API the
+/// token is bad/expired — every call fails identically until it's fixed, so
+/// brain stops nudging (and stops hammering the API) instead of re-nudging every
+/// tick. Doubles per consecutive auth failure, resets on the next authorised
+/// call. Distinct from the count-based storm breaker (which keys on fleet size).
+const AUTH_BACKOFF_BASE_SECS: u64 = 60;
+const AUTH_BACKOFF_MAX_SECS: u64 = 900;
 
 /// Captive-portal-style connectivity probe.
 ///
@@ -629,6 +636,65 @@ fn backoff_secs(streak: u32) -> u64 {
         .min(NUDGE_BACKOFF_MAX_SECS)
 }
 
+/// Seconds brain suppresses nudges after `streak` consecutive auth failures:
+/// `AUTH_BACKOFF_BASE_SECS * 2^(streak-1)`, capped. So 60s, 120s, 240s, 480s,
+/// 900s, 900s… Mirrors [`backoff_secs`] but keyed on the auth episode.
+fn auth_backoff_secs(streak: u32) -> u64 {
+    let shift = streak.saturating_sub(1).min(6);
+    AUTH_BACKOFF_BASE_SECS
+        .saturating_mul(1u64 << shift)
+        .min(AUTH_BACKOFF_MAX_SECS)
+}
+
+/// A hard auth rejection (401/403): the daemon token is bad/expired, so retrying
+/// won't help until it's restored — unlike a transient network error (5xx/429),
+/// which is worth another tick. Keeps the [`AuthBreaker`] from tripping on those.
+fn is_auth_error(e: &ureq::Error) -> bool {
+    matches!(e, ureq::Error::StatusCode(401 | 403))
+}
+
+/// Auth circuit-breaker, threaded across ticks like `breaker_until`. While open,
+/// brain skips the whole tick — no fetch, no nudge — because a rejected token
+/// makes every call futile (the "brain kept nudging through a 401" bug). Trips
+/// on an auth error, backs off exponentially, and clears the moment an
+/// authorised call succeeds.
+#[derive(Default)]
+struct AuthBreaker {
+    /// While `Some(t)` and `now < t`, the breaker is open.
+    until: Option<Instant>,
+    /// Consecutive auth failures — drives the exponential back-off.
+    streak: u32,
+}
+
+impl AuthBreaker {
+    /// Record an auth failure `now`: grow the streak, arm the back-off, log once.
+    fn trip(&mut self, now: Instant) {
+        self.streak = self.streak.saturating_add(1);
+        let wait = auth_backoff_secs(self.streak);
+        let streak = self.streak;
+        self.until = Some(now + Duration::from_secs(wait));
+        eprintln!(
+            "⛑ brain: daemon auth rejected (401/403) — token bad/expired; \
+             suppressing all nudges for {wait}s (streak {streak}). No nudge can \
+             land until auth is restored."
+        );
+    }
+
+    /// Called after any authorised call succeeds: clear the breaker (recovered).
+    fn clear(&mut self) {
+        if self.until.is_some() || self.streak > 0 {
+            eprintln!("⛑ brain: daemon auth restored — resuming nudges.");
+        }
+        self.until = None;
+        self.streak = 0;
+    }
+
+    /// True while the back-off window is open (caller skips the tick).
+    fn is_open(&self, now: Instant) -> bool {
+        self.until.is_some_and(|t| now < t)
+    }
+}
+
 /// AXE A — wall-clock budget for one tick's per-tab `/output` scan.
 ///
 /// The scan does one bounded (`share_link` 3 s timeout) GET per Claude tab,
@@ -689,19 +755,35 @@ fn tick(
     last_nudge_at: &mut Option<Instant>,
     breaker_until: &mut Option<Instant>,
     scan_cursor: &mut usize,
+    auth_breaker: &mut AuthBreaker,
 ) -> Result<(), String> {
+    // Auth breaker: while a 401/403 stands, skip the tick entirely — a rejected
+    // token makes the fetch and every nudge futile until it's restored.
+    if auth_breaker.is_open(Instant::now()) {
+        return Ok(());
+    }
     let ep: Endpoint = discover_endpoint()?;
     let ag = agent();
     let auth = format!("Bearer {}", ep.token);
 
-    let tabs: TabsResponse = ag
+    let mut resp = match ag
         .get(format!("{}/tabs", ep.url))
         .header("Authorization", &auth)
         .call()
-        .map_err(|e| format!("GET /tabs: {e}"))?
+    {
+        Ok(r) => r,
+        Err(e) if is_auth_error(&e) => {
+            auth_breaker.trip(Instant::now());
+            return Ok(());
+        }
+        Err(e) => return Err(format!("GET /tabs: {e}")),
+    };
+    let tabs: TabsResponse = resp
         .body_mut()
         .read_json()
         .map_err(|e| format!("parse /tabs: {e}"))?;
+    // The GET was authorised → any prior auth episode is over.
+    auth_breaker.clear();
 
     let now = Instant::now();
     let mut eligible: Vec<Eligible> = Vec::new();
@@ -926,12 +1008,19 @@ fn tick(
         w.next_nudge_at = Some(now + Duration::from_secs(backoff_secs(w.nudge_streak)));
     }
 
-    let _ = ag
+    match ag
         .post(format!("{}/tabs/by-id/{}/input", ep.url, pick.tab_id))
         .header("Authorization", &auth)
         .header("Content-Type", "application/octet-stream")
         .send(pick.trigger.action().as_bytes())
-        .map_err(|e| format!("POST input for {}: {e}", pick.tab_id))?;
+    {
+        Ok(_) => {}
+        Err(e) if is_auth_error(&e) => {
+            auth_breaker.trip(now);
+            return Ok(());
+        }
+        Err(e) => return Err(format!("POST input for {}: {e}", pick.tab_id)),
+    }
 
     // Inc8 S4: the `continue` landed → bump the tab's usage (observability of who
     // brain is nudging). Best-effort; a failed bump never fails the nudge.
@@ -1038,6 +1127,7 @@ pub fn run(args: &[String]) -> i32 {
     // AXE A — persistent scan cursor: where the next tick's budget-bounded
     // /output scan resumes (see scan_order / TICK_BUDGET).
     let mut scan_cursor: usize = 0;
+    let mut auth_breaker = AuthBreaker::default();
     loop {
         // Run the tick under catch_unwind so a panic anywhere in it (a
         // dependency edge case, a broken-pipe `println!`, …) is caught
@@ -1052,6 +1142,7 @@ pub fn run(args: &[String]) -> i32 {
                 &mut last_nudge_at,
                 &mut breaker_until,
                 &mut scan_cursor,
+                &mut auth_breaker,
             )
         }));
         match outcome {
@@ -1944,6 +2035,43 @@ mod tests {
         assert_eq!(backoff_secs(5), 900); // 960 → capped
         assert_eq!(backoff_secs(20), 900); // stays capped, no overflow
         assert_eq!(backoff_secs(0), 60); // saturating, never panics
+    }
+
+    #[test]
+    fn auth_backoff_grows_and_caps() {
+        // Mirrors the nudge backoff: 60s, 120s, 240s, 480s, then capped 900s.
+        assert_eq!(auth_backoff_secs(1), 60);
+        assert_eq!(auth_backoff_secs(2), 120);
+        assert_eq!(auth_backoff_secs(3), 240);
+        assert_eq!(auth_backoff_secs(4), 480);
+        assert_eq!(auth_backoff_secs(5), 900); // 960 → capped
+        assert_eq!(auth_backoff_secs(20), 900); // stays capped, no overflow
+        assert_eq!(auth_backoff_secs(0), 60); // saturating, never panics
+    }
+
+    #[test]
+    fn auth_breaker_trips_backs_off_and_recovers() {
+        // The "brain kept nudging through a 401" fix: one auth failure opens the
+        // breaker (brain skips ticks) and it stays open for the backoff window;
+        // a second failure grows it; an authorised call clears it at once.
+        let mut b = AuthBreaker::default();
+        let now = Instant::now();
+        assert!(!b.is_open(now)); // closed by default
+
+        b.trip(now); // first 401 → open 60s
+        assert_eq!(b.streak, 1);
+        assert!(b.is_open(now));
+        assert!(b.is_open(now + Duration::from_secs(59)));
+        assert!(!b.is_open(now + Duration::from_secs(61))); // window elapsed
+
+        b.trip(now); // consecutive failure grows the back-off to 120s
+        assert_eq!(b.streak, 2);
+        assert!(b.is_open(now + Duration::from_secs(61)));
+        assert!(!b.is_open(now + Duration::from_secs(121)));
+
+        b.clear(); // authorised call → resume nudging immediately
+        assert_eq!(b.streak, 0);
+        assert!(!b.is_open(now));
     }
 
     #[test]
