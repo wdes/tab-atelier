@@ -4065,15 +4065,27 @@ impl AppState {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .get(stats_idx)
                     .cloned();
-                if let Some(ref p) = power_info {
-                    if p.cpu_percent >= 0.1 {
-                        stats_lines.push(format!("{}: {}", t.cpu, p.cpu_label()));
-                    }
-                    let wl = p.watts_label();
-                    if !wl.is_empty() {
-                        stats_lines.push(format!("{}: {wl}", t.power));
-                    }
-                }
+                // Both rows are ALWAYS rendered when the feature is on, with a
+                // placeholder until the sampler has a reading. They used to
+                // appear only once data existed, so a menu opened in the first
+                // seconds of a tab's life grew a row or two underneath the
+                // cursor — and since it can open upward, every item slid up
+                // and a click meant for "Copy" landed on "Copy all".
+                stats_lines.push(format!(
+                    "{}: {}",
+                    t.cpu,
+                    crate::stat_value(
+                        power_info
+                            .as_ref()
+                            .filter(|p| p.cpu_percent >= 0.1)
+                            .map(super::power::TabPower::cpu_label)
+                    )
+                ));
+                stats_lines.push(format!(
+                    "{}: {}",
+                    t.power,
+                    crate::stat_value(power_info.as_ref().map(super::power::TabPower::watts_label))
+                ));
                 let wh = self.tabs[stats_idx].energy_wh;
                 if wh > 0.0 {
                     if wh >= 1.0 {
