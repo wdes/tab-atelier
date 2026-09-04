@@ -1735,33 +1735,31 @@ impl Render for TerminalView {
                     ks.modifiers.alt,
                     ks.modifiers.function,
                 );
-                if ks.modifiers.control && ks.modifiers.shift {
-                    match ks.key.as_str() {
-                        "c" => {
+                // Window-level chords never reach the PTY. `crate::app_chord`
+                // is the single table both this and the root handler read, so
+                // what we swallow here is exactly what the root acts on when
+                // the event bubbles (see its doc comment).
+                if let Some(chord) =
+                    crate::app_chord(&ks.key, ks.modifiers.control, ks.modifiers.shift, ks.modifiers.alt)
+                {
+                    match chord {
+                        crate::AppChord::Copy => {
                             if let Some(text) = this.copy_selection() {
                                 cx.write_to_clipboard(ClipboardItem::new_string(text));
                             }
-                            return;
                         }
-                        "v" => {
+                        crate::AppChord::Paste => {
                             if let Some(item) = cx.read_from_clipboard()
                                 && let Some(text) = Self::clipboard_to_paste_text(&item)
                             {
                                 this.send_clipboard(&text);
                             }
-                            return;
                         }
-                        "t" => return,
-                        _ => {}
+                        // Swallowed only — the root opens the switcher / adds
+                        // the tab / switches, so the shell never sees `^P`
+                        // (readline "previous") or `^T`.
+                        crate::AppChord::TabSwitcher | crate::AppChord::NewTab | crate::AppChord::NextTab => {}
                     }
-                }
-                if ks.modifiers.alt && ks.key.as_str() == "tab" {
-                    return;
-                }
-                // Ctrl+P opens the app-level MRU tab switcher — handled by the
-                // root `on_key_down` once this bubbles up. Swallow it here so it
-                // doesn't also reach the shell as `^P` (readline "previous").
-                if ks.modifiers.control && !ks.modifiers.shift && !ks.modifiers.alt && ks.key.as_str() == "p" {
                     return;
                 }
                 if ks.modifiers.shift && !ks.modifiers.control {
