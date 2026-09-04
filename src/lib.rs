@@ -1530,6 +1530,23 @@ pub fn folder_style_for<'a>(
         .map(|(_, style)| style)
 }
 
+/// Shown in a stats row whose value the sampler hasn't produced yet.
+pub const STAT_PENDING: &str = "—";
+
+/// A stats row's value, or [`STAT_PENDING`] while it is unknown.
+///
+/// Rows in the right-click menu must exist from the moment it opens, even
+/// empty. The power sampler fills in a second or two later, and a row that
+/// appears then re-lays out an ALREADY-OPEN menu — which, because the menu can
+/// open upward, slides every item under the cursor: a click aimed at "Copy"
+/// lands on "Copy all".
+#[must_use]
+pub fn stat_value(value: Option<String>) -> String {
+    value
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| STAT_PENDING.to_string())
+}
+
 /// An overlay layer that swallows window input while it is up.
 ///
 /// Every one of these blocks both the Ctrl+P switcher and the right-click
@@ -3800,6 +3817,19 @@ mod tests {
             assert!(!is_daemon_kind(bad), "{bad} must not be a daemon kind");
             assert!(daemon_relaunch_command(bad).is_none());
         }
+    }
+
+    #[test]
+    fn a_pending_stat_still_occupies_its_row() {
+        // The row has to be there before the sampler answers, or the menu
+        // changes height while it is open and the click lands on the wrong
+        // item. An empty string counts as "not yet" for the same reason —
+        // `watts_label` returns "" when RAPL has no reading.
+        assert_eq!(stat_value(Some("12.5%".into())), "12.5%");
+        assert_eq!(stat_value(None), STAT_PENDING);
+        assert_eq!(stat_value(Some(String::new())), STAT_PENDING);
+        assert_eq!(stat_value(Some("   ".into())), STAT_PENDING);
+        assert!(!STAT_PENDING.is_empty(), "the placeholder must render as a row");
     }
 
     #[test]
