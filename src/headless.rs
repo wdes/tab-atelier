@@ -62,7 +62,12 @@ const TICK_HOT: Duration = Duration::from_secs(2);
 /// untouched. Chosen ≪ Brian's ~20 s freeze threshold so an active tab always
 /// refreshes its `output_crc` well inside the window (no false freeze), while a
 /// truly idle tab is already skipped by the `ring_len` gate (zero re-scan).
-const SNAPSHOT_THROTTLE: Duration = Duration::from_millis(500);
+// Default raised 500ms -> 3s (batch-2): at ~65 tabs the 1.5s `/dashboard/state`
+// poll is longer than a 500ms window, so every poll re-scanned every streaming
+// tab (throttle bypassed). 3s caps the re-scan to ~once per two polls (~6x less
+// snapshot CPU) and stays well under Brian's freeze threshold. Still overridable
+// per-run via `KALPIN_SNAPSHOT_THROTTLE_MS` (resolved just below).
+const SNAPSHOT_THROTTLE: Duration = Duration::from_secs(3);
 
 // Shared with the GUI — see `crate::tab_env_extras`,
 // `crate::api_url_for_local_clients`, and
