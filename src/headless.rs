@@ -788,12 +788,20 @@ pub fn run() -> std::io::Result<()> {
     // Honour the persisted `tab-atelier log …` filter as a fallback to
     // the env vars, so the CLI toggle works for the daemon too (records
     // still go to stderr/journald here, not a file). Env still wins.
+    // Wrapped in the log ring either way, so `GET /logs` and `tab-atelier
+    // logs` can tail a running daemon that was started with no filter at all.
+    let mut builder = env_logger::Builder::new();
     match crate::resolve_log_filter() {
         Some(filter) => {
-            let _ = env_logger::Builder::new().parse_filters(&filter).try_init();
+            builder.parse_filters(&filter);
         }
-        None => env_logger::init(),
+        None => {
+            builder.parse_default_env();
+        }
     }
+    let logger = builder.build();
+    let level = logger.filter();
+    crate::log_ring::install(logger, level);
 
     if std::env::args().any(|a| a == "-V" || a == "--version") {
         println!("{}", crate::version_line("tab-atelier-headless"));

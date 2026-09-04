@@ -124,6 +124,7 @@ Always pass `-p tab-atelier` — a bare `cargo deb` in this workspace can packag
 - HTTP API (port 7890) + TLS variant (port 7891) with token auth and QR code for remote tab management from a phone
 - **Browser viewer** — the daemon serves a per-tab [xterm.js](https://xtermjs.org/) terminal view (share-link URLs, `noindex`/`X-Robots-Tag` so a leaked link can't be crawled), with file up/download to each tab's sandboxed `inbox/` / `outbox/`
 - `tab-atelier set-status` CLI for in-tab tools (agents, hooks, scripts) to publish thinking/waiting/error state to the desktop LED
+- `tab-atelier logs [--lines N] [--json]` — tail the **running** daemon's recent log records (`GET /logs`). Loopback callers only: the route refuses anything that isn't 127.0.0.1, because the API binds `0.0.0.0` by default and the records name tabs, working directories and errors. Distinct from `tab-atelier log <filter>`, which sets what the *next* start writes to a file.
 - `tab-atelier remote …` — mirror tabs from another instance, attach a sidecar terminal, transfer files (sandboxed). See [Remote tabs](#remote-tabs)
 - **Anthropic API relay** — run Claude locally but route its API calls through a remote tab-atelier that reuses the remote's Claude login (no API key on the local box). See [Anthropic API relay](#anthropic-api-relay)
 - **Per-tab / global env vars** — inject env into tabs from the CLI (`tab-atelier env set …`). See [Environment variables](#environment-variables)

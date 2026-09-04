@@ -19,6 +19,7 @@ pub mod flags;
 /// `tab-atelier log …` — enable/disable the GUI file logger (persisted,
 /// applied on next launch) without wrangling env vars.
 pub mod logging;
+pub mod logs;
 pub mod remote;
 pub mod set_context;
 pub mod set_font;

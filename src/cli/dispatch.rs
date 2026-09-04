@@ -417,6 +417,16 @@ pub enum Commands {
         args: Vec<String>,
     },
 
+    /// Tail the running daemon's log (`GET /logs`, loopback callers only).
+    ///
+    /// Distinct from `log <filter>`, which configures what the NEXT start
+    /// writes to a file. This reads the in-memory ring of a live instance.
+    Logs {
+        /// Passed straight through to `cli::logs::run`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Per-project (or per-tab) colour + badge: `style --folder <dir> --color …`.
     ///
     /// A folder rule styles every tab whose cwd is inside it, so tabs opened in
@@ -812,6 +822,7 @@ fn command_exit_code(cli: Cli) -> Option<i32> {
         Commands::SetContext { args } => crate::cli::client::run("set-context", &args),
         Commands::SetMeta { args } => crate::cli::client::run("set-meta", &args),
         Commands::Style { args } => crate::cli::client::run("style", &args),
+        Commands::Logs { args } => crate::cli::client::run("logs", &args),
         Commands::Token => crate::cli::client::run("token", &[]),
         Commands::RotateTokens => crate::cli::client::run("rotate-tokens", &[]),
         Commands::ResetMasterToken => crate::cli::client::run("reset-master-token", &[]),

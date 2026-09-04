@@ -1447,7 +1447,13 @@ fn html_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnapshot>>, _token: &str, read_only: bool) {
+fn handle_connection<S: Read + Write>(
+    stream: &mut S,
+    state: &Arc<Mutex<TabSnapshot>>,
+    _token: &str,
+    read_only: bool,
+    from_loopback: bool,
+) {
     // Owned BufReader around the stream itself — `try_clone` was only used
     // to dodge the read/write borrow on TcpStream, but it doesn't exist on
     // rustls::Stream. Buffering on `&mut S` works for both, and the read
@@ -1762,6 +1768,21 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
         ("POST", "/relay-mode") => relay::mode(stream, state, &body_bytes),
         ("GET", "/relay-config") => relay::config_get(stream),
         ("POST", "/relay-config") => relay::config_set(stream, state, &body_bytes),
+        ("GET", "/logs") => {
+            // Loopback only. The ring holds whatever the daemon logged — tab
+            // names, cwds, endpoint labels, error strings — and the API binds
+            // 0.0.0.0 in the default config, so holding the master token from
+            // another host must not be enough to read it. The peer address is
+            // the gate; `X-Forwarded-For` is deliberately NOT consulted, since
+            // a proxy on this host would then let anyone forge it.
+            if !from_loopback {
+                error_json(stream, 403, "logs are readable from 127.0.0.1 only");
+                return;
+            }
+            let n = query_lines.unwrap_or(200).min(crate::log_ring::CAPACITY);
+            let body = serde_json::json!({ "lines": crate::log_ring::tail(n) }).to_string();
+            respond_json(stream, 200, &body);
+        }
         ("GET", "/env") => env::list_global(stream),
         ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/env") => env::list_tab(stream, state, p),
         ("POST", "/env") => env::set_global(stream, state, &body_bytes),
@@ -1986,6 +2007,7 @@ async fn handle_hyper_request(
     state: Arc<Mutex<TabSnapshot>>,
     token: String,
     read_only: bool,
+    from_loopback: bool,
 ) -> Result<Response<RespBody>, Infallible> {
     let path = req.uri().path().to_string();
     // Intercept WS upgrade BEFORE we collect the body into the sync
@@ -2027,7 +2049,7 @@ async fn handle_hyper_request(
             input: std::io::Read::chain(std::io::Cursor::new(head), std::io::Cursor::new(body)),
             output: Vec::with_capacity(1024),
         };
-        handle_connection(&mut adapter, &state, &token, read_only);
+        handle_connection(&mut adapter, &state, &token, read_only, from_loopback);
         adapter.output
     })
     .await
@@ -2199,11 +2221,17 @@ async fn handle_relay(req: Request<Incoming>, master_token: &str) -> Response<Re
 /// Pick the right hyper connection driver for the negotiated ALPN.
 /// Called from both the plain (no ALPN, default to h1) and TLS
 /// (ALPN-negotiated) listener paths.
-async fn serve_connection<I>(io: I, h2: bool, state: Arc<Mutex<TabSnapshot>>, token: String, read_only: bool)
-where
+async fn serve_connection<I>(
+    io: I,
+    h2: bool,
+    state: Arc<Mutex<TabSnapshot>>,
+    token: String,
+    read_only: bool,
+    from_loopback: bool,
+) where
     I: hyper::rt::Read + hyper::rt::Write + Send + Unpin + 'static,
 {
-    let svc = service_fn(move |req| handle_hyper_request(req, state.clone(), token.clone(), read_only));
+    let svc = service_fn(move |req| handle_hyper_request(req, state.clone(), token.clone(), read_only, from_loopback));
     if h2 {
         let _ = h2_conn::Builder::new(TokioExecutor::new())
             .serve_connection(io, svc)
@@ -2281,13 +2309,14 @@ pub fn start_api_server(state: Arc<Mutex<TabSnapshot>>, token: String, read_only
             loop {
                 tokio::select! {
                     res = listener.accept() => {
-                        let Ok((stream, _)) = res else { continue };
+                        let Ok((stream, peer)) = res else { continue };
+                        let loopback = peer.ip().is_loopback();
                         let state = state.clone();
                         let token = token.clone();
                         tokio::spawn(async move {
                             // Plain HTTP: no ALPN, HTTP/1.1 with
                             // keep-alive. HTTP/2 only over TLS.
-                            serve_connection(TokioIo::new(stream), false, state, token, read_only).await;
+                            serve_connection(TokioIo::new(stream), false, state, token, read_only, loopback).await;
                         });
                     }
                     () = shutdown.notified() => {
@@ -2414,7 +2443,8 @@ pub fn start_api_server_tls(
             loop {
                 tokio::select! {
                     res = listener.accept() => {
-                        let Ok((stream, _)) = res else { continue };
+                        let Ok((stream, peer)) = res else { continue };
+                        let loopback = peer.ip().is_loopback();
                         let acceptor = acceptor.clone();
                         let state = state.clone();
                         let token = token.clone();
@@ -2430,7 +2460,7 @@ pub fn start_api_server_tls(
                             // protocol so hyper uses the right framing.
                             let alpn = tls.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
                             let is_h2 = alpn.as_deref() == Some(b"h2");
-                            serve_connection(TokioIo::new(tls), is_h2, state, token, read_only).await;
+                            serve_connection(TokioIo::new(tls), is_h2, state, token, read_only, loopback).await;
                         });
                     }
                     () = shutdown.notified() => {
@@ -2708,13 +2738,14 @@ pub fn spawn_test_server(state: &std::sync::Arc<std::sync::Mutex<TabSnapshot>>, 
             let listener = tokio::net::TcpListener::from_std(listener).expect("from_std");
             let _ = ready_tx.send(());
             loop {
-                let Ok((stream, _)) = listener.accept().await else {
+                let Ok((stream, peer)) = listener.accept().await else {
                     continue;
                 };
+                let loopback = peer.ip().is_loopback();
                 let state = s.clone();
                 let token = token.clone();
                 tokio::spawn(async move {
-                    serve_connection(TokioIo::new(stream), false, state, token, read_only).await;
+                    serve_connection(TokioIo::new(stream), false, state, token, read_only, loopback).await;
                 });
             }
         });
@@ -3506,6 +3537,113 @@ mod tests {
             .pending_renames
             .clone();
         assert_eq!(pending, vec![(0_usize, "renamed".into())]);
+    }
+
+    /// A `Read + Write` that replays a canned request and captures the reply,
+    /// so `handle_connection` can be driven with an arbitrary `from_loopback`
+    /// — a real socket to the test server is always 127.0.0.1.
+    struct FakeStream {
+        input: std::io::Cursor<Vec<u8>>,
+        output: Vec<u8>,
+    }
+
+    impl std::io::Read for FakeStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.input.read(buf)
+        }
+    }
+
+    impl Write for FakeStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.output.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn serve_once(req: &str, from_loopback: bool) -> String {
+        let state = test_state();
+        state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .master_token = "test-secret-token".into();
+        let mut fake = FakeStream {
+            input: std::io::Cursor::new(req.as_bytes().to_vec()),
+            output: Vec::new(),
+        };
+        handle_connection(&mut fake, &state, "test-secret-token", false, from_loopback);
+        String::from_utf8_lossy(&fake.output).into_owned()
+    }
+
+    #[test]
+    fn logs_are_readable_from_loopback_only() {
+        let _guard = crate::log_ring::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::log_ring::clear();
+        crate::log_ring::push(crate::log_ring::Line {
+            ts_ms: 42,
+            level: "WARN",
+            target: "test".into(),
+            msg: "a recorded line".into(),
+        });
+        let req = "GET /logs HTTP/1.1\r\nAuthorization: Bearer test-secret-token\r\n\r\n";
+
+        // From 127.0.0.1: the ring comes back.
+        let resp = serve_once(req, true);
+        assert_eq!(status_code(&resp), 200, "loopback reads the ring");
+        assert!(resp.contains("a recorded line"), "body carries the record: {resp}");
+
+        // From anywhere else: refused even WITH the master token, because the
+        // API binds 0.0.0.0 and these records name tabs, cwds and errors.
+        let resp = serve_once(req, false);
+        assert_eq!(status_code(&resp), 403, "remote peer refused");
+        assert!(!resp.contains("a recorded line"), "and told nothing: {resp}");
+
+        // The token still gates it on loopback — being local is a second
+        // requirement, not a replacement for auth.
+        let resp = serve_once("GET /logs HTTP/1.1\r\n\r\n", true);
+        assert_eq!(status_code(&resp), 401, "loopback still needs the token");
+        crate::log_ring::clear();
+    }
+
+    #[test]
+    fn logs_honours_the_lines_cap() {
+        let _guard = crate::log_ring::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::log_ring::clear();
+        for i in 0..10 {
+            crate::log_ring::push(crate::log_ring::Line {
+                ts_ms: i,
+                level: "INFO",
+                target: "test".into(),
+                msg: format!("line-{i}"),
+            });
+        }
+        let req = |q: &str| format!("GET /logs{q} HTTP/1.1\r\nAuthorization: Bearer test-secret-token\r\n\r\n");
+        // ?lines=N returns the newest N …
+        let resp = serve_once(&req("?lines=2"), true);
+        assert!(resp.contains("line-9") && resp.contains("line-8"));
+        assert!(!resp.contains("line-7"), "older lines excluded: {resp}");
+        // … and an absurd count is clamped to the ring rather than refused.
+        let resp = serve_once(&req("?lines=999999"), true);
+        assert_eq!(status_code(&resp), 200);
+        assert!(resp.contains("line-0"));
+        crate::log_ring::clear();
+    }
+
+    #[test]
+    fn openapi_documents_the_logs_route() {
+        // The contract is what a client reads before calling; a route that
+        // exists but isn't declared is invisible to them.
+        assert!(OPENAPI_YAML.contains("/logs:"), "openapi.yaml declares /logs");
+        assert!(
+            OPENAPI_YAML.contains("127.0.0.1"),
+            "and says it is loopback-only, which is the surprising part"
+        );
     }
 
     #[test]

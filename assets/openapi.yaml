@@ -25,7 +25,51 @@ tags:
     description: Tab list, I/O and per-tab state
   - name: tokens
     description: Master token + share-link token management
+  - name: logs
+    description: Recent daemon log records (loopback callers only)
 paths:
+  /logs:
+    get:
+      tags: [logs]
+      summary: Tail the running daemon's log ring
+      description: >
+        The last N records the daemon logged (INFO and above, whatever the
+        console filter is), for diagnosing a running instance without journald
+        access or a pre-configured file sink. Bounded and lossy — a live tail,
+        not an audit log.
+
+
+        **Loopback only.** Refused with 403 unless the peer address is
+        127.0.0.1/::1, because the API binds 0.0.0.0 by default and the records
+        carry tab names, working directories and error strings. The peer
+        address is the gate; `X-Forwarded-For` is not consulted.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: lines
+          in: query
+          required: false
+          schema: { type: integer, minimum: 0, default: 200 }
+          description: How many of the most recent lines to return (capped at the ring size).
+      responses:
+        "200":
+          description: Recent log lines, oldest first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  lines:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        ts_ms: { type: integer, format: int64, description: "Unix milliseconds" }
+                        level: { type: string, example: INFO }
+                        target: { type: string, example: tab_atelier::headless }
+                        msg: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { description: Caller is not on the loopback interface }
   /tabs:
     get:
       tags: [tabs]
