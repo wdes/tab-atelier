@@ -2428,12 +2428,16 @@ mod tests {
     #[test]
     fn net_toggles_and_allowlists_reach_the_daemon() {
         with_server(|state| {
-            assert_eq!(net_off(&args(&["0"])), 0);
+            // net-OFF needs bubblewrap on the host and 412s without it (no CI
+            // runner has it), so its success is conditional. net-ON is
+            // un-jailing and always allowed.
+            let jailed = net_off(&args(&["0"])) == 0;
             assert_eq!(net_on(&args(&["0"])), 0);
             let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let flags: Vec<bool> = s.pending_net_changes.iter().map(|(_, off)| *off).collect();
-            assert_eq!(flags, vec![true, false]);
             drop(s);
+            let want = if jailed { vec![true, false] } else { vec![false] };
+            assert_eq!(flags, want, "only what the host could apply is queued");
             assert_eq!(net_off(&args(&[])), 2);
             assert_eq!(net_on(&args(&["nope"])), 1);
             // Allowlist mode is merged server-side — and is headless-only:
@@ -2471,13 +2475,23 @@ mod tests {
     #[test]
     fn ssh_agent_and_default_limits_are_queued() {
         with_server(|state| {
-            assert_eq!(ssh_agent("0", Some("/tmp/id_ed25519"), false), 0);
-            assert_eq!(ssh_agent("0", None, true), 0, "--off");
-            assert_eq!(ssh_agent("nope", None, true), 1);
+            // Per-tab agents are headless-only: the GUI spawn path can't
+            // inject SSH_AUTH_SOCK, so its route 501s (see `api::ssh_agent`)
+            // and the CLI reports failure rather than a success it didn't get.
+            let managed = !cfg!(feature = "gui");
+            let want = i32::from(!managed);
+            assert_eq!(ssh_agent("0", Some("/tmp/id_ed25519"), false), want);
+            assert_eq!(ssh_agent("0", None, true), want, "--off");
+            assert_eq!(ssh_agent("nope", None, true), 1, "unknown tab, either edition");
             let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            assert_eq!(s.pending_ssh_agent_changes.len(), 2);
-            assert!(s.pending_ssh_agent_changes[1].1.is_none(), "--off clears it");
+            let queued = s.pending_ssh_agent_changes.clone();
             drop(s);
+            if managed {
+                assert_eq!(queued.len(), 2);
+                assert!(queued[1].1.is_none(), "--off clears it");
+            } else {
+                assert!(queued.is_empty(), "a refused route queues nothing");
+            }
             assert_eq!(limit_default(Some("1G"), Some(75), Some(200), false), 0);
             assert_eq!(limit_default(None, None, None, true), 0, "--clear");
             assert_eq!(limit_default(None, None, None, false), 2, "nothing to set");
