@@ -4736,6 +4736,54 @@ impl AppState {
     }
 
     /// Close the switcher without switching, returning focus to the terminal.
+    /// Everything currently swallowing window input, for [`crate::escape_dismisses`].
+    const fn overlay_state(&self) -> crate::OverlayState {
+        crate::OverlayState {
+            context_menu: self.context_menu.is_some(),
+            tab_switcher: self.tab_switcher.is_some(),
+            renaming: self.renaming.is_some(),
+            hotkey_picker: self.show_hotkey_picker,
+            qr: self.show_qr,
+            close_confirm: self.close_confirm.is_some(),
+            exit_confirm: self.exit_confirm.is_some(),
+            preferences: self.show_preferences,
+        }
+    }
+
+    /// Close one overlay layer and hand focus back to the tab.
+    ///
+    /// The layers each have their own dismiss path (a button, a modal-local
+    /// Escape handler that only fires while that modal holds focus); this is
+    /// the one that always works, so a layer opened by accident — a stray
+    /// double-click starting a rename, say — can't leave the window looking
+    /// dead, with Ctrl+P declined and the context menu gated off.
+    fn dismiss_overlay(&mut self, layer: crate::Overlay, window: &mut Window, cx: &mut Context<Self>) {
+        match layer {
+            crate::Overlay::ContextMenu => self.context_menu = None,
+            crate::Overlay::TabSwitcher => {
+                self.close_tab_switcher(window, cx);
+                return;
+            }
+            crate::Overlay::Renaming => {
+                self.renaming = None;
+                self.rename_select_all = false;
+            }
+            crate::Overlay::HotkeyPicker => {
+                self.show_hotkey_picker = false;
+                // The picker parks the global hotkey grab while it listens.
+                if let Some(ref handle) = self.hotkey_handle {
+                    handle.resume();
+                }
+            }
+            crate::Overlay::Qr => self.show_qr = false,
+            crate::Overlay::CloseConfirm => self.close_confirm = None,
+            crate::Overlay::ExitConfirm => self.exit_confirm = None,
+            crate::Overlay::Preferences => self.show_preferences = false,
+        }
+        self.tabs[self.active].view.read(cx).focus_handle(cx).focus(window);
+        cx.notify();
+    }
+
     fn close_tab_switcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.tab_switcher = None;
         self.tabs[self.active].view.read(cx).focus_handle(cx).focus(window);
@@ -6304,6 +6352,16 @@ impl Render for AppState {
             .flex_col()
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 let ks = &ev.keystroke;
+                // Escape always digs out of the topmost overlay. Each layer
+                // has its own dismiss path, but those only fire while that
+                // layer holds focus — and every layer gates Ctrl+P and the
+                // context menu, so one stuck layer looks like a dead window.
+                if ks.key.eq_ignore_ascii_case("escape")
+                    && let Some(layer) = crate::escape_dismisses(this.overlay_state())
+                {
+                    this.dismiss_overlay(layer, window, cx);
+                    return;
+                }
                 // Ctrl+P MRU tab switcher. While it's open the modal holds
                 // focus (so the terminal gets no keys); these arrive here by
                 // bubbling. Handle every switcher key and return so nothing

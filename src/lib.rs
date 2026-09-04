@@ -1526,6 +1526,65 @@ pub fn folder_style_for<'a>(
         .map(|(_, style)| style)
 }
 
+/// An overlay layer that swallows window input while it is up.
+///
+/// Every one of these blocks both the Ctrl+P switcher and the right-click
+/// context menu (see `AppState::render`'s menu gate), so a layer left open by
+/// accident reads as "the mouse and the keyboard stopped working".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Overlay {
+    ContextMenu,
+    TabSwitcher,
+    Renaming,
+    HotkeyPicker,
+    Qr,
+    CloseConfirm,
+    ExitConfirm,
+    Preferences,
+}
+
+/// Which overlay layers are currently up.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OverlayState {
+    pub context_menu: bool,
+    pub tab_switcher: bool,
+    pub renaming: bool,
+    pub hotkey_picker: bool,
+    pub qr: bool,
+    pub close_confirm: bool,
+    pub exit_confirm: bool,
+    pub preferences: bool,
+}
+
+/// The layer a root-level Escape should dismiss, or `None` when nothing is up
+/// (Escape then belongs to the tab, where vim and friends want it).
+///
+/// Ordered outermost-visually-first — the transient menu before the modal
+/// behind it — so one press closes exactly one layer and a user digging out of
+/// a stuck state gets there predictably.
+#[must_use]
+pub const fn escape_dismisses(s: OverlayState) -> Option<Overlay> {
+    if s.context_menu {
+        Some(Overlay::ContextMenu)
+    } else if s.tab_switcher {
+        Some(Overlay::TabSwitcher)
+    } else if s.renaming {
+        Some(Overlay::Renaming)
+    } else if s.hotkey_picker {
+        Some(Overlay::HotkeyPicker)
+    } else if s.qr {
+        Some(Overlay::Qr)
+    } else if s.close_confirm {
+        Some(Overlay::CloseConfirm)
+    } else if s.exit_confirm {
+        Some(Overlay::ExitConfirm)
+    } else if s.preferences {
+        Some(Overlay::Preferences)
+    } else {
+        None
+    }
+}
+
 /// A keyboard chord the WINDOW handles, rather than the tab's PTY.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppChord {
@@ -3736,6 +3795,89 @@ mod tests {
         for bad in ["rm -rf /", "brain;reboot", "Brain", "$(id)", "b", &"x".repeat(25)] {
             assert!(!is_daemon_kind(bad), "{bad} must not be a daemon kind");
             assert!(daemon_relaunch_command(bad).is_none());
+        }
+    }
+
+    #[test]
+    fn escape_digs_out_of_one_layer_at_a_time() {
+        use Overlay::{ContextMenu, Preferences, Renaming, TabSwitcher};
+        // Nothing open: Escape belongs to the tab. Swallowing it here would
+        // break vim's insert mode in every tab.
+        assert_eq!(escape_dismisses(OverlayState::default()), None);
+        // The case that prompted this: a stray double-click on a tab starts a
+        // rename, which gates BOTH Ctrl+P and the context menu — so the whole
+        // window looks dead with no visible cause. Escape must get out of it.
+        let renaming = OverlayState {
+            renaming: true,
+            ..OverlayState::default()
+        };
+        assert_eq!(escape_dismisses(renaming), Some(Renaming));
+        // One press, one layer: the menu goes before what it sits on.
+        let stacked = OverlayState {
+            context_menu: true,
+            renaming: true,
+            preferences: true,
+            ..OverlayState::default()
+        };
+        assert_eq!(escape_dismisses(stacked), Some(ContextMenu));
+        let after_menu = OverlayState {
+            context_menu: false,
+            ..stacked
+        };
+        assert_eq!(escape_dismisses(after_menu), Some(Renaming));
+        assert_eq!(
+            escape_dismisses(OverlayState {
+                renaming: false,
+                ..after_menu
+            }),
+            Some(Preferences)
+        );
+        // Every layer is reachable on its own, so none can strand the window.
+        for (state, want) in [
+            (
+                OverlayState {
+                    tab_switcher: true,
+                    ..OverlayState::default()
+                },
+                TabSwitcher,
+            ),
+            (
+                OverlayState {
+                    hotkey_picker: true,
+                    ..OverlayState::default()
+                },
+                Overlay::HotkeyPicker,
+            ),
+            (
+                OverlayState {
+                    qr: true,
+                    ..OverlayState::default()
+                },
+                Overlay::Qr,
+            ),
+            (
+                OverlayState {
+                    close_confirm: true,
+                    ..OverlayState::default()
+                },
+                Overlay::CloseConfirm,
+            ),
+            (
+                OverlayState {
+                    exit_confirm: true,
+                    ..OverlayState::default()
+                },
+                Overlay::ExitConfirm,
+            ),
+            (
+                OverlayState {
+                    preferences: true,
+                    ..OverlayState::default()
+                },
+                Preferences,
+            ),
+        ] {
+            assert_eq!(escape_dismisses(state), Some(want));
         }
     }
 
