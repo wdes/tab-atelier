@@ -719,6 +719,15 @@ body.band-view { min-height: calc(100vh + 180px); }
 .cat-refresh { margin-left: auto; } .cat-close { margin-left: 0.3rem; font-size: 1.2rem; }
 .cat-list { padding: 0.4rem 0.6rem 0.8rem; }
 .cat-loading, .cat-error, .cat-empty { padding: 1rem; color: var(--muted); }
+/* category-sort (Option A): the header sort selector + collapsible group headers. */
+.cat-sort-wrap { font-size: 0.72rem; color: var(--muted); display: inline-flex; align-items: center; gap: 0.3rem; margin-left: 0.4rem; }
+.cat-sort { font: inherit; font-size: 0.72rem; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 0.05rem 0.3rem; cursor: pointer; }
+.cat-group + .cat-group { margin-top: 0.3rem; }
+.cat-group-head { display: flex; align-items: center; gap: 0.35rem; width: 100%; border: none; background: transparent; color: var(--muted); font: inherit; font-weight: 700; text-align: left; cursor: pointer; padding: 0.35rem 0.2rem; border-bottom: 1px solid var(--border); }
+.cat-group-head:hover { color: var(--fg); background: color-mix(in srgb, var(--fg) 6%, transparent); }
+.cat-group-caret { display: inline-block; width: 1em; }
+.cat-group-count { color: var(--muted); font-weight: 400; }
+.cat-group-body[hidden] { display: none; }
 
 .cat-skill { border-bottom: 1px solid var(--border); }
 .cat-skill-head {
