@@ -2141,6 +2141,14 @@ export function meshModel(state) {
 function renderMesh(state) {
   const svg = document.getElementById("mesh-svg");
   if (!svg) return;
+  const loading = document.getElementById("mesh-loading");
+  // Before the first poll lands (slow /dashboard/state under a heavy fleet),
+  // currentState is null and meshModel would yield an empty graph — the "flash
+  // vide" the user saw on first toggle. Show a loading hint instead of a blank
+  // canvas; render() re-runs and paints the real graph once the poll populates
+  // currentState. (The static #mesh-edges/#mesh-nodes groups are left intact.)
+  if (!state) { if (loading) loading.removeAttribute("hidden"); return; }
+  if (loading) loading.setAttribute("hidden", "");
   const model = meshModel(state);
   const W = svg.clientWidth || 900, H = svg.clientHeight || 600;
   // Keep positions across polls so the graph doesn't jump every 1.5s (anti-flicker).
@@ -2497,8 +2505,15 @@ function bootstrap() {
   // Deep-link: open straight into ?project= if present.
   currentProject = readProjectParam(location.search);
 
-  poll();
-  setInterval(poll, POLL_MS);
+  // Self-scheduling poll: reschedule only AFTER the previous cycle settles, so a
+  // slow /dashboard/state (heavy fleet) never stacks overlapping requests across
+  // viewers — the effective interval self-adapts to serve time. Replaces
+  // setInterval, which fired every POLL_MS regardless of completion and, once
+  // serve-time exceeded POLL_MS, piled up concurrent 66-tab serialisations that
+  // choked the daemon write-path under multi-viewer load.
+  (function pollLoop() {
+    Promise.resolve(poll()).finally(() => setTimeout(pollLoop, POLL_MS));
+  })();
 }
 
 if (typeof document !== "undefined") {
