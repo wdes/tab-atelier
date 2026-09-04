@@ -6,11 +6,12 @@
 //! verbatim from `handle_connection`'s match arms (behavior-preserving).
 
 use std::io::Write;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use super::super::{
-    DASHBOARD_HTML, DashboardTabInput, TabSnapshot, build_dashboard_state, read_activity_json, respond_json,
-    respond_with_etag, tab_activity,
+    DASHBOARD_HTML, DashboardTabInput, TabSnapshot, build_dashboard_state, etag_for, read_activity_json,
+    respond_json, respond_with_etag, respond_with_etag_precomputed, tab_activity,
 };
 
 /// `GET /dashboard` — the dashboard app HTML page (behind the auth gate; its
@@ -46,13 +47,39 @@ pub(in crate::api) fn activity<S: Write>(stream: &mut S) {
     respond_json(stream, 200, &body);
 }
 
-/// `GET /dashboard/state` — the aggregated, phase-grouped fleet view.
-pub(in crate::api) fn state<S: Write>(
-    stream: &mut S,
-    state: &Arc<Mutex<TabSnapshot>>,
-    accept_gzip: bool,
-    if_none_match: Option<&str>,
-) {
+/// S1.5 response-cache entry: the serialized `/dashboard/state` body + its etag
+/// + when it was built.
+struct CachedState {
+    body: String,
+    etag: String,
+    at: Instant,
+}
+
+/// Coalescing response-cache for `/dashboard/state` (see [`state`]).
+static STATE_CACHE: LazyLock<Mutex<Option<CachedState>>> = LazyLock::new(|| Mutex::new(None));
+
+/// TTL of the response-cache. `KALPIN_STATE_CACHE_TTL_MS` overrides it (read once);
+/// `0` disables the cache (always rebuild). Default 1 s, kept ≤ the client poll
+/// period so a viewer never sees more than about one poll of staleness.
+static STATE_CACHE_TTL: LazyLock<Duration> = LazyLock::new(|| {
+    // Tests spin several daemons in ONE process but share this process-global
+    // cache → a stale body would leak across daemons. Disable it under test so
+    // each rebuild reflects that daemon's own state (isolation); production (one
+    // daemon) keeps the cache. The cache's perf behaviour is covered by the busy
+    // multi-viewer smoke, not these content unit tests.
+    if cfg!(test) {
+        return Duration::ZERO;
+    }
+    std::env::var("KALPIN_STATE_CACHE_TTL_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(Duration::from_secs(1), Duration::from_millis)
+});
+
+/// Rebuild the full `/dashboard/state` body: snapshot clone + derived read-models
+/// (org-chart/bands/projects) + the three READ-ONLY FS read-models (tasks, retired,
+/// skills) + pretty JSON. This is the expensive path the response-cache coalesces.
+fn build_state_body(state: &Arc<Mutex<TabSnapshot>>) -> String {
     let snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let inputs: Vec<DashboardTabInput> = snap
         .tabs
@@ -97,8 +124,41 @@ pub(in crate::api) fn state<S: Write>(
     // SV3 v2 skill read-model: same catalogue, folded BY SKILL NAME (v1 quarantined),
     // metrics partitioned by mode + fresh-vs-resume DERIVED at read. READ-ONLY.
     dashboard.skills = crate::cli::catalog::read_skill_profiles();
-    let body = serde_json::to_string_pretty(&dashboard).unwrap_or_default();
-    respond_with_etag(
+    serde_json::to_string_pretty(&dashboard).unwrap_or_default()
+}
+
+/// `GET /dashboard/state` — the aggregated, phase-grouped fleet view. Served from
+/// a short-TTL response-cache: within [`STATE_CACHE_TTL`] every viewer shares ONE
+/// rebuild (coalescing), so a busy fleet + N viewers no longer amplifies the
+/// rebuild N× (the crisis's root). The recompute runs under the cache lock — a
+/// burst of viewers at expiry coalesces onto one rebuild, no thundering herd — and
+/// lock order is always cache → snapshot. Invalidation is purely temporal, so
+/// there is no version to track and nothing stale beyond the TTL. The client still
+/// gets a `304` on an unchanged body via its `If-None-Match` (S1a).
+pub(in crate::api) fn state<S: Write>(
+    stream: &mut S,
+    state: &Arc<Mutex<TabSnapshot>>,
+    accept_gzip: bool,
+    if_none_match: Option<&str>,
+) {
+    let (body, etag) = {
+        let mut cache = STATE_CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = Instant::now();
+        // Clone out of a fresh entry (borrow ends here), else rebuild + store.
+        let hit = cache
+            .as_ref()
+            .filter(|c| now.duration_since(c.at) < *STATE_CACHE_TTL)
+            .map(|c| (c.body.clone(), c.etag.clone()));
+        if let Some(pair) = hit {
+            pair
+        } else {
+            let body = build_state_body(state);
+            let etag = etag_for(body.as_bytes());
+            *cache = Some(CachedState { body: body.clone(), etag: etag.clone(), at: now });
+            (body, etag)
+        }
+    };
+    respond_with_etag_precomputed(
         stream,
         200,
         "application/json",
@@ -106,5 +166,6 @@ pub(in crate::api) fn state<S: Write>(
         accept_gzip,
         if_none_match,
         "",
+        Some(etag),
     );
 }
