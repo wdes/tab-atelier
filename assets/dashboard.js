@@ -313,6 +313,59 @@ export function catalogView(readModel) {
     .sort((a, b) => String(a.skill).localeCompare(String(b.skill)));
 }
 
+// The category-sort MODES (Option A): mechanical sort/group on a field ALREADY on the
+// read-model — pur-vue, zero core, deterministic. The SEMANTIC "category" source (group
+// by the distilled-profile `type`, B3) plugs in here as one more mode once its data
+// shape is pinned; the UI mechanism below is identical whichever source is chosen.
+export const CATALOG_SORT_MODES = [
+  { value: "name", label: "nom" },
+  { value: "usage", label: "usage" },
+  { value: "status", label: "statut" },
+];
+
+// Pure: the skills folded into an ORDERED list of GROUPS `{label, count, skills}` for a
+// display `mode`. `label:null` = a flat, header-less list (the default "name" mode = the
+// historical alpha view -> non-breaking). Empty groups are dropped. Null-safe.
+export function catalogGroups(readModel, mode = "name") {
+  const skills = readModel && Array.isArray(readModel.skills) ? readModel.skills : [];
+  const live = skills.filter((s) => s && s.skill != null);
+  const alpha = (a, b) => String(a.skill).localeCompare(String(b.skill));
+  const usageOf = (s) => (s.usageCount != null ? Number(s.usageCount) : 0);
+  const isRetired = (s) => s.deleted === true || s.tombstoned === true || s.retiredAt != null;
+  const withCount = (g) => ({ ...g, count: g.skills.length });
+
+  if (mode === "usage") {
+    // Buckets on the existing usageCount; most-used first within each bucket.
+    const byUse = (a, b) => usageOf(b) - usageOf(a) || alpha(a, b);
+    const buckets = [
+      { label: "fréquent (5+)", test: (n) => n >= 5 },
+      { label: "rare (1–4)", test: (n) => n >= 1 && n <= 4 },
+      { label: "jamais utilisé", test: (n) => n <= 0 },
+    ];
+    return buckets
+      .map((b) => ({ label: b.label, skills: live.filter((s) => b.test(usageOf(s))).sort(byUse) }))
+      .filter((g) => g.skills.length)
+      .map(withCount);
+  }
+  if (mode === "status") {
+    return [
+      { label: "actifs", skills: live.filter((s) => !isRetired(s)).sort(alpha) },
+      { label: "supprimés", skills: live.filter(isRetired).sort(alpha) },
+    ].filter((g) => g.skills.length).map(withCount);
+  }
+  // default "name": one flat, header-less group = the historical catalogView list.
+  return [{ label: null, count: live.length, skills: catalogView(readModel) }];
+}
+
+const CATALOG_SORT_KEY = "ta-dash.catalog-sort";
+// Restore the persisted sort mode (same pattern as LEGEND_KEY / MESH_KEY). Unknown -> name.
+function loadCatalogSort() {
+  try {
+    const v = localStorage.getItem(CATALOG_SORT_KEY);
+    return CATALOG_SORT_MODES.some((m) => m.value === v) ? v : "name";
+  } catch { return "name"; }
+}
+
 // Pure: a skill's profile fold -> normalised render fields. Absent -> ""/[]/null.
 export function skillProfileModel(skill) {
   const s = skill || {};
@@ -1538,25 +1591,39 @@ function catalogSkillHtml(skill) {
 }
 
 function catalogHtml(readModel) {
-  const skills = catalogView(readModel);
-  const body = skills.length
-    ? skills.map(catalogSkillHtml).join("")
+  const groups = catalogGroups(readModel, catalogMode);
+  const total = groups.reduce((n, g) => n + g.count, 0);
+  const grouped = groups.length > 1 || (groups[0] && groups[0].label != null);
+  // A `label:null` group renders flat (name mode); a labelled group gets a collapsible
+  // header `▾ Label (n)` (usage/statut modes). Reuses catalogSkillHtml unchanged.
+  const groupHtml = (g) =>
+    g.label == null
+      ? g.skills.map(catalogSkillHtml).join("")
+      : `<div class="cat-group"><button class="cat-group-head" aria-expanded="true"><span class="cat-group-caret">▾</span> <span class="cat-group-label">${escapeHtml(g.label)}</span> <span class="cat-group-count">(${g.count})</span></button><div class="cat-group-body">${g.skills.map(catalogSkillHtml).join("")}</div></div>`;
+  const body = total
+    ? groups.map(groupHtml).join("")
     : `<div class="cat-empty">Aucun skill au catalogue.</div>`;
+  const opts = CATALOG_SORT_MODES.map((m) => `<option value="${m.value}"${m.value === catalogMode ? " selected" : ""}>${escapeHtml(m.label)}</option>`).join("");
   // SC3-toggle: "afficher les supprimés" -> re-fetch with ?includeDeleted so the
   // tombstoned cards (deleted:true) show, making the Restore button reachable.
   return `<div class="cat-header">
       <span class="cat-title">Catalogue des skills</span>
-      <span class="cat-count">${skills.length} skill${skills.length === 1 ? "" : "s"}</span>
+      <span class="cat-count">${total} skill${total === 1 ? "" : "s"}</span>
+      <label class="cat-sort-wrap">tri : <select class="cat-sort" aria-label="trier le catalogue">${opts}</select></label>
       <label class="cat-deleted-toggle"><input type="checkbox" class="cat-show-deleted"${catalogIncludeDeleted ? " checked" : ""}> afficher les supprimés</label>
       <button class="cat-refresh" title="rafraîchir">↻</button>
       <button class="cat-close" title="fermer" aria-label="fermer">×</button>
     </div>
-    <div class="cat-list">${body}</div>`;
+    <div class="cat-list${grouped ? " cat-list-grouped" : ""}">${body}</div>`;
 }
 
 let catalogOpen = false;
 // SC3-toggle: whether the current fetch asks the server for tombstoned skills.
 let catalogIncludeDeleted = false;
+// Category-sort (Option A): the active display MODE + the last fetched model, so
+// switching the sort re-renders client-side WITHOUT a re-fetch (RB2: catalogue cold).
+let catalogMode = loadCatalogSort();
+let catalogModel = null;
 
 async function openCatalog() {
   const el = document.getElementById("catalog-panel");
@@ -1568,7 +1635,8 @@ async function openCatalog() {
     const url = catalogIncludeDeleted ? `${CATALOG_URL}?includeDeleted=true` : CATALOG_URL;
     const res = await fetch(url, { headers: { accept: "application/json", ...AUTH_HEADERS } });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    el.innerHTML = catalogHtml(await res.json());
+    catalogModel = await res.json(); // cache: the sort selector re-renders from this, no re-fetch
+    el.innerHTML = catalogHtml(catalogModel);
   } catch (err) {
     el.innerHTML = `<div class="cat-header"><span class="cat-title">Catalogue des skills</span><button class="cat-close" title="fermer" aria-label="fermer">×</button></div><div class="cat-error">catalogue indisponible (${escapeHtml(err.message)})</div>`;
   }
@@ -2416,6 +2484,19 @@ function bootstrap() {
       if (showDel) { catalogIncludeDeleted = !!showDel.checked; openCatalog(); return; }
       // SC3: edit-form controls (save/delete/restore) are async mutations.
       if (e.target.closest(".cat-save, .cat-delete, .cat-restore")) { handleCatalogEdit(e.target); return; }
+      // category-sort: collapse/expand a group (usage/statut modes). Pure DOM, no fetch.
+      const ghead = e.target.closest(".cat-group-head");
+      if (ghead) {
+        const gbody = ghead.parentElement && ghead.parentElement.querySelector(".cat-group-body");
+        const gcaret = ghead.querySelector(".cat-group-caret");
+        if (gbody) {
+          const willShow = gbody.hidden;
+          gbody.hidden = !willShow;
+          ghead.setAttribute("aria-expanded", willShow ? "true" : "false");
+          if (gcaret) gcaret.textContent = willShow ? "▾" : "▸";
+        }
+        return;
+      }
       const head = e.target.closest(".cat-skill-head");
       if (head) {
         const body = head.parentElement && head.parentElement.querySelector(".cat-skill-body");
@@ -2427,6 +2508,16 @@ function bootstrap() {
           if (caret) caret.textContent = willShow ? "▾" : "▸";
         }
       }
+    });
+    // category-sort: the sort <select> fires "change". Re-render from the CACHED model
+    // (RB2: catalogue stays cold, no re-fetch); persist the mode like the legend/mesh.
+    catPanel.addEventListener("change", (e) => {
+      const sortSel = e.target.closest(".cat-sort");
+      if (!sortSel) return;
+      e.stopPropagation();
+      catalogMode = CATALOG_SORT_MODES.some((m) => m.value === sortSel.value) ? sortSel.value : "name";
+      try { localStorage.setItem(CATALOG_SORT_KEY, catalogMode); } catch { /* ignore */ }
+      if (catalogModel) catPanel.innerHTML = catalogHtml(catalogModel);
     });
   }
   // Close the catalog on Escape or a click outside it (but not the toggle button).
