@@ -1547,6 +1547,22 @@ pub fn stat_value(value: Option<String>) -> String {
         .unwrap_or_else(|| STAT_PENDING.to_string())
 }
 
+/// Build the right-click menu's stats rows: one per entry, always.
+///
+/// A row whose value isn't known yet shows [`STAT_PENDING`] rather than being
+/// omitted. The count must depend only on the build's features — never on the
+/// data — because the menu is rebuilt every frame while it is open (that's how
+/// the numbers stay live), and it can open upward: a row appearing when the
+/// sampler answers slides every item above it under a stationary cursor, so a
+/// click meant for one entry lands on the next.
+#[must_use]
+pub fn stats_rows(entries: &[(&str, Option<String>)]) -> Vec<String> {
+    entries
+        .iter()
+        .map(|(label, value)| format!("{label}: {}", stat_value(value.clone())))
+        .collect()
+}
+
 /// An overlay layer that swallows window input while it is up.
 ///
 /// Every one of these blocks both the Ctrl+P switcher and the right-click
@@ -3817,6 +3833,31 @@ mod tests {
             assert!(!is_daemon_kind(bad), "{bad} must not be a daemon kind");
             assert!(daemon_relaunch_command(bad).is_none());
         }
+    }
+
+    #[test]
+    fn the_stats_block_has_the_same_rows_whatever_the_data_says() {
+        // The bug this encodes, twice over: rows used to be pushed only when a
+        // value existed, so the menu grew as the sampler answered — and since
+        // it can open upward, the item under the cursor changed mid-click.
+        let labels = ["CPU", "Power", "Memory", "Connections"];
+        let full: Vec<(&str, Option<String>)> = labels.iter().map(|l| (*l, Some("12".to_string()))).collect();
+        let empty: Vec<(&str, Option<String>)> = labels.iter().map(|l| (*l, None)).collect();
+        let mixed: Vec<(&str, Option<String>)> = vec![
+            ("CPU", Some("3.4%".into())),
+            ("Power", None),
+            ("Memory", Some("41 MB".into())),
+            ("Connections", None),
+        ];
+        assert_eq!(stats_rows(&full).len(), labels.len());
+        assert_eq!(stats_rows(&empty).len(), labels.len(), "no data is still every row");
+        assert_eq!(stats_rows(&mixed).len(), labels.len());
+        // Labels keep their order and their position, so the Nth row is always
+        // the same reading.
+        assert_eq!(stats_rows(&mixed)[0], "CPU: 3.4%");
+        assert_eq!(stats_rows(&mixed)[1], format!("Power: {STAT_PENDING}"));
+        assert_eq!(stats_rows(&mixed)[3], format!("Connections: {STAT_PENDING}"));
+        assert!(stats_rows(&[]).is_empty());
     }
 
     #[test]
