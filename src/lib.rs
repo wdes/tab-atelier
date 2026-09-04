@@ -37,6 +37,7 @@ pub mod headless;
 pub mod http3;
 pub(crate) mod locale;
 #[cfg(target_os = "linux")]
+pub mod log_ring;
 pub mod net_meter;
 #[cfg(all(target_os = "linux", not(feature = "gui")))]
 pub mod net_nft;
@@ -995,11 +996,14 @@ pub fn init_gui_file_logging() {
     let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) else {
         return;
     };
-    let _ = env_logger::Builder::new()
+    let mut builder = env_logger::Builder::new();
+    builder
         .parse_filters(&filter)
         .format_timestamp_millis()
-        .target(env_logger::Target::Pipe(Box::new(file)))
-        .try_init();
+        .target(env_logger::Target::Pipe(Box::new(file)));
+    let logger = builder.build();
+    let level = logger.filter();
+    log_ring::install(logger, level);
 }
 
 /// The effective GUI log filter: `TAB_ATELIER_LOG` env, then `RUST_LOG`

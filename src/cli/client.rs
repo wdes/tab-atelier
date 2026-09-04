@@ -53,6 +53,7 @@ pub fn dispatch(name: &str, rest: &[String]) -> Option<i32> {
         "brain" => brain::run(rest),
         "schedule" => share_link::schedule(rest),
         "log" => logging::run(rest),
+        "logs" => super::logs::run(rest),
         "flags" => flags::run(rest),
         // `tabs`/`list` share the richer `share_link::tabs` (full-UUID +
         // lock/viewer status + `--json`) across both editions, replacing the
