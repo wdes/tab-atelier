@@ -4680,14 +4680,27 @@ impl AppState {
     /// Ctrl+P → Enter jumps straight back. No-op with fewer than two tabs.
     fn open_tab_switcher(&mut self, cx: &mut Context<Self>) {
         // Need something to switch to, and don't stack over another modal.
-        if self.tabs.len() < 2
-            || self.show_preferences
-            || self.show_hotkey_picker
-            || self.show_qr
-            || self.renaming.is_some()
-            || self.exit_confirm.is_some()
-            || self.close_confirm.is_some()
-        {
+        let blocked = if self.tabs.len() < 2 {
+            Some("fewer than two tabs")
+        } else if self.show_preferences {
+            Some("preferences open")
+        } else if self.show_hotkey_picker {
+            Some("hotkey picker open")
+        } else if self.show_qr {
+            Some("QR modal open")
+        } else if self.renaming.is_some() {
+            Some("renaming a tab")
+        } else if self.exit_confirm.is_some() {
+            Some("exit confirm open")
+        } else if self.close_confirm.is_some() {
+            Some("close confirm open")
+        } else {
+            None
+        };
+        if let Some(why) = blocked {
+            // Silent refusals here read as "Ctrl+P is broken"; say which state
+            // ate it so the next report names the blocker.
+            warn!("Ctrl+P declined: {why}");
             return;
         }
         // Order by `last_used_at` (the same field the mobile remote sorts by)
@@ -6300,7 +6313,11 @@ impl Render for AppState {
                     // captured order, so ↑↓/Enter/cycle operate on what's shown.
                     let filtered = this.switcher_filtered();
                     let len = filtered.len();
-                    match ks.key.as_str() {
+                    // Lower-cased for the same reason as `app_chord`: under
+                    // CapsLock the keysym arrives as "P" and the cycle arm
+                    // would miss, leaving the modal open and unresponsive.
+                    let key = ks.key.to_ascii_lowercase();
+                    match key.as_str() {
                         "escape" => this.close_tab_switcher(window, cx),
                         "up" => {
                             if let Some(s) = this.tab_switcher.as_mut() {
@@ -6316,12 +6333,16 @@ impl Render for AppState {
                             }
                             cx.notify();
                         }
-                        // Tapping Ctrl+P again cycles the highlight downward.
-                        "p" if ks.modifiers.control && len > 0 => {
-                            if let Some(s) = this.tab_switcher.as_mut() {
+                        // Tapping Ctrl+P again cycles the highlight downward —
+                        // or dismisses a switcher with nothing to show, which
+                        // would otherwise swallow every later Ctrl+P.
+                        "p" if ks.modifiers.control => {
+                            if len == 0 {
+                                this.close_tab_switcher(window, cx);
+                            } else if let Some(s) = this.tab_switcher.as_mut() {
                                 s.selected = (s.selected + 1) % len;
+                                cx.notify();
                             }
-                            cx.notify();
                         }
                         "enter" => {
                             let pick = filtered
@@ -6355,17 +6376,17 @@ impl Render for AppState {
                     }
                     return;
                 }
-                if ks.modifiers.control && !ks.modifiers.shift && !ks.modifiers.alt && ks.key.as_str() == "p" {
-                    this.open_tab_switcher(cx);
-                    return;
-                }
-                if ks.modifiers.control && ks.modifiers.shift && ks.key.as_str() == "t" {
-                    this.add_tab_after_current(window, cx);
-                    return;
-                }
-                if ks.modifiers.alt && ks.key.as_str() == "tab" {
-                    let next = (this.active + 1) % this.tabs.len();
-                    this.select_tab(next, window, cx);
+                // Same table the terminal swallows on, so the two can't drift.
+                match crate::app_chord(&ks.key, ks.modifiers.control, ks.modifiers.shift, ks.modifiers.alt) {
+                    Some(crate::AppChord::TabSwitcher) => this.open_tab_switcher(cx),
+                    Some(crate::AppChord::NewTab) => this.add_tab_after_current(window, cx),
+                    Some(crate::AppChord::NextTab) => {
+                        let next = (this.active + 1) % this.tabs.len();
+                        this.select_tab(next, window, cx);
+                    }
+                    // Copy/Paste are handled in the terminal view, where the
+                    // selection lives; nothing to do once they bubble.
+                    Some(crate::AppChord::Copy | crate::AppChord::Paste) | None => {}
                 }
             }))
             .child(

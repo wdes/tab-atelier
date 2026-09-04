@@ -1526,6 +1526,45 @@ pub fn folder_style_for<'a>(
         .map(|(_, style)| style)
 }
 
+/// A keyboard chord the WINDOW handles, rather than the tab's PTY.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppChord {
+    /// Ctrl+P — the MRU tab switcher.
+    TabSwitcher,
+    /// Ctrl+Shift+T — new tab after the current one.
+    NewTab,
+    /// Ctrl+Shift+C — copy the selection.
+    Copy,
+    /// Ctrl+Shift+V — paste.
+    Paste,
+    /// Alt+Tab — next tab.
+    NextTab,
+}
+
+/// Match a keystroke to an app chord, or `None` to let the PTY have it.
+///
+/// Both sides of the dispatch consult this: the terminal view swallows (or
+/// acts on) a keystroke that maps to a chord, so the shell never sees `^P`,
+/// and the root handler acts once the event bubbles. Two hand-written
+/// conditions could drift apart — and a chord the terminal swallowed but the
+/// root ignored is a key that silently does nothing.
+///
+/// The key name is matched **case-insensitively**: with `CapsLock` on, or on a
+/// layout that reports the shifted keysym, the same physical chord arrives as
+/// `"P"`, and an exact `"p"` comparison drops it on the floor.
+#[must_use]
+pub fn app_chord(key: &str, ctrl: bool, shift: bool, alt: bool) -> Option<AppChord> {
+    let is = |name: &str| key.eq_ignore_ascii_case(name);
+    match (ctrl, shift, alt) {
+        (true, false, false) if is("p") => Some(AppChord::TabSwitcher),
+        (true, true, false) if is("t") => Some(AppChord::NewTab),
+        (true, true, false) if is("c") => Some(AppChord::Copy),
+        (true, true, false) if is("v") => Some(AppChord::Paste),
+        (false, _, true) if is("tab") => Some(AppChord::NextTab),
+        _ => None,
+    }
+}
+
 /// Resolve the effective background color for a tab: per-tab override
 /// → folder rule → global pref → Tomorrow Night Blue.
 #[must_use]
@@ -3698,6 +3737,51 @@ mod tests {
             assert!(!is_daemon_kind(bad), "{bad} must not be a daemon kind");
             assert!(daemon_relaunch_command(bad).is_none());
         }
+    }
+
+    #[test]
+    fn app_chords_survive_capslock_and_stay_off_the_ptys_keys() {
+        use AppChord::{Copy, NewTab, NextTab, Paste, TabSwitcher};
+        // The regression: an exact "p" comparison drops the chord when the
+        // keysym arrives uppercase (CapsLock, or a layout's shifted level),
+        // and Ctrl+P silently stops opening the switcher.
+        assert_eq!(app_chord("p", true, false, false), Some(TabSwitcher));
+        assert_eq!(app_chord("P", true, false, false), Some(TabSwitcher));
+        assert_eq!(app_chord("t", true, true, false), Some(NewTab));
+        assert_eq!(app_chord("T", true, true, false), Some(NewTab));
+        assert_eq!(app_chord("c", true, true, false), Some(Copy));
+        assert_eq!(app_chord("v", true, true, false), Some(Paste));
+        assert_eq!(app_chord("tab", false, false, true), Some(NextTab));
+        assert_eq!(
+            app_chord("TAB", false, true, true),
+            Some(NextTab),
+            "shift is ignored here"
+        );
+
+        // Everything else belongs to the PTY. In particular a bare letter and
+        // the wrong modifier set must reach the shell untouched — swallowing
+        // them here would make the key do nothing at all.
+        assert_eq!(app_chord("p", false, false, false), None);
+        assert_eq!(
+            app_chord("p", true, true, false),
+            None,
+            "Ctrl+Shift+P is not the switcher"
+        );
+        assert_eq!(
+            app_chord("p", true, false, true),
+            None,
+            "Ctrl+Alt+P is not the switcher"
+        );
+        assert_eq!(app_chord("t", true, false, false), None, "Ctrl+T is the shell's");
+        assert_eq!(
+            app_chord("c", true, false, false),
+            None,
+            "Ctrl+C must interrupt, not copy"
+        );
+        assert_eq!(app_chord("v", true, false, false), None);
+        assert_eq!(app_chord("tab", false, false, false), None, "plain Tab completes");
+        assert_eq!(app_chord("tab", true, false, false), None);
+        assert_eq!(app_chord("", true, false, false), None);
     }
 
     #[test]
