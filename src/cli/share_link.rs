@@ -2436,24 +2436,22 @@ mod tests {
             drop(s);
             assert_eq!(net_off(&args(&[])), 2);
             assert_eq!(net_on(&args(&["nope"])), 1);
-            // Allowlist mode: presets/domains/cidrs are merged server-side.
-            assert_eq!(
-                net_allow("0", &["claude-code".into()], &[], &[], false, false, false),
-                0
-            );
-            assert_eq!(
-                net_allow("0", &[], &["example.com".into()], &[], false, true, false),
-                0,
-                "--add"
-            );
-            assert_eq!(net_allow("0", &[], &[], &["10.0.0.0/8".into()], false, false, false), 0);
-            assert_eq!(net_allow("0", &[], &[], &[], true, false, false), 0, "--clear");
-            // Junk in either list is caught before the request goes out.
-            assert_ne!(
-                net_allow("0", &["not-a-preset".into()], &[], &[], false, false, false),
-                0
-            );
-            assert_ne!(net_allow("0", &[], &[], &["not-a-cidr".into()], false, false, false), 0);
+            // Allowlist mode is merged server-side — and is headless-only:
+            // enforcing it needs nftables + CAP_NET_ADMIN, so the GUI refuses
+            // with 501 rather than reporting a success it cannot deliver (see
+            // `api::net::allow`).
+            let allow_ok = i32::from(cfg!(feature = "gui"));
+            let allow = |presets: &[String], domains: &[String], cidrs: &[String], clear: bool, add: bool| {
+                net_allow("0", presets, domains, cidrs, clear, add, false)
+            };
+            assert_eq!(allow(&["claude-code".into()], &[], &[], false, false), allow_ok);
+            assert_eq!(allow(&[], &["example.com".into()], &[], false, true), allow_ok, "--add");
+            assert_eq!(allow(&[], &[], &["10.0.0.0/8".into()], false, false), allow_ok);
+            assert_eq!(allow(&[], &[], &[], true, false), allow_ok, "--clear");
+            // Junk in either list is caught before the request goes out, in
+            // both editions.
+            assert_ne!(allow(&["not-a-preset".into()], &[], &[], false, false), 0);
+            assert_ne!(allow(&[], &[], &["not-a-cidr".into()], false, false), 0);
         });
     }
 

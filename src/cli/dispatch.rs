@@ -990,16 +990,19 @@ mod tests {
                 );
             }
             // The verbs really reached the daemon, not just the match arm.
+            // Counted only for routes both editions implement on any host:
+            // net-off needs bubblewrap (412 without it) and net-allow /
+            // ssh-agent are headless-only (501 on the GUI), so those would
+            // make the assertion depend on the machine and the feature set.
             let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let (closes, renames, locks, nets, inputs) = (
+            let (closes, renames, locks, inputs) = (
                 s.pending_closes.len(),
                 s.pending_renames.len(),
                 s.pending_lock_changes.len(),
-                s.pending_net_changes.len(),
                 s.pending_input.len(),
             );
             drop(s);
-            assert_eq!((closes, renames, locks, nets, inputs), (1, 1, 2, 2, 1));
+            assert_eq!((closes, renames, locks, inputs), (1, 1, 2, 1));
         });
     }
 
