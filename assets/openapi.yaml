@@ -429,4 +429,6 @@ components:
         last_used_at: { type: [integer, "null"], description: "Unix-millis of the last time this tab was used (input / activate / viewer open). Clients sort by this descending for a most-recently-used list. Omitted for never-used tabs" }
         context: { type: [string, "null"] }
         viewers: { type: integer, description: WS viewers currently watching this tab }
+        output_crc: { type: integer, description: "CRC-32 of the tab's current output — same value /output returns as X-Output-Crc. Poll this to learn which tabs moved in one request, and fetch /output only where it differs" }
+        output_len: { type: integer, description: "Byte length behind output_crc; pairs with it for the conditional /output?since=&crc= form" }
         watts: { type: [number, "null"] }

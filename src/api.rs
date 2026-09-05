@@ -305,6 +305,16 @@ struct TabInfo {
     /// non-agent tabs so existing consumers don't see a new field.
     #[serde(skip_serializing_if = "Option::is_none")]
     tokens: Option<crate::TokenUsage>,
+    /// CRC-32 of the tab's current output — the same value `/output` returns
+    /// as `X-Output-Crc`. Lets a poller learn in ONE request which tabs moved:
+    /// `brain` watches every Claude tab for a frozen screen and otherwise
+    /// re-fetches each tab's whole grid every tick just to discover that
+    /// nothing changed. Compare with the previous listing; fetch `/output`
+    /// only where it differs.
+    output_crc: u32,
+    /// Byte length behind `output_crc`. Pairs with it for the conditional
+    /// `/output?since=&crc=` form, and separates "empty" from "unchanged".
+    output_len: u64,
 }
 
 /// One DNS-entries-view row for the `/tabs` response.
@@ -2908,6 +2918,8 @@ mod tests {
             context: None,
             meta: std::collections::BTreeMap::new(),
             badge: None,
+            output_crc: 0,
+            output_len: 0,
             viewers: 0,
             net_disabled: false,
             connections: 0,
@@ -3330,6 +3342,58 @@ mod tests {
         // The master token is NOT a second way in: it administers every tab,
         // and the point of the split is that the relay credential can't.
         assert_eq!(status_code(&call(&master)), 401, "master is not a relay credential");
+    }
+
+    #[test]
+    fn the_tab_listing_carries_the_output_crc() {
+        // One request tells a poller which tabs moved. Without it `brain`
+        // re-fetched every tab's whole grid each tick just to discover that
+        // nothing had — ~1.4 MiB per sweep on a 63-tab fleet.
+        let (port, state, token) = spawn_server();
+        let resp = request(
+            port,
+            &format!("GET /tabs HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        let listing = body(&resp);
+        let parsed: serde_json::Value = serde_json::from_str(listing).expect("json");
+        let tab = &parsed["tabs"][0];
+        let crc = tab["output_crc"].as_u64().expect("output_crc present");
+        let len = tab["output_len"].as_u64().expect("output_len present");
+        assert!(len > 0, "the fixture tab has output");
+        // It matches what /output reports, so a client can move between the
+        // two without re-deriving anything.
+        let out = request(
+            port,
+            &format!("GET /tabs/0/output HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        assert!(
+            out.to_lowercase().contains(&format!("x-output-crc: {crc:08x}")),
+            "listing CRC must equal the /output header: {crc:08x}"
+        );
+        // And it tracks the content: change the output, the CRC changes.
+        // Set both forms: the listing mirrors /output, which prefers
+        // `raw_output` when the tab has one.
+        let mut s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let fresh = "something else entirely";
+        s.tabs[0].output = fresh.into();
+        s.tabs[0].output_crc = crate::crc32(fresh.as_bytes());
+        s.tabs[0].raw_output = fresh.into();
+        s.tabs[0].raw_output_crc = crate::crc32(fresh.as_bytes());
+        // `/tabs` serves `cached_response` when set; the owner clears it on
+        // every snapshot rebuild, so a test mutating the snapshot must too.
+        s.cached_response = None;
+        drop(s);
+        let resp = request(
+            port,
+            &format!("GET /tabs HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        let listing = body(&resp);
+        let parsed: serde_json::Value = serde_json::from_str(listing).expect("json");
+        assert_ne!(
+            parsed["tabs"][0]["output_crc"].as_u64(),
+            Some(crc),
+            "CRC follows the content"
+        );
     }
 
     #[test]

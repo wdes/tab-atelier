@@ -72,6 +72,18 @@ pub(super) fn list<W: Write>(
             context: t.context.as_deref().map(str::to_string),
             meta: t.meta.clone(),
             badge: t.badge.as_deref().map(str::to_string),
+            // Mirror what /output would serve: raw_output when present (what
+            // the viewer and brain read), else the joined form.
+            output_crc: if t.raw_output.is_empty() {
+                t.output_crc
+            } else {
+                t.raw_output_crc
+            },
+            output_len: if t.raw_output.is_empty() {
+                t.output.len() as u64
+            } else {
+                t.raw_output.len() as u64
+            },
             net_disabled: t.net_disabled,
             connections: t.connections,
             tx_bytes: t.tx_bytes,
