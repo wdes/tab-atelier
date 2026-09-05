@@ -271,9 +271,239 @@ pub struct Note {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topic: Option<String>,
     pub msg: String,
+    /// Stable identity, unique across hosts. This is what makes the log a
+    /// grow-only set: merging two blackboards is a union keyed by `id`, which
+    /// is idempotent, commutative and associative — so hosts converge without
+    /// agreeing on anything (Shapiro et al., CRDTs, 2011).
+    ///
+    /// Empty on entries written before typed notes existed; [`parse_notes`]
+    /// backfills those from a content hash, so old lines still de-duplicate.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    /// Which host wrote it, for display and for gossip accounting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// What kind of entry this is. Plain notes stay `note`, so every existing
+    /// line keeps its meaning.
+    #[serde(default, skip_serializing_if = "NoteKind::is_note")]
+    pub kind: NoteKind,
+    /// The task this entry concerns (`announce`/`bid`/`award`/`done`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    /// A bid's asking price — lower wins. Units are the fleet's business; what
+    /// matters is that they compare.
+    ///
+    /// An integer on purpose: a NaN loose in a bid ordering would make the
+    /// winner depend on comparison order, which is precisely the kind of
+    /// non-determinism a convergent fold must not have.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<i64>,
+    /// An award's winner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    /// Whether a `done` reports success. `None` on other kinds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ok: Option<bool>,
 }
 
-fn blackboard_path() -> PathBuf {
+/// The contract-net message types (Smith, 1980), carried on the blackboard
+/// rather than on a new transport: announce a task, bid for it, award it,
+/// report completion.
+///
+/// Keeping them as entries on the existing append-only log means the whole
+/// protocol inherits the log's properties for free — durable, readable by
+/// every tab, and mergeable across hosts.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum NoteKind {
+    /// A plain broadcast — what `note` has always written.
+    #[default]
+    Note,
+    /// Work that wants doing.
+    Announce,
+    /// "I could take that, at this cost."
+    Bid,
+    /// "It is yours."
+    Award,
+    /// "Finished" (or "failed", per `ok`) — the explicit termination signal
+    /// that silence-polling can only guess at.
+    Done,
+}
+
+impl NoteKind {
+    /// Plain notes are the serialisation default, so they stay off the wire.
+    #[must_use]
+    pub const fn is_note(&self) -> bool {
+        matches!(self, Self::Note)
+    }
+
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Note => "note",
+            Self::Announce => "announce",
+            Self::Bid => "bid",
+            Self::Award => "award",
+            Self::Done => "done",
+        }
+    }
+
+    /// Parse a CLI/wire spelling.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "note" => Some(Self::Note),
+            "announce" => Some(Self::Announce),
+            "bid" => Some(Self::Bid),
+            "award" => Some(Self::Award),
+            "done" => Some(Self::Done),
+            _ => None,
+        }
+    }
+}
+
+/// FNV-1a over a string. Stable across processes and hosts (unlike
+/// `DefaultHasher`), which is what matters for deriving entry ids and for
+/// rendezvous ranking.
+#[must_use]
+pub fn stable_hash(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Mint an entry id: origin + time + a hash of the content, so two hosts
+/// writing at the same millisecond still differ, and a replayed line keeps its
+/// identity rather than duplicating on merge.
+#[must_use]
+pub fn mint_id(origin: &str, ts: u64, content: &str) -> String {
+    format!("{origin}-{ts:x}-{:016x}", stable_hash(content))
+}
+
+/// This host's gossip identity — the hostname, falling back to a hash of the
+/// state directory when there isn't one. Only needs to be stable and unlikely
+/// to collide with a peer.
+#[must_use]
+pub fn origin_id() -> String {
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|h| h.trim().to_owned())
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| format!("host-{:x}", stable_hash(&blackboard_path().display().to_string())))
+}
+
+/// Every entry on this host's blackboard, oldest first.
+///
+/// Shared with the API so `GET /blackboard` and the CLI read exactly the same
+/// file — the log stays the single source of truth rather than being mirrored
+/// into daemon state that could drift from it.
+#[must_use]
+pub fn read_blackboard() -> Vec<Note> {
+    parse_notes(&std::fs::read_to_string(blackboard_path()).unwrap_or_default())
+}
+
+/// Append the entries of `incoming` we don't already have, returning how many
+/// were added.
+///
+/// The union is what makes gossip safe to run in any pattern: re-merging a
+/// batch adds nothing, and two hosts merging each other's logs converge
+/// regardless of who goes first.
+///
+/// # Errors
+/// When the blackboard file can't be created or appended to.
+pub fn merge_into_blackboard(incoming: &[Note]) -> Result<usize, String> {
+    use std::io::Write as _;
+    let path = blackboard_path();
+    let have = read_blackboard();
+    let new = merge_notes(&have, incoming);
+    if new.is_empty() {
+        return Ok(0);
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| format!("open {}: {e}", path.display()))?;
+    let mut body = String::new();
+    for n in &new {
+        body.push_str(&encode_note_line(n));
+    }
+    f.write_all(body.as_bytes())
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(new.len())
+}
+
+/// Append one entry, whatever its kind. `note` is this with `kind: Note`.
+///
+/// # Errors
+/// When the blackboard file can't be created or appended to.
+pub fn append_entry(mut n: Note) -> Result<Note, String> {
+    use std::io::Write as _;
+    let origin = origin_id();
+    if n.id.is_empty() {
+        n.id = mint_id(
+            &origin,
+            n.ts,
+            &format!("{:?}{:?}{}{:?}{:?}", n.from, n.task, n.msg, n.kind, n.cost),
+        );
+    }
+    if n.origin.is_none() {
+        n.origin = Some(origin);
+    }
+    let path = blackboard_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| format!("open {}: {e}", path.display()))?;
+    f.write_all(encode_note_line(&n).as_bytes())
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(n)
+}
+
+/// Build an entry with the current time and this host's origin filled in.
+#[must_use]
+pub fn new_entry(kind: NoteKind, from: Option<String>, msg: &str) -> Note {
+    Note {
+        ts: SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()),
+        from,
+        topic: None,
+        msg: msg.to_owned(),
+        id: String::new(),
+        origin: None,
+        kind,
+        task: None,
+        cost: None,
+        to: None,
+        ok: None,
+    }
+}
+
+/// Test/ops override for the blackboard file. Set via
+/// [`set_blackboard_path`].
+static BLACKBOARD_OVERRIDE: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
+
+/// Point the blackboard at a different file. Tests use a tempdir so a run
+/// never appends to the developer's real board; `None` restores the default.
+pub fn set_blackboard_path(path: Option<PathBuf>) {
+    if let Ok(mut g) = BLACKBOARD_OVERRIDE.write() {
+        *g = path;
+    }
+}
+
+pub(crate) fn blackboard_path() -> PathBuf {
+    if let Some(p) = BLACKBOARD_OVERRIDE.read().ok().and_then(|g| g.clone()) {
+        return p;
+    }
     crate::platform::state_base_dir()
         .join("tab-atelier")
         .join("blackboard.jsonl")
@@ -292,7 +522,34 @@ pub fn encode_note_line(n: &Note) -> String {
 pub fn parse_notes(body: &str) -> Vec<Note> {
     body.lines()
         .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str::<Note>(l).ok())
+        .filter_map(|l| {
+            serde_json::from_str::<Note>(l).ok().map(|mut n| {
+                if n.id.is_empty() {
+                    // Pre-typed entries carry no id. Deriving one from the content
+                    // keeps merge idempotent: the same old line seen twice is one
+                    // entry, not two.
+                    n.id = mint_id("legacy", n.ts, &format!("{:?}{:?}{}", n.from, n.topic, n.msg));
+                }
+                n
+            })
+        })
+        .collect()
+}
+
+/// Merge `incoming` into `have`, returning the entries that were new.
+///
+/// This is the whole cross-host story: a union keyed by id. Idempotent (the
+/// same batch twice adds nothing), commutative and associative (order and
+/// grouping don't matter), so two daemons that gossip in any pattern converge
+/// on the same blackboard without agreeing on anything first.
+#[must_use]
+pub fn merge_notes(have: &[Note], incoming: &[Note]) -> Vec<Note> {
+    let known: std::collections::HashSet<&str> = have.iter().map(|n| n.id.as_str()).collect();
+    let mut seen = std::collections::HashSet::new();
+    incoming
+        .iter()
+        .filter(|n| !n.id.is_empty() && !known.contains(n.id.as_str()) && seen.insert(n.id.clone()))
+        .cloned()
         .collect()
 }
 
@@ -392,11 +649,19 @@ pub fn note(topic: Option<String>, from: Option<String>, msg: &str) -> i32 {
 fn note_at(path: &Path, topic: Option<String>, from: Option<String>, msg: &str) -> i32 {
     use std::io::Write as _;
     let ts = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let origin = origin_id();
     let n = Note {
+        id: mint_id(&origin, ts, &format!("{from:?}{topic:?}{msg}")),
+        origin: Some(origin),
         ts,
         from,
         topic,
         msg: msg.to_string(),
+        kind: NoteKind::Note,
+        task: None,
+        cost: None,
+        to: None,
+        ok: None,
     };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -653,6 +918,13 @@ mod tests {
             topic: topic.map(Into::into),
             from: from.map(Into::into),
             msg: msg.into(),
+            id: format!("t-{ts}"),
+            origin: None,
+            kind: NoteKind::Note,
+            task: None,
+            cost: None,
+            to: None,
+            ok: None,
         }
     }
 

@@ -428,6 +428,81 @@ pub enum Commands {
         args: Vec<String>,
     },
 
+    /// Post work to the shared blackboard: `announce <task-id> <title>`.
+    ///
+    /// The start of a contract net (Smith, 1980): any tab may announce, any
+    /// tab may take. Task ids are free-form but conventionally scoped —
+    /// `cov:src/api.rs`, `audit:src/relay.rs` — so a generator can derive them
+    /// and stay idempotent.
+    Announce {
+        /// Passed straight through to `cli::work::announce`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Offer to do an announced task: `bid <task-id> --cost <n>` (lower wins).
+    Bid {
+        /// Passed straight through to `cli::work::bid`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Hand a task to a bidder: `award <task-id> --to <agent>`.
+    Award {
+        /// Passed straight through to `cli::work::award`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Lease the best open task for this agent: `take [--ttl <s>]`.
+    ///
+    /// Ranks open tasks by a hash of (task, agent) so agents spread out
+    /// without coordinating, then claims the first one that is free. Exits 3
+    /// when there is nothing to take, so a polling loop can tell idle from
+    /// broken.
+    Take {
+        /// Passed straight through to `cli::work::take`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Report a task finished: `done <task-id> [--fail] [result…]`.
+    ///
+    /// The explicit termination signal. Everything else has to infer
+    /// completion from a screen that stopped changing, which is a guess.
+    Done {
+        /// Passed straight through to `cli::work::done`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Show the blackboard folded into tasks: `tasks [--all]`.
+    Tasks {
+        /// Passed straight through to `cli::work::tasks`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Exchange blackboard entries with configured remotes: `gossip`.
+    ///
+    /// Anti-entropy, not replication: the log is a grow-only set, so a round
+    /// is a union in both directions and repeats are free. Safe on a timer.
+    Gossip {
+        /// Passed straight through to `cli::gossip::run`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Announce work derived from a coverage report: `backlog [--lcov <path>]`.
+    ///
+    /// Idempotent, so it can run on a timer: tasks already open (or finished
+    /// within `--cooldown`) are not announced again.
+    Backlog {
+        /// Passed straight through to `cli::backlog::run`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Per-project (or per-tab) colour + badge: `style --folder <dir> --color …`.
     ///
     /// A folder rule styles every tab whose cwd is inside it, so tabs opened in
@@ -824,6 +899,14 @@ fn command_exit_code(cli: Cli) -> Option<i32> {
         Commands::SetMeta { args } => crate::cli::client::run("set-meta", &args),
         Commands::Style { args } => crate::cli::client::run("style", &args),
         Commands::Logs { args } => crate::cli::client::run("logs", &args),
+        Commands::Announce { args } => crate::cli::client::run("announce", &args),
+        Commands::Bid { args } => crate::cli::client::run("bid", &args),
+        Commands::Award { args } => crate::cli::client::run("award", &args),
+        Commands::Take { args } => crate::cli::client::run("take", &args),
+        Commands::Done { args } => crate::cli::client::run("done", &args),
+        Commands::Tasks { args } => crate::cli::client::run("tasks", &args),
+        Commands::Gossip { args } => crate::cli::client::run("gossip", &args),
+        Commands::Backlog { args } => crate::cli::client::run("backlog", &args),
         Commands::Token => crate::cli::client::run("token", &[]),
         Commands::RotateTokens => crate::cli::client::run("rotate-tokens", &[]),
         Commands::ResetMasterToken => crate::cli::client::run("reset-master-token", &[]),

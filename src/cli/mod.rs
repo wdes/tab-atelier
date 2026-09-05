@@ -5,6 +5,9 @@
 /// `tab-atelier claude [ARGS…]` — clear the grid + `exec claude` (a correct,
 /// no-fuss agent launcher; see the module docs).
 pub mod agent;
+/// `tab-atelier backlog` — turn a coverage report into announced work, so the
+/// fleet finds its own tasks instead of waiting to be told.
+pub mod backlog;
 pub mod bench;
 pub mod bench_lag;
 pub mod brain;
@@ -16,6 +19,11 @@ pub mod delegate;
 pub mod dispatch;
 /// `tab-atelier flags …` — toggle agent-instrumentation flags.
 pub mod flags;
+/// `tab-atelier gossip` — anti-entropy between hosts' blackboards.
+///
+/// Exchanges entries with the configured remotes so a fleet can span machines
+/// without a coordinator.
+pub mod gossip;
 /// `tab-atelier log …` — enable/disable the GUI file logger (persisted,
 /// applied on next launch) without wrangling env vars.
 pub mod logging;
@@ -31,7 +39,13 @@ pub mod set_status;
 /// after the first one added; see the module docstring for details.
 pub mod share_link;
 pub mod style;
+/// `tab-atelier tasks` — the contract-net fold over the blackboard: what work
+/// exists, who bid, who won, what finished.
+pub mod tasks;
 /// `tab-atelier peers / note / notes / handoff` — Claude-to-Claude teamwork
 /// verbs (dispatch handles send-a-prompt-and-wait; this is the rest).
 pub mod team;
 pub mod tokens;
+/// `tab-atelier announce / bid / award / take / done` — the verbs an agent
+/// uses to join the fleet and pick up work on its own.
+pub mod work;

@@ -561,6 +561,19 @@ tab-atelier handoff ./report.md db-expert
 
 **Etiquette (and safety):** only `dispatch` to a tab `peers` shows as `idle`/`waiting`, never mid-turn; a locked tab refuses input; and never `--resume`/`--continue` another tab's session — it rotates/strips the session id. To make every agent aware of these verbs, drop the snippet from [`docs/teamwork.md`](docs/teamwork.md) into `~/.claude/CLAUDE.md`.
 
+**Let the fleet divide the work itself** — instead of deciding who does what, put the work on a shared board and let agents take it:
+
+```bash
+cargo llvm-cov --lcov --output-path target/lcov.info
+tab-atelier backlog                    # announce the worst-covered files + a rotation of audits
+tab-atelier tasks                      # the board
+tab-atelier take                       # lease the best open task for THIS agent
+tab-atelier done cov:src/api.rs "40% -> 82%"
+tab-atelier gossip                     # converge boards with configured remotes
+```
+
+`take` leases the task through the daemon, so two agents never pick up the same one, and a lease from a tab that dies simply expires. Nothing schedules; agents rank the board by a hash of (task, agent), so they spread out without talking to each other. See [`docs/self-organization.md`](docs/self-organization.md) for the design — including why this is leases and CRDTs rather than Raft — and `scripts/self-org-sandbox.sh` for a two-host demonstration that touches nothing of yours.
+
 ## Wakatime
 
 Wakatime integration is automatic if your Zed settings contain `wakatime.settings.api-key`. Heartbeats are sent with project detection (walks up to find `.git`).

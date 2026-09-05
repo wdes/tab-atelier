@@ -61,6 +61,16 @@ pub fn dispatch(name: &str, rest: &[String]) -> Option<i32> {
         "tabs" | "list" => share_link::tabs(rest),
         "peers" => team::peers(rest.iter().any(|a| a == "--all")),
         "peek" => team::run_peek(rest),
+        // Self-organising fleet: contract net over the blackboard, plus the
+        // lease that keeps two agents off the same task.
+        "announce" => super::work::announce(rest),
+        "bid" => super::work::bid(rest),
+        "award" => super::work::award(rest),
+        "take" => super::work::take(rest),
+        "done" => super::work::done(rest),
+        "tasks" => super::work::tasks(rest),
+        "gossip" => super::gossip::run(rest),
+        "backlog" => super::backlog::run(rest),
         "note" => team::run_note(rest),
         "notes" => team::run_notes(rest),
         "handoff" => team::run_handoff(rest),
