@@ -213,13 +213,29 @@ pub fn apply_relay_config(change: &crate::api::RelayConfigChange, config_base: &
 }
 
 /// Resolve + install the relay egress flag and forward target from a loaded
+/// The credential to present to a peer's relay route.
+///
+/// One endpoint entry serves two different consumers: the sidecar needs the
+/// peer's MASTER token (it lists tabs, types input, moves files), while the
+/// relay must present the peer's RELAY token, which can do nothing but proxy.
+/// So `relay_token` wins when set, and `token` remains the fallback for an
+/// entry that predates the split or points at a relay-only peer.
+#[must_use]
+pub fn relay_credential(endpoint: &RemoteEndpoint) -> &str {
+    if endpoint.relay_token.is_empty() {
+        &endpoint.token
+    } else {
+        &endpoint.relay_token
+    }
+}
+
 /// `Preferences`. Called at startup (both editions) and after a relay toggle.
 pub fn install_relay_config(prefs: &Preferences) {
     set_relay_egress(prefs.relay_egress);
     let target = prefs.relay_endpoint_id.as_deref().and_then(|id| {
         prefs.remote_endpoints.iter().find(|e| e.id == id).map(|e| RelayTarget {
             url: e.url.trim_end_matches('/').to_string(),
-            token: e.token.clone(),
+            token: relay_credential(e).to_string(),
             cf_access_client_id: e.cf_access_client_id.clone(),
             cf_access_client_secret: e.cf_access_client_secret.clone(),
         })
@@ -2710,7 +2726,15 @@ pub struct RemoteEndpoint {
     /// required).
     pub url: String,
     /// Bearer token. Mirrors the remote's `~/.local/state/tab-atelier/api.token`.
+    /// Full API access: the sidecar (`remote attach` / `put` / `get`) needs it
+    /// to list tabs, send input and move files.
     pub token: String,
+    /// Bearer token for the Anthropic relay hop only, mirroring the remote's
+    /// `relay.token`. Separate from [`Self::token`] because the relay route
+    /// refuses the master token by design — see [`relay_credential`]. Empty
+    /// when the endpoint isn't used for relaying.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub relay_token: String,
     /// Hex SHA-256 of the remote's TLS cert (TOFU-pinned).
     pub cert_sha256: String,
     /// When true, the GUI connects to this endpoint at startup
@@ -3909,6 +3933,32 @@ mod tests {
         assert_eq!(stats_rows(&mixed)[1], format!("Power: {STAT_PENDING}"));
         assert_eq!(stats_rows(&mixed)[3], format!("Connections: {STAT_PENDING}"));
         assert!(stats_rows(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_peer_presents_its_relay_token_and_falls_back_to_the_master() {
+        // One endpoint entry feeds two consumers with different rights: the
+        // sidecar needs the peer's master token (it lists tabs, types input,
+        // moves files), the relay hop must present the relay-only one. Mixing
+        // them up means either the sidecar 401s or the relay does.
+        let mut ep = RemoteEndpoint {
+            id: "id".into(),
+            label: "box".into(),
+            url: "https://box:7891".into(),
+            token: "MASTER".into(),
+            ..RemoteEndpoint::default()
+        };
+        assert_eq!(
+            relay_credential(&ep),
+            "MASTER",
+            "no relay token yet → the old behaviour"
+        );
+        ep.relay_token = "RELAY".into();
+        assert_eq!(relay_credential(&ep), "RELAY", "the relay hop uses the relay token");
+        assert_eq!(ep.token, "MASTER", "and the sidecar's credential is untouched");
+        // Whitespace-only is not a credential.
+        ep.relay_token = String::new();
+        assert_eq!(relay_credential(&ep), "MASTER");
     }
 
     #[test]
@@ -5531,6 +5581,7 @@ mod tests {
                     autoconnect: true,
                     cf_access_client_id: "svc.access".into(),
                     cf_access_client_secret: "s3cr3t".into(),
+                    relay_token: "relay-only".into(),
                 },
                 RemoteEndpoint {
                     id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
