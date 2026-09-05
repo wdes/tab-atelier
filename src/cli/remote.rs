@@ -38,6 +38,14 @@ pub fn run(args: &[String]) -> i32 {
     let rest = &args[1..];
     match sub.as_str() {
         "list" => cmd_list(),
+        // Printed here, pasted into the PEER's `remote add --token`. Scoped to
+        // the sidecar's own operations, unlike the master token.
+        "my-token" => {
+            println!("{}", crate::remote_token());
+            eprintln!("# sidecar credential for THIS instance — on the peer, run:");
+            eprintln!("#   tab-atelier remote add --label <name> --url <this-url> --token <above>");
+            0
+        }
         "add" => cmd_add(rest),
         "remove" | "rm" => cmd_remove(rest),
         "test" => cmd_test(rest, false),
@@ -65,9 +73,11 @@ mod resolver;
 
 fn usage() {
     eprintln!(
-        "usage: tab-atelier remote <list|add|remove|test|watch|attach|put|get|pin-cert|re-pin> [args]\n\
+        "usage: tab-atelier remote <list|my-token|add|remove|test|watch|attach|put|get|pin-cert|re-pin> [args]\n\
          \n\
          list                                          list configured endpoints\n\
+         my-token                                      print this instance's sidecar token, for\n\
+                                                       the peer's `remote add --token`\n\
          add --label L --url U --token T [--relay-token R] [--no-pin] [--autoconnect]\n\
                                                        --token is the peer's master token (tabs,\n\
                                                        input, files); --relay-token its `relay\n\
