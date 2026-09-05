@@ -26,6 +26,33 @@ const REFRESH_URL: &str = "https://console.anthropic.com/v1/oauth/token";
 /// `anthropic-beta` header Claude Code sends for OAuth-authenticated requests.
 pub const ANTHROPIC_BETA: &str = "oauth-2025-04-20,claude-code-20250219";
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
+/// Merge the client's `anthropic-beta` with the flags OAuth requires.
+///
+/// The egress authenticates with a Claude Code OAuth token, which upstream
+/// only accepts alongside [`ANTHROPIC_BETA`] — so those flags must be present.
+/// We used to just *set* the header to that constant, which silently dropped
+/// whatever the client had opted into. A client that sends a body field gated
+/// behind its own beta flag (`context_management`, say) then gets
+/// `400 … extra inputs are not permitted` from upstream: the field arrived,
+/// the opt-in did not. So take the union instead, keeping the client's order
+/// and appending ours, case-insensitively deduplicated.
+#[must_use]
+pub fn merge_beta(client: Option<&str>, required: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for flag in client
+        .unwrap_or("")
+        .split(',')
+        .chain(required.split(','))
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+    {
+        if !out.iter().any(|k| k.eq_ignore_ascii_case(flag)) {
+            out.push(flag);
+        }
+    }
+    out.join(",")
+}
+
 /// Upstream the egress forwards to.
 pub const ANTHROPIC_BASE: &str = "https://api.anthropic.com";
 /// Refresh this many ms before the access token expires so an in-flight
@@ -205,6 +232,31 @@ fn refresh(refresh_token: &str) -> Result<OauthBlob, String> {
 
 #[cfg(test)]
 mod tests {
+    use super::merge_beta;
+
+    #[test]
+    fn the_clients_beta_flags_survive_the_egress() {
+        // The OAuth flags are mandatory upstream, so they are always present…
+        assert_eq!(merge_beta(None, ANTHROPIC_BETA), ANTHROPIC_BETA);
+        assert_eq!(merge_beta(Some(""), ANTHROPIC_BETA), ANTHROPIC_BETA);
+        // …but they must not evict what the client opted into, or a body field
+        // gated behind the client's flag is rejected as an unknown input.
+        let merged = merge_beta(Some("context-management-2025-06-27"), ANTHROPIC_BETA);
+        assert!(merged.starts_with("context-management-2025-06-27,"), "{merged}");
+        for required in ANTHROPIC_BETA.split(',') {
+            assert!(merged.contains(required), "{required} missing from {merged}");
+        }
+        // Overlap is not duplicated, and spacing/case from the client is
+        // tolerated — this header is assembled by several SDKs.
+        let merged = merge_beta(Some(" OAUTH-2025-04-20 , fine-grained-tool-streaming "), ANTHROPIC_BETA);
+        assert_eq!(
+            merged.matches("oauth-2025-04-20").count() + merged.matches("OAUTH-2025-04-20").count(),
+            1
+        );
+        assert!(merged.contains("fine-grained-tool-streaming"), "{merged}");
+        assert!(!merged.contains(" ,"), "no stray spacing: {merged}");
+    }
+
     use super::*;
 
     #[test]

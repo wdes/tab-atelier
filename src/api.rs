@@ -2177,6 +2177,13 @@ async fn handle_relay(req: Request<Incoming>, master_token: &str) -> Response<Re
     // empty credential and a 401 that says nothing about the real problem. The
     // token is the same secret either way, so which envelope carries it buys
     // nothing.
+    // Captured before the body is consumed: whatever the client opted into
+    // travels with the request, on both hops.
+    let client_beta = req
+        .headers()
+        .get("anthropic-beta")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
     let provided = req
         .headers()
         .get("x-api-key")
@@ -2275,9 +2282,17 @@ async fn handle_relay(req: Request<Incoming>, master_token: &str) -> Response<Re
         ];
         if egress {
             hdrs.push(("anthropic-version", crate::relay::ANTHROPIC_VERSION.to_owned()));
-            hdrs.push(("anthropic-beta", crate::relay::ANTHROPIC_BETA.to_owned()));
+            hdrs.push((
+                "anthropic-beta",
+                crate::relay::merge_beta(client_beta.as_deref(), crate::relay::ANTHROPIC_BETA),
+            ));
         } else {
             hdrs.push(("Accept", "application/json".to_owned()));
+            // The local hop is a pipe: the egress needs the client's flags to
+            // merge, and it can't see them if we drop them here.
+            if let Some(beta) = client_beta.clone() {
+                hdrs.push(("anthropic-beta", beta));
+            }
             if let Some((id, sec)) = cf {
                 hdrs.push(("CF-Access-Client-Id", id));
                 hdrs.push(("CF-Access-Client-Secret", sec));
@@ -3282,7 +3297,7 @@ mod tests {
         // two SSE frames with a gap and close (connection-close framing).
         let mock = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let mock_port = mock.local_addr().unwrap().port();
-        let (seen_tx, seen_rx) = std::sync::mpsc::channel::<String>();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel::<(String, String)>();
         std::thread::spawn(move || {
             if let Ok((mut sock, _)) = mock.accept() {
                 sock.set_read_timeout(Some(std::time::Duration::from_secs(2))).ok();
@@ -3303,7 +3318,12 @@ mod tests {
                     .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
                     .unwrap_or("")
                     .to_owned();
-                let _ = seen_tx.send(auth);
+                let beta = head
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("anthropic-beta:"))
+                    .unwrap_or("")
+                    .to_owned();
+                let _ = seen_tx.send((auth, beta));
                 let _ =
                     sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n");
                 let _ = sock.write_all(b"data: {\"type\":\"message_start\"}\n\n");
@@ -3325,7 +3345,7 @@ mod tests {
         let token = crate::relay_token();
         let payload = "{}";
         let req = format!(
-            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nanthropic-beta: context-management-2025-06-27\r\nContent-Length: {}\r\n\r\n{payload}",
             payload.len()
         );
         let resp = request(port, &req);
@@ -3338,7 +3358,7 @@ mod tests {
         assert_eq!(status_code(&resp), 200, "resp: {resp}");
         assert!(resp.contains("data:"), "expected streamed SSE, got: {resp}");
         assert!(resp.contains("[DONE]"), "expected final SSE frame, got: {resp}");
-        let seen = seen_rx
+        let (seen, beta) = seen_rx
             .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap_or_default();
         assert!(
@@ -3348,6 +3368,17 @@ mod tests {
         assert!(
             !seen.contains(token.as_str()),
             "the stand-in relay token must never reach Anthropic; saw: {seen}"
+        );
+        // The OAuth flags are required upstream, but they must not evict the
+        // client's own: dropping `context-management-…` while still forwarding
+        // the body field it gates earns a 400 "extra inputs are not permitted".
+        assert!(
+            beta.contains("context-management-2025-06-27"),
+            "client beta flags must survive the egress; upstream saw: {beta}"
+        );
+        assert!(
+            beta.contains("oauth-2025-04-20"),
+            "OAuth beta flag still required; upstream saw: {beta}"
         );
     }
 
