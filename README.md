@@ -337,7 +337,11 @@ ANTHROPIC_API_KEY  = <the local instance's RELAY token>      # a stand-in, valid
 
 Claude POSTs to the loopback relay, which forwards to the remote's `/relay/anthropic/*` (bearer + optional CF-Access headers); the remote **egress** swaps the stand-in for its live Claude OAuth token (`Authorization: Bearer …` + `anthropic-version`/`anthropic-beta`) and streams the SSE response back end-to-end.
 
-The stand-in is a **relay-only token** (`<state>/relay.token`, minted on first use, `0600`), never the master token. An API key is a value tools copy into debug output, crash reports and shared transcripts; the master token administers every tab, so it must not be the thing sitting in a claude tab's environment. The relay token authenticates `/relay/anthropic/*` and nothing else — it cannot list tabs, read output, inject input or rotate anything. Print it with `tab-atelier relay token`.
+The stand-in is a **relay-only token** (`<state>/relay.token`, minted on first use, `0600`), and it is the *only* credential the relay route accepts — the master token is refused there. An API key is a value tools copy into debug output, crash reports and shared transcripts; the master token administers every tab, so it must not be the thing sitting in a claude tab's environment. The relay token authenticates `/relay/anthropic/*` and nothing else — it cannot list tabs, read output, inject input or rotate anything. Print it with `tab-atelier relay token`.
+
+One route is exempt from auth: `HEAD`/`GET /relay/anthropic/api/hello`, the reachability probe Claude Code sends **before it has a credential to present**. Answering it with 401 makes the client treat the whole relay as unusable, so it is served locally with a 200 — no upstream call, no token involved, and it reveals nothing that completing the TCP handshake hasn't already.
+
+> **Upgrading from a build that used the master token here:** run `tab-atelier relay token` on the egress host and re-run `remote add --token <it>` on the local one. The master is no longer accepted on the relay route, so the link stays down until you do.
 
 **Setup**
 

@@ -2058,6 +2058,24 @@ async fn handle_hyper_request(
 }
 
 /// A small buffered relay response (errors / 401s), boxed to match [`RespBody`].
+/// Claude Code's reachability probe: `HEAD`/`GET {base}/api/hello`, sent with
+/// NO credential at all — it runs before the client has one to present. A 401
+/// there reads as "this endpoint is broken" and the whole relay looks dead,
+/// even though the real `/v1/messages` calls would authenticate fine.
+///
+/// Answered locally and unauthenticated: no upstream call, no token touched,
+/// and it discloses nothing that completing the TCP handshake hasn't already.
+/// Deliberately an exact path match — an unauthenticated branch is security
+/// surface, so it stays one probe wide.
+fn relay_hello(head_only: bool) -> Response<RespBody> {
+    let body = if head_only { "" } else { "{}" };
+    Response::builder()
+        .status(200)
+        .header("content-type", "application/json")
+        .body(Full::new(Bytes::from(body)).boxed())
+        .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()).boxed()))
+}
+
 fn relay_status(code: u16, msg: &str) -> Response<RespBody> {
     Response::builder()
         .status(code)
@@ -2082,7 +2100,14 @@ async fn handle_relay(req: Request<Incoming>, master_token: &str) -> Response<Re
     let sub_pq = req.uri().query().map_or_else(|| sub.clone(), |q| format!("{sub}?{q}"));
     let egress = crate::relay_egress();
 
-    // Auth against this instance's master token (constant-time).
+    // Reachability probe first: it carries no credential by design, so it has
+    // to be answered before the auth gate or the client concludes the relay is
+    // unusable and never gets as far as an authenticated call.
+    if sub == "/api/hello" && matches!(method, hyper::Method::HEAD | hyper::Method::GET) {
+        return relay_hello(method == hyper::Method::HEAD);
+    }
+
+    // Auth against this instance's relay token (constant-time).
     let provided = if egress {
         req.headers()
             .get(hyper::header::AUTHORIZATION)
@@ -2097,21 +2122,13 @@ async fn handle_relay(req: Request<Incoming>, master_token: &str) -> Response<Re
             .unwrap_or("")
             .to_owned()
     };
-    // The relay token is the credential for this route: it authenticates the
-    // relay and nothing else, so the value that ends up in a claude tab's
-    // ANTHROPIC_API_KEY can't administer the instance if it leaks.
-    //
-    // The master token is still accepted, because an instance configured
-    // before the split has the peer's master token saved in its
-    // `remote_endpoints`; refusing it would break that link on upgrade. It's
-    // logged so the setup can be moved over — see `relay token` in the README.
-    let relay = crate::relay_token();
-    if !constant_time_eq(provided.as_bytes(), relay.as_bytes()) {
-        if constant_time_eq(provided.as_bytes(), master_token.as_bytes()) {
-            log::warn!("relay: authenticated with the MASTER token — re-configure the peer with `relay token`");
-        } else {
-            return relay_status(401, "relay: unauthorized");
-        }
+    // The relay token is the ONLY credential for this route. It authenticates
+    // the relay and nothing else, so the value sitting in a claude tab's
+    // ANTHROPIC_API_KEY cannot administer the instance if it leaks — which is
+    // the entire point, and is why the master token is not a second way in.
+    let _ = master_token;
+    if !constant_time_eq(provided.as_bytes(), crate::relay_token().as_bytes()) {
+        return relay_status(401, "relay: unauthorized");
     }
 
     let content_type = req
@@ -3203,7 +3220,10 @@ mod tests {
         crate::relay::set_upstream(Some(format!("http://127.0.0.1:{mock_port}")));
         crate::set_relay_egress(true);
 
-        let (port, _state, token) = spawn_server();
+        let (port, _state, _master) = spawn_server();
+        // The relay route takes the relay token only — the master administers
+        // tabs and is deliberately not a second way in.
+        let token = crate::relay_token();
         let payload = "{}";
         let req = format!(
             "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
@@ -3259,9 +3279,38 @@ mod tests {
         // so it gets as far as the forward attempt and fails there — what
         // matters is that it is NOT 401.
         assert_ne!(status_code(&call(&relay)), 401, "relay token authenticates");
-        // The master still works, so an instance configured with a peer's
-        // master token before the split keeps relaying after an upgrade.
-        assert_ne!(status_code(&call(&master)), 401, "master accepted as legacy");
+        // The master token is NOT a second way in: it administers every tab,
+        // and the point of the split is that the relay credential can't.
+        assert_eq!(status_code(&call(&master)), 401, "master is not a relay credential");
+    }
+
+    #[test]
+    fn the_relay_health_probe_answers_without_a_credential() {
+        let _guard = RELAY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (port, _state, _master) = spawn_server();
+        // Claude Code probes reachability before it has a credential to send —
+        // observed on the wire as a bare HEAD with no x-api-key. 401ing it
+        // makes the client treat the whole relay as unusable.
+        for verb in ["HEAD", "GET"] {
+            let resp = request(
+                port,
+                &format!("{verb} /relay/anthropic/api/hello HTTP/1.1\r\nHost: x\r\n\r\n"),
+            );
+            assert_eq!(status_code(&resp), 200, "{verb} /api/hello must not need auth");
+        }
+        // The exemption is exactly one path: everything else still 401s
+        // without the relay token, including near-misses.
+        for path in [
+            "/relay/anthropic/api/hello/../v1/messages",
+            "/relay/anthropic/api/hellox",
+            "/relay/anthropic/v1/messages",
+            "/relay/anthropic/",
+        ] {
+            let resp = request(port, &format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n"));
+            assert_eq!(status_code(&resp), 401, "{path} still needs the relay token");
+        }
     }
 
     /// configured remote's `/relay/anthropic/*` with the remote's Bearer token,
@@ -3303,11 +3352,12 @@ mod tests {
             cf_access_client_secret: String::new(),
         }));
 
-        let (port, _state, master) = spawn_server();
+        let (port, _state, _master) = spawn_server();
+        let relay = crate::relay_token();
         let payload = "{}";
         // Claude presents the stand-in x-api-key (== the local master token).
         let req = format!(
-            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {master}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {relay}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
             payload.len()
         );
         let resp = request(port, &req);
@@ -3368,10 +3418,11 @@ mod tests {
             cf_access_client_secret: String::new(),
         }));
 
-        let (port, _state, master) = spawn_server();
+        let (port, _state, _master) = spawn_server();
+        let relay = crate::relay_token();
         let payload = "{}";
         let req = format!(
-            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {master}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {relay}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
             payload.len()
         );
         let resp = request(port, &req);
