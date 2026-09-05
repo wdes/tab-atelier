@@ -38,6 +38,26 @@ pub(crate) fn set_test_endpoint(ep: Option<Endpoint>) {
     *TEST_ENDPOINT.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = ep;
 }
 
+/// URL a daemon bound, read from the `api.url` the server writes beside its
+/// token; [`DEFAULT_LOOPBACK_URL`] when absent (an older daemon, or one that
+/// couldn't write its state dir).
+///
+/// Pairing the URL with the token file we just matched matters: the two must
+/// describe the SAME instance, or we authenticate against one daemon with
+/// another's credential and get a 401 that blames the token.
+fn endpoint_url_beside(token_path: &std::path::Path) -> String {
+    token_path
+        .parent()
+        .map(|d| d.join("api.url"))
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|u| u.trim().to_owned())
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| DEFAULT_LOOPBACK_URL.to_owned())
+}
+
+/// Where a daemon lives unless it published otherwise.
+pub(crate) const DEFAULT_LOOPBACK_URL: &str = "http://127.0.0.1:7890";
+
 pub(crate) fn discover_endpoint() -> Result<Endpoint, String> {
     #[cfg(test)]
     {
@@ -73,7 +93,7 @@ pub(crate) fn discover_endpoint() -> Result<Endpoint, String> {
             let token = t.trim().to_string();
             if !token.is_empty() {
                 return Ok(Endpoint {
-                    url: "http://127.0.0.1:7890".into(),
+                    url: endpoint_url_beside(path),
                     token,
                 });
             }
@@ -2222,6 +2242,24 @@ pub(crate) fn with_test_server<T>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn discovery_follows_the_port_the_daemon_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = dir.path().join("api.token");
+        std::fs::write(&token, "0123456789abcdef0123456789abcdef").unwrap();
+        // No api.url (an older daemon): fall back to the documented default
+        // rather than refusing to talk to it at all.
+        assert_eq!(super::endpoint_url_beside(&token), super::DEFAULT_LOOPBACK_URL);
+        // Published: follow it, or a daemon on a non-default port gets a token
+        // meant for it sent to whatever holds 7890 — a 401 that reads like a
+        // credential problem.
+        std::fs::write(dir.path().join("api.url"), "http://127.0.0.1:7899\n").unwrap();
+        assert_eq!(super::endpoint_url_beside(&token), "http://127.0.0.1:7899");
+        // An empty/blank file is treated as absent, not as an empty URL.
+        std::fs::write(dir.path().join("api.url"), "  \n").unwrap();
+        assert_eq!(super::endpoint_url_beside(&token), super::DEFAULT_LOOPBACK_URL);
+    }
+
     use super::*;
 
     fn args(v: &[&str]) -> Vec<String> {
