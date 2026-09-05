@@ -146,6 +146,8 @@ A normal launch acquires a single-instance lock on `~/.local/state/tab-atelier/t
 
 For servers (no display, no gpui), install `tab-atelier-headless.deb` instead. Same HTTP API, same persistence files, same `set-status` / `tabs` / `remote` CLI subcommands — just no window. Ships with a systemd user unit:
 
+> **CLI examples in this README all say `tab-atelier`.** On a headless install the identical verbs live on `tab-atelier-headless` — the two `.deb`s conflict, so each ships only its own name on `PATH`. Substitute accordingly; nothing else differs.
+
 ```sh
 systemctl --user enable --now tab-atelier-headless
 ```
@@ -249,7 +251,8 @@ So you can use the API and manage share access without hunting for the `api.toke
 
 ```sh
 tab-atelier token              # print the master API token (stdout) + URL hint (stderr)
-curl -s "$(tab-atelier token | head -1)" ...   # TOKEN=$(tab-atelier token) is scriptable
+curl -s http://127.0.0.1:7890/tabs \
+  -H "Authorization: Bearer $(tab-atelier token)"   # the token is stdout, so this is scriptable
 tab-atelier rotate-tokens      # revoke every tab's share tokens → existing share links 401
 tab-atelier reset-master-token # rotate the master token live (no restart) → old token 401s
 ```
@@ -329,10 +332,12 @@ When relay mode is on, every claude tab is spawned with:
 
 ```
 ANTHROPIC_BASE_URL = http://127.0.0.1:7890/relay/anthropic   # the local relay route
-ANTHROPIC_API_KEY  = <the local instance's master token>     # a stand-in, validates the loopback
+ANTHROPIC_API_KEY  = <the local instance's RELAY token>      # a stand-in, validates the loopback
 ```
 
 Claude POSTs to the loopback relay, which forwards to the remote's `/relay/anthropic/*` (bearer + optional CF-Access headers); the remote **egress** swaps the stand-in for its live Claude OAuth token (`Authorization: Bearer …` + `anthropic-version`/`anthropic-beta`) and streams the SSE response back end-to-end.
+
+The stand-in is a **relay-only token** (`<state>/relay.token`, minted on first use, `0600`), never the master token. An API key is a value tools copy into debug output, crash reports and shared transcripts; the master token administers every tab, so it must not be the thing sitting in a claude tab's environment. The relay token authenticates `/relay/anthropic/*` and nothing else — it cannot list tabs, read output, inject input or rotate anything. Print it with `tab-atelier relay token`.
 
 **Setup**
 
@@ -340,7 +345,7 @@ On the **remote** (already logged into `claude`, so `~/.claude/.credentials.json
 
 ```sh
 tab-atelier relay egress on          # this host is the terminal hop → Anthropic
-tab-atelier-headless token           # grab its master token for the endpoint below
+tab-atelier relay token              # grab its RELAY token for the endpoint below
 ```
 
 On the **local** machine:
@@ -360,13 +365,14 @@ New claude tabs now relay transparently. The full command:
 | `relay via <label\|id>` | pick the remote to relay through (`relay via ""` clears) |
 | `relay egress on\|off` | mark this host as the terminal hop to Anthropic |
 | `relay status` | print the live config (mode / egress / target) |
+| `relay token` | print this instance's relay-only token (paste into the peer's `remote add --token`) |
 
 All changes apply live (persisted + re-installed, no restart). The `relay_egress` role and `relay_endpoint_id` live in `preferences.json` but are set via the CLI above.
 
 **Smoke test** — verify the whole chain without launching Claude:
 
 ```sh
-curl -N -H "x-api-key: $(tab-atelier token)" -H 'content-type: application/json' \
+curl -N -H "x-api-key: $(tab-atelier relay token)" -H 'content-type: application/json' \
   -d '{"model":"claude-sonnet-4-5","max_tokens":64,"stream":true,
        "messages":[{"role":"user","content":"say hi"}]}' \
   http://127.0.0.1:7890/relay/anthropic/v1/messages

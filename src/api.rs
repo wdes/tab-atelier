@@ -2097,8 +2097,21 @@ async fn handle_relay(req: Request<Incoming>, master_token: &str) -> Response<Re
             .unwrap_or("")
             .to_owned()
     };
-    if !constant_time_eq(provided.as_bytes(), master_token.as_bytes()) {
-        return relay_status(401, "relay: unauthorized");
+    // The relay token is the credential for this route: it authenticates the
+    // relay and nothing else, so the value that ends up in a claude tab's
+    // ANTHROPIC_API_KEY can't administer the instance if it leaks.
+    //
+    // The master token is still accepted, because an instance configured
+    // before the split has the peer's master token saved in its
+    // `remote_endpoints`; refusing it would break that link on upgrade. It's
+    // logged so the setup can be moved over — see `relay token` in the README.
+    let relay = crate::relay_token();
+    if !constant_time_eq(provided.as_bytes(), relay.as_bytes()) {
+        if constant_time_eq(provided.as_bytes(), master_token.as_bytes()) {
+            log::warn!("relay: authenticated with the MASTER token — re-configure the peer with `relay token`");
+        } else {
+            return relay_status(401, "relay: unauthorized");
+        }
     }
 
     let content_type = req
@@ -3220,6 +3233,37 @@ mod tests {
     }
 
     /// End-to-end: a client POST through the LOCAL relay is forwarded to the
+    #[test]
+    fn the_relay_route_takes_the_relay_token_not_just_the_master() {
+        let _guard = RELAY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (port, _state, master) = spawn_server();
+        let relay = crate::relay_token();
+        assert_ne!(relay, master, "the relay credential is its own token");
+
+        let payload = r#"{"model":"m","max_tokens":1,"messages":[]}"#;
+        let call = |key: &str| {
+            request(
+                port,
+                &format!(
+                    "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {key}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+                    payload.len(),
+                ),
+            )
+        };
+        // A token that is neither is refused — the route is not open.
+        assert_eq!(status_code(&call("not-a-token")), 401);
+        assert_eq!(status_code(&call("")), 401);
+        // The relay token authenticates. No relay target is configured here,
+        // so it gets as far as the forward attempt and fails there — what
+        // matters is that it is NOT 401.
+        assert_ne!(status_code(&call(&relay)), 401, "relay token authenticates");
+        // The master still works, so an instance configured with a peer's
+        // master token before the split keeps relaying after an upgrade.
+        assert_ne!(status_code(&call(&master)), 401, "master accepted as legacy");
+    }
+
     /// configured remote's `/relay/anthropic/*` with the remote's Bearer token,
     /// preserving the sub-path and streaming the response back.
     #[test]
