@@ -341,9 +341,9 @@ The stand-in is a **relay-only token** (`<state>/relay.token`, minted on first u
 
 One route is exempt from auth: `HEAD`/`GET /relay/anthropic/api/hello`, the reachability probe Claude Code sends **before it has a credential to present**. Answering it with 401 makes the client treat the whole relay as unusable, so it is served locally with a 200 — no upstream call, no token involved, and it reveals nothing that completing the TCP handshake hasn't already.
 
-One endpoint entry, two credentials, neither of them the master token: `--token` is the peer's **sidecar** token (`tab-atelier remote my-token` over there), scoped to listing tabs, mirroring output, sending input and moving files; `--relay-token` is its **relay** token (`tab-atelier relay token`), used only for the relay hop. An entry without `--relay-token` falls back to `--token` for relaying, which now fails against an up-to-date peer — that's the upgrade step below.
+One endpoint entry, two credentials, neither of them the master token: `--token` is the peer's **sidecar** token (`tab-atelier remote my-token` over there), scoped to listing tabs, mirroring output, sending input and moving files; `--relay-token` is its **relay** token (`tab-atelier relay token`), which can do nothing but proxy. They don't substitute for each other — an entry with no `--relay-token` simply can't relay, and says so, rather than presenting the wrong credential and failing at the peer.
 
-> **Upgrading from a build that used the master token here:** run `tab-atelier relay token` on the egress host, then `tab-atelier remote add … --relay-token <it>` (or re-add the endpoint) on the local one. The master is no longer accepted on the relay route, so the link stays down until you do.
+> The master token is not accepted on either path. Re-add any endpoint configured with it: `tab-atelier remote my-token` and `tab-atelier relay token` on the peer, then `remote add --token <sidecar> --relay-token <relay>` here.
 
 **Setup**
 

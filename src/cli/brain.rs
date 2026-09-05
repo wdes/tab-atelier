@@ -299,6 +299,13 @@ struct TabInfo {
     /// currently in a session doesn't get auto-`continue`ed.
     #[serde(default)]
     agent_session_id: Option<String>,
+    /// CRC-32 of the tab's current output, served on `/tabs`. When it matches
+    /// what we saw last tick the screen has not moved, so there is nothing to
+    /// re-read — the whole point of a watchdog that mostly watches idle
+    /// screens. `None` from a daemon too old to send it, which then falls back
+    /// to fetching every tab.
+    #[serde(default)]
+    output_crc: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -367,6 +374,11 @@ struct TabWatch {
     next_nudge_at: Option<Instant>,
     /// Error label of the last nudge; a different label resets the streak.
     last_label: Option<&'static str>,
+    /// `/tabs` output CRC at the last fetch, and the tail it corresponds to.
+    /// While the CRC is unchanged the screen is byte-identical, so the tail is
+    /// still accurate and no HTTP is needed to know it.
+    cached_crc: Option<u32>,
+    cached_tail: String,
 }
 
 impl TabWatch {
@@ -381,7 +393,41 @@ impl TabWatch {
             nudge_streak: 0,
             next_nudge_at: None,
             last_label: None,
+            cached_crc: None,
+            cached_tail: String::new(),
         }
+    }
+}
+
+/// The trailing window brain actually reads, on a char boundary.
+///
+/// Cached and hashed in this form so the stability check compares like with
+/// like: feeding the full grid on a fetch and the tail on a cache hit would
+/// change the hash every other tick and no screen would ever look frozen.
+#[must_use]
+fn tail_of(text: &str) -> String {
+    if text.len() <= SCOPE_TAIL_BYTES {
+        return text.to_string();
+    }
+    let mut start = text.len() - SCOPE_TAIL_BYTES;
+    while start > 0 && !text.is_char_boundary(start) {
+        start -= 1;
+    }
+    text[start..].to_string()
+}
+
+/// Must this tab's `/output` be fetched this tick?
+///
+/// Only when the screen moved (CRC differs), when we have nothing cached, or
+/// when the daemon doesn't report a CRC at all. Everything else is answered
+/// from the cache, which is the common case: a fleet of idle agent tabs used
+/// to cost one full grid transfer each, every tick, to learn that nothing had
+/// happened.
+#[must_use]
+const fn needs_output(listed_crc: Option<u32>, cached_crc: Option<u32>, has_cached: bool) -> bool {
+    match (listed_crc, cached_crc) {
+        (Some(listed), Some(cached)) => listed != cached || !has_cached,
+        _ => true,
     }
 }
 
@@ -626,25 +672,35 @@ impl Brain {
         for idx in scan_order(claude.len(), self.scan_cursor) {
             let tab = &claude[idx];
             scanned += 1;
-            let output = match ag
-                .get(format!("{}/tabs/by-id/{}/output", ep.url, tab.id))
-                .header("Authorization", &auth)
-                .call()
-                .map_err(|e| format!("GET output for {}: {e}", tab.id))
-                .and_then(|mut r| {
-                    r.body_mut()
-                        .read_to_string()
-                        .map_err(|e| format!("read output for {}: {e}", tab.id))
-                }) {
-                Ok(o) => o,
-                // One tab closing mid-tick must not strand every tab after it.
-                Err(e) => {
-                    eprintln!("⛑ brain: {e}");
-                    continue;
-                }
-            };
-
             let watch = self.watches.entry(tab.id.clone()).or_insert_with(|| TabWatch::new(now));
+            // The listing already said whether this screen moved. When it
+            // didn't, the cached tail is still byte-accurate and no request is
+            // needed — with dozens of mostly-idle agent tabs that turns a
+            // full-grid transfer per tab per tick into nothing at all.
+            if needs_output(tab.output_crc, watch.cached_crc, !watch.cached_tail.is_empty()) {
+                let fetched = ag
+                    .get(format!("{}/tabs/by-id/{}/output", ep.url, tab.id))
+                    .header("Authorization", &auth)
+                    .call()
+                    .map_err(|e| format!("GET output for {}: {e}", tab.id))
+                    .and_then(|mut r| {
+                        r.body_mut()
+                            .read_to_string()
+                            .map_err(|e| format!("read output for {}: {e}", tab.id))
+                    });
+                match fetched {
+                    Ok(o) => {
+                        watch.cached_tail = tail_of(&o);
+                        watch.cached_crc = tab.output_crc;
+                    }
+                    // One tab closing mid-tick must not strand every tab after it.
+                    Err(e) => {
+                        eprintln!("⛑ brain: {e}");
+                        continue;
+                    }
+                }
+            }
+            let output = watch.cached_tail.clone();
             if let Some(trigger) = evaluate_tab(watch, &output, tab.agent_state.as_deref(), now) {
                 eligible.push(Eligible {
                     tab_id: tab.id.clone(),
@@ -1183,6 +1239,50 @@ mod tests {
         assert!(sent > 0, "SILENT FOREVER — the deadlock this design avoids");
         // ~1 per cooldown over 300s, and never a burst.
         assert!((9..=11).contains(&sent), "heartbeat cadence, got {sent}");
+    }
+
+    #[test]
+    fn an_unchanged_screen_costs_no_request() {
+        // The point of the /tabs CRC: brain watches dozens of tabs that are,
+        // by definition, mostly not moving. Re-reading every grid each tick to
+        // learn that was ~1.4 MiB per sweep on a 63-tab fleet.
+        assert!(needs_output(Some(7), None, false), "nothing cached yet → fetch");
+        assert!(needs_output(Some(7), Some(9), true), "screen moved → fetch");
+        assert!(!needs_output(Some(7), Some(7), true), "unchanged → cache answers it");
+        // A cached CRC with no cached text is a torn state, not a hit.
+        assert!(needs_output(Some(7), Some(7), false));
+        // A daemon too old to report a CRC falls back to always fetching,
+        // which is exactly the previous behaviour.
+        assert!(needs_output(None, Some(7), true));
+        assert!(needs_output(None, None, true));
+    }
+
+    #[test]
+    fn the_cached_tail_is_what_gets_hashed_either_way() {
+        // Fetch and cache-hit must present the SAME bytes to `evaluate_tab`:
+        // feeding the full grid one tick and the tail the next would change
+        // the hash every other tick, reset the freeze clock, and no screen
+        // would ever look frozen — the watchdog would go silent.
+        let long = format!("{}TAIL-MARKER", "x".repeat(SCOPE_TAIL_BYTES * 2));
+        let tail = tail_of(&long);
+        assert!(tail.len() <= SCOPE_TAIL_BYTES);
+        assert!(tail.ends_with("TAIL-MARKER"), "keeps the NEWEST bytes");
+        assert_eq!(tail_of(&tail), tail, "already-tailed text is unchanged");
+        assert_eq!(hash_output(&tail_of(&long)), hash_output(&tail), "stable hash");
+        // Short output passes through untouched.
+        assert_eq!(tail_of("short"), "short");
+        // A multi-byte char straddling the cut must not panic or split.
+        let accented = format!("{}é{}", "y".repeat(SCOPE_TAIL_BYTES - 1), "z".repeat(SCOPE_TAIL_BYTES));
+        let cut = tail_of(&accented);
+        assert!(cut.len() <= SCOPE_TAIL_BYTES);
+        assert!(std::str::from_utf8(cut.as_bytes()).is_ok());
+        // And what brain scans is unaffected by the truncation.
+        let err = format!("{}\n● API Error: 529 Overloaded", "x".repeat(SCOPE_TAIL_BYTES * 3));
+        assert_eq!(
+            scan_output(&tail_of(&err)).map(|p| p.label),
+            scan_output(&err).map(|p| p.label),
+            "the tail carries the same verdict as the whole grid"
+        );
     }
 
     #[test]

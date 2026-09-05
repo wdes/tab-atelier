@@ -215,18 +215,15 @@ pub fn apply_relay_config(change: &crate::api::RelayConfigChange, config_base: &
 /// Resolve + install the relay egress flag and forward target from a loaded
 /// The credential to present to a peer's relay route.
 ///
-/// One endpoint entry serves two different consumers: the sidecar needs the
-/// peer's MASTER token (it lists tabs, types input, moves files), while the
-/// relay must present the peer's RELAY token, which can do nothing but proxy.
-/// So `relay_token` wins when set, and `token` remains the fallback for an
-/// entry that predates the split or points at a relay-only peer.
+/// One endpoint entry serves two consumers with different rights: `token` is
+/// the peer's SIDECAR credential (list tabs, type input, move files) and
+/// `relay_token` its RELAY one, which can do nothing but proxy.
+/// There is no fallback between them: presenting the sidecar token to the
+/// relay route would just 401, and trying it anyway turns a clear "you didn't
+/// set --relay-token" into a confusing auth failure at the peer.
 #[must_use]
-pub fn relay_credential(endpoint: &RemoteEndpoint) -> &str {
-    if endpoint.relay_token.is_empty() {
-        &endpoint.token
-    } else {
-        &endpoint.relay_token
-    }
+pub fn relay_credential(endpoint: &RemoteEndpoint) -> Option<&str> {
+    (!endpoint.relay_token.is_empty()).then_some(endpoint.relay_token.as_str())
 }
 
 /// `Preferences`. Called at startup (both editions) and after a relay toggle.
@@ -235,7 +232,7 @@ pub fn install_relay_config(prefs: &Preferences) {
     let target = prefs.relay_endpoint_id.as_deref().and_then(|id| {
         prefs.remote_endpoints.iter().find(|e| e.id == id).map(|e| RelayTarget {
             url: e.url.trim_end_matches('/').to_string(),
-            token: relay_credential(e).to_string(),
+            token: relay_credential(e).unwrap_or_default().to_string(),
             cf_access_client_id: e.cf_access_client_id.clone(),
             cf_access_client_secret: e.cf_access_client_secret.clone(),
         })
@@ -3960,29 +3957,30 @@ mod tests {
     }
 
     #[test]
-    fn a_peer_presents_its_relay_token_and_falls_back_to_the_master() {
+    fn a_peer_presents_only_its_relay_token_never_a_substitute() {
         // One endpoint entry feeds two consumers with different rights: the
-        // sidecar needs the peer's master token (it lists tabs, types input,
-        // moves files), the relay hop must present the relay-only one. Mixing
-        // them up means either the sidecar 401s or the relay does.
+        // sidecar token lists tabs, types input and moves files; the relay hop
+        // must present the relay-only one. Neither stands in for the other.
         let mut ep = RemoteEndpoint {
             id: "id".into(),
             label: "box".into(),
             url: "https://box:7891".into(),
-            token: "MASTER".into(),
+            token: "SIDECAR".into(),
             ..RemoteEndpoint::default()
         };
+        // No relay token configured → nothing to present. Falling back to the
+        // sidecar token would turn "you didn't set --relay-token" into an auth
+        // failure at the peer, which is much harder to read.
+        assert_eq!(relay_credential(&ep), None);
+        ep.relay_token = "RELAY".into();
         assert_eq!(
             relay_credential(&ep),
-            "MASTER",
-            "no relay token yet → the old behaviour"
+            Some("RELAY"),
+            "the relay hop uses the relay token"
         );
-        ep.relay_token = "RELAY".into();
-        assert_eq!(relay_credential(&ep), "RELAY", "the relay hop uses the relay token");
-        assert_eq!(ep.token, "MASTER", "and the sidecar's credential is untouched");
-        // Whitespace-only is not a credential.
+        assert_eq!(ep.token, "SIDECAR", "and the sidecar's credential is untouched");
         ep.relay_token = String::new();
-        assert_eq!(relay_credential(&ep), "MASTER");
+        assert_eq!(relay_credential(&ep), None);
     }
 
     #[test]
