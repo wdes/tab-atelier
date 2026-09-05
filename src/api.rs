@@ -812,6 +812,23 @@ fn write_new_file_no_symlink(path: &std::path::Path, bytes: &[u8]) -> std::io::R
 /// `{state_base}/tab-atelier/api.token` with mode 600. Persisting the
 /// token means already-paired mobile clients keep working across
 /// desktop restarts instead of falling out to 401 every time.
+/// Record the loopback URL this instance actually bound, next to its
+/// `api.token`, so CLI verbs can find a daemon that isn't on the default port.
+///
+/// Discovery used to assume `127.0.0.1:7890`. Move `api_addr` and every verb
+/// then sends a valid token to whatever else is on 7890 — answered by a 401
+/// that looks like a credential problem and isn't. The bound port is the
+/// daemon's to publish, and it's the *real* one (post-fallback), which is why
+/// this is written from the listener rather than from the configured spec.
+pub fn record_bound_url(port: u16) {
+    let dir = crate::platform::state_base_dir().join(crate::APP_DIR);
+    if std::fs::create_dir_all(&dir).is_ok() {
+        // Best-effort, like the token write: a read-only home must not stop
+        // the server from serving.
+        let _ = std::fs::write(dir.join("api.url"), format!("http://127.0.0.1:{port}"));
+    }
+}
+
 pub fn load_or_generate_token() -> String {
     let dir = crate::platform::state_base_dir().join(crate::APP_DIR);
     let path = dir.join("api.token");
@@ -2439,6 +2456,9 @@ pub fn start_api_server(state: Arc<Mutex<TabSnapshot>>, token: String, read_only
             let listener = match TokioListener::bind(&bind).await {
                 Ok(l) => {
                     info!("API: listening on {bind} (HTTP/1.1)");
+                    if let Ok(addr) = l.local_addr() {
+                        record_bound_url(addr.port());
+                    }
                     l
                 }
                 Err(e) => {
