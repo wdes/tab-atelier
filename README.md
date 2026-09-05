@@ -376,6 +376,8 @@ New claude tabs now relay transparently. The full command:
 
 All changes apply live (persisted + re-installed, no restart). The `relay_egress` role and `relay_endpoint_id` live in `preferences.json` but are set via the CLI above.
 
+The relay token travels in either `x-api-key` (what a claude client sends) or `Authorization: Bearer` (what the forwarding hop sends); both are accepted whatever the instance's role, so a claude pointed straight at an egress box works the same as one going through a local hop.
+
 **Smoke test** — verify the whole chain without launching Claude:
 
 ```sh

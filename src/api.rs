@@ -2148,9 +2148,10 @@ fn relay_status(code: u16, msg: &str) -> Response<RespBody> {
 /// sync path can't). Role is config-driven: the **egress** instance forwards to
 /// `api.anthropic.com` injecting the remote's Claude OAuth token (see
 /// [`crate::relay`]); otherwise the **local** instance forwards to the
-/// configured remote's `/relay/anthropic/*`. Auth: the local hop presents the
-/// stand-in `x-api-key`, the egress hop a `Bearer` — both must equal this
-/// instance's master token.
+/// configured remote's `/relay/anthropic/*`. Auth: this instance's relay token
+/// in either `x-api-key` (what a claude client sends) or `Authorization:
+/// Bearer` (what our forwarding hop sends) — the role doesn't change which
+/// header is accepted.
 async fn handle_relay(req: Request<Incoming>, master_token: &str) -> Response<RespBody> {
     let method = req.method().clone();
     let full = req.uri().path();
@@ -2165,28 +2166,56 @@ async fn handle_relay(req: Request<Incoming>, master_token: &str) -> Response<Re
         return relay_hello(method == hyper::Method::HEAD);
     }
 
-    // Auth against this instance's relay token (constant-time).
-    let provided = if egress {
-        req.headers()
-            .get(hyper::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .unwrap_or("")
-            .to_owned()
-    } else {
-        req.headers()
-            .get("x-api-key")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_owned()
-    };
+    // Auth against this instance's relay token (constant-time), from EITHER
+    // header, whatever the role.
+    //
+    // These used to be role-dependent — Bearer on an egress instance, x-api-key
+    // on a local hop — because a claude client speaks x-api-key and our own
+    // forwarding hop speaks Bearer. That made the header a second, undocumented
+    // thing to get right: a claude pointed straight at an egress box, or an
+    // operator running the README's smoke test there, sends x-api-key, gets an
+    // empty credential and a 401 that says nothing about the real problem. The
+    // token is the same secret either way, so which envelope carries it buys
+    // nothing.
+    let provided = req
+        .headers()
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+        .or_else(|| {
+            req.headers()
+                .get(hyper::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+                .map(str::to_owned)
+        })
+        .unwrap_or_default();
     // The relay token is the ONLY credential for this route. It authenticates
     // the relay and nothing else, so the value sitting in a claude tab's
     // ANTHROPIC_API_KEY cannot administer the instance if it leaks — which is
     // the entire point, and is why the master token is not a second way in.
-    let _ = master_token;
     if !constant_time_eq(provided.as_bytes(), crate::relay_token().as_bytes()) {
-        return relay_status(401, "relay: unauthorized");
+        // A bare "unauthorized" leaves the operator guessing which hop, which
+        // route and which credential was wrong — the whole point of the relay
+        // is that two machines and three tokens are involved. Say what we can
+        // without printing anyone's secret: the hop, the path, the header the
+        // client used, and whether what it sent was the master token (the most
+        // common mistake, since that IS what older builds wanted here).
+        let looks_like_master =
+            !master_token.is_empty() && constant_time_eq(provided.as_bytes(), master_token.as_bytes());
+        let hop = if egress { "egress" } else { "local" };
+        let diagnosis = if provided.is_empty() {
+            "no credential presented"
+        } else if looks_like_master {
+            "presented the MASTER token — the relay takes `tab-atelier relay token` only"
+        } else {
+            "credential did not match this instance's relay token"
+        };
+        log::warn!(
+            "relay: 401 on {method} /relay/anthropic{sub} ({hop} hop, {len} chars presented): {diagnosis}",
+            len = provided.chars().count(),
+        );
+        return relay_status(401, &format!("relay: unauthorized ({hop} hop: {diagnosis})"));
     }
 
     let content_type = req
@@ -2220,6 +2249,16 @@ async fn handle_relay(req: Request<Incoming>, master_token: &str) -> Response<Re
             };
             (format!("{}{sub_pq}", crate::relay::upstream()), token, None)
         } else if let Some(t) = target {
+            // Without a relay token for the peer there is nothing to present,
+            // and forwarding an empty Bearer just turns a local misconfig into
+            // a 401 from the other machine — the hardest kind to diagnose.
+            if t.token.is_empty() {
+                let _ = meta_tx.send(Err(format!(
+                    "no relay token for {} — run `tab-atelier relay token` there, then                      `remote add … --relay-token <it>` here",
+                    t.url
+                )));
+                return;
+            }
             let cf = (!t.cf_access_client_id.is_empty())
                 .then(|| (t.cf_access_client_id.clone(), t.cf_access_client_secret.clone()));
             (format!("{}/relay/anthropic{sub_pq}", t.url), t.token, cf)
@@ -3459,6 +3498,84 @@ mod tests {
         // The master still does everything, and a wrong token still nothing.
         assert_eq!(status_code(&get("/env", &master)), 200);
         assert_eq!(status_code(&get("/tabs", "nope")), 401);
+    }
+
+    #[test]
+    fn either_header_carries_the_relay_token_in_either_role() {
+        // The header used to depend on the role: Bearer on an egress instance,
+        // x-api-key on a local hop. A claude pointed straight at an egress box
+        // sends x-api-key — its native header — and got a 401 that had nothing
+        // to do with its token being right. Same for the README smoke test.
+        let _guard = RELAY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (port, _state, _master) = spawn_server();
+        let relay = crate::relay_token();
+        let payload = "{}";
+        let call = |header: String| {
+            request(
+                port,
+                &format!(
+                    "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\n{header}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+                    payload.len(),
+                ),
+            )
+        };
+        for egress in [false, true] {
+            crate::set_relay_egress(egress);
+            for header in [
+                format!("x-api-key: {relay}\r\n"),
+                format!("Authorization: Bearer {relay}\r\n"),
+            ] {
+                let resp = call(header.clone());
+                assert_ne!(
+                    status_code(&resp),
+                    401,
+                    "egress={egress} must accept {}",
+                    header.split(':').next().unwrap_or(""),
+                );
+            }
+            // A wrong credential is still refused in both roles.
+            assert_eq!(status_code(&call("x-api-key: nope\r\n".into())), 401);
+        }
+        crate::set_relay_egress(false);
+    }
+
+    #[test]
+    fn a_relay_401_says_which_hop_and_why() {
+        // Two machines and three tokens are involved, so "unauthorized" alone
+        // leaves an operator with no idea which side rejected what.
+        let _guard = RELAY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (port, _state, master) = spawn_server();
+        let payload = "{}";
+        let call = |header: &str| {
+            request(
+                port,
+                &format!(
+                    "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\n{header}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+                    payload.len(),
+                ),
+            )
+        };
+        // Presenting the master token is the likely mistake — older builds
+        // wanted exactly that here — so the body names it rather than leaving
+        // the operator to guess.
+        let resp = call(&format!("x-api-key: {master}\r\n"));
+        assert_eq!(status_code(&resp), 401);
+        assert!(resp.contains("MASTER"), "names the mistake: {resp}");
+        // No credential at all reads differently from a wrong one.
+        let resp = call("");
+        assert_eq!(status_code(&resp), 401);
+        assert!(resp.contains("no credential"), "{resp}");
+        // A wrong value says so without echoing it back.
+        let resp = call("x-api-key: some-other-token\r\n");
+        assert_eq!(status_code(&resp), 401);
+        assert!(resp.contains("did not match"), "{resp}");
+        assert!(!resp.contains("some-other-token"), "never echo the credential: {resp}");
+        // Every message names the hop, since the two ends fail differently.
+        assert!(resp.contains("local hop"), "{resp}");
     }
 
     #[test]
