@@ -28,6 +28,196 @@ tags:
   - name: logs
     description: Recent daemon log records (loopback callers only)
 paths:
+  /claims:
+    get:
+      tags: [claims]
+      summary: List live leases
+      description: >
+        Every lease currently held on this host, with the wall-clock instant
+        each expires. Lapsed entries are never returned, so a caller does not
+        have to filter by time itself.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Live leases
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  claims:
+                    type: array
+                    items: { $ref: "#/components/schemas/Claim" }
+                  now_ms:
+                    type: integer
+                    format: int64
+                    description: The daemon's clock, so a client can compute remaining time without trusting its own.
+    post:
+      tags: [claims]
+      summary: Take or renew a lease
+      description: >
+        Mutual exclusion over a named key — the primitive that keeps two agents
+        off the same task. Granted when the key is free, its lease has lapsed,
+        or the same holder is renewing (idempotent, so an agent can refresh on
+        a timer without tracking ownership).
+
+
+        Answers **409 with the current holder** when someone else has it, so a
+        refused agent can choose different work instead of spinning.
+
+
+        It is a lease, not a lock: it expires. Agent tabs die constantly, and a
+        lock without expiry in a fleet of ephemeral holders is a deadlock
+        generator. Every grant carries a strictly increasing `fence`, so a
+        stalled holder that comes back can be told apart from the live one.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [key, holder]
+              properties:
+                key: { type: string, maxLength: 200, example: "task:cov:src/api.rs" }
+                holder: { type: string, maxLength: 100, example: "tab-7f3a" }
+                ttl_ms:
+                  type: integer
+                  format: int64
+                  default: 300000
+                  description: Clamped to [1s, 6h].
+      responses:
+        "200":
+          description: Granted (or renewed)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  granted: { type: boolean, enum: [true] }
+                  claim: { $ref: "#/components/schemas/Claim" }
+                  now_ms: { type: integer, format: int64 }
+        "409":
+          description: Held by someone else — the body names them
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  granted: { type: boolean, enum: [false] }
+                  claim: { $ref: "#/components/schemas/Claim" }
+        "400": { description: Missing/invalid key or holder }
+  /claims/release:
+    post:
+      tags: [claims]
+      summary: Give a lease back early
+      description: >
+        Only the holder may release; a lapsed holder cannot release the key out
+        from under whoever took it next. Releasing something you no longer hold
+        answers 200 with `released:false` rather than an error — that is what a
+        late agent does, and it should be a no-op, not a failure.
+
+
+        A POST rather than `DELETE /claims/{key}` because keys contain slashes
+        (they are task ids and file paths).
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [key, holder]
+              properties:
+                key: { type: string }
+                holder: { type: string }
+      responses:
+        "200":
+          description: Whether a lease was actually removed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  released: { type: boolean }
+        "400": { description: Missing key or holder }
+  /blackboard:
+    get:
+      tags: [blackboard]
+      summary: Read blackboard entries
+      description: >
+        The shared append-only log every tab reads, and the medium the
+        contract-net verbs (announce/bid/award/done) travel on.
+
+
+        Reachable by remote peers as well as local callers, because gossip is
+        an exchange between daemons: the log is a grow-only set, so a peer can
+        add entries but can never remove, rewrite or reorder ours.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: since
+          in: query
+          required: false
+          schema: { type: integer, minimum: 0 }
+          description: >
+            Position in this host's file to resume from. A position, not a
+            logical clock — the merge is a set union and does not need one.
+      responses:
+        "200":
+          description: Entries, oldest first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  entries:
+                    type: array
+                    items: { $ref: "#/components/schemas/BlackboardEntry" }
+                  next:
+                    type: integer
+                    description: Pass as `since` next time.
+                  origin:
+                    type: string
+                    description: Which host answered.
+    post:
+      tags: [blackboard]
+      summary: Merge a peer's entries
+      description: >
+        Union by entry id — idempotent, commutative and associative. Two hosts
+        that exchange batches in any order, any number of times, converge on
+        the same board without agreeing on anything first (Shapiro et al.,
+        CRDTs, 2011). Entries without an id cannot be de-duplicated and are
+        dropped rather than accumulating a copy per exchange.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [entries]
+              properties:
+                entries:
+                  type: array
+                  maxItems: 5000
+                  items: { $ref: "#/components/schemas/BlackboardEntry" }
+      responses:
+        "200":
+          description: How many entries were new
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  merged: { type: integer }
+                  received: { type: integer }
+        "400": { description: "Body is not an object with an `entries` array" }
+        "413": { description: Batch larger than 5000 entries }
   /logs:
     get:
       tags: [logs]
@@ -413,6 +603,53 @@ components:
     Error:
       type: object
       properties: { error: { type: string } }
+    Claim:
+      type: object
+      description: One lease over a named key.
+      properties:
+        key: { type: string, example: "task:cov:src/api.rs" }
+        holder:
+          type: string
+          description: Opaque identity — by convention a tab name or uuid.
+          example: "tab-7f3a"
+        granted_ms: { type: integer, format: int64 }
+        expires_ms: { type: integer, format: int64 }
+        fence:
+          type: integer
+          format: int64
+          description: >
+            Strictly increasing across every grant this host makes, including
+            renewals. A holder presenting an older fence is presenting a claim
+            it has already lost.
+    BlackboardEntry:
+      type: object
+      description: >
+        One shared-log entry. Plain broadcasts (`kind: note`) and contract-net
+        messages share the shape, so the protocol needs no separate transport.
+      required: [ts, msg]
+      properties:
+        ts: { type: integer, format: int64, description: Unix seconds. }
+        msg: { type: string }
+        id:
+          type: string
+          description: >
+            Stable identity, unique across hosts — this is what makes the log a
+            grow-only set. Absent on entries written before typed notes
+            existed; readers backfill those from a content hash.
+        origin: { type: string, description: Host that wrote it. }
+        from: { type: string, description: Agent that wrote it. }
+        topic: { type: string, description: Channel, for filtering plain notes. }
+        kind:
+          type: string
+          enum: [note, announce, bid, award, done]
+          default: note
+        task: { type: string, description: Task this entry concerns. }
+        cost:
+          type: integer
+          format: int64
+          description: A bid's asking price, lower wins. Integer so a NaN can't make the winner depend on comparison order.
+        to: { type: string, description: An award's winner. }
+        ok: { type: boolean, description: Whether a `done` reports success. }
     Tab:
       type: object
       properties:

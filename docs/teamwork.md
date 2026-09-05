@@ -49,6 +49,20 @@ Copies the file into the target tab's `inbox/` (the same place web uploads land)
 so its agent can pick it up. Target resolved by name/index/UUID; an ambiguous
 name errors with the candidate indexes.
 
+## Take work off a shared board — `announce` / `take` / `done`
+
+The verbs above are point-to-point: you decide who does what. For a fleet that
+divides work itself, see **[self-organization](./self-organization.md)** —
+contract-net tasks on the same blackboard, a daemon-enforced lease so two
+agents never take one task, and `gossip` to span hosts.
+
+```
+tab-atelier backlog                     # announce work from a coverage report
+tab-atelier tasks                       # what's on the board
+tab-atelier take                        # lease the best open task for me
+tab-atelier done cov:src/api.rs "61% -> 72%"
+```
+
 ## Label a tab — `set-meta`
 
 A small key/value map that lives on the tab, survives a restart, and comes back

@@ -11,8 +11,10 @@ use serde::Serialize;
 use log::{debug, error, info};
 
 mod assets;
+mod blackboard_route;
 #[cfg(feature = "catbus")]
 mod catbus;
+mod claims_route;
 mod claude_only;
 mod env;
 mod files;
@@ -148,6 +150,15 @@ pub const BUILD_HASH: &str = env!("BUILD_HASH");
 /// or re-pointing its relay would be.
 fn sidecar_route(method: &str, path: &str) -> bool {
     if path == "/tabs" {
+        return method == "GET" || method == "POST";
+    }
+    // Gossip: a peer daemon reads our blackboard and offers us its own. Both
+    // directions are safe to expose because the log is a grow-only set —
+    // merging is a union, so a peer can add entries but can never remove,
+    // rewrite or reorder ours. Claims are deliberately NOT here: a lease is
+    // host-local mutual exclusion, and honouring a remote host's claim would
+    // mean trusting its clock.
+    if path == "/blackboard" {
         return method == "GET" || method == "POST";
     }
     let Some(rest) = path.strip_prefix("/tabs/") else {
@@ -1858,6 +1869,16 @@ fn handle_connection<S: Read + Write>(
             let body = serde_json::json!({ "lines": crate::log_ring::tail(n) }).to_string();
             respond_json(stream, 200, &body);
         }
+        ("GET", "/claims") => {
+            let now = crate::unix_millis();
+            let claims = crate::claims::with_registry(|r| r.active(now));
+            let body = serde_json::json!({ "claims": claims, "now_ms": now }).to_string();
+            respond_json(stream, 200, &body);
+        }
+        ("POST", "/claims") => claims_route::grant(stream, &body_bytes),
+        ("POST", "/claims/release") => claims_route::release(stream, &body_bytes),
+        ("GET", "/blackboard") => blackboard_route::list(stream, query_since),
+        ("POST", "/blackboard") => blackboard_route::merge(stream, &body_bytes),
         ("GET", "/env") => env::list_global(stream),
         ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/env") => env::list_tab(stream, state, p),
         ("POST", "/env") => env::set_global(stream, state, &body_bytes),
@@ -3503,11 +3524,22 @@ mod tests {
             ("POST", "/tabs/by-id/tab-a/files"),
             ("GET", "/tabs/by-id/tab-a/outbox"),
             ("GET", "/tabs/by-id/tab-a/outbox/report.md"),
+            // Gossip: a peer daemon exchanges blackboard entries with us. Safe
+            // to expose because the merge is a set union — a peer can add
+            // entries but cannot remove, rewrite or reorder ours.
+            ("GET", "/blackboard"),
+            ("POST", "/blackboard"),
         ];
         for (m, p) in allowed {
             assert!(sidecar_route(m, p), "{m} {p} is part of driving a tab");
         }
         let refused = [
+            // Leases are host-local mutual exclusion: honouring a remote's
+            // claim would mean trusting its clock, so a sidecar cannot take
+            // one out on this host.
+            ("GET", "/claims"),
+            ("POST", "/claims"),
+            ("POST", "/claims/release"),
             ("POST", "/master-token/reset"),
             ("POST", "/tabs/rotate-tokens"),
             ("GET", "/logs"),
@@ -3627,6 +3659,130 @@ mod tests {
         assert!(!resp.contains("some-other-token"), "never echo the credential: {resp}");
         // Every message names the hop, since the two ends fail differently.
         assert!(resp.contains("local hop"), "{resp}");
+    }
+
+    #[test]
+    fn the_blackboard_route_merges_a_peers_entries_idempotently() {
+        let (port, _state, token) = spawn_server();
+        let dir = tempfile::tempdir().unwrap();
+        crate::cli::team::set_blackboard_path(Some(dir.path().join("blackboard.jsonl")));
+
+        let post = |body: &str| {
+            request(
+                port,
+                &format!(
+                    "POST /blackboard HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                ),
+            )
+        };
+        let batch = r#"{"entries":[
+            {"ts":10,"msg":"raise coverage","id":"peer-1","kind":"announce","task":"cov:src/api.rs","from":"backlog"},
+            {"ts":11,"msg":"","id":"peer-2","kind":"bid","task":"cov:src/api.rs","from":"agent-x","cost":40}
+        ]}"#;
+        let first = post(batch);
+        assert_eq!(status_code(&first), 200, "{first}");
+        assert!(first.contains("\"merged\":2"), "{first}");
+
+        // Idempotent: the same batch again is a union with itself. This is
+        // what lets gossip run on a timer, in both directions, without
+        // duplicating the board.
+        let again = post(batch);
+        assert!(
+            again.contains("\"merged\":0"),
+            "replaying a batch must add nothing: {again}"
+        );
+
+        // And what we hold is now readable by a peer.
+        let listed = request(
+            port,
+            &format!("GET /blackboard HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        assert!(listed.contains("cov:src/api.rs"), "{listed}");
+        assert!(listed.contains("\"next\":2"), "{listed}");
+        // `since` lets a puller resume rather than re-fetching everything.
+        let tail = request(
+            port,
+            &format!("GET /blackboard?since=2 HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        assert!(tail.contains("\"entries\":[]"), "{tail}");
+
+        // Entries carrying no id can't be de-duplicated, so they are dropped
+        // rather than accumulating a new copy on every exchange.
+        let anonymous = post(r#"{"entries":[{"ts":12,"msg":"no id","kind":"announce","task":"t"}]}"#);
+        assert!(anonymous.contains("\"merged\":0"), "{anonymous}");
+        assert_eq!(status_code(&post(r#"{"nope":[]}"#)), 400);
+
+        crate::cli::team::set_blackboard_path(None);
+    }
+
+    #[test]
+    fn the_claims_route_grants_one_holder_and_names_the_other() {
+        let (port, _state, token) = spawn_server();
+        // Hermetic: a test run must never touch the developer's real lease
+        // table, and two tests sharing one would race.
+        let dir = tempfile::tempdir().unwrap();
+        crate::claims::set_registry_path(Some(dir.path().join("claims.json")));
+        crate::claims::reset_for_test();
+        let post = |path: &str, body: &str| {
+            request(
+                port,
+                &format!(
+                    "POST {path} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                ),
+            )
+        };
+        let key = "task:cov-api-route-test";
+        let first = post(
+            "/claims",
+            &format!(r#"{{"key":"{key}","holder":"agent-a","ttl_ms":60000}}"#),
+        );
+        assert_eq!(status_code(&first), 200, "{first}");
+        assert!(first.contains("\"granted\":true"), "{first}");
+        assert!(first.contains("\"fence\""), "a grant must carry a fence: {first}");
+
+        // The second agent is refused AND told who holds it, so it can pick
+        // other work instead of spinning on this key.
+        let second = post(
+            "/claims",
+            &format!(r#"{{"key":"{key}","holder":"agent-b","ttl_ms":60000}}"#),
+        );
+        assert_eq!(status_code(&second), 409, "{second}");
+        assert!(second.contains("agent-a"), "409 must name the holder: {second}");
+
+        // Renewal by the holder is idempotent, not a conflict.
+        let renew = post(
+            "/claims",
+            &format!(r#"{{"key":"{key}","holder":"agent-a","ttl_ms":60000}}"#),
+        );
+        assert_eq!(status_code(&renew), 200, "{renew}");
+
+        // A non-holder releasing is a no-op, not a theft.
+        let steal = post("/claims/release", &format!(r#"{{"key":"{key}","holder":"agent-b"}}"#));
+        assert_eq!(status_code(&steal), 200, "{steal}");
+        assert!(steal.contains("\"released\":false"), "{steal}");
+
+        let listed = request(
+            port,
+            &format!("GET /claims HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        assert!(listed.contains(key), "the live lease should be listed: {listed}");
+
+        // The holder may, and then the key is free for the next agent.
+        let released = post("/claims/release", &format!(r#"{{"key":"{key}","holder":"agent-a"}}"#));
+        assert!(released.contains("\"released\":true"), "{released}");
+        let now_free = post(
+            "/claims",
+            &format!(r#"{{"key":"{key}","holder":"agent-b","ttl_ms":60000}}"#),
+        );
+        assert_eq!(status_code(&now_free), 200, "{now_free}");
+
+        // Malformed input is refused rather than granting a nameless lease.
+        assert_eq!(status_code(&post("/claims", r#"{"key":"k"}"#)), 400);
+        assert_eq!(status_code(&post("/claims", r#"{"key":"","holder":"a"}"#)), 400);
+        crate::claims::reset_for_test();
+        crate::claims::set_registry_path(None);
     }
 
     #[test]
