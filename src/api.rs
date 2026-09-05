@@ -32,6 +32,7 @@ mod status;
 mod tab_props;
 mod tabs;
 mod tokens;
+mod upgrade;
 mod usage;
 mod view;
 
@@ -1925,6 +1926,7 @@ fn handle_connection<S: Read + Write>(
         ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/schedule") => {
             schedule::run(stream, state, p, &body_bytes);
         }
+        ("POST", "/upgrade") => upgrade::run(stream),
         ("POST", "/tabs/rotate-tokens") => tokens::rotate(stream, state),
         ("POST", "/master-token/reset") => tokens::reset_master(stream, state),
         ("POST", p) if p.starts_with("/tabs/by-id/") && p.ends_with("/bg-color") => {
