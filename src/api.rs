@@ -135,6 +135,40 @@ pub const BUILD_HASH: &str = env!("BUILD_HASH");
 
 /// Parse the tab segment between `/tabs/` and a suffix into either
 /// a numeric index or a UUID. Returns `(idx, key_for_html)` after
+/// Is this request one a sidecar peer may make with the remote token?
+///
+/// The sidecar mirrors tabs and drives them: list, read output, type input,
+/// move files through the sandboxed inbox/outbox, and the tab-level commands
+/// its protocol exposes (activate / rename / close). Everything else — token
+/// rotation, relay config, env, limits, ssh-agent, the log ring — stays
+/// master-only, so a peer link can't quietly become full control.
+///
+/// Typing into a tab is already arbitrary code execution there, so allowing
+/// close/rename alongside it is no escalation; reading this instance's secrets
+/// or re-pointing its relay would be.
+fn sidecar_route(method: &str, path: &str) -> bool {
+    if path == "/tabs" {
+        return method == "GET" || method == "POST";
+    }
+    let Some(rest) = path.strip_prefix("/tabs/") else {
+        return false;
+    };
+    // `/tabs/<idx>` on its own — close.
+    if !rest.contains('/') {
+        return method == "DELETE";
+    }
+    // A download is `/tabs/<id>/outbox/<name>`, so check the section before
+    // falling back to the trailing segment.
+    if rest.contains("/outbox/") || rest.contains("/inbox/") {
+        return method == "GET";
+    }
+    match rest.rsplit('/').next().unwrap_or("") {
+        "output" | "stream" | "outbox" | "inbox" => method == "GET",
+        "input" | "files" | "activate" | "rename" => method == "POST",
+        _ => false,
+    }
+}
+
 /// resolution against the snapshot: the index is what every internal
 /// path uses; the key is the string the share URL carries (numeric
 /// or `by-id/UUID`) so the HTML viewer rewrites every subrequest with
@@ -1647,7 +1681,21 @@ fn handle_connection<S: Read + Write>(
         }
         ok
     };
-    if !is_master {
+    // A sidecar peer (`remote attach` / `put` / `get` from another machine)
+    // authenticates with THIS instance's remote token, scoped to the tab
+    // operations it performs (see `sidecar_route`). It deliberately cannot
+    // rotate credentials, read the log ring, reconfigure the relay or dump the
+    // env — handing a peer the master token would grant all of that, for as
+    // long as it holds it.
+    let is_remote_peer = !is_master
+        && provided_token
+            .as_deref()
+            .is_some_and(|p| constant_time_eq(p.as_bytes(), crate::remote_token().as_bytes()))
+        && sidecar_route(&method, &path);
+    if is_remote_peer {
+        state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).touch();
+    }
+    if !is_master && !is_remote_peer {
         let allowed = if let Some(p) = provided_token.as_deref()
             && let Some(rest) = path.strip_prefix("/tabs/by-id/")
             && let Some((uuid, action)) = rest.split_once('/')
@@ -3282,6 +3330,71 @@ mod tests {
         // The master token is NOT a second way in: it administers every tab,
         // and the point of the split is that the relay credential can't.
         assert_eq!(status_code(&call(&master)), 401, "master is not a relay credential");
+    }
+
+    #[test]
+    fn the_sidecar_token_is_scoped_to_what_a_sidecar_does() {
+        // A peer driving tabs here gets a credential for exactly that. Handing
+        // it the master token instead would also grant credential rotation,
+        // the log ring, relay config and the env — permanently and invisibly.
+        let allowed = [
+            ("GET", "/tabs"),
+            ("POST", "/tabs"),
+            ("DELETE", "/tabs/2"),
+            ("GET", "/tabs/by-id/tab-a/output"),
+            ("GET", "/tabs/2/output"),
+            ("POST", "/tabs/by-id/tab-a/input"),
+            ("POST", "/tabs/2/rename"),
+            ("POST", "/tabs/2/activate"),
+            ("POST", "/tabs/by-id/tab-a/files"),
+            ("GET", "/tabs/by-id/tab-a/outbox"),
+            ("GET", "/tabs/by-id/tab-a/outbox/report.md"),
+        ];
+        for (m, p) in allowed {
+            assert!(sidecar_route(m, p), "{m} {p} is part of driving a tab");
+        }
+        let refused = [
+            ("POST", "/master-token/reset"),
+            ("POST", "/tabs/rotate-tokens"),
+            ("GET", "/logs"),
+            ("GET", "/env"),
+            ("POST", "/env"),
+            ("GET", "/tabs/by-id/tab-a/env"),
+            ("POST", "/relay-mode"),
+            ("GET", "/relay-config"),
+            ("POST", "/relay-config"),
+            ("POST", "/tabs/by-id/tab-a/ssh-agent"),
+            ("POST", "/tabs/by-id/tab-a/net-allow"),
+            ("POST", "/tabs/by-id/tab-a/limits"),
+            ("POST", "/tabs/by-id/tab-a/meta"),
+            ("GET", "/preferences"),
+            ("DELETE", "/tabs/by-id/tab-a/output"),
+            ("POST", "/tabs/by-id/tab-a/output"),
+        ];
+        for (m, p) in refused {
+            assert!(!sidecar_route(m, p), "{m} {p} must stay master-only");
+        }
+    }
+
+    #[test]
+    fn a_sidecar_peer_authenticates_with_the_remote_token() {
+        let (port, _state, master) = spawn_server();
+        let remote = crate::remote_token();
+        assert_ne!(remote, master, "the sidecar credential is its own token");
+        let get = |path: &str, token: &str| {
+            request(
+                port,
+                &format!("GET {path} HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\r\n"),
+            )
+        };
+        // In scope: it can mirror the fleet.
+        assert_eq!(status_code(&get("/tabs", &remote)), 200);
+        assert_eq!(status_code(&get("/tabs/by-id/tab-a/output", &remote)), 200);
+        // Out of scope: the same token buys nothing else.
+        assert_eq!(status_code(&get("/env", &remote)), 401, "env stays master-only");
+        // The master still does everything, and a wrong token still nothing.
+        assert_eq!(status_code(&get("/env", &master)), 200);
+        assert_eq!(status_code(&get("/tabs", "nope")), 401);
     }
 
     #[test]

@@ -1741,31 +1741,55 @@ pub fn relay_token_path() -> PathBuf {
 #[must_use]
 pub fn relay_token() -> String {
     static CACHED: OnceLock<String> = OnceLock::new();
-    CACHED
-        .get_or_init(|| {
-            let path = relay_token_path();
-            if let Ok(existing) = std::fs::read_to_string(&path) {
-                let existing = existing.trim().to_string();
-                if !existing.is_empty() {
-                    return existing;
-                }
-            }
-            let minted = mint_share_token();
-            if let Some(dir) = path.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            if std::fs::write(&path, &minted).is_ok() {
-                // Owner-only, same as api.token — a world-readable relay token
-                // would hand every local user a free proxy to the account.
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-                }
-            }
-            minted
-        })
-        .clone()
+    CACHED.get_or_init(|| read_or_mint_token(&relay_token_path())).clone()
+}
+
+/// Path of the sidecar token — what a peer's `remote attach` / `put` / `get`
+/// authenticates with, kept apart from the master `api.token`.
+#[must_use]
+pub fn remote_token_path() -> PathBuf {
+    state_dir(&platform::state_base_dir()).join("remote.token")
+}
+
+/// The sidecar token, minted on first use and persisted 0600.
+///
+/// A peer driving tabs here needs to list them, mirror their output, type into
+/// them and move files — not to rotate this instance's credentials, read its
+/// logs, reconfigure its relay or dump its env. Handing out the master token
+/// for a sidecar link grants all of that to the other machine, permanently and
+/// invisibly; this one is scoped to the tab operations the sidecar actually
+/// performs (see the gate in `api::handle_connection`).
+///
+/// Same shape as [`relay_token`]: cached per process, file is the durable
+/// copy, delete it to rotate.
+#[must_use]
+pub fn remote_token() -> String {
+    static CACHED: OnceLock<String> = OnceLock::new();
+    CACHED.get_or_init(|| read_or_mint_token(&remote_token_path())).clone()
+}
+
+/// Read a persisted token file, or mint + persist one owner-only.
+fn read_or_mint_token(path: &std::path::Path) -> String {
+    if let Ok(existing) = std::fs::read_to_string(path) {
+        let existing = existing.trim().to_string();
+        if !existing.is_empty() {
+            return existing;
+        }
+    }
+    let minted = mint_share_token();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if std::fs::write(path, &minted).is_ok() {
+        // Owner-only, same as api.token — a world-readable token would hand
+        // every local user the capability it carries.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+    minted
 }
 
 /// 16 random bytes hex-encoded — used for per-tab share secrets.

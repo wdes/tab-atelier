@@ -341,7 +341,7 @@ The stand-in is a **relay-only token** (`<state>/relay.token`, minted on first u
 
 One route is exempt from auth: `HEAD`/`GET /relay/anthropic/api/hello`, the reachability probe Claude Code sends **before it has a credential to present**. Answering it with 401 makes the client treat the whole relay as unusable, so it is served locally with a 200 — no upstream call, no token involved, and it reveals nothing that completing the TCP handshake hasn't already.
 
-One endpoint entry, two credentials: `--token` is the peer's **master** token, which the sidecar needs to list tabs, send input and move files; `--relay-token` is its **relay** token, used only for the relay hop. An entry without `--relay-token` falls back to `--token` for relaying, which now fails against an up-to-date peer — that's the upgrade step below.
+One endpoint entry, two credentials, neither of them the master token: `--token` is the peer's **sidecar** token (`tab-atelier remote my-token` over there), scoped to listing tabs, mirroring output, sending input and moving files; `--relay-token` is its **relay** token (`tab-atelier relay token`), used only for the relay hop. An entry without `--relay-token` falls back to `--token` for relaying, which now fails against an up-to-date peer — that's the upgrade step below.
 
 > **Upgrading from a build that used the master token here:** run `tab-atelier relay token` on the egress host, then `tab-atelier remote add … --relay-token <it>` (or re-add the endpoint) on the local one. The master is no longer accepted on the relay route, so the link stays down until you do.
 
@@ -358,7 +358,7 @@ On the **local** machine:
 
 ```sh
 tab-atelier remote add --label box --url https://<remote>:7891 \
-  --token <remote-master-token> --relay-token <remote-relay-token>
+  --token <remote-sidecar-token> --relay-token <remote-relay-token>
 tab-atelier relay via box            # relay through the `box` endpoint (by label or id)
 tab-atelier relay on                 # enable; `--relay` at launch also works
 tab-atelier relay status             # {"mode":true,"egress":false,"target":"https://<remote>:7891"}
