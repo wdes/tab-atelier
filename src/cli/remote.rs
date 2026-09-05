@@ -68,7 +68,10 @@ fn usage() {
         "usage: tab-atelier remote <list|add|remove|test|watch|attach|put|get|pin-cert|re-pin> [args]\n\
          \n\
          list                                          list configured endpoints\n\
-         add --label L --url U --token T [--no-pin] [--autoconnect]\n\
+         add --label L --url U --token T [--relay-token R] [--no-pin] [--autoconnect]\n\
+                                                       --token is the peer's master token (tabs,\n\
+                                                       input, files); --relay-token its `relay\n\
+                                                       token`, needed only to relay through it\n\
              [--cf-id ID --cf-secret SECRET]           persist a new endpoint\n\
                                                        (--cf-* = Cloudflare Access service token)\n\
          remove <label-or-id>                          drop one\n\
@@ -118,6 +121,7 @@ fn cmd_add(args: &[String]) -> i32 {
     let mut cert_sha256: Option<String> = None;
     let mut cf_id: Option<String> = None;
     let mut cf_secret: Option<String> = None;
+    let mut relay_token: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -132,6 +136,13 @@ fn cmd_add(args: &[String]) -> i32 {
             "--token" => {
                 i += 1;
                 token = args.get(i).cloned();
+            }
+            // The relay hop presents a different credential than the sidecar:
+            // `--token` is the peer's master token (tabs, input, files), while
+            // the relay route only accepts the peer's `relay token`.
+            "--relay-token" => {
+                i += 1;
+                relay_token = args.get(i).cloned();
             }
             "--cert-sha256" => {
                 i += 1;
@@ -212,6 +223,7 @@ fn cmd_add(args: &[String]) -> i32 {
         autoconnect,
         cf_access_client_id: cf_id.unwrap_or_default().trim().to_string(),
         cf_access_client_secret: cf_secret.unwrap_or_default().trim().to_string(),
+        relay_token: relay_token.unwrap_or_default().trim().to_string(),
     };
     prefs.remote_endpoints.push(endpoint);
     save_preferences(&platform::config_dir(), &prefs);
