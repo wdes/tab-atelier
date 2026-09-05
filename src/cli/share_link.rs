@@ -908,6 +908,15 @@ pub fn relay(action: &str, arg: Option<&str>) -> i32 {
             .send(payload.as_bytes())
     };
     match action {
+        // Printed on the EGRESS host and pasted into the peer's
+        // `remote add --token`. Deliberately not the master token: this one
+        // only authenticates `/relay/anthropic/*`, so a relay peer can't
+        // administer the instance it relays through.
+        "token" => {
+            println!("{}", crate::relay_token());
+            eprintln!("# relay-only credential — paste into: tab-atelier remote add --token <this>");
+            0
+        }
         "on" | "off" => {
             let on = action == "on";
             match post("/relay-mode", format!(r#"{{"on":{on}}}"#)) {

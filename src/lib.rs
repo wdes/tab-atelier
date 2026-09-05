@@ -355,15 +355,18 @@ pub fn tab_env_extras(
     m.insert("TAB_ATELIER_API_TOKEN".into(), api_token.to_string());
     // Relay mode: point every claude tab at the local relay listener. `api_url`
     // is the local API base (`http://127.0.0.1:<port>`); the relay route lives
-    // under `/relay/anthropic`. The local API token doubles as the stand-in
-    // `ANTHROPIC_API_KEY` so Claude Code starts in API-key mode and
-    // authenticates to the loopback relay (other local procs can't abuse it).
+    // under `/relay/anthropic`.
+    //
+    // The stand-in `ANTHROPIC_API_KEY` is the RELAY token, not the master one.
+    // An API key is a value tools copy around — into debug output, crash
+    // reports, shared transcripts — and the master token administers every tab
+    // in the instance. The relay token only authenticates to the relay route.
     if relay_mode() {
         m.insert(
             "ANTHROPIC_BASE_URL".into(),
             format!("{}/relay/anthropic", api_url.trim_end_matches('/')),
         );
-        m.insert("ANTHROPIC_API_KEY".into(), api_token.to_string());
+        m.insert("ANTHROPIC_API_KEY".into(), relay_token());
     }
     m
 }
@@ -1699,6 +1702,54 @@ pub fn parse_hex_rgb(s: &str) -> Option<u32> {
 #[must_use]
 pub fn default_tab_id() -> String {
     uuid::Uuid::new_v4().to_string()
+}
+
+/// Path of the relay token — the credential a relayed claude tab presents to
+/// `/relay/anthropic/*`, kept apart from the master `api.token`.
+#[must_use]
+pub fn relay_token_path() -> PathBuf {
+    state_dir(&platform::state_base_dir()).join("relay.token")
+}
+
+/// The relay token, minted on first use and persisted 0600.
+///
+/// Relay mode puts this in every claude tab's `ANTHROPIC_API_KEY`. That value
+/// leaks far more easily than a deliberate credential — an agent dumping its
+/// environment, a `--debug` transcript, a crash report — so it must not be the
+/// master token, which administers every tab. This one does exactly one thing:
+/// authenticate to this instance's Anthropic relay. It cannot list tabs, read
+/// output, inject input or rotate anything.
+///
+/// Cached per process; the file is the durable copy, so restarts keep the same
+/// value and a remote configured with it keeps working.
+#[must_use]
+pub fn relay_token() -> String {
+    static CACHED: OnceLock<String> = OnceLock::new();
+    CACHED
+        .get_or_init(|| {
+            let path = relay_token_path();
+            if let Ok(existing) = std::fs::read_to_string(&path) {
+                let existing = existing.trim().to_string();
+                if !existing.is_empty() {
+                    return existing;
+                }
+            }
+            let minted = mint_share_token();
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            if std::fs::write(&path, &minted).is_ok() {
+                // Owner-only, same as api.token — a world-readable relay token
+                // would hand every local user a free proxy to the account.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+                }
+            }
+            minted
+        })
+        .clone()
 }
 
 /// 16 random bytes hex-encoded — used for per-tab share secrets.
@@ -3858,6 +3909,31 @@ mod tests {
         assert_eq!(stats_rows(&mixed)[1], format!("Power: {STAT_PENDING}"));
         assert_eq!(stats_rows(&mixed)[3], format!("Connections: {STAT_PENDING}"));
         assert!(stats_rows(&[]).is_empty());
+    }
+
+    #[test]
+    fn the_relay_stand_in_key_is_never_the_master_token() {
+        // Relay mode puts a value in ANTHROPIC_API_KEY, which tools copy into
+        // debug output and transcripts far more readily than a deliberate
+        // credential. It must not be the token that administers every tab.
+        let mut extra = std::collections::BTreeMap::new();
+        extra.insert("KEEP".to_string(), "1".to_string());
+        let env = tab_env_extras("tab-1", "http://127.0.0.1:7890", "MASTER-TOKEN", &extra);
+        // The API token is still exported — that's the deliberate one, used by
+        // set-status and the teamwork verbs from inside the tab.
+        assert_eq!(
+            env.get("TAB_ATELIER_API_TOKEN").map(String::as_str),
+            Some("MASTER-TOKEN")
+        );
+        if let Some(key) = env.get("ANTHROPIC_API_KEY") {
+            assert_ne!(key, "MASTER-TOKEN", "the stand-in key must not be the master token");
+            assert_eq!(key, &relay_token());
+        }
+        // The relay token is stable across calls, so a peer configured with it
+        // keeps working; and it is not the master.
+        assert_eq!(relay_token(), relay_token());
+        assert!(!relay_token().is_empty());
+        assert_ne!(relay_token(), "MASTER-TOKEN");
     }
 
     #[test]
