@@ -307,4 +307,15 @@ mod tests {
     fn rejects_unknown_scheme() {
         assert!(to_ws_url("ftp://h/x").is_err());
     }
+
+    #[test]
+    fn lag_bench_arguments_are_validated_before_it_connects() {
+        // `run_cli` needs a live websocket to measure anything, so only the
+        // argument handling runs here — a benchmark that quietly measures
+        // something other than what was asked is worse than one that refuses.
+        let cli = |v: &[&str]| super::run_cli(&v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+        assert_ne!(cli(&["--nope"]), 0, "unknown flag");
+        assert_ne!(cli(&["-n"]), 0, "flag with no value");
+        assert_ne!(cli(&["-n", "not-a-number"]), 0);
+    }
 }

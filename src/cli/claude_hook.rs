@@ -133,17 +133,27 @@ fn is_nudge(prompt: &str) -> bool {
 
 #[must_use]
 pub fn run(args: &[String]) -> i32 {
+    // Slurp the hook event JSON from stdin. Tiny — a few KB at most
+    // for tool inputs.
+    let mut stdin_buf = String::new();
+    let _ = std::io::stdin().read_to_string(&mut stdin_buf);
+    run_with_payload(args, &stdin_buf)
+}
+
+/// [`run`], with the hook payload already read.
+///
+/// Split out so the event handling can be tested: the payload is the only
+/// input, and reading it from the process's stdin makes every branch here
+/// unreachable from a test.
+#[must_use]
+pub fn run_with_payload(args: &[String], stdin_buf: &str) -> i32 {
     let Some(event) = args.first().map(String::as_str) else {
         eprintln!("usage: tab-atelier-headless claude-hook <event>");
         eprintln!("  events: session-start, user-prompt, pre-tool, post-tool, stop, notification, session-end");
         return 2;
     };
 
-    // Slurp the hook event JSON from stdin. Tiny — a few KB at most
-    // for tool inputs.
-    let mut stdin_buf = String::new();
-    let _ = std::io::stdin().read_to_string(&mut stdin_buf);
-    let payload: serde_json::Value = serde_json::from_str(&stdin_buf).unwrap_or(serde_json::Value::Null);
+    let payload: serde_json::Value = serde_json::from_str(stdin_buf).unwrap_or(serde_json::Value::Null);
     let session_id = payload
         .get("session_id")
         .and_then(serde_json::Value::as_str)
@@ -340,5 +350,53 @@ mod tests {
         // A bare comparison / math expression isn't a tag.
         assert!(!is_synthetic_prompt("< 5 items left"));
         assert!(!is_synthetic_prompt("<"));
+    }
+
+    fn hargs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn every_hook_event_is_handled_and_none_can_fail_the_session() {
+        // The contract that matters most: a hook must NEVER exit non-zero,
+        // because Claude Code treats that as a reason to block the tool call.
+        // The daemon is unreachable in a test, which is exactly the failure
+        // mode this has to swallow.
+        let payload = r#"{"session_id":"abc-123","tool_name":"Bash","message":"waiting"}"#;
+        for event in [
+            "session-start",
+            "user-prompt",
+            "pre-tool",
+            "post-tool",
+            "stop",
+            "notification",
+            "session-end",
+        ] {
+            assert_eq!(
+                super::run_with_payload(&hargs(&[event]), payload),
+                0,
+                "{event} must exit 0 even when the daemon is unreachable"
+            );
+        }
+        // An unknown event is reported but still exits 0 — a future Claude
+        // Code release adding an event must not start blocking tools.
+        assert_eq!(super::run_with_payload(&hargs(&["not-an-event"]), payload), 0);
+        // No event at all IS a usage error: that is a broken settings.json,
+        // caught before it is wired into every session on the machine.
+        assert_eq!(super::run_with_payload(&hargs(&[]), payload), 2);
+    }
+
+    #[test]
+    fn a_malformed_payload_does_not_take_the_session_down() {
+        // Whatever arrives on stdin, the hook exits 0. Claude Code has
+        // changed this shape before, and a parse error must not become a
+        // blocked tool call.
+        for body in ["", "not json", "null", "[]", r#"{"session_id":null}"#, "{\"a\":"] {
+            assert_eq!(
+                super::run_with_payload(&hargs(&["pre-tool"]), body),
+                0,
+                "payload {body:?} broke the hook"
+            );
+        }
     }
 }
