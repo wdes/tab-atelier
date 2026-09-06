@@ -325,6 +325,79 @@ pub(in crate::api) fn mutate<S: Write>(stream: &mut S, state: &Arc<Mutex<TabSnap
     }
 }
 
+/// `GET /reports` — list the report documents living directly under `outbox_base()`
+/// (top-level `*.md`/`*.markdown`, newest first). READ-ONLY. Each item's `path` is the bare
+/// `outbox/<name>` form the `/decisions/file` viewer resolves against `outbox_base()`
+/// (CWD-independent, same sandbox as the decisions). `_archive/` and dotfiles are skipped; a
+/// missing outbox reads empty. The remote-share link (volet 3) is a CLIENT concern layered on
+/// `path` later — NOT built here (clean seam).
+pub(in crate::api) fn reports<S: Write>(stream: &mut S) {
+    let base = crate::cli::decision::outbox_base();
+    let mut items: Vec<(u64, String)> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&base) {
+        for ent in rd.flatten() {
+            let name = ent.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                continue; // skip dotfiles (and never `_archive`, a dir, since we require a file below)
+            }
+            let is_md = std::path::Path::new(&name)
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"));
+            if !is_md || !ent.file_type().is_ok_and(|t| t.is_file()) {
+                continue;
+            }
+            let mtime = ent
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_secs());
+            items.push((mtime, name));
+        }
+    }
+    // Newest first; stable by name for equal mtimes (deterministic ordering for the check).
+    items.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let reports: Vec<_> = items
+        .into_iter()
+        .map(|(mtime, name)| serde_json::json!({ "name": name, "path": format!("outbox/{name}"), "mtime": mtime }))
+        .collect();
+    let body = serde_json::to_string(&serde_json::json!({ "reports": reports })).unwrap_or_default();
+    respond_json(stream, 200, &body);
+}
+
+/// `POST /intent` (volet-2 grille d'intention) — persist an intention grid as a NEW
+/// `intent-<ts>.md` under `outbox_base()`. The filename is SERVER-GENERATED from the daemon
+/// clock (`ts` = unix millis, digits only) — NEVER from the client, so there is no path
+/// traversal and no overwrite of an existing bundle. The body is `{content:"…markdown…"}`
+/// (the client folds the Given/When/Then fields into markdown); it is written VERBATIM as
+/// text — the `/decisions/file` viewer renders it XSS-safe (escape-first) on read, so no
+/// markup from the payload is ever executed. Narrow write scope (dashboard token, same outbox
+/// sandbox as the decisions). Returns 200 `{path, name}` — the bare `outbox/…` the viewer resolves.
+pub(in crate::api) fn intent<S: Write>(stream: &mut S, body_bytes: &[u8]) {
+    #[derive(serde::Deserialize, Default)]
+    struct IntentBody {
+        content: Option<String>,
+    }
+    let body: IntentBody = serde_json::from_slice(body_bytes).unwrap_or_default();
+    let content = body.content.unwrap_or_default();
+    if content.trim().is_empty() {
+        error_json(stream, 400, "intent: non-empty content is required");
+        return;
+    }
+    let base = crate::cli::decision::outbox_base();
+    if std::fs::create_dir_all(&base).is_err() {
+        error_json(stream, 500, "intent: outbox unavailable");
+        return;
+    }
+    // Digits-only, server-clock name — traversal-impossible by construction.
+    let name = format!("intent-{}.md", crate::unix_millis());
+    match std::fs::write(base.join(&name), content.as_bytes()) {
+        Ok(()) => respond_json(stream, 200, &format!(r#"{{"path":"outbox/{name}","name":"{name}"}}"#)),
+        Err(_) => error_json(stream, 500, "intent: write failed"),
+    }
+}
+
 #[cfg(test)]
 mod md_viewer_tests {
     use super::{md_to_html, render_markdown_page};
