@@ -2,3 +2,7 @@
 
 # LLVM coverage artifacts from local instrumented runs
 *.profraw
+
+# Scratch space for local-only tools (the fleet dashboard lives here).
+# Deliberately untracked: it is a personal view, not part of the product.
+/local/

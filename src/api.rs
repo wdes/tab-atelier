@@ -1437,6 +1437,26 @@ fn respond_json<W: Write>(stream: &mut W, status: u16, body: &str) {
     );
 }
 
+/// Like [`respond_json`], plus `Access-Control-Allow-Origin: *`.
+///
+/// Used only for `/fleet`, and only for requests that arrived on loopback, so
+/// a local dashboard can be a plain `file://` page instead of an asset served
+/// by the daemon — which is the point: fetching the viewer's fonts and scripts
+/// from a busy daemon is exactly what is slow when the box is loaded.
+///
+/// The route still requires the token; CORS only decides whether a browser
+/// lets a page READ the reply. A page that already has the token has already
+/// won, and a non-loopback caller gets no header at all.
+fn respond_json_cors<W: Write>(stream: &mut W, status: u16, body: &str) {
+    let _ = write!(
+        stream,
+        "HTTP/1.1 {} OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n{ROBOTS_TAG}Content-Length: {}\r\n\r\n{}",
+        status,
+        body.len(),
+        body
+    );
+}
+
 use crate::strip_ansi;
 
 fn error_json<W: Write>(stream: &mut W, status: u16, msg: &str) {
@@ -1891,7 +1911,7 @@ fn handle_connection<S: Read + Write>(
         }
         ("POST", "/claims") => claims_route::grant(stream, &body_bytes),
         ("POST", "/claims/release") => claims_route::release(stream, &body_bytes),
-        ("GET", "/fleet") => fleet_route::get(stream, state),
+        ("GET", "/fleet") => fleet_route::get(stream, state, from_loopback),
         ("GET", "/blackboard") => blackboard_route::list(stream, query_since),
         ("POST", "/blackboard") => blackboard_route::merge(stream, &body_bytes),
         ("GET", "/env") => env::list_global(stream),
@@ -3808,6 +3828,17 @@ mod tests {
             g.edges
         );
         assert!(g.nodes.iter().any(|n| n.kind == "task" && n.id == "task:cov:x"));
+        // A local `file://` dashboard has origin `null`, so the browser only
+        // lets it READ this if the reply says so. The test server's peer is
+        // loopback, so the header must be here.
+        assert!(
+            body.to_ascii_lowercase().contains("access-control-allow-origin: *"),
+            "the fleet route must be readable by a local page: {body}"
+        );
+        // The token still gates it — CORS decides who may read the answer,
+        // not who may ask.
+        let unauth = request(port, "GET /fleet HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert_eq!(status_code(&unauth), 401, "{unauth}");
         // The working agent is a node even though it has no tab on this host —
         // in a federated fleet most agents are somewhere else, and omitting
         // them would draw work assigned to nobody.

@@ -12,9 +12,9 @@
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
-use super::{TabSnapshot, respond_json};
+use super::{TabSnapshot, respond_json, respond_json_cors};
 
-pub(super) fn get<W: Write>(stream: &mut W, state: &Arc<Mutex<TabSnapshot>>) {
+pub(super) fn get<W: Write>(stream: &mut W, state: &Arc<Mutex<TabSnapshot>>, from_loopback: bool) {
     let tabs: Vec<crate::fleet::AgentTab> = {
         let snap = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         snap.tabs
@@ -45,5 +45,11 @@ pub(super) fn get<W: Write>(stream: &mut W, state: &Arc<Mutex<TabSnapshot>>) {
         now,
     );
     let body = serde_json::to_string(&graph).unwrap_or_else(|_| "{\"nodes\":[],\"edges\":[]}".to_string());
-    respond_json(stream, 200, &body);
+    // A local dashboard is a `file://` page (origin `null`), so it can only
+    // read this if the reply says so — and only from loopback.
+    if from_loopback {
+        respond_json_cors(stream, 200, &body);
+    } else {
+        respond_json(stream, 200, &body);
+    }
 }
