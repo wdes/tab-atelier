@@ -72,8 +72,11 @@
             <path d="M0,0 L10,5 L0,10 z" class="lineage-arrow-head"/>
           </marker>
         </defs>
-        <g id="mesh-edges"></g>
-        <g id="mesh-nodes"></g>
+        <!-- zoom/pan viewport: edges+nodes ride a single transform; loading text stays fixed -->
+        <g id="mesh-viewport">
+          <g id="mesh-edges"></g>
+          <g id="mesh-nodes"></g>
+        </g>
         <text id="mesh-loading" x="50%" y="50%" text-anchor="middle" fill="#8a8f98" font-size="15" hidden>chargement…</text>
       </svg>
       <div id="mesh-tip" class="mesh-tip"></div>
