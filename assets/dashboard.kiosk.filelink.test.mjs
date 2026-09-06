@@ -22,6 +22,19 @@ import { classifyDecisionFile, decisionFileHtml, decisionCardHtml, codeRefBlobUr
     assert.equal(classifyDecisionFile(f).kind, "doc", `${f} → servable doc`);
   }
 
+  // ⭐ Cause-A (#kiosk file-link 404): decision `--files` land BARE (no ~/Dev prefix) —
+  // `outbox/proposition.md`, `_archive/2026-09/rep.md`. The server (GET /decisions/file)
+  // sandboxes to the outbox + its `_archive/` subtree, so a bare outbox/_archive .md IS
+  // servable → kind "doc" → the viewer. Before the fix these fell through to a github blob
+  // URL (a-biskoazh) → 404 (outbox isn't in the repo). This block is RED before the fix.
+  for (const f of ["outbox/proposition.md", "_archive/2026-09/rep.md", "outbox/_archive/2025-08/ra1c/rep.markdown"]) {
+    assert.equal(classifyDecisionFile(f).kind, "doc", `${f} → bare servable doc (cause-A)`);
+  }
+  // inbox/ is NOT in the outbox sandbox → stays kind "code" (copyable/text), never the viewer.
+  assert.equal(classifyDecisionFile("inbox/note.md").kind, "code", "inbox is outside the sandbox → not the viewer");
+  // Anchoring: a name that merely CONTAINS `outbox`/`_archive` mid-segment is not the zone.
+  assert.equal(classifyDecisionFile("myoutbox/x.md").kind, "code", "`myoutbox/` is not the outbox zone (segment-anchored)");
+
   // An already-full web URL → kind "url" (link as-is; reliably constructible).
   assert.equal(classifyDecisionFile("https://github.com/wdes/tab-atelier/blob/main/src/x.rs#L1").kind, "url", "http(s) URL → repo link");
 
