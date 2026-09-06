@@ -35,6 +35,22 @@ pub(super) fn list<W: Write>(stream: &mut W, state: &Arc<Mutex<TabSnapshot>>, p:
         return;
     };
     let dir_path = std::path::Path::new(&*cwd).join(dirname);
+    // The DIRECTORY itself must not be a way out. `read_dir` follows a symlink
+    // given as the path, so an `outbox -> /` link (which anything running in
+    // the tab can create) turned this listing into a filesystem browser for
+    // anyone holding a read-only share token. Downloads were never exposed —
+    // `resolve_sandbox_path` canonicalises — but the names, sizes and mtimes
+    // of the whole host were. Same check here, so the two agree.
+    let inside = match (std::path::Path::new(&*cwd).canonicalize(), dir_path.canonicalize()) {
+        (Ok(root), Ok(real)) => real.starts_with(&root),
+        // Not created yet is normal and lists as empty; anything else is
+        // refused rather than guessed at.
+        _ => false,
+    };
+    if !inside {
+        respond_json(stream, 200, r#"{"files":[],"dir":""}"#);
+        return;
+    }
     // Walk the whole subtree (not just the top level) so files the
     // agent tucked into subfolders show up — the viewer renders
     // them in tree mode. Each file carries a `path` relative to
