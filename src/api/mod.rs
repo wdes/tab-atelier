@@ -2172,6 +2172,12 @@ fn handle_connection<S: Read + Write>(stream: &mut S, state: &Arc<Mutex<TabSnaps
         // #kiosk bug1: serve a bundle's content, SANDBOXED to the outbox — the KIOSK
         // links point here (with the page token) instead of at the raw path (which 401s).
         ("GET", "/decisions/file") => handlers::decisions::file(stream, query_path.as_deref()),
+        // Volet-2 (#kiosk 3 onglets): the Rapports tab lists top-level outbox reports;
+        // the Grille d'intention tab POSTs a folded intention → a server-named intent-<ts>.md
+        // in the outbox sandbox (filename server-generated → traversal-safe). Both share the
+        // /decisions/file viewer + the same dashboard-token gate as the decisions.
+        ("GET", "/reports") => handlers::decisions::reports(stream),
+        ("POST", "/intent") => handlers::decisions::intent(stream, &body_bytes),
         (_, "/" | "/tabs") => {
             error_json(stream, 405, "method not allowed");
         }
@@ -7202,6 +7208,86 @@ mod tests {
         assert_eq!(status_code(&no_path), 400, "missing ?path → 400\n{no_path}");
         let missing = request(port, &format!("GET /decisions/file?path={}&token={token} HTTP/1.1\r\n\r\n", base.join("nope-xyz.md").to_string_lossy()));
         assert_eq!(status_code(&missing), 404, "a non-existent bundle → 404\n{missing}");
+    }
+
+    // Volet-2 (#kiosk 3 onglets), Rapports tab (LIVE route, real-fs): GET /reports lists the
+    // top-level outbox `*.md` with a bare `outbox/<name>` path the viewer resolves. Readable by
+    // the dashboard token. A unique seeded file must appear; a non-.md sibling must not.
+    #[test]
+    fn kiosk_reports_route_lists_outbox_md_for_dashboard() {
+        use crate::cli::decision::outbox_base;
+        let (port, state, token) = spawn_server();
+        let dash = "dash-obs-reports".to_string();
+        state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).dashboard_share_token = dash.as_str().into();
+
+        let base = outbox_base();
+        std::fs::create_dir_all(&base).unwrap();
+        let run = crate::default_tab_id();
+        let md = base.join(format!("reports-selftest-{}.md", &run[..8.min(run.len())]));
+        let txt = base.join(format!("reports-selftest-{}.txt", &run[..8.min(run.len())]));
+        std::fs::write(&md, b"# a report").unwrap();
+        std::fs::write(&txt, b"not a report").unwrap();
+        let _c1 = OutboxFile(md.clone());
+        let _c2 = OutboxFile(txt.clone());
+        let md_name = md.file_name().unwrap().to_string_lossy().into_owned();
+        let txt_name = txt.file_name().unwrap().to_string_lossy().into_owned();
+
+        let listed = request(port, &format!("GET /reports?token={dash} HTTP/1.1\r\n\r\n"));
+        assert_eq!(status_code(&listed), 200, "reports listed for the dashboard token\n{listed}");
+        let body = body_of(&listed);
+        assert!(body.contains(&md_name), "the seeded .md report is listed\n{body}");
+        assert!(body.contains(&format!("outbox/{md_name}")), "path is the bare outbox/<name> the viewer resolves\n{body}");
+        assert!(!body.contains(&txt_name), "a non-.md sibling is NOT listed\n{body}");
+        // A bad token is refused.
+        let denied = request(port, "GET /reports?token=nope HTTP/1.1\r\n\r\n");
+        assert_eq!(status_code(&denied), 401, "reports refuses a bad token\n{denied}");
+        let _ = token;
+    }
+
+    // Volet-2 (#kiosk 3 onglets), Grille d'intention (LIVE route, real-fs): POST /intent writes
+    // a SERVER-NAMED intent-<ts>.md into the outbox with the posted content, VERBATIM. The
+    // filename is server-generated (no client traversal). Empty content is refused 400. The
+    // dashboard token is authorised (its one extra narrow write).
+    #[test]
+    fn kiosk_intent_route_writes_server_named_file() {
+        use crate::cli::decision::outbox_base;
+        let (port, state, _token) = spawn_server();
+        let dash = "dash-obs-intent".to_string();
+        state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).dashboard_share_token = dash.as_str().into();
+        let base = outbox_base();
+        std::fs::create_dir_all(&base).unwrap();
+
+        let nonce = crate::default_tab_id();
+        let content = format!("# Intention {nonce}\n\nGiven X\nWhen Y\nThen Z\n");
+        let req = format!(
+            "POST /intent?token={dash} HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            serde_json::to_string(&serde_json::json!({ "content": content })).unwrap().len(),
+            serde_json::to_string(&serde_json::json!({ "content": content })).unwrap(),
+        );
+        let resp = request(port, &req);
+        assert_eq!(status_code(&resp), 200, "intent persisted for the dashboard token\n{resp}");
+        let body = body_of(&resp);
+        let r: serde_json::Value =
+            serde_json::from_str(body).unwrap_or_else(|e| panic!("intent response is JSON {{path,name}}: {e}\n{body}"));
+        let name = r["name"].as_str().unwrap_or_default().to_string();
+        let rpath = r["path"].as_str().unwrap_or_default().to_string();
+        let name_ok = name.starts_with("intent-")
+            && std::path::Path::new(&name).extension().is_some_and(|e| e.eq_ignore_ascii_case("md"));
+        assert!(name_ok, "server-generated name intent-<ts>.md, got {name}");
+        assert_eq!(rpath, format!("outbox/{name}"), "path is the bare outbox/<name> the viewer resolves");
+        let written = base.join(&name);
+        let _cleanup = OutboxFile(written.clone());
+        assert!(written.is_file(), "the intent file exists on disk at {written:?}");
+        assert_eq!(std::fs::read_to_string(&written).unwrap(), content, "the content is written VERBATIM");
+
+        // Empty content → 400 (no file created).
+        let empty_body = r#"{"content":""}"#;
+        let empty_req = format!(
+            "POST /intent?token={dash} HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{empty_body}",
+            empty_body.len()
+        );
+        let empty = request(port, &empty_req);
+        assert_eq!(status_code(&empty), 400, "empty intent content is refused\n{empty}");
     }
 
     // SC1 borne 3: concurrent EDITs never lose an update — each read-modify-append
