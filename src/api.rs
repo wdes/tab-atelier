@@ -3783,6 +3783,46 @@ mod tests {
     }
 
     #[test]
+    fn an_outbox_symlinked_out_of_the_cwd_lists_nothing() {
+        // Found by the security pass: `read_dir` follows a symlink given as
+        // the path, so `outbox -> /` (which anything running in the tab can
+        // create) turned the listing into a filesystem browser for anyone with
+        // a read-only share token. Downloads were never exposed —
+        // `resolve_sandbox_path` canonicalises — but every name, size and
+        // mtime on the host was.
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::fs::write(elsewhere.path().join("secret.txt"), b"x").unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), dir.path().join("outbox")).unwrap();
+
+        let mut tab = test_snapshot_tab("tab-a", "shell");
+        tab.cwd = Some(dir.path().to_string_lossy().into_owned().into());
+        let state = std::sync::Arc::new(std::sync::Mutex::new(test_snapshot(vec![tab])));
+        state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .master_token = "test-secret-token".into();
+        let port = spawn_test_server(&state, false);
+        let listing = request(
+            port,
+            "GET /tabs/by-id/tab-a/outbox HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer test-secret-token\r\n\r\n",
+        );
+        assert_eq!(status_code(&listing), 200, "{listing}");
+        assert!(!listing.contains("secret.txt"), "listed through the symlink: {listing}");
+        assert!(listing.contains("\"files\":[]"), "{listing}");
+
+        // A real directory in the right place still lists.
+        std::fs::remove_file(dir.path().join("outbox")).unwrap();
+        std::fs::create_dir(dir.path().join("outbox")).unwrap();
+        std::fs::write(dir.path().join("outbox").join("report.md"), b"y").unwrap();
+        let ok = request(
+            port,
+            "GET /tabs/by-id/tab-a/outbox HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer test-secret-token\r\n\r\n",
+        );
+        assert!(ok.contains("report.md"), "a real outbox must still list: {ok}");
+    }
+
+    #[test]
     fn an_outbox_download_is_named_by_its_url_not_by_a_query_parameter() {
         // The bug: the viewer linked to `…/files?path=outbox/x.md`, whose last
         // URL segment is `files`. An `<a download>` only applies same-origin,
