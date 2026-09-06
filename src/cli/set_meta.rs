@@ -124,3 +124,46 @@ pub fn run(args: &[String]) -> i32 {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    fn margs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn a_label_needs_both_a_key_and_a_value() {
+        // These fail before any request. A `set-meta` that silently did
+        // nothing would leave an orchestrator believing a tab was labelled.
+        assert_eq!(super::run(&margs(&[])), 2, "no key");
+        assert_eq!(super::run(&margs(&["role"])), 2, "key with no value");
+        assert_eq!(super::run(&margs(&["--tab"])), 2, "flag with no value");
+        assert_eq!(super::run(&margs(&["--nope", "x"])), 2, "unknown flag");
+        // A key that cannot be stored must be refused here rather than by the
+        // daemon, so the error names the argument the user typed.
+        assert_eq!(super::run(&margs(&["bad key!", "value"])), 2);
+        assert_eq!(super::run(&margs(&["", "value"])), 2);
+    }
+
+    #[test]
+    fn set_meta_talks_to_the_environment_not_the_discovered_endpoint() {
+        // Deliberately NOT server-backed. Unlike every other verb, this one
+        // reads TAB_ATELIER_API_URL/TOKEN straight from the environment
+        // instead of `discover_endpoint()`, so the test harness cannot
+        // redirect it — a test that "used the fake daemon" would in fact be
+        // posting to the developer's real one.
+        //
+        // Two consequences worth knowing:
+        //
+        //  * `--tab` must be a UUID. The request goes to
+        //    `/tabs/by-id/{tab}/meta` with no name or index resolution, so
+        //    `--tab build` 404s where `dispatch --to build` works.
+        //  * Outside a tab (no API env at all) it returns 0 without doing
+        //    anything, which keeps it harmless in a hook but means success
+        //    does not imply a label was stored.
+        //
+        // Only the argument checks are exercised here; they run before any of
+        // that.
+        assert_eq!(super::run(&margs(&["--tab", "tab-a"])), 2, "a tab with no key/value");
+    }
+}

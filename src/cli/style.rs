@@ -432,4 +432,32 @@ mod tests {
         assert!(load_rules(&path).is_empty());
         assert_eq!(list_rules(&path), 0);
     }
+
+    #[test]
+    fn a_per_tab_override_reaches_the_daemon() {
+        crate::cli::share_link::with_test_server(|_| {
+            // Per-tab styling goes through the API (unlike folder rules, which
+            // are written to preferences), so the harness can drive it.
+            assert_eq!(super::run(&args(&["--tab", "tab-a", "--color", "#123456"])), 0);
+            assert_eq!(super::run(&args(&["--tab", "tab-a", "--badge", "OPS"])), 0);
+            // `clear` is a value, not a flag, for both fields.
+            assert_eq!(super::run(&args(&["--tab", "tab-a", "--color", "clear"])), 0);
+            assert_eq!(super::run(&args(&["--tab", "tab-a", "--badge", "clear"])), 0);
+            // A tab that does not exist must fail rather than styling another.
+            assert_ne!(super::run(&args(&["--tab", "ghost", "--badge", "X"])), 0);
+            // Listing folder rules is read-only and always safe.
+            assert_eq!(super::run(&args(&["--list"])), 0);
+        });
+    }
+
+    #[test]
+    fn a_folder_rule_needs_an_absolute_path_and_something_to_set() {
+        // These reject before writing preferences, which is what makes them
+        // safe to assert on — a folder rule test that wrote would edit the
+        // developer's real config.
+        assert_eq!(super::run(&args(&["--folder", "relative/path", "--badge", "X"])), 2);
+        assert_eq!(super::run(&args(&["--folder", "/tmp"])), 2, "nothing to set");
+        assert_eq!(super::run(&args(&["--folder", "/tmp", "--color", "notacolour"])), 2);
+        assert_eq!(super::run(&args(&["--folder", "/a", "--tab", "0", "--badge", "X"])), 2);
+    }
 }
