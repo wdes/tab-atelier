@@ -47,10 +47,19 @@ const DEFAULT_INTERVAL_SECS: u64 = 5;
 /// so a still-booting orchestrator's swamped input isn't lost on the first
 /// round. A PERMANENT skip (daemon/shell) never retries — it's consumed at once.
 const MAX_SKIP_ATTEMPTS: u32 = 6;
-/// Delay before the submitting Enter, so the typed text is ingested as one
-/// paste before `\r` lands (see the dispatch paste-submit fix, #31/#32). A
-/// fixed floor here; a follow-up should reuse dispatch's settle poll.
-const SUBMIT_DELAY: Duration = Duration::from_millis(400);
+/// Bounded in-tick retries of the settle → ⏎ → confirm cycle before falling back
+/// to the cross-round submit re-queue. Each try first waits for the paste to
+/// SETTLE (dispatch's screen-stability poll — the #31/#32 follow-up this replaces
+/// the fixed 400 ms floor with), presses Enter as a SEPARATE write, then confirms
+/// the input drained; a target busy at the first ⏎ is re-submitted once it quiets.
+/// Bounded → never an infinite loop on a wedged tab.
+const MAX_SUBMIT_TRIES: u32 = 3;
+/// How many trailing non-blank screen lines count as the target's "input region"
+/// when confirming a submit drained: Claude's input box + footer live here, while
+/// a submitted message scrolls above. ponytail: a heuristic window — a screen so
+/// short that the just-submitted echo stays inside it yields one harmless extra
+/// ⏎ retry, never a wrong or duplicate delivery (the confirm only gates the ⏎).
+const INPUT_TAIL_LINES: usize = 6;
 
 /// RS1 drain-priority class.
 ///
@@ -644,6 +653,91 @@ fn send_input(ep: &Endpoint, uuid: &str, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// The last significant line of `text` — what would still sit on the target's
+/// input line if a submit had NOT taken. Trimmed; empty when `text` is blank.
+fn input_needle(text: &str) -> String {
+    text.lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Normalise a raw screen into plain visible lines: strip ANSI, then collapse
+/// carriage-return overwrites (keep only what's after the last `\r` on a line),
+/// mirroring how a TUI redraws its input line in place. Pure.
+fn screen_lines(screen: &str) -> Vec<String> {
+    crate::strip_ansi(screen)
+        .split('\n')
+        .map(|l| l.rsplit('\r').next().unwrap_or(l).trim_end().to_string())
+        .collect()
+}
+
+/// Is `line` the target's input CARET line — a `>` prompt, optionally behind a
+/// left box border (`│ > …`, as Claude's input box renders)? Anchoring the input
+/// region here isolates the box (+ any footer below it) from the transcript
+/// ABOVE, so a just-submitted echo scrolled up isn't mistaken for stuck text.
+fn is_prompt_line(line: &str) -> bool {
+    let t = line.trim_start();
+    let t = t.strip_prefix('│').unwrap_or(t).trim_start();
+    t.starts_with('>')
+}
+
+/// Has the submitted `text` DRAINED from the target's input line?
+///
+/// Drained ⇔ its input-line content ([`input_needle`]) no longer appears in the
+/// input REGION: the lines from the last [`is_prompt_line`] caret to the bottom
+/// (the box + any footer), which excludes the submitted echo that scrolls up into
+/// the transcript. Falls back to the last [`INPUT_TAIL_LINES`] non-blank lines
+/// when no caret is on screen (a tool without a `>` box). An empty submit (a
+/// re-queued ⏎-only nudge) is idempotently "drained" — Enter on an empty box is a
+/// no-op. Pure, so the confirm decision is unit-tested without a live tab.
+#[must_use]
+pub fn input_drained(text: &str, screen: &str) -> bool {
+    let needle = input_needle(text);
+    if needle.is_empty() {
+        return true;
+    }
+    let lines = screen_lines(screen);
+    lines.iter().rposition(|l| is_prompt_line(l)).map_or_else(
+        || {
+            !lines
+                .iter()
+                .rev()
+                .filter(|l| !l.trim().is_empty())
+                .take(INPUT_TAIL_LINES)
+                .any(|l| l.contains(&needle))
+        },
+        |caret| !lines[caret..].iter().any(|l| l.contains(&needle)),
+    )
+}
+
+/// Deliver a submitting ⏎ deterministically — the robust replacement for the old
+/// fixed 400 ms floor. Up to [`MAX_SUBMIT_TRIES`] times: wait for the paste to
+/// SETTLE (reusing dispatch's screen-stability poll), press Enter as a SEPARATE
+/// write, then CONFIRM the text left the input line ([`input_drained`]). Returns
+/// `Ok(true)` once confirmed (or for an empty ⏎-only nudge, an idempotent no-op),
+/// `Ok(false)` if still stuck after the budget (caller re-queues a cross-round
+/// retry), or `Err` on a POST failure. Re-pressing Enter on an already-drained box
+/// is harmless, so a retry never double-delivers.
+fn submit_confirmed(ep: &Endpoint, uuid: &str, input: &str) -> Result<bool, String> {
+    let verifiable = !input_needle(input).is_empty();
+    for _ in 0..MAX_SUBMIT_TRIES {
+        crate::cli::delegate::wait_for_paste_settled(ep, uuid);
+        send_input(ep, uuid, b"\r")?;
+        if !verifiable {
+            // A re-queued ⏎-only nudge carries no text to read back; submitting an
+            // already-drained box is a no-op, so treat it as done (idempotent).
+            return Ok(true);
+        }
+        if matches!(crate::cli::delegate::read_output(ep, uuid), Ok(s) if input_drained(input, &s)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// One round: read new swamp entries past the cursor, plan deliver/skip
 /// (guarded), execute deliveries over HTTP, advance the cursor after each
 /// (exactly-once best effort — a crash mid-round re-reads from the persisted
@@ -714,28 +808,35 @@ fn tick(cursor: &mut usize) -> Result<(), String> {
                     return Ok(());
                 }
                 // 2. Submit the ⏎ ATOMICALLY w.r.t. the cursor (gap 'a' fix): the
-                //    entry is consumed only once the newline POST is CONFIRMED.
-                //    "Confirmed" = the input POST returned Ok — the daemon accepted
-                //    the `\r` byte into the tab's PTY. ponytail: best-effort — there
-                //    is no agent-side ack that the line was actually executed; this
-                //    is the most reliable signal the input API exposes, but it's no
-                //    longer fire-and-forget.
+                //    entry is consumed only once the submit is CONFIRMED — the typed
+                //    text has LEFT the input line (input_drained), not merely that
+                //    the POST returned. submit_confirmed settles the paste, presses
+                //    ⏎, and re-submits across a busy→idle transition (bounded).
                 if submit {
-                    std::thread::sleep(SUBMIT_DELAY);
-                    if let Err(e) = send_input(&ep, &tab, b"\r") {
-                        // ⏎ unconfirmed: DON'T drop the nudge. Re-queue a submit-only
-                        // copy (empty text so the body isn't re-typed) with
-                        // attempts+1, bounded by should_retry, then abandon+log.
-                        // Advancing here mirrors the transient-skip re-queue: the
-                        // pending submission survives as a tail entry (kept by the
-                        // end-of-round compaction), later live tabs still deliver.
+                    // Deterministic submit: settle-poll (not a fixed delay) + ⏎ +
+                    // CONFIRM the input drained, re-submitting across the busy→idle
+                    // transition up to MAX_SUBMIT_TRIES (the #31/#32 follow-up).
+                    let confirmed = match submit_confirmed(&ep, &tab, &input) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("🐊 aligator: ⏎ POST failed for {tab}: {e}");
+                            false
+                        }
+                    };
+                    if !confirmed {
+                        // Still stuck after the in-tick budget: DON'T drop the nudge.
+                        // Re-queue a submit-only copy (empty text so the body isn't
+                        // re-typed) with attempts+1, bounded by should_retry, then
+                        // abandon+log. Advancing here mirrors the transient-skip
+                        // re-queue: the pending submission survives as a tail entry
+                        // (kept by the end-of-round compaction) for a later round.
                         let spent = entries[index].attempts;
                         *cursor = index + 1;
                         write_cursor(*cursor);
                         if should_retry(spent) {
                             match append_swamp_line(&swamp_path(), &submit_retry_entry(&entries[index])) {
                                 Ok(()) => eprintln!(
-                                    "🐊 aligator: ⏎ not confirmed for {tab}: {e} — re-queued (attempt {n}/{MAX_SKIP_ATTEMPTS})",
+                                    "🐊 aligator: ⏎ not confirmed for {tab} — re-queued (attempt {n}/{MAX_SKIP_ATTEMPTS})",
                                     n = spent + 1,
                                 ),
                                 Err(w) => eprintln!("🐊 aligator: re-queue ⏎ for {tab} failed: {w} — dropping"),
@@ -1368,10 +1469,20 @@ not json at all
             !should_retry(MAX_SKIP_ATTEMPTS - 1),
             "the last attempt exhausts the budget → abandon (logged)"
         );
-        // (4) a real settle delay still separates text from ⏎.
+        // (4) the ⏎ is now gated by a deterministic drain-confirm with a bounded
+        //     in-tick retry budget (settle-poll replaces the old fixed delay).
+        const { assert!(MAX_SUBMIT_TRIES > 0, "at least one settle→⏎→confirm try") }
+        // A confirmed submit means the text left the input line; an empty ⏎-only
+        // nudge is idempotently "drained" (re-pressing Enter on an empty box is a
+        // no-op), while text still sitting on the input line is NOT drained.
+        assert!(input_drained("", "> "), "empty ⏎ nudge is idempotently drained");
         assert!(
-            SUBMIT_DELAY > Duration::from_millis(0),
-            "a real settle delay separates text from ⏎"
+            !input_drained("run the tests", "> run the tests"),
+            "text still on the input line is NOT drained (stuck)"
+        );
+        assert!(
+            input_drained("run the tests", "you: run the tests\n\n(esc to interrupt)\n> "),
+            "once submitted, the text scrolls above the input box → drained"
         );
     }
 
@@ -1436,6 +1547,39 @@ not json at all
         assert!(self_announce(None).is_none(), "no _TAB_ID → no announce");
         assert!(self_announce(Some("")).is_none(), "empty _TAB_ID → no announce");
         assert!(self_announce(Some("   ")).is_none(), "blank _TAB_ID → no announce");
+    }
+
+    #[test]
+    fn input_drained_distinguishes_stuck_from_submitted() {
+        // The submit-confirm signal: has the swamped text left the input line?
+        // STUCK — text still sits on the input line (the busy-at-submit bug).
+        assert!(!input_drained("please run the tests", "> please run the tests"));
+        // DRAINED — the input box is empty after a real submit.
+        assert!(input_drained("please run the tests", "user: please run the tests\n\n⠋ working…\n> "));
+        // ANSI + carriage-return in-place redraws are collapsed before matching:
+        // a TUI that repaints its input line with `\r\x1b[K> <text>` still reads as
+        // stuck (the last CR-segment carries the live text).
+        assert!(!input_drained(
+            "deploy now",
+            "\x1b[2m> old\x1b[0m\r\x1b[K> deploy now"
+        ));
+        // Multi-line paste: the needle is the LAST non-blank line (what lands on
+        // the input line). Present on the box → stuck; scrolled above → drained.
+        let multi = "line one\nline two RUNME";
+        assert!(!input_drained(multi, "> line one\n  line two RUNME"));
+        assert!(input_drained(multi, "you said: line two RUNME\n\n> "));
+        // Claude's real box renders the caret behind a left border with a footer
+        // BELOW it — a multi-line stuck paste (spanning box lines) is still caught,
+        // while a submitted echo ABOVE the caret is excluded.
+        let boxed_stuck = "\u{2502} > line one\n\u{2502} line two RUNME\n\u{2570}\u{2500}\u{256f}\n  \u{23ce} send";
+        assert!(!input_drained("send it\nline two RUNME", boxed_stuck), "multi-line paste in the box (footer below) is stuck");
+        let boxed_drained = "user: line two RUNME\n\n\u{2502} > \n\u{2570}\u{2500}\u{256f}\n  \u{23ce} send";
+        assert!(input_drained("send it\nline two RUNME", boxed_drained), "echo above an empty box → drained");
+        // No `>` caret on screen at all → fall back to the last-N-lines window.
+        assert!(!input_drained("NEEDLE", "some tool output\nNEEDLE"), "no caret → window fallback finds it");
+        // Empty submit (⏎-only re-queue) is idempotently drained regardless of screen.
+        assert!(input_drained("", "> anything at all"));
+        assert!(input_drained("   ", "> whitespace-only body is a no-op"));
     }
 
     // ---- RS1 fabric v2 — drain heuristics + invariants -------------------

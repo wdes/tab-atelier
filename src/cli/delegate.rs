@@ -366,7 +366,7 @@ fn submit_prompt(ep: &Endpoint, uuid: &str, prompt: &str, submit: bool) -> Resul
 /// giving up after [`SUBMIT_DELAY_MAX`]. Best-effort: an output-read error is
 /// treated as "still settling" and never blocks the caller's Enter — the worst
 /// case degrades to roughly the old fixed-delay behaviour.
-fn wait_for_paste_settled(ep: &Endpoint, uuid: &str) {
+pub(crate) fn wait_for_paste_settled(ep: &Endpoint, uuid: &str) {
     let start = Instant::now();
     std::thread::sleep(SUBMIT_DELAY_MIN);
     let mut last = read_output(ep, uuid).unwrap_or_default();
@@ -394,7 +394,7 @@ fn send_input(ep: &Endpoint, uuid: &str, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn read_output(ep: &Endpoint, uuid: &str) -> Result<String, String> {
+pub(crate) fn read_output(ep: &Endpoint, uuid: &str) -> Result<String, String> {
     agent()
         .get(format!("{}/tabs/by-id/{uuid}/output", ep.url))
         .header("Authorization", format!("Bearer {}", ep.token))
