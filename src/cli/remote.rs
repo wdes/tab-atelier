@@ -463,4 +463,50 @@ mod tests {
         // Multi-byte input must not panic on a mid-char boundary.
         assert!(truncate("héllo-wörld-ünicode", 8).chars().count() <= 8);
     }
+
+    fn rargs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn remote_add_refuses_an_incomplete_endpoint() {
+        // Every one of these returns before touching preferences, which is
+        // what makes them safe to assert on: a half-specified endpoint that
+        // got written would fail later, at connect time, far from the typo.
+        assert_eq!(super::run(&rargs(&["add"])), 2, "no label");
+        assert_eq!(super::run(&rargs(&["add", "--label", "peer"])), 2, "no url");
+        assert_eq!(
+            super::run(&rargs(&["add", "--label", "peer", "--url", "http://x:1"])),
+            2,
+            "no token"
+        );
+        assert_eq!(super::run(&rargs(&["add", "--nope", "x"])), 2, "unknown flag");
+        // A flag with no value must not swallow the next flag as its argument.
+        assert_eq!(super::run(&rargs(&["add", "--label"])), 2);
+        assert_eq!(super::run(&rargs(&["add", "--url"])), 2);
+        assert_eq!(super::run(&rargs(&["add", "--token"])), 2);
+    }
+
+    #[test]
+    fn remote_verbs_validate_before_they_act() {
+        // An unknown action is a usage error, not a silent no-op.
+        assert_eq!(super::run(&rargs(&["frobnicate"])), 2);
+        assert_eq!(super::run(&rargs(&[])), 2);
+        // remove needs something to remove; a bare `remove` must not delete
+        // the first endpoint it finds.
+        assert_eq!(super::run(&rargs(&["remove"])), 2);
+        // pin-cert needs a URL, and refuses a non-https one — pinning a plain
+        // http endpoint would capture nothing while looking like it worked.
+        assert_eq!(super::run(&rargs(&["pin-cert"])), 2);
+        assert_ne!(super::run(&rargs(&["pin-cert", "http://example.com"])), 0);
+        // Listing is always safe, with or without endpoints configured.
+        assert_eq!(super::run(&rargs(&["list"])), 0);
+    }
+
+    #[test]
+    fn removing_an_unknown_label_fails_instead_of_succeeding_quietly() {
+        // Exit code matters: a script that removes a stale peer must be able
+        // to tell "it was not there" from "it is gone now".
+        assert_ne!(super::run(&rargs(&["remove", "definitely-not-an-endpoint-xyz"])), 0);
+    }
 }
