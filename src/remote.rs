@@ -531,8 +531,35 @@ mod tests {
         let port = listener.local_addr().expect("addr").port();
         let handle = std::thread::spawn(move || {
             if let Ok((mut sock, _)) = listener.accept() {
+                // Drain the WHOLE request (head plus declared body) before
+                // answering: the client writes head and body separately, and
+                // replying + closing between the two turns the unread body
+                // into a connection reset that aborts the request mid-send.
+                let mut req = Vec::new();
                 let mut buf = [0u8; 2048];
-                let _ = sock.read(&mut buf);
+                let mut need = None;
+                loop {
+                    match sock.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                    if need.is_none()
+                        && let Some(pos) = req.windows(4).position(|w| w == b"\r\n\r\n")
+                    {
+                        let body_len = String::from_utf8_lossy(&req[..pos])
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                k.eq_ignore_ascii_case("content-length")
+                                    .then(|| v.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        need = Some(pos + 4 + body_len);
+                    }
+                    if need.is_some_and(|n| req.len() >= n) {
+                        break;
+                    }
+                }
                 let _ = write!(
                     sock,
                     "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -542,6 +569,21 @@ mod tests {
             }
         });
         (format!("http://127.0.0.1:{port}"), handle)
+    }
+
+    #[test]
+    fn serve_once_survives_a_client_that_hangs_up_mid_request() {
+        // A body cut short by a hangup must end the drain loop (EOF, not
+        // a spin waiting for bytes that never come) and still let the
+        // responder thread exit cleanly.
+        use std::io::Write;
+        let (url, h) = serve_once("{}", "200 OK");
+        let addr = url.strip_prefix("http://").expect("http url").to_string();
+        let mut sock = std::net::TcpStream::connect(addr).expect("connect");
+        sock.write_all(b"POST /x HTTP/1.1\r\ncontent-length: 5\r\n\r\nab")
+            .expect("partial request");
+        drop(sock);
+        h.join().expect("responder exits cleanly");
     }
 
     fn endpoint(url: String) -> RemoteEndpoint {
