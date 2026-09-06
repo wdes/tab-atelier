@@ -3730,10 +3730,9 @@ mod tests {
         assert!(resp.contains("local hop"), "{resp}");
     }
 
-    /// Serialises the tests that redirect the process-global blackboard and
-    /// lease-registry paths — they would otherwise clobber each other's
-    /// overrides when the suite runs in parallel.
-    static BOARD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// The one lock every board-redirecting test shares (defined in
+    /// `cli::team`), so the API tests cannot race the CLI ones.
+    use crate::cli::team::BOARD_TEST_LOCK;
 
     #[test]
     fn a_missing_or_unwritable_cert_path_is_reported_before_the_server_starts() {

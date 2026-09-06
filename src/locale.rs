@@ -100,6 +100,7 @@ pub struct Strings {
     // Preferences
     pub theme: &'static str,
     pub opacity: &'static str,
+    pub font_size: &'static str,
     pub toggle_hotkeys: &'static str,
     pub add_key: &'static str,
     pub choose_a_key: &'static str,
@@ -201,6 +202,7 @@ pub static EN: Strings = Strings {
 
     theme: "Theme",
     opacity: "Opacity",
+    font_size: "Font size",
     toggle_hotkeys: "Toggle hotkeys",
     add_key: "Add key",
     choose_a_key: "Choose a key",
@@ -301,6 +303,7 @@ pub static FR: Strings = Strings {
 
     theme: "Thème",
     opacity: "Opacité",
+    font_size: "Taille de police",
     toggle_hotkeys: "Raccourcis d'affichage",
     add_key: "Ajouter une touche",
     choose_a_key: "Choisir une touche",

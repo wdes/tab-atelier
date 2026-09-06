@@ -439,8 +439,9 @@ mod tests {
     /// The verbs write to process-global paths, so this also serialises the
     /// tests that use it — two running at once would trade boards mid-assert.
     fn with_fleet<T>(body: impl FnOnce() -> T) -> T {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::cli::team::BOARD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().expect("tempdir");
         crate::cli::team::set_blackboard_path(Some(dir.path().join("blackboard.jsonl")));
         crate::claims::set_registry_path(Some(dir.path().join("claims.json")));
