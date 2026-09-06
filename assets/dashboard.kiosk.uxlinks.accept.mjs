@@ -9,7 +9,11 @@
 //       (assert the CONSTRUCTED repo URL + #L anchor — NOT dead text, NO /decisions/file 404);
 //   (c) PRESENTATION: the short summary is always visible + clicking (+) EXPANDS the long
 //       detail, clicking (-) COLLAPSES it (assert the real expanded/collapsed state).
-// RED before the fix (code ref is a dead span with no href), GREEN after.
+// ⭐ Bug B (volet-2): the SHIPPED default repo-blob base is now EMPTY (a-biskoazh 404 removed;
+// code refs degrade to copyable text — covered by dashboard.kiosk-copy.accept.mjs). This test
+// covers the OTHER half: the DEPLOY path where an operator SETS a real base → code refs become
+// clickable blob links. So it injects a configured base into the served HTML (mirroring how
+// kiosk-copy injects an empty one). RED without the classify/build wiring, GREEN with it.
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -17,7 +21,13 @@ import { chromium } from "playwright";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const read = (f) => readFileSync(join(HERE, f), "utf8");
-const HTML = read("dashboard.html"), JS = read("dashboard.js"), CSS = read("dashboard.css");
+// A configured deploy base (the durability-push target shape) — set it so code refs are clickable.
+const TEST_BASE = "https://github.com/wdes/tab-atelier/blob/tab-atelier-mx";
+const HTML = read("dashboard.html").replace(
+  /<meta name="repo-blob-base"[^>]*>/,
+  `<meta name="repo-blob-base" content="${TEST_BASE}">`,
+);
+const JS = read("dashboard.js"), CSS = read("dashboard.css");
 const ORIGIN = "http://ta-dash.local", TOKEN = "TESTTOKEN";
 
 let failures = 0;

@@ -17,7 +17,9 @@ use super::super::{TabSnapshot, error_json, respond_bytes, respond_json};
 /// `<outbox>` and its `_archive/` subtree (#kiosk).
 ///
 /// The KIOSK panel links point here: a raw outbox path 401s at the daemon, so this route
-/// lets the PO READ a bundle we SHOW them. Every path is `~`-expanded then CANONICALIZED
+/// lets the PO READ a bundle we SHOW them. A bare `outbox/…`/`_archive/…` ref (the shape
+/// decision `--files` carry) is anchored on `outbox_base()`, not the CWD; then every path is
+/// `~`-expanded then CANONICALIZED
 /// (collapsing `..` and symlinks) and must live under the canonicalized outbox — anything
 /// outside (the source tree, `~/.ssh`, `/etc/…`) is refused 403. Served as text/plain.
 /// READ-ONLY.
@@ -26,14 +28,29 @@ pub(in crate::api) fn file<S: Write>(stream: &mut S, path_q: Option<&str>) {
         error_json(stream, 400, "decisions file: ?path= is required");
         return;
     };
-    let requested = raw.strip_prefix("~/").map_or_else(
-        || std::path::PathBuf::from(raw),
-        |rest| std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(rest),
-    );
+    // Resolve the request to an absolute path BEFORE canonicalizing. Three shapes reach us:
+    //  - `~/…`  → HOME-expanded (the `~/Dev/outbox/…` shape the panel builds).
+    //  - a BARE `outbox/…` / `_archive/…` → decision `--files` are pushed WITHOUT the ~/Dev
+    //    prefix, so a plain `PathBuf::from(raw)` would canonicalize RELATIVE to the daemon
+    //    CWD (`/home/mox2` in prod, not `~/Dev`) → the wrong file → a spurious 404. Anchor
+    //    these on `outbox_base()` DETERMINISTICALLY instead — CWD-independent by construction
+    //    (`_archive/` lives under the outbox, so it keeps its whole segment).
+    //  - anything else → taken as-is (an absolute path); the canonicalize + confinement
+    //    check below still gates it to the sandbox.
+    let base_dir = crate::cli::decision::outbox_base();
+    let requested = if let Some(rest) = raw.strip_prefix("~/") {
+        std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(rest)
+    } else if let Some(rest) = raw.strip_prefix("outbox/") {
+        base_dir.join(rest)
+    } else if raw.starts_with("_archive/") {
+        base_dir.join(raw)
+    } else {
+        std::path::PathBuf::from(raw)
+    };
     // Canonicalize both sides so the sandbox check can't be walked out of (`..`, symlink).
     // A non-existent file / unreadable outbox → 404 (never leak whether a path exists
     // outside the sandbox — the confinement check runs on the canonical form first).
-    let (Ok(canon), Ok(base)) = (std::fs::canonicalize(&requested), std::fs::canonicalize(crate::cli::decision::outbox_base()))
+    let (Ok(canon), Ok(base)) = (std::fs::canonicalize(&requested), std::fs::canonicalize(&base_dir))
     else {
         error_json(stream, 404, "decisions file: not found");
         return;
@@ -305,6 +322,79 @@ pub(in crate::api) fn mutate<S: Write>(stream: &mut S, state: &Arc<Mutex<TabSnap
         respond_json(stream, 200, &format!(r#"{{"{verb}":"{id}"}}"#));
     } else {
         error_json(stream, 500, "decision: read-back failed");
+    }
+}
+
+/// `GET /reports` — list the report documents living directly under `outbox_base()`
+/// (top-level `*.md`/`*.markdown`, newest first). READ-ONLY. Each item's `path` is the bare
+/// `outbox/<name>` form the `/decisions/file` viewer resolves against `outbox_base()`
+/// (CWD-independent, same sandbox as the decisions). `_archive/` and dotfiles are skipped; a
+/// missing outbox reads empty. The remote-share link (volet 3) is a CLIENT concern layered on
+/// `path` later — NOT built here (clean seam).
+pub(in crate::api) fn reports<S: Write>(stream: &mut S) {
+    let base = crate::cli::decision::outbox_base();
+    let mut items: Vec<(u64, String)> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&base) {
+        for ent in rd.flatten() {
+            let name = ent.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                continue; // skip dotfiles (and never `_archive`, a dir, since we require a file below)
+            }
+            let is_md = std::path::Path::new(&name)
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"));
+            if !is_md || !ent.file_type().is_ok_and(|t| t.is_file()) {
+                continue;
+            }
+            let mtime = ent
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_secs());
+            items.push((mtime, name));
+        }
+    }
+    // Newest first; stable by name for equal mtimes (deterministic ordering for the check).
+    items.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let reports: Vec<_> = items
+        .into_iter()
+        .map(|(mtime, name)| serde_json::json!({ "name": name, "path": format!("outbox/{name}"), "mtime": mtime }))
+        .collect();
+    let body = serde_json::to_string(&serde_json::json!({ "reports": reports })).unwrap_or_default();
+    respond_json(stream, 200, &body);
+}
+
+/// `POST /intent` (volet-2 grille d'intention) — persist an intention grid as a NEW
+/// `intent-<ts>.md` under `outbox_base()`. The filename is SERVER-GENERATED from the daemon
+/// clock (`ts` = unix millis, digits only) — NEVER from the client, so there is no path
+/// traversal and no overwrite of an existing bundle. The body is `{content:"…markdown…"}`
+/// (the client folds the Given/When/Then fields into markdown); it is written VERBATIM as
+/// text — the `/decisions/file` viewer renders it XSS-safe (escape-first) on read, so no
+/// markup from the payload is ever executed. Narrow write scope (dashboard token, same outbox
+/// sandbox as the decisions). Returns 200 `{path, name}` — the bare `outbox/…` the viewer resolves.
+pub(in crate::api) fn intent<S: Write>(stream: &mut S, body_bytes: &[u8]) {
+    #[derive(serde::Deserialize, Default)]
+    struct IntentBody {
+        content: Option<String>,
+    }
+    let body: IntentBody = serde_json::from_slice(body_bytes).unwrap_or_default();
+    let content = body.content.unwrap_or_default();
+    if content.trim().is_empty() {
+        error_json(stream, 400, "intent: non-empty content is required");
+        return;
+    }
+    let base = crate::cli::decision::outbox_base();
+    if std::fs::create_dir_all(&base).is_err() {
+        error_json(stream, 500, "intent: outbox unavailable");
+        return;
+    }
+    // Digits-only, server-clock name — traversal-impossible by construction.
+    let name = format!("intent-{}.md", crate::unix_millis());
+    match std::fs::write(base.join(&name), content.as_bytes()) {
+        Ok(()) => respond_json(stream, 200, &format!(r#"{{"path":"outbox/{name}","name":"{name}"}}"#)),
+        Err(_) => error_json(stream, 500, "intent: write failed"),
     }
 }
 

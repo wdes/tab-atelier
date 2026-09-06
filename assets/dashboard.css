@@ -835,9 +835,34 @@ body.band-view { min-height: calc(100vh + 180px); }
 .kk-archived-toggle { font-size: 0.72rem; color: var(--muted); display: inline-flex; align-items: center; gap: 0.3rem; margin-left: 0.4rem; cursor: pointer; }
 .kk-archived-toggle input { margin: 0; }
 .kk-refresh, .kk-close { border: none; background: transparent; color: var(--muted); font-size: 1rem; cursor: pointer; }
-.kk-refresh { margin-left: auto; } .kk-close { margin-left: 0.3rem; font-size: 1.2rem; }
+.kk-refresh { margin-left: auto; } .kk-close { margin-left: auto; font-size: 1.2rem; }
 .kk-list { padding: 0.4rem 0.8rem 0.9rem; }
 .kk-loading, .kk-error, .kk-empty { padding: 1rem; color: var(--muted); }
+
+/* Volet-2 (#kiosk 3 onglets): tab bar + panels. */
+.kk-tabs { display: flex; gap: 0.2rem; padding: 0.4rem 0.8rem 0; border-bottom: 1px solid var(--border); position: sticky; top: 3rem; background: var(--panel); z-index: 1; }
+.kk-tab { border: none; background: transparent; color: var(--muted); font: inherit; font-size: 0.82rem; padding: 0.45rem 0.7rem; cursor: pointer; border-bottom: 2px solid transparent; }
+.kk-tab:hover { color: var(--fg); }
+.kk-tab[aria-selected="true"] { color: var(--fg); border-bottom-color: var(--led-working-stroke); font-weight: 600; }
+.kk-tabpanel[hidden] { display: none; }
+.kk-subhead { display: flex; align-items: center; gap: 0.4rem; padding: 0.55rem 0.8rem 0; }
+
+/* Onglet (b) Rapports. */
+.kk-report-list { padding: 0.4rem 0.8rem 0.9rem; display: flex; flex-direction: column; gap: 0.3rem; }
+.kk-report { padding: 0.35rem 0.5rem; border: 1px solid var(--border); border-radius: 6px; }
+
+/* Onglet (c) Grille d'intention. */
+.kk-intent { padding: 0.6rem 0.8rem 1rem; display: flex; flex-direction: column; gap: 0.55rem; }
+.kk-intent-hint { color: var(--muted); font-size: 0.76rem; margin: 0; }
+.kk-intent-label { display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.78rem; color: var(--muted); }
+.kk-intent textarea, .kk-gwt-row textarea { font: inherit; font-size: 0.82rem; width: 100%; box-sizing: border-box; resize: none; overflow: hidden; background: var(--bg, #1b1b1b); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 0.4rem 0.5rem; min-height: 2rem; }
+.kk-gwt-row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0.35rem; margin-bottom: 0.35rem; }
+.kk-gwt-add { align-self: flex-start; font: inherit; font-size: 0.76rem; background: transparent; color: var(--led-working-stroke); border: 1px dashed var(--border); border-radius: 6px; padding: 0.3rem 0.6rem; cursor: pointer; }
+.kk-intent-actions { display: flex; align-items: center; gap: 0.6rem; }
+.kk-intent-post { font: inherit; font-size: 0.82rem; padding: 0.35rem 0.9rem; border-radius: 6px; border: 1px solid var(--led-working-stroke); background: var(--panel); color: var(--led-working-stroke); cursor: pointer; }
+.kk-intent-msg { font-size: 0.78rem; color: var(--muted); }
+.kk-intent-msg.ok { color: var(--led-ok-stroke, #6c6); }
+.kk-intent-msg.err { color: var(--led-error-stroke, #e66); }
 
 .kk-group { margin-top: 0.5rem; }
 .kk-project { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); margin: 0.6rem 0 0.3rem; }
