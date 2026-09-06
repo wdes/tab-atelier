@@ -1848,6 +1848,29 @@ export function codeRefBlobUrl(raw, base = REPO_BLOB_BASE) {
   return `${base.replace(/\/$/, "")}/${enc}${anchor}`;
 }
 
+// volet-3 remote-link deploy seam (SIMPLIFICATION PO): the host a LOCAL report viewer link is
+// rewritten onto so the PO can open/copy it OFF-LAN. Mirrors REPO_BLOB_BASE (a <meta> a deploy can
+// override) but DEFAULTS to amaury (the PO's already-operational CF tunnel) rather than empty — the
+// tunnel + its auth are infra we do NOT build; we only compose the shareable absolute URL.
+const REMOTE_BASE = (function () {
+  const dflt = "https://amaury.wdes.eu";
+  if (typeof document === "undefined") return dflt; // node (unit tests) → the amaury default
+  const m = document.querySelector('meta[name="remote-base"]');
+  const v = m && m.getAttribute("content");
+  return v == null || !v.trim() ? dflt : v.trim(); // absent/empty meta → the amaury default
+})();
+
+// Pure: compose the shareable REMOTE viewer URL for a LOCAL report path. We do NOT parse the local
+// loopback/LAN address — we prefix the fixed remote host onto the SAME relative viewer path
+// (/decisions/file?path=…) + the page token, reusing viewerUrlWithToken (auth = the PO tunnel's job,
+// not ours). Segment-encoded (keeps slashes readable, encodes spaces/specials). Empty path → "".
+export function toRemoteLink(localPath, token = TOKEN, base = REMOTE_BASE) {
+  const path = String(localPath == null ? "" : localPath).trim().replace(/^\.?\//, "");
+  if (!path) return "";
+  const enc = path.split("/").map(encodeURIComponent).join("/");
+  return base.replace(/\/$/, "") + viewerUrlWithToken("/decisions/file?path=" + enc, token);
+}
+
 // FU2 (#kiosk) + follow-up fix: a decision's files[] mixes reference kinds that must NOT
 // render the same way — and NONE of them may render as dead text (the FU2 regression):
 //  - a SERVABLE DOC (a real .md under the served outbox zone, e.g. ~/Dev/outbox/x.md
@@ -2071,16 +2094,22 @@ export function reportsView(readModel) {
   return Array.isArray(readModel) ? readModel : [];
 }
 
-// Onglet (b) — one report row: a LOCAL viewer link (the same sandboxed /decisions/file route
-// the decisions' docs use). The remote share link (amaury.wdes.eu, volet-3) is NOT built here:
-// we only expose a clean seam via data-local-path for a later builder to derive the remote URL.
+// Onglet (b) — one report row: a LOCAL viewer link (the same sandboxed /decisions/file route the
+// decisions' docs use) PLUS a volet-3 "Ouvrir en distant" link — the same viewer path composed onto
+// the remote host (amaury.wdes.eu) so the PO can open/copy it off-LAN. The remote link is gated on a
+// page token (canRule): behind the tunnel the token is required, so a tokenless remote link is useless.
 export function reportItemHtml(report, canRule) {
   const path = String((report && report.path) || "");
   const name = String((report && report.name) || path);
   const href = `/decisions/file?path=${encodeURIComponent(path)}${canRule ? `&token=${encodeURIComponent(TOKEN)}` : ""}`;
+  const remote = canRule ? toRemoteLink(path, TOKEN) : "";
+  // rel=noreferrer so the ?token= never leaks to a third party via the Referer header (design pt 3).
+  const remoteLink = remote
+    ? `<a class="kk-remote-link" href="${escapeHtml(remote)}" target="_blank" rel="noopener noreferrer">Ouvrir en distant</a>`
+    : "";
   return `<div class="kk-report" data-local-path="${escapeHtml(path)}">`
     + `<a class="kk-file" href="${escapeHtml(href)}" target="_blank" rel="noopener">${escapeHtml(name)}</a>`
-    // volet-3 seam: the remote-link builder attaches its affordance here (kept empty on purpose).
+    + remoteLink
     + `</div>`;
 }
 
