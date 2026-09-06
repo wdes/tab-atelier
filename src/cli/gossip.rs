@@ -130,6 +130,15 @@ fn exchange(ep: &crate::RemoteEndpoint, pull_only: bool) -> Round {
     round
 }
 
+/// One exchange with every configured remote, results returned rather than
+/// printed — the daemon's periodic sweep calls this, and a background thread
+/// should log, not write to stdout.
+#[must_use]
+pub fn sweep_all() -> Vec<Round> {
+    let prefs = crate::load_preferences(&crate::platform::config_dir());
+    prefs.remote_endpoints.iter().map(|ep| exchange(ep, false)).collect()
+}
+
 #[must_use]
 pub fn run(args: &[String]) -> i32 {
     let mut peer: Option<String> = None;

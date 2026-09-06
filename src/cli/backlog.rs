@@ -202,8 +202,11 @@ pub fn should_announce(board: &[super::tasks::TaskView], task_id: &str, now_s: u
 }
 
 /// How the built-in coverage source picks files.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CoveragePolicy {
+    /// Repository root, stripped from LCOV's absolute paths so task ids are
+    /// the same in every checkout. Defaults to the process's cwd.
+    pub root: Option<std::path::PathBuf>,
     /// Coverage percentage worth aiming at.
     pub target: f64,
     /// Ignore files smaller than this — a task has overhead, and a 12-line
@@ -218,12 +221,27 @@ pub struct CoveragePolicy {
 impl Default for CoveragePolicy {
     fn default() -> Self {
         Self {
+            root: None,
             target: 80.0,
             min_lines: 40,
             limit: 5,
             audit_largest: 2,
         }
     }
+}
+
+/// Path as it should appear in a task id: relative to `root` when it is
+/// inside it.
+///
+/// LCOV records absolute paths. Left alone, the same file checked out at
+/// `/home/me/proj` and `/srv/build/proj` becomes two different task ids, so
+/// two machines in one fleet would each announce and each do the work — the
+/// exact duplication the whole design exists to prevent. Relative ids are
+/// stable across checkouts.
+#[must_use]
+pub fn relative_to(path: &str, root: Option<&std::path::Path>) -> String {
+    root.and_then(|r| std::path::Path::new(path).strip_prefix(r).ok())
+        .map_or_else(|| path.to_owned(), |p| p.to_string_lossy().into_owned())
 }
 
 /// The built-in coverage source: worst-covered files, plus a rotation of
@@ -233,30 +251,40 @@ impl Default for CoveragePolicy {
 /// in [`plan`], which knows nothing about coverage.
 #[must_use]
 pub fn coverage_candidates(files: &[FileCoverage], p: &CoveragePolicy) -> Vec<Candidate> {
+    // The daemon's periodic sweep runs from wherever it was started, not from
+    // the repository, so the root has to be stated rather than inferred from
+    // the process's cwd.
+    let root = p.root.clone().or_else(|| std::env::current_dir().ok());
+    let rel = |path: &str| relative_to(path, root.as_deref());
     let mut out: Vec<Candidate> = worst_covered(files, p.target, p.min_lines, p.limit)
         .into_iter()
-        .map(|f| Candidate {
-            id: format!("cov:{}", f.path),
-            title: format!(
-                "raise coverage of {} — {:.1}% of {} lines, {} to reach {:.0}%",
-                f.path,
-                f.percent(),
-                f.lines_found,
-                f.lines_to(p.target),
-                p.target,
-            ),
+        .map(|f| {
+            let path = rel(&f.path);
+            Candidate {
+                id: format!("cov:{path}"),
+                title: format!(
+                    "raise coverage of {path} — {:.1}% of {} lines, {} to reach {:.0}%",
+                    f.percent(),
+                    f.lines_found,
+                    f.lines_to(p.target),
+                    p.target,
+                ),
+            }
         })
         .collect();
     // Size is a rough proxy for "most places to hide a bug", and it gives a
     // stable order every host agrees on.
     let mut by_size: Vec<&FileCoverage> = files.iter().collect();
     by_size.sort_by(|a, b| b.lines_found.cmp(&a.lines_found).then_with(|| a.path.cmp(&b.path)));
-    out.extend(by_size.into_iter().take(p.audit_largest).map(|f| Candidate {
-        id: format!("audit:{}", f.path),
-        title: format!(
-            "small audit of {} ({} lines) — one focused pass, report what you find",
-            f.path, f.lines_found
-        ),
+    out.extend(by_size.into_iter().take(p.audit_largest).map(|f| {
+        let path = rel(&f.path);
+        Candidate {
+            id: format!("audit:{path}"),
+            title: format!(
+                "small audit of {path} ({} lines) — one focused pass, report what you find",
+                f.lines_found
+            ),
+        }
     }));
     out
 }
@@ -295,7 +323,8 @@ fn usage_full() {
          --from <command>      run it; each stdout line is `id<TAB>title`\n  \
          --from-file <path>    same format, read from a file\n  \
          --lcov <path>         built-in: worst-covered files + a rotation of audits\n\n\
-         coverage source options: --target <pct> --limit <n> --min-lines <n> --audit-largest <n>\n\n\
+         coverage source options: --target <pct> --limit <n> --min-lines <n> --audit-largest <n>\n  \
+         --root <dir>          strip this prefix from LCOV paths (default: cwd)\n\n\
          Announcing is idempotent: a candidate already open (or finished within\n\
          --cooldown days) is skipped, so a source can emit its whole world every\n\
          run and this can go on a timer.\n\n\
@@ -353,6 +382,10 @@ pub fn run(args: &[String]) -> i32 {
             "--limit" => v.parse().map(|l| policy.limit = l).is_ok(),
             "--min-lines" => v.parse().map(|m| policy.min_lines = m).is_ok(),
             "--audit-largest" => v.parse().map(|a| policy.audit_largest = a).is_ok(),
+            "--root" => {
+                policy.root = Some(std::path::PathBuf::from(&v));
+                true
+            }
             "--cooldown" => v.parse().map(|d| cooldown_days = d).is_ok(),
             other => {
                 eprintln!("backlog: unknown argument: {other}");
@@ -622,6 +655,26 @@ mod tests {
         assert!(c[0].title.contains("400 to reach 80%"), "{}", c[0].title);
         assert_eq!(worst_covered(&files, 80.0, 40, 1).len(), 1, "limit applies");
         assert_eq!(files[2].lines_to(80.0), 0, "a file at target asks for nothing");
+    }
+
+    #[test]
+    fn coverage_ids_are_repo_relative_so_two_checkouts_agree() {
+        let root = std::path::Path::new("/home/me/proj");
+        assert_eq!(relative_to("/home/me/proj/src/api.rs", Some(root)), "src/api.rs");
+        // A path outside the root is left alone rather than mangled.
+        assert_eq!(relative_to("/usr/share/x.rs", Some(root)), "/usr/share/x.rs");
+        assert_eq!(relative_to("src/api.rs", Some(root)), "src/api.rs");
+        assert_eq!(
+            relative_to("/home/me/proj/src/api.rs", None),
+            "/home/me/proj/src/api.rs"
+        );
+        // The point: the same file in two checkouts yields ONE task id, so a
+        // federated fleet doesn't announce and do the work twice.
+        let other = std::path::Path::new("/srv/build/proj");
+        assert_eq!(
+            relative_to("/home/me/proj/src/api.rs", Some(root)),
+            relative_to("/srv/build/proj/src/api.rs", Some(other))
+        );
     }
 
     #[test]

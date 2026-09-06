@@ -1434,6 +1434,8 @@ impl AppState {
         }));
         let api_read_only = crate::read_only();
         api::start_api_server(api_state.clone(), api_token.clone(), api_read_only, api_addr.clone());
+        // Off unless `fleet_sweep_minutes` says otherwise.
+        crate::sweep::spawn_if_configured();
         api::start_api_server_tls(
             api_state.clone(),
             api_token.clone(),
@@ -6027,6 +6029,16 @@ impl AppState {
                                                         // than wiping them on save.
                                                         font_family: on_disk_prefs.font_family,
                                                         font_size: on_disk_prefs.font_size,
+                                                        // Same reason: the fleet-sweep settings are
+                                                        // file-only, and saving from this dialog must
+                                                        // not silently stop a configured sweep.
+                                                        fleet_sweep_minutes: on_disk_prefs.fleet_sweep_minutes,
+                                                        fleet_sweep_sources: on_disk_prefs.fleet_sweep_sources,
+                                                        fleet_sweep_lcov: on_disk_prefs.fleet_sweep_lcov,
+                                                        fleet_sweep_root: on_disk_prefs.fleet_sweep_root,
+                                                        fleet_sweep_gossip: on_disk_prefs.fleet_sweep_gossip,
+                                                        fleet_sweep_cooldown_days: on_disk_prefs
+                                                            .fleet_sweep_cooldown_days,
                                                         lang: Some(lang_str.into()),
                                                         theme: Some(this.theme_name.id().into()),
                                                         cursor_style: Some(this.cursor_style.id().into()),
