@@ -1608,4 +1608,57 @@ mod tests {
         let err = handle_inbound(&frame, Authz::Rw, false, &state, "uuid-1", &mut dedup).unwrap_err();
         assert_eq!(err.code, CloseCode::Policy);
     }
+
+    /// A request carrying `uri` and optional headers, for the extractors.
+    fn req_with(uri: &str, headers: &[(&str, &str)]) -> http::Request<()> {
+        let mut b = http::Request::builder().uri(uri);
+        for (k, v) in headers {
+            b = b.header(*k, *v);
+        }
+        b.body(()).expect("request")
+    }
+
+    #[test]
+    fn the_resume_offset_comes_from_the_query_or_defaults_to_zero() {
+        // `since` is how a reconnecting viewer avoids re-rendering the whole
+        // scrollback. A wrong default here is a full redraw on every blip.
+        assert_eq!(super::extract_since(&req_with("/ws/tabs/0", &[])), 0);
+        assert_eq!(super::extract_since(&req_with("/ws/tabs/0?since=42", &[])), 42);
+        assert_eq!(super::extract_since(&req_with("/ws/tabs/0?token=x&since=7", &[])), 7);
+        // Junk must fall back to 0 (send everything) rather than to a huge
+        // offset that would silently show the viewer nothing.
+        assert_eq!(super::extract_since(&req_with("/ws/tabs/0?since=abc", &[])), 0);
+        assert_eq!(super::extract_since(&req_with("/ws/tabs/0?since=-1", &[])), 0);
+        assert_eq!(super::extract_since(&req_with("/ws/tabs/0?since=", &[])), 0);
+        // A parameter that merely CONTAINS "since" is not the offset.
+        assert_eq!(super::extract_since(&req_with("/ws/tabs/0?notsince=9", &[])), 0);
+    }
+
+    #[test]
+    fn a_token_is_taken_from_the_header_or_the_query() {
+        // Browsers cannot set headers on a WebSocket handshake, so the query
+        // form has to work — but a header must still win where available.
+        let from_query = super::extract_token(&req_with("/ws/tabs/0?token=abc123", &[]));
+        assert_eq!(from_query.as_deref(), Some(&b"abc123"[..]));
+        // Percent-encoding is decoded, or a token with a `+` or `/` in it
+        // would authenticate as a different string.
+        let encoded = super::extract_token(&req_with("/ws/tabs/0?token=a%2Fb%2Bc", &[]));
+        assert_eq!(encoded.as_deref(), Some(&b"a/b+c"[..]));
+        // No credential at all is None, not an empty token.
+        assert!(super::extract_token(&req_with("/ws/tabs/0", &[])).is_none());
+        assert!(super::extract_token(&req_with("/ws/tabs/0?other=1", &[])).is_none());
+    }
+
+    #[test]
+    fn percent_decoding_survives_what_a_url_can_carry() {
+        assert_eq!(super::percent_decode("plain"), b"plain");
+        assert_eq!(super::percent_decode("a%20b"), b"a b");
+        assert_eq!(super::percent_decode("%41%42"), b"AB");
+        // A truncated or invalid escape must not panic or silently drop the
+        // rest of the value — a mangled token should fail auth, not crash.
+        assert_eq!(super::percent_decode("a%"), b"a%");
+        assert_eq!(super::percent_decode("a%2"), b"a%2");
+        assert_eq!(super::percent_decode("a%zz"), b"a%zz");
+        assert_eq!(super::percent_decode(""), b"");
+    }
 }
