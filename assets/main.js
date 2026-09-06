@@ -18,12 +18,6 @@
     const READ_ONLY = PARAMS.get("ro") === "1";
     const headers = TOKEN ? { Authorization: "Bearer " + TOKEN } : {};
     const status = document.getElementById("status");
-    // Touch device (Android WebView / mobile browser): the JS blob download
-    // (fetch → Blob → object-URL <a>.click) can't save a file there, so outbox
-    // rows fall back to a plain native `<a href download>` navigation that the
-    // WebView's DownloadListener / the browser handles. Desktop keeps the
-    // streamed progress bar.
-    const IS_TOUCH = "ontouchstart" in window || navigator.maxTouchPoints > 0;
 
     // The page lives at `<some-prefix>/tabs/<TAB_KEY>/view`. Resolve
     // siblings (`output`, `input`) as relative paths so a reverse
@@ -747,11 +741,14 @@
       const meta = `${humanSize(f.size)} · ${new Date(f.mtime * 1000).toISOString().slice(0, 16).replace("T", " ")}`;
       if (kind === "outbox") {
         const a = document.createElement("a");
-        const qpath = encodeURIComponent(`outbox/${relPath}`);
-        a.href = `${BASE}files?path=${qpath}${TOKEN ? "&token=" + encodeURIComponent(TOKEN) : ""}`;
-        // Keep the native download attr so drag-to-desktop and
-        // modifier-clicks still work and it degrades gracefully; a plain
-        // left-click is intercepted below to stream with a progress bar.
+        // The filename is the LAST URL SEGMENT, not a query parameter. An
+        // `<a download>` only applies to same-origin URLs, so as soon as the
+        // page and the API differ (a share link, a tunnel) the browser
+        // ignores the attribute and names the file after the URL — which is
+        // how `…/files?path=…` became `files.bin`. With the name in the path
+        // the fallback is already right, and Content-Disposition agrees.
+        const segs = `outbox/${relPath}`.split("/").map(encodeURIComponent).join("/");
+        a.href = `${BASE}${segs}${TOKEN ? "?token=" + encodeURIComponent(TOKEN) : ""}`;
         a.download = f.name;
         a.draggable = true;
         a.addEventListener("dragstart", (ev) => {
@@ -759,18 +756,11 @@
           ev.dataTransfer.setData("text/uri-list", `file://${absPath}`);
           ev.dataTransfer.effectAllowed = "copyLink";
         });
-        a.innerHTML = `${htmlEscape(f.name)}<div class="meta">${meta}</div>`
-          + `<div class="dl-progress"><div class="dl-bar"></div></div>`;
-        a.addEventListener("click", (ev) => {
-          // Touch: let the native `<a href download>` navigate so the platform
-          // downloader saves it — the JS blob path can't save in a WebView.
-          if (IS_TOUCH) return;
-          // Desktop: let modified clicks (ctrl/cmd/shift/middle) use the native
-          // download; intercept only the plain left-click for the progress bar.
-          if (ev.button !== 0 || ev.ctrlKey || ev.metaKey || ev.shiftKey || ev.altKey) return;
-          ev.preventDefault();
-          downloadFile(a, a.href, f.name, f.size);
-        });
+        a.innerHTML = `${htmlEscape(f.name)}<div class="meta">${meta}</div>`;
+        // No click interception. It is a plain `<a href download>`: the
+        // browser saves it, drag-to-desktop works, modifier-clicks work, and
+        // a WebView's own downloader handles it. The JS blob path that used
+        // to run here bought a progress bar and cost the filename.
         return a;
       }
       // Inbox row: draggable absolute path, click-to-copy. Not a download
@@ -873,63 +863,6 @@
     // and the row is DISABLED until it finishes — no silent wait, no frantic
     // re-clicks kicking off duplicate downloads. `size` is the server-reported
     // byte count, used when the response omits Content-Length.
-    async function downloadFile(row, url, name, size) {
-      if (row.classList.contains("downloading")) return; // already running → disabled
-      row.classList.remove("dl-error");
-      row.classList.add("downloading");
-      const bar = row.querySelector(".dl-bar");
-      const setPct = (p) => { if (bar) bar.style.width = Math.max(0, Math.min(100, p)) + "%"; };
-      setPct(0);
-      try {
-        const resp = await fetch(url, { headers });
-        if (!resp.ok) throw new Error("HTTP " + resp.status);
-        const total = Number(resp.headers.get("content-length")) || Number(size) || 0;
-        if (!resp.body || !resp.body.getReader) {
-          // Browser can't stream the body — fall back to a plain blob (no live %).
-          saveBlob(await resp.blob(), name);
-          setPct(100);
-          return;
-        }
-        const reader = resp.body.getReader();
-        const chunks = [];
-        let received = 0;
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          chunks.push(value);
-          received += value.length;
-          setPct(total ? (received / total) * 100 : 0);
-        }
-        setPct(100);
-        saveBlob(new Blob(chunks), name);
-      } catch (e) {
-        row.classList.add("dl-error");
-        setPct(100);
-        toast(`download failed: ${e.message || e}`);
-      } finally {
-        // Re-enable shortly after (so the file can be re-fetched) and reset
-        // the bar; the brief delay lets the 100%/error state register visually.
-        setTimeout(() => {
-          row.classList.remove("downloading");
-          row.classList.remove("dl-error");
-          setPct(0);
-        }, 1200);
-      }
-    }
-
-    // Trigger a browser "save as" for an in-memory blob via a throwaway
-    // object-URL anchor (revoked shortly after so we don't leak).
-    function saveBlob(blob, name) {
-      const objUrl = URL.createObjectURL(blob);
-      const tmp = document.createElement("a");
-      tmp.href = objUrl;
-      tmp.download = name;
-      document.body.appendChild(tmp);
-      tmp.click();
-      tmp.remove();
-      setTimeout(() => URL.revokeObjectURL(objUrl), 10000);
-    }
-
     // Monotonic PTY-byte offset we've fed into xterm.js. The server's
     // WebSocket transport. Replaces the previous /stream HTTP polling
     // model: the server PUSHES PTY bytes as soon as they arrive,
