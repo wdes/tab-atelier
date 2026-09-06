@@ -1235,8 +1235,13 @@ pub fn count_files_tree(dir: &std::path::Path) -> usize {
     n
 }
 
+/// Smallest body worth compressing. Shared with `respond_with_etag_precomputed`
+/// so it can tell which representation it is about to send without paying for
+/// the compression first.
+const GZIP_MIN_BODY: usize = 4096;
+
 fn maybe_gzip(bytes: &[u8], accept_gzip: bool) -> Option<Vec<u8>> {
-    const MIN_BODY: usize = 4096;
+    const MIN_BODY: usize = GZIP_MIN_BODY;
     if !accept_gzip || bytes.len() < MIN_BODY {
         return None;
     }
@@ -1379,12 +1384,26 @@ fn respond_with_etag_precomputed<W: Write>(
     extra_headers: &str,
     etag: Option<String>,
 ) {
-    let etag = etag.unwrap_or_else(|| etag_for(body));
+    let base_etag = etag.unwrap_or_else(|| etag_for(body));
+    // One ETag per REPRESENTATION, not per resource. The gzipped and identity
+    // bodies are different bytes, so sharing a tag lets a shared cache hand a
+    // stored gzip response to a client that never asked for one — and a client
+    // revalidating an identity copy could be told 304 for a gzip it does not
+    // have. `will_gzip` mirrors `maybe_gzip`'s rule so this decision costs no
+    // compression on a conditional request that is about to 304.
+    let will_gzip = accept_gzip && body.len() >= GZIP_MIN_BODY;
+    let etag = if will_gzip {
+        format!("{base_etag}-gz")
+    } else {
+        base_etag
+    };
+    // Any cache in the path must key on the encoding for the same reason.
+    let vary = "Vary: Accept-Encoding\r\n";
     if status == 200 && if_none_match.is_some_and(|v| v == etag) {
         // Content is byte-identical to what the client already has.
         let _ = write!(
             stream,
-            "HTTP/1.1 304 Not Modified\r\nETag: \"{etag}\"\r\n{ROBOTS_TAG}{extra_headers}\r\n"
+            "HTTP/1.1 304 Not Modified\r\nETag: \"{etag}\"\r\n{vary}{ROBOTS_TAG}{extra_headers}\r\n"
         );
         return;
     }
@@ -1401,14 +1420,14 @@ fn respond_with_etag_precomputed<W: Write>(
     if let Some(gz) = maybe_gzip(body, accept_gzip) {
         let _ = write!(
             stream,
-            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Encoding: gzip\r\nETag: \"{etag}\"\r\n{ROBOTS_TAG}{extra_headers}Content-Length: {}\r\n\r\n",
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Encoding: gzip\r\nETag: \"{etag}\"\r\n{vary}{ROBOTS_TAG}{extra_headers}Content-Length: {}\r\n\r\n",
             gz.len()
         );
         let _ = stream.write_all(&gz);
     } else {
         let _ = write!(
             stream,
-            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nETag: \"{etag}\"\r\n{ROBOTS_TAG}{extra_headers}Content-Length: {}\r\n\r\n",
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nETag: \"{etag}\"\r\n{vary}{ROBOTS_TAG}{extra_headers}Content-Length: {}\r\n\r\n",
             body.len()
         );
         let _ = stream.write_all(body);
@@ -3299,6 +3318,15 @@ mod tests {
         req.to_string()
     }
 
+    /// The header block of a response, as text. Safe on a binary body.
+    fn head_of(resp: &[u8]) -> String {
+        let end = resp
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map_or(resp.len(), |i| i + 4);
+        String::from_utf8_lossy(&resp[..end]).into_owned()
+    }
+
     fn request(port: u16, req: &str) -> String {
         // Send via raw TCP. `Connection: close` in the request makes
         // hyper close after responding — we read until EOF. We
@@ -3780,6 +3808,61 @@ mod tests {
             assert!(line.contains(':'), "not a header: {line:?}");
             assert!(!line.contains('\n'), "embedded newline: {line:?}");
         }
+    }
+
+    #[test]
+    fn assets_revalidate_with_304_and_vary_per_encoding() {
+        let (port, _state, _token) = spawn_server();
+        // Assets are public: a viewer in a fresh browser must be able to load
+        // the JS before it has a token.
+        let get = |extra: &str| request(port, &format!("GET /assets/main.js HTTP/1.1\r\nHost: x\r\n{extra}\r\n"));
+        let first = get("");
+        assert_eq!(status_code(&first), 200, "RESP: {first}");
+        let low = first.to_ascii_lowercase();
+        // Long-lived + immutable is what lets a warm app skip the request
+        // entirely between tab opens.
+        assert!(
+            low.contains("cache-control: public, max-age=31536000, immutable"),
+            "{first}"
+        );
+        // And Vary, because the gzip and identity bodies are different bytes:
+        // without it a shared cache can hand a stored gzip response to a
+        // client that never asked for one.
+        assert!(low.contains("vary: accept-encoding"), "{first}");
+
+        // The ETag it just gave us must produce a 304, which is the whole
+        // point on a mobile client reopening tab after tab.
+        let etag = first
+            .split("\r\n")
+            .find_map(|l| {
+                l.to_ascii_lowercase()
+                    .starts_with("etag:")
+                    .then(|| l.split_once(':').map(|(_, v)| v.trim().to_owned()).unwrap_or_default())
+            })
+            .unwrap_or_default();
+        assert!(!etag.is_empty(), "no ETag on the identity response: {first}");
+        let again = get(&format!("If-None-Match: {etag}\r\n"));
+        assert_eq!(status_code(&again), 304, "{again}");
+        assert!(again.to_ascii_lowercase().contains("vary: accept-encoding"), "{again}");
+
+        // The gzip representation gets its OWN tag, so an identity copy can
+        // never be revalidated into a gzip body (or the reverse).
+        let gz = head_of(&request_bytes(
+            port,
+            "GET /assets/main.js HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip\r\n\r\n",
+        ));
+        let gz_etag = gz
+            .split("\r\n")
+            .find_map(|l| {
+                l.to_ascii_lowercase()
+                    .starts_with("etag:")
+                    .then(|| l.split_once(':').map(|(_, v)| v.trim().to_owned()).unwrap_or_default())
+            })
+            .unwrap_or_default();
+        assert!(!gz_etag.is_empty(), "no ETag on the gzip response: {gz}");
+        assert_ne!(gz_etag, etag, "gzip and identity must not share an ETag");
+        // Cross-representation revalidation must NOT 304.
+        assert_eq!(status_code(&get(&format!("If-None-Match: {gz_etag}\r\n"))), 200);
     }
 
     #[test]
