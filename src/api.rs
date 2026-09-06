@@ -1958,6 +1958,12 @@ fn handle_connection<S: Read + Write>(
                 if_none_match.as_deref(),
             );
         }
+        // A named download: `/tabs/<key>/outbox/<name>`. The name is in the
+        // path so the browser's fallback filename is already correct when an
+        // `<a download>` is ignored (it is, cross-origin).
+        ("GET", p) if p.starts_with("/tabs/") && p.contains("/outbox/") => {
+            files::download_by_path(stream, state, p, accept_gzip, if_none_match.as_deref());
+        }
         // List `outbox/` or `inbox/` contents so the viewer can
         // render the download / sent-files panels. The panel header
         // shows `dir` (absolute path) so the user can paste it into
@@ -3774,6 +3780,56 @@ mod tests {
             assert!(line.contains(':'), "not a header: {line:?}");
             assert!(!line.contains('\n'), "embedded newline: {line:?}");
         }
+    }
+
+    #[test]
+    fn an_outbox_download_is_named_by_its_url_not_by_a_query_parameter() {
+        // The bug: the viewer linked to `…/files?path=outbox/x.md`, whose last
+        // URL segment is `files`. An `<a download>` only applies same-origin,
+        // so once the page and the API differ the browser ignored it and saved
+        // `files.bin` — the segment plus an extension guessed from the content
+        // type. Addressing the file by path leaves nothing to guess.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("outbox")).unwrap();
+        std::fs::write(dir.path().join("outbox").join("report final.md"), b"# hi\n").unwrap();
+
+        let mut tab = test_snapshot_tab("tab-a", "shell");
+        tab.cwd = Some(dir.path().to_string_lossy().into_owned().into());
+        let state = std::sync::Arc::new(std::sync::Mutex::new(test_snapshot(vec![tab])));
+        state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .master_token = "test-secret-token".into();
+        let port = spawn_test_server(&state, false);
+        let get = |path: &str| {
+            request(
+                port,
+                &format!("GET {path} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer test-secret-token\r\n\r\n"),
+            )
+        };
+
+        // A space in the name must survive percent-encoding in the path.
+        let resp = get("/tabs/by-id/tab-a/outbox/report%20final.md");
+        assert_eq!(status_code(&resp), 200, "{resp}");
+        assert!(resp.contains("# hi"), "the body should be the file: {resp}");
+        // Content-Disposition still names it, so both mechanisms agree.
+        assert!(
+            resp.to_ascii_lowercase().contains("filename=\"report final.md\""),
+            "{resp}"
+        );
+
+        // The sandbox check is the same one the query form uses: a traversal
+        // must be refused, not resolved.
+        let escape = get("/tabs/by-id/tab-a/outbox/..%2F..%2Fetc%2Fpasswd");
+        assert_ne!(status_code(&escape), 200, "traversal was served: {escape}");
+        // A file that is not there is a 404, not an empty 200.
+        assert_ne!(status_code(&get("/tabs/by-id/tab-a/outbox/nope.md")), 200);
+        // And it is still behind the token.
+        let unauth = request(
+            port,
+            "GET /tabs/by-id/tab-a/outbox/report%20final.md HTTP/1.1\r\nHost: x\r\n\r\n",
+        );
+        assert_eq!(status_code(&unauth), 401, "{unauth}");
     }
 
     #[test]
