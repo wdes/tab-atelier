@@ -196,9 +196,19 @@ pub fn run(args: &[String]) -> i32 {
             std::env::var("TAB_ATELIER_NO_BRIEF").ok().as_deref(),
         )
     {
+        // Project briefs come after the built-in one: they are the specific
+        // word, and specifics belong last.
+        let mut brief = agent_brief();
+        if let Ok(cwd) = std::env::current_dir() {
+            let project = crate::briefs::for_cwd(&cwd);
+            if !project.is_empty() {
+                brief.push_str("\n\n");
+                brief.push_str(&project);
+            }
+        }
         // Printed before the status POST so a slow or unreachable daemon can't
         // cost the session its context.
-        println!("{}", brief_json(&agent_brief()));
+        println!("{}", brief_json(&brief));
     }
 
     let (state, label, with_attachment) = match event {

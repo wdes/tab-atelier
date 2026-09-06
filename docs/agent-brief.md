@@ -33,7 +33,53 @@ reach them from the shell.
 `docs/self-organization.md`.
 <!-- BRIEF-END -->
 
-## Customising it
+## Per-project briefs
+
+The built-in text above is the same everywhere. What differs per project goes
+in a **brief directory**, as markdown files with front matter:
+
+```
+~/.config/tab-atelier/briefs/     per user
+/etc/tab-atelier/briefs/          machine-wide
+```
+
+```markdown
+---
+baseDir: /mnt/clients/ABCD
+---
+Client ABCD: PHP 7.4, no `composer update` without asking. Deploys are manual —
+never push to production yourself. Their staging DB is a copy from March.
+```
+
+Any session whose working directory is inside `baseDir` gets that text appended
+to the brief. Repeat `baseDir:` for a project with several checkouts, or use
+`always: true` for something that applies everywhere.
+
+**Matches compose.** A note on `/mnt/clients` and a note on
+`/mnt/clients/ABCD/api` both apply, ordered least-specific first, so the
+narrower one has the last word — the position a reader weighs most. This is the
+same cwd-prefix rule that decides per-project colours, so it should already feel
+familiar.
+
+Check what a directory produces before trusting it:
+
+```
+tab-atelier brief --cwd /mnt/clients/ABCD    # the exact text an agent gets
+tab-atelier brief --list                     # which files matched, and from where
+```
+
+That command exists because the failure mode here is silent: a `baseDir` with a
+typo produces no error, no warning, and an agent that simply never mentions what
+you wrote.
+
+Two limits worth knowing. Briefs are read **once, at session start**, from the
+tab's cwd — an agent that later `cd`s elsewhere is not re-briefed, because
+context can be added to a session but not withdrawn. And the total is capped at
+6000 characters; over that, the least specific briefs are dropped whole (with a
+note saying so) rather than truncated mid-sentence, which would read like a
+corrupted instruction.
+
+## Customising the built-in text
 
 Drop your own `agent-brief.md` in the config directory
 (`~/.config/tab-atelier/agent-brief.md`, or `/etc/tab-atelier/` for the whole

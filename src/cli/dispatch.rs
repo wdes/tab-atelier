@@ -495,6 +495,18 @@ pub enum Commands {
         args: Vec<String>,
     },
 
+    /// What a Claude session starting here would be told: `brief [--cwd <dir>]`.
+    ///
+    /// The brief is assembled at session start and never shown again, so a
+    /// wrong `baseDir` is invisible — the agent simply never mentions what you
+    /// wrote. This prints the same text the hook injects. `--list` shows which
+    /// files matched and from where.
+    Brief {
+        /// Passed straight through to `cli::brief::run`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Who is working on what: `fleet [--json]`.
     ///
     /// `--json` is `GET /fleet` verbatim — nodes (`host`/`agent`/`task`) and
@@ -930,6 +942,7 @@ fn command_exit_code(cli: Cli) -> Option<i32> {
         Commands::Done { args } => crate::cli::client::run("done", &args),
         Commands::Tasks { args } => crate::cli::client::run("tasks", &args),
         Commands::Wait { args } => crate::cli::client::run("wait", &args),
+        Commands::Brief { args } => crate::cli::client::run("brief", &args),
         Commands::Fleet { args } => crate::cli::client::run("fleet", &args),
         Commands::Gossip { args } => crate::cli::client::run("gossip", &args),
         Commands::Backlog { args } => crate::cli::client::run("backlog", &args),

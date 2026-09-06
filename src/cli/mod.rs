@@ -17,6 +17,8 @@ pub mod backlog;
 pub mod bench;
 pub mod bench_lag;
 pub mod brain;
+/// `tab-atelier brief` — what a Claude session starting here would be told.
+pub mod brief;
 pub mod claude_hook;
 /// The single shared client-subcommand router used by both the GUI
 /// (`src/main.rs`) and the headless daemon ([`dispatch`]).

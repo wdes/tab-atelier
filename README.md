@@ -561,6 +561,17 @@ tab-atelier handoff ./report.md db-expert
 
 **Etiquette (and safety):** only `dispatch` to a tab `peers` shows as `idle`/`waiting`, never mid-turn; a locked tab refuses input; and never `--resume`/`--continue` another tab's session — it rotates/strips the session id. Every Claude that starts **inside a tab** is told these verbs exist automatically: the system-wide `SessionStart` hook the deb installs injects a short brief ([`docs/agent-brief.md`](docs/agent-brief.md)). Nothing to copy into `~/.claude/CLAUDE.md`, and a Claude started outside a tab is told nothing about verbs it can't use. Override the text with `~/.config/tab-atelier/agent-brief.md`, or opt out with `TAB_ATELIER_NO_BRIEF=1`.
 
+**Per-project briefs** go in `~/.config/tab-atelier/briefs/*.md` (or `/etc/tab-atelier/briefs/` machine-wide), selected by working directory:
+
+```markdown
+---
+baseDir: /mnt/clients/ABCD
+---
+Client ABCD: PHP 7.4, no `composer update` without asking. Deploys are manual.
+```
+
+Any agent starting inside that directory is told this on top of the standard brief; matches compose, narrowest last. `tab-atelier brief --cwd <dir>` prints exactly what a session there would receive, and `--list` shows which files matched — worth checking, because a typo'd `baseDir` fails silently.
+
 **Let the fleet divide the work itself** — instead of deciding who does what, put the work on a shared board and let agents take it:
 
 ```bash
