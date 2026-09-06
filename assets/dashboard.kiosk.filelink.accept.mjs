@@ -107,9 +107,14 @@ async function main() {
   ok("(a) … NOT a github blob (the 404 incident)", !/github\.com|\/blob\//.test(aDoc.href || ""), `href=${aDoc.href}`);
   const aArch = byText("_archive/2026-09/rep.md");
   ok("(b) bare `_archive/…rep.md` → a /decisions/file viewer href", /\/decisions\/file\?path=/.test(aArch.href || ""), `href=${aArch.href}`);
-  const aCode = byText("src/api/mod.rs:76");
-  ok("(c) discriminant: a real code ref still points at the repo blob (github), not the viewer",
-    /github\.com\/.*\/blob\//.test(aCode.href || "") && !/\/decisions\/file/.test(aCode.href || ""), `href=${aCode.href}`);
+  // ⭐ Bug B (volet-2): a real code ref is NOT a link at all — the empty repo-blob base makes
+  // it honest COPYABLE TEXT (a kk-file-ref span), never a dead a-biskoazh/github 404.
+  ok("(c) discriminant: a code ref is NOT rendered as an <a> link", !links.some((l) => l.text === "src/api/mod.rs:76"), `links=${JSON.stringify(links)}`);
+  const codeRef = await page.locator(`${card} .kk-files .kk-file-ref`).evaluateAll((els) =>
+    els.map((s) => ({ copy: s.getAttribute("data-copy"), text: s.textContent.trim() })));
+  const codeSpan = codeRef.find((s) => s.text === "src/api/mod.rs:76") || {};
+  ok("(c) … it renders as copyable text (kk-file-ref span, data-copy set)", codeSpan.copy === "src/api/mod.rs:76", `span=${JSON.stringify(codeSpan)}`);
+  ok("(c) … no dead a-biskoazh/github link anywhere in the card", !/github\.com|a-biskoazh/.test(JSON.stringify(links)), `links=${JSON.stringify(links)}`);
 
   // ===== Server wiring (the round-trip): CLICK → the daemon SERVES the bundle (200 + content) =====
   const clickServes = async (label, text, mark) => {
@@ -131,7 +136,7 @@ async function main() {
   await browser.close();
   teardown();
   console.log(`\ndashboard.kiosk.filelink.accept.mjs — REAL isolated-daemon round-trip (bare outbox/_archive --files served by the viewer, CWD-independent)`);
-  console.log(`${failures ? `FAIL: ${failures} assertion(s) failed` : "OK: bare outbox/_archive .md -> real daemon /decisions/file 200 + seeded content (foreign cwd); code ref -> repo blob"}`);
+  console.log(`${failures ? `FAIL: ${failures} assertion(s) failed` : "OK: bare outbox/_archive .md -> real daemon /decisions/file 200 + seeded content (foreign cwd); code ref -> copyable text (Bug B, empty base)"}`);
   process.exit(failures ? 1 : 0);
 }
 

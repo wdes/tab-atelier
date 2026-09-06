@@ -24,7 +24,14 @@ import { chromium } from "playwright";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = dirname(HERE);
 const read = (f) => readFileSync(join(HERE, f), "utf8");
-const HTML = read("dashboard.html"); // keep the DEFAULT repo-blob-base meta (we assert blob links)
+// Bug B (volet-2): the SHIPPED default repo-blob base is empty (code refs = copyable text). This
+// test asserts the CONFIGURED-deploy path (code-ref → clickable blob link), so it injects a real
+// base into the served HTML (facet (c) below); the empty-base fallback is covered elsewhere.
+const TEST_BASE = "https://github.com/wdes/tab-atelier/blob/tab-atelier-mx";
+const HTML = read("dashboard.html").replace(
+  /<meta name="repo-blob-base"[^>]*>/,
+  `<meta name="repo-blob-base" content="${TEST_BASE}">`,
+);
 const JS = read("dashboard.js"), CSS = read("dashboard.css");
 const ORIGIN = "http://ta-dash.local", TOKEN = "TESTTOKEN";
 const BIN = join(ROOT, "target", "release", "tab-atelier");

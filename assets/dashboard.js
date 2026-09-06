@@ -1746,8 +1746,24 @@ async function handleCatalogEdit(target) {
 // on-demand (NOT in the 1.5s poll — a separate cold source). The server read-model is
 // rendered VERBATIM: state / verdict / visibility are the fold's call, no JS re-gate.
 const DECISIONS_URL = "/decisions";
+// Volet-2 (#kiosk 3 onglets): the Rapports tab reads the cold report list; the Grille
+// d'intention posts a folded intention → a server-named intent-<ts>.md (both same sandbox).
+const REPORTS_URL = "/reports";
+const INTENT_URL = "/intent";
+// The active Kiosk tab persists across reloads (like the mesh/catalog toggles).
+const KIOSK_TAB_KEY = "ta-dash.kiosk-tab";
+const KIOSK_TABS = ["decisions", "reports", "intent"];
 let kioskOpen = false;
 let kioskIncludeArchived = false;
+
+// The persisted active tab, defaulting to décisions. Feature-detect: node / no-localStorage
+// falls back to "decisions" so the pure render (unit tests) is deterministic.
+function readKioskTab() {
+  try {
+    const v = localStorage.getItem(KIOSK_TAB_KEY);
+    return KIOSK_TABS.includes(v) ? v : "decisions";
+  } catch { return "decisions"; }
+}
 
 // The server read-model -> the decisions array (tolerate {decisions:[…]} or a bare array).
 export function kioskView(readModel) {
@@ -1805,11 +1821,14 @@ export function renderDetail(text) {
 
 // Kiosk deploy seam: base for turning a bare code-source ref into a clickable repo blob
 // link. The dashboard can't know the running checkout's remote/branch, so it reads a
-// <meta name="repo-blob-base"> (dashboard.html) with this default (the mx fork tip). An
-// empty value disables construction → the code ref degrades to honest copyable text.
+// <meta name="repo-blob-base"> (dashboard.html). Bug B (PO « vide-jusqu'au-push ») — the
+// DEFAULT is EMPTY: the old a-biskoazh fork was a dead 404 (outbox isn't in the repo), so
+// until the durability push lands there is no correct base. Empty disables construction →
+// a code ref degrades to honest copyable text (never a dead link). A deploy sets the meta
+// to the durable repo (e.g. wdes/tab-atelier:tab-atelier-mx) to re-enable clickable blobs.
 const REPO_BLOB_BASE = (function () {
-  const dflt = "https://github.com/a-biskoazh/tab-atelier-mx/blob/mx/live";
-  if (typeof document === "undefined") return dflt; // node (unit tests) → the default
+  const dflt = "";
+  if (typeof document === "undefined") return dflt; // node (unit tests) → the empty default
   const m = document.querySelector('meta[name="repo-blob-base"]');
   const v = m && m.getAttribute("content");
   return v == null ? dflt : v.trim(); // present-but-empty meta explicitly disables
@@ -2019,7 +2038,9 @@ function toggleDetail(btn) {
   if (body) body.hidden = expanded;
 }
 
-export function kioskHtml(readModel) {
+// Onglet (a) — the decisions list (grouped by project, open-first). Extracted UNCHANGED from
+// the former single-panel kiosk so the panel gains tabs with ZERO regression on the cards.
+function kioskDecisionsHtml(readModel) {
   const decisions = kioskView(readModel);
   // Group by project (transverse); within a group, open first.
   const byProject = new Map();
@@ -2036,14 +2057,110 @@ export function kioskHtml(readModel) {
   }).join("");
   const openCount = decisions.filter((d) => d.state === "open").length;
   const body = decisions.length ? groups : `<div class="kk-empty">Aucune décision en attente.</div>`;
-  return `<div class="kk-header">
-      <span class="kk-panel-title">Décisions en attente</span>
+  return `<div class="kk-subhead">
       <span class="kk-count">${openCount} à trancher</span>
       <label class="kk-archived-toggle"><input type="checkbox" class="kk-show-archived"${kioskIncludeArchived ? " checked" : ""}> afficher les archivées</label>
       <button class="kk-refresh" title="rafraîchir">↻</button>
-      <button class="kk-close" title="fermer" aria-label="fermer">×</button>
     </div>
     <div class="kk-list">${body}</div>`;
+}
+
+// The server report read-model -> the reports array (tolerate {reports:[…]} or a bare array).
+export function reportsView(readModel) {
+  if (readModel && Array.isArray(readModel.reports)) return readModel.reports;
+  return Array.isArray(readModel) ? readModel : [];
+}
+
+// Onglet (b) — one report row: a LOCAL viewer link (the same sandboxed /decisions/file route
+// the decisions' docs use). The remote share link (amaury.wdes.eu, volet-3) is NOT built here:
+// we only expose a clean seam via data-local-path for a later builder to derive the remote URL.
+export function reportItemHtml(report, canRule) {
+  const path = String((report && report.path) || "");
+  const name = String((report && report.name) || path);
+  const href = `/decisions/file?path=${encodeURIComponent(path)}${canRule ? `&token=${encodeURIComponent(TOKEN)}` : ""}`;
+  return `<div class="kk-report" data-local-path="${escapeHtml(path)}">`
+    + `<a class="kk-file" href="${escapeHtml(href)}" target="_blank" rel="noopener">${escapeHtml(name)}</a>`
+    // volet-3 seam: the remote-link builder attaches its affordance here (kept empty on purpose).
+    + `</div>`;
+}
+
+// Onglet (b) — the reports list (empty state when the outbox has no report).
+export function reportsHtml(readModel, canRule) {
+  const reports = reportsView(readModel);
+  if (!reports.length) return `<div class="kk-empty">Aucun rapport dans l'outbox.</div>`;
+  return `<div class="kk-report-list">${reports.map((r) => reportItemHtml(r, canRule)).join("")}</div>`;
+}
+
+// Onglet (c) — fold the intention grid fields into a markdown artefact. PURE + XSS-neutral:
+// the text is stored VERBATIM (the /decisions/file viewer escapes-first on read), so nothing
+// here needs to escape. Empty rows are dropped; an all-empty grid yields just the heading.
+export function intentMarkdown(fields) {
+  const f = fields || {};
+  const intent = String(f.intent == null ? "" : f.intent).trim();
+  const rows = Array.isArray(f.rows) ? f.rows : [];
+  const lines = ["# Intention", ""];
+  if (intent) lines.push(intent, "");
+  const gwt = rows
+    .map((r) => ({
+      given: String((r && r.given) || "").trim(),
+      when: String((r && r.when) || "").trim(),
+      then: String((r && r.then) || "").trim(),
+    }))
+    .filter((r) => r.given || r.when || r.then);
+  if (gwt.length) {
+    lines.push("## Acceptance (Given/When/Then)", "");
+    for (const r of gwt) lines.push(`- **Given** ${r.given}`, `  **When** ${r.when}`, `  **Then** ${r.then}`, "");
+  }
+  return `${lines.join("\n").replace(/\n+$/, "")}\n`;
+}
+
+// Onglet (c) — one repeatable Given/When/Then row (three auto-grow textareas).
+function intentRowHtml() {
+  return `<div class="kk-gwt-row">`
+    + `<textarea class="kk-gwt-given kk-autogrow" rows="1" placeholder="Given…"></textarea>`
+    + `<textarea class="kk-gwt-when kk-autogrow" rows="1" placeholder="When…"></textarea>`
+    + `<textarea class="kk-gwt-then kk-autogrow" rows="1" placeholder="Then…"></textarea>`
+    + `</div>`;
+}
+
+// Onglet (c) — the intention grid: an auto-grow intent textarea + repeatable G/W/T rows + the
+// "poser l'intention" button. The textareas grow as the text grows (kk-autogrow, wired on input).
+function intentFormHtml() {
+  return `<div class="kk-intent">
+    <p class="kk-intent-hint">Définir l'intention avec le PO. Les champs grandissent à mesure que le texte grandit.</p>
+    <label class="kk-intent-label">Intention
+      <textarea class="kk-intent-text kk-autogrow" rows="3" placeholder="Décrire l'intention / le besoin…"></textarea>
+    </label>
+    <div class="kk-gwt-rows">${intentRowHtml()}</div>
+    <button type="button" class="kk-gwt-add">+ ajouter un Given/When/Then</button>
+    <div class="kk-intent-actions">
+      <button type="button" class="kk-intent-post">poser l'intention</button>
+      <span class="kk-intent-msg" role="status"></span>
+    </div>
+  </div>`;
+}
+
+// The 3-tab Kiosk shell: (a) Décisions, (b) Rapports, (c) Grille d'intention. The active tab
+// (persisted) is baked into the markup; a global close button lives in the header. Reports load
+// lazily on activation; the intent form is static. kioskDecisionsHtml keeps the cards intact.
+export function kioskHtml(readModel) {
+  const active = readKioskTab();
+  const tab = (id, label) =>
+    `<button type="button" class="kk-tab" role="tab" data-tab="${id}" aria-selected="${id === active}">${label}</button>`;
+  const panel = (id, inner) =>
+    `<div class="kk-tabpanel" data-panel="${id}" role="tabpanel"${id === active ? "" : " hidden"}>${inner}</div>`;
+  return `<div class="kk-header">
+      <span class="kk-panel-title">Kiosk</span>
+      <button class="kk-close" title="fermer" aria-label="fermer">×</button>
+    </div>
+    <div class="kk-tabs" role="tablist">
+      ${tab("decisions", "Décisions à prendre")}
+      ${tab("reports", "Rapports")}
+      ${tab("intent", "Grille d'intention")}
+    </div>
+    ${panel("decisions", kioskDecisionsHtml(readModel))}
+    ${panel("reports", `<div class="kk-reports"><div class="kk-loading">chargement…</div></div>`)}
+    ${panel("intent", intentFormHtml())}`;
 }
 
 // The badge = nb of OPEN decisions, from any decisions fetch (never the 1.5s poll —
@@ -2072,14 +2189,94 @@ async function openKiosk() {
   const el = document.getElementById("kiosk-panel");
   if (!el) return;
   kioskOpen = true;
-  el.innerHTML = `<div class="kk-header"><span class="kk-panel-title">Décisions en attente</span></div><div class="kk-loading">chargement…</div>`;
+  el.innerHTML = `<div class="kk-header"><span class="kk-panel-title">Kiosk</span></div><div class="kk-loading">chargement…</div>`;
   el.hidden = false;
   try {
     const model = await fetchDecisions();
     el.innerHTML = kioskHtml(model);
     renderKioskBadge(kioskView(model));
+    afterKioskRender(el);
   } catch (err) {
-    el.innerHTML = `<div class="kk-header"><span class="kk-panel-title">Décisions en attente</span><button class="kk-close" title="fermer" aria-label="fermer">×</button></div><div class="kk-error">décisions indisponibles (${escapeHtml(err.message)})</div>`;
+    el.innerHTML = `<div class="kk-header"><span class="kk-panel-title">Kiosk</span><button class="kk-close" title="fermer" aria-label="fermer">×</button></div><div class="kk-error">décisions indisponibles (${escapeHtml(err.message)})</div>`;
+  }
+}
+
+// After a (re)render: load the reports tab if it's the active one, and size the intent
+// textareas so a restored active-intent tab isn't a squished single row.
+function afterKioskRender(el) {
+  const active = readKioskTab();
+  if (active === "reports") loadReports(el);
+  if (active === "intent") initAutogrow(el);
+}
+
+// Onglet (a↔b↔c) — switch the visible panel, persist the choice, lazy-load reports, size the
+// intent textareas. Feature-detect: unknown tab is a no-op (graceful degradation).
+function switchKioskTab(el, tabId) {
+  if (!KIOSK_TABS.includes(tabId)) return;
+  try { localStorage.setItem(KIOSK_TAB_KEY, tabId); } catch { /* ignore */ }
+  el.querySelectorAll(".kk-tab").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.tab === tabId)));
+  el.querySelectorAll(".kk-tabpanel").forEach((p) => { p.hidden = p.dataset.panel !== tabId; });
+  if (tabId === "reports") loadReports(el);
+  if (tabId === "intent") initAutogrow(el);
+}
+
+// Onglet (b) — fetch + render the reports list into the reports panel (cold source, on-demand).
+async function loadReports(el) {
+  const host = el.querySelector('[data-panel="reports"] .kk-reports');
+  if (!host) return;
+  host.innerHTML = `<div class="kk-loading">chargement…</div>`;
+  try {
+    const res = await fetch(REPORTS_URL, { headers: { accept: "application/json", ...AUTH_HEADERS } });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const canRule = typeof TOKEN === "string" && TOKEN.length > 0;
+    host.innerHTML = reportsHtml(await res.json(), canRule);
+  } catch (err) {
+    host.innerHTML = `<div class="kk-error">rapports indisponibles (${escapeHtml(err.message)})</div>`;
+  }
+}
+
+// Onglet (c) — auto-grow: fit a textarea's height to its content. Feature-detect (no scrollHeight
+// / no style → no-op). Called on input and once after render for any pre-filled field.
+function autogrow(ta) {
+  if (!ta || !ta.style) return;
+  ta.style.height = "auto";
+  ta.style.height = `${ta.scrollHeight}px`;
+}
+function initAutogrow(el) {
+  el.querySelectorAll(".kk-autogrow").forEach(autogrow);
+}
+
+// Onglet (c) — gather the grid fields, fold to markdown, POST /intent (server writes a
+// server-named intent-<ts>.md). On success, show a viewer link to the created artefact.
+async function postIntent(el) {
+  const panel = el.querySelector('[data-panel="intent"]');
+  if (!panel) return;
+  const msg = panel.querySelector(".kk-intent-msg");
+  const setMsg = (html, cls) => { if (msg) { msg.innerHTML = html; msg.className = `kk-intent-msg ${cls}`; } };
+  const intent = panel.querySelector(".kk-intent-text")?.value || "";
+  const rows = [...panel.querySelectorAll(".kk-gwt-row")].map((r) => ({
+    given: r.querySelector(".kk-gwt-given")?.value || "",
+    when: r.querySelector(".kk-gwt-when")?.value || "",
+    then: r.querySelector(".kk-gwt-then")?.value || "",
+  }));
+  // Require SOMETHING (mirrors the server's non-empty-content 400) — a lone heading is not an intention.
+  const hasContent = intent.trim() || rows.some((r) => `${r.given}${r.when}${r.then}`.trim());
+  if (!hasContent) { setMsg("saisir une intention ou un Given/When/Then", "err"); return; }
+  const content = intentMarkdown({ intent, rows });
+  const canRule = typeof TOKEN === "string" && TOKEN.length > 0;
+  if (!canRule) { setMsg("lecture seule — ouvrez le dashboard avec un token pour poser une intention", "err"); return; }
+  try {
+    const res = await fetch(INTENT_URL, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json", ...AUTH_HEADERS },
+      body: JSON.stringify({ content }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const out = await res.json();
+    const href = `/decisions/file?path=${encodeURIComponent(out.path || "")}&token=${encodeURIComponent(TOKEN)}`;
+    setMsg(`intention posée ✓ — <a class="kk-file kk-intent-created" href="${escapeHtml(href)}" target="_blank" rel="noopener">${escapeHtml(String(out.name || ""))}</a>`, "ok");
+  } catch (err) {
+    setMsg(`échec : ${escapeHtml(err.message)}`, "err");
   }
 }
 
@@ -2592,6 +2789,17 @@ function bootstrap() {
       // replaces innerHTML synchronously, detaching e.target — same trap as the catalogue).
       e.stopPropagation();
       if (e.target.closest(".kk-close")) { closeKiosk(); return; }
+      // Volet-2: the tab bar switches the visible panel (a/b/c) + persists the choice.
+      const tabBtn = e.target.closest(".kk-tab");
+      if (tabBtn) { switchKioskTab(kioskPanel, tabBtn.dataset.tab); return; }
+      // Volet-2 (c): grow the grid by one repeatable Given/When/Then row.
+      if (e.target.closest(".kk-gwt-add")) {
+        const rows = kioskPanel.querySelector(".kk-gwt-rows");
+        if (rows) { rows.insertAdjacentHTML("beforeend", intentRowHtml()); }
+        return;
+      }
+      // Volet-2 (c): persist the intention grid to outbox/intent-<ts>.md via POST /intent.
+      if (e.target.closest(".kk-intent-post")) { postIntent(kioskPanel); return; }
       if (e.target.closest(".kk-refresh")) { openKiosk(); return; }
       const showArch = e.target.closest(".kk-show-archived");
       if (showArch) { kioskIncludeArchived = !!showArch.checked; openKiosk(); return; }
@@ -2616,6 +2824,11 @@ function bootstrap() {
       // FU2 a11y: a code-source ref is a role=button — Enter/Space copies it.
       const ref = (e.key === "Enter" || e.key === " ") && e.target.closest && e.target.closest(".kk-file-ref");
       if (ref) { e.preventDefault(); copyToClipboard(ref); }
+    });
+    // Volet-2 (c): the intention textareas grow as the text grows (auto-grow on input).
+    kioskPanel.addEventListener("input", (e) => {
+      const ta = e.target.closest && e.target.closest(".kk-autogrow");
+      if (ta) autogrow(ta);
     });
   }
   document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeKiosk(); });
