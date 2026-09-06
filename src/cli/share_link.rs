@@ -2210,6 +2210,25 @@ pub fn tabs(args: &[String]) -> i32 {
 #[cfg(test)]
 static TEST_SERVER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Run `body` with the endpoint pointed at `ep`, holding the same lock
+/// [`with_test_server`] takes.
+///
+/// The endpoint is process-global, so a test that sets it directly races every
+/// test using the harness — and the failure looks like a flake in an unrelated
+/// module. Anything that needs a specific (usually unreachable) endpoint must
+/// go through here.
+#[cfg(test)]
+pub(crate) fn with_test_endpoint<T>(ep: Endpoint, body: impl FnOnce() -> T) -> T {
+    let guard = TEST_SERVER_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set_test_endpoint(Some(ep));
+    let out = body();
+    set_test_endpoint(None);
+    drop(guard);
+    out
+}
+
 /// Run `body` with every CLI verb pointed at a real in-process API server over
 /// a two-tab snapshot (`tab-a`/shell, `tab-b`/build), so a verb exercises its
 /// actual HTTP path instead of a mock. Shared by the CLI test modules.
