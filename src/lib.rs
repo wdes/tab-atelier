@@ -25,6 +25,7 @@ pub(crate) mod catbus_agent;
 pub mod claims;
 pub mod federation;
 pub mod fleet;
+pub mod sweep;
 // Shared by both binaries now (GUI applies per-tab cgroup limits too); the
 // module's own `#![cfg(target_os = "linux")]` scopes it to Linux.
 #[cfg(target_os = "linux")]
@@ -1110,6 +1111,26 @@ pub fn try_acquire_single_instance_lock() -> bool {
     // Stash the handle so the lock stays held for the process lifetime.
     let _ = INSTANCE_LOCK.set(file);
     true
+}
+
+const fn default_cooldown_days() -> u32 {
+    30
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes by reference"
+)]
+const fn is_default_cooldown(v: &u32) -> bool {
+    *v == 30
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes by reference"
+)]
+const fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2533,6 +2554,29 @@ pub fn load_wakatime_key(config_base: &std::path::Path) -> Option<String> {
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct Preferences {
+    /// Minutes between automatic fleet sweeps (announce from sources, then
+    /// gossip). `0` — the default — means never: an instance that was not
+    /// asked to manage itself must not start doing so after an upgrade.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub fleet_sweep_minutes: u32,
+    /// Commands whose stdout is `id<TAB>title` lines. Any generator of work.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fleet_sweep_sources: Vec<String>,
+    /// Optional LCOV report for the built-in coverage source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fleet_sweep_lcov: Option<String>,
+    /// Repository root stripped from that report's paths, so task ids are the
+    /// same in every checkout. The daemon runs from wherever it was started,
+    /// so this cannot be inferred from its cwd.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fleet_sweep_root: Option<String>,
+    /// Whether a sweep also gossips with the configured remotes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fleet_sweep_gossip: bool,
+    /// Days a finished task stays off the board before a sweep may re-announce
+    /// it. Clamped to at least one day.
+    #[serde(default = "default_cooldown_days", skip_serializing_if = "is_default_cooldown")]
+    pub fleet_sweep_cooldown_days: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lang: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

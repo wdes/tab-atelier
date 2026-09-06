@@ -272,6 +272,40 @@ Two of their modes were live here before this work:
   task completes, taken by a *different* agent — the board already supports it,
   the policy doesn't exist yet.
 
+## Making it run by itself
+
+Everything above is a verb someone runs. `fleet_sweep_minutes` in
+`preferences.json` is the part that runs on its own — every N minutes, announce
+what the configured sources propose, then gossip:
+
+```json
+{
+  "fleet_sweep_minutes": 180,
+  "fleet_sweep_sources": ["./scripts/my-tasks.sh"],
+  "fleet_sweep_lcov": "/path/to/repo/target/lcov.info",
+  "fleet_sweep_root": "/path/to/repo",
+  "fleet_sweep_gossip": true
+}
+```
+
+**Off unless configured** (`0` is the default): an instance that was never
+asked to manage itself must not start doing so because someone upgraded.
+
+It is thin because the safety is in the pieces it calls: announcing is
+idempotent and cooled, so sweeping often costs nothing; gossip is a set union,
+so a round against a converged peer is a no-op. That is what makes "run this
+forever on a timer" reasonable at all.
+
+`fleet_sweep_root` exists because the daemon runs from wherever it was started,
+not from your repository. LCOV records absolute paths, and left alone the same
+file checked out at two paths becomes two task ids — so two machines would each
+announce it and each do the work. The root is stated, not inferred.
+
+Note what the sweep does *not* do: it never runs the build. Producing a
+coverage report is a multi-minute job and a decision, so it stays outside — the
+sweep reads whatever report is there. Wire the regeneration to CI or a timer of
+your own.
+
 ## Trying it
 
 ```
