@@ -538,6 +538,15 @@ pub fn new_entry(kind: NoteKind, from: Option<String>, msg: &str) -> Note {
     }
 }
 
+/// Serialises every test that redirects the process-global blackboard or
+/// lease-registry path.
+///
+/// One lock, shared: three helpers used to hold three separate mutexes while
+/// pointing the same global at their own tempdir, so they took each other's
+/// board mid-assert and failed at random in a full run.
+#[cfg(test)]
+pub static BOARD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Test/ops override for the blackboard file. Set via
 /// [`set_blackboard_path`].
 static BLACKBOARD_OVERRIDE: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);

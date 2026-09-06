@@ -1451,7 +1451,11 @@ mod tests {
                 vec!["wait", "t-dispatch", "--timeout", "0", "--quiet"],
                 vec!["fleet"],
                 vec!["brief"],
-                vec!["gossip"],
+                // Not `gossip` with no arguments: that exchanges boards with
+                // every configured remote, i.e. real network traffic to the
+                // developer's actual peers. `--peer` with a name nothing
+                // matches routes the arm and stops.
+                vec!["gossip", "--peer", "definitely-not-a-configured-peer"],
                 vec!["backlog", "--from-file", "/nonexistent-source.tsv"],
                 vec!["rename", "tab-a", "renamed"],
                 vec!["lock", "tab-a"],
@@ -1469,8 +1473,14 @@ mod tests {
                 vec!["net-dns"],
                 vec!["net-allow", "tab-a", "--clear"],
                 vec!["ssh-agent", "tab-a", "--off"],
-                vec!["set-meta", "role", "tester"],
-                vec!["set-font", "--size", "14"],
+                // set-meta and set-font are routed via their USAGE-ERROR form
+                // on purpose. Both write real user state — set-font edits
+                // preferences.json, and set-meta reads TAB_ATELIER_API_URL
+                // from the environment rather than the test endpoint, so it
+                // posts to the developer's live daemon. Running the working
+                // form here changed the GUI font size out from under the user.
+                vec!["set-meta"],
+                vec!["set-font"],
                 vec!["env", "list"],
                 vec!["settings"],
                 vec!["schedule", "tab-a", "--clear"],

@@ -852,6 +852,21 @@ impl TerminalView {
     /// pulling the working size from `last_size`/`cell_size` and the shell/env
     /// from the stashed [`SpawnRecipe`]. Called eagerly for the active tab, and
     /// in the background for the rest so restored agents come back online.
+    /// Change the rendered font size and re-measure the cell.
+    ///
+    /// `cell_size` is memoised on first paint, and every grid dimension is
+    /// derived from it, so dropping it is what makes the change take effect —
+    /// the next paint re-measures and the PTY resize follows from the new
+    /// columns and rows. Without this the setting would only apply to tabs
+    /// opened afterwards, which is indistinguishable from "does nothing".
+    pub fn set_font_size(&mut self, size: f32) {
+        if (self.font_config.size - size).abs() < f32::EPSILON {
+            return;
+        }
+        self.font_config.size = size;
+        self.cell_size = None;
+    }
+
     pub fn ensure_spawned(&mut self) {
         let Some(recipe) = self.spawn_recipe.take() else {
             return;

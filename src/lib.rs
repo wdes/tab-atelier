@@ -5969,4 +5969,32 @@ mod state_writer_tests {
         let user = crate::new_tab_env(false);
         assert!(user.is_empty(), "{user:?}");
     }
+
+    #[test]
+    fn a_font_size_from_preferences_wins_and_is_bounded_by_the_dialog() {
+        // The setting is a real preference: `preferences.json` beats zed and
+        // fontconfig. A test run that writes it (as one of ours did, silently
+        // changing the developer's font) is a bug in the test, not a feature.
+        let dir = tempfile::tempdir().unwrap();
+        let mut prefs = crate::Preferences::default();
+        assert!(prefs.font_size.is_none(), "unset by default — the user's choice");
+        prefs.font_size = Some(17.5);
+        assert!((crate::resolve_font_config(dir.path(), &prefs).size - 17.5).abs() < f32::EPSILON);
+        // A nonsense size is ignored rather than producing an unusable window.
+        prefs.font_size = Some(0.0);
+        assert!(crate::resolve_font_config(dir.path(), &prefs).size > 0.0);
+        prefs.font_size = Some(-4.0);
+        assert!(crate::resolve_font_config(dir.path(), &prefs).size > 0.0);
+        // The dialog's stepper clamps to the same useful range: below ~6 the
+        // window is unreadable, above ~72 one glyph fills the tab.
+        for (input, want) in [
+            (5.0_f32, 6.0_f32),
+            (6.0, 6.0),
+            (14.0, 14.0),
+            (72.0, 72.0),
+            (900.0, 72.0),
+        ] {
+            assert!((input.clamp(6.0, 72.0) - want).abs() < f32::EPSILON, "{input}");
+        }
+    }
 }

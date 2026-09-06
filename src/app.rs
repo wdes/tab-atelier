@@ -5486,6 +5486,42 @@ impl AppState {
         }
         opacity_slider = opacity_slider.child(track).child(format!("{opacity_pct}%"));
 
+        // Font size. It was settable only through `tab-atelier set-font` and a
+        // restart, which meant the one visual setting people actually reach for
+        // was the one not in the settings dialog. A stepper rather than a
+        // slider: the useful range is ~20 values, and a wrong click here
+        // reflows every tab.
+        let mut font_size_row = div().flex().flex_row().items_center().gap(px(8.0)).mt(px(8.0));
+        for (id, label, delta) in [("pref-font-smaller", "−", -1.0_f32), ("pref-font-bigger", "+", 1.0)] {
+            font_size_row = font_size_row.child(
+                div()
+                    .id(id)
+                    .px(px(10.0))
+                    .py(px(2.0))
+                    .rounded(px(3.0))
+                    .cursor_pointer()
+                    .bg(option_bg)
+                    .hover(|s| s.bg(btn_hover))
+                    .child(label)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                            // Clamped: a zero or negative size is an unusable
+                            // window, and past ~72 one glyph fills the tab.
+                            let size = (this.font_config.size + delta).clamp(6.0, 72.0);
+                            this.font_config.size = size;
+                            // Apply to the tabs that already exist, not just
+                            // the next one opened.
+                            for tab in &this.tabs {
+                                tab.view.update(cx, |v, _| v.set_font_size(size));
+                            }
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+        font_size_row = font_size_row.child(format!("{:.0} px", self.font_config.size));
+
         let mut hotkey_list = div().flex().flex_col().gap(px(4.0)).mt(px(8.0));
         for &kc in &self.hotkeys {
             let label = keycode_label(kc);
@@ -5928,6 +5964,7 @@ impl AppState {
                                         .child(div().child(t.theme).child(theme_options))
                                         .child(div().child("Cursor").child(cursor_options))
                                         .child(div().child(t.opacity).child(opacity_slider))
+                                        .child(div().child(t.font_size).child(font_size_row))
                                         .child(div().child(t.toggle_hotkeys).child(hotkey_list))
                                         .child(div().child(t.language).child(lang_options))
                                         .child(div().child(t.browser).child(browser_input)),
@@ -6056,12 +6093,14 @@ impl AppState {
                                                 save_preferences(
                                                     &platform::config_dir(),
                                                     &Preferences {
-                                                        // Font lives in preferences.json (or zed /
-                                                        // fontconfig); the GUI dialog doesn't edit it,
-                                                        // so carry the on-disk values through rather
-                                                        // than wiping them on save.
+                                                        // The family still comes from
+                                                        // preferences.json / zed / fontconfig — the
+                                                        // dialog does not pick fonts, so carry it
+                                                        // through rather than wiping it. The SIZE is
+                                                        // edited here, so it is written from the live
+                                                        // value.
                                                         font_family: on_disk_prefs.font_family,
-                                                        font_size: on_disk_prefs.font_size,
+                                                        font_size: Some(this.font_config.size),
                                                         // Same reason: the fleet-sweep settings are
                                                         // file-only, and saving from this dialog must
                                                         // not silently stop a configured sweep.
