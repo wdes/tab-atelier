@@ -42,6 +42,10 @@ import android.webkit.WebViewClient;
 public final class WebViewHost {
     private static volatile Dialog currentDialog;
     private static volatile WebView currentWebView;
+    /// The activity the retained WebView belongs to. A WebView holds an
+    /// Activity context, so it may only be reused for that same activity —
+    /// after a rotation the old one is dead and must be destroyed, not shown.
+    private static volatile Activity currentActivity;
     // Pending <input type=file> callback, set when the WebView asks for a file
     // chooser and cleared when FilePickerActivity delivers the result. Static
     // because the picker runs in a separate activity (see FilePickerActivity).
@@ -65,7 +69,24 @@ public final class WebViewHost {
         if (activity == null || url == null) return;
         activity.runOnUiThread(new Runnable() {
             @Override public void run() {
-                dismissLocked();
+                // Reuse the mounted WebView when one is already up: just
+                // point it at the new tab. Destroying and rebuilding it threw
+                // away the parsed xterm bundle and the fonts every single
+                // time, so opening tab after tab re-fetched and re-parsed the
+                // same assets. `hideLocked` keeps the instance warm.
+                // Only reuse it for the SAME activity. A retained WebView
+                // holds an Activity context, so after a rotation the old one
+                // would both leak the dead activity and try to show a dialog
+                // on it.
+                if (currentDialog != null && currentWebView != null && currentActivity == activity) {
+                    currentWebView.loadUrl(url);
+                    try { currentDialog.show(); } catch (Exception ignored) {}
+                    return;
+                }
+                if (currentActivity != activity) {
+                    destroyLocked();
+                }
+                hideLocked();
                 // No-title-bar but NOT fullscreen: keep the system
                 // status-bar / notification area visible above the
                 // dialog. Theme_Black_NoTitleBar_Fullscreen took the
@@ -84,6 +105,14 @@ public final class WebViewHost {
                 WebSettings s = wv.getSettings();
                 s.setJavaScriptEnabled(true);
                 s.setDomStorageEnabled(true);
+                // Use the HTTP cache and revalidate with If-None-Match: the
+                // daemon serves assets with a strong ETag and
+                // `Cache-Control: immutable`, so a warm app pays a 304 at most
+                // and usually nothing at all. LOAD_DEFAULT is the default, but
+                // stating it means a future edit has to argue with a comment
+                // rather than silently drop it.
+                s.setCacheMode(WebSettings.LOAD_DEFAULT);
+                s.setDatabaseEnabled(true);
                 // Self-signed origin certs (or CF Origin certs Android
                 // doesn't trust by default) — the bearer token in the
                 // URL is the authn material; TLS here is just for
@@ -155,6 +184,7 @@ public final class WebViewHost {
                 wv.loadUrl(url);
                 currentDialog = dialog;
                 currentWebView = wv;
+                currentActivity = activity;
             }
         });
     }
@@ -166,17 +196,48 @@ public final class WebViewHost {
     public static boolean dismiss(final Activity activity) {
         if (currentDialog == null || activity == null) return false;
         activity.runOnUiThread(new Runnable() {
-            @Override public void run() { dismissLocked(); }
+            @Override public void run() { hideLocked(); }
         });
         return true;
     }
 
+    /** Internal. Must run on the UI thread.
+     *
+     *  Hides the dialog and parks the WebView on `about:blank`, but does NOT
+     *  destroy it: the next tab open reuses the same instance, so the xterm
+     *  bundle stays parsed and the fonts stay loaded. Stopping the load and
+     *  blanking it is what actually matters on close — it drops the
+     *  WebSocket and stops the tab streaming in the background.
+     *
+     *  Use {@link #release} to actually tear it down. */
+    private static void hideLocked() {
+        Dialog d = currentDialog;
+        WebView wv = currentWebView;
+        if (wv != null) {
+            wv.stopLoading();
+            wv.loadUrl("about:blank");
+        }
+        if (d != null) {
+            try { d.hide(); } catch (IllegalArgumentException ignored) {}
+        }
+    }
+
+    /** Destroy the retained WebView. For activity teardown — a WebView
+     *  outliving its activity leaks the whole context. */
+    public static void release(final Activity activity) {
+        if (activity == null) return;
+        activity.runOnUiThread(new Runnable() {
+            @Override public void run() { destroyLocked(); }
+        });
+    }
+
     /** Internal. Must run on the UI thread. */
-    private static void dismissLocked() {
+    private static void destroyLocked() {
         Dialog d = currentDialog;
         WebView wv = currentWebView;
         currentDialog = null;
         currentWebView = null;
+        currentActivity = null;
         if (wv != null) {
             wv.stopLoading();
             wv.loadUrl("about:blank");
