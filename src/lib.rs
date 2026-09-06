@@ -20,6 +20,7 @@ pub(crate) mod api_ws;
 pub mod app;
 #[cfg(feature = "gui")]
 pub(crate) mod box_drawing;
+pub mod briefs;
 #[cfg(feature = "catbus")]
 pub(crate) mod catbus_agent;
 pub mod claims;
