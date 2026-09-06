@@ -1621,13 +1621,13 @@ mod tests {
     fn a_tick_without_a_daemon_is_an_error_not_a_panic() {
         // The daemon restarts; the brain outlives it. A tick during that gap
         // must return Err so the loop can retry, never unwind the thread.
-        crate::cli::share_link::set_test_endpoint(Some(crate::cli::share_link::Endpoint {
+        let ep = crate::cli::share_link::Endpoint {
             url: "http://127.0.0.1:1".into(),
             token: "t".into(),
-        }));
-        let mut brain = super::Brain::default();
-        let got = brain.tick();
-        crate::cli::share_link::set_test_endpoint(None);
+        };
+        // Through the helper: the endpoint is process-global, and setting it
+        // directly raced every harness-using test in other modules.
+        let got = crate::cli::share_link::with_test_endpoint(ep, || super::Brain::default().tick());
         assert!(got.is_err(), "an unreachable daemon must be an error");
     }
 
