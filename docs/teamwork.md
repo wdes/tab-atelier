@@ -1,5 +1,9 @@
 # Teamwork — making Claude tabs work together
 
+> Agents don't have to be told any of this by hand: the `SessionStart` hook
+> injects a short brief into every session that starts inside a tab. See
+> [agent-brief.md](./agent-brief.md) for what they're told and how to change it.
+
 Every tab can shell out to the local API (the CLI discovers the token the same
 way `brain` does), so the `claude` sessions can coordinate directly — no catbus
 agents involved. The verbs live in `src/cli/team.rs` (`peers`, `note`/`notes`,

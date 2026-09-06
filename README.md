@@ -559,7 +559,7 @@ tab-atelier notes --since 42          # only entries after index 42 (incremental
 tab-atelier handoff ./report.md db-expert
 ```
 
-**Etiquette (and safety):** only `dispatch` to a tab `peers` shows as `idle`/`waiting`, never mid-turn; a locked tab refuses input; and never `--resume`/`--continue` another tab's session — it rotates/strips the session id. To make every agent aware of these verbs, drop the snippet from [`docs/teamwork.md`](docs/teamwork.md) into `~/.claude/CLAUDE.md`.
+**Etiquette (and safety):** only `dispatch` to a tab `peers` shows as `idle`/`waiting`, never mid-turn; a locked tab refuses input; and never `--resume`/`--continue` another tab's session — it rotates/strips the session id. Every Claude that starts **inside a tab** is told these verbs exist automatically: the system-wide `SessionStart` hook the deb installs injects a short brief ([`docs/agent-brief.md`](docs/agent-brief.md)). Nothing to copy into `~/.claude/CLAUDE.md`, and a Claude started outside a tab is told nothing about verbs it can't use. Override the text with `~/.config/tab-atelier/agent-brief.md`, or opt out with `TAB_ATELIER_NO_BRIEF=1`.
 
 **Let the fleet divide the work itself** — instead of deciding who does what, put the work on a shared board and let agents take it:
 
