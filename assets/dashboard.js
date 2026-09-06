@@ -2240,6 +2240,89 @@ function wireLegendToggle() {
 const MESH_BAND_R = { meta: 16, supporter: 13, orchestrator: 13, worker: 8, freelancer: 8 };
 const MESH_SVG_NS = "http://www.w3.org/2000/svg";
 
+// ── Mesh zoom/pan (additive) ─────────────────────────────────────────────────────────
+// #mesh-svg has NO viewBox -> its user space = CSS pixels, so a cursor at (clientX,clientY)
+// maps to svg space by subtracting the svg rect origin. Zoom/pan is ONE transform on the
+// #mesh-viewport <g> that wraps edges+nodes: `translate(tx,ty) scale(s)`. The force solver
+// keeps writing node/edge coords in the ORIGINAL space; the viewport transform rides on top.
+const MESH_VIEW_KEY = "ta-dash.mesh-viewport"; // persisted {s,tx,ty} (sibling of MESH_KEY)
+const MESH_MIN_SCALE = 0.2, MESH_MAX_SCALE = 8;
+let meshTransform = { s: 1, tx: 0, ty: 0 };
+
+// Pure (unit-tested): zoom transform `t` by `factor` around svg-space point (cx,cy), keeping
+// the point under the cursor FIXED. Scale is clamped to [min,max]. Returns a new {s,tx,ty}.
+export function meshZoomAt(t, cx, cy, factor, min = MESH_MIN_SCALE, max = MESH_MAX_SCALE) {
+  const s = Math.max(min, Math.min(max, t.s * factor));
+  const k = s / t.s; // point under cursor stays put: tx' = cx - k*(cx - tx)
+  return { s, tx: cx - k * (cx - t.tx), ty: cy - k * (cy - t.ty) };
+}
+
+function loadMeshTransform() {
+  try {
+    const v = JSON.parse(localStorage.getItem(MESH_VIEW_KEY) || "null");
+    if (v && Number.isFinite(v.s)) {
+      meshTransform = { s: Math.max(MESH_MIN_SCALE, Math.min(MESH_MAX_SCALE, v.s)), tx: +v.tx || 0, ty: +v.ty || 0 };
+    }
+  } catch { /* ignore */ }
+}
+
+// Apply (and persist) the current transform to the viewport <g>. Idempotent — safe to call
+// after every rebuild so a re-poll/toggle never RESETS an active user zoom/pan (care-point).
+function applyMeshTransform() {
+  const vp = document.getElementById("mesh-viewport");
+  if (vp) vp.setAttribute("transform", `translate(${meshTransform.tx},${meshTransform.ty}) scale(${meshTransform.s})`);
+  try { localStorage.setItem(MESH_VIEW_KEY, JSON.stringify(meshTransform)); } catch { /* ignore */ }
+}
+
+// Wire wheel-zoom (+ trackpad pinch = wheel with ctrlKey), click-drag pan, dblclick reset.
+function wireMeshZoomPan() {
+  const svg = document.getElementById("mesh-svg");
+  if (!svg) return;
+  loadMeshTransform();
+  applyMeshTransform();
+  const svgPt = (e) => { const r = svg.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top }; };
+
+  // Wheel = zoom, cursor-centered. A trackpad pinch arrives as wheel+ctrlKey (finer step).
+  svg.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    const p = svgPt(e);
+    const factor = Math.exp(-e.deltaY * (e.ctrlKey ? 0.02 : 0.0015));
+    meshTransform = meshZoomAt(meshTransform, p.x, p.y, factor);
+    applyMeshTransform();
+  }, { passive: false });
+
+  // Pan = pointer-drag on EMPTY canvas. A drag that starts on a node is a node-drag
+  // (meshDragify owns it) -> skip, so the two gestures never fight.
+  let panning = false, lastX = 0, lastY = 0;
+  svg.addEventListener("pointerdown", (e) => {
+    if (e.target.closest && e.target.closest(".mesh-node")) return;
+    panning = true; lastX = e.clientX; lastY = e.clientY;
+    svg.classList.add("mesh-panning");
+    try { svg.setPointerCapture(e.pointerId); } catch { /* ignore */ }
+  });
+  svg.addEventListener("pointermove", (e) => {
+    if (!panning) return;
+    meshTransform.tx += e.clientX - lastX; meshTransform.ty += e.clientY - lastY;
+    lastX = e.clientX; lastY = e.clientY;
+    applyMeshTransform();
+  });
+  const endPan = (e) => {
+    if (!panning) return;
+    panning = false; svg.classList.remove("mesh-panning");
+    try { svg.releasePointerCapture(e.pointerId); } catch { /* ignore */ }
+  };
+  svg.addEventListener("pointerup", endPan);
+  svg.addEventListener("pointercancel", endPan);
+
+  // Escape hatch: double-click empty canvas resets to the identity view (prevents getting
+  // lost after zooming into a corner; a node dblclick is left to the node's own click).
+  svg.addEventListener("dblclick", (e) => {
+    if (e.target.closest && e.target.closest(".mesh-node")) return;
+    meshTransform = { s: 1, tx: 0, ty: 0 };
+    applyMeshTransform();
+  });
+}
+
 // Pure: /dashboard/state -> { nodes:[{id,tab,r}], edges:[{s,t}] } for the mesh.
 // Nodes = every tab deduped by id across the 3 sources (same dedup as bandLayout,
 // DUPLICATED locally on purpose — factoring it out of bandLayout would touch a
@@ -2366,6 +2449,7 @@ function buildMeshDom() {
     meshDragify(g, n);
     n._g = g; gN.appendChild(g);
   }
+  applyMeshTransform(); // re-assert zoom/pan after a rebuild (poll/toggle) — never reset it
 }
 
 function positionMeshDom() {
@@ -2470,6 +2554,7 @@ function bootstrap() {
   applyLegendVisibility();
   wireLegendToggle();
   wireMeshToggle();
+  wireMeshZoomPan();
   // Hover popups on each phase node; a short hide delay lets the pointer travel
   // into the popup (where right-click lives) without it vanishing first.
   for (const el of document.querySelectorAll(".node")) {
