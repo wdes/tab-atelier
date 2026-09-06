@@ -1849,7 +1849,15 @@ export function classifyDecisionFile(f) {
   if (/^https?:\/\//i.test(raw)) return { kind: "url", href: raw, label: raw };
   // Servable doc = under the served outbox zone AND a doc extension (ignore any :line).
   const bare = raw.replace(/:\d+(?:-\d+)?$/, "");
-  const inOutbox = raw.startsWith("~/Dev/outbox/") || /(?:^|\/)Dev\/outbox\//.test(raw);
+  // The outbox zone in its three shapes: an absolute/`~`-expanded `…/Dev/outbox/…`, OR a
+  // BARE `outbox/…` / `_archive/…` (cause-A: decision `--files` are pushed WITHOUT the
+  // ~/Dev prefix). The server (GET /decisions/file) sandboxes to the outbox + its `_archive/`
+  // subtree, so a bare outbox/_archive path IS servable — it must open the viewer, not a
+  // github blob (404). Segment-anchored (`^`/`/`) so `inbox/` and `myoutbox/` don't match.
+  const inOutbox =
+    raw.startsWith("~/Dev/outbox/") ||
+    /(?:^|\/)Dev\/outbox\//.test(raw) ||
+    /(?:^|\/)(?:outbox|_archive)\//.test(bare);
   const isDoc = /\.(?:md|markdown)$/i.test(bare);
   if (inOutbox && isDoc) return { kind: "doc", path: raw, label: raw };
   // Code-source ref → a clickable repo blob link when a base is configured (the default),
