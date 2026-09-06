@@ -62,6 +62,37 @@ const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 /// available, which makes [`apply`] a no-op.
 static DELEGATED_BASE: OnceLock<Option<PathBuf>> = OnceLock::new();
 
+/// Test override for [`delegated_base`].
+///
+/// The real base is resolved once from `/proc/self/cgroup`, which a test can
+/// neither choose nor safely write under. Pointing it at a tempdir is what
+/// makes the per-tab lifecycle here testable at all — every function below is
+/// "create/read/write files under the base", and none of that logic was
+/// covered while the only way to reach it was a delegated cgroup on a live
+/// systemd unit.
+#[cfg(all(test, not(feature = "gui")))]
+static TEST_BASE: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
+
+/// Point the per-tab cgroup helpers at `base`. Tests only; `None` restores.
+///
+/// Only the headless build has per-tab lifecycle helpers to redirect, so the
+/// GUI test build would otherwise carry an unused function.
+#[cfg(all(test, not(feature = "gui")))]
+pub fn set_base_for_test(base: Option<PathBuf>) {
+    if let Ok(mut g) = TEST_BASE.write() {
+        *g = base;
+    }
+}
+
+/// The delegated base, or `None` when delegation is unavailable.
+fn delegated_base() -> Option<PathBuf> {
+    #[cfg(all(test, not(feature = "gui")))]
+    if let Some(p) = TEST_BASE.read().ok().and_then(|g| g.clone()) {
+        return Some(p);
+    }
+    DELEGATED_BASE.get().cloned().flatten()
+}
+
 /// Read this process's cgroup v2 path from `/proc/self/cgroup`.
 ///
 /// The v2 line is `0::/system.slice/tab-atelier-headless.service`; we
@@ -146,7 +177,7 @@ pub fn apply(tab_id: &str, pid: u32, limits: &TabResourceLimits) {
     if unsafe_tab_pid(pid) {
         return;
     }
-    let Some(Some(base)) = DELEGATED_BASE.get() else {
+    let Some(base) = delegated_base() else {
         return;
     };
     // Per-tab cgroup name — sanitise the id to a safe path component.
@@ -189,7 +220,7 @@ pub fn reapply(tab_id: &str, pid: u32, limits: &TabResourceLimits) {
     if unsafe_tab_pid(pid) {
         return;
     }
-    let Some(Some(base)) = DELEGATED_BASE.get() else {
+    let Some(base) = delegated_base() else {
         return;
     };
     let dir = base.join(format!("tab-{}", sanitize_id(tab_id)));
@@ -225,9 +256,7 @@ pub fn reapply(tab_id: &str, pid: u32, limits: &TabResourceLimits) {
 #[must_use]
 #[cfg(not(feature = "gui"))]
 pub fn prepare_tab_cgroup(tab_id: &str) -> Option<String> {
-    let Some(Some(base)) = DELEGATED_BASE.get() else {
-        return None;
-    };
+    let base = delegated_base()?;
     let dir = base.join(format!("tab-{}", sanitize_id(tab_id)));
     std::fs::create_dir_all(&dir).ok()?;
     dir.strip_prefix(CGROUP_ROOT)
@@ -243,7 +272,7 @@ pub fn move_pid_to_tab_cgroup(tab_id: &str, pid: u32) -> bool {
     if unsafe_tab_pid(pid) {
         return false;
     }
-    let Some(Some(base)) = DELEGATED_BASE.get() else {
+    let Some(base) = delegated_base() else {
         return false;
     };
     let dir = base.join(format!("tab-{}", sanitize_id(tab_id)));
@@ -274,7 +303,7 @@ pub fn ensure_tab(tab_id: &str, pid: u32) {
 /// the (now-empty) cgroup dir. No-op when delegation is off or the cgroup is
 /// already gone. Returns `true` if the kill was issued.
 pub fn kill_tab(tab_id: &str) -> bool {
-    let Some(Some(base)) = DELEGATED_BASE.get() else {
+    let Some(base) = delegated_base() else {
         return false;
     };
     let dir = base.join(format!("tab-{}", sanitize_id(tab_id)));
@@ -295,7 +324,7 @@ fn parse_cgroup_procs(text: &str) -> Vec<u32> {
 #[cfg(not(feature = "gui"))]
 /// The pids currently in a tab's cgroup subtree (from `cgroup.procs`).
 fn tab_pids(tab_id: &str) -> Vec<u32> {
-    let Some(Some(base)) = DELEGATED_BASE.get() else {
+    let Some(base) = delegated_base() else {
         return Vec::new();
     };
     let dir = base.join(format!("tab-{}", sanitize_id(tab_id)));
@@ -341,7 +370,7 @@ pub fn terminate_tab(tab_id: &str) {
 /// still-live copy of the same session — the root cause of the duplicate
 /// ghost sessions. Skips the `supervisor` leaf (that's us). Best-effort.
 pub fn reap_stale_tabs() {
-    let Some(Some(base)) = DELEGATED_BASE.get() else {
+    let Some(base) = delegated_base() else {
         return;
     };
     let Ok(entries) = std::fs::read_dir(base) else {
@@ -442,5 +471,131 @@ mod tests {
         assert!(tab_pids(id).is_empty());
         assert!(!tab_has_procs(id));
         terminate_tab(id); // must not panic
+    }
+
+    /// Serialises the tests that repoint the process-global base.
+    #[cfg(not(feature = "gui"))]
+    fn with_base<T>(body: impl FnOnce(&std::path::Path) -> T) -> T {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().expect("tempdir");
+        super::set_base_for_test(Some(dir.path().to_path_buf()));
+        let out = body(dir.path());
+        super::set_base_for_test(None);
+        out
+    }
+
+    // The per-tab lifecycle helpers are headless-only (the GUI drives its
+    // tabs differently), so these tests follow the same gate.
+    #[test]
+    #[cfg(not(feature = "gui"))]
+    fn a_tab_cgroup_is_created_once_and_named_after_the_tab() {
+        with_base(|base| {
+            // The directory is the side effect that matters. The RETURN value
+            // is the path relative to /sys/fs/cgroup — which nftables needs —
+            // so off a real cgroup root it is None even though the create
+            // succeeded. Worth knowing before reusing this function.
+            let _ = super::prepare_tab_cgroup("tab-abc");
+            assert!(base.join("tab-tab-abc").is_dir(), "prepare must create the directory");
+            // Idempotent: a respawn reuses the tab's cgroup rather than
+            // failing because it already exists.
+            let _ = super::prepare_tab_cgroup("tab-abc");
+            assert!(base.join("tab-tab-abc").is_dir());
+        });
+    }
+
+    // The per-tab lifecycle helpers are headless-only (the GUI drives its
+    // tabs differently), so these tests follow the same gate.
+    #[test]
+    #[cfg(not(feature = "gui"))]
+    fn a_hostile_tab_id_cannot_escape_the_delegated_base() {
+        with_base(|base| {
+            // Tab ids reach here from the API. A `..` that survived would let
+            // a caller create cgroup control files anywhere the daemon can
+            // write.
+            let _ = super::prepare_tab_cgroup("../../evil");
+            let escaped = base.parent().map(|p| p.join("evil"));
+            assert!(
+                escaped.is_none_or(|p| !p.exists()),
+                "a ../ in a tab id climbed out of the base"
+            );
+            // It lands inside, as one flattened component.
+            let entries: Vec<String> = std::fs::read_dir(base)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            assert!(
+                entries.iter().all(|e| !e.contains('/')),
+                "created a nested path: {entries:?}"
+            );
+            assert!(!entries.is_empty(), "nothing was created at all");
+        });
+    }
+
+    // The per-tab lifecycle helpers are headless-only (the GUI drives its
+    // tabs differently), so these tests follow the same gate.
+    #[test]
+    #[cfg(not(feature = "gui"))]
+    fn pids_are_written_to_and_read_back_from_the_tabs_cgroup() {
+        with_base(|base| {
+            std::fs::create_dir_all(base.join("tab-t1")).unwrap();
+            // No procs file yet: an empty tab is empty, not an error.
+            assert!(!super::tab_has_procs("t1"));
+            assert!(super::tab_pids("t1").is_empty());
+
+            // The kernel exposes one pid per line; that is what we parse.
+            std::fs::write(base.join("tab-t1").join("cgroup.procs"), "111\n222\n").unwrap();
+            assert_eq!(super::tab_pids("t1"), vec![111, 222]);
+            assert!(super::tab_has_procs("t1"));
+            // A tab that was never prepared reports nothing rather than
+            // inheriting another tab's processes.
+            assert!(super::tab_pids("other").is_empty());
+        });
+    }
+
+    // The per-tab lifecycle helpers are headless-only (the GUI drives its
+    // tabs differently), so these tests follow the same gate.
+    #[test]
+    #[cfg(not(feature = "gui"))]
+    fn moving_a_pid_reports_whether_the_kernel_took_it() {
+        with_base(|base| {
+            // No cgroup for this tab: the move must report failure, because
+            // the caller uses it to decide whether the tab is contained.
+            assert!(!super::move_pid_to_tab_cgroup("ghost", 42));
+            std::fs::create_dir_all(base.join("tab-t2")).unwrap();
+            assert!(super::move_pid_to_tab_cgroup("t2", 4242));
+            let procs = std::fs::read_to_string(base.join("tab-t2").join("cgroup.procs")).unwrap();
+            assert!(procs.contains("4242"), "{procs}");
+        });
+    }
+
+    // The per-tab lifecycle helpers are headless-only (the GUI drives its
+    // tabs differently), so these tests follow the same gate.
+    #[test]
+    #[cfg(not(feature = "gui"))]
+    fn killing_a_tab_writes_the_kernels_kill_switch() {
+        with_base(|base| {
+            std::fs::create_dir_all(base.join("tab-t3")).unwrap();
+            assert!(super::kill_tab("t3"));
+            // cgroup.kill is the atomic "take the whole subtree" the teardown
+            // relies on — signalling pids one by one races a forking agent.
+            let killed = std::fs::read_to_string(base.join("tab-t3").join("cgroup.kill")).unwrap();
+            assert_eq!(killed.trim(), "1");
+            // An unknown tab is a no-op that says so.
+            assert!(!super::kill_tab("never-existed"));
+        });
+    }
+
+    #[test]
+    #[cfg(not(feature = "gui"))]
+    fn the_procs_parser_ignores_what_the_kernel_would_never_write() {
+        // Defensive: a truncated read mid-write, or a file someone else put
+        // there, must not produce a pid 0 that gets signalled.
+        assert_eq!(super::parse_cgroup_procs("1\n2\n3\n"), vec![1, 2, 3]);
+        assert_eq!(super::parse_cgroup_procs(""), Vec::<u32>::new());
+        assert_eq!(super::parse_cgroup_procs("\n\n"), Vec::<u32>::new());
+        assert_eq!(super::parse_cgroup_procs("12\nnot-a-pid\n34"), vec![12, 34]);
+        assert_eq!(super::parse_cgroup_procs("  7  \n"), vec![7]);
     }
 }
