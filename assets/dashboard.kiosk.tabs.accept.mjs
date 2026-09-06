@@ -13,7 +13,7 @@
 import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, execSync } from "node:child_process";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { chromium } from "playwright";
@@ -21,6 +21,22 @@ import { chromium } from "playwright";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = dirname(HERE);
 const BIN = join(ROOT, "target", "debug", "tab-atelier-headless");
+
+// The daemon serves the dashboard bundle EMBEDDED in the binary at compile time (include_str!).
+// rustc can keep a STALE embed across an incremental `.rs`-only rebuild — the daemon then serves
+// the pre-tabs kiosk and `.kk-tabs` never renders (the built≠wired timeout Olympe caught). So this
+// acceptance BUILDS a fresh binary first, touching the assets to FORCE a re-embed. `node <this>`
+// is thus self-sufficient — no "remember to rebuild" footgun.
+function buildFreshBinary() {
+  try {
+    execSync("touch assets/dashboard.js assets/dashboard.html assets/dashboard.css", { cwd: ROOT });
+    console.log("building a fresh headless binary (forces the dashboard re-embed)…");
+    execSync("cargo build --no-default-features --features headless --bin tab-atelier-headless", { cwd: ROOT, stdio: "inherit" });
+  } catch (e) {
+    console.error(`build failed — cannot run the GUI acceptance: ${e.message}`);
+    process.exit(2);
+  }
+}
 
 let failures = 0;
 const ok = (label, cond, detail = "") => {
@@ -35,8 +51,9 @@ const freePort = () => new Promise((res, rej) => {
 });
 
 async function main() {
+  buildFreshBinary();
   if (!existsSync(BIN)) {
-    console.error(`MISSING headless binary: ${BIN}\n  build it: cargo build --no-default-features --features headless --bin tab-atelier-headless`);
+    console.error(`MISSING headless binary after build: ${BIN}`);
     process.exit(2);
   }
   const nonce = `${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`;
@@ -80,6 +97,17 @@ async function main() {
   const browser = await chromium.launch();
   const context = await browser.newContext({ viewport: { width: 1280, height: 950 } });
   const page = await context.newPage();
+
+  // Freshness guard (fail LOUD, not an opaque .kk-tabs timeout): assert the daemon actually serves
+  // the 3-tab bundle. If a stale embed still slipped through, say so + how to fix.
+  const servedJs = await fetch(`${ORIGIN}/assets/dashboard.js`).then((r) => r.text()).catch(() => "");
+  if (!servedJs.includes("kk-tabs")) {
+    console.error("STALE BUNDLE: the running daemon serves a dashboard.js WITHOUT the 3-tab markup (kk-tabs).\n"
+      + "  The binary embeds an old bundle (rustc include_str! incremental staleness). Fix:\n"
+      + "  touch assets/dashboard.js && cargo build --no-default-features --features headless --bin tab-atelier-headless");
+    await browser.close(); teardown(); process.exit(1);
+  }
+
   const openDash = async () => {
     for (let i = 0; i < 40; i++) {
       const r = await page.goto(`${ORIGIN}/dashboard?token=${TOKEN}`, { waitUntil: "domcontentloaded" }).catch(() => null);
