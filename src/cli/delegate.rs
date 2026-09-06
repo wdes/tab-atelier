@@ -382,6 +382,11 @@ fn read_output(ep: &Endpoint, uuid: &str) -> Result<String, String> {
 // `claude -p` during its API call) can read as idle early — for those,
 // use a `--quiet` longer than the silent period, or the default
 // streaming `claude`.
+/// Poll `uuid`'s screen until it stops changing for `quiet` seconds.
+///
+/// Returns `(screen, timed_out)` — the bool is **true when the deadline was
+/// hit**, not when the tab settled. Reading it the other way round is an easy
+/// mistake and reports a timeout as a clean finish.
 fn wait_for_idle(ep: &Endpoint, uuid: &str, quiet: u64, timeout: u64) -> Result<(String, bool), String> {
     let start = Instant::now();
     // Initial grace so we don't read "idle" before the agent even starts.
@@ -503,5 +508,85 @@ mod tests {
         // Polling coarser than the settle window would risk missing an
         // intermediate change and declaring "settled" too early.
         assert!(SUBMIT_SETTLE_POLL <= SUBMIT_SETTLE_QUIET);
+    }
+
+    /// Everything below runs against the harness server `share_link` spawns:
+    /// two tabs, `tab-a` (shell, with output) and `tab-b` (build).
+    fn with_server<T>(body: impl FnOnce() -> T) -> T {
+        crate::cli::share_link::with_test_server(|_| body())
+    }
+
+    #[test]
+    fn a_target_resolves_by_name_index_or_uuid() {
+        with_server(|| {
+            let ep = crate::cli::share_link::discover_endpoint().expect("test endpoint");
+            // Three ways to name the same tab; an orchestrator uses whichever
+            // it happens to hold.
+            let by_name = super::resolve_target(&ep, "tab-a").expect("by name");
+            let by_index = super::resolve_target(&ep, "0").expect("by index");
+            assert_eq!(by_name, by_index, "name and index must resolve to one tab");
+            assert_eq!(super::resolve_target(&ep, &by_name).expect("by uuid"), by_name);
+            // A miss is an error rather than a silent default — dispatching to
+            // the wrong tab types a stranger's prompt into someone's session.
+            assert!(super::resolve_target(&ep, "no-such-tab").is_err());
+            assert!(super::resolve_target(&ep, "999").is_err());
+        });
+    }
+
+    #[test]
+    fn input_and_output_round_trip_through_the_api() {
+        with_server(|| {
+            let ep = crate::cli::share_link::discover_endpoint().expect("test endpoint");
+            let uuid = super::resolve_target(&ep, "tab-a").expect("resolve");
+            // The harness tab starts with known output; reading it back is how
+            // `--wait` decides an agent has gone quiet.
+            let out = super::read_output(&ep, &uuid).expect("read output");
+            assert!(out.contains("foo bar baz"), "{out}");
+            // Sending input must not error even though the harness has no PTY
+            // behind the tab — the CLI's job ends at the API.
+            super::send_input(&ep, &uuid, b"echo hi\n").expect("send input");
+            assert!(super::read_output(&ep, "nope-not-a-uuid").is_err());
+        });
+    }
+
+    #[test]
+    fn waiting_for_idle_gives_up_at_the_timeout() {
+        with_server(|| {
+            let ep = crate::cli::share_link::discover_endpoint().expect("test endpoint");
+            let uuid = super::resolve_target(&ep, "tab-a").expect("resolve");
+            // The bool is `timed_out`, NOT `settled` — the harness output never
+            // changes, so one quiet window ends the wait cleanly and the flag
+            // must stay false.
+            let (screen, timed_out) = super::wait_for_idle(&ep, &uuid, 1, 20).expect("wait");
+            assert!(!timed_out, "unchanging output should settle, not time out");
+            assert!(screen.contains("foo bar baz"), "{screen}");
+            // A quiet window longer than the timeout can never be satisfied, so
+            // the deadline wins and the flag must say so — reporting a timeout
+            // as a clean finish is how a caller mistakes a hung agent for a
+            // finished one.
+            let (_, timed_out) = super::wait_for_idle(&ep, &uuid, 60, 3).expect("wait");
+            assert!(timed_out, "a deadline hit must be reported as a timeout");
+        });
+    }
+
+    #[test]
+    fn run_requires_a_target_and_a_prompt() {
+        with_server(|| {
+            // Neither --to nor --new: refuse rather than guess a target.
+            assert_eq!(super::run(&args(&["hello"])), 2);
+            // A target with no prompt would type an empty line into a session.
+            assert_eq!(super::run(&args(&["--to", "tab-a"])), 2);
+            // Unknown tab: exit non-zero, having typed nothing anywhere.
+            assert_ne!(super::run(&args(&["--to", "ghost", "hello"])), 0);
+        });
+    }
+
+    #[test]
+    fn dispatch_types_the_prompt_into_the_named_tab() {
+        with_server(|| {
+            // --no-submit types without pressing Enter, which is the safe form
+            // to assert on: nothing runs, but the text has to arrive.
+            assert_eq!(super::run(&args(&["--to", "tab-a", "--no-submit", "hello there"])), 0);
+        });
     }
 }

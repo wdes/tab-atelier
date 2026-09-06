@@ -515,3 +515,112 @@ impl HeaderMapLike for http::HeaderMap {
         self.get(name)?.to_str().ok()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{RemoteEndpoint, fetch_tabs};
+
+    /// A one-shot HTTP server that answers the next request with `body`.
+    ///
+    /// The sidecar client had no tests at all — an audit flagged exactly that
+    /// — and its whole job is turning another daemon's JSON into tab
+    /// snapshots. That needs a server, not a mock of our own types.
+    fn serve_once(body: &'static str, status: &'static str) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf);
+                let _ = write!(
+                    sock,
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.flush();
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), handle)
+    }
+
+    fn endpoint(url: String) -> RemoteEndpoint {
+        RemoteEndpoint {
+            id: "ep-1".into(),
+            label: "peer".into(),
+            url,
+            token: "t".into(),
+            relay_token: String::new(),
+            cert_sha256: String::new(),
+            cf_access_client_id: String::new(),
+            cf_access_client_secret: String::new(),
+            autoconnect: false,
+        }
+    }
+
+    #[test]
+    fn a_peers_tab_list_becomes_snapshots() {
+        let body = r#"{"tabs":[
+            {"id":"uuid-a","index":0,"name":"build","cwd":"/srv/x","active":true,
+             "uptime_secs":12.5,"cpu_percent":3.5,"watts":1.25,
+             "agent_state":"thinking","agent_kind":"claude"},
+            {"id":"uuid-b","index":1,"name":"shell"}
+        ]}"#;
+        let (url, h) = serve_once(body, "200 OK");
+        let tabs = fetch_tabs(&super::build_agent(&endpoint(String::new())), &endpoint(url)).expect("fetch");
+        let _ = h.join();
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs[0].remote_id, "uuid-a");
+        assert_eq!(tabs[0].name, "build");
+        assert_eq!(tabs[0].cwd.as_deref(), Some("/srv/x"));
+        assert!(tabs[0].active_on_remote);
+        assert_eq!(tabs[0].watts, Some(1.25));
+        assert_eq!(tabs[0].agent_state.as_deref(), Some("thinking"));
+        // A sparse row must not sink the whole list: the fields a viewer can
+        // live without default, and the ones it cannot (id) are preserved.
+        assert_eq!(tabs[1].remote_id, "uuid-b");
+        assert_eq!(tabs[1].cwd, None);
+        assert!(!tabs[1].active_on_remote);
+        assert_eq!(tabs[1].watts, None);
+    }
+
+    #[test]
+    fn a_row_with_no_name_is_marked_rather_than_left_blank() {
+        // An unnamed tab renders as "?" — a blank entry in a tab strip is
+        // indistinguishable from a rendering bug.
+        let (url, h) = serve_once(r#"{"tabs":[{"id":"x"}]}"#, "200 OK");
+        let tabs = fetch_tabs(&super::build_agent(&endpoint(String::new())), &endpoint(url)).expect("fetch");
+        let _ = h.join();
+        assert_eq!(tabs[0].name, "?");
+        assert_eq!(tabs[0].remote_index, 0);
+    }
+
+    #[test]
+    fn a_malformed_response_is_an_error_not_an_empty_fleet() {
+        // Each of these used to be indistinguishable from "the peer has no
+        // tabs", which silently empties the user's remote tab strip.
+        for (body, status) in [
+            (r#"{"nope":[]}"#, "200 OK"),
+            ("not json at all", "200 OK"),
+            (r#"{"tabs":{}}"#, "200 OK"),
+            ("", "500 Internal Server Error"),
+        ] {
+            let (url, h) = serve_once(body, status);
+            let got = fetch_tabs(&super::build_agent(&endpoint(String::new())), &endpoint(url));
+            let _ = h.join();
+            assert!(got.is_err(), "expected an error for {status} {body:?}");
+        }
+    }
+
+    #[test]
+    fn an_unreachable_peer_reports_the_failure() {
+        // Port 1 is reserved and nothing listens: the client must surface a
+        // connection error rather than hanging or reporting zero tabs.
+        let got = fetch_tabs(
+            &super::build_agent(&endpoint(String::new())),
+            &endpoint("http://127.0.0.1:1".into()),
+        );
+        assert!(got.is_err());
+        assert!(got.unwrap_err().contains("/tabs"), "the error should name what failed");
+    }
+}

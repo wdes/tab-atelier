@@ -434,6 +434,150 @@ mod tests {
         assert_eq!(identity_from(Some(" spaced "), None, "h"), "spaced");
     }
 
+    /// A hermetic fleet: temp blackboard, temp lease registry, live test API.
+    ///
+    /// The verbs write to process-global paths, so this also serialises the
+    /// tests that use it — two running at once would trade boards mid-assert.
+    fn with_fleet<T>(body: impl FnOnce() -> T) -> T {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().expect("tempdir");
+        crate::cli::team::set_blackboard_path(Some(dir.path().join("blackboard.jsonl")));
+        crate::claims::set_registry_path(Some(dir.path().join("claims.json")));
+        crate::claims::reset_for_test();
+        let out = crate::cli::share_link::with_test_server(|_| body());
+        crate::claims::reset_for_test();
+        crate::claims::set_registry_path(None);
+        crate::cli::team::set_blackboard_path(None);
+        out
+    }
+
+    #[test]
+    fn a_task_moves_from_announced_to_taken_to_done() {
+        // The whole loop, against a real API: the states an agent walks
+        // through are exactly the states the board reports back.
+        with_fleet(|| {
+            assert_eq!(announce(&argv(&["cov:src/x.rs", "raise", "coverage"])), 0);
+            let board = super::super::tasks::fold_tasks(&read_blackboard());
+            assert_eq!(board.len(), 1);
+            assert_eq!(board[0].title, "raise coverage");
+            assert_eq!(board[0].state(), super::super::tasks::TaskState::Open);
+
+            // take() leases it and records the award, so every other agent's
+            // board shows it as spoken for — not just this host's lease table.
+            assert_eq!(take(&argv(&["--ttl", "60"])), 0);
+            let board = super::super::tasks::fold_tasks(&read_blackboard());
+            assert_eq!(board[0].state(), super::super::tasks::TaskState::Awarded);
+            assert_eq!(board[0].awarded_to.as_deref(), Some(whoami().as_str()));
+
+            // A second take finds nothing free — exit 3, distinct from an
+            // error, so a polling loop can tell idle from broken.
+            assert_eq!(take(&argv(&["--ttl", "60"])), 3);
+
+            assert_eq!(done(&argv(&["cov:src/x.rs", "40%", "->", "82%"])), 0);
+            let board = super::super::tasks::fold_tasks(&read_blackboard());
+            assert_eq!(board[0].state(), super::super::tasks::TaskState::Done);
+            assert_eq!(board[0].done.as_ref().map(|(_, r)| r.as_str()), Some("40% -> 82%"));
+            // And the lease was handed back rather than parked until its TTL:
+            // the next agent should not wait out work that is finished.
+            let live = crate::claims::with_registry(|r| r.active(crate::unix_millis()));
+            assert!(live.is_empty(), "done must release: {live:?}");
+        });
+    }
+
+    #[test]
+    fn a_failure_is_recorded_as_a_failure() {
+        // `done --fail` has to be distinguishable from success on the board,
+        // or an agent that gave up looks like one that finished.
+        with_fleet(|| {
+            let _ = announce(&argv(&["t1", "something", "hard"]));
+            assert_eq!(done(&argv(&["t1", "--fail", "could", "not", "build"])), 0);
+            let board = super::super::tasks::fold_tasks(&read_blackboard());
+            assert_eq!(board[0].state(), super::super::tasks::TaskState::Failed);
+            assert_eq!(board[0].done.as_ref().map(|(ok, _)| *ok), Some(false));
+            // The reason survives — "--fail" itself must not land in the text.
+            let msg = board[0].done.as_ref().map(|(_, r)| r.clone()).unwrap_or_default();
+            assert_eq!(msg, "could not build");
+        });
+    }
+
+    #[test]
+    fn bids_and_awards_land_on_the_board() {
+        with_fleet(|| {
+            let _ = announce(&argv(&["t1", "work"]));
+            assert_eq!(bid(&argv(&["t1", "--cost", "40", "cheap", "for", "me"])), 0);
+            assert_eq!(award(&argv(&["t1", "--to", "agent-z"])), 0);
+            let board = super::super::tasks::fold_tasks(&read_blackboard());
+            assert_eq!(board[0].bids.len(), 1);
+            assert_eq!(board[0].bids[0].1, 40, "the cost is what makes bids comparable");
+            assert_eq!(board[0].awarded_to.as_deref(), Some("agent-z"));
+            // An awarded task is nobody else's to take.
+            assert_eq!(take(&argv(&["--ttl", "60"])), 3);
+        });
+    }
+
+    #[test]
+    fn take_dry_run_shows_the_ranking_without_claiming_anything() {
+        // A dry run must not lease: an operator inspecting the board should
+        // not accidentally take work away from an agent.
+        with_fleet(|| {
+            let _ = announce(&argv(&["t1", "one"]));
+            let _ = announce(&argv(&["t2", "two"]));
+            assert_eq!(take(&argv(&["--dry-run"])), 0);
+            let live = crate::claims::with_registry(|r| r.active(crate::unix_millis()));
+            assert!(live.is_empty(), "dry run leased something: {live:?}");
+            let board = super::super::tasks::fold_tasks(&read_blackboard());
+            assert!(
+                board.iter().all(|t| t.awarded_to.is_none()),
+                "dry run awarded something"
+            );
+        });
+    }
+
+    #[test]
+    fn an_empty_board_is_reported_as_idle_not_as_an_error() {
+        with_fleet(|| {
+            // Exit 3 = nothing to do. A polling agent treats this as "sleep",
+            // and anything non-zero-and-not-3 as "something is wrong".
+            assert_eq!(take(&argv(&[])), 3);
+            assert_eq!(tasks(&argv(&[])), 0, "an empty board still renders");
+            assert_eq!(tasks(&argv(&["--all"])), 0);
+        });
+    }
+
+    #[test]
+    fn tasks_hides_finished_work_unless_asked() {
+        with_fleet(|| {
+            let _ = announce(&argv(&["t1", "open", "one"]));
+            let _ = announce(&argv(&["t2", "closed", "one"]));
+            let _ = done(&argv(&["t2", "finished"]));
+            let board = super::super::tasks::fold_tasks(&read_blackboard());
+            let open: Vec<&str> = board
+                .iter()
+                .filter(|t| !matches!(t.state(), super::super::tasks::TaskState::Done))
+                .map(|t| t.id.as_str())
+                .collect();
+            // The default view is "what can I pick up", so finished work must
+            // not crowd it out — but --all still has to show everything.
+            assert_eq!(open, vec!["t1"]);
+            assert_eq!(board.len(), 2);
+            assert_eq!(tasks(&argv(&[])), 0);
+            assert_eq!(tasks(&argv(&["--all"])), 0);
+        });
+    }
+
+    #[test]
+    fn the_fleet_view_reports_who_holds_what() {
+        with_fleet(|| {
+            let _ = announce(&argv(&["t1", "work"]));
+            let _ = take(&argv(&["--ttl", "300"]));
+            // Text and JSON both have to work: the first is for a human at a
+            // terminal, the second is what a graph renderer consumes.
+            assert_eq!(fleet(&argv(&[])), 0);
+            assert_eq!(fleet(&argv(&["--json"])), 0);
+        });
+    }
+
     #[test]
     fn the_verbs_reject_input_they_cannot_act_on() {
         // A bid with no price can't be compared, so it must not silently post

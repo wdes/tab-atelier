@@ -2942,6 +2942,12 @@ fn parse_https_host_port(url: &str) -> Result<(String, u16), String> {
         (authority.to_string(), "443")
     };
     let port = port.parse::<u16>().map_err(|e| format!("bad port {port:?}: {e}"))?;
+    // An empty host parses fine and then fails much later, inside the TLS
+    // handshake, as something unrelated-looking. This is used to pin a
+    // certificate to a machine; "no machine" is not an answer.
+    if host.is_empty() {
+        return Err(format!("no host in {url:?}"));
+    }
     Ok((host, port))
 }
 
@@ -5707,5 +5713,145 @@ mod state_writer_tests {
         );
         // A second flush with an empty queue returns immediately.
         w.flush();
+    }
+
+    #[test]
+    fn the_tab_led_stays_dark_until_there_is_something_to_say() {
+        use crate::{AgentState, TabLed, compute_tab_led};
+        // Nothing attached, nothing running: no LED at all. A dot on every
+        // idle tab is a dot that means nothing.
+        assert_eq!(compute_tab_led(None, false, false, false, false, false, false), None);
+        // A session attached to a live agent is worth showing even with no
+        // reported state.
+        assert_eq!(
+            compute_tab_led(None, true, false, true, false, false, false),
+            Some(TabLed::Idle)
+        );
+        // Output moving means working, even if the agent never reported a state
+        // — some tools write without calling set-status.
+        assert_eq!(
+            compute_tab_led(None, true, false, true, false, false, true),
+            Some(TabLed::Working)
+        );
+        assert_eq!(
+            compute_tab_led(Some(AgentState::Thinking), true, false, true, false, false, false),
+            Some(TabLed::Working)
+        );
+    }
+
+    #[test]
+    fn a_dead_agent_outranks_every_other_led_state() {
+        use crate::{AgentState, TabLed, compute_tab_led};
+        // Attached, not alive, not the brain, and a full sweep has confirmed
+        // it: that is a corpse, and it must win over any stale reported state.
+        let dead = compute_tab_led(Some(AgentState::Thinking), true, false, false, true, false, true);
+        assert_eq!(dead, Some(TabLed::Dead));
+        // Without the full sweep we do not yet know it is dead — reporting a
+        // corpse on incomplete information would cry wolf on every startup.
+        assert_ne!(
+            compute_tab_led(Some(AgentState::Thinking), true, false, false, false, false, true),
+            Some(TabLed::Dead)
+        );
+        // The brain is exempt: it has no session of its own to lose.
+        assert_ne!(
+            compute_tab_led(None, true, true, false, true, false, false),
+            Some(TabLed::Dead)
+        );
+    }
+
+    #[test]
+    fn error_beats_working_and_unreviewed_is_the_quietest_signal() {
+        use crate::{AgentState, TabLed, compute_tab_led};
+        // An error must not be hidden by output still trickling out.
+        assert_eq!(
+            compute_tab_led(Some(AgentState::Error), true, false, true, false, false, true),
+            Some(TabLed::Error)
+        );
+        // Finished, with work nobody has looked at: visible, but the calmest
+        // colour — it is a reminder, not an alarm.
+        assert_eq!(
+            compute_tab_led(None, true, false, true, false, true, false),
+            Some(TabLed::Unreviewed)
+        );
+        // Unreviewed work keeps the LED alive even after the agent exits, so
+        // the result is not lost when the process is.
+        assert_eq!(
+            compute_tab_led(None, true, false, false, false, true, false),
+            Some(TabLed::Unreviewed)
+        );
+    }
+
+    #[test]
+    fn the_local_client_url_keeps_only_the_port() {
+        use crate::api_url_for_local_clients;
+        // A tab's own tools must reach the daemon on loopback whatever the
+        // daemon bound: 0.0.0.0 is a bind spec, not an address to call.
+        assert_eq!(api_url_for_local_clients("0.0.0.0:7890"), "http://127.0.0.1:7890");
+        assert_eq!(api_url_for_local_clients("127.0.0.1:7899"), "http://127.0.0.1:7899");
+        assert_eq!(api_url_for_local_clients("[::]:7890"), "http://127.0.0.1:7890");
+        // Junk falls back to the default port rather than producing a URL
+        // nothing can connect to.
+        let fallback = format!("http://127.0.0.1:{}", crate::DEFAULT_API_PORT);
+        assert_eq!(api_url_for_local_clients("nonsense"), fallback);
+        assert_eq!(api_url_for_local_clients(""), fallback);
+    }
+
+    #[test]
+    fn a_share_token_is_long_enough_to_be_unguessable_and_never_repeats() {
+        use std::collections::HashSet;
+        let mut seen = HashSet::new();
+        for _ in 0..64 {
+            let t = crate::mint_share_token();
+            // 32 hex chars = 128 bits. Short tokens are the whole risk here:
+            // a share link is a bearer credential on a URL.
+            assert_eq!(t.len(), 32, "{t}");
+            assert!(t.chars().all(|c| c.is_ascii_hexdigit()), "{t}");
+            assert!(seen.insert(t), "mint_share_token repeated a value");
+        }
+    }
+
+    #[test]
+    fn a_token_file_is_minted_once_and_then_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("some.token");
+        let first = crate::read_or_mint_token(&path);
+        assert_eq!(first.len(), 32);
+        // Stability is the point: a token that changed on every read would
+        // invalidate every link and every configured peer on each call.
+        assert_eq!(crate::read_or_mint_token(&path), first);
+        assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), first);
+        // Whitespace around a hand-edited token is tolerated rather than
+        // producing a credential with a newline in it.
+        std::fs::write(&path, "  padded-token  \n").unwrap();
+        assert_eq!(crate::read_or_mint_token(&path), "padded-token");
+        // An empty file is re-minted rather than returned as an empty token,
+        // which would authenticate nobody and be very confusing.
+        std::fs::write(&path, "\n").unwrap();
+        let reminted = crate::read_or_mint_token(&path);
+        assert_eq!(reminted.len(), 32);
+    }
+
+    #[test]
+    fn an_https_endpoint_splits_into_host_and_port() {
+        use crate::parse_https_host_port;
+        assert_eq!(
+            parse_https_host_port("https://build-box:7891").unwrap(),
+            ("build-box".to_string(), 7891)
+        );
+        // No port means the HTTPS default, not a parse failure.
+        assert_eq!(
+            parse_https_host_port("https://example.com").unwrap(),
+            ("example.com".to_string(), 443)
+        );
+        // A path must not end up in the hostname.
+        assert_eq!(
+            parse_https_host_port("https://host:8443/tabs?x=1").unwrap(),
+            ("host".to_string(), 8443)
+        );
+        // Plain http is refused: this is used to pin a TLS certificate, and
+        // silently accepting an unencrypted URL would pin nothing.
+        assert!(parse_https_host_port("http://host:80").is_err());
+        assert!(parse_https_host_port("host:443").is_err());
+        assert!(parse_https_host_port("https://").is_err());
     }
 }

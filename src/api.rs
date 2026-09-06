@@ -3682,6 +3682,81 @@ mod tests {
     static BOARD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
+    fn a_missing_or_unwritable_cert_path_is_reported_before_the_server_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let ok = dir.path().join("new.pem");
+        // A path that does not exist yet is fine — we are about to create it.
+        super::ensure_writable(&ok).expect("a fresh path is writable");
+        std::fs::write(&ok, b"x").unwrap();
+        super::ensure_writable(&ok).expect("an existing writable file is fine");
+        // A directory where a file should be must fail HERE, not halfway
+        // through writing a certificate.
+        let as_dir = dir.path().join("adir");
+        std::fs::create_dir(&as_dir).unwrap();
+        assert!(super::ensure_writable(&as_dir).is_err());
+        // A path whose parent does not exist cannot be created either.
+        assert!(super::ensure_writable(&dir.path().join("no/such/dir/f.pem")).is_err());
+    }
+
+    #[test]
+    fn an_external_cert_pair_is_loaded_or_refused_with_a_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let crt = dir.path().join("server.crt");
+        let key = dir.path().join("server.key");
+        // Nothing there at all.
+        assert!(super::load_external_cert(&crt, &key).is_err());
+        // Real, self-consistent PEM: generate one the same way the daemon
+        // does, so the test proves the loader accepts what we emit.
+        let generated = super::load_or_generate_cert(None).expect("self-signed");
+        let (chain, der_key) = generated;
+        assert!(!chain.is_empty(), "a generated chain must contain the leaf");
+        assert!(!der_key.is_empty());
+
+        // Garbage in the files is refused rather than half-loaded into a
+        // server that then fails every handshake.
+        std::fs::write(&crt, b"not a certificate").unwrap();
+        std::fs::write(&key, b"not a key").unwrap();
+        assert!(super::load_external_cert(&crt, &key).is_err());
+        // A cert with no key is equally useless.
+        std::fs::write(&crt, b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n").unwrap();
+        std::fs::write(&key, b"").unwrap();
+        assert!(super::load_external_cert(&crt, &key).is_err());
+    }
+
+    #[test]
+    fn a_client_ca_bundle_needs_at_least_one_usable_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = dir.path().join("ca.pem");
+        // Empty or junk bundles must be an error: silently trusting nobody
+        // would present as "every client is rejected" much later.
+        std::fs::write(&ca, b"").unwrap();
+        assert!(super::load_client_ca(&ca).is_err());
+        std::fs::write(&ca, b"garbage\n").unwrap();
+        assert!(super::load_client_ca(&ca).is_err());
+        assert!(super::load_client_ca(&dir.path().join("absent.pem")).is_err());
+    }
+
+    #[test]
+    fn schedule_headers_describe_the_lock_without_breaking_the_response() {
+        let schedule = crate::schedule::TabSchedule {
+            rule: "Mo-Fr 09:00-18:00".into(),
+            tz: "Europe/Paris".into(),
+        };
+        let mut extra = String::new();
+        super::write_schedule_headers(&mut extra, &schedule);
+        // A viewer shows the reason and the next change, so both have to be
+        // present…
+        assert!(extra.contains("X-Tab-Schedule"), "{extra}");
+        // …and every header line must be CRLF-terminated, or the rest of the
+        // response is swallowed into a malformed header block.
+        assert!(extra.ends_with("\r\n"), "{extra:?}");
+        for line in extra.split("\r\n").filter(|l| !l.is_empty()) {
+            assert!(line.contains(':'), "not a header: {line:?}");
+            assert!(!line.contains('\n'), "embedded newline: {line:?}");
+        }
+    }
+
+    #[test]
     fn the_fleet_route_renders_who_is_working_on_what() {
         let _guard = BOARD_TEST_LOCK
             .lock()

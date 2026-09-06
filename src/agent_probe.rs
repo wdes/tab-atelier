@@ -677,4 +677,107 @@ mod tests {
         assert!(t.to_string_lossy().contains("agent_trace_claude-"), "{}", t.display());
         assert_eq!(t.extension().and_then(|e| e.to_str()), Some("txt"));
     }
+
+    /// A minimal sample; only the fields a given test asserts on are set.
+    fn probe_line(ts: f64, cpu: f64) -> super::ProbeLine {
+        super::ProbeLine {
+            ts,
+            dt: 1.0,
+            tab: "tab-x".into(),
+            pid: 42,
+            state: "idle".into(),
+            cpu_pct: cpu,
+            rss_mb: 10.0,
+            threads: 3,
+            procs: 1,
+            ctxsw_per_s: 0.0,
+            vol_per_s: 0.0,
+            nonvol_per_s: 0.0,
+        }
+    }
+
+    #[test]
+    fn probe_lines_round_trip_through_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        // Nothing written yet: an absent log is an empty history, not an
+        // error — a tab that never ran an agent is the normal case.
+        assert!(super::read_all(base, "tab-x").is_empty());
+        assert!(super::read_latest(base, "tab-x").is_none());
+        assert!(super::list_logs(base).is_empty());
+
+        super::append_line(base, "tab-x", &probe_line(1_000.0, 12.5));
+        super::append_line(base, "tab-x", &probe_line(2_000.0, 30.0));
+
+        let all = super::read_all(base, "tab-x");
+        assert_eq!(all.len(), 2, "append must not overwrite the previous sample");
+        assert!((all[0].ts - 1_000.0).abs() < f64::EPSILON);
+        // `read_latest` is what the stats popup shows, so it must be the most
+        // recent sample rather than the first.
+        let latest = super::read_latest(base, "tab-x").expect("latest");
+        assert!((latest.ts - 2_000.0).abs() < f64::EPSILON);
+        assert!((latest.cpu_pct - 30.0).abs() < f64::EPSILON);
+
+        // The log is discoverable by tab, which is how `tab-atelier log`
+        // lists what it can show.
+        let logs = super::list_logs(base);
+        assert!(logs.iter().any(|l| l.contains("tab-x")), "{logs:?}");
+        // A different tab has its own file: one agent's samples must never
+        // land in another tab's history.
+        super::append_line(base, "tab-y", &probe_line(3_000.0, 1.0));
+        assert_eq!(super::read_all(base, "tab-x").len(), 2);
+        assert_eq!(super::read_all(base, "tab-y").len(), 1);
+    }
+
+    #[test]
+    fn a_corrupt_line_does_not_destroy_the_history_around_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        super::append_line(base, "tab-z", &probe_line(7.0, 1.0));
+        // A half-written line is what a crash mid-append leaves behind. The
+        // reader must skip it and keep the good samples, not return nothing.
+        let path = super::log_path(base, "tab-z");
+        let mut body = std::fs::read_to_string(&path).unwrap();
+        body.push_str("{\"ts\": not json\n");
+        body.push_str(&serde_json::to_string(&probe_line(8.0, 1.0)).unwrap());
+        body.push('\n');
+        std::fs::write(&path, body).unwrap();
+        let all = super::read_all(base, "tab-z");
+        assert_eq!(all.len(), 2, "a broken line should be skipped, not fatal");
+        assert!((all[1].ts - 8.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn log_paths_are_namespaced_and_filename_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        // A session id from a hostile or merely awkward source must not climb
+        // out of the state directory.
+        let p = super::frame_log_path(base, "claude", "../../etc/passwd");
+        assert!(p.starts_with(base), "escaped the state dir: {}", p.display());
+        // The real property is that the session id becomes ONE filename
+        // component: `..` with no separator beside it cannot climb anywhere,
+        // so the check is for separators, not for the characters themselves.
+        let name = p.file_name().and_then(std::ffi::OsStr::to_str).expect("file name");
+        assert!(!name.contains('/'), "session id kept a separator: {name}");
+        assert_eq!(p.parent(), Some(crate::state_dir(base).as_path()));
+        // Kind and session both appear, so two agents in one tab don't share
+        // a file.
+        let a = super::frame_log_path(base, "claude", "s1");
+        let b = super::frame_log_path(base, "claude", "s2");
+        let c = super::frame_log_path(base, "aider", "s1");
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn which_finds_a_program_on_the_path_and_rejects_a_missing_one() {
+        // An absolute path is used as-is when it exists…
+        assert_eq!(super::which("/bin/sh").as_deref(), Some("/bin/sh"));
+        // …and refused when it does not, rather than being handed to exec.
+        assert!(super::which("/nonexistent/definitely-not-here").is_none());
+        assert!(super::which("definitely-not-a-real-binary-xyz").is_none());
+        // A bare name resolves through PATH; `sh` is on every POSIX box.
+        assert!(super::which("sh").is_some_and(|p| p.ends_with("/sh")));
+    }
 }
