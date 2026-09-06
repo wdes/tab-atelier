@@ -1595,4 +1595,61 @@ mod tests {
         // stability clock → an auto-retrying agent is never nudged.
         assert_ne!(hash_output("retrying in 38s"), hash_output("retrying in 37s"));
     }
+
+    #[test]
+    fn a_tick_against_a_live_daemon_scans_without_nudging_idle_tabs() {
+        // `tick` is the brain's whole job and was uncovered because it needs
+        // a daemon. The harness gives it one: two tabs, neither of them a
+        // stalled claude, so a correct tick reads the fleet and sends nothing.
+        crate::cli::share_link::with_test_server(|_| {
+            let mut brain = super::Brain::default();
+            brain.tick().expect("a tick against a healthy daemon must succeed");
+            // The scan is resumable, so a second tick is also fine and must
+            // not double-count anything.
+            brain.tick().expect("second tick");
+            // Nothing on the fixture is an idle claude with unseen output, so
+            // nothing should have been nudged — a brain that nudges a shell
+            // types "continue" into someone's terminal.
+            assert!(
+                brain.last_nudge_at.is_none(),
+                "nudged a tab that was not a stalled agent"
+            );
+        });
+    }
+
+    #[test]
+    fn a_tick_without_a_daemon_is_an_error_not_a_panic() {
+        // The daemon restarts; the brain outlives it. A tick during that gap
+        // must return Err so the loop can retry, never unwind the thread.
+        crate::cli::share_link::set_test_endpoint(Some(crate::cli::share_link::Endpoint {
+            url: "http://127.0.0.1:1".into(),
+            token: "t".into(),
+        }));
+        let mut brain = super::Brain::default();
+        let got = brain.tick();
+        crate::cli::share_link::set_test_endpoint(None);
+        assert!(got.is_err(), "an unreachable daemon must be an error");
+    }
+
+    #[test]
+    fn the_connectivity_probe_reports_a_reachable_or_unreachable_network() {
+        // `is_online` gates the systemic-freeze breaker: if it lies, the brain
+        // either nudges into a dead network or refuses to nudge a healthy one.
+        let mut probe = super::ConnectivityProbe::default();
+        let first = probe.is_online();
+        // Whatever the answer, it must be stable within the cache window
+        // rather than re-probing (and re-costing) on every tab.
+        assert_eq!(probe.is_online(), first, "the probe must be cached between calls");
+    }
+
+    #[test]
+    fn the_crash_log_never_panics_on_a_hostile_message() {
+        // It is called from the panic path, so it must survive anything —
+        // including a message that is not valid UTF-8-shaped text or is
+        // enormous.
+        super::crash_log("ordinary message");
+        super::crash_log("");
+        super::crash_log(&"x".repeat(100_000));
+        super::crash_log("null\0byte and \u{1b}[31m escapes");
+    }
 }
