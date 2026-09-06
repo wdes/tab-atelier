@@ -421,6 +421,30 @@ pub fn apply_telemetry_disable_env<S: std::hash::BuildHasher>(env: &mut std::col
     }
 }
 
+/// Extra environment for a newly created tab.
+///
+/// `api_created` marks a tab the API asked for — an agent's tab from
+/// `dispatch --new` or `tab-atelier add`, rather than one the user opened.
+/// Those get the colour opt-out: an agent's output is read by another program
+/// (`peek`, `output`, a `--wait` poll, the next agent along), and ANSI escapes
+/// there are bytes nobody looks at cluttering a scrollback something else has
+/// to parse. The user's own tabs keep their colours.
+///
+/// `NO_COLOR` is the cross-tool convention (any non-empty value disables
+/// colour); `CLICOLOR=0` covers the BSD-style tools that predate it. Neither
+/// touches `TERM`, so the terminal itself still behaves — unlike the
+/// right-click "Disable colors", which sets `TERM=dumb` and would break an
+/// agent's TUI outright.
+#[must_use]
+pub fn new_tab_env(api_created: bool) -> std::collections::HashMap<String, String> {
+    let mut env = std::collections::HashMap::new();
+    if api_created {
+        env.insert("NO_COLOR".into(), "1".into());
+        env.insert("CLICOLOR".into(), "0".into());
+    }
+    env
+}
+
 /// Per-tab environment extras for the NORMAL (non-cleared) spawn path.
 ///
 /// The colour vars from the tab's own flag, plus the telemetry opt-out;
@@ -5924,5 +5948,25 @@ mod state_writer_tests {
         if let Some(prev) = previous {
             crate::set_persisted_log_filter(Some(&prev)).expect("restore");
         }
+    }
+
+    #[test]
+    fn an_api_created_tab_gets_the_colour_opt_out_and_a_users_tab_does_not() {
+        // Regression: agent tabs must launch with colour off. Their output is
+        // read by programs (`peek`, `output`, `--wait`), where ANSI escapes
+        // are noise something else has to parse.
+        let agent = crate::new_tab_env(true);
+        assert_eq!(agent.get("NO_COLOR").map(String::as_str), Some("1"));
+        assert_eq!(agent.get("CLICOLOR").map(String::as_str), Some("0"));
+        // NO_COLOR is honoured by ANY non-empty value, so an empty string here
+        // would silently mean "colours on".
+        assert!(!agent.get("NO_COLOR").is_some_and(String::is_empty));
+        // It must not reach for TERM: `TERM=dumb` is the right-click "Disable
+        // colors" behaviour and would break an agent's TUI outright.
+        assert!(!agent.contains_key("TERM"), "{agent:?}");
+
+        // A tab the user opened is untouched — their colours are theirs.
+        let user = crate::new_tab_env(false);
+        assert!(user.is_empty(), "{user:?}");
     }
 }

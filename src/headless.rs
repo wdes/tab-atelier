@@ -2462,7 +2462,10 @@ fn drain_pending(
             }
         });
         let id = default_tab_id();
-        let env = tab_env_extras(&id, api_url_for_pty, api_token, &std::collections::BTreeMap::new());
+        let mut env = tab_env_extras(&id, api_url_for_pty, api_token, &std::collections::BTreeMap::new());
+        // Every tab here came from the API — an agent's, not the user's — so
+        // it launches with colour output off. See `new_tab_env`.
+        env.extend(crate::new_tab_env(true));
         let name = format!("Terminal {}", tabs.len());
         if let Some(t) = spawn_pty_tab(
             id,

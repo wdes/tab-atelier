@@ -63,15 +63,6 @@ use crate::STREAMING_LED_WINDOW;
 
 struct Tab {
     view: Entity<TerminalView>,
-    /// Created through the API rather than by the user (an agent tab from
-    /// `dispatch --new` or `tab-atelier add`).
-    ///
-    /// Two behaviours hang off this: such a tab does not steal focus when it
-    /// appears — a fleet spawning four workers must not yank the window out
-    /// from under whoever is typing — and it gets no project colour or badge.
-    /// Folder styling exists to tell a human which project a tab belongs to;
-    /// on a throwaway worker it is decoration nobody reads.
-    plain: bool,
     // String-ish fields that flow verbatim into `api::SnapshotTab` are
     // `Arc<str>` so each snapshot rebuild clones a refcount, not bytes.
     name: std::sync::Arc<str>,
@@ -337,10 +328,6 @@ impl Tab {
             badge: ts.badge.clone(),
             applied_tint: std::cell::Cell::new(None),
             resolved_badge: None,
-            // Restored tabs keep whatever the user sees today: a tab that
-            // survived a restart is one they have lived with, so it styles
-            // like any other.
-            plain: false,
             context: None,
             last_pushed_locked: None,
             pending_agent_resume,
@@ -1757,12 +1744,13 @@ impl AppState {
         self.insert_tab(self.tabs.len(), None, window, cx);
     }
 
-    /// A tab the API asked for (`POST /tabs` with `{cwd: ...}`): appended,
-    /// but neither focused nor styled.
+    /// A tab the API asked for (`POST /tabs` with `{cwd: ...}`): appended
+    /// without stealing focus, and with colour output turned off.
     ///
     /// A fleet spawning four workers must not yank the window away from
-    /// whoever is typing, and a throwaway worker gets no project colour —
-    /// folder styling is there to tell a human which project a tab belongs to.
+    /// whoever is typing. And an agent's output is read by a program, not a
+    /// person: ANSI colour in it is bytes nobody looks at, in a scrollback
+    /// another agent may have to read back.
     fn add_tab_in_background(&mut self, cwd: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let at = self.tabs.len();
         self.insert_tab_inner(at, Some(cwd), false, window, cx);
@@ -1802,12 +1790,15 @@ impl AppState {
         let tn = self.theme_name;
         let cs = self.cursor_style;
         let new_id = crate::default_tab_id();
-        let env = tab_env_extras(
+        let mut env = tab_env_extras(
             &new_id,
             &api_url_for_local_clients(&self.api_addr),
             &self.api_token,
             &std::collections::BTreeMap::new(),
         );
+        // `focus` false means the API asked for this tab, so it launches with
+        // colour output off — see `new_tab_env`.
+        env.extend(crate::new_tab_env(!focus));
         // Claude-only mode: a fresh tab launches `claude` in `auto` permission
         // mode instead of a plain shell. Under cleared-env we can `exec`
         // it directly via the shell suffix; otherwise we type the command into
@@ -1849,9 +1840,8 @@ impl AppState {
             name,
             ..TabState::default()
         };
-        let mut tab = Tab::from_state(view, &seed, cwd, None, pending_claude, focus);
-        tab.plain = !focus;
-        self.tabs.insert(idx, tab);
+        self.tabs
+            .insert(idx, Tab::from_state(view, &seed, cwd, None, pending_claude, focus));
         if focus {
             self.active = idx;
         } else if idx <= self.active {
@@ -2142,11 +2132,7 @@ impl AppState {
             let Some(grid) = tab.snap_cache.clone() else {
                 continue;
             };
-            let folder = if tab.plain {
-                crate::FolderStyle::default()
-            } else {
-                crate::folder_style_of(tab.last_known_cwd_string.as_deref())
-            };
+            let folder = crate::folder_style_of(tab.last_known_cwd_string.as_deref());
             let bg_color = crate::effective_tab_bg(
                 tab.bg_color.as_deref(),
                 folder.color.as_deref(),
