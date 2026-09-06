@@ -159,10 +159,18 @@ pub fn done(args: &[String]) -> i32 {
     // Finishing releases the lease immediately rather than leaving the key
     // parked until it lapses — the next agent shouldn't wait out a TTL for
     // work that is already done.
+    // Released where it was taken: for a task with a remote home that is the
+    // home host, not this one.
     if code == 0
         && let Ok(ep) = discover_endpoint()
     {
-        let _ = release_claim(&ep, &format!("task:{}", id.trim()), &whoami());
+        let key = format!("task:{}", id.trim());
+        let board = fold_tasks(&read_blackboard());
+        let target = board
+            .iter()
+            .find(|t| t.id == id.trim())
+            .map_or_else(|| ep.clone(), |t| claim_endpoint(t, &ep).0);
+        let _ = release_claim(&target, &key, &whoami());
     }
     code
 }
@@ -185,6 +193,36 @@ pub fn tasks(args: &[String]) -> i32 {
         println!("{}", format_task(t));
     }
     0
+}
+
+/// Where a task's lease lives.
+///
+/// A task's **home** is the host it was announced on, and the home host's
+/// lease table is authoritative for it — otherwise two hosts with identical
+/// (gossiped) boards each consult their own table and both say yes.
+///
+/// Falls back to the local table when the home is us, unknown, or unreachable.
+/// That fallback is the confederal escape hatch: a member keeps working during
+/// a partition instead of blocking on an absent authority, at the price of a
+/// duplicate that surfaces at `done` time.
+fn claim_endpoint(task: &super::tasks::TaskView, local: &Endpoint) -> (Endpoint, Option<String>) {
+    let Some(home) = task.home.as_deref() else {
+        return (local.clone(), None);
+    };
+    let me = super::team::origin_id();
+    let prefs = crate::load_preferences(&crate::platform::config_dir());
+    crate::federation::endpoint_for(home, &me, &prefs.remote_endpoints).map_or_else(
+        || (local.clone(), None),
+        |remote| {
+            (
+                Endpoint {
+                    url: remote.url,
+                    token: remote.token,
+                },
+                Some(home.to_owned()),
+            )
+        },
+    )
 }
 
 /// Ask the daemon for a lease. `Ok(true)` granted, `Ok(false)` someone else
@@ -210,6 +248,71 @@ fn release_claim(ep: &Endpoint, key: &str, holder: &str) -> Result<(), String> {
         .send_json(&body)
         .map(|_| ())
         .map_err(|e| e.to_string())
+}
+
+/// `fleet [--json]` — who is working on what, as a graph.
+///
+/// The JSON is `GET /fleet` verbatim (nodes + edges), for a renderer. The
+/// default text form is the same data flattened to one line per working agent,
+/// because "who is doing what right now" is the question actually asked at a
+/// terminal.
+#[must_use]
+pub fn fleet(args: &[String]) -> i32 {
+    let json = args.iter().any(|a| a == "--json");
+    let ep = match discover_endpoint() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("fleet: {e}");
+            return 1;
+        }
+    };
+    let body = match agent()
+        .get(format!("{}/fleet", ep.url))
+        .header("Authorization", format!("Bearer {}", ep.token))
+        .call()
+        .map_err(|e| e.to_string())
+        .and_then(|mut r| r.body_mut().read_to_string().map_err(|e| e.to_string()))
+    {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("fleet: {e}");
+            return 1;
+        }
+    };
+    if json {
+        println!("{body}");
+        return 0;
+    }
+    let Ok(g) = serde_json::from_str::<crate::fleet::Graph>(&body) else {
+        eprintln!("fleet: unexpected response shape");
+        return 1;
+    };
+    let label = |id: &str| {
+        g.nodes
+            .iter()
+            .find(|n| n.id == id)
+            .map_or_else(|| id.to_owned(), |n| n.label.clone())
+    };
+    let working: Vec<&crate::fleet::Edge> = g.edges.iter().filter(|e| e.kind == "works_on").collect();
+    if working.is_empty() {
+        println!("(nobody is working on anything — `tab-atelier tasks` for the board)");
+        return 0;
+    }
+    for e in working {
+        // A lease that has lapsed under an award is the thing worth seeing:
+        // the agent said it was working and then stopped holding the work.
+        let held = match (e.leased, e.expires_in_ms) {
+            (Some(true), Some(ms)) => format!("lease {}s left", ms / 1000),
+            (Some(true), None) => "leased".to_owned(),
+            _ => "NO LEASE".to_owned(),
+        };
+        println!(
+            "{} → {}  [{held}]",
+            e.from.strip_prefix("agent:").unwrap_or(&e.from),
+            label(&e.to)
+        );
+    }
+    0
 }
 
 /// `take [--ttl <seconds>] [--dry-run]` — lease the best open task for me.
@@ -264,7 +367,8 @@ pub fn take(args: &[String]) -> i32 {
     // Walk the ranking rather than stopping at the first refusal: a collision
     // means someone else got there, not that there is no work.
     for t in ranked {
-        match take_claim(&ep, &t.claim_key(), &me, ttl_s * 1000) {
+        let (claim_ep, away) = claim_endpoint(t, &ep);
+        match take_claim(&claim_ep, &t.claim_key(), &me, ttl_s * 1000) {
             Ok(None) => {
                 // Record the award so every other agent's board shows the task
                 // as spoken for, not just this host's lease table.
@@ -273,11 +377,29 @@ pub fn take(args: &[String]) -> i32 {
                 n.to = Some(me.clone());
                 let _ = append_entry(n);
                 println!("{}", format_task(t));
-                println!("(leased {} for {ttl_s}s as {me})", t.claim_key());
+                match &away {
+                    Some(home) => println!(
+                        "(leased {} for {ttl_s}s as {me}, from its home host {home})",
+                        t.claim_key()
+                    ),
+                    None => println!("(leased {} for {ttl_s}s as {me})", t.claim_key()),
+                }
                 return 0;
             }
             Ok(Some(_)) => {}
             Err(e) => {
+                // A home host we can't reach must not end the sweep: fall back
+                // to the local table for this task and keep going. Say so —
+                // a duplicate becomes possible, and that must never be silent.
+                if away.is_some() {
+                    eprintln!("take: {} unreachable ({e}) — claiming locally instead", t.claim_key());
+                    if matches!(take_claim(&ep, &t.claim_key(), &me, ttl_s * 1000), Ok(None)) {
+                        println!("{}", format_task(t));
+                        println!("(leased {} locally as {me}; its home host is away)", t.claim_key());
+                        return 0;
+                    }
+                    continue;
+                }
                 eprintln!("take: {e}");
                 return 1;
             }

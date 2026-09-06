@@ -144,6 +144,42 @@ paths:
                 properties:
                   released: { type: boolean }
         "400": { description: Missing key or holder }
+  /fleet:
+    get:
+      tags: [fleet]
+      summary: The fleet as a graph — who is working on what, and where
+      description: >
+        A join of three things that each know part of the answer: the
+        blackboard (what work exists, who was awarded it), the lease registry
+        (what is actually held right now) and the tab list (which agents are
+        alive here), plus the learned federation directory.
+
+
+        `works_on` edges carry `leased` and `expires_in_ms`. An award with no
+        live lease is the interesting state — the agent said it was working and
+        then stopped holding the work, having died or thought past its expiry —
+        so it is a field rather than something a renderer has to infer.
+
+
+        Agents with no tab on this host appear with `status: elsewhere`: in a
+        federated fleet most agents are on another machine, and omitting them
+        would render work assigned to nobody.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Nodes and edges
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  nodes:
+                    type: array
+                    items: { $ref: "#/components/schemas/FleetNode" }
+                  edges:
+                    type: array
+                    items: { $ref: "#/components/schemas/FleetEdge" }
   /blackboard:
     get:
       tags: [blackboard]
@@ -621,6 +657,42 @@ components:
             Strictly increasing across every grant this host makes, including
             renewals. A holder presenting an older fence is presenting a claim
             it has already lost.
+    FleetNode:
+      type: object
+      properties:
+        id:
+          type: string
+          description: "Unique in the graph: `host:<name>`, `agent:<name>`, `task:<id>`."
+          example: "task:cov:src/api.rs"
+        kind: { type: string, enum: [host, agent, task] }
+        label: { type: string, description: What to draw on it. }
+        status:
+          type: string
+          description: >
+            Task lifecycle (open/bidding/awarded/done/failed), an agent's
+            reported state, `elsewhere` for an agent with no tab here, or
+            self/peer on a host.
+        uuid:
+          type: string
+          description: For agents, the tab uuid, so a viewer can link to the tab.
+    FleetEdge:
+      type: object
+      properties:
+        from: { type: string }
+        to: { type: string }
+        kind:
+          type: string
+          enum: [runs_on, announced, bid, works_on, home, peer]
+        label: { type: string, description: A bid's cost, where applicable. }
+        leased:
+          type: boolean
+          description: >
+            On `works_on`: whether a live lease still backs the award. False
+            means the agent stopped holding the work.
+        expires_in_ms:
+          type: integer
+          format: int64
+          description: "On `works_on`: milliseconds until the lease lapses."
     BlackboardEntry:
       type: object
       description: >

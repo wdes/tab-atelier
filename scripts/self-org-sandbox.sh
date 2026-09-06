@@ -11,11 +11,15 @@
 # protocol without spending tokens or depending on a model's behaviour.
 #
 # What it asserts, in order:
-#   1. backlog turns a coverage report into announced work
+#   1. backlog turns a source (here, coverage) into announced work
 #   2. concurrent takes never hand one task to two agents   <- the whole point
 #   3. done closes the task and frees the lease
 #   4. gossip converges two hosts that never coordinated
 #   5. a second backlog sweep announces nothing (idempotent)
+#   6. wait reports outcomes as exit codes, cheaply, many at once
+#   7. the fleet graph joins board + leases + tabs without dangling edges
+#   8. a task taken on one host is leased at its HOME host, so the fleet
+#      cannot hand the same work to two machines
 #
 # Usage: scripts/self-org-sandbox.sh [--keep]
 set -uo pipefail
@@ -162,20 +166,17 @@ check "done released the lease immediately" "$leases_after" "3"
 
 # --- 4. gossip converges two hosts -------------------------------------------
 echo "== 4. gossip =="
+# Membership is BILATERAL by construction: `remote add` is a treaty between two
+# hosts, not admission to a union. Each side registers the other, so each keeps
+# the right to decide who it federates with — and a one-way registration is a
+# legitimate configuration, it just means claims degrade to local on the side
+# that can't reach back.
 # shellcheck disable=SC2086
 b_token=$($(host_env b $PORT_B) "$BIN" token)
 # shellcheck disable=SC2086
-$A remote add --label peer-b --url "http://127.0.0.1:$PORT_B" --token "$b_token" > /dev/null 2>&1 \
-    || python3 - "$SBOX/a/config/tab-atelier/preferences.json" "$PORT_B" "$b_token" <<'PY'
-import json, sys, uuid
-path, port, token = sys.argv[1], sys.argv[2], sys.argv[3]
-doc = json.load(open(path))
-doc.setdefault("remote_endpoints", []).append({
-    "id": str(uuid.uuid4()), "label": "peer-b", "url": f"http://127.0.0.1:{port}",
-    "token": token, "cert_sha256": "", "autoconnect": False,
-})
-json.dump(doc, open(path, "w"))
-PY
+a_token=$($(host_env a $PORT_A) "$BIN" token)
+python3 "$REPO/scripts/sandbox-add-peer.py" "$SBOX/a/config/tab-atelier/preferences.json" peer-b "$PORT_B" "$b_token"
+python3 "$REPO/scripts/sandbox-add-peer.py" "$SBOX/b/config/tab-atelier/preferences.json" peer-a "$PORT_A" "$a_token"
 
 # shellcheck disable=SC2086
 before=$($B tasks --all | grep -c '^\[' || true)
@@ -200,8 +201,14 @@ if echo "$second" | grep -q "pulled 0 pushed 0"; then ok "a second round is a no
 $A announce "cov:src/new.rs" "raise coverage of src/new.rs" > /dev/null
 # shellcheck disable=SC2086
 $A gossip -q > /dev/null
+# B gossips once too: that round is where it learns which endpoint speaks for
+# the host a task calls home. Without it, B knows the work but not who
+# arbitrates it, and would fall back to claiming locally.
+# shellcheck disable=SC2086
+$B gossip | sed 's/^/     /'
 # shellcheck disable=SC2086
 b_take=$($(host_env b $PORT_B) TAB_ATELIER_AGENT="b-agent" "$BIN" take --ttl 60 2>&1)
+echo "$b_take" | sed 's/^/     /'
 if echo "$b_take" | grep -q 'cov:src/new.rs'; then ok "host b took work that host a announced"; else no "host b could not take: $b_take"; fi
 # shellcheck disable=SC2086
 $A gossip | sed 's/^/     /'
@@ -222,6 +229,70 @@ echo "$again" | sed 's/^/     /'
 if echo "$again" | grep -q "nothing to announce"; then ok "a repeat sweep announces nothing"; else no "duplicate tasks: $again"; fi
 # The finished one is still cooling, so it does not come back either.
 if echo "$again" | grep -q "$first_task"; then no "re-announced a task finished seconds ago"; else ok "finished work stayed off the board (cooldown)"; fi
+
+# --- 6. wait: exit codes, not long polls -------------------------------------
+echo "== 6. wait =="
+# shellcheck disable=SC2086
+$A wait "$first_task" --timeout 5 --quiet; code=$?
+check "wait exits 0 for a finished task" "$code" "0"
+# shellcheck disable=SC2086
+$A wait "cov:src/relay.rs" --timeout 0 --quiet; code=$?
+check "wait exits 3 while a task is still running" "$code" "3"
+# shellcheck disable=SC2086
+$A wait "no-such-task" --timeout 0 --quiet; code=$?
+check "wait exits 4 for a task that does not exist" "$code" "4"
+# A failure must be distinguishable from success by exit code alone.
+# shellcheck disable=SC2086
+$A announce "flaky:demo" "a task that will fail" > /dev/null
+# shellcheck disable=SC2086
+$(host_env a $PORT_A) TAB_ATELIER_AGENT="agent-x" "$BIN" "done" "flaky:demo" --fail "could not build" > /dev/null
+# shellcheck disable=SC2086
+$A wait "flaky:demo" --timeout 0 --quiet; code=$?
+check "wait exits 1 for a failed task" "$code" "1"
+# Many at once, each a cheap board read rather than a held connection.
+start=$(date +%s)
+for t in "$first_task" "flaky:demo" "$first_task"; do
+    # shellcheck disable=SC2086
+    ( $(host_env a $PORT_A) "$BIN" wait "$t" --timeout 5 --quiet ) &
+done
+wait
+elapsed=$(( $(date +%s) - start ))
+if [ "$elapsed" -le 3 ]; then ok "three parallel waits returned promptly (${elapsed}s)"; else no "parallel waits took ${elapsed}s"; fi
+
+# --- 7. the graph route ------------------------------------------------------
+echo "== 7. fleet graph =="
+# shellcheck disable=SC2086
+$A fleet | sed 's/^/     /'
+# shellcheck disable=SC2086
+$A fleet --json > "$SBOX/graph.json"
+if python3 "$REPO/scripts/check-fleet-graph.py" "$SBOX/graph.json"; then
+    ok "graph exposes agent→task edges carrying lease state"
+else
+    no "graph shape wrong"
+fi
+
+# --- 8. federation: the home host arbitrates ---------------------------------
+echo "== 8. federated claims =="
+# b-agent took cov:src/new.rs, whose home is host a. With local-only claims,
+# host b would have leased it locally and host a would know nothing.
+a_token=$($(host_env a $PORT_A) "$BIN" token 2>/dev/null)
+leases_a=$(curl -s -H "Authorization: Bearer $a_token" "http://127.0.0.1:$PORT_A/claims" 2>/dev/null)
+if echo "$leases_a" | grep -q "task:cov:src/new.rs"; then
+    ok "a task taken on host b is leased at its HOME host (host a)"
+else
+    no "the lease did not go to the home host"
+    echo "$leases_a" | sed 's/^/       /'
+fi
+if echo "$leases_a" | grep -q "b-agent"; then ok "and it names the remote agent as holder"; else no "holder is not b-agent"; fi
+# The decisive one: with the home host arbitrating, an agent on host a cannot
+# take it too, even though host a's own board shows it as available work.
+# shellcheck disable=SC2086
+dup=$($(host_env a $PORT_A) TAB_ATELIER_AGENT="a-agent" "$BIN" take --ttl 60 2>&1)
+if echo "$dup" | grep -q "cov:src/new.rs"; then
+    no "two hosts handed out the same task: $dup"
+else
+    ok "host a refused to hand out work host b already holds"
+fi
 
 echo
 printf '== %d passed, %d failed ==\n' "$pass" "$fail"

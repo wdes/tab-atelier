@@ -5,8 +5,14 @@
 /// `tab-atelier claude [ARGS…]` — clear the grid + `exec claude` (a correct,
 /// no-fuss agent launcher; see the module docs).
 pub mod agent;
-/// `tab-atelier backlog` — turn a coverage report into announced work, so the
-/// fleet finds its own tasks instead of waiting to be told.
+/// `tab-atelier wait` — block until named tasks finish.
+///
+/// Reports the outcome as an exit code, so a shell can compose it.
+pub mod await_task;
+/// `tab-atelier backlog` — announce work from any source.
+///
+/// Sources emit `id<TAB>title`; this owns the idempotence and cooling that
+/// make a sweep safe to run on a timer.
 pub mod backlog;
 pub mod bench;
 pub mod bench_lag;

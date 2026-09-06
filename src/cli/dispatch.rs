@@ -476,9 +476,33 @@ pub enum Commands {
         args: Vec<String>,
     },
 
+    /// Block until named tasks finish: `wait <task-id>… [--timeout <s>]`.
+    ///
+    /// Reports the outcome as an exit code (0 done, 1 failed, 3 still running,
+    /// 4 unknown task) so a shell can compose it, rather than holding a
+    /// connection open and guessing from a screen that stopped changing. Cheap
+    /// enough to run many at once.
+    Wait {
+        /// Passed straight through to `cli::await_task::run`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Show the blackboard folded into tasks: `tasks [--all]`.
     Tasks {
         /// Passed straight through to `cli::work::tasks`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Who is working on what: `fleet [--json]`.
+    ///
+    /// `--json` is `GET /fleet` verbatim — nodes (`host`/`agent`/`task`) and
+    /// edges (`runs_on`/`announced`/`bid`/`works_on`/`home`/`peer`) for a
+    /// graph renderer. `works_on` says whether a live lease still backs the
+    /// award, which is how an agent that died mid-task shows up.
+    Fleet {
+        /// Passed straight through to `cli::work::fleet`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -905,6 +929,8 @@ fn command_exit_code(cli: Cli) -> Option<i32> {
         Commands::Take { args } => crate::cli::client::run("take", &args),
         Commands::Done { args } => crate::cli::client::run("done", &args),
         Commands::Tasks { args } => crate::cli::client::run("tasks", &args),
+        Commands::Wait { args } => crate::cli::client::run("wait", &args),
+        Commands::Fleet { args } => crate::cli::client::run("fleet", &args),
         Commands::Gossip { args } => crate::cli::client::run("gossip", &args),
         Commands::Backlog { args } => crate::cli::client::run("backlog", &args),
         Commands::Token => crate::cli::client::run("token", &[]),

@@ -31,6 +31,13 @@ pub struct TaskView {
     /// The announcement text.
     pub title: String,
     pub announced_by: Option<String>,
+    /// Host the task was announced on — its **home**.
+    ///
+    /// Once boards span machines, "who may hand out this task" needs an
+    /// answer, and the announcing host is the only one every peer can agree on
+    /// without a protocol: it is written into the entry that created the task,
+    /// and the fold picks the same one everywhere. See `federation.rs`.
+    pub home: Option<String>,
     pub announced_ts: u64,
     /// Timestamp of the most recent entry about this task, whatever its kind.
     /// Cooldown logic needs "when did anything last happen here", which is not
@@ -120,6 +127,7 @@ pub fn fold_tasks(notes: &[Note]) -> Vec<TaskView> {
             id: task.to_owned(),
             title: String::new(),
             announced_by: None,
+            home: None,
             announced_ts: 0,
             last_ts: 0,
             bids: Vec::new(),
@@ -134,6 +142,7 @@ pub fn fold_tasks(notes: &[Note]) -> Vec<TaskView> {
                 if entry.announced_ts == 0 || n.ts < entry.announced_ts {
                     entry.title.clone_from(&n.msg);
                     entry.announced_by.clone_from(&n.from);
+                    entry.home.clone_from(&n.origin);
                     entry.announced_ts = n.ts;
                 }
             }

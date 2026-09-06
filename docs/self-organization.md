@@ -1,9 +1,10 @@
 # A self-organising fleet
 
-**Status: built.** `announce` / `bid` / `award` / `take` / `done` / `tasks`,
-`gossip`, `backlog`, and the `/claims` + `/blackboard` routes are in the tree,
-exercised by unit tests and by `scripts/self-org-sandbox.sh` (two real daemons
-in isolated sandboxes).
+**Status: built.** `announce` / `bid` / `award` / `take` / `done` / `tasks` /
+`wait` / `fleet`, `gossip`, `backlog`, and the `/claims`, `/blackboard` and
+`/fleet` routes are in the tree, exercised by unit tests and by
+`scripts/self-org-sandbox.sh` — 29 assertions against two real daemons in
+isolated sandboxes.
 
 The goal was a fleet that finds its own work — raising coverage, doing small
 audits — without a scheduler telling each agent what to do, and without two
@@ -120,32 +121,138 @@ round and nobody had to track that it was away.
 already includes what they just taught us). It is safe on a timer: a round
 against a converged peer reports `pulled 0 pushed 0` and costs one scan.
 
-**Claims deliberately do not travel.** A lease is host-local mutual exclusion,
-and honouring a remote host's lease would mean trusting its clock. So a task
-announced on one host can be taken on either, and a duplicate is discovered at
-`done` time. That is the right trade when the unit of work is "spend some
-tokens looking at a file" — not when it is "move money".
+**Claims do not travel — the claimant does.** A lease table is not gossiped
+(honouring a copy of a remote table would mean trusting its clock, and a
+grow-only set cannot express a release anyway). Instead an agent taking a task
+announced elsewhere claims it *at that host*. See the next section for why that
+one piece is federated while everything else stays sovereign.
+
+## Federation vs confederation
+
+Worth being precise, because the words describe different amounts of ceded
+sovereignty and tab-atelier deliberately sits between them.
+
+A **confederation** is sovereign members cooperating by agreement. There is no
+central authority; every member keeps full control of its own affairs, joins by
+bilateral treaty, and can leave. BGP confederations work this way — each AS
+keeps its own policy and merely exchanges routes.
+
+A **federation** has a common authority for some matters. Members surrender a
+defined slice of sovereignty to the union and are bound by decisions in that
+slice, while keeping everything outside it. Federated identity is the usual
+computing example: many services, one authority for *who you are*.
+
+What gossip alone gives you is **confederal**. Each daemon is sovereign: it
+owns its tabs, its policy, its resources, its lease table. It exchanges
+knowledge voluntarily with peers it chose, by bilateral `remote add`. Nothing
+can compel a member, and a member that stops gossiping simply drifts.
+
+But knowledge alone is not enough, and the sandbox test proves it: two hosts
+holding *identical* boards will still hand the same task to two agents, because
+each consults its own lease table. Convergent knowledge, divergent decisions.
+
+So the fleet federates exactly one thing: **arbitration of a task's lease**.
+
+- Every task has a **home** — the host it was announced on, recorded in the
+  entry that created it, so the fold picks the same one everywhere.
+- Taking a task means claiming it **at its home host**, over the `remote`
+  endpoint that already exists for sidecars. `take` routes the claim there and
+  says so: *"leased task:cov:src/new.rs, from its home host build-box-3fee"*.
+- Everything else stays sovereign. Tabs, resource limits, policy, which peers
+  to talk to, and whether to run a backlog sweep at all are each host's own
+  business. There is no federal government, only a registrar per name.
+
+Membership is still bilateral — `remote add` is a treaty, not admission to a
+union, and each side registers the other. A one-way registration is a legal
+configuration; it just means the unregistered side can't reach the arbiter and
+falls back to a local claim.
+
+That fallback is the confederal escape hatch, and it is deliberate: **when the
+home host is unreachable, the member claims locally and keeps working**, saying
+so on stderr. A partition produces work, not a stall — at the price of a
+possible duplicate discovered at `done` time. For "spend some tokens on a file"
+that is the right trade. For anything where a duplicate is expensive, it would
+not be, and that is when you would want the phase-3 consensus that this design
+otherwise avoids.
+
+## Waiting without long polls
+
+`tab-atelier wait <task-id>… [--timeout <s>] [--any]`.
+
+`dispatch --wait` holds a connection open and infers completion from a screen
+that stopped changing. `wait` reports the outcome as an **exit code**:
+
+```
+0  all finished ok     2  usage error    4  unknown task
+1  one or more failed  3  still running at the timeout
+```
+
+so it composes as a shell primitive, and `--timeout 0` makes the same verb a
+status probe that returns immediately:
+
+```sh
+tab-atelier wait cov:src/api.rs && echo "and now the follow-up"
+for t in $ids; do tab-atelier wait "$t" --timeout 300 & done; wait
+```
+
+It reads the board file rather than calling the API, so a hundred parallel
+waiters are a hundred cheap reads, not a hundred held sockets. An unknown task
+exits 4 rather than blocking forever — a typo should not look like slow work.
+
+## Seeing it: the fleet graph
+
+`GET /fleet`, or `tab-atelier fleet [--json]`.
+
+Three things each know part of the answer to "who is working on what": the
+board knows what was awarded, the lease registry knows what is actually held,
+and the tab list knows who is alive. The route joins them into nodes
+(`host` / `agent` / `task`) and edges (`runs_on`, `announced`, `bid`,
+`works_on`, `home`, `peer`).
+
+`works_on` carries `leased` and `expires_in_ms`, because the interesting state
+is an award with **no live lease**: the agent said it was working and then
+stopped holding the work — it died, or thought past its expiry. The text view
+prints that as `NO LEASE`; a renderer should draw it in a colour that hurts.
+
+Agents with no tab on this host are drawn too (`status: elsewhere`). In a
+federated fleet most agents are somewhere else, and omitting them would render
+work assigned to nobody.
 
 ## Where the work comes from
 
 `tab-atelier backlog`. A fleet waiting for a human to type tasks is remote
 control, not self-organisation.
 
-```
-cargo llvm-cov --lcov --output-path target/lcov.info
-tab-atelier backlog --limit 5 --audit-largest 2
+It is **not** about coverage. A *source* is anything that prints candidate
+tasks as `id<TAB>title`:
+
+```sh
+tab-atelier backlog --from './scripts/todo-tasks.sh'
+tab-atelier backlog --from-file backlog.tsv
+tab-atelier backlog --lcov target/lcov.info      # built-in coverage source
 ```
 
-It reads the coverage report, announces the worst-covered files ranked by
-**absolute shortfall** (a 40%-covered 900-line file is worth more than a
-10%-covered 30-line one), and rotates small audits over the largest files.
+Sources compose — pass `--from` more than once and every candidate lands on one
+board. What this owns is the part every source needs and none should
+reimplement:
 
-Two properties make it safe on a timer: task ids derive from the target
-(`cov:src/api.rs`), so a repeat sweep announces nothing while the task is open;
-and finished tasks stay off the board for `--cooldown` days, so the fleet moves
-on instead of re-auditing yesterday's file forever. It reads a report rather
-than shelling out to cargo, because generating one is a multi-minute build and
-that is the caller's decision, not a side effect of looking for work.
+- **Idempotence.** A candidate already open, bidding or awarded is not
+  announced again, so sources are free to emit their whole world every run;
+  they don't have to remember what they said.
+- **Cooling.** Finished work stays off the board for `--cooldown` days, so the
+  fleet moves on instead of re-doing yesterday's task forever.
+- **De-duplication.** Two sources proposing the same id announce it once.
+
+That division is what makes it general: **the source decides what is worth
+doing, the backlog decides whether it is worth saying.** A failing source is
+reported and skipped rather than fatal — one broken generator must not stop the
+others from finding work.
+
+The built-in coverage source reads LCOV and ranks by **absolute shortfall** (a
+40%-covered 900-line file beats a 10%-covered 30-line one), plus a rotation of
+audits over the largest files. It reads a report rather than shelling out to
+cargo, because generating one is a multi-minute build — the caller's decision,
+not a side effect of looking for work.
 
 ## What the literature says will go wrong
 
@@ -180,6 +287,37 @@ concurrent takes never hand one task to two agents, that `done` frees the
 lease, and that work announced on one host can be taken on the other and
 travels back.
 
+## Do we even need supervisors?
+
+No, and that is the point — but "supervisor" hides three different jobs, and
+only one of them needs a supervisor-shaped thing.
+
+**Generating work.** Not a supervisor. `backlog` is a pure function of
+measured state plus the board, it is idempotent, and any host may run it. Two
+hosts running it concurrently produce the same announcements and the board
+de-duplicates them. Nobody is in charge of it.
+
+**Allocating work.** Not a supervisor, by construction. Rendezvous ranking plus
+a lease allocates in one round trip with no coordinator; that is the whole
+design. Contract net's *manager* role — announce, collect bids, award — is a
+supervisor, and `take` deliberately skips it. `bid`/`award` remain for the case
+where cost is knowable only to the bidder, which needs a decider; that is a
+role a task can hand out, not a permanent office.
+
+**Judging work.** This one is real, and it is the gap
+[MAST](https://arxiv.org/abs/2503.13657) measures at 21% of multi-agent
+failures. Somebody must check that a `done` means what it says. But that is
+*work*, not authority: announce `verify:<task>` when a task completes, let a
+different agent take it, and the same machinery applies. A verifier is a peer
+with a task, not a boss.
+
+What remains is a **watchdog**, which `brain` already is: it notices tabs that
+have stopped and nudges them. It has no say over what anyone works on.
+
+The honest summary: you need a *source*, an *arbiter of exclusion* (the home
+host's lease table), and *verification as ordinary work*. None of those is a
+supervisor. A human is still the one who decides what the fleet is for.
+
 ## Deliberately not built
 
 - **Consensus.** See above; the trigger is claim survival across a daemon death.
@@ -192,3 +330,11 @@ travels back.
   trip, where an auction needs three and a manager. Bids are there for when a
   task genuinely needs comparison (cost known only to the bidder), not as the
   default path.
+- **Automatic verification.** `done --fail` distinguishes giving up from
+  finishing, but nothing checks a success. The board already supports the fix —
+  announce `verify:<task>` on completion, require a different agent to take it —
+  and it is the highest-value thing left.
+- **Transitive membership.** A peer's peers stay invisible; every link is a
+  bilateral `remote add`. Learning the fleet's shape by gossip would be easy and
+  is deliberately not done: trust here is per-endpoint, and a transitively
+  discovered member would be one nobody chose.
