@@ -1416,4 +1416,77 @@ mod tests {
             );
         }
     }
+
+    /// Every arm of the command table, driven through the parser.
+    ///
+    /// The point is coverage of the DISPATCH, not of each verb: inside
+    /// `with_test_server` the endpoint is redirected at a fake daemon, so even
+    /// `close` and `rename` act on a throwaway snapshot. Exit codes are not
+    /// asserted — several of these legitimately fail against a two-tab
+    /// fixture — only that the table routes them somewhere.
+    #[test]
+    fn every_subcommand_routes_through_the_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        crate::cli::team::set_blackboard_path(Some(dir.path().join("blackboard.jsonl")));
+        crate::claims::set_registry_path(Some(dir.path().join("claims.json")));
+        crate::claims::reset_for_test();
+
+        crate::cli::share_link::with_test_server(|_| {
+            let cases: Vec<Vec<&str>> = vec![
+                vec!["tabs"],
+                vec!["peers"],
+                vec!["peers", "--all"],
+                vec!["peek", "tab-a"],
+                vec!["output", "tab-a"],
+                vec!["stats", "tab-a"],
+                vec!["notes"],
+                vec!["note", "hello"],
+                vec!["tasks"],
+                vec!["tasks", "--all"],
+                vec!["announce", "t-dispatch", "some work"],
+                vec!["bid", "t-dispatch", "--cost", "1"],
+                vec!["award", "t-dispatch", "--to", "someone"],
+                vec!["take", "--dry-run"],
+                vec!["done", "t-dispatch", "finished"],
+                vec!["wait", "t-dispatch", "--timeout", "0", "--quiet"],
+                vec!["fleet"],
+                vec!["brief"],
+                vec!["gossip"],
+                vec!["backlog", "--from-file", "/nonexistent-source.tsv"],
+                vec!["rename", "tab-a", "renamed"],
+                vec!["lock", "tab-a"],
+                vec!["unlock", "tab-a"],
+                vec!["input", "tab-a", "x"],
+                vec!["share-link", "tab-a"],
+                vec!["set-status", "idle"],
+                vec!["set-context", "--clear"],
+                vec!["token"],
+            ];
+            for argv in cases {
+                let mut full = vec!["tab-atelier"];
+                full.extend(argv.iter().copied());
+                let cli = match super::Cli::try_parse_from(&full) {
+                    Ok(c) => c,
+                    Err(e) => panic!("{full:?} did not parse: {e}"),
+                };
+                assert!(
+                    super::command_exit_code(cli).is_some(),
+                    "{full:?} parsed but routed nowhere"
+                );
+            }
+        });
+
+        crate::claims::reset_for_test();
+        crate::claims::set_registry_path(None);
+        crate::cli::team::set_blackboard_path(None);
+    }
+
+    #[test]
+    fn no_subcommand_means_run_the_daemon_not_an_error() {
+        // `tab-atelier` with no verb starts the daemon, so the table must
+        // return None rather than an exit code — a non-None here would make
+        // the binary exit instead of launching.
+        let cli = super::Cli::try_parse_from(["tab-atelier"]).expect("parse");
+        assert!(super::command_exit_code(cli).is_none());
+    }
 }

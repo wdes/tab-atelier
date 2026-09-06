@@ -5854,4 +5854,75 @@ mod state_writer_tests {
         assert!(parse_https_host_port("host:443").is_err());
         assert!(parse_https_host_port("https://").is_err());
     }
+
+    #[test]
+    fn the_pty_env_carries_colour_only_when_colours_are_on() {
+        let on = crate::pty_env(true);
+        // A terminal that claims colour support and then strips it makes
+        // every agent's output unreadable, so this is worth pinning.
+        assert_eq!(on.get("TERM").map(String::as_str), Some("xterm-256color"));
+        assert_eq!(on.get("COLORTERM").map(String::as_str), Some("truecolor"));
+        let off = crate::pty_env(false);
+        assert!(
+            !off.contains_key("COLORTERM"),
+            "colours off must not advertise truecolor"
+        );
+        // TERM is always set: an empty TERM breaks ncurses programs outright.
+        assert!(off.contains_key("TERM"), "TERM must always be set");
+    }
+
+    #[test]
+    fn the_wakatime_key_is_read_from_zeds_settings_or_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        // No zed config at all is the common case and must not be an error.
+        assert!(crate::load_wakatime_key(dir.path()).is_none());
+        let zed = dir.path().join("zed");
+        std::fs::create_dir_all(&zed).unwrap();
+        let settings = zed.join("settings.json");
+        // Malformed JSON must not panic — this file is edited by hand.
+        std::fs::write(&settings, "{ not json").unwrap();
+        assert!(crate::load_wakatime_key(dir.path()).is_none());
+        // Present but without the key.
+        std::fs::write(&settings, r#"{"theme":"One Dark"}"#).unwrap();
+        assert!(crate::load_wakatime_key(dir.path()).is_none());
+        // The real shape.
+        std::fs::write(&settings, r#"{"wakatime": {"settings": {"api-key": "waka_secret"}}}"#).unwrap();
+        assert_eq!(crate::load_wakatime_key(dir.path()).as_deref(), Some("waka_secret"));
+    }
+
+    #[test]
+    fn signalling_a_process_group_refuses_the_pids_that_would_hit_everything() {
+        // pid 0 means "my own process group" and pid 1 is init. Passing either
+        // to killpg would take down the daemon or the machine, so both are
+        // refused before any signal is sent. There is no way to observe "did
+        // not signal" other than that this returns without killing the test
+        // runner — which is the assertion.
+        crate::kill_tab_pgroup(0);
+        crate::kill_tab_pgroup(1);
+        // A pid that cannot exist is a no-op rather than an error.
+        crate::kill_tab_pgroup(u32::MAX);
+    }
+
+    #[test]
+    fn the_persisted_log_filter_round_trips_and_clears() {
+        // Set, read back, clear — the sequence `tab-atelier log` performs.
+        // A filter that survived a "clear" would keep a debug build's noise
+        // on forever with no way to see why.
+        // RUST_LOG wins over the file, so a developer running with it set
+        // would see the env value here rather than what we just wrote.
+        if std::env::var("RUST_LOG").is_ok() {
+            return;
+        }
+        // This writes the developer's real filter file, so put back whatever
+        // was there — a test that silently clears someone's debug filter is a
+        // test that costs an afternoon.
+        let previous = crate::resolve_log_filter();
+        crate::set_persisted_log_filter(Some("tab_atelier=debug")).expect("set");
+        assert_eq!(crate::resolve_log_filter().as_deref(), Some("tab_atelier=debug"));
+        crate::set_persisted_log_filter(None).expect("clear");
+        assert!(crate::resolve_log_filter().is_none());
+        if let Some(prev) = previous {
+            crate::set_persisted_log_filter(Some(&prev)).expect("restore");
+        }
+    }
 }
