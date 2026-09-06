@@ -1622,7 +1622,13 @@ fn handle_connection<S: Read + Write>(
     // by some reverse proxies / Cloudflare Tunnel normalisation)
     // still matches the `ends_with("/view")` route arms below.
     // `/` itself is preserved so the root keeps working.
-    let path = if path.len() > 1 && path.ends_with('/') {
+    // Remembered, not just stripped: the browser resolves the page's relative
+    // asset URLs against the path IT requested, so `/tabs/0/view/` sits one
+    // directory deeper than `/tabs/0/view` and needs one more `../`. Matching
+    // the route without carrying this made every asset 404 behind a proxy that
+    // normalises trailing slashes.
+    let had_trailing_slash = path.len() > 1 && path.ends_with('/');
+    let path = if had_trailing_slash {
         path.trim_end_matches('/').to_string()
     } else {
         path
@@ -1836,7 +1842,14 @@ fn handle_connection<S: Read + Write>(
             catbus::messages(stream, state, p, query_since);
         }
         ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/view") => {
-            view::run(stream, state, p, accept_gzip, if_none_match.as_deref());
+            view::run(
+                stream,
+                state,
+                p,
+                accept_gzip,
+                if_none_match.as_deref(),
+                had_trailing_slash,
+            );
         }
         ("GET", p) if p.starts_with("/tabs/") && p.ends_with("/output") => {
             output::run(stream, state, p, query_since, query_crc, query_lines, accept_gzip);

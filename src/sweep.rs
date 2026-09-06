@@ -110,28 +110,64 @@ pub fn once() -> Outcome {
     out
 }
 
-/// Start the sweep thread if `fleet_sweep_minutes` is non-zero.
+/// Longest wait before the FIRST sweep.
 ///
-/// Called from both editions right after the API server starts, because a
-/// sweep needs the local API for nothing but is pointless without a running
-/// instance to hold the board.
-pub fn spawn_if_configured() {
-    let prefs = crate::load_preferences(&crate::platform::config_dir());
-    let minutes = prefs.fleet_sweep_minutes;
-    if minutes == 0 {
-        return;
+/// A daemon restarted more often than its period would otherwise never sweep
+/// at all — every restart resets the timer. Waiting a little is still right:
+/// startup is the worst moment to shell out to a source that might build.
+const FIRST_DELAY_CAP: Duration = Duration::from_mins(2);
+
+/// How long to wait before the next sweep, or `None` to not sweep at all.
+///
+/// Separated from the thread so the decision is testable without spawning
+/// anything — the earlier version of this test called the spawner, which read
+/// the developer's real config and would start a live sweeping thread during
+/// `cargo test` on a machine where the sweep was enabled.
+#[must_use]
+pub fn sweep_period(minutes: u32, read_only: bool) -> Option<Duration> {
+    // A read-only instance is meant to run BESIDE a normal one. Sweeping from
+    // it would shell out to sources, append to the shared blackboard and
+    // gossip to peers — all writes, from the instance defined by not making
+    // any.
+    if read_only || minutes == 0 {
+        return None;
     }
-    let period = Duration::from_secs(u64::from(minutes) * 60);
+    Some(Duration::from_mins(u64::from(minutes)))
+}
+
+/// Start the sweep thread if the configuration asks for one.
+///
+/// Called from both editions right after the API server starts. `read_only`
+/// is the instance's own flag: a read-only daemon never sweeps.
+pub fn spawn_if_configured(read_only: bool) {
+    let prefs = crate::load_preferences(&crate::platform::config_dir());
+    let Some(period) = sweep_period(prefs.fleet_sweep_minutes, read_only) else {
+        return;
+    };
+    let minutes = prefs.fleet_sweep_minutes;
     let spawned = std::thread::Builder::new()
         .name("tab-atelier-sweep".into())
         .spawn(move || {
-            // One period before the first sweep: starting up is the worst
-            // moment to run a source that might shell out to a build.
+            let mut next = period.min(FIRST_DELAY_CAP);
             loop {
-                std::thread::sleep(period);
-                let out = once();
-                if out.announced > 0 || !out.source_errors.is_empty() || !out.gossip_errors.is_empty() {
-                    log::info!("fleet sweep: {}", format_outcome(&out));
+                std::thread::sleep(next);
+                // Re-read every tick so `fleet_sweep_minutes: 0` actually
+                // stops the loop, rather than requiring a restart to undo.
+                let prefs = crate::load_preferences(&crate::platform::config_dir());
+                let Some(period) = sweep_period(prefs.fleet_sweep_minutes, read_only) else {
+                    log::info!("fleet sweep: disabled in preferences, stopping");
+                    return;
+                };
+                next = period;
+                // A panic here would end the thread permanently and silently —
+                // the loop is unattended, so it has to survive one bad source.
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(once)) {
+                    Ok(out) => {
+                        if out.announced > 0 || !out.source_errors.is_empty() || !out.gossip_errors.is_empty() {
+                            log::info!("fleet sweep: {}", format_outcome(&out));
+                        }
+                    }
+                    Err(_) => log::error!("fleet sweep: panicked; continuing at the next tick"),
                 }
             }
         });
@@ -171,8 +207,30 @@ mod tests {
         assert!(prefs.fleet_sweep_sources.is_empty());
         assert!(prefs.fleet_sweep_lcov.is_none());
         assert!(!prefs.fleet_sweep_gossip);
-        // Calling the starter with that config is a no-op rather than a
-        // thread that wakes every zero seconds.
-        spawn_if_configured();
+        assert_eq!(sweep_period(prefs.fleet_sweep_minutes, false), None);
+        // NOTE: this deliberately does not call `spawn_if_configured` — that
+        // reads the real user config, so on a machine where the sweep IS
+        // enabled the test would start a live thread that shells out to
+        // sources and gossips, from inside `cargo test`.
+    }
+
+    #[test]
+    fn a_read_only_instance_never_sweeps() {
+        // Read-only exists to run beside a normal instance. Sweeping from it
+        // would run source commands, append to the shared blackboard and
+        // gossip to peers — every one of them a write.
+        assert_eq!(sweep_period(60, true), None);
+        assert_eq!(sweep_period(60, false), Some(Duration::from_hours(1)));
+        // Zero is off whatever the mode, and is re-read each tick so turning
+        // it off in preferences stops the loop without a restart.
+        assert_eq!(sweep_period(0, false), None);
+        // The first wait is capped: a daemon restarted more often than its
+        // period would otherwise never sweep at all.
+        assert!(FIRST_DELAY_CAP < Duration::from_hours(1));
+        assert_eq!(
+            sweep_period(1, false).map(|p| p.min(FIRST_DELAY_CAP)),
+            Some(Duration::from_mins(1)),
+            "a short period is used as-is, not padded up to the cap"
+        );
     }
 }

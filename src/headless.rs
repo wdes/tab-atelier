@@ -1056,7 +1056,7 @@ pub fn run() -> std::io::Result<()> {
     info!("API server starting on {api_addr} (TLS {api_tls_addr})");
     api::start_api_server(api_state.clone(), api_token.clone(), read_only, api_addr);
     // Off unless `fleet_sweep_minutes` says otherwise.
-    crate::sweep::spawn_if_configured();
+    crate::sweep::spawn_if_configured(read_only);
     api::start_api_server_tls(
         api_state.clone(),
         api_token.clone(),
