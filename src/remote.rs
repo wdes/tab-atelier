@@ -623,4 +623,67 @@ mod tests {
         assert!(got.is_err());
         assert!(got.unwrap_err().contains("/tabs"), "the error should name what failed");
     }
+
+    fn snapshot(id: &str, index: usize) -> super::RemoteTabSnapshot {
+        super::RemoteTabSnapshot {
+            remote_id: id.into(),
+            remote_index: index,
+            name: "t".into(),
+            cwd: None,
+            active_on_remote: false,
+            uptime_secs: 0.0,
+            cpu_percent: 0.0,
+            watts: None,
+            agent_state: None,
+            agent_kind: None,
+        }
+    }
+
+    #[test]
+    fn commands_address_tabs_by_id_not_by_position() {
+        // A remote index shifts whenever another tab closes, so every command
+        // resolves through the durable uuid. Getting this wrong sends
+        // keystrokes to the wrong session — the failure the audit flagged.
+        let (url, h) = serve_once("{}", "200 OK");
+        let ep = endpoint(url);
+        let agent = super::build_agent(&ep);
+        let tabs = vec![snapshot("uuid-a", 0), snapshot("uuid-b", 7)];
+        let cmd = super::RemoteCommand::SendInput {
+            remote_id: "uuid-b".into(),
+            bytes: b"echo hi\n".to_vec(),
+        };
+        assert!(super::run_command(&agent, &ep, &tabs, &cmd).is_ok());
+        let _ = h.join();
+
+        // An id nothing matches must fail rather than falling back to index 0,
+        // which is somebody else's tab.
+        let (url, h) = serve_once("{}", "200 OK");
+        let ep = endpoint(url);
+        let agent = super::build_agent(&ep);
+        let stray = super::RemoteCommand::SendInput {
+            remote_id: "nope".into(),
+            bytes: b"x".to_vec(),
+        };
+        let err = super::run_command(&agent, &ep, &tabs, &stray).unwrap_err();
+        assert!(err.contains("nope"), "the error should name the id: {err}");
+        // NOT joined: resolution failed before any request, so the responder
+        // is still blocked in accept(). Joining it would hang the suite —
+        // which it did. The thread dies with the process.
+        drop(h);
+    }
+
+    #[test]
+    fn a_rejected_command_is_reported_rather_than_swallowed() {
+        // The remote refusing (423 locked, say) has to reach the caller, or a
+        // viewer silently types into a tab that is ignoring it.
+        let (url, h) = serve_once("locked", "423 Locked");
+        let ep = endpoint(url);
+        let agent = super::build_agent(&ep);
+        let tabs = vec![snapshot("uuid-a", 0)];
+        let cmd = super::RemoteCommand::Close {
+            remote_id: "uuid-a".into(),
+        };
+        assert!(super::run_command(&agent, &ep, &tabs, &cmd).is_err());
+        let _ = h.join();
+    }
 }
