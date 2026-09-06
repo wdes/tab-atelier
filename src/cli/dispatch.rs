@@ -1461,6 +1461,32 @@ mod tests {
                 vec!["set-status", "idle"],
                 vec!["set-context", "--clear"],
                 vec!["token"],
+                // API-backed verbs: all of these hit the harness daemon, so
+                // they exercise their arm without touching the real one.
+                vec!["limit", "tab-a"],
+                vec!["resize", "tab-a", "--cols", "100", "--rows", "40"],
+                vec!["net-stats"],
+                vec!["net-dns"],
+                vec!["net-allow", "tab-a", "--clear"],
+                vec!["ssh-agent", "tab-a", "--off"],
+                vec!["set-meta", "role", "tester"],
+                vec!["set-font", "--size", "14"],
+                vec!["env", "list"],
+                vec!["settings"],
+                vec!["schedule", "tab-a", "--clear"],
+                vec!["flags"],
+                vec!["logs", "--lines", "1"],
+                vec!["claude-only", "off"],
+                vec!["relay", "status"],
+                vec!["style", "--list"],
+                vec!["peek", "tab-a", "--lines", "2"],
+                vec!["handoff", "/nonexistent-file.txt", "tab-a"],
+                vec!["add", "/tmp"],
+                vec!["close", "tab-b"],
+                // Verbs that refuse bad input before doing anything: the
+                // rejection path is the one worth routing here.
+                vec!["remote", "add"],
+                vec!["dispatch"],
             ];
             for argv in cases {
                 let mut full = vec!["tab-atelier"];

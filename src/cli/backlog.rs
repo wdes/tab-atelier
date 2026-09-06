@@ -677,6 +677,91 @@ mod tests {
         );
     }
 
+    /// Announcing writes to the process-global board, so redirect it.
+    fn with_board<T>(body: impl FnOnce() -> T) -> T {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().expect("tempdir");
+        crate::cli::team::set_blackboard_path(Some(dir.path().join("blackboard.jsonl")));
+        let out = body();
+        crate::cli::team::set_blackboard_path(None);
+        out
+    }
+
+    #[test]
+    fn a_sweep_announces_from_a_source_then_says_nothing_the_second_time() {
+        with_board(|| {
+            let argv = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+            // A source is any command printing `id<TAB>title`.
+            let src = "printf 'todo:a\\tclear the TODO in a\\ntodo:b\\tclear the TODO in b\\n'";
+            assert_eq!(run(&argv(&["--from", src])), 0);
+            let board = fold_tasks(&read_blackboard());
+            let ids: Vec<&str> = board.iter().map(|t| t.id.as_str()).collect();
+            assert_eq!(ids, vec!["todo:a", "todo:b"]);
+
+            // The property that makes a timer safe: the same source, run
+            // again, announces nothing rather than duplicating the board.
+            assert_eq!(run(&argv(&["--from", src])), 0);
+            assert_eq!(
+                fold_tasks(&read_blackboard()).len(),
+                2,
+                "a repeat sweep duplicated work"
+            );
+
+            // --dry-run must not write, even for candidates that ARE new.
+            let more = "printf 'todo:c\\tsomething new\\n'";
+            assert_eq!(run(&argv(&["--from", more, "--dry-run"])), 0);
+            assert_eq!(fold_tasks(&read_blackboard()).len(), 2, "dry run announced something");
+        });
+    }
+
+    #[test]
+    fn a_failing_source_is_reported_without_losing_the_healthy_ones() {
+        with_board(|| {
+            let argv = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+            // One generator is broken, one works. The sweep must still put the
+            // good work on the board — a fleet with one bad script is not a
+            // fleet with nothing to do — while reporting the failure.
+            let code = run(&argv(&[
+                "--from",
+                "echo broken >&2; exit 2",
+                "--from",
+                "printf 'ok:1\\tdo the thing\\n'",
+            ]));
+            assert_ne!(code, 0, "a failed source must be reported in the exit code");
+            let board = fold_tasks(&read_blackboard());
+            assert_eq!(board.len(), 1, "the healthy source's work was lost");
+            assert_eq!(board[0].id, "ok:1");
+        });
+    }
+
+    #[test]
+    fn a_coverage_report_becomes_tasks_with_repo_relative_ids() {
+        with_board(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let lcov = dir.path().join("lcov.info");
+            std::fs::write(&lcov, "SF:/build/checkout/src/api.rs\nLF:1000\nLH:100\nend_of_record\n").unwrap();
+            let argv = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+            assert_eq!(
+                run(&argv(&[
+                    "--lcov",
+                    lcov.to_str().unwrap(),
+                    "--root",
+                    "/build/checkout",
+                    "--audit-largest",
+                    "0",
+                ])),
+                0
+            );
+            let board = fold_tasks(&read_blackboard());
+            // Repo-relative, so the same file in another checkout is the SAME
+            // task and two machines do not each do the work.
+            assert_eq!(board.len(), 1);
+            assert_eq!(board[0].id, "cov:src/api.rs");
+            assert!(board[0].title.contains("10.0%"), "{}", board[0].title);
+        });
+    }
+
     #[test]
     fn args_are_validated() {
         let argv = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
