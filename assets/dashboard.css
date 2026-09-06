@@ -850,6 +850,11 @@ body.band-view { min-height: calc(100vh + 180px); }
 /* Onglet (b) Rapports. */
 .kk-report-list { padding: 0.4rem 0.8rem 0.9rem; display: flex; flex-direction: column; gap: 0.3rem; }
 .kk-report { padding: 0.35rem 0.5rem; border: 1px solid var(--border); border-radius: 6px; display: flex; align-items: baseline; justify-content: space-between; gap: 0.5rem; }
+/* volet (b): "à la une" (5 most recent, distinct) + the ranging selector (calqué catalogue). */
+.kk-featured { padding: 0.2rem 0.2rem 0.4rem; }
+.kk-featured-head { font-weight: 700; color: var(--muted); padding: 0.35rem 0.9rem 0.1rem; font-size: 0.82rem; }
+.kk-reports-sub { display: flex; align-items: center; gap: 0.4rem; padding: 0.2rem 0.9rem 0.3rem; border-top: 1px solid var(--border); }
+.kk-report-groups .cat-group-body.kk-report-list { padding-top: 0.25rem; padding-bottom: 0.5rem; }
 /* volet-3: the "Ouvrir en distant" share link sits beside the local viewer link. */
 .kk-remote-link { flex: none; font-size: 0.72rem; color: var(--led-working-stroke); border: 1px solid var(--border); border-radius: 6px; padding: 0.15rem 0.45rem; text-decoration: none; white-space: nowrap; }
 .kk-remote-link:hover, .kk-remote-link:focus { color: var(--fg, #cdd); outline: none; }
