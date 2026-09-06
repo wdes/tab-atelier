@@ -3126,4 +3126,63 @@ mod tests {
         // the NUMBER rather than walking off the end of `UNITS`.
         assert!(human_bytes(u64::MAX).ends_with(" TB"), "{}", human_bytes(u64::MAX));
     }
+
+    #[test]
+    fn port_and_address_settings_are_validated_before_anything_is_written() {
+        // `ports` writes the real preferences file on success, so only the
+        // rejection paths are exercised here — they return before any write,
+        // which is exactly the property worth having.
+        let bad = |v: &[&str]| super::ports(&v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+        assert_eq!(bad(&["--api"]), 2, "a flag with no value");
+        assert_eq!(bad(&["--tls"]), 2);
+        assert_eq!(bad(&["--nope", "x"]), 2, "unknown flag");
+        // A bind spec that cannot be parsed must be refused now rather than
+        // leaving a daemon that fails to start on its next boot.
+        assert_eq!(bad(&["--api", "not-an-address"]), 2);
+        assert_eq!(bad(&["--api", "127.0.0.1:not-a-port"]), 2);
+        assert_eq!(bad(&["--api", "127.0.0.1:99999"]), 2, "port out of range");
+    }
+
+    #[test]
+    fn per_tab_network_verbs_talk_to_the_daemon() {
+        with_test_server(|_| {
+            // These POST to the API, which the harness redirects at a fake
+            // daemon — so the whole path runs without touching the real one.
+            assert_eq!(super::resize("tab-a", Some(100), Some(40), false), 0);
+            assert_eq!(super::resize("tab-a", None, None, true), 0, "clear un-pins");
+            // A tab that does not exist must fail rather than silently
+            // resizing whichever tab happens to be first.
+            assert_ne!(super::resize("ghost", Some(80), Some(24), false), 0);
+
+            let preset = vec!["github".to_string()];
+            let none: Vec<String> = Vec::new();
+            // net-allow needs nftables and a headless daemon, so against the
+            // harness it reports failure rather than succeeding — the point
+            // here is that the request path runs and the outcome is reported,
+            // not swallowed.
+            let code = super::net_allow("tab-a", &preset, &none, &none, false, false, false);
+            assert_ne!(code, 2, "a well-formed request must not be a usage error");
+            let code = super::net_allow("tab-a", &none, &none, &none, true, false, false);
+            assert_ne!(code, 2, "clear is well-formed too");
+            // NOTE: calling with add+remove both true is not checked here —
+            // the guarantee lives in the clap definition
+            // (`conflicts_with_all`), so it is asserted at that boundary in
+            // `cli::dispatch`'s tests. Reaching this function with both set
+            // means someone bypassed the parser.
+        });
+    }
+
+    #[test]
+    fn relay_actions_reach_the_daemon_or_are_refused() {
+        with_test_server(|_| {
+            // `status` reads; `on`/`off` post. All three are redirected at the
+            // fake daemon by the harness.
+            assert_eq!(super::relay("status", None), 0);
+            let on = super::relay("on", None);
+            assert!(on == 0 || on == 1, "unexpected {on}");
+            // An action the verb does not define is a usage error rather than
+            // a silently ignored no-op.
+            assert_eq!(super::relay("frobnicate", None), 2);
+        });
+    }
 }

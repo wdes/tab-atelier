@@ -1482,6 +1482,20 @@ mod tests {
     }
 
     #[test]
+    fn contradictory_allowlist_flags_are_refused_by_the_parser() {
+        // `net_allow` itself resolves add+remove by letting add win silently.
+        // Nothing downstream re-checks, so the parser IS the guarantee — and
+        // an unasserted `conflicts_with_all` is one refactor away from gone.
+        let both = super::Cli::try_parse_from(["tab-atelier", "net-allow", "tab-a", "--add", "--remove"]);
+        assert!(both.is_err(), "--add with --remove must not parse");
+        let with_clear = super::Cli::try_parse_from(["tab-atelier", "net-allow", "tab-a", "--add", "--clear"]);
+        assert!(with_clear.is_err(), "--add with --clear must not parse");
+        // Each alone is fine.
+        assert!(super::Cli::try_parse_from(["tab-atelier", "net-allow", "tab-a", "--add"]).is_ok());
+        assert!(super::Cli::try_parse_from(["tab-atelier", "net-allow", "tab-a", "--clear"]).is_ok());
+    }
+
+    #[test]
     fn no_subcommand_means_run_the_daemon_not_an_error() {
         // `tab-atelier` with no verb starts the daemon, so the table must
         // return None rather than an exit code — a non-None here would make
