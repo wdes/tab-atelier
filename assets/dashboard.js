@@ -2113,11 +2113,99 @@ export function reportItemHtml(report, canRule) {
     + `</div>`;
 }
 
-// Onglet (b) — the reports list (empty state when the outbox has no report).
-export function reportsHtml(readModel, canRule) {
+// Onglet (b) — RANGER (a) + À LA UNE (b): calqués sur le moteur du CATALOGUE (CATALOG_SORT_MODES /
+// catalogGroups / loadCatalogSort). The /reports objects carry ONLY {name, path, mtime} — repo &
+// tâche are NOT real fields, so we DERIVE them from the filename (pure-vue, zero core).
+export const REPORTS_SORT_MODES = [
+  { value: "date", label: "date" },
+  { value: "repo", label: "repo" },
+  { value: "task", label: "tâche" },
+];
+
+// Pure: a report's derived facets {repo, task, day, mtime}. Ponytail ceiling: repo/tâche are a
+// FILENAME heuristic (the outbox is flat: path is always `outbox/<name>`). repo = the first path
+// dir segment below outbox if any, else the leading name token; tâche = the stem minus a trailing
+// version/date/nonce token (a token CONTAINING a digit) so multiple runs of one report collapse.
+// Exact once /reports emits real repo/task (read r.repo/r.task here) or reports land in
+// outbox/<repo>/… subdirs. Null-safe.
+export function reportFacets(report) {
+  const r = report || {};
+  const path = String(r.path || "");
+  const name = String(r.name || path);
+  const stem = name.replace(/\.(md|markdown)$/i, "");
+  const segs = path.split("/").filter(Boolean);
+  const dirs = segs.slice(segs[0] === "outbox" ? 1 : 0, -1); // dir segments between outbox and the file
+  const tokens = stem.split(/[-_.\s]+/).filter(Boolean);
+  const repo = (dirs.length ? dirs[0] : tokens[0]) || "divers";
+  // strip a trailing version/date/nonce token (must contain a digit) — keeps pure-alpha words.
+  const task = stem.replace(/[-_.\s]+(\d{4}-\d{2}-\d{2}|[a-z0-9]*\d[a-z0-9]*)$/i, "").trim() || stem || repo;
+  const mtime = Number(r.mtime) || 0;
+  const day = mtime ? new Date(mtime * 1000).toISOString().slice(0, 10) : "date inconnue";
+  return { repo, task, day, mtime };
+}
+
+// Pure: the reports folded into an ORDERED list of GROUPS `{label, count, reports}` for a display
+// `mode` (repo / task / date). Within a group: newest (mtime) first, ties by name. date mode =
+// newest day first; repo/task = biggest cluster first, ties alpha. Null-safe (calque catalogGroups).
+export function reportGroups(readModel, mode = "date") {
+  const reports = reportsView(readModel).filter((r) => r && (r.name != null || r.path != null));
+  const facetOf = new Map(reports.map((r) => [r, reportFacets(r)]));
+  const keyOf = { repo: (f) => f.repo, task: (f) => f.task, date: (f) => f.day }[mode] || ((f) => f.day);
+  const within = (a, b) =>
+    facetOf.get(b).mtime - facetOf.get(a).mtime ||
+    String(a.name || a.path).localeCompare(String(b.name || b.path));
+  const byKey = new Map();
+  for (const r of reports) {
+    const k = keyOf(facetOf.get(r)) || "divers";
+    if (!byKey.has(k)) byKey.set(k, []);
+    byKey.get(k).push(r);
+  }
+  const groups = [...byKey.entries()].map(([label, rs]) => ({ label, count: rs.length, reports: rs.slice().sort(within) }));
+  if (mode === "date") groups.sort((a, b) => String(b.label).localeCompare(String(a.label)));
+  else groups.sort((a, b) => b.count - a.count || String(a.label).localeCompare(String(b.label)));
+  return groups;
+}
+
+// Pure: the "à la une" section — the top-N reports by mtime desc (ties by name). Distinct from the
+// ranging/grouping below (b). Null-safe.
+export function reportsFeatured(readModel, n = 5) {
+  return reportsView(readModel)
+    .filter((r) => r && (r.name != null || r.path != null))
+    .slice()
+    .sort((a, b) => (Number(b.mtime) || 0) - (Number(a.mtime) || 0) ||
+      String(a.name || a.path).localeCompare(String(b.name || b.path)))
+    .slice(0, n);
+}
+
+const REPORTS_SORT_KEY = "ta-dash.reports-sort";
+// Restore the persisted ranging mode (same pattern as CATALOG_SORT_KEY). Unknown -> date.
+function loadReportsSort() {
+  try {
+    const v = localStorage.getItem(REPORTS_SORT_KEY);
+    return REPORTS_SORT_MODES.some((m) => m.value === v) ? v : "date";
+  } catch { return "date"; }
+}
+
+// Onglet (b) — the reports panel: an "à la une" section (5 most recent, DISTINCT) + a ranging
+// selector (calqué catalogue) + the grouped list REUSING the catalogue group look (cat-group /
+// cat-group-head / cat-group-body = same headers & collapse interaction). Empty state when the
+// outbox has no report. Each row keeps its LOCAL viewer link + volet-3 "Ouvrir en distant" intact.
+export function reportsHtml(readModel, canRule, mode = "date") {
   const reports = reportsView(readModel);
   if (!reports.length) return `<div class="kk-empty">Aucun rapport dans l'outbox.</div>`;
-  return `<div class="kk-report-list">${reports.map((r) => reportItemHtml(r, canRule)).join("")}</div>`;
+  const item = (r) => reportItemHtml(r, canRule);
+  const featured = reportsFeatured(readModel, 5);
+  const featuredHtml = `<div class="kk-featured">
+      <div class="kk-featured-head">À la une — ${featured.length} récent${featured.length === 1 ? "" : "s"}</div>
+      <div class="kk-report-list">${featured.map(item).join("")}</div>
+    </div>`;
+  const opts = REPORTS_SORT_MODES.map((m) => `<option value="${m.value}"${m.value === mode ? " selected" : ""}>${escapeHtml(m.label)}</option>`).join("");
+  const groups = reportGroups(readModel, mode);
+  const groupHtml = (g) =>
+    `<div class="cat-group"><button class="cat-group-head" aria-expanded="true"><span class="cat-group-caret">▾</span> <span class="cat-group-label">${escapeHtml(String(g.label))}</span> <span class="cat-group-count">(${g.count})</span></button><div class="cat-group-body kk-report-list">${g.reports.map(item).join("")}</div></div>`;
+  return `${featuredHtml}
+    <div class="kk-reports-sub"><label class="cat-sort-wrap">ranger par : <select class="kk-reports-sort" aria-label="ranger les rapports">${opts}</select></label></div>
+    <div class="cat-list cat-list-grouped kk-report-groups">${groups.map(groupHtml).join("")}</div>`;
 }
 
 // Onglet (c) — fold the intention grid fields into a markdown artefact. PURE + XSS-neutral:
@@ -2249,7 +2337,13 @@ function switchKioskTab(el, tabId) {
   if (tabId === "intent") initAutogrow(el);
 }
 
-// Onglet (b) — fetch + render the reports list into the reports panel (cold source, on-demand).
+// Onglet (b) — the active ranging mode + the last fetched model/canRule, so switching the sort
+// re-renders client-side WITHOUT a re-fetch (reports are a cold source, same as the catalogue).
+let reportsMode = loadReportsSort();
+let reportsModel = null;
+let reportsCanRule = false;
+
+// Onglet (b) — fetch + render the reports panel (cold source, on-demand).
 async function loadReports(el) {
   const host = el.querySelector('[data-panel="reports"] .kk-reports');
   if (!host) return;
@@ -2257,8 +2351,9 @@ async function loadReports(el) {
   try {
     const res = await fetch(REPORTS_URL, { headers: { accept: "application/json", ...AUTH_HEADERS } });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const canRule = typeof TOKEN === "string" && TOKEN.length > 0;
-    host.innerHTML = reportsHtml(await res.json(), canRule);
+    reportsCanRule = typeof TOKEN === "string" && TOKEN.length > 0;
+    reportsModel = await res.json(); // cache: the ranging selector re-renders from this, no re-fetch
+    host.innerHTML = reportsHtml(reportsModel, reportsCanRule, reportsMode);
   } catch (err) {
     host.innerHTML = `<div class="kk-error">rapports indisponibles (${escapeHtml(err.message)})</div>`;
   }
@@ -2836,6 +2931,19 @@ function bootstrap() {
       // would collapse it again). Expand/collapse the long-form body in place.
       const dt = e.target.closest(".kk-detail-toggle");
       if (dt) { toggleDetail(dt); return; }
+      // Volet (b) ranger: collapse/expand a report GROUP (reuses the catalogue cat-group interaction).
+      const rghead = e.target.closest(".cat-group-head");
+      if (rghead) {
+        const gbody = rghead.parentElement && rghead.parentElement.querySelector(".cat-group-body");
+        const gcaret = rghead.querySelector(".cat-group-caret");
+        if (gbody) {
+          const willShow = gbody.hidden;
+          gbody.hidden = !willShow;
+          rghead.setAttribute("aria-expanded", willShow ? "true" : "false");
+          if (gcaret) gcaret.textContent = willShow ? "▾" : "▸";
+        }
+        return;
+      }
       // Volet (a): 📋 on a fenced code block copies its raw text (a real <button> — Enter/
       // Space fire a click natively, so no separate keydown branch is needed for it).
       const copyBtn = e.target.closest(".kk-copy-code");
@@ -2858,6 +2966,17 @@ function bootstrap() {
     kioskPanel.addEventListener("input", (e) => {
       const ta = e.target.closest && e.target.closest(".kk-autogrow");
       if (ta) autogrow(ta);
+    });
+    // Volet (b) ranger: the ranging <select> fires "change" — re-render from the CACHED model (cold
+    // source, no re-fetch); persist the mode like the catalogue sort.
+    kioskPanel.addEventListener("change", (e) => {
+      const sortSel = e.target.closest(".kk-reports-sort");
+      if (!sortSel) return;
+      e.stopPropagation();
+      reportsMode = REPORTS_SORT_MODES.some((m) => m.value === sortSel.value) ? sortSel.value : "date";
+      try { localStorage.setItem(REPORTS_SORT_KEY, reportsMode); } catch { /* ignore */ }
+      const host = kioskPanel.querySelector('[data-panel="reports"] .kk-reports');
+      if (host && reportsModel) host.innerHTML = reportsHtml(reportsModel, reportsCanRule, reportsMode);
     });
   }
   document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeKiosk(); });
