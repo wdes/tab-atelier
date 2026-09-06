@@ -37,6 +37,9 @@ fn usage() {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Round {
     pub peer: String,
+    /// The host name the peer answered with — learned, then remembered, so a
+    /// later `take` knows which endpoint speaks for a task's home.
+    pub origin: Option<String>,
     /// Entries they had that we didn't.
     pub pulled: usize,
     /// Entries we had that they didn't.
@@ -48,7 +51,10 @@ pub struct Round {
 #[must_use]
 pub fn format_round(r: &Round) -> String {
     r.error.as_ref().map_or_else(
-        || format!("{}: pulled {} pushed {}", r.peer, r.pulled, r.pushed),
+        || {
+            let who = r.origin.as_ref().map_or_else(String::new, |o| format!(" ({o})"));
+            format!("{}{who}: pulled {} pushed {}", r.peer, r.pulled, r.pushed)
+        },
         |e| format!("{}: {e}", r.peer),
     )
 }
@@ -58,7 +64,8 @@ pub fn format_round(r: &Round) -> String {
 /// Push happens after the pull so the batch we send already includes anything
 /// they just taught us — one round then leaves both sides fully converged
 /// rather than needing a second pass.
-fn exchange(label: &str, url: &str, token: &str, pull_only: bool) -> Round {
+fn exchange(ep: &crate::RemoteEndpoint, pull_only: bool) -> Round {
+    let (label, url, token) = (ep.label.as_str(), ep.url.as_str(), ep.token.as_str());
     let mut round = Round {
         peer: label.to_owned(),
         ..Round::default()
@@ -69,11 +76,20 @@ fn exchange(label: &str, url: &str, token: &str, pull_only: bool) -> Round {
         .call()
     {
         Ok(mut resp) => match resp.body_mut().read_to_string() {
-            Ok(body) => serde_json::from_str::<serde_json::Value>(&body)
-                .ok()
-                .and_then(|v| v.get("entries").cloned())
-                .and_then(|e| serde_json::from_value(e).ok())
-                .unwrap_or_default(),
+            Ok(body) => {
+                let doc: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+                // The response names the host that answered, which is how the
+                // fleet's directory gets built: nobody registers anything, a
+                // gossip round is enough to learn who speaks for which name.
+                if let Some(origin) = doc.get("origin").and_then(serde_json::Value::as_str) {
+                    crate::federation::remember(origin, &ep.id);
+                    round.origin = Some(origin.to_owned());
+                }
+                doc.get("entries")
+                    .cloned()
+                    .and_then(|e| serde_json::from_value(e).ok())
+                    .unwrap_or_default()
+            }
             Err(e) => {
                 round.error = Some(format!("read: {e}"));
                 return round;
@@ -159,7 +175,7 @@ pub fn run(args: &[String]) -> i32 {
     }
     let mut failed = false;
     for ep in selected {
-        let round = exchange(&ep.label, &ep.url, &ep.token, pull_only);
+        let round = exchange(ep, pull_only);
         failed |= round.error.is_some();
         if !quiet || round.error.is_some() {
             println!("{}", format_round(&round));
@@ -176,11 +192,19 @@ mod tests {
     fn rounds_render_counts_or_the_failure() {
         let r = Round {
             peer: "build-box".into(),
+            origin: None,
             pulled: 3,
             pushed: 5,
             error: None,
         };
         assert_eq!(format_round(&r), "build-box: pulled 3 pushed 5");
+        // Once the peer names itself, say so — the label is ours, the origin
+        // is theirs, and a task's home is expressed in theirs.
+        let named = Round {
+            origin: Some("colossus".into()),
+            ..r
+        };
+        assert_eq!(format_round(&named), "build-box (colossus): pulled 3 pushed 5");
         // A peer that is down must be visible rather than reported as a
         // successful no-op round — silent convergence failure is the thing
         // that makes distributed state mysterious.

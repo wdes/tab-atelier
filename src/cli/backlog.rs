@@ -5,27 +5,95 @@
 //! `tab-atelier backlog` — turn measured state into announced work.
 //!
 //! A fleet that waits for a human to type tasks isn't self-organising, it's
-//! just remote control. This is the generator: it reads a coverage report,
-//! finds the files that are worst covered and the ones that haven't been
-//! audited lately, and announces them on the blackboard. Agents then take
-//! work with `take`, which needs no scheduler and no supervisor.
+//! just remote control. This is the generator, and it is deliberately not
+//! about any particular kind of work: a **source** is anything that prints
+//! candidate tasks, one per line, as `id<TAB>title`.
 //!
-//! Two properties make it safe to run on a timer:
+//! ```text
+//!   tab-atelier backlog --from ./scripts/tasks-from-todo.sh
+//!   tab-atelier backlog --from-file backlog.tsv
+//!   tab-atelier backlog --lcov target/lcov.info      # built-in coverage source
+//! ```
 //!
-//! - **Idempotent.** Task ids are derived from the target (`cov:src/api.rs`),
-//!   so re-running announces nothing new while the task is still open. The
-//!   blackboard grows with the work, not with the polling.
-//! - **Cooling.** A finished task isn't re-announced until `--cooldown` days
-//!   have passed, so the fleet moves on instead of re-auditing yesterday's
-//!   file forever.
+//! Sources compose — pass `--from` several times and every candidate lands on
+//! one board. What this module actually owns is the part every source needs
+//! and none should reimplement:
 //!
-//! Coverage comes from LCOV (`cargo llvm-cov --lcov --output-path …`) rather
-//! than by shelling out to cargo: generating a report is a multi-minute build,
-//! which is the caller's business, not something a backlog sweep should
-//! trigger.
+//! - **Idempotence.** A candidate whose id is already open, bidding or awarded
+//!   is not announced again, so a sweep can run on a timer without turning the
+//!   board into a pile of duplicates. Sources are therefore free to emit their
+//!   whole world every time; they don't have to remember what they said.
+//! - **Cooling.** A finished task stays off the board for `--cooldown` days, so
+//!   the fleet moves on instead of re-doing yesterday's work forever.
+//!
+//! That division is what makes the mechanism general: the source decides what
+//! is worth doing, the backlog decides whether it is worth *saying*.
 
-use super::tasks::{TaskState, fold_tasks};
+use std::process::Command;
+
+use super::tasks::{TaskState, TaskView, fold_tasks};
 use super::team::{NoteKind, append_entry, new_entry, read_blackboard};
+
+/// One piece of work a source thinks is worth doing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Candidate {
+    /// Stable across runs — this is what makes re-running safe. Derive it from
+    /// the thing being worked on (`cov:src/api.rs`, `todo:src/app.rs:412`),
+    /// never from a timestamp or a counter.
+    pub id: String,
+    pub title: String,
+}
+
+/// Parse a source's output: `id<TAB>title` per line.
+///
+/// Blank lines and `#` comments are skipped so a source can be a readable
+/// file. A line with no tab is taken as an id whose title repeats it, because
+/// a bare list of ids is a reasonable thing to emit and failing on it would be
+/// pedantry. Whitespace-only ids are dropped rather than announced as an
+/// unnameable task.
+#[must_use]
+pub fn parse_candidates(text: &str) -> Vec<Candidate> {
+    text.lines()
+        .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+        .filter_map(|line| {
+            // Split BEFORE trimming the line: a leading tab means "no id", and
+            // trimming first would silently promote the title to an id.
+            let (id, title) = line
+                .split_once('\t')
+                .map_or_else(|| (line.trim(), line.trim()), |(a, b)| (a.trim(), b.trim()));
+            (!id.is_empty()).then(|| Candidate {
+                id: id.to_owned(),
+                title: if title.is_empty() {
+                    id.to_owned()
+                } else {
+                    title.to_owned()
+                },
+            })
+        })
+        .collect()
+}
+
+/// Run a source command through the shell and parse its output.
+///
+/// Shell rather than exec so a source can be a pipeline — which is most of
+/// them in practice (`rg -n TODO src | head -20 | awk …`). A source that fails
+/// is reported and skipped, never fatal: one broken generator must not stop
+/// the others from finding work.
+///
+/// # Errors
+/// When the command can't be spawned, or exits non-zero (stderr is quoted).
+pub fn run_source(cmd: &str) -> Result<Vec<Candidate>, String> {
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .output()
+        .map_err(|e| format!("{cmd}: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("{cmd}: exited {}: {}", out.status, err.trim()));
+    }
+    Ok(parse_candidates(&String::from_utf8_lossy(&out.stdout)))
+}
 
 /// Per-file line coverage, as LCOV reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,15 +201,64 @@ pub fn should_announce(board: &[super::tasks::TaskView], task_id: &str, now_s: u
     }
 }
 
-fn usage() {
-    eprintln!(
-        "usage: tab-atelier backlog [--lcov <path>] [--target <pct>] [--limit N]\n  \
-         [--min-lines N] [--cooldown <days>] [--audit-largest N] [--dry-run]\n\n\
-         Announces work derived from a coverage report: the worst-covered files, plus\n\
-         a rotation of small audits. Idempotent — safe to run on a timer.\n\
-         Produce the report with:\n  \
-         cargo llvm-cov --lcov --output-path target/lcov.info"
-    );
+/// How the built-in coverage source picks files.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CoveragePolicy {
+    /// Coverage percentage worth aiming at.
+    pub target: f64,
+    /// Ignore files smaller than this — a task has overhead, and a 12-line
+    /// file isn't worth an agent's context window.
+    pub min_lines: u32,
+    /// Most coverage tasks to emit.
+    pub limit: usize,
+    /// How many of the largest files to put up for audit.
+    pub audit_largest: usize,
+}
+
+impl Default for CoveragePolicy {
+    fn default() -> Self {
+        Self {
+            target: 80.0,
+            min_lines: 40,
+            limit: 5,
+            audit_largest: 2,
+        }
+    }
+}
+
+/// The built-in coverage source: worst-covered files, plus a rotation of
+/// audits over the largest ones.
+///
+/// It is only a source. Everything that makes the sweep safe to repeat lives
+/// in [`plan`], which knows nothing about coverage.
+#[must_use]
+pub fn coverage_candidates(files: &[FileCoverage], p: &CoveragePolicy) -> Vec<Candidate> {
+    let mut out: Vec<Candidate> = worst_covered(files, p.target, p.min_lines, p.limit)
+        .into_iter()
+        .map(|f| Candidate {
+            id: format!("cov:{}", f.path),
+            title: format!(
+                "raise coverage of {} — {:.1}% of {} lines, {} to reach {:.0}%",
+                f.path,
+                f.percent(),
+                f.lines_found,
+                f.lines_to(p.target),
+                p.target,
+            ),
+        })
+        .collect();
+    // Size is a rough proxy for "most places to hide a bug", and it gives a
+    // stable order every host agrees on.
+    let mut by_size: Vec<&FileCoverage> = files.iter().collect();
+    by_size.sort_by(|a, b| b.lines_found.cmp(&a.lines_found).then_with(|| a.path.cmp(&b.path)));
+    out.extend(by_size.into_iter().take(p.audit_largest).map(|f| Candidate {
+        id: format!("audit:{}", f.path),
+        title: format!(
+            "small audit of {} ({} lines) — one focused pass, report what you find",
+            f.path, f.lines_found
+        ),
+    }));
+    out
 }
 
 /// One planned announcement.
@@ -151,121 +268,96 @@ pub struct Planned {
     pub title: String,
 }
 
-/// What the sweep looks for, kept together so the policy is one value rather
-/// than a handful of positional numbers.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Policy {
-    /// Coverage percentage worth aiming at.
-    pub target: f64,
-    /// Ignore files smaller than this — a task has overhead, and a 12-line
-    /// file isn't worth an agent's context window.
-    pub min_lines: u32,
-    /// Most coverage tasks to announce per sweep.
-    pub limit: usize,
-    /// How many of the largest files to put up for audit.
-    pub audit_largest: usize,
-    /// How long a finished task stays off the board.
-    pub cooldown_s: u64,
-}
-
-impl Default for Policy {
-    fn default() -> Self {
-        Self {
-            target: 80.0,
-            min_lines: 40,
-            limit: 5,
-            audit_largest: 2,
-            cooldown_s: 30 * 86_400,
-        }
-    }
-}
-
-/// Decide what to announce. Pure, so the policy is testable without a board on
-/// disk or a coverage run.
+/// Filter candidates down to what is worth announcing.
+///
+/// This is the whole reusable part, and it is source-agnostic on purpose:
+/// drop anything already in flight, drop anything finished more recently than
+/// `cooldown_s`, and de-duplicate ids within the batch so two sources
+/// proposing the same work announce it once.
 #[must_use]
-pub fn plan(files: &[FileCoverage], board: &[super::tasks::TaskView], p: &Policy, now_s: u64) -> Vec<Planned> {
-    let (target, cooldown_s) = (p.target, p.cooldown_s);
-    let mut out = Vec::new();
-    for f in worst_covered(files, target, p.min_lines, p.limit) {
-        let id = format!("cov:{}", f.path);
-        if should_announce(board, &id, now_s, cooldown_s) {
-            out.push(Planned {
-                id,
-                title: format!(
-                    "raise coverage of {} — {:.1}% of {} lines, {} to reach {target:.0}%",
-                    f.path,
-                    f.percent(),
-                    f.lines_found,
-                    f.lines_to(target),
-                ),
-            });
-        }
-    }
-    // Audits rotate over the biggest files: size is a decent proxy for "most
-    // places to hide a bug", and it gives a stable order every host agrees on.
-    let mut by_size: Vec<&FileCoverage> = files.iter().collect();
-    by_size.sort_by(|a, b| b.lines_found.cmp(&a.lines_found).then_with(|| a.path.cmp(&b.path)));
-    for f in by_size.into_iter().take(p.audit_largest) {
-        let id = format!("audit:{}", f.path);
-        if should_announce(board, &id, now_s, cooldown_s) {
-            out.push(Planned {
-                id,
-                title: format!(
-                    "small audit of {} ({} lines) — one focused pass, report what you find",
-                    f.path, f.lines_found
-                ),
-            });
-        }
-    }
-    out
+pub fn plan(candidates: &[Candidate], board: &[TaskView], now_s: u64, cooldown_s: u64) -> Vec<Planned> {
+    let mut seen = std::collections::HashSet::new();
+    candidates
+        .iter()
+        .filter(|c| seen.insert(c.id.clone()))
+        .filter(|c| should_announce(board, &c.id, now_s, cooldown_s))
+        .map(|c| Planned {
+            id: c.id.clone(),
+            title: c.title.clone(),
+        })
+        .collect()
+}
+
+fn usage_full() {
+    eprintln!(
+        "usage: tab-atelier backlog [sources] [--cooldown <days>] [--dry-run]\n\n\
+         sources (repeatable, combined):\n  \
+         --from <command>      run it; each stdout line is `id<TAB>title`\n  \
+         --from-file <path>    same format, read from a file\n  \
+         --lcov <path>         built-in: worst-covered files + a rotation of audits\n\n\
+         coverage source options: --target <pct> --limit <n> --min-lines <n> --audit-largest <n>\n\n\
+         Announcing is idempotent: a candidate already open (or finished within\n\
+         --cooldown days) is skipped, so a source can emit its whole world every\n\
+         run and this can go on a timer.\n\n\
+         examples:\n  \
+         tab-atelier backlog --from 'rg -n \"TODO\" src | head -20 | sed \"s/\\(.*\\):\\([0-9]*\\):.*/todo:\\1:\\2\\ttidy the TODO at \\1:\\2/\"'\n  \
+         cargo llvm-cov --lcov --output-path target/lcov.info && tab-atelier backlog --lcov target/lcov.info"
+    );
 }
 
 #[must_use]
 pub fn run(args: &[String]) -> i32 {
-    let mut lcov = "target/lcov.info".to_string();
-    let mut policy = Policy::default();
-    let mut cooldown_days = policy.cooldown_s / 86_400;
+    let mut sources: Vec<String> = Vec::new();
+    let mut files: Vec<String> = Vec::new();
+    let mut lcov: Option<String> = None;
+    let mut policy = CoveragePolicy::default();
+    let mut cooldown_days = 30_u64;
     let mut dry = false;
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].clone();
-        // Every flag below takes a value; fetch it once so a missing value is
-        // one error path rather than six.
         let mut value = || -> Option<String> {
             i += 1;
             args.get(i).cloned()
         };
-        let parsed = match flag.as_str() {
+        match flag.as_str() {
             "--dry-run" => {
                 dry = true;
                 i += 1;
                 continue;
             }
             "-h" | "--help" => {
-                usage();
+                usage_full();
                 return 0;
             }
-            "--lcov" | "--target" | "--limit" | "--min-lines" | "--cooldown" | "--audit-largest" => value(),
-            other => {
-                eprintln!("backlog: unknown argument: {other}");
-                return 2;
-            }
-        };
-        let Some(v) = parsed else {
+            _ => {}
+        }
+        let Some(v) = value() else {
             eprintln!("backlog: {flag} expects a value");
             return 2;
         };
         let ok = match flag.as_str() {
+            "--from" => {
+                sources.push(v.clone());
+                true
+            }
+            "--from-file" => {
+                files.push(v.clone());
+                true
+            }
             "--lcov" => {
-                lcov.clone_from(&v);
+                lcov = Some(v.clone());
                 true
             }
             "--target" => v.parse().map(|t| policy.target = t).is_ok(),
             "--limit" => v.parse().map(|l| policy.limit = l).is_ok(),
             "--min-lines" => v.parse().map(|m| policy.min_lines = m).is_ok(),
-            "--cooldown" => v.parse().map(|d| cooldown_days = d).is_ok(),
             "--audit-largest" => v.parse().map(|a| policy.audit_largest = a).is_ok(),
-            _ => true,
+            "--cooldown" => v.parse().map(|d| cooldown_days = d).is_ok(),
+            other => {
+                eprintln!("backlog: unknown argument: {other}");
+                return 2;
+            }
         };
         if !ok {
             eprintln!("backlog: {flag} got {v:?}, which is not a number");
@@ -273,31 +365,66 @@ pub fn run(args: &[String]) -> i32 {
         }
         i += 1;
     }
-    policy.cooldown_s = cooldown_days.saturating_mul(86_400);
-
-    let body = match std::fs::read_to_string(&lcov) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!(
-                "backlog: {lcov}: {e}\n\
-                 generate one with: cargo llvm-cov --lcov --output-path {lcov}"
-            );
-            return 1;
-        }
-    };
-    let files = parse_lcov(&body);
-    if files.is_empty() {
-        eprintln!("backlog: {lcov} has no file records — is it LCOV?");
-        return 1;
+    if sources.is_empty() && files.is_empty() && lcov.is_none() {
+        usage_full();
+        return 2;
     }
+
+    let mut candidates: Vec<Candidate> = Vec::new();
+    let mut had_error = false;
+    for cmd in &sources {
+        match run_source(cmd) {
+            Ok(c) => candidates.extend(c),
+            Err(e) => {
+                // One broken generator must not stop the others: the fleet
+                // should still get whatever work the healthy sources found.
+                eprintln!("backlog: source failed: {e}");
+                had_error = true;
+            }
+        }
+    }
+    for path in &files {
+        match std::fs::read_to_string(path) {
+            Ok(body) => candidates.extend(parse_candidates(&body)),
+            Err(e) => {
+                eprintln!("backlog: {path}: {e}");
+                had_error = true;
+            }
+        }
+    }
+    if let Some(path) = &lcov {
+        match std::fs::read_to_string(path) {
+            Ok(body) => {
+                let files = parse_lcov(&body);
+                if files.is_empty() {
+                    eprintln!("backlog: {path} has no file records — is it LCOV?");
+                    had_error = true;
+                } else {
+                    candidates.extend(coverage_candidates(&files, &policy));
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "backlog: {path}: {e}\n\
+                     generate one with: cargo llvm-cov --lcov --output-path {path}"
+                );
+                had_error = true;
+            }
+        }
+    }
+    if candidates.is_empty() {
+        eprintln!("backlog: no candidates from any source");
+        return i32::from(had_error);
+    }
+
     let board = fold_tasks(&read_blackboard());
     let now_s = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let planned = plan(&files, &board, &policy, now_s);
+    let planned = plan(&candidates, &board, now_s, cooldown_days.saturating_mul(86_400));
     if planned.is_empty() {
         println!("(nothing to announce — every candidate is already on the board or still cooling)");
-        return 0;
+        return i32::from(had_error);
     }
     for p in &planned {
         if dry {
@@ -314,7 +441,7 @@ pub fn run(args: &[String]) -> i32 {
             }
         }
     }
-    0
+    i32::from(had_error)
 }
 
 #[cfg(test)]
@@ -344,73 +471,21 @@ mod tests {
         parse_lcov(LCOV)
     }
 
-    #[test]
-    fn lcov_parses_into_per_file_counts() {
-        let files = cov();
-        assert_eq!(files.len(), 4);
-        assert_eq!(files[0].path, "src/api.rs");
-        assert_eq!((files[0].lines_found, files[0].lines_hit), (1000, 400));
-        assert!((files[0].percent() - 40.0).abs() < f64::EPSILON);
-        // Unknown records (TN:, DA:) are skipped rather than fatal.
-        assert!(files.iter().all(|f| !f.path.is_empty()));
-        // A record with no counts still yields a file rather than vanishing.
-        let partial = parse_lcov("SF:src/x.rs\nend_of_record\n");
-        assert_eq!(partial.len(), 1);
-        assert!(
-            (partial[0].percent() - 100.0).abs() < f64::EPSILON,
-            "nothing to cover is not 0%"
-        );
-        // Junk is not a crash and not a phantom file.
-        assert!(parse_lcov("").is_empty());
-        assert!(parse_lcov("not lcov at all\n").is_empty());
-        // An unterminated record is ignored — half a report is not a file.
-        assert!(parse_lcov("SF:src/x.rs\nLF:10\n").is_empty());
+    fn cand(id: &str) -> Candidate {
+        Candidate {
+            id: id.to_owned(),
+            title: format!("do {id}"),
+        }
     }
 
-    #[test]
-    fn the_worst_covered_are_ranked_by_shortfall_not_percentage() {
-        let files = cov();
-        let worst = worst_covered(&files, 80.0, 40, 5);
-        // src/tiny.rs is 0% but only 10 lines — below min_lines, so it is not
-        // work worth announcing; src/good.rs is already above target.
-        let paths: Vec<&str> = worst.iter().map(|f| f.path.as_str()).collect();
-        assert_eq!(paths, vec!["src/api.rs", "src/mid.rs"]);
-        // 1000-line file at 40% needs 400 lines; 300-line at 50% needs 90.
-        assert_eq!(worst[0].lines_to(80.0), 400);
-        assert_eq!(worst[1].lines_to(80.0), 90);
-        // A file already at target asks for nothing.
-        assert_eq!(files[2].lines_to(80.0), 0);
-        assert_eq!(worst_covered(&files, 80.0, 40, 1).len(), 1, "limit applies");
-    }
-
-    #[test]
-    fn generation_is_idempotent_against_the_board() {
-        let files = cov();
-        let now = 1_000_000_u64;
-        let pol = Policy {
-            audit_largest: 1,
-            ..Policy::default()
-        };
-        let first = plan(&files, &[], &pol, now);
-        let ids: Vec<&str> = first.iter().map(|p| p.id.as_str()).collect();
-        assert_eq!(ids, vec!["cov:src/api.rs", "cov:src/mid.rs", "audit:src/api.rs"]);
-        assert!(first[0].title.contains("40.0%"), "{}", first[0].title);
-        assert!(first[0].title.contains("400 to reach 80%"), "{}", first[0].title);
-
-        // Re-running with those already on the board announces nothing — this
-        // is what makes a timer-driven sweep safe.
-        let board = board_with(&first, now, None);
-        assert!(plan(&files, &board, &pol, now).is_empty());
-    }
-
-    /// Board entries for planned tasks, optionally completed at `done_ts`.
-    fn board_with(planned: &[Planned], ts: u64, done_ts: Option<u64>) -> Vec<super::super::tasks::TaskView> {
-        planned
-            .iter()
-            .map(|p| super::super::tasks::TaskView {
-                id: p.id.clone(),
-                title: p.title.clone(),
+    /// Board entries for ids, optionally completed at `done_ts`.
+    fn board_with(ids: &[&str], ts: u64, done_ts: Option<u64>) -> Vec<TaskView> {
+        ids.iter()
+            .map(|id| TaskView {
+                id: (*id).to_owned(),
+                title: String::new(),
                 announced_by: Some("backlog".into()),
+                home: Some("test-host".into()),
                 announced_ts: ts,
                 last_ts: done_ts.unwrap_or(ts),
                 bids: Vec::new(),
@@ -421,64 +496,132 @@ mod tests {
     }
 
     #[test]
-    fn finished_work_is_re_announced_only_after_it_cools() {
-        let files = cov();
-        let now = 10_000_000_u64;
-        let no_audits = Policy {
-            audit_largest: 0,
-            cooldown_s: 0,
-            ..Policy::default()
-        };
-        let planned = plan(&files, &[], &no_audits, now);
-        let cooling = Policy {
-            audit_largest: 0,
-            ..Policy::default()
-        };
+    fn any_source_can_feed_the_board() {
+        // The general contract: `id<TAB>title`, one per line. Nothing about
+        // this is coverage-specific.
+        let c = parse_candidates(
+            "todo:src/app.rs:412\ttidy the TODO at app.rs:412\n\
+             \n\
+             # a comment, and the blank line above\n\
+             flaky:tests/net.rs\tthis test failed 3 of 10 runs\n\
+               spaced:id  \t  spaced title  \n",
+        );
+        assert_eq!(c.len(), 3);
+        assert_eq!(c[0].id, "todo:src/app.rs:412");
+        assert_eq!(c[0].title, "tidy the TODO at app.rs:412");
+        assert_eq!(c[2].id, "spaced:id", "surrounding whitespace trimmed");
+        assert_eq!(c[2].title, "spaced title");
+        // A bare id is a reasonable thing to emit; failing on it would be
+        // pedantry, so the id doubles as the title.
+        let bare = parse_candidates("just-an-id\n");
+        assert_eq!(bare[0].id, "just-an-id");
+        assert_eq!(bare[0].title, "just-an-id");
+        // An unnameable task is dropped rather than announced.
+        assert!(parse_candidates("\t title with no id\n").is_empty());
+        assert!(parse_candidates("").is_empty());
+    }
 
-        // Finished an hour ago: leave it alone, the fleet has other work.
-        let fresh = board_with(&planned, now - 3_600, Some(now - 3_600));
-        assert!(plan(&files, &fresh, &cooling, now).is_empty());
+    #[test]
+    fn a_source_command_is_run_through_the_shell() {
+        // Sources are pipelines in practice, so the shell is the interface.
+        let c = run_source("printf 'a\\tdo a\\nb\\tdo b\\n'").unwrap();
+        assert_eq!(c.len(), 2);
+        assert_eq!(c[1].id, "b");
+        assert!(run_source("printf 'x\\tdo x\\n' | cat").is_ok(), "pipelines work");
+        // A failing source reports rather than pretending it found nothing —
+        // silence would look identical to "no work", which is a lie.
+        let err = run_source("echo boom >&2; exit 3").unwrap_err();
+        assert!(err.contains("boom"), "{err}");
+        assert!(err.contains("exited"), "{err}");
+    }
 
-        // Finished two months ago: coverage rots, so offer it again.
-        let stale = board_with(&planned, now - 60 * 86_400, Some(now - 60 * 86_400));
-        assert_eq!(plan(&files, &stale, &cooling, now).len(), planned.len());
+    #[test]
+    fn planning_is_idempotent_and_source_agnostic() {
+        let now = 1_000_000_u64;
+        let candidates = vec![cand("todo:a"), cand("cov:src/api.rs"), cand("audit:x")];
+        let all = plan(&candidates, &[], now, 30 * 86_400);
+        assert_eq!(all.len(), 3, "a fresh board takes everything");
+
+        // Already announced: say nothing. This is what makes a timer safe, and
+        // it means a source can emit its whole world every run.
+        let board = board_with(&["todo:a", "cov:src/api.rs", "audit:x"], now, None);
+        assert!(plan(&candidates, &board, now, 30 * 86_400).is_empty());
+
+        // Two sources proposing the same work announce it once.
+        let dupes = vec![cand("todo:a"), cand("todo:a"), cand("todo:b")];
+        let ids: Vec<String> = plan(&dupes, &[], now, 0).into_iter().map(|p| p.id).collect();
+        assert_eq!(ids, vec!["todo:a", "todo:b"]);
     }
 
     #[test]
     fn work_in_flight_is_never_re_announced() {
-        let files = cov();
         let now = 1_000_000_u64;
-        let hot = Policy {
-            audit_largest: 0,
-            cooldown_s: 0,
-            ..Policy::default()
-        };
-        let planned = plan(&files, &[], &hot, now);
-        let mut board = board_with(&planned, now, None);
+        let candidates = vec![cand("todo:a")];
+        let mut board = board_with(&["todo:a"], now, None);
         board[0].awarded_to = Some("agent-a".into());
-        board[0].bids.push(("agent-a".into(), 400));
         // Even with a zero cooldown, an awarded task is somebody's job.
-        let again = plan(&files, &board, &hot, now);
-        assert!(
-            !again.iter().any(|p| p.id == board[0].id),
-            "announced work that is already awarded"
-        );
+        assert!(plan(&candidates, &board, now, 0).is_empty());
+        board[0].awarded_to = None;
+        board[0].bids.push(("agent-a".into(), 5));
+        assert!(plan(&candidates, &board, now, 0).is_empty(), "bidding is in flight too");
     }
 
     #[test]
-    fn audits_rotate_over_the_biggest_files() {
+    fn finished_work_is_re_announced_only_after_it_cools() {
+        let now = 10_000_000_u64;
+        let candidates = vec![cand("todo:a")];
+        let cooldown = 30 * 86_400;
+        // Finished an hour ago: leave it alone, the fleet has other work.
+        let fresh = board_with(&["todo:a"], now - 3_600, Some(now - 3_600));
+        assert!(plan(&candidates, &fresh, now, cooldown).is_empty());
+        // Finished two months ago: worth doing again.
+        let stale = board_with(&["todo:a"], now - 60 * 86_400, Some(now - 60 * 86_400));
+        assert_eq!(plan(&candidates, &stale, now, cooldown).len(), 1);
+        // A failure cools the same way — an agent that gave up may just have
+        // been the wrong agent, but retrying it immediately is a loop.
+        let mut failed = board_with(&["todo:a"], now - 3_600, Some(now - 3_600));
+        failed[0].done = Some((false, "could not build".into()));
+        assert!(plan(&candidates, &failed, now, cooldown).is_empty());
+        assert_eq!(plan(&candidates, &failed, now, 0).len(), 1, "with no cooldown, retry");
+    }
+
+    #[test]
+    fn lcov_parses_into_per_file_counts() {
         let files = cov();
-        let now = 1_000_000_u64;
-        // No coverage tasks (limit 0), just audits: biggest first.
-        let audits_only = Policy {
-            limit: 0,
-            audit_largest: 2,
-            ..Policy::default()
+        assert_eq!(files.len(), 4);
+        assert_eq!(files[0].path, "src/api.rs");
+        assert_eq!((files[0].lines_found, files[0].lines_hit), (1000, 400));
+        assert!((files[0].percent() - 40.0).abs() < f64::EPSILON);
+        // A record with no counts still yields a file rather than vanishing.
+        let partial = parse_lcov("SF:src/x.rs\nend_of_record\n");
+        assert_eq!(partial.len(), 1);
+        assert!(
+            (partial[0].percent() - 100.0).abs() < f64::EPSILON,
+            "nothing to cover is not 0%"
+        );
+        assert!(parse_lcov("").is_empty());
+        assert!(parse_lcov("not lcov at all\n").is_empty());
+        // An unterminated record is ignored — half a report is not a file.
+        assert!(parse_lcov("SF:src/x.rs\nLF:10\n").is_empty());
+    }
+
+    #[test]
+    fn the_coverage_source_ranks_by_shortfall_not_percentage() {
+        let files = cov();
+        let p = CoveragePolicy {
+            audit_largest: 1,
+            ..CoveragePolicy::default()
         };
-        let audits = plan(&files, &[], &audits_only, now);
-        let ids: Vec<&str> = audits.iter().map(|p| p.id.as_str()).collect();
-        assert_eq!(ids, vec!["audit:src/api.rs", "audit:src/mid.rs"]);
-        assert!(audits[0].title.contains("1000 lines"), "{}", audits[0].title);
+        let c = coverage_candidates(&files, &p);
+        let ids: Vec<&str> = c.iter().map(|c| c.id.as_str()).collect();
+        // src/tiny.rs is 0% but 10 lines — below min_lines. src/good.rs is
+        // already above target. A 1000-line file at 40% outranks a 300-line
+        // one at 50%.
+        assert_eq!(ids, vec!["cov:src/api.rs", "cov:src/mid.rs", "audit:src/api.rs"]);
+        assert!(c[0].title.contains("40.0%"), "{}", c[0].title);
+        assert!(c[0].title.contains("400 to reach 80%"), "{}", c[0].title);
+        assert_eq!(worst_covered(&files, 80.0, 40, 1).len(), 1, "limit applies");
+        assert_eq!(files[2].lines_to(80.0), 0, "a file at target asks for nothing");
     }
 
     #[test]
@@ -486,9 +629,11 @@ mod tests {
         let argv = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
         assert_eq!(run(&argv(&["--limit", "abc"])), 2);
         assert_eq!(run(&argv(&["--target"])), 2);
-        assert_eq!(run(&argv(&["--nope"])), 2);
+        assert_eq!(run(&argv(&["--nope", "x"])), 2);
         assert_eq!(run(&argv(&["--help"])), 0);
-        // A missing report explains how to make one rather than failing bare.
-        assert_eq!(run(&argv(&["--lcov", "/nonexistent/lcov.info"])), 1);
+        // No source at all is a usage error, not a silent no-op: the caller
+        // asked for work and got none, and should be told why.
+        assert_eq!(run(&argv(&[])), 2);
+        assert_eq!(run(&argv(&["--from-file", "/nonexistent/tasks.tsv"])), 1);
     }
 }

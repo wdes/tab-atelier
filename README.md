@@ -564,15 +564,19 @@ tab-atelier handoff ./report.md db-expert
 **Let the fleet divide the work itself** — instead of deciding who does what, put the work on a shared board and let agents take it:
 
 ```bash
-cargo llvm-cov --lcov --output-path target/lcov.info
-tab-atelier backlog                    # announce the worst-covered files + a rotation of audits
+tab-atelier backlog --from './my-task-source.sh'   # any source: `id<TAB>title` per line
+tab-atelier backlog --lcov target/lcov.info        # or the built-in coverage source
 tab-atelier tasks                      # the board
 tab-atelier take                       # lease the best open task for THIS agent
 tab-atelier done cov:src/api.rs "40% -> 82%"
+tab-atelier wait cov:src/api.rs && echo "…and now the follow-up"
+tab-atelier fleet                      # who is working on what (--json for a graph)
 tab-atelier gossip                     # converge boards with configured remotes
 ```
 
-`take` leases the task through the daemon, so two agents never pick up the same one, and a lease from a tab that dies simply expires. Nothing schedules; agents rank the board by a hash of (task, agent), so they spread out without talking to each other. See [`docs/self-organization.md`](docs/self-organization.md) for the design — including why this is leases and CRDTs rather than Raft — and `scripts/self-org-sandbox.sh` for a two-host demonstration that touches nothing of yours.
+`take` leases the task through the daemon, so two agents never pick up the same one, and a lease from a tab that dies simply expires. Nothing schedules: agents rank the board by a hash of (task, agent) and spread out without talking to each other. `wait` reports outcomes as exit codes (0 done, 1 failed, 3 running, 4 unknown) instead of holding a connection, so a supervisor can run many at once — or you can skip supervisors entirely, which is the point.
+
+**Across machines**, a task's *home* is the host it was announced on, and taking it means claiming it there over the same `remote` endpoint the sidecar uses — so two machines can't hand out the same work. Everything else stays each host's own business. See [`docs/self-organization.md`](docs/self-organization.md) for the design, the federation-vs-confederation distinction, and why this is leases and CRDTs rather than Raft; `scripts/self-org-sandbox.sh` runs the whole thing across two sandboxed daemons without touching anything of yours.
 
 ## Wakatime
 

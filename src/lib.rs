@@ -23,6 +23,8 @@ pub(crate) mod box_drawing;
 #[cfg(feature = "catbus")]
 pub(crate) mod catbus_agent;
 pub mod claims;
+pub mod federation;
+pub mod fleet;
 // Shared by both binaries now (GUI applies per-tab cgroup limits too); the
 // module's own `#![cfg(target_os = "linux")]` scopes it to Linux.
 #[cfg(target_os = "linux")]

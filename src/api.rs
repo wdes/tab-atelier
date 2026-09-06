@@ -18,6 +18,7 @@ mod claims_route;
 mod claude_only;
 mod env;
 mod files;
+mod fleet_route;
 mod input;
 mod limits;
 mod lock;
@@ -1877,6 +1878,7 @@ fn handle_connection<S: Read + Write>(
         }
         ("POST", "/claims") => claims_route::grant(stream, &body_bytes),
         ("POST", "/claims/release") => claims_route::release(stream, &body_bytes),
+        ("GET", "/fleet") => fleet_route::get(stream, state),
         ("GET", "/blackboard") => blackboard_route::list(stream, query_since),
         ("POST", "/blackboard") => blackboard_route::merge(stream, &body_bytes),
         ("GET", "/env") => env::list_global(stream),
@@ -3661,8 +3663,87 @@ mod tests {
         assert!(resp.contains("local hop"), "{resp}");
     }
 
+    /// Serialises the tests that redirect the process-global blackboard and
+    /// lease-registry paths — they would otherwise clobber each other's
+    /// overrides when the suite runs in parallel.
+    static BOARD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn the_fleet_route_renders_who_is_working_on_what() {
+        let _guard = BOARD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (port, _state, token) = spawn_server();
+        let dir = tempfile::tempdir().unwrap();
+        crate::cli::team::set_blackboard_path(Some(dir.path().join("blackboard.jsonl")));
+        crate::claims::set_registry_path(Some(dir.path().join("claims.json")));
+        crate::claims::reset_for_test();
+
+        let post = |path: &str, body: &str| {
+            request(
+                port,
+                &format!(
+                    "POST {path} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                ),
+            )
+        };
+        // A task announced and awarded, with a live lease behind it.
+        post(
+            "/blackboard",
+            r#"{"entries":[
+                {"ts":10,"msg":"raise coverage","id":"e1","kind":"announce","task":"cov:x","from":"backlog","origin":"host-a"},
+                {"ts":11,"msg":"","id":"e2","kind":"award","task":"cov:x","from":"agent-1","to":"agent-1"}
+            ]}"#,
+        );
+        post("/claims", r#"{"key":"task:cov:x","holder":"agent-1","ttl_ms":60000}"#);
+
+        let body = request(
+            port,
+            &format!("GET /fleet HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\n\r\n"),
+        );
+        assert_eq!(status_code(&body), 200, "{body}");
+        let json = body.split("\r\n\r\n").nth(1).unwrap_or("");
+        let g: crate::fleet::Graph = serde_json::from_str(json).expect("graph json");
+
+        let works: Vec<&crate::fleet::Edge> = g.edges.iter().filter(|e| e.kind == "works_on").collect();
+        assert_eq!(works.len(), 1, "one agent working: {:?}", g.edges);
+        assert_eq!(works[0].from, "agent:agent-1");
+        assert_eq!(works[0].to, "task:cov:x");
+        assert_eq!(works[0].leased, Some(true), "the live lease should back the award");
+        assert!(works[0].expires_in_ms.is_some_and(|ms| ms > 0));
+        // The task's home travelled with the entry, so a viewer can group by
+        // machine without asking anyone.
+        assert!(
+            g.edges.iter().any(|e| e.kind == "home" && e.to == "host:host-a"),
+            "{:?}",
+            g.edges
+        );
+        assert!(g.nodes.iter().any(|n| n.kind == "task" && n.id == "task:cov:x"));
+        // The working agent is a node even though it has no tab on this host —
+        // in a federated fleet most agents are somewhere else, and omitting
+        // them would draw work assigned to nobody.
+        let agent = g
+            .nodes
+            .iter()
+            .find(|n| n.id == "agent:agent-1")
+            .expect("the working agent should be a node");
+        assert_eq!(agent.kind, "agent");
+        assert!(
+            g.nodes.iter().any(|n| n.kind == "host"),
+            "a graph always has at least the host it came from"
+        );
+
+        crate::claims::reset_for_test();
+        crate::claims::set_registry_path(None);
+        crate::cli::team::set_blackboard_path(None);
+    }
+
     #[test]
     fn the_blackboard_route_merges_a_peers_entries_idempotently() {
+        let _guard = BOARD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (port, _state, token) = spawn_server();
         let dir = tempfile::tempdir().unwrap();
         crate::cli::team::set_blackboard_path(Some(dir.path().join("blackboard.jsonl")));
@@ -3718,6 +3799,9 @@ mod tests {
 
     #[test]
     fn the_claims_route_grants_one_holder_and_names_the_other() {
+        let _guard = BOARD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (port, _state, token) = spawn_server();
         // Hermetic: a test run must never touch the developer's real lease
         // table, and two tests sharing one would race.

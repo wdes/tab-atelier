@@ -383,17 +383,67 @@ pub fn mint_id(origin: &str, ts: u64, content: &str) -> String {
     format!("{origin}-{ts:x}-{:016x}", stable_hash(content))
 }
 
-/// This host's gossip identity — the hostname, falling back to a hash of the
-/// state directory when there isn't one. Only needs to be stable and unlikely
-/// to collide with a peer.
+/// This instance's identity in the fleet: `<hostname>-<8 hex>`, minted once
+/// and kept in the state directory.
+///
+/// The hostname alone is not enough, and the sandbox test proved it: two
+/// instances on one machine both called themselves the same thing, so each
+/// believed the other's tasks were its own — a task's home host could never be
+/// resolved, and federated claims silently degraded to local ones. Cloned VMs
+/// and default hostnames have the same problem in the field.
+///
+/// It is worse than a routing bug. Entry ids are minted from the origin, so
+/// two instances sharing one could mint the *same id* for different entries
+/// written in the same second — and a grow-only set de-duplicates by id, so
+/// one of them would vanish on merge. The suffix makes ids unique per state
+/// directory, which is the granularity that actually matters.
 #[must_use]
 pub fn origin_id() -> String {
-    std::fs::read_to_string("/etc/hostname")
+    if let Some(cached) = ORIGIN.get() {
+        return cached.clone();
+    }
+    // Only the default location is cached: a test that redirects the board
+    // must not inherit an identity minted for another one.
+    let default_path = BLACKBOARD_OVERRIDE.read().ok().and_then(|g| g.clone()).is_none();
+    let host = std::fs::read_to_string("/etc/hostname")
         .ok()
         .map(|h| h.trim().to_owned())
         .filter(|h| !h.is_empty())
-        .unwrap_or_else(|| format!("host-{:x}", stable_hash(&blackboard_path().display().to_string())))
+        .unwrap_or_else(|| "host".to_owned());
+    // Beside the blackboard it stamps, so a test pointing the board at a
+    // tempdir gets a temp identity too rather than writing to the developer's
+    // real state directory. Same location in production.
+    let path = blackboard_path().with_file_name("origin");
+    let suffix = std::fs::read_to_string(&path)
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            // Uniqueness, not unpredictability: this names an instance, it does
+            // not authenticate one.
+            let seed = format!(
+                "{host}-{}-{}-{}",
+                crate::unix_millis(),
+                std::process::id(),
+                blackboard_path().display()
+            );
+            let minted = format!("{:08x}", stable_hash(&seed) & 0xffff_ffff);
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&path, &minted);
+            minted
+        });
+    let id = format!("{host}-{suffix}");
+    if default_path {
+        let _ = ORIGIN.set(id.clone());
+    }
+    id
 }
+
+/// Cached so the file is read once per process — `origin_id` is called on
+/// every board write.
+static ORIGIN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// Every entry on this host's blackboard, oldest first.
 ///

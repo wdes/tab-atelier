@@ -69,6 +69,8 @@ pub fn dispatch(name: &str, rest: &[String]) -> Option<i32> {
         "take" => super::work::take(rest),
         "done" => super::work::done(rest),
         "tasks" => super::work::tasks(rest),
+        "wait" => super::await_task::run(rest),
+        "fleet" => super::work::fleet(rest),
         "gossip" => super::gossip::run(rest),
         "backlog" => super::backlog::run(rest),
         "note" => team::run_note(rest),
