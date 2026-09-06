@@ -81,10 +81,19 @@ pub(super) fn authorize(
     let is_dashboard_token = dashboard_matches
         && (matches!(
             path,
-            "/dashboard" | "/dashboard/state" | "/dashboard/activity" | "/catalog/list" | "/decisions" | "/decisions/file"
+            "/dashboard"
+                | "/dashboard/state"
+                | "/dashboard/activity"
+                | "/catalog/list"
+                | "/decisions"
+                | "/decisions/file"
+                | "/reports"
         ) || (method == "POST"
             && path.starts_with("/decisions/")
-            && (path.ends_with("/read") || path.ends_with("/tranch"))));
+            && (path.ends_with("/read") || path.ends_with("/tranch")))
+            // Volet-2 grille d'intention: the Kiosk may POST an intention grid. ULTRA-NARROW —
+            // ONLY this one write, into the server-named outbox sandbox (see handlers::decisions::intent).
+            || (method == "POST" && path == "/intent"));
     if is_master || is_dashboard_token {
         return Gate::Allow;
     }
@@ -242,6 +251,21 @@ mod tests {
         // ...and a made-up decision write verb (401 — only read/tranch are in scope).
         assert_eq!(deny_status(&authorize(&s, "POST", "/decisions/ra1c/delete", Some("dash-secret"))), Some(401));
         assert_eq!(deny_status(&authorize(&s, "POST", "/decisions/ra1c/archive", Some("dash-secret"))), Some(401));
+    }
+
+    #[test]
+    fn dashboard_token_reads_reports_and_posts_intent() {
+        // Volet-2 (#kiosk 3 onglets): the Rapports tab (GET /reports) is a read-only cold source,
+        // the Grille d'intention (POST /intent) is the one extra narrow write the dashboard token gets.
+        let s = fixture();
+        assert!(is_allow(&authorize(&s, "GET", "/reports", Some("dash-secret"))));
+        assert!(is_allow(&authorize(&s, "POST", "/intent", Some("dash-secret"))));
+        // SCOPE GUARD stays tight: the intent write is EXACT — a sub-path doesn't leak in
+        // (only `POST /intent` is whitelisted, not `/intent/<anything>`).
+        assert_eq!(deny_status(&authorize(&s, "POST", "/intent/x", Some("dash-secret"))), Some(401));
+        // A bad/absent token is still refused on both.
+        assert_eq!(deny_status(&authorize(&s, "GET", "/reports", Some("nope"))), Some(401));
+        assert_eq!(deny_status(&authorize(&s, "POST", "/intent", None)), Some(401));
     }
 
     #[test]
