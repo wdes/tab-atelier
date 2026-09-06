@@ -20,10 +20,13 @@
 //! 3. Drains the command channel between polls and translates each
 //!    into the matching HTTP request.
 //!
-//! TLS uses a custom `ServerCertVerifier` that compares ONLY the
-//! leaf cert's SHA-256 against the endpoint's pinned fingerprint.
-//! Set with the `cert_sha256` field from the Preferences "Pin
-//! certificate" flow.
+//! TLS over `https://` endpoints currently runs with verification
+//! DISABLED — a LAN-trust model, not pinning. `cert_sha256` is
+//! captured at `remote add` time and shown to the user, but nothing
+//! enforces it on the wire yet, because ureq 3 exposes no custom
+//! verifier hook (see the comment at the `disable_verification` call
+//! and its `TODO(phase-3)`). Do not describe this as pinned: a MITM
+//! swap is not refused today.
 //!
 //! No gpui dep — the GUI side (Phase 3) takes [`RemoteEvent::Output`]
 //! payloads and feeds them through `vte::ansi::Processor::advance`

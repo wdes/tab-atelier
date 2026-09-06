@@ -306,6 +306,12 @@ coverage report is a multi-minute job and a decision, so it stays outside — th
 sweep reads whatever report is there. Wire the regeneration to CI or a timer of
 your own.
 
+## Driving it
+
+[fleet-playbook.md](./fleet-playbook.md) is written to be handed to a Claude
+tab: how to fill the board, spawn workers (with the worker prompt to copy),
+watch, and — the part that matters — verify what comes back before committing.
+
 ## Trying it
 
 ```

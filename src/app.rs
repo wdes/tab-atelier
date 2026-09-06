@@ -1435,7 +1435,7 @@ impl AppState {
         let api_read_only = crate::read_only();
         api::start_api_server(api_state.clone(), api_token.clone(), api_read_only, api_addr.clone());
         // Off unless `fleet_sweep_minutes` says otherwise.
-        crate::sweep::spawn_if_configured();
+        crate::sweep::spawn_if_configured(api_read_only);
         api::start_api_server_tls(
             api_state.clone(),
             api_token.clone(),

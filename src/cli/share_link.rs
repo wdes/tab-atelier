@@ -2576,6 +2576,516 @@ mod tests {
         assert_eq!(bg_color(&args(&["--global", "not-a-hex"])), 2);
     }
 
+    /// Mutate the served snapshot from inside a `with_server` body.
+    ///
+    /// `/tabs` memoises its JSON in `cached_response`; the daemon drops that on
+    /// every refresh, but nothing does here — so a test that edits a tab and
+    /// forgets the cache would silently assert against the pre-edit payload.
+    fn edit_snapshot(
+        state: &std::sync::Arc<std::sync::Mutex<crate::api::TabSnapshot>>,
+        f: impl FnOnce(&mut crate::api::TabSnapshot),
+    ) {
+        let mut s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        f(&mut s);
+        s.cached_response = None;
+        drop(s);
+    }
+
+    /// The `/tabs` object for one index, as the verbs themselves see it.
+    fn tab_json(idx: usize) -> serde_json::Value {
+        let ep = discover_endpoint().expect("endpoint");
+        fetch_tabs(&ep)
+            .expect("tabs")
+            .into_iter()
+            .find(|t| t.get("index").and_then(serde_json::Value::as_u64) == Some(idx as u64))
+            .expect("tab present")
+    }
+
+    #[test]
+    fn stats_renders_every_optional_field_a_busy_tab_exposes() {
+        // Every line of the human `stats` view sits behind an `if let Some(..)`
+        // keyed by a `/tabs` field NAME. A default tab omits nearly all of
+        // them, so the happy path is never exercised and a server-side field
+        // rename would drop lines from the report without failing a test.
+        // Populate one tab fully, then assert both that the keys `stats` reads
+        // are actually present and that the renderer accepts the payload.
+        with_server(|state| {
+            edit_snapshot(state, |s| {
+                let t = &mut s.tabs[0];
+                t.uptime_secs = 3725.0;
+                t.resident_memory_bytes = Some(3 * 1024 * 1024);
+                t.tokens = Some(crate::TokenUsage {
+                    input: 1234,
+                    output: 56,
+                });
+                t.connections = 4;
+                t.tx_bytes = 2048;
+                t.tx_denied_bytes = 512;
+                t.viewers = 2;
+                t.agent_kind = Some("claude".into());
+                t.agent_state = Some(crate::AgentStateSnapshot {
+                    state: crate::AgentState::Thinking,
+                    label: None,
+                    updated_at: std::time::Instant::now(),
+                });
+                t.net_disabled = true;
+                t.locked = true;
+            });
+            let t = tab_json(0);
+            for key in [
+                "cwd",
+                "uptime_secs",
+                "resident_memory_bytes",
+                "tokens",
+                "connections",
+                "tx_bytes",
+                "viewers",
+                "agent_kind",
+                "agent_state",
+                "net_disabled",
+                "locked",
+                "lock_reason",
+            ] {
+                assert!(t.get(key).is_some(), "/tabs must expose {key} for stats: {t}");
+            }
+            assert_eq!(t.get("lock_reason").and_then(serde_json::Value::as_str), Some("manual"));
+            assert_eq!(stats("0", false), 0, "full human view");
+            assert_eq!(stats("0", true), 0, "same tab as raw JSON");
+            // Resolvable by uuid as well — `stats` re-finds the tab by INDEX
+            // after resolving, so the two lookups must agree.
+            assert_eq!(stats("tab-a", false), 0);
+        });
+    }
+
+    #[test]
+    fn tab_listing_separates_manual_locks_from_scheduled_ones() {
+        // The list prints three different lock strings and an extra rule line
+        // for schedule locks; with no locked tab in the fixture only the
+        // "open" arm ever ran. `Mo-Su off` is closed at every instant, so the
+        // schedule arm is deterministic rather than clock-dependent.
+        with_server(|state| {
+            edit_snapshot(state, |s| {
+                s.tabs[0].locked = true;
+                s.tabs[0].viewers = 3;
+                s.tabs[1].schedule =
+                    Some(crate::schedule::TabSchedule::new("Mo-Su off", "Europe/Paris").expect("valid rule"));
+            });
+            let manual = tab_json(0);
+            let scheduled = tab_json(1);
+            assert_eq!(
+                manual.get("lock_reason").and_then(serde_json::Value::as_str),
+                Some("manual")
+            );
+            assert_eq!(
+                scheduled.get("lock_reason").and_then(serde_json::Value::as_str),
+                Some("schedule"),
+                "an always-closed rule locks the tab without a manual toggle"
+            );
+            // The rule + tz are what the list prints on its `└─` continuation
+            // line; without them it would render "?  [?]".
+            assert_eq!(
+                scheduled.get("schedule_rule").and_then(serde_json::Value::as_str),
+                Some("Mo-Su off")
+            );
+            assert_eq!(
+                scheduled.get("schedule_tz").and_then(serde_json::Value::as_str),
+                Some("Europe/Paris")
+            );
+            assert_eq!(tabs(&args(&[])), 0);
+            assert_eq!(tabs(&args(&["--json"])), 0);
+        });
+    }
+
+    #[test]
+    fn net_dns_filters_denied_queries_and_says_so_when_there_are_none() {
+        // `--denied` exists to answer "what did this tab try to reach and get
+        // blocked?". The filter, the per-row rendering and the empty-result
+        // notice are three distinct paths; the fixture has no DNS log at all,
+        // so only the notice ever ran.
+        with_server(|state| {
+            edit_snapshot(state, |s| {
+                s.tabs[0].dns_entries = vec![
+                    (
+                        "api.anthropic.com".into(),
+                        true,
+                        vec!["160.79.104.10".into(), "160.79.104.11".into()],
+                    ),
+                    ("telemetry.example".into(), false, vec![]),
+                ];
+            });
+            let dns = tab_json(0);
+            let rows = dns.get("dns").and_then(serde_json::Value::as_array).expect("dns rows");
+            assert_eq!(rows.len(), 2);
+            // The renderer keys off `allowed` and `ips`; a denied row carries
+            // no addresses, which is exactly what makes it worth showing.
+            assert_eq!(rows[1].get("allowed").and_then(serde_json::Value::as_bool), Some(false));
+            assert!(rows[1].get("ips").is_none(), "denied rows resolve to nothing");
+            assert_eq!(net_dns(Some("0"), false), 0, "both rows");
+            assert_eq!(net_dns(Some("0"), true), 0, "denied only");
+            assert_eq!(net_dns(None, true), 0, "whole fleet, denied only");
+            // Tab 1 has no log: filtering it alone must fall through to the
+            // "(no denied resolver DNS entries…)" notice, not print a header.
+            assert_eq!(net_dns(Some("1"), true), 0);
+        });
+    }
+
+    #[test]
+    fn net_stats_reports_denied_egress_and_clips_long_names() {
+        // The table is column-aligned by hand; a name longer than the column
+        // would shift TX/DENIED out of line for every following row.
+        with_server(|state| {
+            edit_snapshot(state, |s| {
+                s.tabs[0].name = "a-very-long-tab-name-that-overflows".into();
+                s.tabs[0].connections = 7;
+                s.tabs[0].tx_bytes = 5 * 1024 * 1024;
+                s.tabs[0].tx_denied_bytes = 1024;
+                s.tabs[1].net_disabled = true;
+            });
+            let t = tab_json(0);
+            assert_eq!(t.get("tx_denied_bytes").and_then(serde_json::Value::as_u64), Some(1024));
+            assert_eq!(net_stats(None), 0);
+            assert_eq!(net_stats(Some("0")), 0);
+            assert_eq!(net_stats(Some("1")), 0, "a net-off tab prints too");
+        });
+        // The clip itself: exactly `max` chars out, ellipsis last. Counted in
+        // CHARS, so a multi-byte name can't be cut mid-codepoint.
+        let clipped = truncate("a-very-long-tab-name-that-overflows", 22);
+        assert_eq!(clipped.chars().count(), 22);
+        assert!(clipped.ends_with('…'));
+        assert_eq!(truncate("éééééé", 3), "éé…");
+        assert_eq!(truncate("exactly-10", 10), "exactly-10", "at the limit nothing is cut");
+    }
+
+    #[test]
+    fn net_allow_add_and_remove_merge_against_the_tabs_current_list() {
+        // `--add`/`--remove` are resolved CLIENT-side against what `/tabs`
+        // reports, then POSTed as the complete new allowlist. If the merge is
+        // wrong the daemon faithfully installs the wrong firewall — so assert
+        // on the config that actually left the process.
+        if cfg!(feature = "gui") {
+            return; // the GUI's net-allow route 501s; nothing is ever queued.
+        }
+        with_server(|state| {
+            edit_snapshot(state, |s| {
+                s.tabs[0].net_allow = crate::net_policy::AllowConfig {
+                    presets: vec![crate::net_policy::Preset::from_id("claude-code").expect("preset")],
+                    domains: vec!["keep.example".into(), "drop.example".into()],
+                    cidrs: vec!["10.0.0.0/8".into()],
+                };
+            });
+            let queued = |state: &std::sync::Arc<std::sync::Mutex<crate::api::TabSnapshot>>| {
+                let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let last = s.pending_net_allow_changes.last().cloned();
+                drop(s);
+                last.expect("a change was queued")
+            };
+
+            assert_eq!(
+                net_allow("0", &[], &["drop.example".into()], &[], false, false, true),
+                0
+            );
+            let (id, cfg) = queued(state);
+            assert_eq!(id, "tab-a");
+            assert_eq!(
+                cfg.domains,
+                vec!["keep.example".to_string()],
+                "--remove drops one entry"
+            );
+            assert_eq!(cfg.cidrs, vec!["10.0.0.0/8".to_string()], "untouched axes survive");
+            assert_eq!(cfg.presets.len(), 1, "presets survive a domain removal");
+
+            // Re-adding something already present must not duplicate it: the
+            // allowlist is rendered into nftables sets, and a dupe there is a
+            // wasted rule at best.
+            assert_eq!(
+                net_allow("0", &[], &["keep.example".into()], &[], false, true, false),
+                0
+            );
+            assert_eq!(
+                queued(state).1.domains,
+                vec!["keep.example".to_string(), "drop.example".to_string()]
+            );
+
+            assert_eq!(net_allow("0", &[], &["new.example".into()], &[], false, true, false), 0);
+            let cfg = queued(state).1;
+            assert!(cfg.domains.contains(&"new.example".to_string()), "--add appends");
+            assert_eq!(cfg.domains.len(), 3);
+
+            // A `--remove` that happens to empty the list is REFUSED as usage
+            // (2) and never reaches the daemon: the "nothing to allow" guard
+            // runs on the MERGED result, not on the flags the user passed. So
+            // removing the last entry leaves the tab confined and the caller
+            // has to know to use `--clear` instead. Recorded as current
+            // behaviour, not endorsed.
+            let before = {
+                let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let n = s.pending_net_allow_changes.len();
+                drop(s);
+                n
+            };
+            assert_eq!(
+                net_allow(
+                    "0",
+                    &["claude-code".into()],
+                    &["keep.example".into(), "drop.example".into()],
+                    &["10.0.0.0/8".into()],
+                    false,
+                    false,
+                    true,
+                ),
+                2
+            );
+            let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(s.pending_net_allow_changes.len(), before, "nothing new was queued");
+            drop(s);
+            // `--clear` is the path that does empty it, and it POSTs.
+            assert_eq!(net_allow("0", &[], &[], &[], true, false, false), 0);
+            assert!(queued(state).1.is_empty(), "--clear yields an empty allowlist");
+        });
+    }
+
+    #[test]
+    fn relay_via_and_egress_send_the_field_the_server_reads() {
+        // `/relay-config` takes two independent optional fields; posting the
+        // wrong one silently does nothing, and the CLI still prints success
+        // because it only checks the HTTP status.
+        with_server(|state| {
+            let queued = |state: &std::sync::Arc<std::sync::Mutex<crate::api::TabSnapshot>>| {
+                let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let c = s.pending_relay_config.clone();
+                drop(s);
+                c.expect("relay config queued")
+            };
+            assert_eq!(relay("via", Some("box-a")), 0);
+            let c = queued(state);
+            assert_eq!(c.endpoint.as_deref(), Some("box-a"));
+            assert!(c.egress.is_none(), "`via` must not also flip egress");
+
+            // The empty string is the documented way to CLEAR the endpoint —
+            // it has to reach the server as an empty endpoint, not be dropped.
+            assert_eq!(relay("via", Some("")), 0);
+            assert_eq!(queued(state).endpoint.as_deref(), Some(""));
+
+            assert_eq!(relay("egress", Some("on")), 0);
+            let c = queued(state);
+            assert_eq!(c.egress, Some(true));
+            assert!(c.endpoint.is_none(), "`egress` must not clear the endpoint");
+            assert_eq!(relay("egress", Some("off")), 0);
+            assert_eq!(queued(state).egress, Some(false));
+
+            // Anything else is a usage error, caught before a request.
+            assert_eq!(relay("egress", Some("maybe")), 2);
+            assert_eq!(relay("egress", None), 2);
+            // `relay token` prints the relay-only credential and never touches
+            // the API — it must not be the master token the endpoint holds.
+            assert_eq!(relay("token", None), 0);
+            let ep = discover_endpoint().expect("endpoint");
+            assert_ne!(crate::relay_token(), ep.token, "relay peers get a scoped credential");
+        });
+    }
+
+    #[test]
+    fn env_routes_a_uuid_tab_through_by_id_and_an_index_through_tabs() {
+        // The scope is encoded in the URL: `/env`, `/tabs/<n>/env` and
+        // `/tabs/by-id/<uuid>/env`. Picking the wrong shape 404s, or worse
+        // writes the variable into the global map instead of one tab.
+        with_server(|state| {
+            assert_eq!(env("set", &args(&["A=1"]), false, Some("tab-b")), 0, "by uuid");
+            assert_eq!(env("set", &args(&["B=2"]), false, Some("1")), 0, "by index");
+            assert_eq!(env("unset", &args(&["A", "B"]), false, Some("tab-b")), 0);
+            let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let changes = s.pending_env_changes.clone();
+            drop(s);
+            assert_eq!(changes.len(), 3);
+            // Both spellings must land on the SAME tab — the server resolves
+            // the index to the uuid, so a caller can use either.
+            assert_eq!(changes[0].tab.as_deref(), Some("tab-b"));
+            assert_eq!(changes[1].tab.as_deref(), Some("tab-b"));
+            assert_eq!(changes[0].set.get("A").map(String::as_str), Some("1"));
+            assert!(changes[0].unset.is_empty(), "a `set` queues no removals");
+            assert_eq!(changes[2].unset, vec!["A".to_string(), "B".to_string()]);
+            assert!(changes[2].set.is_empty(), "an `unset` queues no writes");
+            // Listing a single tab's overrides uses the same URL shapes.
+            assert_eq!(env("list", &[], false, Some("tab-b")), 0);
+            assert_eq!(env("list", &[], false, Some("1")), 0);
+            // A write with no scope at all must be refused rather than
+            // defaulting to global — that would leak one tab's secret to all.
+            assert_eq!(env("set", &args(&["A=1"]), false, None), 2);
+            assert_eq!(env("unset", &args(&["A"]), false, None), 2);
+        });
+    }
+
+    #[test]
+    fn add_renames_the_tab_the_daemon_actually_created() {
+        // `add <path> <name>` POSTs, waits for the tab to appear, then renames
+        // it BY INDEX. Nothing drains the queue in-process, so the existing
+        // test only sees the timeout branch — meaning the index the rename
+        // targets has never been checked. Simulate the drain from a thread.
+        with_server(|state| {
+            let spawner = state.clone();
+            let drain = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                let mut s = spawner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                s.tabs.push(crate::api::test_snapshot_tab("tab-c", "shell"));
+                s.cached_response = None;
+                drop(s);
+            });
+            assert_eq!(add(&args(&["/tmp/newdir", "christened"])), 0);
+            drain.join().expect("drain thread");
+            let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            // The rename must target index 2 — the tab that just appeared —
+            // and not 0 or the pre-POST count.
+            assert_eq!(s.pending_renames, vec![(2, "christened".to_string())]);
+            // The cwd from the command line rides along with the creation, or
+            // the new tab silently inherits the active tab's directory.
+            assert_eq!(
+                s.pending_new_tab_cwds.front().map(|p| p.display().to_string()),
+                Some("/tmp/newdir".to_string())
+            );
+            drop(s);
+        });
+    }
+
+    #[test]
+    fn limit_cli_rejects_malformed_flags_before_any_request() {
+        // Every one of these is a typo a user will make, and each must be
+        // caught client-side: a missing value would otherwise swallow the NEXT
+        // flag as its argument, silently capping the wrong axis.
+        with_server(|state| {
+            for bad in [
+                vec!["0", "--memory"],
+                vec!["0", "--cpu"],
+                vec!["0", "--cpu", "half"],
+                vec!["0", "--cpu", "-5"],
+                vec!["0", "--tasks"],
+                vec!["0", "--tasks", "lots"],
+                vec!["0", "--bogus"],
+                vec!["--clear"],
+            ] {
+                assert_eq!(limit_cli(&args(&bad)), 2, "{bad:?} must be usage");
+            }
+            let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(s.pending_limit_changes.is_empty(), "no rejected form reached the API");
+            drop(s);
+            // Short flags are the same flags.
+            assert_eq!(limit_cli(&args(&["0", "-m", "2G", "-c", "150", "-t", "64"])), 0);
+            assert_eq!(limit_cli(&args(&["0", "--clear"])), 0);
+            let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(s.pending_limit_changes.len(), 2);
+            drop(s);
+        });
+    }
+
+    #[test]
+    fn schedule_and_bg_color_validate_arguments_before_resolving_a_tab() {
+        with_server(|_| {
+            assert_eq!(schedule(&args(&["--help"])), 0);
+            // A rule with no tz is ambiguous — "09:00" in whose day? Refuse it
+            // rather than letting the server pick a timezone for the user.
+            assert_eq!(schedule(&args(&["0", "Mo-Fr 09:00-18:00"])), 2);
+            // `--clear` with no tab has nothing to clear.
+            assert_eq!(schedule(&args(&["--clear"])), 2);
+            // A stray third positional is a quoting mistake ("Mo-Fr" "09:00"),
+            // which would otherwise be sent as the rule "Mo-Fr" alone.
+            assert_eq!(schedule(&args(&["0", "24/7", "extra", "--tz", "UTC"])), 2);
+            assert_eq!(schedule(&args(&["nope", "24/7", "--tz", "UTC"])), 1, "unknown tab");
+            assert_eq!(schedule(&args(&["nope", "--clear"])), 1);
+
+            // bg-color resolves the tab first, so an unknown key is a failure
+            // (1) rather than usage (2) even with a valid colour.
+            assert_eq!(bg_color(&args(&["nope", "#112233"])), 1);
+            assert_eq!(bg_color(&args(&["--global"])), 2, "no colour given");
+            assert_eq!(bg_color(&args(&["0", "#112233", "extra"])), 2, "too many positionals");
+            // Case-insensitive `clear`, and hex is validated on the digits.
+            assert!(is_valid_hex("#ABCDEF") && is_valid_hex("#abcdef"));
+            assert!(!is_valid_hex("#gggggg"), "non-hex digits are not a colour");
+            assert!(!is_valid_hex("#1234567") && !is_valid_hex(""));
+            assert_eq!(bg_color(&args(&["0", "CLEAR"])), 0, "`clear` is case-insensitive");
+        });
+    }
+
+    #[test]
+    fn settings_read_and_reject_paths_never_write_the_file() {
+        // `ports` patches the machine's real preferences.json, so only the
+        // paths that return BEFORE the write are safe to exercise here. Each
+        // of these must bail early — a --pty-cols typo that fell through would
+        // rewrite the user's prefs with a bogus value.
+        assert_eq!(ports(&args(&[])), 0, "no args prints the current settings");
+        assert_eq!(ports(&args(&["--help"])), 0);
+        assert_eq!(ports(&args(&["-h"])), 0);
+        assert_eq!(ports(&args(&["--pty-cols", "abc"])), 2);
+        assert_eq!(ports(&args(&["--pty-cols", "3"])), 2, "a 3-column grid is unusable");
+        assert_eq!(ports(&args(&["--pty-cols"])), 2, "missing value");
+        assert_eq!(ports(&args(&["--pty-rows", "0"])), 2);
+        assert_eq!(ports(&args(&["--pty-rows"])), 2);
+        assert_eq!(ports(&args(&["--bg-color", "chartreuse"])), 2);
+        assert_eq!(ports(&args(&["--bg-color"])), 2, "missing value is not `clear`");
+    }
+
+    #[test]
+    fn net_default_validates_every_entry_before_saving_preferences() {
+        // This verb rewrites preferences.json wholesale. Validation has to run
+        // FIRST: a half-applied allowlist (good presets saved, bad CIDR
+        // dropped) would silently narrow what new tabs may reach.
+        assert_eq!(net_default(&["not-a-preset".into()], &[], &[], false), 1);
+        assert_eq!(
+            net_default(&["claude-code".into()], &[], &["not-a-cidr".into()], false),
+            1,
+            "a valid preset does not excuse an invalid CIDR"
+        );
+        assert_eq!(
+            net_default(&[], &[], &["10.0.0.0/33".into()], false),
+            1,
+            "prefix out of range"
+        );
+    }
+
+    #[test]
+    fn share_link_port_follows_the_endpoint_url() {
+        // The URL we print is handed to someone else; pointing it at 7890 when
+        // the daemon bound 9000 produces a link that just doesn't connect.
+        let ep = |url: &str| Endpoint {
+            url: url.into(),
+            token: "t".into(),
+        };
+        assert_eq!(http_port(&ep("http://127.0.0.1:9000")), 9000);
+        assert_eq!(http_port(&ep("http://127.0.0.1:9000/")), 9000, "trailing slash");
+        assert_eq!(http_port(&ep("https://box.example:65535/api")), 65535);
+        // No port at all (or an unparseable one) falls back to the documented
+        // default rather than printing a link with a garbage port.
+        assert_eq!(http_port(&ep("http://box.example")), 7890);
+        assert_eq!(http_port(&ep("http://box.example:not-a-port")), 7890);
+        assert_eq!(http_port(&ep(DEFAULT_LOOPBACK_URL)), 7890);
+    }
+
+    #[test]
+    fn input_escapes_are_expanded_exactly_once() {
+        // These bytes go straight into a live shell. `\n` must become a real
+        // newline (that's what runs the command) while an unknown escape has
+        // to survive verbatim — silently eating the backslash would corrupt
+        // regexes and Windows paths typed into the tab.
+        assert_eq!(unescape(r"ls\n"), "ls\n");
+        assert_eq!(unescape(r"a\rb"), "a\rb");
+        assert_eq!(unescape(r"a\\nb"), "a\\nb", "an escaped backslash is not a newline");
+        assert_eq!(unescape(r"\d+"), r"\d+", "unknown escapes pass through untouched");
+        assert_eq!(unescape("trailing\\"), "trailing\\", "a dangling backslash is literal");
+        assert_eq!(unescape(""), "");
+        with_server(|state| {
+            assert_eq!(send_input(&args(&["0", r"echo hi\n"])), 0);
+            let s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            // The daemon receives the EXPANDED bytes — it does no unescaping
+            // of its own, so anything left encoded here reaches the shell as a
+            // literal backslash-n.
+            assert_eq!(s.pending_input.len(), 1);
+            assert!(
+                String::from_utf8_lossy(&s.pending_input[0].1).ends_with("echo hi\n"),
+                "got {:?}",
+                s.pending_input[0].1
+            );
+            drop(s);
+        });
+    }
+
     #[test]
     fn formatting_helpers_stay_readable() {
         assert_eq!(fmt_uptime(0), "0s");
@@ -2592,5 +3102,28 @@ mod tests {
         assert_eq!(unescape(r"a\nb"), "a\nb");
         assert_eq!(unescape(r"tab\there"), "tab\there");
         assert_eq!(unescape("plain"), "plain");
+    }
+
+    #[test]
+    fn size_and_uptime_formatting_holds_at_the_unit_boundaries() {
+        // Both helpers switch unit on a threshold, and both are read by a
+        // human deciding whether a tab is misbehaving — an off-by-one here
+        // reports "59m" as "0h" or a gigabyte as a kilobyte.
+        assert_eq!(fmt_uptime(3599), "59m 59s", "the last second before an hour");
+        assert_eq!(fmt_uptime(3600), "1h 0m");
+        assert_eq!(fmt_uptime(86_399), "23h 59m", "a day is still counted in hours");
+        assert_eq!(
+            fmt_uptime(90_061),
+            "25h 1m",
+            "no day rollover — this is uptime, not a clock"
+        );
+
+        assert_eq!(human_bytes(1_048_575), "1024.0 KB", "the last byte before a megabyte");
+        assert_eq!(human_bytes(1_048_576), "1.0 MB");
+        assert_eq!(human_bytes(1024 * 1024 * 1024), "1.0 GB");
+        assert_eq!(human_bytes(1024_u64.pow(4)), "1.0 TB");
+        // TB is the last unit in the table: bigger values must keep scaling
+        // the NUMBER rather than walking off the end of `UNITS`.
+        assert!(human_bytes(u64::MAX).ends_with(" TB"), "{}", human_bytes(u64::MAX));
     }
 }
