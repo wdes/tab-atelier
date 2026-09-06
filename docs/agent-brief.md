@@ -29,8 +29,9 @@ reach them from the shell.
 - Never `--resume`/`--continue` another tab's session; it strips the session id.
 - Say who you are with `tab-atelier set-meta role <what-you-are-doing>`.
 
-`<verb> --help` for details; the full model is in the repo's
-`docs/self-organization.md`.
+`<verb> --help` for details. The handbook is `self-organization.md` (the
+model) and `fleet-playbook.md` (how to run a fleet) — in the repo's `docs/`,
+or `/usr/share/doc/tab-atelier/` on a machine that only has the package.
 <!-- BRIEF-END -->
 
 ## Per-project briefs
