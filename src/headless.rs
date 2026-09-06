@@ -2464,7 +2464,7 @@ fn drain_pending(
         let id = default_tab_id();
         let env = tab_env_extras(&id, api_url_for_pty, api_token, &std::collections::BTreeMap::new());
         let name = format!("Terminal {}", tabs.len());
-        if let Some(mut t) = spawn_pty_tab(
+        if let Some(t) = spawn_pty_tab(
             id,
             name,
             cwd,
@@ -2495,12 +2495,12 @@ fn drain_pending(
             crate::cgroup::apply(&t.id, t.pid, default_limits);
             #[cfg(not(target_os = "linux"))]
             let _ = default_limits;
-            if *active < tabs.len() {
-                tabs[*active].deactivate();
-            }
-            t.activate();
+            // API-created tabs (an agent's `dispatch --new`, `tab-atelier
+            // add`) do NOT become active: a fleet spawning workers must not
+            // move the user's selection, and the GUI's matching path leaves
+            // focus alone for the same reason. An explicit `activate` still
+            // works if a caller really wants the switch.
             tabs.push(t);
-            *active = tabs.len() - 1;
         }
     }
     did_work

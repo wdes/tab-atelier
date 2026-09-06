@@ -63,6 +63,15 @@ use crate::STREAMING_LED_WINDOW;
 
 struct Tab {
     view: Entity<TerminalView>,
+    /// Created through the API rather than by the user (an agent tab from
+    /// `dispatch --new` or `tab-atelier add`).
+    ///
+    /// Two behaviours hang off this: such a tab does not steal focus when it
+    /// appears — a fleet spawning four workers must not yank the window out
+    /// from under whoever is typing — and it gets no project colour or badge.
+    /// Folder styling exists to tell a human which project a tab belongs to;
+    /// on a throwaway worker it is decoration nobody reads.
+    plain: bool,
     // String-ish fields that flow verbatim into `api::SnapshotTab` are
     // `Arc<str>` so each snapshot rebuild clones a refcount, not bytes.
     name: std::sync::Arc<str>,
@@ -328,6 +337,10 @@ impl Tab {
             badge: ts.badge.clone(),
             applied_tint: std::cell::Cell::new(None),
             resolved_badge: None,
+            // Restored tabs keep whatever the user sees today: a tab that
+            // survived a restart is one they have lived with, so it styles
+            // like any other.
+            plain: false,
             context: None,
             last_pushed_locked: None,
             pending_agent_resume,
@@ -1744,11 +1757,15 @@ impl AppState {
         self.insert_tab(self.tabs.len(), None, window, cx);
     }
 
-    /// Like `add_tab` but with an explicit cwd hint from the API
-    /// (`POST /tabs` with `{cwd: ...}`). Falls back to the existing
-    /// inherit-from-active behaviour when the path doesn't exist.
-    fn add_tab_in(&mut self, cwd: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        self.insert_tab(self.tabs.len(), Some(cwd), window, cx);
+    /// A tab the API asked for (`POST /tabs` with `{cwd: ...}`): appended,
+    /// but neither focused nor styled.
+    ///
+    /// A fleet spawning four workers must not yank the window away from
+    /// whoever is typing, and a throwaway worker gets no project colour —
+    /// folder styling is there to tell a human which project a tab belongs to.
+    fn add_tab_in_background(&mut self, cwd: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let at = self.tabs.len();
+        self.insert_tab_inner(at, Some(cwd), false, window, cx);
     }
 
     fn add_tab_after_current(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1756,12 +1773,29 @@ impl AppState {
     }
 
     fn insert_tab(&mut self, at: usize, hint: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        self.insert_tab_inner(at, hint, true, window, cx);
+    }
+
+    /// `focus` false leaves the active tab where it is and marks the new tab
+    /// [`Tab::plain`].
+    fn insert_tab_inner(
+        &mut self,
+        at: usize,
+        hint: Option<PathBuf>,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let cwd = hint.filter(|p| p.is_dir()).or_else(|| {
             let pid = self.tabs[self.active].view.read(cx).pid();
             platform::process_cwd(pid).or_else(|| self.tabs[self.active].last_known_cwd.clone())
         });
         let grid = Self::grid_size(window, &self.font_config);
-        self.tabs[self.active].deactivate();
+        // Only the tab we are leaving gets deactivated; a background insert
+        // leaves the user's tab active and its timer running.
+        if focus {
+            self.tabs[self.active].deactivate();
+        }
         let fc = self.font_config.clone();
         let br = self.browser.clone();
         let ce = self.code_editor.clone();
@@ -1815,12 +1849,21 @@ impl AppState {
             name,
             ..TabState::default()
         };
-        self.tabs
-            .insert(idx, Tab::from_state(view, &seed, cwd, None, pending_claude, true));
-        self.active = idx;
+        let mut tab = Tab::from_state(view, &seed, cwd, None, pending_claude, focus);
+        tab.plain = !focus;
+        self.tabs.insert(idx, tab);
+        if focus {
+            self.active = idx;
+        } else if idx <= self.active {
+            // Inserting before the active tab shifts its index; without this
+            // the selection silently jumps to a neighbour.
+            self.active += 1;
+        }
         #[cfg(target_os = "linux")]
         self.apply_tab_limits(idx, cx);
-        self.tabs[self.active].view.read(cx).focus_handle(cx).focus(window);
+        if focus {
+            self.tabs[self.active].view.read(cx).focus_handle(cx).focus(window);
+        }
         cx.notify();
     }
 
@@ -2099,7 +2142,11 @@ impl AppState {
             let Some(grid) = tab.snap_cache.clone() else {
                 continue;
             };
-            let folder = crate::folder_style_of(tab.last_known_cwd_string.as_deref());
+            let folder = if tab.plain {
+                crate::FolderStyle::default()
+            } else {
+                crate::folder_style_of(tab.last_known_cwd_string.as_deref())
+            };
             let bg_color = crate::effective_tab_bg(
                 tab.bg_color.as_deref(),
                 folder.color.as_deref(),
@@ -6267,10 +6314,13 @@ impl Render for AppState {
         };
         let mut cwd_iter = new_tab_cwds.into_iter();
         for _ in 0..new_tab_count {
-            match cwd_iter.next() {
-                Some(cwd) => self.add_tab_in(cwd, window, cx),
-                None => self.add_tab(window, cx),
-            }
+            // API-created: these come from `dispatch --new` / `tab-atelier
+            // add`, so they appear without stealing focus or a colour.
+            let cwd = cwd_iter
+                .next()
+                .or_else(|| self.tabs.get(self.active).and_then(|t| t.last_known_cwd.clone()))
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            self.add_tab_in_background(cwd, window, cx);
         }
         // No tab to show yet (transient empty state / future async boot): the
         // reusable centered screen stands in rather than indexing a missing tab.
