@@ -587,7 +587,16 @@ tab-atelier gossip                     # converge boards with configured remotes
 
 `take` leases the task through the daemon, so two agents never pick up the same one, and a lease from a tab that dies simply expires. Nothing schedules: agents rank the board by a hash of (task, agent) and spread out without talking to each other. `wait` reports outcomes as exit codes (0 done, 1 failed, 3 running, 4 unknown) instead of holding a connection, so a supervisor can run many at once — or you can skip supervisors entirely, which is the point.
 
-**Across machines**, a task's *home* is the host it was announced on, and taking it means claiming it there over the same `remote` endpoint the sidecar uses — so two machines can't hand out the same work. Everything else stays each host's own business. See [`docs/self-organization.md`](docs/self-organization.md) for the design, the federation-vs-confederation distinction, and why this is leases and CRDTs rather than Raft; `scripts/self-org-sandbox.sh` runs the whole thing across two sandboxed daemons without touching anything of yours.
+**Across machines**, a task's *home* is the host it was announced on, and taking it means claiming it there over the same `remote` endpoint the sidecar uses — so two machines can't hand out the same work. Everything else stays each host's own business.
+
+**The handbook** — both shipped in the deb at `/usr/share/doc/tab-atelier/`, so an agent on a machine with no checkout can still read them:
+
+| | |
+|---|---|
+| [`docs/self-organization.md`](docs/self-organization.md) | the model: leases, contract net, gossip, the federation-vs-confederation distinction, and why this is CRDTs rather than Raft |
+| [`docs/fleet-playbook.md`](docs/fleet-playbook.md) | the operational side, written to be handed to an agent: fill a board, spawn workers, and — the part that matters — verify what they report |
+
+`scripts/self-org-sandbox.sh` runs the whole thing across two sandboxed daemons without touching anything of yours.
 
 ## Wakatime
 

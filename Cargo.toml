@@ -348,6 +348,13 @@ assets = [
     # OpenAPI 3.1 spec for the local HTTP API (also served live at
     # GET /openapi.yaml). Point Swagger UI / codegen at it.
     ["assets/openapi.yaml", "/usr/share/doc/tab-atelier/", "644"],
+    # The fleet handbook. `self-organization.md` is the model (leases, contract
+    # net, gossip, and why not Raft); `fleet-playbook.md` is the operational
+    # side, written to be handed to an agent. Shipped because an agent on a
+    # machine that only has the deb has no checkout to read them from — and
+    # the agent brief points at them by name.
+    ["docs/self-organization.md", "/usr/share/doc/tab-atelier/", "644"],
+    ["docs/fleet-playbook.md", "/usr/share/doc/tab-atelier/", "644"],
     # eSheep pets (the `pets` feature): a baked sprite sheet (<id>.png, alpha-keyed
     # + palette-quantized) beside its animation XML (<id>.xml), loaded at runtime
     # from here (dev falls back to ./assets/pets/).
@@ -406,6 +413,13 @@ assets = [
     ["LICENSE", "/usr/share/doc/tab-atelier-headless/", "644"],
     # OpenAPI 3.1 spec (also served live at GET /openapi.yaml).
     ["assets/openapi.yaml", "/usr/share/doc/tab-atelier-headless/", "644"],
+    # The fleet handbook. `self-organization.md` is the model (leases, contract
+    # net, gossip, and why not Raft); `fleet-playbook.md` is the operational
+    # side, written to be handed to an agent. Shipped because an agent on a
+    # machine that only has the deb has no checkout to read them from — and
+    # the agent brief points at them by name.
+    ["docs/self-organization.md", "/usr/share/doc/tab-atelier-headless/", "644"],
+    ["docs/fleet-playbook.md", "/usr/share/doc/tab-atelier-headless/", "644"],
 ]
 # Service-account lifecycle (adduser/deluser) and unit enable/start
 # are handled by these scripts; cargo-deb installs them as the deb's
