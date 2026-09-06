@@ -240,3 +240,113 @@ fn url_encode(s: &str) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{RemoteEndpoint, resolve_tab_index, url_encode};
+
+    fn fargs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// A server that answers every request with `body`.
+    ///
+    /// `resolve_tab_index` spawns the real sidecar client, which polls — so a
+    /// one-shot responder deadlocks it. The thread is detached; it dies with
+    /// the test process.
+    fn serve_tabs(body: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            while let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf);
+                let _ = write!(
+                    sock,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.flush();
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    fn endpoint(url: String) -> RemoteEndpoint {
+        RemoteEndpoint {
+            id: "ep".into(),
+            label: "peer".into(),
+            url,
+            token: "t".into(),
+            relay_token: String::new(),
+            cert_sha256: String::new(),
+            cf_access_client_id: String::new(),
+            cf_access_client_secret: String::new(),
+            autoconnect: false,
+        }
+    }
+
+    #[test]
+    fn a_filename_survives_the_url_intact() {
+        assert_eq!(url_encode("report.md"), "report.md");
+        // A space or a slash in a name must not split the path or silently
+        // land the file somewhere else on the remote.
+        assert_eq!(url_encode("my report.md"), "my%20report.md");
+        assert_eq!(url_encode("a/b"), "a%2Fb");
+        assert_eq!(url_encode("q?x=1&y=2"), "q%3Fx%3D1%26y%3D2");
+        assert_eq!(url_encode("100%"), "100%25");
+        // Unreserved characters stay readable — an encoder that escapes
+        // everything makes every log line unreadable for no gain.
+        assert_eq!(url_encode("a-b_c.d~e"), "a-b_c.d~e");
+        assert_eq!(url_encode(""), "");
+    }
+
+    #[test]
+    fn a_tab_argument_resolves_against_the_remotes_list() {
+        let body = r#"{"tabs":[
+            {"id":"uuid-a","index":0,"name":"build","active":false},
+            {"id":"uuid-b","index":1,"name":"deploy","active":true}
+        ]}"#;
+        let url = serve_tabs(body);
+        // No argument: whichever tab the remote says is active — NOT index 0.
+        assert_eq!(resolve_tab_index(&endpoint(url.clone()), None).ok(), Some(1));
+        assert_eq!(resolve_tab_index(&endpoint(url.clone()), Some("build")).ok(), Some(0));
+        // An index needs the `#` sigil (`--tab '#1'`). A bare number is
+        // treated as a NAME, so `--tab 1` looks for a tab called "1" and
+        // fails — which is safer than silently using position 1, but is easy
+        // to get wrong from the shell, where `#` also starts a comment.
+        assert_eq!(resolve_tab_index(&endpoint(url.clone()), Some("#1")).ok(), Some(1));
+        assert!(resolve_tab_index(&endpoint(url.clone()), Some("1")).is_err());
+        assert_eq!(resolve_tab_index(&endpoint(url.clone()), Some("uuid-a")).ok(), Some(0));
+        // A name nothing matches is an error, not a default — putting a file
+        // in the wrong tab is worse than not putting it at all.
+        assert!(resolve_tab_index(&endpoint(url), Some("ghost")).is_err());
+        // With no active tab and no argument, say so rather than guessing.
+        let none_active = serve_tabs(r#"{"tabs":[{"id":"a","index":0,"name":"x","active":false}]}"#);
+        assert!(resolve_tab_index(&endpoint(none_active), None).is_err());
+    }
+
+    #[test]
+    fn an_unreachable_remote_is_an_error_not_tab_zero() {
+        // Nothing listens on port 1. The failure must surface here rather
+        // than becoming a default index that uploads to a stranger's tab.
+        assert!(resolve_tab_index(&endpoint("http://127.0.0.1:1".into()), None).is_err());
+    }
+
+    #[test]
+    fn put_and_get_refuse_incomplete_commands() {
+        // All of these fail during argument checking, before any network or
+        // filesystem work — which is what makes them safe to assert on.
+        assert_ne!(super::cmd_put(&fargs(&[])), 0, "put with no arguments");
+        assert_ne!(super::cmd_get(&fargs(&[])), 0, "get with no arguments");
+        // A flag with no value must not swallow the next argument.
+        assert_ne!(super::cmd_put(&fargs(&["--tab"])), 0);
+        // A local file that does not exist cannot be uploaded; failing here
+        // beats a confusing error from the far end.
+        assert_ne!(
+            super::cmd_put(&fargs(&["peer", "/nonexistent/definitely-not-here.txt"])),
+            0
+        );
+    }
+}
