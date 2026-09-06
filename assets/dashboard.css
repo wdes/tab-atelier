@@ -899,7 +899,8 @@ body.band-view { min-height: calc(100vh + 180px); }
 .mesh { position: relative; }
 .mesh-filters { display: flex; gap: 12px; align-items: center; padding: 8px 4px; flex-wrap: wrap; color: var(--muted); font-size: 0.8rem; }
 .mesh-filters select { font: inherit; }
-.mesh-svg { width: 100%; height: 72vh; display: block; }
+.mesh-svg { width: 100%; height: 72vh; display: block; touch-action: none; cursor: grab; }
+.mesh-svg.mesh-panning { cursor: grabbing; }
 .mesh-node circle { stroke-width: 1.5; cursor: pointer; }
 .mesh-node text {
   fill: var(--fg); font-size: 10px; pointer-events: none;
