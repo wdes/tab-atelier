@@ -6090,6 +6090,10 @@ mod state_writer_tests {
     ///    compares it as text (`0de5678` < `abc1234`, whatever the clock says).
     ///  * the smoke-test deb must sort below the published one for the same
     ///    commit, so a stray artifact cannot shadow the real build.
+    ///
+    /// It also checks the new suffix outranks the `~nightly{YYYYMMDD}.{HHMMSS}`
+    /// one it grew out of — 14 digits against 8, compared numerically — since
+    /// that is what let the sha be added without asking anyone to downgrade.
     #[test]
     fn snapshot_deb_versions_sort_the_way_apt_needs() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -6107,8 +6111,8 @@ mod state_writer_tests {
 
         let nightly = run(&[]);
         let smoke = run(&["--revision", "0ci"]);
-        // 0.5.0~git20260907072252.04cb329-1
-        let (base, rest) = nightly.split_once("~git").expect("a ~git snapshot version");
+        // 0.5.0~nightly20260907072252.04cb329-1
+        let (base, rest) = nightly.split_once("~nightly").expect("a ~nightly snapshot version");
         let (stamp, tail) = rest.split_once('.').expect("date.hash");
         assert_eq!(stamp.len(), 14, "the date field must be YYYYMMDDHHMMSS, got {stamp}");
         assert!(
@@ -6148,14 +6152,20 @@ mod state_writer_tests {
         ordered(&nightly, "lt", &release); // steps up onto stable when it lands
         ordered(&nightly, "lt", &format!("{base}~pre1-1")); // and below a release candidate
         ordered(&smoke, "lt", &nightly); // the throwaway never shadows the real one
-        ordered(&format!("{base}~git20260907070700.abc1234-1"), "lt", &nightly);
+        ordered(&format!("{base}~nightly20260907070700.abc1234-1"), "lt", &nightly);
 
         // Two pushes in one day, in the order they happened: the earlier one
         // has the alphabetically LARGER hash, so only the time saves us.
         ordered(
-            &format!("{base}~git20260907070700.abc1234-1"),
+            &format!("{base}~nightly20260907070700.abc1234-1"),
             "lt",
-            &format!("{base}~git20260907071500.0de5678-1"),
+            &format!("{base}~nightly20260907071500.0de5678-1"),
         );
+
+        // The suffix this one grew out of, still in the published pool. A
+        // 14-digit stamp beats an 8-digit one numerically, which is the whole
+        // reason the sha could be added without stranding an installed
+        // machine on a version apt would refuse to move off.
+        ordered(&format!("{base}~nightly20260907.090151-1"), "lt", &nightly);
     }
 }
