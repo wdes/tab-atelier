@@ -1535,7 +1535,15 @@ function agentCardHtml(tab) {
   const openLink = viewer
     ? ` <button class="ac-open" data-viewer="${escapeHtml(viewer)}" title="ouvrir l'onglet dans le navigateur (lien distant)" aria-label="ouvrir l'onglet dans le navigateur">↗</button>`
     : "";
-  return `<button class="ac-close" title="close" aria-label="close">×</button><div class="ac-name">${escapeHtml(name)}${openLink}</div>${rows.join("")}`;
+  // Agent-card remote-share (PO): a WRITE-capable link to THIS tab on the remote host (REMOTE_BASE), so the
+  // PO drives the agent off-LAN through the CF tunnel. Sits ALONGSIDE the ↗ local-viewer button (zero regression).
+  // A real <a href> (the browser builds the attribute → clickable/copyable, anti built≠wired) + rel=noreferrer:
+  // the ?token= never leaks via Referer. ⚠️ outward-facing + WRITE — tunnel auth = PO infra, out of our scope.
+  const remoteHref = viewer ? remoteTabLink(viewer, TOKEN) : "";
+  const remoteLink = remoteHref
+    ? ` <a class="ac-remote" href="${escapeHtml(remoteHref)}" target="_blank" rel="noopener noreferrer" title="ouvrir ce tab à distance en écriture (${escapeHtml(REMOTE_BASE)}) — le PO interagit avec l'agent" aria-label="ouvrir à distance en écriture">⇱ distant (écriture)</a>`
+    : "";
+  return `<button class="ac-close" title="close" aria-label="close">×</button><div class="ac-name">${escapeHtml(name)}${openLink}${remoteLink}</div>${rows.join("")}`;
 }
 
 function openAgentCard(id) {
@@ -1869,6 +1877,19 @@ export function toRemoteLink(localPath, token = TOKEN, base = REMOTE_BASE) {
   if (!path) return "";
   const enc = path.split("/").map(encodeURIComponent).join("/");
   return base.replace(/\/$/, "") + viewerUrlWithToken("/decisions/file?path=" + enc, token);
+}
+
+// Pure: compose the shareable WRITE-capable REMOTE viewer URL for a TAB (agent-card remote-share, PO).
+// Unlike toRemoteLink (which re-routes a report path through /decisions/file), a tab's viewerUrl is ALREADY
+// the correct root-relative share route (/tabs/by-id/<uuid>/view) — we ONLY prefix the fixed remote host +
+// the page token (reusing viewerUrlWithToken). The page token is write-capable (it authorises input on
+// /view) → the PO drives the agent off-LAN. ⚠️ outward-facing + WRITE: the rel=noreferrer on the rendered
+// <a> keeps the ?token= from leaking via Referer; the tunnel auth (CF Access) is the PO infra's job, not
+// ours. Empty viewerUrl → "" (no dangling link).
+export function remoteTabLink(viewerUrl, token = TOKEN, base = REMOTE_BASE) {
+  const p = String(viewerUrl == null ? "" : viewerUrl).trim();
+  if (!p) return "";
+  return base.replace(/\/$/, "") + viewerUrlWithToken(p.startsWith("/") ? p : "/" + p, token);
 }
 
 // FU2 (#kiosk) + follow-up fix: a decision's files[] mixes reference kinds that must NOT
@@ -2820,7 +2841,7 @@ function bootstrap() {
     // Inc9 (3): right-click on a FREE ZONE of the open agent-card (not its buttons)
     // opens the agent's tab in the browser (remote viewer).
     const card = e.target.closest && e.target.closest("#agent-card[data-viewer]");
-    if (card && !(e.target.closest && e.target.closest(".ac-close, .ac-more, .ac-open"))) {
+    if (card && !(e.target.closest && e.target.closest(".ac-close, .ac-more, .ac-open, .ac-remote"))) {
       const u = card.getAttribute("data-viewer");
       if (u) { window.open(viewerUrlWithToken(u, TOKEN), "_blank", "noopener"); e.preventDefault(); return; }
     }
