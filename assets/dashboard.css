@@ -664,6 +664,12 @@ body.band-view { min-height: calc(100vh + 180px); }
   font-size: 0.95em; padding: 0 0.25rem; vertical-align: middle;
 }
 .agent-card .ac-open:hover { opacity: 0.8; }
+/* Agent-card remote-share (PO): ⇱ opens THIS tab WRITE-capable on the remote host (amaury.wdes.eu). */
+.agent-card .ac-remote {
+  color: var(--led-working-stroke); font-size: 0.8em; padding: 0 0.25rem;
+  vertical-align: middle; text-decoration: none; white-space: nowrap;
+}
+.agent-card .ac-remote:hover { opacity: 0.8; text-decoration: underline; }
 
 /* --- Inc9 b2: context-usage pill (green <70 / amber 70-90 / red >90) --- */
 .ctx-pill {
