@@ -617,6 +617,19 @@ impl OutputSaver {
 struct AppState {
     tabs: Vec<Tab>,
     active: usize,
+    /// A tab became active from a path with no `Window` in hand, so its
+    /// keyboard focus is still owed.
+    ///
+    /// `persist` (the API's "activate this tab") and `close_tab` (an agent
+    /// closing its own tab) both move `active` off a timer tick, where there is
+    /// no `Window` to call `.focus()` with. Without this the tab paints, the
+    /// mouse wheel still reaches it — scrolling is delivered by hit-test, not
+    /// focus — and every keystroke goes somewhere else: "only scroll works, not
+    /// typing", with app shortcuts dead too because focus sits on a stale view.
+    ///
+    /// `render` has a `Window`, so it settles the debt on the next frame. Same
+    /// trick as the `pending_new_tabs` drain below it.
+    refocus_active: bool,
     context_menu: Option<ContextMenu>,
     /// The desktop screen-mate pet — all its state + rendering lives in
     /// [`crate::pet::PetOverlay`]; summoned/dismissed from the background menu.
@@ -1510,6 +1523,8 @@ impl AppState {
         Self {
             tabs,
             active,
+            // The boot path focuses the active tab itself, with a Window.
+            refocus_active: false,
             context_menu: None,
             #[cfg(feature = "pets")]
             pet: crate::pet::PetOverlay::default(),
@@ -1902,6 +1917,11 @@ impl AppState {
         if was_active {
             self.tabs[self.active].activate();
             self.tabs[self.active].flush_pending_restore(cx);
+            // Closing the active tab hands the keyboard to its neighbour. The
+            // GUI callers focus it themselves (they hold a Window); the API
+            // one — an agent closing its own tab when it finishes — does not,
+            // and left the surviving tab unfocused. Harmless to ask twice.
+            self.refocus_active = true;
         }
         self.context_menu = None;
         cx.notify();
@@ -2869,6 +2889,10 @@ impl AppState {
                 self.active = idx;
                 self.tabs[idx].activate();
                 self.tabs[idx].flush_pending_restore(cx);
+                // No Window on a persist tick — render focuses it next frame.
+                // Skipping this is what left an API-activated tab scrollable
+                // but deaf to the keyboard.
+                self.refocus_active = true;
                 cx.notify();
             }
             for (idx, bytes) in inputs {
@@ -6356,6 +6380,12 @@ impl Render for AppState {
         // was still a skeleton (e.g. the user switched to a not-yet-warmed tab
         // before the boot loader reached it). No-op once spawned.
         self.tabs[self.active].view.update(cx, |v, _| v.ensure_spawned());
+        // Pay off any focus owed by a window-less path (API activate, an agent
+        // closing its own tab). Done after the emptiness guard above so the
+        // index is known good.
+        if std::mem::take(&mut self.refocus_active) {
+            self.tabs[self.active].view.read(cx).focus_handle(cx).focus(window);
+        }
         // Only push the title when it changed — gpui does no diffing, so an
         // unconditional call here meant a format! + X11 property write on
         // every frame (30-60 fps while the terminal streams) for a string
@@ -7006,6 +7036,53 @@ fn spawn_hotkey_listener(keycodes: &[u8], window_handle: WindowHandle<AppState>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every path that makes a different tab active must also hand it the
+    /// keyboard — directly if it holds a `Window`, or by owing it via
+    /// `refocus_active` if it does not.
+    ///
+    /// Forgetting the second half is invisible in review and nearly invisible
+    /// in use: the tab paints, and the mouse wheel still reaches it, because
+    /// scroll is delivered by hit-test rather than focus. Only typing is dead.
+    /// That is how the API's activate path and an agent closing its own tab
+    /// both shipped broken — two timer-driven callers with no `Window` in hand.
+    ///
+    /// So this reads the source rather than the behaviour: a GUI focus bug
+    /// cannot be reproduced here without launching the app, but the invariant
+    /// that would have caught it is a local, checkable property.
+    #[test]
+    fn every_activation_path_hands_over_the_keyboard() {
+        let src = include_str!("app.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        // The assignment that switches tabs. `active += 1` / `-= 1` are index
+        // fix-ups after an insert or remove, not activations, and are excluded.
+        let activations = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.trim_start().starts_with("self.active = ") && !l.contains("if self.active"));
+
+        let mut checked = 0;
+        for (i, line) in activations {
+            // The follow-up is a handful of lines away at most: focus(window)
+            // right there, or the debt recorded for render() to settle.
+            let settled = lines[i..(i + 25).min(lines.len())]
+                .iter()
+                .any(|l| l.contains(".focus(window)") || l.contains("refocus_active = true"));
+            assert!(
+                settled,
+                "src/app.rs:{} makes another tab active but never gives it keyboard focus:\n  {}\n\
+                 Call `.focus(window)` if you hold a Window, else set `self.refocus_active = true` \
+                 and render() will do it on the next frame.",
+                i + 1,
+                line.trim()
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 4,
+            "only found {checked} activation sites — the pattern moved, so this test is no longer looking at anything"
+        );
+    }
 
     fn test_view(cx: &mut gpui::TestAppContext) -> Entity<TerminalView> {
         let window = cx.add_window(|window, cx| {
