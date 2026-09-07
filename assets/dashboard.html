@@ -12,6 +12,10 @@
        copyable text. Set this to the durable repo (e.g. wdes/tab-atelier:tab-atelier-mx) once
        the durability push lands to re-enable clickable blobs. See classifyDecisionFile in dashboard.js. -->
   <meta name="repo-blob-base" content="">
+  <!-- volet-3 remote-link: the public host a report viewer link is composed onto so the PO can
+       open/copy it off-LAN (the CF tunnel + its auth are the PO's infra, not ours). DEFAULTS to
+       amaury when absent/empty; a deploy can point it elsewhere. See toRemoteLink in dashboard.js. -->
+  <meta name="remote-base" content="https://amaury.wdes.eu">
   <title>Harness dashboard · tab-atelier</title>
   <link rel="stylesheet" href="/assets/dashboard.css">
 </head>

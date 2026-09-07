@@ -52,10 +52,10 @@ import { kioskHtml, reportsView, reportItemHtml, reportsHtml, intentMarkdown } f
   // (href is HTML-escaped, so `&` reads `&amp;`; the token VALUE is empty under node — no location).
   assert.match(item, /<a class="kk-file" href="\/decisions\/file\?path=outbox%2Frapport-x.md&amp;token=/, "local /decisions/file viewer link + token param");
   assert.match(item, />rapport-x.md</, "the report name is shown");
-  // ⭐ Clean volet-3 seam: the LOCAL path is exposed for a later remote-link builder; NO remote
-  // URL (amaury.wdes.eu) is constructed here.
+  // ⭐ The LOCAL path is exposed as the volet-3 seam; the seam is now FILLED (see
+  // dashboard.kiosk.remote-link.test.mjs) with an amaury "Ouvrir en distant" link ALONGSIDE the
+  // intact local link — this test stays scoped to the local link + seam presence.
   assert.match(item, /data-local-path="outbox\/rapport-x.md"/, "the local path is exposed as the volet-3 seam");
-  assert.ok(!/amaury\.wdes\.eu|https?:\/\//.test(item), "⭐ no remote link built here (volet-3 is a later builder)");
   // No token when read-only.
   const ro = reportItemHtml({ name: "y.md", path: "outbox/y.md" }, false);
   assert.ok(!/token=/.test(ro), "no token appended when read-only");
