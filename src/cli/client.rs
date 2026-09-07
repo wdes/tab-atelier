@@ -73,6 +73,7 @@ pub fn dispatch(name: &str, rest: &[String]) -> Option<i32> {
         "fleet" => super::work::fleet(rest),
         "brief" => super::brief::run(rest),
         "gossip" => super::gossip::run(rest),
+        "prune" => super::prune::run(rest),
         "backlog" => super::backlog::run(rest),
         "note" => team::run_note(rest),
         "notes" => team::run_notes(rest),

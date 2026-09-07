@@ -36,6 +36,11 @@ pub mod gossip;
 /// applied on next launch) without wrangling env vars.
 pub mod logging;
 pub mod logs;
+/// `tab-atelier prune` — compact the blackboard.
+///
+/// The board is append-only because that is what makes it mergeable; this is
+/// the deliberate, local way to drop history nobody reads.
+pub mod prune;
 pub mod remote;
 pub mod set_context;
 pub mod set_font;
