@@ -869,6 +869,7 @@ let currentMeshView = false;
 let meshNodes = [];
 let meshEdges = [];
 let meshSim = null;
+let meshTabById = new Map(); // id -> tab for mesh nodes (openAgentCard fallback when not in bandTabById)
 
 function escapeHtml(s) {
   return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => (
@@ -1546,9 +1547,13 @@ function agentCardHtml(tab) {
   return `<button class="ac-close" title="close" aria-label="close">×</button><div class="ac-name">${escapeHtml(name)}${openLink}${remoteLink}</div>${rows.join("")}`;
 }
 
-function openAgentCard(id) {
+// `tab` optional: the mesh click passes its node's tab directly (mesh nodes aren't
+// always in bandTabById — in mesh view render() early-returns before buildBandModel,
+// and unmapped tabs re-added on a re-poll never enter it). Fall back to the band map,
+// then the mesh map (both keyed by id), so a right-click that only has the id resolves.
+function openAgentCard(id, tab) {
   const el = document.getElementById("agent-card");
-  const tab = bandTabById.get(id);
+  tab = tab || bandTabById.get(id) || meshTabById.get(id);
   if (!el || !tab) return;
   el.innerHTML = agentCardHtml(tab);
   // Inc9 (3): carry the tab's viewer URL on the popup root so a right-click on a
@@ -2641,28 +2646,53 @@ function wireMeshZoomPan() {
     applyMeshTransform();
   }, { passive: false });
 
-  // Pan = pointer-drag on EMPTY canvas. A drag that starts on a node is a node-drag
-  // (meshDragify owns it) -> skip, so the two gestures never fight.
-  let panning = false, lastX = 0, lastY = 0;
+  // Pointer gestures on the EMPTY canvas: 1 pointer = pan, 2 pointers = pinch-zoom.
+  // A drag that starts on a node is a node-drag (meshDragify owns it) -> skip, so the
+  // gestures never fight. The 2-finger pinch is the CROSS-BROWSER zoom path: Firefox/Linux
+  // does NOT synthesise wheel+ctrlKey on a trackpad pinch (Chrome does), and gesture* events
+  // are Safari-only — so we read the raw pointers. Zoom factor = currentGap/previousGap,
+  // centred on the 2-point centroid (like the wheel zoom is centred on the cursor).
+  const pointers = new Map(); // pointerId -> {x,y} in client coords
+  let panning = false, lastX = 0, lastY = 0, pinchGap = 0;
+  const gapOf = () => { const [a, b] = [...pointers.values()]; return Math.hypot(a.x - b.x, a.y - b.y); };
   svg.addEventListener("pointerdown", (e) => {
-    if (e.target.closest && e.target.closest(".mesh-node")) return;
-    panning = true; lastX = e.clientX; lastY = e.clientY;
-    svg.classList.add("mesh-panning");
+    if (e.target.closest && e.target.closest(".mesh-node")) return; // node-drag owns it
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
     try { svg.setPointerCapture(e.pointerId); } catch { /* ignore */ }
+    if (pointers.size >= 2) { panning = false; svg.classList.remove("mesh-panning"); pinchGap = gapOf(); }
+    else { panning = true; lastX = e.clientX; lastY = e.clientY; svg.classList.add("mesh-panning"); }
   });
   svg.addEventListener("pointermove", (e) => {
+    if (!pointers.has(e.pointerId)) return;
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pointers.size >= 2) {                                   // pinch: scale by gap ratio, centroid-centred
+      const g = gapOf();
+      if (pinchGap > 0 && g > 0) {
+        const [a, b] = [...pointers.values()];
+        const r = svg.getBoundingClientRect();
+        meshTransform = meshZoomAt(meshTransform, (a.x + b.x) / 2 - r.left, (a.y + b.y) / 2 - r.top, g / pinchGap);
+        applyMeshTransform();
+      }
+      pinchGap = g;
+      return;
+    }
     if (!panning) return;
     meshTransform.tx += e.clientX - lastX; meshTransform.ty += e.clientY - lastY;
     lastX = e.clientX; lastY = e.clientY;
     applyMeshTransform();
   });
-  const endPan = (e) => {
-    if (!panning) return;
-    panning = false; svg.classList.remove("mesh-panning");
+  const endPointer = (e) => {
+    if (!pointers.has(e.pointerId)) return;
+    pointers.delete(e.pointerId);
     try { svg.releasePointerCapture(e.pointerId); } catch { /* ignore */ }
+    if (pointers.size < 2) pinchGap = 0;
+    if (pointers.size === 0) { panning = false; svg.classList.remove("mesh-panning"); }
+    else if (pointers.size === 1) {                            // a finger lifted after a pinch -> resume pan
+      const [rem] = [...pointers.values()]; panning = true; lastX = rem.x; lastY = rem.y; svg.classList.add("mesh-panning");
+    }
   };
-  svg.addEventListener("pointerup", endPan);
-  svg.addEventListener("pointercancel", endPan);
+  svg.addEventListener("pointerup", endPointer);
+  svg.addEventListener("pointercancel", endPointer);
 
   // Escape hatch: double-click empty canvas resets to the identity view (prevents getting
   // lost after zooming into a corner; a node dblclick is left to the node's own click).
@@ -2774,6 +2804,7 @@ function buildMeshDom() {
   const gN = document.getElementById("mesh-nodes");
   if (!gE || !gN) return;
   gE.textContent = ""; gN.textContent = "";
+  meshTabById = new Map();
   for (const e of meshEdges) {
     const l = document.createElementNS(MESH_SVG_NS, "line");
     l.setAttribute("class", "lineage-edge");           // reuse the existing edge style
@@ -2785,6 +2816,7 @@ function buildMeshDom() {
     g.setAttribute("class", `mesh-node ${ledClass(n.t.led != null ? n.t.led : n.t.rollupLed)}`);
     g.setAttribute("data-tab-id", n.t.id || "");
     g.setAttribute("data-viewer", n.t.viewerUrl || "");
+    if (n.t.id) meshTabById.set(n.t.id, n.t);
     const c = document.createElementNS(MESH_SVG_NS, "circle");
     c.setAttribute("r", n.r);
     const tx = document.createElementNS(MESH_SVG_NS, "text");
@@ -2793,9 +2825,8 @@ function buildMeshDom() {
     g.append(c, tx);
     g.addEventListener("mousemove", (ev) => showMeshTip(ev, n.t));
     g.addEventListener("mouseleave", hideMeshTip);
-    g.addEventListener("click", () => {
-      const u = n.t.viewerUrl; if (u) window.open(viewerUrlWithToken(u, TOKEN), "_blank", "noopener");
-    });
+    // Left-click = open the agent-card (the viewer stays reachable via the card's ↗ button).
+    // Click-vs-drag is arbitrated inside meshDragify (a moved pointer = a drag, no card).
     meshDragify(g, n);
     n._g = g; gN.appendChild(g);
   }
@@ -2859,15 +2890,25 @@ function applyMeshFilters() {
 function valOf(id) { const e = document.getElementById(id); return e ? e.value : ""; }
 function checkedOf(id) { const e = document.getElementById(id); return e ? e.checked : false; }
 
+// Node gesture: a click that DOESN'T move opens the agent-card; a pointer that travels
+// past MESH_DRAG_PX is a drag (pins the node, no card). This split is what keeps the
+// single-click-opens-card behaviour from being swallowed by the drag/pan (regression #1).
+const MESH_DRAG_PX = 4;
 function meshDragify(g, n) {
-  let down = false;
-  g.addEventListener("mousedown", (e) => { down = true; n.fx = n.x; n.fy = n.y; e.preventDefault(); });
+  let down = false, moved = false, sx = 0, sy = 0;
+  g.addEventListener("mousedown", (e) => { down = true; moved = false; sx = e.clientX; sy = e.clientY; n.fx = n.x; n.fy = n.y; e.preventDefault(); });
   window.addEventListener("mousemove", (e) => {
     if (!down) return;
+    if (!moved && Math.hypot(e.clientX - sx, e.clientY - sy) < MESH_DRAG_PX) return; // still a click, not a drag
+    moved = true;
     const svg = document.getElementById("mesh-svg"); if (!svg) return;
     const r = svg.getBoundingClientRect(); n.fx = e.clientX - r.left; n.fy = e.clientY - r.top;
   });
   window.addEventListener("mouseup", () => { if (down) { down = false; n.fx = n.fy = null; } });
+  // Un vrai drag (moved) ne doit PAS ouvrir la carte ; un clic sans déplacement OUI.
+  // stopPropagation: sinon le click bubble jusqu'au handler document « clic dehors =
+  // ferme la carte » qui refermerait la carte qu'on vient d'ouvrir.
+  g.addEventListener("click", (e) => { if (!moved) { openAgentCard(n.t.id, n.t); e.stopPropagation(); } });
 }
 
 // Symmetric to setViewChrome: show #mesh + hide grid/flow/back when on (and vice-versa).
@@ -2921,7 +2962,9 @@ function bootstrap() {
   // Right-click: on a band node (Inc7/Inc8) open its agent-card (Inc8 S3); on a
   // popup tab entry open its viewer.
   document.addEventListener("contextmenu", (e) => {
-    const node = e.target.closest && e.target.closest(".band-node[data-tab-id]");
+    // Right-click a band node OR a mesh node → its agent-card (which carries the
+    // "⇱ distant (écriture)" write link, same as the dashboard cards).
+    const node = e.target.closest && e.target.closest(".band-node[data-tab-id], .mesh-node[data-tab-id]");
     if (node && node.dataset.tabId) { openAgentCard(node.dataset.tabId); e.preventDefault(); return; }
     // Inc9 (3): right-click on a FREE ZONE of the open agent-card (not its buttons)
     // opens the agent's tab in the browser (remote viewer).
