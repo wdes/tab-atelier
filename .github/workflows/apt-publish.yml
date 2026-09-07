@@ -5,12 +5,20 @@ name: Publish apt repo
 #    version is whatever Cargo.toml says (the `release.yml` tag flow
 #    is expected to bump that to the release version).
 #  * `nightly` — populated on every push to `main`. The package
-#    version is rewritten on the fly to
-#        <base>~nightly<UTC YYYYMMDD>.<UTC HHMMSS>-1
-#    `~` is the Debian pre-release separator (Debian Versioning
-#    wiki) so e.g. `0.4.0~nightly20260527.123000` sorts strictly
-#    BEFORE `0.4.0`. That gives users a "track main" channel that
-#    auto-downgrades-and-upgrades when a stable lands.
+#    version is rewritten on the fly by `scripts/deb-version.sh` to
+#        <base>~git<UTC YYYYMMDDHHMMSS>.<short sha>-1
+#    the shape Debian's "Versioning in Nightly and Prerelease
+#    Binaries" wiki page prescribes. `~` is the pre-release
+#    separator, so `0.5.0~git…` sorts strictly BEFORE `0.5.0`: a
+#    "track main" channel that steps up onto stable when it lands.
+#    The sha means a .deb on disk names the commit that built it.
+#
+#    This replaced a `~nightly<date>` suffix. `git` sorts below
+#    `nightly` alphabetically, so a machine already running an old
+#    nightly sees the new ones as a DOWNGRADE and sits still until
+#    the next stable; it needs one
+#        sudo apt install --allow-downgrades tab-atelier
+#    to rejoin the channel. Noted on the repo's landing page too.
 #
 # Single output: a Debian "pool" repo on the `gh-pages` branch,
 # served from https://deb.tab-atelier.wdes.eu/ (CNAME → GH Pages).
@@ -47,15 +55,15 @@ jobs:
             - name: Decide channel + version
               id: ver
               run: |
+                  # The version itself comes from scripts/deb-version.sh, so
+                  # the published nightly, the smoke-test deb and the Windows
+                  # installers cannot tell three different stories.
                   if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
                       CHANNEL=stable
-                      VERSION="${GITHUB_REF#refs/tags/v}"
                   else
                       CHANNEL=nightly
-                      BASE=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2 | sed 's/-dev$//')
-                      DATE=$(date -u +%Y%m%d.%H%M%S)
-                      VERSION="${BASE}~nightly${DATE}-1"
                   fi
+                  VERSION="$(scripts/deb-version.sh)"
                   echo "channel=$CHANNEL" >> $GITHUB_OUTPUT
                   echo "version=$VERSION" >> $GITHUB_OUTPUT
                   echo "→ publishing $VERSION to $CHANNEL"
@@ -513,6 +521,11 @@ jobs:
                   echo "deb [signed-by=/usr/share/keyrings/tab-atelier.gpg] https://deb.tab-atelier.wdes.eu nightly main" | sudo tee /etc/apt/sources.list.d/tab-atelier.list > /dev/null
                   sudo apt update
                   sudo apt install tab-atelier</pre>
+                  <p data-channel="nightly" class="hidden"><strong>Already on nightly?</strong>
+                  Snapshots moved from <code>0.5.0~nightly&lt;date&gt;</code> to Debian's
+                  <code>0.5.0~git&lt;date&gt;.&lt;commit&gt;</code> convention, which sorts <em>lower</em>.
+                  If apt reports your installed version is newer than the one available, run
+                  <code>sudo apt install --allow-downgrades tab-atelier</code> once to rejoin the channel.</p>
 
                   <h2>Upgrade an existing install</h2>
                   <pre>sudo apt update &amp;&amp; sudo apt install --only-upgrade tab-atelier</pre>
