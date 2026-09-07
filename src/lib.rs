@@ -6075,6 +6075,79 @@ mod state_writer_tests {
         );
     }
 
+    /// The APK is skipped when the app did not change — but never on a tag.
+    ///
+    /// The cheap way to write this rule is `on.push.paths`, and it is wrong in
+    /// a way that only shows up at release time: GitHub evaluates path filters
+    /// against the commits in a push, and a tag points at a commit that was
+    /// already pushed. No commits, no match, no APK for the release — while
+    /// every other artifact builds fine and CI stays green.
+    #[test]
+    fn the_apk_is_skipped_only_when_the_app_is_untouched() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let script = root.join("scripts/apk-needed.sh");
+
+        let decide = |files: &str| -> String {
+            use std::io::Write as _;
+            let mut child = std::process::Command::new(&script)
+                .args(["--files", "-"])
+                .current_dir(root)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("run scripts/apk-needed.sh");
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(files.as_bytes())
+                .expect("write file list");
+            let out = child.wait_with_output().expect("collect output");
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+
+        // Untouched app → skip. This is the whole point of the gate.
+        assert_eq!(decide("src/app.rs\nsrc/api.rs\n"), "false");
+        assert_eq!(decide("README.md\ndocs/fleet-playbook.md\n"), "false");
+        assert_eq!(decide(""), "false");
+        // Touched, in any of the ways that reach the artifact.
+        assert_eq!(decide("android/ta-remote/src/lib.rs\n"), "true");
+        assert_eq!(
+            decide("android/ta-remote/Cargo.toml\n"),
+            "true",
+            "a version bump must rebuild"
+        );
+        assert_eq!(decide(".github/workflows/android-apk.yml\n"), "true");
+        // One app file in a big desktop push is still a rebuild.
+        assert_eq!(decide("src/app.rs\nandroid/ta-remote/Cargo.lock\n"), "true");
+
+        // A tag builds whatever the diff says.
+        let tag = std::process::Command::new(&script)
+            .current_dir(root)
+            .env("GITHUB_REF", "refs/tags/v9.9.9")
+            .env("GITHUB_EVENT_NAME", "push")
+            .output()
+            .expect("run scripts/apk-needed.sh for a tag");
+        assert_eq!(
+            String::from_utf8_lossy(&tag.stdout).trim(),
+            "true",
+            "a release tag must build the APK — that is the case `on.push.paths` gets wrong"
+        );
+
+        // And the workflow actually consults it.
+        let wf = std::fs::read_to_string(root.join(".github/workflows/android-apk.yml")).expect("workflow");
+        assert!(wf.contains("scripts/apk-needed.sh"), "the gate script is not wired up");
+        assert!(
+            wf.contains("needs.changes.outputs.build == 'true'"),
+            "the apk job does not honour the gate"
+        );
+        assert!(
+            !wf.contains("paths:"),
+            "a `paths:` filter here would skip release builds — use the gate job"
+        );
+    }
+
     /// A snapshot .deb must sort below the release it is heading towards, and
     /// above the one before it.
     ///
