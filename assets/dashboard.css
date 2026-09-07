@@ -723,6 +723,10 @@ body.band-view { min-height: calc(100vh + 180px); }
 .cat-count { color: var(--muted); font-size: 0.78rem; }
 .cat-refresh, .cat-close { margin-left: auto; border: none; background: transparent; color: var(--muted); font-size: 1rem; cursor: pointer; }
 .cat-refresh { margin-left: auto; } .cat-close { margin-left: 0.3rem; font-size: 1.2rem; }
+/* one button expands/collapses ALL groups (catalogue header + rapports sub-bar). */
+.cat-groups-toggle { margin-left: auto; border: 1px solid var(--border); background: var(--bg); color: var(--muted); font: inherit; font-size: 0.72rem; border-radius: 4px; padding: 0.05rem 0.4rem; cursor: pointer; white-space: nowrap; }
+.cat-groups-toggle:hover { color: var(--fg); }
+.kk-reports-sub .cat-groups-toggle { margin-left: auto; }
 .cat-list { padding: 0.4rem 0.6rem 0.8rem; }
 .cat-loading, .cat-error, .cat-empty { padding: 1rem; color: var(--muted); }
 /* category-sort (Option A): the header sort selector + collapsible group headers. */
