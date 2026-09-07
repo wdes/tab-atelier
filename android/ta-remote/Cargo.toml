@@ -65,6 +65,12 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 slint-build = "1"
 
 [package.metadata.android]
+# Underscore, NOT a hyphen: the project is "tab-atelier", but an Android
+# package name / applicationId can't contain hyphens — each dotted segment
+# must match [a-zA-Z][a-zA-Z0-9_]* — so the hyphen becomes an underscore.
+# This is the app's identity: changing it makes a fresh install, not an
+# upgrade, for anyone who already has ta-remote. Keep it in sync with the
+# FilePickerActivity name below.
 package = "fr.wdes.tab_atelier"
 build_targets = ["aarch64-linux-android"]
 apk_name = "ta-remote"
