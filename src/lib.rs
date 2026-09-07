@@ -5997,4 +5997,81 @@ mod state_writer_tests {
             assert!((input.clamp(6.0, 72.0) - want).abs() < f32::EPSILON, "{input}");
         }
     }
+
+    /// The packaging list and the deb's asset table must agree.
+    ///
+    /// The Arch package shipped README + openapi and silently fell behind when
+    /// the deb gained the handbook, because the two were maintained by hand in
+    /// different files. `packaging/docs.list` is now the source; the Arch
+    /// PKGBUILD reads it directly and this asserts the deb does too.
+    #[test]
+    fn docs_shipped_by_every_packaging_stay_in_sync() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let list = std::fs::read_to_string(root.join("packaging/docs.list")).expect("packaging/docs.list");
+        let wanted: Vec<&str> = list
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect();
+        assert!(!wanted.is_empty(), "the list is empty — did the format change?");
+
+        let cargo = std::fs::read_to_string(root.join("Cargo.toml")).expect("Cargo.toml");
+        for doc in &wanted {
+            // Every listed doc must exist…
+            assert!(
+                root.join(doc).is_file(),
+                "packaging/docs.list names a missing file: {doc}"
+            );
+            // …and be installed by BOTH debs, or the package ships less than
+            // the list claims.
+            for pkg in ["/usr/share/doc/tab-atelier/", "/usr/share/doc/tab-atelier-headless/"] {
+                let entry = format!("[\"{doc}\", \"{pkg}\"");
+                assert!(
+                    cargo.contains(&entry),
+                    "Cargo.toml is missing a deb asset for {doc} -> {pkg}\n\
+                     add: [\"{doc}\", \"{pkg}\", \"644\"],"
+                );
+            }
+        }
+
+        // The Arch packaging must go through the script rather than listing
+        // docs by hand again — that is how it drifted in the first place.
+        for pkgbuild in ["packaging/arch/PKGBUILD", "packaging/arch/PKGBUILD.git"] {
+            let body = std::fs::read_to_string(root.join(pkgbuild)).expect(pkgbuild);
+            assert!(
+                body.contains("install-docs.sh"),
+                "{pkgbuild} installs docs by hand; call scripts/install-docs.sh"
+            );
+        }
+    }
+
+    /// The Android app carries the same version as the desktop it talks to.
+    ///
+    /// They were 0.1.0 and 0.5.0-dev: a bug report from the phone named a
+    /// version that had never existed on the desktop side. `versionCode` is a
+    /// separate concern — an int that only has to increase — and lives in
+    /// `scripts/android-version.sh`.
+    #[test]
+    fn the_android_app_version_tracks_the_workspace() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let package_version = |body: &str| -> Option<String> {
+            let mut in_package = false;
+            for line in body.lines() {
+                if line.starts_with('[') {
+                    in_package = line.trim() == "[package]";
+                } else if in_package && line.starts_with("version = ") {
+                    return line.split('"').nth(1).map(ToOwned::to_owned);
+                }
+            }
+            None
+        };
+        let ours = package_version(&std::fs::read_to_string(root.join("Cargo.toml")).expect("Cargo.toml"))
+            .expect("workspace version");
+        let android = std::fs::read_to_string(root.join("android/ta-remote/Cargo.toml")).expect("android manifest");
+        assert_eq!(
+            package_version(&android).as_deref(),
+            Some(ours.as_str()),
+            "android/ta-remote is out of step — run scripts/android-version.sh --write"
+        );
+    }
 }
