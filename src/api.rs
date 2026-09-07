@@ -3046,6 +3046,52 @@ mod tests {
     use std::io::Read;
     use std::net::TcpStream;
 
+    /// The viewer's paste handler must leave TEXT paste alone.
+    ///
+    /// Pasting an image into the web viewer did nothing, because a clipboard
+    /// screenshot carries no text for xterm's hidden textarea to receive.
+    /// Uploading it to `inbox/` fixes that — but the tempting shape of the fix,
+    /// handling every paste, would take text paste away from xterm and break
+    /// the common case to fix the rare one. The early return on "no files" is
+    /// the whole safety property, so it is what this pins.
+    #[test]
+    fn the_viewer_only_intercepts_a_paste_that_carries_files() {
+        let js = MAIN_JS;
+        let at = js
+            .find("addEventListener(\"paste\"")
+            .expect("the viewer no longer handles paste at all");
+        let handler = &js[at..(at + 400).min(js.len())];
+        assert!(
+            handler.contains("clipboardData?.files"),
+            "the paste handler must look at clipboardData.files"
+        );
+        // The bail-out has to come BEFORE preventDefault, or a text paste is
+        // swallowed on its way to xterm.
+        let bail = handler.find("if (!files.length) return");
+        let prevent = handler.find("preventDefault");
+        assert!(
+            matches!((bail, prevent), (Some(b), Some(p)) if b < p),
+            "a paste with no files must return before preventDefault, or plain text paste stops working:\n{handler}"
+        );
+    }
+
+    /// Two pasted screenshots must not collide.
+    ///
+    /// Every clipboard image arrives called `image.png`, and `inbox/` is keyed
+    /// by name, so uploading them verbatim means each paste overwrites the one
+    /// before it — silently, since the upload itself succeeds.
+    #[test]
+    fn pasted_clipboard_images_get_a_unique_name() {
+        assert!(
+            MAIN_JS.contains("function pastedName"),
+            "the generic-name rename is gone; pasted images will overwrite each other in inbox/"
+        );
+        assert!(
+            MAIN_JS.contains("uploadFiles(files, { rename: true })"),
+            "paste must ask for the rename — drag-drop deliberately does not"
+        );
+    }
+
     /// A `TabInfo` with every field at its empty/default so a test can
     /// override just the two consumption fields (issue #28, S1/S2).
     fn tab_info_fixture() -> TabInfo {

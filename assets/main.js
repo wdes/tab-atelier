@@ -548,22 +548,25 @@
     // Upload a single File via XMLHttpRequest (fetch can't surface
     // upload-progress events). Reports percentage in the status bar,
     // pops a toast on success / error.
-    function uploadFile(file) {
+    // `nameOverride` exists for pasted clipboard images, which all arrive
+    // called "image.png" — see `pastedName`.
+    function uploadFile(file, nameOverride) {
+      const name = nameOverride || file.name;
       return new Promise((resolve) => {
         if (file.size > UPLOAD_MAX_BYTES) {
-          toast(`${file.name}: too large (${Math.round(file.size / 1048576)} MiB > 100 MiB limit)`);
-          resolve(false);
+          toast(`${name}: too large (${Math.round(file.size / 1048576)} MiB > 100 MiB limit)`);
+          resolve(null);
           return;
         }
         const xhr = new XMLHttpRequest();
-        const url = `${BASE}files?name=${encodeURIComponent(file.name)}${TOKEN ? "&token=" + encodeURIComponent(TOKEN) : ""}`;
+        const url = `${BASE}files?name=${encodeURIComponent(name)}${TOKEN ? "&token=" + encodeURIComponent(TOKEN) : ""}`;
         xhr.open("POST", url);
         if (TOKEN) xhr.setRequestHeader("Authorization", "Bearer " + TOKEN);
         xhr.setRequestHeader("Content-Type", "application/octet-stream");
         xhr.upload.addEventListener("progress", (e) => {
           if (e.lengthComputable) {
             const pct = Math.round((e.loaded / e.total) * 100);
-            status.textContent = `uploading ${file.name} · ${pct}%`;
+            status.textContent = `uploading ${name} · ${pct}%`;
           }
         });
         xhr.addEventListener("load", () => {
@@ -571,7 +574,7 @@
             // Parse the server's response for the relative path
             // ("inbox/<name>") and offer it as a click-to-copy
             // toast so the user can paste straight into Claude.
-            let rel = `inbox/${file.name}`;
+            let rel = `inbox/${name}`;
             try {
               const j = JSON.parse(xhr.responseText);
               if (j.relpath) rel = j.relpath;
@@ -579,15 +582,15 @@
             toast(`uploaded → ${rel} · click to copy`, 6000);
             const onClick = () => { copyText(rel, "copied: " + rel); toastEl.removeEventListener("click", onClick); };
             toastEl.addEventListener("click", onClick, { once: true });
-            resolve(true);
+            resolve(rel);
           } else {
             toast(`upload failed (${xhr.status}): ${xhr.responseText.slice(0, 120)}`);
-            resolve(false);
+            resolve(null);
           }
         });
         xhr.addEventListener("error", () => {
           toast(`upload failed: network error`);
-          resolve(false);
+          resolve(null);
         });
         xhr.send(file);
       });
@@ -595,21 +598,39 @@
     // Shared upload path for BOTH drag-drop and the mobile file-picker.
     // Multiple files upload sequentially so the status bar stays a single
     // "uploading X" string instead of racing N progress values.
-    async function uploadFiles(fileList) {
+    // A clipboard is not a filesystem: every screenshot arrives named
+    // "image.png", so uploading pasted images under their own name would have
+    // each paste silently overwrite the previous one in inbox/. Generic names
+    // get a timestamp; a real file copied out of a file manager keeps the name
+    // it came with.
+    function pastedName(file) {
+      if (file.name && !/^image\.[a-z0-9]+$/i.test(file.name)) return file.name;
+      const ext = ((file.type || "").split("/")[1] || "png").replace(/[^a-z0-9]/gi, "") || "png";
+      const t = new Date().toISOString().replace(/[:-]/g, "").replace(/\.\d+Z$/, "").replace("T", "-");
+      return `pasted-${t}.${ext}`;
+    }
+    // Shared upload path for drag-drop, the mobile file-picker AND paste.
+    // Multiple files upload sequentially so the status bar stays a single
+    // "uploading X" string instead of racing N progress values. Returns the
+    // relative paths that landed, so the caller can do something with them.
+    async function uploadFiles(fileList, { rename = false } = {}) {
       // Mirror the server-side refusal: POST /files returns 423 Locked when
       // serverLocked, so give immediate feedback instead of a failed request.
       if (serverLocked) {
         toast("tab is locked — uploads refused");
-        return;
+        return [];
       }
       const files = Array.from(fileList || []);
-      if (!files.length) return;
+      if (!files.length) return [];
+      const landed = [];
       for (const f of files) {
-        await uploadFile(f);
+        const rel = await uploadFile(f, rename ? pastedName(f) : undefined);
+        if (rel) landed.push(rel);
       }
       // Refresh the outbox panel in case a server-side script moves uploads
       // into outbox/ on receipt.
       if (panelKind === "outbox") refreshFiles("outbox");
+      return landed;
     }
     // Drag-drop wiring. dragover/leave maintain the overlay; drop fires the
     // upload. Touch devices can't drag an OS file into a WebView, so the
@@ -637,6 +658,27 @@
         dragDepth = 0;
         document.body.classList.remove("drag-over");
         await uploadFiles(e.dataTransfer?.files);
+      });
+      // Pasting an image did nothing at all, and looked like paste being
+      // broken in general. It isn't: TEXT paste is xterm's own business — its
+      // hidden textarea turns it into `onData` — and must stay that way. But a
+      // screenshot on the clipboard carries no text for that textarea to
+      // receive, so nothing happened and nothing said why.
+      //
+      // A terminal cannot show an image, so the useful reading of "paste an
+      // image here" is the one drag-drop already implements: put the file in
+      // the tab's inbox/ and hand the prompt its path, which is what an agent
+      // in this tab can actually open. The path is inserted at the cursor with
+      // NO newline — paste inserts, it does not submit.
+      document.addEventListener("paste", async (e) => {
+        const files = Array.from(e.clipboardData?.files || []);
+        if (!files.length) return; // plain text — xterm handles it
+        e.preventDefault();
+        const landed = await uploadFiles(files, { rename: true });
+        if (!landed.length) return;
+        if (serverLocked || !ws || ws.readyState !== WebSocket.OPEN) return;
+        const text = landed.join(" ") + " ";
+        try { ws.send(encodeFrame(0x01, new TextEncoder().encode(text))); } catch { /* swallow */ }
       });
       // Mobile / touch fallback: the hidden <input type=file> opens the
       // system picker (files, Photos, Drive, …); the ⬆-upload toolbar button
