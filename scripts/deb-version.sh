@@ -5,7 +5,7 @@
 #
 # Print the Debian version for the package being built here, right now.
 #
-#     scripts/deb-version.sh                 # 0.5.0~git20260907070700.04cb329-1
+#     scripts/deb-version.sh                 # 0.5.0~nightly20260907070700.04cb329-1
 #     scripts/deb-version.sh --revision 0ci  # …-0ci, for a throwaway build
 #     scripts/deb-version.sh --explain       # the components, one per line
 #
@@ -18,15 +18,20 @@
 #
 #     {upcoming_version}~git{date}.{hash}-{revision}
 #
+# We keep every part of that but spell the marker `nightly` instead of `git`,
+# because it says what the package IS to the person reading the filename — the
+# nightly channel — where `git` only says how it was identified. dpkg does not
+# care which word it is: what matters is the `~`.
+#
 # `~` sorts BEFORE an empty string in dpkg's comparison, and before nothing
 # else does. That single character is what makes a nightly for 0.5.0 sort below
 # the eventual 0.5.0 release, so a machine tracking `nightly` steps up onto
 # stable when it lands rather than being pinned above it forever.
 #
-#     0.5.0-1                        the release
-#     0.5.0~pre2-1                   a release candidate for it
-#     0.5.0~git20260907070700.abc-1  a nightly heading towards it
-#     0.3.0-1                        the previous release
+#     0.5.0-1                            the release
+#     0.5.0~pre2-1                       a release candidate for it
+#     0.5.0~nightly20260907070700.abc-1  a nightly heading towards it
+#     0.3.0-1                            the previous release
 #
 # WHY THE DATE IS 14 DIGITS AND NOT THE WIKI'S 8. The wiki writes the date as
 # YYYYMMDD because it assumes one nightly per day. We publish on every push to
@@ -39,6 +44,11 @@
 # way") applied to a repo that builds more than daily. The hash stays exactly
 # what the wiki says it is: informational, so a .deb on your disk can name the
 # commit it came from.
+#
+# Keeping `~nightly` also costs nothing to switch to: the old suffix was
+# `~nightly{YYYYMMDD}.{HHMMSS}`, and 14 digits compare numerically GREATER than
+# 8, so every version minted here outranks every one already published. No
+# machine has to be told to downgrade.
 #
 # REVISION. `-1` is the real thing, published to the apt repo. The build
 # workflow's smoke-test debs pass `--revision 0ci`: same commit, but built with
@@ -105,7 +115,7 @@ else
     # tarball build with no .git around it.
     hash="$(git -C "$root" rev-parse --short=7 HEAD 2>/dev/null || echo "${GITHUB_SHA:-0000000}")"
     hash="${hash:0:7}"
-    version="${base}~git${stamp}.${hash}-${revision}"
+    version="${base}~nightly${stamp}.${hash}-${revision}"
 fi
 
 if [ "$explain" = 1 ]; then
