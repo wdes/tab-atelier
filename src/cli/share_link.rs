@@ -124,16 +124,52 @@ pub(crate) fn fetch_tabs(ep: &Endpoint) -> Result<Vec<serde_json::Value>, String
 /// and some are uuid-based (view/output/input via /by-id/).
 pub(crate) fn resolve(ep: &Endpoint, key: &str) -> Result<(usize, String), String> {
     let tabs = fetch_tabs(ep)?;
+    let field = |t: &'_ serde_json::Value, k: &str| -> String {
+        t.get(k)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    // Index, then uuid, then NAME. The name arm was missing, so `close
+    // build-box` failed with "no tab matches" while `dispatch --to build-box`
+    // worked — two resolvers disagreeing about what a tab may be called.
     let pick = key.parse::<usize>().map_or_else(
         |_| {
-            tabs.iter()
-                .find(|t| t.get("id").and_then(serde_json::Value::as_str) == Some(key))
+            let by_id = tabs
+                .iter()
+                .find(|t| t.get("id").and_then(serde_json::Value::as_str) == Some(key));
+            if by_id.is_some() {
+                return Ok(by_id);
+            }
+            let named: Vec<&serde_json::Value> = tabs.iter().filter(|t| field(t, "name") == key).collect();
+            match named.len() {
+                0 => Ok(None),
+                1 => Ok(named.into_iter().next()),
+                // Never guess between twins: acting on the wrong tab closes or
+                // renames somebody else's work.
+                _ => {
+                    let idxs: Vec<String> = named
+                        .iter()
+                        .map(|t| {
+                            t.get("index")
+                                .and_then(serde_json::Value::as_u64)
+                                .map_or_else(|| "?".to_owned(), |i| i.to_string())
+                        })
+                        .collect();
+                    Err(format!(
+                        "{} tabs are named {key:?} — use an index: {}",
+                        named.len(),
+                        idxs.join(", ")
+                    ))
+                }
+            }
         },
         |idx| {
-            tabs.iter()
-                .find(|t| t.get("index").and_then(serde_json::Value::as_u64) == Some(idx as u64))
+            Ok(tabs
+                .iter()
+                .find(|t| t.get("index").and_then(serde_json::Value::as_u64) == Some(idx as u64)))
         },
-    );
+    )?;
     let t = pick.ok_or_else(|| format!("no tab matches {key:?}"))?;
     let idx = t
         .get("index")
@@ -262,12 +298,31 @@ pub fn add(args: &[String]) -> i32 {
     0
 }
 
+/// Which tab `close` acts on: the argument, else the tab we are running in.
+///
+/// No argument closes the tab you are IN — an agent that has finished should
+/// be able to clean up after itself, instead of leaving a tab that reads
+/// "open" forever and an operator hunting for its uuid.
+///
+/// Separated from the environment so the decision is testable: reading
+/// `$_TAB_ID` inside `close` made its no-argument behaviour depend on whether
+/// the developer ran the suite from a tab-atelier tab.
 #[must_use]
+pub fn close_target(arg: Option<&str>, tab_id: Option<&str>) -> Option<String> {
+    arg.or(tab_id)
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 pub fn close(args: &[String]) -> i32 {
-    let Some(key) = args.first() else {
-        eprintln!("usage: tab-atelier-headless close <tab-index-or-uuid>");
+    let own = std::env::var("_TAB_ID").ok();
+    let Some(key) = close_target(args.first().map(String::as_str), own.as_deref()) else {
+        eprintln!("usage: tab-atelier close <tab-name|index|uuid>");
+        eprintln!("  with no argument, closes the current tab ($_TAB_ID) — but it is unset here");
         return 2;
     };
+    let key = key.as_str();
     let ep = match discover_endpoint() {
         Ok(e) => e,
         Err(e) => {
@@ -2311,9 +2366,13 @@ mod tests {
             assert_eq!(resolve(&ep, "tab-b").expect("by uuid").1, "tab-b");
             // A key that matches nothing must fail rather than pick tab 0 —
             // every mutating verb routes through here.
-            // Names are NOT resolvable here — index or uuid only, so a tab
-            // named "0" can never shadow tab index 0.
-            assert!(resolve(&ep, "shell").is_err());
+            //
+            // A NAME now resolves too, but only after index and uuid have both
+            // missed. That keeps the property this test was written to protect
+            // — a numeric key is always the index, so a tab named "0" cannot
+            // shadow tab 0 — while making `close build` work like
+            // `dispatch --to build`, which used to be the odd one out.
+            assert_eq!(resolve(&ep, "shell").expect("by name").1, "tab-a");
             assert!(resolve(&ep, "nope").is_err());
             assert!(resolve(&ep, "99").is_err());
             assert_eq!(fetch_tabs(&ep).expect("tabs").len(), 2);
@@ -2351,7 +2410,11 @@ mod tests {
             // Each verb validates its own arguments before reaching the API.
             assert_eq!(add(&args(&[])), 2);
             assert_eq!(rename(&args(&["0"])), 2);
-            assert_eq!(close(&args(&[])), 2);
+            // NOT `close(&[])`: with no argument that closes the tab the developer
+            // is sitting in, so the result would depend on whether the suite runs
+            // from a tab-atelier tab. The decision itself is asserted in
+            // `close_targets_the_current_tab_when_given_no_argument`.
+            assert_eq!(close(&args(&["definitely-not-a-tab"])), 1);
             assert_eq!(rename(&args(&["nope", "x"])), 1);
         });
     }
@@ -3203,5 +3266,19 @@ mod tests {
             // a silently ignored no-op.
             assert_eq!(super::relay("frobnicate", None), 2);
         });
+    }
+
+    #[test]
+    fn close_targets_the_current_tab_when_given_no_argument() {
+        use super::close_target;
+        // An explicit argument always wins, even inside a tab.
+        assert_eq!(close_target(Some("build"), Some("uuid-self")).as_deref(), Some("build"));
+        // No argument inside a tab: close myself. This is the whole point —
+        // an agent that finished can clean up after itself.
+        assert_eq!(close_target(None, Some("uuid-self")).as_deref(), Some("uuid-self"));
+        // Outside a tab there is nothing to close, and guessing would pick a
+        // victim: the caller gets a usage error instead.
+        assert_eq!(close_target(None, None), None);
+        assert_eq!(close_target(None, Some("   ")), None, "a blank _TAB_ID is not a tab");
     }
 }

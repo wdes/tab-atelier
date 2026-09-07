@@ -24,6 +24,10 @@ reach them from the shell.
 - Never work on a task you did not `take`: the lease is what stops two agents
   duplicating each other. If `take` says a task is held, pick another.
 
+**When you are finished**
+- `tab-atelier close` — with no argument, closes YOUR tab. Do this when your
+  work is done and reported, so the tab does not sit there reading "open".
+
 **Etiquette**
 - Only `dispatch` to a tab `peers` shows as `idle` or `waiting` — never mid-turn.
 - Never `--resume`/`--continue` another tab's session; it strips the session id.

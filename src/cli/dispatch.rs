@@ -519,6 +519,18 @@ pub enum Commands {
         args: Vec<String>,
     },
 
+    /// Compact the blackboard: `prune [--older-than <days>] [--dry-run]`.
+    ///
+    /// Drops entries for FINISHED tasks that have been quiet for the cutoff.
+    /// Never touches open, bidding or awarded work — that is live state.
+    /// Removal cannot be gossiped, so a peer still holding an entry will send
+    /// it back; prune each host.
+    Prune {
+        /// Passed straight through to `cli::prune::run`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Exchange blackboard entries with configured remotes: `gossip`.
     ///
     /// Anti-entropy, not replication: the log is a grow-only set, so a round
@@ -945,6 +957,7 @@ fn command_exit_code(cli: Cli) -> Option<i32> {
         Commands::Brief { args } => crate::cli::client::run("brief", &args),
         Commands::Fleet { args } => crate::cli::client::run("fleet", &args),
         Commands::Gossip { args } => crate::cli::client::run("gossip", &args),
+        Commands::Prune { args } => crate::cli::client::run("prune", &args),
         Commands::Backlog { args } => crate::cli::client::run("backlog", &args),
         Commands::Token => crate::cli::client::run("token", &[]),
         Commands::RotateTokens => crate::cli::client::run("rotate-tokens", &[]),
