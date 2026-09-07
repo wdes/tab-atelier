@@ -75,6 +75,11 @@ package = "fr.wdes.tab_atelier"
 build_targets = ["aarch64-linux-android"]
 apk_name = "ta-remote"
 resources = "res"
+# Raw APK assets (aapt -A). Holds adi-registration.properties, the Google
+# "App Developer Identity" ownership token: it must ship inside a release APK
+# signed with our key (fingerprint above) and be uploaded to verify we own
+# the fr.wdes.tab_atelier package.
+assets = "assets"
 # Sources for the in-app WebView host (fullscreen WebView with the
 # SSL bypass that lets us reach a self-signed origin cert). cargo-apk2
 # compiles every *.java under this tree into classes.dex.
