@@ -119,13 +119,24 @@ jobs:
                   CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
               run: |
                   cargo install cargo-deb --locked
-                  cargo deb -p tab-atelier --locked
-                  cargo deb -p tab-atelier --variant headless --locked
+                  # `--revision 0ci` marks these as the throwaway build they
+                  # are: same commit as the published nightly, LTO off, and
+                  # `0ci` sorts below `1` so one can never shadow the other if
+                  # both end up on a machine. Without a version of their own
+                  # every run's artifact was byte-for-byte the same NAME.
+                  DEB_VERSION="$(scripts/deb-version.sh --revision 0ci)"
+                  echo "→ building $DEB_VERSION"
+                  cargo deb -p tab-atelier --locked --deb-version "$DEB_VERSION"
+                  cargo deb -p tab-atelier --variant headless --locked --deb-version "$DEB_VERSION"
+                  ls -la target/debian/
             - name: Upload .deb packages
               id: upload-deb
               uses: actions/upload-artifact@v7
               with:
-                  name: tab-atelier-deb
+                  # The commit is in the artifact name as well as in the .deb
+                  # version inside it: downloading two runs' artifacts used to
+                  # give you two files called `tab-atelier-deb.zip`.
+                  name: tab-atelier-deb-${{ github.sha }}
                   path: target/debian/*.deb
                   retention-days: 5
                   # Two .deb files now (GUI + headless). upload-artifact@v7

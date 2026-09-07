@@ -6074,4 +6074,88 @@ mod state_writer_tests {
             "android/ta-remote is out of step — run scripts/android-version.sh --write"
         );
     }
+
+    /// A snapshot .deb must sort below the release it is heading towards, and
+    /// above the one before it.
+    ///
+    /// The whole point of `scripts/deb-version.sh` is dpkg's ordering, and
+    /// ordering breaks silently: a wrong version does not fail the build, it
+    /// just quietly stops upgrading on the machines that already have the
+    /// package. Two failures this pins down, both of which we shipped or
+    /// nearly shipped:
+    ///
+    ///  * the date field must carry the TIME, not just the day. The Debian
+    ///    wiki writes `~git{YYYYMMDD}.{hash}` assuming one build a night; we
+    ///    build on every push, and the hash cannot break the tie because dpkg
+    ///    compares it as text (`0de5678` < `abc1234`, whatever the clock says).
+    ///  * the smoke-test deb must sort below the published one for the same
+    ///    commit, so a stray artifact cannot shadow the real build.
+    #[test]
+    fn snapshot_deb_versions_sort_the_way_apt_needs() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let script = root.join("scripts/deb-version.sh");
+
+        let run = |args: &[&str]| -> String {
+            let out = std::process::Command::new(&script)
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("run scripts/deb-version.sh");
+            assert!(out.status.success(), "deb-version.sh {args:?} failed");
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+
+        let nightly = run(&[]);
+        let smoke = run(&["--revision", "0ci"]);
+        // 0.5.0~git20260907072252.04cb329-1
+        let (base, rest) = nightly.split_once("~git").expect("a ~git snapshot version");
+        let (stamp, tail) = rest.split_once('.').expect("date.hash");
+        assert_eq!(stamp.len(), 14, "the date field must be YYYYMMDDHHMMSS, got {stamp}");
+        assert!(
+            stamp.chars().all(|c| c.is_ascii_digit()),
+            "date field not numeric: {stamp}"
+        );
+        let (hash, revision) = tail.split_once('-').expect("hash-revision");
+        assert_eq!(hash.len(), 7, "short sha should be 7 chars, got {hash}");
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()), "not a sha: {hash}");
+        assert_eq!(revision, "1");
+        assert!(
+            !base.contains('-'),
+            "a `-` in the upstream part would read as a revision"
+        );
+        assert_eq!(
+            run(&["--base"]),
+            base,
+            "--base must agree with the version it derives from"
+        );
+
+        // dpkg is the authority on ordering, so ask it rather than
+        // reimplementing its comparison. Absent on a non-Debian dev box.
+        if std::process::Command::new("dpkg").arg("--version").output().is_err() {
+            eprintln!("dpkg absent — skipping the ordering half");
+            return;
+        }
+        let ordered = |a: &str, rel: &str, b: &str| {
+            let ok = std::process::Command::new("dpkg")
+                .args(["--compare-versions", a, rel, b])
+                .status()
+                .expect("dpkg --compare-versions")
+                .success();
+            assert!(ok, "dpkg says NOT ({a} {rel} {b})");
+        };
+
+        let release = format!("{base}-1");
+        ordered(&nightly, "lt", &release); // steps up onto stable when it lands
+        ordered(&nightly, "lt", &format!("{base}~pre1-1")); // and below a release candidate
+        ordered(&smoke, "lt", &nightly); // the throwaway never shadows the real one
+        ordered(&format!("{base}~git20260907070700.abc1234-1"), "lt", &nightly);
+
+        // Two pushes in one day, in the order they happened: the earlier one
+        // has the alphabetically LARGER hash, so only the time saves us.
+        ordered(
+            &format!("{base}~git20260907070700.abc1234-1"),
+            "lt",
+            &format!("{base}~git20260907071500.0de5678-1"),
+        );
+    }
 }

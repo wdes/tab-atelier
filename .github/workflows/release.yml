@@ -42,11 +42,27 @@ jobs:
               uses: dtolnay/rust-toolchain@stable
             - name: Cache cargo artifacts
               uses: Swatinem/rust-cache@v2
+            - name: Check the tag matches Cargo.toml
+              run: |
+                  # The binary reports the Cargo version and the .deb reports
+                  # this tag. If they disagree the release ships a package
+                  # whose `--version` contradicts its own name — and nothing
+                  # else in the pipeline notices. So notice here.
+                  TAG="${GITHUB_REF#refs/tags/v}"
+                  CARGO=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+                  if [ "$TAG" != "$CARGO" ]; then
+                      echo "::error::tag v$TAG but Cargo.toml says $CARGO — bump the version before tagging"
+                      exit 1
+                  fi
             - name: Build .deb packages
               run: |
                   cargo install cargo-deb
-                  cargo deb -p tab-atelier --locked
-                  cargo deb -p tab-atelier --variant headless --locked
+                  # Same script as the nightly channel, so a release and a
+                  # snapshot cannot disagree about how a version is spelled.
+                  DEB_VERSION="$(scripts/deb-version.sh)"
+                  echo "→ building $DEB_VERSION"
+                  cargo deb -p tab-atelier --locked --deb-version "$DEB_VERSION"
+                  cargo deb -p tab-atelier --variant headless --locked --deb-version "$DEB_VERSION"
             - name: Attest .deb
               uses: actions/attest-build-provenance@v4
               with:
