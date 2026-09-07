@@ -46,7 +46,11 @@ prepare() {
 build() {
   cd "$pkgbase-$pkgver"
   export RUSTUP_TOOLCHAIN=stable
-  export CARGO_TARGET_DIR=target
+  # `target` inside $srcdir by default, as a normal makepkg build expects.
+  # CI overrides it with a path OUTSIDE $srcdir so the compiled dependencies
+  # survive between runs: $srcdir is named after $pkgver, which changes on
+  # every commit, so anything cached inside it would never be found again.
+  export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 
   # 1. Desktop GUI (default features: gui,energy,catbus,pets) AND the
   #    catbus-agent helper — both are default-members, so one build emits
@@ -74,10 +78,13 @@ package_tab-atelier() {
 
   local src="$srcdir/$pkgbase-$pkgver"
   cd "$src"
+  # package() runs in a fresh makepkg process, so build()'s export is gone —
+  # read the same override again rather than assuming `target`.
+  local out="${CARGO_TARGET_DIR:-target}"
 
-  install -Dm755 target/release/tab-atelier    "$pkgdir/usr/bin/tab-atelier"
+  install -Dm755 "$out/release/tab-atelier"    "$pkgdir/usr/bin/tab-atelier"
   # Bundled so the "Switch to catbus" tab menu resolves the binary on PATH.
-  install -Dm755 target/release/catbus-agent   "$pkgdir/usr/bin/catbus-agent"
+  install -Dm755 "$out/release/catbus-agent"   "$pkgdir/usr/bin/catbus-agent"
 
   install -Dm644 assets/tab-atelier.desktop \
     "$pkgdir/usr/share/applications/tab-atelier.desktop"
@@ -125,10 +132,11 @@ package_tab-atelier-headless() {
 
   local src="$srcdir/$pkgbase-$pkgver"
   cd "$src"
+  local out="${CARGO_TARGET_DIR:-target}"
 
-  install -Dm755 target/release/tab-atelier-headless \
+  install -Dm755 "$out/release/tab-atelier-headless" \
     "$pkgdir/usr/bin/tab-atelier-headless"
-  install -Dm755 target/release/catbus-agent \
+  install -Dm755 "$out/release/catbus-agent" \
     "$pkgdir/usr/bin/catbus-agent"
 
   install -Dm644 assets/tab-atelier-headless.service \
