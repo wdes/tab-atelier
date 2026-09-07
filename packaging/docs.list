@@ -1,0 +1,19 @@
+# Documentation installed into /usr/share/doc/tab-atelier{,-headless}/.
+#
+# ONE list, two packagings. The deb reads it by hand (cargo-deb needs literal
+# asset entries in Cargo.toml, so it cannot read this file) and a test asserts
+# the two agree — add a line here and `docs_shipped_by_every_packaging` tells
+# you if the deb side is missing it. The Arch PKGBUILD calls
+# scripts/install-docs.sh, which reads this directly.
+#
+# The Arch package fell behind exactly because there was no such list: the deb
+# gained the handbook and nobody thought to touch the PKGBUILD.
+#
+# Paths are relative to the repository root. Blank lines and # comments are
+# ignored. LICENSE is deliberately absent: Debian wants it in
+# /usr/share/doc/<pkg>/, Arch in /usr/share/licenses/<pkg>/, so each packaging
+# places it itself.
+README.md
+assets/openapi.yaml
+docs/self-organization.md
+docs/fleet-playbook.md

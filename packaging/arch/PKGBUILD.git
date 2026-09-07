@@ -78,9 +78,8 @@ package_tab-atelier-git() {
   install -d "$pkgdir/usr/share/tab-atelier/pets"
   install -m644 assets/pets/*.xml assets/pets/*.png \
     "$pkgdir/usr/share/tab-atelier/pets/"
-  install -Dm644 README.md "$pkgdir/usr/share/doc/tab-atelier/README.md"
-  install -Dm644 assets/openapi.yaml \
-    "$pkgdir/usr/share/doc/tab-atelier/openapi.yaml"
+  # Docs come from packaging/docs.list, shared with the deb.
+  ./scripts/install-docs.sh "$pkgdir/usr/share/doc/tab-atelier"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/tab-atelier-git/LICENSE"
 }
 
@@ -108,10 +107,7 @@ package_tab-atelier-headless-git() {
     "$pkgdir/etc/tab-atelier/preferences.json"
   install -Dm644 assets/claude-code-managed-settings.json \
     "$pkgdir/etc/claude-code/managed-settings.json"
-  install -Dm644 README.md \
-    "$pkgdir/usr/share/doc/tab-atelier-headless/README.md"
-  install -Dm644 assets/openapi.yaml \
-    "$pkgdir/usr/share/doc/tab-atelier-headless/openapi.yaml"
+  ./scripts/install-docs.sh "$pkgdir/usr/share/doc/tab-atelier-headless"
   install -Dm644 LICENSE \
     "$pkgdir/usr/share/licenses/tab-atelier-headless-git/LICENSE"
 }
