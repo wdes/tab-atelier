@@ -27,6 +27,12 @@ jobs:
         runs-on: ubuntu-latest
         container:
             image: archlinux:latest
+        env:
+            # Outside $srcdir so both survive the run — see the cache step.
+            # The PKGBUILD defaults to plain `target` when these are unset, so
+            # a normal `makepkg` on a user's machine is unaffected.
+            CARGO_HOME: /cache/cargo
+            CARGO_TARGET_DIR: /cache/target
         steps:
             # base-devel = makepkg + gcc/binutils; the rest mirror the .deb CI's
             # -dev packages (Arch bundles headers into the runtime lib package).
@@ -42,6 +48,35 @@ jobs:
             - uses: actions/checkout@v7
               with:
                   fetch-depth: 0
+
+            # This job had no cache and recompiled ~600 crates from scratch on
+            # every push: 16 minutes, and since apt-publish now waits for it,
+            # 16 minutes on the critical path to publishing.
+            #
+            # It cannot share the other jobs' cache. Those pin Rust 1.95.0 via
+            # rustup; the archlinux container ships whatever pacman has (1.98.1
+            # today). The compiler version is part of every Cargo fingerprint,
+            # so a shared cache would restore, match nothing, rebuild
+            # everything, and cost the download on top. Hence its own cache,
+            # keyed by the version pacman actually installed — when Arch rolls
+            # the compiler the key changes and we take one cold build.
+            - name: Note the Arch Rust version
+              id: rustv
+              run: echo "v=$(rustc --version | cut -d' ' -f2)" >> "$GITHUB_OUTPUT"
+            - name: Restore Rust build cache
+              id: cache
+              uses: actions/cache/restore@v4
+              with:
+                  # Both live outside $srcdir on purpose: $srcdir is named
+                  # after $pkgver, which changes every commit, so a target dir
+                  # inside it could never be found again on the next run.
+                  path: |
+                      /cache/cargo
+                      /cache/target
+                  key: arch-cargo-${{ steps.rustv.outputs.v }}-${{ hashFiles('Cargo.lock') }}
+                  # Cargo.lock moves more often than the dependency graph does;
+                  # an older cache still spares most of the compile.
+                  restore-keys: arch-cargo-${{ steps.rustv.outputs.v }}-
 
             - name: Decide pkgver (arch-legal, no '~' or '-')
               id: ver
@@ -69,6 +104,9 @@ jobs:
                   # makepkg refuses to run as root — build under a throwaway user.
                   useradd -m builder
                   chown -R builder:builder "$GITHUB_WORKSPACE"
+                  # The cache was restored as root; makepkg writes as builder.
+                  mkdir -p /cache/cargo /cache/target
+                  chown -R builder:builder /cache
 
                   # Package THIS commit: archive the checkout into the tarball the
                   # versioned PKGBUILD expects (so we get clean package names,
@@ -85,11 +123,58 @@ jobs:
 
                   # Deps are pre-installed above, so no -s (which would need
                   # pacman-as-builder). --noarchive keeps it fast; -f overwrites.
-                  sudo -u builder makepkg -p PKGBUILD -f --noconfirm --nocheck
+                  #
+                  # --preserve-env is load-bearing: sudo's env_reset would drop
+                  # CARGO_HOME/CARGO_TARGET_DIR, the build would quietly use
+                  # $srcdir/target, and the cache would sit there doing nothing
+                  # while every run still took 16 minutes.
+                  sudo -u builder \
+                      --preserve-env=CARGO_HOME,CARGO_TARGET_DIR \
+                      makepkg -p PKGBUILD -f --noconfirm --nocheck
+
+                  # Prove the override took, rather than trusting it: a cache
+                  # that silently stopped working looks exactly like a slow CI.
+                  if [ ! -x /cache/target/release/tab-atelier ]; then
+                      echo "::error::CARGO_TARGET_DIR was not honoured — nothing in /cache/target"
+                      exit 1
+                  fi
 
                   ls -la ./*.pkg.tar.zst
                   mkdir -p "$GITHUB_WORKSPACE/arch-out"
                   cp ./*.pkg.tar.zst "$GITHUB_WORKSPACE/arch-out/"
+
+            # Keep only what is expensive to rebuild — the dependency
+            # artifacts. Our own crates are recompiled every push anyway (the
+            # source changed, that is why the run exists), and the extracted
+            # registry sources re-expand from the .crate files in seconds. An
+            # unpruned target dir is several GB, and the repo-wide cache budget
+            # is 10 GB shared with every other workflow: a fat cache here would
+            # evict theirs and make everything slower.
+            - name: Trim the cache to the dependency build
+              if: always()
+              run: |
+                  du -sh /cache/target /cache/cargo 2>/dev/null || true
+                  rm -rf /cache/target/release/incremental
+                  rm -f  /cache/target/release/tab-atelier \
+                         /cache/target/release/tab-atelier-headless \
+                         /cache/target/release/catbus-agent
+                  rm -rf /cache/target/release/deps/tab_atelier-* \
+                         /cache/target/release/deps/libtab_atelier* \
+                         /cache/target/release/deps/catbus_agent-* \
+                         /cache/target/release/.fingerprint/tab-atelier-* \
+                         /cache/target/release/.fingerprint/catbus-agent-*
+                  # Re-extracted from registry/cache/*.crate on demand.
+                  rm -rf /cache/cargo/registry/src
+                  echo "after trim:"
+                  du -sh /cache/target /cache/cargo 2>/dev/null || true
+            - name: Save Rust build cache
+              if: steps.cache.outputs.cache-hit != 'true'
+              uses: actions/cache/save@v4
+              with:
+                  path: |
+                      /cache/cargo
+                      /cache/target
+                  key: ${{ steps.cache.outputs.cache-primary-key }}
 
             # One multi-file artifact; apt-publish `gh run download`s it and
             # unzips the .pkg.tar.zst files into site/arch/.
