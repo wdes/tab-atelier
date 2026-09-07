@@ -57,6 +57,10 @@ pub enum RemoteCommand {
     Rename { remote_id: String, name: String },
     /// Close the remote tab.
     Close { remote_id: String },
+    /// Create a brand-new tab on the remote (`POST /tabs`). `path`
+    /// seeds its cwd hint, `name` its title — both optional, the remote
+    /// inherits the active tab's cwd and auto-names when either is absent.
+    Create { path: Option<String>, name: Option<String> },
     /// Stop the client thread cleanly.
     Shutdown,
 }
@@ -477,8 +481,31 @@ fn run_command(
                 .map_err(|e| format!("DELETE /tabs: {e}"))?;
             Ok(())
         }
+        RemoteCommand::Create { path, name } => {
+            let url = format!("{}/tabs", endpoint.url.trim_end_matches('/'));
+            let body = create_body(path.as_deref(), name.as_deref());
+            authorized(agent.post(&url), endpoint)
+                .header("Content-Type", "application/json")
+                .send(&body)
+                .map_err(|e| format!("POST /tabs: {e}"))?;
+            Ok(())
+        }
         RemoteCommand::Shutdown => Ok(()),
     }
+}
+
+/// Build the `POST /tabs` JSON body for a [`RemoteCommand::Create`],
+/// omitting empty/absent fields so the daemon applies its own
+/// cwd-inherit / auto-name defaults for whatever the caller left out.
+fn create_body(path: Option<&str>, name: Option<&str>) -> String {
+    let mut obj = serde_json::Map::new();
+    if let Some(p) = path.filter(|s| !s.is_empty()) {
+        obj.insert("cwd".into(), serde_json::Value::String(p.to_string()));
+    }
+    if let Some(n) = name.filter(|s| !s.is_empty()) {
+        obj.insert("name".into(), serde_json::Value::String(n.to_string()));
+    }
+    serde_json::Value::Object(obj).to_string()
 }
 
 const fn command_label(cmd: &RemoteCommand) -> &'static str {
@@ -487,6 +514,7 @@ const fn command_label(cmd: &RemoteCommand) -> &'static str {
         RemoteCommand::Activate { .. } => "activate",
         RemoteCommand::Rename { .. } => "rename",
         RemoteCommand::Close { .. } => "close",
+        RemoteCommand::Create { .. } => "create",
         RemoteCommand::Shutdown => "shutdown",
     }
 }
@@ -510,5 +538,24 @@ trait HeaderMapLike {
 impl HeaderMapLike for http::HeaderMap {
     fn get_str(&self, name: &str) -> Option<&str> {
         self.get(name)?.to_str().ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::create_body;
+
+    #[test]
+    fn create_body_includes_only_present_fields() {
+        assert_eq!(create_body(None, None), "{}");
+        assert_eq!(create_body(Some("/tmp/x"), None), r#"{"cwd":"/tmp/x"}"#);
+        assert_eq!(create_body(None, Some("hi")), r#"{"name":"hi"}"#);
+        // serde_json::Map is a BTreeMap → keys sort ("cwd" before "name").
+        assert_eq!(
+            create_body(Some("/tmp/x"), Some("hi")),
+            r#"{"cwd":"/tmp/x","name":"hi"}"#
+        );
+        // Empty strings are treated as absent (daemon defaults apply).
+        assert_eq!(create_body(Some(""), Some("")), "{}");
     }
 }

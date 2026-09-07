@@ -21,6 +21,7 @@
 //! tab-atelier remote attach <label-or-id> <tab>      # interactive mirror (sidecar)
 //! tab-atelier remote put    <label-or-id> <local-path> [--tab T]
 //! tab-atelier remote get    <label-or-id> <remote-path> [--tab T] [-o local-path]
+//! tab-atelier remote spawn  --url U --token T [--path DIR] [--name N]  # create a tab (inline)
 //! tab-atelier remote pin-cert <https-url>            # print fingerprint
 //! tab-atelier remote re-pin <label-or-id>            # re-capture pinned cert
 //! ```
@@ -45,6 +46,7 @@ pub fn run(args: &[String]) -> i32 {
         "attach" => attach::run(rest),
         "put" => files::cmd_put(rest),
         "get" => files::cmd_get(rest),
+        "spawn" | "new" => cmd_spawn(rest),
         "pin-cert" | "pin" => cmd_pin_cert(rest),
         "re-pin" | "repin" => cmd_repin(rest),
         "-h" | "--help" | "help" => {
@@ -65,7 +67,7 @@ mod resolver;
 
 fn usage() {
     eprintln!(
-        "usage: tab-atelier remote <list|add|remove|test|watch|attach|put|get|pin-cert|re-pin> [args]\n\
+        "usage: tab-atelier remote <list|add|remove|test|watch|attach|put|get|spawn|pin-cert|re-pin> [args]\n\
          \n\
          list                                          list configured endpoints\n\
          add --label L --url U --token T [--no-pin] [--autoconnect]\n\
@@ -80,6 +82,9 @@ fn usage() {
          get    <label-or-id> <remote-path> [--tab T] [-o local-path]\n\
                                                        download a file — remote-path MUST start\n\
                                                        with inbox/ or outbox/ (sandboxed)\n\
+         spawn  --url U --token T [--path DIR] [--name N]\n\
+                                                       create a new tab on a remote given inline\n\
+                                                       (no stored endpoint / no prefs touched)\n\
          pin-cert <https-url>                          print the cert SHA-256 fingerprint\n\
          re-pin   <label-or-id>                        re-capture an endpoint's pinned cert"
     );
@@ -339,6 +344,114 @@ fn cmd_test(args: &[String], watch: bool) -> i32 {
         return 1;
     }
     0
+}
+
+/// `tab-atelier remote spawn --url U --token T [--path DIR] [--name N]`
+/// — create a new tab on a remote whose endpoint is given INLINE (no
+/// stored `RemoteEndpoint`, no prefs read/write, zero touch to the local
+/// daemon). Builds an ephemeral endpoint, spawns the shared polling
+/// [`remote::Client`], sends [`remote::RemoteCommand::Create`], then
+/// confirms the tab actually appeared on the remote's `/tabs`.
+fn cmd_spawn(args: &[String]) -> i32 {
+    let mut url: Option<String> = None;
+    let mut token: Option<String> = None;
+    let mut path: Option<String> = None;
+    let mut name: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--url" => {
+                i += 1;
+                url = args.get(i).cloned();
+            }
+            "--token" => {
+                i += 1;
+                token = args.get(i).cloned();
+            }
+            "--path" | "--cwd" => {
+                i += 1;
+                path = args.get(i).cloned();
+            }
+            "--name" => {
+                i += 1;
+                name = args.get(i).cloned();
+            }
+            other => {
+                eprintln!("tab-atelier remote spawn: unknown argument: {other}");
+                return 2;
+            }
+        }
+        i += 1;
+    }
+    let Some(url) = url.filter(|s| !s.is_empty()) else {
+        eprintln!("tab-atelier remote spawn: --url is required");
+        return 2;
+    };
+    let Some(token) = token.filter(|s| !s.is_empty()) else {
+        eprintln!("tab-atelier remote spawn: --token is required");
+        return 2;
+    };
+    // Ephemeral endpoint — never persisted. The polling client only reads
+    // url/token/cf-*, so the id/label/cert fields are placeholders.
+    let endpoint = RemoteEndpoint {
+        id: "inline".to_string(),
+        label: url.clone(),
+        url: url.clone(),
+        token,
+        cert_sha256: String::new(),
+        autoconnect: false,
+        cf_access_client_id: String::new(),
+        cf_access_client_secret: String::new(),
+    };
+    let Some(client) = remote::Client::spawn(endpoint) else {
+        eprintln!("tab-atelier remote spawn: could not start the remote client thread");
+        return 1;
+    };
+    // Baseline the remote's current tab list so we can confirm the new one.
+    let baseline = match resolver::wait_for_first_tabs(&client, Duration::from_secs(5)) {
+        Ok(tabs) => tabs.len(),
+        Err(e) => {
+            eprintln!("tab-atelier remote spawn: {e}");
+            return 1;
+        }
+    };
+    if let Err(e) = client.tx.send(remote::RemoteCommand::Create {
+        path,
+        name: name.clone(),
+    }) {
+        eprintln!("tab-atelier remote spawn: {e}");
+        return 1;
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if crate::SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
+            println!("(interrupted)");
+            break;
+        }
+        #[allow(clippy::match_same_arms)]
+        match client.rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(remote::RemoteEvent::Tabs { tabs, .. }) => {
+                let appeared = tabs.len() > baseline
+                    || name.as_deref().is_some_and(|n| tabs.iter().any(|t| t.name == n));
+                if appeared {
+                    println!("✓ created new tab on {url}");
+                    return 0;
+                }
+            }
+            Ok(remote::RemoteEvent::Error { message }) => {
+                eprintln!("tab-atelier remote spawn: {message}");
+                return 1;
+            }
+            Ok(remote::RemoteEvent::Output { .. }) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                eprintln!("tab-atelier remote spawn: client thread disconnected");
+                return 1;
+            }
+        }
+    }
+    eprintln!("tab-atelier remote spawn: timed out waiting for the new tab to appear on the remote");
+    1
 }
 
 fn cmd_repin(args: &[String]) -> i32 {

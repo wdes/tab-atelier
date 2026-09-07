@@ -773,6 +773,11 @@ pub struct TabSnapshot {
     /// is fine — the remainder fall back to inheriting from the
     /// currently-active tab as before.
     pub pending_new_tab_cwds: std::collections::VecDeque<std::path::PathBuf>,
+    /// Optional explicit name for each `POST /tabs` creation, pushed 1:1
+    /// with `pending_new_tabs` (empty string ⇒ auto-name). Kept in
+    /// lock-step with the counter so interleaved cwd-only / named
+    /// creations stay aligned when the owner drains them.
+    pub pending_new_tab_names: std::collections::VecDeque<String>,
     /// Per-tab resource-limit changes queued by `POST /tabs/<id>/limits`,
     /// drained by the owner (GUI render loop / headless tick): `(tab uuid,
     /// override, clear)`. `clear == true` lifts every axis; otherwise the
@@ -2272,6 +2277,7 @@ pub fn test_snapshot(tabs: Vec<SnapshotTab>) -> TabSnapshot {
         pending_schedule_changes: vec![],
         pending_new_tabs: 0,
         pending_new_tab_cwds: std::collections::VecDeque::new(),
+        pending_new_tab_names: std::collections::VecDeque::new(),
         pending_limit_changes: Vec::new(),
         pending_default_limits: None,
         pending_resizes: Vec::new(),

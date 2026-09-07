@@ -1461,6 +1461,7 @@ impl AppState {
             pending_schedule_changes: Vec::new(),
             pending_new_tabs: 0,
             pending_new_tab_cwds: std::collections::VecDeque::new(),
+            pending_new_tab_names: std::collections::VecDeque::new(),
             pending_limit_changes: Vec::new(),
             pending_default_limits: None,
             pending_resizes: Vec::new(),
