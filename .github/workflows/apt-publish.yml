@@ -144,14 +144,13 @@ jobs:
               env:
                   GH_TOKEN: ${{ github.token }}
               run: |
-                  RUN_ID=$(gh run list --repo "$GITHUB_REPOSITORY" \
-                      --workflow=windows-msi.yml --status=success \
-                      -L 1 --json databaseId --jq '.[0].databaseId // empty')
+                  # `0`: windows-msi is tag-only, so on a push to main there is
+                  # no run for this commit and nothing to wait for — it falls
+                  # straight back to the last successful (tag) build.
+                  RUN_ID=$(scripts/ci-artifact-run.sh windows-msi.yml 0)
                   echo "run_id=${RUN_ID}" >> "$GITHUB_OUTPUT"
-                  if [ -n "$RUN_ID" ]; then
-                      echo "→ will pull MSIs from windows-msi run $RUN_ID"
-                  else
-                      echo "→ no successful windows-msi run yet; keeping existing MSIs"
+                  if [ -z "$RUN_ID" ]; then
+                      echo "→ no usable windows-msi run; keeping existing MSIs"
                   fi
             - name: Stage MSI artifacts + regenerate index
               env:
@@ -258,14 +257,10 @@ jobs:
               env:
                   GH_TOKEN: ${{ github.token }}
               run: |
-                  RUN_ID=$(gh run list --repo "$GITHUB_REPOSITORY" \
-                      --workflow=android-apk.yml --status=success \
-                      -L 1 --json databaseId --jq '.[0].databaseId // empty')
+                  RUN_ID=$(scripts/ci-artifact-run.sh android-apk.yml 1800)
                   echo "run_id=${RUN_ID}" >> "$GITHUB_OUTPUT"
-                  if [ -n "$RUN_ID" ]; then
-                      echo "→ will pull APK from android-apk run $RUN_ID"
-                  else
-                      echo "→ no successful android-apk run yet; keeping existing APKs"
+                  if [ -z "$RUN_ID" ]; then
+                      echo "→ no usable android-apk run; keeping existing APKs"
                   fi
             - name: Stage APK artifact + regenerate index
               env:
@@ -342,14 +337,14 @@ jobs:
               env:
                   GH_TOKEN: ${{ github.token }}
               run: |
-                  RUN_ID=$(gh run list --repo "$GITHUB_REPOSITORY" \
-                      --workflow=arch-pkg.yml --status=success \
-                      -L 1 --json databaseId --jq '.[0].databaseId // empty')
+                  # Waits for THIS commit's arch-pkg run (the long one, ~15
+                  # min) rather than grabbing the previous commit's, which is
+                  # what "latest successful" means while a sibling is still
+                  # compiling. See scripts/ci-artifact-run.sh.
+                  RUN_ID=$(scripts/ci-artifact-run.sh arch-pkg.yml 1800)
                   echo "run_id=${RUN_ID}" >> "$GITHUB_OUTPUT"
-                  if [ -n "$RUN_ID" ]; then
-                      echo "→ will pull Arch packages from arch-pkg run $RUN_ID"
-                  else
-                      echo "→ no successful arch-pkg run yet; keeping existing packages"
+                  if [ -z "$RUN_ID" ]; then
+                      echo "→ no usable arch-pkg run; keeping existing packages"
                   fi
             - name: Stage Arch packages + build pacman repo
               env:
