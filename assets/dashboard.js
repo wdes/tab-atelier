@@ -1665,6 +1665,7 @@ function catalogHtml(readModel) {
       <span class="cat-count">${total} skill${total === 1 ? "" : "s"}</span>
       <label class="cat-sort-wrap">tri : <select class="cat-sort" aria-label="trier le catalogue">${opts}</select></label>
       <label class="cat-deleted-toggle"><input type="checkbox" class="cat-show-deleted"${catalogIncludeDeleted ? " checked" : ""}> afficher les supprimés</label>
+      ${grouped ? `<button class="cat-groups-toggle" title="tout dérouler / tout enrouler les groupes" aria-label="tout dérouler ou enrouler les groupes">⇕ tout</button>` : ""}
       <button class="cat-refresh" title="rafraîchir">↻</button>
       <button class="cat-close" title="fermer" aria-label="fermer">×</button>
     </div>
@@ -2072,6 +2073,31 @@ function copyToClipboard(el) {
   if (legacyCopy(text)) showCopyToast(el);
 }
 
+// Set ONE cat-group's collapsed state (body hidden + head aria-expanded + caret glyph). The
+// single collapse mechanism, shared by the per-header click AND the expand/collapse-ALL toggle
+// on both the catalogue and the rapports onglets — one place, no divergence.
+function setGroupCollapsed(head, collapsed) {
+  const body = head.parentElement && head.parentElement.querySelector(".cat-group-body");
+  const caret = head.querySelector(".cat-group-caret");
+  if (!body) return;
+  body.hidden = collapsed;
+  head.setAttribute("aria-expanded", collapsed ? "false" : "true");
+  if (caret) caret.textContent = collapsed ? "▸" : "▾";
+}
+
+// Expand/collapse ALL cat-groups within `container`. Majority-open (ties included) → collapse
+// all; otherwise expand all. Reuses setGroupCollapsed (identical per-group mechanism).
+function toggleAllGroups(container) {
+  const heads = Array.from(container.querySelectorAll(".cat-group-head"));
+  if (!heads.length) return;
+  const open = heads.filter((h) => {
+    const b = h.parentElement && h.parentElement.querySelector(".cat-group-body");
+    return b && !b.hidden;
+  }).length;
+  const collapse = open * 2 >= heads.length;
+  for (const h of heads) setGroupCollapsed(h, collapse);
+}
+
 // Flip one card's detail toggle: (+) collapsed <-> (-) expanded. Purely local (no fetch).
 function toggleDetail(btn) {
   const card = btn.closest && btn.closest(".kk-card");
@@ -2225,7 +2251,7 @@ export function reportsHtml(readModel, canRule, mode = "date") {
   const groupHtml = (g) =>
     `<div class="cat-group"><button class="cat-group-head" aria-expanded="true"><span class="cat-group-caret">▾</span> <span class="cat-group-label">${escapeHtml(String(g.label))}</span> <span class="cat-group-count">(${g.count})</span></button><div class="cat-group-body kk-report-list">${g.reports.map(item).join("")}</div></div>`;
   return `${featuredHtml}
-    <div class="kk-reports-sub"><label class="cat-sort-wrap">ranger par : <select class="kk-reports-sort" aria-label="ranger les rapports">${opts}</select></label></div>
+    <div class="kk-reports-sub"><label class="cat-sort-wrap">ranger par : <select class="kk-reports-sort" aria-label="ranger les rapports">${opts}</select></label><button class="cat-groups-toggle" title="tout dérouler / tout enrouler les groupes" aria-label="tout dérouler ou enrouler les groupes">⇕ tout</button></div>
     <div class="cat-list cat-list-grouped kk-report-groups">${groups.map(groupHtml).join("")}</div>`;
 }
 
@@ -2965,17 +2991,17 @@ function bootstrap() {
       if (showDel) { catalogIncludeDeleted = !!showDel.checked; openCatalog(); return; }
       // SC3: edit-form controls (save/delete/restore) are async mutations.
       if (e.target.closest(".cat-save, .cat-delete, .cat-restore")) { handleCatalogEdit(e.target); return; }
+      // group toggle: one button flips ALL groups (majority-open → collapse all, else expand all).
+      if (e.target.closest(".cat-groups-toggle")) {
+        const list = catPanel.querySelector(".cat-list");
+        if (list) toggleAllGroups(list);
+        return;
+      }
       // category-sort: collapse/expand a group (usage/statut modes). Pure DOM, no fetch.
       const ghead = e.target.closest(".cat-group-head");
       if (ghead) {
         const gbody = ghead.parentElement && ghead.parentElement.querySelector(".cat-group-body");
-        const gcaret = ghead.querySelector(".cat-group-caret");
-        if (gbody) {
-          const willShow = gbody.hidden;
-          gbody.hidden = !willShow;
-          ghead.setAttribute("aria-expanded", willShow ? "true" : "false");
-          if (gcaret) gcaret.textContent = willShow ? "▾" : "▸";
-        }
+        setGroupCollapsed(ghead, !(gbody && gbody.hidden));
         return;
       }
       const head = e.target.closest(".cat-skill-head");
@@ -3037,17 +3063,17 @@ function bootstrap() {
       // would collapse it again). Expand/collapse the long-form body in place.
       const dt = e.target.closest(".kk-detail-toggle");
       if (dt) { toggleDetail(dt); return; }
+      // Volet (b) ranger: one button flips ALL report groups (reuses the catalogue mechanism).
+      if (e.target.closest(".cat-groups-toggle")) {
+        const groupsEl = kioskPanel.querySelector(".kk-report-groups");
+        if (groupsEl) toggleAllGroups(groupsEl);
+        return;
+      }
       // Volet (b) ranger: collapse/expand a report GROUP (reuses the catalogue cat-group interaction).
       const rghead = e.target.closest(".cat-group-head");
       if (rghead) {
         const gbody = rghead.parentElement && rghead.parentElement.querySelector(".cat-group-body");
-        const gcaret = rghead.querySelector(".cat-group-caret");
-        if (gbody) {
-          const willShow = gbody.hidden;
-          gbody.hidden = !willShow;
-          rghead.setAttribute("aria-expanded", willShow ? "true" : "false");
-          if (gcaret) gcaret.textContent = willShow ? "▾" : "▸";
-        }
+        setGroupCollapsed(rghead, !(gbody && gbody.hidden));
         return;
       }
       // Volet (a): 📋 on a fenced code block copies its raw text (a real <button> — Enter/
