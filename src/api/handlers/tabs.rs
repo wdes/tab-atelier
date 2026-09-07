@@ -442,26 +442,32 @@ pub(in crate::api) fn delete<S: Write>(stream: &mut S, state: &Arc<Mutex<TabSnap
 
 /// `POST /tabs` — queue a new tab (optional `{"cwd":…}`).
 pub(in crate::api) fn create<S: Write>(stream: &mut S, state: &Arc<Mutex<TabSnapshot>>, body_bytes: &[u8]) {
-    let cwd_hint: Option<std::path::PathBuf> = if body_bytes.is_empty() {
-        None
-    } else {
-        serde_json::from_slice::<serde_json::Value>(body_bytes)
-            .ok()
-            .and_then(|v| {
-                v.get("cwd")
-                    .and_then(serde_json::Value::as_str)
-                    .map(std::path::PathBuf::from)
-            })
-    };
+    let parsed: Option<serde_json::Value> = (!body_bytes.is_empty())
+        .then(|| serde_json::from_slice::<serde_json::Value>(body_bytes).ok())
+        .flatten();
+    let cwd_hint: Option<std::path::PathBuf> = parsed.as_ref().and_then(|v| {
+        v.get("cwd")
+            .and_then(serde_json::Value::as_str)
+            .map(std::path::PathBuf::from)
+    });
+    let name_hint: String = parsed
+        .as_ref()
+        .and_then(|v| v.get("name").and_then(serde_json::Value::as_str))
+        .unwrap_or_default()
+        .to_string();
     let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     info!(
-        "API: queueing new tab creation (cwd: {})",
-        cwd_hint.as_ref().map_or("inherit", |p| p.to_str().unwrap_or("?"))
+        "API: queueing new tab creation (cwd: {}, name: {})",
+        cwd_hint.as_ref().map_or("inherit", |p| p.to_str().unwrap_or("?")),
+        if name_hint.is_empty() { "auto" } else { name_hint.as_str() }
     );
     state.pending_new_tabs += 1;
     if let Some(cwd) = cwd_hint {
         state.pending_new_tab_cwds.push_back(cwd);
     }
+    // Pushed unconditionally (empty ⇒ auto-name) so it stays index-aligned
+    // with the counter above regardless of whether a cwd was supplied.
+    state.pending_new_tab_names.push_back(name_hint);
     drop(state);
     let body = serde_json::to_string(&serde_json::json!({"queued": "new"})).unwrap_or_default();
     respond_json(stream, 200, &body);

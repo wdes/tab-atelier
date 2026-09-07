@@ -21,21 +21,29 @@ impl Render for AppState {
         // frame contend with whatever an API handler was doing under
         // the same mutex (e.g. the /tabs body rebuild).
         let seq = self.activity_signal.load(std::sync::atomic::Ordering::Relaxed);
-        let (new_tab_count, new_tab_cwds): (usize, Vec<PathBuf>) = if seq == self.render_activity_seen.get() {
-            (0, Vec::new())
-        } else {
-            self.render_activity_seen.set(seq);
-            let mut snap = self.api_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let n = std::mem::take(&mut snap.pending_new_tabs);
-            let cwds: Vec<PathBuf> = std::mem::take(&mut snap.pending_new_tab_cwds).into_iter().collect();
-            drop(snap);
-            (n, cwds)
-        };
+        let (new_tab_count, new_tab_cwds, new_tab_names): (usize, Vec<PathBuf>, Vec<String>) =
+            if seq == self.render_activity_seen.get() {
+                (0, Vec::new(), Vec::new())
+            } else {
+                self.render_activity_seen.set(seq);
+                let mut snap = self.api_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let n = std::mem::take(&mut snap.pending_new_tabs);
+                let cwds: Vec<PathBuf> = std::mem::take(&mut snap.pending_new_tab_cwds).into_iter().collect();
+                let names: Vec<String> = std::mem::take(&mut snap.pending_new_tab_names).into_iter().collect();
+                drop(snap);
+                (n, cwds, names)
+            };
         let mut cwd_iter = new_tab_cwds.into_iter();
+        let mut name_iter = new_tab_names.into_iter();
         for _ in 0..new_tab_count {
             match cwd_iter.next() {
                 Some(cwd) => self.add_tab_in(cwd, window, cx),
                 None => self.add_tab(window, cx),
+            }
+            // `add_tab*` sets `self.active` to the new tab — honour the
+            // API-supplied name (empty ⇒ keep the auto-generated one).
+            if let Some(name) = name_iter.next().filter(|n| !n.is_empty()) {
+                self.tabs[self.active].name = name.into();
             }
         }
         // No tab to show yet (transient empty state / future async boot): the
