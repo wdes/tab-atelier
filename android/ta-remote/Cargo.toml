@@ -87,6 +87,12 @@ target_sdk_version = 33
 [package.metadata.android.signing.release]
 path = "release.keystore"
 keystore_password = "tar3mote"
+# Release signing certificate fingerprints (alias "ta-remote",
+# CN=William Desportes, valid 2026-05-16 → 2053-10-01). Needed for Play
+# Console, App Links / Digital Asset Links (assetlinks.json), and any API
+# consoles that key on the signing cert:
+#   SHA-256: D8:EE:6B:25:59:9F:1D:73:12:5F:F6:CD:1D:55:58:15:D8:64:CA:33:B8:6C:22:64:2E:0B:A6:BD:AA:52:20:CA
+#   SHA-1:   24:1F:6A:A1:FA:A1:95:2F:E1:73:04:C8:83:B4:86:94:64:95:B5:EA
 
 [[package.metadata.android.uses_permission]]
 name = "android.permission.INTERNET"
