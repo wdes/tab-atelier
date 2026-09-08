@@ -20,6 +20,15 @@
 //!
 //! It is deliberately NOT an audit log: no prompts, no request bodies, no
 //! per-call records. Counts and timestamps only.
+//!
+//! # On disk
+//!
+//! `usage/<account-id>/YYYY-MM-DD_usage.json` — a directory per account, a
+//! file per UTC day. Every hour records WHICH MODEL was billed, because a
+//! token total cannot say whether it was Opus or Haiku and the price differs
+//! by an order of magnitude. That matters more here than in most proxies:
+//! [`crate::fallback`] rewrites the model under pressure, so what the caller
+//! asked for and what the plan paid for are not always the same thing.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -80,6 +89,17 @@ pub struct Bucket {
     pub errors: u64,
     #[serde(flatten)]
     pub tokens: Tokens,
+    /// The same hour split by the model that was actually BILLED.
+    ///
+    /// A total says how much was spent; it cannot say whether that was Opus or
+    /// Haiku, which is most of what the number means — the price differs by an
+    /// order of magnitude. It matters more here than in most proxies because
+    /// [`crate::fallback`] rewrites the model under pressure, so what the
+    /// caller asked for and what the plan paid for are not always the same
+    /// thing. This records what upstream reported, which is the one that was
+    /// charged.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub by_model: BTreeMap<String, Tokens>,
 }
 
 /// One account's history.
@@ -100,10 +120,21 @@ struct Doc {
     accounts: BTreeMap<String, AccountUsage>,
 }
 
-/// The usage store, persisted as JSON beside the accounts.
+/// Where a day of one account's buckets lives, under the usage root.
+///
+/// `usage/<account-id>/YYYY-MM-DD_usage.json` — a directory per account and a
+/// file per UTC day. One file for everybody meant every account's history was
+/// rewritten whenever any of them made a call, and it grew without a natural
+/// place to stop. Split this way, a write touches one account's current day,
+/// retention is deleting old files, and "what did this person spend last
+/// Tuesday" is a path rather than a scan.
+///
+/// An account id is a UUID we generated, so it is safe as a directory name —
+/// but it is checked anyway ([`safe_id`]) rather than trusted, because a
+/// path built from a stored value is exactly where traversal creeps in.
 #[derive(Debug)]
 pub struct Store {
-    path: PathBuf,
+    root: PathBuf,
     accounts: BTreeMap<String, AccountUsage>,
     /// Last time this was written. Recording happens on every proxied request,
     /// and rewriting the file each time would make the disk the bottleneck on
@@ -115,6 +146,29 @@ pub struct Store {
 /// How long a change may sit unwritten. A crash loses at most this much
 /// accounting, which is the right trade against an fsync per API call.
 const SAVE_EVERY_SECS: u64 = 30;
+
+/// The day part of a bucket's path, from the bucket's own hour.
+#[must_use]
+pub fn day_of(hour: u64) -> String {
+    let days = hour / 86_400;
+    let shifted = i64::try_from(days).unwrap_or(0) + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_pos = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_pos + 2) / 5 + 1;
+    let month = if month_pos < 10 { month_pos + 3 } else { month_pos - 9 };
+    let year = if month <= 2 { year + 1 } else { year };
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// Account ids are UUIDs we minted, but this builds a filesystem path from a
+/// stored value, so it is verified rather than trusted.
+fn safe_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
 
 #[must_use]
 pub fn now_secs() -> u64 {
@@ -129,28 +183,67 @@ pub const fn hour_of(ts: u64) -> u64 {
 }
 
 impl Store {
-    /// Load, or start empty.
+    /// Load every account's daily files under `root`.
     ///
-    /// Unlike the account store, a malformed usage file is NOT fatal: usage is
-    /// accounting, not access control. Losing it must never stop the proxy
-    /// from serving — the file is renamed aside and a fresh one started, so
-    /// the damaged copy is still there to look at.
+    /// A malformed file is NOT fatal, unlike the account store: usage is
+    /// accounting, not access control, and losing it must never stop the proxy
+    /// serving. The damaged file is renamed aside so it is still there to look
+    /// at, and the rest of the history loads around it.
     #[must_use]
-    pub fn load(path: impl Into<PathBuf>) -> Self {
-        let path = path.into();
-        let accounts = match std::fs::read_to_string(&path) {
-            Ok(raw) if !raw.trim().is_empty() => match serde_json::from_str::<Doc>(&raw) {
-                Ok(d) => d.accounts,
+    pub fn load(root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
+        let mut accounts: BTreeMap<String, AccountUsage> = BTreeMap::new();
+
+        // The single all-accounts file earlier versions wrote. Still someone's
+        // history, so it is folded in; nothing writes to it again.
+        let legacy = root.join("usage.json");
+        if let Ok(raw) = std::fs::read_to_string(&legacy) {
+            match serde_json::from_str::<Doc>(&raw) {
+                Ok(d) => accounts = d.accounts,
                 Err(e) => {
-                    log::warn!("usage: {} is unreadable ({e}); starting fresh", path.display());
-                    let _ = std::fs::rename(&path, path.with_extension("json.corrupt"));
-                    BTreeMap::new()
+                    log::warn!("usage: {} is unreadable ({e}); ignoring it", legacy.display());
+                    let _ = std::fs::rename(&legacy, legacy.with_extension("json.corrupt"));
                 }
-            },
-            _ => BTreeMap::new(),
-        };
+            }
+        }
+
+        if let Ok(entries) = std::fs::read_dir(&root) {
+            for account_dir in entries.flatten().filter(|e| e.path().is_dir()) {
+                let id = account_dir.file_name().to_string_lossy().into_owned();
+                if !safe_id(&id) {
+                    continue;
+                }
+                let entry = accounts.entry(id).or_default();
+                let mut files: Vec<PathBuf> = std::fs::read_dir(account_dir.path())
+                    .map(|d| {
+                        d.flatten()
+                            .map(|e| e.path())
+                            .filter(|p| p.extension().is_some_and(|x| x == "json"))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                files.sort(); // dated names sort into chronological order
+                for f in files {
+                    let Ok(raw) = std::fs::read_to_string(&f) else { continue };
+                    match serde_json::from_str::<AccountUsage>(&raw) {
+                        Ok(day) => {
+                            entry.buckets.extend(day.buckets);
+                            for (model, t) in day.by_model {
+                                entry.by_model.entry(model).or_default().add(t);
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("usage: {} is unreadable ({e}); skipping", f.display());
+                            let _ = std::fs::rename(&f, f.with_extension("json.corrupt"));
+                        }
+                    }
+                }
+                entry.buckets.sort_by_key(|b| b.hour);
+            }
+        }
+
         Self {
-            path,
+            root,
             accounts,
             last_save: 0,
             dirty: false,
@@ -179,13 +272,31 @@ impl Store {
             bucket.errors += 1;
         }
         bucket.tokens.add(tokens);
+        if let Some(m) = model.filter(|_| !tokens.is_zero()) {
+            bucket.by_model.entry(m.to_owned()).or_default().add(tokens);
+        }
 
         if let Some(m) = model.filter(|_| !tokens.is_zero()) {
             entry.by_model.entry(m.to_owned()).or_default().add(tokens);
         }
 
         let cutoff = hour.saturating_sub(RETAIN_HOURS * HOUR);
+        // Deduplicated to days as we go: an expired day holds 24 buckets and
+        // needs one unlink, not 24.
+        let stale: std::collections::BTreeSet<String> = entry
+            .buckets
+            .iter()
+            .filter(|b| b.hour < cutoff)
+            .map(|b| day_of(b.hour))
+            .collect();
         entry.buckets.retain(|b| b.hour >= cutoff);
+        // Days that fell out of the window lose their file, so retention is a
+        // deletion rather than a file that shrinks to `[]` and stays forever.
+        if safe_id(account_id) {
+            for day in stale {
+                let _ = std::fs::remove_file(self.root.join(account_id).join(format!("{day}_usage.json")));
+            }
+        }
 
         self.dirty = true;
         self.maybe_save();
@@ -200,24 +311,46 @@ impl Store {
 
     /// Write now, whatever the coalescing window says.
     ///
+    /// Only the days that actually hold buckets are written, so a quiet
+    /// account costs nothing and a busy one rewrites one small file rather
+    /// than everybody's history.
+    ///
     /// # Errors
-    /// Anything that stops the file reaching disk.
+    /// Anything that stops a file reaching disk.
     pub fn save(&mut self) -> Result<(), String> {
-        if let Some(dir) = self.path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        for (id, usage) in &self.accounts {
+            if !safe_id(id) {
+                continue;
+            }
+            let dir = self.root.join(id);
+            std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+
+            // Split this account's buckets by day, then write each day whole.
+            let mut days: BTreeMap<String, AccountUsage> = BTreeMap::new();
+            for b in &usage.buckets {
+                days.entry(day_of(b.hour)).or_default().buckets.push(b.clone());
+            }
+            for (day, mut doc) in days {
+                // The all-time per-model totals belong to the account, not to
+                // a day; recording the day's own split keeps each file
+                // self-describing when read on its own.
+                for b in &doc.buckets {
+                    for (model, t) in &b.by_model {
+                        doc.by_model.entry(model.clone()).or_default().add(*t);
+                    }
+                }
+                let path = dir.join(format!("{day}_usage.json"));
+                let json = serde_json::to_string(&doc).map_err(|e| e.to_string())?;
+                let tmp = path.with_extension("json.tmp");
+                std::fs::write(&tmp, json).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+                }
+                std::fs::rename(&tmp, &path).map_err(|e| format!("rename into {}: {e}", path.display()))?;
+            }
         }
-        let json = serde_json::to_string(&Doc {
-            accounts: self.accounts.clone(),
-        })
-        .map_err(|e| e.to_string())?;
-        let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, json).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-        }
-        std::fs::rename(&tmp, &self.path).map_err(|e| format!("rename into {}: {e}", self.path.display()))?;
         self.last_save = now_secs();
         self.dirty = false;
         Ok(())
@@ -272,6 +405,7 @@ impl Store {
                         slot.calls = b.calls;
                         slot.errors = b.errors;
                         slot.tokens = b.tokens;
+                        slot.by_model.clone_from(&b.by_model);
                     }
                 }
             }
@@ -289,6 +423,11 @@ impl Store {
     /// "forget this person" actually forgets them.
     pub fn forget(&mut self, id: &str) {
         if self.accounts.remove(id).is_some() {
+            // The directory goes too, or "forget this person" would leave
+            // their history on disk under an id nothing refers to any more.
+            if safe_id(id) {
+                let _ = std::fs::remove_dir_all(self.root.join(id));
+            }
             self.dirty = true;
             let _ = self.save();
         }
@@ -429,7 +568,7 @@ mod tests {
     fn tmp(name: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("ta-proxy-usage-{name}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&p).expect("mkdir");
-        p.join("usage.json")
+        p
     }
 
     #[test]
@@ -531,6 +670,46 @@ mod tests {
         assert_eq!(ada.by_model.get("claude-opus-5").map(Tokens::total), Some(19));
     }
 
+    /// Which model was billed, hour by hour — not just in the all-time total.
+    ///
+    /// Model fallback means the model asked for and the model charged can
+    /// differ, so "how much did we spend" is only half an answer without it.
+    #[test]
+    fn each_hour_records_which_model_was_billed() {
+        let mut s = Store::load(tmp("models"));
+        let opus = Tokens {
+            input: 1_000,
+            output: 500,
+            ..Tokens::default()
+        };
+        let haiku = Tokens {
+            input: 200,
+            output: 100,
+            ..Tokens::default()
+        };
+        s.record("ada", Some("claude-opus-5"), opus, true);
+        s.record("ada", Some("claude-haiku-4-5"), haiku, true);
+        s.record("ada", Some("claude-haiku-4-5"), haiku, true);
+
+        let bucket = &s.for_account("ada").expect("ada").buckets[0];
+        assert_eq!(bucket.calls, 3);
+        assert_eq!(bucket.by_model.len(), 2, "both models must appear in the hour");
+        assert_eq!(bucket.by_model["claude-opus-5"].total(), 1_500);
+        assert_eq!(
+            bucket.by_model["claude-haiku-4-5"].total(),
+            600,
+            "two haiku calls summed"
+        );
+        // The hour's total still agrees with the split.
+        let summed: u64 = bucket.by_model.values().map(Tokens::total).sum();
+        assert_eq!(summed, bucket.tokens.total());
+
+        // And the series carries it, so a chart can break the hour down.
+        let series = s.series("ada", 2);
+        let last = series.last().expect("current hour");
+        assert_eq!(last.by_model.len(), 2);
+    }
+
     #[test]
     fn the_series_is_dense_so_idle_hours_are_visible() {
         let mut s = Store::load(tmp("dense"));
@@ -574,18 +753,98 @@ mod tests {
         reloaded.forget("ada");
         assert!(reloaded.for_account("ada").is_none());
         assert!(Store::load(&path).for_account("ada").is_none(), "and it stays gone");
+        assert!(
+            !path.join("ada").exists(),
+            "the account's directory goes with it — otherwise 'forget' leaves the \
+             history on disk under an id nothing refers to any more"
+        );
+    }
+
+    /// A directory per account, a file per UTC day.
+    #[test]
+    fn each_account_gets_a_folder_and_each_day_a_file() {
+        let root = tmp("layout");
+        let mut s = Store::load(&root);
+        s.record(
+            "ada",
+            Some("claude-opus-5"),
+            Tokens {
+                input: 5,
+                ..Tokens::default()
+            },
+            true,
+        );
+        s.record(
+            "grace",
+            Some("claude-haiku-4-5"),
+            Tokens {
+                input: 3,
+                ..Tokens::default()
+            },
+            true,
+        );
+        s.save().expect("save");
+
+        let today = day_of(hour_of(now_secs()));
+        for who in ["ada", "grace"] {
+            let f = root.join(who).join(format!("{today}_usage.json"));
+            assert!(f.is_file(), "expected {}", f.display());
+        }
+
+        // One account's traffic must not rewrite another's file — that is the
+        // point of splitting them.
+        let ada = std::fs::read_to_string(root.join("ada").join(format!("{today}_usage.json"))).expect("read");
+        assert!(ada.contains("claude-opus-5"));
+        assert!(
+            !ada.contains("claude-haiku-4-5"),
+            "grace's models must not be in ada's file"
+        );
+
+        // A day file is self-describing when read on its own.
+        let doc: AccountUsage = serde_json::from_str(&ada).expect("parse day");
+        assert_eq!(doc.by_model["claude-opus-5"].total(), 5);
+
+        let back = Store::load(&root);
+        assert_eq!(back.totals("ada", 0).2.input, 5);
+        assert_eq!(back.totals("grace", 0).2.input, 3);
+    }
+
+    /// Dates come from the bucket's own hour, and ids never leave the root.
+    #[test]
+    fn the_day_name_is_the_buckets_utc_date() {
+        assert_eq!(day_of(0), "1970-01-01");
+        assert_eq!(day_of(1_709_164_800), "2024-02-29");
+        assert_eq!(day_of(1_757_320_000 - (1_757_320_000 % 3600)), "2025-09-08");
+        // The id becomes a directory name, so it is verified rather than
+        // trusted — a path built from a stored value is where traversal creeps
+        // in, even when we minted the value ourselves.
+        assert!(safe_id("6f1e4b2a-0000-4000-8000-000000000000"));
+        assert!(!safe_id("../etc"));
+        assert!(!safe_id("a/b"));
+        assert!(!safe_id(""));
     }
 
     /// Accounting must never be able to stop the proxy serving.
     #[test]
     fn a_corrupt_usage_file_is_survivable() {
-        let path = tmp("corrupt");
-        std::fs::write(&path, "{not json").expect("write");
-        let s = Store::load(&path);
-        assert!(s.account_ids().is_empty());
+        let root = tmp("corrupt");
+        // One damaged day, and one good one, for the same account.
+        let dir = root.join("ada");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("2026-09-07_usage.json"), "{not json").expect("write bad");
+        std::fs::write(
+            dir.join("2026-09-08_usage.json"),
+            r#"{"buckets":[{"hour":1757289600,"calls":2,"input":9}],"by_model":{}}"#,
+        )
+        .expect("write good");
+
+        let s = Store::load(&root);
+        // The good day still loads: one bad file must not cost the history.
+        assert_eq!(s.totals("ada", 0).0, 2, "the intact day should still be there");
         assert!(
-            path.with_extension("json.corrupt").exists(),
+            dir.join("2026-09-07_usage.json.corrupt").exists(),
             "the damaged file is kept for inspection, not deleted"
         );
+        assert!(!dir.join("2026-09-07_usage.json").exists());
     }
 }
