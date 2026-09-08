@@ -1,50 +1,84 @@
 [Unit]
 Description=tab-atelier multi-user Anthropic API proxy
 Documentation=https://github.com/wdes/tab-atelier
+# The egress needs working DNS and a route before it can refresh its OAuth
+# token, so wait for the network to be configured rather than merely present.
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-# Loopback by default. The proxy carries user keys and the host's own Claude
+# Loopback by default. This carries user keys AND the host's Claude
 # credential, so it expects a TLS terminator in front rather than facing the
-# network itself. Change --listen only alongside that.
+# network itself. Change --listen only alongside one.
 ExecStart=/usr/bin/tab-atelier-proxy serve --listen 127.0.0.1:7900
 Restart=on-failure
-RestartSec=2
+RestartSec=2s
+TimeoutStopSec=10s
 
 User=tab-atelier-proxy
 Group=tab-atelier-proxy
-# /var/lib/tab-atelier-proxy: accounts + admin token, created 0700 by systemd.
+# /var/lib/tab-atelier-proxy, created 0700 by systemd. Both the secrets
+# (users.json, admin.token) and the usage history live here: a system service
+# has no home directory to split them across, and this is the one path
+# systemd guarantees is writable and private.
 StateDirectory=tab-atelier-proxy
 StateDirectoryMode=0700
 Environment=TAB_ATELIER_PROXY_STATE=/var/lib/tab-atelier-proxy
-# The service account's own ~/.claude/.credentials.json is the egress login.
+Environment=TAB_ATELIER_PROXY_CONFIG=/var/lib/tab-atelier-proxy
+# The service account's own ~/.claude/.credentials.json is the egress login,
+# and the OAuth refresh rewrites it, so HOME must be the writable state dir.
 Environment=HOME=/var/lib/tab-atelier-proxy
+Environment=RUST_LOG=tab_atelier_proxy=info
 
-# It reads one credential file, writes one account file, and talks to one
-# upstream. Nothing else needs to be reachable from here.
+# ── Sandbox ─────────────────────────────────────────────────────────
+# This does strictly less than tab-atelier-headless, so it gets strictly less:
+# no CAP_NET_ADMIN (no nftables), no AF_NETLINK, no cgroup delegation, no
+# docker socket, no PTYs. It opens one listening socket, talks to one upstream,
+# and reads and writes four files.
 NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
 PrivateTmp=yes
 PrivateDevices=yes
+# The proxy never looks at another account's uid, so it runs in its own user
+# namespace where root is nobody. (An explicit empty DeviceAllow= was tried
+# alongside and changes nothing — PrivateDevices= puts /dev/rtc back — so it
+# is not carried here pretending to.)
+PrivateUsers=yes
 ProtectSystem=strict
 ProtectHome=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
+ProtectKernelLogs=yes
 ProtectControlGroups=yes
 ProtectClock=yes
 ProtectHostname=yes
 ProtectProc=invisible
+ProcSubset=pid
 RestrictNamespaces=yes
 RestrictRealtime=yes
-RestrictSUIDSGID=yes
-RestrictAddressFamilies=AF_INET AF_INET6
+RemoveIPC=yes
+KeyringMode=private
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
-SystemCallFilter=@system-service
-SystemCallErrorNumber=EPERM
-CapabilityBoundingSet=
 UMask=0077
+
+# AF_UNIX is NOT for serving — the listener is TCP. glibc's name resolution
+# reaches nss-systemd/nscd over a unix socket on most systemd hosts, so
+# removing it turns every upstream call into a DNS failure that looks like an
+# Anthropic outage. AF_INET/AF_INET6 are the actual traffic.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# Blocks the 32-bit syscall table, which is otherwise a way around the filter
+# below on x86-64.
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@clock @cpu-emulation @debug @module @mount @obsolete @privileged @raw-io @reboot @resources @swap @keyring @pkey
+# Unlike the headless daemon, nothing here ever changes uid/gid.
+SystemCallFilter=~capset setuid setgid setgroups setresuid setresgid setreuid setregid setfsuid setfsgid
+SystemCallErrorNumber=EPERM
 
 [Install]
 WantedBy=multi-user.target
