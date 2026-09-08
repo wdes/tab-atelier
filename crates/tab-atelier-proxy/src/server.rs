@@ -26,7 +26,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response};
 
 use crate::users::{Account, Store, constant_time_eq};
-use crate::{account, egress, fallback, qos, usage};
+use crate::{account, egress, provider, qos, routing, usage};
 
 type Body = http_body_util::combinators::BoxBody<Bytes, Infallible>;
 
@@ -40,6 +40,12 @@ pub struct State {
     pub sched: Mutex<qos::Sched>,
     /// How much of the shared plan is left, polled from upstream.
     pub account: Mutex<account::Monitor>,
+    /// Everywhere a request can go.
+    pub registry: provider::Registry,
+    /// Providers upstream has told us to leave alone, and until when (unix
+    /// seconds). Keyed by provider id, because a 429 from one says nothing
+    /// about another — that is the entire point of having more than one.
+    pub provider_backoff: Mutex<std::collections::BTreeMap<String, u64>>,
     /// Woken when capacity frees up, so a queued call retries promptly instead
     /// of sitting out its full backoff.
     pub wake: tokio::sync::Notify,
@@ -253,7 +259,7 @@ async fn anthropic(req: Request<Incoming>, state: Arc<State>, peer: std::net::Ip
     // Only /v1/messages spends tokens; a metadata call should not queue
     // behind a fleet's generations.
     let metered = is_post && sub.contains("/messages");
-    let (body, swapped) = match shape_and_admit(&state, &account, body, metered).await {
+    let (body, route) = match shape_and_admit(&state, &account, body, metered).await {
         Ok(pair) => pair,
         Err(resp) => return resp,
     };
@@ -267,6 +273,7 @@ async fn anthropic(req: Request<Incoming>, state: Arc<State>, peer: std::net::Ip
         account_id: account.id.clone(),
         weight: account.weight,
         metered,
+        route: route.clone(),
         state: Arc::clone(&state),
     };
     // Bridge ureq's blocking reader to an async hyper stream: the blocking task
@@ -275,7 +282,7 @@ async fn anthropic(req: Request<Incoming>, state: Arc<State>, peer: std::net::Ip
     // whole generation finished, which for a long answer looks like a hang.
     let (meta_tx, meta_rx) = tokio::sync::oneshot::channel::<Result<(u16, Option<String>), String>>();
     let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Bytes>(16);
-    tokio::task::spawn_blocking(move || forward(fwd, meta_tx, &body_tx));
+    tokio::task::spawn_blocking(move || forward(&fwd, meta_tx, &body_tx));
 
     let meta = match meta_rx.await {
         Ok(Ok(m)) => m,
@@ -285,14 +292,34 @@ async fn anthropic(req: Request<Incoming>, state: Arc<State>, peer: std::net::Ip
     let stream = futures_util::stream::unfold(body_rx, |mut rx| async move {
         rx.recv().await.map(|b| (Ok::<_, Infallible>(Frame::data(b)), rx))
     });
+    streamed(meta, stream, &route)
+}
+
+/// Wrap the upstream stream in a response that says where it came from.
+///
+/// Never route silently: a caller that got something other than what it asked
+/// for is entitled to know which provider and model answered, or results stop
+/// being reproducible and a bug report names the wrong model.
+fn streamed<S>(meta: (u16, Option<String>), stream: S, route: &routing::Route) -> Response<Body>
+where
+    S: futures_util::Stream<Item = Result<Frame<Bytes>, Infallible>> + Send + Sync + 'static,
+{
     let mut builder = Response::builder().status(meta.0);
     if let Some(ct) = meta.1 {
         builder = builder.header("content-type", ct);
     }
-    // Never degrade silently: a caller given a cheaper answer than it asked
-    // for is entitled to know, or results stop being reproducible.
-    if let Some((from, to)) = swapped {
-        builder = builder.header("x-tab-atelier-proxy-fallback", format!("{from} -> {to}"));
+    builder = builder.header(
+        "x-tab-atelier-proxy-route",
+        format!("{}/{}", route.provider_id, route.model_id),
+    );
+    // A request that named no model was not "rerouted from nothing" — there
+    // was nothing to reroute from, and saying so would be noise.
+    if let (Some(from), Some(reason)) = (route.changed_from.as_ref().filter(|f| !f.is_empty()), route.reason) {
+        let name = match reason {
+            "degraded" => "x-tab-atelier-proxy-degraded",
+            _ => "x-tab-atelier-proxy-rerouted",
+        };
+        builder = builder.header(name, from.clone());
     }
     builder
         .body(StreamBody::new(stream).boxed())
@@ -309,28 +336,49 @@ async fn shape_and_admit(
     account: &Account,
     body: Bytes,
     metered: bool,
-) -> Result<(Bytes, Option<(String, String)>), Response<Body>> {
+) -> Result<(Bytes, routing::Route), Response<Body>> {
     if !metered {
-        return Ok((body, None));
+        // Not a generation: it still has to go somewhere, but no class
+        // reasoning applies.
+        return Ok((
+            body,
+            routing::Route {
+                provider_id: "anthropic".to_owned(),
+                model_id: String::new(),
+                class: provider::Class::Balanced,
+                changed_from: None,
+                reason: None,
+            },
+        ));
     }
-    // Degrade before admission, not after: a downgraded call is cheaper, so it
-    // should be judged at the price it will actually pay.
-    let util = state
-        .account
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .utilization();
-    let (body, swapped) = fallback::rewrite_body(&body, util, account.weight).map_or_else(
-        || (body.clone(), None),
-        |(rewritten, from, to)| {
-            log::info!(
-                "proxy: {} degraded {from} → {to} (plan at {:.0}%)",
-                account.display_name(),
-                util.unwrap_or(0.0) * 100.0
-            );
-            (Bytes::from(rewritten), Some((from, to)))
-        },
-    );
+    // Choose the destination BEFORE admission, so the call is judged at the
+    // price it will actually pay rather than the one it asked for.
+    let requested = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_owned))
+        .unwrap_or_default();
+    let health = provider_health(state);
+    let Some(route) = routing::choose(&state.registry, &requested, &health, |v| std::env::var(v).ok()) else {
+        // Nothing configured can serve this at any class. A guess would be
+        // worse than saying so.
+        return Err(text(
+            503,
+            "tab-atelier-proxy: no provider available for this request (all blocked, or none configured)",
+        ));
+    };
+    if let Some(reason) = route.reason {
+        log::info!(
+            "proxy: {} {reason} {requested} → {}/{}",
+            account.display_name(),
+            route.provider_id,
+            route.model_id
+        );
+    }
+    let body = if route.model_id == requested {
+        body
+    } else {
+        rewrite_model(&body, &route.model_id).map_or(body, Bytes::from)
+    };
 
     let est = qos::estimate_cost(&body);
     if let Err(retry_after) = admit(state, &account.id, account.weight, est).await {
@@ -350,7 +398,38 @@ async fn shape_and_admit(
         record(state, &account.id, None, usage::Tokens::default(), 429);
         return Err(resp);
     }
-    Ok((body, swapped))
+    Ok((body, route))
+}
+
+/// Swap the `model` field, leaving everything else exactly as it arrived.
+fn rewrite_model(body: &[u8], model: &str) -> Option<Vec<u8>> {
+    let mut v = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+    *v.get_mut("model")? = serde_json::Value::String(model.to_owned());
+    serde_json::to_vec(&v).ok()
+}
+
+/// What routing needs to know about each provider right now.
+///
+/// The subscription reports its own utilisation, so that is used directly.
+/// Everyone else is judged only by whether they have recently refused us —
+/// there is no equivalent signal, and inventing one would keep working
+/// providers idle.
+fn provider_health(state: &Arc<State>) -> impl Fn(&str) -> routing::Health + '_ {
+    let now = usage::now_secs();
+    let plan = state
+        .account
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .utilization();
+    let backoff = state
+        .provider_backoff
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    move |id: &str| routing::Health {
+        utilization: if id == "anthropic" { plan } else { None },
+        backoff_secs: backoff.get(id).map_or(0, |until| until.saturating_sub(now)),
+    }
 }
 
 /// Per-account usage for the dashboard.
@@ -399,8 +478,11 @@ fn pressure_json(state: &Arc<State>) -> Response<Body> {
         &serde_json::json!({
             "plan": plan,
             "scheduler": scheduler,
-            "degrade_above": fallback::DEGRADE_ABOVE,
-            "floor_above": fallback::FLOOR_ABOVE,
+            // The point above which a provider stops being first choice.
+            // Routing prefers moving the work to another provider at this
+            // level; only when none is left does the class step down.
+            "strained_above": routing::STRAINED_ABOVE,
+            "providers": state.registry.summary(),
         })
         .to_string(),
     )
@@ -444,6 +526,8 @@ struct Forward {
     /// Whether this call was admitted by the scheduler, and so has an estimate
     /// outstanding that must be settled.
     metered: bool,
+    /// Where this is going, chosen by [`crate::routing`].
+    route: routing::Route,
     /// Who to bill. Carried down rather than looked up again, because by the
     /// time the response finishes the account may have been deleted — the call
     /// still happened and still spent tokens.
@@ -457,26 +541,24 @@ struct Forward {
 /// statuses. A proxy that turned a 429 into its own 502 would hide both the
 /// reason and the `retry-after` the client needs.
 fn forward(
-    f: Forward,
+    f: &Forward,
     // By value: a oneshot Sender is consumed by `send`, which is also what
     // makes "exactly one answer" a type-level guarantee rather than a habit.
     meta_tx: tokio::sync::oneshot::Sender<Result<(u16, Option<String>), String>>,
     body_tx: &tokio::sync::mpsc::Sender<Bytes>,
 ) {
-    // Deliberately not held anywhere: fetched per request so a refreshed token
-    // is picked up without restarting, and never written to a log.
-    let token = match egress::oauth_access_token() {
-        Ok(t) => t,
+    let (base, auth) = match destination(&f.state, &f.route.provider_id) {
+        Ok(d) => d,
         Err(e) => {
-            let _ = meta_tx.send(Err(format!("egress oauth: {e}")));
+            let _ = meta_tx.send(Err(e));
             return;
         }
     };
-    let url = format!("{}{}", egress::upstream(), f.sub_pq);
+    let url = format!("{base}{}", f.sub_pq);
     let agent = egress::relay_agent();
     let hdrs: Vec<(&str, String)> = vec![
-        ("Content-Type", f.content_type),
-        ("Authorization", format!("Bearer {token}")),
+        ("Content-Type", f.content_type.clone()),
+        (auth.0, auth.1),
         ("anthropic-version", egress::ANTHROPIC_VERSION.to_owned()),
         // The client's own beta flags are merged in, not replaced: a body field
         // gated behind a flag the client opted into is rejected upstream as an
@@ -524,16 +606,7 @@ fn forward(
     let remaining = header_num("anthropic-ratelimit-tokens-remaining");
     let reset_in = header_num("anthropic-ratelimit-tokens-reset");
     let retry_after = header_num("retry-after");
-    {
-        let mut sched = f.state.sched.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if status == 429 {
-            // Everyone stops. Continuing to send is what turns one 429 into a
-            // sustained outage for the whole fleet.
-            sched.on_429(retry_after, now_ms());
-        } else {
-            sched.observe(remaining, reset_in, now_ms());
-        }
-    }
+    observe_upstream(f, status, remaining, reset_in, retry_after);
     // Count what Anthropic says it billed, read off the response as it goes
     // past. Asking the client to report its own usage would be unenforceable,
     // and re-tokenising the prompt here would be a guess.
@@ -574,6 +647,70 @@ fn forward(
         f.state.wake.notify_waiters();
     }
     let _ = f.weight;
+}
+
+/// The base URL and credential header for a chosen provider.
+///
+/// # Errors
+/// The provider's credential is missing, which is a configuration problem
+/// rather than something to paper over with an unauthenticated request.
+fn destination(state: &State, provider_id: &str) -> Result<(String, (&'static str, String)), String> {
+    let chosen = state.registry.get(provider_id);
+    // An explicit upstream override replaces the SUBSCRIPTION's base URL —
+    // that is what it exists for (a test's mock, or an ops redirect). It must
+    // not silently retarget a third-party provider, whose URL is its identity.
+    let uses_oauth = chosen.is_none_or(|p| matches!(p.auth, provider::Auth::ClaudeOauth));
+    let base = match (uses_oauth, egress::upstream_override()) {
+        (true, Some(o)) => o,
+        _ => chosen.map_or_else(egress::upstream, |p| p.base_url.trim_end_matches('/').to_owned()),
+    };
+
+    // Credentials are fetched per request, never held: a refreshed OAuth token
+    // is picked up without a restart, and nothing lands in a log.
+    let auth = match chosen.map(|p| &p.auth) {
+        None | Some(provider::Auth::ClaudeOauth) => {
+            let t = egress::oauth_access_token().map_err(|e| format!("egress oauth: {e}"))?;
+            ("Authorization", format!("Bearer {t}"))
+        }
+        // An Anthropic-compatible provider takes a key in x-api-key, the
+        // convention its own SDKs use.
+        Some(provider::Auth::ApiKeyEnv { var }) => match std::env::var(var) {
+            Ok(k) if !k.trim().is_empty() => ("x-api-key", k),
+            _ => return Err(format!("provider {provider_id} has no credential in ${var}")),
+        },
+    };
+    Ok((base, auth))
+}
+
+/// Fold an upstream answer back into what the proxy knows.
+///
+/// A 429 stops traffic to THAT provider, not to every provider: its limit is
+/// its own, and the next request routes elsewhere instead of waiting. Any
+/// other answer clears the block — a provider that responds is working again.
+fn observe_upstream(f: &Forward, status: u16, remaining: Option<u64>, reset_in: Option<u64>, retry_after: Option<u64>) {
+    {
+        let mut sched = f.state.sched.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if status == 429 {
+            sched.on_429(retry_after, now_ms());
+        } else {
+            sched.observe(remaining, reset_in, now_ms());
+        }
+    }
+    let mut blocked = f
+        .state
+        .provider_backoff
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if status == 429 {
+        let wait = retry_after.unwrap_or(30).clamp(1, 300);
+        blocked.insert(f.route.provider_id.clone(), usage::now_secs() + wait);
+        log::warn!(
+            "proxy: {} refused us (429) — routing elsewhere for {wait}s",
+            f.route.provider_id
+        );
+    } else {
+        blocked.remove(&f.route.provider_id);
+    }
 }
 
 /// File one call against an account. Never fails the request it describes:
@@ -917,6 +1054,8 @@ mod tests {
             sched: Mutex::new(qos::Sched::new()),
             account: Mutex::new(account::Monitor::load(std::env::temp_dir())),
             wake: tokio::sync::Notify::new(),
+            registry: provider::Registry::default(),
+            provider_backoff: Mutex::new(std::collections::BTreeMap::new()),
             admin_token: "t".to_owned(),
             web_root: Some(std::path::PathBuf::from("/usr/share/tab-atelier-proxy/web")),
         };

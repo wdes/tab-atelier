@@ -225,42 +225,67 @@ fn print_new_key(a: &Account, key: &str) {
     println!("        --relay-token {key}");
 }
 
+/// Start the proxy and serve until Ctrl-C.
+///
+/// # Errors
+/// The listen address is unusable, the state directories cannot be read, or
+/// the runtime fails to start.
+fn serve(listen: &str) -> Result<(), String> {
+    let addr: SocketAddr = listen.parse().map_err(|e| format!("bad --listen {listen}: {e}"))?;
+    let state_path = state_dir()?;
+    let token = admin_token(&config_dir()?)?;
+    let store = store()?;
+
+    // First run leaves an editable providers.json rather than a mystery: the
+    // default is the subscription alone, which is what the proxy did before
+    // providers existed.
+    let providers_path = config_dir()?.join("providers.json");
+    let registry = tab_atelier_proxy::provider::Registry::load(&providers_path);
+    if !providers_path.exists() {
+        let _ = registry.save(&providers_path);
+        log::info!("wrote {} — edit it to add providers", providers_path.display());
+    }
+    log::info!(
+        "routing across {} provider(s): {:?}",
+        registry.providers.len(),
+        registry.summary()
+    );
+
+    let root = web_root();
+    if root.is_none() {
+        log::warn!("no web UI found — account management is CLI-only in this install");
+    }
+    let state = Arc::new(server::State {
+        store: Mutex::new(store),
+        usage: Mutex::new(tab_atelier_proxy::usage::Store::load(state_path.join("usage"))),
+        sched: Mutex::new(tab_atelier_proxy::qos::Sched::new()),
+        account: Mutex::new(tab_atelier_proxy::account::Monitor::load(&state_path)),
+        wake: tokio::sync::Notify::new(),
+        registry,
+        provider_backoff: Mutex::new(std::collections::BTreeMap::new()),
+        admin_token: token,
+        web_root: root,
+    });
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("runtime: {e}"))?;
+    rt.block_on(async {
+        tokio::spawn(poll_account_usage(Arc::clone(&state)));
+        tokio::select! {
+            r = server::serve(addr, state) => r,
+            _ = tokio::signal::ctrl_c() => {
+                log::info!("shutting down");
+                Ok(())
+            }
+        }
+    })
+}
+
 fn run() -> Result<(), String> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Serve { listen } => {
-            let addr: SocketAddr = listen.parse().map_err(|e| format!("bad --listen {listen}: {e}"))?;
-            let state = state_dir()?;
-            let token = admin_token(&config_dir()?)?;
-            let store = store()?;
-            let root = web_root();
-            if root.is_none() {
-                log::warn!("no web UI found — account management is CLI-only in this install");
-            }
-            let state = Arc::new(server::State {
-                store: Mutex::new(store),
-                usage: Mutex::new(tab_atelier_proxy::usage::Store::load(state.join("usage"))),
-                sched: Mutex::new(tab_atelier_proxy::qos::Sched::new()),
-                account: Mutex::new(tab_atelier_proxy::account::Monitor::load(&state)),
-                wake: tokio::sync::Notify::new(),
-                admin_token: token,
-                web_root: root,
-            });
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| format!("runtime: {e}"))?;
-            rt.block_on(async {
-                tokio::spawn(poll_account_usage(Arc::clone(&state)));
-                tokio::select! {
-                    r = server::serve(addr, state) => r,
-                    _ = tokio::signal::ctrl_c() => {
-                        log::info!("shutting down");
-                        Ok(())
-                    }
-                }
-            })
-        }
+        Command::Serve { listen } => serve(&listen),
         Command::AdminToken => {
             println!("{}", admin_token(&config_dir()?)?);
             Ok(())

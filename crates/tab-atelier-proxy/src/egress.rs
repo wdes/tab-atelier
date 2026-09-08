@@ -111,6 +111,22 @@ pub fn set_upstream(url: Option<String>) {
     }
 }
 
+/// An explicitly configured upstream, if there is one.
+///
+/// Distinct from [`upstream`], which always answers. Routing needs to know
+/// whether an override was SET, because it replaces the base URL of the
+/// subscription provider — that is what the override is for, and silently
+/// ignoring it would leave a test or an ops redirect pointing nowhere.
+#[must_use]
+pub fn upstream_override() -> Option<String> {
+    if let Some(u) = UPSTREAM_OVERRIDE.read().ok().and_then(|g| g.clone()) {
+        return Some(u.trim_end_matches('/').to_owned());
+    }
+    std::env::var("TAB_ATELIER_PROXY_UPSTREAM")
+        .ok()
+        .map(|u| u.trim_end_matches('/').to_owned())
+}
+
 /// The egress upstream base URL (no trailing slash).
 #[must_use]
 pub fn upstream() -> String {

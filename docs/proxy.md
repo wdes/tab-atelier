@@ -68,6 +68,63 @@ you again — lost key, `rotate`. (A fast hash is right here: the key is 32 byte
 of CSPRNG output, so there is no dictionary to run against it, and a slow KDF
 would only add latency to every proxied request.)
 
+## The proxy picks the model
+
+Nobody using this chooses a model. A client asks for one, and that name says
+what KIND of work it is — quick, ordinary, or hard — not which endpoint should
+bill it. Only the proxy knows that the five-hour window is 97% spent, or that
+one provider is refusing while another is answering.
+
+So it does two things, in order:
+
+1. **Reroute.** Same class of model, different provider. Bedrock and Vertex
+   serve the *same* models from *different* quota pools, so a saturated
+   subscription is a reason to move the work, not to make it worse.
+2. **Degrade**, only when nothing is left that can serve the class — a cheaper
+   class, trading quality for getting an answer at all.
+
+Never upward: idle capacity in an expensive class does not promote a request
+that asked for something cheap. Never silently: the response carries
+`x-tab-atelier-proxy-route: <provider>/<model>`, plus
+`x-tab-atelier-proxy-rerouted` or `-degraded` naming what was asked for.
+
+Providers live in `providers.json` beside the accounts, written on first run:
+
+```json
+{
+  "providers": [
+    {
+      "id": "anthropic",
+      "base_url": "https://api.anthropic.com",
+      "auth": {"kind": "claude_oauth"},
+      "preference": 0,
+      "models": [
+        {"id": "claude-haiku-4-5-20251001", "class": "fast",     "relative_cost": 1},
+        {"id": "claude-sonnet-5",           "class": "balanced", "relative_cost": 5},
+        {"id": "claude-opus-5",             "class": "heavy",    "relative_cost": 25}
+      ]
+    }
+  ]
+}
+```
+
+Add a second provider with `"auth": {"kind": "api_key_env", "var": "SOME_KEY"}`
+and a higher `preference`. The key is named, not inlined — a credential in a
+config file is a credential in a backup. A provider whose variable is unset is
+never offered, because routing to it would produce a 401 from somewhere nobody
+was looking.
+
+**Every provider must speak the Anthropic Messages API.** Claude Code speaks
+it, so that is the contract on the way in, and providers that share it — the
+same models on Bedrock or Vertex, and the third parties that ship an
+Anthropic-compatible endpoint for exactly this purpose — can be swapped by
+changing a URL, a credential and a model name. Nothing is translated, so tool
+use, prompt caching and extended thinking pass through untouched. An
+OpenAI-shaped provider would need the request and the streamed response
+rewritten, and tool-call semantics do not survive that intact — which for
+Claude Code, whose every turn is tool use, is a reroute that silently breaks
+the client. That adapter is a separate piece of work, not another base URL.
+
 ## Is it the proxy, or is it Anthropic?
 
 ```sh
