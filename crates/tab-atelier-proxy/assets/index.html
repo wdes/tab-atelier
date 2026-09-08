@@ -140,8 +140,9 @@
                   <div v-if="plan.latest && plan.latest.seven_day != null">
                     7-day: {{ Math.round(plan.latest.seven_day * 100) }}%
                   </div>
-                  <div v-if="plan.latest && plan.latest.five_hour_resets">
-                    resets {{ plan.latest.five_hour_resets.replace('T',' ').replace(/\..*/,'') }}
+                  <div v-if="plan.latest && plan.latest.five_hour_resets"
+                       :title="whenLocal(plan.latest.five_hour_resets)">
+                    resets {{ untilLocal(plan.latest.five_hour_resets) }}
                   </div>
                   <div v-if="sched.backoff_for">backing off {{ sched.backoff_for }}s</div>
                   <div v-if="sched.rejected">{{ sched.rejected }} queued out</div>
