@@ -78,10 +78,13 @@ fn usage() {
          list                                          list configured endpoints\n\
          my-token                                      print this instance's sidecar token, for\n\
                                                        the peer's `remote add --token`\n\
-         add --label L --url U --token T [--relay-token R] [--no-pin] [--autoconnect]\n\
+         add --label L --url U [--token T] [--relay-token R] [--no-pin] [--autoconnect]\n\
                                                        --token is the peer's master token (tabs,\n\
                                                        input, files); --relay-token its `relay\n\
-                                                       token`, needed only to relay through it\n\
+                                                       token`, or a tab-atelier-proxy key.\n\
+                                                       One of the two is required: a proxy has no\n\
+                                                       master token, so --relay-token alone is a\n\
+                                                       relay-only endpoint\n\
              [--cf-id ID --cf-secret SECRET]           persist a new endpoint\n\
                                                        (--cf-* = Cloudflare Access service token)\n\
          remove <label-or-id>                          drop one\n\
@@ -189,10 +192,19 @@ fn cmd_add(args: &[String]) -> i32 {
             return 2;
         }
     };
+    // --token is the PEER'S MASTER TOKEN, for tabs/input/files. A
+    // tab-atelier-proxy is not a peer tab-atelier and has none of those
+    // endpoints, so relaying through one needs --relay-token and nothing else.
+    // Requiring a master token there would mean inventing a value to satisfy
+    // the parser, which teaches people to put junk in a credential field.
     let token = match token {
         Some(s) if !s.is_empty() => s,
+        _ if relay_token.as_deref().is_some_and(|t| !t.is_empty()) => {
+            eprintln!("tab-atelier remote add: no --token — relay-only endpoint (no tabs, input or files)");
+            String::new()
+        }
         _ => {
-            eprintln!("tab-atelier remote add: --token is required");
+            eprintln!("tab-atelier remote add: --token is required (or --relay-token for a relay-only endpoint)");
             return 2;
         }
     };
