@@ -3998,7 +3998,7 @@ impl AppState {
                             cx.notify();
                         }),
                     )
-                    .child("\u{26d1}\u{fe0f} Brain"),
+                    .child(format!("\u{26d1}\u{fe0f} {}", self.t().brain)),
             );
 
             let colors_enabled = self.tabs[idx].view.read(cx).colors_enabled();
@@ -4575,7 +4575,7 @@ impl AppState {
                             cx.notify();
                         }),
                     )
-                    .child("🐾 Summon a pet"),
+                    .child(format!("🐾 {}", self.t().summon_pet)),
             );
             if self.pet.count() > 0 {
                 container = container.child(
@@ -4593,7 +4593,7 @@ impl AppState {
                                 cx.notify();
                             }),
                         )
-                        .child("🐾 Dismiss all pets"),
+                        .child(format!("🐾 {}", self.t().dismiss_pets)),
                 );
             }
         }
@@ -4906,7 +4906,7 @@ impl AppState {
                 div()
                     .text_color(muted)
                     .text_size(px(13.0))
-                    .child("Type to filter tabs\u{2026}")
+                    .child(self.t().switcher_filter_placeholder)
             } else {
                 div().text_color(dialog_fg).child(format!("{}\u{258c}", sw.query))
             });
@@ -4919,7 +4919,7 @@ impl AppState {
                     .py(px(6.0))
                     .text_size(px(13.0))
                     .text_color(muted)
-                    .child("No matching tabs"),
+                    .child(self.t().switcher_no_matches),
             );
         }
         for (row, &idx) in filtered.iter().enumerate() {
@@ -5003,7 +5003,7 @@ impl AppState {
                         .overflow_hidden()
                         .text_color(dialog_fg)
                         .text_size(px(14.0))
-                        .child(div().text_size(px(13.0)).text_color(muted).child("Recent tabs"))
+                        .child(div().text_size(px(13.0)).text_color(muted).child(self.t().switcher_recent))
                         .child(query_row)
                         .child(list)
                         .child(
@@ -5375,7 +5375,7 @@ impl AppState {
                                 .flex()
                                 .flex_col()
                                 .gap(px(2.0))
-                                .child(div().text_color(dialog_fg).child("Also reachable at:"));
+                                .child(div().text_color(dialog_fg).child(self.t().also_reachable_at));
                             for ip in ips.iter().skip(1) {
                                 list = list.child(div().text_color(link_fg).child(format!(
                                     "http://{ip}:{}",
@@ -5881,7 +5881,7 @@ impl AppState {
                 }),
             )
             .when(default_mem_text.is_empty(), |el| {
-                el.child(div().text_color(placeholder_fg).child("unlimited (e.g. 8G)"))
+                el.child(div().text_color(placeholder_fg).child(self.t().memory_unlimited_hint))
             })
             .when(!default_mem_text.is_empty(), |el| {
                 el.child(default_mem_text)
@@ -5986,7 +5986,7 @@ impl AppState {
                                         .flex_1()
                                         .gap(px(16.0))
                                         .child(div().child(t.theme).child(theme_options))
-                                        .child(div().child("Cursor").child(cursor_options))
+                                        .child(div().child(self.t().cursor).child(cursor_options))
                                         .child(div().child(t.opacity).child(opacity_slider))
                                         .child(div().child(t.font_size).child(font_size_row))
                                         .child(div().child(t.toggle_hotkeys).child(hotkey_list))
