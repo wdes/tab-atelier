@@ -794,6 +794,26 @@ fn mutate(state: &Arc<State>, method: &Method, path: &str, body: &Bytes) -> Resp
 
 // ── the web UI ──────────────────────────────────────────────────────
 
+/// Libraries the distribution already packages, so this does not have to.
+///
+/// Debian ships Bootstrap as `libjs-bootstrap5`, which the .deb depends on.
+/// Serving it from there rather than committing a copy means it is patched by
+/// `apt upgrade` like everything else on the machine, and the repository does
+/// not carry a third-party CSS blob nobody reviews.
+///
+/// It also removes the symlink that used to be needed to run from a source
+/// checkout — an absolute link into /usr/share that was broken on any machine
+/// without the package, and one more thing to explain.
+///
+/// Vue is NOT here because Debian does not package it (checked: no `libjs-vue`
+/// or `node-vue` in trixie), so that one stays vendored, pinned by checksum.
+fn distro_asset(rel: &str) -> Option<&'static str> {
+    match rel {
+        "vendor/bootstrap.min.css" => Some("/usr/share/javascript/bootstrap5/css/bootstrap.min.css"),
+        _ => None,
+    }
+}
+
 /// Serve the UI from `web_root`.
 ///
 /// Path traversal is refused by rejecting any `..` component outright rather
@@ -812,8 +832,13 @@ fn web(path: &str, state: &State) -> Response<Body> {
         return text(400, "bad path");
     }
     let full = root.join(rel);
-    let Ok(bytes) = std::fs::read(&full) else {
-        return text(404, "not found");
+    let bytes = match std::fs::read(&full) {
+        Ok(b) => b,
+        // Not in our tree — try the distribution's copy before giving up.
+        Err(_) => match distro_asset(rel).and_then(|p| std::fs::read(p).ok()) {
+            Some(b) => b,
+            None => return text(404, "not found"),
+        },
     };
     let ctype = match full.extension().and_then(|e| e.to_str()) {
         Some("html") => "text/html; charset=utf-8",
@@ -910,6 +935,31 @@ mod tests {
                 resp.status()
             );
         }
+    }
+
+    /// Bootstrap comes from the distribution, so neither the repository nor
+    /// the package carries a copy — and a source checkout needs no symlink.
+    #[test]
+    fn bootstrap_is_served_from_the_distribution_package() {
+        assert_eq!(
+            distro_asset("vendor/bootstrap.min.css"),
+            Some("/usr/share/javascript/bootstrap5/css/bootstrap.min.css")
+        );
+        // Only the libraries the distribution actually packages. Vue is not
+        // one of them, so it must stay vendored rather than 404 at runtime.
+        assert_eq!(distro_asset("vendor/vue.global.prod.js"), None);
+        assert_eq!(distro_asset("app.js"), None);
+        assert_eq!(distro_asset("../../../etc/passwd"), None);
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+        assert!(
+            !root.join("vendor/bootstrap.min.css").exists(),
+            "a local copy would shadow the distribution's and stop getting updates"
+        );
+        assert!(
+            root.join("vendor/vue.global.prod.js").is_file(),
+            "Vue has no distribution package, so it has to be in the tree"
+        );
     }
 
     #[test]

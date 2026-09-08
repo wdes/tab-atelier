@@ -1,18 +1,15 @@
 # Vendored web dependencies
 
-## `bootstrap.min.css` — NOT here
+## `bootstrap.min.css` — NOT here, and nothing to do
 
-Debian packages it (`libjs-bootstrap5`), so the `.deb` depends on that and
-`postinst` symlinks `/usr/share/javascript/bootstrap5/css/bootstrap.min.css`
-into this directory. Security updates then reach the UI without anyone
-re-vendoring anything.
+Debian packages it (`libjs-bootstrap5`), so the `.deb` depends on that and the
+server serves `/vendor/bootstrap.min.css` straight from
+`/usr/share/javascript/bootstrap5/` when it is not in this directory. Security
+updates reach the UI through `apt upgrade`, with nothing re-vendored and no
+symlink to create — running from a source checkout works as-is.
 
-Running from a source checkout on a Debian box, make the same link yourself:
-
-```sh
-ln -sf /usr/share/javascript/bootstrap5/css/bootstrap.min.css \
-       crates/tab-atelier-proxy/assets/vendor/bootstrap.min.css
-```
+Drop a file here with that name and it wins, if you ever need to pin a
+different build.
 
 ## `vue.global.prod.js` — here, because Debian has no Vue package
 
