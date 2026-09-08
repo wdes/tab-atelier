@@ -12,6 +12,7 @@
 inbox/
 outbox/
 
-# Dev-only symlink to Debian's libjs-bootstrap5. Absolute, so it is broken on
-# any machine without that package; the .deb makes it in postinst instead.
+# A local Bootstrap would shadow Debian's libjs-bootstrap5, which the server
+# serves straight from /usr/share/javascript. Only put one here to pin a
+# different build on purpose.
 crates/tab-atelier-proxy/assets/vendor/bootstrap.min.css

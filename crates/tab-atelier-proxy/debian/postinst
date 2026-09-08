@@ -12,12 +12,6 @@ case "$1" in
                     tab-atelier-proxy >/dev/null
         fi
         install -d -o tab-atelier-proxy -g tab-atelier-proxy -m 0700 /var/lib/tab-atelier-proxy
-        # Bootstrap is Debian's copy (libjs-bootstrap5), linked into the web
-        # root rather than duplicated, so a security update to that package
-        # reaches this UI without rebuilding it.
-        install -d /usr/share/tab-atelier-proxy/web/vendor
-        ln -sf /usr/share/javascript/bootstrap5/css/bootstrap.min.css \
-               /usr/share/tab-atelier-proxy/web/vendor/bootstrap.min.css
         ;;
 esac
 #DEBHELPER#
