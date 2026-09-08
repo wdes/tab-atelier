@@ -82,7 +82,9 @@ fn account_json(a: &Account) -> serde_json::Value {
         "last_name": a.last_name,
         "email": a.email,
         "created_at": a.created_at,
+        "first_used_at": a.first_used_at,
         "last_used_at": a.last_used_at,
+        "last_used_ip": a.last_used_ip,
         "disabled": a.disabled,
         "weight": a.weight,
         "has_key": !a.key_hash.is_empty(),
@@ -117,18 +119,22 @@ fn presented(req: &Request<Incoming>) -> String {
 /// `service_fn` requires one. Failures become status codes, not errors: a
 /// proxy that drops a connection instead of answering 502 tells the client
 /// nothing about what went wrong.
-pub async fn handle(req: Request<Incoming>, state: Arc<State>) -> Result<Response<Body>, Infallible> {
+pub async fn handle(
+    req: Request<Incoming>,
+    state: Arc<State>,
+    peer: std::net::IpAddr,
+) -> Result<Response<Body>, Infallible> {
     let path = req.uri().path().to_owned();
     let method = req.method().clone();
 
     if path.starts_with("/relay/anthropic") {
-        return Ok(anthropic(req, state).await);
+        return Ok(anthropic(req, state, peer).await);
     }
     // The account's own statistics, opened by the account's own key — the
     // route a person hands to their agent. Deliberately NOT under /api/,
     // which is the admin surface: this one is meant to be given away.
     if path == "/me/usage" {
-        return Ok(me_usage(&req, &state));
+        return Ok(me_usage(&req, &state, peer));
     }
     if path.starts_with("/api/") {
         return Ok(admin(req, state).await);
@@ -141,7 +147,42 @@ pub async fn handle(req: Request<Incoming>, state: Arc<State>) -> Result<Respons
 
 // ── the proxied path ────────────────────────────────────────────────
 
-async fn anthropic(req: Request<Incoming>, state: Arc<State>) -> Response<Body> {
+/// Look up the key's account and record that it was used, from where.
+fn authenticate_and_stamp(state: &State, key: &str, ip: &str) -> Option<Account> {
+    let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let found = store.authenticate(key).cloned();
+    if let Some(ref a) = found {
+        store.touch(&a.id, Some(ip));
+    }
+    found
+}
+
+/// Who the caller actually is, as far as this proxy can honestly tell.
+///
+/// The socket's peer is the truth when the client connects directly. It is NOT
+/// the truth behind the TLS terminator this is meant to run behind — there the
+/// peer is always the terminator, and `X-Forwarded-For` carries the real
+/// address.
+///
+/// So the header is honoured ONLY when the connection came from loopback,
+/// which is where that terminator lives. Trusting it from anywhere else would
+/// let a caller write its own address into the log by setting a header, which
+/// is worse than recording nothing.
+fn client_ip(req: &Request<Incoming>, peer: std::net::IpAddr) -> String {
+    let forwarded = req
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    match forwarded {
+        Some(fwd) if peer.is_loopback() => fwd.to_owned(),
+        _ => peer.to_string(),
+    }
+}
+
+async fn anthropic(req: Request<Incoming>, state: Arc<State>, peer: std::net::IpAddr) -> Response<Body> {
     let method = req.method().clone();
     let sub = req
         .uri()
@@ -166,14 +207,8 @@ async fn anthropic(req: Request<Incoming>, state: Arc<State>) -> Response<Body> 
     }
 
     let key = presented(&req);
-    let who = {
-        let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let found = store.authenticate(&key).cloned();
-        if let Some(ref a) = found {
-            store.touch(&a.id);
-        }
-        found
-    };
+    let ip = client_ip(&req, peer);
+    let who = authenticate_and_stamp(&state, &key, &ip);
     let Some(account) = who else {
         // Say which of the two credentials was wrong without printing either.
         // "unauthorized" alone leaves an operator guessing between a revoked
@@ -192,7 +227,7 @@ async fn anthropic(req: Request<Incoming>, state: Arc<State>) -> Response<Body> 
         return text(401, &format!("tab-atelier-proxy: unauthorized ({diagnosis})"));
     };
     log::info!(
-        "proxy: {method} {sub} for {} <{}>",
+        "proxy: {method} {sub} for {} <{}> from {ip}",
         account.display_name(),
         account.email
     );
@@ -610,15 +645,15 @@ fn usage_json(u: &usage::Store, id: &str, hours: u64) -> serde_json::Value {
 /// per-model breakdown, and a dense hourly series. It answers for the caller
 /// and nobody else — the key names the account, so there is no id to pass and
 /// no way to ask about someone else.
-fn me_usage(req: &Request<Incoming>, state: &State) -> Response<Body> {
+fn me_usage(req: &Request<Incoming>, state: &State, peer: std::net::IpAddr) -> Response<Body> {
     if req.method() != Method::GET {
         return json(405, r#"{"error":"GET only"}"#);
     }
     let key = presented(req);
-    let account = {
-        let store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        store.authenticate(&key).cloned()
-    };
+    // Reading your own statistics is a use of the key like any other, and an
+    // agent polling this is exactly the traffic someone reviewing access wants
+    // to see.
+    let account = authenticate_and_stamp(state, &key, &client_ip(req, peer));
     let Some(account) = account else {
         return json(
             401,
@@ -821,7 +856,7 @@ pub async fn serve(addr: SocketAddr, state: Arc<State>) -> Result<(), String> {
 /// Does not return in normal operation.
 pub async fn serve_on(listener: tokio::net::TcpListener, state: Arc<State>) -> Result<(), String> {
     loop {
-        let (stream, _peer) = match listener.accept().await {
+        let (stream, peer) = match listener.accept().await {
             Ok(s) => s,
             Err(e) => {
                 log::warn!("accept: {e}");
@@ -831,7 +866,7 @@ pub async fn serve_on(listener: tokio::net::TcpListener, state: Arc<State>) -> R
         let state = Arc::clone(&state);
         tokio::spawn(async move {
             let io = hyper_util::rt::TokioIo::new(stream);
-            let svc = service_fn(move |req| handle(req, Arc::clone(&state)));
+            let svc = service_fn(move |req| handle(req, Arc::clone(&state), peer.ip()));
             let _ = hyper::server::conn::http1::Builder::new()
                 .keep_alive(true)
                 .timer(hyper_util::rt::TokioTimer::new())
@@ -886,7 +921,9 @@ mod tests {
             email: "ada@example.org".to_owned(),
             key_hash: "deadbeef".to_owned(),
             created_at: 1,
+            first_used_at: None,
             last_used_at: None,
+            last_used_ip: None,
             disabled: false,
             weight: 1,
         };

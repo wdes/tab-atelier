@@ -43,11 +43,28 @@ pub struct Account {
     #[serde(default)]
     pub key_hash: String,
     pub created_at: u64,
+    /// When the CURRENT key was first used, and last used. Both reset on
+    /// rotation, because they describe the key rather than the person: after a
+    /// rotate, "first used" answering with the old key's date would be a lie
+    /// about the credential you are looking at.
+    ///
+    /// A key created and never used is the interesting case — it means someone
+    /// was issued access they never took up, or the key went astray on the way
+    /// to them.
+    #[serde(default)]
+    pub first_used_at: Option<u64>,
     /// Set on every accepted request, so an operator can see which accounts are
     /// dormant before revoking them. Coarse (seconds) on purpose — this is not
     /// an audit log, and a precise one would make the file a write hotspot.
     #[serde(default)]
     pub last_used_at: Option<u64>,
+    /// Where the current key was last used from.
+    ///
+    /// One address, not a history: enough to notice a key being used from
+    /// somewhere it should not be, without turning the account file into a
+    /// movement log of the people using it.
+    #[serde(default)]
+    pub last_used_ip: Option<String>,
     /// Refused without being deleted: keeps the name attached to past usage
     /// while stopping the key today.
     #[serde(default)]
@@ -310,7 +327,9 @@ impl Store {
             email: email.to_owned(),
             key_hash: hash_key(&key),
             created_at: now_secs(),
+            first_used_at: None,
             last_used_at: None,
+            last_used_ip: None,
             disabled: false,
             weight: default_weight(),
         };
@@ -338,6 +357,12 @@ impl Store {
             .find(|a| a.id == id)
             .ok_or_else(|| Error::NotFound(who.to_owned()))?;
         account.key_hash = hash;
+        // A new key has its own history. Carrying the old key's dates over
+        // would misreport when THIS credential was first seen — which is the
+        // one question these fields exist to answer.
+        account.first_used_at = None;
+        account.last_used_at = None;
+        account.last_used_ip = None;
         let out = account.clone();
         self.reindex();
         self.save()?;
@@ -410,19 +435,33 @@ impl Store {
         Ok(gone)
     }
 
-    /// Stamp an account as having been used. Best-effort: a failed write must
-    /// not fail the request it is describing.
-    pub fn touch(&mut self, id: &str) {
-        if let Some(a) = self.accounts.iter_mut().find(|a| a.id == id) {
+    /// Stamp an account as having been used, from `ip`.
+    ///
+    /// Best-effort: a failed write must not fail the request it is describing.
+    pub fn touch(&mut self, id: &str, ip: Option<&str>) {
+        let persist = if let Some(a) = self.accounts.iter_mut().find(|a| a.id == id) {
             let now = now_secs();
-            // One write per minute per account at most. Without this every
-            // proxied request rewrites the file.
-            if a.last_used_at.is_some_and(|t| now.saturating_sub(t) < 60) {
-                return;
+            // First use of a key, and any change of address, are worth a write
+            // immediately — they are the two things someone reviewing access
+            // actually looks for. Ordinary traffic is coalesced to one write a
+            // minute, or every proxied request would rewrite the file.
+            let first = a.first_used_at.is_none();
+            let moved = ip.is_some() && a.last_used_ip.as_deref() != ip;
+            let stale = a.last_used_at.is_none_or(|t| now.saturating_sub(t) >= 60);
+            if first {
+                a.first_used_at = Some(now);
+            }
+            if let Some(ip) = ip {
+                a.last_used_ip = Some(ip.to_owned());
             }
             a.last_used_at = Some(now);
+            first || moved || stale
+        } else {
+            false
+        };
+        if persist {
+            let _ = self.save();
         }
-        let _ = self.save();
     }
 
     /// Write the file: temp + rename, 0600.
@@ -514,6 +553,52 @@ mod tests {
         s.remove("grace@example.org").expect("remove");
         assert!(s.authenticate(&grace_key).is_none());
         assert!(s.authenticate(&ada_key).is_some());
+    }
+
+    /// A key's own history: when it was first used, last used, and from where.
+    #[test]
+    fn a_key_records_when_and_where_it_was_used() {
+        let (mut s, _d) = store();
+        let (ada, key) = s.add("Ada", "Lovelace", "ada@example.org").expect("add");
+        // Issued but never used is a state worth being able to see.
+        assert_eq!(ada.first_used_at, None);
+        assert_eq!(ada.last_used_ip, None);
+
+        s.touch(&ada.id, Some("203.0.113.7"));
+        let seen = s.find("ada@example.org").expect("account").clone();
+        assert!(seen.first_used_at.is_some());
+        assert_eq!(
+            seen.last_used_at, seen.first_used_at,
+            "first use is also the last so far"
+        );
+        assert_eq!(seen.last_used_ip.as_deref(), Some("203.0.113.7"));
+
+        // A later call from elsewhere moves last_used_ip but never first_used.
+        s.touch(&ada.id, Some("198.51.100.4"));
+        let moved = s.find("ada@example.org").expect("account").clone();
+        assert_eq!(moved.first_used_at, seen.first_used_at, "first use is set once");
+        assert_eq!(moved.last_used_ip.as_deref(), Some("198.51.100.4"));
+        assert!(s.authenticate(&key).is_some(), "none of this disturbs the key");
+    }
+
+    /// The dates describe the KEY, not the person: after a rotate, reporting
+    /// when the old key was first used would be a lie about the credential
+    /// being looked at.
+    #[test]
+    fn rotating_starts_the_history_over() {
+        let (mut s, _d) = store();
+        let (ada, _key) = s.add("Ada", "Lovelace", "ada@example.org").expect("add");
+        s.touch(&ada.id, Some("203.0.113.7"));
+        assert!(s.find("ada@example.org").expect("a").first_used_at.is_some());
+
+        let (rotated, _new_key) = s.rotate("ada@example.org").expect("rotate");
+        assert_eq!(rotated.first_used_at, None);
+        assert_eq!(rotated.last_used_at, None);
+        assert_eq!(rotated.last_used_ip, None);
+        // The account itself is untouched — this is the key's history, not the
+        // person's.
+        assert_eq!(rotated.email, "ada@example.org");
+        assert_eq!(rotated.created_at, ada.created_at);
     }
 
     #[test]
