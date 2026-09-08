@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use clap::{Parser, Subcommand};
 use tab_atelier_proxy::users::{Account, Store};
-use tab_atelier_proxy::{admin_token, server, state_dir, web_root};
+use tab_atelier_proxy::{admin_token, config_dir, server, state_dir, web_root};
 
 #[derive(Parser)]
 #[command(
@@ -125,8 +125,19 @@ fn now_rfc3339_at(secs: u64) -> String {
 }
 
 fn store() -> Result<Store, String> {
-    let dir = state_dir()?;
-    Store::load(dir.join("users.json")).map_err(|e| e.to_string())
+    let dir = config_dir()?;
+    let path = dir.join("users.json");
+    // The accounts used to sit in the state dir. Move them once rather than
+    // reading from either place forever — two possible homes for the file that
+    // decides access is exactly the ambiguity worth spending a rename to kill.
+    let legacy = state_dir().map(|d| d.join("users.json")).ok().filter(|p| p.exists());
+    if let (false, Some(legacy)) = (path.exists(), legacy) {
+        let _ = std::fs::create_dir_all(&dir);
+        if std::fs::rename(&legacy, &path).is_ok() {
+            log::info!("moved accounts to {} (secrets belong under config)", path.display());
+        }
+    }
+    Store::load(path).map_err(|e| e.to_string())
 }
 
 fn print_account(a: &Account) {
@@ -159,7 +170,8 @@ fn print_new_key(a: &Account, key: &str) {
     println!("  key: {key}");
     println!("  This is the only time it is shown — the proxy stores a hash. Lost it? `rotate`.");
     println!("  On the machine that will use it:");
-    println!("    tab-atelier remote add proxy --url https://<proxy-host> --relay-token {key}");
+    println!("    tab-atelier remote add --label proxy --url https://<proxy-host> \\");
+    println!("        --relay-token {key}");
 }
 
 fn run() -> Result<(), String> {
@@ -167,8 +179,8 @@ fn run() -> Result<(), String> {
     match cli.command {
         Command::Serve { listen } => {
             let addr: SocketAddr = listen.parse().map_err(|e| format!("bad --listen {listen}: {e}"))?;
-            let dir = state_dir()?;
-            let token = admin_token(&dir)?;
+            let state = state_dir()?;
+            let token = admin_token(&config_dir()?)?;
             let store = store()?;
             let root = web_root();
             if root.is_none() {
@@ -176,10 +188,10 @@ fn run() -> Result<(), String> {
             }
             let state = Arc::new(server::State {
                 store: Mutex::new(store),
-                usage: Mutex::new(tab_atelier_proxy::usage::Store::load(dir.join("usage.json"))),
+                usage: Mutex::new(tab_atelier_proxy::usage::Store::load(state.join("usage.json"))),
                 sched: Mutex::new(tab_atelier_proxy::qos::Sched::new()),
                 account: Mutex::new(tab_atelier_proxy::account::Monitor::load(
-                    dir.join("account-usage.jsonl"),
+                    state.join("account-usage.jsonl"),
                 )),
                 wake: tokio::sync::Notify::new(),
                 admin_token: token,
@@ -201,8 +213,7 @@ fn run() -> Result<(), String> {
             })
         }
         Command::AdminToken => {
-            let dir = state_dir()?;
-            println!("{}", admin_token(&dir)?);
+            println!("{}", admin_token(&config_dir()?)?);
             Ok(())
         }
         Command::Add {

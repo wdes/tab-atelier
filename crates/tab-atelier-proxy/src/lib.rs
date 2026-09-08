@@ -42,7 +42,33 @@ pub mod users;
 
 use std::path::PathBuf;
 
-/// Where accounts and the admin token live.
+/// Where the SECRETS live: accounts (with their key hashes) and the admin
+/// token.
+///
+/// Separate from [`state_dir`] on purpose. Identity material belongs under
+/// `~/.config`, which is what people back up and what survives a "clear the
+/// caches" sweep; `~/.local/state` is for things a program can regenerate —
+/// here, the usage history. Losing state costs you a graph. Losing this costs
+/// everyone their access.
+///
+/// `$TAB_ATELIER_PROXY_CONFIG` wins, then `$XDG_CONFIG_HOME`, then
+/// `~/.config`. Under the shipped systemd unit both land in
+/// `/var/lib/tab-atelier-proxy`: a system service has no home directory, and
+/// `StateDirectory=` is the one place systemd guarantees is writable and
+/// 0700.
+///
+/// # Errors
+/// Neither the override nor `$HOME` is set, so there is nowhere to put it.
+pub fn config_dir() -> Result<PathBuf, String> {
+    resolve_dir(
+        std::env::var_os("TAB_ATELIER_PROXY_CONFIG").map(PathBuf::from),
+        std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+        ".config",
+    )
+}
+
+/// Where the usage history lives.
 ///
 /// `$TAB_ATELIER_PROXY_STATE` wins, then `$XDG_STATE_HOME`, then
 /// `~/.local/state`. Under the shipped systemd unit this lands in
@@ -51,10 +77,11 @@ use std::path::PathBuf;
 /// # Errors
 /// Neither the override nor `$HOME` is set, so there is nowhere to put it.
 pub fn state_dir() -> Result<PathBuf, String> {
-    resolve_state_dir(
+    resolve_dir(
         std::env::var_os("TAB_ATELIER_PROXY_STATE").map(PathBuf::from),
         std::env::var_os("XDG_STATE_HOME").map(PathBuf::from),
         std::env::var_os("HOME").map(PathBuf::from),
+        ".local/state",
     )
 }
 
@@ -62,13 +89,11 @@ pub fn state_dir() -> Result<PathBuf, String> {
 ///
 /// Mutating the process environment in a test is both `unsafe` (forbidden in
 /// this crate) and racy with every other test in the binary.
-///
-/// # Errors
-/// Nothing usable was supplied.
-fn resolve_state_dir(
+fn resolve_dir(
     explicit: Option<PathBuf>,
     xdg: Option<PathBuf>,
     home: Option<PathBuf>,
+    home_relative: &str,
 ) -> Result<PathBuf, String> {
     if let Some(p) = explicit {
         return Ok(p);
@@ -76,14 +101,14 @@ fn resolve_state_dir(
     if let Some(p) = xdg {
         return Ok(p.join("tab-atelier-proxy"));
     }
-    let home = home.ok_or("no $HOME and no $TAB_ATELIER_PROXY_STATE")?;
-    Ok(home.join(".local").join("state").join("tab-atelier-proxy"))
+    let home = home.ok_or("no $HOME and no TAB_ATELIER_PROXY_{CONFIG,STATE}")?;
+    Ok(home.join(home_relative).join("tab-atelier-proxy"))
 }
 
 /// Read the admin token, minting one on first run.
 ///
-/// Kept beside the accounts rather than in a config file so that `chmod 600`
-/// on one directory covers every secret the proxy owns.
+/// Lives beside the accounts, under [`config_dir`], so one `chmod 700` covers
+/// every secret the proxy owns.
 ///
 /// # Errors
 /// The state directory is unusable.
@@ -134,19 +159,30 @@ mod tests {
         // The explicit override wins, which is what the systemd unit relies on
         // to keep state in /var/lib rather than the service account's home.
         assert_eq!(
-            resolve_state_dir(Some(p("/explicit")), Some(p("/xdg")), Some(p("/home/u"))).expect("dir"),
+            resolve_dir(
+                Some(p("/explicit")),
+                Some(p("/xdg")),
+                Some(p("/home/u")),
+                ".local/state"
+            )
+            .expect("dir"),
             p("/explicit")
         );
         assert_eq!(
-            resolve_state_dir(None, Some(p("/xdg")), Some(p("/home/u"))).expect("dir"),
+            resolve_dir(None, Some(p("/xdg")), Some(p("/home/u")), ".local/state").expect("dir"),
             p("/xdg/tab-atelier-proxy")
         );
         assert_eq!(
-            resolve_state_dir(None, None, Some(p("/home/u"))).expect("dir"),
+            resolve_dir(None, None, Some(p("/home/u")), ".local/state").expect("dir"),
             p("/home/u/.local/state/tab-atelier-proxy")
         );
         // Nowhere to put accounts is an error, not a guess at /tmp.
-        assert!(resolve_state_dir(None, None, None).is_err());
+        assert!(resolve_dir(None, None, None, ".local/state").is_err());
+        // Secrets and history are deliberately different directories.
+        assert_eq!(
+            resolve_dir(None, None, Some(p("/home/u")), ".config").expect("dir"),
+            p("/home/u/.config/tab-atelier-proxy")
+        );
     }
 
     #[test]
