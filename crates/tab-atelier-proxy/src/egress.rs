@@ -262,6 +262,120 @@ pub fn account_usage() -> Result<(u16, String), String> {
     Ok((status, body))
 }
 
+/// One timed probe of the upstream API.
+#[derive(Debug, Clone)]
+pub struct Probe {
+    pub label: &'static str,
+    pub status: Option<u16>,
+    pub elapsed: Duration,
+    pub note: String,
+}
+
+/// Time the round trip to Anthropic, in the stages that can fail separately.
+///
+/// A slow proxy is usually not the proxy. Splitting the trip apart says which
+/// part is slow instead of leaving an operator to guess:
+///
+/// * **token** — reading (and possibly refreshing) the local OAuth credential.
+///   Slow here means the refresh endpoint, not the API.
+/// * **connect** — DNS plus TCP plus TLS to the upstream host, measured by a
+///   request that does no model work.
+/// * **round trip** — a real `/v1/messages` call with a one-token completion.
+///   This is the number that matters, and it is the only one that includes
+///   the model actually thinking.
+///
+/// The last one costs a handful of tokens against the shared plan. That is the
+/// price of measuring the thing people actually wait for; a HEAD request to an
+/// unrelated path would measure the CDN and tell you nothing.
+#[must_use]
+pub fn probe_round_trip(model: &str) -> Vec<Probe> {
+    let mut out = Vec::new();
+
+    let started = std::time::Instant::now();
+    let token = match oauth_access_token() {
+        Ok(t) => {
+            out.push(Probe {
+                label: "credential",
+                status: None,
+                elapsed: started.elapsed(),
+                note: "local OAuth token read (refreshed if it was near expiry)".to_owned(),
+            });
+            t
+        }
+        Err(e) => {
+            out.push(Probe {
+                label: "credential",
+                status: None,
+                elapsed: started.elapsed(),
+                note: format!("FAILED: {e}"),
+            });
+            return out;
+        }
+    };
+
+    let agent = relay_agent();
+    let base = upstream();
+
+    // Reachability only: the endpoint Claude Code itself probes, which does no
+    // model work, so this isolates DNS + TCP + TLS from generation time.
+    let started = std::time::Instant::now();
+    match agent.get(&format!("{base}/api/hello")).call() {
+        Ok(r) => out.push(Probe {
+            label: "connect",
+            status: Some(r.status().as_u16()),
+            elapsed: started.elapsed(),
+            note: "DNS + TCP + TLS to the API host".to_owned(),
+        }),
+        Err(e) => out.push(Probe {
+            label: "connect",
+            status: None,
+            elapsed: started.elapsed(),
+            note: format!("FAILED: {e}"),
+        }),
+    }
+
+    // The real thing: a one-token completion.
+    let body = serde_json::json!({
+        "model": model,
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "ping"}],
+    });
+    let started = std::time::Instant::now();
+    let sent = agent
+        .post(&format!("{base}/v1/messages"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("anthropic-version", ANTHROPIC_VERSION)
+        .header("anthropic-beta", ANTHROPIC_BETA)
+        .header("Content-Type", "application/json")
+        .send_json(&body);
+    match sent {
+        Ok(mut r) => {
+            let status = r.status().as_u16();
+            let text = r.body_mut().read_to_string().unwrap_or_default();
+            let note = if (200..300).contains(&status) {
+                format!("{model} answered")
+            } else {
+                // The body is where upstream says WHY — an overloaded 529 and
+                // a 400 about the model name need different responses.
+                text.chars().take(160).collect::<String>()
+            };
+            out.push(Probe {
+                label: "round trip",
+                status: Some(status),
+                elapsed: started.elapsed(),
+                note,
+            });
+        }
+        Err(e) => out.push(Probe {
+            label: "round trip",
+            status: None,
+            elapsed: started.elapsed(),
+            note: format!("FAILED: {e}"),
+        }),
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::merge_beta;
