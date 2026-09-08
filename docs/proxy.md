@@ -68,6 +68,31 @@ you again — lost key, `rotate`. (A fast hash is right here: the key is 32 byte
 of CSPRNG output, so there is no dictionary to run against it, and a slow KDF
 would only add latency to every proxied request.)
 
+## Is it the proxy, or is it Anthropic?
+
+```sh
+tab-atelier-proxy ping --count 3
+```
+
+```
+upstream: https://api.anthropic.com
+  credential      —         0 ms   local OAuth token read (refreshed if it was near expiry)
+  connect       200       288 ms   DNS + TCP + TLS to the API host
+  round trip    200       701 ms   claude-haiku-4-5-20251001 answered
+
+round trip over 3 probes: min 701 ms · mean 768 ms · max 826 ms
+```
+
+Three stages because they fail for different reasons: a slow **credential**
+stage is the OAuth refresh endpoint, not the API; **connect** is DNS, TCP and
+TLS with no model work in it; **round trip** is a real one-token completion,
+which is the number people actually wait for. It exits non-zero if any stage
+fails, so it works as a monitoring probe and not only by eye.
+
+It costs a handful of tokens against the shared plan. That is the price of
+measuring the thing that matters — a HEAD to some unrelated path would time
+the CDN and tell you nothing.
+
 ## Web UI
 
 Browse to the proxy and paste the admin token:

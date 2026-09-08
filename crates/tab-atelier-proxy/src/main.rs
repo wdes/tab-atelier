@@ -33,6 +33,15 @@ enum Command {
     },
     /// Print the admin token (minting it on first run).
     AdminToken,
+    /// Time the round trip to the Anthropic API, stage by stage.
+    Ping {
+        /// Model to ask for the one-token completion.
+        #[arg(long, default_value = "claude-haiku-4-5-20251001")]
+        model: String,
+        /// Repeat this many times and report the spread.
+        #[arg(long, default_value_t = 1)]
+        count: u32,
+    },
     /// Add an account and print its key. The key is shown once.
     Add {
         first_name: String,
@@ -122,6 +131,48 @@ fn now_rfc3339_at(secs: u64) -> String {
     let month = if month_pos < 10 { month_pos + 3 } else { month_pos - 9 };
     let year = if month <= 2 { year + 1 } else { year };
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// Time the trip to Anthropic and print where it went.
+///
+/// Exits non-zero if any stage failed, so it is usable as a health check in a
+/// script or a monitoring probe rather than only by eye.
+fn ping(model: &str, count: u32) -> Result<(), String> {
+    println!("upstream: {}", tab_atelier_proxy::egress::upstream());
+    let mut round_trips = Vec::new();
+    let mut failed = false;
+    for i in 0..count.max(1) {
+        if count > 1 {
+            println!("\n— probe {} of {count}", i + 1);
+        }
+        for p in tab_atelier_proxy::egress::probe_round_trip(model) {
+            let ms = p.elapsed.as_secs_f64() * 1000.0;
+            let status = p.status.map_or_else(|| "   —".to_owned(), |s| format!("{s:>4}"));
+            println!("  {:<12} {status}  {ms:>8.0} ms   {}", p.label, p.note);
+            if p.note.starts_with("FAILED") || p.status.is_some_and(|s| !(200..300).contains(&s)) {
+                failed = true;
+            }
+            if p.label == "round trip" {
+                round_trips.push(ms);
+            }
+        }
+    }
+    if round_trips.len() > 1 {
+        // Min and max, not an average: what people feel is the slow one, and a
+        // mean hides it behind the fast ones.
+        let min = round_trips.iter().copied().fold(f64::INFINITY, f64::min);
+        let max = round_trips.iter().copied().fold(0.0_f64, f64::max);
+        // A probe count is a handful; f64::from a u32 is exact and needs no cast lint.
+        let mean = round_trips.iter().sum::<f64>() / f64::from(u32::try_from(round_trips.len()).unwrap_or(1));
+        println!(
+            "\nround trip over {} probes: min {min:.0} ms · mean {mean:.0} ms · max {max:.0} ms",
+            round_trips.len()
+        );
+    }
+    if failed {
+        return Err("at least one stage failed — see above".to_owned());
+    }
+    Ok(())
 }
 
 fn store() -> Result<Store, String> {
@@ -214,6 +265,7 @@ fn run() -> Result<(), String> {
             println!("{}", admin_token(&config_dir()?)?);
             Ok(())
         }
+        Command::Ping { model, count } => ping(&model, count),
         Command::Add {
             first_name,
             last_name,
