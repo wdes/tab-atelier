@@ -289,7 +289,19 @@
                     {{ shareOf(u) }}
                   </div>
                 </td>
-                <td class="small text-body-secondary">{{ ago(u.last_used_at) }}</td>
+                <td class="small text-body-secondary">
+                  <div>{{ ago(u.last_used_at) }}</div>
+                  <!-- A key issued and never used is worth seeing: either
+                       someone never took up their access, or it went astray
+                       on the way to them. -->
+                  <div v-if="!u.first_used_at" class="fst-italic">never used</div>
+                  <template v-else>
+                    <div style="font-size:.75rem">first {{ ago(u.first_used_at) }}</div>
+                    <div v-if="u.last_used_ip" class="font-monospace" style="font-size:.75rem">
+                      {{ u.last_used_ip }}
+                    </div>
+                  </template>
+                </td>
                 <td class="text-end small">
                   <a href="#" @click.prevent="focus = u.id" class="text-decoration-none">
                     {{ fmt(usageOf(u.id).last_7d.tokens.total) }}
