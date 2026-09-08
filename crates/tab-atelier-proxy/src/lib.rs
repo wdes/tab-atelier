@@ -34,6 +34,7 @@
 
 pub mod egress;
 pub mod server;
+pub mod usage;
 pub mod users;
 
 use std::path::PathBuf;

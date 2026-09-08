@@ -68,6 +68,7 @@ assets = [
     ["target/release/tab-atelier-proxy", "/usr/bin/", "755"],
     ["assets/index.html", "/usr/share/tab-atelier-proxy/web/", "644"],
     ["assets/app.js", "/usr/share/tab-atelier-proxy/web/", "644"],
+    ["assets/charts.js", "/usr/share/tab-atelier-proxy/web/", "644"],
     ["assets/vendor/vue.global.prod.js", "/usr/share/tab-atelier-proxy/web/vendor/", "644"],
     ["systemd/tab-atelier-proxy.service", "/usr/lib/systemd/system/", "644"],
     ["README.md", "/usr/share/doc/tab-atelier-proxy/", "644"],
