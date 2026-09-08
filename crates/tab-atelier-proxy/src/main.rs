@@ -51,6 +51,72 @@ enum Command {
     Remove { who: String },
 }
 
+/// How often to ask Anthropic how much of the plan is left.
+///
+/// Five minutes: the five-hour window moves slowly enough that finer polling
+/// buys nothing, and this is a call against the same quota it is measuring.
+const USAGE_POLL: std::time::Duration = std::time::Duration::from_mins(5);
+
+/// Keep the shared plan's utilisation current, in the background.
+///
+/// Every reading is appended — successes and failures alike — so a gap in the
+/// log always means "the monitor was not running", never "a call failed and
+/// nobody said so". Same JSONL shape as
+/// `.claude/scripts/claude-usage-monitor.mjs`, so tooling that reads those
+/// files reads these.
+async fn poll_account_usage(state: Arc<server::State>) {
+    loop {
+        let sample = tokio::task::spawn_blocking(|| {
+            let ts = now_rfc3339();
+            match tab_atelier_proxy::egress::account_usage() {
+                Ok((status, body)) => tab_atelier_proxy::account::parse_usage(status, &body, ts),
+                Err(e) => tab_atelier_proxy::account::Sample {
+                    ts,
+                    error: Some(e),
+                    ..tab_atelier_proxy::account::Sample::default()
+                },
+            }
+        })
+        .await;
+        if let Ok(sample) = sample {
+            match sample.utilization() {
+                Some(u) => log::info!(
+                    "plan utilisation: {:.0}%",
+                    tab_atelier_proxy::account::as_fraction(u) * 100.0
+                ),
+                None => log::warn!("plan utilisation unknown: {:?}", sample.error),
+            }
+            state
+                .account
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(sample);
+        }
+        tokio::time::sleep(USAGE_POLL).await;
+    }
+}
+
+/// RFC3339 in UTC, without pulling in a date library for one format string.
+fn now_rfc3339() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let (hour, minute, second) = ((secs % 86_400) / 3600, (secs % 3600) / 60, secs % 60);
+    // Civil-from-days (Howard Hinnant's algorithm), so the timestamp is a real
+    // date rather than an epoch count nobody can read on a dashboard.
+    let shifted = i64::try_from(secs / 86_400).unwrap_or(0) + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_pos = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_pos + 2) / 5 + 1;
+    let month = if month_pos < 10 { month_pos + 3 } else { month_pos - 9 };
+    let year = if month <= 2 { year + 1 } else { year };
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
 fn store() -> Result<Store, String> {
     let dir = state_dir()?;
     Store::load(dir.join("users.json")).map_err(|e| e.to_string())
@@ -104,6 +170,11 @@ fn run() -> Result<(), String> {
             let state = Arc::new(server::State {
                 store: Mutex::new(store),
                 usage: Mutex::new(tab_atelier_proxy::usage::Store::load(dir.join("usage.json"))),
+                sched: Mutex::new(tab_atelier_proxy::qos::Sched::new()),
+                account: Mutex::new(tab_atelier_proxy::account::Monitor::load(
+                    dir.join("account-usage.jsonl"),
+                )),
+                wake: tokio::sync::Notify::new(),
                 admin_token: token,
                 web_root: root,
             });
@@ -112,6 +183,7 @@ fn run() -> Result<(), String> {
                 .build()
                 .map_err(|e| format!("runtime: {e}"))?;
             rt.block_on(async {
+                tokio::spawn(poll_account_usage(Arc::clone(&state)));
                 tokio::select! {
                     r = server::serve(addr, state) => r,
                     _ = tokio::signal::ctrl_c() => {

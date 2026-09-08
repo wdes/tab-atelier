@@ -32,7 +32,10 @@
 //! it never leaves the machine, and a leaked user key cannot be replayed
 //! against Anthropic directly.
 
+pub mod account;
 pub mod egress;
+pub mod fallback;
+pub mod qos;
 pub mod server;
 pub mod usage;
 pub mod users;

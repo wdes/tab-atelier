@@ -25,9 +25,8 @@ use hyper::body::{Frame, Incoming};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response};
 
-use crate::egress;
-use crate::usage;
 use crate::users::{Account, Store, constant_time_eq};
+use crate::{account, egress, fallback, qos, usage};
 
 type Body = http_body_util::combinators::BoxBody<Bytes, Infallible>;
 
@@ -37,6 +36,13 @@ pub struct State {
     /// Separate lock from the accounts: recording usage happens on every
     /// proxied request, and it must not queue behind an admin listing users.
     pub usage: Mutex<usage::Store>,
+    /// Who goes next when the shared quota is tight.
+    pub sched: Mutex<qos::Sched>,
+    /// How much of the shared plan is left, polled from upstream.
+    pub account: Mutex<account::Monitor>,
+    /// Woken when capacity frees up, so a queued call retries promptly instead
+    /// of sitting out its full backoff.
+    pub wake: tokio::sync::Notify,
     pub admin_token: String,
     pub web_root: Option<std::path::PathBuf>,
 }
@@ -60,6 +66,13 @@ fn json(code: u16, body: &str) -> Response<Body> {
         .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()).boxed()))
 }
 
+#[must_use]
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
 fn account_json(a: &Account) -> serde_json::Value {
     // Never the key hash. It is not a secret you can use, but it is the input
     // to an offline guess, and the UI has no reason to hold it.
@@ -71,6 +84,7 @@ fn account_json(a: &Account) -> serde_json::Value {
         "created_at": a.created_at,
         "last_used_at": a.last_used_at,
         "disabled": a.disabled,
+        "weight": a.weight,
         "has_key": !a.key_hash.is_empty(),
     })
 }
@@ -201,6 +215,14 @@ async fn anthropic(req: Request<Incoming>, state: Arc<State>) -> Response<Body> 
         Err(_) => return text(400, "bad request body"),
     };
 
+    // Only /v1/messages spends tokens; a metadata call should not queue
+    // behind a fleet's generations.
+    let metered = is_post && sub.contains("/messages");
+    let (body, swapped) = match shape_and_admit(&state, &account, body, metered).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+
     let fwd = Forward {
         sub_pq,
         is_post,
@@ -208,6 +230,8 @@ async fn anthropic(req: Request<Incoming>, state: Arc<State>) -> Response<Body> 
         client_beta,
         body,
         account_id: account.id.clone(),
+        weight: account.weight,
+        metered,
         state: Arc::clone(&state),
     };
     // Bridge ureq's blocking reader to an async hyper stream: the blocking task
@@ -230,9 +254,148 @@ async fn anthropic(req: Request<Incoming>, state: Arc<State>) -> Response<Body> 
     if let Some(ct) = meta.1 {
         builder = builder.header("content-type", ct);
     }
+    // Never degrade silently: a caller given a cheaper answer than it asked
+    // for is entitled to know, or results stop being reproducible.
+    if let Some((from, to)) = swapped {
+        builder = builder.header("x-tab-atelier-proxy-fallback", format!("{from} -> {to}"));
+    }
     builder
         .body(StreamBody::new(stream).boxed())
         .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()).boxed()))
+}
+
+/// Degrade the request if the plan is tight, then wait for a turn.
+///
+/// Returns the (possibly rewritten) body and what was swapped, or the 429 to
+/// send back. Split out of `anthropic` because it is the whole `QoS` decision
+/// and reads better as one unit than inline in the middle of the forwarder.
+async fn shape_and_admit(
+    state: &Arc<State>,
+    account: &Account,
+    body: Bytes,
+    metered: bool,
+) -> Result<(Bytes, Option<(String, String)>), Response<Body>> {
+    if !metered {
+        return Ok((body, None));
+    }
+    // Degrade before admission, not after: a downgraded call is cheaper, so it
+    // should be judged at the price it will actually pay.
+    let util = state
+        .account
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .utilization();
+    let (body, swapped) = fallback::rewrite_body(&body, util, account.weight).map_or_else(
+        || (body.clone(), None),
+        |(rewritten, from, to)| {
+            log::info!(
+                "proxy: {} degraded {from} → {to} (plan at {:.0}%)",
+                account.display_name(),
+                util.unwrap_or(0.0) * 100.0
+            );
+            (Bytes::from(rewritten), Some((from, to)))
+        },
+    );
+
+    let est = qos::estimate_cost(&body);
+    if let Err(retry_after) = admit(state, &account.id, account.weight, est).await {
+        log::warn!(
+            "proxy: 429 for {} after waiting — retry in {retry_after}s",
+            account.display_name()
+        );
+        let mut resp = text(
+            429,
+            &format!("tab-atelier-proxy: the shared quota is saturated; retry in {retry_after}s"),
+        );
+        if let Ok(v) = hyper::header::HeaderValue::from_str(&retry_after.to_string()) {
+            resp.headers_mut().insert(hyper::header::RETRY_AFTER, v);
+        }
+        // A refused call still happened, and an operator looking at a quiet
+        // graph should see the refusals.
+        record(state, &account.id, None, usage::Tokens::default(), 429);
+        return Err(resp);
+    }
+    Ok((body, swapped))
+}
+
+/// Per-account usage for the dashboard.
+fn usage_report(state: &Arc<State>, store: &Store, query: &str) -> Response<Body> {
+    let hours = path_hours(query).unwrap_or(24 * 7).clamp(1, usage::RETAIN_HOURS);
+    let body = {
+        let u = state.usage.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let per_user: Vec<_> = store
+            .accounts()
+            .iter()
+            .map(|a| {
+                let mut v = usage_json(&u, &a.id, hours);
+                if let Some(o) = v.as_object_mut() {
+                    o.insert("user".to_owned(), account_json(a));
+                }
+                v
+            })
+            .collect();
+        serde_json::json!({ "hours": hours, "users": per_user }).to_string()
+    };
+    json(200, &body)
+}
+
+/// What the dashboard shows about pressure: what the plan says about itself,
+/// and what the scheduler is doing about it.
+fn pressure_json(state: &Arc<State>) -> Response<Body> {
+    let now = now_ms();
+    // One tiny scope per lock: both are on the request path, so neither is
+    // held across the other or across building the response.
+    let plan = {
+        let acct = state.account.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        serde_json::json!({
+            // The honest signal — upstream's own report about the shared plan,
+            // not an inference from our accounting.
+            "utilization": acct.utilization(),
+            "latest": acct.latest(),
+            "history": acct.recent(),
+        })
+    };
+    let scheduler = {
+        let sched = state.sched.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        sched.snapshot(now)
+    };
+    json(
+        200,
+        &serde_json::json!({
+            "plan": plan,
+            "scheduler": scheduler,
+            "degrade_above": fallback::DEGRADE_ABOVE,
+            "floor_above": fallback::FLOOR_ABOVE,
+        })
+        .to_string(),
+    )
+}
+
+/// Wait for the scheduler to let this call through.
+///
+/// Queue-then-reject: hold briefly for a turn, and past [`qos::MAX_WAIT`]
+/// answer 429 with a figure the client can act on. Holding a connection open
+/// indefinitely is worse for everyone — the client would retry anyway, and
+/// meanwhile the socket and its task are spent doing nothing.
+///
+/// Returns `Err(retry_after_secs)` when the caller should be turned away.
+async fn admit(state: &Arc<State>, id: &str, weight: u32, est: u64) -> Result<(), u64> {
+    let started = std::time::Instant::now();
+    loop {
+        let decision = {
+            let mut sched = state.sched.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            sched.try_admit(id, weight, est, now_ms(), started.elapsed())
+        };
+        match decision {
+            qos::Decision::Go { .. } => return Ok(()),
+            qos::Decision::Reject { retry_after } => return Err(retry_after),
+            qos::Decision::Wait(d) => {
+                // Woken early when a call settles and frees capacity, so a
+                // queued request does not sit out a full sleep for nothing.
+                let _ = tokio::time::timeout(d, state.wake.notified()).await;
+            }
+        }
+    }
 }
 
 /// One request on its way upstream, moved into the blocking task.
@@ -242,6 +405,10 @@ struct Forward {
     content_type: String,
     client_beta: Option<String>,
     body: Bytes,
+    weight: u32,
+    /// Whether this call was admitted by the scheduler, and so has an estimate
+    /// outstanding that must be settled.
+    metered: bool,
     /// Who to bill. Carried down rather than looked up again, because by the
     /// time the response finishes the account may have been deleted — the call
     /// still happened and still spent tokens.
@@ -310,6 +477,28 @@ fn forward(
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
+    // Capacity is measured, not invented: Anthropic reports what is left on
+    // every response, so the scheduler tracks the real plan rather than a
+    // number somebody typed into a config.
+    let header_num = |name: &str| {
+        resp.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+    };
+    let remaining = header_num("anthropic-ratelimit-tokens-remaining");
+    let reset_in = header_num("anthropic-ratelimit-tokens-reset");
+    let retry_after = header_num("retry-after");
+    {
+        let mut sched = f.state.sched.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if status == 429 {
+            // Everyone stops. Continuing to send is what turns one 429 into a
+            // sustained outage for the whole fleet.
+            sched.on_429(retry_after, now_ms());
+        } else {
+            sched.observe(remaining, reset_in, now_ms());
+        }
+    }
     // Count what Anthropic says it billed, read off the response as it goes
     // past. Asking the client to report its own usage would be unenforceable,
     // and re-tokenising the prompt here would be a guess.
@@ -335,6 +524,21 @@ fn forward(
     }
     let (model, tokens) = sniffer.finish();
     record(&f.state, &f.account_id, model.as_deref(), tokens, status);
+    if f.metered {
+        // Replace the estimate with what it really cost. An underestimate is
+        // owed back out of the next turn; an overestimate is credited, or a
+        // cautious estimator would throttle its own account forever.
+        let est = qos::estimate_cost(&f.body);
+        let actual = tokens.total().max(1);
+        f.state
+            .sched
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .settle(&f.account_id, est, actual, now_ms());
+        // Capacity just freed up; let anyone queued try again immediately.
+        f.state.wake.notify_waiters();
+    }
+    let _ = f.weight;
 }
 
 /// File one call against an account. Never fails the request it describes:
@@ -464,37 +668,38 @@ async fn admin(req: Request<Incoming>, state: Arc<State>) -> Response<Body> {
         Ok(c) => c.to_bytes(),
         Err(_) => return json(400, r#"{"error":"bad body"}"#),
     };
-    let field = |v: &serde_json::Value, k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_owned();
-    let parsed = |b: &Bytes| serde_json::from_slice::<serde_json::Value>(b).unwrap_or(serde_json::Value::Null);
+
+    // Reports first: they take their own locks, so they must not run while the
+    // account store is held for a mutation.
+    match (&method, path.as_str()) {
+        (&Method::GET, "/api/pressure") => return pressure_json(&state),
+        (&Method::GET, "/api/usage") => {
+            let store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            return usage_report(&state, &store, &query);
+        }
+        _ => {}
+    }
+    mutate(&state, &method, &path, &body)
+}
+
+/// The account-mutating half of the admin API.
+fn mutate(state: &Arc<State>, method: &Method, path: &str, body: &Bytes) -> Response<Body> {
+    let parsed = serde_json::from_slice::<serde_json::Value>(body).unwrap_or(serde_json::Value::Null);
+    let field = |k: &str| parsed.get(k).and_then(|x| x.as_str()).unwrap_or("").to_owned();
+    let who = |suffix: &str| {
+        path.trim_start_matches("/api/users/")
+            .trim_end_matches(suffix)
+            .to_owned()
+    };
     let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    match (method, path.as_str()) {
-        (Method::GET, "/api/users") => {
+    match (method, path) {
+        (&Method::GET, "/api/users") => {
             let list: Vec<_> = store.accounts().iter().map(account_json).collect();
             json(200, &serde_json::json!({ "users": list }).to_string())
         }
-        (Method::GET, "/api/usage") => {
-            let hours = path_hours(&query).unwrap_or(24 * 7).clamp(1, usage::RETAIN_HOURS);
-            let u = state.usage.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let per_user: Vec<_> = store
-                .accounts()
-                .iter()
-                .map(|a| {
-                    let mut v = usage_json(&u, &a.id, hours);
-                    if let Some(o) = v.as_object_mut() {
-                        o.insert("user".to_owned(), account_json(a));
-                    }
-                    v
-                })
-                .collect();
-            json(
-                200,
-                &serde_json::json!({ "hours": hours, "users": per_user }).to_string(),
-            )
-        }
-        (Method::POST, "/api/users") => {
-            let v = parsed(&body);
-            match store.add(&field(&v, "first_name"), &field(&v, "last_name"), &field(&v, "email")) {
+        (&Method::POST, "/api/users") => {
+            match store.add(&field("first_name"), &field("last_name"), &field("email")) {
                 // The key is in this response and in no other, ever. The UI
                 // shows it once and says so.
                 Ok((a, key)) => json(
@@ -504,28 +709,35 @@ async fn admin(req: Request<Incoming>, state: Arc<State>) -> Response<Body> {
                 Err(e) => json(400, &serde_json::json!({ "error": e.to_string() }).to_string()),
             }
         }
-        (Method::POST, p) if p.ends_with("/rotate") => {
-            let who = p.trim_start_matches("/api/users/").trim_end_matches("/rotate");
-            match store.rotate(who) {
-                Ok((a, key)) => json(
-                    200,
-                    &serde_json::json!({ "user": account_json(&a), "key": key }).to_string(),
-                ),
-                Err(e) => json(404, &serde_json::json!({ "error": e.to_string() }).to_string()),
-            }
-        }
-        (Method::POST, p) if p.ends_with("/disabled") => {
-            let who = p.trim_start_matches("/api/users/").trim_end_matches("/disabled");
-            let disabled = parsed(&body)
+        (&Method::POST, p) if p.ends_with("/rotate") => match store.rotate(&who("/rotate")) {
+            Ok((a, key)) => json(
+                200,
+                &serde_json::json!({ "user": account_json(&a), "key": key }).to_string(),
+            ),
+            Err(e) => json(404, &serde_json::json!({ "error": e.to_string() }).to_string()),
+        },
+        (&Method::POST, p) if p.ends_with("/disabled") => {
+            let disabled = parsed
                 .get("disabled")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(true);
-            match store.set_disabled(who, disabled) {
+            match store.set_disabled(&who("/disabled"), disabled) {
                 Ok(a) => json(200, &serde_json::json!({ "user": account_json(&a) }).to_string()),
                 Err(e) => json(404, &serde_json::json!({ "error": e.to_string() }).to_string()),
             }
         }
-        (Method::DELETE, p) if p.starts_with("/api/users/") => {
+        (&Method::POST, p) if p.ends_with("/weight") => {
+            let weight = parsed
+                .get("weight")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|w| u32::try_from(w).ok())
+                .unwrap_or(1);
+            match store.set_weight(&who("/weight"), weight) {
+                Ok(a) => json(200, &serde_json::json!({ "user": account_json(&a) }).to_string()),
+                Err(e) => json(404, &serde_json::json!({ "error": e.to_string() }).to_string()),
+            }
+        }
+        (&Method::DELETE, p) if p.starts_with("/api/users/") => {
             match store.remove(p.trim_start_matches("/api/users/")) {
                 Ok(a) => {
                     // Deleting someone forgets their history too, or "remove"
@@ -642,6 +854,11 @@ mod tests {
         let state = State {
             store: Mutex::new(Store::load(std::env::temp_dir().join("ta-proxy-web-test.json")).expect("store")),
             usage: Mutex::new(usage::Store::load(std::env::temp_dir().join("ta-proxy-web-usage.json"))),
+            sched: Mutex::new(qos::Sched::new()),
+            account: Mutex::new(account::Monitor::load(
+                std::env::temp_dir().join("ta-proxy-web-account.jsonl"),
+            )),
+            wake: tokio::sync::Notify::new(),
             admin_token: "t".to_owned(),
             web_root: Some(std::path::PathBuf::from("/usr/share/tab-atelier-proxy/web")),
         };
@@ -671,10 +888,85 @@ mod tests {
             created_at: 1,
             last_used_at: None,
             disabled: false,
+            weight: 1,
         };
         let json = account_json(&a).to_string();
         assert!(!json.contains("deadbeef"), "the key hash must not reach the UI: {json}");
         assert!(json.contains("ada@example.org"));
         assert!(json.contains("\"has_key\":true"));
+    }
+}
+
+#[cfg(test)]
+mod ui_tests {
+    /// The UI's HTML must be well-formed enough for Vue to compile it.
+    ///
+    /// Vue compiles `index.html`'s body as a template at runtime, so a
+    /// malformed comment or an unbalanced tag is not a cosmetic problem: the
+    /// compile throws and NOTHING renders. A blank page with one console line
+    /// is the worst failure mode in this UI, and it has happened twice — once
+    /// from a `->` typo closing a comment, which swallowed the rest of the
+    /// template.
+    ///
+    /// This checks the two structural properties that caused it. It is not an
+    /// HTML parser and does not try to be; `@vue/compiler-dom` is the real
+    /// authority, but requiring node in the test run to reach it would cost
+    /// more than it is worth for the failure it catches.
+    #[test]
+    fn the_ui_html_is_structurally_sound() {
+        let html = include_str!("../assets/index.html");
+
+        // Every comment must close. An unclosed one eats everything after it.
+        let opens = html.matches("<!--").count();
+        let closes = html.matches("-->").count();
+        assert_eq!(
+            opens, closes,
+            "unbalanced HTML comments in index.html ({opens} <!-- vs {closes} -->) — \
+             an unclosed comment swallows the rest of the template and Vue renders nothing"
+        );
+
+        // And the elements Vue cares about must balance.
+        let mut depth: std::collections::BTreeMap<&str, i32> = std::collections::BTreeMap::new();
+        for tag in [
+            "div", "table", "tbody", "thead", "tr", "td", "th", "form", "template", "p", "span",
+        ] {
+            let open = html.matches(&format!("<{tag} ")).count() + html.matches(&format!("<{tag}>")).count();
+            let close = html.matches(&format!("</{tag}>")).count();
+            if open != close {
+                depth.insert(
+                    tag,
+                    i32::try_from(open).unwrap_or(0) - i32::try_from(close).unwrap_or(0),
+                );
+            }
+        }
+        assert!(depth.is_empty(), "unbalanced tags in index.html: {depth:?}");
+
+        // Self-closing syntax on a component is the subtle one, and it is
+        // invisible to a string-based template compiler.
+        //
+        // `<my-chart />` is honoured when Vue compiles a template STRING. This
+        // file is an in-DOM template: the browser's HTML parser gets it first,
+        // and HTML has no self-closing syntax for non-void elements. The slash
+        // is ignored, the tag stays open, and every following sibling becomes
+        // a CHILD of the component — which shows up as a baffling
+        // "v-else has no adjacent v-if" from somewhere far below.
+        for (i, line) in html.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed.strip_prefix('<') {
+                let name: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_lowercase() || *c == '-')
+                    .collect();
+                // Hyphen means a custom element: a Vue component, not HTML.
+                if name.contains('-') {
+                    assert!(
+                        !line.trim_end().ends_with("/>"),
+                        "index.html:{}: <{name} … /> is self-closed. HTML ignores that, so the tag \
+                         stays open and the rest of the template becomes its children:\n  {line}",
+                        i + 1
+                    );
+                }
+            }
+        }
     }
 }

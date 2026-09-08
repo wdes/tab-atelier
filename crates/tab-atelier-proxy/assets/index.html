@@ -63,6 +63,9 @@
       .ta-dot-1 { fill: var(--series-1); stroke: var(--surface-1); stroke-width: 2; }
       .ta-bar-1 { fill: var(--series-1); }
       .ta-bar-2 { fill: var(--series-2); }
+      .ta-threshold line { stroke: var(--danger); stroke-width: 1; stroke-dasharray: 4 3; opacity: .7; }
+      .ta-threshold text { fill: var(--danger); font-size: 10px; }
+      .ta-hero { font-size: 2rem; line-height: 1.1; }
       .ta-crosshair { stroke: var(--text-muted); stroke-width: 1; stroke-dasharray: 3 3; }
       .ta-tip {
         position: absolute; top: 8px; transform: translateX(-50%);
@@ -116,6 +119,42 @@
 
         <div v-if="error" class="alert alert-danger py-2 small">{{ error }}</div>
 
+        <!-- Plan pressure: the shared subscription, reported by Anthropic -->
+        <div class="ta-viz mb-4">
+          <div class="card shadow-sm mb-3" v-if="pressure">
+            <div class="card-body">
+              <div class="d-flex align-items-start mb-2">
+                <div class="flex-grow-1">
+                  <h2 class="h6 mb-1">
+                    Plan pressure
+                    <span class="text-body-secondary fw-normal">· the shared subscription</span>
+                  </h2>
+                  <div class="ta-hero" :class="planClass">
+                    <template v-if="planUtil != null">{{ Math.round(planUtil * 100) }}%</template>
+                    <template v-else>—</template>
+                  </div>
+                  <!-- Status is never colour alone: it is spelled out. -->
+                  <div class="small" :class="planClass">{{ planState }}</div>
+                </div>
+                <div class="text-end small text-body-secondary">
+                  <div v-if="plan.latest && plan.latest.seven_day != null">
+                    7-day: {{ Math.round(plan.latest.seven_day * 100) }}%
+                  </div>
+                  <div v-if="plan.latest && plan.latest.five_hour_resets">
+                    resets {{ plan.latest.five_hour_resets.replace('T',' ').replace(/\..*/,'') }}
+                  </div>
+                  <div v-if="sched.backoff_for">backing off {{ sched.backoff_for }}s</div>
+                  <div v-if="sched.rejected">{{ sched.rejected }} queued out</div>
+                </div>
+              </div>
+              <pressure-chart v-if="planSeries.length > 1" :points="planSeries" :threshold="degradeAbove"></pressure-chart>
+              <p v-else class="small text-body-secondary mb-0">
+                Collecting samples — the proxy polls the plan every five minutes.
+              </p>
+            </div>
+          </div>
+        </div>
+
         <!-- Dashboard ------------------------------------------------->
         <div class="ta-viz mb-4">
           <div class="row g-2 mb-3">
@@ -143,7 +182,7 @@
                   <option :value="720">30 d</option>
                 </select>
               </div>
-              <calls-chart :points="series" />
+              <calls-chart :points="series"></calls-chart>
             </div>
           </div>
 
@@ -160,7 +199,7 @@
                   <span class="ta-key ta-bg-2 ms-3"></span>output
                 </span>
               </div>
-              <tokens-chart :points="series" />
+              <tokens-chart :points="series"></tokens-chart>
             </div>
           </div>
 
@@ -219,6 +258,7 @@
                 <th>Name</th>
                 <th>Email</th>
                 <th>Status</th>
+                <th class="text-center">Priority</th>
                 <th>Last used</th>
                 <th class="text-end">Tokens (7 d)</th>
                 <th class="text-end">Key</th>
@@ -232,6 +272,22 @@
                   <span v-if="u.disabled" class="badge text-bg-secondary">disabled</span>
                   <span v-else-if="!u.has_key" class="badge text-bg-warning">no key</span>
                   <span v-else class="badge text-bg-success">active</span>
+                </td>
+                <td class="text-center">
+                  <select
+                    class="form-select form-select-sm mx-auto"
+                    style="width: 7.5rem"
+                    :value="u.weight"
+                    @change="setWeight(u, $event.target.value)"
+                    :disabled="busy"
+                  >
+                    <option v-for="t in tiersFor(u)" :key="t.weight" :value="t.weight">{{ t.label }}</option>
+                  </select>
+                  <!-- The number means nothing on its own; the share it works
+                       out to is the thing being decided. -->
+                  <div class="text-body-secondary" style="font-size:.75rem">
+                    {{ shareOf(u) }}
+                  </div>
                 </td>
                 <td class="small text-body-secondary">{{ ago(u.last_used_at) }}</td>
                 <td class="text-end small">
@@ -294,6 +350,13 @@
         <p class="text-body-secondary small mt-3">
           A key opens the Anthropic path and its own usage, and nothing else — it cannot
           reach this page. Disabling keeps the account and its history; deleting forgets both.
+        </p>
+        <p class="text-body-secondary small">
+          <strong>Priority</strong> only decides who waits when the plan is busy. With
+          capacity to spare everyone is served regardless, so raising someone costs the
+          others nothing until it is actually contended — and an idle account's share goes
+          to whoever is working, never unused. Everyone is Normal unless changed; raising
+          one person is how you lower the rest.
         </p>
       </template>
     </div>

@@ -13,7 +13,7 @@ use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 
 use tab_atelier_proxy::server::{State, serve_on};
-use tab_atelier_proxy::{egress, usage, users::Store};
+use tab_atelier_proxy::{account, egress, qos, usage, users::Store};
 
 /// A mock Anthropic that records what it was sent, then streams two SSE frames
 /// with a gap between them and closes.
@@ -94,6 +94,9 @@ fn a_users_key_is_exchanged_for_the_proxys_claude_token() {
     let state = Arc::new(State {
         store: Mutex::new(store),
         usage: Mutex::new(usage::Store::load(dir.join("usage.json"))),
+        sched: Mutex::new(qos::Sched::new()),
+        account: Mutex::new(account::Monitor::load(dir.join("account.jsonl"))),
+        wake: tokio::sync::Notify::new(),
         admin_token: "tap_admin_not_valid_here".to_owned(),
         web_root: None,
     });
@@ -167,6 +170,9 @@ fn a_revoked_key_stops_working_without_reaching_upstream() {
     let state = Arc::new(State {
         store: Mutex::new(store),
         usage: Mutex::new(usage::Store::load(dir.join("usage.json"))),
+        sched: Mutex::new(qos::Sched::new()),
+        account: Mutex::new(account::Monitor::load(dir.join("account.jsonl"))),
+        wake: tokio::sync::Notify::new(),
         admin_token: "tap_admin".to_owned(),
         web_root: None,
     });

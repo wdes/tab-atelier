@@ -207,5 +207,79 @@ const TokensChart = {
     </div>`,
 };
 
-window.TaCharts = { CallsChart, TokensChart };
+// ── Plan pressure over time ─────────────────────────────────────────
+// One series (utilisation), so no legend — the title names it. The thing that
+// makes this chart worth drawing is the THRESHOLD rule: a number on its own
+// does not tell you whether you are about to be degraded, and the distance to
+// that line is the actual question.
+const PressureChart = {
+  mixins: [hoverable, xLabels],
+  props: {
+    points: { type: Array, required: true },
+    threshold: { type: Number, default: 0.85 },
+  },
+  computed: {
+    // Always full scale: utilisation is a fraction of a fixed thing, and
+    // rescaling to the data would make 12% look alarming.
+    max() {
+      return 1;
+    },
+    yOf() {
+      return (v) => PAD.top + this.plotH * (1 - Math.min(v, 1) / this.max);
+    },
+    line() {
+      return this.points
+        .map((p, i) => `${i ? "L" : "M"}${this.xOf(i)},${this.yOf(p.util ?? 0)}`)
+        .join(" ");
+    },
+    area() {
+      if (!this.points.length) return "";
+      const base = PAD.top + this.plotH;
+      return `${this.line} L${this.xOf(this.points.length - 1)},${base} L${this.xOf(0)},${base} Z`;
+    },
+  },
+  methods: {
+    pct(v) {
+      return `${Math.round((v ?? 0) * 100)}%`;
+    },
+  },
+  template: `
+    <div class="ta-chart">
+      <svg :viewBox="'0 0 ' + ${W} + ' ' + ${H}" @mousemove="onMove" @mouseleave="onLeave" role="img"
+           aria-label="Share of the plan used over time">
+        <g class="ta-grid">
+          <line v-for="t in [0, 0.5, 1]" :key="'g'+t"
+                :x1="${PAD.left}" :x2="${W - PAD.right}" :y1="yOf(t)" :y2="yOf(t)" />
+          <text v-for="t in [0, 0.5, 1]" :key="'l'+t" :x="${PAD.left - 8}" :y="yOf(t) + 4"
+                text-anchor="end">{{ pct(t) }}</text>
+        </g>
+        <path :d="area" class="ta-area-1" />
+        <path :d="line" class="ta-line-1" />
+        <!-- Where fallback begins. Labelled, not just coloured. -->
+        <g class="ta-threshold">
+          <line :x1="${PAD.left}" :x2="${W - PAD.right}" :y1="yOf(threshold)" :y2="yOf(threshold)" />
+          <text :x="${W - PAD.right}" :y="yOf(threshold) - 5" text-anchor="end">
+            fallback above {{ pct(threshold) }}
+          </text>
+        </g>
+        <g v-if="hover >= 0">
+          <line class="ta-crosshair" :x1="xOf(hover)" :x2="xOf(hover)" :y1="${PAD.top}" :y2="${H - PAD.bottom}" />
+          <circle :cx="xOf(hover)" :cy="yOf(points[hover].util ?? 0)" r="5" class="ta-dot-1" />
+        </g>
+        <g class="ta-axis">
+          <text v-for="l in labels" :key="'x'+l.i"
+                :x="xOf(l.i)" :y="${H - 6}" text-anchor="middle">{{ l.p.label }}</text>
+        </g>
+      </svg>
+      <div v-if="hover >= 0" class="ta-tip" :style="tipStyle(hover)">
+        <div class="ta-tip-h">{{ points[hover].label }}</div>
+        <div><span class="ta-key ta-bg-1"></span>{{ pct(points[hover].util) }} of the plan</div>
+        <div v-if="points[hover].seven_day != null" class="ta-tip-sub">
+          {{ pct(points[hover].seven_day) }} over 7 d
+        </div>
+      </div>
+    </div>`,
+};
+
+window.TaCharts = { CallsChart, TokensChart, PressureChart };
 })();

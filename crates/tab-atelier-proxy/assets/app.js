@@ -17,6 +17,7 @@ createApp({
   components: {
     CallsChart: window.TaCharts.CallsChart,
     TokensChart: window.TaCharts.TokensChart,
+    PressureChart: window.TaCharts.PressureChart,
   },
   data() {
     return {
@@ -38,9 +39,63 @@ createApp({
       // total drills in, which is the only question the summed charts cannot
       // answer ("who is that spike?").
       focus: null,
+      // The shared plan, as Anthropic reports it. Real data even when the
+      // per-person numbers are seeded — this one is not ours to invent.
+      pressure: null,
+      pressureTimer: null,
+      // "Weight" is the scheduler's word for this and means nothing to anyone
+      // reading a table of people. The stored value is still a weight — the
+      // API and the QoS maths are unchanged — but the UI names what it does.
+      //
+      // Normal sits in the MIDDLE so a CI account or a backlog fleet can yield
+      // without everyone else needing a promotion. Roughly geometric, so each
+      // step is a real difference: Background gets a tenth of what Normal
+      // does, Critical ten times.
+      tiers: [
+        { weight: 1, label: "Background" },
+        { weight: 2, label: "Low" },
+        { weight: 5, label: "Normal" },
+        { weight: 10, label: "Elevated" },
+        { weight: 20, label: "High" },
+        { weight: 50, label: "Critical" },
+      ],
     };
   },
   computed: {
+    plan() {
+      return this.pressure?.plan || {};
+    },
+    sched() {
+      return this.pressure?.scheduler || {};
+    },
+    degradeAbove() {
+      return this.pressure?.degrade_above ?? 0.85;
+    },
+    planUtil() {
+      return this.plan.utilization ?? null;
+    },
+    // Spelled out beside the number, so the state never rests on colour.
+    planState() {
+      if (this.sched.backoff_for) return "upstream is rate-limiting — everything is waiting";
+      if (this.planUtil == null) return "no reading yet";
+      if (this.planUtil >= (this.pressure?.floor_above ?? 0.95)) return "nearly exhausted — falling back to the cheapest model";
+      if (this.planUtil >= this.degradeAbove) return "tight — large models are being downgraded";
+      return "healthy — nothing is being throttled";
+    },
+    planClass() {
+      if (this.sched.backoff_for || (this.planUtil ?? 0) >= (this.pressure?.floor_above ?? 0.95)) return "text-danger";
+      if ((this.planUtil ?? 0) >= this.degradeAbove) return "text-warning";
+      return "";
+    },
+    planSeries() {
+      return (this.plan.history || [])
+        .filter((s) => s.five_hour != null || s.seven_day != null)
+        .map((s) => ({
+          util: s.five_hour ?? s.seven_day,
+          seven_day: s.seven_day,
+          label: (s.ts || "").replace("T", " ").replace(/:\d\dZ?$/, ""),
+        }));
+    },
     scopeLabel() {
       if (!this.focus) return "everyone";
       const u = this.users.find((x) => x.id === this.focus);
@@ -123,6 +178,9 @@ createApp({
         this.authed = true;
         sessionStorage.setItem("ta-proxy-admin", this.token);
         await this.loadUsage();
+        await this.loadPressure();
+        // The plan moves on its own, independently of anything done here.
+        this.pressureTimer ??= setInterval(() => this.loadPressure(), 30_000);
       } catch (e) {
         this.error = String(e.message || e);
         this.authed = false;
@@ -138,11 +196,47 @@ createApp({
       this.users = [];
       this.usage = {};
       this.focus = null;
+      this.pressure = null;
+      clearInterval(this.pressureTimer);
+      this.pressureTimer = null;
       this.freshKey = null;
     },
     async refresh() {
       this.users = (await this.api("GET", "/api/users")).users;
       await this.loadUsage();
+    },
+    async loadPressure() {
+      try {
+        this.pressure = await this.api("GET", "/api/pressure");
+      } catch {
+        // A pressure read failing must not blank the accounts page it sits on.
+      }
+    },
+    // A weight set through the API need not be on the ladder, so the select
+    // has to be able to show it rather than silently snapping it to a tier.
+    tierLabel(weight) {
+      const t = this.tiers.find((x) => x.weight === weight);
+      return t ? t.label : `Custom (${weight})`;
+    },
+    tiersFor(u) {
+      const w = u.weight || 1;
+      return this.tiers.some((t) => t.weight === w)
+        ? this.tiers
+        : [...this.tiers, { weight: w, label: this.tierLabel(w) }].sort((a, b) => a.weight - b.weight);
+    },
+    // What this priority actually works out to, if everyone were busy at once.
+    // A number like "3" is meaningless on its own; "≈60% when everyone is
+    // busy" is the decision being made.
+    shareOf(u) {
+      const active = this.users.filter((x) => !x.disabled);
+      const total = active.reduce((a, x) => a + (x.weight || 1), 0);
+      if (u.disabled) return "disabled";
+      if (!total || active.length < 2) return "all of it when alone";
+      return `≈${Math.round(((u.weight || 1) / total) * 100)}% when all busy`;
+    },
+    setWeight(u, value) {
+      const weight = Math.max(1, Math.min(100, Number(value) || 1));
+      return this.act(() => this.api("POST", `/api/users/${u.id}/weight`, { weight }));
     },
     async loadUsage() {
       const data = await this.api("GET", `/api/usage?hours=${this.hours}`);
