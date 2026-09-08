@@ -93,7 +93,7 @@ fn a_users_key_is_exchanged_for_the_proxys_claude_token() {
 
     let state = Arc::new(State {
         store: Mutex::new(store),
-        usage: Mutex::new(usage::Store::load(dir.join("usage.json"))),
+        usage: Mutex::new(usage::Store::load(dir.join("usage"))),
         sched: Mutex::new(qos::Sched::new()),
         account: Mutex::new(account::Monitor::load(&dir)),
         wake: tokio::sync::Notify::new(),
@@ -169,7 +169,7 @@ fn a_revoked_key_stops_working_without_reaching_upstream() {
 
     let state = Arc::new(State {
         store: Mutex::new(store),
-        usage: Mutex::new(usage::Store::load(dir.join("usage.json"))),
+        usage: Mutex::new(usage::Store::load(dir.join("usage"))),
         sched: Mutex::new(qos::Sched::new()),
         account: Mutex::new(account::Monitor::load(&dir)),
         wake: tokio::sync::Notify::new(),

@@ -188,7 +188,7 @@ fn run() -> Result<(), String> {
             }
             let state = Arc::new(server::State {
                 store: Mutex::new(store),
-                usage: Mutex::new(tab_atelier_proxy::usage::Store::load(state.join("usage.json"))),
+                usage: Mutex::new(tab_atelier_proxy::usage::Store::load(state.join("usage"))),
                 sched: Mutex::new(tab_atelier_proxy::qos::Sched::new()),
                 account: Mutex::new(tab_atelier_proxy::account::Monitor::load(&state)),
                 wake: tokio::sync::Notify::new(),

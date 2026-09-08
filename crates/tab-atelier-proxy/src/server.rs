@@ -913,7 +913,7 @@ mod tests {
     fn the_web_root_cannot_be_climbed_out_of() {
         let state = State {
             store: Mutex::new(Store::load(std::env::temp_dir().join("ta-proxy-web-test.json")).expect("store")),
-            usage: Mutex::new(usage::Store::load(std::env::temp_dir().join("ta-proxy-web-usage.json"))),
+            usage: Mutex::new(usage::Store::load(std::env::temp_dir().join("ta-proxy-web-usage"))),
             sched: Mutex::new(qos::Sched::new()),
             account: Mutex::new(account::Monitor::load(std::env::temp_dir())),
             wake: tokio::sync::Notify::new(),
