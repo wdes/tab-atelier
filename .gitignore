@@ -6,3 +6,8 @@
 # Scratch space for local-only tools (the fleet dashboard lives here).
 # Deliberately untracked: it is a personal view, not part of the product.
 /local/
+
+# Agent handoff drops (tab-atelier handoff / the API upload endpoint write here).
+# Working files for whoever is at the terminal — never part of the source.
+inbox/
+outbox/
