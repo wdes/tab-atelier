@@ -595,6 +595,7 @@ tab-atelier gossip                     # converge boards with configured remotes
 |---|---|
 | [`docs/self-organization.md`](docs/self-organization.md) | the model: leases, contract net, gossip, the federation-vs-confederation distinction, and why this is CRDTs rather than Raft |
 | [`docs/fleet-playbook.md`](docs/fleet-playbook.md) | the operational side, written to be handed to an agent: fill a board, spawn workers, and — the part that matters — verify what they report |
+| [`docs/proxy.md`](docs/proxy.md) | `tab-atelier-proxy`: one Claude login shared by a team, with an account and a key per person instead of one token for everybody |
 
 `scripts/self-org-sandbox.sh` runs the whole thing across two sandboxed daemons without touching anything of yours.
 

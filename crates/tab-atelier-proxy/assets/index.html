@@ -1,0 +1,156 @@
+<!doctype html>
+<!--
+  This Source Code Form is subject to the terms of the Mozilla Public
+  License, v. 2.0. If a copy of the MPL was not distributed with this
+  file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+  Account management for tab-atelier-proxy.
+
+  Everything is local: Vue and Bootstrap are served from vendor/ by the proxy
+  itself, with no CDN. A credential proxy is exactly the kind of thing that
+  runs on a locked-down network, and an admin UI that only works with outbound
+  internet would be useless there — quite apart from handing a third party a
+  script tag on the page where the admin token is typed.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="no-referrer" />
+    <title>tab-atelier-proxy — accounts</title>
+    <link rel="stylesheet" href="vendor/bootstrap.min.css" />
+  </head>
+  <body class="bg-body-tertiary">
+    <div id="app" class="container py-4" style="max-width: 60rem">
+      <!-- Sign in ------------------------------------------------------->
+      <div v-if="!authed" class="card shadow-sm mx-auto" style="max-width: 30rem">
+        <div class="card-body">
+          <h1 class="h5 card-title">tab-atelier-proxy</h1>
+          <p class="text-body-secondary small">
+            Paste the admin token. On the proxy host:
+            <code>tab-atelier-proxy admin-token</code>
+          </p>
+          <form @submit.prevent="signIn">
+            <input
+              v-model="token"
+              type="password"
+              class="form-control font-monospace"
+              placeholder="tap_…"
+              autocomplete="off"
+              autofocus
+            />
+            <div v-if="error" class="alert alert-danger mt-3 mb-0 py-2 small">{{ error }}</div>
+            <button class="btn btn-primary w-100 mt-3" :disabled="busy">
+              {{ busy ? 'Checking…' : 'Sign in' }}
+            </button>
+          </form>
+        </div>
+      </div>
+
+      <!-- Accounts ------------------------------------------------------>
+      <template v-else>
+        <div class="d-flex align-items-center mb-3">
+          <h1 class="h4 mb-0 flex-grow-1">Accounts</h1>
+          <button class="btn btn-sm btn-outline-secondary" @click="signOut">Sign out</button>
+        </div>
+
+        <div v-if="error" class="alert alert-danger py-2 small">{{ error }}</div>
+
+        <!-- A key exists in readable form exactly once. Say so plainly, and
+             make it easy to copy, or it gets lost the moment this closes. -->
+        <div v-if="freshKey" class="alert alert-success">
+          <div class="fw-semibold">Key for {{ freshKey.who }}</div>
+          <div class="input-group my-2">
+            <input class="form-control font-monospace" :value="freshKey.key" readonly />
+            <button class="btn btn-outline-success" @click="copy(freshKey.key)">
+              {{ copied ? 'Copied' : 'Copy' }}
+            </button>
+          </div>
+          <div class="small mb-0">
+            Shown once — the proxy keeps only a hash. If it is lost, rotate for a new one.
+            On the machine that will use it:
+            <div><code>tab-atelier remote add proxy --url {{ origin }} --relay-token &lt;key&gt;</code></div>
+          </div>
+          <button class="btn btn-sm btn-success mt-2" @click="freshKey = null">Done</button>
+        </div>
+
+        <div class="card shadow-sm mb-4">
+          <div class="card-body">
+            <h2 class="h6 card-title">Add someone</h2>
+            <form class="row g-2 align-items-end" @submit.prevent="add">
+              <div class="col-sm-3">
+                <label class="form-label small mb-1">First name</label>
+                <input v-model="form.first_name" class="form-control form-control-sm" required />
+              </div>
+              <div class="col-sm-3">
+                <label class="form-label small mb-1">Last name</label>
+                <input v-model="form.last_name" class="form-control form-control-sm" required />
+              </div>
+              <div class="col-sm-4">
+                <label class="form-label small mb-1">Email</label>
+                <input v-model="form.email" type="email" class="form-control form-control-sm" required />
+              </div>
+              <div class="col-sm-2">
+                <button class="btn btn-sm btn-primary w-100" :disabled="busy">Add</button>
+              </div>
+            </form>
+          </div>
+        </div>
+
+        <div class="card shadow-sm">
+          <table class="table table-hover align-middle mb-0">
+            <thead>
+              <tr class="small text-body-secondary">
+                <th>Name</th>
+                <th>Email</th>
+                <th>Status</th>
+                <th>Last used</th>
+                <th class="text-end">Key</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="u in users" :key="u.id" :class="{ 'opacity-50': u.disabled }">
+                <td>{{ u.first_name }} {{ u.last_name }}</td>
+                <td class="font-monospace small">{{ u.email }}</td>
+                <td>
+                  <span v-if="u.disabled" class="badge text-bg-secondary">disabled</span>
+                  <span v-else-if="!u.has_key" class="badge text-bg-warning">no key</span>
+                  <span v-else class="badge text-bg-success">active</span>
+                </td>
+                <td class="small text-body-secondary">{{ ago(u.last_used_at) }}</td>
+                <td class="text-end text-nowrap">
+                  <button class="btn btn-sm btn-outline-primary" @click="rotate(u)" :disabled="busy">
+                    Rotate
+                  </button>
+                  <button
+                    class="btn btn-sm btn-outline-secondary"
+                    @click="setDisabled(u, !u.disabled)"
+                    :disabled="busy"
+                  >
+                    {{ u.disabled ? 'Enable' : 'Disable' }}
+                  </button>
+                  <button class="btn btn-sm btn-outline-danger" @click="remove(u)" :disabled="busy">
+                    Delete
+                  </button>
+                </td>
+              </tr>
+              <tr v-if="!users.length">
+                <td colspan="5" class="text-center text-body-secondary py-4">
+                  No accounts yet.
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p class="text-body-secondary small mt-3">
+          A key opens the Anthropic path and nothing else — it cannot reach this page.
+          Disabling keeps the account and its history; deleting forgets both.
+        </p>
+      </template>
+    </div>
+
+    <script src="vendor/vue.global.prod.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>

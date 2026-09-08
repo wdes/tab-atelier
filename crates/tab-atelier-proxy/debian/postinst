@@ -1,0 +1,24 @@
+#!/bin/sh
+# Service account for the proxy. It owns the account file and the host's Claude
+# login, so it is a system user with no shell and no login.
+set -e
+case "$1" in
+    configure)
+        if ! getent passwd tab-atelier-proxy >/dev/null; then
+            adduser --system --group --no-create-home \
+                    --home /var/lib/tab-atelier-proxy \
+                    --shell /usr/sbin/nologin \
+                    --gecos "tab-atelier proxy" \
+                    tab-atelier-proxy >/dev/null
+        fi
+        install -d -o tab-atelier-proxy -g tab-atelier-proxy -m 0700 /var/lib/tab-atelier-proxy
+        # Bootstrap is Debian's copy (libjs-bootstrap5), linked into the web
+        # root rather than duplicated, so a security update to that package
+        # reaches this UI without rebuilding it.
+        install -d /usr/share/tab-atelier-proxy/web/vendor
+        ln -sf /usr/share/javascript/bootstrap5/css/bootstrap.min.css \
+               /usr/share/tab-atelier-proxy/web/vendor/bootstrap.min.css
+        ;;
+esac
+#DEBHELPER#
+exit 0

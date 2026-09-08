@@ -1,0 +1,76 @@
+[package]
+name = "tab-atelier-proxy"
+version = "0.5.0-dev"
+edition = "2024"
+license = "MPL-2.0"
+description = "Multi-user Anthropic API proxy for tab-atelier fleets"
+repository = "https://github.com/wdes/tab-atelier"
+publish = false
+
+[[bin]]
+name = "tab-atelier-proxy"
+path = "src/main.rs"
+
+[lib]
+name = "tab_atelier_proxy"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+env_logger = "0.11"
+clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
+# Blocking HTTP for the upstream hop: an LLM stream is read chunk-by-chunk and
+# handed to hyper, so async buys nothing on that side and ureq keeps the
+# dependency tree small. Mirrors the desktop crate's egress.
+ureq = { version = "3", features = ["json"] }
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "net", "sync", "time", "io-util", "macros", "signal"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+futures-util = { version = "0.3", default-features = false }
+sha2 = { version = "0.10", default-features = false }
+uuid = { version = "1", features = ["v4"] }
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+# One .deb per binary, unlike catbus-agent (which ships inside the desktop
+# packages). The proxy is a SERVER: it runs on a different machine from the
+# terminal, as its own user, under its own systemd unit — installing the whole
+# desktop package to get it would drag in X11 and a terminal emulator.
+[package.metadata.deb]
+name = "tab-atelier-proxy"
+maintainer = "William Desportes <williamdes@wdes.fr>"
+copyright = "2026, William Desportes <williamdes@wdes.fr>"
+license-file = ["../../LICENSE", "0"]
+extended-description = """\
+A multi-user Anthropic API proxy for tab-atelier. Each account has its own \
+key, so a fleet's machines authenticate as people rather than sharing one \
+secret, and revoking one does not disturb the others. Serves a small web UI \
+for account management."""
+section = "utils"
+priority = "optional"
+# Bootstrap comes from Debian rather than a vendored copy: it is already
+# packaged, it gets security updates without us re-vendoring, and duplicating
+# it would put a second unreviewed copy of a large CSS file in this repo.
+# postinst symlinks it into the web root. Vue is NOT in Debian, so that one is
+# vendored — see assets/vendor/README.md.
+depends = "$auto, libjs-bootstrap5, adduser"
+assets = [
+    ["target/release/tab-atelier-proxy", "/usr/bin/", "755"],
+    ["assets/index.html", "/usr/share/tab-atelier-proxy/web/", "644"],
+    ["assets/app.js", "/usr/share/tab-atelier-proxy/web/", "644"],
+    ["assets/vendor/vue.global.prod.js", "/usr/share/tab-atelier-proxy/web/vendor/", "644"],
+    ["systemd/tab-atelier-proxy.service", "/usr/lib/systemd/system/", "644"],
+    ["README.md", "/usr/share/doc/tab-atelier-proxy/", "644"],
+]
+maintainer-scripts = "debian/"
+systemd-units = { unit-name = "tab-atelier-proxy", enable = false, start = false }

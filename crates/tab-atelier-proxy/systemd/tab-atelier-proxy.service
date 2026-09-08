@@ -1,0 +1,50 @@
+[Unit]
+Description=tab-atelier multi-user Anthropic API proxy
+Documentation=https://github.com/wdes/tab-atelier
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Loopback by default. The proxy carries user keys and the host's own Claude
+# credential, so it expects a TLS terminator in front rather than facing the
+# network itself. Change --listen only alongside that.
+ExecStart=/usr/bin/tab-atelier-proxy serve --listen 127.0.0.1:7900
+Restart=on-failure
+RestartSec=2
+
+User=tab-atelier-proxy
+Group=tab-atelier-proxy
+# /var/lib/tab-atelier-proxy: accounts + admin token, created 0700 by systemd.
+StateDirectory=tab-atelier-proxy
+StateDirectoryMode=0700
+Environment=TAB_ATELIER_PROXY_STATE=/var/lib/tab-atelier-proxy
+# The service account's own ~/.claude/.credentials.json is the egress login.
+Environment=HOME=/var/lib/tab-atelier-proxy
+
+# It reads one credential file, writes one account file, and talks to one
+# upstream. Nothing else needs to be reachable from here.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
