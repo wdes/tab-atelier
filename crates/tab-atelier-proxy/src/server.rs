@@ -915,9 +915,7 @@ mod tests {
             store: Mutex::new(Store::load(std::env::temp_dir().join("ta-proxy-web-test.json")).expect("store")),
             usage: Mutex::new(usage::Store::load(std::env::temp_dir().join("ta-proxy-web-usage.json"))),
             sched: Mutex::new(qos::Sched::new()),
-            account: Mutex::new(account::Monitor::load(
-                std::env::temp_dir().join("ta-proxy-web-account.jsonl"),
-            )),
+            account: Mutex::new(account::Monitor::load(std::env::temp_dir())),
             wake: tokio::sync::Notify::new(),
             admin_token: "t".to_owned(),
             web_root: Some(std::path::PathBuf::from("/usr/share/tab-atelier-proxy/web")),
