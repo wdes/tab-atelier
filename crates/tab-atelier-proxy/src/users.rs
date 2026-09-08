@@ -52,6 +52,31 @@ pub struct Account {
     /// while stopping the key today.
     #[serde(default)]
     pub disabled: bool,
+    /// Share of the upstream quota under contention, relative to everyone
+    /// else's. 1 unless someone decided otherwise; see [`crate::qos`].
+    ///
+    /// It only matters when capacity binds — with spare quota a weight-1
+    /// account still gets everything it asks for, because the scheduler is
+    /// work-conserving.
+    #[serde(default = "default_weight")]
+    pub weight: u32,
+}
+
+/// Normal, on the scale the UI presents.
+///
+/// 5 rather than 1 so there is room BELOW the default: a CI account or a
+/// backlog-grinding fleet should be able to yield to people without everyone
+/// else having to be promoted. A scale whose default is also its floor can
+/// only express "raise someone", which is the same decision seen from the
+/// wrong end.
+///
+/// The ladder the UI offers is 1 / 2 / 5 / 10 / 20 / 50 — roughly geometric,
+/// so each step is a real difference rather than a rounding one. Any value in
+/// 1..=100 is accepted; the API is not restricted to the ladder.
+pub const NORMAL_WEIGHT: u32 = 5;
+
+const fn default_weight() -> u32 {
+    NORMAL_WEIGHT
 }
 
 impl Account {
@@ -287,6 +312,7 @@ impl Store {
             created_at: now_secs(),
             last_used_at: None,
             disabled: false,
+            weight: default_weight(),
         };
         self.accounts.push(account.clone());
         self.reindex();
@@ -316,6 +342,29 @@ impl Store {
         self.reindex();
         self.save()?;
         Ok((out, key))
+    }
+
+    /// Change an account's share of the quota under contention.
+    ///
+    /// # Errors
+    /// No such account, or the file could not be written.
+    pub fn set_weight(&mut self, who: &str, weight: u32) -> Result<Account, Error> {
+        let id = self
+            .find(who)
+            .ok_or_else(|| Error::NotFound(who.to_owned()))?
+            .id
+            .clone();
+        let account = self
+            .accounts
+            .iter_mut()
+            .find(|a| a.id == id)
+            .ok_or_else(|| Error::NotFound(who.to_owned()))?;
+        // Zero would mean "never scheduled", which is what `disable` is for
+        // and is far too easy to do by accident.
+        account.weight = weight.clamp(1, 100);
+        let out = account.clone();
+        self.save()?;
+        Ok(out)
     }
 
     /// Turn an account off (or back on) without losing who they were.
@@ -534,6 +583,28 @@ mod tests {
         assert!(s.find("ada").is_none(), "two people match — acting on either is wrong");
         assert!(s.find("lovelace").is_some());
         assert!(s.find("ada@example.org").is_some());
+    }
+
+    /// The priority ladder must have room below the default, or "lower this
+    /// account" is inexpressible and the only move is promoting everyone else.
+    #[test]
+    fn the_default_priority_sits_in_the_middle_of_its_range() {
+        let (mut s, _d) = store();
+        let (a, _k) = s.add("Ada", "Lovelace", "ada@example.org").expect("add");
+        assert_eq!(a.weight, NORMAL_WEIGHT);
+        const { assert!(NORMAL_WEIGHT > 1, "a default of 1 leaves nothing below it") }
+
+        // Both directions are reachable, and the ratio is a real difference.
+        let down = s.set_weight("ada@example.org", 1).expect("lower");
+        assert_eq!(down.weight, 1);
+        let up = s.set_weight("ada@example.org", 50).expect("raise");
+        assert_eq!(up.weight, 50);
+
+        // Out-of-range values are clamped rather than rejected — and never to
+        // zero, which would mean "never scheduled" and is what `disable` is
+        // for.
+        assert_eq!(s.set_weight("ada@example.org", 0).expect("clamp").weight, 1);
+        assert_eq!(s.set_weight("ada@example.org", 9_999).expect("clamp").weight, 100);
     }
 
     #[test]

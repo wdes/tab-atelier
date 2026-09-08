@@ -235,6 +235,33 @@ fn refresh(refresh_token: &str) -> Result<OauthBlob, String> {
     })
 }
 
+/// Ask Anthropic how much of the shared plan is left.
+///
+/// `GET /api/oauth/usage` with the Claude Code OAuth token — the same endpoint
+/// `.claude/scripts/claude-usage-monitor.mjs` polls. It is the only source
+/// that knows the subscription's real utilisation; everything else the proxy
+/// can see is per-request accounting.
+///
+/// # Errors
+/// No usable credential, or the request failed. The caller records the failure
+/// as a sample rather than dropping it.
+pub fn account_usage() -> Result<(u16, String), String> {
+    let token = oauth_access_token()?;
+    let mut resp = relay_agent()
+        .get(&format!("{}/api/oauth/usage", upstream()))
+        .header("Authorization", format!("Bearer {token}"))
+        // Without this beta flag the endpoint refuses an OAuth credential.
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .call()
+        .map_err(|e| format!("usage request failed: {e}"))?;
+    let status = resp.status().as_u16();
+    let body = resp
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| format!("usage body: {e}"))?;
+    Ok((status, body))
+}
+
 #[cfg(test)]
 mod tests {
     use super::merge_beta;
