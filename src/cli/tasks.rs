@@ -213,7 +213,14 @@ pub fn best_bid(t: &TaskView) -> Option<&(String, i64)> {
 /// selection rather than cache placement.
 #[must_use]
 pub fn rank_tasks<'a>(tasks: &'a [TaskView], me: &str) -> Vec<&'a TaskView> {
-    let mut open: Vec<&TaskView> = tasks.iter().filter(|t| t.is_takeable()).collect();
+    // An agent never ranks a job IT announced (`announced_by == me`): verification
+    // is only meaningful from a DIFFERENT agent, and announced work is for the
+    // fleet, not the announcer. Universal author-exclusion at the single take
+    // chokepoint (`rank_tasks` is take-only) — this is the missing policy the
+    // "automatic verification" note calls for: the board already routes a
+    // `verify:<task>` to a peer, but nothing stopped the announcer taking it back.
+    let mut open: Vec<&TaskView> =
+        tasks.iter().filter(|t| t.is_takeable() && t.announced_by.as_deref() != Some(me)).collect();
     open.sort_by_key(|t| {
         // Task id as the tie-break keeps the order total even if two weights
         // collide, so the ranking is deterministic for a given agent.
@@ -457,5 +464,21 @@ mod tests {
             "task:t1",
             "every agent derives the same lease key"
         );
+    }
+
+    #[test]
+    fn a_producer_never_ranks_its_own_job_but_a_peer_can() {
+        // The announcer must not take (and thus "verify") its own job; a distinct
+        // peer can. This enforces the "require a different agent" rule the
+        // self-organization design leaves to policy.
+        let notes = vec![entry(NoteKind::Announce, "verify-cov", "boss", 10, "verify src/api.rs")];
+        let folded = fold_tasks(&notes);
+        assert!(
+            rank_tasks(&folded, "boss").is_empty(),
+            "the producer 'boss' must NOT rank/take its own announced job"
+        );
+        let peer = rank_tasks(&folded, "worker-1");
+        assert_eq!(peer.len(), 1, "a distinct peer CAN take the announced job");
+        assert_eq!(peer[0].id, "verify-cov");
     }
 }
