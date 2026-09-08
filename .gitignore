@@ -11,3 +11,7 @@
 # Working files for whoever is at the terminal — never part of the source.
 inbox/
 outbox/
+
+# Dev-only symlink to Debian's libjs-bootstrap5. Absolute, so it is broken on
+# any machine without that package; the .deb makes it in postinst instead.
+crates/tab-atelier-proxy/assets/vendor/bootstrap.min.css

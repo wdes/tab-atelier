@@ -2345,14 +2345,25 @@ async fn handle_relay(req: Request<Incoming>, master_token: &str) -> Response<Re
     tokio::task::spawn_blocking(move || {
         let agent = crate::relay::relay_agent();
         let (url, bearer, cf) = if egress {
-            let token = match crate::relay::oauth_access_token() {
-                Ok(t) => t,
-                Err(e) => {
-                    let _ = meta_tx.send(Err(format!("egress oauth: {e}")));
-                    return;
-                }
-            };
-            (format!("{}{sub_pq}", crate::relay::upstream()), token, None)
+            // The egress role moved out to the `tab-atelier-proxy` package.
+            //
+            // It authenticated an entire fleet with ONE shared token, which
+            // cannot say who spent the quota and cannot be taken away from one
+            // machine without re-keying every other. The replacement has an
+            // account per person and a key each. It is also a server, and this
+            // is a terminal emulator — running it here meant installing X11 and
+            // gpui on a box that wanted neither.
+            //
+            // Refused loudly rather than quietly forwarding: a relay that keeps
+            // half-working after its credential model changed is worse than one
+            // that says what to install.
+            let _ = meta_tx.send(Err(
+                "the egress role is now the `tab-atelier-proxy` package — install it there, \
+                 `tab-atelier-proxy add <first> <last> <email>` for a key, then point this \
+                 instance at it with `relay via`. See docs/proxy.md"
+                    .to_owned(),
+            ));
+            return;
         } else if let Some(t) = target {
             // Without a relay token for the peer there is nothing to present,
             // and forwarding an empty Bearer just turns a local misconfig into
@@ -3429,112 +3440,43 @@ mod tests {
         String::from_utf8_lossy(&buf).into_owned()
     }
 
-    /// End-to-end: a client POST through the EGRESS relay is forwarded to a
-    /// mock "Anthropic", streaming the SSE response back, with the stand-in
-    /// auth swapped for the remote's Claude OAuth token. Mocks the real Claude
-    /// API (mirrors `catbus-agent/tests/openai_mock.rs`).
+    /// The egress role is retired here, and says where it went.
+    ///
+    /// The forwarding it used to do — inject the host's Claude OAuth token and
+    /// stream the SSE back — now lives in the `tab-atelier-proxy` crate, whose
+    /// `tests/forwarding.rs` covers it end to end against a mock Anthropic,
+    /// plus the thing this crate never could: that ONE caller's key can be
+    /// revoked without touching anyone else's.
+    ///
+    /// What is checked here is that the retirement is loud. A relay that
+    /// silently stopped injecting a credential would answer 401s from upstream
+    /// and look like an Anthropic outage.
     #[test]
-    fn relay_egress_streams_sse_and_injects_oauth() {
-        use std::io::{Read, Write};
+    fn the_egress_role_points_at_the_proxy_package_instead_of_half_working() {
         let _guard = RELAY_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        // Fixture credentials: a far-future access token so no network refresh.
-        let dir = tempfile::tempdir().unwrap();
-        let creds = dir.path().join("creds.json");
-        std::fs::write(
-            &creds,
-            r#"{"claudeAiOauth":{"accessToken":"oat-fixture-xyz","refreshToken":"ort-x","expiresAt":9999999999999,"scopes":["user:inference"]}}"#,
-        )
-        .unwrap();
-
-        // Mock upstream Anthropic: capture the Authorization header, then stream
-        // two SSE frames with a gap and close (connection-close framing).
-        let mock = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let mock_port = mock.local_addr().unwrap().port();
-        let (seen_tx, seen_rx) = std::sync::mpsc::channel::<(String, String)>();
-        std::thread::spawn(move || {
-            if let Ok((mut sock, _)) = mock.accept() {
-                sock.set_read_timeout(Some(std::time::Duration::from_secs(2))).ok();
-                let mut buf = Vec::new();
-                let mut tmp = [0u8; 1024];
-                while let Ok(n) = sock.read(&mut tmp) {
-                    if n == 0 {
-                        break;
-                    }
-                    buf.extend_from_slice(&tmp[..n]);
-                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-                let head = String::from_utf8_lossy(&buf);
-                let auth = head
-                    .lines()
-                    .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
-                    .unwrap_or("")
-                    .to_owned();
-                let beta = head
-                    .lines()
-                    .find(|l| l.to_ascii_lowercase().starts_with("anthropic-beta:"))
-                    .unwrap_or("")
-                    .to_owned();
-                let _ = seen_tx.send((auth, beta));
-                let _ =
-                    sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n");
-                let _ = sock.write_all(b"data: {\"type\":\"message_start\"}\n\n");
-                let _ = sock.flush();
-                std::thread::sleep(std::time::Duration::from_millis(40));
-                let _ = sock.write_all(b"data: [DONE]\n\n");
-                let _ = sock.flush();
-            }
-        });
-
-        // Configure the egress role + point it at the mock + fixture creds.
-        crate::relay::set_credentials_path(Some(creds));
-        crate::relay::set_upstream(Some(format!("http://127.0.0.1:{mock_port}")));
         crate::set_relay_egress(true);
-
         let (port, _state, _master) = spawn_server();
-        // The relay route takes the relay token only — the master administers
-        // tabs and is deliberately not a second way in.
         let token = crate::relay_token();
         let payload = "{}";
-        let req = format!(
-            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nanthropic-beta: context-management-2025-06-27\r\nContent-Length: {}\r\n\r\n{payload}",
-            payload.len()
+        let resp = request(
+            port,
+            &format!(
+                "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+                payload.len()
+            ),
         );
-        let resp = request(port, &req);
-
-        // Restore globals so parallel/later tests aren't affected.
         crate::set_relay_egress(false);
-        crate::relay::set_upstream(None);
-        crate::relay::set_credentials_path(None);
 
-        assert_eq!(status_code(&resp), 200, "resp: {resp}");
-        assert!(resp.contains("data:"), "expected streamed SSE, got: {resp}");
-        assert!(resp.contains("[DONE]"), "expected final SSE frame, got: {resp}");
-        let (seen, beta) = seen_rx
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .unwrap_or_default();
+        assert_eq!(status_code(&resp), 502, "resp: {resp}");
         assert!(
-            seen.contains("oat-fixture-xyz"),
-            "egress must inject the Claude OAuth token; upstream saw: {seen}"
+            resp.contains("tab-atelier-proxy"),
+            "the error must name the package that replaced this role: {resp}"
         );
         assert!(
-            !seen.contains(token.as_str()),
-            "the stand-in relay token must never reach Anthropic; saw: {seen}"
-        );
-        // The OAuth flags are required upstream, but they must not evict the
-        // client's own: dropping `context-management-…` while still forwarding
-        // the body field it gates earns a 400 "extra inputs are not permitted".
-        assert!(
-            beta.contains("context-management-2025-06-27"),
-            "client beta flags must survive the egress; upstream saw: {beta}"
-        );
-        assert!(
-            beta.contains("oauth-2025-04-20"),
-            "OAuth beta flag still required; upstream saw: {beta}"
+            resp.contains("docs/proxy.md"),
+            "and where to read about the migration: {resp}"
         );
     }
 

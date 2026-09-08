@@ -128,6 +128,7 @@ jobs:
                   echo "→ building $DEB_VERSION"
                   cargo deb -p tab-atelier --locked --deb-version "$DEB_VERSION"
                   cargo deb -p tab-atelier --variant headless --locked --deb-version "$DEB_VERSION"
+                  cargo deb -p tab-atelier-proxy --locked --deb-version "$DEB_VERSION"
                   ls -la target/debian/
             - name: Upload .deb packages
               id: upload-deb

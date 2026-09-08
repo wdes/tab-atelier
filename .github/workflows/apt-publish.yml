@@ -84,6 +84,10 @@ jobs:
                   cargo install cargo-deb --locked
                   cargo deb -p tab-atelier --locked --deb-version "${{ steps.ver.outputs.version }}"
                   cargo deb -p tab-atelier --variant headless --locked --deb-version "${{ steps.ver.outputs.version }}"
+                  # Third package: the server half of the relay. Its own .deb
+                  # because it runs on a different machine from the terminal —
+                  # see docs/proxy.md.
+                  cargo deb -p tab-atelier-proxy --locked --deb-version "${{ steps.ver.outputs.version }}"
                   ls -la target/debian/
 
             # Pull the existing gh-pages tree into site/ so the
@@ -117,7 +121,7 @@ jobs:
                   # Cap the pool at the 10 most recent .debs per package
                   # so the repo doesn't balloon forever. Sort by mtime
                   # then prune the tail.
-                  for pkg in tab-atelier tab-atelier-headless; do
+                  for pkg in tab-atelier tab-atelier-headless tab-atelier-proxy; do
                       ls -1t pool/$CHANNEL/main/t/tab-atelier/${pkg}_*.deb 2>/dev/null \
                           | tail -n +11 | xargs -r rm -f
                   done
