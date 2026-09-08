@@ -134,6 +134,19 @@ pub struct Strings {
     pub remote_endpoint_test_ok: &'static str,
     pub remote_endpoint_test_failed: &'static str,
     pub remote_endpoint_reconnect: &'static str,
+
+    // Ctrl+P tab switcher, the pet menu, and the odd corner of preferences —
+    // all of it shipped as English literals in the render code, so a French
+    // desktop got an English switcher.
+    pub switcher_filter_placeholder: &'static str,
+    pub switcher_no_matches: &'static str,
+    pub switcher_recent: &'static str,
+    pub summon_pet: &'static str,
+    pub dismiss_pets: &'static str,
+    pub also_reachable_at: &'static str,
+    pub memory_unlimited_hint: &'static str,
+    pub cursor: &'static str,
+    pub brain: &'static str,
 }
 
 pub static EN: Strings = Strings {
@@ -235,6 +248,15 @@ pub static EN: Strings = Strings {
     remote_endpoint_test_ok: "Endpoint test: OK",
     remote_endpoint_test_failed: "Endpoint test failed",
     remote_endpoint_reconnect: "Reconnect",
+    switcher_filter_placeholder: "Type to filter tabs\u{2026}",
+    switcher_no_matches: "No matching tabs",
+    switcher_recent: "Recent tabs",
+    summon_pet: "Summon a pet",
+    dismiss_pets: "Dismiss all pets",
+    also_reachable_at: "Also reachable at:",
+    memory_unlimited_hint: "unlimited (e.g. 8G)",
+    cursor: "Cursor",
+    brain: "Brain",
 };
 
 pub static FR: Strings = Strings {
@@ -336,6 +358,15 @@ pub static FR: Strings = Strings {
     remote_endpoint_test_ok: "Test du point d'accès : OK",
     remote_endpoint_test_failed: "Échec du test du point d'accès",
     remote_endpoint_reconnect: "Reconnecter",
+    switcher_filter_placeholder: "Filtrer les onglets\u{2026}",
+    switcher_no_matches: "Aucun onglet correspondant",
+    switcher_recent: "Onglets récents",
+    summon_pet: "Invoquer une mascotte",
+    dismiss_pets: "Congédier les mascottes",
+    also_reachable_at: "Également accessible à :",
+    memory_unlimited_hint: "illimité (p. ex. 8G)",
+    cursor: "Curseur",
+    brain: "Cerveau",
 };
 
 pub fn detect_lang() -> Lang {
@@ -365,6 +396,65 @@ mod tests {
     fn all_langs_have_labels() {
         for lang in Lang::ALL {
             assert!(!lang.label().is_empty());
+        }
+    }
+
+    /// Every user-visible string is actually translated in every language.
+    ///
+    /// A MISSING field would not compile, so that is not the failure worth
+    /// guarding. The one that ships is a French entry still holding the
+    /// English text — copied in when the field was added, never revisited, and
+    /// invisible to anyone developing in English. That is exactly how the
+    /// Ctrl+P switcher, the pet menu and part of preferences ended up
+    /// English-only on a French desktop.
+    ///
+    /// Reads the source rather than the structs: deriving `Debug` on 90-odd
+    /// fields to compare them at runtime would put formatting code for all of
+    /// them in the shipped binary, for a test.
+    #[test]
+    fn every_language_translates_every_string() {
+        // Some strings ARE the same in both — a product name, an acronym. They
+        // are listed rather than guessed at, and the list is short on purpose:
+        // adding to it should feel like a decision.
+        const SAME_IN_BOTH: &[&str] = &["Terminal", "Tab Atelier", " — Tab Atelier", "CPU", "Tokens", "URL"];
+
+        let src = include_str!("locale.rs");
+        let table = |name: &str| -> Vec<(String, String)> {
+            let start = src
+                .find(&format!("pub static {name}: Strings = Strings {{"))
+                .unwrap_or_else(|| panic!("no {name} table"));
+            let body = &src[start..];
+            let end = body.find("\n};").unwrap_or(body.len());
+            body[..end]
+                .lines()
+                .filter_map(|l| {
+                    let (field, value) = l.trim().split_once(": ")?;
+                    let value = value.trim().trim_end_matches(',').trim_matches('"');
+                    field
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c == '_')
+                        .then(|| (field.to_owned(), value.to_owned()))
+                })
+                .collect()
+        };
+
+        let en = table("EN");
+        let fr = table("FR");
+        assert!(
+            en.len() > 50,
+            "only found {} EN strings — did the table move?",
+            en.len()
+        );
+        assert_eq!(en.len(), fr.len(), "EN and FR have different numbers of strings");
+
+        for ((en_field, en_value), (fr_field, fr_value)) in en.iter().zip(fr.iter()) {
+            assert_eq!(en_field, fr_field, "the two tables list fields in a different order");
+            let untranslated =
+                en_value == fr_value && en_value.chars().count() > 2 && !SAME_IN_BOTH.contains(&en_value.as_str());
+            assert!(
+                !untranslated,
+                "locale: `{en_field}` is untranslated in FR — still the English {en_value:?}"
+            );
         }
     }
 
