@@ -190,9 +190,7 @@ fn run() -> Result<(), String> {
                 store: Mutex::new(store),
                 usage: Mutex::new(tab_atelier_proxy::usage::Store::load(state.join("usage.json"))),
                 sched: Mutex::new(tab_atelier_proxy::qos::Sched::new()),
-                account: Mutex::new(tab_atelier_proxy::account::Monitor::load(
-                    state.join("account-usage.jsonl"),
-                )),
+                account: Mutex::new(tab_atelier_proxy::account::Monitor::load(&state)),
                 wake: tokio::sync::Notify::new(),
                 admin_token: token,
                 web_root: root,
