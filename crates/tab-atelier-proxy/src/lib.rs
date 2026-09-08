@@ -34,8 +34,9 @@
 
 pub mod account;
 pub mod egress;
-pub mod fallback;
+pub mod provider;
 pub mod qos;
+pub mod routing;
 pub mod server;
 pub mod usage;
 pub mod users;
