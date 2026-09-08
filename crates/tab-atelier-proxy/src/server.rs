@@ -26,6 +26,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response};
 
 use crate::egress;
+use crate::usage;
 use crate::users::{Account, Store, constant_time_eq};
 
 type Body = http_body_util::combinators::BoxBody<Bytes, Infallible>;
@@ -33,6 +34,9 @@ type Body = http_body_util::combinators::BoxBody<Bytes, Infallible>;
 /// Everything a request handler needs.
 pub struct State {
     pub store: Mutex<Store>,
+    /// Separate lock from the accounts: recording usage happens on every
+    /// proxied request, and it must not queue behind an admin listing users.
+    pub usage: Mutex<usage::Store>,
     pub admin_token: String,
     pub web_root: Option<std::path::PathBuf>,
 }
@@ -105,6 +109,12 @@ pub async fn handle(req: Request<Incoming>, state: Arc<State>) -> Result<Respons
 
     if path.starts_with("/relay/anthropic") {
         return Ok(anthropic(req, state).await);
+    }
+    // The account's own statistics, opened by the account's own key — the
+    // route a person hands to their agent. Deliberately NOT under /api/,
+    // which is the admin surface: this one is meant to be given away.
+    if path == "/me/usage" {
+        return Ok(me_usage(&req, &state));
     }
     if path.starts_with("/api/") {
         return Ok(admin(req, state).await);
@@ -197,6 +207,8 @@ async fn anthropic(req: Request<Incoming>, state: Arc<State>) -> Response<Body> 
         content_type,
         client_beta,
         body,
+        account_id: account.id.clone(),
+        state: Arc::clone(&state),
     };
     // Bridge ureq's blocking reader to an async hyper stream: the blocking task
     // sends (status, content-type) over a oneshot, then pumps chunks over an
@@ -230,6 +242,11 @@ struct Forward {
     content_type: String,
     client_beta: Option<String>,
     body: Bytes,
+    /// Who to bill. Carried down rather than looked up again, because by the
+    /// time the response finishes the account may have been deleted — the call
+    /// still happened and still spent tokens.
+    account_id: String,
+    state: Arc<State>,
 }
 
 /// The blocking half: authenticate to Anthropic, send, and pump the response.
@@ -293,7 +310,14 @@ fn forward(
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
+    // Count what Anthropic says it billed, read off the response as it goes
+    // past. Asking the client to report its own usage would be unenforceable,
+    // and re-tokenising the prompt here would be a guess.
+    let mut sniffer = usage::Sniffer::new(ctype.as_deref());
     if meta_tx.send(Ok((status, ctype))).is_err() {
+        // The client is gone, but the call was still made and still cost
+        // tokens — so it is recorded anyway, just without a body to read.
+        record(&f.state, &f.account_id, None, usage::Tokens::default(), status);
         return;
     }
     let mut reader = resp.body_mut().as_reader();
@@ -302,12 +326,125 @@ fn forward(
         match std::io::Read::read(&mut reader, &mut buf) {
             Ok(0) | Err(_) => break, // EOF, or an upstream read error
             Ok(n) => {
+                sniffer.feed(&buf[..n]);
                 if body_tx.blocking_send(Bytes::copy_from_slice(&buf[..n])).is_err() {
                     break; // client hung up
                 }
             }
         }
     }
+    let (model, tokens) = sniffer.finish();
+    record(&f.state, &f.account_id, model.as_deref(), tokens, status);
+}
+
+/// File one call against an account. Never fails the request it describes:
+/// accounting is not worth a 502.
+fn record(state: &State, account_id: &str, model: Option<&str>, tokens: usage::Tokens, status: u16) {
+    let mut u = state.usage.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    u.record(account_id, model, tokens, (200..300).contains(&status));
+}
+
+// ── an account's own statistics ─────────────────────────────────────
+
+/// `?hours=N` off a query string, if present and sane.
+fn path_hours(query: &str) -> Option<u64> {
+    query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("hours="))
+        .and_then(|v| v.parse::<u64>().ok())
+}
+
+/// Render one account's usage as JSON.
+fn usage_json(u: &usage::Store, id: &str, hours: u64) -> serde_json::Value {
+    let tok = |t: &usage::Tokens| {
+        serde_json::json!({
+            "input": t.input,
+            "output": t.output,
+            "cache_read": t.cache_read,
+            "cache_write": t.cache_write,
+            "total": t.total(),
+        })
+    };
+    let window = |h: u64| {
+        let (calls, errors, t) = u.totals(id, h);
+        serde_json::json!({ "calls": calls, "errors": errors, "tokens": tok(&t) })
+    };
+    let series: Vec<_> = u
+        .series(id, hours)
+        .into_iter()
+        .map(|b| {
+            serde_json::json!({
+                "hour": b.hour,
+                "calls": b.calls,
+                "errors": b.errors,
+                "input": b.tokens.input,
+                "output": b.tokens.output,
+                "cache_read": b.tokens.cache_read,
+                "cache_write": b.tokens.cache_write,
+            })
+        })
+        .collect();
+    let by_model: serde_json::Value = u.for_account(id).map_or_else(
+        || serde_json::json!({}),
+        |a| a.by_model.iter().map(|(m, t)| (m.clone(), tok(t))).collect(),
+    );
+    serde_json::json!({
+        "all_time": window(0),
+        "last_24h": window(24),
+        "last_7d": window(24 * 7),
+        "by_model": by_model,
+        // Dense hourly buckets, oldest first, ending at the current hour.
+        "series_hourly": series,
+        "retained_hours": usage::RETAIN_HOURS,
+    })
+}
+
+/// `GET /me/usage` — the account's own numbers, opened by its own key.
+///
+/// This is the route a person gives to their agent, so it is shaped to be
+/// read by one: totals for the windows anybody actually asks about, a
+/// per-model breakdown, and a dense hourly series. It answers for the caller
+/// and nobody else — the key names the account, so there is no id to pass and
+/// no way to ask about someone else.
+fn me_usage(req: &Request<Incoming>, state: &State) -> Response<Body> {
+    if req.method() != Method::GET {
+        return json(405, r#"{"error":"GET only"}"#);
+    }
+    let key = presented(req);
+    let account = {
+        let store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        store.authenticate(&key).cloned()
+    };
+    let Some(account) = account else {
+        return json(
+            401,
+            r#"{"error":"present your proxy key (x-api-key or Authorization: Bearer)"}"#,
+        );
+    };
+    let hours = req
+        .uri()
+        .query()
+        .and_then(|q| {
+            q.split('&')
+                .find_map(|kv| kv.strip_prefix("hours="))
+                .and_then(|v| v.parse::<u64>().ok())
+        })
+        .unwrap_or(24 * 7)
+        .clamp(1, usage::RETAIN_HOURS);
+    let mut body = {
+        let u = state.usage.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        usage_json(&u, &account.id, hours)
+    };
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert(
+            "account".to_owned(),
+            serde_json::json!({
+                "name": account.display_name(),
+                "email": account.email,
+            }),
+        );
+    }
+    json(200, &body.to_string())
 }
 
 // ── the admin API ───────────────────────────────────────────────────
@@ -321,6 +458,7 @@ async fn admin(req: Request<Incoming>, state: Arc<State>) -> Response<Body> {
     }
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
+    let query = req.uri().query().unwrap_or_default().to_owned();
     let (_parts, body) = req.into_parts();
     let body = match body.collect().await {
         Ok(c) => c.to_bytes(),
@@ -334,6 +472,25 @@ async fn admin(req: Request<Incoming>, state: Arc<State>) -> Response<Body> {
         (Method::GET, "/api/users") => {
             let list: Vec<_> = store.accounts().iter().map(account_json).collect();
             json(200, &serde_json::json!({ "users": list }).to_string())
+        }
+        (Method::GET, "/api/usage") => {
+            let hours = path_hours(&query).unwrap_or(24 * 7).clamp(1, usage::RETAIN_HOURS);
+            let u = state.usage.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let per_user: Vec<_> = store
+                .accounts()
+                .iter()
+                .map(|a| {
+                    let mut v = usage_json(&u, &a.id, hours);
+                    if let Some(o) = v.as_object_mut() {
+                        o.insert("user".to_owned(), account_json(a));
+                    }
+                    v
+                })
+                .collect();
+            json(
+                200,
+                &serde_json::json!({ "hours": hours, "users": per_user }).to_string(),
+            )
         }
         (Method::POST, "/api/users") => {
             let v = parsed(&body);
@@ -370,7 +527,17 @@ async fn admin(req: Request<Incoming>, state: Arc<State>) -> Response<Body> {
         }
         (Method::DELETE, p) if p.starts_with("/api/users/") => {
             match store.remove(p.trim_start_matches("/api/users/")) {
-                Ok(a) => json(200, &serde_json::json!({ "removed": account_json(&a) }).to_string()),
+                Ok(a) => {
+                    // Deleting someone forgets their history too, or "remove"
+                    // would leave their numbers on the dashboard forever with
+                    // no name attached to them.
+                    state
+                        .usage
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .forget(&a.id);
+                    json(200, &serde_json::json!({ "removed": account_json(&a) }).to_string())
+                }
                 Err(e) => json(404, &serde_json::json!({ "error": e.to_string() }).to_string()),
             }
         }
@@ -474,6 +641,7 @@ mod tests {
     fn the_web_root_cannot_be_climbed_out_of() {
         let state = State {
             store: Mutex::new(Store::load(std::env::temp_dir().join("ta-proxy-web-test.json")).expect("store")),
+            usage: Mutex::new(usage::Store::load(std::env::temp_dir().join("ta-proxy-web-usage.json"))),
             admin_token: "t".to_owned(),
             web_root: Some(std::path::PathBuf::from("/usr/share/tab-atelier-proxy/web")),
         };

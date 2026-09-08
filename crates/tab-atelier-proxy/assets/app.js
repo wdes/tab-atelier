@@ -10,6 +10,14 @@
 const { createApp } = Vue;
 
 createApp({
+  // Read off the namespace rather than destructured into consts: these files
+  // are plain <script> tags sharing one scope, so a top-level `const
+  // CallsChart` here collides with the one in charts.js and the page dies with
+  // a redeclaration SyntaxError before Vue ever mounts.
+  components: {
+    CallsChart: window.TaCharts.CallsChart,
+    TokensChart: window.TaCharts.TokensChart,
+  },
   data() {
     return {
       // sessionStorage, not localStorage: the admin token should not outlive
@@ -23,7 +31,60 @@ createApp({
       error: "",
       busy: false,
       origin: window.location.origin,
+      // Per-account usage, keyed by id, as returned by /api/usage.
+      usage: {},
+      hours: 168,
+      // null = everyone; an account id = just them. Clicking a row's token
+      // total drills in, which is the only question the summed charts cannot
+      // answer ("who is that spike?").
+      focus: null,
     };
+  },
+  computed: {
+    scopeLabel() {
+      if (!this.focus) return "everyone";
+      const u = this.users.find((x) => x.id === this.focus);
+      return u ? `${u.first_name} ${u.last_name}` : "unknown";
+    },
+    // The series the charts draw: one account's, or every account's summed
+    // hour by hour. Summing here rather than server-side keeps /api/usage a
+    // plain per-account dump that the drill-down can reuse without refetching.
+    series() {
+      const all = Object.values(this.usage);
+      const chosen = this.focus ? all.filter((u) => u.user.id === this.focus) : all;
+      if (!chosen.length) return [];
+      const base = chosen[0].series_hourly.map((b) => ({ ...b }));
+      for (const acct of chosen.slice(1)) {
+        acct.series_hourly.forEach((b, i) => {
+          const t = base[i];
+          if (!t || t.hour !== b.hour) return;
+          t.calls += b.calls;
+          t.errors += b.errors;
+          t.input += b.input;
+          t.output += b.output;
+          t.cache_read += b.cache_read;
+          t.cache_write += b.cache_write;
+        });
+      }
+      return base;
+    },
+    tiles() {
+      const sum = (pick) => this.series.reduce((a, b) => a + pick(b), 0);
+      const calls = sum((b) => b.calls);
+      const errors = sum((b) => b.errors);
+      const input = sum((b) => b.input);
+      const output = sum((b) => b.output);
+      const cache = sum((b) => b.cache_read);
+      return [
+        { label: "API calls", value: this.fmt(calls), sub: errors ? `${errors} failed` : "none failed" },
+        { label: "Tokens", value: this.fmt(input + output + cache), sub: "input + output + cache" },
+        { label: "Input", value: this.fmt(input), sub: cache ? `${this.fmt(cache)} from cache` : "no cache hits" },
+        { label: "Output", value: this.fmt(output), sub: this.scopeLabel },
+      ];
+    },
+    meUrl() {
+      return `${this.origin}/me/usage`;
+    },
   },
   mounted() {
     // A token already in this session means a reload should land straight back
@@ -61,6 +122,7 @@ createApp({
         this.users = data.users;
         this.authed = true;
         sessionStorage.setItem("ta-proxy-admin", this.token);
+        await this.loadUsage();
       } catch (e) {
         this.error = String(e.message || e);
         this.authed = false;
@@ -74,10 +136,38 @@ createApp({
       this.token = "";
       this.authed = false;
       this.users = [];
+      this.usage = {};
+      this.focus = null;
       this.freshKey = null;
     },
     async refresh() {
       this.users = (await this.api("GET", "/api/users")).users;
+      await this.loadUsage();
+    },
+    async loadUsage() {
+      const data = await this.api("GET", `/api/usage?hours=${this.hours}`);
+      const next = {};
+      for (const u of data.users) next[u.user.id] = u;
+      this.usage = next;
+      // Drilling into someone who has since been deleted would show an empty
+      // chart with their name on it.
+      if (this.focus && !next[this.focus]) this.focus = null;
+    },
+    // Rows render before the first usage load returns, and for an account
+    // that has never called anything there is simply no entry.
+    usageOf(id) {
+      return (
+        this.usage[id] || {
+          last_7d: { calls: 0, errors: 0, tokens: { total: 0 } },
+          all_time: { calls: 0, errors: 0, tokens: { total: 0 } },
+        }
+      );
+    },
+    fmt(n) {
+      if (n >= 1e9) return `${(n / 1e9).toFixed(1)}B`;
+      if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+      if (n >= 1e3) return `${(n / 1e3).toFixed(1)}k`;
+      return String(n ?? 0);
     },
     // Every mutation funnels through here so a failure always lands in the
     // banner instead of the console, and the list can never drift from the

@@ -103,6 +103,7 @@ fn run() -> Result<(), String> {
             }
             let state = Arc::new(server::State {
                 store: Mutex::new(store),
+                usage: Mutex::new(tab_atelier_proxy::usage::Store::load(dir.join("usage.json"))),
                 admin_token: token,
                 web_root: root,
             });

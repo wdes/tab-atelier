@@ -19,6 +19,66 @@
     <meta name="referrer" content="no-referrer" />
     <title>tab-atelier-proxy — accounts</title>
     <link rel="stylesheet" href="vendor/bootstrap.min.css" />
+    <style>
+      /* Chart roles as custom properties, so light and dark are chosen from
+         the same ramps in ONE place and the SVG is written against roles
+         rather than hex. Both palettes were run through the validator; dark is
+         its own steps for the dark surface, not an automatic flip. */
+      .ta-viz {
+        --surface-1: #fcfcfb;
+        --text-secondary: #52514e;
+        --text-muted: #85837b;
+        --grid: #e6e5e0;
+        --series-1: #2a78d6;
+        --series-2: #eb6834;
+        --danger: #c0392b;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root:where(:not([data-bs-theme="light"])) .ta-viz {
+          --surface-1: #1a1a19;
+          --text-secondary: #c3c2b7;
+          --text-muted: #8f8e85;
+          --grid: #33322f;
+          --series-1: #3987e5;
+          --series-2: #d95926;
+          --danger: #e06c5b;
+        }
+      }
+      :root[data-bs-theme="dark"] .ta-viz {
+        --surface-1: #1a1a19;
+        --text-secondary: #c3c2b7;
+        --text-muted: #8f8e85;
+        --grid: #33322f;
+        --series-1: #3987e5;
+        --series-2: #d95926;
+        --danger: #e06c5b;
+      }
+      .ta-chart { position: relative; }
+      .ta-chart svg { width: 100%; height: auto; display: block; }
+      /* Recessive: the data is the ink, the scaffolding is not. */
+      .ta-grid line { stroke: var(--grid); stroke-width: 1; }
+      .ta-grid text, .ta-axis text { fill: var(--text-muted); font-size: 11px; }
+      .ta-line-1 { fill: none; stroke: var(--series-1); stroke-width: 2; stroke-linejoin: round; }
+      .ta-area-1 { fill: var(--series-1); opacity: 0.14; }
+      .ta-dot-1 { fill: var(--series-1); stroke: var(--surface-1); stroke-width: 2; }
+      .ta-bar-1 { fill: var(--series-1); }
+      .ta-bar-2 { fill: var(--series-2); }
+      .ta-crosshair { stroke: var(--text-muted); stroke-width: 1; stroke-dasharray: 3 3; }
+      .ta-tip {
+        position: absolute; top: 8px; transform: translateX(-50%);
+        background: var(--surface-1); color: var(--text-secondary);
+        border: 1px solid var(--grid); border-radius: 6px;
+        padding: 6px 10px; font-size: 12px; pointer-events: none; white-space: nowrap;
+        box-shadow: 0 2px 8px rgb(0 0 0 / 0.12);
+      }
+      .ta-tip-h { font-weight: 600; margin-bottom: 2px; }
+      .ta-tip-err { color: var(--danger); }
+      .ta-tip-sub { color: var(--text-muted); }
+      /* Identity is never colour alone: every key sits beside its label. */
+      .ta-key { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 6px; }
+      .ta-bg-1 { background: var(--series-1); }
+      .ta-bg-2 { background: var(--series-2); }
+    </style>
   </head>
   <body class="bg-body-tertiary">
     <div id="app" class="container py-4" style="max-width: 60rem">
@@ -55,6 +115,61 @@
         </div>
 
         <div v-if="error" class="alert alert-danger py-2 small">{{ error }}</div>
+
+        <!-- Dashboard ------------------------------------------------->
+        <div class="ta-viz mb-4">
+          <div class="row g-2 mb-3">
+            <div class="col-6 col-lg-3" v-for="tile in tiles" :key="tile.label">
+              <div class="card shadow-sm h-100">
+                <div class="card-body py-2">
+                  <div class="text-body-secondary small">{{ tile.label }}</div>
+                  <div class="fs-4">{{ tile.value }}</div>
+                  <div class="text-body-secondary" style="font-size: .75rem">{{ tile.sub }}</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card shadow-sm mb-3">
+            <div class="card-body">
+              <div class="d-flex align-items-center mb-1">
+                <h2 class="h6 mb-0 flex-grow-1">
+                  API calls per hour
+                  <span class="text-body-secondary fw-normal">· {{ scopeLabel }}</span>
+                </h2>
+                <select v-model.number="hours" @change="loadUsage" class="form-select form-select-sm w-auto">
+                  <option :value="24">24 h</option>
+                  <option :value="168">7 d</option>
+                  <option :value="720">30 d</option>
+                </select>
+              </div>
+              <calls-chart :points="series" />
+            </div>
+          </div>
+
+          <div class="card shadow-sm mb-3">
+            <div class="card-body">
+              <div class="d-flex align-items-baseline mb-1">
+                <h2 class="h6 mb-0 flex-grow-1">
+                  Tokens per hour
+                  <span class="text-body-secondary fw-normal">· {{ scopeLabel }}</span>
+                </h2>
+                <!-- Two series, so a legend is always shown. -->
+                <span class="small text-body-secondary">
+                  <span class="ta-key ta-bg-1"></span>input
+                  <span class="ta-key ta-bg-2 ms-3"></span>output
+                </span>
+              </div>
+              <tokens-chart :points="series" />
+            </div>
+          </div>
+
+          <div class="d-flex align-items-center mb-3" v-if="focus">
+            <button class="btn btn-sm btn-outline-secondary" @click="focus = null">
+              ← back to everyone
+            </button>
+          </div>
+        </div>
 
         <!-- A key exists in readable form exactly once. Say so plainly, and
              make it easy to copy, or it gets lost the moment this closes. -->
@@ -105,6 +220,7 @@
                 <th>Email</th>
                 <th>Status</th>
                 <th>Last used</th>
+                <th class="text-end">Tokens (7 d)</th>
                 <th class="text-end">Key</th>
               </tr>
             </thead>
@@ -118,20 +234,34 @@
                   <span v-else class="badge text-bg-success">active</span>
                 </td>
                 <td class="small text-body-secondary">{{ ago(u.last_used_at) }}</td>
-                <td class="text-end text-nowrap">
-                  <button class="btn btn-sm btn-outline-primary" @click="rotate(u)" :disabled="busy">
-                    Rotate
-                  </button>
-                  <button
-                    class="btn btn-sm btn-outline-secondary"
-                    @click="setDisabled(u, !u.disabled)"
-                    :disabled="busy"
-                  >
-                    {{ u.disabled ? 'Enable' : 'Disable' }}
-                  </button>
-                  <button class="btn btn-sm btn-outline-danger" @click="remove(u)" :disabled="busy">
-                    Delete
-                  </button>
+                <td class="text-end small">
+                  <a href="#" @click.prevent="focus = u.id" class="text-decoration-none">
+                    {{ fmt(usageOf(u.id).last_7d.tokens.total) }}
+                  </a>
+                  <div class="text-body-secondary" style="font-size:.75rem">
+                    {{ usageOf(u.id).last_7d.calls }} calls
+                  </div>
+                </td>
+                <td class="text-end">
+                  <!-- gap-2 rather than bare adjacency: three destructive-ish
+                       actions touching each other is how the wrong one gets
+                       clicked. flex-wrap so they stack instead of overflowing
+                       the cell on a narrow window. -->
+                  <div class="d-inline-flex flex-wrap gap-2 justify-content-end">
+                    <button class="btn btn-sm btn-outline-primary" @click="rotate(u)" :disabled="busy">
+                      Rotate
+                    </button>
+                    <button
+                      class="btn btn-sm btn-outline-secondary"
+                      @click="setDisabled(u, !u.disabled)"
+                      :disabled="busy"
+                    >
+                      {{ u.disabled ? 'Enable' : 'Disable' }}
+                    </button>
+                    <button class="btn btn-sm btn-outline-danger" @click="remove(u)" :disabled="busy">
+                      Delete
+                    </button>
+                  </div>
                 </td>
               </tr>
               <tr v-if="!users.length">
@@ -143,14 +273,33 @@
           </table>
         </div>
 
+        <div class="card shadow-sm mt-4">
+          <div class="card-body">
+            <h2 class="h6 card-title">Give an agent its own usage</h2>
+            <p class="small text-body-secondary mb-2">
+              This route reports the statistics of whoever's key calls it — hand it to an
+              agent along with that person's key and it answers for them, and only them.
+              No account id to pass, and nothing to see about anybody else.
+            </p>
+            <div class="input-group input-group-sm mb-2">
+              <input class="form-control font-monospace" :value="meUrl" readonly />
+              <button class="btn btn-outline-secondary" @click="copy(meUrl)">
+                {{ copied ? 'Copied' : 'Copy' }}
+              </button>
+            </div>
+            <pre class="small text-body-secondary mb-0">curl -H "x-api-key: $ANTHROPIC_API_KEY" {{ meUrl }}</pre>
+          </div>
+        </div>
+
         <p class="text-body-secondary small mt-3">
-          A key opens the Anthropic path and nothing else — it cannot reach this page.
-          Disabling keeps the account and its history; deleting forgets both.
+          A key opens the Anthropic path and its own usage, and nothing else — it cannot
+          reach this page. Disabling keeps the account and its history; deleting forgets both.
         </p>
       </template>
     </div>
 
     <script src="vendor/vue.global.prod.js"></script>
+    <script src="charts.js"></script>
     <script src="app.js"></script>
   </body>
 </html>
