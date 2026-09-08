@@ -98,9 +98,16 @@ async fn poll_account_usage(state: Arc<server::State>) {
 
 /// RFC3339 in UTC, without pulling in a date library for one format string.
 fn now_rfc3339() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
+    now_rfc3339_at(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs()),
+    )
+}
+
+/// The conversion, taking the instant, so it can be tested against known
+/// dates instead of whatever the clock says.
+fn now_rfc3339_at(secs: u64) -> String {
     let (hour, minute, second) = ((secs % 86_400) / 3600, (secs % 3600) / 60, secs % 60);
     // Civil-from-days (Howard Hinnant's algorithm), so the timestamp is a real
     // date rather than an epoch count nobody can read on a dashboard.
@@ -259,5 +266,35 @@ fn main() {
     if let Err(e) = run() {
         eprintln!("tab-atelier-proxy: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::now_rfc3339_at;
+
+    /// Every timestamp this proxy writes carries a zone.
+    ///
+    /// The sample log is read by other tools (and by a browser that renders it
+    /// in the viewer's zone), so a bare local-looking timestamp would be
+    /// ambiguous by exactly the offset of whoever wrote it. `Z` says UTC.
+    ///
+    /// The conversion is hand-rolled — a date library for one format string is
+    /// not worth the dependency — which is precisely why it is pinned here
+    /// against known instants rather than trusted.
+    #[test]
+    fn timestamps_are_utc_and_say_so() {
+        // Epoch itself, a leap day, and a date past 2038 (the proxy outlives
+        // 32-bit time_t, and the arithmetic is u64 throughout).
+        for (secs, expect) in [
+            (0_u64, "1970-01-01T00:00:00Z"),
+            (1_709_164_800, "2024-02-29T00:00:00Z"),
+            (1_767_225_599, "2025-12-31T23:59:59Z"),
+            (2_524_608_000, "2050-01-01T00:00:00Z"),
+            (1_757_320_000, "2025-09-08T08:26:40Z"),
+        ] {
+            assert_eq!(now_rfc3339_at(secs), expect, "for {secs}");
+        }
+        assert!(now_rfc3339_at(0).ends_with('Z'), "the zone designator is not optional");
     }
 }

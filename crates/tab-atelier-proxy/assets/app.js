@@ -93,7 +93,7 @@ createApp({
         .map((s) => ({
           util: s.five_hour ?? s.seven_day,
           seven_day: s.seven_day,
-          label: (s.ts || "").replace("T", " ").replace(/:\d\dZ?$/, ""),
+          label: this.whenLocal(s.ts),
         }));
     },
     scopeLabel() {
@@ -313,6 +313,28 @@ createApp({
         // to do instead of failing silently.
         this.error = "Clipboard unavailable (needs HTTPS) — select the key and copy it manually.";
       }
+    },
+    // Every timestamp the proxy emits carries a zone — epoch seconds, or ISO
+    // 8601 with an offset. Rendering is the browser's job, in the zone of
+    // whoever is looking: chopping the offset off the string and showing the
+    // rest, which is what this used to do, silently displays UTC as if it were
+    // local. An hour wrong is worse than no timestamp.
+    whenLocal(iso) {
+      const d = new Date(iso);
+      if (Number.isNaN(d.getTime())) return String(iso ?? "");
+      return d.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+    },
+    // "resets 09:00" is only useful if you already know what time it is there.
+    // What anybody actually wants is how long they have.
+    untilLocal(iso) {
+      const d = new Date(iso);
+      if (Number.isNaN(d.getTime())) return "";
+      const mins = Math.round((d.getTime() - Date.now()) / 60000);
+      if (mins <= 0) return "any moment";
+      if (mins < 60) return `in ${mins} min`;
+      const h = Math.floor(mins / 60);
+      const m = mins % 60;
+      return m ? `in ${h} h ${m} min` : `in ${h} h`;
     },
     ago(secs) {
       if (!secs) return "never";
