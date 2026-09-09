@@ -175,20 +175,36 @@ fn ping(model: &str, count: u32) -> Result<(), String> {
     Ok(())
 }
 
-fn store() -> Result<Store, String> {
+/// Move a secret that used to live in the state directory.
+///
+/// Both files moved when secrets were split out of `~/.local/state`, and
+/// missing one is worse than missing both: `admin.token` is MINTED when
+/// absent, so an unmigrated upgrade silently issues a new token and the one
+/// the operator wrote down starts answering "admin token required".
+fn migrate_secret(name: &str) -> Result<std::path::PathBuf, String> {
     let dir = config_dir()?;
-    let path = dir.join("users.json");
-    // The accounts used to sit in the state dir. Move them once rather than
-    // reading from either place forever — two possible homes for the file that
-    // decides access is exactly the ambiguity worth spending a rename to kill.
-    let legacy = state_dir().map(|d| d.join("users.json")).ok().filter(|p| p.exists());
+    let path = dir.join(name);
+    let legacy = state_dir().map(|d| d.join(name)).ok().filter(|p| p.exists());
     if let (false, Some(legacy)) = (path.exists(), legacy) {
-        let _ = std::fs::create_dir_all(&dir);
+        std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
         if std::fs::rename(&legacy, &path).is_ok() {
-            log::info!("moved accounts to {} (secrets belong under config)", path.display());
+            log::info!("moved {name} to {} (secrets belong under config)", path.display());
         }
     }
+    Ok(path)
+}
+
+fn store() -> Result<Store, String> {
+    // Two possible homes for the file that decides access is exactly the
+    // ambiguity worth spending a rename to kill.
+    let path = migrate_secret("users.json")?;
     Store::load(path).map_err(|e| e.to_string())
+}
+
+/// The admin token, after moving it out of the old location if it is there.
+fn admin_token_migrated() -> Result<String, String> {
+    migrate_secret("admin.token")?;
+    admin_token(&config_dir()?)
 }
 
 fn print_account(a: &Account) {
@@ -233,7 +249,7 @@ fn print_new_key(a: &Account, key: &str) {
 fn serve(listen: &str) -> Result<(), String> {
     let addr: SocketAddr = listen.parse().map_err(|e| format!("bad --listen {listen}: {e}"))?;
     let state_path = state_dir()?;
-    let token = admin_token(&config_dir()?)?;
+    let token = admin_token_migrated()?;
     let store = store()?;
 
     // First run leaves an editable providers.json rather than a mystery: the
@@ -245,6 +261,9 @@ fn serve(listen: &str) -> Result<(), String> {
         let _ = registry.save(&providers_path);
         log::info!("wrote {} — edit it to add providers", providers_path.display());
     }
+    // Say where the token was read from: "admin token required" with no idea
+    // which file the server is actually using is a miserable thing to debug.
+    log::info!("admin token: {}", config_dir()?.join("admin.token").display());
     log::info!(
         "routing across {} provider(s): {:?}",
         registry.providers.len(),
@@ -287,7 +306,7 @@ fn run() -> Result<(), String> {
     match cli.command {
         Command::Serve { listen } => serve(&listen),
         Command::AdminToken => {
-            println!("{}", admin_token(&config_dir()?)?);
+            println!("{}", admin_token_migrated()?);
             Ok(())
         }
         Command::Ping { model, count } => ping(&model, count),
