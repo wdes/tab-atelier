@@ -15,47 +15,42 @@
 //! Defaults to the caller's own tab (`_TAB_ID`); `--tab <id>` targets another.
 //! Same env contract as `set-status` / `set-context`.
 
+/// `tab-atelier set-meta [--tab <id>] <key> <value>` — or `<key> --clear`.
+#[derive(clap::Parser, Debug)]
+#[command(
+    name = "tab-atelier set-meta",
+    about = "Attach a free-form durable label to a tab",
+    long_about = "Attach a free-form durable label to a tab, surfaced in `tabs --json` and on \
+                  GET /tabs. Keys are yours to choose ([a-z0-9_-]); several words of value are \
+                  joined with spaces.",
+    after_help = "Examples:\n  \
+                  tab-atelier set-meta role reviewer\n  \
+                  tab-atelier set-meta project kalpin-back\n  \
+                  tab-atelier set-meta role --clear"
+)]
+struct Cli {
+    /// The key, then its value. `<key>` alone is only valid with `--clear`.
+    #[arg(trailing_var_arg = true)]
+    parts: Vec<String>,
+    /// Which tab; defaults to the caller's own (`_TAB_ID`).
+    #[arg(long)]
+    tab: Option<String>,
+    /// Remove the key instead of setting it.
+    #[arg(long)]
+    clear: bool,
+}
+
 #[must_use]
 pub fn run(args: &[String]) -> i32 {
-    let mut clear = false;
-    let mut tab_override: Option<String> = None;
-    let mut parts: Vec<String> = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--clear" => clear = true,
-            "--tab" => {
-                i += 1;
-                let Some(t) = args.get(i) else {
-                    eprintln!("set-meta: --tab expects a tab id");
-                    return 2;
-                };
-                tab_override = Some(t.clone());
-            }
-            "-h" | "--help" => {
-                eprintln!(
-                    "usage: tab-atelier set-meta [--tab <id>] <key> <value>  |  <key> --clear\n\
-                     Attach a free-form durable label to a tab, surfaced in `tabs --json`\n\
-                     and on GET /tabs. Keys are yours to choose ([a-z0-9_-], max {k} chars);\n\
-                     up to {n} per tab, values up to {v} chars.\n\
-                     Examples:\n  \
-                       tab-atelier set-meta role reviewer\n  \
-                       tab-atelier set-meta project kalpin-back\n  \
-                       tab-atelier set-meta role --clear",
-                    k = crate::META_KEY_MAX,
-                    n = crate::META_MAX_KEYS,
-                    v = crate::META_VALUE_MAX,
-                );
-                return 0;
-            }
-            other if !other.starts_with("--") => parts.push(other.to_string()),
-            other => {
-                eprintln!("set-meta: unknown argument: {other}");
-                return 2;
-            }
-        }
-        i += 1;
-    }
+    let cli = match super::parse::<Cli>("tab-atelier set-meta", args) {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    let Cli {
+        parts,
+        tab: tab_override,
+        clear,
+    } = cli;
 
     let Some((key, rest)) = parts.split_first() else {
         eprintln!("set-meta: expected <key> (see --help)");

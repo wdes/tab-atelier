@@ -14,44 +14,40 @@
 //! `TAB_ATELIER_API_URL`, `TAB_ATELIER_API_TOKEN` from env — same as
 //! `set-status`.
 
-/// Parse `[--tab <id>] [--clear] <text…>` and POST it to the tab's
-/// `/context` endpoint.
+/// `tab-atelier set-context [--tab <id>] "<text>"` — or `--clear`.
+#[derive(clap::Parser, Debug)]
+#[command(
+    name = "tab-atelier set-context",
+    about = "Declare what this tab is working on (PR/issue/task)",
+    long_about = "Declare what this tab is working on (PR/issue/task). Shows as a hover \
+                  tooltip on the GUI tab name and on /tabs. Defaults to the current tab.",
+    after_help = "Examples:\n  \
+                  tab-atelier set-context \"PR #3719: dompdf font reproduction\"\n  \
+                  tab-atelier set-context --clear"
+)]
+struct Cli {
+    /// The context text. Several words are joined with spaces.
+    #[arg(trailing_var_arg = true)]
+    text: Vec<String>,
+    /// Which tab; defaults to the caller's own (`_TAB_ID`).
+    #[arg(long)]
+    tab: Option<String>,
+    /// Drop the tab's context instead of setting one.
+    #[arg(long)]
+    clear: bool,
+}
+
 #[must_use]
 pub fn run(args: &[String]) -> i32 {
-    let mut clear = false;
-    let mut tab_override: Option<String> = None;
-    let mut parts: Vec<String> = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--clear" => clear = true,
-            "--tab" => {
-                i += 1;
-                let Some(t) = args.get(i) else {
-                    eprintln!("set-context: --tab expects a tab id");
-                    return 2;
-                };
-                tab_override = Some(t.clone());
-            }
-            "-h" | "--help" => {
-                eprintln!(
-                    "usage: tab-atelier set-context [--tab <id>] \"<text>\"  |  --clear\n\
-                     Declare what this tab is working on (PR/issue/task). Shows as a hover\n\
-                     tooltip on the GUI tab name and on /tabs. Defaults to the current tab.\n\
-                     Examples:\n  \
-                       tab-atelier set-context \"PR #3719: dompdf font reproduction\"\n  \
-                       tab-atelier set-context --clear"
-                );
-                return 0;
-            }
-            other if !other.starts_with("--") => parts.push(other.to_string()),
-            other => {
-                eprintln!("set-context: unknown argument: {other}");
-                return 2;
-            }
-        }
-        i += 1;
-    }
+    let cli = match super::parse::<Cli>("tab-atelier set-context", args) {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    let Cli {
+        text: parts,
+        tab: tab_override,
+        clear,
+    } = cli;
 
     // Outside a tab-atelier tab the API env isn't exported. Treat that
     // as a silent no-op (exit 0) — exactly like `set-status` — so a
