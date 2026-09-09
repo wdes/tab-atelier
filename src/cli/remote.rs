@@ -188,6 +188,12 @@ fn cmd_add(args: &[String]) -> i32 {
             "--autoconnect" => autoconnect = true,
             other => {
                 eprintln!("tab-atelier remote add: unknown argument: {other}");
+                // Every argument here is named, so a bare word is nearly
+                // always someone writing the label positionally — say so
+                // instead of making them re-read the usage block.
+                if !other.starts_with('-') {
+                    eprintln!("  the label is a named argument — did you mean `--label {other}`?");
+                }
                 return 2;
             }
         }
@@ -480,6 +486,112 @@ mod tests {
         assert_eq!(run(&argv(&["re-pin"])), 2);
     }
 
+    /// Flags [`cmd_add`] accepts, and whether each takes a value. Must
+    /// mirror the `match` in `cmd_add` — [`every_add_flag_is_listed_here`]
+    /// fails if the parser grows one this forgets.
+    const ADD_FLAGS: &[(&str, bool)] = &[
+        ("--label", true),
+        ("--url", true),
+        ("--token", true),
+        ("--relay-token", true),
+        ("--cert-sha256", true),
+        ("--cf-id", true),
+        ("--cf-secret", true),
+        ("--no-pin", false),
+        ("--autoconnect", false),
+    ];
+
+    #[test]
+    fn every_add_flag_is_listed_here() {
+        // Reads the parser's own source: a new arm in `cmd_add` that is not
+        // in ADD_FLAGS would make the doc check below silently blind to it.
+        let src = include_str!("remote.rs");
+        let body = src
+            .split_once("fn cmd_add(args: &[String]) -> i32 {")
+            .map(|(_, rest)| {
+                rest.split_once("\n    let label = match label")
+                    .map_or(rest, |(b, _)| b)
+            })
+            .unwrap_or_default();
+        for line in body.lines() {
+            let t = line.trim();
+            // Match arms look like `"--flag" => {` or `"--a" | "--b" => …`.
+            if !t.starts_with('"') {
+                continue;
+            }
+            for flag in t.split("=>").next().unwrap_or_default().split('|') {
+                let flag = flag.trim().trim_matches('"');
+                if !flag.starts_with("--") {
+                    continue;
+                }
+                assert!(
+                    ADD_FLAGS.iter().any(|(f, _)| *f == flag),
+                    "cmd_add accepts {flag} but ADD_FLAGS does not list it — the docs check cannot see it"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_documented_remote_add_would_actually_parse() {
+        // `tab-atelier remote add proxy --url …` shipped in docs/proxy.md and
+        // failed on the user's first paste: the label is a named argument.
+        // Docs are copy-pasted verbatim, so they are held to the parser.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = vec![root.join("README.md")];
+        if let Ok(dir) = std::fs::read_dir(root.join("docs")) {
+            files.extend(
+                dir.flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().is_some_and(|x| x == "md")),
+            );
+        }
+        assert!(files.len() > 1, "expected docs/*.md to be readable");
+
+        let mut checked = 0usize;
+        for path in files {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            // Re-join shell line continuations so a multi-line example is
+            // validated as the single command a reader would run.
+            let joined = text.replace("\\\n", " ");
+            for line in joined.lines() {
+                let Some(rest) = line.split_once("tab-atelier remote add") else {
+                    continue;
+                };
+                let tokens: Vec<&str> = rest
+                    .1
+                    .split_whitespace()
+                    .map(|t| t.trim_matches('`'))
+                    .take_while(|t| !t.is_empty() && *t != "#" && *t != "&&")
+                    .collect();
+                checked += 1;
+                let mut i = 0;
+                while i < tokens.len() {
+                    let tok = tokens[i];
+                    // Prose ellipsis standing in for "the other flags".
+                    if tok == "…" || tok == "..." {
+                        i += 1;
+                        continue;
+                    }
+                    let Some((_, takes_value)) = ADD_FLAGS.iter().find(|(f, _)| *f == tok) else {
+                        panic!(
+                            "{}: `tab-atelier remote add` example passes {tok:?}, which the parser rejects\n  line: {}",
+                            path.display(),
+                            line.trim()
+                        );
+                    };
+                    i += if *takes_value { 2 } else { 1 };
+                }
+            }
+        }
+        assert!(
+            checked > 0,
+            "found no documented `remote add` examples — did the docs move?"
+        );
+    }
+
     #[test]
     fn truncate_keeps_the_table_aligned() {
         assert_eq!(truncate("short", 10), "short");
@@ -508,6 +620,13 @@ mod tests {
             "no token"
         );
         assert_eq!(super::run(&rargs(&["add", "--nope", "x"])), 2, "unknown flag");
+        // The label written positionally — `remote add proxy --url …` — is
+        // the mistake a copy-paste from the docs produced, so it is pinned.
+        assert_eq!(
+            super::run(&rargs(&["add", "proxy", "--url", "http://x:1"])),
+            2,
+            "positional label"
+        );
         // A flag with no value must not swallow the next flag as its argument.
         assert_eq!(super::run(&rargs(&["add", "--label"])), 2);
         assert_eq!(super::run(&rargs(&["add", "--url"])), 2);
