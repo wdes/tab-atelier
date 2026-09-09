@@ -318,40 +318,30 @@ pub fn fleet(args: &[String]) -> i32 {
 /// Exit 0 with the task printed when something was taken, 3 when the board
 /// has nothing free (a distinct code so a polling loop can tell "idle" from
 /// "broken"), 1 on failure.
+#[derive(clap::Parser, Debug)]
+#[command(
+    name = "tab-atelier take",
+    about = "Lease the best open task for this agent",
+    after_help = "Exit 3 when nothing is free, so a polling loop can tell idle from broken."
+)]
+struct TakeArgs {
+    /// How long the lease is held before it can be reclaimed.
+    #[arg(long, value_name = "SECONDS", default_value_t = 900)]
+    ttl: u64,
+    /// Show which task would be taken, without taking it.
+    #[arg(long)]
+    dry_run: bool,
+}
+
 #[must_use]
 pub fn take(args: &[String]) -> i32 {
-    let mut ttl_s = 900u64;
-    let mut dry = false;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--ttl" => {
-                i += 1;
-                let Some(v) = args.get(i).and_then(|v| v.parse::<u64>().ok()) else {
-                    eprintln!("take: --ttl expects seconds");
-                    return 2;
-                };
-                ttl_s = v;
-            }
-            "--dry-run" => dry = true,
-            "-h" | "--help" => {
-                eprintln!(
-                    "usage: tab-atelier take [--ttl <seconds>] [--dry-run]\n\
-                     \n\
-                     Lease the best open task for this agent. Exit 3 when nothing is free.\n\
-                     \n\
-                     --ttl <seconds>   how long the lease is held before it can be reclaimed\n\
-                     --dry-run         show which task would be taken, without taking it"
-                );
-                return 0;
-            }
-            other => {
-                eprintln!("take: unknown argument: {other}");
-                return 2;
-            }
-        }
-        i += 1;
-    }
+    let TakeArgs {
+        ttl: ttl_s,
+        dry_run: dry,
+    } = match super::parse::<TakeArgs>("tab-atelier take", args) {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
     let me = whoami();
     let notes = read_blackboard();
     let folded = fold_tasks(&notes);

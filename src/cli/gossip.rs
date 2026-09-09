@@ -23,14 +23,6 @@
 use super::share_link::agent;
 use super::team::{Note, merge_into_blackboard, read_blackboard};
 
-fn usage() {
-    eprintln!(
-        "usage: tab-atelier gossip [--peer <label-or-id>] [--pull-only] [--quiet]\n\
-         Exchange blackboard entries with configured remotes (all of them by default).\n\
-         Safe to run on a timer: the merge is a set union, so repeats are free."
-    );
-}
-
 /// What one exchange with one peer did.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Round {
@@ -137,35 +129,32 @@ pub fn sweep_all() -> Vec<Round> {
     prefs.remote_endpoints.iter().map(|ep| exchange(ep, false)).collect()
 }
 
+/// `tab-atelier gossip [--peer <label-or-id>] [--pull-only] [--quiet]`
+#[derive(clap::Parser, Debug)]
+#[command(
+    name = "tab-atelier gossip",
+    about = "Exchange blackboard entries with configured remotes (all of them by default)",
+    after_help = "Safe to run on a timer: the merge is a set union, so repeats are free."
+)]
+struct Cli {
+    /// Exchange with just this remote, by label or id.
+    #[arg(long)]
+    peer: Option<String>,
+    /// Take their entries without offering ours.
+    #[arg(long)]
+    pull_only: bool,
+    /// Say nothing unless something went wrong.
+    #[arg(long, short = 'q')]
+    quiet: bool,
+}
+
 #[must_use]
 pub fn run(args: &[String]) -> i32 {
-    let mut peer: Option<String> = None;
-    let mut pull_only = false;
-    let mut quiet = false;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--peer" => {
-                i += 1;
-                let Some(v) = args.get(i) else {
-                    eprintln!("gossip: --peer expects a label or id");
-                    return 2;
-                };
-                peer = Some(v.clone());
-            }
-            "--pull-only" => pull_only = true,
-            "--quiet" | "-q" => quiet = true,
-            "-h" | "--help" => {
-                usage();
-                return 0;
-            }
-            other => {
-                eprintln!("gossip: unknown argument: {other}");
-                return 2;
-            }
-        }
-        i += 1;
-    }
+    let cli = match super::parse::<Cli>("tab-atelier gossip", args) {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    let Cli { peer, pull_only, quiet } = cli;
     let prefs = crate::load_preferences(&crate::platform::config_dir());
     let selected: Vec<&crate::RemoteEndpoint> = prefs
         .remote_endpoints

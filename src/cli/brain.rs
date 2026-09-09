@@ -821,59 +821,74 @@ fn crash_log(msg: &str) {
     }
 }
 
+/// `tab-atelier brain [--once] [--interval SECS]`
+///
+/// The long help is built at runtime because it quotes the tuning constants;
+/// a hand-written copy would drift from them the first time one changed.
+#[derive(clap::Parser, Debug)]
+#[command(
+    name = "tab-atelier brain",
+    about = "Watch Claude tabs for known failure signatures and nudge them"
+)]
+struct Cli {
+    /// One tick, then exit.
+    #[arg(long)]
+    once: bool,
+    /// Seconds between ticks.
+    #[arg(long, value_name = "SECS", default_value_t = DEFAULT_INTERVAL_SECS, value_parser = clap::value_parser!(u64).range(1..))]
+    interval: u64,
+}
+
+/// What `--help` explains beyond the one-line summary.
+fn long_help() -> String {
+    format!(
+        "Watches every Claude tab for known agent-failure signatures and\n\
+         sends `continue\\r` to the matching tab. A tab is nudged only when\n\
+         its screen has been FROZEN for {STABLE_SECS}s (so an actively-working\n\
+         or auto-retrying agent — whose output is still moving — is never\n\
+         interrupted), and only ONCE per frozen screen (re-nudges wait for\n\
+         the output to change first).\n\
+         Patterns: {n} known signatures (Anthropic API connectivity).\n\
+         Connectivity probe (Google generate_204 + Cloudflare 1.1.1.1) gates\n\
+         every send; offline → suppress, retry on next tick when back online.\n\
+         Round-robin: at most one send per tick across all eligible tabs.\n\
+         Repeat nudges for the SAME error back off exponentially, {b}s → {m}s.\n\
+         When more than {t} eligible tabs are stuck on an Anthropic capacity\n\
+         error (529 / 503 / 5xx / rate-limited) the fleet is capped upstream,\n\
+         so sends drop to one every {c}s until it recovers — spaced, never\n\
+         silent. Each tick scans for at most {budget}s and resumes where it\n\
+         stopped, so a large fleet can't outrun the poll interval.",
+        n = PATTERNS.len(),
+        b = NUDGE_BACKOFF_BASE_SECS,
+        m = NUDGE_BACKOFF_MAX_SECS,
+        t = CIRCUIT_BREAKER_THRESHOLD,
+        c = CIRCUIT_BREAKER_COOLDOWN.as_secs(),
+        budget = TICK_BUDGET.as_secs(),
+    )
+}
+
 #[must_use]
 pub fn run(args: &[String]) -> i32 {
-    let mut once = false;
-    let mut interval = DEFAULT_INTERVAL_SECS;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--once" => once = true,
-            "--interval" => {
-                i += 1;
-                match args.get(i).and_then(|v| v.parse::<u64>().ok()) {
-                    Some(n) if n >= 1 => interval = n,
-                    _ => {
-                        eprintln!("brain: --interval expects a number >= 1");
-                        return 2;
-                    }
-                }
-            }
-            "-h" | "--help" => {
-                eprintln!(
-                    "usage: tab-atelier-headless brain [--once] [--interval SECS]\n\
-                     Watches every Claude tab for known agent-failure signatures and\n\
-                     sends `continue\\r` to the matching tab. A tab is nudged only when\n\
-                     its screen has been FROZEN for {STABLE_SECS}s (so an actively-working\n\
-                     or auto-retrying agent — whose output is still moving — is never\n\
-                     interrupted), and only ONCE per frozen screen (re-nudges wait for\n\
-                     the output to change first).\n\
-                     Patterns: {n} known signatures (Anthropic API connectivity).\n\
-                     Connectivity probe (Google generate_204 + Cloudflare 1.1.1.1) gates\n\
-                     every send; offline → suppress, retry on next tick when back online.\n\
-                     Round-robin: at most one send per tick across all eligible tabs.\n\
-                     Repeat nudges for the SAME error back off exponentially, {b}s → {m}s.\n\
-                     When more than {t} eligible tabs are stuck on an Anthropic capacity\n\
-                     error (529 / 503 / 5xx / rate-limited) the fleet is capped upstream,\n\
-                     so sends drop to one every {c}s until it recovers — spaced, never\n\
-                     silent. Each tick scans for at most {budget}s and resumes where it\n\
-                     stopped, so a large fleet can't outrun the poll interval.",
-                    n = PATTERNS.len(),
-                    b = NUDGE_BACKOFF_BASE_SECS,
-                    m = NUDGE_BACKOFF_MAX_SECS,
-                    t = CIRCUIT_BREAKER_THRESHOLD,
-                    c = CIRCUIT_BREAKER_COOLDOWN.as_secs(),
-                    budget = TICK_BUDGET.as_secs(),
-                );
-                return 0;
-            }
-            other => {
-                eprintln!("brain: unknown argument: {other}");
+    let cmd = <Cli as clap::CommandFactory>::command().long_about(long_help());
+    let argv = std::iter::once("tab-atelier brain".to_owned()).chain(args.iter().cloned());
+    let cli = match cmd.try_get_matches_from(argv) {
+        Ok(m) => match <Cli as clap::FromArgMatches>::from_arg_matches(&m) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = e.print();
                 return 2;
             }
+        },
+        Err(e) => {
+            let help = matches!(
+                e.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            );
+            let _ = e.print();
+            return i32::from(!help) * 2;
         }
-        i += 1;
-    }
+    };
+    let Cli { once, interval } = cli;
 
     // Name the tab so the share-link viewer's <title> and any /tabs
     // consumer see the right label. OSC 2 = window title.
