@@ -23,8 +23,132 @@
 //! Adding a client command is now one arm here (+ one `clap` variant in
 //! `dispatch` if headless should list it in `--help`).
 
+use std::time::Duration;
+
 use super::{bench, bench_lag, brain, claude_hook, delegate, flags, logging, remote};
 use super::{set_context, set_font, set_meta, set_status, share_link, team, tokens};
+
+// ── the local API endpoint ──────────────────────────────────────────
+//
+// Every client subcommand talks to the same local HTTP API, so they all need
+// the same two things: where it is, and the token to present. This used to
+// live in `share_link` and be imported from there by nine modules — while
+// `set-status`, `set-context` and `set-meta` each re-derived it by hand from
+// the environment alone, and so failed on any machine where the daemon runs
+// as a service and the token is in a file. That is a discovery rule with a
+// hole in it, not three little duplications.
+
+#[derive(Debug, Clone)]
+pub(crate) struct Endpoint {
+    pub(crate) url: String,
+    pub(crate) token: String,
+}
+
+/// Endpoint injected by the CLI tests, which point the verbs at an
+/// in-process API server. Set through [`set_test_endpoint`]; `None` in every
+/// other build, where discovery goes through env + the token files below.
+#[cfg(test)]
+static TEST_ENDPOINT: std::sync::Mutex<Option<Endpoint>> = std::sync::Mutex::new(None);
+
+/// Point every verb at `ep` (or back at real discovery with `None`).
+#[cfg(test)]
+pub(crate) fn set_test_endpoint(ep: Option<Endpoint>) {
+    *TEST_ENDPOINT.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = ep;
+}
+
+/// URL a daemon bound, read from the `api.url` the server writes beside its
+/// token; [`DEFAULT_LOOPBACK_URL`] when absent (an older daemon, or one that
+/// couldn't write its state dir).
+///
+/// Pairing the URL with the token file we just matched matters: the two must
+/// describe the SAME instance, or we authenticate against one daemon with
+/// another's credential and get a 401 that blames the token.
+fn endpoint_url_beside(token_path: &std::path::Path) -> String {
+    token_path
+        .parent()
+        .map(|d| d.join("api.url"))
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|u| u.trim().to_owned())
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| DEFAULT_LOOPBACK_URL.to_owned())
+}
+
+/// Where a daemon lives unless it published otherwise.
+pub(crate) const DEFAULT_LOOPBACK_URL: &str = "http://127.0.0.1:7890";
+
+pub(crate) fn discover_endpoint() -> Result<Endpoint, String> {
+    #[cfg(test)]
+    {
+        let injected = TEST_ENDPOINT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(ep) = injected {
+            return Ok(ep);
+        }
+    }
+    if let (Ok(url), Ok(token)) = (
+        std::env::var("TAB_ATELIER_API_URL"),
+        std::env::var("TAB_ATELIER_API_TOKEN"),
+    ) {
+        return Ok(Endpoint { url, token });
+    }
+    // Order matters: the system-service install runs under
+    // HOME=/var/lib/tab-atelier so XDG_STATE_HOME resolves to
+    // `/var/lib/tab-atelier/.local/state`. Check that path FIRST so
+    // a stale per-user token (left over from a direct
+    // `tab-atelier-headless` invocation as root) doesn't trump the
+    // live daemon's token. Per-user comes after for non-service installs.
+    let candidates = [
+        std::path::PathBuf::from("/var/lib/tab-atelier/.local/state/tab-atelier/api.token"),
+        std::path::PathBuf::from("/var/lib/tab-atelier/api.token"),
+        crate::platform::state_base_dir().join("tab-atelier").join("api.token"),
+    ];
+    let mut tried = Vec::new();
+    for path in &candidates {
+        tried.push(path.display().to_string());
+        if let Ok(t) = std::fs::read_to_string(path) {
+            let token = t.trim().to_string();
+            if !token.is_empty() {
+                return Ok(Endpoint {
+                    url: endpoint_url_beside(path),
+                    token,
+                });
+            }
+        }
+    }
+    Err(format!("no api.token found (tried env vars + {})", tried.join(", ")))
+}
+
+pub(crate) fn agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(3)))
+        .build()
+        .into()
+}
+
+/// A `POST` to the local API, authenticated.
+///
+/// Takes an already-discovered endpoint rather than discovering one, because
+/// the callers must tell "there is no daemon here" (a silent no-op, so a
+/// shell hook outside a tab never blocks) apart from "the POST failed" (a
+/// real error worth reporting). Collapsing the two would make one of them
+/// lie.
+///
+/// The bearer header was hand-built at three call sites and imported from a
+/// fourth; a typo there is a 401 that blames the token, so it is written once.
+///
+/// # Errors
+/// The request failed or the daemon refused it.
+pub(crate) fn api_post_to(ep: &Endpoint, path: &str, body: String) -> Result<(), String> {
+    agent()
+        .post(format!("{}{path}", ep.url))
+        .header("Authorization", format!("Bearer {}", ep.token))
+        .header("Content-Type", "application/json")
+        .send(body)
+        .map(|_| ())
+        .map_err(|e| format!("POST {path}: {e}"))
+}
 
 /// Dispatch a client subcommand by name against raw `&[String]` args.
 ///
@@ -114,4 +238,80 @@ pub fn run(name: &str, rest: &[String]) -> i32 {
         eprintln!("internal error: '{name}' is not in the shared client dispatch table");
         2
     })
+}
+
+#[cfg(test)]
+mod tests {
+    /// No verb may re-derive the API endpoint from the environment.
+    ///
+    /// `set-status`, `set-context` and `set-meta` each did, reading
+    /// `TAB_ATELIER_API_URL`/`TAB_ATELIER_API_TOKEN` and returning 0 — silent
+    /// success — when they were unset. On a machine where the daemon runs as
+    /// a service the vars are not exported and the token lives in a file, so
+    /// those three did nothing at all while `share-link` worked fine.
+    ///
+    /// Checked by reading the sources rather than by behaviour, deliberately:
+    /// a behavioural test would have to unset process-wide environment
+    /// variables to be meaningful, which is both unsound under parallel test
+    /// execution and forbidden here (`unsafe_code`). It also silently passes
+    /// when the developer happens to be running inside a tab-atelier tab,
+    /// where those vars ARE set — which is exactly how this went unnoticed.
+    #[test]
+    fn no_verb_reads_the_api_endpoint_out_of_the_environment() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cli");
+        let mut offenders = Vec::new();
+        let mut checked = 0;
+        let mut stack = vec![dir];
+        while let Some(d) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&d) else { continue };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                // This module is where the reading is SUPPOSED to happen.
+                if path.file_name().is_some_and(|f| f == "client.rs") {
+                    continue;
+                }
+                let Ok(src) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                checked += 1;
+                for var in ["TAB_ATELIER_API_URL", "TAB_ATELIER_API_TOKEN"] {
+                    if src.contains(&format!("env::var(\"{var}\")")) {
+                        offenders.push(format!("{} reads {var}", path.display()));
+                    }
+                }
+            }
+        }
+        assert!(checked > 10, "only scanned {checked} cli modules — did they move?");
+        assert!(
+            offenders.is_empty(),
+            "these bypass `discover_endpoint()`, so they silently no-op against a daemon \
+             whose token is in a file rather than the environment:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
+    #[test]
+    fn discovery_follows_the_port_the_daemon_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = dir.path().join("api.token");
+        std::fs::write(&token, "0123456789abcdef0123456789abcdef").unwrap();
+        // No api.url (an older daemon): fall back to the documented default
+        // rather than refusing to talk to it at all.
+        assert_eq!(super::endpoint_url_beside(&token), super::DEFAULT_LOOPBACK_URL);
+        // Published: follow it, or a daemon on a non-default port gets a token
+        // meant for it sent to whatever holds 7890 — a 401 that reads like a
+        // credential problem.
+        std::fs::write(dir.path().join("api.url"), "http://127.0.0.1:7899\n").unwrap();
+        assert_eq!(super::endpoint_url_beside(&token), "http://127.0.0.1:7899");
+        // An empty/blank file is treated as absent, not as an empty URL.
+        std::fs::write(dir.path().join("api.url"), "  \n").unwrap();
+        assert_eq!(super::endpoint_url_beside(&token), super::DEFAULT_LOOPBACK_URL);
+    }
 }

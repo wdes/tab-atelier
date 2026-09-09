@@ -3,12 +3,12 @@
 //! `tab-atelier set-status <state> [--label …] [--session …] [--kind …] [--plan]`
 //!
 //! Tiny CLI for tools (catbus-agent, shell hooks, …) running inside a
-//! tab-atelier tab to publish a per-tab agent state. Reads `_TAB_ID`,
-//! `TAB_ATELIER_API_URL`, `TAB_ATELIER_API_TOKEN` from env. Silently
-//! no-ops (exit 0) when those aren't set so a shell rc file calling
-//! it outside a tab doesn't spam errors.
-
-use std::time::Duration;
+//! tab-atelier tab to publish a per-tab agent state. Reads `_TAB_ID` from
+//! env and finds the API through the shared discovery in
+//! [`crate::cli::client`] — env vars first, then the daemon's token file,
+//! which is how it reaches an instance running as a system service.
+//! Silently no-ops (exit 0) outside a tab so a shell rc file calling it
+//! doesn't spam errors.
 
 #[must_use]
 pub fn run(args: &[String]) -> i32 {
@@ -16,10 +16,10 @@ pub fn run(args: &[String]) -> i32 {
         // Outside a tab-atelier tab — silent no-op.
         return 0;
     };
-    let Ok(api_url) = std::env::var("TAB_ATELIER_API_URL") else {
-        return 0;
-    };
-    let Ok(api_token) = std::env::var("TAB_ATELIER_API_TOKEN") else {
+    // No endpoint at all — silent no-op, as above. Discovery covers the
+    // token file too, so this no longer misses a daemon that runs as a
+    // service and never exported the env vars.
+    let Ok(ep) = super::client::discover_endpoint() else {
         return 0;
     };
 
@@ -103,18 +103,8 @@ pub fn run(args: &[String]) -> i32 {
     }
     let body = serde_json::Value::Object(body).to_string();
 
-    let url = format!("{api_url}/tabs/by-id/{tab_id}/status");
-    let agent = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(2)))
-        .build()
-        .new_agent();
-    match agent
-        .post(&url)
-        .header("Authorization", &format!("Bearer {api_token}"))
-        .header("Content-Type", "application/json")
-        .send(&body)
-    {
-        Ok(_) => 0,
+    match super::client::api_post_to(&ep, &format!("/tabs/by-id/{tab_id}/status"), body) {
+        Ok(()) => 0,
         Err(e) => {
             eprintln!("tab-atelier set-status: {e}");
             1
