@@ -294,9 +294,23 @@ createApp({
         this.form = { first_name: "", last_name: "", email: "" };
       });
     },
-    rotate(u) {
-      if (!confirm(`Replace ${u.first_name} ${u.last_name}'s key? The current one stops working at once.`)) return;
-      return this.act(async () => this.showKey(await this.api("POST", `/api/users/${u.id}/rotate`)));
+    // Adding a key never disturbs the existing ones, which is what makes
+    // moving a machine across safe: add, deploy, then delete the old one.
+    addKey(u) {
+      const name = prompt(`Name for ${u.first_name}'s new key (laptop, ci, fleet…)`, "");
+      if (!name) return;
+      return this.act(async () => {
+        const data = await this.api("POST", `/api/users/${u.id}/keys`, { name });
+        this.showKey({ user: u, key: data.secret, name: data.key.name });
+      });
+    },
+    removeKey(u, k) {
+      if (!confirm(`Delete ${u.first_name}'s key "${k.name}"? Anything using it stops working. Their other keys are unaffected.`))
+        return;
+      return this.act(() => this.api("DELETE", `/api/users/${u.id}/keys/${k.id}`));
+    },
+    toggleKey(u, k) {
+      return this.act(() => this.api("POST", `/api/users/${u.id}/keys/${k.id}/disabled`, { disabled: !k.disabled }));
     },
     setDisabled(u, disabled) {
       return this.act(() => this.api("POST", `/api/users/${u.id}/disabled`, { disabled }));
@@ -310,6 +324,7 @@ createApp({
       this.freshKey = {
         who: `${data.user.first_name} ${data.user.last_name} <${data.user.email}>`,
         key: data.key,
+        name: data.name ? `"${data.name}"` : "",
       };
     },
     async copy(text) {

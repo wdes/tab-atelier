@@ -214,7 +214,7 @@
         <!-- A key exists in readable form exactly once. Say so plainly, and
              make it easy to copy, or it gets lost the moment this closes. -->
         <div v-if="freshKey" class="alert alert-success">
-          <div class="fw-semibold">Key for {{ freshKey.who }}</div>
+          <div class="fw-semibold">Key {{ freshKey.name }} for {{ freshKey.who }}</div>
           <div class="input-group my-2">
             <input class="form-control font-monospace" :value="freshKey.key" readonly />
             <button class="btn btn-outline-success" @click="copy(freshKey.key)">
@@ -260,7 +260,7 @@
                 <th>Email</th>
                 <th>Status</th>
                 <th class="text-center">Priority</th>
-                <th>Last used</th>
+                <th>Keys · last used</th>
                 <th class="text-end">Tokens (7 d)</th>
                 <th class="text-end">Key</th>
               </tr>
@@ -290,18 +290,32 @@
                     {{ shareOf(u) }}
                   </div>
                 </td>
-                <td class="small text-body-secondary">
-                  <div>{{ ago(u.last_used_at) }}</div>
-                  <!-- A key issued and never used is worth seeing: either
-                       someone never took up their access, or it went astray
-                       on the way to them. -->
-                  <div v-if="!u.first_used_at" class="fst-italic">never used</div>
-                  <template v-else>
-                    <div style="font-size:.75rem">first {{ ago(u.first_used_at) }}</div>
-                    <div v-if="u.last_used_ip" class="font-monospace" style="font-size:.75rem">
-                      {{ u.last_used_ip }}
-                    </div>
-                  </template>
+                <td class="small text-body-secondary" style="min-width: 18rem">
+                  <!-- One row per key. The dates and the address belong to the
+                       KEY: "last used from here" says nothing when three keys
+                       share an account. -->
+                  <div v-for="k in (u.keys || [])" :key="k.id" class="d-flex align-items-baseline gap-2 mb-1">
+                    <span class="font-monospace" :class="k.disabled ? 'text-decoration-line-through' : ''">
+                      {{ k.name }}
+                    </span>
+                    <span v-if="!k.first_used_at" class="fst-italic">never used</span>
+                    <span v-else>
+                      {{ ago(k.last_used_at) }}
+                      <span v-if="k.last_used_ip" class="font-monospace">· {{ k.last_used_ip }}</span>
+                    </span>
+                    <span class="ms-auto text-nowrap">
+                      <a href="#" @click.prevent="toggleKey(u, k)" class="text-decoration-none">
+                        {{ k.disabled ? 'enable' : 'disable' }}
+                      </a>
+                      <a href="#" @click.prevent="removeKey(u, k)" class="text-danger text-decoration-none ms-2">
+                        delete
+                      </a>
+                    </span>
+                  </div>
+                  <div v-if="!(u.keys || []).length" class="fst-italic">no keys</div>
+                  <a href="#" @click.prevent="addKey(u)" class="text-decoration-none" style="font-size:.75rem">
+                    + add a key
+                  </a>
                 </td>
                 <td class="text-end small">
                   <a href="#" @click.prevent="focus = u.id" class="text-decoration-none">
@@ -317,9 +331,6 @@
                        clicked. flex-wrap so they stack instead of overflowing
                        the cell on a narrow window. -->
                   <div class="d-inline-flex flex-wrap gap-2 justify-content-end">
-                    <button class="btn btn-sm btn-outline-primary" @click="rotate(u)" :disabled="busy">
-                      Rotate
-                    </button>
                     <button
                       class="btn btn-sm btn-outline-secondary"
                       @click="setDisabled(u, !u.disabled)"
