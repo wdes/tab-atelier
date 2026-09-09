@@ -186,6 +186,28 @@ mod tests {
         );
     }
 
+    /// Minting on absence is the right behaviour and also a trap: if the file
+    /// moves and nothing carries it across, the next start issues a NEW token
+    /// and the one the operator wrote down begins answering "admin token
+    /// required" — with nothing to say it was replaced.
+    #[test]
+    fn a_token_is_never_silently_replaced_by_a_new_one() {
+        let dir = std::env::temp_dir().join(format!("ta-proxy-tok-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("admin.token"),
+            "tap_existing
+",
+        )
+        .expect("write");
+        assert_eq!(
+            admin_token(&dir).expect("read"),
+            "tap_existing",
+            "an existing token must be returned as-is (trimmed), never re-minted"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn an_admin_token_is_minted_once_and_then_reused() {
         let dir = std::env::temp_dir().join(format!("ta-proxy-admin-{}", uuid::Uuid::new_v4()));

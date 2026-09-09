@@ -173,6 +173,9 @@ createApp({
       this.busy = true;
       this.error = "";
       try {
+        // Trim: a token pasted from a terminal usually brings a newline, and
+        // the comparison is exact.
+        this.token = (this.token || "").trim();
         const data = await this.api("GET", "/api/users");
         this.users = data.users;
         this.authed = true;

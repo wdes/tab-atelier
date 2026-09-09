@@ -829,8 +829,31 @@ async fn admin(req: Request<Incoming>, state: Arc<State>) -> Response<Body> {
     if state.admin_token.is_empty() {
         return json(503, r#"{"error":"no admin token configured"}"#);
     }
-    if !constant_time_eq(presented(&req).as_bytes(), state.admin_token.as_bytes()) {
-        return json(401, r#"{"error":"admin token required"}"#);
+    let offered = presented(&req);
+    if !constant_time_eq(offered.as_bytes(), state.admin_token.as_bytes()) {
+        // "admin token required" alone leaves an operator with nothing to act
+        // on — the same unhelpful 401 the proxy path deliberately avoids. Say
+        // what was wrong without printing anyone's secret.
+        let why = if offered.is_empty() {
+            "no credential presented — a reverse proxy that drops the Authorization header does this"
+        } else if state
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .authenticate(&offered)
+            .is_some()
+        {
+            "that is a USER key — it opens the Anthropic path and /me/usage, never this API"
+        } else if offered.trim() != offered {
+            "the token has leading or trailing whitespace — it was probably pasted with a newline"
+        } else {
+            "token mismatch — check `tab-atelier-proxy admin-token` ON THE SERVER, as the service user"
+        };
+        log::warn!("admin: 401 ({} chars presented): {why}", offered.chars().count());
+        return json(
+            401,
+            &serde_json::json!({ "error": format!("admin token required: {why}") }).to_string(),
+        );
     }
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
