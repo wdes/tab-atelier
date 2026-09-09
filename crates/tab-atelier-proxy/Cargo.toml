@@ -33,6 +33,12 @@ bytes = "1"
 futures-util = { version = "0.3", default-features = false }
 sha2 = { version = "0.10", default-features = false }
 uuid = { version = "1", features = ["v4"] }
+# Timestamp parsing for the usage log. Spelled exactly as env_logger declares
+# it, so this is the same rlib the proxy already builds via env_logger's
+# `humantime` feature — zero extra compile units. `default-features = false` is
+# load-bearing: the defaults drag in a proc-macro and a bundled tz database,
+# and nothing here needs a timezone, only UTC instants.
+jiff = { version = "0.2", default-features = false, features = ["std"] }
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }

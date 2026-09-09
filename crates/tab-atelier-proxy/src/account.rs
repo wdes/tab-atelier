@@ -266,9 +266,88 @@ impl Monitor {
     /// Current utilisation, 0.0–1.0, if it is known.
     #[must_use]
     pub fn utilization(&self) -> Option<f64> {
-        // Already a fraction: everything entering the store is normalised.
-        self.latest().and_then(Sample::utilization)
+        self.utilization_at(crate::usage::now_secs())
     }
+
+    /// Utilisation as of `now`, or `None` if the newest good reading is too
+    /// old to act on.
+    ///
+    /// The staleness bound is the point of this function. `latest()` skips
+    /// failed samples, so without it a monitor that broke at noon keeps
+    /// answering with noon's number indefinitely — and this value feeds
+    /// routing, which would go on treating a plan it cannot see as the 11% it
+    /// last measured. An unknown plan and an idle plan are not the same
+    /// claim; only one of them is honest here.
+    #[must_use]
+    pub fn utilization_at(&self, now: u64) -> Option<f64> {
+        let latest = self.latest()?;
+        let age = epoch_of(&latest.ts).map(|t| now.saturating_sub(t));
+        // An unparseable timestamp is not evidence of freshness.
+        if age? > STALE_AFTER_SECS {
+            return None;
+        }
+        // Already a fraction: everything entering the store is normalised.
+        latest.utilization()
+    }
+
+    /// Whether the monitor itself is working, for the dashboard.
+    ///
+    /// Separate from utilisation because "the plan is at 11%" and "we last
+    /// heard that ten hours ago" are different facts, and a chart that only
+    /// plots the first silently drew the second as a line that stops.
+    #[must_use]
+    pub fn health(&self, now: u64) -> Health {
+        let last_ok = self.latest();
+        let newest = self.recent.last();
+        Health {
+            stale: self.utilization_at(now).is_none() && last_ok.is_some(),
+            last_ok_ts: last_ok.map(|s| s.ts.clone()),
+            last_ok_age_secs: last_ok.and_then(|s| epoch_of(&s.ts)).map(|t| now.saturating_sub(t)),
+            // The newest sample's error, not the newest error: if the monitor
+            // has recovered, there is nothing to report.
+            last_error: newest.and_then(|s| s.error.clone()),
+            consecutive_failures: u32::try_from(self.recent.iter().rev().take_while(|s| !s.is_ok()).count())
+                .unwrap_or(u32::MAX),
+        }
+    }
+}
+
+/// How old the newest good reading may be before it stops counting.
+///
+/// Twenty minutes is four missed polls at the healthy five-minute interval —
+/// long enough that one slow or rate-limited call changes nothing, short
+/// enough that a monitor which has genuinely stopped is not still steering
+/// routing an hour later.
+pub const STALE_AFTER_SECS: u64 = 20 * 60;
+
+/// What the dashboard needs to say about the monitor rather than the plan.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Health {
+    /// A reading exists but is too old to act on.
+    pub stale: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_ok_ts: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_ok_age_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub consecutive_failures: u32,
+}
+
+/// Seconds since the epoch for an RFC3339 timestamp.
+///
+/// Parsing is jiff's, not ours: this used to be a hand-rolled days-from-civil
+/// conversion, which accepted `2026-02-30` (silently March 2nd) and hour 99
+/// because it only range-checked the month and the day. jiff is already
+/// compiled into this binary — `env_logger` pulls it in for `humantime` — so
+/// the correct parser costs nothing the calendar arithmetic was not already
+/// costing.
+///
+/// A timestamp before 1970 yields `None`; every producer of these files writes
+/// `now()`, so that is a malformed file rather than a date to reason about.
+#[must_use]
+pub fn epoch_of(ts: &str) -> Option<u64> {
+    u64::try_from(ts.parse::<jiff::Timestamp>().ok()?.as_second()).ok()
 }
 
 #[cfg(test)]
@@ -285,6 +364,15 @@ mod tests {
         let p = std::env::temp_dir().join(format!("ta-proxy-acct-{name}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&p).expect("mkdir");
         p
+    }
+
+    /// A minute after `ts` — the "now" to judge a fixture sample against.
+    ///
+    /// Fixtures carry fixed dates, so asserting on `utilization()` would tie
+    /// the test to the wall clock and start failing twenty minutes after the
+    /// date someone wrote in the string.
+    fn just_after(ts: &str) -> u64 {
+        epoch_of(ts).map_or(0, |t| t + 60)
     }
 
     fn sample_on(day: &str, five_hour: f64) -> Sample {
@@ -361,7 +449,7 @@ mod tests {
         )
         .expect("write");
         let m = Monitor::load(&dir);
-        assert_eq!(m.utilization(), Some(0.37));
+        assert_eq!(m.utilization_at(just_after("2026-09-09T08:00:00Z")), Some(0.37));
         assert_eq!(
             m.recent()[0].seven_day,
             Some(0.19),
@@ -394,7 +482,8 @@ mod tests {
 
         let reloaded = Monitor::load(&dir);
         assert_eq!(reloaded.recent().len(), 2, "the JSONL tail must survive a restart");
-        assert!((reloaded.utilization().unwrap_or(0.0) - 0.62).abs() < 1e-9);
+        let util = reloaded.utilization_at(just_after("2026-09-08T09:00:00Z"));
+        assert!((util.unwrap_or(0.0) - 0.62).abs() < 1e-9);
     }
 
     /// One file per UTC day, named so a directory listing sorts into
@@ -477,5 +566,109 @@ mod tests {
     fn no_samples_means_no_reading_not_zero() {
         let m = Monitor::load(tmp("empty"));
         assert_eq!(m.utilization(), None, "unknown must not read as 'plenty left'");
+    }
+
+    /// The timestamp in a sample, `secs` seconds after the epoch, in the
+    /// format the monitor writes.
+    fn ts_at(secs: u64) -> String {
+        i64::try_from(secs)
+            .ok()
+            .and_then(|s| jiff::Timestamp::from_second(s).ok())
+            .unwrap_or(jiff::Timestamp::UNIX_EPOCH)
+            .strftime("%Y-%m-%dT%H:%M:%SZ")
+            .to_string()
+    }
+
+    #[test]
+    fn a_timestamp_survives_the_round_trip_it_was_written_with() {
+        // Held against the same civil-from-days the binary formats with, so
+        // the two cannot drift apart: a parser that is wrong by a day would
+        // mark every reading stale and silently blind routing.
+        for secs in [0_u64, 1_000_000, 1_788_000_000, 1_788_991_236, 4_102_444_800] {
+            let ts = ts_at(secs);
+            assert_eq!(epoch_of(&ts), Some(secs), "round trip {ts}");
+        }
+    }
+
+    #[test]
+    fn the_timestamp_spellings_the_monitors_actually_write_all_parse() {
+        // The Rust monitor writes `…Z`; the .mjs one writes fractional
+        // seconds with a `+00:00` offset. Both files feed the same store.
+        let base = epoch_of("2026-09-09T12:20:36Z").expect("plain Z");
+        assert_eq!(epoch_of("2026-09-09T12:20:36.562143+00:00"), Some(base));
+        assert_eq!(epoch_of("2026-09-09T12:20:36.5Z"), Some(base));
+        assert_eq!(epoch_of("2026-09-09t12:20:36z"), Some(base));
+        // A real offset is converted, not refused: the hand-rolled parser
+        // this replaced could not do the arithmetic, so it rejected them.
+        assert_eq!(epoch_of("2026-09-09T12:20:36+02:00"), Some(base - 2 * 3600));
+        // Impossible dates and times are rejected rather than normalised
+        // into some other day — the old parser accepted Feb 30 as March 2.
+        assert_eq!(epoch_of("2026-02-30T12:00:00Z"), None, "Feb 30");
+        assert_eq!(epoch_of("2026-09-09T99:20:36Z"), None, "hour 99");
+        assert_eq!(epoch_of("2026-09-09T12:99:36Z"), None, "minute 99");
+        assert_eq!(epoch_of("not a timestamp"), None);
+        assert_eq!(epoch_of("2026-13-09T12:20:36Z"), None, "month 13");
+        assert_eq!(epoch_of(""), None);
+    }
+
+    #[test]
+    fn a_reading_stops_counting_once_it_is_too_old() {
+        // The production failure this exists for: the last good sample was
+        // 12:20:36, every poll after it failed, and the stale number went on
+        // steering routing for ten hours.
+        let mut m = Monitor::load(tmp("stale"));
+        let t0 = 1_788_000_000;
+        m.push(Sample {
+            ts: ts_at(t0),
+            http: Some(200),
+            five_hour: Some(0.11),
+            ..Sample::default()
+        });
+        assert_eq!(m.utilization_at(t0 + 60), Some(0.11), "fresh reading counts");
+        assert_eq!(
+            m.utilization_at(t0 + STALE_AFTER_SECS - 1),
+            Some(0.11),
+            "inside the window"
+        );
+        assert_eq!(m.utilization_at(t0 + STALE_AFTER_SECS + 1), None, "outside it, unknown");
+    }
+
+    #[test]
+    fn health_reports_the_failure_the_chart_cannot_show() {
+        let mut m = Monitor::load(tmp("health"));
+        let t0 = 1_788_000_000;
+        m.push(Sample {
+            ts: ts_at(t0),
+            http: Some(200),
+            five_hour: Some(0.11),
+            ..Sample::default()
+        });
+        let ok = m.health(t0 + 60);
+        assert!(!ok.stale);
+        assert_eq!(ok.consecutive_failures, 0);
+        assert_eq!(ok.last_error, None);
+
+        // The two real failures, in the order they happened.
+        m.push(Sample {
+            ts: ts_at(t0 + 300),
+            http: Some(429),
+            error: Some("http 429".to_owned()),
+            ..Sample::default()
+        });
+        m.push(Sample {
+            ts: ts_at(t0 + 36_000),
+            error: Some("refresh rejected: http 400: invalid_grant".to_owned()),
+            ..Sample::default()
+        });
+        let bad = m.health(t0 + 36_060);
+        assert!(bad.stale, "a reading exists but is far too old");
+        assert_eq!(bad.consecutive_failures, 2);
+        assert_eq!(
+            bad.last_error.as_deref(),
+            Some("refresh rejected: http 400: invalid_grant"),
+            "the newest failure, not the first"
+        );
+        assert_eq!(bad.last_ok_ts.as_deref(), Some(ts_at(t0).as_str()));
+        assert_eq!(bad.last_ok_age_secs, Some(36_060));
     }
 }

@@ -513,9 +513,12 @@ fn pressure_json(state: &Arc<State>) -> Response<Body> {
         let acct = state.account.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         serde_json::json!({
             // The honest signal — upstream's own report about the shared plan,
-            // not an inference from our accounting.
+            // not an inference from our accounting. `null` when the monitor
+            // has gone quiet: `health` says why, and the UI must show that
+            // rather than the last number it happened to see.
             "utilization": acct.utilization(),
             "latest": acct.latest(),
+            "health": acct.health(usage::now_secs()),
             "history": acct.recent(),
         })
     };
