@@ -134,6 +134,23 @@ const TAG_PREVIEW: u8 = 0x0C;
 /// compressed size and fall back to raw if it didn't actually shrink.
 const COMPRESS_MIN_BYTES: usize = 256;
 
+/// Frames at or above this get gzip level 6 instead of level 1. The
+/// split exists because the two kinds of `out` frame want opposite
+/// things: a keystroke echo is latency-critical and barely
+/// compressible, while the `since=0` bootstrap is a one-shot bulk
+/// transfer whose size is what makes a phone wait. Measured on real
+/// rings dumped from this app — 15 distinct tabs, 4,463,190 B total:
+/// level 1 → 803,795 B in 40 ms, level 6 → 644,513 B in 85 ms. Trading
+/// 45 ms of one-off server CPU for 20% less to push over a mobile link
+/// is worth it; on a single typical 368 KB tab it is 61,693 → 49,019 B
+/// for 2 ms. Level 9 was measured too and rejected: only 4% beyond
+/// level 6 for 3x the CPU (273 ms).
+///
+/// Deliberately equal to [`OFFLOAD_MIN_BYTES`] — the same threshold
+/// that decides a frame is a bulk replay worth rendering a preview
+/// for also decides it is worth compressing hard.
+const COMPRESS_HARD_MIN_BYTES: usize = OFFLOAD_MIN_BYTES;
+
 /// When `TAB_ATELIER_WS_DEBUG_INPUT` is set in the environment, every
 /// inbound `TAG_IN` frame is logged to stderr (wall-clock ms, raw
 /// bytes, printable repr, and what `ImeDedup` decided). Used to
@@ -980,12 +997,24 @@ fn encode_out_frame(chunk: Vec<u8>) -> Vec<u8> {
     encode_frame(TAG_OUT, chunk)
 }
 
-/// gzip `data` at a fast level (terminal text compresses well even at
-/// level 1, and this can sit on the output hot path). `None` on the
+/// gzip `data`, hard for a bulk bootstrap and fast for anything that
+/// might be on the keystroke path — see [`COMPRESS_HARD_MIN_BYTES`] for
+/// the measurements behind the split. `None` on the
 /// practically-impossible encoder error so the caller falls back to raw.
+///
+/// gzip and not brotli/zstd on purpose: a WebSocket payload has to be
+/// inflated by the page itself, and `DecompressionStream` takes
+/// `brotli` only on Firefox 147+/Safari 18.4+ and `zstd` only on
+/// Firefox 138+ — neither on Chrome, which is most of mobile. `gzip` is
+/// the only format every engine decodes natively.
 fn gzip(data: &[u8]) -> Option<Vec<u8>> {
     use std::io::Write;
-    let mut enc = flate2::write::GzEncoder::new(Vec::with_capacity(data.len() / 3 + 32), flate2::Compression::fast());
+    let level = if data.len() >= COMPRESS_HARD_MIN_BYTES {
+        flate2::Compression::new(6)
+    } else {
+        flate2::Compression::fast()
+    };
+    let mut enc = flate2::write::GzEncoder::new(Vec::with_capacity(data.len() / 3 + 32), level);
     enc.write_all(data).ok()?;
     enc.finish().ok()
 }
@@ -1868,6 +1897,68 @@ mod tests {
             // was read mid-PTY-write) can't panic the WS pump.
             let bytes = b"hello\x1b[31mworld\x1b[";
             let _ = build_preview(bytes, 20, 5); // must not panic
+        }
+    }
+
+    mod compression {
+        use super::super::{COMPRESS_HARD_MIN_BYTES, TAG_OUT, TAG_OUT_DEFLATE, encode_out_frame, gzip};
+
+        /// Scrollback-shaped filler: repetitive VT text, like the ring
+        /// content this actually compresses in production.
+        fn scrollback(len: usize) -> Vec<u8> {
+            let line = b"\x1b[32m$\x1b[0m cargo build --release   Compiling tab-atelier v0.1.0\r\n";
+            line.iter().copied().cycle().take(len).collect()
+        }
+
+        #[test]
+        fn a_bootstrap_sized_frame_compresses_harder_than_a_live_one() {
+            // The whole point of the level split: the same bytes must come
+            // out smaller when they arrive as one bulk frame than when they
+            // arrive as sub-threshold live chunks.
+            let big = scrollback(COMPRESS_HARD_MIN_BYTES * 4);
+            let small = scrollback(COMPRESS_HARD_MIN_BYTES - 1);
+
+            let bulk = gzip(&big).expect("gzip of scrollback");
+            let live = gzip(&small).expect("gzip of scrollback");
+
+            let bulk_ratio = bulk.len() as f64 / big.len() as f64;
+            let live_ratio = live.len() as f64 / small.len() as f64;
+            assert!(
+                bulk_ratio < live_ratio,
+                "level 6 should beat level 1 on the same shape of data: bulk {bulk_ratio} vs live {live_ratio}"
+            );
+        }
+
+        #[test]
+        fn every_level_round_trips_through_the_client_side_inflate() {
+            // Both branches of the split must still be plain gzip — the
+            // browser inflates them with DecompressionStream('gzip') and has
+            // no idea which level produced them.
+            use std::io::Read;
+            for len in [
+                COMPRESS_HARD_MIN_BYTES - 1,
+                COMPRESS_HARD_MIN_BYTES,
+                COMPRESS_HARD_MIN_BYTES * 3,
+            ] {
+                let data = scrollback(len);
+                let gz = gzip(&data).expect("gzip");
+                let mut back = Vec::new();
+                flate2::read::GzDecoder::new(gz.as_slice())
+                    .read_to_end(&mut back)
+                    .expect("inflate");
+                assert_eq!(back, data, "round trip at len {len}");
+            }
+        }
+
+        #[test]
+        fn a_keystroke_echo_stays_on_the_raw_path() {
+            // Latency, not size, is what matters for an echo — it must not
+            // pick up the compressor at all.
+            let frame = encode_out_frame(b"a".to_vec());
+            assert_eq!(frame.first().copied(), Some(TAG_OUT));
+
+            let frame = encode_out_frame(scrollback(COMPRESS_HARD_MIN_BYTES * 2));
+            assert_eq!(frame.first().copied(), Some(TAG_OUT_DEFLATE));
         }
     }
 }
