@@ -204,7 +204,7 @@ giving a third party a script tag on the page where the admin token is typed.
 On the machine with the terminal:
 
 ```sh
-tab-atelier remote add proxy --url https://proxy.example.org --relay-token tap_…
+tab-atelier remote add --label proxy --url https://proxy.example.org --relay-token tap_…
 tab-atelier relay via proxy
 tab-atelier relay on
 ```
