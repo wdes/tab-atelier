@@ -56,6 +56,21 @@ pub fn run(args: &[String]) -> i32 {
             other if state.is_none() && !other.starts_with("--") => {
                 state = Some(other.to_string());
             }
+            "-h" | "--help" => {
+                eprintln!(
+                    "usage: tab-atelier set-status <state> [--label L] [--session ID] [--kind K] \
+                     [--daemon] [--plan|--no-plan]\n\
+                     \n\
+                     Publish this tab's agent state, shown as the tab's LED.\n\
+                     \n\
+                     --label L     free-text label beside the state\n\
+                     --session ID  the agent session this belongs to\n\
+                     --kind K      which agent (claude, catbus, ...)\n\
+                     --daemon      a session-less daemon tab: restore relaunches the verb\n\
+                     --plan        the agent is in plan mode (--no-plan clears it)"
+                );
+                return 0;
+            }
             other => {
                 eprintln!("tab-atelier set-status: unknown argument: {other}");
                 return 2;

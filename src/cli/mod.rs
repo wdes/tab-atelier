@@ -62,3 +62,63 @@ pub mod tokens;
 /// `tab-atelier announce / bid / award / take / done` — the verbs an agent
 /// uses to join the fleet and pick up work on its own.
 pub mod work;
+
+#[cfg(test)]
+mod help_tests {
+    /// Every hand-rolled argument parser answers `--help`.
+    ///
+    /// The subcommands that take `[ARGS]...` and parse them by hand are
+    /// invisible to clap, so clap's generated `--help` stops at the verb. A
+    /// parser that then reports `unknown argument: --help` is worse than one
+    /// with no help at all: it reads as "this command has no help" rather than
+    /// "you are in the wrong place". `tab-atelier remote add --help` did
+    /// exactly that.
+    ///
+    /// Any file that can say "unknown argument" must also handle `--help`
+    /// somewhere. Checked by reading the sources, because these parsers have
+    /// no shared entry point to test through.
+    #[test]
+    fn every_hand_rolled_parser_answers_help() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cli");
+        let mut checked = 0;
+        let mut missing = Vec::new();
+
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                // This file is not a parser: it only mentions the marker
+                // because it is the thing doing the looking.
+                if path.ends_with(std::path::Path::new(file!()).file_name().unwrap_or_default()) {
+                    continue;
+                }
+                let Ok(src) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                if !src.contains("unknown argument: {") {
+                    continue;
+                }
+                checked += 1;
+                if !src.contains("\"--help\"") {
+                    missing.push(path.display().to_string());
+                }
+            }
+        }
+
+        assert!(checked > 5, "only found {checked} hand-rolled parsers — did they move?");
+        assert!(
+            missing.is_empty(),
+            "these reject unknown flags but never answer --help, so `--help` reports itself \
+             as an unknown argument:\n  {}",
+            missing.join("\n  ")
+        );
+    }
+}

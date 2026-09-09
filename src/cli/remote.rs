@@ -29,6 +29,9 @@ use std::time::Duration;
 
 use crate::{RemoteEndpoint, fetch_cert_fingerprint, load_preferences, platform, remote, save_preferences};
 
+/// Verbs whose own parser prints a better help than the general usage.
+const SELF_HELPING: &[&str] = &["put", "get"];
+
 #[must_use]
 pub fn run(args: &[String]) -> i32 {
     let Some(sub) = args.first() else {
@@ -36,6 +39,18 @@ pub fn run(args: &[String]) -> i32 {
         return 2;
     };
     let rest = &args[1..];
+    // `remote add --help` used to answer "unknown argument: --help": help was
+    // handled for the bare `remote`, and every verb below hand-rolls its own
+    // parser that had never heard of it. A flag that works at one level and
+    // errors one level down is worse than no flag at all, because it reads as
+    // "this command has no help" rather than "you are in the wrong place".
+    //
+    // Verbs with something more specific to say answer for themselves; the
+    // rest fall back to the full usage, which does list every verb's flags.
+    if rest.iter().any(|a| a == "-h" || a == "--help") && !SELF_HELPING.contains(&sub.as_str()) {
+        usage();
+        return 0;
+    }
     match sub.as_str() {
         "list" => cmd_list(),
         // Printed here, pasted into the PEER's `remote add --token`. Scoped to
