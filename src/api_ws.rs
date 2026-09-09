@@ -37,9 +37,41 @@
 //! | 0x07 | activate | C→S | empty — make this tab active           |
 //! | 0x08 | rename   | C→S | JSON `{"name":"…"}`                    |
 //! | 0x09 | close    | C→S | empty — close this tab                 |
+//! | 0x0C | preview  | S→C | UTF-8 ANSI text — quick approximate paint |
 //!
 //! Ping/pong stay on tungstenite's built-in control frames; no
 //! application-layer keepalive.
+//!
+//! ## Fast first paint (`preview`)
+//!
+//! A `since=0` bootstrap on a long-running tab can mean replaying
+//! megabytes of raw PTY history (see [`PtyRing`]'s docs on why the
+//! ring, not alacritty's grid, is the source of truth) — that's
+//! multiple seconds of transfer on a slow link, plus real client-side
+//! `xterm.js` parse time before anything is visible. Slicing the raw
+//! byte stream by count to send "just the tail" was considered and
+//! rejected: raw PTY bytes are a STATEFUL stream (cursor position, SGR
+//! colours, screen contents all depend on everything before the cut),
+//! so an arbitrary byte-count cut can start mid escape-sequence
+//! (printing its tail as literal garbage text) or mid a full-screen
+//! redraw (leaving rows blank that a correct render would have
+//! filled) — reproduced with a synthetic 4 MiB TUI-like corpus during
+//! this change's development.
+//!
+//! Instead, on a `since=0` bootstrap big enough to matter
+//! ([`OFFLOAD_MIN_BYTES`]), the server parses the SAME bytes it's
+//! about to replay through a disposable, throwaway
+//! `alacritty_terminal::Term` (server-side, Rust — not xterm.js) and
+//! ships just the last `2 * rows` screen rows as a `preview` frame
+//! FIRST — small and always byte-correct because it's derived from
+//! the authoritative grid, not a slice of the wire format. The real,
+//! unchanged full replay (`out` / `out-gz`) follows right behind and
+//! is what the client's `since=` reconnect bookkeeping tracks; the
+//! `preview` frame is a pure bonus paint that never advances that
+//! offset. The client resets its terminal before applying the
+//! authoritative replay, so the temporary preview never persists,
+//! never duplicates a line, and the final buffer is byte-identical to
+//! what a single full replay would have produced.
 //!
 //! ## Auth + RO
 //!
@@ -87,6 +119,12 @@ const TAG_FOCUS: u8 = 0x0B;
 /// only for frames over [`COMPRESS_MIN_BYTES`] where it actually
 /// shrinks them — keystroke echoes stay raw `TAG_OUT`.
 const TAG_OUT_DEFLATE: u8 = 0x0A;
+/// S→C: a quick, approximate paint of the last `2 * rows` screen rows,
+/// sent (at most once) ahead of a big `since=0` bootstrap so the
+/// viewer shows something almost immediately. NOT counted in the
+/// client's `since=` reconnect offset — see the module docs' "Fast
+/// first paint" section and [`build_preview`].
+const TAG_PREVIEW: u8 = 0x0C;
 
 /// Don't bother gzipping `out` frames below this — gzip's ~18-byte
 /// header + deflate framing would erase the win on tiny payloads, and
@@ -748,6 +786,32 @@ async fn run_pump(
             None
         };
 
+    // Fast first paint: on a brand-new bootstrap (since=0) with a
+    // nontrivial amount of history queued, ship a small, byte-correct
+    // preview of the last `2 * rows` rows BEFORE the real (potentially
+    // multi-MB) replay. See the module docs' "Fast first paint"
+    // section for why this is NOT a slice of the raw ring bytes.
+    if since == 0
+        && let Some(meta) = last_meta.as_ref()
+        && meta.cols > 0
+        && meta.rows > 0
+    {
+        let snapshot = {
+            let Ok(r) = ring.lock() else { return };
+            r.since(0)
+        };
+        if snapshot.len() >= OFFLOAD_MIN_BYTES {
+            let (cols, rows) = (meta.cols, meta.rows);
+            let preview = tokio::task::spawn_blocking(move || build_preview(&snapshot, cols, rows)).await;
+            if let Ok(Some(text)) = preview {
+                let frame = encode_frame(TAG_PREVIEW, text.into_bytes());
+                if sink.send(Message::Binary(frame.into())).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+
     // Event-driven output: wake on a `PtyRing` push and flush
     // immediately. `notify` is cloned from the ring once up front, along
     // with the viewer-count handle.
@@ -924,6 +988,43 @@ fn gzip(data: &[u8]) -> Option<Vec<u8>> {
     let mut enc = flate2::write::GzEncoder::new(Vec::with_capacity(data.len() / 3 + 32), flate2::Compression::fast());
     enc.write_all(data).ok()?;
     enc.finish().ok()
+}
+
+/// A `Term` event listener that does nothing — [`build_preview`] only
+/// needs the grid `Term::advance` populates, not damage/title/bell
+/// events.
+struct NopEventListener;
+impl alacritty_terminal::event::EventListener for NopEventListener {}
+
+/// Parse `bytes` (a `since=0` ring snapshot) through a disposable,
+/// throwaway `alacritty_terminal::Term` sized `cols x rows`, and
+/// return the last `2 * rows` screen rows as ANSI text — a small,
+/// byte-CORRECT preview of the current screen, safe to paint before
+/// the real (identical-content) replay arrives. `None` when the
+/// parsed screen is entirely blank (nothing worth painting early).
+///
+/// Deliberately does NOT reuse the tab's live `Term` (owned by the GUI
+/// or headless tab, each generic over a different `EventListener`):
+/// this keeps the fast path self-contained in `api_ws.rs`, with no
+/// coupling to either binary's rendering thread, at the cost of
+/// re-parsing the snapshot once more — offloaded to `spawn_blocking`
+/// by the caller, same as the existing gzip path for payloads this
+/// size. See the module docs' "Fast first paint" section for why this
+/// parses instead of slicing the raw bytes.
+fn build_preview(bytes: &[u8], cols: u16, rows: u16) -> Option<String> {
+    let term = alacritty_terminal::term::Term::new(
+        alacritty_terminal::term::Config::default(),
+        &crate::term_export::TermDims {
+            columns: usize::from(cols),
+            screen_lines: usize::from(rows),
+        },
+        NopEventListener,
+    );
+    let term = alacritty_terminal::sync::FairMutex::new(term);
+    let mut parser: vte::ansi::Processor = vte::ansi::Processor::new();
+    parser.advance(&mut *term.lock(), bytes);
+    let (text, _cursor) = crate::term_export::term_to_ansi_rows(&term, Some(usize::from(rows) * 2));
+    (!text.trim().is_empty()).then_some(text)
 }
 
 /// Dispatch a single C→S frame into the snapshot's pending queues.
@@ -1662,45 +1763,111 @@ mod tests {
         assert_eq!(super::percent_decode(""), b"");
     }
 
-    // THROWAWAY measurement, not a real regression test — run explicitly
-    // with `cargo test --release temp_bench_scrollback_bootstrap -- --ignored --nocapture`.
-    // Deleted before this change lands.
-    #[test]
-    #[ignore = "throwaway manual benchmark, not a regression test"]
-    fn temp_bench_scrollback_bootstrap() {
-        let raw = std::fs::read("/tmp/ta-bench/synthetic_scrollback.bin").expect("run gen.js first");
-        eprintln!("payload: {} bytes", raw.len());
+    mod preview {
+        use super::build_preview;
 
-        // gzip the whole payload, same call as encode_out_frame's hot path.
-        let t0 = std::time::Instant::now();
-        let gz = super::gzip(&raw).expect("gzip");
-        let gzip_dt = t0.elapsed();
-        eprintln!(
-            "gzip whole payload: {:?}  {} -> {} bytes ({:.1}x)",
-            gzip_dt,
-            raw.len(),
-            gz.len(),
-            raw.len() as f64 / gz.len() as f64
-        );
-
-        // Populate a PtyRing exactly like the real PTY tap would (4 KiB
-        // reads), forcing cold-chunk compaction, then time `.since(0)` —
-        // the read the WS pump does on every since=0 bootstrap.
-        let mut ring = crate::pty_ring::PtyRing::with_capacity(crate::pty_ring::DEFAULT_CAPACITY_BYTES);
-        for chunk in raw.chunks(4096) {
-            ring.push(chunk);
+        /// `\x1b[<row>;<col>H` — 1-indexed absolute cursor position.
+        fn goto(row: usize, col: usize) -> String {
+            format!("\x1b[{row};{col}H")
         }
-        let t0 = std::time::Instant::now();
-        let since0 = ring.since(0);
-        let since_dt = t0.elapsed();
-        eprintln!("ring.since(0): {since_dt:?}  -> {} bytes", since0.len());
 
-        // Full pipeline: since(0) + gzip, as run inline in `run_pump` for
-        // any chunk under OFFLOAD_MIN_BYTES, or on the blocking pool above it.
-        let t0 = std::time::Instant::now();
-        let bytes = ring.since(0);
-        let _frame = super::encode_out_frame(bytes);
-        let total_dt = t0.elapsed();
-        eprintln!("since(0) + encode_out_frame total: {total_dt:?}");
+        #[test]
+        fn reconstructs_a_later_partial_redraw_over_an_earlier_full_one() {
+            // Mirrors how real TUIs (Claude Code, htop) actually update: a
+            // full-screen paint, then LATER redraws that only touch a few
+            // rows via cursor positioning, leaving the rest as-is. A byte-
+            // count slice of the raw stream landing between the two redraws
+            // would show the untouched rows blank (proven separately with a
+            // client-side xterm.js harness during this change's
+            // development); build_preview parses from the true start, so
+            // every row is correct regardless of where the "interesting"
+            // bytes start.
+            let (cols, rows) = (10usize, 5usize);
+            let mut bytes = String::new();
+            for r in 1..=rows {
+                bytes.push_str(&goto(r, 1));
+                bytes.push_str(&"A".repeat(cols));
+            }
+            // A large gap of unrelated activity between the full paint above
+            // and the partial redraw below — enough that a byte-count tail
+            // slice of `2 * rows * cols` reaches back only into this gap,
+            // NOT to the first redraw. Without this, a small input could
+            // accidentally survive a naive slice intact and this test would
+            // pass for the wrong reason. A no-visual-effect SGR reset (NOT
+            // `\r\n`, which would really scroll rows 1..4 off-screen and make
+            // "untouched rows keep the first redraw" false for a correct
+            // implementation too) keeps this a pure byte-count/escape-parsing
+            // test, not a scrolling one.
+            for _ in 0..2000 {
+                bytes.push_str("\x1b[0m");
+            }
+            // Second pass: only the LAST row changes.
+            bytes.push_str(&goto(rows, 1));
+            bytes.push_str(&"B".repeat(cols));
+
+            let preview = build_preview(bytes.as_bytes(), cols as u16, rows as u16).expect("non-blank");
+            let lines: Vec<&str> = preview.trim_end_matches('\n').split('\n').collect();
+            assert_eq!(lines.len(), rows, "one line per screen row: {lines:?}");
+            for line in &lines[..rows - 1] {
+                assert_eq!(
+                    *line,
+                    "A".repeat(cols),
+                    "untouched rows keep the first redraw: {lines:?}"
+                );
+            }
+            assert_eq!(
+                lines[rows - 1],
+                "B".repeat(cols),
+                "last row shows the later redraw: {lines:?}"
+            );
+        }
+
+        #[test]
+        fn caps_at_two_screen_heights_and_shows_the_tail_not_the_start() {
+            // A grid taller than the screen (real scrollback via newlines) —
+            // the preview must be bounded to `2 * rows` and must be the most
+            // RECENT content, not whatever happened to fit from offset 0.
+            use std::fmt::Write as _;
+            let (cols, rows) = (8usize, 4usize);
+            let mut bytes = String::new();
+            // Scroll through far more than 2*rows distinct lines.
+            for i in 0..500 {
+                let _ = write!(bytes, "{i:0>cols$}\r\n");
+            }
+            let preview = build_preview(bytes.as_bytes(), cols as u16, rows as u16).expect("non-blank");
+            let lines: Vec<&str> = preview.trim_end_matches('\n').split('\n').collect();
+            assert!(
+                lines.len() <= rows * 2,
+                "bounded to 2 screen heights: {} lines",
+                lines.len()
+            );
+            // The newest line pushed was 499 (padded to `cols` width); the
+            // very first was 0. The preview must show the former and never
+            // the latter.
+            assert!(
+                preview.contains("00000499"),
+                "shows the newest content, not the oldest: {preview:?}"
+            );
+            assert!(
+                !preview.contains("00000000"),
+                "must not show the very first (ancient) line: {preview:?}"
+            );
+        }
+
+        #[test]
+        fn blank_screen_yields_none() {
+            assert!(build_preview(b"", 80, 24).is_none());
+            assert!(build_preview(b"   \r\n  \r\n", 80, 24).is_none());
+        }
+
+        #[test]
+        fn survives_a_cut_mid_escape_sequence_without_panicking() {
+            // Not a correctness claim about THIS malformed input (it's
+            // intentionally truncated) — just proof that a stray partial
+            // CSI sequence at the end of a `since=0` snapshot (e.g. the ring
+            // was read mid-PTY-write) can't panic the WS pump.
+            let bytes = b"hello\x1b[31mworld\x1b[";
+            let _ = build_preview(bytes, 20, 5); // must not panic
+        }
     }
 }

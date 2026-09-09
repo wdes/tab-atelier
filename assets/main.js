@@ -917,6 +917,7 @@
     //   tag 0x03 meta     S→C  JSON state delta
     //   tag 0x04 resize   C→S  JSON {cols, rows}
     //   tag 0x0b focus    C→S  payload-less; user focused the tab (MRU stamp)
+    //   tag 0x0c preview  S→C  UTF-8 ANSI text — quick approximate paint
     //
     // Reconnect: the client tracks `ringOffset` (= total bytes
     // received since session start) and on disconnect reconnects with
@@ -925,8 +926,19 @@
     // ring on bootstrap (alacritty's grid history is wiped by
     // \x1b[3J and never grows when TUIs redraw in-place; the ring is
     // the only source of historical bytes).
+    //
+    // `preview` (0x0c): on a big since=0 bootstrap the server may send
+    // ONE small preview frame first — the last ~2 screens, rendered
+    // server-side from the authoritative grid — so something correct
+    // is visible before the (potentially multi-MB) real replay finishes
+    // transferring and parsing. It does NOT advance `ringOffset` (it's
+    // not counted PTY history). `pendingPreviewReset` marks that the
+    // NEXT real `out`/`out-gz` frame must `term.reset()` first, so the
+    // temporary preview is wiped rather than duplicated by the
+    // authoritative replay that follows it.
 
     let ringOffset = 0;
+    let pendingPreviewReset = false;
     // Serialises `out` frame handling. A gzip `out-gz` (0x0A) frame
     // inflates asynchronously; without a queue a following raw `out`
     // (0x02) frame could overtake the still-inflating one and corrupt
@@ -1142,6 +1154,15 @@
     }
 
     function handleOut(bytes) {
+      // A preview frame painted before this one — wipe it now, before
+      // applying the authoritative replay, so it never persists
+      // alongside (or duplicates) the real content. Unconditional: even
+      // mid-selection/scrolled-up, the reset must happen before anything
+      // else below queues or writes.
+      if (pendingPreviewReset) {
+        pendingPreviewReset = false;
+        term.reset();
+      }
       // Predictive-echo RTT estimate: time from the last keystroke to
       // this (presumed echo) frame. Drives auto-enable/disable so the
       // feature stays off on fast links where it'd only add flicker.
@@ -1270,6 +1291,14 @@
           } catch (e) {
             console.warn("bad meta frame:", e);
           }
+        } else if (tag === 0x0c) { // preview — quick approximate paint, NOT counted in ringOffset
+          outChain = outChain
+            .then(() => {
+              const text = new TextDecoder("utf-8", { fatal: false }).decode(payload);
+              term.write(text);
+              pendingPreviewReset = true;
+            })
+            .catch((e) => console.warn("preview:", e));
         }
         // 0x01 in / 0x04 resize / 0x07-0x09 / 0x0b focus are C→S only — ignore.
       };
