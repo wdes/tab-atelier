@@ -152,6 +152,12 @@ createApp({
         method,
         headers: {
           Authorization: "Bearer " + this.token,
+          // Sent twice on purpose: Authorization is the header reverse
+          // proxies and auth modules are most likely to consume before it
+          // reaches a backend, and when that happens the server sees no
+          // credential at all — indistinguishable from a wrong token. A
+          // plainly-named custom header survives those arrangements.
+          "X-Admin-Token": this.token,
           ...(body ? { "Content-Type": "application/json" } : {}),
         },
         body: body ? JSON.stringify(body) : undefined,

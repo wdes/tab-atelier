@@ -97,23 +97,36 @@ fn account_json(a: &Account) -> serde_json::Value {
     })
 }
 
-/// Pull a bearer-ish credential out of either header a client might use.
+/// Pull a bearer-ish credential out of any header a client might use.
 ///
 /// A claude client sends `x-api-key`; our own forwarding hop and the web UI
-/// send `Authorization: Bearer`. Accepting both from the start avoids the
-/// class of bug where the credential is right and the envelope is not — which
-/// produces a 401 that tells the operator nothing.
+/// send `Authorization: Bearer`. Accepting both avoids the class of bug where
+/// the credential is right and the envelope is not.
+///
+/// `x-admin-token` is the third, and it exists for a reason worth writing
+/// down: `Authorization` is the header reverse proxies and auth modules are
+/// most likely to consume or strip before it ever reaches a backend. When that
+/// happens the proxy sees no credential at all and can only report that, which
+/// looks exactly like a wrong token. A plainly-named custom header passes
+/// through arrangements that eat the standard one, so the UI sends both and
+/// whichever survives is used.
 fn presented(req: &Request<Incoming>) -> String {
-    req.headers()
-        .get("x-api-key")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned)
+    let header = |name: &str| {
+        req.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty())
+    };
+    header("x-api-key")
+        .or_else(|| header("x-admin-token"))
         .or_else(|| {
             req.headers()
                 .get(hyper::header::AUTHORIZATION)
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.strip_prefix("Bearer "))
-                .map(str::to_owned)
+                .map(|v| v.trim().to_owned())
+                .filter(|v| !v.is_empty())
         })
         .unwrap_or_default()
 }
@@ -835,7 +848,8 @@ async fn admin(req: Request<Incoming>, state: Arc<State>) -> Response<Body> {
         // on — the same unhelpful 401 the proxy path deliberately avoids. Say
         // what was wrong without printing anyone's secret.
         let why = if offered.is_empty() {
-            "no credential presented — a reverse proxy that drops the Authorization header does this"
+            "no credential presented — nothing arrived in Authorization, x-admin-token or x-api-key, \
+             which usually means something in front of the proxy stripped it"
         } else if state
             .store
             .lock()
