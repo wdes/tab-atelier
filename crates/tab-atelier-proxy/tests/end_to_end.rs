@@ -1,6 +1,4 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
 
 //! The whole thing, through the real binary: mint a key with the CLI, start
 //! the server, and spend that key on a request.

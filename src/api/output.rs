@@ -1,6 +1,4 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
 
 //! The `/tabs/<id>/output` polling endpoint: CRC-delta / line-tail / full
 //! scrollback, with the live tab state (lock, schedule, agent) in headers.

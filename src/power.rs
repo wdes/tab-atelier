@@ -1,6 +1,4 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
 
 // A few helper methods on `TabPower` (`label` / `cpu_label` / `watts_label`)
 // are GUI-rendering helpers; headless builds compile the type because

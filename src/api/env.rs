@@ -1,6 +1,4 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
 
 //! The `env`-var HTTP resource: masked `env list` (global + per-tab) and the
 //! queued `env set/unset` changes drained by the main loop.
