@@ -16,96 +16,9 @@
 //! 2. Token file at `~/.local/state/tab-atelier/api.token`.
 //! 3. System-service token at `/var/lib/tab-atelier/api.token`.
 
-use std::time::Duration;
-
-#[derive(Debug, Clone)]
-pub(crate) struct Endpoint {
-    pub(crate) url: String,
-    pub(crate) token: String,
-}
-
-/// Endpoint injected by the CLI tests, which point the verbs at an
-/// in-process API server. Set through [`set_test_endpoint`]; `None` in every
-/// other build, where discovery goes through env + the token files below.
 #[cfg(test)]
-static TEST_ENDPOINT: std::sync::Mutex<Option<Endpoint>> = std::sync::Mutex::new(None);
-
-/// Point every verb at `ep` (or back at real discovery with `None`).
-#[cfg(test)]
-pub(crate) fn set_test_endpoint(ep: Option<Endpoint>) {
-    *TEST_ENDPOINT.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = ep;
-}
-
-/// URL a daemon bound, read from the `api.url` the server writes beside its
-/// token; [`DEFAULT_LOOPBACK_URL`] when absent (an older daemon, or one that
-/// couldn't write its state dir).
-///
-/// Pairing the URL with the token file we just matched matters: the two must
-/// describe the SAME instance, or we authenticate against one daemon with
-/// another's credential and get a 401 that blames the token.
-fn endpoint_url_beside(token_path: &std::path::Path) -> String {
-    token_path
-        .parent()
-        .map(|d| d.join("api.url"))
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .map(|u| u.trim().to_owned())
-        .filter(|u| !u.is_empty())
-        .unwrap_or_else(|| DEFAULT_LOOPBACK_URL.to_owned())
-}
-
-/// Where a daemon lives unless it published otherwise.
-pub(crate) const DEFAULT_LOOPBACK_URL: &str = "http://127.0.0.1:7890";
-
-pub(crate) fn discover_endpoint() -> Result<Endpoint, String> {
-    #[cfg(test)]
-    {
-        let injected = TEST_ENDPOINT
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        if let Some(ep) = injected {
-            return Ok(ep);
-        }
-    }
-    if let (Ok(url), Ok(token)) = (
-        std::env::var("TAB_ATELIER_API_URL"),
-        std::env::var("TAB_ATELIER_API_TOKEN"),
-    ) {
-        return Ok(Endpoint { url, token });
-    }
-    // Order matters: the system-service install runs under
-    // HOME=/var/lib/tab-atelier so XDG_STATE_HOME resolves to
-    // `/var/lib/tab-atelier/.local/state`. Check that path FIRST so
-    // a stale per-user token (left over from a direct
-    // `tab-atelier-headless` invocation as root) doesn't trump the
-    // live daemon's token. Per-user comes after for non-service installs.
-    let candidates = [
-        std::path::PathBuf::from("/var/lib/tab-atelier/.local/state/tab-atelier/api.token"),
-        std::path::PathBuf::from("/var/lib/tab-atelier/api.token"),
-        crate::platform::state_base_dir().join("tab-atelier").join("api.token"),
-    ];
-    let mut tried = Vec::new();
-    for path in &candidates {
-        tried.push(path.display().to_string());
-        if let Ok(t) = std::fs::read_to_string(path) {
-            let token = t.trim().to_string();
-            if !token.is_empty() {
-                return Ok(Endpoint {
-                    url: endpoint_url_beside(path),
-                    token,
-                });
-            }
-        }
-    }
-    Err(format!("no api.token found (tried env vars + {})", tried.join(", ")))
-}
-
-pub(crate) fn agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(3)))
-        .build()
-        .into()
-}
+pub(crate) use super::client::set_test_endpoint;
+pub(crate) use super::client::{Endpoint, agent, discover_endpoint};
 
 pub(crate) fn fetch_tabs(ep: &Endpoint) -> Result<Vec<serde_json::Value>, String> {
     let mut resp = agent()
@@ -2314,24 +2227,7 @@ pub(crate) fn with_test_server<T>(
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn discovery_follows_the_port_the_daemon_published() {
-        let dir = tempfile::tempdir().unwrap();
-        let token = dir.path().join("api.token");
-        std::fs::write(&token, "0123456789abcdef0123456789abcdef").unwrap();
-        // No api.url (an older daemon): fall back to the documented default
-        // rather than refusing to talk to it at all.
-        assert_eq!(super::endpoint_url_beside(&token), super::DEFAULT_LOOPBACK_URL);
-        // Published: follow it, or a daemon on a non-default port gets a token
-        // meant for it sent to whatever holds 7890 — a 401 that reads like a
-        // credential problem.
-        std::fs::write(dir.path().join("api.url"), "http://127.0.0.1:7899\n").unwrap();
-        assert_eq!(super::endpoint_url_beside(&token), "http://127.0.0.1:7899");
-        // An empty/blank file is treated as absent, not as an empty URL.
-        std::fs::write(dir.path().join("api.url"), "  \n").unwrap();
-        assert_eq!(super::endpoint_url_beside(&token), super::DEFAULT_LOOPBACK_URL);
-    }
-
+    use super::super::client::DEFAULT_LOOPBACK_URL;
     use super::*;
 
     fn args(v: &[&str]) -> Vec<String> {

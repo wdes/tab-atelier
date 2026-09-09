@@ -14,8 +14,6 @@
 //! `TAB_ATELIER_API_URL`, `TAB_ATELIER_API_TOKEN` from env — same as
 //! `set-status`.
 
-use std::time::Duration;
-
 /// Parse `[--tab <id>] [--clear] <text…>` and POST it to the tab's
 /// `/context` endpoint.
 #[must_use]
@@ -60,10 +58,10 @@ pub fn run(args: &[String]) -> i32 {
     // UserPromptSubmit / SessionEnd hook wired to this can never block
     // prompt submission or spam errors when `claude` runs outside any
     // tab. Once the env IS present we surface real failures normally.
-    let (Ok(api_url), Ok(api_token)) = (
-        std::env::var("TAB_ATELIER_API_URL"),
-        std::env::var("TAB_ATELIER_API_TOKEN"),
-    ) else {
+    // Discovery covers the daemon's token file as well as the env vars, so
+    // this now works against an instance running as a system service — which
+    // it did not when it read the environment alone.
+    let Ok(ep) = super::client::discover_endpoint() else {
         return 0;
     };
 
@@ -88,18 +86,8 @@ pub fn run(args: &[String]) -> i32 {
 
     let cleared = context.is_none();
     let body = serde_json::json!({ "context": context }).to_string();
-    let url = format!("{api_url}/tabs/by-id/{tab_id}/context");
-    let agent = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(2)))
-        .build()
-        .new_agent();
-    match agent
-        .post(&url)
-        .header("Authorization", &format!("Bearer {api_token}"))
-        .header("Content-Type", "application/json")
-        .send(&body)
-    {
-        Ok(_) => {
+    match super::client::api_post_to(&ep, &format!("/tabs/by-id/{tab_id}/context"), body) {
+        Ok(()) => {
             if cleared {
                 println!("✓ tab context cleared");
             } else {

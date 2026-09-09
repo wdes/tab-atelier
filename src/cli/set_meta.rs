@@ -15,8 +15,6 @@
 //! Defaults to the caller's own tab (`_TAB_ID`); `--tab <id>` targets another.
 //! Same env contract as `set-status` / `set-context`.
 
-use std::time::Duration;
-
 #[must_use]
 pub fn run(args: &[String]) -> i32 {
     let mut clear = false;
@@ -79,10 +77,10 @@ pub fn run(args: &[String]) -> i32 {
 
     // Outside a tab-atelier tab the API env isn't exported — silent no-op,
     // exactly like `set-status`, so a hook wired to this never blocks.
-    let (Ok(api_url), Ok(api_token)) = (
-        std::env::var("TAB_ATELIER_API_URL"),
-        std::env::var("TAB_ATELIER_API_TOKEN"),
-    ) else {
+    // Discovery covers the daemon's token file as well as the env vars, so
+    // this now works against an instance running as a system service — which
+    // it did not when it read the environment alone.
+    let Ok(ep) = super::client::discover_endpoint() else {
         return 0;
     };
     let tab_id = match tab_override.or_else(|| std::env::var("_TAB_ID").ok()) {
@@ -98,17 +96,8 @@ pub fn run(args: &[String]) -> i32 {
         "value": if clear { serde_json::Value::Null } else { serde_json::Value::String(value) },
     })
     .to_string();
-    let agent = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(2)))
-        .build()
-        .new_agent();
-    match agent
-        .post(format!("{api_url}/tabs/by-id/{tab_id}/meta"))
-        .header("Authorization", &format!("Bearer {api_token}"))
-        .header("Content-Type", "application/json")
-        .send(&body)
-    {
-        Ok(_) => {
+    match super::client::api_post_to(&ep, &format!("/tabs/by-id/{tab_id}/meta"), body) {
+        Ok(()) => {
             if clear {
                 println!("✓ meta {key} cleared");
             } else {
@@ -144,24 +133,49 @@ mod tests {
     }
 
     #[test]
-    fn set_meta_talks_to_the_environment_not_the_discovered_endpoint() {
-        // Deliberately NOT server-backed. Unlike every other verb, this one
-        // reads TAB_ATELIER_API_URL/TOKEN straight from the environment
-        // instead of `discover_endpoint()`, so the test harness cannot
-        // redirect it — a test that "used the fake daemon" would in fact be
-        // posting to the developer's real one.
+    fn set_meta_reaches_a_daemon_the_environment_never_mentioned() {
+        // This verb used to read TAB_ATELIER_API_URL/TOKEN straight from the
+        // environment, so on a machine where the daemon runs as a service —
+        // env vars unexported, token in a file — it returned 0 having done
+        // nothing at all. Silent success is the worst possible answer there.
         //
-        // Two consequences worth knowing:
-        //
-        //  * `--tab` must be a UUID. The request goes to
-        //    `/tabs/by-id/{tab}/meta` with no name or index resolution, so
-        //    `--tab build` 404s where `dispatch --to build` works.
-        //  * Outside a tab (no API env at all) it returns 0 without doing
-        //    anything, which keeps it harmless in a hook but means success
-        //    does not imply a label was stored.
-        //
-        // Only the argument checks are exercised here; they run before any of
-        // that.
+        // Going through `discover_endpoint()` fixes that, and this test is
+        // what proves it: the harness injects an endpoint through discovery
+        // and NEVER sets the env vars, so it can only pass if the verb asks
+        // discovery rather than the environment.
+        crate::cli::share_link::with_test_server(|state| {
+            let uuid = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .tabs
+                .first()
+                .map(|t| t.id.to_string())
+                .expect("harness tab");
+            assert_eq!(
+                super::run(&margs(&["--tab", &uuid, "role", "reviewer"])),
+                0,
+                "set-meta must reach the discovered daemon"
+            );
+            // Asserting the EFFECT, not the exit code: the old behaviour also
+            // returned 0 here, because "no API env" was a silent no-op. Only
+            // a queued change proves the request actually arrived.
+            let queued = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pending_meta_changes
+                .clone();
+            let mine = queued
+                .iter()
+                .find(|m| m.tab_id == uuid && m.key == "role")
+                .expect("set-meta reached the daemon but queued nothing");
+            assert_eq!(mine.value.as_deref(), Some("reviewer"));
+        });
+    }
+
+    #[test]
+    fn set_meta_checks_its_arguments_before_looking_for_a_daemon() {
+        // Runs before any endpoint work, which is what makes it safe to
+        // assert on without a server.
         assert_eq!(super::run(&margs(&["--tab", "tab-a"])), 2, "a tab with no key/value");
     }
 }
