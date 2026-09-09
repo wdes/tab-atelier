@@ -146,6 +146,24 @@
                   <div v-if="sched.rejected">{{ sched.rejected }} queued out</div>
                 </div>
               </div>
+              <!--
+                The monitor's own health, stated rather than left to be
+                inferred from a chart that stops. A failed poll produces a
+                sample with no numbers, so the series simply ends — for ten
+                hours, in the case this was written for, while the page went
+                on showing the last figure it had seen as if it were current.
+              -->
+              <div v-if="monitorBroken" class="alert alert-warning py-2 small mb-3" role="status">
+                <strong>The plan monitor is not reporting.</strong>
+                {{ monitorProblem }}.
+                <template v-if="planHealth.last_error">
+                  Last error: <code>{{ planHealth.last_error }}</code>.
+                </template>
+                <template v-if="String(planHealth.last_error || '').includes('invalid_grant')">
+                  The proxy's stored Claude credentials need importing again.
+                </template>
+                Anything plotted below this point is history, not the plan right now.
+              </div>
               <pressure-chart v-if="planSeries.length > 1" :points="planSeries" :threshold="degradeAbove"></pressure-chart>
               <p v-else class="small text-body-secondary mb-0">
                 Collecting samples — the proxy polls the plan every five minutes.
