@@ -211,6 +211,20 @@ pub fn apply_relay_config(change: &crate::api::RelayConfigChange, config_base: &
     if let Some(eg) = change.egress {
         prefs.relay_egress = eg;
     }
+    // `relay via <peer>` and `relay egress on` are opposite roles: "forward to
+    // that host" and "I am the host that forwards". Holding both is not a
+    // preference, it is an unreachable config — the request path tests egress
+    // first, so every call 502s with "the egress role moved to the proxy
+    // package" no matter how correct the endpoint is. Picking a target is the
+    // more recent, more specific statement of intent, so it wins.
+    //
+    // Cleared on disk rather than only at runtime: the migration in
+    // docs/proxy.md says to point an old egress box at a proxy, and an operator
+    // who follows it lands here with a relay that cannot work and a 502 naming
+    // a role they thought they had left behind.
+    if prefs.relay_egress && change.endpoint.as_ref().is_some_and(|e| !e.is_empty()) {
+        prefs.relay_egress = false;
+    }
     if !read_only() {
         save_preferences(config_base, &prefs);
     }
@@ -233,7 +247,6 @@ pub fn relay_credential(endpoint: &RemoteEndpoint) -> Option<&str> {
 
 /// `Preferences`. Called at startup (both editions) and after a relay toggle.
 pub fn install_relay_config(prefs: &Preferences) {
-    set_relay_egress(prefs.relay_egress);
     let target = prefs.relay_endpoint_id.as_deref().and_then(|id| {
         prefs.remote_endpoints.iter().find(|e| e.id == id).map(|e| RelayTarget {
             url: e.url.trim_end_matches('/').to_string(),
@@ -242,6 +255,20 @@ pub fn install_relay_config(prefs: &Preferences) {
             cf_access_client_secret: e.cf_access_client_secret.clone(),
         })
     });
+    // Same mutual exclusion `apply_relay_config` writes, applied again on the
+    // way in — a preferences file written before that rule existed still holds
+    // both, and reading it back faithfully would mean the relay stays broken
+    // until someone runs a command nothing told them to run. A resolved target
+    // is unambiguous evidence of which role this host has.
+    let egress = prefs.relay_egress && target.is_none();
+    if prefs.relay_egress && !egress {
+        log::warn!(
+            "relay: ignoring the stored egress role — this instance relays through {}; \
+             the egress role now belongs to the tab-atelier-proxy package",
+            target.as_ref().map_or("a peer", |t| t.url.as_str()),
+        );
+    }
+    set_relay_egress(egress);
     set_relay_target(target);
 }
 
