@@ -4154,14 +4154,14 @@ impl AppState {
                     }),
                 ));
             }
-            entries.push((t.uptime, Some(format_duration(elapsed))));
+            entries.push((t.uptime, Some(crate::fmt::duration(elapsed))));
             // How long since this tab was last the foreground tab. The active
             // tab reads ~0 (refreshed every sweep); background tabs age.
             entries.push((
                 t.last_seen,
                 self.tabs[stats_idx]
                     .last_focused_at
-                    .map(|seen| format_duration(seen.elapsed())),
+                    .map(|seen| crate::fmt::duration(seen.elapsed())),
             ));
             // Per-tab consumption (issue #28): resident memory of the shell
             // subtree + last agent token totals, re-read per frame so they
@@ -4932,7 +4932,7 @@ impl AppState {
                 || "never".to_string(),
                 |ms| {
                     let elapsed = std::time::Duration::from_millis(crate::unix_millis().saturating_sub(ms));
-                    format!("{} ago", format_duration(elapsed))
+                    format!("{} ago", crate::fmt::duration(elapsed))
                 },
             );
             let selected = row == sw.selected;
@@ -6820,19 +6820,6 @@ fn mru_tab_order<T: Ord>(active: usize, last_focused: &[Option<T>]) -> Vec<usize
     order
 }
 
-fn format_duration(d: std::time::Duration) -> String {
-    let secs = d.as_secs();
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        format!("{}m {}s", secs / 60, secs % 60)
-    } else {
-        let h = secs / 3600;
-        let m = (secs % 3600) / 60;
-        format!("{h}h {m}m")
-    }
-}
-
 fn run_check() {
     println!("tab-atelier v{} --check", env!("CARGO_PKG_VERSION"));
 
@@ -7314,27 +7301,6 @@ mod tests {
         // grid rather than 0 lines / <2 cols.
         let (cols, lines) = grid_dims(5.0, 10.0, 8.0, 16.0).expect("some");
         assert!(cols >= 2 && lines >= 1);
-    }
-
-    #[test]
-    fn format_duration_seconds() {
-        assert_eq!(format_duration(std::time::Duration::from_secs(0)), "0s");
-        assert_eq!(format_duration(std::time::Duration::from_secs(45)), "45s");
-        assert_eq!(format_duration(std::time::Duration::from_secs(59)), "59s");
-    }
-
-    #[test]
-    fn format_duration_minutes() {
-        assert_eq!(format_duration(std::time::Duration::from_mins(1)), "1m 0s");
-        assert_eq!(format_duration(std::time::Duration::from_secs(125)), "2m 5s");
-        assert_eq!(format_duration(std::time::Duration::from_secs(3599)), "59m 59s");
-    }
-
-    #[test]
-    fn format_duration_hours() {
-        assert_eq!(format_duration(std::time::Duration::from_hours(1)), "1h 0m");
-        assert_eq!(format_duration(std::time::Duration::from_mins(121)), "2h 1m");
-        assert_eq!(format_duration(std::time::Duration::from_hours(24)), "24h 0m");
     }
 
     #[test]

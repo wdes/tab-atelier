@@ -24,6 +24,8 @@ pub(crate) mod catbus_agent;
 pub mod claims;
 pub mod federation;
 pub mod fleet;
+/// Human-readable renderings shared by both editions.
+pub mod fmt;
 pub mod sweep;
 // Shared by both binaries now (GUI applies per-tab cgroup limits too); the
 // module's own `#![cfg(target_os = "linux")]` scopes it to Linux.
