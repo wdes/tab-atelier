@@ -123,7 +123,7 @@ impl AgentProbe {
         {
             let dt = dt.as_secs_f64();
             if dt > 0.0
-                && let Some(line) = build_line(tab, pid, state, prev, cur, dt, unix_secs(now))
+                && let Some(line) = build_line(tab, pid, state, prev, cur, dt, secs_since_epoch(now))
             {
                 append_line(base, tab, &line);
             }
@@ -561,7 +561,12 @@ pub fn sh_squote(s: &str) -> String {
 }
 
 #[must_use]
-fn unix_secs(t: SystemTime) -> f64 {
+/// Fractional seconds since the epoch for a GIVEN instant.
+///
+/// Named apart from `crate::unix_secs`, which reads the clock: they differ in
+/// what they take, what they return and what they mean, and two functions
+/// called `unix_secs` in one crate is a mistake waiting to be made.
+fn secs_since_epoch(t: SystemTime) -> f64 {
     t.duration_since(UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64())
 }
 

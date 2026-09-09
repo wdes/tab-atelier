@@ -1986,6 +1986,22 @@ pub fn unix_millis() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
+/// Whole seconds since the unix epoch, now.
+///
+/// The second half of the pair with [`unix_millis`]. A clock before 1970
+/// reads as 0 rather than panicking: nothing here is worth aborting a
+/// terminal emulator over, and a zero timestamp is visibly wrong wherever it
+/// surfaces.
+///
+/// Not to be confused with `agent_probe::secs_since_epoch`, which converts a
+/// `SystemTime` someone hands it — this one reads the clock.
+#[must_use]
+pub fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 /// How long after the last PTY output a tab's LED stays green ("working").
 ///
 /// A `--resume`d agent streams its reply with no thinking hook, so fresh output
