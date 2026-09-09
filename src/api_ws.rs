@@ -1661,4 +1661,46 @@ mod tests {
         assert_eq!(super::percent_decode("a%zz"), b"a%zz");
         assert_eq!(super::percent_decode(""), b"");
     }
+
+    // THROWAWAY measurement, not a real regression test — run explicitly
+    // with `cargo test --release temp_bench_scrollback_bootstrap -- --ignored --nocapture`.
+    // Deleted before this change lands.
+    #[test]
+    #[ignore = "throwaway manual benchmark, not a regression test"]
+    fn temp_bench_scrollback_bootstrap() {
+        let raw = std::fs::read("/tmp/ta-bench/synthetic_scrollback.bin").expect("run gen.js first");
+        eprintln!("payload: {} bytes", raw.len());
+
+        // gzip the whole payload, same call as encode_out_frame's hot path.
+        let t0 = std::time::Instant::now();
+        let gz = super::gzip(&raw).expect("gzip");
+        let gzip_dt = t0.elapsed();
+        eprintln!(
+            "gzip whole payload: {:?}  {} -> {} bytes ({:.1}x)",
+            gzip_dt,
+            raw.len(),
+            gz.len(),
+            raw.len() as f64 / gz.len() as f64
+        );
+
+        // Populate a PtyRing exactly like the real PTY tap would (4 KiB
+        // reads), forcing cold-chunk compaction, then time `.since(0)` —
+        // the read the WS pump does on every since=0 bootstrap.
+        let mut ring = crate::pty_ring::PtyRing::with_capacity(crate::pty_ring::DEFAULT_CAPACITY_BYTES);
+        for chunk in raw.chunks(4096) {
+            ring.push(chunk);
+        }
+        let t0 = std::time::Instant::now();
+        let since0 = ring.since(0);
+        let since_dt = t0.elapsed();
+        eprintln!("ring.since(0): {since_dt:?}  -> {} bytes", since0.len());
+
+        // Full pipeline: since(0) + gzip, as run inline in `run_pump` for
+        // any chunk under OFFLOAD_MIN_BYTES, or on the blocking pool above it.
+        let t0 = std::time::Instant::now();
+        let bytes = ring.since(0);
+        let _frame = super::encode_out_frame(bytes);
+        let total_dt = t0.elapsed();
+        eprintln!("since(0) + encode_out_frame total: {total_dt:?}");
+    }
 }

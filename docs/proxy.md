@@ -55,13 +55,40 @@ exposing it directly — it carries keys.
 ```sh
 sudo -u tab-atelier-proxy tab-atelier-proxy add Ada Lovelace ada@example.org
 sudo -u tab-atelier-proxy tab-atelier-proxy list
-sudo -u tab-atelier-proxy tab-atelier-proxy rotate ada@example.org
-sudo -u tab-atelier-proxy tab-atelier-proxy disable ada@example.org   # keep the account, stop the key
-sudo -u tab-atelier-proxy tab-atelier-proxy remove  ada@example.org   # forget both
+sudo -u tab-atelier-proxy tab-atelier-proxy disable ada@example.org   # suspend the person
+sudo -u tab-atelier-proxy tab-atelier-proxy remove  ada@example.org   # forget them entirely
 ```
 
 `disable` and `remove` differ on purpose: disabling keeps the name attached to
 past usage, deleting forgets it.
+
+## One key per place, not one per person
+
+```sh
+tab-atelier-proxy add-key    ada@example.org laptop   # prints the key once
+tab-atelier-proxy add-key    ada@example.org ci
+tab-atelier-proxy keys       ada@example.org
+tab-atelier-proxy remove-key ada@example.org laptop   # the rest keep working
+```
+
+```
+  default          active    first never used     last from -
+  ci               active    first 3 min ago      last from 203.0.113.7
+  laptop           active    first just now       last from 198.51.100.4
+```
+
+A person holds several keys because that is what makes revocation usable: with
+one key each, losing a laptop means re-keying everything that person runs;
+with a key per place, it means deleting one row.
+
+**The dates and the address belong to the KEY, not the person** — "last used
+from 203.0.113.7" says nothing when three keys share an account. *Issued and
+never used* is the state worth looking for: either someone never took up their
+access, or the key went astray on the way to them.
+
+There is no `rotate`. Add the new key, deploy it, then delete the old one —
+rotation revoked the only credential and issued another, so there was a moment
+when everything using it was broken at once.
 
 **A key is shown once.** The proxy stores a SHA-256 of it and cannot show it to
 you again — lost key, `rotate`. (A fast hash is right here: the key is 32 bytes

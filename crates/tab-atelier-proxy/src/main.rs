@@ -50,8 +50,17 @@ enum Command {
     },
     /// List accounts.
     List,
-    /// Replace an account's key, invalidating the old one.
-    Rotate { who: String },
+    /// Add a named key to an account, printing it once.
+    AddKey {
+        who: String,
+        /// What it is for — `laptop`, `ci`, `fleet`. Names are how keys get
+        /// revoked later, so a vague one costs you at exactly the wrong time.
+        name: String,
+    },
+    /// List an account's keys, with when and where each was last used.
+    Keys { who: String },
+    /// Delete one key by name or id. The account's other keys keep working.
+    RemoveKey { who: String, key: String },
     /// Refuse an account's key without deleting the account.
     Disable { who: String },
     /// Let a disabled account back in.
@@ -207,27 +216,37 @@ fn admin_token_migrated() -> Result<String, String> {
     admin_token(&config_dir()?)
 }
 
+/// "3 min ago" — relative, so no timezone has to be decided here.
+fn ago(t: u64) -> String {
+    let secs = tab_atelier_proxy::users::now_secs().saturating_sub(t);
+    match secs {
+        0..=90 => "just now".to_owned(),
+        91..=5400 => format!("{} min ago", secs / 60),
+        5401..=172_800 => format!("{} h ago", secs / 3600),
+        _ => format!("{} d ago", secs / 86400),
+    }
+}
+
 fn print_account(a: &Account) {
     let state = if a.disabled {
         "disabled"
-    } else if a.key_hash.is_empty() {
-        "no key"
-    } else {
+    } else if a.keys.iter().any(tab_atelier_proxy::users::Key::active) {
         "active"
+    } else {
+        "no key"
     };
-    let last = a.last_used_at.map_or_else(
-        || "never used".to_owned(),
-        |t| {
-            let ago = tab_atelier_proxy::users::now_secs().saturating_sub(t);
-            match ago {
-                0..=90 => "just now".to_owned(),
-                91..=5400 => format!("{} min ago", ago / 60),
-                5401..=172_800 => format!("{} h ago", ago / 3600),
-                _ => format!("{} d ago", ago / 86400),
-            }
-        },
+    let last = a
+        .keys
+        .iter()
+        .filter_map(|k| k.last_used_at)
+        .max()
+        .map_or_else(|| "never used".to_owned(), ago);
+    let keys = a.keys.len();
+    println!(
+        "{:<30}  {:<26}  {state:<8}  {keys} key(s)  {last}",
+        a.display_name(),
+        a.email
     );
-    println!("{:<38}  {:<28}  {state:<8}  {last}", a.display_name(), a.email);
 }
 
 /// The one moment a key exists in readable form. Say so, rather than letting
@@ -331,10 +350,37 @@ fn run() -> Result<(), String> {
             }
             Ok(())
         }
-        Command::Rotate { who } => {
+        Command::AddKey { who, name } => {
             let mut s = store()?;
-            let (a, key) = s.rotate(&who).map_err(|e| e.to_string())?;
-            print_new_key(&a, &key);
+            let (k, secret) = s.add_key(&who, &name).map_err(|e| e.to_string())?;
+            let a = s.find(&who).ok_or("account vanished")?.clone();
+            println!("{} <{}> — key {:?}", a.display_name(), a.email, k.name);
+            println!("  key: {secret}");
+            println!("  This is the only time it is shown — the proxy stores a hash.");
+            println!("  On the machine that will use it:");
+            println!("    tab-atelier remote add --label proxy --url https://<proxy-host> \\");
+            println!("        --relay-token {secret}");
+            Ok(())
+        }
+        Command::Keys { who } => {
+            let s = store()?;
+            let a = s.find(&who).ok_or_else(|| format!("no such account: {who}"))?;
+            if a.keys.is_empty() {
+                println!("{} has no keys — `add-key {who} <name>`", a.display_name());
+                return Ok(());
+            }
+            for k in &a.keys {
+                let state = if k.disabled { "disabled" } else { "active" };
+                let first = k.first_used_at.map_or_else(|| "never used".to_owned(), ago);
+                let from = k.last_used_ip.as_deref().unwrap_or("-");
+                println!("  {:<16} {state:<9} first {first:<14} last from {from}", k.name);
+            }
+            Ok(())
+        }
+        Command::RemoveKey { who, key } => {
+            let mut s = store()?;
+            let k = s.remove_key(&who, &key).map_err(|e| e.to_string())?;
+            println!("removed key {:?} — the account's other keys are unaffected", k.name);
             Ok(())
         }
         Command::Disable { who } => {

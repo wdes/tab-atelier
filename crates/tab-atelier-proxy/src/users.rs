@@ -32,6 +32,50 @@ use sha2::{Digest, Sha256};
 /// and greppable when it leaks.
 pub const KEY_PREFIX: &str = "tap_";
 
+/// One credential belonging to an account.
+///
+/// A person has several: a laptop, a CI runner, a fleet worker. That is not a
+/// convenience — it is what makes revocation usable. With one key per person,
+/// losing a laptop means re-keying everything that person runs; with a key per
+/// place, it means deleting one row and leaving the rest working.
+///
+/// The dates and the address describe THE KEY, not the person, which is the
+/// only level at which they mean anything: "last used from 203.0.113.7" says
+/// nothing if three keys share an account.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Key {
+    pub id: String,
+    /// What it is for — `laptop`, `ci`, `fleet`. The reason multiple keys are
+    /// manageable at all: an unnamed list of hashes cannot be revoked with any
+    /// confidence about what will break.
+    pub name: String,
+    /// Hex SHA-256. The key itself is shown once, at creation, and never
+    /// stored.
+    pub hash: String,
+    pub created_at: u64,
+    /// Issued and never used is the state worth seeing: either someone never
+    /// took up their access, or the key went astray on the way to them.
+    #[serde(default)]
+    pub first_used_at: Option<u64>,
+    #[serde(default)]
+    pub last_used_at: Option<u64>,
+    /// One address, not a history: enough to notice a key being used from
+    /// somewhere it should not be, without turning the file into a movement
+    /// log of the people using it.
+    #[serde(default)]
+    pub last_used_ip: Option<String>,
+    /// Refused without being deleted, so the name stays attached to past use.
+    #[serde(default)]
+    pub disabled: bool,
+}
+
+impl Key {
+    #[must_use]
+    pub const fn active(&self) -> bool {
+        !self.disabled && !self.hash.is_empty()
+    }
+}
+
 /// A person who may use the proxy.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Account {
@@ -39,34 +83,26 @@ pub struct Account {
     pub first_name: String,
     pub last_name: String,
     pub email: String,
-    /// Hex SHA-256 of the key. Empty until one is minted.
-    #[serde(default)]
-    pub key_hash: String,
     pub created_at: u64,
-    /// When the CURRENT key was first used, and last used. Both reset on
-    /// rotation, because they describe the key rather than the person: after a
-    /// rotate, "first used" answering with the old key's date would be a lie
-    /// about the credential you are looking at.
-    ///
-    /// A key created and never used is the interesting case — it means someone
-    /// was issued access they never took up, or the key went astray on the way
-    /// to them.
+    /// Every credential this person holds. See [`Key`].
     #[serde(default)]
-    pub first_used_at: Option<u64>,
-    /// Set on every accepted request, so an operator can see which accounts are
-    /// dormant before revoking them. Coarse (seconds) on purpose — this is not
-    /// an audit log, and a precise one would make the file a write hotspot.
-    #[serde(default)]
-    pub last_used_at: Option<u64>,
-    /// Where the current key was last used from.
-    ///
-    /// One address, not a history: enough to notice a key being used from
-    /// somewhere it should not be, without turning the account file into a
-    /// movement log of the people using it.
-    #[serde(default)]
-    pub last_used_ip: Option<String>,
-    /// Refused without being deleted: keeps the name attached to past usage
-    /// while stopping the key today.
+    pub keys: Vec<Key>,
+    /// The single key this account used to have, read once and folded into
+    /// `keys` on load. Never written again.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub key_hash: String,
+    /// Provenance that used to live on the account, when there was one key.
+    /// Read once during migration and then written on the key instead, where
+    /// it means something.
+    #[serde(default, rename = "first_used_at", skip_serializing_if = "Option::is_none")]
+    pub legacy_first_used_at: Option<u64>,
+    #[serde(default, rename = "last_used_at", skip_serializing_if = "Option::is_none")]
+    pub legacy_last_used_at: Option<u64>,
+    #[serde(default, rename = "last_used_ip", skip_serializing_if = "Option::is_none")]
+    pub legacy_last_used_ip: Option<String>,
+    /// Suspends the WHOLE account, whatever its keys say. Distinct from
+    /// disabling one key: this is "this person is out", not "that laptop is
+    /// gone".
     #[serde(default)]
     pub disabled: bool,
     /// Share of the upstream quota under contention, relative to everyone
@@ -104,10 +140,35 @@ impl Account {
         if full.is_empty() { self.email.clone() } else { full }
     }
 
-    /// Usable right now: enabled, and actually has a key.
+    /// Usable right now: not suspended, and holding at least one live key.
     #[must_use]
-    pub const fn active(&self) -> bool {
-        !self.disabled && !self.key_hash.is_empty()
+    pub fn active(&self) -> bool {
+        !self.disabled && self.keys.iter().any(Key::active)
+    }
+
+    /// Fold a pre-multi-key account into one named key.
+    ///
+    /// Called on load so an upgrade keeps working: the old single hash becomes
+    /// a key called `default`, carrying the provenance that used to sit on the
+    /// account. Doing this at the boundary means nothing below has to know the
+    /// old shape ever existed.
+    fn migrate_single_key(&mut self) {
+        if self.key_hash.is_empty() {
+            return;
+        }
+        if !self.keys.iter().any(|k| k.hash == self.key_hash) {
+            self.keys.push(Key {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: "default".to_owned(),
+                hash: std::mem::take(&mut self.key_hash),
+                created_at: self.created_at,
+                first_used_at: self.legacy_first_used_at,
+                last_used_at: self.legacy_last_used_at,
+                last_used_ip: self.legacy_last_used_ip.take(),
+                disabled: false,
+            });
+        }
+        self.key_hash = String::new();
     }
 }
 
@@ -127,7 +188,7 @@ pub struct Store {
     /// hash → index, rebuilt on load and after every mutation. Authentication
     /// happens on every proxied request; a linear scan over the accounts would
     /// also make the comparison's cost depend on position in the file.
-    by_hash: BTreeMap<String, usize>,
+    by_hash: BTreeMap<String, (usize, usize)>,
 }
 
 /// Why a mutation was refused. Callers turn these into an exit code or an HTTP
@@ -136,6 +197,7 @@ pub struct Store {
 pub enum Error {
     NotFound(String),
     DuplicateEmail(String),
+    DuplicateKeyName(String),
     InvalidEmail(String),
     MissingName,
     Io(String),
@@ -146,6 +208,7 @@ impl std::fmt::Display for Error {
         match self {
             Self::NotFound(who) => write!(f, "no such account: {who}"),
             Self::DuplicateEmail(e) => write!(f, "an account already uses {e}"),
+            Self::DuplicateKeyName(n) => write!(f, "this account already has a key named {n}"),
             Self::InvalidEmail(e) => write!(f, "not an email address: {e}"),
             Self::MissingName => write!(f, "first and last name are both required"),
             Self::Io(e) => write!(f, "{e}"),
@@ -252,6 +315,11 @@ impl Store {
             accounts,
             by_hash: BTreeMap::new(),
         };
+        // Fold any pre-multi-key account into one named key before anything
+        // else looks at it.
+        for a in &mut store.accounts {
+            a.migrate_single_key();
+        }
         store.reindex();
         Ok(store)
     }
@@ -261,8 +329,14 @@ impl Store {
             .accounts
             .iter()
             .enumerate()
-            .filter(|(_, a)| a.active())
-            .map(|(i, a)| (a.key_hash.clone(), i))
+            .filter(|(_, a)| !a.disabled)
+            .flat_map(|(ai, a)| {
+                a.keys
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, k)| k.active())
+                    .map(move |(ki, k)| (k.hash.clone(), (ai, ki)))
+            })
             .collect();
     }
 
@@ -278,10 +352,22 @@ impl Store {
     /// how long a rejection took, because a wrong key simply is not in the map.
     #[must_use]
     pub fn authenticate(&self, key: &str) -> Option<&Account> {
+        self.authenticate_key(key).map(|(a, _)| a)
+    }
+
+    /// The account AND which of its keys was used.
+    ///
+    /// Callers that record anything want the key, not just the person: usage
+    /// is billed to the account, but "last used, and from where" belongs to
+    /// the credential that was actually presented.
+    #[must_use]
+    pub fn authenticate_key(&self, key: &str) -> Option<(&Account, &Key)> {
         let hash = hash_key(key);
-        let idx = *self.by_hash.get(&hash)?;
-        let account = self.accounts.get(idx)?;
-        (account.active() && constant_time_eq(account.key_hash.as_bytes(), hash.as_bytes())).then_some(account)
+        let (ai, ki) = *self.by_hash.get(&hash)?;
+        let account = self.accounts.get(ai)?;
+        let k = account.keys.get(ki)?;
+        (!account.disabled && k.active() && constant_time_eq(k.hash.as_bytes(), hash.as_bytes()))
+            .then_some((account, k))
     }
 
     /// Find by id, or by email, or by unique case-insensitive name fragment.
@@ -320,16 +406,29 @@ impl Store {
             return Err(Error::DuplicateEmail(email.to_owned()));
         }
         let key = mint_key();
+        let now = now_secs();
         let account = Account {
             id: uuid::Uuid::new_v4().to_string(),
             first_name: first.to_owned(),
             last_name: last.to_owned(),
             email: email.to_owned(),
-            key_hash: hash_key(&key),
-            created_at: now_secs(),
-            first_used_at: None,
-            last_used_at: None,
-            last_used_ip: None,
+            created_at: now,
+            // The first key is named for where it will be used from. "default"
+            // is a placeholder an operator is meant to replace, not a name.
+            keys: vec![Key {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: "default".to_owned(),
+                hash: hash_key(&key),
+                created_at: now,
+                first_used_at: None,
+                last_used_at: None,
+                last_used_ip: None,
+                disabled: false,
+            }],
+            key_hash: String::new(),
+            legacy_first_used_at: None,
+            legacy_last_used_at: None,
+            legacy_last_used_ip: None,
             disabled: false,
             weight: default_weight(),
         };
@@ -339,34 +438,104 @@ impl Store {
         Ok((account, key))
     }
 
-    /// Replace an account's key. The old one stops working immediately.
+    /// Add a named key to an account. Returns it once, in readable form.
+    ///
+    /// This replaces the old `rotate`, and is strictly better: rotation
+    /// revoked the only key and issued another, so there was a moment with no
+    /// working credential and everything using it broke at once. Adding first
+    /// and removing later means a machine can be moved across without a gap.
     ///
     /// # Errors
-    /// No such account, or the file could not be written.
-    pub fn rotate(&mut self, who: &str) -> Result<(Account, String), Error> {
+    /// No such account, a name already in use on this account, or the file
+    /// could not be written.
+    pub fn add_key(&mut self, who: &str, name: &str) -> Result<(Key, String), Error> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(Error::MissingName);
+        }
         let id = self
             .find(who)
             .ok_or_else(|| Error::NotFound(who.to_owned()))?
             .id
             .clone();
-        let key = mint_key();
-        let hash = hash_key(&key);
         let account = self
             .accounts
             .iter_mut()
             .find(|a| a.id == id)
             .ok_or_else(|| Error::NotFound(who.to_owned()))?;
-        account.key_hash = hash;
-        // A new key has its own history. Carrying the old key's dates over
-        // would misreport when THIS credential was first seen — which is the
-        // one question these fields exist to answer.
-        account.first_used_at = None;
-        account.last_used_at = None;
-        account.last_used_ip = None;
-        let out = account.clone();
+        // Names are how keys are revoked, so two of the same on one account
+        // would make "delete the laptop key" ambiguous.
+        if account.keys.iter().any(|k| k.name.eq_ignore_ascii_case(name)) {
+            return Err(Error::DuplicateKeyName(name.to_owned()));
+        }
+        let secret = mint_key();
+        let key = Key {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.to_owned(),
+            hash: hash_key(&secret),
+            created_at: now_secs(),
+            first_used_at: None,
+            last_used_at: None,
+            last_used_ip: None,
+            disabled: false,
+        };
+        account.keys.push(key.clone());
         self.reindex();
         self.save()?;
-        Ok((out, key))
+        Ok((key, secret))
+    }
+
+    /// Delete one key. The account and its other keys are untouched.
+    ///
+    /// # Errors
+    /// No such account or key, or the file could not be written.
+    pub fn remove_key(&mut self, who: &str, key_ref: &str) -> Result<Key, Error> {
+        let id = self
+            .find(who)
+            .ok_or_else(|| Error::NotFound(who.to_owned()))?
+            .id
+            .clone();
+        let account = self
+            .accounts
+            .iter_mut()
+            .find(|a| a.id == id)
+            .ok_or_else(|| Error::NotFound(who.to_owned()))?;
+        let idx = account
+            .keys
+            .iter()
+            .position(|k| k.id == key_ref || k.name.eq_ignore_ascii_case(key_ref))
+            .ok_or_else(|| Error::NotFound(format!("key {key_ref}")))?;
+        let gone = account.keys.remove(idx);
+        self.reindex();
+        self.save()?;
+        Ok(gone)
+    }
+
+    /// Turn one key off (or back on) without deleting it.
+    ///
+    /// # Errors
+    /// No such account or key, or the file could not be written.
+    pub fn set_key_disabled(&mut self, who: &str, key_ref: &str, disabled: bool) -> Result<Key, Error> {
+        let id = self
+            .find(who)
+            .ok_or_else(|| Error::NotFound(who.to_owned()))?
+            .id
+            .clone();
+        let account = self
+            .accounts
+            .iter_mut()
+            .find(|a| a.id == id)
+            .ok_or_else(|| Error::NotFound(who.to_owned()))?;
+        let key = account
+            .keys
+            .iter_mut()
+            .find(|k| k.id == key_ref || k.name.eq_ignore_ascii_case(key_ref))
+            .ok_or_else(|| Error::NotFound(format!("key {key_ref}")))?;
+        key.disabled = disabled;
+        let out = key.clone();
+        self.reindex();
+        self.save()?;
+        Ok(out)
     }
 
     /// Change an account's share of the quota under contention.
@@ -435,30 +604,34 @@ impl Store {
         Ok(gone)
     }
 
-    /// Stamp an account as having been used, from `ip`.
+    /// Stamp the KEY that was used, from `ip`.
     ///
     /// Best-effort: a failed write must not fail the request it is describing.
-    pub fn touch(&mut self, id: &str, ip: Option<&str>) {
-        let persist = if let Some(a) = self.accounts.iter_mut().find(|a| a.id == id) {
-            let now = now_secs();
-            // First use of a key, and any change of address, are worth a write
-            // immediately — they are the two things someone reviewing access
-            // actually looks for. Ordinary traffic is coalesced to one write a
-            // minute, or every proxied request would rewrite the file.
-            let first = a.first_used_at.is_none();
-            let moved = ip.is_some() && a.last_used_ip.as_deref() != ip;
-            let stale = a.last_used_at.is_none_or(|t| now.saturating_sub(t) >= 60);
-            if first {
-                a.first_used_at = Some(now);
-            }
-            if let Some(ip) = ip {
-                a.last_used_ip = Some(ip.to_owned());
-            }
-            a.last_used_at = Some(now);
-            first || moved || stale
-        } else {
-            false
-        };
+    pub fn touch(&mut self, key_id: &str, ip: Option<&str>) {
+        let now = now_secs();
+        let persist = self
+            .accounts
+            .iter_mut()
+            .flat_map(|a| a.keys.iter_mut())
+            .find(|k| k.id == key_id)
+            .is_some_and(|k| {
+                // First use of a key, and any change of address, are worth a
+                // write immediately — they are the two things someone
+                // reviewing access actually looks for. Ordinary traffic is
+                // coalesced to one write a minute, or every proxied request
+                // would rewrite the file.
+                let first = k.first_used_at.is_none();
+                let moved = ip.is_some() && k.last_used_ip.as_deref() != ip;
+                let stale = k.last_used_at.is_none_or(|t| now.saturating_sub(t) >= 60);
+                if first {
+                    k.first_used_at = Some(now);
+                }
+                if let Some(ip) = ip {
+                    k.last_used_ip = Some(ip.to_owned());
+                }
+                k.last_used_at = Some(now);
+                first || moved || stale
+            });
         if persist {
             let _ = self.save();
         }
@@ -555,60 +728,127 @@ mod tests {
         assert!(s.authenticate(&ada_key).is_some());
     }
 
-    /// A key's own history: when it was first used, last used, and from where.
+    /// Each key carries its own history, which is the only level at which it
+    /// means anything: "last used from 203.0.113.7" says nothing when three
+    /// keys share an account.
     #[test]
-    fn a_key_records_when_and_where_it_was_used() {
+    fn each_key_records_when_and_where_it_was_used() {
         let (mut s, _d) = store();
-        let (ada, key) = s.add("Ada", "Lovelace", "ada@example.org").expect("add");
-        // Issued but never used is a state worth being able to see.
-        assert_eq!(ada.first_used_at, None);
-        assert_eq!(ada.last_used_ip, None);
+        let (ada, _first) = s.add("Ada", "Lovelace", "ada@example.org").expect("add");
+        let (ci, _ci_secret) = s.add_key("ada@example.org", "ci").expect("add key");
 
-        s.touch(&ada.id, Some("203.0.113.7"));
-        let seen = s.find("ada@example.org").expect("account").clone();
+        let laptop = s.find("ada@example.org").expect("a").keys[0].clone();
+        assert_eq!(laptop.first_used_at, None, "issued and never used is worth seeing");
+
+        s.touch(&laptop.id, Some("203.0.113.7"));
+        let after = s.find("ada@example.org").expect("a").clone();
+        let seen = after.keys.iter().find(|k| k.id == laptop.id).expect("laptop");
         assert!(seen.first_used_at.is_some());
-        assert_eq!(
-            seen.last_used_at, seen.first_used_at,
-            "first use is also the last so far"
-        );
         assert_eq!(seen.last_used_ip.as_deref(), Some("203.0.113.7"));
 
-        // A later call from elsewhere moves last_used_ip but never first_used.
-        s.touch(&ada.id, Some("198.51.100.4"));
-        let moved = s.find("ada@example.org").expect("account").clone();
+        // The OTHER key is untouched — that is the whole point of per-key
+        // provenance.
+        let other = after.keys.iter().find(|k| k.id == ci.id).expect("ci");
+        assert_eq!(other.first_used_at, None);
+        assert_eq!(other.last_used_ip, None);
+
+        // A later call from elsewhere moves last_used_ip, never first_used.
+        s.touch(&laptop.id, Some("198.51.100.4"));
+        let moved = s.find("ada@example.org").expect("a").keys[0].clone();
         assert_eq!(moved.first_used_at, seen.first_used_at, "first use is set once");
         assert_eq!(moved.last_used_ip.as_deref(), Some("198.51.100.4"));
-        assert!(s.authenticate(&key).is_some(), "none of this disturbs the key");
+        assert_eq!(ada.email, "ada@example.org");
     }
 
-    /// The dates describe the KEY, not the person: after a rotate, reporting
-    /// when the old key was first used would be a lie about the credential
-    /// being looked at.
+    /// Several named keys, revoked one at a time. With a single key per
+    /// person, losing a laptop meant re-keying everything they run.
     #[test]
-    fn rotating_starts_the_history_over() {
+    fn one_key_can_be_revoked_without_disturbing_the_others() {
         let (mut s, _d) = store();
-        let (ada, _key) = s.add("Ada", "Lovelace", "ada@example.org").expect("add");
-        s.touch(&ada.id, Some("203.0.113.7"));
-        assert!(s.find("ada@example.org").expect("a").first_used_at.is_some());
+        // The account's first key is named "default"; the others are named
+        // for where they live.
+        let (_a, first) = s.add("Ada", "Lovelace", "ada@example.org").expect("add");
+        let (_lk, laptop) = s.add_key("ada@example.org", "laptop").expect("laptop");
+        let (_k, ci) = s.add_key("ada@example.org", "ci").expect("ci");
+        let (_k2, fleet) = s.add_key("ada@example.org", "fleet").expect("fleet");
+        for k in [&first, &laptop, &ci, &fleet] {
+            assert!(s.authenticate(k).is_some(), "every key should work");
+        }
 
-        let (rotated, _new_key) = s.rotate("ada@example.org").expect("rotate");
-        assert_eq!(rotated.first_used_at, None);
-        assert_eq!(rotated.last_used_at, None);
-        assert_eq!(rotated.last_used_ip, None);
-        // The account itself is untouched — this is the key's history, not the
-        // person's.
-        assert_eq!(rotated.email, "ada@example.org");
-        assert_eq!(rotated.created_at, ada.created_at);
+        // Lose the laptop.
+        s.remove_key("ada@example.org", "laptop").expect("remove");
+        assert!(s.authenticate(&laptop).is_none(), "the lost key must stop working");
+        assert!(s.authenticate(&ci).is_some(), "and nothing else is disturbed");
+        assert!(s.authenticate(&fleet).is_some());
+        assert!(s.authenticate(&first).is_some());
+
+        // Disabling is the reversible form, and keeps the name attached.
+        s.set_key_disabled("ada@example.org", "ci", true).expect("disable");
+        assert!(s.authenticate(&ci).is_none());
+        s.set_key_disabled("ada@example.org", "ci", false).expect("enable");
+        assert!(s.authenticate(&ci).is_some(), "re-enabling restores the same key");
+
+        // Suspending the PERSON stops all of them at once, which is a
+        // different decision from revoking one credential.
+        s.set_disabled("ada@example.org", true).expect("suspend");
+        for k in [&ci, &fleet] {
+            assert!(s.authenticate(k).is_none(), "a suspended account has no working keys");
+        }
     }
 
     #[test]
-    fn rotating_invalidates_the_previous_key() {
+    fn key_names_are_unique_within_an_account() {
         let (mut s, _d) = store();
-        let (_, old) = s.add("Ada", "Lovelace", "ada@example.org").expect("add");
-        let (_, new) = s.rotate("ada@example.org").expect("rotate");
-        assert_ne!(old, new);
-        assert!(s.authenticate(&old).is_none(), "the old key must stop working at once");
-        assert!(s.authenticate(&new).is_some());
+        s.add("Ada", "Lovelace", "ada@example.org").expect("add");
+        s.add_key("ada@example.org", "ci").expect("ci");
+        assert_eq!(
+            s.add_key("ada@example.org", "CI").unwrap_err(),
+            Error::DuplicateKeyName("CI".to_owned()),
+            "names are how keys are revoked, so a duplicate makes revocation ambiguous"
+        );
+        // But two PEOPLE may each have a key called ci.
+        s.add("Grace", "Hopper", "grace@example.org").expect("add");
+        assert!(s.add_key("grace@example.org", "ci").is_ok());
+    }
+
+    /// An account written before keys were a list still works, and its
+    /// provenance moves onto the key rather than being lost.
+    #[test]
+    fn a_single_key_account_migrates_to_one_named_key() {
+        let dir = TempDir::new();
+        let path = dir.path().join("users.json");
+        let secret = mint_key();
+        let doc = serde_json::json!({
+            "accounts": [{
+                "id": "old-1",
+                "first_name": "Ada",
+                "last_name": "Lovelace",
+                "email": "ada@example.org",
+                "key_hash": hash_key(&secret),
+                "created_at": 1_700_000_000,
+                "first_used_at": 1_700_000_100,
+                "last_used_at": 1_700_000_200,
+                "last_used_ip": "203.0.113.7",
+                "disabled": false,
+                "weight": 5
+            }]
+        });
+        std::fs::write(&path, doc.to_string()).expect("write");
+
+        let s = Store::load(&path).expect("load");
+        let a = s.find("ada@example.org").expect("account survived");
+        assert_eq!(a.keys.len(), 1, "the single key becomes one key");
+        assert_eq!(a.keys[0].name, "default");
+        assert_eq!(
+            a.keys[0].last_used_ip.as_deref(),
+            Some("203.0.113.7"),
+            "the account's provenance moves onto the key, where it means something"
+        );
+        assert_eq!(a.keys[0].first_used_at, Some(1_700_000_100));
+        assert!(
+            s.authenticate(&secret).is_some(),
+            "and the key that was working before must still work"
+        );
     }
 
     #[test]

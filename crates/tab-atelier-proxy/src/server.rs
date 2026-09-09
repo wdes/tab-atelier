@@ -25,7 +25,7 @@ use hyper::body::{Frame, Incoming};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response};
 
-use crate::users::{Account, Store, constant_time_eq};
+use crate::users::{self, Account, Store, constant_time_eq};
 use crate::{account, egress, provider, qos, routing, usage};
 
 type Body = http_body_util::combinators::BoxBody<Bytes, Infallible>;
@@ -79,6 +79,25 @@ pub fn now_ms() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
+/// `/api/users/<account>/keys/<key>` → the two ids.
+fn split_key_path(path: &str) -> (&str, &str) {
+    let rest = path.trim_start_matches("/api/users/");
+    rest.split_once("/keys/").unwrap_or((rest, ""))
+}
+
+/// One key, without its hash.
+fn key_json(k: &users::Key) -> serde_json::Value {
+    serde_json::json!({
+        "id": k.id,
+        "name": k.name,
+        "created_at": k.created_at,
+        "first_used_at": k.first_used_at,
+        "last_used_at": k.last_used_at,
+        "last_used_ip": k.last_used_ip,
+        "disabled": k.disabled,
+    })
+}
+
 fn account_json(a: &Account) -> serde_json::Value {
     // Never the key hash. It is not a secret you can use, but it is the input
     // to an offline guess, and the UI has no reason to hold it.
@@ -88,12 +107,24 @@ fn account_json(a: &Account) -> serde_json::Value {
         "last_name": a.last_name,
         "email": a.email,
         "created_at": a.created_at,
-        "first_used_at": a.first_used_at,
-        "last_used_at": a.last_used_at,
-        "last_used_ip": a.last_used_ip,
         "disabled": a.disabled,
         "weight": a.weight,
-        "has_key": !a.key_hash.is_empty(),
+        // Every key, each with its own history. The hash is never included:
+        // it is not a usable secret, but it is the input to an offline guess
+        // and the UI has no reason to hold it.
+        "keys": a.keys.iter().map(|k| serde_json::json!({
+            "id": k.id,
+            "name": k.name,
+            "created_at": k.created_at,
+            "first_used_at": k.first_used_at,
+            "last_used_at": k.last_used_at,
+            "last_used_ip": k.last_used_ip,
+            "disabled": k.disabled,
+        })).collect::<Vec<_>>(),
+        // The account's most recent activity across all its keys, for the
+        // row summary.
+        "last_used_at": a.keys.iter().filter_map(|k| k.last_used_at).max(),
+        "has_key": a.keys.iter().any(users::Key::active),
     })
 }
 
@@ -168,12 +199,18 @@ pub async fn handle(
 
 /// Look up the key's account and record that it was used, from where.
 fn authenticate_and_stamp(state: &State, key: &str, ip: &str) -> Option<Account> {
-    let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let found = store.authenticate(key).cloned();
-    if let Some(ref a) = found {
-        store.touch(&a.id, Some(ip));
-    }
-    found
+    // The KEY is stamped, not the account: "last used from here" says nothing
+    // when several keys share an account, which is the whole reason they are
+    // named separately.
+    let found = {
+        let mut store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let found = store.authenticate_key(key).map(|(a, k)| (a.clone(), k.id.clone()));
+        if let Some((_, ref key_id)) = found {
+            store.touch(key_id, Some(ip));
+        }
+        found
+    };
+    found.map(|(a, _)| a)
 }
 
 /// Who the caller actually is, as far as this proxy can honestly tell.
@@ -918,13 +955,39 @@ fn mutate(state: &Arc<State>, method: &Method, path: &str, body: &Bytes) -> Resp
                 Err(e) => json(400, &serde_json::json!({ "error": e.to_string() }).to_string()),
             }
         }
-        (&Method::POST, p) if p.ends_with("/rotate") => match store.rotate(&who("/rotate")) {
-            Ok((a, key)) => json(
-                200,
-                &serde_json::json!({ "user": account_json(&a), "key": key }).to_string(),
-            ),
-            Err(e) => json(404, &serde_json::json!({ "error": e.to_string() }).to_string()),
-        },
+        // Add a named key. Replaces the old `/rotate`: adding first and
+        // removing later means a machine can be moved across without a moment
+        // where nothing works.
+        (&Method::POST, p) if p.ends_with("/keys") => {
+            let name = field("name");
+            let name = if name.is_empty() { "new" } else { &name };
+            match store.add_key(&who("/keys"), name) {
+                Ok((k, secret)) => json(
+                    201,
+                    // The secret is in this response and no other, ever.
+                    &serde_json::json!({ "key": key_json(&k), "secret": secret }).to_string(),
+                ),
+                Err(e) => json(400, &serde_json::json!({ "error": e.to_string() }).to_string()),
+            }
+        }
+        (&Method::DELETE, p) if p.contains("/keys/") => {
+            let (owner, key_ref) = split_key_path(p);
+            match store.remove_key(owner, key_ref) {
+                Ok(k) => json(200, &serde_json::json!({ "removed": key_json(&k) }).to_string()),
+                Err(e) => json(404, &serde_json::json!({ "error": e.to_string() }).to_string()),
+            }
+        }
+        (&Method::POST, p) if p.contains("/keys/") && p.ends_with("/disabled") => {
+            let (owner, key_ref) = split_key_path(p.trim_end_matches("/disabled"));
+            let disabled = parsed
+                .get("disabled")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true);
+            match store.set_key_disabled(owner, key_ref, disabled) {
+                Ok(k) => json(200, &serde_json::json!({ "key": key_json(&k) }).to_string()),
+                Err(e) => json(404, &serde_json::json!({ "error": e.to_string() }).to_string()),
+            }
+        }
         (&Method::POST, p) if p.ends_with("/disabled") => {
             let disabled = parsed
                 .get("disabled")
@@ -1143,16 +1206,30 @@ mod tests {
             first_name: "Ada".to_owned(),
             last_name: "Lovelace".to_owned(),
             email: "ada@example.org".to_owned(),
-            key_hash: "deadbeef".to_owned(),
             created_at: 1,
-            first_used_at: None,
-            last_used_at: None,
-            last_used_ip: None,
+            keys: vec![users::Key {
+                id: "k-1".to_owned(),
+                name: "laptop".to_owned(),
+                hash: "deadbeef".to_owned(),
+                created_at: 1,
+                first_used_at: None,
+                last_used_at: None,
+                last_used_ip: None,
+                disabled: false,
+            }],
+            key_hash: String::new(),
+            legacy_first_used_at: None,
+            legacy_last_used_at: None,
+            legacy_last_used_ip: None,
             disabled: false,
             weight: 1,
         };
         let json = account_json(&a).to_string();
-        assert!(!json.contains("deadbeef"), "the key hash must not reach the UI: {json}");
+        assert!(
+            !json.contains("deadbeef"),
+            "no key hash may reach the UI, on the account or on any of its keys: {json}"
+        );
+        assert!(json.contains("laptop"), "keys are listed by name: {json}");
         assert!(json.contains("ada@example.org"));
         assert!(json.contains("\"has_key\":true"));
     }
