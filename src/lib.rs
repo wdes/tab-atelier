@@ -6172,10 +6172,20 @@ mod state_writer_tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let script = root.join("scripts/deb-version.sh");
 
+        // Both invocations are pinned to ONE instant. The script stamps from
+        // the clock, so two calls that straddle a second tick produce a smoke
+        // build NEWER than the nightly and invert the very ordering being
+        // asserted — an intermittent failure that says nothing about the code.
+        // SOURCE_DATE_EPOCH is the script's own reproducibility knob.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+            .to_string();
         let run = |args: &[&str]| -> String {
             let out = std::process::Command::new(&script)
                 .args(args)
                 .current_dir(root)
+                .env("SOURCE_DATE_EPOCH", &now)
                 .output()
                 .expect("run scripts/deb-version.sh");
             assert!(out.status.success(), "deb-version.sh {args:?} failed");
