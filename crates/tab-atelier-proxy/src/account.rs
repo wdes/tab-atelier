@@ -632,6 +632,31 @@ mod tests {
     }
 
     #[test]
+    fn the_dashboard_reads_the_field_names_health_actually_serialises() {
+        // app.js renders this block; a rename on either side turns the
+        // warning banner back off silently, which is precisely the failure
+        // the banner exists to prevent.
+        let json = serde_json::to_value(Health {
+            stale: true,
+            last_ok_ts: Some("2026-09-09T12:20:36Z".to_owned()),
+            last_ok_age_secs: Some(36_060),
+            last_error: Some("http 429".to_owned()),
+            consecutive_failures: 2,
+        })
+        .expect("Health serialises");
+        // Either half of the UI may do the reading: computed properties live
+        // in app.js, the markup that shows them in index.html.
+        let ui = concat!(include_str!("../assets/app.js"), include_str!("../assets/index.html"));
+        for field in ["stale", "consecutive_failures", "last_ok_ts", "last_error"] {
+            assert!(json.get(field).is_some(), "Health has no `{field}`");
+            assert!(
+                ui.contains(field),
+                "the dashboard never reads `{field}` — it cannot show what it is not told"
+            );
+        }
+    }
+
+    #[test]
     fn health_reports_the_failure_the_chart_cannot_show() {
         let mut m = Monitor::load(tmp("health"));
         let t0 = 1_788_000_000;

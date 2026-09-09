@@ -72,8 +72,31 @@ createApp({
     planUtil() {
       return this.plan.utilization ?? null;
     },
+    planHealth() {
+      return this.plan.health || {};
+    },
+    // Whether the MONITOR is broken, as opposed to the plan being busy. The
+    // two used to be indistinguishable on this page: a failing poll produced
+    // a sample with no numbers, planSeries dropped it, and the chart simply
+    // ended — which reads as "nothing happened since noon" rather than "we
+    // stopped being able to look".
+    monitorBroken() {
+      return this.planHealth.stale === true || (this.planHealth.consecutive_failures ?? 0) > 0;
+    },
+    // What to say about it, in words, without making anyone read a log.
+    monitorProblem() {
+      if (!this.monitorBroken) return "";
+      const h = this.planHealth;
+      const since = h.last_ok_ts ? `last good reading ${this.whenLocal(h.last_ok_ts)}` : "no good reading yet";
+      const n = h.consecutive_failures ?? 0;
+      const failures = n === 1 ? "1 failed poll" : `${n} failed polls`;
+      return `${since} · ${failures}`;
+    },
     // Spelled out beside the number, so the state never rests on colour.
     planState() {
+      // Checked before the utilisation branches: an unknown plan must not be
+      // described as a healthy one, and this is the state routing is in too.
+      if (this.planHealth.stale) return "plan unknown — the reading is too old to act on";
       if (this.sched.backoff_for) return "upstream is rate-limiting — everything is waiting";
       if (this.planUtil == null) return "no reading yet";
       if (this.planUtil >= (this.pressure?.floor_above ?? 0.95)) return "nearly exhausted — falling back to the cheapest model";
@@ -81,6 +104,7 @@ createApp({
       return "healthy — nothing is being throttled";
     },
     planClass() {
+      if (this.planHealth.stale) return "text-body-secondary";
       if (this.sched.backoff_for || (this.planUtil ?? 0) >= (this.pressure?.floor_above ?? 0.95)) return "text-danger";
       if ((this.planUtil ?? 0) >= this.degradeAbove) return "text-warning";
       return "";
