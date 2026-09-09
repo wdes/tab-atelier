@@ -491,18 +491,6 @@ pub fn net_on(args: &[String]) -> i32 {
     set_net(args, false, "net-on")
 }
 
-/// Human "1h 12m" / "3m 5s" / "45s" from a second count. Local to the CLI —
-/// the GUI's `format_duration` lives behind the `gui` feature.
-fn fmt_uptime(secs: u64) -> String {
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        format!("{}m {}s", secs / 60, secs % 60)
-    } else {
-        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
-    }
-}
-
 /// `stats <tab> [--json]` — per-tab diagnostics, the CLI form of the desktop
 /// right-click "Stats" popup, read over the local API (`/tabs`).
 ///
@@ -558,7 +546,7 @@ pub fn stats(tab: &str, json: bool) -> i32 {
         line("cwd", cwd);
     }
     if let Some(up) = f64_of("uptime_secs") {
-        line("Active time", &fmt_uptime(up as u64));
+        line("Active time", &crate::fmt::duration_secs(up as u64));
     }
     if let Some(cpu) = f64_of("cpu_percent") {
         line("CPU", &format!("{cpu:.1} %"));
@@ -3064,10 +3052,10 @@ mod tests {
 
     #[test]
     fn formatting_helpers_stay_readable() {
-        assert_eq!(fmt_uptime(0), "0s");
-        assert_eq!(fmt_uptime(59), "59s");
-        assert_eq!(fmt_uptime(60), "1m 0s");
-        assert_eq!(fmt_uptime(3661), "1h 1m");
+        assert_eq!(crate::fmt::duration_secs(0), "0s");
+        assert_eq!(crate::fmt::duration_secs(59), "59s");
+        assert_eq!(crate::fmt::duration_secs(60), "1m 0s");
+        assert_eq!(crate::fmt::duration_secs(3661), "1h 1m");
         assert_eq!(human_bytes(0), "0 B");
         assert_eq!(human_bytes(1023), "1023 B");
         assert_eq!(human_bytes(1024), "1.0 KB");
@@ -3085,11 +3073,19 @@ mod tests {
         // Both helpers switch unit on a threshold, and both are read by a
         // human deciding whether a tab is misbehaving — an off-by-one here
         // reports "59m" as "0h" or a gigabyte as a kilobyte.
-        assert_eq!(fmt_uptime(3599), "59m 59s", "the last second before an hour");
-        assert_eq!(fmt_uptime(3600), "1h 0m");
-        assert_eq!(fmt_uptime(86_399), "23h 59m", "a day is still counted in hours");
         assert_eq!(
-            fmt_uptime(90_061),
+            crate::fmt::duration_secs(3599),
+            "59m 59s",
+            "the last second before an hour"
+        );
+        assert_eq!(crate::fmt::duration_secs(3600), "1h 0m");
+        assert_eq!(
+            crate::fmt::duration_secs(86_399),
+            "23h 59m",
+            "a day is still counted in hours"
+        );
+        assert_eq!(
+            crate::fmt::duration_secs(90_061),
             "25h 1m",
             "no day rollover — this is uptime, not a clock"
         );
