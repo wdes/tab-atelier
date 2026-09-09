@@ -75,6 +75,29 @@ enum Command {
 /// buys nothing, and this is a call against the same quota it is measuring.
 const USAGE_POLL: std::time::Duration = std::time::Duration::from_mins(5);
 
+/// Longest gap between polls once they start failing.
+///
+/// An hour, because the failures worth backing off from are not transient:
+/// observed in production, `/api/oauth/usage` answered 429 and then every
+/// five-minute poll for the next ten hours failed too, first on the rate limit
+/// and later on an expired refresh token. Retrying an endpoint that is telling
+/// us to stop, at full rate, against the same quota it measures, is the one
+/// thing guaranteed not to help.
+const USAGE_POLL_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_hours(1);
+
+/// How long to wait after `failures` consecutive failed polls.
+///
+/// Doubles from the normal interval and stops at [`USAGE_POLL_MAX_BACKOFF`];
+/// zero failures is the normal interval, so the healthy path is unchanged.
+fn usage_poll_delay(failures: u32) -> std::time::Duration {
+    if failures == 0 {
+        return USAGE_POLL;
+    }
+    USAGE_POLL
+        .saturating_mul(1u32 << failures.min(5))
+        .min(USAGE_POLL_MAX_BACKOFF)
+}
+
 /// Keep the shared plan's utilisation current, in the background.
 ///
 /// Every reading is appended — successes and failures alike — so a gap in the
@@ -83,6 +106,7 @@ const USAGE_POLL: std::time::Duration = std::time::Duration::from_mins(5);
 /// `.claude/scripts/claude-usage-monitor.mjs`, so tooling that reads those
 /// files reads these.
 async fn poll_account_usage(state: Arc<server::State>) {
+    let mut failures: u32 = 0;
     loop {
         let sample = tokio::task::spawn_blocking(|| {
             let ts = now_rfc3339();
@@ -104,17 +128,31 @@ async fn poll_account_usage(state: Arc<server::State>) {
                 ),
                 None => log::warn!("plan utilisation unknown: {:?}", sample.error),
             }
+            failures = if sample.is_ok() { 0 } else { failures.saturating_add(1) };
             state
                 .account
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(sample);
+        } else {
+            // The blocking task panicked. Nothing was appended, so without
+            // this the loop would spin at full rate on a fault it never
+            // records — the one shape of failure the JSONL cannot show.
+            log::error!("plan utilisation poll panicked");
+            failures = failures.saturating_add(1);
         }
-        tokio::time::sleep(USAGE_POLL).await;
+        let delay = usage_poll_delay(failures);
+        if failures > 0 {
+            log::warn!(
+                "plan utilisation: {failures} consecutive failures, next poll in {}s",
+                delay.as_secs()
+            );
+        }
+        tokio::time::sleep(delay).await;
     }
 }
 
-/// RFC3339 in UTC, without pulling in a date library for one format string.
+/// RFC3339 in UTC, the shape the usage log and the .mjs monitor both use.
 fn now_rfc3339() -> String {
     now_rfc3339_at(
         std::time::SystemTime::now()
@@ -125,21 +163,20 @@ fn now_rfc3339() -> String {
 
 /// The conversion, taking the instant, so it can be tested against known
 /// dates instead of whatever the clock says.
+///
+/// jiff rather than a hand-rolled civil-from-days: it is already compiled into
+/// this binary via `env_logger`, and the inverse of this function
+/// ([`tab_atelier_proxy::account::epoch_of`]) has to agree with it exactly —
+/// two independent implementations of the same calendar is the kind of pair
+/// that stays correct until a leap year says otherwise.
 fn now_rfc3339_at(secs: u64) -> String {
-    let (hour, minute, second) = ((secs % 86_400) / 3600, (secs % 3600) / 60, secs % 60);
-    // Civil-from-days (Howard Hinnant's algorithm), so the timestamp is a real
-    // date rather than an epoch count nobody can read on a dashboard.
-    let shifted = i64::try_from(secs / 86_400).unwrap_or(0) + 719_468;
-    let era = shifted.div_euclid(146_097);
-    let day_of_era = shifted.rem_euclid(146_097);
-    let year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_pos = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_pos + 2) / 5 + 1;
-    let month = if month_pos < 10 { month_pos + 3 } else { month_pos - 9 };
-    let year = if month <= 2 { year + 1 } else { year };
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+    let ts = i64::try_from(secs)
+        .ok()
+        .and_then(|s| jiff::Timestamp::from_second(s).ok())
+        .unwrap_or(jiff::Timestamp::UNIX_EPOCH);
+    // Second precision, `Z` rather than `+00:00`, to match what the .mjs
+    // monitor writes and what the existing logs already hold.
+    ts.strftime("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 /// Time the trip to Anthropic and print where it went.

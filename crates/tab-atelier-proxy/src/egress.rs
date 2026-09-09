@@ -210,6 +210,41 @@ fn persist(path: &std::path::Path, blob: &OauthBlob) -> Result<(), String> {
     Ok(())
 }
 
+/// Turn an OAuth error response into something an operator can act on.
+///
+/// `invalid_grant` is the one that matters and the one that is easiest to
+/// misread: it does not mean the proxy is misconfigured, it means the stored
+/// refresh token is no longer accepted — normally because the credentials were
+/// copied from a machine that has since refreshed them and rotated the token
+/// out from under this copy. The fix is to import them again, so the message
+/// says that instead of leaving it to be inferred.
+fn describe_oauth_error(status: u16, raw: &str) -> String {
+    let parsed = serde_json::from_str::<serde_json::Value>(raw).ok();
+    let field = |k: &str| {
+        parsed
+            .as_ref()
+            .and_then(|v| v.get(k))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    };
+    let code = field("error").unwrap_or_else(|| format!("http {status}"));
+    let detail = field("error_description").unwrap_or_else(|| {
+        // Not an OAuth envelope — keep a bounded slice of whatever came back
+        // rather than discarding the only evidence there is.
+        raw.chars().take(200).collect()
+    });
+    let hint = if code == "invalid_grant" {
+        " — the stored refresh token is no longer valid; import the credentials again"
+    } else {
+        ""
+    };
+    if detail.trim().is_empty() {
+        format!("http {status}: {code}{hint}")
+    } else {
+        format!("http {status}: {code}: {detail}{hint}")
+    }
+}
+
 fn refresh(refresh_token: &str) -> Result<OauthBlob, String> {
     #[derive(Serialize)]
     struct Req<'a> {
@@ -235,6 +270,17 @@ fn refresh(refresh_token: &str) -> Result<OauthBlob, String> {
             client_id: CLIENT_ID,
         })
         .map_err(|e| format!("refresh request failed: {e}"))?;
+    // The agent is built with HTTP errors NOT raised as errors, so a rejected
+    // refresh arrives here as a normal response carrying an OAuth error
+    // envelope. Decoding that as a token blob reports "missing field
+    // `access_token`" — which describes our struct, not the problem, and sent
+    // an operator looking at the wrong thing. Read the status first and say
+    // what the server actually said.
+    let status = resp.status().as_u16();
+    if !(200..300).contains(&status) {
+        let raw = resp.body_mut().read_to_string().unwrap_or_default();
+        return Err(format!("refresh rejected: {}", describe_oauth_error(status, &raw)));
+    }
     let body: Resp = resp
         .body_mut()
         .read_json()
