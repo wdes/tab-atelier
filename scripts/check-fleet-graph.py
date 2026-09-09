@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-# This Source Code Form is subject to the terms of the Mozilla Public
-# License, v. 2.0. If a copy of the MPL was not distributed with this
-# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+# @licence MPL-2.0 https://mozilla.org/MPL/2.0/
 """Assert that `tab-atelier fleet --json` is renderable as a graph.
 
 Checks the contract a viewer depends on: every edge points at a node that
