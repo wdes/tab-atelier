@@ -10,49 +10,37 @@
 
 use std::path::PathBuf;
 
-fn usage() {
-    eprintln!(
-        "usage: tab-atelier brief [--cwd <dir>] [--json] [--list]\n\n\
-         Prints what a Claude session starting in <dir> (default: here) is told.\n\
-         --list   show which brief files matched, and from where\n\
-         --json   the exact SessionStart payload the hook prints\n\n\
-         Project briefs are .md files with front matter, read from:\n  \
-         ~/.config/tab-atelier/briefs/   and   /etc/tab-atelier/briefs/\n\n\
-         ---\n  \
-         baseDir: /mnt/clients/ABCD\n  \
-         ---\n  \
-         Client ABCD: PHP 7.4. Deploys are manual — never push to production."
-    );
+/// `tab-atelier brief [--cwd <dir>] [--json] [--list]`
+#[derive(clap::Parser, Debug)]
+#[command(
+    name = "tab-atelier brief",
+    about = "Print what a Claude session starting in <dir> is told",
+    after_help = "Project briefs are .md files with front matter, read from:\n  \
+                  ~/.config/tab-atelier/briefs/   and   /etc/tab-atelier/briefs/\n\n\
+                  ---\n  \
+                  baseDir: /mnt/clients/ABCD\n  \
+                  ---\n  \
+                  Client ABCD: PHP 7.4. Deploys are manual — never push to production."
+)]
+struct Cli {
+    /// Where the session would start. Defaults to the current directory.
+    #[arg(long)]
+    cwd: Option<PathBuf>,
+    /// The exact `SessionStart` payload the hook prints.
+    #[arg(long)]
+    json: bool,
+    /// Show which brief files matched, and from where.
+    #[arg(long, short = 'l')]
+    list: bool,
 }
 
 #[must_use]
 pub fn run(args: &[String]) -> i32 {
-    let mut cwd: Option<PathBuf> = None;
-    let (mut json, mut list) = (false, false);
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--json" => json = true,
-            "--list" | "-l" => list = true,
-            "--cwd" => {
-                i += 1;
-                let Some(v) = args.get(i) else {
-                    eprintln!("brief: --cwd expects a directory");
-                    return 2;
-                };
-                cwd = Some(PathBuf::from(v));
-            }
-            "-h" | "--help" => {
-                usage();
-                return 0;
-            }
-            other => {
-                eprintln!("brief: unknown argument: {other}");
-                return 2;
-            }
-        }
-        i += 1;
-    }
+    let cli = match super::parse::<Cli>("tab-atelier brief", args) {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    let Cli { cwd, json, list } = cli;
     let here = cwd.or_else(|| std::env::current_dir().ok()).unwrap_or_default();
     let all = crate::briefs::load_all();
     let selected = crate::briefs::select(&all, &here);

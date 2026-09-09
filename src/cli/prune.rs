@@ -26,26 +26,27 @@ use super::team::{Note, blackboard_path, encode_note_line, read_blackboard};
 /// Default age before a finished task is compacted away.
 pub const DEFAULT_DAYS: u64 = 14;
 
-fn usage() {
-    eprintln!(
-        "usage: tab-atelier prune [--older-than <days>] [--notes] [--all-done] [--dry-run]\n\n\
-         Compacts the blackboard by dropping entries for FINISHED tasks that\n\
-         have been quiet for --older-than days (default 14).\n\n  \
-         --notes      also drop plain notes older than the same cutoff\n  \
-         --all-done   ignore the age cutoff: every finished task goes\n  \
-         --dry-run    report what would go, write nothing\n\n\
-         Never drops open, bidding or awarded tasks — that is live state.\n\
-         Removal cannot be gossiped: a peer that still has an entry will send\n\
-         it back. Prune each host, or expect history to return."
-    );
-}
-
 /// A parsed invocation.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(clap::Parser, Debug, PartialEq, Eq)]
+#[command(
+    name = "tab-atelier prune",
+    about = "Compact the blackboard by dropping entries for finished, quiet tasks",
+    after_help = "Never drops open, bidding or awarded tasks — that is live state.\n\
+                  Removal cannot be gossiped: a peer that still has an entry will send\n\
+                  it back. Prune each host, or expect history to return."
+)]
 pub struct PruneArgs {
+    /// Drop finished tasks quiet for at least this many days.
+    #[arg(long = "older-than", value_name = "DAYS", default_value_t = DEFAULT_DAYS)]
     pub older_than_days: u64,
+    /// Also drop plain notes older than the same cutoff.
+    #[arg(long)]
     pub notes: bool,
+    /// Ignore the age cutoff: every finished task goes.
+    #[arg(long)]
     pub all_done: bool,
+    /// Report what would go, write nothing.
+    #[arg(long, short = 'n')]
     pub dry_run: bool,
 }
 
@@ -63,33 +64,7 @@ impl Default for PruneArgs {
 /// # Errors
 /// `Err(0)` on `--help`, `Err(2)` on a bad flag or a non-numeric age.
 pub fn parse_args(args: &[String]) -> Result<PruneArgs, i32> {
-    let mut out = PruneArgs::default();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--notes" => out.notes = true,
-            "--all-done" => out.all_done = true,
-            "--dry-run" | "-n" => out.dry_run = true,
-            "--older-than" => {
-                i += 1;
-                let Some(v) = args.get(i).and_then(|v| v.parse::<u64>().ok()) else {
-                    eprintln!("prune: --older-than expects a number of days");
-                    return Err(2);
-                };
-                out.older_than_days = v;
-            }
-            "-h" | "--help" => {
-                usage();
-                return Err(0);
-            }
-            other => {
-                eprintln!("prune: unknown argument: {other}");
-                return Err(2);
-            }
-        }
-        i += 1;
-    }
-    Ok(out)
+    super::parse::<PruneArgs>("tab-atelier prune", args)
 }
 
 /// Split the board into the entries to keep and the ones to drop.

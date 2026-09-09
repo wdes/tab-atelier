@@ -12,20 +12,21 @@
 
 use super::share_link::{agent, discover_endpoint};
 
-fn usage() {
-    eprintln!(
-        "usage: tab-atelier logs [--lines N] [--json]\n\
-         Tail the running daemon's recent log records (INFO and above).\n\
-         Reads GET /logs, which only answers callers on 127.0.0.1 — to read a\n\
-         remote instance's log, run this on that host.\n\
-         See `tab-atelier log <filter>` to change what gets logged."
-    );
-}
-
 /// A parsed `logs` invocation.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(clap::Parser, Debug, Default, PartialEq, Eq)]
+#[command(
+    name = "tab-atelier logs",
+    about = "Tail the running daemon's recent log records (INFO and above)",
+    after_help = "Reads GET /logs, which only answers callers on 127.0.0.1 — to read a\n\
+                  remote instance's log, run this on that host.\n\
+                  See `tab-atelier log <filter>` to change what gets logged."
+)]
 pub struct LogsArgs {
+    /// How many records to show.
+    #[arg(long, short = 'n')]
     pub lines: Option<usize>,
+    /// Emit the raw records instead of the human view.
+    #[arg(long)]
     pub json: bool,
 }
 
@@ -35,31 +36,7 @@ pub struct LogsArgs {
 /// `Err(0)` on `-h`/`--help` (usage printed), `Err(2)` on an unknown flag or a
 /// `--lines` value that isn't a number.
 pub fn parse_args(args: &[String]) -> Result<LogsArgs, i32> {
-    let mut out = LogsArgs::default();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--json" => out.json = true,
-            "-n" | "--lines" => {
-                i += 1;
-                let Some(n) = args.get(i).and_then(|v| v.parse::<usize>().ok()) else {
-                    eprintln!("logs: --lines expects a number");
-                    return Err(2);
-                };
-                out.lines = Some(n);
-            }
-            "-h" | "--help" => {
-                usage();
-                return Err(0);
-            }
-            other => {
-                eprintln!("logs: unknown argument: {other}");
-                return Err(2);
-            }
-        }
-        i += 1;
-    }
-    Ok(out)
+    super::parse::<LogsArgs>("tab-atelier logs", args)
 }
 
 /// `HH:MM:SS.mmm` in UTC from unix millis — no timezone database, and stable

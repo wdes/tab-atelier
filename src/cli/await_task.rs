@@ -40,63 +40,37 @@ pub const EXIT_PENDING: i32 = 3;
 /// Exit code for "no task by that id".
 pub const EXIT_UNKNOWN: i32 = 4;
 
-fn usage() {
-    eprintln!(
-        "usage: tab-atelier wait <task-id>… [--timeout <seconds>] [--any] [--quiet]\n\n\
-         Blocks until the named tasks finish. Exit codes:\n  \
-         0  all finished ok        2  usage error        4  unknown task\n  \
-         1  one or more failed     3  still running at the timeout\n\n\
-         --any       return as soon as ONE finishes, rather than all\n\
-         --timeout 0 don't block at all — check and exit (a status probe)\n\n\
-         Cheap enough to run many at once: it reads the board, it does not hold\n\
-         a connection."
-    );
-}
-
 /// A parsed `wait` invocation.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(clap::Parser, Debug, Default, PartialEq, Eq)]
+#[command(
+    name = "tab-atelier wait",
+    about = "Block until the named tasks finish",
+    after_help = "Exit codes:\n  \
+                  0  all finished ok        2  usage error        4  unknown task\n  \
+                  1  one or more failed     3  still running at the timeout\n\n\
+                  Cheap enough to run many at once: it reads the board, it does not hold\n\
+                  a connection."
+)]
 pub struct WaitArgs {
+    /// The tasks to wait for.
+    #[arg(required = true)]
     pub ids: Vec<String>,
-    /// `None` = wait indefinitely.
+    /// Seconds to wait. `0` doesn't block at all — check and exit (a status
+    /// probe). Omitted means wait indefinitely.
+    #[arg(long = "timeout", short = 't', value_name = "SECONDS")]
     pub timeout_s: Option<u64>,
+    /// Return as soon as ONE finishes, rather than all.
+    #[arg(long)]
     pub any: bool,
+    /// Say nothing; report through the exit code alone.
+    #[arg(long, short = 'q')]
     pub quiet: bool,
 }
 
 /// # Errors
 /// `Err(0)` on `--help`, `Err(2)` on a bad flag or no task ids.
 pub fn parse_args(args: &[String]) -> Result<WaitArgs, i32> {
-    let mut out = WaitArgs::default();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--any" => out.any = true,
-            "--quiet" | "-q" => out.quiet = true,
-            "-h" | "--help" => {
-                usage();
-                return Err(0);
-            }
-            "--timeout" | "-t" => {
-                i += 1;
-                let Some(v) = args.get(i).and_then(|v| v.parse::<u64>().ok()) else {
-                    eprintln!("wait: --timeout expects seconds");
-                    return Err(2);
-                };
-                out.timeout_s = Some(v);
-            }
-            other if other.starts_with('-') => {
-                eprintln!("wait: unknown argument: {other}");
-                return Err(2);
-            }
-            id => out.ids.push(id.to_owned()),
-        }
-        i += 1;
-    }
-    if out.ids.is_empty() {
-        usage();
-        return Err(2);
-    }
-    Ok(out)
+    super::parse::<WaitArgs>("tab-atelier wait", args)
 }
 
 /// What one poll of the board concluded.

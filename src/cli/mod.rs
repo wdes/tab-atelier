@@ -61,25 +61,55 @@ pub mod tokens;
 /// uses to join the fleet and pick up work on its own.
 pub mod work;
 
+/// Parse one subcommand's arguments with clap, mapping clap's outcomes onto
+/// this CLI's exit codes.
+///
+/// Every verb here is reached through a `[ARGS]…` passthrough in
+/// [`dispatch`], so each one gets only the words that followed it and has to
+/// stand up its own parser. This is that parser's front door: `name` becomes
+/// argv[0], so usage and error messages read as the command the person
+/// actually typed.
+///
+/// `--help` and `--version` arrive from clap as *errors* carrying the text to
+/// print. They are successful outcomes and exit 0; everything else is a usage
+/// error and exits 2.
+///
+/// # Errors
+/// The exit code to return, after the help or the diagnosis has been printed.
+pub fn parse<T: clap::Parser>(name: &str, args: &[String]) -> Result<T, i32> {
+    let argv = std::iter::once(name.to_owned()).chain(args.iter().cloned());
+    T::try_parse_from(argv).map_err(|e| {
+        let help = matches!(
+            e.kind(),
+            clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+        );
+        let _ = e.print();
+        if help { 0 } else { 2 }
+    })
+}
+
 #[cfg(test)]
 mod help_tests {
-    /// Every hand-rolled argument parser answers `--help`.
+    /// Verbs that still parse their arguments by hand.
     ///
-    /// The subcommands that take `[ARGS]...` and parse them by hand are
-    /// invisible to clap, so clap's generated `--help` stops at the verb. A
-    /// parser that then reports `unknown argument: --help` is worse than one
-    /// with no help at all: it reads as "this command has no help" rather than
-    /// "you are in the wrong place". `tab-atelier remote add --help` did
-    /// exactly that.
+    /// The list only shrinks. Each of these is a `while` loop over
+    /// `&[String]` that clap cannot see, so `tab-atelier <verb> --help` is
+    /// answered — if at all — by a string literal maintained beside the
+    /// `match` it describes, and an argument the loop does not recognise is
+    /// whatever that loop decides. `remote add proxy --url …` shipped in the
+    /// docs because nothing could reject it.
+    const STILL_HAND_ROLLED: &[&str] = &["backlog.rs", "brain.rs", "gossip.rs", "style.rs", "work.rs"];
+
+    /// No verb outside [`STILL_HAND_ROLLED`] parses arguments by hand.
     ///
-    /// Any file that can say "unknown argument" must also handle `--help`
-    /// somewhere. Checked by reading the sources, because these parsers have
-    /// no shared entry point to test through.
+    /// This replaces a test that asserted at least five hand-rolled parsers
+    /// existed, which would have failed as they were converted — reporting
+    /// success as a regression. Inverting it means finishing the job makes
+    /// the list empty rather than making the test wrong.
     #[test]
-    fn every_hand_rolled_parser_answers_help() {
+    fn no_verb_outside_the_known_list_parses_arguments_by_hand() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cli");
-        let mut checked = 0;
-        let mut missing = Vec::new();
+        let mut found = Vec::new();
 
         let mut stack = vec![root];
         while let Some(dir) = stack.pop() {
@@ -104,19 +134,46 @@ mod help_tests {
                 if !src.contains("unknown argument: {") {
                     continue;
                 }
-                checked += 1;
-                if !src.contains("\"--help\"") {
-                    missing.push(path.display().to_string());
+                let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                if !STILL_HAND_ROLLED.contains(&name.as_str()) {
+                    found.push(path.display().to_string());
                 }
             }
         }
 
-        assert!(checked > 5, "only found {checked} hand-rolled parsers — did they move?");
         assert!(
-            missing.is_empty(),
-            "these reject unknown flags but never answer --help, so `--help` reports itself \
-             as an unknown argument:\n  {}",
-            missing.join("\n  ")
+            found.is_empty(),
+            "these parse arguments by hand and are not on the known list — use clap \
+             (see `cli::parse`), or add them to STILL_HAND_ROLLED with a reason:\n  {}",
+            found.join("\n  ")
         );
+    }
+
+    /// Every verb still on the list at least answers `--help`.
+    ///
+    /// A hand-rolled parser that reports `unknown argument: --help` is worse
+    /// than one with no help at all: it reads as "this command has no help"
+    /// rather than "you are in the wrong place".
+    #[test]
+    fn every_remaining_hand_rolled_parser_answers_help() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cli");
+        let mut missing = Vec::new();
+        for name in STILL_HAND_ROLLED {
+            let path = root.join(name);
+            let Ok(src) = std::fs::read_to_string(&path) else {
+                // Converted and renamed, or gone: drop it from the list.
+                missing.push(format!("{} is on STILL_HAND_ROLLED but does not exist", path.display()));
+                continue;
+            };
+            assert!(
+                src.contains("unknown argument: {"),
+                "{} is on STILL_HAND_ROLLED but no longer parses by hand — remove it from the list",
+                path.display()
+            );
+            if !src.contains("\"--help\"") {
+                missing.push(format!("{} never answers --help", path.display()));
+            }
+        }
+        assert!(missing.is_empty(), "{}", missing.join("\n  "));
     }
 }
