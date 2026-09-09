@@ -92,13 +92,17 @@ pub fn parse<T: clap::Parser>(name: &str, args: &[String]) -> Result<T, i32> {
 mod help_tests {
     /// Verbs that still parse their arguments by hand.
     ///
-    /// The list only shrinks. Each of these is a `while` loop over
-    /// `&[String]` that clap cannot see, so `tab-atelier <verb> --help` is
+    /// Empty, and meant to stay that way. A hand-rolled `while` loop over
+    /// `&[String]` is invisible to clap, so `tab-atelier <verb> --help` is
     /// answered — if at all — by a string literal maintained beside the
     /// `match` it describes, and an argument the loop does not recognise is
     /// whatever that loop decides. `remote add proxy --url …` shipped in the
     /// docs because nothing could reject it.
-    const STILL_HAND_ROLLED: &[&str] = &["backlog.rs", "brain.rs", "gossip.rs", "style.rs", "work.rs"];
+    ///
+    /// Kept rather than deleted so the check below has something to name: a
+    /// new verb added with a hand-rolled parser fails the test instead of
+    /// quietly rejoining the old pattern.
+    const STILL_HAND_ROLLED: &[&str] = &[];
 
     /// No verb outside [`STILL_HAND_ROLLED`] parses arguments by hand.
     ///

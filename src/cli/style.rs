@@ -13,19 +13,6 @@
 
 use super::share_link::{agent, discover_endpoint, resolve};
 
-fn usage() {
-    eprintln!(
-        "usage:\n  \
-         tab-atelier style --folder <dir> [--color #RRGGBB] [--badge TXT]\n  \
-         tab-atelier style --folder <dir> --clear\n  \
-         tab-atelier style --tab <idx-or-uuid> [--color #RRGGBB|clear] [--badge TXT|clear]\n  \
-         tab-atelier style --list\n\n\
-         A folder rule styles every tab whose cwd is inside it (longest match wins),\n\
-         so tabs opened in a project — including with Ctrl+Shift+T — pick it up.\n\
-         A per-tab override wins over the folder rule."
-    );
-}
-
 /// Path used for matching: absolute, `~` expanded, trailing slash trimmed.
 fn normalize_dir(dir: &str) -> Result<String, String> {
     let expanded = match dir.strip_prefix("~/") {
@@ -46,13 +33,37 @@ fn normalize_dir(dir: &str) -> Result<String, String> {
 }
 
 /// What one `style` invocation asks for, parsed off the command line.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(clap::Parser, Debug, Default, PartialEq, Eq)]
+#[command(
+    name = "tab-atelier style",
+    about = "Colour and badge tabs, by folder rule or per tab",
+    after_help = "A folder rule styles every tab whose cwd is inside it (longest match wins),\n\
+                  so tabs opened in a project — including with Ctrl+Shift+T — pick it up.\n\
+                  A per-tab override wins over the folder rule.\n\n\
+                  Examples:\n  \
+                  tab-atelier style --folder <dir> [--color #RRGGBB] [--badge TXT]\n  \
+                  tab-atelier style --folder <dir> --clear\n  \
+                  tab-atelier style --tab <idx-or-uuid> [--color #RRGGBB|clear] [--badge TXT|clear]\n  \
+                  tab-atelier style --list"
+)]
 pub struct StyleArgs {
+    /// Style every tab whose cwd is inside this directory.
+    #[arg(long, short = 'f', conflicts_with = "tab")]
     pub folder: Option<String>,
+    /// Style one tab, by index or uuid.
+    #[arg(long, short = 't')]
     pub tab: Option<String>,
+    /// `#RRGGBB`, or `clear` to drop it.
+    #[arg(long, short = 'c')]
     pub color: Option<String>,
+    /// Short badge text, or `clear` to drop it.
+    #[arg(long, short = 'b')]
     pub badge: Option<String>,
+    /// Remove the rule or override entirely.
+    #[arg(long)]
     pub clear: bool,
+    /// Show the configured folder rules.
+    #[arg(long, short = 'l')]
     pub list: bool,
 }
 
@@ -64,43 +75,15 @@ pub struct StyleArgs {
 /// unknown flag, a colour that isn't `#RRGGBB`, or a badge that fails
 /// [`crate::sanitize_badge`].
 pub fn parse_style_args(args: &[String]) -> Result<StyleArgs, i32> {
-    let (mut folder, mut tab, mut color, mut badge) = (None, None, None, None);
-    let (mut clear, mut list) = (false, false);
-    let mut i = 0;
-    while i < args.len() {
-        let flag = args[i].as_str();
-        let slot = match flag {
-            "--folder" | "-f" => Some(&mut folder),
-            "--tab" | "-t" => Some(&mut tab),
-            "--color" | "-c" => Some(&mut color),
-            "--badge" | "-b" => Some(&mut badge),
-            "--clear" => {
-                clear = true;
-                None
-            }
-            "--list" | "-l" => {
-                list = true;
-                None
-            }
-            "-h" | "--help" => {
-                usage();
-                return Err(0);
-            }
-            other => {
-                eprintln!("style: unknown argument: {other}");
-                return Err(2);
-            }
-        };
-        if let Some(slot) = slot {
-            i += 1;
-            let Some(v) = args.get(i) else {
-                eprintln!("style: {flag} expects a value");
-                return Err(2);
-            };
-            *slot = Some(v.clone());
-        }
-        i += 1;
-    }
+    let parsed = super::parse::<StyleArgs>("tab-atelier style", args)?;
+    let StyleArgs {
+        folder,
+        tab,
+        color,
+        badge,
+        clear,
+        list,
+    } = parsed;
 
     if let Some(ref c) = color
         && !c.eq_ignore_ascii_case("clear")
@@ -116,12 +99,11 @@ pub fn parse_style_args(args: &[String]) -> Result<StyleArgs, i32> {
         eprintln!("style: {e}");
         return Err(2);
     }
-    if folder.is_some() && tab.is_some() {
-        eprintln!("style: pass --folder or --tab, not both");
-        return Err(2);
-    }
+    // `--folder` with `--tab` is refused by clap (`conflicts_with`), but
+    // "neither, and not --list" is a shape clap cannot express as tidily, so
+    // it stays here.
     if !list && folder.is_none() && tab.is_none() {
-        usage();
+        eprintln!("style: pass --folder <dir>, --tab <idx-or-uuid>, or --list");
         return Err(2);
     }
     Ok(StyleArgs {

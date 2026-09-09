@@ -314,90 +314,79 @@ pub fn plan(candidates: &[Candidate], board: &[TaskView], now_s: u64, cooldown_s
         .collect()
 }
 
-fn usage_full() {
-    eprintln!(
-        "usage: tab-atelier backlog [sources] [--cooldown <days>] [--dry-run]\n\n\
-         sources (repeatable, combined):\n  \
-         --from <command>      run it; each stdout line is `id<TAB>title`\n  \
-         --from-file <path>    same format, read from a file\n  \
-         --lcov <path>         built-in: worst-covered files + a rotation of audits\n\n\
-         coverage source options: --target <pct> --limit <n> --min-lines <n> --audit-largest <n>\n  \
-         --root <dir>          strip this prefix from LCOV paths (default: cwd)\n\n\
-         Announcing is idempotent: a candidate already open (or finished within\n\
-         --cooldown days) is skipped, so a source can emit its whole world every\n\
-         run and this can go on a timer.\n\n\
-         examples:\n  \
-         tab-atelier backlog --from 'rg -n \"TODO\" src | head -20 | sed \"s/\\(.*\\):\\([0-9]*\\):.*/todo:\\1:\\2\\ttidy the TODO at \\1:\\2/\"'\n  \
-         cargo llvm-cov --lcov --output-path target/lcov.info && tab-atelier backlog --lcov target/lcov.info"
-    );
+/// `tab-atelier backlog [sources] [--cooldown <days>] [--dry-run]`
+#[derive(clap::Parser, Debug)]
+#[command(
+    name = "tab-atelier backlog",
+    about = "Announce work from any source",
+    after_help = "Announcing is idempotent: a candidate already open (or finished within\n\
+                  --cooldown days) is skipped, so a source can emit its whole world every\n\
+                  run and this can go on a timer.\n\n\
+                  examples:\n  \
+                  tab-atelier backlog --from 'rg -n \"TODO\" src | head -20'\n  \
+                  cargo llvm-cov --lcov --output-path target/lcov.info && \\\n    \
+                  tab-atelier backlog --lcov target/lcov.info"
+)]
+struct Cli {
+    /// Run it; each stdout line is `id<TAB>title`. Repeatable.
+    #[arg(long = "from", value_name = "COMMAND")]
+    sources: Vec<String>,
+    /// Same format, read from a file. Repeatable.
+    #[arg(long = "from-file", value_name = "PATH")]
+    files: Vec<String>,
+    /// Built-in source: worst-covered files plus a rotation of audits.
+    #[arg(long, value_name = "PATH")]
+    lcov: Option<String>,
+    /// Coverage percentage worth aiming at.
+    #[arg(long, value_name = "PCT", default_value_t = CoveragePolicy::default().target)]
+    target: f64,
+    /// Most coverage tasks to emit.
+    #[arg(long, value_name = "N", default_value_t = CoveragePolicy::default().limit)]
+    limit: usize,
+    /// Ignore files smaller than this.
+    #[arg(long, value_name = "N", default_value_t = CoveragePolicy::default().min_lines)]
+    min_lines: u32,
+    /// How many of the largest files to put up for audit.
+    #[arg(long, value_name = "N", default_value_t = CoveragePolicy::default().audit_largest)]
+    audit_largest: usize,
+    /// Strip this prefix from LCOV paths. Defaults to the cwd.
+    #[arg(long, value_name = "DIR")]
+    root: Option<std::path::PathBuf>,
+    /// Skip candidates finished within this many days.
+    #[arg(long, value_name = "DAYS", default_value_t = 30)]
+    cooldown: u64,
+    /// Show what would be announced, announce nothing.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[must_use]
 pub fn run(args: &[String]) -> i32 {
-    let mut sources: Vec<String> = Vec::new();
-    let mut files: Vec<String> = Vec::new();
-    let mut lcov: Option<String> = None;
-    let mut policy = CoveragePolicy::default();
-    let mut cooldown_days = 30_u64;
-    let mut dry = false;
-    let mut i = 0;
-    while i < args.len() {
-        let flag = args[i].clone();
-        let mut value = || -> Option<String> {
-            i += 1;
-            args.get(i).cloned()
-        };
-        match flag.as_str() {
-            "--dry-run" => {
-                dry = true;
-                i += 1;
-                continue;
-            }
-            "-h" | "--help" => {
-                usage_full();
-                return 0;
-            }
-            _ => {}
-        }
-        let Some(v) = value() else {
-            eprintln!("backlog: {flag} expects a value");
-            return 2;
-        };
-        let ok = match flag.as_str() {
-            "--from" => {
-                sources.push(v.clone());
-                true
-            }
-            "--from-file" => {
-                files.push(v.clone());
-                true
-            }
-            "--lcov" => {
-                lcov = Some(v.clone());
-                true
-            }
-            "--target" => v.parse().map(|t| policy.target = t).is_ok(),
-            "--limit" => v.parse().map(|l| policy.limit = l).is_ok(),
-            "--min-lines" => v.parse().map(|m| policy.min_lines = m).is_ok(),
-            "--audit-largest" => v.parse().map(|a| policy.audit_largest = a).is_ok(),
-            "--root" => {
-                policy.root = Some(std::path::PathBuf::from(&v));
-                true
-            }
-            "--cooldown" => v.parse().map(|d| cooldown_days = d).is_ok(),
-            other => {
-                eprintln!("backlog: unknown argument: {other}");
-                return 2;
-            }
-        };
-        if !ok {
-            eprintln!("backlog: {flag} got {v:?}, which is not a number");
-            return 2;
-        }
-        i += 1;
-    }
+    let cli = match super::parse::<Cli>("tab-atelier backlog", args) {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    let Cli {
+        sources,
+        files,
+        lcov,
+        target,
+        limit,
+        min_lines,
+        audit_largest,
+        root,
+        cooldown: cooldown_days,
+        dry_run: dry,
+    } = cli;
+    let policy = CoveragePolicy {
+        root,
+        target,
+        min_lines,
+        limit,
+        audit_largest,
+    };
     if sources.is_empty() && files.is_empty() && lcov.is_none() {
-        usage_full();
+        eprintln!("backlog: nothing to read — pass --from, --from-file or --lcov (see --help)");
         return 2;
     }
 
