@@ -34,6 +34,17 @@ pub fn cmd_put(args: &[String]) -> i32 {
                 i += 1;
                 remote_name = args.get(i).cloned();
             }
+            "-h" | "--help" => {
+                eprintln!(
+                    "usage: tab-atelier remote put <label-or-id> <local-path> [--tab T] [--remote-name N]\n\
+                     \n\
+                     Upload a file into the remote tab's inbox/.\n\
+                     \n\
+                     --tab T          which tab (name, id or #index); default the active one\n\
+                     --remote-name N  store it under this name instead of the local basename"
+                );
+                return 0;
+            }
             other if other.starts_with("--") => {
                 eprintln!("tab-atelier remote put: unknown argument: {other}");
                 return 2;
@@ -129,6 +140,18 @@ pub fn cmd_get(args: &[String]) -> i32 {
             "-o" | "--output" => {
                 i += 1;
                 local_out = args.get(i).map(PathBuf::from);
+            }
+            "-h" | "--help" => {
+                eprintln!(
+                    "usage: tab-atelier remote get <label-or-id> <remote-path> [--tab T] [-o local-path]\n\
+                     \n\
+                     Download a file from the remote tab. The path MUST start with inbox/ or\n\
+                     outbox/ — the endpoint is sandboxed to those two.\n\
+                     \n\
+                     --tab T          which tab (name, id or #index); default the active one\n\
+                     -o local-path    write here instead of the remote basename"
+                );
+                return 0;
             }
             other if other.starts_with("--") || other.starts_with('-') && other.len() == 2 => {
                 eprintln!("tab-atelier remote get: unknown argument: {other}");

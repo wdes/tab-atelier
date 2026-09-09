@@ -336,6 +336,17 @@ pub fn take(args: &[String]) -> i32 {
                 ttl_s = v;
             }
             "--dry-run" => dry = true,
+            "-h" | "--help" => {
+                eprintln!(
+                    "usage: tab-atelier take [--ttl <seconds>] [--dry-run]\n\
+                     \n\
+                     Lease the best open task for this agent. Exit 3 when nothing is free.\n\
+                     \n\
+                     --ttl <seconds>   how long the lease is held before it can be reclaimed\n\
+                     --dry-run         show which task would be taken, without taking it"
+                );
+                return 0;
+            }
             other => {
                 eprintln!("take: unknown argument: {other}");
                 return 2;
