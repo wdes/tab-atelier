@@ -41,7 +41,7 @@ pub mod server;
 pub mod usage;
 pub mod users;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Where the SECRETS live: accounts (with their key hashes) and the admin
 /// token.
@@ -96,14 +96,52 @@ fn resolve_dir(
     home: Option<PathBuf>,
     home_relative: &str,
 ) -> Result<PathBuf, String> {
+    resolve_dir_within(explicit, xdg, home, home_relative, Path::new(SYSTEM_DIR))
+}
+
+/// Where a packaged install keeps everything.
+///
+/// The systemd unit points both directories here explicitly, and a service
+/// account has no home to split them across.
+pub const SYSTEM_DIR: &str = "/var/lib/tab-atelier-proxy";
+
+/// [`resolve_dir`] with the system location supplied, so it can be tested
+/// without a `/var/lib` to look at.
+fn resolve_dir_within(
+    explicit: Option<PathBuf>,
+    xdg: Option<PathBuf>,
+    home: Option<PathBuf>,
+    home_relative: &str,
+    system: &Path,
+) -> Result<PathBuf, String> {
     if let Some(p) = explicit {
         return Ok(p);
     }
-    if let Some(p) = xdg {
-        return Ok(p.join("tab-atelier-proxy"));
+    let user = xdg
+        .map(|p| p.join("tab-atelier-proxy"))
+        .or_else(|| home.map(|h| h.join(home_relative).join("tab-atelier-proxy")));
+
+    // A user directory that already holds something wins: somebody running
+    // their own proxy on a machine that also has the packaged service must not
+    // be quietly redirected into the service's data.
+    if user.as_deref().is_some_and(has_data) {
+        return user.ok_or_else(|| unreachable!());
     }
-    let home = home.ok_or("no $HOME and no TAB_ATELIER_PROXY_{CONFIG,STATE}")?;
-    Ok(home.join(home_relative).join("tab-atelier-proxy"))
+    // Otherwise, if a packaged install is present, that is the deployment
+    // being asked about. This is what makes
+    // `sudo -u tab-atelier-proxy tab-atelier-proxy admin-token` print the
+    // token the SERVICE uses: the unit's Environment= does not reach a command
+    // run by hand, so without this the CLI reads a different directory and
+    // mints a second token that authenticates nothing.
+    if has_data(system) {
+        return Ok(system.to_path_buf());
+    }
+    user.ok_or_else(|| "no $HOME and no TAB_ATELIER_PROXY_{CONFIG,STATE}".to_owned())
+}
+
+/// Whether a directory exists and holds anything at all.
+fn has_data(dir: &Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|mut d| d.next().is_some())
 }
 
 /// Read the admin token, minting one on first run.
@@ -154,9 +192,46 @@ pub fn web_root() -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    /// A packaged install is found when the caller has no data of their own,
+    /// which is what makes the documented `sudo -u …` command work: the unit's
+    /// Environment= does not reach a command run by hand.
+    #[test]
+    fn a_packaged_install_is_preferred_over_an_empty_home() {
+        let tmp = std::env::temp_dir().join(format!("ta-proxy-res-{}", uuid::Uuid::new_v4()));
+        let system = tmp.join("var-lib");
+        let home = tmp.join("home");
+        std::fs::create_dir_all(&system).expect("mkdir");
+        std::fs::create_dir_all(&home).expect("mkdir");
+        std::fs::write(system.join("admin.token"), "tap_x").expect("write");
+
+        // Nothing in the user's home → the packaged install is the answer.
+        assert_eq!(
+            resolve_dir_within(None, None, Some(home.clone()), ".config", &system).expect("dir"),
+            system
+        );
+
+        // But a user who HAS their own data keeps it: running your own proxy
+        // on a machine that also runs the service must not be hijacked.
+        let mine = home.join(".config").join("tab-atelier-proxy");
+        std::fs::create_dir_all(&mine).expect("mkdir");
+        std::fs::write(mine.join("users.json"), "{}").expect("write");
+        assert_eq!(
+            resolve_dir_within(None, None, Some(home.clone()), ".config", &system).expect("dir"),
+            mine
+        );
+
+        // And an explicit override beats both, always.
+        assert_eq!(
+            resolve_dir_within(Some(PathBuf::from("/explicit")), None, Some(home), ".config", &system).expect("dir"),
+            PathBuf::from("/explicit")
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[test]
     fn the_state_dir_follows_its_precedence() {
         let p = |s: &str| PathBuf::from(s);
+        let no_system = p("/nonexistent-system-dir-for-this-test");
         // The explicit override wins, which is what the systemd unit relies on
         // to keep state in /var/lib rather than the service account's home.
         assert_eq!(
@@ -170,18 +245,18 @@ mod tests {
             p("/explicit")
         );
         assert_eq!(
-            resolve_dir(None, Some(p("/xdg")), Some(p("/home/u")), ".local/state").expect("dir"),
+            resolve_dir_within(None, Some(p("/xdg")), Some(p("/home/u")), ".local/state", &no_system).expect("dir"),
             p("/xdg/tab-atelier-proxy")
         );
         assert_eq!(
-            resolve_dir(None, None, Some(p("/home/u")), ".local/state").expect("dir"),
+            resolve_dir_within(None, None, Some(p("/home/u")), ".local/state", &no_system).expect("dir"),
             p("/home/u/.local/state/tab-atelier-proxy")
         );
         // Nowhere to put accounts is an error, not a guess at /tmp.
-        assert!(resolve_dir(None, None, None, ".local/state").is_err());
+        assert!(resolve_dir_within(None, None, None, ".local/state", &no_system).is_err());
         // Secrets and history are deliberately different directories.
         assert_eq!(
-            resolve_dir(None, None, Some(p("/home/u")), ".config").expect("dir"),
+            resolve_dir_within(None, None, Some(p("/home/u")), ".config", &no_system).expect("dir"),
             p("/home/u/.config/tab-atelier-proxy")
         );
     }

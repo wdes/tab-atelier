@@ -156,7 +156,16 @@ Browse to the proxy and paste the admin token:
 
 ```sh
 sudo -u tab-atelier-proxy tab-atelier-proxy admin-token
+# or, always correct and needing no binary:
+sudo cat /var/lib/tab-atelier-proxy/admin.token
 ```
+
+The first form works because the CLI finds a packaged install when the caller
+has no data of its own. That matters: the systemd unit sets
+`TAB_ATELIER_PROXY_CONFIG`, and a command run by hand inherits none of the
+unit's environment — without that fallback the CLI reads a different directory
+and mints a SECOND token, which authenticates nothing and looks exactly like a
+wrong password.
 
 Vue and Bootstrap are served by the proxy itself, with no CDN: a credential
 proxy is exactly the kind of thing that runs on a locked-down network, and an
