@@ -74,6 +74,21 @@ impl Sample {
     pub fn is_ok(&self) -> bool {
         self.error.is_none() && self.http.is_some_and(|c| (200..300).contains(&c))
     }
+
+    /// Every ratio as a fraction of one.
+    ///
+    /// Applied at the boundary, to every sample entering the store, so that
+    /// NOTHING downstream has to ask which convention it is holding. Getting
+    /// this wrong in one place is not a rounding error: the endpoint reports
+    /// `35` for 35%, and a consumer that multiplies by 100 renders "3500%" and
+    /// pins a chart to its ceiling — which is exactly what shipped.
+    #[must_use]
+    pub fn normalised(mut self) -> Self {
+        self.five_hour = self.five_hour.map(as_fraction);
+        self.seven_day = self.seven_day.map(as_fraction);
+        self.seven_day_sonnet = self.seven_day_sonnet.map(as_fraction);
+        self
+    }
 }
 
 /// Parse the `/api/oauth/usage` body into a sample.
@@ -108,7 +123,7 @@ pub fn parse_usage(status: u16, body: &str, ts: String) -> Sample {
     if !(200..300).contains(&status) {
         s.error = Some(format!("http {status}"));
     }
-    s
+    s.normalised()
 }
 
 /// Utilisation is reported either as a fraction or as a percentage depending
@@ -163,7 +178,13 @@ impl Monitor {
         let mut recent: Vec<Sample> = Vec::new();
         for f in files.iter().rev().take(RETAIN_DAYS) {
             let Ok(raw) = std::fs::read_to_string(f) else { continue };
-            let mut day: Vec<Sample> = raw.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+            // Normalised on the way in: logs written before this was done hold
+            // percentages, and mixing the two conventions in one series is
+            // worse than either alone.
+            let mut day: Vec<Sample> = raw
+                .lines()
+                .filter_map(|l| serde_json::from_str::<Sample>(l).ok().map(Sample::normalised))
+                .collect();
             day.append(&mut recent);
             recent = day;
             if recent.len() >= KEEP {
@@ -198,6 +219,7 @@ impl Monitor {
 
     /// Append a sample to its day's log.
     pub fn push(&mut self, sample: Sample) {
+        let sample = sample.normalised();
         let path = self.dir.join(format!("{}{LOG_SUFFIX}", day_of(&sample)));
         if let Ok(line) = serde_json::to_string(&sample) {
             let _ = std::fs::create_dir_all(&self.dir);
@@ -244,7 +266,8 @@ impl Monitor {
     /// Current utilisation, 0.0–1.0, if it is known.
     #[must_use]
     pub fn utilization(&self) -> Option<f64> {
-        self.latest().and_then(Sample::utilization).map(as_fraction)
+        // Already a fraction: everything entering the store is normalised.
+        self.latest().and_then(Sample::utilization)
     }
 }
 
@@ -317,6 +340,35 @@ mod tests {
 
     /// Percentages and fractions both appear in the wild; downstream code
     /// should never have to ask which it got.
+    /// The bug this exists to prevent, from a live dashboard: the endpoint
+    /// reports 35 for 35%, the UI multiplied by 100, and the card read
+    /// "7-day: 3500%" with the chart pinned to its ceiling.
+    #[test]
+    fn a_percentage_from_upstream_becomes_a_fraction_everywhere() {
+        let body = r#"{"five_hour":{"utilization":16},"seven_day":{"utilization":35},
+                       "seven_day_sonnet":{"utilization":4}}"#;
+        let s = parse_usage(200, body, "t".to_owned());
+        assert_eq!(s.five_hour, Some(0.16));
+        assert_eq!(s.seven_day, Some(0.35), "35 means 35%, not 3500%");
+        assert_eq!(s.seven_day_sonnet, Some(0.04));
+
+        // A log written before normalisation held raw percentages; reading it
+        // must not produce a series that mixes the two conventions.
+        let dir = tmp("legacy-percent");
+        std::fs::write(
+            dir.join("2026-09-09_account-usage.jsonl"),
+            "{\"ts\":\"2026-09-09T08:00:00Z\",\"http\":200,\"five_hour\":37.0,\"seven_day\":19.0}\n",
+        )
+        .expect("write");
+        let m = Monitor::load(&dir);
+        assert_eq!(m.utilization(), Some(0.37));
+        assert_eq!(
+            m.recent()[0].seven_day,
+            Some(0.19),
+            "the whole sample is normalised, not just the headline"
+        );
+    }
+
     #[test]
     fn utilisation_normalises_to_a_fraction() {
         assert!((as_fraction(0.62) - 0.62).abs() < 1e-9);
