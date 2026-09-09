@@ -25,96 +25,187 @@
 //! tab-atelier remote re-pin <label-or-id>            # re-capture pinned cert
 //! ```
 
+use std::path::PathBuf;
 use std::time::Duration;
+
+use clap::{Args, Parser, Subcommand};
 
 use crate::{RemoteEndpoint, fetch_cert_fingerprint, load_preferences, platform, remote, save_preferences};
 
-/// Verbs whose own parser prints a better help than the general usage.
-const SELF_HELPING: &[&str] = &["put", "get"];
+/// `tab-atelier remote …`, parsed by clap like the rest of the CLI.
+///
+/// This subtree used to hand-roll its argument parsing, one `while` loop per
+/// verb. That is what shipped `remote add proxy --url …` in the docs: nothing
+/// could reject a positional argument the parser did not accept, `--help`
+/// answered "unknown argument: --help" one level down, and each verb's usage
+/// text was a string literal maintained by hand next to the `match` it was
+/// supposed to describe. clap derives all three from the same declaration.
+#[derive(Parser, Debug)]
+#[command(
+    name = "tab-atelier remote",
+    about = "Talk to a remote tab-atelier or a tab-atelier-proxy",
+    disable_help_flag = false
+)]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand, Debug)]
+enum Cmd {
+    /// List configured endpoints.
+    List,
+    /// Print this instance's sidecar token, for the peer's `remote add --token`.
+    MyToken,
+    /// Persist a new endpoint.
+    Add(AddArgs),
+    /// Drop an endpoint.
+    #[command(alias = "rm")]
+    Remove {
+        /// Label or id.
+        endpoint: String,
+    },
+    /// Connect, list the remote's tabs, exit.
+    Test {
+        /// Label or id.
+        endpoint: String,
+    },
+    /// Follow scrollback events until Ctrl-C.
+    Watch {
+        /// Label or id.
+        endpoint: String,
+    },
+    /// Interactive mirror of one remote tab.
+    Attach {
+        /// Label or id.
+        endpoint: String,
+        /// Tab name, id or `#index`.
+        tab: String,
+    },
+    /// Upload a file into the remote tab's `inbox/`.
+    Put(PutArgs),
+    /// Download a file from the remote tab.
+    Get(GetArgs),
+    /// Print an HTTPS endpoint's cert SHA-256 fingerprint.
+    #[command(name = "pin-cert", alias = "pin")]
+    PinCert {
+        /// The `https://…` URL to inspect.
+        url: String,
+    },
+    /// Re-capture an endpoint's pinned cert.
+    #[command(name = "re-pin", alias = "repin")]
+    RePin {
+        /// Label or id.
+        endpoint: String,
+    },
+}
+
+#[derive(Args, Debug)]
+pub struct AddArgs {
+    /// Short name for the endpoint, used everywhere else in place of the id.
+    #[arg(long)]
+    label: String,
+    /// Base URL, e.g. `https://host:7891`.
+    #[arg(long)]
+    url: String,
+    /// The peer's MASTER token — tabs, input, files. Not needed for a proxy.
+    #[arg(long)]
+    token: Option<String>,
+    /// The peer's `relay token`, or a tab-atelier-proxy key.
+    ///
+    /// A tab-atelier-proxy is not a peer tab-atelier and has none of the tab
+    /// endpoints, so relaying through one needs this and nothing else.
+    /// Requiring a master token there would mean inventing a value to satisfy
+    /// the parser, which teaches people to put junk in a credential field.
+    #[arg(long)]
+    relay_token: Option<String>,
+    /// Pin this fingerprint instead of capturing one.
+    #[arg(long)]
+    cert_sha256: Option<String>,
+    /// Cloudflare Access service token id.
+    #[arg(long)]
+    cf_id: Option<String>,
+    /// Cloudflare Access service token secret.
+    #[arg(long)]
+    cf_secret: Option<String>,
+    /// Skip TLS certificate pinning.
+    #[arg(long)]
+    no_pin: bool,
+    /// Connect to this endpoint at startup.
+    #[arg(long)]
+    autoconnect: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct PutArgs {
+    /// Label or id.
+    endpoint: String,
+    /// The local file to upload.
+    local_path: PathBuf,
+    /// Which tab (name, id or `#index`); default the active one.
+    #[arg(long)]
+    tab: Option<String>,
+    /// Store it under this name instead of the local basename.
+    #[arg(long, alias = "remote-path")]
+    remote_name: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct GetArgs {
+    /// Label or id.
+    endpoint: String,
+    /// Path on the remote. MUST start with `inbox/` or `outbox/`.
+    remote_path: String,
+    /// Which tab (name, id or `#index`); default the active one.
+    #[arg(long)]
+    tab: Option<String>,
+    /// Write here instead of the remote basename.
+    #[arg(short = 'o', long = "output")]
+    local_out: Option<PathBuf>,
+}
 
 #[must_use]
 pub fn run(args: &[String]) -> i32 {
-    let Some(sub) = args.first() else {
-        usage();
-        return 2;
+    // clap expects argv[0]; the caller hands us only what followed `remote`.
+    let argv = std::iter::once("tab-atelier remote".to_owned()).chain(args.iter().cloned());
+    let cli = match Cli::try_parse_from(argv) {
+        Ok(c) => c,
+        Err(e) => {
+            // `--help` and `--version` arrive as errors carrying the text to
+            // print; they are successful outcomes and must not exit non-zero.
+            let ok = matches!(
+                e.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            );
+            let _ = e.print();
+            return i32::from(!ok) * 2;
+        }
     };
-    let rest = &args[1..];
-    // `remote add --help` used to answer "unknown argument: --help": help was
-    // handled for the bare `remote`, and every verb below hand-rolls its own
-    // parser that had never heard of it. A flag that works at one level and
-    // errors one level down is worse than no flag at all, because it reads as
-    // "this command has no help" rather than "you are in the wrong place".
-    //
-    // Verbs with something more specific to say answer for themselves; the
-    // rest fall back to the full usage, which does list every verb's flags.
-    if rest.iter().any(|a| a == "-h" || a == "--help") && !SELF_HELPING.contains(&sub.as_str()) {
-        usage();
-        return 0;
-    }
-    match sub.as_str() {
-        "list" => cmd_list(),
+    match cli.cmd {
+        Cmd::List => cmd_list(),
         // Printed here, pasted into the PEER's `remote add --token`. Scoped to
         // the sidecar's own operations, unlike the master token.
-        "my-token" => {
+        Cmd::MyToken => {
             println!("{}", crate::remote_token());
             eprintln!("# sidecar credential for THIS instance — on the peer, run:");
             eprintln!("#   tab-atelier remote add --label <name> --url <this-url> --token <above>");
             0
         }
-        "add" => cmd_add(rest),
-        "remove" | "rm" => cmd_remove(rest),
-        "test" => cmd_test(rest, false),
-        "watch" => cmd_test(rest, true),
-        "attach" => attach::run(rest),
-        "put" => files::cmd_put(rest),
-        "get" => files::cmd_get(rest),
-        "pin-cert" | "pin" => cmd_pin_cert(rest),
-        "re-pin" | "repin" => cmd_repin(rest),
-        "-h" | "--help" | "help" => {
-            usage();
-            0
-        }
-        other => {
-            eprintln!("tab-atelier remote: unknown subcommand: {other}");
-            usage();
-            2
-        }
+        Cmd::Add(a) => cmd_add(a),
+        Cmd::Remove { endpoint } => cmd_remove(&endpoint),
+        Cmd::Test { endpoint } => cmd_test(&endpoint, false),
+        Cmd::Watch { endpoint } => cmd_test(&endpoint, true),
+        Cmd::Attach { endpoint, tab } => attach::run(&endpoint, &tab),
+        Cmd::Put(a) => files::cmd_put(a),
+        Cmd::Get(a) => files::cmd_get(a),
+        Cmd::PinCert { url } => cmd_pin_cert(&url),
+        Cmd::RePin { endpoint } => cmd_repin(&endpoint),
     }
 }
 
 mod attach;
 mod files;
 mod resolver;
-
-fn usage() {
-    eprintln!(
-        "usage: tab-atelier remote <list|my-token|add|remove|test|watch|attach|put|get|pin-cert|re-pin> [args]\n\
-         \n\
-         list                                          list configured endpoints\n\
-         my-token                                      print this instance's sidecar token, for\n\
-                                                       the peer's `remote add --token`\n\
-         add --label L --url U [--token T] [--relay-token R] [--no-pin] [--autoconnect]\n\
-                                                       --token is the peer's master token (tabs,\n\
-                                                       input, files); --relay-token its `relay\n\
-                                                       token`, or a tab-atelier-proxy key.\n\
-                                                       One of the two is required: a proxy has no\n\
-                                                       master token, so --relay-token alone is a\n\
-                                                       relay-only endpoint\n\
-             [--cf-id ID --cf-secret SECRET]           persist a new endpoint\n\
-                                                       (--cf-* = Cloudflare Access service token)\n\
-         remove <label-or-id>                          drop one\n\
-         test <label-or-id>                            connect, list remote tabs, exit\n\
-         watch <label-or-id>                           follow scrollback events until Ctrl-C\n\
-         attach <label-or-id> <tab-name-or-id|#idx>    interactive mirror of one remote tab\n\
-         put    <label-or-id> <local-path> [--tab T] [--remote-name N]\n\
-                                                       upload a file into the tab's inbox/\n\
-         get    <label-or-id> <remote-path> [--tab T] [-o local-path]\n\
-                                                       download a file — remote-path MUST start\n\
-                                                       with inbox/ or outbox/ (sandboxed)\n\
-         pin-cert <https-url>                          print the cert SHA-256 fingerprint\n\
-         re-pin   <label-or-id>                        re-capture an endpoint's pinned cert"
-    );
-}
 
 fn cmd_list() -> i32 {
     let prefs = load_preferences(&platform::config_dir());
@@ -140,79 +231,22 @@ fn cmd_list() -> i32 {
     0
 }
 
-fn cmd_add(args: &[String]) -> i32 {
-    let mut label: Option<String> = None;
-    let mut url: Option<String> = None;
-    let mut token: Option<String> = None;
-    let mut no_pin = false;
-    let mut autoconnect = false;
-    let mut cert_sha256: Option<String> = None;
-    let mut cf_id: Option<String> = None;
-    let mut cf_secret: Option<String> = None;
-    let mut relay_token: Option<String> = None;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--label" => {
-                i += 1;
-                label = args.get(i).cloned();
-            }
-            "--url" => {
-                i += 1;
-                url = args.get(i).cloned();
-            }
-            "--token" => {
-                i += 1;
-                token = args.get(i).cloned();
-            }
-            // The relay hop presents a different credential than the sidecar:
-            // `--token` is the peer's master token (tabs, input, files), while
-            // the relay route only accepts the peer's `relay token`.
-            "--relay-token" => {
-                i += 1;
-                relay_token = args.get(i).cloned();
-            }
-            "--cert-sha256" => {
-                i += 1;
-                cert_sha256 = args.get(i).cloned();
-            }
-            "--cf-id" => {
-                i += 1;
-                cf_id = args.get(i).cloned();
-            }
-            "--cf-secret" => {
-                i += 1;
-                cf_secret = args.get(i).cloned();
-            }
-            "--no-pin" => no_pin = true,
-            "--autoconnect" => autoconnect = true,
-            other => {
-                eprintln!("tab-atelier remote add: unknown argument: {other}");
-                // Every argument here is named, so a bare word is nearly
-                // always someone writing the label positionally — say so
-                // instead of making them re-read the usage block.
-                if !other.starts_with('-') {
-                    eprintln!("  the label is a named argument — did you mean `--label {other}`?");
-                }
-                return 2;
-            }
-        }
-        i += 1;
+fn cmd_add(args: AddArgs) -> i32 {
+    let AddArgs {
+        label,
+        url,
+        token,
+        relay_token,
+        cert_sha256,
+        cf_id,
+        cf_secret,
+        no_pin,
+        autoconnect,
+    } = args;
+    if label.is_empty() || url.is_empty() {
+        eprintln!("tab-atelier remote add: --label and --url cannot be empty");
+        return 2;
     }
-    let label = match label {
-        Some(s) if !s.is_empty() => s,
-        _ => {
-            eprintln!("tab-atelier remote add: --label is required");
-            return 2;
-        }
-    };
-    let url = match url {
-        Some(s) if !s.is_empty() => s,
-        _ => {
-            eprintln!("tab-atelier remote add: --url is required");
-            return 2;
-        }
-    };
     // --token is the PEER'S MASTER TOKEN, for tabs/input/files. A
     // tab-atelier-proxy is not a peer tab-atelier and has none of those
     // endpoints, so relaying through one needs --relay-token and nothing else.
@@ -277,16 +311,12 @@ fn cmd_add(args: &[String]) -> i32 {
     0
 }
 
-fn cmd_remove(args: &[String]) -> i32 {
-    let Some(key) = args.first() else {
-        eprintln!("usage: tab-atelier remote remove <label-or-id>");
-        return 2;
-    };
+fn cmd_remove(key: &str) -> i32 {
     let mut prefs = load_preferences(&platform::config_dir());
     let before = prefs.remote_endpoints.len();
     prefs
         .remote_endpoints
-        .retain(|e| !(e.label.eq_ignore_ascii_case(key) || e.id == *key));
+        .retain(|e| !(e.label.eq_ignore_ascii_case(key) || e.id == key));
     if prefs.remote_endpoints.len() == before {
         eprintln!("tab-atelier remote remove: no endpoint matched {key:?}");
         return 1;
@@ -296,16 +326,12 @@ fn cmd_remove(args: &[String]) -> i32 {
     0
 }
 
-fn cmd_test(args: &[String], watch: bool) -> i32 {
-    let Some(key) = args.first() else {
-        eprintln!("usage: tab-atelier remote test <label-or-id>");
-        return 2;
-    };
+fn cmd_test(key: &str, watch: bool) -> i32 {
     let prefs = load_preferences(&platform::config_dir());
     let Some(endpoint) = prefs
         .remote_endpoints
         .into_iter()
-        .find(|e| e.label.eq_ignore_ascii_case(key) || e.id == *key)
+        .find(|e| e.label.eq_ignore_ascii_case(key) || e.id == key)
     else {
         eprintln!("tab-atelier remote test: no endpoint matched {key:?}");
         return 1;
@@ -396,16 +422,12 @@ fn cmd_test(args: &[String], watch: bool) -> i32 {
     0
 }
 
-fn cmd_repin(args: &[String]) -> i32 {
-    let Some(key) = args.first() else {
-        eprintln!("usage: tab-atelier remote re-pin <label-or-id>");
-        return 2;
-    };
+fn cmd_repin(key: &str) -> i32 {
     let mut prefs = load_preferences(&platform::config_dir());
     let Some(ep) = prefs
         .remote_endpoints
         .iter_mut()
-        .find(|e| e.label.eq_ignore_ascii_case(key) || e.id == *key)
+        .find(|e| e.label.eq_ignore_ascii_case(key) || e.id == key)
     else {
         eprintln!("tab-atelier remote re-pin: no endpoint matched {key:?}");
         return 1;
@@ -435,11 +457,7 @@ fn cmd_repin(args: &[String]) -> i32 {
     }
 }
 
-fn cmd_pin_cert(args: &[String]) -> i32 {
-    let Some(url) = args.first() else {
-        eprintln!("usage: tab-atelier remote pin-cert <https-url>");
-        return 2;
-    };
+fn cmd_pin_cert(url: &str) -> i32 {
     match fetch_cert_fingerprint(url) {
         Ok(fp) => {
             println!("{fp}");
@@ -486,57 +504,13 @@ mod tests {
         assert_eq!(run(&argv(&["re-pin"])), 2);
     }
 
-    /// Flags [`cmd_add`] accepts, and whether each takes a value. Must
-    /// mirror the `match` in `cmd_add` — [`every_add_flag_is_listed_here`]
-    /// fails if the parser grows one this forgets.
-    const ADD_FLAGS: &[(&str, bool)] = &[
-        ("--label", true),
-        ("--url", true),
-        ("--token", true),
-        ("--relay-token", true),
-        ("--cert-sha256", true),
-        ("--cf-id", true),
-        ("--cf-secret", true),
-        ("--no-pin", false),
-        ("--autoconnect", false),
-    ];
-
-    #[test]
-    fn every_add_flag_is_listed_here() {
-        // Reads the parser's own source: a new arm in `cmd_add` that is not
-        // in ADD_FLAGS would make the doc check below silently blind to it.
-        let src = include_str!("remote.rs");
-        let body = src
-            .split_once("fn cmd_add(args: &[String]) -> i32 {")
-            .map(|(_, rest)| {
-                rest.split_once("\n    let label = match label")
-                    .map_or(rest, |(b, _)| b)
-            })
-            .unwrap_or_default();
-        for line in body.lines() {
-            let t = line.trim();
-            // Match arms look like `"--flag" => {` or `"--a" | "--b" => …`.
-            if !t.starts_with('"') {
-                continue;
-            }
-            for flag in t.split("=>").next().unwrap_or_default().split('|') {
-                let flag = flag.trim().trim_matches('"');
-                if !flag.starts_with("--") {
-                    continue;
-                }
-                assert!(
-                    ADD_FLAGS.iter().any(|(f, _)| *f == flag),
-                    "cmd_add accepts {flag} but ADD_FLAGS does not list it — the docs check cannot see it"
-                );
-            }
-        }
-    }
-
     #[test]
     fn every_documented_remote_add_would_actually_parse() {
         // `tab-atelier remote add proxy --url …` shipped in docs/proxy.md and
-        // failed on the user's first paste: the label is a named argument.
-        // Docs are copy-pasted verbatim, so they are held to the parser.
+        // failed on the first paste: the label is a named argument. Docs are
+        // copy-pasted verbatim, so they are held to the real parser — this
+        // asks clap itself rather than a hand-maintained table of flags,
+        // which could drift out of step with the parser it describes.
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut files = vec![root.join("README.md")];
         if let Ok(dir) = std::fs::read_dir(root.join("docs")) {
@@ -557,32 +531,36 @@ mod tests {
             // validated as the single command a reader would run.
             let joined = text.replace("\\\n", " ");
             for line in joined.lines() {
-                let Some(rest) = line.split_once("tab-atelier remote add") else {
+                let Some((_, rest)) = line.split_once("tab-atelier remote add") else {
                     continue;
                 };
-                let tokens: Vec<&str> = rest
-                    .1
+                let tokens: Vec<String> = rest
                     .split_whitespace()
-                    .map(|t| t.trim_matches('`'))
-                    .take_while(|t| !t.is_empty() && *t != "#" && *t != "&&")
+                    .map(|t| t.trim_matches('`').to_owned())
+                    .take_while(|t| !t.is_empty() && t != "#" && t != "&&")
+                    // Prose ellipsis standing in for "the other flags", and
+                    // the placeholders a reader is meant to substitute.
+                    .filter(|t| t != "…" && t != "...")
                     .collect();
+                if tokens.is_empty() {
+                    continue;
+                }
                 checked += 1;
-                let mut i = 0;
-                while i < tokens.len() {
-                    let tok = tokens[i];
-                    // Prose ellipsis standing in for "the other flags".
-                    if tok == "…" || tok == "..." {
-                        i += 1;
-                        continue;
-                    }
-                    let Some((_, takes_value)) = ADD_FLAGS.iter().find(|(f, _)| *f == tok) else {
-                        panic!(
-                            "{}: `tab-atelier remote add` example passes {tok:?}, which the parser rejects\n  line: {}",
-                            path.display(),
-                            line.trim()
-                        );
-                    };
-                    i += if *takes_value { 2 } else { 1 };
+                let argv = ["tab-atelier remote".to_owned(), "add".to_owned()]
+                    .into_iter()
+                    .chain(tokens);
+                if let Err(e) = Cli::try_parse_from(argv) {
+                    // MissingRequiredArgument is fine: a doc line may show
+                    // only the flags it is talking about. An argument the
+                    // parser does not know is not.
+                    assert_eq!(
+                        e.kind(),
+                        clap::error::ErrorKind::MissingRequiredArgument,
+                        "{}: `remote add` example does not parse ({:?})\n  line: {}\n  {e}",
+                        path.display(),
+                        e.kind(),
+                        line.trim(),
+                    );
                 }
             }
         }

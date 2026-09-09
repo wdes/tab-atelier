@@ -19,46 +19,13 @@ use crate::cli::remote::resolver;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub fn cmd_put(args: &[String]) -> i32 {
-    let mut positional: Vec<&String> = Vec::new();
-    let mut tab_arg: Option<String> = None;
-    let mut remote_name: Option<String> = None;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--tab" => {
-                i += 1;
-                tab_arg = args.get(i).cloned();
-            }
-            "--remote-name" | "--remote-path" => {
-                i += 1;
-                remote_name = args.get(i).cloned();
-            }
-            "-h" | "--help" => {
-                eprintln!(
-                    "usage: tab-atelier remote put <label-or-id> <local-path> [--tab T] [--remote-name N]\n\
-                     \n\
-                     Upload a file into the remote tab's inbox/.\n\
-                     \n\
-                     --tab T          which tab (name, id or #index); default the active one\n\
-                     --remote-name N  store it under this name instead of the local basename"
-                );
-                return 0;
-            }
-            other if other.starts_with("--") => {
-                eprintln!("tab-atelier remote put: unknown argument: {other}");
-                return 2;
-            }
-            _ => positional.push(&args[i]),
-        }
-        i += 1;
-    }
-    if positional.len() != 2 {
-        eprintln!("usage: tab-atelier remote put <label-or-id> <local-path> [--tab T] [--remote-name N]");
-        return 2;
-    }
-    let endpoint_key = positional[0].clone();
-    let local_path = PathBuf::from(positional[1]);
+pub fn cmd_put(args: super::PutArgs) -> i32 {
+    let super::PutArgs {
+        endpoint: endpoint_key,
+        local_path,
+        tab: tab_arg,
+        remote_name,
+    } = args;
 
     let endpoint = match resolver::endpoint(&endpoint_key) {
         Ok(e) => e,
@@ -126,47 +93,13 @@ pub fn cmd_put(args: &[String]) -> i32 {
     }
 }
 
-pub fn cmd_get(args: &[String]) -> i32 {
-    let mut positional: Vec<&String> = Vec::new();
-    let mut tab_arg: Option<String> = None;
-    let mut local_out: Option<PathBuf> = None;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--tab" => {
-                i += 1;
-                tab_arg = args.get(i).cloned();
-            }
-            "-o" | "--output" => {
-                i += 1;
-                local_out = args.get(i).map(PathBuf::from);
-            }
-            "-h" | "--help" => {
-                eprintln!(
-                    "usage: tab-atelier remote get <label-or-id> <remote-path> [--tab T] [-o local-path]\n\
-                     \n\
-                     Download a file from the remote tab. The path MUST start with inbox/ or\n\
-                     outbox/ — the endpoint is sandboxed to those two.\n\
-                     \n\
-                     --tab T          which tab (name, id or #index); default the active one\n\
-                     -o local-path    write here instead of the remote basename"
-                );
-                return 0;
-            }
-            other if other.starts_with("--") || other.starts_with('-') && other.len() == 2 => {
-                eprintln!("tab-atelier remote get: unknown argument: {other}");
-                return 2;
-            }
-            _ => positional.push(&args[i]),
-        }
-        i += 1;
-    }
-    if positional.len() != 2 {
-        eprintln!("usage: tab-atelier remote get <label-or-id> <remote-path> [--tab T] [-o local-path]");
-        return 2;
-    }
-    let endpoint_key = positional[0].clone();
-    let remote_path = positional[1].clone();
+pub fn cmd_get(args: super::GetArgs) -> i32 {
+    let super::GetArgs {
+        endpoint: endpoint_key,
+        remote_path,
+        tab: tab_arg,
+        local_out,
+    } = args;
 
     let endpoint = match resolver::endpoint(&endpoint_key) {
         Ok(e) => e,
@@ -268,10 +201,6 @@ fn url_encode(s: &str) -> String {
 mod tests {
     use super::{RemoteEndpoint, resolve_tab_index, url_encode};
 
-    fn fargs(v: &[&str]) -> Vec<String> {
-        v.iter().map(|s| (*s).to_string()).collect()
-    }
-
     /// A server that answers every request with `body`.
     ///
     /// `resolve_tab_index` spawns the real sidecar client, which polls — so a
@@ -359,17 +288,26 @@ mod tests {
 
     #[test]
     fn put_and_get_refuse_incomplete_commands() {
-        // All of these fail during argument checking, before any network or
-        // filesystem work — which is what makes them safe to assert on.
-        assert_ne!(super::cmd_put(&fargs(&[])), 0, "put with no arguments");
-        assert_ne!(super::cmd_get(&fargs(&[])), 0, "get with no arguments");
+        // Driven through the real `remote` parser, so these assert what a
+        // person typing the command actually gets. clap rejects all of them
+        // before any network or filesystem work, which is what makes them
+        // safe to assert on.
+        let run = |v: &[&str]| super::super::run(&v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+        assert_eq!(run(&["put"]), 2, "put with no arguments");
+        assert_eq!(run(&["get"]), 2, "get with no arguments");
+        assert_eq!(run(&["put", "peer"]), 2, "put with no local path");
         // A flag with no value must not swallow the next argument.
-        assert_ne!(super::cmd_put(&fargs(&["--tab"])), 0);
-        // A local file that does not exist cannot be uploaded; failing here
-        // beats a confusing error from the far end.
-        assert_ne!(
-            super::cmd_put(&fargs(&["peer", "/nonexistent/definitely-not-here.txt"])),
-            0
+        assert_eq!(run(&["put", "peer", "f", "--tab"]), 2);
+        // Unknown flags are caught rather than ignored.
+        assert_eq!(run(&["get", "peer", "inbox/x", "--nope"]), 2);
+        // `--help` is a success everywhere, not "unknown argument".
+        assert_eq!(run(&["put", "--help"]), 0);
+        assert_eq!(run(&["get", "--help"]), 0);
+        // A complete command still fails, on the unknown endpoint rather than
+        // on parsing — proof the arguments got through.
+        assert_eq!(
+            run(&["put", "no-such-endpoint", "/nonexistent/definitely-not-here.txt"]),
+            1
         );
     }
 }
