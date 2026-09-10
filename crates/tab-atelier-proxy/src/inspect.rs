@@ -39,13 +39,20 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 /// How many captures to keep. Small on purpose: this is for looking at the
-/// last few calls, not for building an archive.
-const KEEP: usize = 40;
+/// last few calls, not for building an archive. With full bodies now stored
+/// rather than clipped fragments, this is the number that bounds the file.
+const KEEP: usize = 25;
 
-/// Longest body fragment recorded, in bytes. A Claude Code request with a full
-/// context is megabytes; the interesting part — model, system blocks, tools,
-/// the tail of the conversation — is at both ends, so both ends are kept.
-const MAX_BODY: usize = 32 * 1024;
+/// Longest body recorded, in bytes.
+///
+/// This started at 32 KB, on the theory that a truncated request still showed
+/// the interesting parts. It does not: a body cut in half is not JSON, so the
+/// one thing anybody opens this panel to do — read the object that was sent —
+/// was impossible for essentially every real request. A Claude Code call with
+/// a working context is a few hundred KB, so the cap is now well clear of
+/// real traffic and exists only so that one pathological request cannot fill
+/// the disk.
+const MAX_BODY: usize = 4 * 1024 * 1024;
 
 /// Longest an inspection window may be armed for.
 ///
@@ -93,6 +100,15 @@ pub struct Capture {
     pub request_truncated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<u16>,
+    /// What upstream said this call cost, read off the response.
+    ///
+    /// The same numbers the billing path uses — taken from the one parse, not
+    /// counted a second time. Without them the panel shows what was SENT and
+    /// says nothing about what it cost, which is half of why anybody opens it:
+    /// "why was that turn expensive" is answered by these four numbers beside
+    /// the request that produced them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<crate::usage::Tokens>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_excerpt: Option<String>,
 }
@@ -197,6 +213,7 @@ pub fn capture(o: &Outgoing<'_>) -> Capture {
         request_body,
         request_truncated,
         status: None,
+        tokens: None,
         response_excerpt: None,
     }
 }
@@ -452,9 +469,12 @@ mod tests {
     fn an_enormous_body_keeps_both_ends_and_says_so() {
         // A real request is megabytes and the interesting parts are the model
         // and system blocks at the start and the newest turn at the end.
+        // The cap is megabytes now, so the fixture has to be bigger than a
+        // real request to exercise the guard at all. That is the point of
+        // raising it: nothing ordinary meets it.
         let big = format!(
             r#"{{"model":"claude-opus-5","messages":[{}]}}"#,
-            "x".repeat(MAX_BODY * 2)
+            "x".repeat(MAX_BODY + 1024)
         );
         let c = capture(&Outgoing {
             ts: "t".to_owned(),
@@ -484,6 +504,7 @@ mod tests {
     fn truncation_does_not_split_a_multibyte_character() {
         // Slicing a String on a byte index panics mid-character, and a prompt
         // is exactly the place non-ASCII shows up.
+        // é is two bytes in UTF-8, so this is 2×MAX_BODY bytes.
         let big = "é".repeat(MAX_BODY);
         let (out, cut) = clamp(&big);
         assert!(cut);

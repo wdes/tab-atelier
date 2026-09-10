@@ -66,6 +66,19 @@ enum Command {
     Enable { who: String },
     /// Delete an account.
     Remove { who: String },
+    /// Route every request from this account through one provider.
+    ///
+    /// An empty provider clears the pin and returns the account to normal
+    /// routing. Enforced, not preferred: an account pinned to a provider that
+    /// is unavailable gets a 503 rather than a quiet fall back to the
+    /// subscription the operator was keeping it off.
+    SetProvider {
+        /// Account email or id.
+        who: String,
+        /// Provider id, as listed in `providers.json`. Empty clears the pin.
+        #[arg(default_value = "")]
+        provider: String,
+    },
     /// Install a Claude login copied from a machine that can run `claude`.
     ///
     /// The proxy talks to Anthropic with the host's own Claude OAuth
@@ -82,6 +95,38 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         from: Option<std::path::PathBuf>,
     },
+}
+
+/// Pin an account to a provider, or clear the pin.
+fn set_provider(who: &str, provider: &str) -> Result<(), String> {
+    let mut s = store()?;
+    let wanted = provider.trim();
+    // Validated here, where the registry is in hand: a pin to a typo would
+    // otherwise be a 503 nobody could explain.
+    if !wanted.is_empty() {
+        let path = config_dir()?.join("providers.json");
+        let reg = tab_atelier_proxy::provider::Registry::load(&path);
+        if reg.get(wanted).is_none() {
+            return Err(format!(
+                "no provider {wanted:?} in {} — configured: {}",
+                path.display(),
+                reg.providers
+                    .iter()
+                    .map(|p| p.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+    let a = s
+        .set_provider(who, (!wanted.is_empty()).then_some(wanted))
+        .map_err(|e| e.to_string())?;
+    if wanted.is_empty() {
+        println!("{} <{}> — normal routing", a.display_name(), a.email);
+    } else {
+        println!("{} <{}> — every request goes to {wanted}", a.display_name(), a.email);
+    }
+    Ok(())
 }
 
 /// How often to ask Anthropic how much of the plan has been used.
@@ -243,6 +288,59 @@ fn ping(model: &str, count: u32) -> Result<(), String> {
             round_trips.len()
         );
     }
+    // Every other provider, with its OWN credential. The stages above answer
+    // "is Anthropic reachable"; this answers "does the second provider work",
+    // which is the question an operator has just created by adding one and
+    // the one that otherwise stays invisible until a reroute fails mid-turn.
+    let providers_path = config_dir()?.join("providers.json");
+    let registry = tab_atelier_proxy::provider::Registry::load(&providers_path);
+    let others: Vec<_> = registry
+        .providers
+        .iter()
+        .filter(|p| !matches!(p.auth, tab_atelier_proxy::provider::Auth::ClaudeOauth))
+        .collect();
+    if !others.is_empty() {
+        println!(
+            "
+providers ({})",
+            providers_path.display()
+        );
+        for p in others {
+            let state = if !p.enabled {
+                "disabled"
+            } else if p.credential_ready() {
+                "enabled"
+            } else {
+                "NO CREDENTIAL"
+            };
+            println!("  {:<14} {state}", p.id);
+            if !p.enabled || !p.credential_ready() {
+                failed = true;
+                continue;
+            }
+            // One model per provider, so a multi-model provider costs one
+            // probe and not a bill. The first current one is representative:
+            // what this measures is reachability and authentication.
+            let Some(model) = p
+                .models
+                .iter()
+                .find(|m| !m.deprecated && m.class == tab_atelier_proxy::provider::Class::Fast)
+                .or_else(|| p.models.iter().find(|m| !m.deprecated))
+            else {
+                println!("    no current model to probe");
+                failed = true;
+                continue;
+            };
+            let probe = tab_atelier_proxy::egress::probe_provider(p, &model.id);
+            let ms = probe.elapsed.as_secs_f64() * 1000.0;
+            let status = probe.status.map_or_else(|| "   —".to_owned(), |s| format!("{s:>4}"));
+            println!("    {:<12} {status}  {ms:>8.0} ms   {}", probe.label, probe.note);
+            if probe.note.starts_with("FAILED") || probe.status.is_some_and(|s| !(200..300).contains(&s)) {
+                failed = true;
+            }
+        }
+    }
+
     if failed {
         return Err("at least one stage failed — see above".to_owned());
     }
@@ -356,7 +454,8 @@ fn serve(listen: &str) -> Result<(), String> {
         account: Mutex::new(tab_atelier_proxy::account::Monitor::load(&state_path)),
         inspect: Mutex::new(tab_atelier_proxy::inspect::Store::load(&state_path)),
         wake: tokio::sync::Notify::new(),
-        registry,
+        registry: Mutex::new(registry),
+        registry_path: providers_path,
         provider_backoff: Mutex::new(std::collections::BTreeMap::new()),
         admin_token: token,
         web_root: root,
@@ -464,6 +563,7 @@ fn run() -> Result<(), String> {
             );
             Ok(())
         }
+        Command::SetProvider { who, provider } => set_provider(&who, &provider),
         Command::Remove { who } => {
             let mut s = store()?;
             let a = s.remove(&who).map_err(|e| e.to_string())?;

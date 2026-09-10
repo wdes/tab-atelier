@@ -131,6 +131,13 @@ interface Pressure {
 }
 
 /** One captured request, as sent to Anthropic. Credentials are already gone. */
+interface CaptureTokens {
+    input: number;
+    output: number;
+    cache_read: number;
+    cache_write: number;
+}
+
 interface Capture {
     ts: string;
     account_id: string;
@@ -143,7 +150,49 @@ interface Capture {
     request_body: string;
     request_truncated: boolean;
     status?: number;
+    tokens?: CaptureTokens;
     response_excerpt?: string;
+}
+
+/** One model a provider lists. */
+interface ProviderModel {
+    id: string;
+    class: string;
+    relative_cost: number;
+    cost_now: number;
+    deprecated: boolean;
+    note?: string;
+}
+
+interface ProviderView {
+    id: string;
+    base_url: string;
+    preference: number;
+    enabled: boolean;
+    peak_now: boolean;
+    peak?: { multiplier_percent: number; windows: unknown[] };
+    ready: boolean;
+    auth: string;
+    models: ProviderModel[];
+}
+
+interface PresetView {
+    id: string;
+    label: string;
+    base_url: string;
+    configured: boolean;
+}
+
+interface MappingView {
+    from: string;
+    to: string;
+    note?: string;
+}
+
+interface ProvidersResponse {
+    providers: ProviderView[];
+    presets: PresetView[];
+    mappings: MappingView[];
 }
 
 interface InspectState {
@@ -217,6 +266,8 @@ interface AppState {
     tiers: Tier[];
     inspect: InspectState | null;
     inspectOpen: Capture | null;
+    providers: ProvidersResponse | null;
+    newMapping: { from: string; to: string; note: string };
 }
 
 /**

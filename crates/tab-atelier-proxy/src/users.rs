@@ -111,6 +111,19 @@ pub struct Account {
     /// work-conserving.
     #[serde(default = "default_weight")]
     pub weight: u32,
+    /// Pin every request from this account to one provider, by id.
+    ///
+    /// `None` — the default — means the usual routing, where the proxy picks
+    /// from everything configured. A pin is for the cases routing cannot know
+    /// about: work that must not leave a jurisdiction, a contractor whose
+    /// usage has to land on a particular invoice, a person whose experiments
+    /// have no business spending the shared subscription.
+    ///
+    /// It is enforced, not preferred: an account pinned to a provider that is
+    /// disabled or out of capacity gets a 503 rather than a quiet fall back to
+    /// the thing the operator was keeping it away from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
 }
 
 /// Normal, on the scale the UI presents.
@@ -425,6 +438,7 @@ impl Store {
             legacy_last_used_ip: None,
             disabled: false,
             weight: default_weight(),
+            provider: None,
         };
         self.accounts.push(account.clone());
         self.reindex();
@@ -533,6 +547,38 @@ impl Store {
     }
 
     /// Change an account's share of the quota under contention.
+    ///
+    /// # Errors
+    /// No such account, or the file could not be written.
+    /// Pin an account to a provider, or clear the pin with `None`.
+    ///
+    /// The provider id is NOT validated here: this module knows about people,
+    /// not about where requests can go, and a users.json that could not be
+    /// loaded because it named a provider that has since been removed would be
+    /// a much worse failure than a pin that resolves to nothing at runtime.
+    /// The route validates it, where the registry is in hand.
+    ///
+    /// # Errors
+    /// No such account, or the file could not be written.
+    pub fn set_provider(&mut self, who: &str, provider: Option<&str>) -> Result<Account, Error> {
+        let id = self
+            .find(who)
+            .ok_or_else(|| Error::NotFound(who.to_owned()))?
+            .id
+            .clone();
+        let account = self
+            .accounts
+            .iter_mut()
+            .find(|a| a.id == id)
+            .ok_or_else(|| Error::NotFound(who.to_owned()))?;
+        account.provider = provider.map(str::to_owned).filter(|p| !p.is_empty());
+        let out = account.clone();
+        self.reindex();
+        self.save()?;
+        Ok(out)
+    }
+
+    /// Set an account's share of upstream quota under contention.
     ///
     /// # Errors
     /// No such account, or the file could not be written.
