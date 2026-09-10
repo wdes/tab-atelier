@@ -434,3 +434,11 @@ accepts it.
 `/var/lib/tab-atelier-proxy` (0700), holding `users.json` and `admin.token`,
 both 0600. Purging the package does **not** delete it: removing a package
 should not silently revoke everyone's access with no way back.
+
+## See also
+
+- [Proxy-side request compaction](proxy-compaction.md) — what shortening
+  `messages[]` costs and saves on each hop, and the per-provider control for it.
+- [Proxy-side tool policy](proxy-tools.md) — `tools[]` is 19 % of a request and
+  is ahead of every cache breakpoint: whitelist it, disable it, or rewrite the
+  volatile parts of it. The two providers disagree about what is legal here.
