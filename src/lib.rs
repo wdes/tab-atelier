@@ -231,7 +231,6 @@ pub fn apply_relay_config(change: &crate::api::RelayConfigChange, config_base: &
     install_relay_config(&prefs);
 }
 
-/// Resolve + install the relay egress flag and forward target from a loaded
 /// The credential to present to a peer's relay route.
 ///
 /// One endpoint entry serves two consumers with different rights: `token` is
@@ -245,6 +244,7 @@ pub fn relay_credential(endpoint: &RemoteEndpoint) -> Option<&str> {
     (!endpoint.relay_token.is_empty()).then_some(endpoint.relay_token.as_str())
 }
 
+/// Resolve + install the relay egress flag and forward target from a loaded
 /// `Preferences`. Called at startup (both editions) and after a relay toggle.
 pub fn install_relay_config(prefs: &Preferences) {
     let target = prefs.relay_endpoint_id.as_deref().and_then(|id| {
@@ -3917,6 +3917,175 @@ pub fn file_path_for_open(path: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serialises the tests that touch the process-global relay state.
+    ///
+    /// `set_relay_egress` / `set_relay_target` are globals by design — every
+    /// tab's env is built from them — so two tests writing them at once would
+    /// read each other's values.
+    static RELAY_STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A preferences file holding one endpoint, plus whatever relay state the
+    /// caller wants to start from.
+    fn relay_prefs(egress: bool, endpoint_id: Option<&str>) -> (tempfile::TempDir, Preferences) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let prefs = Preferences {
+            remote_endpoints: vec![RemoteEndpoint {
+                id: "ep-1111".to_owned(),
+                label: "proxy".to_owned(),
+                url: "https://proxy.example.org".to_owned(),
+                token: String::new(),
+                relay_token: "tap_secret".to_owned(),
+                ..RemoteEndpoint::default()
+            }],
+            relay_egress: egress,
+            relay_endpoint_id: endpoint_id.map(str::to_owned),
+            ..Preferences::default()
+        };
+        save_preferences(dir.path(), &prefs);
+        (dir, prefs)
+    }
+
+    #[test]
+    fn picking_a_relay_target_clears_the_egress_role_on_disk() {
+        let _guard = RELAY_STATE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The state an old egress box is in when it follows docs/proxy.md and
+        // points itself at a proxy.
+        let (dir, _) = relay_prefs(true, None);
+
+        apply_relay_config(
+            &crate::api::RelayConfigChange {
+                endpoint: Some("proxy".to_owned()),
+                egress: None,
+            },
+            dir.path(),
+        );
+
+        let saved = load_preferences(dir.path());
+        assert_eq!(
+            saved.relay_endpoint_id.as_deref(),
+            Some("ep-1111"),
+            "the label must resolve to the stable id"
+        );
+        assert!(
+            !saved.relay_egress,
+            "egress must be cleared: holding both makes every relay call 502 \
+             regardless of how correct the endpoint is"
+        );
+        // And the runtime agrees with what was written.
+        assert!(!relay_egress());
+        assert_eq!(
+            relay_target().map(|t| t.url),
+            Some("https://proxy.example.org".to_owned())
+        );
+    }
+
+    #[test]
+    fn clearing_the_target_leaves_the_egress_role_alone() {
+        let _guard = RELAY_STATE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The rule is "a target wins over egress", not "a target change
+        // clears egress" — `relay via ""` removes the target, so there is no
+        // conflict left to resolve and the flag is the operator's again.
+        let (dir, _) = relay_prefs(true, Some("ep-1111"));
+
+        apply_relay_config(
+            &crate::api::RelayConfigChange {
+                endpoint: Some(String::new()),
+                egress: None,
+            },
+            dir.path(),
+        );
+
+        let saved = load_preferences(dir.path());
+        assert_eq!(saved.relay_endpoint_id, None, "the target is gone");
+        assert!(saved.relay_egress, "with no target there is nothing to conflict with");
+    }
+
+    #[test]
+    fn asking_for_egress_while_a_target_is_set_still_resolves_to_the_target() {
+        let _guard = RELAY_STATE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // `relay egress on` on a box that already relays through a proxy.
+        // Writing the flag is honoured on disk only if it can mean anything;
+        // here it cannot, so the install resolves it away rather than leaving
+        // a config that answers 502 to everything.
+        let (dir, _) = relay_prefs(false, Some("ep-1111"));
+
+        apply_relay_config(
+            &crate::api::RelayConfigChange {
+                endpoint: None,
+                egress: Some(true),
+            },
+            dir.path(),
+        );
+
+        assert!(
+            !relay_egress(),
+            "a resolvable target means this host forwards, whatever the flag says"
+        );
+        assert!(relay_target().is_some());
+    }
+
+    #[test]
+    fn a_preferences_file_holding_both_repairs_itself_at_startup() {
+        let _guard = RELAY_STATE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Written before the rule existed: nothing will call
+        // `apply_relay_config` on this box until someone runs a command, and
+        // until then every relay call 502s. Reading it back faithfully would
+        // mean staying broken for a reason nobody can see.
+        let prefs = Preferences {
+            remote_endpoints: vec![RemoteEndpoint {
+                id: "ep-1111".to_owned(),
+                label: "proxy".to_owned(),
+                url: "https://proxy.example.org/".to_owned(),
+                relay_token: "tap_secret".to_owned(),
+                ..RemoteEndpoint::default()
+            }],
+            relay_egress: true,
+            relay_endpoint_id: Some("ep-1111".to_owned()),
+            ..Preferences::default()
+        };
+
+        install_relay_config(&prefs);
+
+        assert!(!relay_egress(), "target wins");
+        let target = relay_target().expect("a target was configured");
+        assert_eq!(target.url, "https://proxy.example.org", "the trailing slash is trimmed");
+        assert_eq!(target.token, "tap_secret", "the RELAY credential, not the sidecar one");
+    }
+
+    #[test]
+    fn the_egress_role_survives_when_there_is_no_target_to_prefer() {
+        let _guard = RELAY_STATE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The mutual exclusion must not become "egress never works". With no
+        // endpoint id, and with one that resolves to nothing, the flag is the
+        // only statement of intent there is.
+        for endpoint_id in [None, Some("no-such-endpoint")] {
+            let prefs = Preferences {
+                relay_egress: true,
+                relay_endpoint_id: endpoint_id.map(str::to_owned),
+                ..Preferences::default()
+            };
+            install_relay_config(&prefs);
+            assert!(
+                relay_egress(),
+                "egress must hold when {endpoint_id:?} resolves to no target"
+            );
+            assert!(relay_target().is_none());
+        }
+        // Leave the global as the rest of the suite expects to find it.
+        set_relay_egress(false);
+        set_relay_target(None);
+    }
 
     #[test]
     fn version_line_carries_name_version_and_nonempty_build_hash() {
