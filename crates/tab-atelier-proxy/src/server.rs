@@ -24,7 +24,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response};
 
 use crate::users::{self, Account, Store, constant_time_eq};
-use crate::{account, egress, provider, qos, routing, usage};
+use crate::{account, egress, inspect, provider, qos, routing, usage};
 
 type Body = http_body_util::combinators::BoxBody<Bytes, Infallible>;
 
@@ -48,6 +48,9 @@ pub struct State {
     /// Woken when capacity frees up, so a queued call retries promptly instead
     /// of sitting out its full backoff.
     pub wake: tokio::sync::Notify,
+    /// Captured requests, when inspection is armed. Off by default and
+    /// self-disarming — see [`crate::inspect`].
+    pub inspect: Mutex<inspect::Store>,
     pub admin_token: String,
     pub web_root: Option<std::path::PathBuf>,
 }
@@ -364,6 +367,7 @@ async fn anthropic(req: Request<Incoming>, state: Arc<State>, peer: std::net::Ip
         client_headers,
         body,
         account_id: account.id.clone(),
+        account_email: account.email.clone(),
         weight: account.weight,
         metered,
         route: route.clone(),
@@ -638,6 +642,10 @@ struct Forward {
     /// time the response finishes the account may have been deleted — the call
     /// still happened and still spent tokens.
     account_id: String,
+    /// For labelling a capture. Carried rather than looked up, for the same
+    /// reason as `account_id`: by the time the response finishes the account
+    /// may be gone, and the call still happened.
+    account_email: String,
     state: Arc<State>,
 }
 
@@ -692,6 +700,49 @@ fn passthrough_headers(headers: &hyper::HeaderMap) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Snapshot the outgoing request, when inspection is armed.
+///
+/// Separate from [`forward`] so the lock is taken and released in one small
+/// scope rather than living across the send — a blocking upstream call holding
+/// the inspection mutex would stall the admin page behind an LLM stream.
+fn begin_capture(f: &Forward, hdrs: &[(String, String)]) -> Option<inspect::Capture> {
+    // Read the flag and release the lock before building anything: the guard
+    // must not be alive across the scrub-and-clamp below, let alone the send.
+    let armed = {
+        let ins = f
+            .state
+            .inspect
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ins.armed(usage::now_secs())
+    };
+    if !armed {
+        return None;
+    }
+    Some(inspect::capture(&inspect::Outgoing {
+        ts: crate::now_rfc3339(),
+        account_id: &f.account_id,
+        account_email: &f.account_email,
+        method: if f.is_post { "POST" } else { "GET" },
+        path: &f.sub_pq,
+        provider: &f.route.provider_id,
+        headers: hdrs,
+        body: &f.body,
+    }))
+}
+
+/// Stamp the upstream status onto a pending capture and store it.
+fn finish_capture(f: &Forward, pending: Option<inspect::Capture>, status: u16) {
+    let Some(mut c) = pending else { return };
+    c.status = Some(status);
+    let mut ins = f
+        .state
+        .inspect
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    ins.push(c);
+}
+
 /// The blocking half: authenticate to Anthropic, send, and pump the response.
 ///
 /// The upstream status and body are passed through untouched, including error
@@ -735,6 +786,12 @@ fn forward(
             hdrs.push((k.to_owned(), v));
         }
     }
+    // The request as it will actually leave: after routing rewrote the model,
+    // after the beta flags were merged, with the proxy's credential in place.
+    // That is the thing nobody can otherwise see, and it is the whole reason
+    // inspection exists. Scrubbing happens inside `inspect::capture`.
+    let mut pending = begin_capture(f, &hdrs);
+
     let sent = if f.is_post {
         let mut rb = agent.post(&url);
         for (k, v) in &hdrs {
@@ -756,6 +813,7 @@ fn forward(
         }
     };
     let status = resp.status().as_u16();
+    finish_capture(f, pending.take(), status);
     let ctype = resp
         .headers()
         .get("content-type")
@@ -1108,6 +1166,57 @@ async fn admin(req: Request<Incoming>, state: Arc<State>) -> Response<Body> {
             let store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             return usage_report(&state, &store, &query);
         }
+        // Inspection. Admin-only, like everything under /api — a capture is a
+        // prompt, so a user key must never be able to read one, not even its
+        // own account's.
+        (&Method::GET, "/api/inspect") => {
+            let ins = state.inspect.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let now = usage::now_secs();
+            return json(
+                200,
+                &serde_json::json!({
+                    "armed": ins.armed(now),
+                    "armed_until": ins.armed_until(),
+                    "seconds_left": ins.armed_until().saturating_sub(now),
+                    "max_arm_minutes": inspect::MAX_ARM_MINUTES,
+                    "captures": ins.recent(),
+                })
+                .to_string(),
+            );
+        }
+        (&Method::POST, "/api/inspect") => {
+            let minutes = serde_json::from_slice::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v.get("minutes").and_then(serde_json::Value::as_u64))
+                .unwrap_or(15);
+            // Scoped so the guard is gone before the log call: a mutex held
+            // across formatting is a mutex held for no reason.
+            let until = {
+                let mut ins = state.inspect.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                ins.arm(usage::now_secs(), minutes)
+            };
+            log::warn!(
+                "proxy: request inspection ARMED until {} — captures contain prompts",
+                crate::now_rfc3339_at(until)
+            );
+            return json(200, &serde_json::json!({ "armed_until": until }).to_string());
+        }
+        // Disarm and forget. One button, because "stop recording" and "and
+        // delete what you recorded" are the same intention in practice.
+        (&Method::DELETE, "/api/inspect") => {
+            let cleared = {
+                let mut ins = state.inspect.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                ins.disarm();
+                ins.clear()
+            };
+            return match cleared {
+                Ok(()) => {
+                    log::info!("proxy: request inspection disarmed and captures cleared");
+                    json(200, r#"{"ok":true}"#)
+                }
+                Err(e) => json(500, &serde_json::json!({ "error": e }).to_string()),
+            };
+        }
         _ => {}
     }
     mutate(&state, &method, &path, &body)
@@ -1393,6 +1502,7 @@ mod tests {
             usage: Mutex::new(usage::Store::load(std::env::temp_dir().join("ta-proxy-web-usage"))),
             sched: Mutex::new(qos::Sched::new()),
             account: Mutex::new(account::Monitor::load(std::env::temp_dir())),
+            inspect: Mutex::new(inspect::Store::load(std::env::temp_dir())),
             wake: tokio::sync::Notify::new(),
             registry: provider::Registry::default(),
             provider_backoff: Mutex::new(std::collections::BTreeMap::new()),

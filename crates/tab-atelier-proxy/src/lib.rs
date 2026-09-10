@@ -31,7 +31,37 @@
 //! against Anthropic directly.
 
 pub mod account;
+/// RFC3339 in UTC, the shape the usage log and the .mjs monitor both use.
+#[must_use]
+pub fn now_rfc3339() -> String {
+    now_rfc3339_at(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs()),
+    )
+}
+
+/// The conversion, taking the instant, so it can be tested against known
+/// dates instead of whatever the clock says.
+///
+/// jiff rather than a hand-rolled civil-from-days: it is already compiled into
+/// this binary via `env_logger`, and the inverse of this function
+/// ([`account::epoch_of`]) has to agree with it exactly —
+/// two independent implementations of the same calendar is the kind of pair
+/// that stays correct until a leap year says otherwise.
+#[must_use]
+pub fn now_rfc3339_at(secs: u64) -> String {
+    let ts = i64::try_from(secs)
+        .ok()
+        .and_then(|s| jiff::Timestamp::from_second(s).ok())
+        .unwrap_or(jiff::Timestamp::UNIX_EPOCH);
+    // Second precision, `Z` rather than `+00:00`, to match what the .mjs
+    // monitor writes and what the existing logs already hold.
+    ts.strftime("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
 pub mod egress;
+pub mod inspect;
 pub mod provider;
 pub mod qos;
 pub mod routing;
