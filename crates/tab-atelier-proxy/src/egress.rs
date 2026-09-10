@@ -90,6 +90,21 @@ pub fn set_credentials_path(path: Option<PathBuf>) {
     }
 }
 
+/// Where the Claude credential is read from, resolved the same way the egress
+/// resolves it.
+///
+/// Public because it is the first thing worth printing when the proxy cannot
+/// authenticate: the service runs with `HOME=/var/lib/tab-atelier-proxy` from
+/// its unit, so a `claude` login performed in an operator's own shell writes
+/// somewhere else entirely and the proxy never sees it. "Which file" answers
+/// that in one line; "token read" does not.
+///
+/// # Errors
+/// `$HOME` is unset and no override was configured.
+pub fn credentials_file() -> Result<PathBuf, String> {
+    credentials_path()
+}
+
 fn credentials_path() -> Result<PathBuf, String> {
     if let Some(p) = CREDS_PATH_OVERRIDE.read().ok().and_then(|g| g.clone()) {
         return Ok(p);
@@ -565,13 +580,14 @@ pub fn probe_round_trip(model: &str) -> Vec<Probe> {
     let mut out = Vec::new();
 
     let started = std::time::Instant::now();
+    let where_from = credentials_path().map_or_else(|e| e, |p| p.display().to_string());
     let token = match oauth_access_token() {
         Ok(t) => {
             out.push(Probe {
                 label: "credential",
                 status: None,
                 elapsed: started.elapsed(),
-                note: "local OAuth token read (refreshed if it was near expiry)".to_owned(),
+                note: format!("read {where_from}"),
             });
             t
         }
@@ -580,7 +596,9 @@ pub fn probe_round_trip(model: &str) -> Vec<Probe> {
                 label: "credential",
                 status: None,
                 elapsed: started.elapsed(),
-                note: format!("FAILED: {e}"),
+                // The path is the point: "no such file" means the login was
+                // performed as a different user than the service runs as.
+                note: format!("FAILED reading {where_from}: {e}"),
             });
             return out;
         }

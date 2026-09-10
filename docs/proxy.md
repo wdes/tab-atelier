@@ -39,12 +39,31 @@ directly. Presenting the admin token on the proxy path is refused, and says so.
 
 ```sh
 sudo apt install tab-atelier-proxy
-sudo -u tab-atelier-proxy claude          # log in once; this is the egress login
+# Log in once — this is the egress login. HOME is set explicitly on purpose:
+# see below.
+sudo -u tab-atelier-proxy env HOME=/var/lib/tab-atelier-proxy claude
 sudo systemctl enable --now tab-atelier-proxy
 ```
 
 It listens on `127.0.0.1:7900`. Put a TLS terminator in front rather than
 exposing it directly — it carries keys.
+
+### `HOME` is the whole trick
+
+The service runs as `tab-atelier-proxy` with `Environment=HOME=/var/lib/tab-atelier-proxy`
+in its unit, and reads `$HOME/.claude/.credentials.json`. A hand-run command
+inherits none of that: `sudo -u tab-atelier-proxy claude` runs *as* the right
+user but does not reliably reset `HOME`, so the login lands in the invoking
+user's home and the proxy never sees it. The symptom is a successful `claude`
+login on the host followed by `OAuth access token has been revoked` — or
+nothing at all — from the proxy.
+
+`tab-atelier-proxy ping` prints the file it actually read, which is the fastest
+way to tell the two apart:
+
+```
+  credential      —         0 ms   read /var/lib/tab-atelier-proxy/.claude/.credentials.json
+```
 
 ### If the host cannot run `claude`
 
