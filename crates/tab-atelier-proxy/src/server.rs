@@ -185,6 +185,11 @@ pub async fn handle(
     if path == "/me/usage" {
         return Ok(me_usage(&req, &state, peer));
     }
+    // Repair the shared Claude login from a machine that still has a working
+    // one. Body-carrying, so it is handled async like the proxy path.
+    if path == "/me/credentials" {
+        return Ok(me_credentials(req, &state, peer).await);
+    }
     if path.starts_with("/api/") {
         return Ok(admin(req, state).await);
     }
@@ -873,6 +878,74 @@ fn me_usage(req: &Request<Incoming>, state: &State, peer: std::net::IpAddr) -> R
         );
     }
     json(200, &body.to_string())
+}
+
+/// `POST /me/credentials` — repair the proxy's Claude login over the network.
+///
+/// The proxy authenticates to Anthropic with one shared Claude OAuth
+/// credential, and that credential dies whenever somebody logs in again
+/// elsewhere: a refresh rotates the refresh token and revokes every other
+/// copy. Until now the only fix was shell access to the host, which is a poor
+/// answer when the person who can fix it is the one holding a laptop with a
+/// working login.
+///
+/// Two guards, in [`egress::repair_credentials`], make this safe to expose to
+/// anyone with a user key: it only acts when the installed credential is
+/// already dead (verified against Anthropic, not assumed), and only accepts a
+/// replacement belonging to the same Anthropic account. So the worst outcome
+/// is that a broken proxy gets restored to the account it already had.
+///
+/// The credential itself is never logged. What IS logged is who did it, which
+/// is the part worth being able to review afterwards.
+async fn me_credentials(req: Request<Incoming>, state: &Arc<State>, peer: std::net::IpAddr) -> Response<Body> {
+    if req.method() != Method::POST {
+        return json(405, r#"{"error":"POST only"}"#);
+    }
+    let key = presented(&req);
+    let ip = client_ip(&req, peer);
+    let Some(account) = authenticate_and_stamp(state, &key, &ip) else {
+        return json(
+            401,
+            r#"{"error":"present your proxy key (x-api-key or Authorization: Bearer)"}"#,
+        );
+    };
+    let body = match req.into_body().collect().await {
+        Ok(c) => c.to_bytes(),
+        Err(_) => return json(400, r#"{"error":"unreadable body"}"#),
+    };
+    let Ok(raw) = String::from_utf8(body.to_vec()) else {
+        return json(400, r#"{"error":"body is not UTF-8"}"#);
+    };
+
+    // Blocking: it makes up to two calls to Anthropic.
+    let outcome = tokio::task::spawn_blocking(move || egress::repair_credentials(&raw)).await;
+    match outcome {
+        Ok(Ok(imported)) => {
+            log::warn!(
+                "claude credential replaced via /me/credentials by {} <{}> from {ip}",
+                account.display_name(),
+                account.email,
+            );
+            let who = imported.identity.map(|i| i.email).unwrap_or_default();
+            json(
+                200,
+                &serde_json::json!({ "installed": true, "account": who }).to_string(),
+            )
+        }
+        Ok(Err(e)) => {
+            log::warn!(
+                "credential repair refused for {} <{}> from {ip}: {e}",
+                account.display_name(),
+                account.email,
+            );
+            // 409: the request was well-formed and authenticated, the state
+            // just does not permit it — a working proxy, or somebody else's
+            // account. Distinct from 400 so a client can tell "nothing to fix"
+            // from "you sent rubbish".
+            json(409, &serde_json::json!({ "error": e }).to_string())
+        }
+        Err(_) => json(500, r#"{"error":"credential repair panicked"}"#),
+    }
 }
 
 // ── the admin API ───────────────────────────────────────────────────

@@ -295,10 +295,12 @@ pub enum Commands {
     /// `relay on|off` toggles the mode; `relay via <label|id>` picks the remote
     /// to relay through (`""` clears); `relay egress on|off` makes this host the
     /// terminal hop to Anthropic; `relay status` prints the live config;
-    /// `relay token` prints the relay-only credential a peer authenticates with.
+    /// `relay token` prints the relay-only credential a peer authenticates with;
+    /// `relay push-credentials` repairs a proxy whose Claude login has been
+    /// revoked, using this machine's own.
     Relay {
         /// `on`, `off`, `via`, `egress`, `status`, or `token`.
-        #[arg(value_parser = ["on", "off", "via", "egress", "status", "token"])]
+        #[arg(value_parser = ["on", "off", "via", "egress", "status", "token", "push-credentials"])]
         action: String,
         /// For `via`: endpoint label/id (or empty to clear). For `egress`: on|off.
         arg: Option<String>,

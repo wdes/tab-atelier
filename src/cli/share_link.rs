@@ -803,9 +803,85 @@ pub fn claude_only(args: &[String]) -> i32 {
 
 /// `relay on|off|via <ep>|egress on|off|status` — configure relay mode.
 ///
-/// `on/off` toggle the mode; `via <label|id>` sets which remote to relay through
-/// (or clears it with `""`); `egress on|off` sets this instance as the terminal
-/// hop to Anthropic; `status` prints the live config. All take effect live.
+/// `relay push-credentials` — repair the proxy's Claude login from here.
+///
+/// The proxy holds one shared Claude OAuth credential, and it dies whenever
+/// anyone logs in again elsewhere: a refresh rotates the refresh token and
+/// revokes every other copy. Fixing that used to need shell access to the
+/// proxy host, which is the wrong requirement — the person who can fix it is
+/// whoever has a working `claude` login, not whoever has ssh.
+///
+/// The proxy enforces the safety, not this: it accepts only when its own
+/// credential is already dead, and only a replacement belonging to the same
+/// Anthropic account. So this is a repair tool, not a way to repoint someone
+/// else's proxy.
+fn relay_push_credentials() -> i32 {
+    let Some(target) = crate::relay_target() else {
+        eprintln!("relay push-credentials: no relay target — set one with `relay via <endpoint>`");
+        return 2;
+    };
+    if target.token.is_empty() {
+        eprintln!("relay push-credentials: that endpoint has no relay token (`remote add --relay-token`)");
+        return 2;
+    }
+    let Some(home) = std::env::var_os("HOME") else {
+        eprintln!("relay push-credentials: no $HOME — cannot find ~/.claude/.credentials.json");
+        return 1;
+    };
+    let path = std::path::PathBuf::from(home).join(".claude").join(".credentials.json");
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("relay push-credentials: read {}: {e}", path.display());
+            eprintln!("    this machine needs a working `claude` login to donate one");
+            return 1;
+        }
+    };
+
+    let url = format!("{}/me/credentials", target.url.trim_end_matches('/'));
+    let mut resp = match agent()
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", target.token))
+        .header("Content-Type", "application/json")
+        .send(raw)
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("relay push-credentials: POST {url}: {e}");
+            return 1;
+        }
+    };
+    let status = resp.status().as_u16();
+    let body = resp.body_mut().read_to_string().unwrap_or_default();
+    let field = |k: &str| {
+        serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v.get(k).and_then(serde_json::Value::as_str).map(str::to_owned))
+    };
+    if (200..300).contains(&status) {
+        match field("account") {
+            Some(who) if !who.is_empty() => println!("✓ {} now holds the Claude login for {who}", target.url),
+            _ => println!("✓ {} accepted the Claude login", target.url),
+        }
+        return 0;
+    }
+    eprintln!(
+        "relay push-credentials: {} refused ({status}): {}",
+        target.url,
+        field("error").unwrap_or(body)
+    );
+    // A refusal is usually "nothing is broken", which is not a failure of
+    // this command so much as an answer to it.
+    1
+}
+
+/// Every `relay` verb, dispatched. All take effect live.
+///
+/// `on`/`off` toggle the mode; `via <label|id>` sets which remote to relay
+/// through (or clears it with `""`); `egress on|off` sets this instance as the
+/// terminal hop to Anthropic; `status` prints the live config;
+/// `push-credentials` sends this machine's Claude login to a proxy whose own
+/// has been revoked.
 #[must_use]
 pub fn relay(action: &str, arg: Option<&str>) -> i32 {
     let ep = match discover_endpoint() {
@@ -894,8 +970,9 @@ pub fn relay(action: &str, arg: Option<&str>) -> i32 {
                 1
             }
         },
+        "push-credentials" => relay_push_credentials(),
         _ => {
-            eprintln!("relay: expected on|off|via|egress|status");
+            eprintln!("relay: expected on|off|via|egress|status|token|push-credentials");
             2
         }
     }
