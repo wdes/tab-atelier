@@ -211,20 +211,11 @@ pub fn apply_relay_config(change: &crate::api::RelayConfigChange, config_base: &
     if let Some(eg) = change.egress {
         prefs.relay_egress = eg;
     }
-    // `relay via <peer>` and `relay egress on` are opposite roles: "forward to
-    // that host" and "I am the host that forwards". Holding both is not a
-    // preference, it is an unreachable config — the request path tests egress
-    // first, so every call 502s with "the egress role moved to the proxy
-    // package" no matter how correct the endpoint is. Picking a target is the
-    // more recent, more specific statement of intent, so it wins.
-    //
     // Cleared on disk rather than only at runtime: the migration in
-    // docs/proxy.md says to point an old egress box at a proxy, and an operator
-    // who follows it lands here with a relay that cannot work and a 502 naming
-    // a role they thought they had left behind.
-    if prefs.relay_egress && change.endpoint.as_ref().is_some_and(|e| !e.is_empty()) {
-        prefs.relay_egress = false;
-    }
+    // docs/proxy.md says to point an old egress box at a proxy, and an
+    // operator who follows it lands here with a relay that cannot work and a
+    // 502 naming a role they thought they had left behind.
+    normalise_relay_config(&mut prefs);
     if !read_only() {
         save_preferences(config_base, &prefs);
     }
@@ -242,6 +233,34 @@ pub fn apply_relay_config(change: &crate::api::RelayConfigChange, config_base: &
 #[must_use]
 pub fn relay_credential(endpoint: &RemoteEndpoint) -> Option<&str> {
     (!endpoint.relay_token.is_empty()).then_some(endpoint.relay_token.as_str())
+}
+
+/// Resolve the egress/target contradiction in place, reporting whether it had
+/// to.
+///
+/// `relay via <peer>` and `relay egress on` are opposite roles — "forward to
+/// that host" and "I am the host that forwards" — and the request path tests
+/// egress first, so holding both means every call 502s no matter how correct
+/// the endpoint is. A resolvable target is the more specific statement of
+/// intent, so it wins.
+///
+/// Returns `true` when it changed something, which is the caller's cue to
+/// write the corrected preferences back. Repairing this only in memory is not
+/// enough: the file keeps the contradiction, so the next reader that has not
+/// been through here — an older binary, a tool reading preferences.json — sees
+/// `relay_egress: true` and reports an "egress hop" failure on an instance
+/// whose live config says otherwise. That is exactly how this stayed confusing
+/// after it was supposedly fixed.
+pub fn normalise_relay_config(prefs: &mut Preferences) -> bool {
+    let has_target = prefs
+        .relay_endpoint_id
+        .as_deref()
+        .is_some_and(|id| prefs.remote_endpoints.iter().any(|e| e.id == id));
+    if prefs.relay_egress && has_target {
+        prefs.relay_egress = false;
+        return true;
+    }
+    false
 }
 
 /// Resolve + install the relay egress flag and forward target from a loaded
@@ -4029,6 +4048,59 @@ mod tests {
             "a resolvable target means this host forwards, whatever the flag says"
         );
         assert!(relay_target().is_some());
+    }
+
+    #[test]
+    fn the_startup_repair_is_written_back_not_just_applied_in_memory() {
+        let _guard = RELAY_STATE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The bug this exists for: `relay status` reported egress:false while
+        // preferences.json still said true, because the repair only ever
+        // happened in memory. Anything that read the file afterwards — an
+        // older binary, another tool — found the contradiction still there and
+        // reported an "egress hop" failure nobody could locate.
+        let (dir, _) = relay_prefs(true, Some("ep-1111"));
+        assert!(
+            load_preferences(dir.path()).relay_egress,
+            "the fixture must start in the broken state"
+        );
+
+        let mut prefs = load_preferences(dir.path());
+        assert!(normalise_relay_config(&mut prefs), "it had something to repair");
+        save_preferences(dir.path(), &prefs);
+
+        assert!(
+            !load_preferences(dir.path()).relay_egress,
+            "the correction must survive being read back"
+        );
+        // And it is idempotent: a second pass has nothing to do, so startup
+        // does not rewrite preferences.json on every launch.
+        let mut again = load_preferences(dir.path());
+        assert!(!normalise_relay_config(&mut again), "nothing left to repair");
+    }
+
+    #[test]
+    fn normalise_leaves_a_config_that_is_not_contradictory_alone() {
+        let _guard = RELAY_STATE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Egress with no target is a legitimate role, not a mistake.
+        let mut egress_only = Preferences {
+            relay_egress: true,
+            ..Preferences::default()
+        };
+        assert!(!normalise_relay_config(&mut egress_only));
+        assert!(egress_only.relay_egress, "egress alone must survive");
+
+        // An endpoint id that resolves to nothing is not a target either.
+        let mut dangling = Preferences {
+            relay_egress: true,
+            relay_endpoint_id: Some("no-such-endpoint".to_owned()),
+            ..Preferences::default()
+        };
+        assert!(!normalise_relay_config(&mut dangling));
+        assert!(dangling.relay_egress, "a target that does not resolve cannot win");
     }
 
     #[test]
