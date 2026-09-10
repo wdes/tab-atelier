@@ -11,7 +11,7 @@
 //! daemon on the next tick when the file's mtime moves). Per-tab overrides go
 //! through the running daemon and win over the folder rule.
 
-use super::share_link::{agent, discover_endpoint, resolve};
+use super::share_link::{discover_endpoint, resolve};
 
 /// Path used for matching: absolute, `~` expanded, trailing slash trimmed.
 fn normalize_dir(dir: &str) -> Result<String, String> {
@@ -250,10 +250,7 @@ fn set_tab(key: &str, color: Option<&str>, badge: Option<&str>, clear: bool) -> 
     let color = if clear { Some("clear") } else { color };
     let badge = if clear { Some("clear") } else { badge };
     let post = |route: &str, body: String| -> Result<(), String> {
-        agent()
-            .post(format!("{}/tabs/by-id/{uuid}/{route}", ep.url))
-            .header("Authorization", format!("Bearer {}", ep.token))
-            .header("Content-Type", "application/json")
+        super::client::authed_post(&ep, &format!("/tabs/by-id/{uuid}/{route}"))
             .send(body.as_bytes())
             .map(|_| ())
             .map_err(|e| format!("{route}: {e}"))

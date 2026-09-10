@@ -45,11 +45,7 @@ pub fn rotate(_args: &[String]) -> i32 {
             return 1;
         }
     };
-    match agent()
-        .post(format!("{}/tabs/rotate-tokens", ep.url))
-        .header("Authorization", &format!("Bearer {}", ep.token))
-        .send_empty()
-    {
+    match crate::cli::client::authed_post(&ep, "/tabs/rotate-tokens").send_empty() {
         Ok(mut resp) => {
             let revoked = resp
                 .body_mut()

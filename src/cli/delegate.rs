@@ -252,10 +252,7 @@ fn spawn_agent_tab(ep: &Endpoint, o: &Opts, prompt: &str) -> Result<String, Stri
         || "{}".to_string(),
         |c| format!("{{\"cwd\":{}}}", serde_json::Value::String(c.clone())),
     );
-    agent()
-        .post(format!("{}/tabs", ep.url))
-        .header("Authorization", format!("Bearer {}", ep.token))
-        .header("Content-Type", "application/json")
+    crate::cli::client::authed_post(ep, "/tabs")
         .send(body.as_bytes())
         .map_err(|e| format!("POST /tabs: {e}"))?;
 
@@ -278,10 +275,7 @@ fn spawn_agent_tab(ep: &Endpoint, o: &Opts, prompt: &str) -> Result<String, Stri
 
     if let Some(name) = &o.name {
         let (idx, _) = resolve(ep, &uuid).map_err(|e| format!("resolve new tab: {e}"))?;
-        let _ = agent()
-            .post(format!("{}/tabs/{idx}/rename", ep.url))
-            .header("Authorization", format!("Bearer {}", ep.token))
-            .header("Content-Type", "application/json")
+        let _ = crate::cli::client::authed_post(ep, &format!("/tabs/{idx}/rename"))
             .send(format!("{{\"name\":{}}}", serde_json::Value::String(name.clone())).as_bytes());
     }
 
@@ -361,9 +355,7 @@ fn send_input(ep: &Endpoint, uuid: &str, bytes: &[u8]) -> Result<(), String> {
 }
 
 fn read_output(ep: &Endpoint, uuid: &str) -> Result<String, String> {
-    agent()
-        .get(format!("{}/tabs/by-id/{uuid}/output", ep.url))
-        .header("Authorization", format!("Bearer {}", ep.token))
+    crate::cli::client::authed_get(ep, &format!("/tabs/by-id/{uuid}/output"))
         .call()
         .map_err(|e| format!("GET output for {uuid}: {e}"))?
         .body_mut()
