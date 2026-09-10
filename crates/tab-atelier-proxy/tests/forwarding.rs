@@ -106,7 +106,8 @@ fn a_users_key_is_exchanged_for_the_proxys_claude_token() {
         account: Mutex::new(account::Monitor::load(&dir)),
         inspect: Mutex::new(tab_atelier_proxy::inspect::Store::load(std::env::temp_dir())),
         wake: tokio::sync::Notify::new(),
-        registry: tab_atelier_proxy::provider::Registry::default(),
+        registry: Mutex::new(tab_atelier_proxy::provider::Registry::default()),
+        registry_path: std::env::temp_dir().join("ta-proxy-providers-test.json"),
         provider_backoff: Mutex::new(std::collections::BTreeMap::new()),
         admin_token: "tap_admin_not_valid_here".to_owned(),
         web_root: None,
@@ -221,7 +222,8 @@ fn a_revoked_key_stops_working_without_reaching_upstream() {
         account: Mutex::new(account::Monitor::load(&dir)),
         inspect: Mutex::new(tab_atelier_proxy::inspect::Store::load(std::env::temp_dir())),
         wake: tokio::sync::Notify::new(),
-        registry: tab_atelier_proxy::provider::Registry::default(),
+        registry: Mutex::new(tab_atelier_proxy::provider::Registry::default()),
+        registry_path: std::env::temp_dir().join("ta-proxy-providers-test.json"),
         provider_backoff: Mutex::new(std::collections::BTreeMap::new()),
         admin_token: "tap_admin".to_owned(),
         web_root: None,
@@ -254,6 +256,27 @@ fn a_revoked_key_stops_working_without_reaching_upstream() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A provider that answers on `port` with one balanced model, for the tests
+/// that care about WHERE traffic went rather than what it looked like.
+fn stub_provider(id: &str, port: u16, preference: i32) -> Provider {
+    Provider {
+        id: id.to_owned(),
+        wire: Wire::Anthropic,
+        base_url: format!("http://127.0.0.1:{port}"),
+        auth: Auth::ClaudeOauth,
+        preference,
+        enabled: true,
+        peak: None,
+        models: vec![Model {
+            id: format!("{id}-balanced"),
+            class: Class::Balanced,
+            relative_cost: 5,
+            deprecated: false,
+            note: None,
+        }],
+    }
+}
+
 /// The headline claim, end to end: when one provider refuses, the work moves
 /// to another instead of stopping or getting worse.
 #[test]
@@ -273,34 +296,8 @@ fn a_429_moves_the_next_request_to_another_provider() {
     egress::set_credentials_path(Some(creds));
 
     let registry = Registry {
-        providers: vec![
-            Provider {
-                id: "primary".to_owned(),
-                wire: Wire::Anthropic,
-                base_url: format!("http://127.0.0.1:{refuser}"),
-                auth: Auth::ClaudeOauth,
-                preference: 0,
-                enabled: true,
-                models: vec![Model {
-                    id: "primary-balanced".to_owned(),
-                    class: Class::Balanced,
-                    relative_cost: 5,
-                }],
-            },
-            Provider {
-                id: "backup".to_owned(),
-                wire: Wire::Anthropic,
-                base_url: format!("http://127.0.0.1:{backup}"),
-                auth: Auth::ClaudeOauth,
-                preference: 1,
-                enabled: true,
-                models: vec![Model {
-                    id: "backup-balanced".to_owned(),
-                    class: Class::Balanced,
-                    relative_cost: 6,
-                }],
-            },
-        ],
+        mappings: vec![],
+        providers: vec![stub_provider("primary", refuser, 0), stub_provider("backup", backup, 1)],
     };
 
     let mut store = Store::load(dir.join("users.json")).expect("store");
@@ -314,7 +311,8 @@ fn a_429_moves_the_next_request_to_another_provider() {
         account: Mutex::new(account::Monitor::load(&dir)),
         inspect: Mutex::new(tab_atelier_proxy::inspect::Store::load(std::env::temp_dir())),
         wake: tokio::sync::Notify::new(),
-        registry,
+        registry: Mutex::new(registry),
+        registry_path: dir.join("providers.json"),
         provider_backoff: Mutex::new(std::collections::BTreeMap::new()),
         admin_token: "tap_admin".to_owned(),
         web_root: None,

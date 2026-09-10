@@ -8,9 +8,13 @@
 //! moment. A developer cannot know that the five-hour window is 97% spent, or
 //! that Bedrock is answering while the subscription is not. The proxy can.
 //!
-//! # Two moves, in order
+//! # Three moves, in order
 //!
-//! **Reroute first.** Same class, different provider. Bedrock and Vertex serve
+//! **Mapping first.** If the operator has written `opus → deepseek-flash`,
+//! that is a decision and it is honoured verbatim when the named model exists
+//! somewhere usable. See [`crate::provider::Mapping`].
+//!
+//! **Reroute second.** Same class, different provider. Bedrock and Vertex serve
 //! the same models from different quota pools, so a saturated subscription is
 //! a reason to move the work, not to make it worse. The answer is unchanged.
 //!
@@ -26,7 +30,17 @@
 //!
 //! Never silently: the chosen route travels back on the response, so a caller
 //! that got something other than what it asked for can see that, and a
-//! recorded transcript says which provider produced it.
+//! recorded transcript says which provider produced it. `mapped`, `rerouted`
+//! and `degraded` are distinct because they mean different things — a mapping
+//! was somebody's decision, a reroute preserved the answer, a degrade did not.
+//!
+//! # Pinning
+//!
+//! An account may be pinned to one provider ([`crate::users::Account::provider`]).
+//! That is a statement about where someone's work is allowed to go, so it
+//! filters candidates rather than merely preferring one, and an empty set is a
+//! 503 — visible — rather than a quiet fall back to the provider the operator
+//! was trying to keep them off.
 
 use crate::provider::{Class, Model, Provider, Registry};
 
@@ -82,20 +96,51 @@ pub struct Route {
 
 /// Pick a destination for a request that asked for `requested`.
 ///
-/// `health` answers for a provider id. Returns `None` only when nothing is
-/// configured that could serve the work at all — a caller should treat that as
-/// 503 rather than guessing.
+/// `health` answers for a provider id. `pinned` is the account's provider, if
+/// it has one — see [`Registry::candidates_pinned`] for why that filters
+/// rather than hints. Returns `None` only when nothing is configured that
+/// could serve the work at all — a caller should treat that as 503 rather than
+/// guessing.
 #[must_use]
 pub fn choose(
     registry: &Registry,
     requested: &str,
+    pinned: Option<&str>,
     health: &dyn Fn(&str) -> Health,
     env: impl Fn(&str) -> Option<String> + Copy,
+    now: u64,
 ) -> Option<Route> {
+    // A mapping rewrites the NAME and nothing else. Health, preference and the
+    // degrade ladder all still apply to whatever it resolves to, so an
+    // operator who writes `opus → deepseek-flash` gets DeepSeek when DeepSeek
+    // is usable and the normal ladder when it is not — rather than a hard pin
+    // that turns into an outage the first time the far end rate-limits.
+    let (target, mapped_from) = registry.resolve(requested);
+
+    // An explicit mapping to a model that exactly ONE provider serves is a
+    // decision about destination, not just a rename: `deepseek-flash` exists
+    // only at DeepSeek, so preference order must not send it to Anthropic.
+    // Tried before the class ladder, because it is the most specific answer
+    // available.
+    if mapped_from.is_some()
+        && let Some((p, m)) = pick_exact(registry, &target, health, env, now, pinned)
+    {
+        return Some(Route {
+            provider_id: p.id.clone(),
+            model_id: m.id.clone(),
+            class: m.class,
+            changed_from: mapped_from,
+            reason: Some("mapped"),
+        });
+    }
+
     // An unrecognised name is treated as the middle of the road. Refusing it
     // would break a client asking for a model we simply have not listed, and
     // assuming Heavy would hand it the most expensive thing we have.
-    let asked_class = registry.class_of(requested).unwrap_or(Class::Balanced);
+    let asked_class = registry.class_of(&target).unwrap_or(Class::Balanced);
+    // Nothing was mapped, but the name may still have been rewritten by a
+    // chain we then failed to place — report that rather than losing it.
+    let changed_from = mapped_from.or_else(|| (target != requested).then(|| requested.to_owned()));
 
     // First pass: the class the caller's request implies, healthy providers
     // only. Second: the same class including strained ones — a strained
@@ -104,20 +149,28 @@ pub fn choose(
     let mut class = Some(asked_class);
     while let Some(c) = class {
         for allow_strained in [false, true] {
-            if let Some((p, m)) = pick_in(registry, c, health, env, allow_strained) {
-                let changed = m.id != requested;
+            if let Some((p, m)) = pick_in(registry, c, health, env, now, pinned, allow_strained) {
+                let changed = m.id != target;
+                // Moved, not cloned: the loop returns on the first hit, so
+                // this value is consumed exactly once.
+                let from = if changed {
+                    changed_from.or_else(|| Some(target.clone()))
+                } else {
+                    changed_from
+                };
+                let reason = if from.is_none() && !changed {
+                    None
+                } else if c == asked_class {
+                    Some("rerouted")
+                } else {
+                    Some("degraded")
+                };
                 return Some(Route {
                     provider_id: p.id.clone(),
                     model_id: m.id.clone(),
                     class: c,
-                    changed_from: changed.then(|| requested.to_owned()),
-                    reason: if !changed {
-                        None
-                    } else if c == asked_class {
-                        Some("rerouted")
-                    } else {
-                        Some("degraded")
-                    },
+                    changed_from: from,
+                    reason,
                 });
             }
         }
@@ -126,19 +179,50 @@ pub fn choose(
     None
 }
 
+/// A provider that serves this exact model id, healthy first.
+fn pick_exact<'a>(
+    registry: &'a Registry,
+    model_id: &str,
+    health: &dyn Fn(&str) -> Health,
+    env: impl Fn(&str) -> Option<String> + Copy,
+    now: u64,
+    pinned: Option<&str>,
+) -> Option<(&'a Provider, &'a Model)> {
+    let candidates = registry.providers_serving(model_id, env, now, pinned);
+    // Blocked is absolute: upstream said stop, and sending anyway is what
+    // turns one 429 into a sustained one. So a blocked provider is not a
+    // candidate even when a mapping named it — the whole reason a mapping is a
+    // rewrite and not a pin is that it must survive the far end refusing.
+    let usable: Vec<_> = candidates.iter().filter(|(p, _)| !health(&p.id).blocked()).collect();
+    // Strained is a preference, not a bar: a mapping named this model, and
+    // using a busy provider that serves it beats quietly serving something
+    // else.
+    usable
+        .iter()
+        .find(|(p, _)| !health(&p.id).strained())
+        .or_else(|| usable.first())
+        .copied()
+        .copied()
+}
+
 fn pick_in<'a>(
     registry: &'a Registry,
     class: Class,
     health: &dyn Fn(&str) -> Health,
     env: impl Fn(&str) -> Option<String> + Copy,
+    now: u64,
+    pinned: Option<&str>,
     allow_strained: bool,
 ) -> Option<(&'a Provider, &'a Model)> {
-    registry.candidates_with(class, env).into_iter().find(|(p, _)| {
-        let h = health(&p.id);
-        // A blocked provider is never used: upstream has said so outright,
-        // and sending anyway is what turns one 429 into a sustained one.
-        !h.blocked() && (allow_strained || !h.strained())
-    })
+    registry
+        .candidates_pinned(class, env, now, pinned)
+        .into_iter()
+        .find(|(p, _)| {
+            let h = health(&p.id);
+            // A blocked provider is never used: upstream has said so outright,
+            // and sending anyway is what turns one 429 into a sustained one.
+            !h.blocked() && (allow_strained || !h.strained())
+        })
 }
 
 #[cfg(test)]
@@ -162,6 +246,7 @@ mod tests {
     fn two_providers() -> Registry {
         let mut r = Registry::default();
         r.providers.push(Provider {
+            peak: None,
             id: "bedrock".to_owned(),
             wire: Wire::Anthropic,
             base_url: "https://bedrock.example".to_owned(),
@@ -173,11 +258,15 @@ mod tests {
                     id: "bedrock.opus".to_owned(),
                     class: Class::Heavy,
                     relative_cost: 30,
+                    deprecated: false,
+                    note: None,
                 },
                 Model {
                     id: "bedrock.haiku".to_owned(),
                     class: Class::Fast,
                     relative_cost: 2,
+                    deprecated: false,
+                    note: None,
                 },
             ],
         });
@@ -187,7 +276,7 @@ mod tests {
     #[test]
     fn a_healthy_subscription_serves_what_was_asked_for() {
         let r = two_providers();
-        let route = choose(&r, "claude-opus-5", &healthy, env_with_key).expect("a route");
+        let route = choose(&r, "claude-opus-5", None, &healthy, env_with_key, 0).expect("a route");
         assert_eq!(route.provider_id, "anthropic");
         assert_eq!(route.model_id, "claude-opus-5");
         assert_eq!(route.changed_from, None, "nothing to report when nothing changed");
@@ -209,7 +298,7 @@ mod tests {
                 Health::default()
             }
         };
-        let route = choose(&r, "claude-opus-5", &squeezed, env_with_key).expect("a route");
+        let route = choose(&r, "claude-opus-5", None, &squeezed, env_with_key, 0).expect("a route");
         assert_eq!(route.provider_id, "bedrock", "the work should move, not shrink");
         assert_eq!(route.class, Class::Heavy, "and stay at the same class");
         assert_eq!(route.reason, Some("rerouted"));
@@ -226,7 +315,7 @@ mod tests {
             backoff_secs: 30,
         };
         assert_eq!(
-            choose(&r, "claude-opus-5", &blocked, env_with_key),
+            choose(&r, "claude-opus-5", None, &blocked, env_with_key, 0),
             None,
             "a blocked provider serves nothing, at any class"
         );
@@ -245,7 +334,7 @@ mod tests {
                 Health::default()
             }
         };
-        let route = choose(&r, "claude-opus-5", &bedrock_blocked, env_with_key).expect("a route");
+        let route = choose(&r, "claude-opus-5", None, &bedrock_blocked, env_with_key, 0).expect("a route");
         assert_eq!(
             route.class,
             Class::Balanced,
@@ -265,7 +354,7 @@ mod tests {
             utilization: Some(0.93),
             backoff_secs: 0,
         };
-        let route = choose(&r, "claude-opus-5", &strained, env_with_key).expect("a route");
+        let route = choose(&r, "claude-opus-5", None, &strained, env_with_key, 0).expect("a route");
         assert_eq!(
             route.class,
             Class::Heavy,
@@ -280,7 +369,7 @@ mod tests {
     #[test]
     fn a_cheap_request_is_never_promoted() {
         let r = two_providers();
-        let route = choose(&r, "claude-haiku-4-5-20251001", &healthy, env_with_key).expect("a route");
+        let route = choose(&r, "claude-haiku-4-5-20251001", None, &healthy, env_with_key, 0).expect("a route");
         assert_eq!(route.class, Class::Fast);
         assert_ne!(route.model_id, "claude-opus-5");
     }
@@ -288,16 +377,170 @@ mod tests {
     #[test]
     fn an_unknown_model_is_treated_as_ordinary_work() {
         let r = Registry::default();
-        let route = choose(&r, "some-model-we-never-listed", &healthy, env_with_key).expect("a route");
+        let route = choose(&r, "some-model-we-never-listed", None, &healthy, env_with_key, 0).expect("a route");
         // Not Heavy — an unrecognised name must not buy the most expensive
         // thing available — and not a refusal either.
         assert_eq!(route.class, Class::Balanced);
         assert_eq!(route.reason, Some("rerouted"));
     }
 
+    /// A registry where `DeepSeek` is configured and usable, with its preset's
+    /// models and peak schedule.
+    ///
+    /// The preset ships a file credential, which would be filtered out here
+    /// for having no key on disk — correctly, and it is worth noticing that
+    /// this helper has to say otherwise. A provider that cannot authenticate
+    /// is not a candidate at any price.
+    fn with_deepseek() -> Registry {
+        let mut r = Registry::default();
+        let mut ds = crate::provider::Preset::Deepseek.provider(std::path::Path::new("/tmp"));
+        ds.auth = crate::provider::Auth::ApiKeyEnv { var: "K".to_owned() };
+        r.providers.push(ds);
+        r
+    }
+
+    /// The case the whole mapping feature exists for: a client asks for a
+    /// Claude model name, and the answer is a model only another provider has.
+    #[test]
+    fn a_mapping_to_another_providers_model_routes_there() {
+        let mut r = with_deepseek();
+        r.set_mapping("claude-opus-5", "deepseek-flash", None);
+
+        let route = choose(&r, "claude-opus-5", None, &healthy, env_with_key, 0).expect("a route");
+        // Not Anthropic, even though it has preference 0 and serves a model of
+        // the same class. `deepseek-flash` exists in exactly one place, so the
+        // mapping named a destination, not just a rename.
+        assert_eq!(route.provider_id, "deepseek");
+        assert_eq!(route.model_id, "deepseek-flash");
+        assert_eq!(route.reason, Some("mapped"));
+        assert_eq!(route.changed_from.as_deref(), Some("claude-opus-5"));
+    }
+
+    /// Mapping claude to claude: a deliberate downgrade, same provider.
+    #[test]
+    fn a_mapping_within_one_provider_is_honoured_even_though_it_costs_less() {
+        let mut r = Registry::default();
+        r.set_mapping("claude-opus-5", "claude-sonnet-5", Some("cost control".to_owned()));
+
+        let route = choose(&r, "claude-opus-5", None, &healthy, env_with_key, 0).expect("a route");
+        assert_eq!(route.provider_id, "anthropic");
+        assert_eq!(route.model_id, "claude-sonnet-5");
+        assert_eq!(route.class, Class::Balanced);
+        assert_eq!(route.reason, Some("mapped"));
+    }
+
+    /// A mapping is a decision, not a hard pin: when the mapped destination is
+    /// unreachable, routing still has somewhere to go. A pin would turn the
+    /// first rate-limit at the far end into an outage.
+    #[test]
+    fn a_mapping_does_not_become_a_pin_that_survives_an_outage() {
+        let mut r = with_deepseek();
+        r.set_mapping("claude-opus-5", "deepseek-flash", None);
+
+        // DeepSeek is refusing traffic outright.
+        let no_deepseek = |id: &str| Health {
+            utilization: None,
+            backoff_secs: if id == "deepseek" { 60 } else { 0 },
+        };
+        let route = choose(&r, "claude-opus-5", None, &no_deepseek, env_with_key, 0).expect("a route");
+        assert_eq!(
+            route.provider_id, "anthropic",
+            "the work still gets done; the mapping was a preference for DeepSeek, and it is unusable"
+        );
+    }
+
+    /// Pinning is a statement about where someone's work is allowed to go.
+    #[test]
+    fn a_pinned_account_only_ever_reaches_its_provider() {
+        let r = with_deepseek();
+        // Pinned to DeepSeek: even a heavy request, which DeepSeek has no
+        // current model for, does not fall back to the subscription.
+        // Either DeepSeek or nothing at all — never a quiet substitution. The
+        // `None` case is the honest answer: a 503 the operator can see, rather
+        // than a fall back to the very provider they were keeping this person
+        // off.
+        if let Some(rt) = choose(&r, "claude-opus-5", Some("deepseek"), &healthy, env_with_key, 0) {
+            assert_eq!(rt.provider_id, "deepseek", "the pin filters, it does not hint");
+        }
+
+        // Pinned to Anthropic: DeepSeek is never chosen, whatever it costs.
+        let route = choose(&r, "claude-opus-5", Some("anthropic"), &healthy, env_with_key, 0).expect("a route");
+        assert_eq!(route.provider_id, "anthropic");
+    }
+
+    /// A pin to something that is not configured must fail visibly.
+    #[test]
+    fn a_pin_to_nothing_yields_no_route_rather_than_a_quiet_substitution() {
+        let r = with_deepseek();
+        assert_eq!(
+            choose(
+                &r,
+                "claude-sonnet-5",
+                Some("typo-not-a-provider"),
+                &healthy,
+                env_with_key,
+                0
+            ),
+            None,
+            "a pinned account whose provider is gone must 503, not silently bill someone else"
+        );
+    }
+
+    /// Peak pricing is a property of the provider, evaluated at the moment of
+    /// the request — so it can reorder two providers serving the same class.
+    #[test]
+    fn peak_pricing_is_evaluated_per_provider_at_the_time_of_the_request() {
+        let mut r = Registry::default();
+        // Make the subscription's only balanced model expensive enough that
+        // the two are within a factor of the multiplier, so peak decides.
+        for m in &mut r.providers[0].models {
+            if m.class == Class::Balanced {
+                m.relative_cost = 20;
+            }
+        }
+        let mut ds = crate::provider::Preset::Deepseek.provider(std::path::Path::new("/tmp"));
+        ds.auth = crate::provider::Auth::ApiKeyEnv { var: "K".to_owned() };
+        r.providers.push(ds);
+
+        // Off-peak: DeepSeek's flash (15) beats the subscription (20).
+        let off = choose(
+            &r,
+            "claude-sonnet-5",
+            Some("deepseek"),
+            &healthy,
+            env_with_key,
+            1_789_016_400,
+        );
+        assert_eq!(off.map(|rt| rt.provider_id), Some("deepseek".to_owned()));
+
+        // At peak flash is 30, so the subscription would win — if it were
+        // allowed. The pin still decides here, which is the point: peak moves
+        // the price, the pin moves the traffic.
+        let peak = choose(
+            &r,
+            "claude-sonnet-5",
+            Some("deepseek"),
+            &healthy,
+            env_with_key,
+            1_789_005_600,
+        );
+        assert_eq!(peak.map(|rt| rt.provider_id), Some("deepseek".to_owned()));
+
+        // With no pin, the ordering is what changes.
+        let unpinned_peak =
+            choose(&r, "claude-sonnet-5", None, &healthy, env_with_key, 1_789_005_600).expect("a route");
+        assert_eq!(
+            unpinned_peak.provider_id, "anthropic",
+            "at peak, a provider whose price doubles should lose a close call"
+        );
+    }
+
     #[test]
     fn nothing_configured_means_no_route_rather_than_a_guess() {
-        let empty = Registry { providers: vec![] };
-        assert_eq!(choose(&empty, "claude-opus-5", &healthy, env_with_key), None);
+        let empty = Registry {
+            providers: vec![],
+            mappings: vec![],
+        };
+        assert_eq!(choose(&empty, "claude-opus-5", None, &healthy, env_with_key, 0), None);
     }
 }

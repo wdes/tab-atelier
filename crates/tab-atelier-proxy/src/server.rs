@@ -40,7 +40,13 @@ pub struct State {
     /// Consumed, not remaining: 1.0 means exhausted.
     pub account: Mutex<account::Monitor>,
     /// Everywhere a request can go.
-    pub registry: provider::Registry,
+    ///
+    /// Behind a lock because it is editable at runtime: an operator adds a
+    /// provider from the UI and the next request uses it, with no restart.
+    /// Held only for the read, never across a request to an upstream.
+    pub registry: Mutex<provider::Registry>,
+    /// Where the registry is written back to when it changes.
+    pub registry_path: std::path::PathBuf,
     /// Providers upstream has told us to leave alone, and until when (unix
     /// seconds). Keyed by provider id, because a 429 from one says nothing
     /// about another — that is the entire point of having more than one.
@@ -111,6 +117,8 @@ fn account_json(a: &Account) -> serde_json::Value {
         "created_at": a.created_at,
         "disabled": a.disabled,
         "weight": a.weight,
+        // The pin, so a row can say where this person's work goes.
+        "provider": a.provider,
         // Every key, each with its own history. The hash is never included:
         // it is not a usable secret, but it is the input to an offline guess
         // and the UI has no reason to hold it.
@@ -436,11 +444,15 @@ async fn shape_and_admit(
 ) -> Result<(Bytes, routing::Route), Response<Body>> {
     if !metered {
         // Not a generation: it still has to go somewhere, but no class
-        // reasoning applies.
+        // reasoning applies. The pin still does — an account routed to a
+        // provider does not get its metadata calls answered by a different
+        // one, which would be a leak of exactly the thing the pin exists to
+        // contain.
+        let provider_id = account.provider.clone().unwrap_or_else(|| "anthropic".to_owned());
         return Ok((
             body,
             routing::Route {
-                provider_id: "anthropic".to_owned(),
+                provider_id,
                 model_id: String::new(),
                 class: provider::Class::Balanced,
                 changed_from: None,
@@ -455,7 +467,21 @@ async fn shape_and_admit(
         .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_owned))
         .unwrap_or_default();
     let health = provider_health(state);
-    let Some(route) = routing::choose(&state.registry, &requested, &health, |v| std::env::var(v).ok()) else {
+    // Scoped: the registry lock is a std Mutex, and holding one across an
+    // await makes this future non-Send — which the compiler reports as a
+    // spawn failure a long way from here. Taken only for the decision.
+    let route = {
+        let registry = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        routing::choose(
+            &registry,
+            &requested,
+            account.provider.as_deref(),
+            &health,
+            |v| std::env::var(v).ok(),
+            usage::now_secs(),
+        )
+    };
+    let Some(route) = route else {
         // Nothing configured can serve this at any class. A guess would be
         // worse than saying so.
         return Err(text(
@@ -589,7 +615,7 @@ fn pressure_json(state: &Arc<State>) -> Response<Body> {
             // Routing prefers moving the work to another provider at this
             // level; only when none is left does the class step down.
             "strained_above": routing::STRAINED_ABOVE,
-            "providers": state.registry.summary(),
+                "providers": state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner).summary(),
         })
         .to_string(),
     )
@@ -731,10 +757,29 @@ fn begin_capture(f: &Forward, hdrs: &[(String, String)]) -> Option<inspect::Capt
     }))
 }
 
-/// Stamp the upstream status onto a pending capture and store it.
-fn finish_capture(f: &Forward, pending: Option<inspect::Capture>, status: u16) {
+/// Stamp what upstream answered onto a pending capture and store it.
+///
+/// Called at the end of the stream, because the token counts only exist once
+/// the response has been read to the end — they come from the same parse the
+/// billing path uses, so the panel and the usage graph cannot disagree.
+fn finish_capture(
+    f: &Forward,
+    pending: Option<inspect::Capture>,
+    status: u16,
+    tokens: &usage::Tokens,
+    model: Option<&str>,
+) {
     let Some(mut c) = pending else { return };
     c.status = Some(status);
+    c.tokens = Some(*tokens);
+    // What upstream REPORTED the model as, when it was the routing that chose
+    // it. Usually the same as what we sent; different means the far end
+    // substituted, which is worth seeing.
+    if let Some(m) = model
+        && c.model.as_deref() != Some(m)
+    {
+        c.model = Some(m.to_owned());
+    }
     let mut ins = f
         .state
         .inspect
@@ -813,7 +858,6 @@ fn forward(
         }
     };
     let status = resp.status().as_u16();
-    finish_capture(f, pending.take(), status);
     let ctype = resp
         .headers()
         .get("content-type")
@@ -840,6 +884,10 @@ fn forward(
         // The client is gone, but the call was still made and still cost
         // tokens — so it is recorded anyway, just without a body to read.
         record(&f.state, &f.account_id, None, usage::Tokens::default(), status);
+        // The capture is still filed: the request WAS made and the client
+        // hanging up does not unmake it. No token counts, because the
+        // response was never read.
+        finish_capture(f, pending.take(), status, &usage::Tokens::default(), None);
         return;
     }
     let mut reader = resp.body_mut().as_reader();
@@ -857,6 +905,7 @@ fn forward(
     }
     let (model, tokens) = sniffer.finish();
     record(&f.state, &f.account_id, model.as_deref(), tokens, status);
+    finish_capture(f, pending.take(), status, &tokens, model.as_deref());
     if f.metered {
         // Replace the estimate with what it really cost. An underestimate is
         // owed back out of the next turn; an overestimate is credited, or a
@@ -880,7 +929,13 @@ fn forward(
 /// The provider's credential is missing, which is a configuration problem
 /// rather than something to paper over with an unauthenticated request.
 fn destination(state: &State, provider_id: &str) -> Result<(String, (&'static str, String)), String> {
-    let chosen = state.registry.get(provider_id);
+    // Cloned out rather than held: the guard must not live across the network
+    // work below, and a Provider is a handful of strings.
+    let chosen = {
+        let registry = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        registry.get(provider_id).cloned()
+    };
+    let chosen = chosen.as_ref();
     // An explicit upstream override replaces the SUBSCRIPTION's base URL —
     // that is what it exists for (a test's mock, or an ops redirect). It must
     // not silently retarget a third-party provider, whose URL is its identity.
@@ -898,11 +953,12 @@ fn destination(state: &State, provider_id: &str) -> Result<(String, (&'static st
             ("Authorization", format!("Bearer {t}"))
         }
         // An Anthropic-compatible provider takes a key in x-api-key, the
-        // convention its own SDKs use.
-        Some(provider::Auth::ApiKeyEnv { var }) => match std::env::var(var) {
-            Ok(k) if !k.trim().is_empty() => ("x-api-key", k),
-            _ => return Err(format!("provider {provider_id} has no credential in ${var}")),
-        },
+        // convention its own SDKs use. Env var or file is the provider's
+        // choice; the route only cares that one resolved.
+        Some(auth) => {
+            let key = auth.secret_with(|v| std::env::var(v).ok())?;
+            ("x-api-key", key)
+        }
     };
     Ok((base, auth))
 }
@@ -1162,6 +1218,9 @@ async fn admin(req: Request<Incoming>, state: Arc<State>) -> Response<Body> {
     // account store is held for a mutation.
     match (&method, path.as_str()) {
         (&Method::GET, "/api/pressure") => return pressure_json(&state),
+        // Provider configuration. Read-only here; mutations go through
+        // `mutate`, which holds the registry lock for the whole edit.
+        (&Method::GET, "/api/providers") => return providers_json(&state),
         (&Method::GET, "/api/usage") => {
             let store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             return usage_report(&state, &store, &query);
@@ -1222,7 +1281,266 @@ async fn admin(req: Request<Incoming>, state: Arc<State>) -> Response<Body> {
     mutate(&state, &method, &path, &body)
 }
 
+/// Everything the providers panel needs, and no credential anywhere in it.
+fn providers_json(state: &State) -> Response<Body> {
+    let reg = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let now = usage::now_secs();
+    let presets: Vec<_> = provider::Preset::ALL
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "id": p.id(),
+                "label": p.label(),
+                // Shown before anyone commits to adding it, so the endpoint
+                // and the models are visible up front.
+                "base_url": p.provider(std::path::Path::new("/")).base_url,
+                "configured": reg.get(p.id()).is_some(),
+            })
+        })
+        .collect();
+    let list: Vec<_> = reg
+        .providers
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "id": p.id,
+                "base_url": p.base_url,
+                "preference": p.preference,
+                "enabled": p.enabled,
+                "peak_now": p.peak_now(now),
+                "peak": p.peak,
+                // Whether the credential resolves — never the credential.
+                "ready": p.credential_ready(),
+                "auth": match &p.auth {
+                    provider::Auth::ClaudeOauth => "claude_oauth",
+                    provider::Auth::ApiKeyEnv { .. } => "api_key_env",
+                    provider::Auth::ApiKeyFile { .. } => "api_key_file",
+                },
+                "models": p.models.iter().map(|m| serde_json::json!({
+                    "id": m.id,
+                    "class": m.class,
+                    "relative_cost": m.relative_cost,
+                    "cost_now": p.cost_at(m, now),
+                    "deprecated": m.deprecated,
+                    "note": m.note,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    json(
+        200,
+        &serde_json::json!({
+            "providers": list,
+            "presets": presets,
+            "mappings": reg.mappings,
+        })
+        .to_string(),
+    )
+}
+
+/// Rotate one provider's key, leaving everything else alone.
+fn rotate_provider_key(state: &Arc<State>, id: &str, key: &str) -> Response<Body> {
+    if key.trim().is_empty() {
+        return json(400, r#"{"error":"no key given"}"#);
+    }
+    let known = {
+        let reg = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        reg.get(id).is_some()
+    };
+    if !known {
+        return json(404, r#"{"error":"no such provider"}"#);
+    }
+    let path = provider::provider_key_path(&registry_dir(state), id);
+    if let Err(e) = provider::write_provider_key(&path, key) {
+        return json(500, &serde_json::json!({ "error": e }).to_string());
+    }
+    // No restart: the credential is read per request, which is the whole
+    // reason it lives in a file rather than in the service's environment.
+    log::info!("proxy: provider {id} key rotated");
+    json(200, r#"{"ok":true}"#)
+}
+
+/// Forget a provider, and unpin anyone routed to it.
+///
+/// Leaving pins behind would strand those accounts on a provider that no
+/// longer exists — a 503 on their next request, caused by an admin action
+/// somewhere else entirely.
+fn remove_provider(state: &Arc<State>, store: &mut Store, id: &str) -> Response<Body> {
+    let pinned_here: Vec<String> = store
+        .accounts()
+        .iter()
+        .filter(|a| a.provider.as_deref() == Some(id))
+        .map(Account::display_name)
+        .collect();
+    for who in &pinned_here {
+        if let Err(e) = store.set_provider(who, None) {
+            log::error!("proxy: could not unpin {who} from {id}: {e}");
+        }
+    }
+    if !pinned_here.is_empty() {
+        log::warn!(
+            "proxy: provider {id} removed — unpinned {} (they had been routed there)",
+            pinned_here.join(", ")
+        );
+    }
+
+    let mut reg = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !reg.remove(id) {
+        return json(404, r#"{"error":"no such provider"}"#);
+    }
+    let saved = reg.save(&state.registry_path);
+    drop(reg);
+    if let Err(e) = saved {
+        return json(500, &serde_json::json!({ "error": e }).to_string());
+    }
+    json(200, r#"{"ok":true}"#)
+}
+
+/// "When someone asks for X, use Y."
+fn add_mapping(state: &Arc<State>, from: &str, to: &str, note: &str) -> Response<Body> {
+    if from.is_empty() || to.is_empty() {
+        return json(400, r#"{"error":"a mapping needs both a from and a to"}"#);
+    }
+    if from == to {
+        // Not an error, a no-op — and storing it would leave a row in the
+        // table that looks like a decision.
+        return json(400, r#"{"error":"a mapping from a name to itself does nothing"}"#);
+    }
+    let mut reg = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    reg.set_mapping(from, to, (!note.is_empty()).then(|| note.to_owned()));
+    let saved = reg.save(&state.registry_path);
+    drop(reg);
+    if let Err(e) = saved {
+        return json(500, &serde_json::json!({ "error": e }).to_string());
+    }
+    json(200, r#"{"ok":true}"#)
+}
+
+fn remove_mapping(state: &Arc<State>, from: &str) -> Response<Body> {
+    let mut reg = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !reg.remove_mapping(from) {
+        return json(404, r#"{"error":"no such mapping"}"#);
+    }
+    let saved = reg.save(&state.registry_path);
+    drop(reg);
+    if let Err(e) = saved {
+        return json(500, &serde_json::json!({ "error": e }).to_string());
+    }
+    json(200, r#"{"ok":true}"#)
+}
+
+/// Pin an account to a provider, or clear the pin.
+fn set_user_provider(state: &Arc<State>, store: &mut Store, who: &str, wanted: &str) -> Response<Body> {
+    let wanted = wanted.trim();
+    // Validated HERE, where the registry is in hand, rather than in users.rs
+    // which knows about people and not about destinations. A pin to a typo
+    // would otherwise be a 503 nobody could explain.
+    if !wanted.is_empty() {
+        let known = {
+            let reg = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            reg.get(wanted).is_some()
+        };
+        if !known {
+            return json(
+                400,
+                &serde_json::json!({ "error": format!("no provider {wanted:?}") }).to_string(),
+            );
+        }
+    }
+    match store.set_provider(who, (!wanted.is_empty()).then_some(wanted)) {
+        Ok(a) => json(200, &serde_json::json!({ "user": account_json(&a) }).to_string()),
+        Err(e) => json(404, &serde_json::json!({ "error": e.to_string() }).to_string()),
+    }
+}
+
+/// Add or update a provider from the UI's form.
+///
+/// Either a preset — one field, everything else supplied from code — or a
+/// hand-written one with a base URL, a model list and a key.
+fn save_provider(state: &Arc<State>, field: &dyn Fn(&str) -> String, body: &Bytes) -> Response<Body> {
+    let dir = registry_dir(state);
+    let mut reg = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let preset = provider::Preset::ALL
+        .iter()
+        .find(|p| p.id() == field("preset").as_str())
+        .copied();
+    let mut new = if let Some(p) = preset {
+        p.provider(&dir)
+    } else {
+        {
+            let id = field("id");
+            if id.is_empty() {
+                return json(400, r#"{"error":"a provider needs an id"}"#);
+            }
+            let base_url = field("base_url");
+            if base_url.is_empty() {
+                return json(400, r#"{"error":"a provider needs a base_url"}"#);
+            }
+            let models = match provider::parse_models(&field("models")) {
+                Ok(m) => m,
+                Err(e) => return json(400, &serde_json::json!({ "error": e }).to_string()),
+            };
+            provider::Provider {
+                id: id.clone(),
+                wire: provider::Wire::Anthropic,
+                base_url: base_url.trim_end_matches('/').to_owned(),
+                auth: provider::Auth::ApiKeyFile {
+                    path: provider::provider_key_path(&dir, &id).display().to_string(),
+                },
+                models,
+                preference: serde_json::from_slice::<serde_json::Value>(body)
+                    .ok()
+                    .and_then(|v| v.get("preference").and_then(serde_json::Value::as_i64))
+                    .and_then(|n| i32::try_from(n).ok())
+                    .unwrap_or(10),
+                enabled: true,
+                peak: None,
+            }
+        }
+    };
+    // Keep an existing preference and enabled flag on update: the form does
+    // not show them, and a save that silently reset them would undo an
+    // operator's ordering.
+    if let Some(old) = reg.get(&new.id) {
+        new.preference = old.preference;
+        new.enabled = old.enabled;
+    }
+    let id = new.id.clone();
+
+    // The key, if one was pasted. Written to its own 0600 file BEFORE the
+    // registry mentions it, so a failed write cannot leave a provider pointing
+    // at a file that is not there.
+    let key = field("key");
+    if !key.trim().is_empty()
+        && let Err(e) =
+            provider::write_provider_key(std::path::Path::new(&provider::provider_key_path(&dir, &id)), &key)
+    {
+        return json(500, &serde_json::json!({ "error": e }).to_string());
+    }
+
+    reg.upsert(new);
+    let saved = reg.save(&state.registry_path);
+    // Scoped: the lock must not be held across the log line below.
+    drop(reg);
+    if let Err(e) = saved {
+        return json(500, &serde_json::json!({ "error": e }).to_string());
+    }
+    log::info!("proxy: provider {id} saved");
+    json(200, &serde_json::json!({ "id": id }).to_string())
+}
+
 /// The account-mutating half of the admin API.
+///
+/// The directory `providers.json` lives in, which is where key files go too,
+/// is [`registry_dir`].
+fn registry_dir(state: &State) -> std::path::PathBuf {
+    state
+        .registry_path
+        .parent()
+        .map_or_else(|| std::path::PathBuf::from("."), std::path::Path::to_path_buf)
+}
+
 fn mutate(state: &Arc<State>, method: &Method, path: &str, body: &Bytes) -> Response<Body> {
     let parsed = serde_json::from_slice::<serde_json::Value>(body).unwrap_or(serde_json::Value::Null);
     let field = |k: &str| parsed.get(k).and_then(|x| x.as_str()).unwrap_or("").to_owned();
@@ -1237,6 +1555,27 @@ fn mutate(state: &Arc<State>, method: &Method, path: &str, body: &Bytes) -> Resp
         (&Method::GET, "/api/users") => {
             let list: Vec<_> = store.accounts().iter().map(account_json).collect();
             json(200, &serde_json::json!({ "users": list }).to_string())
+        }
+        // Add or update a provider. Either a preset (one field: which) or a
+        // hand-written one — base URL, models, key.
+        (&Method::POST, "/api/providers") => save_provider(state, &field, body),
+        // Rotate a provider's key without touching anything else.
+        (&Method::POST, p) if p.starts_with("/api/providers/") && p.ends_with("/key") => {
+            let id = p.trim_start_matches("/api/providers/").trim_end_matches("/key");
+            rotate_provider_key(state, id, &field("key"))
+        }
+        (&Method::DELETE, p) if p.starts_with("/api/providers/") => {
+            remove_provider(state, &mut store, p.trim_start_matches("/api/providers/"))
+        }
+        // Mappings. One table, global, applied before routing.
+        (&Method::POST, "/api/mappings") => add_mapping(state, &field("from"), &field("to"), &field("note")),
+        (&Method::DELETE, p) if p.starts_with("/api/mappings/") => {
+            remove_mapping(state, p.trim_start_matches("/api/mappings/"))
+        }
+        // Pin an account to a provider, or clear the pin.
+        (&Method::POST, p) if p.starts_with("/api/users/") && p.ends_with("/provider") => {
+            let who = p.trim_start_matches("/api/users/").trim_end_matches("/provider");
+            set_user_provider(state, &mut store, who, &field("provider"))
         }
         (&Method::POST, "/api/users") => {
             match store.add(&field("first_name"), &field("last_name"), &field("email")) {
@@ -1504,7 +1843,8 @@ mod tests {
             account: Mutex::new(account::Monitor::load(std::env::temp_dir())),
             inspect: Mutex::new(inspect::Store::load(std::env::temp_dir())),
             wake: tokio::sync::Notify::new(),
-            registry: provider::Registry::default(),
+            registry: Mutex::new(provider::Registry::default()),
+            registry_path: std::env::temp_dir().join("ta-proxy-providers-test.json"),
             provider_backoff: Mutex::new(std::collections::BTreeMap::new()),
             admin_token: "t".to_owned(),
             web_root: Some(std::path::PathBuf::from("/usr/share/tab-atelier-proxy/web")),
@@ -1552,6 +1892,7 @@ mod tests {
     #[test]
     fn an_account_serialises_without_its_hash() {
         let a = Account {
+            provider: None,
             id: "id-1".to_owned(),
             first_name: "Ada".to_owned(),
             last_name: "Lovelace".to_owned(),

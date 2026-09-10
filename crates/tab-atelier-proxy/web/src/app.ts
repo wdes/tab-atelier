@@ -85,6 +85,8 @@ const AdminApp = Vue.defineComponent({
       // and nothing hints that captures exist — unless someone asks.
       inspect: null,
       inspectOpen: null,
+      providers: null,
+      newMapping: { from: "", to: "", note: "" },
       // "Weight" is the scheduler's word for this and means nothing to anyone
       // reading a table of people. The stored value is still a weight — the
       // API and the QoS maths are unchanged — but the UI names what it does.
@@ -330,6 +332,59 @@ const AdminApp = Vue.defineComponent({
     // Inspection. Nothing is fetched until the panel is opened: a page that
     // silently pulled captured prompts on every load would be collecting them
     // into a browser as well as a file.
+    async loadProviders() {
+      this.providers = await this.api<ProvidersResponse>("GET", "/api/providers");
+    },
+    async addPreset(p: PresetView) {
+      await this.api("POST", "/api/providers", { preset: p.id });
+      await this.loadProviders();
+    },
+    async setKey(p: ProviderView) {
+      const key = prompt(`API key for ${p.id}:`, "");
+      if (!key) return;
+      await this.api("POST", `/api/providers/${p.id}/key`, { key });
+      await this.loadProviders();
+    },
+    async toggleProvider(p: ProviderView) {
+      await this.api("POST", "/api/providers", {
+        id: p.id,
+        base_url: p.base_url,
+        models: p.models.filter((m) => !m.deprecated).map((m) => `${m.id}:${m.class}:${m.relative_cost}`).join(","),
+        preference: p.preference,
+      });
+      await this.loadProviders();
+    },
+    async removeProvider(p: ProviderView) {
+      if (!confirm(`Remove provider ${p.id}? Accounts pinned to it are unpinned.`)) return;
+      await this.api("DELETE", `/api/providers/${p.id}`);
+      await this.loadProviders();
+      await this.refresh();
+    },
+    async addMapping() {
+      const m = this.newMapping;
+      if (!m.from || !m.to) return;
+      await this.api("POST", "/api/mappings", m);
+      this.newMapping = { from: "", to: "", note: "" };
+      await this.loadProviders();
+    },
+    async removeMapping(m: MappingView) {
+      await this.api("DELETE", `/api/mappings/${encodeURIComponent(m.from)}`);
+      await this.loadProviders();
+    },
+    async setUserProvider(u: ApiUser, provider: string) {
+      await this.api("POST", `/api/users/${u.id}/provider`, { provider });
+      await this.refresh();
+    },
+    // "in 12 · out 340 · cache 1.2k" — the four numbers that answer "why was
+    // that turn expensive", beside the request that produced them.
+    tokenSummary(c: Capture): string {
+      const t = c.tokens;
+      if (!t) return "—";
+      const parts = [`in ${this.fmt(t.input)}`, `out ${this.fmt(t.output)}`];
+      const cached = t.cache_read + t.cache_write;
+      if (cached) parts.push(`cache ${this.fmt(cached)}`);
+      return parts.join(" · ");
+    },
     async loadInspect() {
       this.inspect = await this.api<InspectState>("GET", "/api/inspect");
     },

@@ -291,6 +291,89 @@ pub struct Probe {
     pub note: String,
 }
 
+/// One probe of a configured provider, using that provider's own credential.
+///
+/// The subscription probe below answers "is Anthropic reachable"; this answers
+/// "does the SECOND provider work", which is a different question and the one
+/// an operator has just created by adding one. A provider that is configured,
+/// enabled, and silently unable to authenticate is invisible until real work
+/// is routed to it — and by then a reroute has already failed mid-turn.
+#[must_use]
+pub fn probe_provider(provider: &crate::provider::Provider, model: &str) -> Probe {
+    let started = std::time::Instant::now();
+    let secret = match &provider.auth {
+        crate::provider::Auth::ClaudeOauth => {
+            return Probe {
+                label: "subscription",
+                status: None,
+                elapsed: started.elapsed(),
+                note: "uses the proxy's own Claude login — see the stages above".to_owned(),
+            };
+        }
+        a => a.secret_with(|v| std::env::var(v).ok()),
+    };
+    let key = match secret {
+        Ok(k) => k,
+        Err(e) => {
+            return Probe {
+                label: "credential",
+                status: None,
+                elapsed: started.elapsed(),
+                note: format!("FAILED: {e}"),
+            };
+        }
+    };
+
+    let base = provider.base_url.trim_end_matches('/');
+    let body = serde_json::json!({
+        "model": model,
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "ping"}],
+    });
+    let mut rb = relay_agent().post(&format!("{base}/v1/messages"));
+    for (k, v) in claude_api::api_headers(None) {
+        rb = rb.header(k, &v);
+    }
+    // Started BEFORE the send: `send_json` performs the request, so a timer
+    // taken after it measures the body read and reports a round trip as 0 ms.
+    let started = std::time::Instant::now();
+    let sent = rb
+        .header("Content-Type", "application/json")
+        // A provider key goes in x-api-key, the convention Anthropic's own
+        // SDKs use and what every Anthropic-compatible endpoint expects.
+        .header("x-api-key", &key)
+        .header("anthropic-version", ANTHROPIC_VERSION)
+        .header("anthropic-beta", ANTHROPIC_BETA)
+        .send_json(&body);
+
+    match sent {
+        Ok(mut r) => {
+            let status = r.status().as_u16();
+            let text = r.body_mut().read_to_string().unwrap_or_default();
+            let note = if (200..300).contains(&status) {
+                format!("{model} answered")
+            } else {
+                // The body is where the far end says WHY — a wrong key, a
+                // model name it does not have, and a suspended account need
+                // different responses from the operator.
+                text.chars().take(160).collect::<String>()
+            };
+            Probe {
+                label: "round trip",
+                status: Some(status),
+                elapsed: started.elapsed(),
+                note,
+            }
+        }
+        Err(e) => Probe {
+            label: "round trip",
+            status: None,
+            elapsed: started.elapsed(),
+            note: format!("FAILED: {e}"),
+        },
+    }
+}
+
 /// Time the round trip to Anthropic, in the stages that can fail separately.
 ///
 /// A slow proxy is usually not the proxy. Splitting the trip apart says which

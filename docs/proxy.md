@@ -148,18 +148,22 @@ what KIND of work it is — quick, ordinary, or hard — not which endpoint shou
 bill it. Only the proxy knows that the five-hour window is 97% spent, or that
 one provider is refusing while another is answering.
 
-So it does two things, in order:
+So it does three things, in order:
 
-1. **Reroute.** Same class of model, different provider. Bedrock and Vertex
+1. **Map.** A name the operator has rewritten is honoured verbatim, when
+   something usable serves it. See *Model mapping* below.
+2. **Reroute.** Same class of model, different provider. Bedrock and Vertex
    serve the *same* models from *different* quota pools, so a saturated
    subscription is a reason to move the work, not to make it worse.
-2. **Degrade**, only when nothing is left that can serve the class — a cheaper
+3. **Degrade**, only when nothing is left that can serve the class — a cheaper
    class, trading quality for getting an answer at all.
 
 Never upward: idle capacity in an expensive class does not promote a request
 that asked for something cheap. Never silently: the response carries
-`x-tab-atelier-proxy-route: <provider>/<model>`, plus
-`x-tab-atelier-proxy-rerouted` or `-degraded` naming what was asked for.
+`x-tab-atelier-proxy-route: <provider>/<model>`, plus `-mapped`, `-rerouted` or
+`-degraded` naming what was asked for — three words because they mean three
+things: a mapping was somebody's decision, a reroute preserved the answer, a
+degrade did not.
 
 Providers live in `providers.json` beside the accounts, written on first run:
 
@@ -172,20 +176,22 @@ Providers live in `providers.json` beside the accounts, written on first run:
       "auth": {"kind": "claude_oauth"},
       "preference": 0,
       "models": [
-        {"id": "claude-haiku-4-5-20251001", "class": "fast",     "relative_cost": 1},
-        {"id": "claude-sonnet-5",           "class": "balanced", "relative_cost": 5},
-        {"id": "claude-opus-5",             "class": "heavy",    "relative_cost": 25}
+        {"id": "claude-haiku-4-5-20251001", "class": "fast",     "relative_cost": 100},
+        {"id": "claude-sonnet-5",           "class": "balanced", "relative_cost": 300},
+        {"id": "claude-opus-5",             "class": "heavy",    "relative_cost": 1500}
       ]
     }
   ]
 }
 ```
 
-Add a second provider with `"auth": {"kind": "api_key_env", "var": "SOME_KEY"}`
-and a higher `preference`. The key is named, not inlined — a credential in a
-config file is a credential in a backup. A provider whose variable is unset is
-never offered, because routing to it would produce a 401 from somewhere nobody
-was looking.
+`relative_cost` is only ever compared with other entries, so these are the
+cache-miss input figures per 1M tokens — the number that actually decides a
+reroute. Add a second provider with `"auth": {"kind": "api_key_env", "var":
+"SOME_KEY"}` and a higher `preference`. The key is named, not inlined — a
+credential in a config file is a credential in a backup. A provider whose
+credential does not resolve is never offered, because routing to it would
+produce a 401 from somewhere nobody was looking.
 
 **Every provider must speak the Anthropic Messages API.** Claude Code speaks
 it, so that is the contract on the way in, and providers that share it — the
@@ -230,16 +236,28 @@ is merged, the credential is swapped — and what goes on the wire exists for a
 few milliseconds inside a blocking task. **Inspect requests** in the web UI
 records it.
 
+A capture carries the request as sent, the status that came back, and the
+**token counts** — input, output and cache — read off the same response parse
+the billing path uses, so the panel and the usage graph cannot disagree. That
+pairing is the point: "why was that turn expensive" is answered by four numbers
+beside the request that produced them.
+
 It is off, and it turns itself off. A capture is a prompt, and a prompt is
 whatever someone was working on, so:
 
 * armed explicitly, for a stated number of minutes, up to 60;
 * **it disarms itself** — "remember to switch it off" is not a control, and a
   debug flag left on is how a month of everyone's prompts ends up in a file;
-* 40 captures, each clipped to 32 KB with both ends kept;
+* 25 captures, 4 MB each, stored whole;
 * `inspect.jsonl` beside the accounts, `0600`, and an armed window never
   survives a restart;
 * admin-only. A user key cannot read captures, not even its own account's.
+
+The 4 MB cap is a disk guard, not a budget: an earlier 32 KB one made the
+panel nearly useless, because a body cut in half is not JSON and reading the
+object that was sent is the one thing anybody opens it for. A capture lands
+when the call *finishes*, so the panel has a **Refresh** — without it the
+request you just made is the one thing not shown.
 
 Credentials are removed before anything is written. Headers are an allowlist,
 so `Authorization` and `x-api-key` are absent by construction rather than by a
@@ -247,6 +265,87 @@ rule someone could forget to update, and both bodies are additionally swept for
 `sk-ant-…` and `tap_…` runs — because a prompt can contain a key that no header
 rule would catch, and "why is my key not working, here it is" is exactly the
 kind of session that gets inspected.
+
+## A second provider
+
+`providers.json` takes more than the subscription. Add one from the UI, or
+paste this shape in by hand:
+
+```json
+{
+  "providers": [
+    { "id": "deepseek", "base_url": "https://api.deepseek.com/anthropic",
+      "auth": {"kind": "api_key_file", "path": "/var/lib/tab-atelier-proxy/provider-deepseek.key"},
+      "preference": 10, "enabled": true,
+      "models": [
+        {"id": "deepseek-flash", "class": "balanced", "relative_cost": 15},
+        {"id": "deepseek-v4-pro", "class": "heavy", "relative_cost": 66,
+         "deprecated": true,
+         "note": "withdrawn 2026-09-14; requests are served by deepseek-flash at Flash prices"}
+      ],
+      "peak": {"multiplier_percent": 200,
+               "windows": [{"weekdays": [1,2,3,4,5], "start_hour": 1, "end_hour": 4}]} }
+  ]
+}
+```
+
+**Every provider must speak the Anthropic Messages API.** DeepSeek's endpoint
+for this is `/anthropic`, not its bare host — the bare host is the OpenAI-shaped
+API, and pointing at it mangles every tool call rather than failing. Nothing is
+translated on the way through, so tool use, prompt caching and thinking arrive
+intact. A true OpenAI-wire adapter is still separate work, and the reason is in
+`provider.rs`: tool-call semantics do not survive the round trip.
+
+`api_key_file` rather than a key inline, because `providers.json` is the file an
+operator copies around and pastes into a bug report. The key gets its own
+`0600` file, written by the UI, read per request — so rotating it is a file
+write, not a restart. `api_key_env` still works for a key already in the unit's
+environment.
+
+**`deprecated` is not decoration.** `deepseek-v4-pro` is withdrawn on
+2026-09-14, after which requests to it are served by a *different model* at a
+*different price*. A router that kept offering it would report a cost and a
+capability that are both about to stop being true, so deprecated models are
+listed, never routed to, and never probed.
+
+### Peak pricing
+
+A provider can charge more for the same tokens at certain hours — DeepSeek
+doubles from 01:00–04:00 and 06:00–10:00 UTC, Monday to Friday. That is a real
+difference in a comparison whose whole job is ordering providers by cost, so it
+is modelled rather than written in a comment: `relative_cost` stays one true
+number and the schedule explains itself. `ping` and the UI both say when a
+provider is in peak right now.
+
+### Pinning someone to a provider
+
+The **Routed to** column sets an account's provider. An empty value means
+normal routing; a value is enforced, not preferred:
+
+```sh
+sudo -u tab-atelier-proxy tab-atelier-proxy set-provider ada@example.org deepseek
+```
+
+An account pinned to a provider that is disabled or out of capacity gets a
+**503**, not a quiet fall back to the subscription the operator was keeping
+them off. That is the point of a pin: it is a statement about where someone's
+work is allowed to go — a jurisdiction, an invoice, a quota.
+
+### Model mapping
+
+One global table, applied before routing. "When someone asks for the name on
+the left, use the one on the right."
+
+```
+claude-opus-5  →  deepseek-flash      across providers
+claude-opus-5  →  claude-sonnet-5     within one — a deliberate downgrade
+```
+
+A mapping names a **model**, not a lock. When the destination is a model only
+one provider serves, the request goes there whatever the preference order says;
+when that provider is unreachable, normal routing applies instead. That is what
+stops a cost-control measure from turning into an outage the first time the far
+end rate-limits.
 
 ## Is it the proxy, or is it Anthropic?
 
@@ -261,6 +360,16 @@ upstream: https://api.anthropic.com
   round trip    200       701 ms   claude-haiku-4-5-20251001 answered
 
 round trip over 3 probes: min 701 ms · mean 768 ms · max 826 ms
+
+providers (/var/lib/tab-atelier-proxy/providers.json)
+  deepseek       enabled
+    round trip    401       985 ms   {"error":{"message":"Authentication Fails, ...
+```
+
+Each configured provider is probed with its OWN credential. The stages above
+answer "is Anthropic reachable"; this answers "does the second provider work",
+which is the question an operator has just created by adding one — and the one
+that otherwise stays invisible until a reroute fails mid-turn.
 ```
 
 Three stages because they fail for different reasons: a slow **credential**
