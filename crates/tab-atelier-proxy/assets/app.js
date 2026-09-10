@@ -113,6 +113,19 @@ createApp({
       if ((this.planUtil ?? 0) >= this.degradeAbove) return "text-warning";
       return "";
     },
+    weeklyUtil() {
+      return this.plan.latest?.seven_day ?? null;
+    },
+    // The weekly cap can be the binding one even while the session window
+    // looks calm, so it gets the same warning treatment rather than staying
+    // grey until someone happens to read the number.
+    weeklyClass() {
+      const w = this.weeklyUtil;
+      if (w == null) return "";
+      if (w >= 0.95) return "text-danger";
+      if (w >= this.degradeAbove) return "text-warning";
+      return "";
+    },
     planSeries() {
       return (this.plan.history || [])
         .filter((s) => s.five_hour != null || s.seven_day != null)

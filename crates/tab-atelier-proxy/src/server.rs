@@ -224,21 +224,58 @@ fn authenticate_and_stamp(state: &State, key: &str, ip: &str) -> Option<Account>
 /// peer is always the terminator, and `X-Forwarded-For` carries the real
 /// address.
 ///
-/// So the header is honoured ONLY when the connection came from loopback,
-/// which is where that terminator lives. Trusting it from anywhere else would
-/// let a caller write its own address into the log by setting a header, which
-/// is worse than recording nothing.
-fn client_ip(req: &Request<Incoming>, peer: std::net::IpAddr) -> String {
-    let forwarded = req
-        .headers()
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
-        .map(str::trim)
-        .filter(|v| !v.is_empty());
-    match forwarded {
-        Some(fwd) if peer.is_loopback() => fwd.to_owned(),
-        _ => peer.to_string(),
+/// So the header is honoured only from a hop we have reason to trust — see
+/// [`is_trusted_hop`]. Trusting it from anywhere else would let a caller write
+/// its own address into the log by setting a header, which is worse than
+/// recording nothing.
+///
+/// Both spellings are read. Caddy and nginx set `X-Real-IP` to a single
+/// address; `X-Forwarded-For` is a comma-separated chain whose FIRST entry is
+/// the original client. `X-Real-IP` is preferred because it is unambiguous —
+/// an XFF chain can be extended by the client, and only the trusted hop's own
+/// append is reliable.
+fn client_ip(headers: &hyper::HeaderMap, peer: std::net::IpAddr) -> String {
+    if !is_trusted_hop(peer) {
+        return peer.to_string();
+    }
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(',').next())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned)
+    };
+    header("x-real-ip")
+        .or_else(|| header("x-forwarded-for"))
+        .unwrap_or_else(|| peer.to_string())
+}
+
+/// Whether a forwarding header from this peer should be believed.
+///
+/// Loopback is the obvious case. Private and unique-local addresses are here
+/// because the terminator usually is not on loopback: put Caddy in a container
+/// and it reaches the proxy from a bridge network, so every request arrived
+/// from something like `172.31.112.6` and the header was discarded — which is
+/// how a whole fleet came to be logged under one address, making the per-key
+/// "last used from" column useless for the exact question it exists to answer.
+///
+/// The cost is stated plainly: anything already inside the private network can
+/// claim any address. That is a trade this proxy is entitled to make — it is
+/// documented as belonging behind a terminator, and the address is an audit
+/// aid rather than an authorisation input. Nothing is granted by it.
+const fn is_trusted_hop(peer: std::net::IpAddr) -> bool {
+    match peer {
+        std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return mapped.is_loopback() || mapped.is_private() || mapped.is_link_local();
+            }
+            let seg = v6.segments()[0];
+            // fc00::/7 unique-local, fe80::/10 link-local.
+            v6.is_loopback() || (seg & 0xfe00) == 0xfc00 || (seg & 0xffc0) == 0xfe80
+        }
     }
 }
 
@@ -267,7 +304,7 @@ async fn anthropic(req: Request<Incoming>, state: Arc<State>, peer: std::net::Ip
     }
 
     let key = presented(&req);
-    let ip = client_ip(&req, peer);
+    let ip = client_ip(req.headers(), peer);
     let who = authenticate_and_stamp(&state, &key, &ip);
     let Some(account) = who else {
         // Say which of the two credentials was wrong without printing either.
@@ -525,6 +562,13 @@ fn pressure_json(state: &Arc<State>) -> Response<Body> {
             "utilization": acct.utilization(),
             "latest": acct.latest(),
             "health": acct.health(usage::now_secs()),
+            // What upstream claims about the weekly window, and what we
+            // actually watched it do. They disagree, routinely — see
+            // `Sample::seven_day_resets` — so the UI shows both rather than
+            // choosing one to present as fact.
+            "weekly_last_drop": acct.last_weekly_drop().map(|(ts, from, to)| serde_json::json!({
+                "ts": ts, "from": from, "to": to,
+            })),
             "history": acct.recent(),
         })
     };
@@ -913,7 +957,7 @@ fn me_usage(req: &Request<Incoming>, state: &State, peer: std::net::IpAddr) -> R
     // Reading your own statistics is a use of the key like any other, and an
     // agent polling this is exactly the traffic someone reviewing access wants
     // to see.
-    let account = authenticate_and_stamp(state, &key, &client_ip(req, peer));
+    let account = authenticate_and_stamp(state, &key, &client_ip(req.headers(), peer));
     let Some(account) = account else {
         return json(
             401,
@@ -968,7 +1012,7 @@ async fn me_credentials(req: Request<Incoming>, state: &Arc<State>, peer: std::n
         return json(405, r#"{"error":"POST only"}"#);
     }
     let key = presented(&req);
-    let ip = client_ip(&req, peer);
+    let ip = client_ip(req.headers(), peer);
     let Some(account) = authenticate_and_stamp(state, &key, &ip) else {
         return json(
             401,
@@ -1285,6 +1329,62 @@ pub async fn serve_on(listener: tokio::net::TcpListener, state: Arc<State>) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The terminator is rarely on loopback, and a whole fleet logged under
+    /// one address is the symptom.
+    #[test]
+    fn a_forwarding_header_is_believed_from_the_terminator_and_nowhere_else() {
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().expect("parse");
+        // The address this actually failed on: Caddy in a container, reaching
+        // the proxy across a bridge network. Not loopback, so the header used
+        // to be discarded and every client was recorded as the container.
+        assert!(is_trusted_hop(ip("172.31.112.6")), "RFC1918 is where terminators live");
+        assert!(is_trusted_hop(ip("127.0.0.1")));
+        assert!(is_trusted_hop(ip("::1")));
+        assert!(is_trusted_hop(ip("10.1.2.3")));
+        assert!(is_trusted_hop(ip("192.168.1.1")));
+        assert!(is_trusted_hop(ip("fd00::1")), "unique-local");
+        assert!(is_trusted_hop(ip("::ffff:10.0.0.1")), "v4-mapped private");
+
+        // A public peer is a client talking to us directly. If it could set
+        // its own X-Real-IP, the audit column would record whatever it liked.
+        assert!(!is_trusted_hop(ip("203.0.113.7")));
+        assert!(!is_trusted_hop(ip("2001:db8::1")));
+        assert!(!is_trusted_hop(ip("::ffff:203.0.113.7")), "v4-mapped public");
+    }
+
+    #[test]
+    fn the_real_client_is_taken_from_the_header_the_terminator_sets() {
+        let build = |pairs: &[(&str, &str)]| {
+            let mut h = hyper::HeaderMap::new();
+            for (k, v) in pairs {
+                h.insert(
+                    hyper::header::HeaderName::from_bytes(k.as_bytes()).expect("name"),
+                    v.parse().expect("value"),
+                );
+            }
+            h
+        };
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().expect("parse");
+        let caddy = ip("172.31.112.6");
+
+        // Caddy's X-Real-IP wins: it is a single unambiguous address, whereas
+        // an XFF chain can have been extended by the client before it arrived.
+        let req = build(&[("x-real-ip", "203.0.113.9"), ("x-forwarded-for", "198.51.100.1")]);
+        assert_eq!(client_ip(&req, caddy), "203.0.113.9");
+
+        // XFF alone still works, and the FIRST entry is the original client.
+        let req = build(&[("x-forwarded-for", "198.51.100.1, 172.31.112.6")]);
+        assert_eq!(client_ip(&req, caddy), "198.51.100.1");
+
+        // No header: the socket peer is all we honestly have.
+        assert_eq!(client_ip(&build(&[]), caddy), "172.31.112.6");
+
+        // From an untrusted peer the headers are ignored outright — otherwise
+        // any caller could write its own address into the audit log.
+        let req = build(&[("x-real-ip", "10.0.0.1")]);
+        assert_eq!(client_ip(&req, ip("203.0.113.7")), "203.0.113.7");
+    }
 
     #[test]
     fn the_web_root_cannot_be_climbed_out_of() {

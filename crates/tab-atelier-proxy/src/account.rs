@@ -41,6 +41,14 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// How far the weekly fraction must fall between two readings to count as a
+/// reset rather than the window merely ageing.
+///
+/// A rolling seven-day window declines continuously as old tokens expire, so a
+/// small dip is normal and means nothing. Twenty points in one polling
+/// interval is not ageing; it is a flush.
+const RESET_DROP: f64 = 0.20;
+
 /// One reading of the shared plan's utilisation.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Sample {
@@ -53,8 +61,21 @@ pub struct Sample {
     pub five_hour: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub five_hour_resets: Option<String>,
+    /// 0.0–1.0 of the "weekly" window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seven_day: Option<f64>,
+    /// What upstream SAYS the weekly window resets at.
+    ///
+    /// Recorded, and deliberately not trusted as the moment fresh allocation
+    /// arrives. It is the tail of a rolling window — when the oldest tokens
+    /// age out — so it sits about a week ahead and keeps sliding. Observers
+    /// have repeatedly watched `seven_day` drop to near zero long before this
+    /// timestamp, on cadences that changed underneath them (a stretch of
+    /// 72-hour resets in mid-2026, then twice-weekly, then neither). So we
+    /// store what upstream claims AND, in [`Monitor`], the drops we actually
+    /// saw — and show both rather than picking one to believe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seven_day_resets: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seven_day_sonnet: Option<f64>,
     /// Set when the reading failed. A sample is still appended, so a gap in
@@ -119,11 +140,14 @@ pub fn parse_usage(status: u16, body: &str, ts: String) -> Sample {
     s.five_hour = util("five_hour");
     s.seven_day = util("seven_day");
     s.seven_day_sonnet = util("seven_day_sonnet");
-    s.five_hour_resets = v
-        .get("five_hour")
-        .and_then(|w| w.get("resets_at"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned);
+    let resets = |key: &str| {
+        v.get(key)
+            .and_then(|w| w.get("resets_at"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    };
+    s.five_hour_resets = resets("five_hour");
+    s.seven_day_resets = resets("seven_day");
     if !(200..300).contains(&status) {
         s.error = Some(format!("http {status}"));
     }
@@ -262,6 +286,36 @@ impl Monitor {
         self.recent.iter().rev().find(|s| s.is_ok())
     }
 
+    /// When the weekly counter was last seen to DROP, and by how much.
+    ///
+    /// `seven_day.resets_at` describes the tail of a rolling window — the
+    /// moment the oldest tokens age out — so it reads about a week ahead and
+    /// keeps sliding forward. It is not the moment fresh allocation lands, and
+    /// people have burned real time planning around it. What actually happened
+    /// is observable: the counter falls off a cliff. So report the cliff.
+    ///
+    /// A drop counts when the fraction falls by at least [`RESET_DROP`] between
+    /// consecutive OK samples. That threshold is deliberately coarse — a
+    /// weekly window genuinely creeps downward as old tokens expire, and
+    /// calling that a reset would be the same mistake as trusting `resets_at`.
+    ///
+    /// Returns `(timestamp, from, to)` of the most recent one.
+    #[must_use]
+    pub fn last_weekly_drop(&self) -> Option<(String, f64, f64)> {
+        let mut prev: Option<(&str, f64)> = None;
+        let mut found = None;
+        for s in self.recent.iter().filter(|s| s.is_ok()) {
+            let Some(now) = s.seven_day else { continue };
+            if let Some((_, before)) = prev
+                && before - now >= RESET_DROP
+            {
+                found = Some((s.ts.clone(), before, now));
+            }
+            prev = Some((&s.ts, now));
+        }
+        found
+    }
+
     #[must_use]
     pub fn recent(&self) -> &[Sample] {
         &self.recent
@@ -377,6 +431,48 @@ mod tests {
     /// date someone wrote in the string.
     fn just_after(ts: &str) -> u64 {
         epoch_of(ts).map_or(0, |t| t + 60)
+    }
+
+    /// The weekly counter's own reset is observable even when the timestamp
+    /// upstream reports is a week out and sliding.
+    #[test]
+    fn a_weekly_reset_is_detected_from_the_drop_not_the_promised_timestamp() {
+        let weekly = |ts: &str, v: f64| Sample {
+            ts: ts.to_owned(),
+            // A sample only counts as a reading when the call succeeded —
+            // a failed poll carries no numbers and must not look like a drop
+            // to zero, which is the exact false reset worth avoiding.
+            http: Some(200),
+            seven_day: Some(v),
+            // Always a week out, always wrong about when fresh allocation
+            // lands. Recorded, never used to decide anything.
+            seven_day_resets: Some("2026-09-17T07:00:00Z".to_owned()),
+            ..Sample::default()
+        };
+        let mut m = Monitor::load(tmp("weekly-drop"));
+        m.recent = vec![
+            weekly("2026-09-08T00:00:00Z", 0.40),
+            // Ordinary ageing of a rolling window: down, but not a flush.
+            weekly("2026-09-08T06:00:00Z", 0.38),
+            weekly("2026-09-09T00:00:00Z", 0.91),
+            // The cliff.
+            weekly("2026-09-09T06:00:00Z", 0.02),
+            weekly("2026-09-09T12:00:00Z", 0.07),
+        ];
+        let (ts, from, to) = m.last_weekly_drop().expect("the drop is visible in the samples");
+        assert_eq!(ts, "2026-09-09T06:00:00Z");
+        assert!((from - 0.91).abs() < 1e-9, "{from}");
+        assert!((to - 0.02).abs() < 1e-9, "{to}");
+
+        // A window that only ages must NOT be reported as a reset, or the
+        // number becomes noise and nobody reads it.
+        let mut quiet = Monitor::load(tmp("weekly-quiet"));
+        quiet.recent = vec![
+            weekly("2026-09-08T00:00:00Z", 0.60),
+            weekly("2026-09-08T06:00:00Z", 0.55),
+            weekly("2026-09-08T12:00:00Z", 0.47),
+        ];
+        assert!(quiet.last_weekly_drop().is_none(), "gradual decay is not a reset");
     }
 
     fn sample_on(day: &str, five_hour: f64) -> Sample {
