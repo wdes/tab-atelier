@@ -1343,12 +1343,27 @@ fn rotate_provider_key(state: &Arc<State>, id: &str, key: &str) -> Response<Body
     if key.trim().is_empty() {
         return json(400, r#"{"error":"no key given"}"#);
     }
-    let known = {
+    let auth = {
         let reg = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        reg.get(id).is_some()
+        reg.get(id).map(|p| p.auth.clone())
     };
-    if !known {
+    // WHICH kinds of provider can hold a key at all, checked before anything
+    // is written.
+    //
+    // This used to accept a key for any provider and write it to a file. For a
+    // `claude_oauth` provider that file is never read — the egress resolves
+    // the host's own login instead — so the write silently did nothing and
+    // left a live Anthropic credential on disk that no code path consults.
+    // Worse than useless: an operator who later changed the auth kind would
+    // find a key they had forgotten they pasted, suddenly in use.
+    let Some(auth) = auth else {
         return json(404, r#"{"error":"no such provider"}"#);
+    };
+    // Refused BEFORE anything is written, and refused on the server as well as
+    // in the UI: a disabled button is a hint, and the API is reachable without
+    // one.
+    if let Some(reason) = auth.no_key_reason(id) {
+        return json(400, &serde_json::json!({ "error": reason }).to_string());
     }
     let path = provider::provider_key_path(&registry_dir(state), id);
     if let Err(e) = provider::write_provider_key(&path, key) {
@@ -1499,12 +1514,20 @@ fn save_provider(state: &Arc<State>, field: &dyn Fn(&str) -> String, body: &Byte
             }
         }
     };
-    // Keep an existing preference and enabled flag on update: the form does
-    // not show them, and a save that silently reset them would undo an
-    // operator's ordering.
+    // On update, everything the form CANNOT express is preserved.
+    //
+    // The form shows a base URL, models and a key. It has no field for the
+    // auth kind, the preference, the enabled flag or the peak schedule — so a
+    // save used to overwrite them with whatever the request implied. For
+    // `auth` that was not cosmetic: saving the subscription's own row through
+    // the form rewrote it from `claude_oauth` to `api_key_file`, which left it
+    // with no credential, out of the candidate list, and the whole proxy
+    // falling back to nothing. A partial view must save partially.
     if let Some(old) = reg.get(&new.id) {
         new.preference = old.preference;
         new.enabled = old.enabled;
+        new.auth = old.auth.clone();
+        new.peak.clone_from(&old.peak);
     }
     let id = new.id.clone();
 
