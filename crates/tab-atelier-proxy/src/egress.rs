@@ -295,7 +295,7 @@ fn refresh(refresh_token: &str) -> Result<OauthBlob, String> {
     })
 }
 
-/// Ask Anthropic how much of the shared plan is left.
+/// Ask Anthropic how much of the shared plan has been used.
 ///
 /// `GET /api/oauth/usage` with the Claude Code OAuth token — the same endpoint
 /// `.claude/scripts/claude-usage-monitor.mjs` polls. It is the only source

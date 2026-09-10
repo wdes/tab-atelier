@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! How much of the *subscription* is left — the pressure everyone shares.
+//! How much of the *subscription* has been used — the pressure everyone shares.
+//!
+//! Every ratio here is CONSUMED, never remaining: `0.85` means 85% spent and
+//! 15% to go. Anthropic's field is called `utilization` and that is the sense
+//! it carries, so the whole module keeps it rather than inverting somewhere in
+//! the middle. A consumer that reads one of these as "share left" relaxes
+//! exactly when the plan is nearly gone.
 //!
 //! Per-account token counts say who spent what. They cannot say how close the
 //! shared Claude plan is to its limit, because that limit is not denominated
@@ -629,6 +635,39 @@ mod tests {
             "inside the window"
         );
         assert_eq!(m.utilization_at(t0 + STALE_AFTER_SECS + 1), None, "outside it, unknown");
+    }
+
+    #[test]
+    fn utilisation_means_consumed_and_the_ui_says_so() {
+        // The direction of this number is the one thing about it that cannot
+        // be got wrong quietly. `utilization` is the share SPENT, so 0.95 is
+        // nearly exhausted, not nearly untouched — and every threshold in
+        // routing is a `>=`, which only makes sense in that direction.
+        let s = parse_usage(
+            200,
+            r#"{"five_hour":{"utilization":0.95},"seven_day":{"utilization":0.10}}"#,
+            "2026-09-09T12:00:00Z".to_owned(),
+        );
+        assert_eq!(s.utilization(), Some(0.95));
+        assert!(
+            s.utilization().is_some_and(|u| u >= crate::routing::STRAINED_ABOVE),
+            "0.95 must read as strained; if this fails the sense has been inverted \
+             and the proxy will throttle a fresh plan while flooring an exhausted one"
+        );
+
+        // And the UI must not present it bare. "62%" beside "Plan pressure"
+        // is as readable as "62% remaining", which would invite exactly the
+        // wrong reaction, so the word is required rather than implied.
+        let html = include_str!("../assets/index.html");
+        let charts = include_str!("../assets/charts.js");
+        assert!(
+            html.contains("planUtil * 100") && html.contains(">used<"),
+            "the hero percentage must be labelled `used`"
+        );
+        assert!(
+            charts.contains("of the plan used"),
+            "the chart tooltip must say which direction it is measuring"
+        );
     }
 
     #[test]

@@ -36,7 +36,8 @@ pub struct State {
     pub usage: Mutex<usage::Store>,
     /// Who goes next when the shared quota is tight.
     pub sched: Mutex<qos::Sched>,
-    /// How much of the shared plan is left, polled from upstream.
+    /// How much of the shared plan has been USED, polled from upstream.
+    /// Consumed, not remaining: 1.0 means exhausted.
     pub account: Mutex<account::Monitor>,
     /// Everywhere a request can go.
     pub registry: provider::Registry,
