@@ -62,6 +62,8 @@ const AdminApp = Vue.defineComponent({
             copied: false,
             error: "",
             busy: false,
+            usageBusy: false,
+            pressureBusy: false,
             origin: window.location.origin,
             // Per-account usage, keyed by id, as returned by /api/usage.
             usage: {},
@@ -453,12 +455,27 @@ const AdminApp = Vue.defineComponent({
                 return body;
             }
         },
-        async loadPressure() {
+        // Quiet by default because of the 30 s poll: a failing read must not blank
+        // the accounts page it sits on, and a banner raised on every tick would be
+        // unreadable. A reload someone pressed is not quiet — silence there is
+        // indistinguishable from a button that does nothing.
+        async loadPressure(quiet = true) {
             try {
                 this.pressure = await this.api("GET", "/api/pressure");
             }
-            catch {
-                // A pressure read failing must not blank the accounts page it sits on.
+            catch (e) {
+                if (!quiet)
+                    this.error = e instanceof Error ? e.message : String(e);
+            }
+        },
+        async reloadPressure() {
+            this.pressureBusy = true;
+            this.error = "";
+            try {
+                await this.loadPressure(false);
+            }
+            finally {
+                this.pressureBusy = false;
             }
         },
         // A weight set through the API need not be on the ladder, so the select
@@ -499,6 +516,21 @@ const AdminApp = Vue.defineComponent({
             // chart with their name on it.
             if (this.focus && !next[this.focus])
                 this.focus = null;
+        },
+        // The loader throws where its callers already catch (saving a weight, the
+        // window picker's own handler); a reload pressed by hand has no such caller.
+        async reloadUsage() {
+            this.usageBusy = true;
+            this.error = "";
+            try {
+                await this.loadUsage();
+            }
+            catch (e) {
+                this.error = e instanceof Error ? e.message : String(e);
+            }
+            finally {
+                this.usageBusy = false;
+            }
         },
         // Rows render before the first usage load returns, and for an account
         // that has never called anything there is simply no entry.

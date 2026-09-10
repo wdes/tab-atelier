@@ -257,6 +257,13 @@ interface AppState {
     copied: boolean;
     error: string;
     busy: boolean;
+    /**
+     * Per-chart, rather than the page-wide `busy`: reloading a chart is no
+     * reason to grey out the account table. Calls and tokens share one because
+     * they share a fetch — when either is reloaded, both really are.
+     */
+    usageBusy: boolean;
+    pressureBusy: boolean;
     origin: string;
     usage: Record<string, AccountUsage>;
     hours: number;

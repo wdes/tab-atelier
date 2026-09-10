@@ -252,6 +252,46 @@ fn import_credentials(from: Option<&std::path::Path>) -> Result<(), String> {
     Ok(())
 }
 
+/// Print what routing would DO for a request that asked for each canonical
+/// model, and report whether anything had nowhere to go.
+///
+/// This is the question an operator has after adding a provider or writing a
+/// mapping, and the one thing the probes above cannot answer: they exercise
+/// the subscription's credential directly rather than the decision that picks
+/// a destination. Returns true when something could not be routed.
+fn report_routing(registry: &tab_atelier_proxy::provider::Registry) -> bool {
+    // Healthy throughout: this is an offline check, and a provider in backoff
+    // would otherwise read as misconfigured.
+    let healthy = |_: &str| tab_atelier_proxy::routing::Health::default();
+    let mut failed = false;
+    println!("\nrouting (healthy providers)");
+    for model in ["claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5-20251001"] {
+        // No account, so no pin: this is what an unpinned person gets.
+        let chosen = tab_atelier_proxy::routing::choose(
+            registry,
+            model,
+            None,
+            &healthy,
+            |v| std::env::var(v).ok(),
+            tab_atelier_proxy::usage::now_secs(),
+        );
+        let Some(route) = chosen else {
+            println!("  {model:<26} -> NOTHING can serve this");
+            failed = true;
+            continue;
+        };
+        let why = match route.reason {
+            Some(r) => format!(" ({r} from {})", route.changed_from.as_deref().unwrap_or("?")),
+            None => String::new(),
+        };
+        println!("  {:<26} -> {}/{}{why}", model, route.provider_id, route.model_id);
+    }
+    if registry.mappings.is_empty() {
+        println!("  no mappings configured");
+    }
+    failed
+}
+
 /// Time the trip to Anthropic and print where it went.
 ///
 /// Exits non-zero if any stage failed, so it is usable as a health check in a
@@ -340,6 +380,8 @@ providers ({})",
             }
         }
     }
+
+    failed |= report_routing(&registry);
 
     if failed {
         return Err("at least one stage failed — see above".to_owned());

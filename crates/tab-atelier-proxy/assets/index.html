@@ -192,6 +192,10 @@
                   <div v-if="sched.backoff_for">backing off {{ sched.backoff_for }}s</div>
                   <div v-if="sched.rejected">{{ sched.rejected }} queued out</div>
                 </div>
+                <button class="btn btn-sm btn-outline-secondary ms-3"
+                        :disabled="pressureBusy" @click="reloadPressure">
+                  {{ pressureBusy ? 'Refreshing…' : 'Refresh' }}
+                </button>
               </div>
               <!--
                 The monitor's own health, stated rather than left to be
@@ -245,6 +249,10 @@
                   <option :value="168">7 d</option>
                   <option :value="720">30 d</option>
                 </select>
+                <button class="btn btn-sm btn-outline-secondary ms-2"
+                        :disabled="usageBusy" @click="reloadUsage">
+                  {{ usageBusy ? 'Refreshing…' : 'Refresh' }}
+                </button>
               </div>
               <calls-chart :points="series"></calls-chart>
             </div>
@@ -262,6 +270,13 @@
                   <span class="ta-key ta-bg-1"></span>input
                   <span class="ta-key ta-bg-2 ms-3"></span>output
                 </span>
+                <!-- Same series, and so the same fetch, as the card above. A
+                     second button is not a second load: the thing being
+                     refreshed is the chart in front of you. -->
+                <button class="btn btn-sm btn-outline-secondary ms-3"
+                        :disabled="usageBusy" @click="reloadUsage">
+                  {{ usageBusy ? 'Refreshing…' : 'Refresh' }}
+                </button>
               </div>
               <tokens-chart :points="series"></tokens-chart>
             </div>
