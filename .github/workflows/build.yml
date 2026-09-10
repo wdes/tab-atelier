@@ -63,6 +63,13 @@ jobs:
                   # Per-branch multi-GB saves evict main's entry from the
                   # repo's 10 GB cache budget; PR runs restore main's.
                   save-if: ${{ github.ref == 'refs/heads/main' }}
+                  # Shared with apt-publish.yml and release.yml. Without this
+                  # rust-cache puts the JOB ID in the key, so three jobs that
+                  # compile the same graph on the same runner each kept their
+                  # own multi-GB entry — and the budget is 10 GB for the repo,
+                  # so they evicted each other and started cold anyway.
+                  shared-key: linux-x64
+
             - name: Build without energy feature
               run: cargo check --locked --no-default-features --features gui
             - name: Build
@@ -110,13 +117,17 @@ jobs:
                   fail_ci_if_error: false
                   token: ${{ secrets.CODECOV_TOKEN }}
             - name: Build .deb packages (smoke-test only)
-              # These debs only feed the integration job below; users
-              # install the ones apt-publish.yml / release.yml build
-              # with the real fat-LTO profile. Env (not Cargo.toml) so
-              # the target/release/ asset paths stay valid.
-              env:
-                  CARGO_PROFILE_RELEASE_LTO: "off"
-                  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+              # These debs feed the integration job below; the ones users
+              # install come from apt-publish.yml / release.yml.
+              #
+              # This step used to override the profile to LTO off /
+              # codegen-units 16 to build them faster. That override was the
+              # ONLY reason this job's release artifacts had a different
+              # fingerprint from apt-publish's, which run concurrently on the
+              # same commit — so the two jobs could never share a cache, and
+              # each recompiled the whole graph. It also meant the integration
+              # test exercised a binary built differently from the shipped one.
+              # Same profile now, one `shared-key` cache between them.
               run: |
                   cargo install cargo-deb --locked
                   # `--revision 0ci` marks these as the throwaway build they

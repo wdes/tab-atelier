@@ -42,6 +42,12 @@ jobs:
               uses: dtolnay/rust-toolchain@stable
             - name: Cache cargo artifacts
               uses: Swatinem/rust-cache@v2
+              with:
+                  # Shared with build.yml / apt-publish.yml — see build.yml.
+                  shared-key: linux-x64
+                  # Restore-only, same reason as apt-publish.yml: build.yml
+                  # compiles the superset and owns the save.
+                  save-if: false
             - name: Check the tag matches Cargo.toml
               run: |
                   # The binary reports the Cargo version and the .deb reports
