@@ -26,7 +26,7 @@
 use std::time::Duration;
 
 use super::{bench, bench_lag, brain, claude_hook, delegate, flags, logging, remote};
-use super::{set_context, set_font, set_meta, set_status, share_link, team, tokens};
+use super::{set_context, set_font, set_meta, set_status, share_link, team, tokens, upgrade};
 
 // ── the local API endpoint ──────────────────────────────────────────
 //
@@ -218,6 +218,9 @@ pub fn dispatch(name: &str, rest: &[String]) -> Option<i32> {
         "token" => tokens::show(rest),
         "rotate-tokens" => tokens::rotate(rest),
         "reset-master-token" => tokens::reset_master(rest),
+        // Hot-swap the running instance onto the newly installed binary,
+        // keeping every tab's shell alive across the exec.
+        "upgrade" => upgrade::run(rest),
         "claude-hook" => claude_hook::run(rest),
         // Orchestration / teamwork.
         "dispatch" => delegate::run(rest),
