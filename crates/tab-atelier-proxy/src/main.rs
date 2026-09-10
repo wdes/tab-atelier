@@ -67,7 +67,7 @@ enum Command {
     Remove { who: String },
 }
 
-/// How often to ask Anthropic how much of the plan is left.
+/// How often to ask Anthropic how much of the plan has been used.
 ///
 /// Five minutes: the five-hour window moves slowly enough that finer polling
 /// buys nothing, and this is a call against the same quota it is measuring.

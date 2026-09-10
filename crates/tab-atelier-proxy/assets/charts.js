@@ -271,9 +271,9 @@ const PressureChart = {
       </svg>
       <div v-if="hover >= 0" class="ta-tip" :style="tipStyle(hover)">
         <div class="ta-tip-h">{{ points[hover].label }}</div>
-        <div><span class="ta-key ta-bg-1"></span>{{ pct(points[hover].util) }} of the plan</div>
+        <div><span class="ta-key ta-bg-1"></span>{{ pct(points[hover].util) }} of the plan used</div>
         <div v-if="points[hover].seven_day != null" class="ta-tip-sub">
-          {{ pct(points[hover].seven_day) }} over 7 d
+          {{ pct(points[hover].seven_day) }} used over 7 d
         </div>
       </div>
     </div>`,

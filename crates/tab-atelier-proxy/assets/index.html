@@ -127,16 +127,24 @@
                     Plan pressure
                     <span class="text-body-secondary fw-normal">· the shared subscription</span>
                   </h2>
+                  <!--
+                    The number is what Anthropic calls `utilization`: the share
+                    of the window CONSUMED, so bigger is worse. Unlabelled it
+                    read as "percent of the plan", which is exactly as likely
+                    to be understood as the remaining share — the opposite,
+                    and a reason to relax when the plan is nearly gone.
+                  -->
                   <div class="ta-hero" :class="planClass">
                     <template v-if="planUtil != null">{{ Math.round(planUtil * 100) }}%</template>
                     <template v-else>—</template>
+                    <span class="fs-6 text-body-secondary">used</span>
                   </div>
                   <!-- Status is never colour alone: it is spelled out. -->
                   <div class="small" :class="planClass">{{ planState }}</div>
                 </div>
                 <div class="text-end small text-body-secondary">
                   <div v-if="plan.latest && plan.latest.seven_day != null">
-                    7-day: {{ Math.round(plan.latest.seven_day * 100) }}%
+                    7-day: {{ Math.round(plan.latest.seven_day * 100) }}% used
                   </div>
                   <div v-if="plan.latest && plan.latest.five_hour_resets"
                        :title="whenLocal(plan.latest.five_hour_resets)">
