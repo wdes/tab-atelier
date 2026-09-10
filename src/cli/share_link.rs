@@ -21,12 +21,7 @@ pub(crate) use super::client::set_test_endpoint;
 pub(crate) use super::client::{Endpoint, agent, discover_endpoint};
 
 pub(crate) fn fetch_tabs(ep: &Endpoint) -> Result<Vec<serde_json::Value>, String> {
-    let mut resp = agent()
-        .get(format!("{}/tabs", ep.url))
-        .header("Authorization", format!("Bearer {}", ep.token))
-        .call()
-        .map_err(|e| format!("GET /tabs: {e}"))?;
-    let v: serde_json::Value = resp.body_mut().read_json().map_err(|e| format!("parse /tabs: {e}"))?;
+    let v = super::client::api_get_json(ep, "/tabs")?;
     Ok(v.get("tabs").and_then(|t| t.as_array()).cloned().unwrap_or_default())
 }
 
@@ -165,12 +160,7 @@ pub fn add(args: &[String]) -> i32 {
     };
     let before = fetch_tabs(&ep).map_or(0, |v| v.len());
     let body = serde_json::json!({"cwd": path.to_string_lossy()}).to_string();
-    if let Err(e) = agent()
-        .post(format!("{}/tabs", ep.url))
-        .header("Authorization", format!("Bearer {}", ep.token))
-        .header("Content-Type", "application/json")
-        .send(body.as_bytes())
-    {
+    if let Err(e) = super::client::api_post_to(&ep, "/tabs", body) {
         eprintln!("add: POST /tabs: {e}");
         return 1;
     }
@@ -195,12 +185,7 @@ pub fn add(args: &[String]) -> i32 {
     };
     if let Some(name) = name {
         let rename = serde_json::json!({"name": name}).to_string();
-        if let Err(e) = agent()
-            .post(format!("{}/tabs/{idx}/rename", ep.url))
-            .header("Authorization", format!("Bearer {}", ep.token))
-            .header("Content-Type", "application/json")
-            .send(rename.as_bytes())
-        {
+        if let Err(e) = super::client::api_post_to(&ep, &format!("/tabs/{idx}/rename"), rename) {
             eprintln!("add: rename failed: {e}");
             return 1;
         }
@@ -248,11 +233,7 @@ pub fn close(args: &[String]) -> i32 {
             return 1;
         }
     };
-    if let Err(e) = agent()
-        .delete(format!("{}/tabs/{idx}", ep.url))
-        .header("Authorization", format!("Bearer {}", ep.token))
-        .call()
-    {
+    if let Err(e) = super::client::api_delete(&ep, &format!("/tabs/{idx}")) {
         eprintln!("close: {e}");
         return 1;
     }
@@ -281,12 +262,7 @@ pub fn rename(args: &[String]) -> i32 {
         }
     };
     let body = serde_json::json!({"name": args[1]}).to_string();
-    if let Err(e) = agent()
-        .post(format!("{}/tabs/{idx}/rename", ep.url))
-        .header("Authorization", format!("Bearer {}", ep.token))
-        .header("Content-Type", "application/json")
-        .send(body.as_bytes())
-    {
+    if let Err(e) = super::client::api_post_to(&ep, &format!("/tabs/{idx}/rename"), body) {
         eprintln!("rename: {e}");
         return 1;
     }
@@ -322,12 +298,7 @@ fn set_lock(args: &[String], on: bool, verb: &str) -> i32 {
         }
     };
     let body = serde_json::json!({"on": on}).to_string();
-    let mut resp = match agent()
-        .post(format!("{}/tabs/by-id/{uuid}/lock", ep.url))
-        .header("Authorization", format!("Bearer {}", ep.token))
-        .header("Content-Type", "application/json")
-        .send(body.as_bytes())
-    {
+    let mut resp = match super::client::authed_post(&ep, &format!("/tabs/by-id/{uuid}/lock")).send(body.as_bytes()) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("{verb}: {e}");
@@ -392,12 +363,7 @@ fn set_net(args: &[String], disabled: bool, verb: &str) -> i32 {
         }
     };
     let body = serde_json::json!({"disabled": disabled}).to_string();
-    let mut resp = match agent()
-        .post(format!("{}/tabs/by-id/{uuid}/net", ep.url))
-        .header("Authorization", format!("Bearer {}", ep.token))
-        .header("Content-Type", "application/json")
-        .send(body.as_bytes())
-    {
+    let mut resp = match super::client::authed_post(&ep, &format!("/tabs/by-id/{uuid}/net")).send(body.as_bytes()) {
         Ok(r) => r,
         Err(ureq::Error::StatusCode(412)) => {
             eprintln!("{verb}: bubblewrap (bwrap) is not installed on the daemon host");
@@ -453,12 +419,7 @@ pub fn ssh_agent(tab: &str, key: Option<&str>, off: bool) -> i32 {
     };
     let enabled = !off;
     let body = serde_json::json!({"enabled": enabled, "key": key}).to_string();
-    let resp = match agent()
-        .post(format!("{}/tabs/by-id/{uuid}/ssh-agent", ep.url))
-        .header("Authorization", format!("Bearer {}", ep.token))
-        .header("Content-Type", "application/json")
-        .send(body.as_bytes())
-    {
+    let resp = match super::client::authed_post(&ep, &format!("/tabs/by-id/{uuid}/ssh-agent")).send(body.as_bytes()) {
         Ok(r) => r,
         Err(ureq::Error::StatusCode(501)) => {
             eprintln!("ssh-agent: per-tab ssh-agent requires the headless daemon (not the desktop GUI)");
@@ -641,12 +602,7 @@ pub fn resize(tab: &str, cols: Option<u16>, rows: Option<u16>, clear: bool) -> i
         body.insert("rows".into(), serde_json::Value::from(rows.unwrap_or(0)));
     }
     let payload = serde_json::Value::Object(body).to_string();
-    match agent()
-        .post(format!("{}/tabs/by-id/{uuid}/resize", ep.url))
-        .header("Authorization", format!("Bearer {}", ep.token))
-        .header("Content-Type", "application/json")
-        .send(payload.as_bytes())
-    {
+    match super::client::authed_post(&ep, &format!("/tabs/by-id/{uuid}/resize")).send(payload.as_bytes()) {
         Ok(_) => {
             if clear {
                 println!("tab {idx} size un-pinned (back to window-driven, applies on the next tick)");
@@ -719,12 +675,7 @@ pub fn limit(tab: &str, memory: Option<&str>, cpu: Option<u32>, tasks: Option<u6
         set_parts.push(format!("tasks={t}"));
     }
     let payload = serde_json::Value::Object(body).to_string();
-    match agent()
-        .post(format!("{}/tabs/by-id/{uuid}/limits", ep.url))
-        .header("Authorization", format!("Bearer {}", ep.token))
-        .header("Content-Type", "application/json")
-        .send(payload.as_bytes())
-    {
+    match super::client::authed_post(&ep, &format!("/tabs/by-id/{uuid}/limits")).send(payload.as_bytes()) {
         Ok(_) => {
             if clear {
                 println!("limits cleared for tab {idx} (applies on the next drain tick)");
@@ -787,12 +738,7 @@ pub fn limit_default(memory: Option<&str>, cpu: Option<u32>, tasks: Option<u64>,
         set_parts.push(format!("tasks={t}"));
     }
     let payload = serde_json::Value::Object(body).to_string();
-    match agent()
-        .post(format!("{}/limits/default", ep.url))
-        .header("Authorization", format!("Bearer {}", ep.token))
-        .header("Content-Type", "application/json")
-        .send(payload.as_bytes())
-    {
+    match super::client::authed_post(&ep, "/limits/default").send(payload.as_bytes()) {
         Ok(_) => {
             if clear {
                 println!("default tab limits cleared (all tabs + new tabs, applies on the next tick)");
@@ -839,12 +785,7 @@ pub fn claude_only(args: &[String]) -> i32 {
         }
     };
     let payload = format!(r#"{{"on":{on}}}"#);
-    match agent()
-        .post(format!("{}/claude-only", ep.url))
-        .header("Authorization", format!("Bearer {}", ep.token))
-        .header("Content-Type", "application/json")
-        .send(payload.as_bytes())
-    {
+    match super::client::authed_post(&ep, "/claude-only").send(payload.as_bytes()) {
         Ok(_) => {
             if on {
                 println!("claude-only mode enabled (new tabs launch claude in auto mode)");
@@ -874,13 +815,7 @@ pub fn relay(action: &str, arg: Option<&str>) -> i32 {
             return 1;
         }
     };
-    let post = |path: &str, payload: String| {
-        agent()
-            .post(format!("{}{path}", ep.url))
-            .header("Authorization", format!("Bearer {}", ep.token))
-            .header("Content-Type", "application/json")
-            .send(payload.as_bytes())
-    };
+    let post = |path: &str, payload: String| super::client::authed_post(&ep, path).send(payload.as_bytes());
     match action {
         // Printed on the EGRESS host and pasted into the peer's
         // `remote add --token`. Deliberately not the master token: this one
@@ -949,11 +884,7 @@ pub fn relay(action: &str, arg: Option<&str>) -> i32 {
                 }
             }
         }
-        "status" => match agent()
-            .get(format!("{}/relay-config", ep.url))
-            .header("Authorization", format!("Bearer {}", ep.token))
-            .call()
-        {
+        "status" => match super::client::authed_get(&ep, "/relay-config").call() {
             Ok(mut r) => {
                 println!("{}", r.body_mut().read_to_string().unwrap_or_default());
                 0
@@ -1405,11 +1336,7 @@ pub fn net_allow(
         "cidrs": cidrs,
     })
     .to_string();
-    let mut resp = match agent()
-        .post(format!("{}/tabs/by-id/{uuid}/net-allow", ep.url))
-        .header("Authorization", format!("Bearer {}", ep.token))
-        .header("Content-Type", "application/json")
-        .send(body.as_bytes())
+    let mut resp = match super::client::authed_post(&ep, &format!("/tabs/by-id/{uuid}/net-allow")).send(body.as_bytes())
     {
         Ok(r) => r,
         Err(ureq::Error::StatusCode(400)) => {
@@ -1492,11 +1419,7 @@ pub fn output(args: &[String]) -> i32 {
             return 1;
         }
     };
-    match agent()
-        .get(format!("{}/tabs/{idx}/output", ep.url))
-        .header("Authorization", format!("Bearer {}", ep.token))
-        .call()
-    {
+    match super::client::authed_get(&ep, &format!("/tabs/{idx}/output")).call() {
         Ok(mut r) => match r.body_mut().read_to_string() {
             Ok(s) => {
                 print!("{s}");
@@ -1868,12 +1791,7 @@ pub fn bg_color(args: &[String]) -> i32 {
         }
         serde_json::json!({"color": color_arg}).to_string()
     };
-    match agent()
-        .post(format!("{}/tabs/by-id/{uuid}/bg-color", ep.url))
-        .header("Authorization", format!("Bearer {}", ep.token))
-        .header("Content-Type", "application/json")
-        .send(body.as_bytes())
-    {
+    match super::client::authed_post(&ep, &format!("/tabs/by-id/{uuid}/bg-color")).send(body.as_bytes()) {
         Ok(_) => {
             if color_arg.eq_ignore_ascii_case("clear") {
                 println!("cleared bg-color override on tab {uuid}");
@@ -2017,11 +1935,7 @@ pub fn schedule(args: &[String]) -> i32 {
         })
         .to_string()
     };
-    let mut resp = match agent()
-        .post(format!("{}/tabs/by-id/{uuid}/schedule", ep.url))
-        .header("Authorization", format!("Bearer {}", ep.token))
-        .header("Content-Type", "application/json")
-        .send(body.as_bytes())
+    let mut resp = match super::client::authed_post(&ep, &format!("/tabs/by-id/{uuid}/schedule")).send(body.as_bytes())
     {
         Ok(r) => r,
         Err(e) => {

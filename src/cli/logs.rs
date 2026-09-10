@@ -10,7 +10,7 @@
 //! The route is loopback-only, so this works against a local daemon and
 //! deliberately fails against a remote one.
 
-use super::share_link::{agent, discover_endpoint};
+use super::share_link::discover_endpoint;
 
 /// A parsed `logs` invocation.
 #[derive(clap::Parser, Debug, Default, PartialEq, Eq)]
@@ -68,14 +68,10 @@ pub fn run(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let url = parsed
+    let path = parsed
         .lines
-        .map_or_else(|| format!("{}/logs", ep.url), |n| format!("{}/logs?lines={n}", ep.url));
-    let mut resp = match agent()
-        .get(url)
-        .header("Authorization", format!("Bearer {}", ep.token))
-        .call()
-    {
+        .map_or_else(|| "/logs".to_owned(), |n| format!("/logs?lines={n}"));
+    let mut resp = match super::client::authed_get(&ep, &path).call() {
         Ok(r) => r,
         Err(ureq::Error::StatusCode(403)) => {
             eprintln!("logs: refused — /logs answers callers on 127.0.0.1 only; run this on the daemon's host");

@@ -235,9 +235,7 @@ pub fn peek(tab: &str, lines: usize, raw: bool) -> i32 {
             return 1;
         }
     };
-    let body = match crate::cli::share_link::agent()
-        .get(format!("{}/tabs/by-id/{}/output", ep.url, target.id))
-        .header("Authorization", format!("Bearer {}", ep.token))
+    let body = match crate::cli::client::authed_get(&ep, &format!("/tabs/by-id/{}/output", target.id))
         .call()
         .and_then(|mut r| r.body_mut().read_to_string())
     {

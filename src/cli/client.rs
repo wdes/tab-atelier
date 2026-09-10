@@ -127,6 +127,56 @@ pub(crate) fn agent() -> ureq::Agent {
         .into()
 }
 
+/// An authenticated request builder, for callers that must inspect the raw
+/// response.
+///
+/// Several verbs match on a specific upstream status — `412` means the daemon
+/// has no bubblewrap, `501` means per-tab ssh-agent needs the headless
+/// edition — and turn it into a sentence a person can act on. A helper that
+/// flattened everything to `Result<_, String>` would throw that away, so
+/// these keep the `ureq` error and take only the header from here.
+pub(crate) fn authed_post(ep: &Endpoint, path: &str) -> ureq::RequestBuilder<ureq::typestate::WithBody> {
+    agent()
+        .post(format!("{}{path}", ep.url))
+        .header("Authorization", format!("Bearer {}", ep.token))
+        .header("Content-Type", "application/json")
+}
+
+/// The `GET` counterpart of [`authed_post`].
+pub(crate) fn authed_get(ep: &Endpoint, path: &str) -> ureq::RequestBuilder<ureq::typestate::WithoutBody> {
+    agent()
+        .get(format!("{}{path}", ep.url))
+        .header("Authorization", format!("Bearer {}", ep.token))
+}
+
+/// A `GET` returning parsed JSON.
+///
+/// # Errors
+/// The request failed, or the body was not JSON.
+pub(crate) fn api_get_json(ep: &Endpoint, path: &str) -> Result<serde_json::Value, String> {
+    agent()
+        .get(format!("{}{path}", ep.url))
+        .header("Authorization", format!("Bearer {}", ep.token))
+        .call()
+        .map_err(|e| format!("GET {path}: {e}"))?
+        .body_mut()
+        .read_json()
+        .map_err(|e| format!("parse {path}: {e}"))
+}
+
+/// A `DELETE`, for the routes that remove something.
+///
+/// # Errors
+/// The request failed or the daemon refused it.
+pub(crate) fn api_delete(ep: &Endpoint, path: &str) -> Result<(), String> {
+    agent()
+        .delete(format!("{}{path}", ep.url))
+        .header("Authorization", format!("Bearer {}", ep.token))
+        .call()
+        .map(|_| ())
+        .map_err(|e| format!("DELETE {path}: {e}"))
+}
+
 /// A `POST` to the local API, authenticated.
 ///
 /// Takes an already-discovered endpoint rather than discovering one, because

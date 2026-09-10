@@ -264,9 +264,7 @@ pub fn fleet(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let body = match agent()
-        .get(format!("{}/fleet", ep.url))
-        .header("Authorization", format!("Bearer {}", ep.token))
+    let body = match super::client::authed_get(&ep, "/fleet")
         .call()
         .map_err(|e| e.to_string())
         .and_then(|mut r| r.body_mut().read_to_string().map_err(|e| e.to_string()))
