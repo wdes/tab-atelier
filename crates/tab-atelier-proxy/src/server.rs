@@ -297,6 +297,7 @@ async fn anthropic(req: Request<Incoming>, state: Arc<State>, peer: std::net::Ip
         .get("anthropic-beta")
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
+    let client_headers = passthrough_headers(req.headers());
     let content_type = req
         .headers()
         .get(hyper::header::CONTENT_TYPE)
@@ -323,6 +324,7 @@ async fn anthropic(req: Request<Incoming>, state: Arc<State>, peer: std::net::Ip
         is_post,
         content_type,
         client_beta,
+        client_headers,
         body,
         account_id: account.id.clone(),
         weight: account.weight,
@@ -578,6 +580,9 @@ struct Forward {
     is_post: bool,
     content_type: String,
     client_beta: Option<String>,
+    /// The client's own Claude Code identity headers, forwarded verbatim.
+    /// See [`passthrough_headers`].
+    client_headers: Vec<(String, String)>,
     body: Bytes,
     weight: u32,
     /// Whether this call was admitted by the scheduler, and so has an estimate
@@ -590,6 +595,57 @@ struct Forward {
     /// still happened and still spent tokens.
     account_id: String,
     state: Arc<State>,
+}
+
+/// Client headers the proxy forwards to Anthropic unchanged.
+///
+/// The client on the far side IS Claude Code, and Anthropic's OAuth path is
+/// for Claude Code. Rebuilding the request from scratch — which is what this
+/// used to do — replaced that fingerprint with `tab-atelier-proxy/0.5.0` and
+/// dropped the session id, so every proxied call looked like an unknown client
+/// and no support question about a session could be traced through.
+///
+/// An **allowlist**, not a denylist: a denylist forgets, and the things it
+/// forgets here are `cookie`, `cf-access-*` and the caller's own
+/// `authorization` — credentials for a different hop that must not be handed
+/// to Anthropic. Anything not named is dropped.
+///
+/// Deliberately absent:
+/// * `authorization` / `x-api-key` — the proxy substitutes its own credential;
+///   the user key authenticates to the PROXY and is not an Anthropic one.
+/// * `anthropic-beta` — merged separately, see [`claude_api::merge_beta`].
+/// * `host`, `content-length`, `connection`, `accept-encoding` — hop-by-hop or
+///   recomputed by the outgoing client.
+const FORWARDED_HEADERS: &[&str] = &[
+    "user-agent",
+    "x-app",
+    "x-claude-code-session-id",
+    "x-claude-code-agent-id",
+    "x-claude-code-parent-agent-id",
+    "x-client-app",
+    "anthropic-dangerous-direct-browser-access",
+    "anthropic-version",
+    "accept",
+];
+
+/// Prefix allowlist, for the SDK's telemetry headers (`x-stainless-lang`,
+/// `-os`, `-runtime`, `-retry-count`, …). They are enumerated by the SDK
+/// version, not by us, so matching the prefix is what keeps this from going
+/// stale on the client's next upgrade.
+const FORWARDED_PREFIXES: &[&str] = &["x-stainless-"];
+
+/// Collect the headers of [`FORWARDED_HEADERS`] / [`FORWARDED_PREFIXES`].
+fn passthrough_headers(headers: &hyper::HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            let n = name.as_str();
+            let keep = FORWARDED_HEADERS.contains(&n) || FORWARDED_PREFIXES.iter().any(|p| n.starts_with(p));
+            // Non-UTF-8 header values cannot be re-sent and are not something
+            // Anthropic emits; dropping one is better than failing the call.
+            keep.then(|| value.to_str().ok().map(|v| (n.to_owned(), v.to_owned())))?
+        })
+        .collect()
 }
 
 /// The blocking half: authenticate to Anthropic, send, and pump the response.
@@ -613,28 +669,38 @@ fn forward(
     };
     let url = format!("{base}{}", f.sub_pq);
     let agent = egress::relay_agent();
-    let hdrs: Vec<(&str, String)> = vec![
-        ("Content-Type", f.content_type.clone()),
-        (auth.0, auth.1),
-        ("anthropic-version", egress::ANTHROPIC_VERSION.to_owned()),
+    let mut hdrs: Vec<(String, String)> = vec![
+        ("Content-Type".to_owned(), f.content_type.clone()),
+        (auth.0.to_owned(), auth.1),
         // The client's own beta flags are merged in, not replaced: a body field
         // gated behind a flag the client opted into is rejected upstream as an
         // unknown input if only our flags survive.
         (
-            "anthropic-beta",
+            "anthropic-beta".to_owned(),
             egress::merge_beta(f.client_beta.as_deref(), egress::ANTHROPIC_BETA),
         ),
     ];
+    // The client's Claude Code identity travels with the request — it is the
+    // fingerprint Anthropic's OAuth path expects, and we are not it.
+    hdrs.extend(f.client_headers.iter().cloned());
+    // A client that sent none of them (a curl smoke test, another SDK) still
+    // has to look like Claude Code upstream, so fill in what is missing rather
+    // than either overriding the real client or sending nothing.
+    for (k, v) in claude_api::api_headers(None) {
+        if !hdrs.iter().any(|(n, _)| n.eq_ignore_ascii_case(k)) {
+            hdrs.push((k.to_owned(), v));
+        }
+    }
     let sent = if f.is_post {
         let mut rb = agent.post(&url);
         for (k, v) in &hdrs {
-            rb = rb.header(*k, v);
+            rb = rb.header(k.as_str(), v);
         }
         rb.send(&f.body[..])
     } else {
         let mut rb = agent.get(&url);
         for (k, v) in &hdrs {
-            rb = rb.header(*k, v);
+            rb = rb.header(k.as_str(), v);
         }
         rb.call()
     };

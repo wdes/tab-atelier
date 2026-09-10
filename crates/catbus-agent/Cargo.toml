@@ -30,6 +30,10 @@ anthropic-auth = "0.1"
 tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "io-std", "fs", "sync", "time", "process", "signal"] }
 # HTTPS client. reqwest with rustls keeps us off OpenSSL.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+# Anthropic endpoints, headers and the credential schema. `default-features =
+# false` drops the ureq transport: this crate is async and already has reqwest,
+# and a second TLS stack would be pure weight.
+claude-api = { path = "../claude-api", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 log = "0.4"

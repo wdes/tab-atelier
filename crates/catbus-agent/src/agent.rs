@@ -25,15 +25,13 @@ use crate::tools;
 /// block on every OAuth-authenticated Messages call.
 const CLAUDE_CODE_PREFIX: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 
-/// Beta-flag list our OAuth tokens need. Server rejects requests
-/// without `oauth-2025-04-20` + `claude-code-20250219` and the list
-/// drifts; keep these in one place so it's obvious where to edit.
-const ANTHROPIC_BETA: &str = "oauth-2025-04-20,claude-code-20250219";
-
 /// Sticking to a non-thinking, non-1M-context model keeps the bring-up
 /// surface small. Both can be swapped via `/model` later.
 const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
-const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
+/// Beta flags, API version and the Messages endpoint all come from
+/// `claude_api` — the proxy and the desktop relay send the same ones, and
+/// three copies of this list had already drifted once.
+use claude_api::ANTHROPIC_BETA;
 
 /// Static portion of our second system block. The dynamic prefix (cwd,
 /// plan-mode flag) is `format!()`'d once per call; this 1.5 KB tail is
@@ -369,10 +367,14 @@ impl Agent {
         };
         let request = self
             .http
-            .post(MESSAGES_URL)
+            .post(format!("{}{}", claude_api::BASE_API_URL, claude_api::MESSAGES_PATH))
             .bearer_auth(token)
-            .header("anthropic-version", "2023-06-01")
+            .header("anthropic-version", claude_api::ANTHROPIC_VERSION)
             .header("anthropic-beta", ANTHROPIC_BETA)
+            // The identity headers Claude Code's API client sends. Without
+            // them an OAuth token is talking to an endpoint that expects
+            // Claude Code and seeing a client it does not recognise.
+            .header("x-app", "cli")
             .json(&body);
         drop(active);
         let resp = request.send().await.map_err(|e| AgentError::Http(e.to_string()))?;

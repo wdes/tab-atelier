@@ -947,6 +947,7 @@ version = "0.1.0-dev"
 dependencies = [
  "anthropic-auth",
  "clap",
+ "claude-api",
  "env_logger",
  "jiff",
  "log",
@@ -1115,6 +1116,15 @@ name = "clap_lex"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
+
+[[package]]
+name = "claude-api"
+version = "0.5.0-dev"
+dependencies = [
+ "serde",
+ "serde_json",
+ "ureq",
+]
 
 [[package]]
 name = "cocoa"
@@ -6296,6 +6306,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "clap",
+ "claude-api",
  "crossterm 0.29.0",
  "ctrlc",
  "env_logger",
@@ -6342,6 +6353,7 @@ version = "0.5.0-dev"
 dependencies = [
  "bytes",
  "clap",
+ "claude-api",
  "env_logger",
  "futures-util",
  "http-body-util",

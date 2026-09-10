@@ -192,6 +192,30 @@ rewritten, and tool-call semantics do not survive that intact — which for
 Claude Code, whose every turn is tool use, is a reroute that silently breaks
 the client. That adapter is a separate piece of work, not another base URL.
 
+## What Anthropic sees
+
+The client on the far side of the proxy *is* Claude Code, and Anthropic's OAuth
+path is for Claude Code. So the proxy forwards the client's own identity rather
+than substituting its own: the `claude-cli/…` User-Agent, `x-app`, the session
+id, the SDK's `x-stainless-*` telemetry headers and the client's
+`anthropic-beta` flags all travel unchanged. It used to rebuild each request
+from scratch, which replaced that fingerprint with `tab-atelier-proxy/0.5.0`
+and dropped the session id — so every call looked like an unknown client, and a
+support question about one session could not be traced through.
+
+What does **not** travel is anything scoped to a different hop: the user key
+(`x-api-key`/`Authorization`, which authenticates to the *proxy* and is not an
+Anthropic credential), cookies, and the `CF-Access-*` pair. That list is an
+allowlist rather than a denylist, because a denylist forgets.
+
+A client that sends none of those headers — a `curl` smoke test, a different
+SDK — still reaches Anthropic looking like Claude Code: the proxy fills in what
+is missing instead of either overriding a real client or sending nothing.
+
+Every endpoint, header and credential the proxy uses lives in one crate,
+`crates/claude-api`, shared with the desktop package and `catbus-agent`. There
+were three copies of that list once and they had drifted apart.
+
 ## Is it the proxy, or is it Anthropic?
 
 ```sh
@@ -200,7 +224,7 @@ tab-atelier-proxy ping --count 3
 
 ```
 upstream: https://api.anthropic.com
-  credential      —         0 ms   local OAuth token read (refreshed if it was near expiry)
+  credential      —         0 ms   read /var/lib/tab-atelier-proxy/.claude/.credentials.json
   connect       200       288 ms   DNS + TCP + TLS to the API host
   round trip    200       701 ms   claude-haiku-4-5-20251001 answered
 

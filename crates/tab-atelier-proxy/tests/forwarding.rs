@@ -126,6 +126,10 @@ fn a_users_key_is_exchanged_for_the_proxys_claude_token() {
         &format!(
             "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {key}\r\n\
              Content-Type: application/json\r\nanthropic-beta: context-management-2025-06-27\r\n\
+             User-Agent: claude-cli/2.1.266 (external, cli)\r\nx-app: cli\r\n\
+             x-claude-code-session-id: fdb378a6-aab8-4cd3-ba82-82c9a7248507\r\n\
+             x-stainless-lang: js\r\nanthropic-dangerous-direct-browser-access: true\r\n\
+             Cookie: session=secret-for-a-different-hop\r\n\
              Content-Length: {}\r\n\r\n{payload}",
             payload.len()
         ),
@@ -158,6 +162,35 @@ fn a_users_key_is_exchanged_for_the_proxys_claude_token() {
     assert!(
         seen.contains("oauth-2025-04-20"),
         "the OAuth beta flags are mandatory upstream; upstream saw: {seen}"
+    );
+    // The client on the far side IS Claude Code, and Anthropic's OAuth path is
+    // for Claude Code. The proxy used to rebuild the request from scratch,
+    // which replaced that fingerprint with its own name and dropped the
+    // session id — so every proxied call looked like an unknown client and no
+    // support question about a session could be traced through.
+    for expected in [
+        "claude-cli/2.1.266",
+        "x-app: cli",
+        "fdb378a6-aab8-4cd3-ba82-82c9a7248507",
+        // Enumerated by the SDK version rather than by us, so the prefix is
+        // what keeps the allowlist from going stale on the client's upgrade.
+        "x-stainless-lang",
+        "anthropic-dangerous-direct-browser-access",
+    ] {
+        assert!(
+            seen.contains(expected),
+            "the client's Claude Code identity must reach upstream, missing {expected}; upstream saw: {seen}"
+        );
+    }
+    assert!(
+        !seen.contains("tab-atelier-proxy/"),
+        "the proxy must not overwrite the client's User-Agent; upstream saw: {seen}"
+    );
+    // The forwarding list is an allowlist precisely so that a credential for a
+    // different hop is not handed to Anthropic by accident.
+    assert!(
+        !seen.contains("secret-for-a-different-hop"),
+        "a cookie is for another hop and must never be forwarded; upstream saw: {seen}"
     );
 
     egress::set_upstream(None);
