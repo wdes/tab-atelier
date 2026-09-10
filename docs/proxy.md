@@ -94,6 +94,7 @@ something the proxy can paper over.
 
 ```sh
 sudo -u tab-atelier-proxy tab-atelier-proxy add Ada Lovelace ada@example.org
+sudo -u tab-atelier-proxy tab-atelier-proxy add-key ada@example.org laptop
 sudo -u tab-atelier-proxy tab-atelier-proxy list
 sudo -u tab-atelier-proxy tab-atelier-proxy disable ada@example.org   # suspend the person
 sudo -u tab-atelier-proxy tab-atelier-proxy remove  ada@example.org   # forget them entirely
@@ -112,10 +113,14 @@ tab-atelier-proxy remove-key ada@example.org laptop   # the rest keep working
 ```
 
 ```
-  default          active    first never used     last from -
   ci               active    first 3 min ago      last from 203.0.113.7
   laptop           active    first just now       last from 198.51.100.4
 ```
+
+Adding someone mints **no** key — `add-key` does, and it needs a place to name
+it after. There used to be one called `default` created at signup, which was
+reliably the key that got deployed everywhere, unnamed: the accounts that most
+needed a key per machine were the ones that never got one.
 
 A person holds several keys because that is what makes revocation usable: with
 one key each, losing a laptop means re-keying everything that person runs;
@@ -131,7 +136,8 @@ rotation revoked the only credential and issued another, so there was a moment
 when everything using it was broken at once.
 
 **A key is shown once.** The proxy stores a SHA-256 of it and cannot show it to
-you again — lost key, `rotate`. (A fast hash is right here: the key is 32 bytes
+you again — lost key, `add-key` a replacement and `remove-key` the old one.
+(A fast hash is right here: the key is 32 bytes
 of CSPRNG output, so there is no dictionary to run against it, and a slow KDF
 would only add latency to every proxied request.)
 

@@ -306,6 +306,18 @@ pub enum Commands {
         arg: Option<String>,
     },
 
+    /// Check the relay chain end to end and name the fix for anything broken.
+    ///
+    /// Three hops and four credentials, each of which fails with a message
+    /// that is accurate about what happened and silent about which credential
+    /// was wrong. This says which.
+    Doctor {
+        /// Repair what can be repaired without asking — currently, pre-approve
+        /// the relay token in Claude Code's API-key gate.
+        #[arg(long)]
+        fix: bool,
+    },
+
     /// Set/unset/list env vars injected into tabs' PTYs (applies on next spawn).
     ///
     /// `env set KEY=VAL --global`, `env unset KEY --tab 3`, `env list --tab 3`.
@@ -850,6 +862,7 @@ fn command_exit_code(cli: Cli) -> Option<i32> {
         }
         Commands::ClaudeOnly { state } => crate::cli::share_link::claude_only(&[state]),
         Commands::Relay { action, arg } => crate::cli::share_link::relay(&action, arg.as_deref()),
+        Commands::Doctor { fix } => crate::cli::doctor::run(fix),
         Commands::Env {
             action,
             args,

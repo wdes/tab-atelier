@@ -1087,12 +1087,11 @@ fn mutate(state: &Arc<State>, method: &Method, path: &str, body: &Bytes) -> Resp
         }
         (&Method::POST, "/api/users") => {
             match store.add(&field("first_name"), &field("last_name"), &field("email")) {
-                // The key is in this response and in no other, ever. The UI
-                // shows it once and says so.
-                Ok((a, key)) => json(
-                    201,
-                    &serde_json::json!({ "user": account_json(&a), "key": key }).to_string(),
-                ),
+                // No key yet, on purpose: a key is named for where it will be
+                // used, and one handed out at signup is the one that gets
+                // deployed unnamed. The UI asks for a place and calls
+                // POST /keys next.
+                Ok(a) => json(201, &serde_json::json!({ "user": account_json(&a) }).to_string()),
                 Err(e) => json(400, &serde_json::json!({ "error": e.to_string() }).to_string()),
             }
         }
