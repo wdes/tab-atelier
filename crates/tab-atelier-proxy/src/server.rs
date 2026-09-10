@@ -368,6 +368,15 @@ async fn anthropic(req: Request<Incoming>, state: Arc<State>, peer: std::net::Ip
     };
 
     let fwd = Forward {
+        // Absent from the registry means `destination` falls back to the
+        // egress's own Claude login, so an unknown id DOES spend the plan —
+        // the same `is_none_or` the credential choice makes.
+        uses_the_subscription: state
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&route.provider_id)
+            .is_none_or(provider::Provider::uses_the_subscription),
         sub_pq,
         is_post,
         content_type,
@@ -499,8 +508,25 @@ async fn shape_and_admit(
     }
     let body = shape_body(state, &body, &route, &requested);
 
+    // Admission gates on the SUBSCRIPTION's budget, so it applies only to a
+    // destination that spends it.
+    //
+    // It used to gate everything. The scheduler's whole model of "how much is
+    // left" is `anthropic-ratelimit-*` headers and the plan monitor — one
+    // quota, Anthropic's — so a request bound for a provider that bills
+    // separately was being refused because an unrelated account was maxed out.
+    // The symptom is a 429 naming a saturation the caller is not causing, and
+    // the workaround is to disable the subscription entirely, which is exactly
+    // the wrong answer: the far end that could have served it sits idle while
+    // the plan it does not use is blamed.
+    let on_subscription = state
+        .registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&route.provider_id)
+        .is_none_or(provider::Provider::uses_the_subscription);
     let est = qos::estimate_cost(&body);
-    if let Err(retry_after) = admit(state, &account.id, account.weight, est).await {
+    if on_subscription && let Err(retry_after) = admit(state, &account.id, account.weight, est).await {
         log::warn!(
             "proxy: 429 for {} after waiting — retry in {retry_after}s",
             account.display_name()
@@ -708,6 +734,13 @@ struct Forward {
     metered: bool,
     /// Where this is going, chosen by [`crate::routing`].
     route: routing::Route,
+    /// Whether this request spends the shared Claude subscription.
+    ///
+    /// Resolved once, at the same moment the destination is, so the scheduler
+    /// and the response feedback agree about which quota is in play. A request
+    /// bound for a provider that bills separately must be neither gated by the
+    /// subscription's budget nor able to spend it.
+    uses_the_subscription: bool,
     /// Who to bill. Carried down rather than looked up again, because by the
     /// time the response finishes the account may have been deleted — the call
     /// still happened and still spent tokens.
@@ -1022,7 +1055,15 @@ fn destination(state: &State, provider_id: &str) -> Result<(String, (&'static st
 /// its own, and the next request routes elsewhere instead of waiting. Any
 /// other answer clears the block — a provider that responds is working again.
 fn observe_upstream(f: &Forward, status: u16, remaining: Option<u64>, reset_in: Option<u64>, retry_after: Option<u64>) {
-    {
+    // The scheduler measures ONE quota — the subscription's. Feeding it a
+    // second provider's answers merges two limits that have nothing to do with
+    // each other: a 429 from anywhere set a GLOBAL backoff, so a provider
+    // refusing traffic stopped the subscription from being used at all, and
+    // vice versa. That is not a subtle degradation; it takes a working far end
+    // out of service because an unrelated one is busy.
+    //
+    // `provider_backoff`, below, is the per-provider mechanism and always runs.
+    if f.uses_the_subscription {
         let mut sched = f.state.sched.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if status == 429 {
             sched.on_429(retry_after, now_ms());
