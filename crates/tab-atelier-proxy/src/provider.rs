@@ -111,6 +111,36 @@ pub enum Auth {
 }
 
 impl Auth {
+    /// Whether a key can be set for this provider from the UI or the API.
+    ///
+    /// Only a file-backed credential can. The other two have a credential
+    /// already, and it does not live here: writing a key file for a
+    /// `claude_oauth` provider would be a write no code path reads, leaving a
+    /// live Anthropic key on disk that nothing consults — and that an operator
+    /// who later changed the auth kind would find suddenly in use.
+    #[must_use]
+    pub const fn accepts_a_key(&self) -> bool {
+        matches!(self, Self::ApiKeyFile { .. })
+    }
+
+    /// Why a key cannot be set, phrased so the reader knows what to do instead.
+    ///
+    /// `None` when it can be.
+    #[must_use]
+    pub fn no_key_reason(&self, id: &str) -> Option<String> {
+        // Single lines each: a `\`-continued Rust literal is tempting here and
+        // the indentation of the next line ends up inside the message.
+        match self {
+            Self::ApiKeyFile { .. } => None,
+            Self::ClaudeOauth => Some(format!(
+                "provider {id} uses the proxy host's own Claude login — there is no key to set. Re-import it with `tab-atelier-proxy import-credentials`."
+            )),
+            Self::ApiKeyEnv { var } => Some(format!(
+                "provider {id} reads its key from ${var} — set that in the service's environment and restart it. Writing a file here would be ignored."
+            )),
+        }
+    }
+
     /// The credential, or a message saying what is missing.
     ///
     /// Read per request rather than captured at startup, so rotating a key is
@@ -1071,6 +1101,76 @@ mod tests {
         assert_eq!(r.resolve("a").0, "z");
         assert!(r.remove_mapping("a"));
         assert!(!r.remove_mapping("a"), "second removal is a no-op");
+    }
+
+    /// A provider whose credential is not a file must refuse a key write
+    /// rather than accept one into a file nothing reads.
+    #[test]
+    fn only_a_file_backed_provider_can_be_given_a_key() {
+        // The predicate the ROUTE calls, not a reimplementation of it — a test
+        // that restates the rule passes happily while the route does something
+        // else, which is the whole failure mode worth avoiding here.
+        let file = Auth::ApiKeyFile {
+            path: "/tmp/x.key".to_owned(),
+        };
+        assert!(file.accepts_a_key());
+        assert!(file.no_key_reason("x").is_none());
+
+        // The subscription's credential is the host's Claude login. A key file
+        // would never be read, and would sit on disk as a live secret nothing
+        // consults.
+        assert!(!Auth::ClaudeOauth.accepts_a_key());
+        let why = Auth::ClaudeOauth.no_key_reason("anthropic").expect("a reason");
+        assert!(
+            why.contains("import-credentials"),
+            "the refusal says what to do instead: {why}"
+        );
+
+        // An env-backed provider reads the environment; a file would be ignored.
+        let env = Auth::ApiKeyEnv {
+            var: "BEDROCK_KEY".to_owned(),
+        };
+        assert!(!env.accepts_a_key());
+        let why = env.no_key_reason("bedrock").expect("a reason");
+        assert!(why.contains("BEDROCK_KEY"), "it names the variable: {why}");
+    }
+
+    /// The form is a partial view, and a partial view must save partially.
+    #[test]
+    fn updating_a_provider_keeps_what_the_form_cannot_express() {
+        let r = Registry::default();
+        let original = r.providers[0].clone();
+        assert_eq!(original.auth, Auth::ClaudeOauth);
+
+        // What the form would rebuild: a base URL, models and a file
+        // credential, because that is all it has fields for.
+        let from_form = Provider {
+            auth: Auth::ApiKeyFile {
+                path: "/tmp/whatever.key".to_owned(),
+            },
+            peak: None,
+            preference: 99,
+            enabled: false,
+            ..original.clone()
+        };
+
+        // The merge `save_provider` performs.
+        let mut merged = from_form;
+        let old = r.providers[0].clone();
+        merged.preference = old.preference;
+        merged.enabled = old.enabled;
+        merged.auth = old.auth.clone();
+        merged.peak.clone_from(&old.peak);
+
+        // Without this, saving the subscription's own row turned it into a
+        // keyless file-backed provider: not ready, not a candidate, and the
+        // whole proxy with nothing to serve from.
+        assert_eq!(merged.auth, Auth::ClaudeOauth, "auth must survive a form save");
+        assert!(merged.credential_ready_with(|_| None), "and it is still ready");
+        assert_eq!(merged.preference, 0);
+        assert!(merged.enabled);
+        // What the form DOES express still takes effect.
+        assert_eq!(merged.base_url, original.base_url);
     }
 
     #[test]

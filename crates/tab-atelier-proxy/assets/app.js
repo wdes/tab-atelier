@@ -317,6 +317,11 @@ const AdminApp = Vue.defineComponent({
                 sessionStorage.setItem("ta-proxy-admin", this.token);
                 await this.loadUsage();
                 await this.loadPressure();
+                // With the rest, not behind a button: the account table's "routed to"
+                // dropdown reads this list, so leaving it unloaded gave every row an
+                // empty picker and made a configured proxy look like it had no
+                // providers at all.
+                await this.loadProviders();
                 // The plan moves on its own, independently of anything done here.
                 this.pressureTimer ??= setInterval(() => this.loadPressure(), 30_000);
             }
@@ -347,6 +352,11 @@ const AdminApp = Vue.defineComponent({
         async refresh() {
             this.users = (await this.api("GET", "/api/users")).users;
             await this.loadUsage();
+            // Kept in step with the account list: a provider added or removed in
+            // another tab would otherwise leave every row's picker showing stale
+            // choices.
+            if (this.providers)
+                await this.loadProviders();
         },
         // Inspection. Nothing is fetched until the panel is opened: a page that
         // silently pulled captured prompts on every load would be collecting them

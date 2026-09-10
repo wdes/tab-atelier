@@ -329,7 +329,7 @@
                   DeepSeek's endpoint for this is <code>/anthropic</code>, not its bare host.
                 </p>
               </div>
-              <button class="btn btn-sm btn-outline-secondary ms-3" @click="loadProviders">Load</button>
+              <button class="btn btn-sm btn-outline-secondary ms-3" @click="loadProviders">Refresh</button>
             </div>
 
             <div v-if="providers" class="mt-3">
@@ -360,13 +360,30 @@
                       </div>
                     </td>
                     <td class="text-center small">
-                      <span v-if="p.auth === 'claude_oauth'" class="text-body-secondary">login</span>
+                      <!-- What "key" even means depends on the auth kind, so
+                           the column says which kind it is rather than
+                           flattening three things into one word. -->
+                      <span v-if="p.auth === 'claude_oauth'" class="text-body-secondary"
+                            title="The proxy host's own Claude login, refreshed by the egress.">login</span>
+                      <span v-else-if="p.auth === 'api_key_env'" class="text-body-secondary"
+                            title="Read from the service's environment at request time.">env var</span>
                       <span v-else-if="p.ready" class="text-success">set</span>
-                      <button v-else class="btn btn-sm btn-outline-danger" @click="setKey(p)">missing</button>
+                      <span v-else class="text-danger">missing</span>
                     </td>
                     <td class="text-end small">{{ p.preference }}</td>
                     <td class="text-end text-nowrap">
-                      <button class="btn btn-sm btn-outline-secondary me-1" @click="setKey(p)">Key</button>
+                      <!-- Disabled, not hidden: a missing button reads as a
+                           page that has not loaded. The title says what to do
+                           instead, and the server refuses the same request —
+                           a disabled control is a hint, not a control. -->
+                      <button class="btn btn-sm btn-outline-secondary me-1"
+                              :disabled="p.auth !== 'api_key_file'"
+                              :title="p.auth === 'claude_oauth'
+                                ? 'Uses the proxy host\'s own Claude login. Re-import it with: tab-atelier-proxy import-credentials'
+                                : p.auth === 'api_key_env'
+                                  ? 'Read from the service environment — set the variable there and restart.'
+                                  : 'Set or rotate this provider\'s API key.'"
+                              @click="setKey(p)">Key</button>
                       <button class="btn btn-sm btn-outline-danger" @click="removeProvider(p)">Remove</button>
                     </td>
                   </tr>
@@ -429,7 +446,7 @@
               </form>
             </div>
             <div v-else class="small text-body-secondary mt-3">
-              Press <em>Load</em> to see the configured providers.
+              Loading…
             </div>
           </div>
         </div>
