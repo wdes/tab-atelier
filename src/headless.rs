@@ -808,7 +808,7 @@ pub fn run() -> std::io::Result<()> {
 
     info!("starting {}", crate::version_line("tab-atelier-headless"));
 
-    let prefs = load_preferences(&platform::config_dir());
+    let mut prefs = load_preferences(&platform::config_dir());
     // Default allowlist for NEW tabs (the seed tab + API-created ones).
     // Restored tabs keep their own persisted config.
     let default_net_allow = prefs.default_allow_config();
@@ -822,6 +822,21 @@ pub fn run() -> std::io::Result<()> {
     // global), so OR it in. `relay_egress` is read where the relay route runs.
     if crate::relay_mode() || prefs.relay_mode {
         crate::set_relay_mode(true);
+    }
+    // Repair a preferences file that holds both roles, and WRITE IT BACK.
+    // Correcting this only in memory leaves the contradiction on disk, where
+    // the next reader finds it again — which is why an instance could report
+    // `egress: false` from `relay status` while preferences.json still said
+    // true, and an "egress hop" 401 kept coming back from somewhere nobody
+    // could point at.
+    if crate::normalise_relay_config(&mut prefs) {
+        log::warn!(
+            "relay: preferences held both the egress role and a relay target; \
+             the target wins — clearing the egress flag on disk"
+        );
+        if !crate::read_only() {
+            crate::save_preferences(&crate::platform::config_dir(), &prefs);
+        }
     }
     crate::install_relay_config(&prefs);
     crate::set_tab_env_global(prefs.tab_env.clone());
