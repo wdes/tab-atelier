@@ -1,4 +1,4 @@
-// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+// SPDX-License-Identifier: MPL-2.0
 
 //! Per-tab raw PTY byte ring + tap wrapper for alacritty's
 //! [`tty::Pty`].

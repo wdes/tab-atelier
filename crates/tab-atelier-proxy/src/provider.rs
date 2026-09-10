@@ -1,4 +1,4 @@
-// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+// SPDX-License-Identifier: MPL-2.0
 
 //! Where a request can be sent, and what lives there.
 //!

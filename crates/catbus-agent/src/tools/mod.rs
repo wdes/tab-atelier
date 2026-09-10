@@ -1,4 +1,4 @@
-// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+// SPDX-License-Identifier: MPL-2.0
 
 //! The four primitives the agent loop exposes to the model:
 //! `Read`, `Write`, `Edit`, `Bash`. Plan-mode gates the three that

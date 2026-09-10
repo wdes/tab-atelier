@@ -1,4 +1,4 @@
-// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+// SPDX-License-Identifier: MPL-2.0
 
 //! Captures a build-identity string at compile time and exposes it
 //! as `BUILD_HASH` via `env!`. The headless API embeds it into the

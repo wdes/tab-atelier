@@ -1,4 +1,4 @@
-// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+// SPDX-License-Identifier: MPL-2.0
 
 //! Desktop "screen mate" pets — eSheep-compatible (the Mini Owl, rainbow sheep,
 //! Blue Ham Ham).

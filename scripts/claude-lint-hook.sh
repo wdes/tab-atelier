@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+# SPDX-License-Identifier: MPL-2.0
 #
 # Claude Code PostToolUse hook (see .claude/settings.json): after every
 # Write/Edit of a Rust file, auto-fix what clippy can fix mechanically,

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MPL-2.0
 # One-shot setup for the apt repo publishing flow:
 #
 #   1. Generate (or import) a dedicated GPG key for signing the

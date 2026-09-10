@@ -1,4 +1,4 @@
-// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+// SPDX-License-Identifier: MPL-2.0
 
 //! Discovery + parsing of catbus-agent session transcripts (with
 //! the legacy Claude Code TUI as a recognised fallback).

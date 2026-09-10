@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+# SPDX-License-Identifier: MPL-2.0
 #
 # Fetch the pinned Vue build the proxy's admin UI is served with, and commit
 # the result. Run once; it is vendored, not downloaded at build time.

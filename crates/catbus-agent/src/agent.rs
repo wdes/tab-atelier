@@ -1,4 +1,4 @@
-// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+// SPDX-License-Identifier: MPL-2.0
 
 //! The agent loop: send user message → call Messages API → execute
 //! tool calls → loop until the model stops asking for tools.

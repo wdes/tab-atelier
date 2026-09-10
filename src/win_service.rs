@@ -1,4 +1,4 @@
-// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+// SPDX-License-Identifier: MPL-2.0
 
 //! Windows Service (SCM) integration — the analogue of the Linux
 //! systemd unit. When the Service Control Manager launches

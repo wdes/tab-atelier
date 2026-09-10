@@ -1,4 +1,4 @@
-// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+// SPDX-License-Identifier: MPL-2.0
 
 // `WakatimeTracker` is currently a GUI-only feature. Headless builds
 // still need `USER_AGENT` (the API server identifies itself with it),

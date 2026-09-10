@@ -1,4 +1,4 @@
-// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+// SPDX-License-Identifier: MPL-2.0
 
 //! Token administration: revoke every tab's share tokens, and hot-swap the
 //! master API token. Master token only.

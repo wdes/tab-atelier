@@ -1,4 +1,4 @@
-// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+// SPDX-License-Identifier: MPL-2.0
 
 //! The per-tab `meta` label resource (`set-meta`): validated, capped key/value
 //! changes queued onto the tab's durable meta map.

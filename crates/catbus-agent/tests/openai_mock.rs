@@ -1,4 +1,4 @@
-// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+// SPDX-License-Identifier: MPL-2.0
 
 // Integration test crate — unwrap/expect are idiomatic here.
 #![allow(clippy::unwrap_used, clippy::expect_used)]

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+# SPDX-License-Identifier: MPL-2.0
 #
 # Keep the Android app's version tied to tab-atelier's, and print the
 # Android versionCode for a build.

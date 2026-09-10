@@ -1,4 +1,4 @@
-// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+// SPDX-License-Identifier: MPL-2.0
 
 //! UNIX socket protocol. Each connection is one prompt → one
 //! streamed response. Wire format is newline-delimited JSON. Each

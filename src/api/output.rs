@@ -1,4 +1,4 @@
-// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+// SPDX-License-Identifier: MPL-2.0
 
 //! The `/tabs/<id>/output` polling endpoint: CRC-delta / line-tail / full
 //! scrollback, with the live tab state (lock, schedule, agent) in headers.

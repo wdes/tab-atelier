@@ -1,4 +1,4 @@
-// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+// SPDX-License-Identifier: MPL-2.0
 
 //! `OpenAI`-compatible chat-completions backend — any service that
 //! speaks the `POST {base}/chat/completions` dialect with Bearer-token

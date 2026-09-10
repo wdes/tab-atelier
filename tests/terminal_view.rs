@@ -1,4 +1,4 @@
-// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+// SPDX-License-Identifier: MPL-2.0
 
 // Integration test crate — `.unwrap()` is idiomatic here (the crate-wide deny
 // in Cargo.toml also covers `tests/`, which never sets `cfg(test)`).

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MPL-2.0
 # Validate the nftables shape of the DOMAIN-allowlist "pre-resolve" model
 # (src/net_nft.rs::domain_ruleset + src/net_resolver.rs). The daemon resolves
 # the allowlisted domains itself and fills @allow_dyn; the tab resolves via the

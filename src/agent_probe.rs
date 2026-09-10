@@ -1,4 +1,4 @@
-// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+// SPDX-License-Identifier: MPL-2.0
 
 //! Resource instrumentation for a tab's agent (Claude Code / catbus-agent).
 //!

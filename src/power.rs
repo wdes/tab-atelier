@@ -1,4 +1,4 @@
-// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+// SPDX-License-Identifier: MPL-2.0
 
 // A few helper methods on `TabPower` (`label` / `cpu_label` / `watts_label`)
 // are GUI-rendering helpers; headless builds compile the type because

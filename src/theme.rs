@@ -1,4 +1,4 @@
-// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+// SPDX-License-Identifier: MPL-2.0
 
 // The palette (`Theme`, `ThemeName`) compiles in both builds; the
 // `*_hsla` adapters that actually need gpui are gated behind `gui`.

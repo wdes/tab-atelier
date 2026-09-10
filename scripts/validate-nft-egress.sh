@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MPL-2.0
 # Validate the per-tab nftables egress allowlist mechanism that
 # `src/net_nft.rs` implements — specifically the `socket cgroupv2` cgroup
 # match, which is the one piece that can't be tested unprivileged.

@@ -1,4 +1,4 @@
-// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+// SPDX-License-Identifier: MPL-2.0
 
 //! The per-tab agent-state hook (`set-status`): thinking/waiting/error/idle,
 //! plus session/kind/plan/daemon metadata, queued to the owner.

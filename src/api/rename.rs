@@ -1,4 +1,4 @@
-// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+// SPDX-License-Identifier: MPL-2.0
 
 //! The tab rename resource (`POST /tabs/<idx>/rename`), queued to the owner.
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+# SPDX-License-Identifier: MPL-2.0
 """Assert that `tab-atelier fleet --json` is renderable as a graph.
 
 Checks the contract a viewer depends on: every edge points at a node that

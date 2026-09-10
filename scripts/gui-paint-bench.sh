@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MPL-2.0
 # GUI paint-loop benchmark harness.
 #
 # Launches a FULLY ISOLATED tab-atelier GUI instance (its own HOME →

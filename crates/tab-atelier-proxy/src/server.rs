@@ -1,4 +1,4 @@
-// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+// SPDX-License-Identifier: MPL-2.0
 
 //! The HTTP surface: the proxied Anthropic path, the admin API behind it, and
 //! the web UI.

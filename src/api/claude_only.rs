@@ -1,4 +1,4 @@
-// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+// SPDX-License-Identifier: MPL-2.0
 
 //! The forced Claude-only mode toggle (`POST /claude-only`), queued to the
 //! owner which mirrors it onto `CLAUDE_ONLY` and persists.

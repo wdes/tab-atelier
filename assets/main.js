@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
     // __TAB_KEY__ is the route segment after `/tabs/` (numeric idx or
     // `by-id/<uuid>` form). The same value is what every subrequest
     // uses, so the share URL identifies one tab end-to-end.

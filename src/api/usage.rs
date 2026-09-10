@@ -1,4 +1,4 @@
-// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+// SPDX-License-Identifier: MPL-2.0
 
 //! The `/tabs/usage` read-model: per-tab RSS, token usage, CPU%, connections
 //! and egress — an ETag-cached projection parallel to `/tabs`.

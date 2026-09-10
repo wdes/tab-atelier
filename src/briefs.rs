@@ -1,4 +1,4 @@
-// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+// SPDX-License-Identifier: MPL-2.0
 
 //! Per-project briefs: markdown files that reach an agent when it starts in a
 //! matching directory.
