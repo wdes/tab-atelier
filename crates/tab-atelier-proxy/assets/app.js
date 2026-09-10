@@ -162,6 +162,30 @@ createApp({
     meUrl() {
       return `${this.origin}/me/usage`;
     },
+    // Both recipes carry the real key. It is readable exactly once, so a
+    // `<key>` placeholder here means hand-copying 68 characters out of the
+    // field above — and the commonest way that goes wrong is a truncated
+    // paste, which fails as "no active account has that key" and reads like a
+    // proxy fault rather than a typo.
+    relayRecipe() {
+      const key = this.freshKey ? this.freshKey.key : "<key>";
+      // `--label` is a named flag. This block used to say `remote add proxy
+      // --url …`, which the CLI rejects outright as an unknown argument.
+      return [
+        `tab-atelier remote add --label proxy --url ${this.origin} --relay-token ${key}`,
+        "tab-atelier relay via proxy",
+        "tab-atelier relay on",
+      ].join("\n");
+    },
+    // The proxy's Anthropic path lives under /relay/anthropic; the client
+    // appends /v1/messages itself.
+    envRecipe() {
+      const key = this.freshKey ? this.freshKey.key : "<key>";
+      return [
+        `export ANTHROPIC_BASE_URL=${this.origin}/relay/anthropic`,
+        `export ANTHROPIC_API_KEY=${key}`,
+      ].join("\n");
+    },
   },
   mounted() {
     // A token already in this session means a reload should land straight back
