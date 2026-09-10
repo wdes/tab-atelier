@@ -506,7 +506,10 @@
             </div>
 
             <div v-if="inspect && inspect.captures.length" class="table-responsive mt-3">
-              <table class="table table-sm align-middle mb-0">
+              <!-- Striped: six columns of small monospace, read down a column
+                   to compare one call against the next. The banding is what
+                   keeps the eye on a row across that width. -->
+              <table class="table table-sm table-striped align-middle mb-0">
                 <thead>
                   <tr class="text-body-secondary">
                     <th>When</th><th>Who</th><th>Model</th><th class="text-end">Tokens</th>
