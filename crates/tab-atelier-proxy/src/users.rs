@@ -387,12 +387,20 @@ impl Store {
             })
     }
 
-    /// Create an account and mint its first key. Returns the key — the only
-    /// time it exists in readable form.
+    /// Create an account, with no keys.
+    ///
+    /// It used to mint one called `default`. A key's name says WHERE it is
+    /// used — that is the whole reason there is a key per place rather than
+    /// per person, because revoking a lost laptop should be one row and not a
+    /// re-keying. `default` says nothing, and being handed one at signup meant
+    /// it was the one that got deployed, so the accounts that most needed
+    /// named keys were the ones that never got them.
+    ///
+    /// `add-key <who> <place>` mints the first real one.
     ///
     /// # Errors
     /// Missing names, an unusable email, or an email already in use.
-    pub fn add(&mut self, first: &str, last: &str, email: &str) -> Result<(Account, String), Error> {
+    pub fn add(&mut self, first: &str, last: &str, email: &str) -> Result<Account, Error> {
         let (first, last, email) = (first.trim(), last.trim(), email.trim());
         if first.is_empty() || last.is_empty() {
             return Err(Error::MissingName);
@@ -403,7 +411,6 @@ impl Store {
         if self.accounts.iter().any(|a| a.email.eq_ignore_ascii_case(email)) {
             return Err(Error::DuplicateEmail(email.to_owned()));
         }
-        let key = mint_key();
         let now = now_secs();
         let account = Account {
             id: uuid::Uuid::new_v4().to_string(),
@@ -411,18 +418,7 @@ impl Store {
             last_name: last.to_owned(),
             email: email.to_owned(),
             created_at: now,
-            // The first key is named for where it will be used from. "default"
-            // is a placeholder an operator is meant to replace, not a name.
-            keys: vec![Key {
-                id: uuid::Uuid::new_v4().to_string(),
-                name: "default".to_owned(),
-                hash: hash_key(&key),
-                created_at: now,
-                first_used_at: None,
-                last_used_at: None,
-                last_used_ip: None,
-                disabled: false,
-            }],
+            keys: Vec::new(),
             key_hash: String::new(),
             legacy_first_used_at: None,
             legacy_last_used_at: None,
@@ -433,7 +429,7 @@ impl Store {
         self.accounts.push(account.clone());
         self.reindex();
         self.save()?;
-        Ok((account, key))
+        Ok(account)
     }
 
     /// Add a named key to an account. Returns it once, in readable form.
@@ -697,8 +693,12 @@ mod tests {
     #[test]
     fn a_key_authenticates_exactly_its_own_account() {
         let (mut s, _d) = store();
-        let (ada, ada_key) = s.add("Ada", "Lovelace", "ada@example.org").expect("add");
-        let (_grace, grace_key) = s.add("Grace", "Hopper", "grace@example.org").expect("add");
+        let ada = s.add("Ada", "Lovelace", "ada@example.org").expect("add");
+        // Accounts start with no keys — one is minted per place it is used.
+        let (_k, ada_key) = s.add_key(&ada.email, "laptop").expect("key");
+        let grace = s.add("Grace", "Hopper", "grace@example.org").expect("add");
+        // Accounts start with no keys — one is minted per place it is used.
+        let (_k, grace_key) = s.add_key(&grace.email, "laptop").expect("key");
 
         assert_eq!(s.authenticate(&ada_key).map(|a| a.id.clone()), Some(ada.id.clone()));
         assert_ne!(s.authenticate(&grace_key).map(|a| a.id.clone()), Some(ada.id));
@@ -711,8 +711,11 @@ mod tests {
     #[test]
     fn revoking_one_account_leaves_the_others_working() {
         let (mut s, _d) = store();
-        let (_, ada_key) = s.add("Ada", "Lovelace", "ada@example.org").expect("add");
-        let (_, grace_key) = s.add("Grace", "Hopper", "grace@example.org").expect("add");
+        // Accounts start with no keys — one is minted per place it is used.
+        s.add("Ada", "Lovelace", "ada@example.org").expect("add");
+        let (_, ada_key) = s.add_key("ada@example.org", "laptop").expect("key");
+        s.add("Grace", "Hopper", "grace@example.org").expect("add");
+        let (_, grace_key) = s.add_key("grace@example.org", "laptop").expect("key");
 
         s.set_disabled("ada@example.org", true).expect("disable");
         assert!(s.authenticate(&ada_key).is_none(), "a disabled account must be refused");
@@ -732,7 +735,9 @@ mod tests {
     #[test]
     fn each_key_records_when_and_where_it_was_used() {
         let (mut s, _d) = store();
-        let (ada, _first) = s.add("Ada", "Lovelace", "ada@example.org").expect("add");
+        let ada = s.add("Ada", "Lovelace", "ada@example.org").expect("add");
+        // Accounts start with no keys — one is minted per place it is used.
+        let (_k, _first) = s.add_key(&ada.email, "laptop").expect("key");
         let (ci, _ci_secret) = s.add_key("ada@example.org", "ci").expect("add key");
 
         let laptop = s.find("ada@example.org").expect("a").keys[0].clone();
@@ -763,9 +768,11 @@ mod tests {
     #[test]
     fn one_key_can_be_revoked_without_disturbing_the_others() {
         let (mut s, _d) = store();
-        // The account's first key is named "default"; the others are named
-        // for where they live.
-        let (_a, first) = s.add("Ada", "Lovelace", "ada@example.org").expect("add");
+        // An account starts with NO keys; every one is named for where it
+        // lives. There used to be a "default" minted at signup, which is
+        // exactly the key that ended up deployed everywhere unnamed.
+        s.add("Ada", "Lovelace", "ada@example.org").expect("add");
+        let (_k, first) = s.add_key("ada@example.org", "desktop").expect("desktop");
         let (_lk, laptop) = s.add_key("ada@example.org", "laptop").expect("laptop");
         let (_k, ci) = s.add_key("ada@example.org", "ci").expect("ci");
         let (_k2, fleet) = s.add_key("ada@example.org", "fleet").expect("fleet");
@@ -852,7 +859,8 @@ mod tests {
     #[test]
     fn keys_are_not_recoverable_from_the_file() {
         let (mut s, _d) = store();
-        let (_, key) = s.add("Ada", "Lovelace", "ada@example.org").expect("add");
+        s.add("Ada", "Lovelace", "ada@example.org").expect("add");
+        let (_, key) = s.add_key("ada@example.org", "laptop").expect("key");
         let raw = std::fs::read_to_string(s.path()).expect("read back");
         assert!(!raw.contains(&key), "the key itself must never reach disk");
         assert!(raw.contains(&hash_key(&key)));
@@ -861,7 +869,8 @@ mod tests {
     #[test]
     fn accounts_survive_a_reload() {
         let (mut s, dir) = store();
-        let (_, key) = s.add("Ada", "Lovelace", "ada@example.org").expect("add");
+        s.add("Ada", "Lovelace", "ada@example.org").expect("add");
+        let (_, key) = s.add_key("ada@example.org", "laptop").expect("key");
         drop(s);
         let s = Store::load(dir.path().join("users.json")).expect("reload");
         assert_eq!(s.accounts().len(), 1);
@@ -913,7 +922,7 @@ mod tests {
     #[test]
     fn the_default_priority_sits_in_the_middle_of_its_range() {
         let (mut s, _d) = store();
-        let (a, _k) = s.add("Ada", "Lovelace", "ada@example.org").expect("add");
+        let a = s.add("Ada", "Lovelace", "ada@example.org").expect("add");
         assert_eq!(a.weight, NORMAL_WEIGHT);
         const { assert!(NORMAL_WEIGHT > 1, "a default of 1 leaves nothing below it") }
 

@@ -32,7 +32,11 @@ createApp({
       origin: window.location.origin,
       // Per-account usage, keyed by id, as returned by /api/usage.
       usage: {},
-      hours: 168,
+      // 24 h, not the week: the question this page gets opened for is "what is
+      // happening now" — a spike, a burst of errors, a key that just started
+      // being used. A 7-day default flattens exactly that into the noise floor,
+      // and the wider windows are one click away.
+      hours: 24,
       // null = everyone; an account id = just them. Clicking a row's token
       // total drills in, which is the only question the summed charts cannot
       // answer ("who is that spike?").
@@ -333,11 +337,20 @@ createApp({
         this.busy = false;
       }
     },
+    // Creating someone mints no key. A key is named for the machine it lives
+    // on — that is what makes losing a laptop one row to delete instead of a
+    // re-key of everything that person runs — and a key handed out at signup
+    // is the one that gets deployed with no name at all. So ask where this
+    // first one goes, in the same breath.
     add() {
       return this.act(async () => {
         const data = await this.api("POST", "/api/users", this.form);
-        this.showKey(data);
+        const who = data.user;
         this.form = { first_name: "", last_name: "", email: "" };
+        const name = prompt(`Account created. Where will ${who.first_name}'s first key be used? (laptop, ci, fleet…)`, "laptop");
+        if (!name) return;
+        const k = await this.api("POST", `/api/users/${who.id}/keys`, { name });
+        this.showKey({ user: who, key: k.secret, name: k.key.name });
       });
     },
     // Adding a key never disturbs the existing ones, which is what makes

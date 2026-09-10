@@ -212,11 +212,18 @@ fn a_key_minted_by_the_cli_works_against_the_running_server() {
     let upstream = mock_upstream();
     let port = free_port();
 
-    // 1. Add an account with the CLI. The key is printed once, here and
-    //    nowhere else, which is the behaviour this asserts by having to parse
-    //    it out of the output.
+    // 1. Add an account, then mint a key for a named place. `add` deliberately
+    //    mints nothing: a key is named for the machine it lives on, and one
+    //    handed out at signup is the one that gets deployed unnamed. The key
+    //    is printed once, here and nowhere else, which is the behaviour this
+    //    asserts by having to parse it out of the output.
     let added = cli(scratch.path(), &["add", "Ada", "Lovelace", "ada@example.org"]);
-    let key = added
+    assert!(
+        !added.contains("key: "),
+        "creating an account must not mint a key:\n{added}"
+    );
+    let minted = cli(scratch.path(), &["add-key", "ada@example.org", "laptop"]);
+    let key = minted
         .lines()
         .find_map(|l| l.trim().strip_prefix("key: "))
         .expect("the CLI prints the key exactly once")
@@ -335,8 +342,9 @@ fn the_cli_and_the_server_agree_on_where_the_files_are() {
     let port = free_port();
 
     // Mint through the CLI…
-    let added = cli(scratch.path(), &["add", "Grace", "Hopper", "grace@example.org"]);
-    let key = added
+    cli(scratch.path(), &["add", "Grace", "Hopper", "grace@example.org"]);
+    let minted = cli(scratch.path(), &["add-key", "grace@example.org", "laptop"]);
+    let key = minted
         .lines()
         .find_map(|l| l.trim().strip_prefix("key: "))
         .expect("key")

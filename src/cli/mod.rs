@@ -23,6 +23,7 @@ pub mod claude_hook;
 pub mod client;
 pub mod delegate;
 pub mod dispatch;
+pub mod doctor;
 /// `tab-atelier flags …` — toggle agent-instrumentation flags.
 pub mod flags;
 /// `tab-atelier gossip` — anti-entropy between hosts' blackboards.

@@ -95,7 +95,9 @@ fn a_users_key_is_exchanged_for_the_proxys_claude_token() {
     egress::set_upstream(Some(format!("http://127.0.0.1:{upstream_port}")));
 
     let mut store = Store::load(dir.join("users.json")).expect("store");
-    let (_ada, key) = store.add("Ada", "Lovelace", "ada@example.org").expect("add");
+    let ada = store.add("Ada", "Lovelace", "ada@example.org").expect("add");
+    // Accounts start with no keys — one is minted per place it is used.
+    let (_k, key) = store.add_key(&ada.email, "laptop").expect("key");
 
     let state = Arc::new(State {
         store: Mutex::new(store),
@@ -206,7 +208,9 @@ fn a_revoked_key_stops_working_without_reaching_upstream() {
     egress::set_upstream(Some(format!("http://127.0.0.1:{upstream_port}")));
 
     let mut store = Store::load(dir.join("users.json")).expect("store");
-    let (_a, key) = store.add("Ada", "Lovelace", "ada@example.org").expect("add");
+    let a = store.add("Ada", "Lovelace", "ada@example.org").expect("add");
+    // Accounts start with no keys — one is minted per place it is used.
+    let (_k, key) = store.add_key(&a.email, "laptop").expect("key");
     store.set_disabled("ada@example.org", true).expect("disable");
 
     let state = Arc::new(State {
@@ -298,7 +302,9 @@ fn a_429_moves_the_next_request_to_another_provider() {
     };
 
     let mut store = Store::load(dir.join("users.json")).expect("store");
-    let (_a, key) = store.add("Ada", "Lovelace", "ada@example.org").expect("add");
+    let a = store.add("Ada", "Lovelace", "ada@example.org").expect("add");
+    // Accounts start with no keys — one is minted per place it is used.
+    let (_k, key) = store.add_key(&a.email, "laptop").expect("key");
     let state = Arc::new(State {
         store: Mutex::new(store),
         usage: Mutex::new(usage::Store::load(dir.join("usage"))),

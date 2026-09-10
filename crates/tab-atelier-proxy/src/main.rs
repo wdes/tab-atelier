@@ -342,15 +342,6 @@ fn print_account(a: &Account) {
 
 /// The one moment a key exists in readable form. Say so, rather than letting
 /// someone discover it when they come back for it.
-fn print_new_key(a: &Account, key: &str) {
-    println!("{} <{}>", a.display_name(), a.email);
-    println!("  key: {key}");
-    println!("  This is the only time it is shown — the proxy stores a hash. Lost it? `rotate`.");
-    println!("  On the machine that will use it:");
-    println!("    tab-atelier remote add --label proxy --url https://<proxy-host> \\");
-    println!("        --relay-token {key}");
-}
-
 /// Start the proxy and serve until Ctrl-C.
 ///
 /// # Errors
@@ -426,8 +417,12 @@ fn run() -> Result<(), String> {
             email,
         } => {
             let mut s = store()?;
-            let (a, key) = s.add(&first_name, &last_name, &email).map_err(|e| e.to_string())?;
-            print_new_key(&a, &key);
+            let a = s.add(&first_name, &last_name, &email).map_err(|e| e.to_string())?;
+            // Deliberately no key. Naming it after the machine it will live on
+            // is what makes revoking one laptop a single row rather than a
+            // re-key of everything that person runs.
+            println!("added {} <{}>", a.display_name(), a.email);
+            println!("  next: tab-atelier-proxy add-key {} <laptop|ci|...>", a.email);
             Ok(())
         }
         Command::List => {
