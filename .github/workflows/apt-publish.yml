@@ -78,6 +78,19 @@ jobs:
               with:
                   toolchain: ${{ env.RUST_VERSION }}
             - uses: Swatinem/rust-cache@v2
+              with:
+                  # Same key as build.yml and release.yml: same runner, same
+                  # toolchain, same release profile, so they compile the same
+                  # rlibs. rust-cache keys on the job id by default, which gave
+                  # each of them a separate multi-GB entry competing for one
+                  # 10 GB budget.
+                  shared-key: linux-x64
+                  # Restore-only: build.yml owns the save. It compiles the
+                  # superset (debug + coverage + release), so if this job won
+                  # the race to save first, the entry would be release-only and
+                  # build.yml would start cold on the next run. Tags reuse the
+                  # entry main saved — same Cargo.lock, same key.
+                  save-if: false
 
             - name: Build .deb (both variants)
               run: |
