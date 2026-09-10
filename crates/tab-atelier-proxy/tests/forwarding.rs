@@ -559,3 +559,228 @@ fn compaction_reaches_upstream_and_only_where_it_is_configured() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The regression this pins: `admit` gated EVERY request on the
+/// subscription's budget, so a plan that was maxed out returned "the shared
+/// quota is saturated; retry in Ns" for traffic bound somewhere else. The only
+/// way to get that traffic moving was to disable the subscription, which is
+/// the opposite of the point — the plan was not what the request was spending.
+#[test]
+fn a_saturated_subscription_does_not_gate_a_provider_that_bills_separately() {
+    let _serial = EGRESS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (upstream, seen) = mock_status(200, "{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}");
+    let dir = scratch("sched-scope");
+    let stub_key = dir.join("stub.key");
+    std::fs::write(&stub_key, "sk-stub").expect("write stub key");
+
+    // DeepSeek only: the subscription is not configured at all, which is the
+    // shape of a deployment that has moved a profile off it.
+    let state = state_with(
+        vec![stub_provider("deepseek", upstream, 10, &stub_key)],
+        &dir,
+        sched_spent(),
+    );
+
+    let key = first_key(&state);
+    let rt = serve(&state);
+    let port = rt.port;
+
+    let payload = r#"{"model":"claude-sonnet-5","max_tokens":1,"messages":[{"role":"user","content":"x"}]}"#;
+    let resp = request(
+        port,
+        &format!(
+            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {key}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+            payload.len()
+        ),
+    );
+
+    assert!(
+        !resp.contains("429"),
+        "a provider that bills separately must not inherit the subscription's backoff: {resp}"
+    );
+    assert!(resp.starts_with("HTTP/1.1 200"), "resp: {resp}");
+    let seen = seen
+        .recv_timeout(std::time::Duration::from_secs(3))
+        .expect("upstream saw it");
+    assert!(!seen.contains("retry-after"), "a borrowed Retry-After leaked: {seen}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A scheduler that has been told the plan is exhausted and is backing off —
+/// the exact state the reported 429 came from.
+fn sched_spent() -> qos::Sched {
+    // The REAL clock. An earlier version passed 0, which proved nothing: a
+    // 172-second backoff established at the unix epoch is long expired, so the
+    // request sailed through an open gate and the assertion passed against
+    // code that was still wrong.
+    let now = tab_atelier_proxy::server::now_ms();
+    let mut sched = qos::Sched::new();
+    sched.observe(Some(0), Some(3600), now);
+    sched.on_429(Some(172), now);
+    sched
+}
+
+/// The other direction: a far end's 429 must not put the SUBSCRIPTION on hold.
+///
+/// `observe_upstream` used to feed every provider's answers into the scheduler,
+/// so a provider refusing traffic paused requests bound for Anthropic — which
+/// had capacity, and was being billed for the privilege of waiting.
+///
+/// The upstream answers a long `retry-after` rather than the bare 429 the other
+/// mock sends: `on_429(None, …)` defaults to a five-second backoff, and this
+/// test's own request cycle takes about that long, so a default would expire
+/// before the assertion and the test would pass against broken code.
+#[test]
+fn a_providers_429_does_not_pause_the_subscription() {
+    let _serial = EGRESS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (upstream, _seen) = mock_429(300);
+    let dir = scratch("sched-reverse");
+    let stub_key = dir.join("stub.key");
+    std::fs::write(&stub_key, "sk-stub").expect("write stub key");
+
+    let state = state_with(
+        vec![stub_provider("deepseek", upstream, 10, &stub_key)],
+        &dir,
+        qos::Sched::new(),
+    );
+
+    let key = first_key(&state);
+    let rt = serve(&state);
+
+    let payload = r#"{"model":"claude-sonnet-5","max_tokens":1,"messages":[{"role":"user","content":"x"}]}"#;
+    let resp = request(
+        rt.port,
+        &format!(
+            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {key}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+            payload.len()
+        ),
+    );
+    // The provider's own 429 is passed through — that part is correct, and is
+    // the whole point of a transparent relay.
+    assert!(
+        resp.contains("429"),
+        "the far end's 429 should reach the client: {resp}"
+    );
+
+    // …and the scheduler, which measures the subscription, must be untouched.
+    let snap = {
+        let sched = state.sched.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        sched.snapshot(tab_atelier_proxy::server::now_ms())
+    };
+    assert_eq!(
+        snap["backoff_for"], 0,
+        "a provider's 429 must not set the SUBSCRIPTION's backoff: {snap}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A mock upstream that refuses with a stated `retry-after`, so a backoff it
+/// causes cannot quietly expire while the test finishes.
+fn mock_429(retry_after_secs: u64) -> (u16, std::sync::mpsc::Receiver<String>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
+    let port = listener.local_addr().expect("addr").port();
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut sock) = stream else { break };
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 1024];
+            while let Ok(n) = sock.read(&mut tmp) {
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
+            let body = "{\"error\":{\"type\":\"rate_limit_error\",\"message\":\"slow down\"}}";
+            let _ = sock.write_all(
+                format!(
+                    "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\n\
+                     retry-after: {retry_after_secs}\r\nconnection: close\r\n\
+                     content-length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+            let _ = sock.flush();
+        }
+    });
+    (port, rx)
+}
+
+/// A `State` with one account and the given providers, for the scheduler tests.
+fn state_with(providers: Vec<Provider>, dir: &std::path::Path, sched: qos::Sched) -> Arc<State> {
+    let mut store = Store::load(dir.join("users.json")).expect("store");
+    let a = store.add("Ada", "Lovelace", "ada@example.org").expect("add");
+    let (_k, key) = store.add_key(&a.email, "laptop").expect("key");
+    LEAKED_KEYS.with(|k| k.borrow_mut().insert(a.email.clone(), key));
+    Arc::new(State {
+        store: Mutex::new(store),
+        usage: Mutex::new(usage::Store::load(dir.join("usage"))),
+        sched: Mutex::new(sched),
+        account: Mutex::new(account::Monitor::load(dir)),
+        inspect: Mutex::new(tab_atelier_proxy::inspect::Store::load(std::env::temp_dir())),
+        wake: tokio::sync::Notify::new(),
+        registry: Mutex::new(Registry {
+            mappings: vec![],
+            providers,
+        }),
+        registry_path: dir.join("providers.json"),
+        provider_backoff: Mutex::new(std::collections::BTreeMap::new()),
+        admin_token: "tap_admin".to_owned(),
+        web_root: None,
+    })
+}
+
+/// Serve `state` on an ephemeral port. The runtime is leaked deliberately: the
+/// server task must outlive the caller's scope for the request to be answered.
+fn serve(state: &Arc<State>) -> Leaked {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let listener = rt
+        .block_on(async { tokio::net::TcpListener::bind("127.0.0.1:0").await })
+        .expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let served = Arc::clone(state);
+    rt.spawn(async move { serve_on(listener, served).await });
+    std::mem::forget(rt);
+    Leaked { port }
+}
+
+struct Leaked {
+    port: u16,
+}
+
+/// The first account's only key, read back out of the store.
+fn first_key(state: &Arc<State>) -> String {
+    // Keys are stored hashed, so the test mints its own and hands the same
+    // string on — see `state_with`, which must therefore return it. Kept as a
+    // separate lookup so the tests read the same way.
+    let store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let a = store.accounts().first().expect("an account").clone();
+    drop(store);
+    LEAKED_KEYS.with(|k| {
+        k.borrow_mut()
+            .remove(&a.email)
+            .unwrap_or_else(|| panic!("no key was recorded for {}", a.email))
+    })
+}
+
+thread_local! {
+    /// The plaintext of each account's key, keyed by email.
+    ///
+    /// A `Store` keeps only hashes, by design — a key is shown once and never
+    /// again. So a test that needs to present one has to keep its own copy,
+    /// which is what [`state_with`] does here.
+    static LEAKED_KEYS: std::cell::RefCell<std::collections::HashMap<String, String>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}

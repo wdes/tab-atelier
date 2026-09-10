@@ -391,6 +391,24 @@ impl Provider {
         self.peak.as_ref().is_some_and(|p| p.active_at(now))
     }
 
+    /// Whether sending to this provider spends the shared Claude subscription.
+    ///
+    /// True exactly when the credential is the host's own Claude login, which
+    /// is also what [`Provider::unusable_reason`] ties to Anthropic's host —
+    /// so "spends the plan" and "is the subscription" cannot drift apart.
+    ///
+    /// This is the line the `QoS` scheduler is drawn along. Its budget is read
+    /// from `anthropic-ratelimit-*` headers and from the plan monitor, so it
+    /// measures ONE quota; a request bound for a provider that bills
+    /// separately is not spending it and must not be gated by it. Getting this
+    /// wrong is not subtle in effect — a saturated subscription stops traffic
+    /// it has nothing to do with, and the far end that could have served it
+    /// sits idle.
+    #[must_use]
+    pub const fn uses_the_subscription(&self) -> bool {
+        matches!(self.auth, Auth::ClaudeOauth)
+    }
+
     /// Why compaction must not be enabled on this provider, if it must not be.
     ///
     /// `claude_oauth` means the subscription hop, and compaction there is
@@ -1344,6 +1362,59 @@ mod tests {
         assert!(merged.enabled);
         // What the form DOES express still takes effect.
         assert_eq!(merged.base_url, original.base_url);
+    }
+
+    /// The `QoS` scheduler measures ONE quota, and this is the line it is drawn
+    /// along.
+    ///
+    /// Regression: `on_429` set a GLOBAL backoff and `admit` gated every
+    /// request, so a saturated subscription returned "the shared quota is
+    /// saturated; retry in 172s" for traffic bound somewhere else entirely —
+    /// and disabling the subscription was the only way to get that traffic
+    /// moving again. The reverse also held: a far end refusing traffic put the
+    /// subscription's own requests on hold.
+    #[test]
+    fn only_the_subscription_provider_spends_the_subscription() {
+        assert!(
+            Registry::default().providers[0].uses_the_subscription(),
+            "the host's own Claude login IS the plan"
+        );
+
+        // A provider with its own credential bills separately, whatever its
+        // base URL or what it is called.
+        for auth in [
+            Auth::ApiKeyFile {
+                path: "/tmp/k".to_owned(),
+            },
+            Auth::ApiKeyEnv { var: "K".to_owned() },
+        ] {
+            let p = Provider {
+                id: "somewhere-else".to_owned(),
+                wire: Wire::Anthropic,
+                base_url: "https://api.deepseek.com/anthropic".to_owned(),
+                auth,
+                models: vec![Model::new("m", Class::Balanced, 1)],
+                preference: 10,
+                enabled: true,
+                compact: crate::compact::Compact::None,
+                peak: None,
+            };
+            assert!(
+                !p.uses_the_subscription(),
+                "a keyed provider must not be gated by the plan"
+            );
+        }
+
+        // "Spends the plan" and "is the subscription" cannot drift apart: the
+        // first is literally the credential the second is tied to.
+        for p in &Registry::default().providers {
+            assert_eq!(
+                p.uses_the_subscription(),
+                p.auth == Auth::ClaudeOauth,
+                "{} disagrees with its own credential",
+                p.id
+            );
+        }
     }
 
     /// Compaction is a per-provider setting with a default that must not move.
