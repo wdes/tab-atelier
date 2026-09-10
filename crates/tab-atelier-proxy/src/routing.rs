@@ -247,6 +247,7 @@ mod tests {
         let mut r = Registry::default();
         r.providers.push(Provider {
             peak: None,
+            compact: crate::compact::Compact::None,
             id: "bedrock".to_owned(),
             wire: Wire::Anthropic,
             base_url: "https://bedrock.example".to_owned(),

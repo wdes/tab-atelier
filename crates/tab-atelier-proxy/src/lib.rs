@@ -31,6 +31,16 @@
 //! against Anthropic directly.
 
 pub mod account;
+pub mod compact;
+pub mod egress;
+pub mod inspect;
+pub mod provider;
+pub mod qos;
+pub mod routing;
+pub mod server;
+pub mod usage;
+pub mod users;
+
 /// RFC3339 in UTC, the shape the usage log and the .mjs monitor both use.
 #[must_use]
 pub fn now_rfc3339() -> String {
@@ -59,15 +69,6 @@ pub fn now_rfc3339_at(secs: u64) -> String {
     // monitor writes and what the existing logs already hold.
     ts.strftime("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
-
-pub mod egress;
-pub mod inspect;
-pub mod provider;
-pub mod qos;
-pub mod routing;
-pub mod server;
-pub mod usage;
-pub mod users;
 
 use std::path::{Path, PathBuf};
 

@@ -96,19 +96,48 @@ Layer C is worth almost nothing in bytes — 23 messages × 49 B ≈ 1.2 KB. It 
 worth keeping for a different reason: a stale token count re-read 23 times is
 noise, not context.
 
+### What a "turn" is
+
+A message. Layer A counts back over messages that contain a `tool_result`; the
+last six of those are the window, and anything earlier is elided.
+
+Layer B counts back over messages that contain a `thinking` block — *not* over
+every assistant message. On the measured body those coincide, because each
+assistant turn carries one thinking block. They part company the moment a turn
+does not, and counting those would shrink the window by exactly the number of
+turns it never needed to protect: a "keep 6" rule that quietly keeps 3.
+
+### Idempotent, and why that is load-bearing
+
+An elided block is recognised by its own stub marker, and left alone on a second
+pass. Without that check the pass is merely *deterministic*, not idempotent —
+and the difference is not academic. A retry, or one request crossing two route
+changes, re-runs the pass over its own output, elides the stubs again, and
+recomputes their byte count **from the stub**: the number in the message shrinks
+on every pass and the size of the result it replaced is gone. The marker is
+what makes the count mean "how much this cost" rather than "how big the last
+thing I wrote was".
+
 ## The control
 
 A `<select>` on each provider in the admin UI, written to that provider's entry
 in `providers.json`:
 
 ```html
-<select v-model="provider.compact">
+<select :value="p.compact" @change="setCompact(p, $event.target.value)">
   <option value="none">None</option>
   <option value="tools">Remove old tool results</option>
   <option value="tools_thinking">Remove old tool results and thinking</option>
   <option value="all">Remove old tool results, thinking and banners</option>
 </select>
 ```
+
+`v-model` is not used, and that is the point of the binding: this page persists
+through the API rather than into a local object, so a change that the server
+refuses has to snap the control back to what is actually stored. The four
+labels are *served*, not written here — `Compact::label()` is the same enum
+routing reads, and a second copy in TypeScript would be a second thing to keep
+in step.
 
 Parsed as a field on the provider, defaulting to `"none"` for providers already
 in the file:
@@ -130,6 +159,11 @@ configuration that quietly costs its owner money. If a global control is ever
 added it should refuse to apply to a provider whose `auth.kind` is
 `claude_oauth` — a setting that cannot be correct is a setting that should not
 be offerable.
+
+That rule is enforced on the three levels that exist, not merely in the UI:
+`Provider::compact_refusal` is checked on the save path, so `POST
+/api/providers` answers 400 with the reason, and the UI shows the server's own
+words rather than keeping a second copy of the rule.
 
 ## What must never change
 

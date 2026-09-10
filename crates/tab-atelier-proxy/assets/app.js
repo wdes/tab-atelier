@@ -386,6 +386,40 @@ const AdminApp = Vue.defineComponent({
             });
             await this.loadProviders();
         },
+        // Changing how much of an old conversation this provider is sent.
+        //
+        // Refused client-side with the SERVER's own explanation — `compact_refusal`
+        // is the same rule the save path enforces, sent up rather than restated
+        // here, because a second copy of "which provider is the subscription"
+        // would eventually disagree with the first.
+        //
+        // Deliberately not via `act`: that clears `this.error` before running, so
+        // the reason would be wiped by the very call it explains. The select is
+        // bound with `:value`, not `v-model`, so a refused change snaps back to
+        // what is actually stored.
+        async setCompact(p, value) {
+            if (value !== "none" && p.compact_refusal) {
+                this.error = p.compact_refusal;
+                return;
+            }
+            this.busy = true;
+            try {
+                await this.api("POST", "/api/providers", {
+                    id: p.id,
+                    base_url: p.base_url,
+                    models: p.models.filter((m) => !m.deprecated).map((m) => `${m.id}:${m.class}:${m.relative_cost}`).join(","),
+                    compact: value,
+                });
+                this.error = "";
+                await this.loadProviders();
+            }
+            catch (e) {
+                this.error = e instanceof Error ? e.message : String(e);
+            }
+            finally {
+                this.busy = false;
+            }
+        },
         async removeProvider(p) {
             if (!confirm(`Remove provider ${p.id}? Accounts pinned to it are unpinned.`))
                 return;
