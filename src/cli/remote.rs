@@ -203,7 +203,7 @@ pub fn run(args: &[String]) -> i32 {
 
 mod attach;
 mod files;
-mod resolver;
+pub(crate) mod resolver;
 
 fn cmd_list() -> i32 {
     let prefs = load_preferences(&platform::config_dir());

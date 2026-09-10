@@ -181,3 +181,135 @@ mod help_tests {
         assert!(missing.is_empty(), "{}", missing.join("\n  "));
     }
 }
+
+#[cfg(test)]
+mod tab_key_tests {
+    //! Pins how the tab-key resolvers disagree.
+    //!
+    //! Three functions turn a key someone typed into one tab, and they do not
+    //! agree on precedence, on whether a bare number is an index, or on case.
+    //! See `docs/tab-key-resolution.md` for the table and what each possible
+    //! fix would break.
+    //!
+    //! These assertions describe what the code does TODAY. They are not an
+    //! endorsement of it — they exist so the divergence cannot widen quietly,
+    //! and so that whoever unifies these has to change a test that says, in
+    //! words, which behaviour they are choosing to break.
+
+    use crate::cli::remote::resolver::pick_tab;
+    use crate::cli::team::{TabView, resolve_target};
+    use crate::remote::RemoteTabSnapshot;
+
+    /// Two tabs: index 0 named `build`, index 1 named `3`. The tab named `3`
+    /// is the whole point — it is where "is a bare number an index" bites.
+    fn views() -> Vec<TabView> {
+        serde_json::from_value(serde_json::json!([
+            { "index": 0, "id": "uuid-aaa", "name": "build" },
+            { "index": 1, "id": "uuid-bbb", "name": "3" },
+        ]))
+        .expect("fixture")
+    }
+
+    fn snapshots() -> Vec<RemoteTabSnapshot> {
+        vec![
+            RemoteTabSnapshot {
+                remote_id: "uuid-aaa".to_owned(),
+                remote_index: 0,
+                name: "build".to_owned(),
+                ..RemoteTabSnapshot::default()
+            },
+            RemoteTabSnapshot {
+                remote_id: "uuid-bbb".to_owned(),
+                remote_index: 1,
+                name: "3".to_owned(),
+                ..RemoteTabSnapshot::default()
+            },
+        ]
+    }
+
+    #[test]
+    fn a_bare_number_means_different_tabs_to_different_verbs() {
+        // team: NAME first, so the tab called "3" wins over index 3 — and
+        // here there is no index 3, yet it still resolves.
+        let views = views();
+        let t = resolve_target(&views, "3").expect("team resolves a bare number");
+        assert_eq!(t.id, "uuid-bbb", "team matched the tab NAMED 3");
+
+        // remote: a bare number is never an index. It falls through to uuid,
+        // then name — landing on the same tab by a different route.
+        let snaps = snapshots();
+        let r = pick_tab(&snaps, "3").expect("remote resolves a bare number");
+        assert_eq!(r.remote_id, "uuid-bbb", "remote matched the tab NAMED 3");
+
+        // And the index form each accepts is not the same string.
+        assert!(pick_tab(&snaps, "#0").is_ok(), "remote wants #N");
+        assert!(pick_tab(&snaps, "0").is_err(), "remote does not take a bare index");
+        assert!(
+            resolve_target(&views, "0").is_ok(),
+            "team takes a bare index when no tab is named it"
+        );
+    }
+
+    #[test]
+    fn only_the_remote_resolver_folds_case() {
+        assert!(
+            pick_tab(&snapshots(), "BUILD").is_ok(),
+            "remote matches a name case-insensitively"
+        );
+        assert!(
+            resolve_target(&views(), "BUILD").is_err(),
+            "team does not — the same key finds a tab over a remote and nothing locally"
+        );
+    }
+
+    #[test]
+    fn neither_guesses_between_two_tabs_sharing_a_name() {
+        // The one rule all three DO agree on, and the one worth keeping
+        // whatever else changes: acting on the wrong tab types into somebody
+        // else's session.
+        let twins: Vec<TabView> = serde_json::from_value(serde_json::json!([
+            { "index": 0, "id": "uuid-aaa", "name": "build" },
+            { "index": 1, "id": "uuid-bbb", "name": "build" },
+        ]))
+        .expect("fixture");
+        let err = resolve_target(&twins, "build").expect_err("ambiguous");
+        assert!(
+            err.contains('0') && err.contains('1'),
+            "names the indexes to pick from: {err}"
+        );
+
+        let twins = vec![
+            RemoteTabSnapshot {
+                remote_id: "uuid-aaa".to_owned(),
+                remote_index: 0,
+                name: "build".to_owned(),
+                ..RemoteTabSnapshot::default()
+            },
+            RemoteTabSnapshot {
+                remote_id: "uuid-bbb".to_owned(),
+                remote_index: 1,
+                name: "build".to_owned(),
+                ..RemoteTabSnapshot::default()
+            },
+        ];
+        let err = pick_tab(&twins, "build").expect_err("ambiguous");
+        assert!(err.contains("ambiguous"), "{err}");
+    }
+
+    #[test]
+    fn they_agree_that_the_index_is_zero_based() {
+        // Ruled out first, because an off-by-one between them would be a much
+        // worse bug than the precedence disagreement. Both read the `index`
+        // the API publishes, which is `.enumerate()` in src/api/tabs.rs.
+        assert_eq!(
+            resolve_target(&views(), "0").expect("index 0").id,
+            "uuid-aaa",
+            "team: index 0 is the first tab"
+        );
+        assert_eq!(
+            pick_tab(&snapshots(), "#0").expect("index 0").remote_id,
+            "uuid-aaa",
+            "remote: #0 is the first tab"
+        );
+    }
+}
