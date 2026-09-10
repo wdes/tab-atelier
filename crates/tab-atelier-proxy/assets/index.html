@@ -352,8 +352,8 @@
                 <thead>
                   <tr class="text-body-secondary">
                     <th>Provider</th><th>Endpoint</th><th>Models</th>
-                    <th class="text-center">Key</th><th>Compaction</th>
-                    <th class="text-end">Order</th><th></th>
+                    <th class="text-center">Key</th>
+                    <th class="text-end">Pref</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -385,25 +385,6 @@
                             title="Read from the service's environment at request time.">env var</span>
                       <span v-else-if="p.ready" class="text-success">set</span>
                       <span v-else class="text-danger">missing</span>
-                    </td>
-                    <td class="small">
-                      <!--
-                        How much of an old conversation this provider is sent.
-                        Only worth anything where the cache is already gone —
-                        a rewritten body invalidates every breakpoint after the
-                        edit, so on the subscription it is a shorter body and a
-                        bigger bill. That is why the option is refused there,
-                        with the reason shown rather than a silent revert.
-                      -->
-                      <select class="form-select form-select-sm" autocomplete="off"
-                              style="min-width: 15rem"
-                              :disabled="busy"
-                              :value="p.compact"
-                              :title="p.compact_refusal || ''"
-                              @change="setCompact(p, $event.target.value)">
-                        <option v-for="c in (providers ? providers.compact_levels : [])"
-                                :key="c.value" :value="c.value">{{ c.label }}</option>
-                      </select>
                     </td>
                     <td class="text-end small">{{ p.preference }}</td>
                     <td class="text-end text-nowrap">
@@ -540,7 +521,12 @@
                   <tr v-for="(c, i) in inspect.captures.slice().reverse()" :key="'cap'+i">
                     <td class="small text-nowrap">{{ whenLocal(c.ts) }}</td>
                     <td class="small">{{ c.account_email }}</td>
-                    <td class="small font-monospace">{{ c.model || '—' }}</td>
+                    <td class="small">
+                      <span v-if="c.kind === 'classifier'"
+                            class="badge text-bg-secondary me-1"
+                            title="Claude Code's auto-mode permission classifier — a separate call per gated action, not part of the conversation">auto-mode</span>
+                      <span class="font-monospace">{{ c.model || '—' }}</span>
+                    </td>
                     <td class="small text-end text-nowrap">{{ tokenSummary(c) }}</td>
                     <td class="small text-end" :class="c.status && c.status >= 400 ? 'text-danger' : ''">
                       {{ c.status || '—' }}
@@ -561,8 +547,21 @@
             <div v-if="inspectOpen" class="mt-3 border rounded p-3">
               <div class="d-flex align-items-start mb-2">
                 <div class="flex-grow-1 small">
-                  <div class="fw-semibold">{{ inspectOpen.method }} {{ inspectOpen.path }}</div>
+                  <div class="fw-semibold">
+                    {{ inspectOpen.method }} {{ inspectOpen.path }}
+                    <span v-if="inspectOpen.kind === 'classifier'"
+                          class="badge text-bg-secondary ms-1">auto-mode classifier</span>
+                  </div>
                   <div class="text-body-secondary">
+                    <!-- Said out loud here, where the request can be read: one
+                         of these is emitted per gated action and its input is
+                         the whole transcript, so a row is not the same unit of
+                         work as a conversation turn. -->
+                    <div v-if="inspectOpen.kind === 'classifier'">
+                      The auto-mode permission classifier, not the conversation. Claude Code
+                      makes one of these per gated action; the transcript is embedded in its
+                      single user turn and its reply is a parsed verdict.
+                    </div>
                     {{ whenLocal(inspectOpen.ts) }} · {{ inspectOpen.account_email }} ·
                     via {{ inspectOpen.provider }}
                     <span v-if="inspectOpen.status"> · HTTP {{ inspectOpen.status }}</span>
@@ -625,6 +624,7 @@
                 <th>Keys · last used</th>
                 <th class="text-end">Tokens (7 d) · calls · avg/call</th>
                 <th>Routed to</th>
+                <th>Compaction</th>
                 <th class="text-end">Key</th>
               </tr>
             </thead>
@@ -709,6 +709,31 @@
                     <option v-for="p in (providers ? providers.providers : [])" :key="p.id" :value="p.id">
                       {{ p.id }}
                     </option>
+                  </select>
+                </td>
+                <td>
+                  <!-- Per PERSON, not per provider. The operator reasoning
+                       about compaction is looking at a person ("this account
+                       is dragging a context it stopped needing"), and routing
+                       picks the hop per request — so a level filed under a
+                       provider silently means something else the moment that
+                       provider stops being where the traffic goes.
+
+                       The hop still gets a say: compacting through the
+                       subscription invalidates the cache breakpoints that are
+                       the only reason it is affordable. That refusal lives on
+                       the provider and is raised by the server against every
+                       destination this account could actually reach, so it is
+                       reported here rather than pre-computed into an option
+                       list that would have to guess which hop is live. -->
+                  <select autocomplete="off"
+                    class="form-select form-select-sm"
+                    style="min-width: 13rem"
+                    :value="u.compact"
+                    @change="setUserCompact(u, $event.target.value)"
+                    :disabled="busy">
+                    <option v-for="c in (providers ? providers.compact_levels : [])"
+                            :key="c.value" :value="c.value">{{ c.label }}</option>
                   </select>
                 </td>
                 <td class="text-end">

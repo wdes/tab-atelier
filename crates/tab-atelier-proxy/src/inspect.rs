@@ -92,6 +92,14 @@ pub struct Capture {
     /// the client asked for — that is half the point of looking.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Whether this is the conversation or the auto-mode permission classifier.
+    ///
+    /// Defaults to `Work`, which is the right reading for the lines already on
+    /// disk and for any request the detector does not fire on. The panel uses
+    /// it to keep the judge out of the per-account call and token figures,
+    /// which answer a question about work.
+    #[serde(default)]
+    pub kind: crate::classifier::Kind,
     pub request_headers: Vec<(String, String)>,
     /// The JSON sent to Anthropic, scrubbed and truncated.
     pub request_body: String,
@@ -174,6 +182,9 @@ pub struct Outgoing<'a> {
     /// Path and query, as sent.
     pub path: &'a str,
     pub provider: &'a str,
+    /// The conversation, or the auto-mode classifier. Detected from the body
+    /// by the caller, which has already parsed it to route the request.
+    pub kind: crate::classifier::Kind,
     pub headers: &'a [(String, String)],
     pub body: &'a [u8],
 }
@@ -188,6 +199,7 @@ pub fn capture(o: &Outgoing<'_>) -> Capture {
         method,
         path,
         provider,
+        kind,
         headers,
         body,
     } = o;
@@ -205,6 +217,7 @@ pub fn capture(o: &Outgoing<'_>) -> Capture {
         path: (*path).to_owned(),
         provider: (*provider).to_owned(),
         model,
+        kind: *kind,
         request_headers: headers
             .iter()
             .filter(|(k, _)| KEEP_HEADERS.contains(&k.to_ascii_lowercase().as_str()))
@@ -383,6 +396,7 @@ mod tests {
             method: "POST",
             path: "/v1/messages",
             provider: "anthropic",
+            kind: crate::classifier::Kind::Work,
             headers: &headers,
             body: br#"{"model":"claude-haiku-4-5-20251001"}"#,
         });
@@ -432,6 +446,7 @@ mod tests {
                 method: "POST",
                 path: "/v1/messages",
                 provider: "anthropic",
+                kind: crate::classifier::Kind::Work,
                 headers: &[],
                 body: br#"{"model":"m"}"#,
             })
@@ -483,6 +498,7 @@ mod tests {
             method: "POST",
             path: "/v1/messages",
             provider: "anthropic",
+            kind: crate::classifier::Kind::Work,
             headers: &[],
             body: big.as_bytes(),
         });

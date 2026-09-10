@@ -111,6 +111,17 @@ pub struct Account {
     /// work-conserving.
     #[serde(default = "default_weight")]
     pub weight: u32,
+    /// How much of an old conversation is elided before this person's request
+    /// goes out — see [`crate::compact`] and `docs/proxy-compaction.md`.
+    ///
+    /// PER PERSON, not per provider. It looks like a property of the hop
+    /// because the harm it can do is a property of the hop, but the operator
+    /// reasoning about it is looking at a person: "Mallory is costing us a
+    /// fortune in context she has already stopped needing". The hop is then an
+    /// implementation detail the routing decides, and the pass handles that —
+    /// see [`crate::compact`] on why it declines to act on the subscription.
+    #[serde(default)]
+    pub compact: crate::compact::Compact,
     /// Pin every request from this account to one provider, by id.
     ///
     /// `None` — the default — means the usual routing, where the proxy picks
@@ -439,6 +450,7 @@ impl Store {
             disabled: false,
             weight: default_weight(),
             provider: None,
+            compact: crate::compact::Compact::None,
         };
         self.accounts.push(account.clone());
         self.reindex();
@@ -572,6 +584,28 @@ impl Store {
             .find(|a| a.id == id)
             .ok_or_else(|| Error::NotFound(who.to_owned()))?;
         account.provider = provider.map(str::to_owned).filter(|p| !p.is_empty());
+        let out = account.clone();
+        self.reindex();
+        self.save()?;
+        Ok(out)
+    }
+
+    /// Set how much of this person's old conversation is elided.
+    ///
+    /// # Errors
+    /// No such account, or the file could not be written.
+    pub fn set_compact(&mut self, who: &str, level: crate::compact::Compact) -> Result<Account, Error> {
+        let id = self
+            .find(who)
+            .ok_or_else(|| Error::NotFound(who.to_owned()))?
+            .id
+            .clone();
+        let account = self
+            .accounts
+            .iter_mut()
+            .find(|a| a.id == id)
+            .ok_or_else(|| Error::NotFound(who.to_owned()))?;
+        account.compact = level;
         let out = account.clone();
         self.reindex();
         self.save()?;

@@ -24,7 +24,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response};
 
 use crate::users::{self, Account, Store, constant_time_eq};
-use crate::{account, egress, inspect, provider, qos, routing, usage};
+use crate::{account, classifier, egress, inspect, provider, qos, routing, usage};
 
 type Body = http_body_util::combinators::BoxBody<Bytes, Infallible>;
 
@@ -119,6 +119,9 @@ fn account_json(a: &Account) -> serde_json::Value {
         "weight": a.weight,
         // The pin, so a row can say where this person's work goes.
         "provider": a.provider,
+        // This person's compaction level. Per ACCOUNT, not per provider — see
+        // `set_user_compact` for why the two axes meet there.
+        "compact": a.compact.as_str(),
         // Every key, each with its own history. The hash is never included:
         // it is not a usable secret, but it is the input to an offline guess
         // and the UI has no reason to hold it.
@@ -464,6 +467,7 @@ async fn shape_and_admit(
                 provider_id,
                 model_id: String::new(),
                 class: provider::Class::Balanced,
+                kind: classifier::Kind::Work,
                 changed_from: None,
                 reason: None,
             },
@@ -471,10 +475,21 @@ async fn shape_and_admit(
     }
     // Choose the destination BEFORE admission, so the call is judged at the
     // price it will actually pay rather than the one it asked for.
-    let requested = serde_json::from_slice::<serde_json::Value>(&body)
-        .ok()
+    //
+    // One parse answers both questions routing asks: which model the caller
+    // named, and whether this is the conversation or the auto-mode classifier.
+    // The classifier is routed differently — a mapping may not retarget it and
+    // it is never compacted — so it has to be known before `choose`.
+    let parsed = serde_json::from_slice::<serde_json::Value>(&body).ok();
+    let requested = parsed
+        .as_ref()
         .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_owned))
         .unwrap_or_default();
+    let kind = if parsed.as_ref().is_some_and(classifier::is_classifier) {
+        classifier::Kind::Classifier
+    } else {
+        classifier::Kind::Work
+    };
     let health = provider_health(state);
     // Scoped: the registry lock is a std Mutex, and holding one across an
     // await makes this future non-Send — which the compiler reports as a
@@ -485,6 +500,7 @@ async fn shape_and_admit(
             &registry,
             &requested,
             account.provider.as_deref(),
+            kind,
             &health,
             |v| std::env::var(v).ok(),
             usage::now_secs(),
@@ -506,7 +522,18 @@ async fn shape_and_admit(
             route.model_id
         );
     }
-    let body = shape_body(state, &body, &route, &requested);
+    // Once per gated action, so it stays at debug: visible when an operator is
+    // asking where the classifier went, silent otherwise. The mapping it did
+    // NOT take is recorded too — that is the surprising half.
+    if kind == classifier::Kind::Classifier {
+        log::debug!(
+            "proxy: {} auto-mode classifier {requested} → {}/{} (mappings not applied)",
+            account.display_name(),
+            route.provider_id,
+            route.model_id
+        );
+    }
+    let body = shape_body(&body, &route, &requested, account.compact);
 
     // Admission gates on the SUBSCRIPTION's budget, so it applies only to a
     // destination that spends it.
@@ -557,16 +584,25 @@ async fn shape_and_admit(
 /// here: admission then scores the call at the size that will actually be sent
 /// rather than at the size it arrived. Returns the body untouched when there is
 /// nothing to do, which is the common case — every provider defaults to `none`.
-fn shape_body(state: &Arc<State>, body: &Bytes, route: &routing::Route, requested: &str) -> Bytes {
+fn shape_body(body: &Bytes, route: &routing::Route, requested: &str, compact: crate::compact::Compact) -> Bytes {
     let rename = (route.model_id != requested).then_some(route.model_id.as_str());
-    // Asked for under a lock, which is released before any work: the registry
-    // is a std Mutex and this function is called from an async context.
-    let level = state
-        .registry
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&route.provider_id)
-        .map_or(crate::compact::Compact::None, |p| p.compact);
+    // The level is the account's, resolved by the caller from wherever the
+    // store lives — not the provider's. It reads like a property of the hop,
+    // because the harm it can do is one (see `Provider::compact_refusal`), but
+    // the operator is reasoning about a PERSON, and routing picks the hop per
+    // request: a level filed under a provider silently means something else the
+    // moment that provider stops being where the traffic goes.
+    //
+    // The classifier is exempt by construction. Its transcript is TEXT inside a
+    // single user turn rather than `tool_result` blocks, so today's pass would
+    // find nothing — but that is a property of the current elision target, and
+    // a pass must never be the thing that decides which part of a safety
+    // judgement the judge gets to read. See `classifier::Kind::compacts`.
+    let level = if route.kind.compacts() {
+        compact
+    } else {
+        crate::compact::Compact::None
+    };
     if rename.is_none() && level.is_none() {
         return body.clone();
     }
@@ -829,6 +865,7 @@ fn begin_capture(f: &Forward, hdrs: &[(String, String)]) -> Option<inspect::Capt
         method: if f.is_post { "POST" } else { "GET" },
         path: &f.sub_pq,
         provider: &f.route.provider_id,
+        kind: f.route.kind,
         headers: hdrs,
         body: &f.body,
     }))
@@ -1407,10 +1444,12 @@ fn providers_json(state: &State) -> Response<Body> {
                     "enabled": p.enabled,
                     "peak_now": p.peak_now(now),
                     "peak": p.peak,
-                    "compact": p.compact.as_str(),
-                    // Whether the UI may offer anything but `none` here. Sent so
-                    // the reason is the server's, not a second copy of the rule
-                    // in TypeScript — the same rule the save path enforces.
+                    // Whether the UI may offer anything but `none` for traffic
+                    // through here, and why not. Level-independent: the harm
+                    // is a property of the HOP, so any non-none level meets it
+                    // equally, and the account's level is what decides whether
+                    // the warning is shown. Sent so the reason is the server's,
+                    // not a second copy of the rule in TypeScript.
                     "compact_refusal": p.compact_refusal(crate::compact::Compact::Tools),
                     // Whether the credential resolves — never the credential.
                     "ready": p.credential_ready(),
@@ -1557,6 +1596,58 @@ fn remove_mapping(state: &Arc<State>, from: &str) -> Response<Body> {
 }
 
 /// Pin an account to a provider, or clear the pin.
+/// Set an account's compaction level.
+///
+/// The level is the ACCOUNT's ([`Account::compact`]) but the objection is the
+/// HOP's ([`provider::Provider::compact_refusal`]): compacting through the
+/// subscription invalidates the cache breakpoints that are the only reason it
+/// is affordable, so a level there costs money and buys nothing. The two axes
+/// meet here because this is the one place that knows both — the person being
+/// configured, and every place their traffic could actually go.
+fn set_user_compact(state: &Arc<State>, store: &mut Store, who: &str, wanted: &str) -> Response<Body> {
+    let Some(level) = crate::compact::Compact::ALL
+        .into_iter()
+        .find(|c| c.as_str() == wanted.trim())
+    else {
+        return json(
+            400,
+            &serde_json::json!({ "error": format!("unknown compaction level {wanted:?}") }).to_string(),
+        );
+    };
+    // Refused on the SERVER, not only by the option the UI disables. A setting
+    // that cannot be correct should not be offerable, and the browser is not
+    // the only way in — this API is authenticated, not private.
+    if !level.is_none()
+        && let Some(why) = compact_refusal_for(state, store, who)
+    {
+        return json(400, &serde_json::json!({ "error": why }).to_string());
+    }
+    match store.set_compact(who, level) {
+        Ok(a) => json(200, &serde_json::json!({ "user": account_json(&a) }).to_string()),
+        Err(e) => json(404, &serde_json::json!({ "error": e.to_string() }).to_string()),
+    }
+}
+
+/// Why compaction would only cost money for this account, if it would.
+///
+/// [`provider::Provider::compact_refusal`] answers for ONE hop. This asks it of
+/// the account's destination: its pin when it has one, since that is the only
+/// place its traffic may go, and otherwise every enabled provider the router
+/// could pick. Any of them is enough to refuse. The router chooses per request,
+/// so an account that MIGHT be sent through the subscription is one whose
+/// compaction level is not free — and a refusal that only fired when there was
+/// no alternative would be a refusal that fired too late to be useful.
+fn compact_refusal_for(state: &Arc<State>, store: &Store, who: &str) -> Option<String> {
+    let reg = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // The hop's objection is level-independent — it is the breaker on
+    // `compact != none` — so any non-`none` level stands in for the rest.
+    let ask = |p: &provider::Provider| p.compact_refusal(crate::compact::Compact::Tools);
+    match store.find(who).and_then(|a| a.provider.as_deref()) {
+        Some(id) => reg.get(id).and_then(ask),
+        None => reg.providers.iter().filter(|p| p.enabled).find_map(ask),
+    }
+}
+
 fn set_user_provider(state: &Arc<State>, store: &mut Store, who: &str, wanted: &str) -> Response<Body> {
     let wanted = wanted.trim();
     // Validated HERE, where the registry is in hand, rather than in users.rs
@@ -1626,13 +1717,6 @@ fn save_provider(state: &Arc<State>, field: &dyn Fn(&str) -> String, body: &Byte
                     path: provider::provider_key_path(&dir, &id).display().to_string(),
                 },
                 models,
-                // From the form, but an absent field falls back to whatever is
-                // already set rather than resetting it: the toggle path posts
-                // the same form without a compaction choice, and a save must
-                // not silently turn a deliberate setting off.
-                compact: compact_from(body, &field("compact"))
-                    .or_else(|| reg.get(&id).map(|p| p.compact))
-                    .unwrap_or_default(),
                 preference: serde_json::from_slice::<serde_json::Value>(body)
                     .ok()
                     .and_then(|v| v.get("preference").and_then(serde_json::Value::as_i64))
@@ -1659,12 +1743,6 @@ fn save_provider(state: &Arc<State>, field: &dyn Fn(&str) -> String, body: &Byte
         new.peak.clone_from(&old.peak);
     }
 
-    // Refused on the SERVER, not only by the option the UI disables. A setting
-    // that cannot be correct should not be offerable, and the browser is not
-    // the only way in — this API is authenticated, not private.
-    if let Some(why) = new.compact_refusal(new.compact) {
-        return json(400, &serde_json::json!({ "error": why }).to_string());
-    }
     let id = new.id.clone();
 
     // The key, if one was pasted. Written to its own 0600 file BEFORE the
@@ -1687,24 +1765,6 @@ fn save_provider(state: &Arc<State>, field: &dyn Fn(&str) -> String, body: &Byte
     }
     log::info!("proxy: provider {id} saved");
     json(200, &serde_json::json!({ "id": id }).to_string())
-}
-
-/// A compaction level named in a request body, if one was named.
-///
-/// `None` for an absent field, which is not the same as an explicit `"none"` —
-/// the caller uses that difference to decide whether a save is setting the
-/// value or merely not mentioning it.
-fn compact_from(body: &Bytes, named: &str) -> Option<crate::compact::Compact> {
-    let text = if named.is_empty() {
-        serde_json::from_slice::<serde_json::Value>(body)
-            .ok()?
-            .get("compact")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)?
-    } else {
-        named.to_owned()
-    };
-    crate::compact::Compact::ALL.into_iter().find(|c| c.as_str() == text)
 }
 
 /// The account-mutating half of the admin API.
@@ -1754,6 +1814,18 @@ fn mutate(state: &Arc<State>, method: &Method, path: &str, body: &Bytes) -> Resp
             let who = p.trim_start_matches("/api/users/").trim_end_matches("/provider");
             set_user_provider(state, &mut store, who, &field("provider"))
         }
+        // The account's compaction level. Per PERSON, not per provider: the
+        // operator reasoning about it is looking at a person, and routing picks
+        // the hop per request — a level filed under a provider silently means
+        // something else the moment that provider stops being where the traffic
+        // goes. The hop still gets a say, because the harm is a property of the
+        // hop; see the refusal below.
+        (&Method::POST, p) if p.starts_with("/api/users/") && p.ends_with("/compact") => set_user_compact(
+            state,
+            &mut store,
+            p.trim_start_matches("/api/users/").trim_end_matches("/compact"),
+            &field("compact"),
+        ),
         (&Method::POST, "/api/users") => {
             match store.add(&field("first_name"), &field("last_name"), &field("email")) {
                 // No key yet, on purpose: a key is named for where it will be
@@ -2070,6 +2142,7 @@ mod tests {
     fn an_account_serialises_without_its_hash() {
         let a = Account {
             provider: None,
+            compact: crate::compact::Compact::None,
             id: "id-1".to_owned(),
             first_name: "Ada".to_owned(),
             last_name: "Lovelace".to_owned(),

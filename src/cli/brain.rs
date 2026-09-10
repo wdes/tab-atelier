@@ -221,12 +221,20 @@ pub const PATTERNS: &[Pattern] = &[
         label: "connection-closed-mid-response",
         action: "continue\r",
     },
-    // Auto-mode model-routing classifier briefly unavailable
-    // (Anthropic-side dependency that decides which model to use
-    // for the next turn). Shape Claude Code prints:
+    // The auto-mode permission classifier could not return a verdict, so
+    // auto mode will not gate the next action. Shape Claude Code prints:
     //   "<model> is temporarily unavailable, so auto mode cannot
     //    determine the safety of Bash right now. Wait briefly …"
-    // Recovery is identical to the other transient outages.
+    //
+    // The message reads as an upstream outage and the recovery is the same
+    // as for one, but the cause is NOT necessarily Anthropic-side — this is
+    // a separate Messages call per gated action, and through the relay it
+    // can fail for reasons the conversation never sees (a credential for
+    // whoever it was routed to, a 429 there, a proxy hop that dropped it).
+    // So when this fires under tab-atelier, check the proxy before the
+    // vendor: the reply is one parsed tag, and anything that stops it
+    // arriving looks identical from here. See the classifier module in
+    // tab-atelier-proxy for what that call is and why it is treated apart.
     Pattern {
         needle: "auto mode cannot determine the safety",
         label: "auto-mode-classifier-down",

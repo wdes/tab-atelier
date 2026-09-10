@@ -120,11 +120,11 @@ thing I wrote was".
 
 ## The control
 
-A `<select>` on each provider in the admin UI, written to that provider's entry
-in `providers.json`:
+A `<select>` on each **account** in the admin UI, written to that account's entry
+in `users.json`:
 
 ```html
-<select :value="p.compact" @change="setCompact(p, $event.target.value)">
+<select :value="u.compact" @change="setUserCompact(u, $event.target.value)">
   <option value="none">None</option>
   <option value="tools">Remove old tool results</option>
   <option value="tools_thinking">Remove old tool results and thinking</option>
@@ -139,16 +139,37 @@ labels are *served*, not written here — `Compact::label()` is the same enum
 routing reads, and a second copy in TypeScript would be a second thing to keep
 in step.
 
-Parsed as a field on the provider, defaulting to `"none"` for providers already
-in the file:
+### Why it is per account, not per provider
+
+It reads like a property of the hop, because the harm it can do *is* one (see
+[The honest limits](#the-honest-limits)). But the operator reasoning about it is
+looking at a **person** — "this account is dragging a context it stopped
+needing" — and routing picks the hop **per request**. A level filed under a
+provider therefore silently changes meaning the moment that provider stops being
+where the traffic goes: the setting stays put, and the thing it governs does not.
+
+So the level lives on the account, and the hop's objection is raised *against
+whatever route was actually taken*. `Provider::compact_refusal` still exists and
+still answers for one hop; the server asks it of every destination the account
+could reach — its pin, or every enabled provider — and refuses the save if any of
+them is the subscription. An account that *might* be sent through the
+subscription is one whose compaction is not free, and a refusal that only fired
+once there was no alternative would fire too late to be useful.
+
+Parsed as a field on the account, defaulting to `"none"` for every account
+already in the file:
 
 ```json
 {
-  "id": "deepseek",
-  "base_url": "https://api.deepseek.com/anthropic",
+  "id": "…",
+  "email": "someone@example.com",
   "compact": "tools_thinking"
 }
 ```
+
+`#[serde(default)]` is what makes that backward compatible: a file without the
+key loads as `none` rather than failing. A file that does not parse costs every
+key in it, which is every login in the file.
 
 **`none` is the default, and it is the right value on the Anthropic provider.**
 The whole point is that the operator sets it per hop, with the reasoning above
@@ -182,13 +203,22 @@ The last one is not decoration: `tools[]` sits at the front of the cache prefix,
 and editing a schema can desync the `tool_use` arguments the model already
 emitted.
 
+And one whole request class is out of scope by construction: the **auto-mode
+permission classifier** is never compacted, whatever level the account is set
+to. Its transcript is *text inside one user turn*, not `tool_result` blocks, so
+today's pass would find nothing to elide — but that is a coincidence of the
+current elision target, and a pass must never be the thing that decides which
+part of a safety judgement the judge gets to read. See
+[`proxy-classifier.md`](proxy-classifier.md).
+
 ## Where it hooks in
 
 In `shape_and_admit` ([`server.rs`](../crates/tab-atelier-proxy/src/server.rs)),
 after `routing::choose` has picked a destination and before `qos::estimate_cost`
 scores it — so the admission decision is made at the size that will actually be
-sent. The body is already a `Value` at that point, and `rewrite_model` is the
-pattern to follow.
+sent. The body has already been parsed once, to find `model` and to tell the
+conversation from the auto-mode classifier, and `shape_body` is where the parse
+is reused for both mutations rather than repeated.
 
 The policy itself lives in the proxy crate, in `src/compact.rs`, beside
 [`src/transcript_compact.rs`](../src/transcript_compact.rs) in the sense of
@@ -225,10 +255,13 @@ fallback for the providers that do not.
 
 **And it is not free of the cache argument even here.** Compact early and often
 and you re-warm a truncated prefix on every route change. The setting is
-per-provider precisely so that decision stays where it was made.
+per-account so that the decision stays with the person it is about, and the
+hop's objection is raised against whatever route their traffic actually takes.
 
 ## See also
 
 - [Proxy-side tool policy](proxy-tools.md) — the same chokepoint and the same
-  per-provider control applied to `tools[]`, which is 19 % of the request and
+  per-account control applied to `tools[]`, which is 19 % of the request and
   sits *ahead of* every breakpoint this document reasons about.
+- [The auto-mode permission classifier](proxy-classifier.md) — the one request
+  class this pass must never touch, and why.
