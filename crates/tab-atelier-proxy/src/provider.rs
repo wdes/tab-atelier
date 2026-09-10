@@ -40,17 +40,34 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// What a model is for, rather than what it is called.
+/// The host part of a URL, lowercased.
 ///
-/// Routing happens within a class: a request that arrived asking for Opus is a
-/// request for something in [`Class::Heavy`], and any heavy model with
-/// capacity can serve it.
+/// Enough parsing for the one comparison that matters — which host a
+/// credential is about to be sent to — and deliberately not a URL parser: this
+/// crate has no business growing one to answer a two-line question.
+#[must_use]
+pub fn host_of(url: &str) -> String {
+    url.split("://")
+        .nth(1)
+        .unwrap_or(url)
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
+}
+
 /// How many mapping hops to follow before giving up.
 ///
 /// A chain longer than this is not a routing strategy, it is a mistake — and
 /// the loop has to terminate whatever the table says.
 const MAX_MAPPING_HOPS: usize = 8;
 
+/// What a model is for, rather than what it is called.
+///
+/// Routing happens within a class: a request that arrived asking for Opus is a
+/// request for something in [`Class::Heavy`], and any heavy model with
+/// capacity can serve it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Class {
@@ -363,6 +380,30 @@ impl Provider {
         self.peak.as_ref().is_some_and(|p| p.active_at(now))
     }
 
+    /// Why this provider must never be used, if there is such a reason.
+    ///
+    /// A coherence check rather than a credential check, and it guards the one
+    /// combination that leaks:
+    ///
+    /// `auth: claude_oauth` means "send the PROXY HOST'S OWN Claude access
+    /// token". Point that at anything but Anthropic and the proxy hands its
+    /// subscription credential to a third party on every request — silently,
+    /// because the request succeeds and the far end is delighted. Nothing in
+    /// the type system connects the auth kind to the URL, so the connection is
+    /// made here and enforced wherever a provider is considered.
+    #[must_use]
+    pub fn unusable_reason(&self) -> Option<String> {
+        match &self.auth {
+            Auth::ClaudeOauth if host_of(&self.base_url) != host_of(crate::egress::ANTHROPIC_BASE) => Some(format!(
+                "provider {} has auth claude_oauth but points at {}, not Anthropic — that would send this \
+                 host's own Claude token to a third party. Use an api_key_file credential instead.",
+                self.id,
+                host_of(&self.base_url)
+            )),
+            _ => None,
+        }
+    }
+
     /// Whether its credential is actually present.
     ///
     /// A provider configured but unusable must be visibly unusable — routing
@@ -379,6 +420,9 @@ impl Provider {
     /// (forbidden in this crate) and races every other test in the binary.
     #[must_use]
     pub fn credential_ready_with(&self, get: impl Fn(&str) -> Option<String>) -> bool {
+        if self.unusable_reason().is_some() {
+            return false;
+        }
         match &self.auth {
             Auth::ClaudeOauth => true,
             Auth::ApiKeyEnv { var } => get(var).is_some_and(|v| !v.trim().is_empty()),
@@ -626,7 +670,19 @@ impl Registry {
             return Self::default();
         };
         match serde_json::from_str::<Self>(&raw) {
-            Ok(r) if !r.providers.is_empty() => r,
+            Ok(r) if !r.providers.is_empty() => {
+                // Loud at LOAD, not only at the first request that would have
+                // used it. A provider that can never be used still sits in the
+                // file looking configured, and the operator's next question is
+                // "why is my traffic going to the subscription" — which is a
+                // far worse place to learn it.
+                for p in &r.providers {
+                    if let Some(why) = p.unusable_reason() {
+                        log::error!("provider {} is UNUSABLE: {why}", p.id);
+                    }
+                }
+                r
+            }
             Ok(_) => {
                 log::warn!("{}: no providers listed; using the built-in default", path.display());
                 Self::default()
@@ -1105,6 +1161,74 @@ mod tests {
 
     /// A provider whose credential is not a file must refuse a key write
     /// rather than accept one into a file nothing reads.
+    /// The one combination that leaks a credential, refused wherever a
+    /// provider is considered.
+    #[test]
+    fn claude_oauth_is_only_ever_pointed_at_anthropic() {
+        // `claude_oauth` means "send the proxy host's own Claude access token".
+        // Pointed anywhere else, every request hands the subscription
+        // credential to a third party — and succeeds, so nothing looks wrong.
+        let mut p = Provider {
+            id: "not-anthropic".to_owned(),
+            wire: Wire::Anthropic,
+            base_url: "https://evil.example/v1".to_owned(),
+            auth: Auth::ClaudeOauth,
+            models: vec![Model::new("m", Class::Balanced, 1)],
+            preference: 0,
+            enabled: true,
+            peak: None,
+        };
+        let why = p
+            .unusable_reason()
+            .expect("a non-Anthropic host with an OAuth credential");
+        assert!(why.contains("evil.example"), "the message names the destination: {why}");
+        // Not merely reported — excluded, or it would still be chosen.
+        assert!(!p.credential_ready_with(|_| Some("k".to_owned())));
+        let r = Registry {
+            providers: vec![p.clone()],
+            mappings: vec![],
+        };
+        assert!(
+            r.candidates_with(Class::Balanced, |_| Some("k".to_owned()), 0)
+                .is_empty(),
+            "an unusable provider must not be a candidate, whatever else is configured"
+        );
+
+        // The same provider pointing at Anthropic is fine.
+        p.base_url = "https://api.anthropic.com".to_owned();
+        assert!(p.unusable_reason().is_none());
+        assert!(p.credential_ready_with(|_| None), "and needs no key");
+
+        // A trailing slash or a different case is the same host, not a
+        // different one — a check that refused these would be a bug of its own.
+        for ok in [
+            "https://api.anthropic.com/",
+            "https://API.ANTHROPIC.COM",
+            "https://api.anthropic.com",
+        ] {
+            p.base_url = ok.to_owned();
+            assert!(p.unusable_reason().is_none(), "{ok} is Anthropic");
+        }
+
+        // A file-backed provider may point anywhere: its credential is its own.
+        p.auth = Auth::ApiKeyFile {
+            path: "/tmp/k".to_owned(),
+        };
+        p.base_url = "https://api.deepseek.com/anthropic".to_owned();
+        assert!(p.unusable_reason().is_none());
+    }
+
+    #[test]
+    fn host_of_takes_the_host_and_nothing_else() {
+        assert_eq!(host_of("https://api.anthropic.com/v1/messages"), "api.anthropic.com");
+        assert_eq!(host_of("https://api.anthropic.com"), "api.anthropic.com");
+        assert_eq!(host_of("https://API.Anthropic.com:443/x"), "api.anthropic.com:443");
+        // No scheme at all still yields the host rather than the whole URL,
+        // which is the shape a comparison silently fails on.
+        assert_eq!(host_of("api.anthropic.com/v1"), "api.anthropic.com");
+        assert_eq!(host_of(""), "");
+    }
+
     #[test]
     fn only_a_file_backed_provider_can_be_given_a_key() {
         // The predicate the ROUTE calls, not a reimplementation of it — a test

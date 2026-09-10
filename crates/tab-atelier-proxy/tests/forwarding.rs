@@ -258,12 +258,20 @@ fn a_revoked_key_stops_working_without_reaching_upstream() {
 
 /// A provider that answers on `port` with one balanced model, for the tests
 /// that care about WHERE traffic went rather than what it looked like.
-fn stub_provider(id: &str, port: u16, preference: i32) -> Provider {
+///
+/// Credentialed by file, not by `claude_oauth`. A second provider holding the
+/// proxy's own Claude login is refused outright — that would send the
+/// subscription's token to whatever host the entry names — so a stub standing
+/// in for "another Anthropic-compatible provider" carries its own key, which
+/// is what such a provider really has.
+fn stub_provider(id: &str, port: u16, preference: i32, key_path: &std::path::Path) -> Provider {
     Provider {
         id: id.to_owned(),
         wire: Wire::Anthropic,
         base_url: format!("http://127.0.0.1:{port}"),
-        auth: Auth::ClaudeOauth,
+        auth: Auth::ApiKeyFile {
+            path: key_path.display().to_string(),
+        },
         preference,
         enabled: true,
         peak: None,
@@ -295,9 +303,14 @@ fn a_429_moves_the_next_request_to_another_provider() {
     .expect("write creds");
     egress::set_credentials_path(Some(creds));
 
+    let stub_key = dir.join("stub.key");
+    std::fs::write(&stub_key, "sk-stub-provider").expect("write stub key");
     let registry = Registry {
         mappings: vec![],
-        providers: vec![stub_provider("primary", refuser, 0), stub_provider("backup", backup, 1)],
+        providers: vec![
+            stub_provider("primary", refuser, 0, &stub_key),
+            stub_provider("backup", backup, 1, &stub_key),
+        ],
     };
 
     let mut store = Store::load(dir.join("users.json")).expect("store");

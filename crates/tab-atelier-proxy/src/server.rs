@@ -936,6 +936,15 @@ fn destination(state: &State, provider_id: &str) -> Result<(String, (&'static st
         registry.get(provider_id).cloned()
     };
     let chosen = chosen.as_ref();
+    // Belt to the candidate filter's braces. `choose` never returns an
+    // unusable provider, but the metadata path names one directly from an
+    // account's pin — so the refusal lives here too, where the credential is
+    // actually attached to a URL.
+    if let Some(p) = chosen
+        && let Some(why) = p.unusable_reason()
+    {
+        return Err(why);
+    }
     // An explicit upstream override replaces the SUBSCRIPTION's base URL —
     // that is what it exists for (a test's mock, or an ops redirect). It must
     // not silently retarget a third-party provider, whose URL is its identity.
@@ -1460,6 +1469,16 @@ fn set_user_provider(state: &Arc<State>, store: &mut Store, who: &str, wanted: &
                 400,
                 &serde_json::json!({ "error": format!("no provider {wanted:?}") }).to_string(),
             );
+        }
+        // A pin to a provider that can never be used is a 503 on every request
+        // from that account, caused by an admin action somewhere else. Refuse
+        // it here, where there is a message to give.
+        let why = {
+            let reg = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            reg.get(wanted).and_then(provider::Provider::unusable_reason)
+        };
+        if let Some(why) = why {
+            return json(400, &serde_json::json!({ "error": why }).to_string());
         }
     }
     match store.set_provider(who, (!wanted.is_empty()).then_some(wanted)) {
