@@ -158,6 +158,54 @@ fn wait_until_listening(port: u16, child: &mut Child) {
 }
 
 /// CLI mints a key → server accepts it → the call is billed to that account.
+/// The credential-repair route: same boundary rules as everything else, plus
+/// the guard that stops it being a way to repoint a proxy.
+///
+/// Its own function because the walkthrough above is already at the length
+/// clippy allows, and this is a self-contained property.
+fn credential_repair_is_guarded(port: u16, key: &str) {
+    // 6b. The credential-repair route: same key, same boundary rules, and the
+    //     guard that stops it being a way to repoint a proxy.
+    let creds = r#"{"claudeAiOauth":{"accessToken":"a","refreshToken":"r","expiresAt":1}}"#;
+    let post_creds = |auth: &str| {
+        http(
+            port,
+            &format!(
+                "POST /me/credentials HTTP/1.1\r\nHost: x\r\n{auth}\r\n\
+                 Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{creds}",
+                creds.len()
+            ),
+        )
+    };
+    let no_key = post_creds("Connection: close");
+    assert!(
+        no_key.starts_with("HTTP/1.1 401"),
+        "credential repair must require a key:\n{no_key}"
+    );
+    // With a valid key it still refuses, because this scratch proxy has no
+    // recorded identity to check a replacement against. Bootstrapping is a
+    // host-side act on purpose: with nothing on record, "same account" cannot
+    // be enforced, and a guard that cannot be enforced must not be skipped.
+    let bootstrap = post_creds(&format!("x-api-key: {key}"));
+    assert!(
+        bootstrap.starts_with("HTTP/1.1 409"),
+        "expected a refusal naming the missing identity:\n{bootstrap}"
+    );
+    assert!(
+        bootstrap.contains("no identity on record"),
+        "the refusal must say what to do about it:\n{bootstrap}"
+    );
+    // And it is a POST-only route.
+    let wrong_method = http(
+        port,
+        &format!("GET /me/credentials HTTP/1.1\r\nHost: x\r\nx-api-key: {key}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(
+        wrong_method.starts_with("HTTP/1.1 405"),
+        "credential repair is POST only:\n{wrong_method}"
+    );
+}
+
 #[test]
 fn a_key_minted_by_the_cli_works_against_the_running_server() {
     let scratch = Scratch::new("full");
@@ -235,6 +283,8 @@ fn a_key_minted_by_the_cli_works_against_the_running_server() {
         refused.starts_with("HTTP/1.1 401"),
         "a user key opened the admin API:\n{refused}"
     );
+
+    credential_repair_is_guarded(port, &key);
 
     // 7. The admin token does, and sees the account the CLI created.
     let users = http(

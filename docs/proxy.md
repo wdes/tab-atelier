@@ -46,6 +46,31 @@ sudo systemctl enable --now tab-atelier-proxy
 It listens on `127.0.0.1:7900`. Put a TLS terminator in front rather than
 exposing it directly — it carries keys.
 
+### If the host cannot run `claude`
+
+The login above needs a browser and a TTY, which a server often has neither of.
+Copy one in from a machine that does:
+
+```sh
+ssh proxy-host sudo -u tab-atelier-proxy tab-atelier-proxy import-credentials < ~/.claude/.credentials.json
+ssh proxy-host sudo systemctl restart tab-atelier-proxy
+```
+
+It validates before writing, so a wrong paste is refused rather than
+overwriting a working login, and the file lands `0600`.
+
+**This copy has a lifetime.** A refresh rotates the refresh token and
+invalidates every other copy of it, so logging in again on the laptop revokes
+the proxy's. When that happens every call comes back:
+
+```json
+{"type":"error","error":{"type":"authentication_error","message":"OAuth access token has been revoked."}}
+```
+
+and the admin dashboard shows the plan monitor as not reporting. Re-run the
+import. Two machines sharing one Claude login is the underlying constraint, not
+something the proxy can paper over.
+
 ## Accounts
 
 ```sh

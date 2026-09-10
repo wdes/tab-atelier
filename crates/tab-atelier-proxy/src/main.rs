@@ -65,6 +65,22 @@ enum Command {
     Enable { who: String },
     /// Delete an account.
     Remove { who: String },
+    /// Install a Claude login copied from a machine that can run `claude`.
+    ///
+    /// The proxy talks to Anthropic with the host's own Claude OAuth
+    /// credentials, and a headless server cannot complete that login. Copy
+    /// `~/.claude/.credentials.json` from a machine that can:
+    ///
+    ///   ssh proxy-host tab-atelier-proxy import-credentials < ~/.claude/.credentials.json
+    ///
+    /// Re-run it whenever the proxy reports "OAuth access token has been
+    /// revoked": a refresh rotates the refresh token, so logging in again
+    /// anywhere else invalidates this copy.
+    ImportCredentials {
+        /// Read from this file instead of stdin.
+        #[arg(long, value_name = "PATH")]
+        from: Option<std::path::PathBuf>,
+    },
 }
 
 /// How often to ask Anthropic how much of the plan has been used.
@@ -175,6 +191,46 @@ fn now_rfc3339_at(secs: u64) -> String {
     // Second precision, `Z` rather than `+00:00`, to match what the .mjs
     // monitor writes and what the existing logs already hold.
     ts.strftime("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+/// Install a Claude login copied from a machine that could perform it.
+///
+/// Reads the file, or stdin when there is none — piping is the natural shape
+/// for this, since the credential should not be sitting in a second file on
+/// the way over.
+fn import_credentials(from: Option<&std::path::Path>) -> Result<(), String> {
+    let raw = if let Some(path) = from {
+        std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?
+    } else {
+        use std::io::Read as _;
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .map_err(|e| format!("read stdin: {e}"))?;
+        buf
+    };
+    let imported = tab_atelier_proxy::egress::import_credentials(&raw)?;
+    println!("installed {}", imported.path.display());
+    // The access token's expiry is the cheap proof that a LIVE credential
+    // arrived rather than a stale file someone had lying around — the most
+    // likely mistake when copying between machines.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+    if imported.expires_at > now {
+        println!(
+            "  access token valid for another {} min",
+            (imported.expires_at - now) / 60_000
+        );
+    } else {
+        println!("  access token already expired — the refresh token will be used on the next call");
+    }
+    if !imported.scopes.is_empty() {
+        println!("  scopes: {}", imported.scopes.join(" "));
+    }
+    println!("restart the service so the running proxy picks it up:");
+    println!("  systemctl restart tab-atelier-proxy");
+    Ok(())
 }
 
 /// Time the trip to Anthropic and print where it went.
@@ -444,6 +500,7 @@ fn run() -> Result<(), String> {
             println!("removed {} <{}>", a.display_name(), a.email);
             Ok(())
         }
+        Command::ImportCredentials { from } => import_credentials(from.as_deref()),
     }
 }
 
