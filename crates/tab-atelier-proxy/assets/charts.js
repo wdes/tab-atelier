@@ -210,6 +210,9 @@ const TokensChart = {
 // makes this chart worth drawing is the THRESHOLD rule: a number on its own
 // does not tell you whether you are about to be degraded, and the distance to
 // that line is the actual question.
+// Below this the five-hour window counts as reset. See `sessionResets`.
+const RESET_EPS = 0.01;
+
 const PressureChart = {
   mixins: [hoverable, xLabels],
   props: {
@@ -235,6 +238,48 @@ const PressureChart = {
       const base = PAD.top + this.plotH;
       return `${this.line} L${this.xOf(this.points.length - 1)},${base} L${this.xOf(0)},${base} Z`;
     },
+    // The weekly window, drawn behind the five-hour one. Same axis, because
+    // both are a fraction of their OWN window — a second y-scale here would be
+    // the classic dual-axis lie, inviting comparison of two numbers that share
+    // no denominator.
+    //
+    // Gaps are breaks, not zeroes: a failed poll carries no weekly figure, and
+    // joining across it would draw a decline that never happened.
+    weeklySegments() {
+      const out = [];
+      let run = [];
+      this.points.forEach((p, i) => {
+        if (p.seven_day == null) {
+          if (run.length > 1) out.push(run.join(" "));
+          run = [];
+          return;
+        }
+        run.push(`${run.length ? "L" : "M"}${this.xOf(i)},${this.yOf(p.seven_day)}`);
+      });
+      if (run.length > 1) out.push(run.join(" "));
+      return out;
+    },
+    hasWeekly() {
+      return this.points.some((p) => p.seven_day != null);
+    },
+    // Where the five-hour window rolled over: utilisation fell from above 1%
+    // to at or below it between two readings. Without these the line is one
+    // continuous sawtooth with no way to see where a session window ends and
+    // the next begins — and that window is the unit the limit is enforced in.
+    //
+    // A threshold rather than `=== 0` because the window is only visible
+    // through five-minute polls: the odds of sampling the instant it reads
+    // exactly zero are poor, and a reset caught at 0.4% is still a reset.
+    sessionResets() {
+      const out = [];
+      for (let i = 1; i < this.points.length; i++) {
+        const before = this.points[i - 1].util;
+        const now = this.points[i].util;
+        if (before == null || now == null) continue;
+        if (before > RESET_EPS && now <= RESET_EPS) out.push(i);
+      }
+      return out;
+    },
   },
   methods: {
     pct(v) {
@@ -251,6 +296,15 @@ const PressureChart = {
           <text v-for="t in [0, 0.5, 1]" :key="'l'+t" :x="${PAD.left - 8}" :y="yOf(t) + 4"
                 text-anchor="end">{{ pct(t) }}</text>
         </g>
+        <!-- Session-window boundaries: annotation, so they sit behind the data. -->
+        <g class="ta-reset">
+          <line v-for="i in sessionResets" :key="'r'+i"
+                :x1="xOf(i)" :x2="xOf(i)" :y1="${PAD.top}" :y2="${H - PAD.bottom}" />
+        </g>
+        <!-- The weekly window, behind the main line and dashed. The dash is a
+             second channel carrying the same identity as the hue, so the two
+             series stay apart in greyscale, in print and for a CVD reader. -->
+        <path v-for="(d, i) in weeklySegments" :key="'w'+i" :d="d" class="ta-line-2-bg" />
         <path :d="area" class="ta-area-1" />
         <path :d="line" class="ta-line-1" />
         <!-- Where fallback begins. Labelled, not just coloured. -->
@@ -262,6 +316,8 @@ const PressureChart = {
         </g>
         <g v-if="hover >= 0">
           <line class="ta-crosshair" :x1="xOf(hover)" :x2="xOf(hover)" :y1="${PAD.top}" :y2="${H - PAD.bottom}" />
+          <circle v-if="points[hover].seven_day != null" :cx="xOf(hover)"
+                  :cy="yOf(points[hover].seven_day)" r="4" class="ta-dot-2" />
           <circle :cx="xOf(hover)" :cy="yOf(points[hover].util ?? 0)" r="5" class="ta-dot-1" />
         </g>
         <g class="ta-axis">
@@ -269,11 +325,17 @@ const PressureChart = {
                 :x="xOf(l.i)" :y="${H - 6}" text-anchor="middle">{{ l.p.label }}</text>
         </g>
       </svg>
+      <!-- Two series means a legend, always: identity must not rest on hue. -->
+      <div class="small text-body-secondary mt-1">
+        <span class="me-3"><span class="ta-key ta-bg-1"></span>session (5 h)</span>
+        <span v-if="hasWeekly" class="me-3"><span class="ta-key ta-key-dash ta-bg-2"></span>weekly</span>
+        <span v-if="sessionResets.length"><span class="ta-key ta-key-rule"></span>session reset</span>
+      </div>
       <div v-if="hover >= 0" class="ta-tip" :style="tipStyle(hover)">
         <div class="ta-tip-h">{{ points[hover].label }}</div>
-        <div><span class="ta-key ta-bg-1"></span>{{ pct(points[hover].util) }} of the plan used</div>
-        <div v-if="points[hover].seven_day != null" class="ta-tip-sub">
-          {{ pct(points[hover].seven_day) }} used over 7 d
+        <div><span class="ta-key ta-bg-1"></span>{{ pct(points[hover].util) }} session (5 h)</div>
+        <div v-if="points[hover].seven_day != null">
+          <span class="ta-key ta-key-dash ta-bg-2"></span>{{ pct(points[hover].seven_day) }} weekly
         </div>
       </div>
     </div>`,

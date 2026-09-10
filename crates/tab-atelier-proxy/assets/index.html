@@ -59,6 +59,21 @@
       .ta-line-1 { fill: none; stroke: var(--series-1); stroke-width: 2; stroke-linejoin: round; }
       .ta-area-1 { fill: var(--series-1); opacity: 0.14; }
       .ta-dot-1 { fill: var(--series-1); stroke: var(--surface-1); stroke-width: 2; }
+      /* The weekly window: present, readable, and plainly not the headline.
+         Thinner and dashed rather than merely faded — a low-opacity line of
+         the same weight reads as "the same series, badly drawn", and opacity
+         alone disappears entirely in forced-colors mode. */
+      .ta-line-2-bg {
+        fill: none; stroke: var(--series-2); stroke-width: 1.5;
+        stroke-dasharray: 5 4; stroke-linejoin: round; opacity: .75;
+      }
+      .ta-dot-2 { fill: var(--series-2); stroke: var(--surface-1); stroke-width: 2; }
+      /* Window boundaries are annotation, not data: muted ink, hairline, and
+         behind everything, so they divide the plot without competing with it. */
+      .ta-reset line { stroke: var(--text-muted); stroke-width: 1; stroke-dasharray: 2 4; opacity: .55; }
+      .ta-key-rule {
+        background: repeating-linear-gradient(0deg, var(--text-muted) 0 2px, transparent 2px 6px);
+      }
       .ta-bar-1 { fill: var(--series-1); }
       .ta-bar-2 { fill: var(--series-2); }
       .ta-threshold line { stroke: var(--danger); stroke-width: 1; stroke-dasharray: 4 3; opacity: .7; }
@@ -79,6 +94,11 @@
       .ta-key { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 6px; }
       .ta-bg-1 { background: var(--series-1); }
       .ta-bg-2 { background: var(--series-2); }
+      /* The legend key repeats the dash, so the swatch matches the mark it
+         stands for instead of only its hue. */
+      .ta-key-dash {
+        background: repeating-linear-gradient(90deg, var(--series-2) 0 3px, transparent 3px 5px);
+      }
     </style>
   </head>
   <body class="bg-body-tertiary">
@@ -143,12 +163,29 @@
                   <div class="small" :class="planClass">{{ planState }}</div>
                 </div>
                 <div class="text-end small text-body-secondary">
-                  <div v-if="plan.latest && plan.latest.seven_day != null">
-                    7-day: {{ Math.round(plan.latest.seven_day * 100) }}% used
+                  <div v-if="weeklyUtil != null" :class="weeklyClass">
+                    <span class="ta-key ta-key-dash ta-bg-2"></span>weekly
+                    {{ Math.round(weeklyUtil * 100) }}% used
+                  </div>
+                  <!--
+                    Upstream's own claim, marked as a claim. `seven_day.resets_at`
+                    is the tail of a rolling window — when the oldest tokens age
+                    out — so it reads about a week ahead and slides forward daily.
+                    It is NOT when fresh allocation arrives, and people have
+                    planned work around it and been wrong.
+                  -->
+                  <div v-if="plan.latest && plan.latest.seven_day_resets"
+                       :title="'Upstream reports this as the weekly window rolling over: ' + whenLocal(plan.latest.seven_day_resets) + '. It describes the oldest tokens ageing out, not a fresh allocation.'">
+                    upstream says {{ untilLocal(plan.latest.seven_day_resets) }}
+                  </div>
+                  <!-- What we actually watched it do. -->
+                  <div v-if="plan.weekly_last_drop"
+                       :title="'Observed: the weekly counter fell from ' + Math.round(plan.weekly_last_drop.from * 100) + '% to ' + Math.round(plan.weekly_last_drop.to * 100) + '% at ' + whenLocal(plan.weekly_last_drop.ts)">
+                    last actually reset {{ untilLocal(plan.weekly_last_drop.ts) }}
                   </div>
                   <div v-if="plan.latest && plan.latest.five_hour_resets"
                        :title="whenLocal(plan.latest.five_hour_resets)">
-                    resets {{ untilLocal(plan.latest.five_hour_resets) }}
+                    session resets {{ untilLocal(plan.latest.five_hour_resets) }}
                   </div>
                   <div v-if="sched.backoff_for">backing off {{ sched.backoff_for }}s</div>
                   <div v-if="sched.rejected">{{ sched.rejected }} queued out</div>
