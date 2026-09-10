@@ -1,4 +1,4 @@
-// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+// SPDX-License-Identifier: MPL-2.0
 
 //! File transfer inside a tab's sandbox: upload into `inbox/` (atomic,
 //! symlink-guarded, per-token concurrency cap) and download from `inbox/` /

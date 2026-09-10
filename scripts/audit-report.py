@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+# SPDX-License-Identifier: MPL-2.0
 """Render the fleet's audit reports from the blackboard into docs/audit-findings.md.
 
 The board is the source of truth — every `done` on an `audit:` task is one

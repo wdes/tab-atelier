@@ -1,4 +1,4 @@
-// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+// SPDX-License-Identifier: MPL-2.0
 
 //! The core tab collection: the `GET /` / `/tabs` list (ETag-cached), tab
 //! creation (`POST /tabs`) and close (`DELETE /tabs/<id>`).

@@ -1,4 +1,4 @@
-// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+// SPDX-License-Identifier: MPL-2.0
 
 //! Per-tab network policy — the pure model shared by every enforcement
 //! path. A tab is in one of three modes:

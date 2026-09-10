@@ -1,4 +1,4 @@
-// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+// SPDX-License-Identifier: MPL-2.0
 
 //! Per-tab and global-default cgroup resource limits (`limit`), queued to the
 //! owner which applies them live.

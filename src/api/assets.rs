@@ -1,4 +1,4 @@
-// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+// SPDX-License-Identifier: MPL-2.0
 
 //! Public (pre-auth) static serving: the `OpenAPI` spec, the RFC 9727 API
 //! catalog, the viewer's vendored + own JS/CSS/font, and the site icons.

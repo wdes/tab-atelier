@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MPL-2.0
 # Install GitHub Next's Monaspace v1.400 (variable build) into the
 # user's font dir and refresh the fontconfig cache. Variable build
 # lets gpui interpolate any `ui_font_weight` value (e.g. 250) across

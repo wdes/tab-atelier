@@ -1,4 +1,4 @@
-// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+// SPDX-License-Identifier: MPL-2.0
 
 //! The per-tab off-hours auto-lock schedule resource, validated through
 //! `TabSchedule::new` and queued to the owner.

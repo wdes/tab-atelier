@@ -1,4 +1,4 @@
-// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+// SPDX-License-Identifier: MPL-2.0
 
 //! `tab-atelier wait` — block until named tasks finish, and say so with an
 //! exit code.

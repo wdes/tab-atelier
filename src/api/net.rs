@@ -1,4 +1,4 @@
-// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+// SPDX-License-Identifier: MPL-2.0
 
 //! Per-tab network resources: full-airgap (`net-off` / `net-on`, a bubblewrap
 //! net-namespace jail) and the nftables allowlist (`net-allow`). Both queue

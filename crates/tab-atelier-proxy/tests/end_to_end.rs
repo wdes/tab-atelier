@@ -1,4 +1,4 @@
-// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+// SPDX-License-Identifier: MPL-2.0
 
 //! The whole thing, through the real binary: mint a key with the CLI, start
 //! the server, and spend that key on a request.

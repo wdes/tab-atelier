@@ -1,4 +1,4 @@
-// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+// SPDX-License-Identifier: MPL-2.0
 
 //! Enumerate every catbus-agent currently listening on a socket. We
 //! treat the on-disk socket file in `~/.claude/projects/*/*.sock` as

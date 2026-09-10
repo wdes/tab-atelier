@@ -1,4 +1,4 @@
-// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+// SPDX-License-Identifier: MPL-2.0
 
 //! WebSocket transport for one attached tab — used by the xterm.js
 //! viewer and (eventually) `tab-atelier remote attach`.

@@ -1,4 +1,4 @@
-// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+// SPDX-License-Identifier: MPL-2.0
 //
 // Account management UI. Vue 3 global build — no bundler, no build step: the
 // proxy serves these two files and the vendored libraries as they are, so

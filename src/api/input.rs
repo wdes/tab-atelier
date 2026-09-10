@@ -1,4 +1,4 @@
-// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+// SPDX-License-Identifier: MPL-2.0
 
 //! The keystroke-input resource (`input`), refused when the tab is locked
 //! (manual or schedule), queued to the owner.

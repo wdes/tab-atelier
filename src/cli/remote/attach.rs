@@ -1,4 +1,4 @@
-// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+// SPDX-License-Identifier: MPL-2.0
 
 //! `tab-atelier remote attach <label-or-id> <tab>` — interactive
 //! mirror of one remote tab into the current local terminal.

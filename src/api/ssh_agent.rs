@@ -1,4 +1,4 @@
-// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+// SPDX-License-Identifier: MPL-2.0
 
 //! Per-tab ssh-agent enable/disable. Headless-only: the GUI edition returns
 //! 501 (the daemon owns the agent lifecycle).

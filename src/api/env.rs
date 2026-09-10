@@ -1,4 +1,4 @@
-// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+// SPDX-License-Identifier: MPL-2.0
 
 //! The `env`-var HTTP resource: masked `env list` (global + per-tab) and the
 //! queued `env set/unset` changes drained by the main loop.

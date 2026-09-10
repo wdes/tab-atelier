@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+# SPDX-License-Identifier: MPL-2.0
 #
 # Decide whether the Android APK has to be rebuilt for this event.
 # Prints `true` or `false`, and its reasoning on stderr.

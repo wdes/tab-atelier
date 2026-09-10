@@ -1,4 +1,4 @@
-// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+// SPDX-License-Identifier: MPL-2.0
 
 //! Helpers shared by the `attach` / `put` / `get` subcommands —
 //! endpoint lookup, tab-name resolution against `/tabs`, and a small

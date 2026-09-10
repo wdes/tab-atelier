@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+# SPDX-License-Identifier: MPL-2.0
 #
 # A backlog source: one audit task per module.
 #

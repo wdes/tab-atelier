@@ -1,4 +1,4 @@
-// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+// SPDX-License-Identifier: MPL-2.0
 
 //! The `/tabs/<id>/view` share-link viewer: the xterm.js document with the
 //! tab's name/background/key templated in, served with no-store + strict CSP.

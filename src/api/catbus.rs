@@ -1,4 +1,4 @@
-// @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+// SPDX-License-Identifier: MPL-2.0
 
 //! The catbus-agent bridge: session metadata, prompt forwarding over the
 //! agent's UNIX socket, and the parsed conversation.

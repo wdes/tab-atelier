@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# @licence MPL-2.0 https://mozilla.org/MPL/2.0/
+# SPDX-License-Identifier: MPL-2.0
 """Pre-trust folders for Claude Code, so a fresh agent tab does not stop to ask.
 
     scripts/claude-trust.py /mnt/Dev/@wdes /mnt/clients        # whole trees
