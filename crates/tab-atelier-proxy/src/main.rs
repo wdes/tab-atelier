@@ -271,6 +271,10 @@ fn report_routing(registry: &tab_atelier_proxy::provider::Registry) -> bool {
             registry,
             model,
             None,
+            // Work, not the classifier: `doctor` reports where conversations
+            // go. The classifier is routed off the raw name and would only
+            // confuse the table.
+            tab_atelier_proxy::classifier::Kind::Work,
             &healthy,
             |v| std::env::var(v).ok(),
             tab_atelier_proxy::usage::now_secs(),

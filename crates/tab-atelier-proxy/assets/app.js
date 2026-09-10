@@ -29,6 +29,10 @@ function emptyUsage(id) {
             keys: [],
             last_used_at: null,
             has_key: false,
+            provider: null,
+            // Off, matching the server's default and the `#[serde(default)]` that
+            // gives every account already on disk the same value.
+            compact: "none",
         },
         last_24h: emptyWindow(),
         last_7d: emptyWindow(),
@@ -420,6 +424,25 @@ const AdminApp = Vue.defineComponent({
                 this.busy = false;
             }
         },
+        // The account's own compaction level. Bound with `:value`, not `v-model`,
+        // like the provider select below was: a refused change must snap back to
+        // what is actually stored, and the server is the one that refuses — it
+        // knows every hop this account could reach, the browser does not.
+        async setUserCompact(u, value) {
+            this.busy = true;
+            try {
+                await this.api("POST", `/api/users/${u.id}/compact`, { compact: value });
+                this.error = "";
+                await this.refresh();
+            }
+            catch (e) {
+                this.error = e instanceof Error ? e.message : String(e);
+                await this.refresh();
+            }
+            finally {
+                this.busy = false;
+            }
+        },
         async removeProvider(p) {
             if (!confirm(`Remove provider ${p.id}? Accounts pinned to it are unpinned.`))
                 return;
@@ -442,6 +465,11 @@ const AdminApp = Vue.defineComponent({
         async setUserProvider(u, provider) {
             await this.api("POST", `/api/users/${u.id}/provider`, { provider });
             await this.refresh();
+        },
+        // The account's compaction level, as words rather than wire spelling.
+        compactLabel(u) {
+            const found = this.providers?.compact_levels.find((c) => c.value === u.compact);
+            return found ? found.label : u.compact;
         },
         // "in 12 · out 340 · cache 1.2k" — the four numbers that answer "why was
         // that turn expensive", beside the request that produced them.

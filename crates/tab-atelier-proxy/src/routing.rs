@@ -86,6 +86,11 @@ pub struct Route {
     pub provider_id: String,
     pub model_id: String,
     pub class: Class,
+    /// Whether this is the conversation or the auto-mode classifier. Carried
+    /// here because the routing decision is what makes it matter: it is the
+    /// difference between a destination chosen for work and one chosen for the
+    /// gate that guards work.
+    pub kind: crate::classifier::Kind,
     /// Set when this is not what the caller asked for.
     pub changed_from: Option<String>,
     /// `rerouted` (same class, different provider) or `degraded` (cheaper
@@ -98,14 +103,17 @@ pub struct Route {
 ///
 /// `health` answers for a provider id. `pinned` is the account's provider, if
 /// it has one — see [`Registry::candidates_pinned`] for why that filters
-/// rather than hints. Returns `None` only when nothing is configured that
-/// could serve the work at all — a caller should treat that as 503 rather than
-/// guessing.
+/// rather than hints. `kind` is the conversation or the auto-mode classifier;
+/// see [`crate::classifier::Kind::retargets_by_mapping`] for why only the
+/// former may be rewritten by a mapping. Returns `None` only when nothing is
+/// configured that could serve the work at all — a caller should treat that as
+/// 503 rather than guessing.
 #[must_use]
 pub fn choose(
     registry: &Registry,
     requested: &str,
     pinned: Option<&str>,
+    kind: crate::classifier::Kind,
     health: &dyn Fn(&str) -> Health,
     env: impl Fn(&str) -> Option<String> + Copy,
     now: u64,
@@ -115,7 +123,16 @@ pub fn choose(
     // operator who writes `opus → deepseek-flash` gets DeepSeek when DeepSeek
     // is usable and the normal ladder when it is not — rather than a hard pin
     // that turns into an outage the first time the far end rate-limits.
-    let (target, mapped_from) = registry.resolve(requested);
+    //
+    // Held to work, though: the classifier judges whether work may run, and
+    // "save money on the conversation" is not a statement about who adjudicates
+    // `rm -rf`. So the classifier is routed on the name it asked for. The pin
+    // and the ladder below still apply, so it goes somewhere fast and cheap.
+    let (target, mapped_from) = if kind.retargets_by_mapping() {
+        registry.resolve(requested)
+    } else {
+        (requested.to_owned(), None)
+    };
 
     // An explicit mapping to a model that exactly ONE provider serves is a
     // decision about destination, not just a rename: `deepseek-flash` exists
@@ -129,6 +146,7 @@ pub fn choose(
             provider_id: p.id.clone(),
             model_id: m.id.clone(),
             class: m.class,
+            kind,
             changed_from: mapped_from,
             reason: Some("mapped"),
         });
@@ -169,6 +187,7 @@ pub fn choose(
                     provider_id: p.id.clone(),
                     model_id: m.id.clone(),
                     class: c,
+                    kind,
                     changed_from: from,
                     reason,
                 });
@@ -228,6 +247,7 @@ fn pick_in<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::classifier;
     use crate::provider::{Auth, Model, Provider, Wire};
 
     fn healthy(_: &str) -> Health {
@@ -247,7 +267,6 @@ mod tests {
         let mut r = Registry::default();
         r.providers.push(Provider {
             peak: None,
-            compact: crate::compact::Compact::None,
             id: "bedrock".to_owned(),
             wire: Wire::Anthropic,
             base_url: "https://bedrock.example".to_owned(),
@@ -277,7 +296,16 @@ mod tests {
     #[test]
     fn a_healthy_subscription_serves_what_was_asked_for() {
         let r = two_providers();
-        let route = choose(&r, "claude-opus-5", None, &healthy, env_with_key, 0).expect("a route");
+        let route = choose(
+            &r,
+            "claude-opus-5",
+            None,
+            classifier::Kind::Work,
+            &healthy,
+            env_with_key,
+            0,
+        )
+        .expect("a route");
         assert_eq!(route.provider_id, "anthropic");
         assert_eq!(route.model_id, "claude-opus-5");
         assert_eq!(route.changed_from, None, "nothing to report when nothing changed");
@@ -299,7 +327,16 @@ mod tests {
                 Health::default()
             }
         };
-        let route = choose(&r, "claude-opus-5", None, &squeezed, env_with_key, 0).expect("a route");
+        let route = choose(
+            &r,
+            "claude-opus-5",
+            None,
+            classifier::Kind::Work,
+            &squeezed,
+            env_with_key,
+            0,
+        )
+        .expect("a route");
         assert_eq!(route.provider_id, "bedrock", "the work should move, not shrink");
         assert_eq!(route.class, Class::Heavy, "and stay at the same class");
         assert_eq!(route.reason, Some("rerouted"));
@@ -316,7 +353,15 @@ mod tests {
             backoff_secs: 30,
         };
         assert_eq!(
-            choose(&r, "claude-opus-5", None, &blocked, env_with_key, 0),
+            choose(
+                &r,
+                "claude-opus-5",
+                None,
+                classifier::Kind::Work,
+                &blocked,
+                env_with_key,
+                0
+            ),
             None,
             "a blocked provider serves nothing, at any class"
         );
@@ -335,7 +380,16 @@ mod tests {
                 Health::default()
             }
         };
-        let route = choose(&r, "claude-opus-5", None, &bedrock_blocked, env_with_key, 0).expect("a route");
+        let route = choose(
+            &r,
+            "claude-opus-5",
+            None,
+            classifier::Kind::Work,
+            &bedrock_blocked,
+            env_with_key,
+            0,
+        )
+        .expect("a route");
         assert_eq!(
             route.class,
             Class::Balanced,
@@ -355,7 +409,16 @@ mod tests {
             utilization: Some(0.93),
             backoff_secs: 0,
         };
-        let route = choose(&r, "claude-opus-5", None, &strained, env_with_key, 0).expect("a route");
+        let route = choose(
+            &r,
+            "claude-opus-5",
+            None,
+            classifier::Kind::Work,
+            &strained,
+            env_with_key,
+            0,
+        )
+        .expect("a route");
         assert_eq!(
             route.class,
             Class::Heavy,
@@ -370,7 +433,16 @@ mod tests {
     #[test]
     fn a_cheap_request_is_never_promoted() {
         let r = two_providers();
-        let route = choose(&r, "claude-haiku-4-5-20251001", None, &healthy, env_with_key, 0).expect("a route");
+        let route = choose(
+            &r,
+            "claude-haiku-4-5-20251001",
+            None,
+            classifier::Kind::Work,
+            &healthy,
+            env_with_key,
+            0,
+        )
+        .expect("a route");
         assert_eq!(route.class, Class::Fast);
         assert_ne!(route.model_id, "claude-opus-5");
     }
@@ -378,7 +450,16 @@ mod tests {
     #[test]
     fn an_unknown_model_is_treated_as_ordinary_work() {
         let r = Registry::default();
-        let route = choose(&r, "some-model-we-never-listed", None, &healthy, env_with_key, 0).expect("a route");
+        let route = choose(
+            &r,
+            "some-model-we-never-listed",
+            None,
+            classifier::Kind::Work,
+            &healthy,
+            env_with_key,
+            0,
+        )
+        .expect("a route");
         // Not Heavy — an unrecognised name must not buy the most expensive
         // thing available — and not a refusal either.
         assert_eq!(route.class, Class::Balanced);
@@ -407,7 +488,16 @@ mod tests {
         let mut r = with_deepseek();
         r.set_mapping("claude-opus-5", "deepseek-flash", None);
 
-        let route = choose(&r, "claude-opus-5", None, &healthy, env_with_key, 0).expect("a route");
+        let route = choose(
+            &r,
+            "claude-opus-5",
+            None,
+            classifier::Kind::Work,
+            &healthy,
+            env_with_key,
+            0,
+        )
+        .expect("a route");
         // Not Anthropic, even though it has preference 0 and serves a model of
         // the same class. `deepseek-flash` exists in exactly one place, so the
         // mapping named a destination, not just a rename.
@@ -423,7 +513,16 @@ mod tests {
         let mut r = Registry::default();
         r.set_mapping("claude-opus-5", "claude-sonnet-5", Some("cost control".to_owned()));
 
-        let route = choose(&r, "claude-opus-5", None, &healthy, env_with_key, 0).expect("a route");
+        let route = choose(
+            &r,
+            "claude-opus-5",
+            None,
+            classifier::Kind::Work,
+            &healthy,
+            env_with_key,
+            0,
+        )
+        .expect("a route");
         assert_eq!(route.provider_id, "anthropic");
         assert_eq!(route.model_id, "claude-sonnet-5");
         assert_eq!(route.class, Class::Balanced);
@@ -443,7 +542,16 @@ mod tests {
             utilization: None,
             backoff_secs: if id == "deepseek" { 60 } else { 0 },
         };
-        let route = choose(&r, "claude-opus-5", None, &no_deepseek, env_with_key, 0).expect("a route");
+        let route = choose(
+            &r,
+            "claude-opus-5",
+            None,
+            classifier::Kind::Work,
+            &no_deepseek,
+            env_with_key,
+            0,
+        )
+        .expect("a route");
         assert_eq!(
             route.provider_id, "anthropic",
             "the work still gets done; the mapping was a preference for DeepSeek, and it is unusable"
@@ -460,12 +568,29 @@ mod tests {
         // `None` case is the honest answer: a 503 the operator can see, rather
         // than a fall back to the very provider they were keeping this person
         // off.
-        if let Some(rt) = choose(&r, "claude-opus-5", Some("deepseek"), &healthy, env_with_key, 0) {
+        if let Some(rt) = choose(
+            &r,
+            "claude-opus-5",
+            Some("deepseek"),
+            classifier::Kind::Work,
+            &healthy,
+            env_with_key,
+            0,
+        ) {
             assert_eq!(rt.provider_id, "deepseek", "the pin filters, it does not hint");
         }
 
         // Pinned to Anthropic: DeepSeek is never chosen, whatever it costs.
-        let route = choose(&r, "claude-opus-5", Some("anthropic"), &healthy, env_with_key, 0).expect("a route");
+        let route = choose(
+            &r,
+            "claude-opus-5",
+            Some("anthropic"),
+            classifier::Kind::Work,
+            &healthy,
+            env_with_key,
+            0,
+        )
+        .expect("a route");
         assert_eq!(route.provider_id, "anthropic");
     }
 
@@ -478,6 +603,7 @@ mod tests {
                 &r,
                 "claude-sonnet-5",
                 Some("typo-not-a-provider"),
+                classifier::Kind::Work,
                 &healthy,
                 env_with_key,
                 0
@@ -508,6 +634,7 @@ mod tests {
             &r,
             "claude-sonnet-5",
             Some("deepseek"),
+            classifier::Kind::Work,
             &healthy,
             env_with_key,
             1_789_016_400,
@@ -521,6 +648,7 @@ mod tests {
             &r,
             "claude-sonnet-5",
             Some("deepseek"),
+            classifier::Kind::Work,
             &healthy,
             env_with_key,
             1_789_005_600,
@@ -528,8 +656,16 @@ mod tests {
         assert_eq!(peak.map(|rt| rt.provider_id), Some("deepseek".to_owned()));
 
         // With no pin, the ordering is what changes.
-        let unpinned_peak =
-            choose(&r, "claude-sonnet-5", None, &healthy, env_with_key, 1_789_005_600).expect("a route");
+        let unpinned_peak = choose(
+            &r,
+            "claude-sonnet-5",
+            None,
+            classifier::Kind::Work,
+            &healthy,
+            env_with_key,
+            1_789_005_600,
+        )
+        .expect("a route");
         assert_eq!(
             unpinned_peak.provider_id, "anthropic",
             "at peak, a provider whose price doubles should lose a close call"
@@ -542,6 +678,17 @@ mod tests {
             providers: vec![],
             mappings: vec![],
         };
-        assert_eq!(choose(&empty, "claude-opus-5", None, &healthy, env_with_key, 0), None);
+        assert_eq!(
+            choose(
+                &empty,
+                "claude-opus-5",
+                None,
+                classifier::Kind::Work,
+                &healthy,
+                env_with_key,
+                0
+            ),
+            None
+        );
     }
 }

@@ -275,7 +275,6 @@ fn stub_provider(id: &str, port: u16, preference: i32, key_path: &std::path::Pat
         preference,
         enabled: true,
         peak: None,
-        compact: tab_atelier_proxy::compact::Compact::None,
         models: vec![Model {
             id: format!("{id}-balanced"),
             class: Class::Balanced,
@@ -462,10 +461,15 @@ fn compaction_reaches_upstream_and_only_where_it_is_configured() {
         deprecated: false,
         note: None,
     }];
-    provider.compact = tab_atelier_proxy::compact::Compact::ToolsThinking;
 
     let mut store = Store::load(dir.join("users.json")).expect("store");
     let a = store.add("Ada", "Lovelace", "ada@example.org").expect("add");
+    // On the ACCOUNT, not the provider. The level is per person: routing picks
+    // the hop per request, so one filed under a provider would quietly mean
+    // something else the moment traffic stopped going there.
+    store
+        .set_compact(&a.id, tab_atelier_proxy::compact::Compact::ToolsThinking)
+        .expect("set");
     let (_k, key) = store.add_key(&a.email, "laptop").expect("key");
     let state = Arc::new(State {
         store: Mutex::new(store),
@@ -556,6 +560,121 @@ fn compaction_reaches_upstream_and_only_where_it_is_configured() {
     for field in ["tools", "system"] {
         assert_eq!(got[field], want[field], "{field} must survive the pass");
     }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Why the auto-mode permission classifier is routed, compacted and booked
+/// differently from the conversation it guards.
+#[test]
+fn the_auto_mode_classifier_is_not_retargeted_by_a_mapping() {
+    let _serial = EGRESS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (upstream, seen) = mock_status(200, "{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}");
+    let dir = scratch("classifier");
+    let stub_key = dir.join("stub.key");
+    std::fs::write(&stub_key, "sk-stub-provider").expect("write stub key");
+
+    // One provider, serving both names. Both a mapping and the class ladder
+    // would happily send the classifier here; what is asserted is the NAME it
+    // is sent under, which is the difference between a destination chosen for
+    // work and one chosen for the gate that guards work.
+    let mut provider = stub_provider("primary", upstream, 0, &stub_key);
+    provider.models = vec![
+        Model {
+            id: "primary-heavy".to_owned(),
+            class: Class::Heavy,
+            relative_cost: 50,
+            deprecated: false,
+            note: None,
+        },
+        Model {
+            id: "primary-balanced".to_owned(),
+            class: Class::Balanced,
+            relative_cost: 5,
+            deprecated: false,
+            note: None,
+        },
+    ];
+
+    let mut store = Store::load(dir.join("users.json")).expect("store");
+    let a = store.add("Ada", "Lovelace", "ada@example.org").expect("add");
+    // Compaction ON for this account, so its absence upstream is the
+    // exemption rather than an unconfigured pass.
+    store
+        .set_compact(&a.id, tab_atelier_proxy::compact::Compact::All)
+        .expect("set");
+    let (_k, key) = store.add_key(&a.email, "laptop").expect("key");
+    let state = Arc::new(State {
+        store: Mutex::new(store),
+        usage: Mutex::new(usage::Store::load(dir.join("usage"))),
+        sched: Mutex::new(qos::Sched::new()),
+        account: Mutex::new(account::Monitor::load(&dir)),
+        inspect: Mutex::new(tab_atelier_proxy::inspect::Store::load(std::env::temp_dir())),
+        wake: tokio::sync::Notify::new(),
+        registry: Mutex::new(Registry {
+            // Every heavy request is rewritten to the balanced name. An
+            // operator who wrote this meant the CONVERSATION; they did not say
+            // "let the balanced model adjudicate whether `rm -rf` is safe".
+            mappings: vec![tab_atelier_proxy::provider::Mapping {
+                from: "claude-opus-5".to_owned(),
+                to: "primary-balanced".to_owned(),
+                note: None,
+            }],
+            providers: vec![provider],
+        }),
+        registry_path: dir.join("providers.json"),
+        provider_backoff: Mutex::new(std::collections::BTreeMap::new()),
+        admin_token: "tap_admin".to_owned(),
+        web_root: None,
+    });
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let listener = rt
+        .block_on(async { tokio::net::TcpListener::bind("127.0.0.1:0").await })
+        .expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    rt.spawn(async move { serve_on(listener, state).await });
+
+    // The classifier exactly as Claude Code sends it, cut down to the parts
+    // that decide routing and compaction. The transcript is a STRING inside the
+    // single user turn — not `tool_result` blocks — which is the whole reason
+    // the current elision pass would find nothing to do here.
+    let classifier = r#"{"model":"claude-opus-5","max_tokens":64,"stop_sequences":["</severity>"],"thinking":{"type":"disabled"},"system":[{"type":"text","text":"You are a security monitor for autonomous AI coding agents."}],"messages":[{"role":"user","content":"<transcript>Bash: rm -rf /tmp/scratch</transcript>\n<cc_automode_permissions>Bash</cc_automode_permissions>"}]}"#;
+    let resp = request(
+        port,
+        &format!(
+            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {key}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{classifier}",
+            classifier.len()
+        ),
+    );
+    assert!(resp.starts_with("HTTP/1.1 200"), "resp: {resp}");
+
+    let seen = seen
+        .recv_timeout(std::time::Duration::from_secs(3))
+        .expect("upstream saw the request");
+    let (_, body) = seen.split_once("\r\n\r\n").expect("headers and body");
+    let got: serde_json::Value = serde_json::from_str(body).expect("upstream body is JSON");
+
+    // The name the caller asked for, not the mapped one.
+    assert_eq!(
+        got["model"], "primary-heavy",
+        "the classifier must not be retargeted by a mapping: {body}"
+    );
+    // And it was not compacted, though this account compacts everything else.
+    assert_eq!(
+        got["messages"],
+        serde_json::from_str::<serde_json::Value>(classifier).expect("json")["messages"]
+    );
+    // The field the live probe proved is load-bearing: without it the verdict
+    // comes back empty and auto mode reads as unable to decide.
+    assert_eq!(
+        got["thinking"]["type"], "disabled",
+        "thinking must pass through untouched"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

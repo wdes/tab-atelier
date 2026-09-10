@@ -34,6 +34,14 @@ interface ApiUser {
     keys: ApiKey[];
     last_used_at: number | null;
     has_key: boolean;
+    /** The provider this account's work is pinned to, if any. */
+    provider: string | null;
+    /**
+     * This account's compaction level. Per ACCOUNT, not per provider: routing
+     * picks the provider per request, so a level filed under one would quietly
+     * mean something else the moment traffic stopped going there.
+     */
+    compact: string;
 }
 
 interface TokenTotals {
@@ -146,6 +154,11 @@ interface Capture {
     path: string;
     provider: string;
     model?: string;
+    /**
+     * `"work"` or `"classifier"`. Always present — the server defaults it,
+     * so a capture written before the field existed still reads as work.
+     */
+    kind: string;
     request_headers: [string, string][];
     request_body: string;
     request_truncated: boolean;

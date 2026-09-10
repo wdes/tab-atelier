@@ -31,6 +31,7 @@
 //! against Anthropic directly.
 
 pub mod account;
+pub mod classifier;
 pub mod compact;
 pub mod egress;
 pub mod inspect;

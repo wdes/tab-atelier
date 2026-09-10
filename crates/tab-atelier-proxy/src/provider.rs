@@ -305,17 +305,6 @@ pub struct Provider {
     /// When this provider charges more for the same tokens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peak: Option<Peak>,
-    /// How much of an old conversation to elide before sending — see
-    /// [`crate::compact`] and `docs/proxy-compaction.md`.
-    ///
-    /// Per provider, not global, and `none` is the default because on the
-    /// Anthropic hop this is actively harmful: a compacted body invalidates
-    /// every `cache_control` breakpoint after the edit, which turns a cache
-    /// read into a full-price miss. Shorter body, bigger bill. It only pays
-    /// where the cache is already gone — on a reroute to a provider that never
-    /// had it.
-    #[serde(default)]
-    pub compact: crate::compact::Compact,
 }
 
 impl Provider {
@@ -549,11 +538,6 @@ impl Preset {
                 // for, so it is only worth leaving when it is out of capacity.
                 preference: 10,
                 enabled: true,
-                // Off, like every other provider. Compaction is the one setting
-                // here that rewrites what somebody's model actually reads, so
-                // it is the operator's call and not a preset's — one click on
-                // the row, and the reasoning is in docs/proxy-compaction.md.
-                compact: crate::compact::Compact::None,
                 peak: Some(Peak {
                     multiplier_percent: 200,
                     windows: vec![
@@ -702,10 +686,6 @@ impl Default for Registry {
                 base_url: crate::egress::ANTHROPIC_BASE.to_owned(),
                 auth: Auth::ClaudeOauth,
                 preference: 0,
-                // Never anything else here — see [`Provider::compact`]. A
-                // compacted body invalidates the cache breakpoints that make
-                // the subscription affordable in the first place.
-                compact: crate::compact::Compact::None,
                 enabled: true,
                 peak: None,
                 models: vec![
@@ -973,7 +953,6 @@ mod tests {
         // reroute story exists for.
         r.providers.push(Provider {
             peak: None,
-            compact: crate::compact::Compact::None,
             id: "bedrock".to_owned(),
             wire: Wire::Anthropic,
             base_url: "https://bedrock.example".to_owned(),
@@ -1242,7 +1221,6 @@ mod tests {
             preference: 0,
             enabled: true,
             peak: None,
-            compact: crate::compact::Compact::None,
         };
         let why = p
             .unusable_reason()
@@ -1339,7 +1317,6 @@ mod tests {
                 path: "/tmp/whatever.key".to_owned(),
             },
             peak: None,
-            compact: crate::compact::Compact::None,
             preference: 99,
             enabled: false,
             ..original.clone()
@@ -1396,7 +1373,6 @@ mod tests {
                 models: vec![Model::new("m", Class::Balanced, 1)],
                 preference: 10,
                 enabled: true,
-                compact: crate::compact::Compact::None,
                 peak: None,
             };
             assert!(
@@ -1417,43 +1393,57 @@ mod tests {
         }
     }
 
-    /// Compaction is a per-provider setting with a default that must not move.
+    /// Compaction is a PER-PERSON setting, not a per-provider one, with a
+    /// default that must not move.
+    ///
+    /// It reads like a property of the hop, because the harm it can do is a
+    /// property of the hop — see [`Provider::compact_refusal`]. But the
+    /// operator reasoning about it is looking at a person ("Mallory is costing
+    /// us a fortune in context she has stopped needing"), the hop is chosen
+    /// per request by routing, and a level filed under a provider silently
+    /// changes meaning the moment that provider is no longer where her traffic
+    /// goes. So the level lives on the account and the hop's objection is
+    /// raised against whatever route was actually taken.
     #[test]
     fn compact_round_trips_and_defaults_to_none() {
-        // A file written before this field existed has no `compact` key, and
-        // must read as `none` rather than failing to parse — every provider
-        // already in providers.json is in that position.
-        let old = r#"{"providers":[{"id":"p","base_url":"https://x","auth":{"kind":"claude_oauth"},
-            "models":[{"id":"m","class":"balanced","relative_cost":1}]}]}"#;
-        let parsed: Registry = serde_json::from_str(old).expect("a pre-compaction file still parses");
-        assert_eq!(parsed.providers[0].compact, crate::compact::Compact::None);
-        // It is written back explicitly rather than omitted, unlike `peak`:
-        // `none` is a value the operator chose, not an absent one, and a file
-        // that says so is one the UI and the docs can be read against. An
-        // older binary reading this file ignores the unknown field rather than
-        // refusing it, so the downgrade is safe either way.
-        let json = serde_json::to_string(&parsed).expect("serialize");
-        assert!(json.contains(r#""compact":"none""#), "{json}");
+        let dir = std::env::temp_dir().join(format!("ta-compact-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("users.json");
+        let mut store = crate::users::Store::load(&path).expect("empty store");
+        store.add("Who", "Ever", "who@example.com").expect("add");
+        let id = store.accounts()[0].id.clone();
+
+        assert!(
+            store.find(&id).expect("added").compact.is_none(),
+            "compaction must default off"
+        );
 
         for level in crate::compact::Compact::ALL {
-            let mut r = Registry::default();
-            r.providers[0].compact = level;
-            let json = serde_json::to_string(&r).expect("serialize");
-            let back: Registry = serde_json::from_str(&json).expect("parse");
-            assert_eq!(back.providers[0].compact, level, "{level:?} did not round-trip");
+            store.set_compact(&id, level).expect("set");
+            // Reloaded from disk rather than round-tripped in memory: what has
+            // to hold is that a RESTARTED service reads back the level an
+            // operator chose, and only the file knows that.
+            let back = crate::users::Store::load(&path).expect("reload");
+            assert_eq!(back.find(&id).expect("round-tripped").compact, level, "{level:?}");
             // The spelling in the file is the one the UI and the docs use.
+            let json = std::fs::read_to_string(&path).expect("read");
             assert!(json.contains(level.as_str()), "{json}");
         }
 
-        // The default registry — the subscription — is off, and must stay off.
-        assert!(Registry::default().providers[0].compact.is_none());
-        assert!(
-            crate::provider::Preset::Deepseek
-                .provider(Path::new("/tmp"))
-                .compact
-                .is_none(),
-            "a preset must not enable a setting that rewrites what a model reads"
-        );
+        // A file written before the field existed has no `compact` key and must
+        // read as `none` rather than failing to load: a file that does not
+        // parse costs every key in it, which is every login in the file.
+        let legacy = dir.join("legacy.json");
+        std::fs::write(
+            &legacy,
+            r#"{"accounts":[{"id":"a","first_name":"A","last_name":"B",
+                "email":"a@b.c","created_at":0,"keys":[]}]}"#,
+        )
+        .expect("write");
+        let old = crate::users::Store::load(&legacy).expect("a pre-compaction file still parses");
+        assert!(old.accounts()[0].compact.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The combination the spec calls out as impossible to be correct.

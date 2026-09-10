@@ -7,11 +7,15 @@ the third part of the request and the one nobody reads. In a measured Claude
 Code request it is **56,905 B — 19 % of a 306 KB body** — and **4,361 B of it
 was ever called**.
 
-This is the same chokepoint, the same per-provider config, and the same
+This is the same chokepoint, the same per-account config, and the same
 `serde_json::Value` the routing decision already paid to parse. What is
 different is the failure mode. A compaction bug makes a turn expensive. A tool
 policy bug makes a turn **fail**, on one provider and not the other, which is
 the worst shape a proxy defect can take.
+
+It is also the one pass that can *introduce* a `tools[]` where there was none:
+`referenced ∪ pins` on a body with no `tools` key is pins-only. So the first
+requirement below is not an optimisation.
 
 ## Two families of tool
 
@@ -188,6 +192,14 @@ Verified on the measured body, and the first of these is not a heuristic:
   from `tools[]` while keeping the history is a request the API can refuse.
 - **The scan runs against `messages[]`, never against the operator's list.**
   The policy is a preference; the history is the fact.
+- **A body with no `tools` key is not a candidate for the pass at all.** This
+  is the classifier case, and it is the reason this policy is exempt from it:
+  a body carrying no `tools[]` is not a request that chose its tools, and
+  `referenced ∪ pins` would *add* them. Concretely, the auto-mode permission
+  classifier is one such body — a judge written to emit a single parsed tag,
+  which must not be handed a toolkit. See
+  [`proxy-classifier.md`](proxy-classifier.md). Hard-coding the classifier
+  check here would be the wrong shape; the rule is the missing key.
 
 ### The trap: the two providers disagree
 
