@@ -518,6 +518,14 @@ mod tests {
                     .filter(|p| p.extension().is_some_and(|x| x == "md")),
             );
         }
+        // The proxy's web UI hands out this command too, and it is the copy
+        // people actually use — it appears beside a freshly minted key, once.
+        // Scanning only the markdown let the UI keep shipping the broken
+        // `remote add proxy --url …` form long after the docs were corrected,
+        // so a user pasted it and got "unknown argument: proxy" from a page
+        // that had just told them it would work.
+        files.push(root.join("crates/tab-atelier-proxy/assets/app.js"));
+        files.push(root.join("crates/tab-atelier-proxy/assets/index.html"));
         assert!(files.len() > 1, "expected docs/*.md to be readable");
 
         let mut checked = 0usize;
@@ -534,7 +542,9 @@ mod tests {
                 };
                 let tokens: Vec<String> = rest
                     .split_whitespace()
-                    .map(|t| t.trim_matches('`').to_owned())
+                    // Backticks and quotes from markdown, and the trailing
+                    // `",` that ends a line of a JS string array.
+                    .map(|t| t.trim_matches(['`', '"', '\'', ',']).to_owned())
                     .take_while(|t| !t.is_empty() && t != "#" && t != "&&")
                     // Prose ellipsis standing in for "the other flags", and
                     // the placeholders a reader is meant to substitute.

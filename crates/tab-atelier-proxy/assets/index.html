@@ -247,8 +247,32 @@
           </div>
           <div class="small mb-0">
             Shown once — the proxy keeps only a hash. If it is lost, rotate for a new one.
-            On the machine that will use it:
-            <div><code>tab-atelier remote add proxy --url {{ origin }} --relay-token &lt;key&gt;</code></div>
+
+            <!-- The key is substituted, not left as <key>. A placeholder in a
+                 block that is shown exactly once means retyping a 68-character
+                 secret by hand, and the copy button below is the only thing
+                 standing between that and a typo. -->
+            <div class="mt-2 fw-semibold">Route a whole tab-atelier through the proxy</div>
+            <div class="input-group input-group-sm my-1">
+              <textarea class="form-control font-monospace" rows="3" readonly>{{ relayRecipe }}</textarea>
+              <button class="btn btn-outline-success" @click="copy(relayRecipe)">
+                {{ copied ? 'Copied' : 'Copy' }}
+              </button>
+            </div>
+            <div class="text-muted">Claude tabs opened <em>after</em> this route through the proxy — existing ones keep the environment they were started with.</div>
+
+            <!-- The other half of the question people actually ask. A tab that
+                 already sets ANTHROPIC_BASE_URL itself never consults
+                 tab-atelier's relay config, so the commands above do nothing
+                 for it and it fails in a way that looks like a broken proxy. -->
+            <div class="mt-3 fw-semibold">Or point one tab (or any tool) straight here</div>
+            <div class="input-group input-group-sm my-1">
+              <textarea class="form-control font-monospace" rows="2" readonly>{{ envRecipe }}</textarea>
+              <button class="btn btn-outline-success" @click="copy(envRecipe)">
+                {{ copied ? 'Copied' : 'Copy' }}
+              </button>
+            </div>
+            <div class="text-muted">Needs no tab-atelier at all. Use this when a tab sets <code>ANTHROPIC_BASE_URL</code> of its own — that setting wins over relay mode, so it must name the proxy itself.</div>
           </div>
           <button class="btn btn-sm btn-success mt-2" @click="freshKey = null">Done</button>
         </div>
