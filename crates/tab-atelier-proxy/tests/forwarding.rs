@@ -275,6 +275,7 @@ fn stub_provider(id: &str, port: u16, preference: i32, key_path: &std::path::Pat
         preference,
         enabled: true,
         peak: None,
+        compact: tab_atelier_proxy::compact::Compact::None,
         models: vec![Model {
             id: format!("{id}-balanced"),
             class: Class::Balanced,
@@ -436,4 +437,125 @@ fn mock_status(status: u16, body: &'static str) -> (u16, std::sync::mpsc::Receiv
         }
     });
     (port, rx)
+}
+
+/// Compaction reaches the wire, and only on the provider that asked for it.
+///
+/// The unit tests prove the pass is correct in isolation. This proves it is
+/// WIRED — that `shape_and_admit` looks the level up on the chosen provider and
+/// the bytes that leave are the compacted ones. A pass that is never called is
+/// the failure mode a unit test cannot see.
+#[test]
+fn compaction_reaches_upstream_and_only_where_it_is_configured() {
+    let _serial = EGRESS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (upstream, seen) = mock_status(200, "{\"usage\":{\"input_tokens\":3,\"output_tokens\":4}}");
+    let dir = scratch("compact");
+    let stub_key = dir.join("stub.key");
+    std::fs::write(&stub_key, "sk-stub-provider").expect("write stub key");
+
+    let mut provider = stub_provider("primary", upstream, 0, &stub_key);
+    // Balanced, and named for the class the fixture asks for.
+    provider.models = vec![Model {
+        id: "primary-balanced".to_owned(),
+        class: Class::Balanced,
+        relative_cost: 5,
+        deprecated: false,
+        note: None,
+    }];
+    provider.compact = tab_atelier_proxy::compact::Compact::ToolsThinking;
+
+    let mut store = Store::load(dir.join("users.json")).expect("store");
+    let a = store.add("Ada", "Lovelace", "ada@example.org").expect("add");
+    let (_k, key) = store.add_key(&a.email, "laptop").expect("key");
+    let state = Arc::new(State {
+        store: Mutex::new(store),
+        usage: Mutex::new(usage::Store::load(dir.join("usage"))),
+        sched: Mutex::new(qos::Sched::new()),
+        account: Mutex::new(account::Monitor::load(&dir)),
+        inspect: Mutex::new(tab_atelier_proxy::inspect::Store::load(std::env::temp_dir())),
+        wake: tokio::sync::Notify::new(),
+        registry: Mutex::new(Registry {
+            mappings: vec![],
+            providers: vec![provider],
+        }),
+        registry_path: dir.join("providers.json"),
+        provider_backoff: Mutex::new(std::collections::BTreeMap::new()),
+        admin_token: "tap_admin".to_owned(),
+        web_root: None,
+    });
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let listener = rt
+        .block_on(async { tokio::net::TcpListener::bind("127.0.0.1:0").await })
+        .expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    rt.spawn(async move { serve_on(listener, state).await });
+
+    // Ten tool-result turns, so six survive the window and four are elided —
+    // the same shape the unit fixture uses.
+    let mut messages = Vec::new();
+    for i in 0..10 {
+        messages.push(format!(
+            r#"{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"call_{i:02}","content":"{}"}}]}}"#,
+            "r".repeat(1000)
+        ));
+        messages.push(format!(
+            r#"{{"role":"assistant","content":[{{"type":"thinking","thinking":"{}","signature":"s{i:02}"}},{{"type":"tool_use","id":"call_{i:02}","name":"Bash","input":{{}}}}]}}"#,
+            "t".repeat(300)
+        ));
+    }
+    let payload = format!(
+        r#"{{"model":"primary-balanced","max_tokens":1,"system":[{{"type":"text","text":"sys"}}],"tools":[{{"name":"Bash","input_schema":{{"type":"object"}}}}],"messages":[{}]}}"#,
+        messages.join(",")
+    );
+    let sent = payload.len();
+    let resp = request(
+        port,
+        &format!(
+            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {key}\r\n\
+             Content-Type: application/json\r\nContent-Length: {sent}\r\n\r\n{payload}"
+        ),
+    );
+    assert!(resp.starts_with("HTTP/1.1 200"), "resp: {resp}");
+
+    let seen = seen
+        .recv_timeout(std::time::Duration::from_secs(3))
+        .expect("upstream saw the request");
+    // Upstream's view: the body after the proxy was done with it.
+    let (_, body) = seen.split_once("\r\n\r\n").expect("headers and body");
+    assert!(
+        body.len() < sent,
+        "the body should have shrunk upstream: {sent} → {}",
+        body.len()
+    );
+    assert!(
+        body.contains("tool result elided by tab-atelier-proxy"),
+        "no stub upstream"
+    );
+    let elided = body.matches("tool result elided by tab-atelier-proxy").count();
+    assert_eq!(elided, 4, "tool results elided (want 4): {elided}");
+    let kept_thinking = body.matches(r#""type":"thinking""#).count();
+    assert_eq!(kept_thinking, 6, "thinking blocks kept (want 6): {kept_thinking}");
+    // The pairing survives the trip, which is the invariant that matters.
+    assert_eq!(
+        body.matches(r#""type":"tool_use""#).count(),
+        body.matches(r#""type":"tool_result""#).count(),
+        "tool_use and tool_result must still pair: {body:.400}"
+    );
+    // And the cache root is untouched — compared as a VALUE, not as bytes.
+    // Re-serializing through `serde_json::Value` sorts object keys, so a
+    // byte-wise assertion here would be testing the map implementation rather
+    // than whether the tool schema survived. (It also means the proxy only
+    // preserves the original bytes when it changes nothing at all, which is
+    // why `shape_body` returns early in that case.)
+    let got: serde_json::Value = serde_json::from_str(body).expect("upstream body is JSON");
+    let want: serde_json::Value = serde_json::from_str(&payload).expect("payload is JSON");
+    for field in ["tools", "system"] {
+        assert_eq!(got[field], want[field], "{field} must survive the pass");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

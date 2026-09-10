@@ -352,7 +352,8 @@
                 <thead>
                   <tr class="text-body-secondary">
                     <th>Provider</th><th>Endpoint</th><th>Models</th>
-                    <th class="text-center">Key</th><th class="text-end">Order</th><th></th>
+                    <th class="text-center">Key</th><th>Compaction</th>
+                    <th class="text-end">Order</th><th></th>
                   </tr>
                 </thead>
                 <tbody>
@@ -384,6 +385,25 @@
                             title="Read from the service's environment at request time.">env var</span>
                       <span v-else-if="p.ready" class="text-success">set</span>
                       <span v-else class="text-danger">missing</span>
+                    </td>
+                    <td class="small">
+                      <!--
+                        How much of an old conversation this provider is sent.
+                        Only worth anything where the cache is already gone —
+                        a rewritten body invalidates every breakpoint after the
+                        edit, so on the subscription it is a shorter body and a
+                        bigger bill. That is why the option is refused there,
+                        with the reason shown rather than a silent revert.
+                      -->
+                      <select class="form-select form-select-sm" autocomplete="off"
+                              style="min-width: 15rem"
+                              :disabled="busy"
+                              :value="p.compact"
+                              :title="p.compact_refusal || ''"
+                              @change="setCompact(p, $event.target.value)">
+                        <option v-for="c in (providers ? providers.compact_levels : [])"
+                                :key="c.value" :value="c.value">{{ c.label }}</option>
+                      </select>
                     </td>
                     <td class="text-end small">{{ p.preference }}</td>
                     <td class="text-end text-nowrap">

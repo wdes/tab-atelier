@@ -497,11 +497,7 @@ async fn shape_and_admit(
             route.model_id
         );
     }
-    let body = if route.model_id == requested {
-        body
-    } else {
-        rewrite_model(&body, &route.model_id).map_or(body, Bytes::from)
-    };
+    let body = shape_body(state, &body, &route, &requested);
 
     let est = qos::estimate_cost(&body);
     if let Err(retry_after) = admit(state, &account.id, account.weight, est).await {
@@ -524,11 +520,59 @@ async fn shape_and_admit(
     Ok((body, route))
 }
 
-/// Swap the `model` field, leaving everything else exactly as it arrived.
-fn rewrite_model(body: &[u8], model: &str) -> Option<Vec<u8>> {
-    let mut v = serde_json::from_slice::<serde_json::Value>(body).ok()?;
-    *v.get_mut("model")? = serde_json::Value::String(model.to_owned());
-    serde_json::to_vec(&v).ok()
+/// Rewrite the outgoing request for its destination: the model, and the
+/// provider's compaction level.
+///
+/// One parse for both. The proxy has already paid to deserialize this body to
+/// find `model`, and `estimate_cost` is about to deserialize it again — a
+/// third pass for a second mutation would be pure waste on every request.
+///
+/// Compaction runs BEFORE `estimate_cost`, which is the whole point of doing it
+/// here: admission then scores the call at the size that will actually be sent
+/// rather than at the size it arrived. Returns the body untouched when there is
+/// nothing to do, which is the common case — every provider defaults to `none`.
+fn shape_body(state: &Arc<State>, body: &Bytes, route: &routing::Route, requested: &str) -> Bytes {
+    let rename = (route.model_id != requested).then_some(route.model_id.as_str());
+    // Asked for under a lock, which is released before any work: the registry
+    // is a std Mutex and this function is called from an async context.
+    let level = state
+        .registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&route.provider_id)
+        .map_or(crate::compact::Compact::None, |p| p.compact);
+    if rename.is_none() && level.is_none() {
+        return body.clone();
+    }
+
+    let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(body) else {
+        // Not JSON. The old `rewrite_model` swallowed this and forwarded the
+        // original, which is right — the far end gives a better error than we
+        // could — and compaction has nothing to act on either way.
+        return body.clone();
+    };
+    if let Some(model) = rename {
+        v["model"] = serde_json::Value::String(model.to_owned());
+    }
+    let before = body.len();
+    let elided = crate::compact::apply(&mut v, level);
+    let Ok(encoded) = serde_json::to_vec(&v) else {
+        return body.clone();
+    };
+    if elided.changed() {
+        log::info!(
+            "proxy: compacted {}/{} {before} → {} bytes: {} tool results elided ({} errors kept), \
+             {} thinking dropped, {} banners dropped",
+            route.provider_id,
+            route.model_id,
+            encoded.len(),
+            elided.tool_results_elided,
+            elided.tool_results_kept_for_error,
+            elided.thinking_dropped,
+            elided.banners_dropped
+        );
+    }
+    Bytes::from(encoded)
 }
 
 /// What routing needs to know about each provider right now.
@@ -1292,56 +1336,74 @@ async fn admin(req: Request<Incoming>, state: Arc<State>) -> Response<Body> {
 
 /// Everything the providers panel needs, and no credential anywhere in it.
 fn providers_json(state: &State) -> Response<Body> {
-    let reg = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let now = usage::now_secs();
-    let presets: Vec<_> = provider::Preset::ALL
-        .iter()
-        .map(|p| {
-            serde_json::json!({
-                "id": p.id(),
-                "label": p.label(),
-                // Shown before anyone commits to adding it, so the endpoint
-                // and the models are visible up front.
-                "base_url": p.provider(std::path::Path::new("/")).base_url,
-                "configured": reg.get(p.id()).is_some(),
+    // Everything is lifted out and the registry lock released before the
+    // response is built: it is a std Mutex on a request path, and holding it
+    // across a JSON allocation buys nothing.
+    let (presets, list, mappings) = {
+        let reg = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = usage::now_secs();
+        let presets: Vec<_> = provider::Preset::ALL
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "id": p.id(),
+                    "label": p.label(),
+                    // Shown before anyone commits to adding it, so the endpoint
+                    // and the models are visible up front.
+                    "base_url": p.provider(std::path::Path::new("/")).base_url,
+                    "configured": reg.get(p.id()).is_some(),
+                })
             })
-        })
-        .collect();
-    let list: Vec<_> = reg
-        .providers
-        .iter()
-        .map(|p| {
-            serde_json::json!({
-                "id": p.id,
-                "base_url": p.base_url,
-                "preference": p.preference,
-                "enabled": p.enabled,
-                "peak_now": p.peak_now(now),
-                "peak": p.peak,
-                // Whether the credential resolves — never the credential.
-                "ready": p.credential_ready(),
-                "auth": match &p.auth {
-                    provider::Auth::ClaudeOauth => "claude_oauth",
-                    provider::Auth::ApiKeyEnv { .. } => "api_key_env",
-                    provider::Auth::ApiKeyFile { .. } => "api_key_file",
-                },
-                "models": p.models.iter().map(|m| serde_json::json!({
-                    "id": m.id,
-                    "class": m.class,
-                    "relative_cost": m.relative_cost,
-                    "cost_now": p.cost_at(m, now),
-                    "deprecated": m.deprecated,
-                    "note": m.note,
-                })).collect::<Vec<_>>(),
+            .collect();
+        let list: Vec<_> = reg
+            .providers
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "id": p.id,
+                    "base_url": p.base_url,
+                    "preference": p.preference,
+                    "enabled": p.enabled,
+                    "peak_now": p.peak_now(now),
+                    "peak": p.peak,
+                    "compact": p.compact.as_str(),
+                    // Whether the UI may offer anything but `none` here. Sent so
+                    // the reason is the server's, not a second copy of the rule
+                    // in TypeScript — the same rule the save path enforces.
+                    "compact_refusal": p.compact_refusal(crate::compact::Compact::Tools),
+                    // Whether the credential resolves — never the credential.
+                    "ready": p.credential_ready(),
+                    "auth": match &p.auth {
+                        provider::Auth::ClaudeOauth => "claude_oauth",
+                        provider::Auth::ApiKeyEnv { .. } => "api_key_env",
+                        provider::Auth::ApiKeyFile { .. } => "api_key_file",
+                    },
+                    "models": p.models.iter().map(|m| serde_json::json!({
+                        "id": m.id,
+                        "class": m.class,
+                        "relative_cost": m.relative_cost,
+                        "cost_now": p.cost_at(m, now),
+                        "deprecated": m.deprecated,
+                        "note": m.note,
+                    })).collect::<Vec<_>>(),
+                })
             })
-        })
-        .collect();
+            .collect();
+        (presets, list, reg.mappings.clone())
+    };
     json(
         200,
         &serde_json::json!({
             "providers": list,
             "presets": presets,
-            "mappings": reg.mappings,
+            "mappings": mappings,
+            // The compaction levels and their labels come from the server so
+            // the wording lives in one place — the enum the routing reads is
+            // the same one the UI renders.
+            "compact_levels": crate::compact::Compact::ALL
+                .into_iter()
+                .map(|c| serde_json::json!({"value": c.as_str(), "label": c.label()}))
+                .collect::<Vec<_>>(),
         })
         .to_string(),
     )
@@ -1523,6 +1585,13 @@ fn save_provider(state: &Arc<State>, field: &dyn Fn(&str) -> String, body: &Byte
                     path: provider::provider_key_path(&dir, &id).display().to_string(),
                 },
                 models,
+                // From the form, but an absent field falls back to whatever is
+                // already set rather than resetting it: the toggle path posts
+                // the same form without a compaction choice, and a save must
+                // not silently turn a deliberate setting off.
+                compact: compact_from(body, &field("compact"))
+                    .or_else(|| reg.get(&id).map(|p| p.compact))
+                    .unwrap_or_default(),
                 preference: serde_json::from_slice::<serde_json::Value>(body)
                     .ok()
                     .and_then(|v| v.get("preference").and_then(serde_json::Value::as_i64))
@@ -1548,6 +1617,13 @@ fn save_provider(state: &Arc<State>, field: &dyn Fn(&str) -> String, body: &Byte
         new.auth = old.auth.clone();
         new.peak.clone_from(&old.peak);
     }
+
+    // Refused on the SERVER, not only by the option the UI disables. A setting
+    // that cannot be correct should not be offerable, and the browser is not
+    // the only way in — this API is authenticated, not private.
+    if let Some(why) = new.compact_refusal(new.compact) {
+        return json(400, &serde_json::json!({ "error": why }).to_string());
+    }
     let id = new.id.clone();
 
     // The key, if one was pasted. Written to its own 0600 file BEFORE the
@@ -1570,6 +1646,24 @@ fn save_provider(state: &Arc<State>, field: &dyn Fn(&str) -> String, body: &Byte
     }
     log::info!("proxy: provider {id} saved");
     json(200, &serde_json::json!({ "id": id }).to_string())
+}
+
+/// A compaction level named in a request body, if one was named.
+///
+/// `None` for an absent field, which is not the same as an explicit `"none"` —
+/// the caller uses that difference to decide whether a save is setting the
+/// value or merely not mentioning it.
+fn compact_from(body: &Bytes, named: &str) -> Option<crate::compact::Compact> {
+    let text = if named.is_empty() {
+        serde_json::from_slice::<serde_json::Value>(body)
+            .ok()?
+            .get("compact")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)?
+    } else {
+        named.to_owned()
+    };
+    crate::compact::Compact::ALL.into_iter().find(|c| c.as_str() == text)
 }
 
 /// The account-mutating half of the admin API.

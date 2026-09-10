@@ -305,6 +305,17 @@ pub struct Provider {
     /// When this provider charges more for the same tokens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peak: Option<Peak>,
+    /// How much of an old conversation to elide before sending — see
+    /// [`crate::compact`] and `docs/proxy-compaction.md`.
+    ///
+    /// Per provider, not global, and `none` is the default because on the
+    /// Anthropic hop this is actively harmful: a compacted body invalidates
+    /// every `cache_control` breakpoint after the edit, which turns a cache
+    /// read into a full-price miss. Shorter body, bigger bill. It only pays
+    /// where the cache is already gone — on a reroute to a provider that never
+    /// had it.
+    #[serde(default)]
+    pub compact: crate::compact::Compact,
 }
 
 impl Provider {
@@ -378,6 +389,32 @@ impl Provider {
     #[must_use]
     pub fn peak_now(&self, now: u64) -> bool {
         self.peak.as_ref().is_some_and(|p| p.active_at(now))
+    }
+
+    /// Why compaction must not be enabled on this provider, if it must not be.
+    ///
+    /// `claude_oauth` means the subscription hop, and compaction there is
+    /// self-defeating rather than merely useless. `cache_control` breakpoints
+    /// make everything before the last one a cache read at roughly a tenth of
+    /// list price; a body rewritten in the middle of `messages` invalidates
+    /// every breakpoint after the edit, so the next turn is a full-price miss.
+    /// A shorter body and a bigger bill is a configuration that cannot be
+    /// correct, and a setting that cannot be correct should not be offerable —
+    /// enforced here so the API refuses it as well as the button.
+    ///
+    /// `None` when the level is acceptable, including `none` on any provider.
+    #[must_use]
+    pub fn compact_refusal(&self, wanted: crate::compact::Compact) -> Option<String> {
+        if wanted.is_none() || !matches!(self.auth, Auth::ClaudeOauth) {
+            return None;
+        }
+        Some(format!(
+            "provider {} authenticates with the host's own Claude login, so compaction there only costs money: \
+             rewriting the body invalidates every cache breakpoint after the edit and turns the next turn into a \
+             full-price miss. Leave it on `none`, or use Anthropic's own context_management on a provider that \
+             honours it.",
+            self.id
+        ))
     }
 
     /// Why this provider must never be used, if there is such a reason.
@@ -494,6 +531,11 @@ impl Preset {
                 // for, so it is only worth leaving when it is out of capacity.
                 preference: 10,
                 enabled: true,
+                // Off, like every other provider. Compaction is the one setting
+                // here that rewrites what somebody's model actually reads, so
+                // it is the operator's call and not a preset's — one click on
+                // the row, and the reasoning is in docs/proxy-compaction.md.
+                compact: crate::compact::Compact::None,
                 peak: Some(Peak {
                     multiplier_percent: 200,
                     windows: vec![
@@ -642,6 +684,10 @@ impl Default for Registry {
                 base_url: crate::egress::ANTHROPIC_BASE.to_owned(),
                 auth: Auth::ClaudeOauth,
                 preference: 0,
+                // Never anything else here — see [`Provider::compact`]. A
+                // compacted body invalidates the cache breakpoints that make
+                // the subscription affordable in the first place.
+                compact: crate::compact::Compact::None,
                 enabled: true,
                 peak: None,
                 models: vec![
@@ -909,6 +955,7 @@ mod tests {
         // reroute story exists for.
         r.providers.push(Provider {
             peak: None,
+            compact: crate::compact::Compact::None,
             id: "bedrock".to_owned(),
             wire: Wire::Anthropic,
             base_url: "https://bedrock.example".to_owned(),
@@ -1177,6 +1224,7 @@ mod tests {
             preference: 0,
             enabled: true,
             peak: None,
+            compact: crate::compact::Compact::None,
         };
         let why = p
             .unusable_reason()
@@ -1273,6 +1321,7 @@ mod tests {
                 path: "/tmp/whatever.key".to_owned(),
             },
             peak: None,
+            compact: crate::compact::Compact::None,
             preference: 99,
             enabled: false,
             ..original.clone()
@@ -1295,6 +1344,85 @@ mod tests {
         assert!(merged.enabled);
         // What the form DOES express still takes effect.
         assert_eq!(merged.base_url, original.base_url);
+    }
+
+    /// Compaction is a per-provider setting with a default that must not move.
+    #[test]
+    fn compact_round_trips_and_defaults_to_none() {
+        // A file written before this field existed has no `compact` key, and
+        // must read as `none` rather than failing to parse — every provider
+        // already in providers.json is in that position.
+        let old = r#"{"providers":[{"id":"p","base_url":"https://x","auth":{"kind":"claude_oauth"},
+            "models":[{"id":"m","class":"balanced","relative_cost":1}]}]}"#;
+        let parsed: Registry = serde_json::from_str(old).expect("a pre-compaction file still parses");
+        assert_eq!(parsed.providers[0].compact, crate::compact::Compact::None);
+        // It is written back explicitly rather than omitted, unlike `peak`:
+        // `none` is a value the operator chose, not an absent one, and a file
+        // that says so is one the UI and the docs can be read against. An
+        // older binary reading this file ignores the unknown field rather than
+        // refusing it, so the downgrade is safe either way.
+        let json = serde_json::to_string(&parsed).expect("serialize");
+        assert!(json.contains(r#""compact":"none""#), "{json}");
+
+        for level in crate::compact::Compact::ALL {
+            let mut r = Registry::default();
+            r.providers[0].compact = level;
+            let json = serde_json::to_string(&r).expect("serialize");
+            let back: Registry = serde_json::from_str(&json).expect("parse");
+            assert_eq!(back.providers[0].compact, level, "{level:?} did not round-trip");
+            // The spelling in the file is the one the UI and the docs use.
+            assert!(json.contains(level.as_str()), "{json}");
+        }
+
+        // The default registry — the subscription — is off, and must stay off.
+        assert!(Registry::default().providers[0].compact.is_none());
+        assert!(
+            crate::provider::Preset::Deepseek
+                .provider(Path::new("/tmp"))
+                .compact
+                .is_none(),
+            "a preset must not enable a setting that rewrites what a model reads"
+        );
+    }
+
+    /// The combination the spec calls out as impossible to be correct.
+    #[test]
+    fn compaction_is_refused_on_the_anthropic_login() {
+        let mut r = Registry::default();
+        let anthropic = &r.providers[0];
+        assert_eq!(anthropic.auth, Auth::ClaudeOauth);
+
+        // `none` is always fine.
+        assert!(anthropic.compact_refusal(crate::compact::Compact::None).is_none());
+
+        // Anything else is not, and the message says why in the terms that
+        // matter: a rewritten body invalidates the cache breakpoints that make
+        // the subscription affordable.
+        for level in [
+            crate::compact::Compact::Tools,
+            crate::compact::Compact::ToolsThinking,
+            crate::compact::Compact::All,
+        ] {
+            let why = anthropic
+                .compact_refusal(level)
+                .unwrap_or_else(|| panic!("{level:?} must be refused on claude_oauth"));
+            assert!(why.contains("cache"), "{why}");
+            assert!(why.contains("none"), "the refusal says what to use instead: {why}");
+        }
+
+        // A provider with its own credential is free to compact: the cache it
+        // would invalidate is not Anthropic's to have kept.
+        let mut deepseek = crate::provider::Preset::Deepseek.provider(Path::new("/tmp"));
+        deepseek.auth = Auth::ApiKeyFile {
+            path: "/tmp/k".to_owned(),
+        };
+        for level in crate::compact::Compact::ALL {
+            assert!(
+                deepseek.compact_refusal(level).is_none(),
+                "{level:?} must be allowed on a keyed provider"
+            );
+        }
+        r.providers.push(deepseek);
     }
 
     #[test]

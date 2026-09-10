@@ -173,7 +173,24 @@ interface ProviderView {
     peak?: { multiplier_percent: number; windows: unknown[] };
     ready: boolean;
     auth: string;
+    /** The current level, as `providers.json` spells it. */
+    compact: string;
+    /**
+     * Why this provider may not compact, or null when it may.
+     *
+     * From the server, not re-derived here: the save path enforces the same
+     * rule, and two copies of it would eventually disagree about which
+     * provider is the subscription.
+     */
+    compact_refusal: string | null;
     models: ProviderModel[];
+}
+
+/** One compaction level, keyed and labelled by the server so the wording
+ *  lives beside the enum that routing actually reads. */
+interface CompactLevel {
+    value: string;
+    label: string;
 }
 
 interface PresetView {
@@ -193,6 +210,7 @@ interface ProvidersResponse {
     providers: ProviderView[];
     presets: PresetView[];
     mappings: MappingView[];
+    compact_levels: CompactLevel[];
 }
 
 interface InspectState {
