@@ -1,0 +1,13 @@
+{
+  "name": "tab-atelier-proxy-web",
+  "private": true,
+  "description": "Admin UI sources. Compiled output is committed beside this file; see README-typescript.md.",
+  "scripts": {
+    "build": "tsc",
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2",
+    "vue": "^3.5.42"
+  }
+}

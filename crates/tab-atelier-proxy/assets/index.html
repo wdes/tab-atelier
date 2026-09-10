@@ -102,7 +102,9 @@
     </style>
   </head>
   <body class="bg-body-tertiary">
-    <div id="app" class="container py-4" style="max-width: 60rem">
+    <!-- Full width: the account table has seven columns and the charts read
+         better wide. A 60rem cap left two thirds of a laptop screen empty. -->
+    <div id="app" class="container-fluid px-4 py-4">
       <!-- Sign in ------------------------------------------------------->
       <div v-if="!authed" class="card shadow-sm mx-auto" style="max-width: 30rem">
         <div class="card-body">
@@ -314,6 +316,97 @@
           <button class="btn btn-sm btn-success mt-2" @click="freshKey = null">Done</button>
         </div>
 
+        <!-- Inspection ------------------------------------------------->
+        <div class="card shadow-sm mb-4">
+          <div class="card-body">
+            <div class="d-flex align-items-start">
+              <div class="flex-grow-1">
+                <h2 class="h6 card-title mb-1">Inspect requests</h2>
+                <p class="small text-body-secondary mb-0">
+                  Records the JSON actually sent to Anthropic — after routing rewrites the model and
+                  the beta flags are merged. Captures contain <strong>prompts</strong>. Credentials
+                  are stripped; the rest is not. Recording stops by itself.
+                </p>
+              </div>
+              <div class="text-end ms-3">
+                <button v-if="!inspect" class="btn btn-sm btn-outline-secondary" @click="loadInspect">
+                  Open
+                </button>
+                <template v-else>
+                  <!-- Armed state is stated in words, not by a coloured dot:
+                       "is it still recording" is the question this panel has to
+                       answer at a glance. -->
+                  <div v-if="inspect.armed" class="small text-warning fw-semibold mb-1">
+                    recording · stops {{ untilLocal(inspect.armed_until * 1000) }}
+                  </div>
+                  <div v-else class="small text-body-secondary mb-1">not recording</div>
+                  <button class="btn btn-sm btn-outline-primary me-1" @click="armInspect">
+                    {{ inspect.armed ? 'Extend' : 'Record' }}
+                  </button>
+                  <button class="btn btn-sm btn-outline-danger" :disabled="!inspect.armed && !inspect.captures.length"
+                          @click="stopInspect">
+                    Stop &amp; delete
+                  </button>
+                </template>
+              </div>
+            </div>
+
+            <div v-if="inspect && inspect.captures.length" class="table-responsive mt-3">
+              <table class="table table-sm align-middle mb-0">
+                <thead>
+                  <tr class="text-body-secondary">
+                    <th>When</th><th>Who</th><th>Model</th><th>Path</th>
+                    <th class="text-end">Status</th><th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="(c, i) in inspect.captures.slice().reverse()" :key="'cap'+i">
+                    <td class="small text-nowrap">{{ whenLocal(c.ts) }}</td>
+                    <td class="small">{{ c.account_email }}</td>
+                    <td class="small font-monospace">{{ c.model || '—' }}</td>
+                    <td class="small font-monospace text-truncate" style="max-width: 22rem">{{ c.path }}</td>
+                    <td class="small text-end" :class="c.status && c.status >= 400 ? 'text-danger' : ''">
+                      {{ c.status || '—' }}
+                    </td>
+                    <td class="text-end">
+                      <button class="btn btn-sm btn-outline-secondary" @click="inspectOpen = c">JSON</button>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div v-else-if="inspect" class="small text-body-secondary mt-3">
+              Nothing captured. Press <em>Record</em>, then make a request through the proxy.
+            </div>
+
+            <!-- The body itself, expanded in place rather than in a modal: it
+                 is the thing being read, so it gets the width. -->
+            <div v-if="inspectOpen" class="mt-3 border rounded p-3">
+              <div class="d-flex align-items-start mb-2">
+                <div class="flex-grow-1 small">
+                  <div class="fw-semibold">{{ inspectOpen.method }} {{ inspectOpen.path }}</div>
+                  <div class="text-body-secondary">
+                    {{ whenLocal(inspectOpen.ts) }} · {{ inspectOpen.account_email }} ·
+                    via {{ inspectOpen.provider }}
+                    <span v-if="inspectOpen.status"> · HTTP {{ inspectOpen.status }}</span>
+                  </div>
+                </div>
+                <button class="btn btn-sm btn-outline-secondary ms-2" @click="copy(inspectOpen.request_body)">
+                  {{ copied ? 'Copied' : 'Copy JSON' }}
+                </button>
+                <button class="btn-close ms-2" aria-label="Close" @click="inspectOpen = null"></button>
+              </div>
+              <div v-if="inspectOpen.request_truncated" class="alert alert-warning py-1 px-2 small">
+                Truncated by the proxy — both ends kept. This is not valid JSON as shown.
+              </div>
+              <div class="small text-body-secondary mb-1">Headers</div>
+              <pre class="small bg-body-tertiary p-2 rounded mb-2" style="max-height: 10rem; overflow:auto">{{ inspectOpen.request_headers.map(h => h[0] + ': ' + h[1]).join('\n') }}</pre>
+              <div class="small text-body-secondary mb-1">Body</div>
+              <pre class="small bg-body-tertiary p-2 rounded mb-0" style="max-height: 30rem; overflow:auto">{{ prettyJson(inspectOpen.request_body) }}</pre>
+            </div>
+          </div>
+        </div>
+
         <div class="card shadow-sm mb-4">
           <div class="card-body">
             <h2 class="h6 card-title">Add someone</h2>
@@ -346,7 +439,7 @@
                 <th>Status</th>
                 <th class="text-center">Priority</th>
                 <th>Keys · last used</th>
-                <th class="text-end">Tokens (7 d)</th>
+                <th class="text-end">Tokens (7 d) · calls · avg/call</th>
                 <th class="text-end">Key</th>
               </tr>
             </thead>
@@ -408,6 +501,14 @@
                   </a>
                   <div class="text-body-secondary" style="font-size:.75rem">
                     {{ usageOf(u.id).last_7d.calls }} calls
+                  </div>
+                  <!-- The per-call average is the comparable number: a total
+                       says who was busy, this says who is expensive per turn,
+                       which is what distinguishes a heavy user from one
+                       dragging a huge context through every request. -->
+                  <div class="text-body-secondary" style="font-size:.75rem"
+                       :title="'Mean tokens per call over 7 days — input + output + cache'">
+                    {{ avgPerCall(u.id) }}
                   </div>
                 </td>
                 <td class="text-end">

@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use clap::{Parser, Subcommand};
+use tab_atelier_proxy::now_rfc3339;
 use tab_atelier_proxy::users::{Account, Store};
 use tab_atelier_proxy::{admin_token, config_dir, server, state_dir, web_root};
 
@@ -164,33 +165,6 @@ async fn poll_account_usage(state: Arc<server::State>) {
         }
         tokio::time::sleep(delay).await;
     }
-}
-
-/// RFC3339 in UTC, the shape the usage log and the .mjs monitor both use.
-fn now_rfc3339() -> String {
-    now_rfc3339_at(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs()),
-    )
-}
-
-/// The conversion, taking the instant, so it can be tested against known
-/// dates instead of whatever the clock says.
-///
-/// jiff rather than a hand-rolled civil-from-days: it is already compiled into
-/// this binary via `env_logger`, and the inverse of this function
-/// ([`tab_atelier_proxy::account::epoch_of`]) has to agree with it exactly —
-/// two independent implementations of the same calendar is the kind of pair
-/// that stays correct until a leap year says otherwise.
-fn now_rfc3339_at(secs: u64) -> String {
-    let ts = i64::try_from(secs)
-        .ok()
-        .and_then(|s| jiff::Timestamp::from_second(s).ok())
-        .unwrap_or(jiff::Timestamp::UNIX_EPOCH);
-    // Second precision, `Z` rather than `+00:00`, to match what the .mjs
-    // monitor writes and what the existing logs already hold.
-    ts.strftime("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 /// Install a Claude login copied from a machine that could perform it.
@@ -380,6 +354,7 @@ fn serve(listen: &str) -> Result<(), String> {
         usage: Mutex::new(tab_atelier_proxy::usage::Store::load(state_path.join("usage"))),
         sched: Mutex::new(tab_atelier_proxy::qos::Sched::new()),
         account: Mutex::new(tab_atelier_proxy::account::Monitor::load(&state_path)),
+        inspect: Mutex::new(tab_atelier_proxy::inspect::Store::load(&state_path)),
         wake: tokio::sync::Notify::new(),
         registry,
         provider_backoff: Mutex::new(std::collections::BTreeMap::new()),
@@ -509,7 +484,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::now_rfc3339_at;
+    use tab_atelier_proxy::now_rfc3339_at;
 
     /// Every timestamp this proxy writes carries a zone.
     ///

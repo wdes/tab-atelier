@@ -222,6 +222,32 @@ Every endpoint, header and credential the proxy uses lives in one crate,
 `crates/claude-api`, shared with the desktop package and `catbus-agent`. There
 were three copies of that list once and they had drifted apart.
 
+## Inspecting what was actually sent
+
+When a call misbehaves the one thing nobody can see is the request. The client
+builds it, the proxy reshapes it — routing rewrites the model, `anthropic-beta`
+is merged, the credential is swapped — and what goes on the wire exists for a
+few milliseconds inside a blocking task. **Inspect requests** in the web UI
+records it.
+
+It is off, and it turns itself off. A capture is a prompt, and a prompt is
+whatever someone was working on, so:
+
+* armed explicitly, for a stated number of minutes, up to 60;
+* **it disarms itself** — "remember to switch it off" is not a control, and a
+  debug flag left on is how a month of everyone's prompts ends up in a file;
+* 40 captures, each clipped to 32 KB with both ends kept;
+* `inspect.jsonl` beside the accounts, `0600`, and an armed window never
+  survives a restart;
+* admin-only. A user key cannot read captures, not even its own account's.
+
+Credentials are removed before anything is written. Headers are an allowlist,
+so `Authorization` and `x-api-key` are absent by construction rather than by a
+rule someone could forget to update, and both bodies are additionally swept for
+`sk-ant-…` and `tap_…` runs — because a prompt can contain a key that no header
+rule would catch, and "why is my key not working, here it is" is exactly the
+kind of session that gets inspected.
+
 ## Is it the proxy, or is it Anthropic?
 
 ```sh

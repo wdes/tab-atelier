@@ -16,3 +16,8 @@ outbox/
 # serves straight from /usr/share/javascript. Only put one here to pin a
 # different build on purpose.
 crates/tab-atelier-proxy/assets/vendor/bootstrap.min.css
+
+# Web UI toolchain. TypeScript sources compile to the committed assets/*.js —
+# see crates/tab-atelier-proxy/assets/README-typescript.md — so a package
+# build never needs Node, and these never belong in the repo.
+crates/tab-atelier-proxy/web/node_modules/
