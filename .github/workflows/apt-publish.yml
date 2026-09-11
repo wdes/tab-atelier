@@ -104,6 +104,12 @@ jobs:
               run: cargo install cargo-deb --locked
             - name: Build .deb (both variants)
               run: |
+                  # No --dbgsym here, deliberately. A nightly is throwaway,
+                  # and this pool could not carry the symbols anyway:
+                  # apt-ftparchive below scans only *.deb, so a
+                  # -dbgsym.ddeb dropped in the pool would be silently
+                  # ignored rather than installable. Tagged releases do
+                  # ship them — see release.yml.
                   cargo deb -p tab-atelier --locked --deb-version "${{ steps.ver.outputs.version }}"
                   cargo deb -p tab-atelier --variant headless --locked --deb-version "${{ steps.ver.outputs.version }}"
                   # Third package: the server half of the relay. Its own .deb

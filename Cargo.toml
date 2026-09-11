@@ -8,14 +8,30 @@ default-members = [".", "crates/catbus-agent", "crates/claude-api"]
 # Release codegen tuned for the hot VT-parse / grid-update loop. Cargo's
 # defaults (lto = false, codegen-units = 16) leave cross-crate inlining
 # on the table — the parser lives in alacritty_terminal/vte while the
-# Term handler and our ring live here, so fat LTO lets LLVM inline across
+# Term handler and our ring live here, so LTO lets LLVM inline across
 # that boundary, and a single codegen unit gives it the whole picture.
 # Biggest near-free win for CPU-bound cases (cursor_motion) and the whole
 # pipeline; panic stays "unwind" because gpui and the test suite rely on
 # it, and target-cpu is left default so the shipped .deb runs everywhere.
+#
+# thin rather than fat: both inline across the alacritty_terminal/vte
+# boundary, but fat merges every module into one and re-optimises the
+# whole program, which is what made a release link take ~6 minutes — the
+# single largest cost in every CI workflow, and three of them run per
+# commit. thin does the cross-module inlining on the hot paths and links
+# in a fraction of the time. If a profile ever shows the difference
+# matters, fat is a one-word change.
+#
+# debug = 2 keeps full DWARF in the binary. It costs nothing at runtime —
+# it is not mapped unless a debugger or a panic unwinder asks — and
+# cargo-deb splits it into a separate -dbgsym.ddeb, so the shipped .deb
+# stays stripped while the symbols stay retrievable. That is Debian's
+# convention, not a Rust one, which is why the split lives in the deb
+# build rather than in this profile.
 [profile.release]
-lto = "fat"
+lto = "thin"
 codegen-units = 1
+debug = 2
 
 [package]
 name = "tab-atelier"

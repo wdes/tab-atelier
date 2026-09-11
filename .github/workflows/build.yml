@@ -143,15 +143,18 @@ jobs:
               # Same profile now, one `shared-key` cache between them.
               run: |
                   # `--revision 0ci` marks these as the throwaway build they
-                  # are: same commit as the published nightly, LTO off, and
-                  # `0ci` sorts below `1` so one can never shadow the other if
+                  # are: same profile as the published nightly, and `0ci`
+                  # sorts below `1` so one can never shadow the other if
                   # both end up on a machine. Without a version of their own
                   # every run's artifact was byte-for-byte the same NAME.
                   DEB_VERSION="$(scripts/deb-version.sh --revision 0ci)"
                   echo "→ building $DEB_VERSION"
-                  cargo deb -p tab-atelier --locked --deb-version "$DEB_VERSION"
-                  cargo deb -p tab-atelier --variant headless --locked --deb-version "$DEB_VERSION"
-                  cargo deb -p tab-atelier-proxy --locked --deb-version "$DEB_VERSION"
+                  # --dbgsym so this smoke build exercises the same cargo-deb
+                  # invocation the release uses: a flag that only ever runs
+                  # at tag time is a flag that breaks at tag time.
+                  cargo deb -p tab-atelier --locked --deb-version "$DEB_VERSION" --dbgsym --compress-debug-symbols=zlib
+                  cargo deb -p tab-atelier --variant headless --locked --deb-version "$DEB_VERSION" --dbgsym --compress-debug-symbols=zlib
+                  cargo deb -p tab-atelier-proxy --locked --deb-version "$DEB_VERSION" --dbgsym --compress-debug-symbols=zlib
                   ls -la target/debian/
             - name: Upload .deb packages
               id: upload-deb
