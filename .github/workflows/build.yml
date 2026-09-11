@@ -124,6 +124,11 @@ jobs:
                   flags: rust
                   fail_ci_if_error: false
                   token: ${{ secrets.CODECOV_TOKEN }}
+            - name: Install cargo-deb
+              # Its own step so CI reports its duration: it is bundled into the
+              # build step below otherwise, and "install + three cargo deb
+              # invocations" is one number that hides which half is slow.
+              run: cargo install cargo-deb --locked
             - name: Build .deb packages (smoke-test only)
               # These debs feed the integration job below; the ones users
               # install come from apt-publish.yml / release.yml.
@@ -137,7 +142,6 @@ jobs:
               # test exercised a binary built differently from the shipped one.
               # Same profile now, one `shared-key` cache between them.
               run: |
-                  cargo install cargo-deb --locked
                   # `--revision 0ci` marks these as the throwaway build they
                   # are: same commit as the published nightly, LTO off, and
                   # `0ci` sorts below `1` so one can never shadow the other if
