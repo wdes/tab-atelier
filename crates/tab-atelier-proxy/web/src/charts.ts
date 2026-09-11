@@ -263,6 +263,24 @@ const CallsChart = Vue.defineComponent({
 // lines: input and output sum to something meaningful (what the hour cost),
 // which a pair of lines would not show. 2px surface gap between the segments
 // and a 4px rounded top on the data-end.
+/**
+ * Input and output tokens per hour, as two panels with their OWN scales.
+ *
+ * This was a stacked bar on one axis, and it could not do its job. Output is
+ * routinely a rounding error beside input — 11k against 440k — so an output
+ * band two per cent tall is a sliver, and the SHAPE of the output series, which
+ * is the thing worth watching, was invisible.
+ *
+ * One scale cannot fix that and a second y-axis on the same plot would be
+ * worse: two scales drawn over one grid invite reading a crossing as a
+ * relationship. So the panels are separated instead — the classic small
+ * multiple. Each carries its own total in its title, so the magnitude
+ * relationship is STATED rather than implied by a shared axis.
+ *
+ * Stacking was also the wrong idea for these two series independently: input
+ * and output are not parts of a whole, they are two different things measured
+ * in the same unit.
+ */
 const TokensChart = Vue.defineComponent({
   mixins: [hoverable, xLabels],
   props: { points: { type: Array as () => readonly UsageBucket[], required: true } },
@@ -273,40 +291,88 @@ const TokensChart = Vue.defineComponent({
     pts(): readonly UsageBucket[] {
       return this.points as readonly UsageBucket[];
     },
-    max() {
-      return this.niceMax(Math.max(1, ...this.pts.map((p) => p.input + p.output)));
+    // Two panels, the gap between them, and the x axis they share.
+    gap(): number {
+      return 18;
     },
-    yOf() {
-      return (v: number) => PAD.top + this.plotH * (1 - v / this.max);
+    panelH(): number {
+      return (this.plotH - this.gap) / 2;
     },
-    barW() {
+    maxIn(): number {
+      return this.niceMax(Math.max(1, ...this.pts.map((p) => p.input)));
+    },
+    maxOut(): number {
+      return this.niceMax(Math.max(1, ...this.pts.map((p) => p.output)));
+    },
+    // The window's totals, for the panel titles: with separate scales these
+    // numbers are the only place the ratio between the two survives.
+    totalIn(): number {
+      return this.pts.reduce((a, p) => a + p.input, 0);
+    },
+    totalOut(): number {
+      return this.pts.reduce((a, p) => a + p.output, 0);
+    },
+    barW(): number {
       // 2px of surface between neighbours, and never a sliver.
       return Math.max(1, this.plotW / this.points.length - 2);
     },
   },
   methods: {
-    seg(i: number, from: number, to: number) {
-      const y = this.yOf(to);
-      const h = Math.max(0, this.yOf(from) - y);
-      return { x: this.xOf(i) - this.barW / 2, y, width: this.barW, height: h };
+    // The two scales, kept as separate functions rather than one parameterised
+    // by a panel index — mixing them up would silently plot output against
+    // input's axis, which is the bug this whole change exists to avoid.
+    yIn(v: number): number {
+      return PAD.top + this.panelH * (1 - v / this.maxIn);
+    },
+    yOut(v: number): number {
+      return PAD.top + this.panelH + this.gap + (1 - v / this.maxOut) * this.panelH;
+    },
+    // A bar is read from ITS panel's baseline, so the height is the difference
+    // between the baseline and the value on that panel's own scale.
+    bar(i: number, v: number, bottom: number, y: (v: number) => number) {
+      const top = y(v);
+      return { x: this.xOf(i) - this.barW / 2, y: top, width: this.barW, height: Math.max(0, bottom - top) };
+    },
+    barIn(i: number, v: number) {
+      return this.bar(i, v, PAD.top + this.panelH, (n) => this.yIn(n));
+    },
+    barOut(i: number, v: number) {
+      return this.bar(i, v, PAD.top + this.panelH + this.gap + this.panelH, (n) => this.yOut(n));
     },
   },
   template: `
     <div class="ta-chart">
       <svg :viewBox="'0 0 ' + ${W} + ' ' + ${H}" @mousemove="onMove" @mouseleave="onLeave" role="img"
-           aria-label="Input and output tokens per hour">
+           aria-label="Input and output tokens per hour, on separate scales">
+        <!-- Input -->
         <g class="ta-grid">
-          <line v-for="t in ticks(max)" :key="'g'+t"
-                :x1="${PAD.left}" :x2="${W - PAD.right}" :y1="yOf(t)" :y2="yOf(t)" />
-          <text v-for="t in ticks(max)" :key="'l'+t" :x="${PAD.left - 8}" :y="yOf(t) + 4"
+          <line v-for="t in ticks(maxIn)" :key="'gi'+t"
+                :x1="${PAD.left}" :x2="${W - PAD.right}" :y1="yIn(t)" :y2="yIn(t)" />
+          <text v-for="t in ticks(maxIn)" :key="'li'+t" :x="${PAD.left - 8}" :y="yIn(t) + 4"
                 text-anchor="end">{{ fmt(t) }}</text>
         </g>
-        <g v-for="(p, i) in points" :key="'b'+i">
-          <!-- output sits on top, so the rounded data-end belongs to it -->
-          <rect v-if="p.input" v-bind="seg(i, 0, p.input)" class="ta-bar-1" />
-          <rect v-if="p.output" v-bind="seg(i, p.input + 2 * max / ${H}, p.input + p.output)"
-                class="ta-bar-2" rx="4" />
+        <text class="ta-panel-title" :x="${PAD.left + 4}" :y="${PAD.top + 10}">
+          <tspan class="ta-key ta-bg-1"></tspan>input · {{ fmt(totalIn) }}
+        </text>
+        <g v-for="(p, i) in pts" :key="'bi'+i">
+          <rect v-if="p.input" v-bind="barIn(i, p.input)" class="ta-bar-1" rx="4" />
         </g>
+
+        <!-- Output, on its own scale: the point of the split. -->
+        <g class="ta-grid">
+          <line v-for="t in ticks(maxOut)" :key="'go'+t"
+                :x1="${PAD.left}" :x2="${W - PAD.right}" :y1="yOut(t)" :y2="yOut(t)" />
+          <text v-for="t in ticks(maxOut)" :key="'lo'+t" :x="${PAD.left - 8}" :y="yOut(t) + 4"
+                text-anchor="end">{{ fmt(t) }}</text>
+        </g>
+        <text class="ta-panel-title" :x="${PAD.left + 4}" :y="yOut(maxOut) + 10">
+          <tspan class="ta-key ta-bg-2"></tspan>output · {{ fmt(totalOut) }}
+        </text>
+        <g v-for="(p, i) in pts" :key="'bo'+i">
+          <rect v-if="p.output" v-bind="barOut(i, p.output)" class="ta-bar-2" rx="4" />
+        </g>
+
+        <!-- One crosshair across both, because the x axis is shared. -->
         <line v-if="hover >= 0" class="ta-crosshair" :x1="xOf(hover)" :x2="xOf(hover)"
               :y1="${PAD.top}" :y2="${H - PAD.bottom}" />
         <g class="ta-axis">

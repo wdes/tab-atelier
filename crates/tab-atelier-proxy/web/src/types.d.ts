@@ -331,6 +331,8 @@ interface AppState {
      */
     usageBusy: boolean;
     pressureBusy: boolean;
+    providersBusy: boolean;
+    inspectBusy: boolean;
     origin: string;
     usage: Record<string, AccountUsage>;
     hours: number;

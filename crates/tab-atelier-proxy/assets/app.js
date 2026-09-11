@@ -68,6 +68,10 @@ const AdminApp = Vue.defineComponent({
             busy: false,
             usageBusy: false,
             pressureBusy: false,
+            // Per-panel, for the same reason as the chart flags: a fetch that greys
+            // out unrelated controls reads as the page being broken.
+            providersBusy: false,
+            inspectBusy: false,
             origin: window.location.origin,
             // Per-account usage, keyed by id, as returned by /api/usage.
             usage: {},
@@ -449,8 +453,22 @@ const AdminApp = Vue.defineComponent({
         // Inspection. Nothing is fetched until the panel is opened: a page that
         // silently pulled captured prompts on every load would be collecting them
         // into a browser as well as a file.
+        /**
+         * Fetch the provider list, with the panel's spinner on.
+         *
+         * The busy flag lives in here rather than in the button's handler on
+         * purpose: `refresh`, `setCompact`, `addPreset` and the rest all reload
+         * this list, and a spinner that only appears for one of them would look
+         * like the page had hung for the others.
+         */
         async loadProviders() {
-            this.providers = await this.api("GET", "/api/providers");
+            this.providersBusy = true;
+            try {
+                this.providers = await this.api("GET", "/api/providers");
+            }
+            finally {
+                this.providersBusy = false;
+            }
         },
         async addPreset(p) {
             await this.api("POST", "/api/providers", { preset: p.id });
@@ -628,7 +646,13 @@ const AdminApp = Vue.defineComponent({
             return parts.join(" · ");
         },
         async loadInspect() {
-            this.inspect = await this.api("GET", "/api/inspect");
+            this.inspectBusy = true;
+            try {
+                this.inspect = await this.api("GET", "/api/inspect");
+            }
+            finally {
+                this.inspectBusy = false;
+            }
         },
         async armInspect() {
             const raw = prompt(`Capture the JSON sent to Anthropic for how many minutes? (max ${this.inspect?.max_arm_minutes ?? 60})\n\n` +
