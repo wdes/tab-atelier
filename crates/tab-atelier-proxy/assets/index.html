@@ -107,6 +107,9 @@
          eight of them overlap, and no area fill: stacked-looking bands would
          read as a total, and these are alternatives, not parts. */
       .ta-line-user { fill: none; stroke-width: 1.6; stroke-linejoin: round; opacity: .9; }
+      /* Panel titles in the small-multiple tokens chart. Muted ink, like the
+         axis labels: they name the panel, they are not the data. */
+      .ta-panel-title { fill: var(--text-secondary); font-size: 11px; font-weight: 600; }
       .ta-bar-1 { fill: var(--series-1); }
       .ta-bar-2 { fill: var(--series-2); }
       .ta-threshold line { stroke: var(--danger); stroke-width: 1; stroke-dasharray: 4 3; opacity: .7; }
@@ -227,7 +230,7 @@
                 </div>
                 <button class="btn btn-sm btn-outline-secondary ms-3"
                         :disabled="pressureBusy" @click="reloadPressure">
-                  {{ pressureBusy ? 'Refreshing…' : 'Refresh' }}
+                  <span v-if="pressureBusy" class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>{{ pressureBusy ? 'Refreshing…' : 'Refresh' }}
                 </button>
               </div>
               <!--
@@ -284,7 +287,7 @@
                 </select>
                 <button class="btn btn-sm btn-outline-secondary ms-2"
                         :disabled="usageBusy" @click="reloadUsage">
-                  {{ usageBusy ? 'Refreshing…' : 'Refresh' }}
+                  <span v-if="usageBusy" class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>{{ usageBusy ? 'Refreshing…' : 'Refresh' }}
                 </button>
               </div>
               <calls-chart :points="series" :by-user="callsByUser"></calls-chart>
@@ -308,7 +311,7 @@
                      refreshed is the chart in front of you. -->
                 <button class="btn btn-sm btn-outline-secondary ms-3"
                         :disabled="usageBusy" @click="reloadUsage">
-                  {{ usageBusy ? 'Refreshing…' : 'Refresh' }}
+                  <span v-if="usageBusy" class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>{{ usageBusy ? 'Refreshing…' : 'Refresh' }}
                 </button>
               </div>
               <tokens-chart :points="series"></tokens-chart>
@@ -377,7 +380,10 @@
                   DeepSeek's endpoint for this is <code>/anthropic</code>, not its bare host.
                 </p>
               </div>
-              <button class="btn btn-sm btn-outline-secondary ms-3" @click="loadProviders">Refresh</button>
+              <button class="btn btn-sm btn-outline-secondary ms-3" :disabled="providersBusy"
+                      @click="loadProviders">
+                <span v-if="providersBusy" class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>{{ providersBusy ? 'Loading…' : 'Refresh' }}
+              </button>
             </div>
 
             <div v-if="providers" class="mt-3">
@@ -536,7 +542,10 @@
                   <!-- A capture lands when the call FINISHES, so this panel
                        is always one request behind. Without a refresh the
                        thing you just did is the one thing not shown. -->
-                  <button class="btn btn-sm btn-outline-secondary me-1" @click="loadInspect">Refresh</button>
+                  <button class="btn btn-sm btn-outline-secondary me-1" :disabled="inspectBusy"
+                          @click="loadInspect">
+                    <span v-if="inspectBusy" class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>{{ inspectBusy ? 'Loading…' : 'Refresh' }}
+                  </button>
                   <button class="btn btn-sm btn-outline-primary me-1" @click="armInspect">
                     {{ inspect.armed ? 'Extend' : 'Record' }}
                   </button>
