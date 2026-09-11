@@ -125,6 +125,9 @@ pub struct Capture {
     /// a provider that has it off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction: Option<Compaction>,
+    /// How the request arrived — see [`Origin`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<Origin>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_excerpt: Option<String>,
 }
@@ -223,6 +226,36 @@ pub struct Outgoing<'a> {
     pub kind: crate::classifier::Kind,
     pub headers: &'a [(String, String)],
     pub body: &'a [u8],
+    /// What the request looked like on ARRIVAL, when the caller knows.
+    ///
+    /// The rest of a capture is the request as it leaves, which is the half
+    /// nobody can otherwise see. This is the other end of the same question,
+    /// and it is here because a client-IP question took three exchanges to
+    /// even state: every answer was about the code, and the code was reading
+    /// the header it was asked to read. What was missing was the value that
+    /// actually arrived, and the peer it arrived from.
+    pub origin: Option<Origin>,
+}
+
+/// Where a request came from, as the proxy saw it.
+///
+/// Both the resolved answer and the raw inputs, deliberately. Showing only the
+/// resolved IP answers "what did we record" and not "why" — and the why is the
+/// whole question when it is wrong.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Origin {
+    /// The socket peer, before any header is believed.
+    pub peer: String,
+    /// Whether that peer was trusted enough to read a forwarding header at all.
+    /// `false` explains a result that ignored a header the operator can see.
+    pub peer_trusted: bool,
+    /// What the proxy resolved, and therefore what it recorded against a key.
+    pub client_ip: String,
+    /// The headers as received, including whether they were there at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x_real_ip: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x_forwarded_for: Option<String>,
 }
 
 /// Build a capture from the request as it is about to leave.
@@ -238,6 +271,9 @@ pub fn capture(o: &Outgoing<'_>) -> Capture {
         kind,
         headers,
         body,
+        // Not destructured: read straight off `o` at the end, so adding a
+        // field to `Outgoing` does not mean touching this binding list too.
+        ..
     } = o;
     let raw = String::from_utf8_lossy(body);
     let scrubbed = scrub(&raw);
@@ -266,6 +302,7 @@ pub fn capture(o: &Outgoing<'_>) -> Capture {
         // Filled in by the caller, which is the only thing that knows whether
         // a compaction pass ran on this request at all.
         compaction: None,
+        origin: o.origin.clone(),
         response_excerpt: None,
     }
 }
@@ -437,6 +474,7 @@ mod tests {
             provider: "anthropic",
             kind: crate::classifier::Kind::Work,
             headers: &headers,
+            origin: None,
             body: br#"{"model":"claude-haiku-4-5-20251001"}"#,
         });
         let names: Vec<_> = c.request_headers.iter().map(|(k, _)| k.to_ascii_lowercase()).collect();
@@ -487,6 +525,7 @@ mod tests {
                 provider: "anthropic",
                 kind: crate::classifier::Kind::Work,
                 headers: &[],
+                origin: None,
                 body: br#"{"model":"m"}"#,
             })
         };
@@ -539,6 +578,7 @@ mod tests {
             provider: "anthropic",
             kind: crate::classifier::Kind::Work,
             headers: &[],
+            origin: None,
             body: big.as_bytes(),
         });
         assert!(c.request_truncated, "truncation must be declared, not silent");

@@ -279,6 +279,20 @@ fn client_ip(headers: &hyper::HeaderMap, peer: std::net::IpAddr) -> String {
 /// claim any address. That is a trade this proxy is entitled to make — it is
 /// documented as belonging behind a terminator, and the address is an audit
 /// aid rather than an authorisation input. Nothing is granted by it.
+/// One header, as received, for the arrival record.
+///
+/// Separate from [`client_ip`]'s inline reads because this reports rather than
+/// decides: it keeps the raw value even when the peer is untrusted and the
+/// header will be ignored, which is precisely the case worth seeing.
+fn header_of(headers: &hyper::HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned)
+}
+
 const fn is_trusted_hop(peer: std::net::IpAddr) -> bool {
     match peer {
         std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
@@ -319,6 +333,16 @@ async fn anthropic(req: Request<Incoming>, state: Arc<State>, peer: std::net::Ip
 
     let key = presented(&req);
     let ip = client_ip(req.headers(), peer);
+    // Kept alongside the resolved answer, because "what did we record" and
+    // "why" are different questions and only the first one was answerable.
+    // Built here, where the raw headers and the socket peer are both in hand.
+    let origin = inspect::Origin {
+        peer: peer.to_string(),
+        peer_trusted: is_trusted_hop(peer),
+        client_ip: ip.clone(),
+        x_real_ip: header_of(req.headers(), "x-real-ip"),
+        x_forwarded_for: header_of(req.headers(), "x-forwarded-for"),
+    };
     let who = authenticate_and_stamp(&state, &key, &ip);
     let Some(account) = who else {
         // Say which of the two credentials was wrong without printing either.
@@ -392,6 +416,7 @@ async fn anthropic(req: Request<Incoming>, state: Arc<State>, peer: std::net::Ip
         // visible: the panel shows the body as sent, so a compacted request
         // and a small one look identical without it.
         compaction,
+        origin,
         weight: account.weight,
         metered,
         route: route.clone(),
@@ -809,6 +834,8 @@ struct Forward {
     /// What compaction removed on the way out, if it ran. Attached to the
     /// inspection capture — see [`inspect::Compaction`].
     compaction: Option<inspect::Compaction>,
+    /// How the request arrived. See [`inspect::Origin`].
+    origin: inspect::Origin,
     /// Who to bill. Carried down rather than looked up again, because by the
     /// time the response finishes the account may have been deleted — the call
     /// still happened and still spent tokens.
@@ -900,6 +927,7 @@ fn begin_capture(f: &Forward, hdrs: &[(String, String)]) -> Option<inspect::Capt
         kind: f.route.kind,
         headers: hdrs,
         body: &f.body,
+        origin: Some(f.origin.clone()),
     }))
 }
 
@@ -921,6 +949,9 @@ fn finish_capture(
     // What compaction removed from THIS request, so the panel can show the
     // saving rather than only the compacted result.
     c.compaction.clone_from(&f.compaction);
+    // Whether this capture's own client_ip can be trusted at all, recorded
+    // beside it rather than left to be inferred from the log.
+    c.origin = Some(f.origin.clone());
     // What upstream REPORTED the model as, when it was the routing that chose
     // it. Usually the same as what we sent; different means the far end
     // substituted, which is worth seeing.
