@@ -1642,10 +1642,10 @@ fn compact_refusal_for(state: &Arc<State>, store: &Store, who: &str) -> Option<S
     // The hop's objection is level-independent — it is the breaker on
     // `compact != none` — so any non-`none` level stands in for the rest.
     let ask = |p: &provider::Provider| p.compact_refusal(crate::compact::Compact::Tools);
-    match store.find(who).and_then(|a| a.provider.as_deref()) {
-        Some(id) => reg.get(id).and_then(ask),
-        None => reg.providers.iter().filter(|p| p.enabled).find_map(ask),
-    }
+    store.find(who).and_then(|a| a.provider.as_deref()).map_or_else(
+        || reg.providers.iter().filter(|p| p.enabled).find_map(ask),
+        |id| reg.get(id).and_then(ask),
+    )
 }
 
 fn set_user_provider(state: &Arc<State>, store: &mut Store, who: &str, wanted: &str) -> Response<Body> {
@@ -1730,17 +1730,24 @@ fn save_provider(state: &Arc<State>, field: &dyn Fn(&str) -> String, body: &Byte
     // On update, everything the form CANNOT express is preserved.
     //
     // The form shows a base URL, models and a key. It has no field for the
-    // auth kind, the preference, the enabled flag or the peak schedule — so a
-    // save used to overwrite them with whatever the request implied. For
-    // `auth` that was not cosmetic: saving the subscription's own row through
-    // the form rewrote it from `claude_oauth` to `api_key_file`, which left it
-    // with no credential, out of the candidate list, and the whole proxy
-    // falling back to nothing. A partial view must save partially.
+    // auth kind, the preference or the peak schedule — so a save used to
+    // overwrite them with whatever the request implied. For `auth` that was
+    // not cosmetic: saving the subscription's own row through the form rewrote
+    // it from `claude_oauth` to `api_key_file`, which left it with no
+    // credential, out of the candidate list, and the whole proxy falling back
+    // to nothing. A partial view must save partially.
+    //
+    // `enabled` is the exception: the table DOES show it, so a request that
+    // names it is taken at its word and one that does not is preserved. That
+    // second half is what keeps the older form working.
+    let enabled = flag_from(body, &field("enabled"));
     if let Some(old) = reg.get(&new.id) {
         new.preference = old.preference;
-        new.enabled = old.enabled;
+        new.enabled = enabled.unwrap_or(old.enabled);
         new.auth = old.auth.clone();
         new.peak.clone_from(&old.peak);
+    } else if let Some(wanted) = enabled {
+        new.enabled = wanted;
     }
 
     let id = new.id.clone();
@@ -1776,6 +1783,35 @@ fn registry_dir(state: &State) -> std::path::PathBuf {
         .registry_path
         .parent()
         .map_or_else(|| std::path::PathBuf::from("."), std::path::Path::to_path_buf)
+}
+
+/// Create an account. Mints no key, on purpose: a key is named for the place
+/// it will be used, and one handed out at signup is the one that gets deployed
+/// unnamed. The UI asks for a place and calls `POST /keys` next.
+fn add_user(store: &mut Store, field: &dyn Fn(&str) -> String) -> Response<Body> {
+    match store.add(&field("first_name"), &field("last_name"), &field("email")) {
+        Ok(a) => json(201, &serde_json::json!({ "user": account_json(&a) }).to_string()),
+        Err(e) => json(400, &serde_json::json!({ "error": e.to_string() }).to_string()),
+    }
+}
+
+/// A boolean named in a request body, if one was named.
+///
+/// `None` for an absent field, which is not the same as an explicit `false` —
+/// the save path uses that difference to decide whether the request is setting
+/// the value or merely not mentioning it. Without it, every older caller that
+/// does not know about a new flag would silently reset it.
+fn flag_from(body: &Bytes, named: &str) -> Option<bool> {
+    if named == "true" {
+        return Some(true);
+    }
+    if named == "false" {
+        return Some(false);
+    }
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()?
+        .get("enabled")
+        .and_then(serde_json::Value::as_bool)
 }
 
 fn mutate(state: &Arc<State>, method: &Method, path: &str, body: &Bytes) -> Response<Body> {
@@ -1820,22 +1856,10 @@ fn mutate(state: &Arc<State>, method: &Method, path: &str, body: &Bytes) -> Resp
         // something else the moment that provider stops being where the traffic
         // goes. The hop still gets a say, because the harm is a property of the
         // hop; see the refusal below.
-        (&Method::POST, p) if p.starts_with("/api/users/") && p.ends_with("/compact") => set_user_compact(
-            state,
-            &mut store,
-            p.trim_start_matches("/api/users/").trim_end_matches("/compact"),
-            &field("compact"),
-        ),
-        (&Method::POST, "/api/users") => {
-            match store.add(&field("first_name"), &field("last_name"), &field("email")) {
-                // No key yet, on purpose: a key is named for where it will be
-                // used, and one handed out at signup is the one that gets
-                // deployed unnamed. The UI asks for a place and calls
-                // POST /keys next.
-                Ok(a) => json(201, &serde_json::json!({ "user": account_json(&a) }).to_string()),
-                Err(e) => json(400, &serde_json::json!({ "error": e.to_string() }).to_string()),
-            }
+        (&Method::POST, p) if p.ends_with("/compact") => {
+            set_user_compact(state, &mut store, &who("/compact"), &field("compact"))
         }
+        (&Method::POST, "/api/users") => add_user(&mut store, &field),
         // Add a named key. Replaces the old `/rotate`: adding first and
         // removing later means a machine can be moved across without a moment
         // where nothing works.

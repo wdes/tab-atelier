@@ -384,7 +384,7 @@
               <table class="table table-sm align-middle mb-3">
                 <thead>
                   <tr class="text-body-secondary">
-                    <th>Provider</th><th>Endpoint</th><th>Models</th>
+                    <th>On</th><th>Provider</th><th>Endpoint</th><th>Models</th>
                     <th class="text-center">Key</th>
                     <th class="text-end">Pref</th>
                   </tr>
@@ -392,7 +392,16 @@
                 <tbody>
                   <tr v-for="p in providers.providers" :key="p.id">
                     <td class="small">
-                      <span v-if="!p.enabled" class="badge text-bg-secondary me-1">off</span>
+                      <!-- A checkbox, not a badge with a hidden action. An
+                           operator taking a provider out of service is doing
+                           it because something is wrong, and should not have
+                           to find that out from a CLI. -->
+                      <input class="form-check-input me-2" type="checkbox" autocomplete="off"
+                             :checked="p.enabled" :disabled="busy"
+                             :title="p.enabled
+                               ? 'Requests can go here. Untick to take it out of service.'
+                               : 'No request routes here. Tick to put it back.'"
+                             @change="setProviderEnabled(p, $event.target.checked)" />
                       {{ p.id }}
                       <!-- Peak is the provider's own schedule, so it is shown
                            per provider and changes with the clock. -->
