@@ -107,7 +107,20 @@
     // stretch read as idle rather than as missing data.
     const CallsChart = Vue.defineComponent({
         mixins: [hoverable, xLabels],
-        props: { points: { type: Array, required: true } },
+        props: {
+            points: { type: Array, required: true },
+            /**
+             * One series per account, when nobody is selected. Empty means the caller
+             * has drilled into one account, and the single-series rendering below is
+             * used instead.
+             *
+             * The colour slot arrives WITH the series rather than being chosen here:
+             * slots must be stable across a filter change, and a chart that assigned
+             * them by size would recolour every line the moment the busiest account
+             * changed. See `callsByUser` in app.ts.
+             */
+            byUser: { type: Array, default: () => [] },
+        },
         computed: {
             // The mixins declare `points` as the union they can plot, and Vue
             // merges their props ahead of this component's. `pts` undoes that
@@ -115,8 +128,45 @@
             pts() {
                 return this.points;
             },
+            users() {
+                return this.byUser;
+            },
+            multi() {
+                return this.users.length > 0;
+            },
+            // The series themselves, WITHOUT their path strings. `peak` needs the
+            // points to size the axis, and a path is drawn against that axis — so
+            // building `d` here would close the loop peak → series → yOf → max → peak
+            // and recurse until the stack goes. The split is not tidiness; it is what
+            // breaks the cycle.
+            seriesList() {
+                return this.users.map((s) => ({
+                    key: s.id,
+                    name: s.name,
+                    slot: s.slot,
+                    points: s.points,
+                }));
+            },
+            // Every series, laid out against the same x positions as `pts`. The caller
+            // builds them on the same hour grid, so index alignment is guaranteed
+            // rather than hoped for.
+            seriesPaths() {
+                return this.seriesList.map((s) => ({
+                    ...s,
+                    d: s.points.map((p, i) => `${i ? "L" : "M"}${this.xOf(i)},${this.yOf(p.calls)}`).join(" "),
+                }));
+            },
+            peak() {
+                if (!this.multi)
+                    return Math.max(1, ...this.pts.map((p) => p.calls));
+                // Across every series: one y-scale for all of them, or the lines would
+                // be compared on axes that do not agree. From `seriesList`, not from the
+                // paths — see above.
+                const all = this.seriesList.flatMap((s) => s.points.map((p) => p.calls));
+                return Math.max(1, ...all);
+            },
             max() {
-                return this.niceMax(Math.max(1, ...this.pts.map((p) => p.calls)));
+                return this.niceMax(this.peak);
             },
             yOf() {
                 return (v) => PAD.top + this.plotH * (1 - v / this.max);
@@ -130,6 +180,26 @@
                 const base = PAD.top + this.plotH;
                 return `${this.line} L${this.xOf(this.points.length - 1)},${base} L${this.xOf(0)},${base} Z`;
             },
+            // Who was calling at the hovered hour, busiest first — the question the
+            // summed single line cannot answer.
+            hoverRows() {
+                if (this.hover < 0)
+                    return [];
+                return this.seriesPaths
+                    .map((s) => {
+                    const b = s.points[this.hover];
+                    return { name: s.name, slot: s.slot, calls: b?.calls ?? 0, errors: b?.errors ?? 0 };
+                })
+                    .filter((r) => r.calls > 0)
+                    .sort((a, b) => b.calls - a.calls);
+            },
+        },
+        methods: {
+            // The categorical hue for a slot, or muted ink for the folded "Other" —
+            // which is a group, not an entity, and should not read as one more person.
+            stroke(slot) {
+                return slot >= 0 && slot < 8 ? `var(--cat-${slot + 1})` : "var(--text-muted)";
+            },
         },
         template: `
     <div class="ta-chart">
@@ -141,21 +211,52 @@
           <text v-for="t in ticks(max)" :key="'l'+t" :x="${PAD.left - 8}" :y="yOf(t) + 4"
                 text-anchor="end">{{ fmt(t) }}</text>
         </g>
-        <path :d="area" class="ta-area-1" />
-        <path :d="line" class="ta-line-1" />
         <g v-if="hover >= 0">
           <line class="ta-crosshair" :x1="xOf(hover)" :x2="xOf(hover)" :y1="${PAD.top}" :y2="${H - PAD.bottom}" />
-          <circle :cx="xOf(hover)" :cy="yOf(points[hover].calls)" r="5" class="ta-dot-1" />
+        </g>
+        <!-- One series per account, or the single summed one when focused. -->
+        <template v-if="multi">
+          <path v-for="s in seriesPaths" :key="s.key" :d="s.d" class="ta-line-user"
+                :stroke="stroke(s.slot)" />
+        </template>
+        <template v-else>
+          <path :d="area" class="ta-area-1" />
+          <path :d="line" class="ta-line-1" />
+        </template>
+        <g v-if="hover >= 0">
+          <template v-if="multi">
+            <circle v-for="s in seriesPaths" :key="'d'+s.key"
+                    :cx="xOf(hover)" :cy="yOf(s.points[hover]?.calls ?? 0)" r="3.5"
+                    :fill="stroke(s.slot)" />
+          </template>
+          <circle v-else :cx="xOf(hover)" :cy="yOf(points[hover].calls)" r="5" class="ta-dot-1" />
         </g>
         <g class="ta-axis">
           <text v-for="l in labels" :key="'x'+l.i"
                 :x="xOf(l.i)" :y="${H - 6}" text-anchor="middle">{{ hourLabel(l.p.hour) }}</text>
         </g>
       </svg>
+      <!-- A legend is not optional at two or more series: identity must never
+           rest on hue alone. It also discharges the light-mode contrast warning
+           on three of these slots, which obliges visible labels. -->
+      <div v-if="multi" class="small text-body-secondary mt-1">
+        <span v-for="s in seriesPaths" :key="'k'+s.key" class="me-3 text-nowrap">
+          <span class="ta-key" :style="{ background: stroke(s.slot) }"></span>{{ s.name }}
+        </span>
+      </div>
       <div v-if="hover >= 0" class="ta-tip" :style="tipStyle(hover)">
         <div class="ta-tip-h">{{ hourLabel(points[hover].hour) }}</div>
-        <div><span class="ta-key ta-bg-1"></span>{{ points[hover].calls }} calls</div>
-        <div v-if="points[hover].errors" class="ta-tip-err">{{ points[hover].errors }} failed</div>
+        <template v-if="multi">
+          <div v-for="r in hoverRows" :key="r.name">
+            <span class="ta-key" :style="{ background: stroke(r.slot) }"></span>{{ r.name }}
+            <span class="ta-tip-sub">{{ r.calls }}</span>
+          </div>
+          <div v-if="!hoverRows.length" class="ta-tip-sub">no calls</div>
+        </template>
+        <template v-else>
+          <div><span class="ta-key ta-bg-1"></span>{{ points[hover].calls }} calls</div>
+          <div v-if="points[hover].errors" class="ta-tip-err">{{ points[hover].errors }} failed</div>
+        </template>
       </div>
     </div>`,
     });

@@ -30,6 +30,17 @@
         --series-1: #2a78d6;
         --series-2: #eb6834;
         --danger: #c0392b;
+        /* One hue per account, in a FIXED order — the ordering is the
+           colourblind-safety mechanism, not decoration, so slots are assigned
+           by a stable list and never by size. See `callsByUser` in app.ts. */
+        --cat-1: #2a78d6;
+        --cat-2: #eb6834;
+        --cat-3: #1baf7a;
+        --cat-4: #eda100;
+        --cat-5: #e87ba4;
+        --cat-6: #008300;
+        --cat-7: #4a3aa7;
+        --cat-8: #e34948;
       }
       @media (prefers-color-scheme: dark) {
         :root:where(:not([data-bs-theme="light"])) .ta-viz {
@@ -40,6 +51,16 @@
           --series-1: #3987e5;
           --series-2: #d95926;
           --danger: #e06c5b;
+          /* Dark is its own steps from the same ramps, not an automatic flip:
+             the light steps fall outside the dark lightness band. */
+          --cat-1: #3987e5;
+          --cat-2: #d95926;
+          --cat-3: #199e70;
+          --cat-4: #c98500;
+          --cat-5: #d55181;
+          --cat-6: #008300;
+          --cat-7: #9085e9;
+          --cat-8: #e66767;
         }
       }
       :root[data-bs-theme="dark"] .ta-viz {
@@ -50,6 +71,14 @@
         --series-1: #3987e5;
         --series-2: #d95926;
         --danger: #e06c5b;
+        --cat-1: #3987e5;
+        --cat-2: #d95926;
+        --cat-3: #199e70;
+        --cat-4: #c98500;
+        --cat-5: #d55181;
+        --cat-6: #008300;
+        --cat-7: #9085e9;
+        --cat-8: #e66767;
       }
       .ta-chart { position: relative; }
       .ta-chart svg { width: 100%; height: auto; display: block; }
@@ -74,6 +103,10 @@
       .ta-key-rule {
         background: repeating-linear-gradient(0deg, var(--text-muted) 0 2px, transparent 2px 6px);
       }
+      /* One line per account. Thinner than the single-series line because
+         eight of them overlap, and no area fill: stacked-looking bands would
+         read as a total, and these are alternatives, not parts. */
+      .ta-line-user { fill: none; stroke-width: 1.6; stroke-linejoin: round; opacity: .9; }
       .ta-bar-1 { fill: var(--series-1); }
       .ta-bar-2 { fill: var(--series-2); }
       .ta-threshold line { stroke: var(--danger); stroke-width: 1; stroke-dasharray: 4 3; opacity: .7; }
@@ -254,7 +287,7 @@
                   {{ usageBusy ? 'Refreshing…' : 'Refresh' }}
                 </button>
               </div>
-              <calls-chart :points="series"></calls-chart>
+              <calls-chart :points="series" :by-user="callsByUser"></calls-chart>
             </div>
           </div>
 
