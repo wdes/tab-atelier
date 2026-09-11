@@ -47,7 +47,13 @@ jobs:
         steps:
             - uses: actions/checkout@v7
               with:
-                  fetch-depth: 0
+                  # Depth 1 is enough here: the version comes from GITHUB_REF
+                  # and `git rev-parse --short=7 HEAD`, both of which a
+                  # shallow clone has. The only other git use is a separate
+                  # `git clone --depth=1` for gh-pages. Do NOT copy this to
+                  # arch-pkg.yml — that one needs full history, because its
+                  # pkgver embeds `git rev-list --count HEAD`.
+                  fetch-depth: 1
             - name: Decide channel + version
               id: ver
               run: |
@@ -92,9 +98,12 @@ jobs:
                   # entry main saved — same Cargo.lock, same key.
                   save-if: false
 
+            - name: Install cargo-deb
+              # Split out of the build step so CI reports its duration
+              # separately — see the note in build.yml.
+              run: cargo install cargo-deb --locked
             - name: Build .deb (both variants)
               run: |
-                  cargo install cargo-deb --locked
                   cargo deb -p tab-atelier --locked --deb-version "${{ steps.ver.outputs.version }}"
                   cargo deb -p tab-atelier --variant headless --locked --deb-version "${{ steps.ver.outputs.version }}"
                   # Third package: the server half of the relay. Its own .deb
