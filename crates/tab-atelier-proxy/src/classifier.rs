@@ -33,7 +33,7 @@
 //! is what makes that readable rather than misleading.
 //!
 //! One live finding is worth recording, because it is invisible in the code
-//! that has to preserve it: probing DeepSeek's Anthropic-compatible endpoint
+//! that has to preserve it: probing `DeepSeek`'s Anthropic-compatible endpoint
 //! with this body, `deepseek-flash` WITHOUT `thinking:{"type":"disabled"}`
 //! returns `stop_reason: max_tokens` and EMPTY content — a reasoning model that
 //! spends all 64 tokens thinking and never emits a verdict. With the field it

@@ -532,6 +532,38 @@ const AdminApp = Vue.defineComponent({
             await this.loadProviders();
             await this.refresh();
         },
+        /**
+         * Take a provider out of service, or put it back.
+         *
+         * Distinct from Remove, and the distinction is the point: this keeps the
+         * entry, its key and its models, so the reversal is one click. Remove
+         * forgets all of it and unpins whoever was routed there.
+         *
+         * The checkbox is bound with `:checked` rather than `v-model`, so a
+         * refusal snaps it back to what the server actually holds instead of
+         * showing a state that was never saved.
+         */
+        async setProviderEnabled(p, enabled) {
+            this.busy = true;
+            try {
+                await this.api("POST", "/api/providers", {
+                    id: p.id,
+                    base_url: p.base_url,
+                    models: p.models.filter((m) => !m.deprecated).map((m) => `${m.id}:${m.class}:${m.relative_cost}`).join(","),
+                    enabled,
+                });
+                this.error = "";
+            }
+            catch (e) {
+                this.error = e instanceof Error ? e.message : String(e);
+            }
+            finally {
+                this.busy = false;
+                // Either way: on success to reflect what was stored, on failure to put
+                // the tick back where it was.
+                await this.loadProviders();
+            }
+        },
         async addMapping() {
             const m = this.newMapping;
             if (!m.from || !m.to)
