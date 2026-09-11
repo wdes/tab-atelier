@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+
 //! The auto-mode permission classifier.
 //!
 //! Claude Code's auto mode does not decide on its own whether a gated action
