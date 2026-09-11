@@ -61,10 +61,12 @@ jobs:
                       exit 1
                   fi
             - name: Install cargo-deb
-              # --locked was missing here while the other two workflows had
-              # it, so a release could pick up newer semver-compatible deps
-              # for the build tool than the nightly that passed CI.
-              run: cargo install cargo-deb --locked
+              # Prebuilt and version-pinned. The pin matters most here: the
+              # tool that assembles an attested, immutable release should be
+              # a known version, not whatever was latest at tag time.
+              uses: taiki-e/install-action@v2
+              with:
+                  tool: cargo-deb@3.2.0
             - name: Build .deb packages
               run: |
                   # Same script as the nightly channel, so a release and a

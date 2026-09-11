@@ -99,9 +99,10 @@ jobs:
                   save-if: false
 
             - name: Install cargo-deb
-              # Split out of the build step so CI reports its duration
-              # separately — see the note in build.yml.
-              run: cargo install cargo-deb --locked
+              # Prebuilt and version-pinned — see the note in build.yml.
+              uses: taiki-e/install-action@v2
+              with:
+                  tool: cargo-deb@3.2.0
             - name: Build .deb (both variants)
               run: |
                   # No --dbgsym here, deliberately. A nightly is throwaway,
