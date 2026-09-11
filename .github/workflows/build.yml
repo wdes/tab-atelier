@@ -80,8 +80,16 @@ jobs:
                   RUSTDOCFLAGS: "-Cinstrument-coverage"
             - name: Build headless
               run: cargo build --locked --no-default-features --features headless,energy
+            # --workspace is load-bearing, not tidiness. tab-atelier-proxy is
+            # a non-default member (see default-members in Cargo.toml), and
+            # --all-targets selects targets WITHIN the selected packages, never
+            # additional packages — so without this the test, clippy and fmt
+            # steps all skip the proxy crate entirely. The only thing that
+            # compiles it in this job is the `cargo deb -p tab-atelier-proxy`
+            # smoke-build near the bottom, which exercises linking and nothing
+            # else.
             - name: Run tests
-              run: cargo test --locked --all-targets --no-fail-fast
+              run: cargo test --workspace --locked --all-targets --no-fail-fast
               env:
                   CARGO_INCREMENTAL: "0"
                   RUSTFLAGS: "-Cinstrument-coverage"
@@ -90,13 +98,13 @@ jobs:
             # the shipped headless .deb) — a differing set compiles the
             # whole crate graph once more just for this step.
             - name: Run headless tests
-              run: cargo test --locked --no-default-features --features headless,energy --no-fail-fast
+              run: cargo test --workspace --locked --no-default-features --features headless,energy --no-fail-fast
             - name: Check formatting
-              run: cargo fmt -- --check
+              run: cargo fmt --all -- --check
             - name: Clippy (GUI)
-              run: cargo clippy --all-targets --locked -- -D warnings
+              run: cargo clippy --workspace --all-targets --locked -- -D warnings
             - name: Clippy (headless)
-              run: cargo clippy --no-default-features --features headless,energy --all-targets --locked -- -D warnings
+              run: cargo clippy --workspace --no-default-features --features headless,energy --all-targets --locked -- -D warnings
             - name: Install grcov
               run: |
                   mkdir -p "${HOME}/.local/bin"
