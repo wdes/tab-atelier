@@ -92,6 +92,17 @@ pub struct Capture {
     /// the client asked for — that is half the point of looking.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Which client session sent this, from the body's `metadata`.
+    ///
+    /// The one field on a capture that answers "who" at a finer grain than the
+    /// key. A key belongs to a PLACE, and one machine runs many tabs; without
+    /// this, forty calls from four sessions are one undifferentiated row.
+    ///
+    /// Client-supplied and NOT authenticated: anything holding a valid key can
+    /// put any string here, so it groups and explains, and must never be the
+    /// basis of a billing or access decision. See [`Client`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<Client>,
     /// Whether this is the conversation or the auto-mode permission classifier.
     ///
     /// Defaults to `Work`, which is the right reading for the lines already on
@@ -148,6 +159,13 @@ pub struct Compaction {
     /// is explicable rather than mysterious.
     pub tool_results_kept_for_error: usize,
     pub thinking_dropped: usize,
+    /// Layer D: file bodies stubbed inside old `Write`/`Edit` inputs.
+    ///
+    /// Counted per STRING, so one editing turn can report two. Read together
+    /// with the byte counts, not on its own: a pass that stubs four small
+    /// strings has done far less than one naming a single tool result.
+    #[serde(default)]
+    pub writes_elided: usize,
     pub banners_dropped: usize,
 }
 
@@ -237,6 +255,66 @@ pub struct Outgoing<'a> {
     pub origin: Option<Origin>,
 }
 
+/// What the client says about itself, unpacked from the body's `metadata`.
+///
+/// Claude Code sends `metadata.user_id` as a STRING holding a JSON document,
+/// so reading it is a parse of a parse:
+///
+/// ```text
+/// {"metadata": {"user_id": "{\"device_id\":\"323056…\",\"account_uuid\":\"\",\"session_id\":\"a3412ddb-…\"}"}}
+/// ```
+///
+/// That shape is Anthropic's doing, not the client's: every `metadata` value
+/// has to be a string, so a structured value has nowhere to go but inside one.
+/// It is unpacked here rather than left as one opaque blob because the parts
+/// answer different questions, and a reader who has to decode base64-ish
+/// nesting by eye will not bother.
+///
+/// All three fields are optional and an empty string counts as absent: the
+/// client sends `account_uuid: ""` when nobody is logged in, and rendering
+/// that as a value would state something the wire did not.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Client {
+    /// Stable per install. Answers "same machine, or two?".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    /// Per conversation, which is what makes one tab distinguishable from the
+    /// four others running beside it on the same key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// The account the CLIENT is logged into. Frequently empty, and unrelated
+    /// to this proxy's own accounts — it is Anthropic's, seen from the far
+    /// side, and useful mainly for spotting a session running under a login
+    /// nobody expected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_uuid: Option<String>,
+}
+
+/// Unpack `metadata.user_id`, if the body has one.
+///
+/// Returns `None` rather than an all-empty `Client` when there is nothing to
+/// report, so the field is absent from a capture instead of present and blank.
+fn parse_client(body: &serde_json::Value) -> Option<Client> {
+    let inner = body.get("metadata")?.get("user_id")?.as_str()?;
+    let parsed: serde_json::Value = serde_json::from_str(inner).ok()?;
+    // Empty means absent: `account_uuid` is routinely `""` for a session that
+    // is not logged in, and treating that as a value would report a logged-out
+    // tab as belonging to an account named nothing.
+    let field = |key: &str| {
+        parsed
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    let client = Client {
+        device_id: field("device_id"),
+        session_id: field("session_id"),
+        account_uuid: field("account_uuid"),
+    };
+    (client != Client::default()).then_some(client)
+}
+
 /// Where a request came from, as the proxy saw it.
 ///
 /// Both the resolved answer and the raw inputs, deliberately. Showing only the
@@ -277,9 +355,11 @@ pub fn capture(o: &Outgoing<'_>) -> Capture {
     } = o;
     let raw = String::from_utf8_lossy(body);
     let scrubbed = scrub(&raw);
-    let model = serde_json::from_str::<serde_json::Value>(&raw)
-        .ok()
+    let parsed = serde_json::from_str::<serde_json::Value>(&raw).ok();
+    let model = parsed
+        .as_ref()
         .and_then(|v| v.get("model").and_then(serde_json::Value::as_str).map(str::to_owned));
+    let client = parsed.as_ref().and_then(parse_client);
     let (request_body, request_truncated) = clamp(&scrubbed);
     Capture {
         ts: ts.clone(),
@@ -289,6 +369,7 @@ pub fn capture(o: &Outgoing<'_>) -> Capture {
         path: (*path).to_owned(),
         provider: (*provider).to_owned(),
         model,
+        client,
         kind: *kind,
         request_headers: headers
             .iter()
@@ -430,6 +511,86 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    /// The real thing, copied from a live request body.
+    ///
+    /// Reproduced rather than invented, because the whole difficulty of this
+    /// field is that it is a JSON document stored inside a JSON string — a
+    /// fixture written from memory would likely be the shape someone WISHED
+    /// the wire had.
+    #[test]
+    fn the_client_identity_unpacks_from_its_own_nested_json() {
+        let body: serde_json::Value = serde_json::from_str(
+            r#"{"model":"claude-opus-5","metadata":{"user_id":"{\"device_id\":\"323056b1018ba40f8d9327977429a92eab0a05a7a6a1a8d8f026bef3b779d625\",\"account_uuid\":\"\",\"session_id\":\"a3412ddb-82d5-4ce5-868a-1c8475b5cb38\"}"}}"#,
+        )
+        .expect("parses");
+
+        let client = parse_client(&body).expect("a client");
+        assert_eq!(
+            client.device_id.as_deref(),
+            Some("323056b1018ba40f8d9327977429a92eab0a05a7a6a1a8d8f026bef3b779d625")
+        );
+        assert_eq!(
+            client.session_id.as_deref(),
+            Some("a3412ddb-82d5-4ce5-868a-1c8475b5cb38")
+        );
+        // `account_uuid: ""` is what a logged-out session sends. Reported as
+        // ABSENT, because rendering it would state something the wire did not.
+        assert_eq!(client.account_uuid, None);
+    }
+
+    /// Everything absent, or absent entirely, is `None` — not an empty struct.
+    /// A capture carrying `{"client":{}}` says "there is a client and it told
+    /// us nothing", which is a different and wrong claim.
+    #[test]
+    fn a_body_without_a_usable_user_id_has_no_client() {
+        for body in [
+            json!({"model": "claude-opus-5"}),
+            json!({"metadata": {}}),
+            json!({"metadata": {"user_id": ""}}),
+            json!({"metadata": {"user_id": "not json at all"}}),
+            json!({"metadata": {"user_id": "[1,2,3]"}}),
+            json!({"metadata": {"user_id": 42}}),
+            json!({"metadata": "user_id"}),
+            // Parses, but names nothing we can report.
+            json!({"metadata": {"user_id": "{\"account_uuid\":\"\"}"}}),
+            json!({"metadata": {"user_id": "{}"}}),
+        ] {
+            assert_eq!(parse_client(&body), None, "should be no client: {body}");
+        }
+    }
+
+    /// A partial payload still reports the parts it has — the fields are
+    /// independent, and a client that sends only a session id is usable.
+    #[test]
+    fn a_partial_user_id_reports_what_it_has() {
+        let body = json!({"metadata": {"user_id": "{\"session_id\":\"s-1\"}"}});
+        let client = parse_client(&body).expect("a client");
+        assert_eq!(client.session_id.as_deref(), Some("s-1"));
+        assert_eq!(client.device_id, None);
+
+        // And non-string members are ignored rather than coerced.
+        let body = json!({"metadata": {"user_id": "{\"session_id\":42,\"device_id\":\"d-1\"}"}});
+        let client = parse_client(&body).expect("a client");
+        assert_eq!(client.session_id, None);
+        assert_eq!(client.device_id.as_deref(), Some("d-1"));
+    }
+
+    /// The field is optional on capture, so a file written before it existed
+    /// still parses — the same rule every other added field here follows.
+    #[test]
+    fn a_capture_without_a_client_reads_back_as_none() {
+        let old = r#"{"ts":"2026-09-11T00:00:00Z","account_id":"a","account_email":"e",
+                      "method":"POST","path":"/v1/messages","provider":"anthropic",
+                      "request_headers":[],"request_body":"{}","request_truncated":false}"#;
+        let parsed: Capture = serde_json::from_str(old).expect("an older capture must load");
+        assert_eq!(parsed.client, None);
+        // And it is not written back out as a null, which would grow every
+        // stored line for no information.
+        let round = serde_json::to_string(&parsed).expect("serializes");
+        assert!(!round.contains("client"), "{round}");
+    }
 
     fn tmp(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("ta-inspect-{tag}-{}", std::process::id()));
