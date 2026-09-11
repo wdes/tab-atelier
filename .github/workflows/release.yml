@@ -71,20 +71,34 @@ jobs:
                   # snapshot cannot disagree about how a version is spelled.
                   DEB_VERSION="$(scripts/deb-version.sh)"
                   echo "→ building $DEB_VERSION"
-                  cargo deb -p tab-atelier --locked --deb-version "$DEB_VERSION"
-                  cargo deb -p tab-atelier --variant headless --locked --deb-version "$DEB_VERSION"
-            - name: Attest .deb
+                  # --dbgsym is Debian's convention: the shipped .deb stays
+                  # stripped and the DWARF goes into a separate
+                  # tab-atelier-dbgsym_*.ddeb beside it. zlib rather than
+                  # zstd because cargo-deb's help notes zlib round-trips
+                  # through Rust's backtraces and zstd may not. The profile's
+                  # debug = 2 is what makes the symbols exist to split.
+                  DBGSYM=(--dbgsym --compress-debug-symbols=zlib)
+                  cargo deb -p tab-atelier --locked --deb-version "$DEB_VERSION" "${DBGSYM[@]}"
+                  cargo deb -p tab-atelier --variant headless --locked --deb-version "$DEB_VERSION" "${DBGSYM[@]}"
+            - name: Attest .deb + .ddeb
               uses: actions/attest-build-provenance@v4
               with:
-                  subject-path: target/debian/*.deb
-            - name: Upload .deb artifact
+                  # Both: a -dbgsym.ddeb is a shipped release asset too, so
+                  # provenance should cover every artifact a user downloads.
+                  subject-path: |
+                      target/debian/*.deb
+                      target/debian/*.ddeb
+            - name: Upload .deb + .ddeb artifact
               uses: actions/upload-artifact@v7
               with:
                   name: tab-atelier-deb
-                  path: target/debian/*.deb
-                  # Two .deb files (GUI + headless); upload-artifact's
-                  # `archive: false` requires exactly one. Default
-                  # `archive: true` bundles them into the artifact zip.
+                  path: |
+                      target/debian/*.deb
+                      target/debian/*.ddeb
+                  # Three .deb files (GUI + headless + proxy) plus their
+                  # symbol packages; upload-artifact's `archive: false`
+                  # requires exactly one. Default `archive: true` bundles
+                  # them into the artifact zip.
 
     release:
         name: Create draft release
@@ -101,4 +115,6 @@ jobs:
               with:
                   draft: true
                   generate_release_notes: true
-                  files: "*.deb"
+                  files: |
+                      *.deb
+                      *.ddeb
