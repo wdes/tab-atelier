@@ -117,8 +117,44 @@ pub struct Capture {
     /// the request that produced them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens: Option<crate::usage::Tokens>,
+    /// What compaction removed from this request, when it ran.
+    ///
+    /// Otherwise invisible: the panel shows the body AS SENT, so a compacted
+    /// request simply looks like a smaller one. Without this, "is compaction
+    /// on, and is it doing anything" can only be answered by comparing against
+    /// a provider that has it off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<Compaction>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_excerpt: Option<String>,
+}
+
+/// What one compaction pass removed, recorded on the capture.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Compaction {
+    /// The level that ran, as `providers.json` spells it.
+    pub level: String,
+    /// The request body before and after. Both numbers rather than a
+    /// percentage: the ratio is arithmetic the reader can do, and a stale
+    /// percentage is harder to notice than two sizes that do not look right.
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+    pub tool_results_elided: usize,
+    /// Tool results left alone because they carry an error — see
+    /// [`crate::compact`]. Reported so a pass that elided less than expected
+    /// is explicable rather than mysterious.
+    pub tool_results_kept_for_error: usize,
+    pub thinking_dropped: usize,
+    pub banners_dropped: usize,
+}
+
+impl Compaction {
+    /// Bytes shed. Saturating, so a pass that somehow grew the body reports
+    /// nothing saved rather than wrapping.
+    #[must_use]
+    pub const fn saved(&self) -> u64 {
+        self.bytes_before.saturating_sub(self.bytes_after)
+    }
 }
 
 /// Replace credential-shaped runs with a marker.
@@ -227,6 +263,9 @@ pub fn capture(o: &Outgoing<'_>) -> Capture {
         request_truncated,
         status: None,
         tokens: None,
+        // Filled in by the caller, which is the only thing that knows whether
+        // a compaction pass ran on this request at all.
+        compaction: None,
         response_excerpt: None,
     }
 }

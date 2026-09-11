@@ -365,8 +365,8 @@ async fn anthropic(req: Request<Incoming>, state: Arc<State>, peer: std::net::Ip
     // Only /v1/messages spends tokens; a metadata call should not queue
     // behind a fleet's generations.
     let metered = is_post && sub.contains("/messages");
-    let (body, route) = match shape_and_admit(&state, &account, body, metered).await {
-        Ok(pair) => pair,
+    let (body, route, compaction) = match shape_and_admit(&state, &account, body, metered).await {
+        Ok(triple) => triple,
         Err(resp) => return resp,
     };
 
@@ -388,6 +388,10 @@ async fn anthropic(req: Request<Incoming>, state: Arc<State>, peer: std::net::Ip
         body,
         account_id: account.id.clone(),
         account_email: account.email.clone(),
+        // Carried to the capture, which is the only place the saving is
+        // visible: the panel shows the body as sent, so a compacted request
+        // and a small one look identical without it.
+        compaction,
         weight: account.weight,
         metered,
         route: route.clone(),
@@ -445,15 +449,16 @@ where
 
 /// Degrade the request if the plan is tight, then wait for a turn.
 ///
-/// Returns the (possibly rewritten) body and what was swapped, or the 429 to
-/// send back. Split out of `anthropic` because it is the whole `QoS` decision
-/// and reads better as one unit than inline in the middle of the forwarder.
+/// Returns the (possibly rewritten) body, what was swapped, and what
+/// compaction removed, or the 429 to send back. Split out of `anthropic`
+/// because it is the whole `QoS` decision and reads better as one unit than
+/// inline in the middle of the forwarder.
 async fn shape_and_admit(
     state: &Arc<State>,
     account: &Account,
     body: Bytes,
     metered: bool,
-) -> Result<(Bytes, routing::Route), Response<Body>> {
+) -> Result<(Bytes, routing::Route, Option<inspect::Compaction>), Response<Body>> {
     if !metered {
         // Not a generation: it still has to go somewhere, but no class
         // reasoning applies. The pin still does — an account routed to a
@@ -471,6 +476,8 @@ async fn shape_and_admit(
                 changed_from: None,
                 reason: None,
             },
+            // Not a generation, so there was nothing to compact either.
+            None,
         ));
     }
     // Choose the destination BEFORE admission, so the call is judged at the
@@ -533,7 +540,7 @@ async fn shape_and_admit(
             route.model_id
         );
     }
-    let body = shape_body(&body, &route, &requested, account.compact);
+    let (body, compaction) = shape_body(&body, &route, &requested, account.compact);
 
     // Admission gates on the SUBSCRIPTION's budget, so it applies only to a
     // destination that spends it.
@@ -570,21 +577,31 @@ async fn shape_and_admit(
         record(state, &account.id, None, usage::Tokens::default(), 429);
         return Err(resp);
     }
-    Ok((body, route))
+    Ok((body, route, compaction))
 }
 
 /// Rewrite the outgoing request for its destination: the model, and the
-/// provider's compaction level.
+/// account's compaction level.
 ///
-/// One parse for both. The proxy has already paid to deserialize this body to
-/// find `model`, and `estimate_cost` is about to deserialize it again — a
-/// third pass for a second mutation would be pure waste on every request.
+/// Returns what compaction did alongside the body, so an inspection capture
+/// can report it: the panel shows the body AS SENT, so without this a
+/// compacted request is indistinguishable from a small one.
+///
+/// One parse for both mutations. The proxy has already paid to deserialize
+/// this body to find `model`, and `estimate_cost` is about to deserialize it
+/// again — a third pass for a second mutation would be pure waste on every
+/// request.
 ///
 /// Compaction runs BEFORE `estimate_cost`, which is the whole point of doing it
 /// here: admission then scores the call at the size that will actually be sent
 /// rather than at the size it arrived. Returns the body untouched when there is
-/// nothing to do, which is the common case — every provider defaults to `none`.
-fn shape_body(body: &Bytes, route: &routing::Route, requested: &str, compact: crate::compact::Compact) -> Bytes {
+/// nothing to do, which is the common case — every account defaults to `none`.
+fn shape_body(
+    body: &Bytes,
+    route: &routing::Route,
+    requested: &str,
+    compact: crate::compact::Compact,
+) -> (Bytes, Option<inspect::Compaction>) {
     let rename = (route.model_id != requested).then_some(route.model_id.as_str());
     // The level is the account's, resolved by the caller from wherever the
     // store lives — not the provider's. It reads like a property of the hop,
@@ -604,14 +621,14 @@ fn shape_body(body: &Bytes, route: &routing::Route, requested: &str, compact: cr
         crate::compact::Compact::None
     };
     if rename.is_none() && level.is_none() {
-        return body.clone();
+        return (body.clone(), None);
     }
 
     let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(body) else {
         // Not JSON. The old `rewrite_model` swallowed this and forwarded the
         // original, which is right — the far end gives a better error than we
         // could — and compaction has nothing to act on either way.
-        return body.clone();
+        return (body.clone(), None);
     };
     if let Some(model) = rename {
         v["model"] = serde_json::Value::String(model.to_owned());
@@ -619,7 +636,7 @@ fn shape_body(body: &Bytes, route: &routing::Route, requested: &str, compact: cr
     let before = body.len();
     let elided = crate::compact::apply(&mut v, level);
     let Ok(encoded) = serde_json::to_vec(&v) else {
-        return body.clone();
+        return (body.clone(), None);
     };
     if elided.changed() {
         log::info!(
@@ -634,7 +651,19 @@ fn shape_body(body: &Bytes, route: &routing::Route, requested: &str, compact: cr
             elided.banners_dropped
         );
     }
-    Bytes::from(encoded)
+    // Recorded whenever a level was in force, even if it changed nothing:
+    // "compaction is on and elided nothing" and "compaction is off" are
+    // different answers, and the panel should be able to tell them apart.
+    let record = inspect::Compaction {
+        level: level.as_str().to_owned(),
+        bytes_before: u64::try_from(before).unwrap_or(u64::MAX),
+        bytes_after: u64::try_from(encoded.len()).unwrap_or(u64::MAX),
+        tool_results_elided: elided.tool_results_elided,
+        tool_results_kept_for_error: elided.tool_results_kept_for_error,
+        thinking_dropped: elided.thinking_dropped,
+        banners_dropped: elided.banners_dropped,
+    };
+    (Bytes::from(encoded), Some(record))
 }
 
 /// What routing needs to know about each provider right now.
@@ -777,6 +806,9 @@ struct Forward {
     /// bound for a provider that bills separately must be neither gated by the
     /// subscription's budget nor able to spend it.
     uses_the_subscription: bool,
+    /// What compaction removed on the way out, if it ran. Attached to the
+    /// inspection capture — see [`inspect::Compaction`].
+    compaction: Option<inspect::Compaction>,
     /// Who to bill. Carried down rather than looked up again, because by the
     /// time the response finishes the account may have been deleted — the call
     /// still happened and still spent tokens.
@@ -886,6 +918,9 @@ fn finish_capture(
     let Some(mut c) = pending else { return };
     c.status = Some(status);
     c.tokens = Some(*tokens);
+    // What compaction removed from THIS request, so the panel can show the
+    // saving rather than only the compacted result.
+    c.compaction.clone_from(&f.compaction);
     // What upstream REPORTED the model as, when it was the routing that chose
     // it. Usually the same as what we sent; different means the far end
     // substituted, which is worth seeing.
@@ -2105,6 +2140,60 @@ mod tests {
         // any caller could write its own address into the audit log.
         let req = build(&[("x-real-ip", "10.0.0.1")]);
         assert_eq!(client_ip(&req, ip("203.0.113.7")), "203.0.113.7");
+    }
+
+    /// An inspection capture must carry what compaction removed.
+    ///
+    /// The panel renders the body AS SENT, so without this a compacted request
+    /// is indistinguishable from one that was simply small — and "is
+    /// compaction on, and is it doing anything" is exactly the question an
+    /// operator opens the panel with.
+    #[test]
+    fn shape_body_reports_what_compaction_removed() {
+        let route = routing::Route {
+            provider_id: "p".to_owned(),
+            model_id: "m".to_owned(),
+            class: provider::Class::Balanced,
+            // Work, not the classifier: the classifier is exempt from
+            // compaction by construction, so it would report nothing and the
+            // test would pass for the wrong reason.
+            kind: classifier::Kind::Work,
+            changed_from: None,
+            reason: None,
+        };
+        // Ten tool-result turns, so six survive the window.
+        let mut turns = Vec::new();
+        for i in 0..10 {
+            turns.push(format!(
+                r#"{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"call_{i:02}","content":"{}"}}]}}"#,
+                "r".repeat(500)
+            ));
+        }
+        let body = Bytes::from(format!(r#"{{"model":"m","messages":[{}]}}"#, turns.join(",")));
+        let before = body.len();
+
+        let (after, record) = shape_body(&body, &route, "m", crate::compact::Compact::Tools);
+        let record = record.expect("a level was in force, so a record must come back");
+        assert_eq!(record.level, "tools");
+        assert_eq!(record.tool_results_elided, 4, "six of ten are inside the keep window");
+        assert_eq!(record.bytes_before, u64::try_from(before).expect("fits"));
+        assert_eq!(record.bytes_after, u64::try_from(after.len()).expect("fits"));
+        assert!(record.saved() > 0, "the body did shrink");
+        assert!(after.len() < before);
+
+        // A level that is set but has nothing to remove still reports, because
+        // "on, and elided nothing" is a different answer from "off".
+        let plain = Bytes::from(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#);
+        let (_, quiet) = shape_body(&plain, &route, "m", crate::compact::Compact::All);
+        let quiet = quiet.expect("still a record");
+        assert_eq!(quiet.tool_results_elided, 0);
+        assert_eq!(quiet.saved(), 0);
+
+        // …and `none` reports nothing at all, which is the distinction the UI
+        // draws by leaving the cell blank.
+        let (untouched, off) = shape_body(&plain, &route, "m", crate::compact::Compact::None);
+        assert!(off.is_none(), "no level, no record");
+        assert_eq!(untouched, plain, "and the bytes are the ones that arrived");
     }
 
     #[test]

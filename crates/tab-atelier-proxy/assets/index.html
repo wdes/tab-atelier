@@ -556,6 +556,7 @@
                 <thead>
                   <tr class="text-body-secondary">
                     <th>When</th><th>Who</th><th>Model</th><th class="text-end">Tokens</th>
+                    <th>Compaction</th>
                     <th class="text-end">Status</th><th></th>
                   </tr>
                 </thead>
@@ -570,6 +571,15 @@
                       <span class="font-monospace">{{ c.model || '—' }}</span>
                     </td>
                     <td class="small text-end text-nowrap">{{ tokenSummary(c) }}</td>
+                    <!-- Blank when no level was in force: "off" and "on but
+                         saved nothing" are different states, and the detail
+                         title distinguishes them. -->
+                    <td class="small text-nowrap" :title="compactionDetail(c)">
+                      <span v-if="c.compaction" class="text-body-secondary">
+                        −{{ Math.round((1 - c.compaction.bytes_after / c.compaction.bytes_before) * 100) }}%
+                        <span class="text-body-secondary" style="font-size:.75rem">{{ c.compaction.level }}</span>
+                      </span>
+                    </td>
                     <td class="small text-end" :class="c.status && c.status >= 400 ? 'text-danger' : ''">
                       {{ c.status || '—' }}
                     </td>
@@ -608,6 +618,9 @@
                     via {{ inspectOpen.provider }}
                     <span v-if="inspectOpen.status"> · HTTP {{ inspectOpen.status }}</span>
                     <span v-if="inspectOpen.tokens"> · {{ tokenSummary(inspectOpen) }}</span>
+                    <div v-if="inspectOpen.compaction" class="text-body-secondary">
+                      {{ compactionSummary(inspectOpen) }} — {{ compactionDetail(inspectOpen) }}
+                    </div>
                   </div>
                 </div>
                 <button class="btn btn-sm btn-outline-secondary ms-2" @click="copy(inspectOpen.request_body)">
