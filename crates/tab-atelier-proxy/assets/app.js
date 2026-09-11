@@ -228,6 +228,88 @@ const AdminApp = Vue.defineComponent({
             }
             return base;
         },
+        /**
+         * One calls line per account, for the un-focused view.
+         *
+         * Slots come from the ACCOUNT LIST POSITION, not from size. Two reasons,
+         * and the second is the one that matters:
+         *
+         *  - colour must follow the entity, never its rank, or an hour where
+         *    somebody else is busiest repaints the whole chart;
+         *  - clicking a row sets `focus`, and a size-ordered palette would
+         *    recolour every remaining account at that moment. Stable slots mean
+         *    the line you were following stays the same colour when you drill in.
+         *
+         * Past eight, the rest fold into a muted "Other" — a ninth hue is never
+         * generated, because a generated one is not colourblind-safe and the
+         * ordering is what makes the palette work at all.
+         */
+        callsByUser() {
+            // Focused: the chart draws the single summed series instead, and an
+            // empty list is how it is told to.
+            if (this.focus)
+                return [];
+            const withUsage = this.users.filter((u) => this.usage[u.id]);
+            if (withUsage.length < 2)
+                return [];
+            const grid = this.series.map((b) => b.hour);
+            const series = withUsage.map((u, i) => {
+                const acct = this.usage[u.id];
+                const byHour = new Map((acct?.series_hourly ?? []).map((b) => [b.hour, b]));
+                // Rebuilt on the SAME grid as `series`, so index alignment with the
+                // x axis is guaranteed rather than assumed — the chart maps a series
+                // point to an x position by index.
+                const points = grid.map((hour) => {
+                    const b = byHour.get(hour);
+                    return {
+                        hour,
+                        calls: b?.calls ?? 0,
+                        errors: b?.errors ?? 0,
+                        input: b?.input ?? 0,
+                        output: b?.output ?? 0,
+                        cache_read: b?.cache_read ?? 0,
+                        cache_write: b?.cache_write ?? 0,
+                    };
+                });
+                return { id: u.id, name: u.first_name || u.email, slot: 0, points };
+            });
+            const calls = (s) => s.points.reduce((a, p) => a + p.calls, 0);
+            const drawn = series.filter((s) => s.points.some((p) => p.calls > 0));
+            if (drawn.length <= 8) {
+                // Slots come from the position in THIS list — the account list, which
+                // the server returns in a fixed order — so they are stable across
+                // refreshes and across a focus change.
+                return drawn.map((s, i) => ({ ...s, slot: i }));
+            }
+            // Past eight, the busiest eight keep a colour and the rest are summed.
+            const busiest = new Set([...drawn]
+                .sort((a, b) => calls(b) - calls(a))
+                .slice(0, 8)
+                .map((s) => s.id));
+            // …but the kept eight take their slots from the STABLE order, not from
+            // their rank by size. Numbering them by rank would repaint every line the
+            // moment one account overtook another, and — as this was first written —
+            // could hand out slot 8, 9 or 10 to the busiest accounts, which the
+            // eight-slot palette maps to muted ink and so renders indistinguishably
+            // from the folded group.
+            const kept = drawn.filter((s) => busiest.has(s.id));
+            const other = series.filter((s) => !busiest.has(s.id));
+            const folded = {
+                id: "__other__",
+                name: `Other (${other.length})`,
+                slot: -1,
+                points: grid.map((hour, i) => ({
+                    hour,
+                    calls: other.reduce((a, s) => a + (s.points[i]?.calls ?? 0), 0),
+                    errors: other.reduce((a, s) => a + (s.points[i]?.errors ?? 0), 0),
+                    input: 0,
+                    output: 0,
+                    cache_read: 0,
+                    cache_write: 0,
+                })),
+            };
+            return [...kept.map((s, i) => ({ ...s, slot: i })), folded];
+        },
         tiles() {
             const sum = (pick) => this.series.reduce((a, b) => a + pick(b), 0);
             const calls = sum((b) => b.calls);

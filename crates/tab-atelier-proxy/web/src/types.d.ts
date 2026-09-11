@@ -69,6 +69,22 @@ interface UsageBucket {
     cache_write: number;
 }
 
+/**
+ * One account's calls-per-hour, as a line of its own.
+ *
+ * `slot` is the categorical colour, assigned by the CALLER from a stable order
+ * rather than by the chart. Colour follows the entity, never its rank: if the
+ * chart picked slots by size, a busy hour would repaint every line on the page,
+ * and focusing one account would recolour all the others. `-1` is the folded
+ * "Other" group, which gets muted ink because it is not an entity.
+ */
+interface UserSeries {
+    id: string;
+    name: string;
+    slot: number;
+    points: UsageBucket[];
+}
+
 interface AccountUsage {
     user: ApiUser;
     last_24h: UsageWindow;
@@ -186,14 +202,15 @@ interface ProviderView {
     peak?: { multiplier_percent: number; windows: unknown[] };
     ready: boolean;
     auth: string;
-    /** The current level, as `providers.json` spells it. */
-    compact: string;
     /**
-     * Why this provider may not compact, or null when it may.
+     * Why compaction through THIS hop would only cost money, or null when it
+     * would not.
      *
-     * From the server, not re-derived here: the save path enforces the same
-     * rule, and two copies of it would eventually disagree about which
-     * provider is the subscription.
+     * Level-independent: the harm is a property of the provider, so any
+     * non-`none` level meets it equally. The level itself is per ACCOUNT — see
+     * `ApiUser.compact` — and the server raises this refusal against every
+     * destination an account could reach when its level is set. Kept here as
+     * well so the reason is inspectable per hop without a save attempt.
      */
     compact_refusal: string | null;
     models: ProviderModel[];
