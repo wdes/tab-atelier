@@ -27,8 +27,17 @@ cd "${CLAUDE_PROJECT_DIR:-.}" || exit 0
 rel=${file#"$PWD"/}
 clippy_extra=()
 case "$rel" in
-crates/catbus-agent/*) pkg=catbus-agent ;;
 android/*) exit 0 ;; # separate cargo project, not a workspace member
+# Any crate under crates/: its directory name is its package name. Linting the
+# crate that owns the file — not the root package — is both correct and much
+# faster. Correct because a non-default member such as tab-atelier-proxy is
+# otherwise never linted at all (plain `-p tab-atelier` does not reach it), and
+# faster because the root package drags in the whole desktop dependency graph on
+# every edit. None of these crates declare features, so clippy_extra stays empty.
+crates/*/*)
+    pkg=${rel#crates/}
+    pkg=${pkg%%/*}
+    ;;
 *) pkg=tab-atelier clippy_extra=(--no-default-features --features headless,energy) ;;
 esac
 
