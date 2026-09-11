@@ -585,6 +585,36 @@ const AdminApp = Vue.defineComponent({
             const found = this.providers?.compact_levels.find((c) => c.value === u.compact);
             return found ? found.label : u.compact;
         },
+        // What compaction took off this request before it was sent.
+        //
+        // Worth showing on every capture, including when it saved nothing: the
+        // panel renders the body AS SENT, so without this a compacted request is
+        // indistinguishable from one that was simply small — and "is compaction
+        // on at all" is the question this answers.
+        compactionSummary(c) {
+            const k = c.compaction;
+            if (!k)
+                return "";
+            const pct = k.bytes_before ? Math.round((1 - k.bytes_after / k.bytes_before) * 100) : 0;
+            return `compacted ${this.fmt(k.bytes_before)} → ${this.fmt(k.bytes_after)} (−${pct}%)`;
+        },
+        // "12 tool results, 4 thinking, 2 banners" — what the level actually did,
+        // which is not the same as what it is set to.
+        compactionDetail(c) {
+            const k = c.compaction;
+            if (!k)
+                return "";
+            const parts = [];
+            if (k.tool_results_elided)
+                parts.push(`${k.tool_results_elided} tool results`);
+            if (k.tool_results_kept_for_error)
+                parts.push(`${k.tool_results_kept_for_error} errors kept`);
+            if (k.thinking_dropped)
+                parts.push(`${k.thinking_dropped} thinking`);
+            if (k.banners_dropped)
+                parts.push(`${k.banners_dropped} banners`);
+            return parts.length ? `${k.level}: ${parts.join(", ")}` : `${k.level}: nothing to remove`;
+        },
         // "in 12 · out 340 · cache 1.2k" — the four numbers that answer "why was
         // that turn expensive", beside the request that produced them.
         tokenSummary(c) {

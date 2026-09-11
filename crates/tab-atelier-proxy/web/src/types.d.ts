@@ -180,7 +180,26 @@ interface Capture {
     request_truncated: boolean;
     status?: number;
     tokens?: CaptureTokens;
+    /** What compaction removed, when a level was in force for this request. */
+    compaction?: CaptureCompaction;
     response_excerpt?: string;
+}
+
+/**
+ * What one compaction pass removed.
+ *
+ * Both byte counts rather than a percentage: the ratio is arithmetic the
+ * reader can do, and a stale percentage is harder to notice than two sizes
+ * that do not look right.
+ */
+interface CaptureCompaction {
+    level: string;
+    bytes_before: number;
+    bytes_after: number;
+    tool_results_elided: number;
+    tool_results_kept_for_error: number;
+    thinking_dropped: number;
+    banners_dropped: number;
 }
 
 /** One model a provider lists. */
