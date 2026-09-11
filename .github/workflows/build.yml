@@ -125,10 +125,15 @@ jobs:
                   fail_ci_if_error: false
                   token: ${{ secrets.CODECOV_TOKEN }}
             - name: Install cargo-deb
-              # Its own step so CI reports its duration: it is bundled into the
-              # build step below otherwise, and "install + three cargo deb
-              # invocations" is one number that hides which half is slow.
-              run: cargo install cargo-deb --locked
+              # Prebuilt release binary rather than `cargo install`, which
+              # recompiles the tool from source in each of three workflows
+              # per commit. Version-pinned too — and that is stricter than
+              # the `--locked` it replaces, which pins cargo-deb's
+              # dependencies rather than cargo-deb itself, so the build
+              # tool floated even with it.
+              uses: taiki-e/install-action@v2
+              with:
+                  tool: cargo-deb@3.2.0
             - name: Build .deb packages (smoke-test only)
               # These debs feed the integration job below; the ones users
               # install come from apt-publish.yml / release.yml.
