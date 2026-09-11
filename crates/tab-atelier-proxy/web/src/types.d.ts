@@ -91,6 +91,35 @@ interface AccountUsage {
     last_7d: UsageWindow;
     all_time: UsageWindow;
     series_hourly: UsageBucket[];
+    /**
+     * The requested window, as the server resolved it.
+     *
+     * Fixed windows sit beside it rather than inside it: `last_24h` and
+     * `last_7d` are what the account table reads and must mean the same thing
+     * whatever the graph is zoomed to, while this is the graph's own range.
+     */
+    window: UsageSpan;
+}
+
+interface UsageSpan {
+    start: string;
+    end: string;
+    hours: number;
+}
+
+/**
+ * The dashboard's usage response.
+ *
+ * Distinct from `AccountUsage` because the window the server actually served
+ * is a property of the response, not of any one account.
+ */
+interface UsageResponse {
+    /** The canonical token — not necessarily the one that was sent. */
+    window: string;
+    hours: number;
+    window_start: string;
+    window_end: string;
+    users: AccountUsage[];
 }
 
 /**
@@ -169,7 +198,19 @@ interface Capture {
     method: string;
     path: string;
     provider: string;
+    /** The model actually requested upstream, not necessarily the one asked for. */
     model?: string;
+    /**
+     * Which client session sent this, unpacked from the body's `metadata`.
+     *
+     * Client-supplied and unauthenticated: it groups and explains, and must
+     * never be read as a fact about who is calling. Absent when the client sent
+     * nothing usable — most often `account_uuid: ""`, which is omitted rather
+     * than rendered as blank.
+     */
+    client?: CaptureClient;
+    /** How the request arrived, as the proxy saw it. */
+    origin?: CaptureOrigin;
     /**
      * `"work"` or `"classifier"`. Always present — the server defaults it,
      * so a capture written before the field existed still reads as work.
@@ -186,6 +227,44 @@ interface Capture {
 }
 
 /**
+ * What the client said about itself, from the body's `metadata.user_id`.
+ *
+ * That field is a JSON document stored inside a JSON string, because every
+ * `metadata` value has to be a string. All three members are optional on the
+ * wire and absent when empty: Claude Code sends `account_uuid: ""` for a
+ * session that is not logged in, and the server reports that as missing rather
+ * than as a value.
+ *
+ * Unauthenticated — anything with a valid key can put any string here. Display
+ * it to group and explain; never to decide.
+ */
+interface CaptureClient {
+    /** Stable per install. Answers "same machine, or two?". */
+    device_id?: string;
+    /** Per conversation — what tells one tab from four others on one key. */
+    session_id?: string;
+    /** The CLIENT's Anthropic account, frequently empty. Not this proxy's. */
+    account_uuid?: string;
+}
+
+/**
+ * How a request arrived, as the proxy saw it.
+ *
+ * Exists to settle "which IP is it using" from data rather than from a
+ * reading of the code: it records the socket peer AND the forwarding headers
+ * as received, beside the one the proxy actually resolved.
+ */
+interface CaptureOrigin {
+    peer: string;
+    /** False explains a result that ignored a header the operator can see. */
+    peer_trusted: boolean;
+    /** What the proxy resolved, and therefore logged against the key. */
+    client_ip: string;
+    x_real_ip?: string;
+    x_forwarded_for?: string;
+}
+
+/**
  * What one compaction pass removed.
  *
  * Both byte counts rather than a percentage: the ratio is arithmetic the
@@ -199,6 +278,13 @@ interface CaptureCompaction {
     tool_results_elided: number;
     tool_results_kept_for_error: number;
     thinking_dropped: number;
+    /**
+     * Layer D: file bodies stubbed inside old `Write`/`Edit` inputs.
+     *
+     * Optional because `inspect.jsonl` holds captures written before the
+     * field existed, and a file that fails to parse costs the whole history.
+     */
+    writes_elided?: number;
     banners_dropped: number;
 }
 
@@ -335,7 +421,13 @@ interface AppState {
     inspectBusy: boolean;
     origin: string;
     usage: Record<string, AccountUsage>;
-    hours: number;
+    /**
+     * The graph's time range, as a `usage::Window` token.
+     *
+     * A string rather than an hour count: "this week" is the current calendar
+     * week, so no number expresses it. The server canonicalises what comes back.
+     */
+    usageWindow: string;
     focus: string | null;
     pressure: Pressure | null;
     pressureTimer: ReturnType<typeof setInterval> | null;

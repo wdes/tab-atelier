@@ -280,10 +280,28 @@
                   API calls per hour
                   <span class="text-body-secondary fw-normal">· {{ scopeLabel }}</span>
                 </h2>
-                <select autocomplete="off" v-model.number="hours" @change="loadUsage" class="form-select form-select-sm w-auto">
-                  <option :value="24">24 h</option>
-                  <option :value="168">7 d</option>
-                  <option :value="720">30 d</option>
+                <select autocomplete="off" v-model="usageWindow" @change="loadUsage" class="form-select form-select-sm w-auto">
+                  <!--
+                    The values are `usage::Window` tokens and must stay in sync
+                    with `Window::TOKENS`; the labels are prose and may not.
+                    `tests/web_assets.rs` reads this block and asserts every
+                    value parses, so a token renamed on one side fails the
+                    build rather than 400ing a dropdown at runtime.
+
+                    One entry per DISTINCT window. 48h is 2 d and 1 w is 7 d,
+                    and `Window::parse` accepts either spelling — but offering
+                    both would put two rows in this list that draw the same
+                    graph, which reads as a bug in the data.
+                  -->
+                  <option value="week">This week</option>
+                  <option value="24h">Last 24 h</option>
+                  <option value="2d">Last 2 d</option>
+                  <option value="3d">Last 3 d</option>
+                  <option value="4d">Last 4 d</option>
+                  <option value="5d">Last 5 d</option>
+                  <option value="6d">Last 6 d</option>
+                  <option value="7d">Last 7 d</option>
+                  <option value="30d">Last 30 d</option>
                 </select>
                 <button class="btn btn-sm btn-outline-secondary ms-2"
                         :disabled="usageBusy" @click="reloadUsage">
@@ -629,6 +647,36 @@
                     <span v-if="inspectOpen.tokens"> · {{ tokenSummary(inspectOpen) }}</span>
                     <div v-if="inspectOpen.compaction" class="text-body-secondary">
                       {{ compactionSummary(inspectOpen) }} — {{ compactionDetail(inspectOpen) }}
+                    </div>
+                    <!-- Unauthenticated, and labelled as such where it is read:
+                         a valid key can put any string here, so this explains
+                         and groups, and never decides anything. -->
+                    <div v-if="inspectOpen.client" class="text-body-secondary">
+                      session <code>{{ shortHash(inspectOpen.client.session_id) }}</code>
+                      <span v-if="inspectOpen.client.device_id">
+                        · device <code>{{ shortHash(inspectOpen.client.device_id) }}</code>
+                      </span>
+                      <span v-if="inspectOpen.client.account_uuid">
+                        · client account <code>{{ shortHash(inspectOpen.client.account_uuid) }}</code>
+                      </span>
+                    </div>
+                    <!-- What arrived, beside what it resolved to. This is the
+                         row that answers "which IP is it really using": the
+                         peer, the headers as received, and the result, so a
+                         header the proxy ignored is visible as ignored. -->
+                    <div v-if="inspectOpen.origin" class="text-body-secondary">
+                      from <code>{{ inspectOpen.origin.client_ip }}</code>
+                      <span v-if="inspectOpen.origin.client_ip !== inspectOpen.origin.peer">
+                        (socket peer <code>{{ inspectOpen.origin.peer }}</code>)</span>
+                      <span v-if="inspectOpen.origin.x_real_ip">
+                        · X-Real-IP <code>{{ inspectOpen.origin.x_real_ip }}</code></span>
+                      <span v-if="inspectOpen.origin.x_forwarded_for">
+                        · XFF <code>{{ inspectOpen.origin.x_forwarded_for }}</code></span>
+                      <span v-if="!inspectOpen.origin.peer_trusted"
+                            class="badge text-bg-warning ms-1"
+                            title="The socket peer is not a trusted hop, so forwarding headers from it were ignored.">
+                        untrusted hop — headers ignored
+                      </span>
                     </div>
                   </div>
                 </div>

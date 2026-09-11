@@ -40,6 +40,11 @@ function emptyUsage(id: string): AccountUsage {
     last_7d: emptyWindow(),
     all_time: emptyWindow(),
     series_hourly: [],
+    // Empty rather than a guessed range: this is only ever read for an account
+    // the server has not reported on yet, and a made-up span would draw an
+    // axis with the wrong dates on it. The caller that draws charts fetches
+    // the real window off the response.
+    window: { start: "", end: "", hours: 0 },
   };
 }
 
@@ -82,7 +87,12 @@ const AdminApp = Vue.defineComponent({
       // happening now" — a spike, a burst of errors, a key that just started
       // being used. A 7-day default flattens exactly that into the noise floor,
       // and the wider windows are one click away.
-      hours: 24,
+      //
+      // A token, not an hour count: "this week" is the current calendar week,
+      // whose length depends on when you ask. `Window::token` on the server
+      // canonicalises it, and `loadUsage` writes back whatever comes home, so
+      // this stays one of a known set.
+      usageWindow: "24h",
       // null = everyone; an account id = just them. Clicking a row's token
       // total drills in, which is the only question the summed charts cannot
       // answer ("who is that spike?").
@@ -595,6 +605,9 @@ const AdminApp = Vue.defineComponent({
       if (k.tool_results_elided) parts.push(`${k.tool_results_elided} tool results`);
       if (k.tool_results_kept_for_error) parts.push(`${k.tool_results_kept_for_error} errors kept`);
       if (k.thinking_dropped) parts.push(`${k.thinking_dropped} thinking`);
+      // Singular/plural matters here more than elsewhere: "1 write payloads"
+      // reads as a bug in the counter rather than a count of one.
+      if (k.writes_elided) parts.push(`${k.writes_elided} write ${k.writes_elided === 1 ? "payload" : "payloads"}`);
       if (k.banners_dropped) parts.push(`${k.banners_dropped} banners`);
       return parts.length ? `${k.level}: ${parts.join(", ")}` : `${k.level}: nothing to remove`;
     },
@@ -646,6 +659,19 @@ const AdminApp = Vue.defineComponent({
         return body;
       }
     },
+    /**
+     * The first eight characters of an opaque id, for display.
+     *
+     * A session id and a device id are both long enough to wrap the line they
+     * sit on and short enough in their distinctive part that eight characters
+     * tell two apart. Enough to compare two rows against each other, which is
+     * the only thing this column is for — the full value is in the JSON below,
+     * where anyone who needs it can read it.
+     */
+    shortHash(value: string | undefined): string {
+      if (!value) return "—";
+      return value.length <= 8 ? value : value.slice(0, 8);
+    },
     // Quiet by default because of the 30 s poll: a failing read must not blank
     // the accounts page it sits on, and a banner raised on every tick would be
     // unreadable. A reload someone pressed is not quiet — silence there is
@@ -693,7 +719,12 @@ const AdminApp = Vue.defineComponent({
       return this.act(() => this.api("POST", `/api/users/${u.id}/weight`, { weight }));
     },
     async loadUsage() {
-      const data = await this.api<{ users: AccountUsage[] }>("GET", `/api/usage?hours=${this.hours}`);
+      const data = await this.api<UsageResponse>("GET", `/api/usage?window=${this.usageWindow}`);
+      // The server owns the window vocabulary and echoes the canonical token
+      // back — `48h` settles to `2d`, and a window it did not recognise falls
+      // back to its default. Taking that value rather than keeping the one we
+      // sent is what stops the dropdown and the graph disagreeing.
+      this.usageWindow = data.window;
       const next: Record<string, AccountUsage> = {};
       for (const u of data.users) next[u.user.id] = u;
       this.usage = next;

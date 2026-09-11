@@ -307,6 +307,28 @@ const fn is_trusted_hop(peer: std::net::IpAddr) -> bool {
     }
 }
 
+/// Claude Code probes reachability with an unauthenticated HEAD/GET before it
+/// has a credential to present. Answering 401 here reads as "this endpoint is
+/// broken" and the client never attempts a real call, so this is answered
+/// first — and kept to an exact path, because an unauthenticated branch is
+/// security surface.
+///
+/// Split out of `anthropic` because it is the whole decision and reads better
+/// as one unit.
+fn reachability_probe(sub: &str, method: &Method) -> Option<Response<Body>> {
+    if sub != "/api/hello" || !matches!(*method, Method::HEAD | Method::GET) {
+        return None;
+    }
+    let body = if *method == Method::HEAD { "" } else { "{}" };
+    Some(
+        Response::builder()
+            .status(200)
+            .header("content-type", "application/json")
+            .body(Full::new(Bytes::from(body)).boxed())
+            .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()).boxed())),
+    )
+}
+
 async fn anthropic(req: Request<Incoming>, state: Arc<State>, peer: std::net::IpAddr) -> Response<Body> {
     let method = req.method().clone();
     let sub = req
@@ -317,18 +339,8 @@ async fn anthropic(req: Request<Incoming>, state: Arc<State>, peer: std::net::Ip
         .to_owned();
     let sub_pq = req.uri().query().map_or_else(|| sub.clone(), |q| format!("{sub}?{q}"));
 
-    // Claude Code probes reachability with an UNAUTHENTICATED HEAD/GET before
-    // it has a credential to present. Answering 401 here reads as "this
-    // endpoint is broken" and the client never attempts a real call, so this
-    // is answered first — and kept to an exact path, because an
-    // unauthenticated branch is security surface.
-    if sub == "/api/hello" && matches!(method, Method::HEAD | Method::GET) {
-        let body = if method == Method::HEAD { "" } else { "{}" };
-        return Response::builder()
-            .status(200)
-            .header("content-type", "application/json")
-            .body(Full::new(Bytes::from(body)).boxed())
-            .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()).boxed()));
+    if let Some(probe) = reachability_probe(&sub, &method) {
+        return probe;
     }
 
     let key = presented(&req);
@@ -666,13 +678,14 @@ fn shape_body(
     if elided.changed() {
         log::info!(
             "proxy: compacted {}/{} {before} → {} bytes: {} tool results elided ({} errors kept), \
-             {} thinking dropped, {} banners dropped",
+             {} thinking dropped, {} write payloads stubbed, {} banners dropped",
             route.provider_id,
             route.model_id,
             encoded.len(),
             elided.tool_results_elided,
             elided.tool_results_kept_for_error,
             elided.thinking_dropped,
+            elided.writes_elided,
             elided.banners_dropped
         );
     }
@@ -686,6 +699,7 @@ fn shape_body(
         tool_results_elided: elided.tool_results_elided,
         tool_results_kept_for_error: elided.tool_results_kept_for_error,
         thinking_dropped: elided.thinking_dropped,
+        writes_elided: elided.writes_elided,
         banners_dropped: elided.banners_dropped,
     };
     (Bytes::from(encoded), Some(record))
@@ -717,21 +731,34 @@ fn provider_health(state: &Arc<State>) -> impl Fn(&str) -> routing::Health + '_ 
 
 /// Per-account usage for the dashboard.
 fn usage_report(state: &Arc<State>, store: &Store, query: &str) -> Response<Body> {
-    let hours = path_hours(query).unwrap_or(24 * 7).clamp(1, usage::RETAIN_HOURS);
+    let now = usage::now_secs();
+    // One resolution for the whole response. Calling `span` again inside
+    // `usage_json` would re-read the clock, and a response that straddled an
+    // hour boundary would answer its totals and its series for two different
+    // windows.
+    let window = path_window(query).unwrap_or(usage::Window::Hours(24 * 7));
+    let span = window.span(now);
     let body = {
         let u = state.usage.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let per_user: Vec<_> = store
             .accounts()
             .iter()
             .map(|a| {
-                let mut v = usage_json(&u, &a.id, hours);
+                let mut v = usage_json(&u, &a.id, span, now);
                 if let Some(o) = v.as_object_mut() {
                     o.insert("user".to_owned(), account_json(a));
                 }
                 v
             })
             .collect();
-        serde_json::json!({ "hours": hours, "users": per_user }).to_string()
+        serde_json::json!({
+            "window": window.token(),
+            "hours": span.hours(),
+            "window_start": crate::now_rfc3339_at(span.first),
+            "window_end": crate::now_rfc3339_at(span.last),
+            "users": per_user,
+        })
+        .to_string()
     };
     json(200, &body)
 }
@@ -1200,16 +1227,23 @@ fn record(state: &State, account_id: &str, model: Option<&str>, tokens: usage::T
 
 // ── an account's own statistics ─────────────────────────────────────
 
-/// `?hours=N` off a query string, if present and sane.
-fn path_hours(query: &str) -> Option<u64> {
+/// `?window=` off a query string, if present and sane.
+///
+/// An unrecognised token falls back to the default rather than 400ing: this is
+/// a GET the dashboard re-issues on a timer, and a stale bookmark naming a
+/// window that was removed should show a graph, not an error page.
+fn path_window(query: &str) -> Option<usage::Window> {
     query
         .split('&')
-        .find_map(|kv| kv.strip_prefix("hours="))
-        .and_then(|v| v.parse::<u64>().ok())
+        .find_map(|kv| kv.strip_prefix("window="))
+        .and_then(usage::Window::parse)
 }
 
 /// Render one account's usage as JSON.
-fn usage_json(u: &usage::Store, id: &str, hours: u64) -> serde_json::Value {
+///
+/// `now` is passed rather than read here, so the requested window and the two
+/// fixed ones are resolved from one reading of the clock.
+fn usage_json(u: &usage::Store, id: &str, span: usage::Span, now: u64) -> serde_json::Value {
     let tok = |t: &usage::Tokens| {
         serde_json::json!({
             "input": t.input,
@@ -1219,12 +1253,12 @@ fn usage_json(u: &usage::Store, id: &str, hours: u64) -> serde_json::Value {
             "total": t.total(),
         })
     };
-    let window = |h: u64| {
-        let (calls, errors, t) = u.totals(id, h);
+    let window = |w: usage::Window| {
+        let (calls, errors, t) = u.totals(id, w.span(now));
         serde_json::json!({ "calls": calls, "errors": errors, "tokens": tok(&t) })
     };
     let series: Vec<_> = u
-        .series(id, hours)
+        .series(id, span)
         .into_iter()
         .map(|b| {
             serde_json::json!({
@@ -1243,9 +1277,18 @@ fn usage_json(u: &usage::Store, id: &str, hours: u64) -> serde_json::Value {
         |a| a.by_model.iter().map(|(m, t)| (m.clone(), tok(t))).collect(),
     );
     serde_json::json!({
-        "all_time": window(0),
-        "last_24h": window(24),
-        "last_7d": window(24 * 7),
+        // The two fixed windows stay: they are what the account table and the
+        // "average tokens per call" column read, and they must mean the same
+        // thing whatever the graph is currently zoomed to. `span` is the
+        // caller's requested window, carried separately.
+        "window": {
+            "start": crate::now_rfc3339_at(span.first),
+            "end": crate::now_rfc3339_at(span.last),
+            "hours": span.hours(),
+        },
+        "all_time": window(usage::Window::All),
+        "last_24h": window(usage::Window::Hours(24)),
+        "last_7d": window(usage::Window::Hours(24 * 7)),
         "by_model": by_model,
         // Dense hourly buckets, oldest first, ending at the current hour.
         "series_hourly": series,
@@ -1275,19 +1318,11 @@ fn me_usage(req: &Request<Incoming>, state: &State, peer: std::net::IpAddr) -> R
             r#"{"error":"present your proxy key (x-api-key or Authorization: Bearer)"}"#,
         );
     };
-    let hours = req
-        .uri()
-        .query()
-        .and_then(|q| {
-            q.split('&')
-                .find_map(|kv| kv.strip_prefix("hours="))
-                .and_then(|v| v.parse::<u64>().ok())
-        })
-        .unwrap_or(24 * 7)
-        .clamp(1, usage::RETAIN_HOURS);
+    let now = usage::now_secs();
+    let window = path_window(req.uri().query().unwrap_or_default()).unwrap_or(usage::Window::Hours(24 * 7));
     let mut body = {
         let u = state.usage.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        usage_json(&u, &account.id, hours)
+        usage_json(&u, &account.id, window.span(now), now)
     };
     if let Some(obj) = body.as_object_mut() {
         obj.insert(

@@ -180,6 +180,161 @@ pub const fn hour_of(ts: u64) -> u64 {
     ts - (ts % HOUR)
 }
 
+/// The start of the calendar week `secs` falls in, in UTC: Monday 00:00.
+///
+/// Deliberately the ISO week rather than the subscription plan's own weekly
+/// window. The two are different things that happen to share a name: the plan
+/// resets at an instant Anthropic chooses, which is what `weekly_last_drop`
+/// records and what the `QoS` scheduler budgets against, while this is a
+/// calendar the reader already knows how to find on a wall. This window covers
+/// every provider an account may have been routed to, and those have no shared
+/// reset instant to align to — so the explainable definition wins.
+///
+/// The weekday comes from jiff, for the reason [`crate::now_rfc3339_at`] gives:
+/// two implementations of one calendar stay correct until a leap year says
+/// otherwise. The day floor is integer arithmetic on epoch seconds, which no
+/// calendar can perturb.
+#[must_use]
+pub fn week_start(secs: u64) -> u64 {
+    let days_back = i64::try_from(secs)
+        .ok()
+        .and_then(|s| jiff::Timestamp::from_second(s).ok())
+        .map_or(0, |ts| {
+            // 0 for Monday through 6 for Sunday, in UTC.
+            i64::from(ts.to_zoned(jiff::tz::TimeZone::UTC).weekday().to_monday_zero_offset())
+        });
+    let monday = secs.saturating_sub(u64::try_from(days_back).unwrap_or(0) * 86_400);
+    hour_of(monday - monday % 86_400)
+}
+
+/// A window over the usage history, as a caller asked for it.
+///
+/// Not a bare hour count, which is what this replaced: "this week" is the
+/// current calendar week and its length depends on when you ask, so no number
+/// of hours expresses it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Window {
+    /// Everything retained — [`RETAIN_HOURS`] at most.
+    All,
+    /// The last `n` hours, the current one included.
+    Hours(u64),
+    /// The current calendar week in UTC, Monday 00:00 through now. See
+    /// [`week_start`].
+    ThisWeek,
+}
+
+/// An inclusive range of hour buckets.
+///
+/// Resolved once per request and passed down, rather than recomputed inside
+/// each call. Two calls to the clock in one response can land either side of an
+/// hour boundary, which would answer the totals and the series for two
+/// different windows — a discrepancy of one bucket, and one nobody would ever
+/// think to look for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Span {
+    pub first: u64,
+    pub last: u64,
+}
+
+impl Span {
+    /// How many hour buckets this covers, always at least one.
+    #[must_use]
+    pub const fn hours(self) -> u64 {
+        (self.last - self.first) / HOUR + 1
+    }
+}
+
+impl Window {
+    /// What `?window=` accepts, and what the admin UI offers, in the order the
+    /// dropdown shows them.
+    ///
+    /// The list is here and the `<option>` markup is in `assets/index.html`,
+    /// because the tokens are a wire contract and the labels are a language.
+    /// A test reads the markup and asserts every value in it parses back to
+    /// the same window, so the two cannot drift into a dropdown that 400s.
+    pub const TOKENS: [&'static str; 9] = ["week", "24h", "2d", "3d", "4d", "5d", "6d", "7d", "30d"];
+
+    /// Parse one `?window=` token.
+    ///
+    /// `12h`, `48h` and `2d` all parse even though only some are offered: the
+    /// parser is `n` plus a unit, so a link written by hand for 36 hours works
+    /// without anybody having to add it to a list first.
+    #[must_use]
+    pub fn parse(token: &str) -> Option<Self> {
+        if token == "week" {
+            return Some(Self::ThisWeek);
+        }
+        if token == "all" {
+            return Some(Self::All);
+        }
+        let unit_at = token.find(|c: char| c.is_ascii_alphabetic())?;
+        let (count, unit) = token.split_at(unit_at);
+        let count: u64 = count.parse().ok()?;
+        if count == 0 {
+            return None;
+        }
+        match unit {
+            "h" => Some(Self::Hours(count)),
+            // Saturating rather than wrapping: `999999999999d` is a nonsense
+            // window, and the honest answer to it is "everything", not a small
+            // number produced by an overflow.
+            "d" => Some(Self::Hours(count.saturating_mul(24))),
+            _ => None,
+        }
+    }
+
+    /// The canonical token for this window.
+    ///
+    /// Prefers a token from [`Window::TOKENS`] and only falls back to `Nh`
+    /// when the window has no offered spelling, so `parse` and `token` are
+    /// inverses on everything the UI can send. `24h` is the case that makes the
+    /// order matter: it IS 1 day, but `1d` is not offered, so canonicalising on
+    /// the arithmetic alone would echo back a value the dropdown cannot show
+    /// and the menu would fall blank on the first refresh.
+    ///
+    /// Not necessarily byte-equal to what the caller sent: `48h` and `2d` are
+    /// both accepted by [`Window::parse`] and both settle to `2d`. That is
+    /// deliberate — a hand-written URL then lives on as one window rather than
+    /// two spellings of one.
+    ///
+    /// `All` has no entry in [`Window::TOKENS`] and no `<option>` in the UI; it
+    /// is reachable by hand and is not a default anywhere.
+    #[must_use]
+    pub fn token(self) -> String {
+        match self {
+            Self::All => "all".to_owned(),
+            Self::ThisWeek => "week".to_owned(),
+            Self::Hours(h) => {
+                let offered = if h % 24 == 0 {
+                    format!("{}d", h / 24)
+                } else {
+                    String::new()
+                };
+                if Self::TOKENS.contains(&offered.as_str()) {
+                    offered
+                } else {
+                    format!("{h}h")
+                }
+            }
+        }
+    }
+
+    /// The range this covers, given the current time.
+    #[must_use]
+    pub fn span(self, now: u64) -> Span {
+        let last = hour_of(now);
+        let first = match self {
+            Self::All => 0,
+            Self::Hours(hours) => last.saturating_sub(hours.saturating_sub(1).saturating_mul(HOUR)),
+            Self::ThisWeek => week_start(now),
+        };
+        Span {
+            first: first.min(last),
+            last,
+        }
+    }
+}
+
 impl Store {
     /// Load every account's daily files under `root`.
     ///
@@ -359,19 +514,15 @@ impl Store {
         self.accounts.get(id)
     }
 
-    /// Sum a window ending now. `hours` of 0 means everything retained.
+    /// Sum a window. Resolve it once with [`Window::span`] and pass the same
+    /// [`Span`] to [`Store::series`], or the two can describe different hours.
     #[must_use]
-    pub fn totals(&self, id: &str, hours: u64) -> (u64, u64, Tokens) {
-        let cutoff = if hours == 0 {
-            0
-        } else {
-            hour_of(now_secs()).saturating_sub((hours - 1) * HOUR)
-        };
+    pub fn totals(&self, id: &str, span: Span) -> (u64, u64, Tokens) {
         let mut calls = 0;
         let mut errors = 0;
         let mut tokens = Tokens::default();
         if let Some(a) = self.accounts.get(id) {
-            for b in a.buckets.iter().filter(|b| b.hour >= cutoff) {
+            for b in a.buckets.iter().filter(|b| b.hour >= span.first && b.hour <= span.last) {
                 calls += b.calls;
                 errors += b.errors;
                 tokens.add(b.tokens);
@@ -380,15 +531,14 @@ impl Store {
         (calls, errors, tokens)
     }
 
-    /// A dense hourly series ending at the current hour.
+    /// A dense hourly series over `span`.
     ///
     /// Dense matters: hours with no traffic must appear as zeroes, or a chart
     /// drawn from this silently compresses idle time and every gap reads as
     /// activity that never happened.
     #[must_use]
-    pub fn series(&self, id: &str, hours: u64) -> Vec<Bucket> {
-        let end = hour_of(now_secs());
-        let start = end.saturating_sub(hours.saturating_sub(1) * HOUR);
+    pub fn series(&self, id: &str, span: Span) -> Vec<Bucket> {
+        let (start, hours) = (span.first, span.hours());
         let mut filled: Vec<Bucket> = (0..hours)
             .map(|i| Bucket {
                 hour: start + i * HOUR,
@@ -397,7 +547,7 @@ impl Store {
             .collect();
         if let Some(a) = self.accounts.get(id) {
             for b in &a.buckets {
-                if b.hour >= start && b.hour <= end {
+                if b.hour >= span.first && b.hour <= span.last {
                     let idx = ((b.hour - start) / HOUR) as usize;
                     if let Some(slot) = filled.get_mut(idx) {
                         slot.calls = b.calls;
@@ -563,10 +713,135 @@ impl Sniffer {
 mod tests {
     use super::*;
 
+    /// Monday 00:00 UTC is the start of the week, and the epoch is the case a
+    /// hand-rolled `secs / 86_400 % 7` gets wrong: 1970-01-01 was a THURSDAY,
+    /// so a naive modulo puts every week's boundary three days off.
+    #[test]
+    fn the_week_starts_on_monday_in_utc() {
+        let day = |n: u64| n * 86_400;
+        // Epoch day 0 is Thursday 1970-01-01; its week began Monday the 29th of
+        // December, 1969 — three days earlier, which is `saturating_sub`'s job.
+        assert_eq!(week_start(day(0)), 0, "there is no earlier bucket to reach");
+        assert_eq!(week_start(day(3)), 0, "Sunday the 4th is still that week");
+        assert_eq!(week_start(day(4)), day(4), "Monday the 5th opens a new one");
+
+        // A known Monday well past the epoch, so a drift cannot hide.
+        // 2026-09-07 is a Monday and epoch day 20_703.
+        let monday = day(20_703);
+        for h in [0, 1, 12, 23] {
+            assert_eq!(week_start(monday + h * 3_600), monday, "hour {h} of a Monday");
+        }
+        assert_eq!(
+            week_start(monday - 1),
+            monday - 7 * 86_400,
+            "its Sunday is the week before"
+        );
+    }
+
+    #[test]
+    fn a_window_parses_carrying_its_unit() {
+        assert_eq!(Window::parse("24h"), Some(Window::Hours(24)));
+        assert_eq!(Window::parse("48h"), Some(Window::Hours(48)));
+        assert_eq!(Window::parse("2d"), Some(Window::Hours(48)));
+        assert_eq!(Window::parse("7d"), Some(Window::Hours(168)));
+        assert_eq!(Window::parse("30d"), Some(Window::Hours(720)));
+        assert_eq!(Window::parse("week"), Some(Window::ThisWeek));
+        assert_eq!(Window::parse("all"), Some(Window::All));
+        // Not windows, and not silently something else.
+        for bad in [
+            "", "h", "d", "0h", "0d", "24", "-1h", "1w", "24m", "24 h", "nan", "1d2h",
+        ] {
+            assert_eq!(Window::parse(bad), None, "{bad:?} must not parse");
+        }
+    }
+
+    /// A number large enough to be nonsense is "everything", not a wrapped
+    /// small window — the one case in this file where an overflow would be
+    /// indistinguishable from a real answer.
+    #[test]
+    fn an_absurd_hour_count_saturates_rather_than_wrapping() {
+        // 999_999_999_999 days is 2.4e13 hours: no overflow yet, just a number
+        // far larger than anything retained.
+        assert_eq!(
+            Window::parse("999999999999d"),
+            Some(Window::Hours(999_999_999_999 * 24))
+        );
+        // Past that, `saturating_mul` pins to the maximum instead of wrapping
+        // to a small window that would look like a plausible answer. The count
+        // itself still has to fit in a `u64`, so this is the largest one.
+        assert_eq!(Window::parse(&format!("{}d", u64::MAX)), Some(Window::Hours(u64::MAX)));
+        let span = Window::parse(&format!("{}d", u64::MAX))
+            .expect("parses")
+            .span(1_800_000_000);
+        assert_eq!(span.first, 0, "which reaches back to the beginning of time");
+    }
+
+    /// `token` is the inverse of `parse` on every window the UI can offer.
+    /// This is what lets the server echo a value back and have the dropdown
+    /// recognise it.
+    #[test]
+    fn every_offered_token_round_trips_to_itself() {
+        for token in Window::TOKENS {
+            let w = Window::parse(token).unwrap_or_else(|| panic!("{token} must parse"));
+            assert_eq!(w.token(), token, "{token} did not round-trip");
+        }
+    }
+
+    /// And the two spellings of one window collapse to one token, so a
+    /// hand-written URL settles rather than living on as a duplicate entry.
+    #[test]
+    fn alternate_spellings_canonicalise() {
+        assert_eq!(Window::Hours(48).token(), "2d");
+        assert_eq!(Window::Hours(168).token(), "7d");
+        assert_eq!(Window::Hours(36).token(), "36h");
+        assert_eq!(Window::Hours(1).token(), "1h");
+    }
+
+    /// `span` is a closed range of hours, and the two ways of getting it wrong
+    /// — an off-by-one, or a window that starts in the future — are both
+    /// checked here rather than at a chart.
+    #[test]
+    fn a_span_covers_exactly_the_hours_it_names() {
+        let now = 1_700_000_000_u64;
+        let hour = hour_of(now);
+
+        let one = Window::Hours(1).span(now);
+        assert_eq!((one.first, one.last, one.hours()), (hour, hour, 1));
+
+        let day = Window::Hours(24).span(now);
+        assert_eq!(day.last, hour);
+        assert_eq!(day.first, hour - 23 * HOUR, "24 hours ENDS at this one");
+        assert_eq!(day.hours(), 24);
+
+        // `All` reaches back further than anything retained, which is the
+        // point: the totals filter by `first`, so 0 means "no cutoff".
+        let all = Window::All.span(now);
+        assert_eq!((all.first, all.last), (0, hour));
+        assert_eq!(all.hours(), hour / HOUR + 1);
+
+        // An early clock cannot produce a window that starts after it ends.
+        let early = Window::Hours(24).span(3_600);
+        assert!(early.first <= early.last, "{early:?}");
+        assert_eq!(early.first, 0);
+    }
+
     fn tmp(name: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("ta-proxy-usage-{name}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&p).expect("mkdir");
         p
+    }
+
+    /// The window a test means by "everything", resolved at the clock.
+    ///
+    /// Resolving through the real [`Window`] rather than hand-building a
+    /// `Span` keeps the fixtures honest about the type they now pass.
+    fn all() -> Span {
+        Window::All.span(now_secs())
+    }
+
+    /// A window of `n` hours ending at the current hour.
+    fn hours(n: u64) -> Span {
+        Window::Hours(n).span(now_secs())
     }
 
     #[test]
@@ -651,11 +926,11 @@ mod tests {
         );
         s.record("grace", Some("claude-haiku-4-5"), Tokens::default(), false);
 
-        let (calls, errors, t) = s.totals("ada", 0);
+        let (calls, errors, t) = s.totals("ada", all());
         assert_eq!((calls, errors), (2, 0));
         assert_eq!((t.input, t.output), (13, 6));
         // The whole point: one person's spend is not another's.
-        let (gcalls, gerrors, gt) = s.totals("grace", 0);
+        let (gcalls, gerrors, gt) = s.totals("grace", all());
         assert_eq!(
             (gcalls, gerrors),
             (1, 1),
@@ -703,7 +978,7 @@ mod tests {
         assert_eq!(summed, bucket.tokens.total());
 
         // And the series carries it, so a chart can break the hour down.
-        let series = s.series("ada", 2);
+        let series = s.series("ada", hours(2));
         let last = series.last().expect("current hour");
         assert_eq!(last.by_model.len(), 2);
     }
@@ -720,7 +995,7 @@ mod tests {
             },
             true,
         );
-        let series = s.series("ada", 24);
+        let series = s.series("ada", hours(24));
         assert_eq!(series.len(), 24, "a fixed-width window, gaps included");
         assert_eq!(series.last().map(|b| b.calls), Some(1), "now is the last bucket");
         assert!(
@@ -747,7 +1022,7 @@ mod tests {
         s.save().expect("save");
 
         let mut reloaded = Store::load(&path);
-        assert_eq!(reloaded.totals("ada", 0).2.input, 7);
+        assert_eq!(reloaded.totals("ada", all()).2.input, 7);
         reloaded.forget("ada");
         assert!(reloaded.for_account("ada").is_none());
         assert!(Store::load(&path).for_account("ada").is_none(), "and it stays gone");
@@ -803,8 +1078,8 @@ mod tests {
         assert_eq!(doc.by_model["claude-opus-5"].total(), 5);
 
         let back = Store::load(&root);
-        assert_eq!(back.totals("ada", 0).2.input, 5);
-        assert_eq!(back.totals("grace", 0).2.input, 3);
+        assert_eq!(back.totals("ada", all()).2.input, 5);
+        assert_eq!(back.totals("grace", all()).2.input, 3);
     }
 
     /// Dates come from the bucket's own hour, and ids never leave the root.
@@ -838,7 +1113,7 @@ mod tests {
 
         let s = Store::load(&root);
         // The good day still loads: one bad file must not cost the history.
-        assert_eq!(s.totals("ada", 0).0, 2, "the intact day should still be there");
+        assert_eq!(s.totals("ada", all()).0, 2, "the intact day should still be there");
         assert!(
             dir.join("2026-09-07_usage.json.corrupt").exists(),
             "the damaged file is kept for inspection, not deleted"
