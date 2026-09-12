@@ -68,6 +68,11 @@ jobs:
               with:
                   tool: cargo-deb@3.2.0
             - name: Build .deb packages
+              # The DWARF the .ddeb carries. Set here rather than in
+              # Cargo.toml so arch-pkg — which ships no debug symbols at all
+              # — is not taxed for them; see the note in the release profile.
+              env:
+                  CARGO_PROFILE_RELEASE_DEBUG: "2"
               run: |
                   # Same script as the nightly channel, so a release and a
                   # snapshot cannot disagree about how a version is spelled.
@@ -77,8 +82,8 @@ jobs:
                   # stripped and the DWARF goes into a separate
                   # tab-atelier-dbgsym_*.ddeb beside it. zlib rather than
                   # zstd because cargo-deb's help notes zlib round-trips
-                  # through Rust's backtraces and zstd may not. The profile's
-                  # debug = 2 is what makes the symbols exist to split.
+                  # through Rust's backtraces and zstd may not. The DWARF
+                  # comes from CARGO_PROFILE_RELEASE_DEBUG above.
                   DBGSYM=(--dbgsym --compress-debug-symbols=zlib)
                   cargo deb -p tab-atelier --locked --deb-version "$DEB_VERSION" "${DBGSYM[@]}"
                   cargo deb -p tab-atelier --variant headless --locked --deb-version "$DEB_VERSION" "${DBGSYM[@]}"
