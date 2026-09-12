@@ -1,16 +1,295 @@
 #!/usr/bin/env bash
-# Run `cargo fmt -- --check` so the CI `Check formatting` step can't
-# fail on a freshly-pushed commit. If you really want to commit
-# unformatted code (e.g. for a partial work-in-progress branch), pass
-# `--no-verify` to git commit.
+# SPDX-License-Identifier: MPL-2.0
+#
+# Pre-commit gate: the checks CI blocks on, scoped to what you actually
+# staged.
+#
+# The point is not to run CI locally — it is to not spend a CI round on
+# something a five-second local check would have caught. So every check
+# below is gated on the staged file set: a docs-only commit runs none of
+# them, and a commit that touches one crate lints that crate rather than
+# the workspace.
 #
 # Enable once with: `git config core.hooksPath .githooks`
-set -euo pipefail
+#
+# Skip a check with TA_PRECOMMIT_SKIP=licence,fmt,clippy,assets
+# Skip everything with `git commit --no-verify` (ordinary git).
+set -uo pipefail
 
-if ! cargo fmt -- --check >/dev/null 2>&1; then
-    echo "pre-commit: cargo fmt -- --check failed."
-    echo "            run 'cargo fmt' and re-stage the changes."
-    echo "            (or 'git commit --no-verify' to skip)"
-    cargo fmt -- --check
+root="$(git rev-parse --show-toplevel)" || exit 1
+cd "$root" || exit 1
+
+# ── the toolchain ─────────────────────────────────────────────────────
+#
+# Resolved once, because two traps sit here and both are quiet.
+#
+# `~/.cargo/bin` is not on PATH in a non-interactive shell, so a plain
+# `cargo` from a hook is the distro's — and on this tree that one is too
+# old to compile it at all. What it prints for a let-chain or a const
+# `str::is_empty` reads like the *code* is broken rather than the
+# compiler, which is a genuinely misleading way to block someone's commit.
+#
+# And the default toolchain is not necessarily CI's, so the version is
+# read from build.yml rather than assumed: a bump there cannot leave this
+# hook gating on a different compiler than the one gating the push.
+cargo_bin=(cargo)
+rust_version="$(sed -n 's/^ *RUST_VERSION: *"\([^"]*\)".*/\1/p' \
+    .github/workflows/build.yml 2>/dev/null | head -n 1)"
+
+cargo_home="${CARGO_HOME:-$HOME/.cargo}/bin"
+if [[ -d "$cargo_home" ]]; then
+    PATH="$cargo_home:$PATH"
+    export PATH
+fi
+if [[ -n "$rust_version" ]] && command -v rustup >/dev/null 2>&1; then
+    cargo_bin=(cargo "+$rust_version")
+fi
+
+# Staged, and still on disk (a file deleted in the worktree but not
+# staged would otherwise be read here and reported as missing a header).
+mapfile -t staged < <(git diff --cached --name-only --diff-filter=ACMR)
+((${#staged[@]})) || exit 0
+
+failures=0
+note() { printf 'pre-commit: %s\n' "$*" >&2; }
+skip="${TA_PRECOMMIT_SKIP:-}"
+skipping() { [[ ",$skip," == *",$1,"* ]]; }
+
+# ── licence headers ───────────────────────────────────────────────────
+#
+# The rule `tests/licence_headers.rs` enforces, applied to the staged set
+# instead of the whole tree. That test exists because 149 files once went
+# from *detected as MPL-2.0* to *UNKNOWN* in a single commit: the header
+# was rewritten to a spelling no scanner knows. `debian/copyright` is
+# derived by running `licensecheck`, so the file comes back UNKNOWN with a
+# FIXME, and that is the kind of thing that gets a package bounced.
+#
+# Reading the first three lines with awk is not a reimplementation of the
+# test — it is the same rule the test states, which is itself a
+# reimplementation of what licensecheck reads. Keeping the two in step
+# matters more than either being clever.
+check_licence() {
+    local tag="SPDX-License-Identifier: MPL-2.0" f base ext bad=0
+    for f in "${staged[@]}"; do
+        case "$f" in
+            */target/*|*/vendor/*|*/node_modules/*|*/.git/*|*/inbox/*|*/outbox/*) continue ;;
+        esac
+        [[ -f "$f" ]] || continue
+
+        # Off the BASENAME: a dot anywhere in the path — `.githooks/…`,
+        # `some.dir/file` — otherwise lands in `ext` and this file's own
+        # extension is never examined.
+        base="${f##*/}"
+        ext="${base##*.}"
+        if [[ "$ext" == "$base" ]]; then
+            # No extension at all. A script only if it says so; this is how
+            # `.githooks/pre-commit` and friends get checked rather than
+            # skipped, which is what bit the version of this that used the
+            # whole path.
+            head -n 1 -- "$f" | grep -q '^#!' || continue
+            ext="sh"
+        fi
+
+        case "$ext" in
+            rs|js|sh|py|html) ;;
+            *) continue ;;
+        esac
+
+        if ! awk -v tag="$tag" '
+            /^#!/ { next }
+            {
+                t = $0; sub(/^[ \t]+/, "", t)
+                if (t == "") next
+                if (tolower(t) ~ /^<!doctype/) next
+                seen++
+                if (index($0, tag) > 0) found = 1
+                if (found || seen >= 3) exit
+            }
+            END { exit found ? 0 : 1 }
+        ' "$f"; then
+            note "$f: no '$tag' in the first 3 lines."
+            note "  licensecheck reads it as UNKNOWN and debian/copyright inherits that."
+            bad=1
+        fi
+
+        # A separate failure, and a much worse one: a licence line above
+        # `#!/usr/bin/env bash` stops the script being executable at all.
+        if head -n 5 -- "$f" | grep -q '^#!'; then
+            case "$(head -n 1 -- "$f")" in
+                '#!'*) ;;
+                *)
+                    note "$f: has a shebang that is not on line 1 — the kernel ignores it."
+                    bad=1
+                    ;;
+            esac
+        fi
+    done
+    return "$bad"
+}
+
+# ── generated assets ──────────────────────────────────────────────────
+#
+# `web/src/*.ts` compiles into `assets/app.js` and `assets/charts.js`,
+# and the committed .js is what the running proxy serves — there is no
+# build step at deploy time. So a commit that changes the sources without
+# the output ships a UI that does not match its own source, and nothing
+# fails: the tests pass, the bundle is simply old.
+#
+# (assets/index.html is hand-maintained, not generated. Only the two .js
+# files come from tsc.)
+check_assets() {
+    local f web=0 assets=0
+    for f in "${staged[@]}"; do
+        case "$f" in
+            crates/tab-atelier-proxy/web/src/*|crates/tab-atelier-proxy/web/tsconfig.json) web=1 ;;
+        esac
+    done
+    ((web)) || return 0
+
+    # Only the sources changed. If the build is genuinely up to date this
+    # writes nothing and the check passes; the mismatch is what we are
+    # after, not the edit itself.
+    local webdir="crates/tab-atelier-proxy/web"
+    if [[ ! -d "$webdir/node_modules" ]]; then
+        note "web sources staged but $webdir/node_modules is absent — cannot verify the bundle."
+        note "  (cd $webdir && npm install) to enable this check."
+        return 0
+    fi
+    if ! (cd "$webdir" && npm run --silent build) >/dev/null 2>&1; then
+        note "web build failed — run it directly to see why: (cd $webdir && npm run build)"
+        return 1
+    fi
+
+    for f in crates/tab-atelier-proxy/assets/app.js crates/tab-atelier-proxy/assets/charts.js; do
+        if ! git diff --quiet -- "$f"; then assets=1; fi
+    done
+    ((assets)) || return 0
+
+    note "the committed UI bundle is stale: web/src changed but assets/*.js did not."
+    note "  the build just rewrote the output — stage it and commit again:"
+    note "    git add crates/tab-atelier-proxy/assets/app.js crates/tab-atelier-proxy/assets/charts.js"
+    return 1
+}
+
+# ── rustfmt ───────────────────────────────────────────────────────────
+#
+# `--all`, unlike the `cargo fmt --` this hook used to run: without it
+# rustfmt only reaches the current package, so the workspace members were
+# never checked here and drifted to fail CI's `Check formatting` step.
+check_fmt() {
+    local f any=0
+    for f in "${staged[@]}"; do
+        case "$f" in *.rs) any=1 ;; esac
+    done
+    ((any)) || return 0
+    if ! "${cargo_bin[@]}" fmt --all -- --check; then
+        note "rustfmt would reformat the above. run 'cargo fmt --all' and re-stage."
+        return 1
+    fi
+    return 0
+}
+
+# ── clippy ────────────────────────────────────────────────────────────
+#
+# The expensive one, so it runs against the crates you touched rather than
+# the workspace. CI pins RUST_VERSION in build.yml; read it rather than
+# repeating the number, so a bump there cannot leave this hook linting
+# with a different compiler than the one that gates the push.
+#
+# One feature configuration only. CI lints two (`--workspace
+# --all-targets`, then the same again with `--no-default-features
+# --features headless,energy`), but alternating between them locally
+# invalidates the whole target directory — the two sets fingerprint
+# differently, so each run throws away the other's cache and both get
+# slower. The headless pass is left to CI; set TA_PRECOMMIT_ALL_FEATURES=1
+# to run it here too.
+check_clippy() {
+    local f pkg
+    local -a packages=()
+    local workspace=0
+
+    for f in "${staged[@]}"; do
+        case "$f" in
+            android/*) continue ;;
+            crates/*/*)
+                pkg="${f#crates/}"; pkg="${pkg%%/*}"
+                packages+=("$pkg")
+                ;;
+            Cargo.lock) workspace=1 ;;
+            *.rs|Cargo.toml) packages+=(tab-atelier) ;;
+        esac
+    done
+    ((${#packages[@]})) || ((workspace)) || return 0
+
+    # A pinned version that cannot be honoured is worse than a missing
+    # check. The wrong compiler's complaints about this tree are real
+    # errors about imaginary problems, so stop rather than report them.
+    if [[ -n "$rust_version" ]] && ! command -v rustup >/dev/null 2>&1; then
+        note "CI pins Rust $rust_version, but rustup is not on PATH to select it."
+        note "  refusing to lint with a different compiler, which would report"
+        note "  working code as broken. fix: export PATH=\"\$HOME/.cargo/bin:\$PATH\""
+        return 1
+    fi
+    if ! "${cargo_bin[@]}" --version >/dev/null 2>&1; then
+        note "cannot run '${cargo_bin[*]}' — is the ${rust_version:-default} toolchain installed?"
+        return 1
+    fi
+
+    local -a targets=()
+    if ((workspace)); then
+        targets=(--workspace)
+    else
+        # Deduplicated: a commit touching three files in one crate should
+        # not lint that crate three times.
+        mapfile -t packages < <(printf '%s\n' "${packages[@]}" | sort -u)
+        for pkg in "${packages[@]}"; do
+            targets+=(-p "$pkg")
+        done
+    fi
+
+    if ! "${cargo_bin[@]}" clippy "${targets[@]}" --all-targets --locked -- -D warnings; then
+        note "clippy failed (see above). CI runs this with -D warnings."
+        return 1
+    fi
+
+    if [[ -n "${TA_PRECOMMIT_ALL_FEATURES:-}" ]]; then
+        if ! "${cargo_bin[@]}" clippy "${targets[@]}" --all-targets --locked \
+            --no-default-features --features headless,energy -- -D warnings; then
+            note "clippy failed in the headless feature configuration."
+            return 1
+        fi
+    fi
+    return 0
+}
+
+run() {
+    local name="$1" rc=0
+    if skipping "$name"; then
+        note "skipping $name (TA_PRECOMMIT_SKIP)"
+        return 0
+    fi
+    # Dispatched by name rather than taking the function as an argument:
+    # `run "$fn"` hides the calls from shellcheck, which then reports every
+    # line of every check as unreachable (SC2317).
+    case "$name" in
+        licence) check_licence ;;
+        assets)  check_assets ;;
+        fmt)     check_fmt ;;
+        clippy)  check_clippy ;;
+        *)       note "unknown check '$name'"; return 0 ;;
+    esac || rc=$?
+    ((rc)) && failures=$((failures + 1))
+    return 0
+}
+
+run licence
+run assets
+run fmt
+run clippy
+
+if ((failures)); then
+    note "$failures check(s) failed — commit aborted."
+    note "fix them, or 'git commit --no-verify' for a one-off WIP commit."
     exit 1
 fi
+exit 0
