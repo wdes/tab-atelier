@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+
 //! Interactive tool policy: what `tools[]` this client actually gets.
 //!
 //! The design and its reasoning live in `docs/proxy-tools.md`; this is the
