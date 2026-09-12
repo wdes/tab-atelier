@@ -104,6 +104,11 @@ jobs:
               with:
                   tool: cargo-deb@3.2.0
             - name: Build .deb (both variants)
+              # The DWARF the .ddeb carries. Set here rather than in
+              # Cargo.toml so arch-pkg — which ships no debug symbols at all
+              # — is not taxed for them; see the note in the release profile.
+              env:
+                  CARGO_PROFILE_RELEASE_DEBUG: "2"
               run: |
                   # --dbgsym: nightly is the main channel people debug
                   # against, so the symbols ship here and not only at tag
