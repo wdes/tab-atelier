@@ -105,18 +105,21 @@ jobs:
                   tool: cargo-deb@3.2.0
             - name: Build .deb (both variants)
               run: |
-                  # No --dbgsym here, deliberately. A nightly is throwaway,
-                  # and this pool could not carry the symbols anyway:
-                  # apt-ftparchive below scans only *.deb, so a
-                  # -dbgsym.ddeb dropped in the pool would be silently
-                  # ignored rather than installable. Tagged releases do
-                  # ship them — see release.yml.
-                  cargo deb -p tab-atelier --locked --deb-version "${{ steps.ver.outputs.version }}"
-                  cargo deb -p tab-atelier --variant headless --locked --deb-version "${{ steps.ver.outputs.version }}"
+                  # --dbgsym: nightly is the main channel people debug
+                  # against, so the symbols ship here and not only at tag
+                  # time. This pool can carry them — apt-ftparchive picks
+                  # *.ddeb up and writes a proper stanza (Section: debug,
+                  # Auto-Built-Package: debug-symbols, Recommends on the
+                  # exact version), verified against real artifacts. An
+                  # earlier comment here claimed it scanned only *.deb and
+                  # that a .ddeb would be silently ignored; that was wrong.
+                  DBGSYM=(--dbgsym --compress-debug-symbols=zlib)
+                  cargo deb -p tab-atelier --locked --deb-version "${{ steps.ver.outputs.version }}" "${DBGSYM[@]}"
+                  cargo deb -p tab-atelier --variant headless --locked --deb-version "${{ steps.ver.outputs.version }}" "${DBGSYM[@]}"
                   # Third package: the server half of the relay. Its own .deb
                   # because it runs on a different machine from the terminal —
                   # see docs/proxy.md.
-                  cargo deb -p tab-atelier-proxy --locked --deb-version "${{ steps.ver.outputs.version }}"
+                  cargo deb -p tab-atelier-proxy --locked --deb-version "${{ steps.ver.outputs.version }}" "${DBGSYM[@]}"
                   ls -la target/debian/
 
             # Pull the existing gh-pages tree into site/ so the
@@ -146,13 +149,23 @@ jobs:
               run: |
                   cd site
                   mkdir -p pool/$CHANNEL/main/t/tab-atelier
-                  cp ../target/debian/*.deb pool/$CHANNEL/main/t/tab-atelier/
-                  # Cap the pool at the 10 most recent .debs per package
-                  # so the repo doesn't balloon forever. Sort by mtime
-                  # then prune the tail.
+                  cp ../target/debian/*.deb ../target/debian/*.ddeb pool/$CHANNEL/main/t/tab-atelier/
+                  # Cap the pool so the published site doesn't balloon
+                  # forever. Sort by mtime, prune the tail.
+                  #
+                  # The two extensions carry different caps on purpose.
+                  # Measured across all three packages: a version's .debs
+                  # total ~19 MB while its -dbgsym.ddebs total ~151 MB. The
+                  # site is ~500 MB today, so holding symbols as long as
+                  # binaries would add ~1.5 GB to it. Three symbol versions
+                  # is a few days of nightlies, which covers the case this
+                  # exists for — "the nightly I am running crashed"; older
+                  # versions keep their binaries.
                   for pkg in tab-atelier tab-atelier-headless tab-atelier-proxy; do
                       ls -1t pool/$CHANNEL/main/t/tab-atelier/${pkg}_*.deb 2>/dev/null \
                           | tail -n +11 | xargs -r rm -f
+                      ls -1t pool/$CHANNEL/main/t/tab-atelier/${pkg}-dbgsym_*.ddeb 2>/dev/null \
+                          | tail -n +4 | xargs -r rm -f
                   done
 
             # Windows MSIs are built on a windows runner by
@@ -618,3 +631,16 @@ jobs:
                   user_email: 'williamdes+wdes-bot@wdes.fr'
                   commit_message: 'Publish ${{ steps.ver.outputs.version }} to ${{ steps.ver.outputs.channel }}'
                   keep_files: false
+                  # force_orphan: each publish becomes a fresh root commit
+                  # instead of a new tip on a growing chain. `keep_files:
+                  # false` prunes the TREE, but without this every nightly's
+                  # ~20 MB of package blobs stayed reachable in history
+                  # forever — gh-pages had reached 347 commits and the repo
+                  # ~6.7 GB before this was noticed, and shipping symbols
+                  # would have multiplied the growth rather than adding to
+                  # it. Orphaned commits become unreachable and are
+                  # garbage-collected server-side, so the repo stops
+                  # growing. The full tree is rebuilt from the shallow
+                  # checkout above each run, so no published content is
+                  # lost — only the history of how it got there.
+                  force_orphan: true
