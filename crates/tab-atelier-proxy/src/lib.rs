@@ -39,6 +39,7 @@ pub mod provider;
 pub mod qos;
 pub mod routing;
 pub mod server;
+pub mod tools;
 pub mod usage;
 pub mod users;
 
