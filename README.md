@@ -619,16 +619,30 @@ cargo test
 cargo clippy
 ```
 
-After a fresh clone, opt-in to the repo's pre-commit hook so CI's
-`Check formatting` step can't fail on a freshly-pushed commit:
+After a fresh clone, opt-in to the repo's pre-commit hook so a commit that
+would fail CI fails in three seconds instead of fifteen minutes:
 
 ```sh
 git config core.hooksPath .githooks
 ```
 
-The hook runs `cargo fmt -- --check` and aborts the commit (with the
-offending diff) when the tree drifts from rustfmt. Pass `--no-verify`
-to skip for a one-off WIP commit.
+The hook runs the checks CI blocks on, but only against what you staged —
+a docs-only commit runs none of them, and a commit touching one crate
+lints that crate rather than the workspace:
+
+- **licence headers** — every staged `.rs`/`.js`/`.sh`/`.py`/`.html` file
+  must carry the SPDX line where `licensecheck` looks, since
+  `debian/copyright` is generated from it.
+- **generated assets** — `web/src/*.ts` must ship with a rebuilt
+  `assets/*.js`; a stale bundle passes every test and serves the old UI.
+- **rustfmt** — `cargo fmt --all -- --check`.
+- **clippy** — `-D warnings` on the crates you touched, using the
+  `RUST_VERSION` pinned in `.github/workflows/build.yml`. Set
+  `TA_PRECOMMIT_ALL_FEATURES=1` to also run CI's headless feature pass
+  (it invalidates the build cache, so it is off by default).
+
+`TA_PRECOMMIT_SKIP=licence,fmt,clippy,assets` skips named checks;
+`git commit --no-verify` skips all of them for a one-off WIP commit.
 
 ## License
 
