@@ -9,6 +9,22 @@
 
 const { createApp } = Vue;
 
+/** The tool policy every request already gets, and the one an account that
+ *  predates the field is carrying. `all` sends the client's toolkit through
+ *  untouched — the only default that cannot silently break a session. */
+function defaultTools(): ToolsPolicy {
+  return { mode: "all", disable: [], allow: [], add: [] };
+}
+
+/** Commas or newlines — a pasted column of names is as likely as a typed list,
+ *  and neither separator can appear inside a tool name. */
+function splitNames(text: string): string[] {
+  return text
+    .split(/[,\n]/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
 /** A zeroed usage record, for an account that has not called anything yet. */
 function emptyWindow(): UsageWindow {
   return {
@@ -35,6 +51,7 @@ function emptyUsage(id: string): AccountUsage {
       // Off, matching the server's default and the `#[serde(default)]` that
       // gives every account already on disk the same value.
       compact: "none",
+      tools: defaultTools(),
     },
     last_24h: emptyWindow(),
     last_7d: emptyWindow(),
@@ -107,6 +124,7 @@ const AdminApp = Vue.defineComponent({
       inspectOpen: null,
       providers: null,
       newMapping: { from: "", to: "", note: "" },
+      tools: null,
       // "Weight" is the scheduler's word for this and means nothing to anyone
       // reading a table of people. The stored value is still a weight — the
       // API and the QoS maths are unchanged — but the UI names what it does.
@@ -528,6 +546,50 @@ const AdminApp = Vue.defineComponent({
         this.busy = false;
       }
     },
+    // The tool editor. Opened from the row and saved whole, because the
+    // refusals are about the COMBINATION — a name in both `disable` and
+    // `allow`, a definition with no name — and three fields saved one at a
+    // time would pass through states the operator never chose.
+    editTools(u: ApiUser) {
+      this.tools = {
+        id: u.id,
+        mode: u.tools.mode,
+        disable: u.tools.disable.join(", "),
+        allow: u.tools.allow.join(", "),
+        // Pretty-printed, not compact: someone may open this to read a
+        // definition, and a tool schema is not one line long.
+        add: u.tools.add.length ? JSON.stringify(u.tools.add, null, 2) : "",
+      };
+    },
+    saveTools() {
+      const t = this.tools;
+      if (!t) return Promise.resolve();
+      // Parsed here rather than sent as a string for the server to parse:
+      // a syntax error in a text box is the typist's, and `JSON.parse` can say
+      // where it is. What the server gets is the stored shape.
+      let added: unknown[] = [];
+      if (t.add.trim()) {
+        try {
+          added = JSON.parse(t.add) as unknown[];
+        } catch (e) {
+          this.error = `that is not valid JSON: ${e instanceof Error ? e.message : e}`;
+          return Promise.resolve();
+        }
+        if (!Array.isArray(added)) {
+          this.error = "the added tools must be a JSON array of definitions";
+          return Promise.resolve();
+        }
+      }
+      return this.act(async () => {
+        await this.api("POST", `/api/users/${t.id}/tools`, {
+          mode: t.mode,
+          disable: splitNames(t.disable),
+          allow: splitNames(t.allow),
+          add: added,
+        });
+        this.tools = null;
+      });
+    },
     async removeProvider(p: ProviderView) {
       if (!confirm(`Remove provider ${p.id}? Accounts pinned to it are unpinned.`)) return;
       await this.api("DELETE", `/api/providers/${p.id}`);
@@ -578,6 +640,17 @@ const AdminApp = Vue.defineComponent({
     async setUserProvider(u: ApiUser, provider: string) {
       await this.api("POST", `/api/users/${u.id}/provider`, { provider });
       await this.refresh();
+    },
+    /** What the row's badge says: enough to tell "governed" from "default"
+     *  without opening the editor, and no more. The mode is the headline; the
+     *  counts are there so a policy that only adds tools does not read the
+     *  same as one that only removes them. */
+    toolsBadge(u: ApiUser): string {
+      const parts: string[] = [];
+      if (u.tools.mode !== "all") parts.push(u.tools.mode);
+      if (u.tools.disable.length) parts.push(`−${u.tools.disable.length}`);
+      if (u.tools.add.length) parts.push(`+${u.tools.add.length}`);
+      return parts.join(" ") || "default";
     },
     // The account's compaction level, as words rather than wire spelling.
     compactLabel(u: ApiUser): string {
