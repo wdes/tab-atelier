@@ -22,12 +22,12 @@ default-members = [".", "crates/catbus-agent", "crates/claude-api"]
 # in a fraction of the time. If a profile ever shows the difference
 # matters, fat is a one-word change.
 #
-# debug = 2 keeps full DWARF in the binary. It costs nothing at runtime —
-# it is not mapped unless a debugger or a panic unwinder asks — and
-# cargo-deb splits it into a separate -dbgsym.ddeb, so the shipped .deb
-# stays stripped while the symbols stay retrievable. That is Debian's
-# convention, not a Rust one, which is why the split lives in the deb
-# build rather than in this profile.
+# The debug symbols are NOT set here — see the note in `[profile.release]`
+# below. They cost nothing at runtime (DWARF is not mapped unless a debugger
+# or a panic unwinder asks for it) and cargo-deb splits them into a separate
+# -dbgsym.ddeb, so a shipped .deb stays stripped while the symbols stay
+# retrievable. That is Debian's convention, not a Rust one, which is why the
+# split lives in the deb build rather than in this profile.
 [profile.release]
 lto = "thin"
 codegen-units = 1
@@ -138,6 +138,7 @@ struct_excessive_bools = "allow"
 needless_pass_by_ref_mut = "allow"
 
 [dependencies]
+# hook test comment in the dependencies section
 # Global allocator (both binaries). Replaces glibc malloc, whose per-thread
 # arenas (up to 8×ncpu) fragment badly and hoard freed memory under our
 # many-threaded workload (one PTY-reader thread per tab) — the dominant cause of

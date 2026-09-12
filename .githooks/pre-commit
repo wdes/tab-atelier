@@ -203,6 +203,31 @@ check_fmt() {
 # differently, so each run throws away the other's cache and both get
 # slower. The headless pass is left to CI; set TA_PRECOMMIT_ALL_FEATURES=1
 # to run it here too.
+
+# `[profile.*]` blocks, and only those, removed — so two Cargo.tomls can be
+# compared with the profile settings disregarded. A line opens a section iff
+# it starts with `[`; everything after it belongs to that section until the
+# next one.
+strip_profiles() {
+    awk '/^\[/ { in_profile = ($0 ~ /^\[profile\./) } !in_profile'
+}
+
+# Whether a staged Cargo.toml could change what clippy sees. False only when
+# the difference from HEAD is entirely inside `[profile.*]`. Anything else —
+# a dependency, a feature, a lint table — is a real change and lints.
+#
+# A manifest with no HEAD version (newly added) is not comparable, so it
+# lints: the safe direction to be wrong in.
+manifest_needs_lint() {
+    local f="$1"
+    if diff -q \
+        <(git show "HEAD:$f" 2>/dev/null | strip_profiles) \
+        <(strip_profiles <"$f") >/dev/null 2>&1; then
+        return 1
+    fi
+    return 0
+}
+
 check_clippy() {
     local f pkg
     local -a packages=()
@@ -216,7 +241,20 @@ check_clippy() {
                 packages+=("$pkg")
                 ;;
             Cargo.lock) workspace=1 ;;
-            *.rs|Cargo.toml) packages+=(tab-atelier) ;;
+            Cargo.toml)
+                # A profile-only edit is the one manifest change that cannot
+                # alter what clippy reports: clippy runs the DEV profile, so
+                # [profile.release] is not the profile under test. Nor can it
+                # change what compiles.
+                #
+                # Worth the special case because a changed manifest
+                # invalidates every fingerprint in the graph, so the lint that
+                # follows is a full rebuild — minutes — rather than the
+                # seconds an unchanged tree costs.
+                manifest_needs_lint "$f" || continue
+                packages+=(tab-atelier)
+                ;;
+            *.rs) packages+=(tab-atelier) ;;
         esac
     done
     ((${#packages[@]})) || ((workspace)) || return 0
