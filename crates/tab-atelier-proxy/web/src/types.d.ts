@@ -42,6 +42,30 @@ interface ApiUser {
      * mean something else the moment traffic stopped going there.
      */
     compact: string;
+    /**
+     * This account's tool policy. Per ACCOUNT for the same reason `compact`
+     * above is: routing picks the hop per request.
+     */
+    tools: ToolsPolicy;
+}
+
+/**
+ * Which of a request's tool definitions are sent on.
+ *
+ * `mode` decides the base set and `disable` subtracts from it, but neither is
+ * the last word: a name the conversation has already called, or that
+ * `tool_choice` forces, is kept whatever the policy says. That rule is the
+ * server's (`tools.rs`), not this file's — the UI must not re-derive it, or
+ * the two will disagree about what a policy does.
+ */
+interface ToolsPolicy {
+    mode: "all" | "referenced" | "allow" | "none";
+    /** Names removed, in every mode. */
+    disable: string[];
+    /** The complete set, read only by `mode: "allow"`. */
+    allow: string[];
+    /** Definitions injected when the client did not send them. */
+    add: unknown[];
 }
 
 interface TokenTotals {
@@ -436,6 +460,27 @@ interface AppState {
     inspectOpen: Capture | null;
     providers: ProvidersResponse | null;
     newMapping: { from: string; to: string; note: string };
+    /**
+     * The tool policy being edited, or null when no account has its editor
+     * open — one at a time, because two half-written policies on screen is how
+     * the wrong one gets saved.
+     *
+     * The lists are held as TEXT, not as `string[]`, because they are typed
+     * into a field and a half-typed `Bash, Ed` is a legitimate intermediate
+     * state — a split-on-keystroke would fight the typist. The split happens
+     * once, on save, and the wire shape sent is the stored shape exactly.
+     */
+    tools: ToolsDraft | null;
+}
+
+interface ToolsDraft {
+    id: string;
+    mode: ToolsPolicy["mode"];
+    disable: string;
+    allow: string;
+    /** JSON, as typed. Parsed in `saveTools`, so a syntax error is reported
+     *  against the field the typist is looking at. */
+    add: string;
 }
 
 /**

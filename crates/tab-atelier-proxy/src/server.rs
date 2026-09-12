@@ -122,6 +122,9 @@ fn account_json(a: &Account) -> serde_json::Value {
         // This person's compaction level. Per ACCOUNT, not per provider — see
         // `set_user_compact` for why the two axes meet there.
         "compact": a.compact.as_str(),
+        // The whole policy, not a summary of it: the UI edits it field by
+        // field, so it needs the parts it is not currently changing.
+        "tools": a.tools,
         // Every key, each with its own history. The hash is never included:
         // it is not a usable secret, but it is the input to an offline guess
         // and the UI has no reason to hold it.
@@ -577,7 +580,22 @@ async fn shape_and_admit(
             route.model_id
         );
     }
-    let (body, compaction) = shape_body(&body, &route, &requested, account.compact);
+    let (body, compaction) = shape_body(
+        &body,
+        &route,
+        &requested,
+        account.compact,
+        &account.tools,
+        // True unconditionally — a judgement, not a reading of the provider.
+        // Every hop here speaks the Messages wire (`Wire::Anthropic` is the
+        // only variant in use), and whatever marks the client already puts
+        // in `tools[]` it puts there today without us, so a far end that
+        // rejected them would be failing requests the client was already
+        // making on its own. Stripping marks we did not add would buy
+        // nothing and cost the cache. The flag is here for a provider that
+        // turns out to need it.
+        true,
+    );
 
     // Admission gates on the SUBSCRIPTION's budget, so it applies only to a
     // destination that spends it.
@@ -638,6 +656,8 @@ fn shape_body(
     route: &routing::Route,
     requested: &str,
     compact: crate::compact::Compact,
+    policy: &crate::tools::Policy,
+    takes_cache: bool,
 ) -> (Bytes, Option<inspect::Compaction>) {
     let rename = (route.model_id != requested).then_some(route.model_id.as_str());
     // The level is the account's, resolved by the caller from wherever the
@@ -657,7 +677,15 @@ fn shape_body(
     } else {
         crate::compact::Compact::None
     };
-    if rename.is_none() && level.is_none() {
+    // The tool policy is exempt from the classifier for a sharper reason than
+    // the level is: this pass ADDS tools, and the classifier is a judge written
+    // to emit one tag. Handing it a toolkit changes what it is, not merely what
+    // it reads. See `classifier::Kind::shapes_tools`.
+    let policy = route.kind.shapes_tools().then_some(policy);
+    // The tool policy joins the early-out rather than being checked after
+    // it. An account with no policy must not pay for the parse and the
+    // re-encode, and that is most accounts on most requests.
+    if rename.is_none() && level.is_none() && policy.is_none_or(crate::tools::is_noop) {
         return (body.clone(), None);
     }
 
@@ -672,9 +700,41 @@ fn shape_body(
     }
     let before = body.len();
     let elided = crate::compact::apply(&mut v, level);
+    // After compaction, deliberately. Compaction walks `messages[]` and the
+    // tool policy's pin rule reads that same array to decide what is still
+    // live; running the policy first would pin tools against history that
+    // compaction was about to elide.
+    let governed = policy.map_or_else(crate::tools::Report::default, |policy| {
+        crate::tools::apply(&mut v, policy, takes_cache)
+    });
     let Ok(encoded) = serde_json::to_vec(&v) else {
         return (body.clone(), None);
     };
+    if governed.changed() {
+        log::info!(
+            "proxy: tools {} offered → {} sent on {}: {} removed, {} added, {} pinned{}",
+            governed.offered,
+            governed.sent,
+            route.provider_id,
+            governed.removed.len(),
+            governed.added,
+            governed.pinned.len(),
+            if governed.refused.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ", {} refused ({})",
+                    governed.refused.len(),
+                    governed
+                        .refused
+                        .iter()
+                        .map(crate::tools::Refusal::describe)
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )
+            }
+        );
+    }
     if elided.changed() {
         log::info!(
             "proxy: compacted {}/{} {before} → {} bytes: {} tool results elided ({} errors kept), \
@@ -692,17 +752,27 @@ fn shape_body(
     // Recorded whenever a level was in force, even if it changed nothing:
     // "compaction is on and elided nothing" and "compaction is off" are
     // different answers, and the panel should be able to tell them apart.
-    let record = inspect::Compaction {
-        level: level.as_str().to_owned(),
-        bytes_before: u64::try_from(before).unwrap_or(u64::MAX),
-        bytes_after: u64::try_from(encoded.len()).unwrap_or(u64::MAX),
-        tool_results_elided: elided.tool_results_elided,
-        tool_results_kept_for_error: elided.tool_results_kept_for_error,
-        thinking_dropped: elided.thinking_dropped,
-        writes_elided: elided.writes_elided,
-        banners_dropped: elided.banners_dropped,
+    //
+    // Tied to `level`, not to "the body was parsed". A request the tool policy
+    // alone brought through this function has no level in force, and attaching
+    // a record anyway would put a row in the panel reading `none` next to a
+    // savings of zero — indistinguishable from a real pass that found nothing,
+    // which is the one distinction this field exists to make.
+    let record = if level.is_none() {
+        None
+    } else {
+        Some(inspect::Compaction {
+            level: level.as_str().to_owned(),
+            bytes_before: u64::try_from(before).unwrap_or(u64::MAX),
+            bytes_after: u64::try_from(encoded.len()).unwrap_or(u64::MAX),
+            tool_results_elided: elided.tool_results_elided,
+            tool_results_kept_for_error: elided.tool_results_kept_for_error,
+            thinking_dropped: elided.thinking_dropped,
+            writes_elided: elided.writes_elided,
+            banners_dropped: elided.banners_dropped,
+        })
     };
-    (Bytes::from(encoded), Some(record))
+    (Bytes::from(encoded), record)
 }
 
 /// What routing needs to know about each provider right now.
@@ -1749,6 +1819,39 @@ fn compact_refusal_for(state: &Arc<State>, store: &Store, who: &str) -> Option<S
     )
 }
 
+/// Replace an account's tool policy.
+///
+/// Whole-object, not field at a time. `mode`, `disable`, `allow` and `add` are
+/// one decision — `allow` means nothing without the mode that reads it, and
+/// `mode: allow` with no list is `none` wearing a different name — so replacing
+/// the lot is the only edit that cannot leave a half-applied policy behind.
+/// The UI sends the whole object on every save, so there is nothing to merge.
+fn set_user_tools(store: &mut Store, who: &str, incoming: Option<&serde_json::Value>) -> Response<Body> {
+    let Some(value) = incoming else {
+        return json(400, &serde_json::json!({ "error": "missing `tools`" }).to_string());
+    };
+    // Deserialized rather than hand-read field by field, so the wire shape and
+    // the stored shape cannot drift. An unknown `mode` fails here, which is the
+    // point: `allow` typed as `allowed` must not quietly become the default
+    // mode, because the default mode offers everything.
+    let policy = match serde_json::from_value::<crate::tools::Policy>(value.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            return json(
+                400,
+                &serde_json::json!({ "error": format!("bad tool policy: {e}") }).to_string(),
+            );
+        }
+    };
+    if let Err(e) = crate::tools::validate(&policy) {
+        return json(400, &serde_json::json!({ "error": e }).to_string());
+    }
+    match store.set_tools(who, policy) {
+        Ok(a) => json(200, &serde_json::json!({ "user": account_json(&a) }).to_string()),
+        Err(e) => json(404, &serde_json::json!({ "error": e.to_string() }).to_string()),
+    }
+}
+
 fn set_user_provider(state: &Arc<State>, store: &mut Store, who: &str, wanted: &str) -> Response<Body> {
     let wanted = wanted.trim();
     // Validated HERE, where the registry is in hand, rather than in users.rs
@@ -1960,6 +2063,11 @@ fn mutate(state: &Arc<State>, method: &Method, path: &str, body: &Bytes) -> Resp
         (&Method::POST, p) if p.ends_with("/compact") => {
             set_user_compact(state, &mut store, &who("/compact"), &field("compact"))
         }
+        // The account's tool policy. Suffix-matched like the rest, but handed
+        // the whole request rather than a `field`-mangled string: it is an
+        // object, and flattening it to a string would only be to flatten it
+        // back. See `set_user_tools` for why the write is whole-object.
+        (&Method::POST, p) if p.ends_with("/tools") => set_user_tools(&mut store, &who("/tools"), parsed.get("tools")),
         (&Method::POST, "/api/users") => add_user(&mut store, &field),
         // Add a named key. Replaces the old `/rotate`: adding first and
         // removing later means a machine can be moved across without a moment
@@ -2238,7 +2346,14 @@ mod tests {
         let body = Bytes::from(format!(r#"{{"model":"m","messages":[{}]}}"#, turns.join(",")));
         let before = body.len();
 
-        let (after, record) = shape_body(&body, &route, "m", crate::compact::Compact::Tools);
+        let (after, record) = shape_body(
+            &body,
+            &route,
+            "m",
+            crate::compact::Compact::Tools,
+            &crate::tools::Policy::default(),
+            true,
+        );
         let record = record.expect("a level was in force, so a record must come back");
         assert_eq!(record.level, "tools");
         assert_eq!(record.tool_results_elided, 4, "six of ten are inside the keep window");
@@ -2250,14 +2365,28 @@ mod tests {
         // A level that is set but has nothing to remove still reports, because
         // "on, and elided nothing" is a different answer from "off".
         let plain = Bytes::from(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#);
-        let (_, quiet) = shape_body(&plain, &route, "m", crate::compact::Compact::All);
+        let (_, quiet) = shape_body(
+            &plain,
+            &route,
+            "m",
+            crate::compact::Compact::All,
+            &crate::tools::Policy::default(),
+            true,
+        );
         let quiet = quiet.expect("still a record");
         assert_eq!(quiet.tool_results_elided, 0);
         assert_eq!(quiet.saved(), 0);
 
         // …and `none` reports nothing at all, which is the distinction the UI
         // draws by leaving the cell blank.
-        let (untouched, off) = shape_body(&plain, &route, "m", crate::compact::Compact::None);
+        let (untouched, off) = shape_body(
+            &plain,
+            &route,
+            "m",
+            crate::compact::Compact::None,
+            &crate::tools::Policy::default(),
+            true,
+        );
         assert!(off.is_none(), "no level, no record");
         assert_eq!(untouched, plain, "and the bytes are the ones that arrived");
     }
@@ -2322,6 +2451,7 @@ mod tests {
         let a = Account {
             provider: None,
             compact: crate::compact::Compact::None,
+            tools: crate::tools::Policy::default(),
             id: "id-1".to_owned(),
             first_name: "Ada".to_owned(),
             last_name: "Lovelace".to_owned(),

@@ -135,6 +135,16 @@
       .ta-key-dash {
         background: repeating-linear-gradient(90deg, var(--series-2) 0 3px, transparent 3px 5px);
       }
+      /* The tool-policy editor. Hand-rolled rather than Bootstrap's modal: the
+         vendored bundle is CSS-only, so `Modal` does not exist, and the whole
+         behaviour needed is "sit on top, close on backdrop click". */
+      .ta-modal-backdrop {
+        position: fixed; inset: 0; z-index: 1050;
+        background: rgb(0 0 0 / .5);
+        display: flex; align-items: flex-start; justify-content: center;
+        padding: 4vh 1rem; overflow-y: auto;
+      }
+      .ta-modal { width: 100%; max-width: 46rem; }
     </style>
   </head>
   <body class="bg-body-tertiary">
@@ -854,6 +864,10 @@
                        clicked. flex-wrap so they stack instead of overflowing
                        the cell on a narrow window. -->
                   <div class="d-inline-flex flex-wrap gap-2 justify-content-end">
+                    <button class="btn btn-sm btn-outline-secondary" @click="editTools(u)" :disabled="busy">
+                      Tools<span v-if="toolsBadge(u) !== 'default'"
+                                 class="badge text-bg-secondary ms-1">{{ toolsBadge(u) }}</span>
+                    </button>
                     <button
                       class="btn btn-sm btn-outline-secondary"
                       @click="setDisabled(u, !u.disabled)"
@@ -905,6 +919,78 @@
           to whoever is working, never unused. Everyone is Normal unless changed; raising
           one person is how you lower the rest.
         </p>
+
+        <!-- The tool policy editor. A modal rather than a row of inline
+             controls: the refusals are about the COMBINATION of fields (a name
+             in both disable and allow, a definition with no name), so the set
+             has to be saveable in one go — and a row that only commits on blur
+             is a row that commits half-finished policies as you tab through. -->
+        <div v-if="tools" class="ta-modal-backdrop" @click.self="tools = null">
+          <div class="card shadow ta-modal">
+            <div class="card-body">
+              <h2 class="h5 card-title mb-1">Tools for {{ tools.id }}</h2>
+              <p class="small text-body-secondary">
+                What this account's requests are allowed to carry. Applied to the
+                <strong>tools</strong> array on the way upstream — the request is otherwise
+                untouched, and an account left on <em>every tool</em> is not rewritten at all.
+              </p>
+
+              <label class="form-label small fw-semibold" for="ta-tools-mode">Mode</label>
+              <select id="ta-tools-mode" class="form-select form-select-sm mb-1" v-model="tools.mode">
+                <option value="all">Every tool — send the client's array as it stands</option>
+                <option value="referenced">Only what a conversation is already using</option>
+                <option value="allow">Only the names listed below</option>
+                <option value="none">None — drop the client's tools entirely</option>
+              </select>
+              <p class="small text-body-secondary mb-3">
+                <strong>Referenced</strong> is the safe way to save context: a tool the
+                conversation has already called, or that is still in the recent history, is
+                kept whether or not it is listed here. That is not a preference — a
+                <code>tool_use</code> naming a tool that is no longer defined is rejected
+                outright, which would fail the turn rather than shrink it.
+              </p>
+
+              <label class="form-label small fw-semibold" for="ta-tools-allow">Allowed names</label>
+              <textarea id="ta-tools-allow" rows="2" class="form-control form-control-sm font-monospace mb-1"
+                        v-model="tools.allow"
+                        :disabled="tools.mode !== 'allow'"
+                        placeholder="Read, Glob, Grep"></textarea>
+              <p class="small text-body-secondary mb-3">
+                Used only by the <strong>allow</strong> mode above.
+              </p>
+
+              <label class="form-label small fw-semibold" for="ta-tools-disable">Never send</label>
+              <textarea id="ta-tools-disable" rows="2" class="form-control form-control-sm font-monospace mb-1"
+                        v-model="tools.disable"
+                        placeholder="WebFetch"></textarea>
+              <p class="small text-body-secondary mb-3">
+                Removed whatever else says otherwise — except from a conversation already
+                using them, which falls back to the rule above.
+              </p>
+
+              <label class="form-label small fw-semibold" for="ta-tools-add">Add definitions</label>
+              <textarea id="ta-tools-add" rows="5" class="form-control form-control-sm font-monospace mb-1"
+                        v-model="tools.add"
+                        placeholder='[{"name": "deploy", "description": "…", "input_schema": {"type": "object"}}]'></textarea>
+              <p class="small text-body-secondary mb-3">
+                A JSON array, in the API's own tool shape. To <em>override</em> a tool the
+                client already sends, add your definition here and put its name in
+                <strong>never send</strong> — the client's copy is dropped and yours is
+                substituted. A definition with no name, or one that collides with a built-in
+                the proxy must keep, is refused rather than guessed at.
+              </p>
+
+              <div class="d-flex gap-2 justify-content-end">
+                <button class="btn btn-sm btn-outline-secondary" @click="tools = null" :disabled="busy">
+                  Cancel
+                </button>
+                <button class="btn btn-sm btn-primary" @click="saveTools()" :disabled="busy">
+                  Save
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
       </template>
     </div>
 

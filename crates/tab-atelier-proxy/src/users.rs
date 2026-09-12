@@ -122,6 +122,16 @@ pub struct Account {
     /// see [`crate::compact`] on why it declines to act on the subscription.
     #[serde(default)]
     pub compact: crate::compact::Compact,
+    /// Which tools this person's requests may carry — see [`crate::tools`]
+    /// and `docs/proxy-tools.md`.
+    ///
+    /// PER PERSON like `compact` above, and for the same reason. The policy
+    /// reads like a property of the hop, but the person asking for it is
+    /// thinking about a colleague: "the reviewer's agent should not be able
+    /// to push", "this box gets no web tools". Which provider carries it is
+    /// then the routing's business, not the policy's.
+    #[serde(default)]
+    pub tools: crate::tools::Policy,
     /// Pin every request from this account to one provider, by id.
     ///
     /// `None` — the default — means the usual routing, where the proxy picks
@@ -451,6 +461,7 @@ impl Store {
             weight: default_weight(),
             provider: None,
             compact: crate::compact::Compact::None,
+            tools: crate::tools::Policy::default(),
         };
         self.accounts.push(account.clone());
         self.reindex();
@@ -606,6 +617,28 @@ impl Store {
             .find(|a| a.id == id)
             .ok_or_else(|| Error::NotFound(who.to_owned()))?;
         account.compact = level;
+        let out = account.clone();
+        self.reindex();
+        self.save()?;
+        Ok(out)
+    }
+
+    /// Set which tools this person's requests may carry.
+    ///
+    /// # Errors
+    /// No such account, or the file could not be written.
+    pub fn set_tools(&mut self, who: &str, policy: crate::tools::Policy) -> Result<Account, Error> {
+        let id = self
+            .find(who)
+            .ok_or_else(|| Error::NotFound(who.to_owned()))?
+            .id
+            .clone();
+        let account = self
+            .accounts
+            .iter_mut()
+            .find(|a| a.id == id)
+            .ok_or_else(|| Error::NotFound(who.to_owned()))?;
+        account.tools = policy;
         let out = account.clone();
         self.reindex();
         self.save()?;

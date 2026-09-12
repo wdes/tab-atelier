@@ -144,9 +144,47 @@ impl Report {
 
 /// Whether this policy could change any request. The default cannot, and
 /// `shape_body` uses that to stay out of the way entirely.
+///
+/// No `allow` term, deliberately. `allow` is read only in [`Mode::Allow`],
+/// which already prunes — so `!prunes()` has answered "no" before the list
+/// could be consulted, and the term would be dead code that reads as if it
+/// were doing work. The tempting misreading it would invite is the opposite of
+/// the truth: a populated `allow` under [`Mode::All`] is still a no-op, because
+/// `All` ignores the list. Such a policy is stored and means something the
+/// moment the mode changes; it just does not act now.
 #[must_use]
 pub const fn is_noop(policy: &Policy) -> bool {
-    !policy.mode.prunes() && policy.disable.is_empty() && policy.add.is_empty() && policy.allow.is_empty()
+    !policy.mode.prunes() && policy.disable.is_empty() && policy.add.is_empty()
+}
+
+/// Reject a policy that could never do what it says, before it is stored.
+///
+/// Only the mistakes that are certain. `add` shadowing a native tool depends on
+/// what the client sends, so it stays a per-request [`Refusal`]; a policy that
+/// merely surprises its author does not get vetoed here. What is caught is the
+/// empty name — it matches no tool and can never become non-empty, so a policy
+/// holding one is a typo that would otherwise be silently inert forever, which
+/// is exactly the failure [`Refusal`] exists to prevent.
+///
+/// # Errors
+/// The name of the offending entry.
+pub fn validate(policy: &Policy) -> Result<(), String> {
+    let empty = |what: &str, name: &str| format!("{what} entry {name:?} has no name");
+    for name in policy.disable.iter().chain(&policy.allow) {
+        if name.trim().is_empty() {
+            return Err(empty("a disable/allow", name));
+        }
+    }
+    for entry in &policy.add {
+        if entry
+            .get("name")
+            .and_then(Value::as_str)
+            .is_none_or(|n| n.trim().is_empty())
+        {
+            return Err("an add entry needs a non-empty `name`".to_owned());
+        }
+    }
+    Ok(())
 }
 
 /// Apply `policy` to a request body in place.
@@ -174,8 +212,13 @@ pub fn apply(body: &mut Value, policy: &Policy, takes_cache: bool) -> Report {
 
     report.offered = tools.len();
     let first_turn = is_first_turn(body);
-    let pins = referenced_names(body);
-    let keep = pins;
+    let mut keep = referenced_names(body);
+    // A forced tool is a pin the body states outright. Folded in here rather
+    // than given an arm of its own so it inherits the same protection — and so
+    // `disable` cannot win against it, which is the whole reason it is here.
+    if let Some(forced) = forced_name(body) {
+        keep.insert(forced.to_owned());
+    }
     let disabled: std::collections::HashSet<&str> = policy.disable.iter().map(String::as_str).collect();
 
     let mut sent: Vec<Value> = Vec::with_capacity(tools.len());
@@ -394,6 +437,25 @@ fn messages(body: &Value) -> impl Iterator<Item = &Value> {
         .iter()
 }
 
+/// The tool `tool_choice` forces, if it names one.
+///
+/// `tool_choice: {"type":"tool","name":"X"}` is a demand, not a hint: upstream
+/// rejects the request if `X` is absent from `tools[]`. It reads as the same
+/// kind of thing as a pin — a name that must survive — but it arrives somewhere
+/// neither of the other two guards looks, so a policy that filters perfectly
+/// still 400s on the one request that used it.
+///
+/// Only the named form. `auto`, `any` and `none` name nothing, and `any`
+/// merely requires *some* tool to remain, which is the one case a policy that
+/// empties the array breaks regardless of what this returns.
+fn forced_name(body: &Value) -> Option<&str> {
+    let choice = body.get("tool_choice")?;
+    if choice.get("type").and_then(Value::as_str) != Some("tool") {
+        return None;
+    }
+    choice.get("name").and_then(Value::as_str).filter(|n| !n.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -438,6 +500,42 @@ mod tests {
         let before = body.clone();
         apply(&mut body, &Policy::default(), false);
         assert_eq!(body, before, "an untouched array is not rebuilt, so no stripping");
+    }
+
+    /// `allow` belongs to one mode and is dead weight in the others. Locked
+    /// down because the other reading is plausible enough to "fix" into
+    /// existence: a populated `allow` under `all` looks like a policy that
+    /// should run, and making it run would re-encode the body — reordering
+    /// every key through `serde_json` — to accomplish nothing.
+    #[test]
+    fn an_allow_list_under_the_mode_that_ignores_it_is_still_a_noop() {
+        let policy = Policy {
+            mode: Mode::All,
+            allow: vec!["Read".into(), "Bash".into()],
+            ..Policy::default()
+        };
+        assert!(is_noop(&policy), "`all` never consults the list");
+        let mut body = request(&["Read", "Bash", "WebFetch"]);
+        let before = body.clone();
+        let report = apply(&mut body, &policy, true);
+        assert_eq!(body, before, "byte-identical, not merely equivalent");
+        assert!(!report.changed());
+    }
+
+    /// …but the same list is not a no-op under the mode that reads it, which
+    /// is the half that keeps the test above from proving too much.
+    #[test]
+    fn the_same_allow_list_acts_once_the_mode_reads_it() {
+        let policy = Policy {
+            mode: Mode::Allow,
+            allow: vec!["Read".into(), "Bash".into()],
+            ..Policy::default()
+        };
+        assert!(!is_noop(&policy));
+        let mut body = request(&["Read", "Bash", "WebFetch"]);
+        let report = apply(&mut body, &policy, true);
+        assert_eq!(report.removed, vec!["WebFetch".to_owned()]);
+        assert_eq!(report.sent, 2);
     }
 
     #[test]
@@ -502,6 +600,38 @@ mod tests {
         assert_eq!(names(&body), ["Read", "Bash"], "pinned, so not removed");
         assert!(report.removed.is_empty());
         assert_eq!(report.pinned, ["Bash"]);
+    }
+
+    #[test]
+    fn a_forced_tool_choice_outranks_the_mode_and_disable() {
+        // Upstream rejects a request whose `tool_choice` names a tool that is
+        // not in `tools[]`. Whichever way the policy would have gone, this
+        // name has to come out the other side.
+        let policy = Policy {
+            mode: Mode::None,
+            disable: vec!["Bash".into()],
+            ..Policy::default()
+        };
+        let mut body = request(&["Read", "Bash", "Edit"]);
+        body["tool_choice"] = json!({"type": "tool", "name": "Bash"});
+        let report = apply(&mut body, &policy, true);
+        assert_eq!(names(&body), ["Bash"]);
+        assert_eq!(report.pinned, ["Bash"]);
+    }
+
+    /// `any` names no tool, so there is nothing to protect — but it does
+    /// require *something* to remain, which means a policy that empties
+    /// `tools[]` breaks it however carefully this one is written.
+    #[test]
+    fn an_unnamed_tool_choice_protects_nothing() {
+        let policy = Policy {
+            mode: Mode::None,
+            ..Policy::default()
+        };
+        let mut body = request(&["Read", "Bash"]);
+        body["tool_choice"] = json!({"type": "any"});
+        apply(&mut body, &policy, true);
+        assert!(names(&body).is_empty(), "an unnamed choice pins nothing");
     }
 
     #[test]

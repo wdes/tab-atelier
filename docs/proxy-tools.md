@@ -215,53 +215,80 @@ default is `all`, and `disable` is a decision, not a fallback.
 
 ## The control
 
-Per-provider, beside `compact`, in the same file routing already reads:
+Per-**account**, beside `compact`, in `users.json` — the same reasoning that put
+compaction there. The operator editing this is looking at a person; routing picks
+the hop per request, so a policy filed under a provider silently comes to mean
+something else the moment that provider stops being where the traffic goes.
 
 ```json
 {
-  "id": "deepseek",
-  "base_url": "https://api.deepseek.com/anthropic",
+  "id": "u_…",
   "compact": "tools_thinking",
   "tools": {
     "mode": "referenced",
-    "pins": ["WebSearch", "Grep"],
-    "rewrite": { "WebSearch": "no-date" }
+    "disable": ["WebSearch"],
+    "allow": [],
+    "add": [
+      { "name": "ListAgents", "description": "…", "input_schema": { "type": "object" } }
+    ]
   }
 }
 ```
 
-`mode` is `all` (default) | `referenced` | `allow` | `none`, with `allow` carrying
-a `names` list. `rewrite` names a normalisation, not a replacement body of text:
-the transformations are fixed and named so that `providers.json` — the file
-operators copy into bug reports — stays readable, and so a rewrite cannot be
-used to smuggle arbitrary prompt injection through the proxy.
+`mode` is `all` (default) | `referenced` | `allow` | `none`. `allow` carries its
+own list in the same object. `disable` is checked after the mode, so it wins over
+`all` — but never over the referenced-union rule below, which is what keeps a
+disabled tool that the history already calls.
 
-In the UI, next to the compaction `<select>`: a mode `<select>`, a checkbox
-list of the tools seen in the last captured request, and a pin field. The
-capture already stores the request whole, so the list is free.
+`add` is the override: a definition injected when the client did not send one.
+Redefining a name the client *did* send is refused per request rather than
+applied, because silently replacing the definition a session is mid-way through
+is how a working tool turns into a mysteriously broken one. Names are matched
+loosely (case-insensitively) so `Bash` and `bash` cannot both be live.
 
-Hook point is unchanged — inside `shape_and_admit`, on the same `Value`, after
-the route is chosen. The history walk is the one `compact.rs` already performs.
+**`rewrite` is not implemented.** It was the third verb in the original design —
+a fixed, named normalisation of a tool's description (strip a date, drop a
+provider claim) rather than a free-text replacement, so that `providers.json`
+stays readable and cannot smuggle prompt injection. It is the most valuable of
+the three on the Anthropic hop, because a description that stops changing is a
+prefix that stops changing, but it needs the named-normalisation catalogue and
+its tests before it can safely exist. The `tools` object above has no such key;
+adding one is a separate change.
 
-**`none` is not a useful setting** and should be refused on a provider that
-serves Claude Code: a request with no tools cannot act. It exists only for
-completeness and for non-coding clients.
+The write is whole-object (`POST /api/users/<id>/tools`), not field-at-a-time:
+`allow` means nothing apart from the mode that reads it, and `mode: allow` with
+no list is `none` under another name. Partial writes are the only way to leave a
+half-applied policy behind, so there are none.
 
-**A policy that cannot be correct on the Anthropic hop should not be
-offerable there** — the same rule the compaction control carries. Since
-editing `tools[]` costs the cache it is meant to save, `compact: none` plus
-`tools.mode: all` is the correct configuration on a `claude_oauth` provider,
-and the UI should say so rather than permit the combination silently.
+### The two guards the field names invite you to get wrong
+
+**`mode: none` is not a tool-removal switch.** It removes what the *client*
+offers; it does not remove what `add` injects, and a body carrying no `tools[]`
+at all still gets its additions. `disable: ["Bash"]` is how you remove one tool
+by name. The two are easy to reach for interchangeably and only one of them is
+right for any given intent.
+
+**A policy for `add` with an empty `name` is refused at the API**, not silently
+stored. An empty name matches nothing and can never match anything, so a policy
+holding one is a typo that would be inert forever — the exact failure the
+`Refusal` report exists to surface, caught one layer earlier where it can still
+be reported to the person who made it.
+
 
 ## The honest limits
 
-**Pins go stale.** A pinned tool the client no longer ships does nothing, which
-is harmless, but a tool the operator forgot to pin is one the model cannot use.
-`referenced` is conservative by construction; a pin list is a human promise.
+**An `add` definition is a promise the operator makes.** A name the client never
+sends is a tool the model can call and nothing can answer — the proxy does not
+execute tools, it only describes them. `add` is for restoring a tool the client
+stopped shipping, or for a tool the client's own config cannot express; it is not
+a way to give the model capabilities the harness will not perform.
 
 **`referenced` cannot bootstrap.** It is the right default for a session in
 progress and the wrong one at turn one, and there is no way to tell the two
-apart from a single body. If it is enabled globally, the pins carry the load.
+apart from a single body. A session that starts under `referenced` gets only
+`ToolSearch` (kept unconditionally) until the client sends real `tools[]`, which
+Claude Code does on its first turn. On a client that does not, `referenced` is
+`none` and the pins never arrive; `add` is what makes that configuration work.
 
 **The volatility argument is measured, the prefix argument is inferred.** That
 the client's own session served 77,312 of 77,507 tokens from cache on its 77th
