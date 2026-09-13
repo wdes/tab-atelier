@@ -17,10 +17,16 @@
 //! The declaration is deliberately **not** rebuilt as a callable function tool.
 //! A callable tool is one the model may call, and a call to a tool the client
 //! has never heard of returns to the client as a call it cannot run. The data
-//! goes in as a completed exchange instead — the call already made, the result
-//! already in hand — so the model reads the data without ever being able to ask
-//! for it. The client stores only the model's answer, never this exchange, so
-//! the injection does not accumulate across turns.
+//! goes in as an aside on the caller's own turn instead, so the model reads the
+//! data without ever being able to ask for it. The client stores only the
+//! model's answer, never this aside, so the injection does not accumulate
+//! across turns.
+//!
+//! It is also deliberately not a fabricated `tool_use`/`tool_result` exchange.
+//! That shape means inventing an assistant turn the model never took, and any
+//! vendor running in a thinking mode rejects one: `DeepSeek`'s Anthropic endpoint
+//! requires an assistant turn's `thinking` blocks be passed back with it, and a
+//! turn that did not happen has none to pass. A text block cannot trip that.
 
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -52,11 +58,6 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 /// body is injected into a prompt, and a prompt is billed by the token.
 const MAX_BYTES: u64 = 64 * 1024;
 
-/// Fixed rather than generated: the exchange lives for exactly one request, and
-/// the client never echoes it back, so there is nothing for two ids to collide
-/// with. A random one would only make the capture harder to read.
-const TOOL_USE_ID: &str = "srvtoolu_cloudflare_ips";
-
 static CACHE: OnceLock<Mutex<Option<(Instant, String)>>> = OnceLock::new();
 
 /// Whether this name is one the proxy answers rather than forwards.
@@ -68,50 +69,71 @@ pub const fn is_local(name: &str) -> bool {
     name.eq_ignore_ascii_case(CLOUDFLARE_IPS)
 }
 
-/// Put the tool's result in `messages[]`, if the policy asked for it.
+/// Put the tool's data in `messages[]`, if the policy asked for it.
 ///
 /// `names` is whatever the policy's `add` list resolved to as local; only
 /// [`CLOUDFLARE_IPS`] is understood today, and an unrecognised name is dropped
-/// rather than injected as a result for a call that never happened.
+/// rather than injected as data for a lookup that never happened.
 pub fn inject(body: &mut Value, names: &[String]) {
     if !names.iter().any(|name| is_local(name)) {
         return;
     }
     let text = ranges().unwrap_or_else(|err| {
         log::warn!("proxy: {CLOUDFLARE_IPS}: {err}");
-        // A real tool that fails still hands back a result saying so, and the
+        // A real tool that fails still hands back something saying so, and the
         // model gets to decide what that means. Silence would be a stranger
-        // failure: the tool call is in the transcript either way.
+        // failure: the aside is in the prompt either way.
         format!("{CLOUDFLARE_IPS} could not be fetched: {err}")
     });
-    inject_exchange(body, &text);
+    inject_note(body, &text);
 }
 
-/// The completed call-and-result pair, appended after the caller's messages.
+/// The fetched data as an aside on the conversation's last turn, so the model
+/// reads the caller's question, then the data, then answers with it in hand.
 ///
-/// It goes last so the model reads the caller's question, then the data, then
-/// answers the question with the data in hand.
-fn inject_exchange(body: &mut Value, text: &str) {
+/// The data joins a trailing user turn rather than starting a second user
+/// message: two user turns in a row is a shape some vendors reject, and the
+/// caller's question and this aside are one turn's worth of reading anyway.
+/// When the caller ended on an assistant turn — a prefill — there is nothing to
+/// join, so a user turn is added.
+fn inject_note(body: &mut Value, text: &str) {
     let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
         return;
     };
-    messages.push(json!({
-        "role": "assistant",
-        "content": [{
-            "type": "tool_use",
-            "id": TOOL_USE_ID,
-            "name": CLOUDFLARE_IPS,
-            "input": {},
-        }],
-    }));
-    messages.push(json!({
-        "role": "user",
-        "content": [{
-            "type": "tool_result",
-            "tool_use_id": TOOL_USE_ID,
-            "content": text,
-        }],
-    }));
+    let note = json!({ "type": "text", "text": format!("{CLOUDFLARE_IPS}:\n{text}") });
+    let ends_on_a_user_turn = messages
+        .last()
+        .and_then(|last| last.get("role"))
+        .and_then(Value::as_str)
+        == Some("user");
+    if ends_on_a_user_turn {
+        if let Some(last) = messages.last_mut() {
+            append_note(last, note);
+        }
+        return;
+    }
+    messages.push(json!({ "role": "user", "content": [note] }));
+}
+
+/// Attach `note` to a message's content, whatever shape that content is in.
+///
+/// A caller's prompt arrives either as a bare string or as an array of blocks.
+/// The string is wrapped in a text block rather than replaced, so nothing the
+/// caller wrote is lost.
+fn append_note(message: &mut Value, note: Value) {
+    match message.get_mut("content") {
+        Some(Value::Array(blocks)) => blocks.push(note),
+        Some(slot) => {
+            let prior = match slot {
+                Value::String(prompt) => {
+                    vec![json!({ "type": "text", "text": std::mem::take(prompt) })]
+                }
+                _ => Vec::new(),
+            };
+            *slot = Value::Array(prior.into_iter().chain([note]).collect());
+        }
+        None => message["content"] = Value::Array(vec![note]),
+    }
 }
 
 /// The concatenated lists, cached for [`TTL`].
@@ -199,32 +221,70 @@ mod tests {
     }
 
     #[test]
-    fn the_result_is_appended_as_a_completed_exchange() {
+    fn the_result_joins_the_callers_last_turn() {
         let mut body = json!({"messages": [{"role": "user", "content": "hi"}]});
-        inject_exchange(&mut body, "1.1.1.1/32");
+        inject_note(&mut body, "1.1.1.1/32");
         assert_eq!(
             body["messages"].as_array().map(Vec::len),
-            Some(3),
-            "the exchange is two messages on top of the caller's one"
+            Some(1),
+            "no message is invented: the aside joins the caller's turn"
         );
-        let call = &body["messages"][1];
-        assert_eq!(call["role"], "assistant");
-        assert_eq!(call["content"][0]["type"], "tool_use");
-        assert_eq!(call["content"][0]["name"], CLOUDFLARE_IPS);
-        let result = &body["messages"][2];
-        assert_eq!(result["role"], "user");
-        assert_eq!(result["content"][0]["type"], "tool_result");
-        assert_eq!(result["content"][0]["content"], "1.1.1.1/32");
-        assert_eq!(
-            call["content"][0]["id"], result["content"][0]["tool_use_id"],
-            "the result must name the call it answers"
+        let content = body["messages"][0]["content"]
+            .as_array()
+            .expect("the string content became blocks");
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "hi", "the caller's prompt survives");
+        assert_eq!(content[1]["type"], "text");
+        assert!(
+            content[1]["text"].as_str().is_some_and(|t| t.contains("1.1.1.1/32")),
+            "the data is in the aside: {}",
+            content[1]["text"]
         );
+    }
+
+    /// The regression this exists for: `DeepSeek`'s Anthropic endpoint rejects a
+    /// thinking-mode assistant turn that carries no `thinking` block, and a
+    /// fabricated `tool_use` turn carried none.
+    #[test]
+    fn no_assistant_turn_is_invented() {
+        let mut body = json!({"messages": [{"role": "user", "content": "hi"}]});
+        inject_note(&mut body, "1.1.1.1/32");
+        let roles: Vec<&str> = body["messages"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .filter_map(|m| m["role"].as_str())
+            .collect();
+        assert_eq!(roles, ["user"], "the model is never told it acted");
+        let types: Vec<&str> = body["messages"][0]["content"]
+            .as_array()
+            .expect("blocks")
+            .iter()
+            .filter_map(|b| b["type"].as_str())
+            .collect();
+        assert_eq!(types, ["text", "text"], "no tool_use, no tool_result");
+    }
+
+    #[test]
+    fn a_prefill_gets_a_turn_of_its_own() {
+        let mut body = json!({
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "Sure"},
+            ]
+        });
+        inject_note(&mut body, "1.1.1.1/32");
+        let messages = body["messages"].as_array().expect("array");
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[2]["content"][0]["type"], "text");
     }
 
     #[test]
     fn a_body_without_messages_is_left_alone() {
         let mut body = json!({"tools": []});
-        inject_exchange(&mut body, "1.1.1.1/32");
+        inject_note(&mut body, "1.1.1.1/32");
         assert_eq!(body, json!({"tools": []}));
     }
 
