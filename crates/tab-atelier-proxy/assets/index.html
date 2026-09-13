@@ -879,10 +879,15 @@
                        On the OpenAI wire a model cannot take tools and
                        reasoning at once — a request with function tools must
                        force reasoning off — so the list carries two entries per
-                       such model. The value is `model#flavour`; choosing the
-                       reasoning flavour also clears the tool policy, which is
-                       what lifts the tools from the request. See modelChoices
-                       and setUserModel. -->
+                       such model. The value is `model#flavour`. The flavour is
+                       not stored separately — it IS the tool mode, since on
+                       this wire whether tools may ride along is exactly
+                       whether reasoning is on. So each choice has to move the
+                       mode: "reasoning" sets `none`, and "tools" has to clear
+                       that `none` back to `all`, or the select would snap back
+                       to the label it was already showing. Both directions are
+                       in setUserModel.
+                       See modelChoices and setUserModel. -->
                   <select class="form-select form-select-sm" autocomplete="off"
                           style="min-width: 15rem"
                           :value="userModelValue(u)"
