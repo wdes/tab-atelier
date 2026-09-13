@@ -6351,6 +6351,7 @@ dependencies = [
 name = "tab-atelier-proxy"
 version = "0.5.0-dev"
 dependencies = [
+ "base64",
  "bytes",
  "clap",
  "claude-api",

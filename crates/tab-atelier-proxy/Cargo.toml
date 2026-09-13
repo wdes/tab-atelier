@@ -35,6 +35,9 @@ http-body-util = "0.1"
 bytes = "1"
 futures-util = { version = "0.3", default-features = false }
 sha2 = { version = "0.10", default-features = false }
+# Subresource Integrity, which mandates base64 — hex cannot stand in for it.
+# Already in this crate's graph via ureq, so declaring it costs no compile unit.
+base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
 # Timestamp parsing for the usage log. Spelled exactly as env_logger declares
 # it, so this is the same rlib the proxy already builds via env_logger's

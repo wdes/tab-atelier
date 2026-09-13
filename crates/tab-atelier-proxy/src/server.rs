@@ -2468,6 +2468,24 @@ fn content_hash(bytes: &[u8]) -> String {
     out
 }
 
+/// The Subresource Integrity value for an asset: the digest a browser checks
+/// the bytes against before it will run them.
+///
+/// `sha384` because that is what SRI tooling conventionally emits. The digest
+/// is taken over the bytes as served, which is what the browser hashes too, so
+/// a response that arrives any different is refused rather than executed —
+/// which is the point: an intermediary serving a stale copy under a fresh URL
+/// fails loudly instead of running old code against new markup.
+fn integrity(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha384};
+    let digest = Sha384::digest(bytes);
+    format!(
+        "sha384-{}",
+        base64::engine::general_purpose::STANDARD.encode(&digest[..])
+    )
+}
+
 /// Rewrite `index.html` so every asset it names is fetched from a URL carrying
 /// that asset's current content hash.
 ///
@@ -2476,6 +2494,11 @@ fn content_hash(bytes: &[u8]) -> String {
 /// nothing has to be revalidated. Only the references are touched — no
 /// templating, no placeholder syntax to keep in sync — so the file on disk
 /// stays valid HTML that opens straight from a checkout.
+///
+/// Each reference also gains an `integrity` attribute, taken from the same read
+/// that produced the URL. Every entry in `VERSIONED` is a script or a
+/// stylesheet, which is what `integrity` means something on; an asset used as
+/// anything else does not belong in that list.
 fn versioned_index(root: &std::path::Path, html: &str) -> String {
     let mut out = html.to_owned();
     for rel in VERSIONED {
@@ -2484,7 +2507,14 @@ fn versioned_index(root: &std::path::Path, html: &str) -> String {
             // 404 says so rather than a broken URL hiding which one it was.
             continue;
         };
-        out = out.replace(&format!("\"{rel}\""), &format!("\"{rel}?v={}\"", content_hash(&bytes)));
+        out = out.replace(
+            &format!("\"{rel}\""),
+            &format!(
+                "\"{rel}?v={}\" integrity=\"{}\"",
+                content_hash(&bytes),
+                integrity(&bytes)
+            ),
+        );
     }
     out
 }
@@ -2495,6 +2525,30 @@ fn versioned_index(root: &std::path::Path, html: &str) -> String {
 /// than canonicalising and comparing: there is nothing under this root a
 /// caller should reach by climbing, so the simplest rule that cannot be
 /// subtly wrong is the right one.
+/// The rewritten index, computed once per process.
+///
+/// The bytes on disk cannot change under a running process, and a browser asks
+/// for this page once per session, so re-reading and re-digesting the assets on
+/// every hit buys nothing. There is one root per process by construction: the
+/// dev tree or the installed package, chosen when the state is built.
+static VERSIONED_INDEX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The UI's index, with each asset reference versioned and verified.
+fn served_index(root: &std::path::Path) -> &'static str {
+    VERSIONED_INDEX.get_or_init(|| {
+        // `asset_bytes` has already established this file exists.
+        let Ok(bytes) = std::fs::read(root.join("index.html")) else {
+            return String::new();
+        };
+        match String::from_utf8(bytes) {
+            Ok(html) => versioned_index(root, &html),
+            // Not UTF-8, so not ours to rewrite; serve it as found rather than
+            // fail a page load over a rewrite that could not be performed.
+            Err(e) => String::from_utf8_lossy(&e.into_bytes()).into_owned(),
+        }
+    })
+}
+
 fn web(path: &str, state: &State) -> Response<Body> {
     let Some(root) = state.web_root.as_ref() else {
         return text(404, "web UI not installed");
@@ -2529,15 +2583,12 @@ fn web(path: &str, state: &State) -> Response<Body> {
     } else {
         "public, max-age=31536000, immutable"
     };
-    let bytes = if rel == "index.html" {
-        match String::from_utf8(bytes) {
-            Ok(html) => versioned_index(root, &html).into_bytes(),
-            // Not UTF-8, so not ours; serve it as found rather than fail a
-            // page load over a rewrite that could not be performed.
-            Err(e) => e.into_bytes(),
-        }
+    // The index costs no copy: `served_index` hands back a `&'static str`, so
+    // its bytes are static too.
+    let body = if rel == "index.html" {
+        Bytes::from_static(served_index(root).as_bytes())
     } else {
-        bytes
+        Bytes::from(bytes)
     };
     Response::builder()
         .status(200)
@@ -2548,7 +2599,7 @@ fn web(path: &str, state: &State) -> Response<Body> {
         .header("x-content-type-options", "nosniff")
         .header("x-frame-options", "DENY")
         .header("referrer-policy", "no-referrer")
-        .body(Full::new(Bytes::from(bytes)).boxed())
+        .body(Full::new(body).boxed())
         .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()).boxed()))
 }
 
@@ -2628,6 +2679,45 @@ mod tests {
             serde_json::Value::Null,
         ] {
             assert!(tools_body(&body).is_none(), "{body}");
+        }
+    }
+
+    /// SRI is worth nothing unless the advertised digest is the digest of the
+    /// bytes actually served. Both come from one read here, so pin the shape a
+    /// browser insists on: the algorithm prefix, and base64 that decodes to the
+    /// 48 bytes sha384 is.
+    #[test]
+    fn an_integrity_digest_is_a_base64_sha384() {
+        use base64::Engine as _;
+        let sri = integrity(b"alert(1)");
+        let encoded = sri
+            .strip_prefix("sha384-")
+            .expect("the algorithm prefix a browser requires");
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("valid base64");
+        assert_eq!(raw.len(), 48, "sha384 is 48 bytes");
+        assert_ne!(sri, integrity(b"alert(2)"), "different bytes must not share a digest");
+    }
+
+    /// The shipped page, against the shipped assets: every reference the browser
+    /// will act on is versioned, and each one advertises a digest. A reference
+    /// missed here is a stale asset no cache header can save.
+    #[test]
+    fn the_ui_is_served_with_versioned_and_verified_assets() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+        let html = std::fs::read_to_string(root.join("index.html")).expect("the committed UI");
+        let out = versioned_index(&root, &html);
+        for rel in VERSIONED {
+            let marker = format!("\"{rel}?v=");
+            let at = out
+                .find(&marker)
+                .unwrap_or_else(|| panic!("{rel} is not versioned anywhere in the page"));
+            let reference = &out[at..out.len().min(at + 128)];
+            assert!(
+                reference.contains("integrity=\"sha384-"),
+                "{rel} is versioned but carries no digest: {reference}"
+            );
         }
     }
 
