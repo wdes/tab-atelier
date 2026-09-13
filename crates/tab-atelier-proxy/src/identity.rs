@@ -73,24 +73,119 @@ impl Vendor {
     }
 }
 
-/// Rewrite the system prompt of `body` for `vendor`.
+/// Rewrite the request's prose for `vendor`.
+///
+/// Two places carry it, and the second is the one that bites: the system
+/// prompt, and the tool definitions. `Claude Code` writes its own commit and PR
+/// conventions into the `Bash` tool's description — `Co-Authored-By: Claude
+/// …` among them — so a rewrite that walks `system` alone leaves the
+/// attribution sitting in `tools[].description`, untouched and sent to a
+/// competitor's model. Tool *names* are never touched; only prose is.
+///
+/// One rule is conditional rather than textual: the sentence forbidding the
+/// Agent tool is dropped only when the body no longer offers one. That is a
+/// question about `tools[]`, so it is asked here — this runs after the tool
+/// policy, on the list that will actually be sent.
 pub fn apply(body: &mut Value, vendor: Vendor, model: &str) {
     if vendor == Vendor::Anthropic {
         return;
     }
     let trailer = vendor.trailer(model);
-    let Some(system) = body.get_mut("system") else {
-        return;
-    };
-    match system {
-        Value::String(text) => *text = rewrite(text, trailer.as_deref(), model),
-        // A system prompt is a string or a list of text blocks. Both spellings
-        // are in use, and a client is free to pick either.
-        Value::Array(blocks) => {
-            for block in blocks {
-                if let Some(Value::String(text)) = block.get_mut("text") {
-                    *text = rewrite(text, trailer.as_deref(), model);
+    let drop_agent_rule = agent_rule_is_dangling(body);
+    if let Some(system) = body.get_mut("system") {
+        match system {
+            Value::String(text) => {
+                *text = system_rewrite(text, trailer.as_deref(), model, drop_agent_rule);
+            }
+            // A system prompt is a string or a list of text blocks. Both
+            // spellings are in use, and a client is free to pick either.
+            Value::Array(blocks) => {
+                for block in blocks {
+                    if let Some(Value::String(text)) = block.get_mut("text") {
+                        *text = system_rewrite(text, trailer.as_deref(), model, drop_agent_rule);
+                    }
                 }
+            }
+            _ => {}
+        }
+    }
+    if let Some(tools) = body.get_mut("tools") {
+        rewrite_descriptions(tools, trailer.as_deref(), model);
+    }
+}
+
+/// `system` text with the unconditional rules applied, then the Agent sentence
+/// removed if it has nothing left to govern.
+fn system_rewrite(text: &str, trailer: Option<&str>, model: &str, drop_agent_rule: bool) -> String {
+    let text = rewrite(text, trailer, model);
+    if drop_agent_rule { strip_agent_rule(&text) } else { text }
+}
+
+/// The tools the "do not use the Agent tool…" sentence governs.
+///
+/// `Agent` is the current name and `Task` the former one; both spellings ship.
+/// `Workflow` and `DeepResearch` are guesses at the other two things the
+/// sentence lists, and a name that never appears costs nothing here — it can
+/// only ever count as absent. An unrecognized spelling is the one error that
+/// matters, and it fails toward keeping the sentence.
+const AGENT_RULE_TOOLS: [&str; 4] = ["Agent", "Task", "Workflow", "DeepResearch"];
+
+/// Whether the sentence forbidding the Agent tool has nothing left to forbid.
+///
+/// Asked of the body rather than of the text, because the answer is about what
+/// the tool policy sent, not about what the sentence says. A body with no
+/// `tools[]` at all keeps the sentence: sending no tools is not evidence a tool
+/// was removed, and a request that carries none was not written for this rule.
+fn agent_rule_is_dangling(body: &Value) -> bool {
+    let Some(tools) = body.get("tools").and_then(Value::as_array) else {
+        return false;
+    };
+    let names_a_governed_tool = |tool: &Value| {
+        tool.get("name")
+            .or_else(|| tool.pointer("/function/name"))
+            .and_then(Value::as_str)
+            .is_some_and(|name| AGENT_RULE_TOOLS.iter().any(|known| known.eq_ignore_ascii_case(name)))
+    };
+    !tools.iter().any(names_a_governed_tool)
+}
+
+/// Drop the sentence forbidding the Agent tool, whole lines only.
+///
+/// Matched on its opening clause: `do not use the agent tool` is specific to
+/// this sentence, while its tail — `unless the user, a CLAUDE.md file, or a
+/// skill asks for it` — is the shape of any permission rule and would
+/// over-match. Lines are the unit, as everywhere else here.
+fn strip_agent_rule(text: &str) -> String {
+    const NEEDLE: &str = "do not use the agent tool";
+    text.split_inclusive('\n')
+        .filter(|line| !line.to_ascii_lowercase().contains(NEEDLE))
+        .collect()
+}
+
+/// Rewrite every `description` string under `value`, at any depth.
+///
+/// Recursive because the prose is not only at the top: a tool's
+/// `input_schema` describes each of its own properties, and those
+/// descriptions are written by the same client. Keyed on the word
+/// `description` rather than on a path, so it finds them both — and never
+/// matches a `name`, an `enum` value or a `type`, which are the members a
+/// rewrite would actually break.
+fn rewrite_descriptions(value: &mut Value, trailer: Option<&str>, model: &str) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                if key == "description"
+                    && let Value::String(text) = child
+                {
+                    *text = rewrite(text, trailer, model);
+                    continue;
+                }
+                rewrite_descriptions(child, trailer, model);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                rewrite_descriptions(item, trailer, model);
             }
         }
         _ => {}
@@ -147,7 +242,14 @@ fn model_line(line: &str, model: &str) -> Option<String> {
     if !line.is_char_boundary(at) {
         return None;
     }
-    Some(format!("{}You are powered by the model named {model}.", &line[..at]))
+    // The line terminator is part of the line: `split_inclusive` kept it, and
+    // rebuilding without it would run this line into the next one. Only the
+    // text after the needle is dropped, not the break that follows it.
+    let end = &line[line.trim_end_matches('\n').len()..];
+    Some(format!(
+        "{}You are powered by the model named {model}.{end}",
+        &line[..at]
+    ))
 }
 
 fn dropped(line: &str) -> bool {
@@ -161,8 +263,30 @@ fn dropped(line: &str) -> bool {
         || lower.starts_with("end pr bodies with")
         || lower.starts_with("assistant knowledge cutoff is")
         || lower.starts_with("the most recent claude model family is")
+        || lower.starts_with("the most recent claude models are")
         || lower.starts_with("claude code is available as a")
         || lower.starts_with("fast mode for claude code")
+        // The security-scope paragraph. Anthropic's policy, addressed to Claude
+        // by name, and the only entry in this list that constrains behaviour
+        // rather than branding. Dropping it is therefore not cosmetic: the
+        // request goes on governed by the answering model's own policy, which
+        // is the arrangement the operator chose by routing here in the first
+        // place — not a second vendor's instructions carried along unread.
+        //
+        // Matched on the tail, not the head, unlike its neighbours. The head of
+        // this one is generic — "IMPORTANT: …" is how anyone opens a directive,
+        // so a `starts_with` on it would delete a real instruction that merely
+        // began the same way, and would miss this one entirely if the client
+        // prefixed it with a marker other than `-`. The clause at the end is
+        // unique to this sentence, so quoting it in some other line is the only
+        // way to over-match, and that is not a thing clients do.
+        //
+        // The client sends the paragraph as one unbroken line. Were it ever
+        // hard-wrapped, no line would carry the tail and the opening line would
+        // survive — the price of per-line matching, paid by every rule here.
+        || lower.contains(
+            "pentesting engagements, ctf competitions, security research, or defensive use cases",
+        )
 }
 
 /// Replace each `Co-Authored-By: … <…>` on its line with `replacement`.
@@ -178,21 +302,40 @@ fn rewrite_trailer(text: &str, replacement: &str) -> String {
             out.push_str(line);
             continue;
         };
-        // The name sits between `<` and `>`; a line mentioning the trailer
-        // without both is prose about it, not a trailer, and is left alone.
-        let (Some(open), Some(close)) = (line[start..].find('<'), line[start..].find('>')) else {
+        // A line mentioning the trailer with no address at all is prose about
+        // it, not a trailer, and is left alone.
+        let Some(end) = closing_bracket(&line[start..]) else {
             out.push_str(line);
             continue;
         };
-        if open >= close {
-            out.push_str(line);
-            continue;
-        }
         out.push_str(&line[..start]);
         out.push_str(replacement);
-        out.push_str(&line[start + close + 1..]);
+        // Whatever closed the address is the last thing replaced; the rest of
+        // the line, break included, is kept as it was.
+        out.push_str(&line[start + end..]);
     }
     out
+}
+
+/// The byte just past the address in `rest`, if `rest` holds one.
+///
+/// A git trailer writes `Name <mail>`; the `Bash` tool's description of the
+/// same convention writes `Name (mail)`. Both are shipped by the client, so
+/// both have to close a trailer — matching only angle brackets is how the
+/// `Co-Authored-By` line survived the rewrite that exists to remove it.
+///
+/// Either bracket only closes a trailer if it wraps an `@`: a line that merely
+/// mentions the trailer, `Co-Authored-By: (see the docs)`, is prose about the
+/// convention and is left alone. Every address has an `@`, so requiring one
+/// costs no real trailer and buys back the false positive the second bracket
+/// would otherwise introduce.
+fn closing_bracket(rest: &str) -> Option<usize> {
+    let open = rest.find(['<', '('])?;
+    let close = rest[open..].find(['>', ')'])?;
+    if !rest[open + 1..open + close].contains('@') {
+        return None;
+    }
+    Some(open + close + 1)
 }
 
 fn find_ignoring_ascii_case(haystack: &str, needle: &[u8]) -> Option<usize> {
@@ -339,5 +482,249 @@ mod tests {
         let mut body = json!({ "system": "Write it so you can end PR bodies with a table." });
         apply(&mut body, Vendor::Deepseek, "deepseek-flash");
         assert!(body["system"].as_str().unwrap().contains("end PR bodies with a table."));
+    }
+
+    #[test]
+    fn the_model_line_keeps_its_own_line_break() {
+        // The instruction shares a line with the exact-model-ID sentence and is
+        // followed by a break. Rebuilding it without that break ran it into the
+        // next line the prune had let through, which is how it was noticed.
+        let mut body = json!({
+            "system": concat!(
+                " - You are powered by the model named Opus 4.8. The exact model ID is claude-opus-4-8.\n",
+                " - Assistant knowledge cutoff is January 2026.\n",
+                " - You are an interactive agent.",
+            ),
+        });
+        apply(&mut body, Vendor::Deepseek, "deepseek-flash");
+        let text = body["system"].as_str().unwrap();
+        assert!(
+            text.contains("You are powered by the model named deepseek-flash.\n"),
+            "{text:?}"
+        );
+        assert!(!text.contains("claude-opus-4-8"), "{text:?}");
+        assert!(!text.contains("knowledge cutoff"), "{text:?}");
+        assert!(text.contains("\n - You are an interactive agent."), "{text:?}");
+    }
+
+    #[test]
+    fn the_model_catalogue_goes_whole() {
+        // The real line, verbatim: one bullet, ~330 characters, present tense
+        // and plural ("models are") where the rule had only ever matched a
+        // different phrasing. The catalogue therefore survived the prune.
+        let mut body = json!({
+            "system": concat!(
+                " - The most recent Claude models are the Claude 5 family and Haiku 4.5. ",
+                "Model IDs — Fable 5.1: 'claude-fable-5-1', Opus 5: 'claude-opus-5', ",
+                "Sonnet 5: 'claude-sonnet-5', Haiku 4.5: 'claude-haiku-4-5-20251001'. ",
+                "When building AI applications, default to the latest and most capable Claude models.\n",
+                " - Kept.",
+            ),
+        });
+        apply(&mut body, Vendor::Deepseek, "deepseek-flash");
+        let text = body["system"].as_str().unwrap();
+        assert!(!text.contains("most recent Claude models"), "{text:?}");
+        assert!(!text.contains("claude-fable-5-1"), "{text:?}");
+        assert!(!text.contains("default to the latest and most capable"), "{text:?}");
+        assert!(text.contains("- Kept."), "{text:?}");
+    }
+
+    #[test]
+    fn the_bash_tool_description_carries_the_same_trailer_and_is_rewritten() {
+        // The regression. The client puts its commit and PR conventions in the
+        // `Bash` tool's description, not the system prompt, so a rewrite scoped
+        // to `system` left both the attribution and the PR footer in place.
+        let mut body = json!({
+            "system": "An unrelated prompt.",
+            "tools": [{
+                "name": "Bash",
+                "description": concat!(
+                    "Runs a command.\n",
+                    "- End git commit messages with:\n",
+                    "Co-Authored-By: Claude 4.8 (noreply@anthropic.com)\n",
+                    "- End PR bodies with:\n",
+                    "🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+                ),
+            }],
+        });
+        apply(&mut body, Vendor::Deepseek, "deepseek-flash");
+        let text = body["tools"][0]["description"].as_str().unwrap();
+        assert!(
+            text.contains("Co-authored-by: DeepSeek <noreply@deepseek.com>"),
+            "{text:?}"
+        );
+        assert!(!text.contains("anthropic"), "{text:?}");
+        assert!(!text.contains("Generated with"), "{text:?}");
+        assert!(text.contains("Runs a command."), "{text:?}");
+    }
+
+    #[test]
+    fn a_property_description_inside_a_tool_schema_is_rewritten() {
+        // The prose is not only at the top of a tool: every property carries a
+        // description of its own, written by the same client.
+        let mut body = json!({
+            "tools": [{
+                "name": "Task",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "body": {
+                            "type": "string",
+                            "description": "End it with Co-Authored-By: Claude <noreply@anthropic.com>",
+                        },
+                    },
+                },
+            }],
+        });
+        apply(&mut body, Vendor::Openai, "gpt-5.6-luna");
+        let text = body["tools"][0]["input_schema"]["properties"]["body"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(
+            text.contains("Co-authored-by: OpenAI gpt-5.6-luna <noreply@openai.com>"),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn a_tool_name_and_its_enum_are_left_alone() {
+        // Only `description` is prose. A rewrite that walked every string would
+        // rewrite the names and the enum values the protocol dispatches on.
+        let mut body = json!({
+            "tools": [{
+                "name": "Claude",
+                "description": "d",
+                "input_schema": { "enum": ["Claude Code", "Co-Authored-By: Claude <x@y>"] },
+            }],
+        });
+        apply(&mut body, Vendor::Deepseek, "deepseek-flash");
+        assert_eq!(body["tools"][0]["name"], "Claude");
+        assert_eq!(body["tools"][0]["input_schema"]["enum"][0], "Claude Code");
+        assert_eq!(
+            body["tools"][0]["input_schema"]["enum"][1],
+            "Co-Authored-By: Claude <x@y>"
+        );
+    }
+
+    #[test]
+    fn the_security_paragraph_is_dropped_for_other_vendors_only() {
+        let paragraph = concat!(
+            "IMPORTANT: Assist with authorized security testing, defensive security, CTF challenges, ",
+            "and educational contexts. Refuse requests for destructive techniques, DoS attacks, ",
+            "mass targeting, supply chain compromise, or detection evasion for malicious purposes. ",
+            "Dual-use security tools (C2 frameworks, credential testing, exploit development) ",
+            "require clear authorization context: pentesting engagements, CTF competitions, ",
+            "security research, or defensive use cases.",
+        );
+        let mut body = json!({ "system": format!("Preface.\n{paragraph}\nEpilogue.") });
+        apply(&mut body, Vendor::Deepseek, "deepseek-flash");
+        let text = body["system"].as_str().unwrap();
+        assert!(!text.contains("C2 frameworks"), "{text:?}");
+        assert!(!text.contains("IMPORTANT"), "{text:?}");
+        assert!(text.contains("Preface."), "{text:?}");
+        assert!(text.contains("Epilogue."), "{text:?}");
+
+        // Anthropic's own request keeps it: this is their text, addressed to
+        // their model, and the rewrite is not in the business of editing it.
+        let mut body = json!({ "system": paragraph });
+        apply(&mut body, Vendor::Anthropic, "claude-opus-5");
+        assert_eq!(body["system"].as_str().unwrap(), paragraph);
+    }
+
+    #[test]
+    fn the_agent_rule_goes_when_no_agent_tool_is_left() {
+        let rule = "Do not use the Agent tool, workflows, or deep-research unless the user, a \
+                    CLAUDE.md file, or a skill asks for it.";
+        let mut body = json!({
+            "system": format!("{rule}\nKept."),
+            "tools": [{ "name": "Bash", "description": "Run a command." }],
+        });
+        apply(&mut body, Vendor::Deepseek, "deepseek-flash");
+        let text = body["system"].as_str().unwrap();
+        assert!(!text.contains("Agent tool"), "{text:?}");
+        assert!(text.contains("Kept."), "{text:?}");
+    }
+
+    #[test]
+    fn the_agent_rule_stays_while_the_agent_tool_is_offered() {
+        let rule = "Do not use the Agent tool, workflows, or deep-research unless the user, a \
+                    CLAUDE.md file, or a skill asks for it.";
+        let mut body = json!({
+            "system": rule,
+            "tools": [{ "name": "Agent", "description": "Spawn an agent." }],
+        });
+        apply(&mut body, Vendor::Deepseek, "deepseek-flash");
+        // The other name the same tool ships under.
+        let mut body_b = json!({
+            "system": rule,
+            "tools": [{ "name": "Task", "description": "Spawn a subagent." }],
+        });
+        apply(&mut body_b, Vendor::Deepseek, "deepseek-flash");
+        assert!(body["system"].as_str().unwrap().contains("Agent tool"));
+        assert!(body_b["system"].as_str().unwrap().contains("Agent tool"));
+    }
+
+    #[test]
+    fn the_agent_rule_is_kept_when_the_body_sends_no_tools() {
+        // No `tools[]` is not evidence the tool was removed. Deleting an
+        // instruction on a guess is the failure this guards against.
+        let rule = "Do not use the Agent tool, workflows, or deep-research unless the user, a \
+                    CLAUDE.md file, or a skill asks for it.";
+        let mut body = json!({ "system": rule });
+        apply(&mut body, Vendor::Deepseek, "deepseek-flash");
+        assert!(body["system"].as_str().unwrap().contains("Agent tool"));
+    }
+
+    #[test]
+    fn a_tool_schema_description_is_rewritten_like_the_system_prompt() {
+        // The reported failure: the commit convention lives in the Bash tool's
+        // description, and a `system`-only walk never reached it.
+        let mut body = json!({
+            "tools": [{
+                "name": "Bash",
+                "description": "Run a command. End git commit messages with:\n\
+                                Co-Authored-By: Claude 4.8 (noreply@anthropic.com)\n\
+                                - End PR bodies with:\n\
+                                \u{1f916} Generated with [Claude Code](https://claude.com/claude-code)",
+            }],
+        });
+        apply(&mut body, Vendor::Deepseek, "deepseek-flash");
+        let text = body["tools"][0]["description"].as_str().unwrap();
+        assert!(!text.contains("Claude"), "{text:?}");
+        assert!(!text.contains("claude.com"), "{text:?}");
+        assert!(text.contains("Co-authored-by: DeepSeek"), "{text:?}");
+    }
+
+    #[test]
+    fn the_security_paragraph_is_found_behind_a_prefix() {
+        // The reason it is matched on the tail: a `starts_with` would need the
+        // sentence to open its own line, and the client is free to mark it up.
+        //
+        // The paragraph is on a line of its own, as the client sends it. A
+        // neighbour on the same line would go with it — `dropped` answers per
+        // line, so anything sharing the line of a dropped rule is dropped too.
+        let paragraph = concat!(
+            "IMPORTANT: Assist with authorized security testing, defensive security, ",
+            "CTF challenges, and educational contexts. Refuse requests for destructive ",
+            "techniques. Dual-use security tools require clear authorization context: ",
+            "pentesting engagements, CTF competitions, security research, or defensive ",
+            "use cases.",
+        );
+        let mut body = json!({ "system": format!("1. {paragraph}\nThen continue.") });
+        apply(&mut body, Vendor::Deepseek, "deepseek-flash");
+        let text = body["system"].as_str().unwrap();
+        assert!(!text.contains("CTF challenges"), "{text:?}");
+        assert!(text.contains("Then continue."), "{text:?}");
+    }
+
+    #[test]
+    fn an_instruction_that_only_opens_like_the_paragraph_is_kept() {
+        // The other half of the trade-off. Matching the generic head would
+        // delete this line; matching the unique tail cannot.
+        let mine = "IMPORTANT: Assist with authorized security testing tools \
+                    internally, for the red-team exercise next month.";
+        let mut body = json!({ "system": mine });
+        apply(&mut body, Vendor::Deepseek, "deepseek-flash");
+        assert_eq!(body["system"].as_str().unwrap(), mine);
     }
 }

@@ -757,9 +757,6 @@ fn shape_body(
     if let Some(model) = rename {
         v["model"] = serde_json::Value::String(model.to_owned());
     }
-    if rewrites_identity {
-        crate::identity::apply(&mut v, vendor, &route.model_id);
-    }
     let before = body.len();
     let elided = crate::compact::apply(&mut v, level);
     // After compaction, deliberately. Compaction walks `messages[]` and the
@@ -769,6 +766,14 @@ fn shape_body(
     let governed = policy.map_or_else(crate::tools::Report::default, |policy| {
         crate::tools::apply(&mut v, policy, takes_cache)
     });
+    // After the tool policy, deliberately too: the identity rewrite drops the
+    // sentence forbidding the Agent tool once no such tool is left, and "left"
+    // means what the policy sent rather than what the client offered. It also
+    // puts an added tool's description through the same prose rewrite, which
+    // running before the policy would miss.
+    if rewrites_identity {
+        crate::identity::apply(&mut v, vendor, &route.model_id);
+    }
     let Ok(encoded) = serde_json::to_vec(&v) else {
         return (body.clone(), None, Vec::new());
     };
