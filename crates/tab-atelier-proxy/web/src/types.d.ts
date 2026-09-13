@@ -271,7 +271,13 @@ interface Capture {
     tokens?: CaptureTokens;
     /** What compaction removed, when a level was in force for this request. */
     compaction?: CaptureCompaction;
+    /**
+     * The opening of the reply, as it went to the client, capped server-side.
+     * Verbatim: the panel is where a reply is read, so its shape is preserved.
+     */
     response_excerpt?: string;
+    /** The reply ran past the cap, so the excerpt is a head, not the whole. */
+    response_truncated?: boolean;
 }
 
 /**

@@ -54,6 +54,14 @@ const KEEP: usize = 25;
 /// the disk.
 const MAX_BODY: usize = 4 * 1024 * 1024;
 
+/// How much of a reply is kept on the capture.
+///
+/// Much smaller than [`MAX_BODY`]: a request is kept to be read in full, but a
+/// reply is read to answer "what did it say", and the answer is at the front.
+/// The cap also holds for a streamed reply, which arrives in pieces and would
+/// otherwise accumulate every token of a long generation.
+pub const MAX_EXCERPT: usize = 8 * 1024;
+
 /// Longest an inspection window may be armed for.
 ///
 /// A cap rather than a suggestion: the reason this exists is that a switch
@@ -150,8 +158,18 @@ pub struct Capture {
     /// How the request arrived — see [`Origin`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<Origin>,
+    /// The head of the reply, as the client received it.
+    ///
+    /// Streamed replies are the raw SSE frames, not a JSON document, so this is
+    /// kept verbatim and shown verbatim. It exists to separate "the request was
+    /// rejected" from "the model answered with nothing", which look identical
+    /// from the request side alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_excerpt: Option<String>,
+    /// True when [`MAX_EXCERPT`] cut the reply. Stated for the same reason as
+    /// [`Self::request_truncated`]: a clipped reply is not a short one.
+    #[serde(default)]
+    pub response_truncated: bool,
 }
 
 /// What one compaction pass removed, recorded on the capture.
@@ -416,6 +434,7 @@ pub fn capture(o: &Outgoing<'_>) -> Capture {
             .collect(),
         request_body,
         request_truncated,
+        response_truncated: false,
         status: None,
         tokens: None,
         // Filled in by the caller, which is the only thing that knows whether
