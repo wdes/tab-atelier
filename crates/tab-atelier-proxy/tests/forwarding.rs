@@ -18,7 +18,7 @@ static EGRESS: Mutex<()> = Mutex::new(());
 
 use tab_atelier_proxy::provider::{Auth, Class, Model, Provider, Registry, Wire};
 use tab_atelier_proxy::server::{State, serve_on};
-use tab_atelier_proxy::{account, egress, qos, usage, users::Store};
+use tab_atelier_proxy::{account, egress, qos, tools, usage, users::Store};
 
 /// A mock Anthropic that records what it was sent, then streams two SSE frames
 /// with a gap between them and closes.
@@ -902,4 +902,99 @@ thread_local! {
     /// which is what [`state_with`] does here.
     static LEAKED_KEYS: std::cell::RefCell<std::collections::HashMap<String, String>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// A tool the proxy answers itself is resolved here, not asked of the far end.
+///
+/// The declaration never leaves: the far end has no such `type` and refuses the
+/// whole body over it (which is how the `ou_est_charlie` incident produced a
+/// 400 on every request of a session). What the upstream sees instead is a
+/// finished call-and-result, so the model reads the data without ever being
+/// able to ask for it.
+#[test]
+fn a_local_tool_is_resolved_by_the_proxy_and_never_asked_upstream() {
+    let _serial = EGRESS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (upstream, seen) = mock_status(200, "{\"usage\":{\"input_tokens\":3,\"output_tokens\":4}}");
+    let dir = scratch("localtool");
+    let stub_key = dir.join("stub.key");
+    std::fs::write(&stub_key, "sk-stub-provider").expect("write stub key");
+    let provider = stub_provider("primary", upstream, 0, &stub_key);
+
+    let mut store = Store::load(dir.join("users.json")).expect("store");
+    let a = store.add("Ada", "Lovelace", "ada@example.org").expect("add");
+    // Opting in is declaring the name, exactly as for any other injected tool.
+    let declared = serde_json::json!({
+        "type": "cloudflare_ips_20260913",
+        "name": "cloudflare_ips",
+    });
+    store
+        .set_tools(
+            &a.id,
+            tools::Policy {
+                add: vec![declared],
+                ..tools::Policy::default()
+            },
+        )
+        .expect("set tools");
+    let (_k, key) = store.add_key(&a.email, "laptop").expect("key");
+    let state = Arc::new(State {
+        store: Mutex::new(store),
+        usage: Mutex::new(usage::Store::load(dir.join("usage"))),
+        sched: Mutex::new(qos::Sched::new()),
+        account: Mutex::new(account::Monitor::load(&dir)),
+        inspect: Mutex::new(tab_atelier_proxy::inspect::Store::load(std::env::temp_dir())),
+        wake: tokio::sync::Notify::new(),
+        registry: Mutex::new(Registry {
+            mappings: vec![],
+            providers: vec![provider],
+        }),
+        registry_path: dir.join("providers.json"),
+        provider_backoff: Mutex::new(std::collections::BTreeMap::new()),
+        admin_token: "tap_admin".to_owned(),
+        web_root: None,
+    });
+    let served = serve(&state);
+
+    let payload = r#"{"model":"primary-balanced","max_tokens":16,"tools":[{"name":"Bash","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"the cloudflare ranges?"}]}"#;
+    let resp = request(
+        served.port,
+        &format!(
+            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {key}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+            payload.len()
+        ),
+    );
+    assert!(resp.starts_with("HTTP/1.1 200"), "resp: {resp}");
+
+    let seen = seen
+        .recv_timeout(std::time::Duration::from_secs(3))
+        .expect("upstream saw the request");
+    let (_, body) = seen.split_once("\r\n\r\n").expect("headers and body");
+    let got: serde_json::Value = serde_json::from_str(body).expect("upstream body is JSON");
+
+    // The declaration is gone, and the client's own tool is untouched.
+    let text = got.to_string();
+    assert!(
+        !text.contains("cloudflare_ips_20260913"),
+        "the typed declaration must not be forwarded: {text:.400}"
+    );
+    assert!(
+        got["tools"]
+            .as_array()
+            .is_some_and(|t| t.iter().any(|t| t["name"] == "Bash")),
+        "the client's own tool survives: {text:.400}"
+    );
+
+    // The answer arrives as a completed exchange, appended after the caller's
+    // messages so the model reads the question, then the data.
+    let messages = got["messages"].as_array().expect("messages");
+    let result = messages.last().expect("a last message");
+    assert_eq!(result["role"], "user");
+    assert_eq!(result["content"][0]["type"], "tool_result");
+    assert_eq!(result["content"][0]["tool_use_id"], "srvtoolu_cloudflare_ips");
+    let call = &messages[messages.len() - 2];
+    assert_eq!(call["role"], "assistant");
+    assert_eq!(call["content"][0]["name"], "cloudflare_ips");
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -381,6 +381,9 @@ pub struct Report {
     pub refused: Vec<Refusal>,
     /// Names whose description a rewrite edited.
     pub rewritten: Vec<String>,
+    /// Names the proxy resolves itself, so they are neither forwarded as
+    /// declarations nor counted as added.
+    pub local: Vec<String>,
     /// `cache_control` marks dropped because the provider cannot take them.
     pub cache_stripped: bool,
 }
@@ -392,6 +395,7 @@ impl Report {
             || self.added > 0
             || !self.refused.is_empty()
             || !self.rewritten.is_empty()
+            || !self.local.is_empty()
             || self.cache_stripped
     }
 }
@@ -656,6 +660,16 @@ fn reject_and_append(
             report.refused.push(Refusal::Nameless);
             continue;
         };
+        if crate::localtool::is_local(&name) {
+            // The proxy answers this one itself, so the declaration must not be
+            // forwarded: the far end has no such tool and refuses the whole body
+            // over the unknown type. The name is enough to resolve it.
+            // ponytail: the injected entry has no description the model could
+            // read before the result arrives; if a local tool ever needs one,
+            // give it a definition here rather than in the policy.
+            report.local.push(name);
+            continue;
+        }
         if client_names.contains(&name) || seen.contains(&name) {
             report.refused.push(Refusal::Shadow(name));
             continue;

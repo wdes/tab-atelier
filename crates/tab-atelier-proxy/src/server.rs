@@ -399,8 +399,8 @@ async fn anthropic(req: Request<Incoming>, state: Arc<State>, peer: std::net::Ip
     // Only /v1/messages spends tokens; a metadata call should not queue
     // behind a fleet's generations.
     let metered = is_post && sub.contains("/messages");
-    let (body, route, compaction) = match shape_and_admit(&state, &account, body, metered).await {
-        Ok(triple) => triple,
+    let (body, route, compaction, local_tools) = match shape_and_admit(&state, &account, body, metered).await {
+        Ok(quad) => quad,
         Err(resp) => return resp,
     };
 
@@ -429,6 +429,7 @@ async fn anthropic(req: Request<Incoming>, state: Arc<State>, peer: std::net::Ip
         origin,
         weight: account.weight,
         metered,
+        local_tools,
         route: route.clone(),
         state: Arc::clone(&state),
     };
@@ -535,7 +536,7 @@ async fn shape_and_admit(
     account: &Account,
     body: Bytes,
     metered: bool,
-) -> Result<(Bytes, routing::Route, Option<inspect::Compaction>), Response<Body>> {
+) -> Result<(Bytes, routing::Route, Option<inspect::Compaction>, Vec<String>), Response<Body>> {
     if !metered {
         // Not a generation: it still has to go somewhere, but no class
         // reasoning applies. The pin still does — an account routed to a
@@ -555,6 +556,8 @@ async fn shape_and_admit(
             },
             // Not a generation, so there was nothing to compact either.
             None,
+            // …and no tools were shaped to find a local one in.
+            Vec::new(),
         ));
     }
     // Choose the destination BEFORE admission, so the call is judged at the
@@ -625,7 +628,7 @@ async fn shape_and_admit(
             route.model_id
         );
     }
-    let (body, compaction) = shape_body(
+    let (body, compaction, local) = shape_body(
         &body,
         &route,
         &requested,
@@ -677,7 +680,7 @@ async fn shape_and_admit(
         record(state, &account.id, None, usage::Tokens::default(), 429);
         return Err(resp);
     }
-    Ok((body, route, compaction))
+    Ok((body, route, compaction, local))
 }
 
 /// Rewrite the outgoing request for its destination: the model, and the
@@ -703,7 +706,7 @@ fn shape_body(
     compact: crate::compact::Compact,
     policy: &crate::tools::Policy,
     takes_cache: bool,
-) -> (Bytes, Option<inspect::Compaction>) {
+) -> (Bytes, Option<inspect::Compaction>, Vec<String>) {
     let rename = (route.model_id != requested).then_some(route.model_id.as_str());
     // The level is the account's, resolved by the caller from wherever the
     // store lives — not the provider's. It reads like a property of the hop,
@@ -731,14 +734,14 @@ fn shape_body(
     // it. An account with no policy must not pay for the parse and the
     // re-encode, and that is most accounts on most requests.
     if rename.is_none() && level.is_none() && policy.is_none_or(crate::tools::is_noop) {
-        return (body.clone(), None);
+        return (body.clone(), None, Vec::new());
     }
 
     let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(body) else {
         // Not JSON. The old `rewrite_model` swallowed this and forwarded the
         // original, which is right — the far end gives a better error than we
         // could — and compaction has nothing to act on either way.
-        return (body.clone(), None);
+        return (body.clone(), None, Vec::new());
     };
     if let Some(model) = rename {
         v["model"] = serde_json::Value::String(model.to_owned());
@@ -753,17 +756,18 @@ fn shape_body(
         crate::tools::apply(&mut v, policy, takes_cache)
     });
     let Ok(encoded) = serde_json::to_vec(&v) else {
-        return (body.clone(), None);
+        return (body.clone(), None, Vec::new());
     };
     if governed.changed() {
         log::info!(
-            "proxy: tools {} offered → {} sent on {}: {} removed, {} added, {} pinned{}",
+            "proxy: tools {} offered → {} sent on {}: {} removed, {} added, {} pinned, {} local{}",
             governed.offered,
             governed.sent,
             route.provider_id,
             governed.removed.len(),
             governed.added,
             governed.pinned.len(),
+            governed.local.len(),
             if governed.refused.is_empty() {
                 String::new()
             } else {
@@ -817,7 +821,7 @@ fn shape_body(
             banners_dropped: elided.banners_dropped,
         })
     };
-    (Bytes::from(encoded), record)
+    (Bytes::from(encoded), record, governed.local)
 }
 
 /// What routing needs to know about each provider right now.
@@ -976,6 +980,10 @@ struct Forward {
     /// What compaction removed on the way out, if it ran. Attached to the
     /// inspection capture — see [`inspect::Compaction`].
     compaction: Option<inspect::Compaction>,
+    /// Names the policy resolved to a tool this proxy answers itself, so the
+    /// forwarder can put the result in the body. Empty for almost every
+    /// request — see [`crate::localtool`].
+    local_tools: Vec<String>,
     /// How the request arrived. See [`inspect::Origin`].
     origin: inspect::Origin,
     /// Who to bill. Carried down rather than looked up again, because by the
@@ -1249,22 +1257,8 @@ fn forward(
         }
     };
     // The path and the body both depend on the dialect, and both are needed
-    // before the headers so the capture below records what actually left. An
-    // Anthropic-shaped hop is forwarded verbatim; an OpenAI-shaped one needs
-    // the translated body and the OpenAI path it belongs to.
-    let (path, body) = match wire {
-        provider::Wire::Anthropic => (f.sub_pq.clone(), f.body.clone()),
-        provider::Wire::Openai => {
-            // The body was validated as JSON on the way in, so a parse failure
-            // here would be a bug rather than bad input; `Null` translates to
-            // the minimal valid request instead of panicking in a proxy.
-            let parsed: serde_json::Value = serde_json::from_slice(&f.body).unwrap_or(serde_json::Value::Null);
-            (
-                "/v1/chat/completions".to_owned(),
-                Bytes::from(serde_json::to_vec(&openai::to_chat(&parsed)).unwrap_or_default()),
-            )
-        }
-    };
+    // before the headers so the capture below records what actually left.
+    let (path, body) = upstream_body(f, wire);
     let url = upstream_url(&base, wire, &path);
     let agent = egress::relay_agent();
     let hdrs = upstream_headers(f, auth, wire);
@@ -2663,6 +2657,44 @@ fn upstream_url(base: &str, wire: provider::Wire, path: &str) -> String {
     }
 }
 
+/// The path and body a hop actually sends, by wire.
+///
+/// An Anthropic-shaped hop is forwarded verbatim, with one exception: when the
+/// policy named a tool the proxy answers itself, the result goes in as a
+/// completed exchange ([`crate::localtool`]). An `OpenAI` hop needs the
+/// translated body and the chat path it belongs to, and the exchange is put in
+/// before the translation so it travels in a shape the translation already
+/// understands. A policy that named no local tool — nearly every request —
+/// leaves the bytes untouched.
+fn upstream_body(f: &Forward, wire: provider::Wire) -> (String, Bytes) {
+    match wire {
+        provider::Wire::Anthropic => {
+            if f.local_tools.is_empty() {
+                return (f.sub_pq.clone(), f.body.clone());
+            }
+            let body = serde_json::from_slice::<serde_json::Value>(&f.body).map_or_else(
+                |_| f.body.clone(),
+                |mut parsed| {
+                    crate::localtool::inject(&mut parsed, &f.local_tools);
+                    Bytes::from(serde_json::to_vec(&parsed).unwrap_or_default())
+                },
+            );
+            (f.sub_pq.clone(), body)
+        }
+        provider::Wire::Openai => {
+            // Validated as JSON on the way in, so a parse failure here would be
+            // a bug rather than bad input; `Null` translates to the minimal
+            // valid request instead of panicking in a proxy.
+            let mut parsed: serde_json::Value = serde_json::from_slice(&f.body).unwrap_or(serde_json::Value::Null);
+            crate::localtool::inject(&mut parsed, &f.local_tools);
+            (
+                "/v1/chat/completions".to_owned(),
+                Bytes::from(serde_json::to_vec(&openai::to_chat(&parsed)).unwrap_or_default()),
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2854,7 +2886,7 @@ mod tests {
         let body = Bytes::from(format!(r#"{{"model":"m","messages":[{}]}}"#, turns.join(",")));
         let before = body.len();
 
-        let (after, record) = shape_body(
+        let (after, record, _) = shape_body(
             &body,
             &route,
             "m",
@@ -2873,7 +2905,7 @@ mod tests {
         // A level that is set but has nothing to remove still reports, because
         // "on, and elided nothing" is a different answer from "off".
         let plain = Bytes::from(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#);
-        let (_, quiet) = shape_body(
+        let (_, quiet, _) = shape_body(
             &plain,
             &route,
             "m",
@@ -2887,7 +2919,7 @@ mod tests {
 
         // …and `none` reports nothing at all, which is the distinction the UI
         // draws by leaving the cell blank.
-        let (untouched, off) = shape_body(
+        let (untouched, off, _) = shape_body(
             &plain,
             &route,
             "m",
