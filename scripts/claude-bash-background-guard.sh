@@ -38,6 +38,29 @@ background="$(printf '%s' "$payload" | jq -r '.tool_input.run_in_background // f
 
 block() { printf '%s\n' "$1" >&2; exit 2; }
 
+# 0. The wrappers in scripts/ are the sanctioned way to run the heavy commands
+#    the rules below block, so a bare call to one is allowed by path. They exist
+#    so nobody has to remember the toolchain pin, the two clippy invocations, or
+#    which of the waits are safe: the script encodes it and is reviewed as code.
+#
+#    Only as a sole command. A composite (`scripts/gate.sh && cargo build`) is
+#    not vouched for by the wrapper -- it falls through and is judged by the
+#    rules below like anything else, which is what catches the cargo build in
+#    that example.
+#
+#    This hook guards a habit, not a boundary: it knows the commands that block
+#    in the foreground and allows everything else, so a command it does not
+#    recognise is allowed. `rm -rf /`, to pick the obvious case, is none of its
+#    business and it will not stop it.
+if printf '%s' "$cmd" | grep -qE '^[[:space:]]*((bash|sh)[[:space:]]+)?(\./)?([^[:space:]]*/)?scripts/[A-Za-z0-9._-]+\.sh([[:space:]]|$)'; then
+  # A bare wrapper call is a path, spaces, and flags. Anything outside that
+  # character set means the command is doing something else as well, so it goes
+  # through the rules below instead of being waved through.
+  if ! printf '%s' "$cmd" | grep -qE '[^A-Za-z0-9 ./_=-]'; then
+    exit 0
+  fi
+fi
+
 # 1. sleep -- the tick of a poll loop.
 #
 #    Matched at any command position rather than only at the start, so
