@@ -672,15 +672,20 @@ impl Sniffer {
             .and_then(|msg| msg.get("usage"))
             .or_else(|| value.get("usage"));
         let Some(counts) = found else { return };
-        let n = |key: &str| counts.get(key).and_then(serde_json::Value::as_u64).unwrap_or(0);
-        // Replace rather than accumulate: `message_delta` repeats a RUNNING
-        // total, so adding them would multiply a long generation's output
-        // count by the number of deltas.
+        let pick = |keys: &[&str]| {
+            keys.iter()
+                .find_map(|key| counts.get(*key).and_then(serde_json::Value::as_u64))
+                .unwrap_or(0)
+        };
+        // `OpenAI` names the same two counts `prompt_tokens` and
+        // `completion_tokens`. Reading only Anthropic's names left every OpenAI
+        // call recorded as zero tokens — a statistic that lies by omission, and
+        // the reason its spend never matched the upstream invoice.
         let (i, o, cr, cw) = (
-            n("input_tokens"),
-            n("output_tokens"),
-            n("cache_read_input_tokens"),
-            n("cache_creation_input_tokens"),
+            pick(&["input_tokens", "prompt_tokens"]),
+            pick(&["output_tokens", "completion_tokens"]),
+            pick(&["cache_read_input_tokens"]),
+            pick(&["cache_creation_input_tokens"]),
         );
         if i > 0 {
             self.tokens.input = i;
@@ -855,6 +860,36 @@ mod tests {
         assert_eq!(t.output, 34);
         assert_eq!(t.cache_read, 5);
         assert_eq!(t.total(), 51);
+    }
+
+    /// The failure this guards: `OpenAI` names the same two counts differently,
+    /// so a sniffer that knew only Anthropic's names recorded every `OpenAI` call
+    /// as zero — a spend figure that under-reported instead of erroring.
+    #[test]
+    fn an_openai_reply_reports_its_usage_under_its_own_names() {
+        let mut s = Sniffer::new(Some("application/json"));
+        s.feed(br#"{"model":"gpt-5.6-luna","usage":{"prompt_tokens":25,"#);
+        s.feed(br#""completion_tokens":4,"total_tokens":29}}"#);
+        let (model, t) = s.finish();
+        assert_eq!(model.as_deref(), Some("gpt-5.6-luna"));
+        assert_eq!(t.input, 25);
+        assert_eq!(t.output, 4);
+        assert_eq!(t.total(), 29);
+    }
+
+    /// The streaming case: `OpenAI` puts the counts in a final chunk, and the
+    /// `include_usage` flag is what makes it send them at all.
+    #[test]
+    fn an_openai_stream_takes_usage_from_its_final_chunk() {
+        let mut s = Sniffer::new(Some("text/event-stream"));
+        s.feed(b"data: {\"model\":\"gpt-5.6-luna\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n");
+        s.feed(br#"data: {"model":"gpt-5.6-luna","choices":[],"usage":{"prompt_tokens":25,"completion_tokens":4,"total_tokens":29}}"#);
+        s.feed(b"\n\n");
+        s.feed(b"data: [DONE]\n\n");
+        let (model, t) = s.finish();
+        assert_eq!(model.as_deref(), Some("gpt-5.6-luna"));
+        assert_eq!(t.input, 25);
+        assert_eq!(t.output, 4);
     }
 
     /// The failure this guards: `message_delta` repeats a RUNNING output total,
