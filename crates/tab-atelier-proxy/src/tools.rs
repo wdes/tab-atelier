@@ -1461,4 +1461,22 @@ mod tests {
         assert_eq!(Mode::Allow.as_str(), "allow");
         assert_eq!(Mode::None.as_str(), "none");
     }
+
+    /// The policy shipped in `docs/cloudflare-ips.policy.json` is a real
+    /// artifact — an operator copies it into `POST /api/users/<id>/tools`.
+    /// Parsing it here is what stops it rotting into a 400.
+    #[test]
+    fn the_shipped_cloudflare_policy_is_accepted() {
+        let policy: Policy = serde_json::from_str(include_str!("../../../docs/cloudflare-ips.policy.json"))
+            .expect("the shipped policy must deserialize");
+        assert_eq!(policy.mode, Mode::All);
+        assert_eq!(policy.add.len(), 1);
+        validate(&policy).expect("the shipped policy must validate");
+
+        // The name has to be one the proxy answers itself. If it is not, the
+        // declaration is forwarded to a provider that has never heard of it,
+        // which is the 400 this whole feature exists to avoid.
+        let name = tool_name(&policy.add[0]).expect("the added tool carries a name");
+        assert!(crate::localtool::is_local(name), "{name} is not a local tool");
+    }
 }
