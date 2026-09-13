@@ -248,10 +248,8 @@
                   <div v-if="sched.backoff_for">backing off {{ sched.backoff_for }}s</div>
                   <div v-if="sched.rejected">{{ sched.rejected }} queued out</div>
                 </div>
-                <button class="btn btn-sm btn-outline-secondary ms-3"
-                        :disabled="pressureBusy" @click="reloadPressure">
-                  <span v-if="pressureBusy" class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>{{ pressureBusy ? 'Refreshing…' : 'Refresh' }}
-                </button>
+                <busy-button class="ms-3" :busy="pressureBusy" label="Refresh"
+                             busy-label="Refreshing…" @click="reloadPressure"></busy-button>
               </div>
               <!--
                 The monitor's own health, stated rather than left to be
@@ -323,10 +321,8 @@
                   <option value="7d">Last 7 d</option>
                   <option value="30d">Last 30 d</option>
                 </select>
-                <button class="btn btn-sm btn-outline-secondary ms-2"
-                        :disabled="usageBusy" @click="reloadUsage">
-                  <span v-if="usageBusy" class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>{{ usageBusy ? 'Refreshing…' : 'Refresh' }}
-                </button>
+                <busy-button class="ms-2" :busy="usageBusy" label="Refresh"
+                             busy-label="Refreshing…" @click="reloadUsage"></busy-button>
               </div>
               <calls-chart :points="series" :by-user="callsByUser"></calls-chart>
             </div>
@@ -347,10 +343,8 @@
                 <!-- Same series, and so the same fetch, as the card above. A
                      second button is not a second load: the thing being
                      refreshed is the chart in front of you. -->
-                <button class="btn btn-sm btn-outline-secondary ms-3"
-                        :disabled="usageBusy" @click="reloadUsage">
-                  <span v-if="usageBusy" class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>{{ usageBusy ? 'Refreshing…' : 'Refresh' }}
-                </button>
+                <busy-button class="ms-3" :busy="usageBusy" label="Refresh"
+                             busy-label="Refreshing…" @click="reloadUsage"></busy-button>
               </div>
               <tokens-chart :points="series"></tokens-chart>
             </div>
@@ -418,10 +412,8 @@
                   DeepSeek's endpoint for this is <code>/anthropic</code>, not its bare host.
                 </p>
               </div>
-              <button class="btn btn-sm btn-outline-secondary ms-3" :disabled="providersBusy"
-                      @click="loadProviders">
-                <span v-if="providersBusy" class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>{{ providersBusy ? 'Loading…' : 'Refresh' }}
-              </button>
+              <busy-button class="ms-3" :busy="providersBusy" label="Refresh"
+                           busy-label="Loading…" @click="loadProviders"></busy-button>
             </div>
 
             <div v-if="providers" class="mt-3">
@@ -566,9 +558,8 @@
                 </p>
               </div>
               <div class="text-end ms-3">
-                <button v-if="!inspect" class="btn btn-sm btn-outline-secondary" @click="loadInspect">
-                  Open
-                </button>
+                <busy-button v-if="!inspect" :busy="inspectBusy" label="Open"
+                             busy-label="Opening…" @click="loadInspect"></busy-button>
                 <template v-else>
                   <!-- Armed state is stated in words, not by a coloured dot:
                        "is it still recording" is the question this panel has to
@@ -580,16 +571,17 @@
                   <!-- A capture lands when the call FINISHES, so this panel
                        is always one request behind. Without a refresh the
                        thing you just did is the one thing not shown. -->
-                  <button class="btn btn-sm btn-outline-secondary me-1" :disabled="inspectBusy"
-                          @click="loadInspect">
-                    <span v-if="inspectBusy" class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>{{ inspectBusy ? 'Loading…' : 'Refresh' }}
-                  </button>
+                  <busy-button class="me-1" :busy="inspectBusy" label="Refresh"
+                               busy-label="Loading…" @click="loadInspect"></busy-button>
                   <button class="btn btn-sm btn-outline-primary me-1" @click="armInspect">
                     {{ inspect.armed ? 'Extend' : 'Record' }}
                   </button>
+                  <!-- "Stop" only means something while it is recording;
+                       with nothing armed this is a plain delete of what was
+                       kept. -->
                   <button class="btn btn-sm btn-outline-danger" :disabled="!inspect.armed && !inspect.captures.length"
                           @click="stopInspect">
-                    Stop &amp; delete
+                    {{ inspect.armed ? 'Stop & delete' : 'Delete' }}
                   </button>
                 </template>
               </div>
