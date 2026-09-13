@@ -1265,7 +1265,7 @@ fn forward(
             )
         }
     };
-    let url = format!("{base}{path}");
+    let url = upstream_url(&base, wire, &path);
     let agent = egress::relay_agent();
     let hdrs = upstream_headers(f, auth, wire);
     // The request as it will actually leave: after routing rewrote the model,
@@ -2649,6 +2649,20 @@ pub async fn serve_on(listener: tokio::net::TcpListener, state: Arc<State>) -> R
     }
 }
 
+/// The URL a request is actually sent to.
+///
+/// `base_url` carries a different convention per wire: an Anthropic base is the
+/// host root and takes the client's own path, while an `OpenAI` base is already
+/// versioned (`…/v1`) and takes [`openai::chat_url`]'s suffix. Concatenating
+/// the same path onto both is what doubled the `/v1` on every `OpenAI` hop and
+/// turned it into a 404 before a model was ever reached.
+fn upstream_url(base: &str, wire: provider::Wire, path: &str) -> String {
+    match wire {
+        provider::Wire::Openai => openai::chat_url(base),
+        provider::Wire::Anthropic => format!("{base}{path}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2667,6 +2681,25 @@ mod tests {
             assert_eq!(policy.mode, crate::tools::Mode::None);
             assert_eq!(policy.disable, vec!["Read".to_string()]);
         }
+    }
+
+    /// The preset's `OpenAI` base already ends in `/v1`, so the path must not
+    /// carry another: `…/v1` + `…/v1/chat/completions` is the 404 this guards.
+    /// An Anthropic base is the bare host and does take `/v1/messages`.
+    #[test]
+    fn an_openai_base_is_not_versioned_twice() {
+        assert_eq!(
+            upstream_url(
+                "https://api.openai.com/v1",
+                provider::Wire::Openai,
+                "/v1/chat/completions"
+            ),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            upstream_url("https://api.anthropic.com", provider::Wire::Anthropic, "/v1/messages"),
+            "https://api.anthropic.com/v1/messages"
+        );
     }
 
     /// A default `Policy` is `mode: all`, so a body that cannot be read is
