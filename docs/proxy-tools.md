@@ -246,14 +246,43 @@ applied, because silently replacing the definition a session is mid-way through
 is how a working tool turns into a mysteriously broken one. Names are matched
 loosely (case-insensitively) so `Bash` and `bash` cannot both be live.
 
-**`rewrite` is not implemented.** It was the third verb in the original design —
-a fixed, named normalisation of a tool's description (strip a date, drop a
-provider claim) rather than a free-text replacement, so that `providers.json`
-stays readable and cannot smuggle prompt injection. It is the most valuable of
-the three on the Anthropic hop, because a description that stops changing is a
-prefix that stops changing, but it needs the named-normalisation catalogue and
-its tests before it can safely exist. The `tools` object above has no such key;
-adding one is a separate change.
+**`rewrite` is the third verb.** It is a fixed, *named* normalisation of a tool's
+description rather than a free-text replacement, so that `providers.json` stays
+readable and cannot smuggle prompt injection. It is the most valuable of the
+three on the Anthropic hop, because a description that stops changing is a prefix
+that stops changing — a date restated inside a description poisons the cache for
+every request that follows it, which no amount of tool pruning fixes.
+
+The rules live under the tool name they apply to:
+
+```json
+"rewrite": { "WebSearch": ["dates"] }
+```
+
+Three normalisations are defined. `dates` drops the sentences that pin a current
+date; `provider` prunes the ones naming a rival's product, from a fixed list of
+claims this code knows how to recognise. Both are named because a rule that is
+*chosen* can be audited, and a description that merely looks normalised cannot.
+The third is `{"replaced": {"find": "...", "replace": "..."}}`, a literal
+substring swap — no regex, so there is no pattern language to get wrong, and
+`Bash curl -> fetch` is the whole of it. Replacement is global within the
+description.
+
+Rewrites touch the description only. A tool is never added, removed, or renamed
+by this verb, which is why it does not interact with the referenced-or-pinned
+safety rule at all.
+
+Two things it deliberately does not do. It does not clear the cache: a rewritten
+description still carries the client's `cache_control` marks, and that is correct,
+because the marks are still on the tools they were put on — an in-place edit moves
+no array element, so nothing has been invalidated. And it does not renumber:
+`pins` is about *array position* for prefix caching, and rewriting a string does
+not move anything.
+
+An empty `find` is refused at validation, since it would match at every position.
+A rule whose `find` does not occur is not an error: the client is free to send a
+description this proxy has never seen, and refusing the request over a rule that
+had nothing to do would turn a cache optimisation into an outage.
 
 The write is whole-object (`POST /api/users/<id>/tools`), not field-at-a-time:
 `allow` means nothing apart from the mode that reads it, and `mode: allow` with

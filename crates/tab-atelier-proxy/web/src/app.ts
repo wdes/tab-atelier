@@ -13,7 +13,7 @@ const { createApp } = Vue;
  *  predates the field is carrying. `all` sends the client's toolkit through
  *  untouched — the only default that cannot silently break a session. */
 function defaultTools(): ToolsPolicy {
-  return { mode: "all", disable: [], allow: [], add: [] };
+  return { mode: "all", disable: [], allow: [], add: [], rewrite: {} };
 }
 
 /** Commas or newlines — a pasted column of names is as likely as a typed list,
@@ -23,6 +23,59 @@ function splitNames(text: string): string[] {
     .split(/[,\n]/)
     .map((s) => s.trim())
     .filter(Boolean);
+}
+
+/**
+ * One rewrite rule per line: a tool name, then `dates`, `provider`, or a
+ * `find -> replace` pair.
+ *
+ * Throws on a line it cannot read rather than dropping it. A rule silently
+ * discarded here is a policy that silently does not do what it says, and the
+ * typist has no way to notice — the failure mode is an extra sentence three
+ * turns later, which is not a thing anyone traces back to this box.
+ * `saveTools` shows the message the way it shows a `JSON.parse` failure.
+ */
+function splitRules(text: string): Record<string, RewriteRule[]> {
+  const rules: Record<string, RewriteRule[]> = {};
+  for (const raw of text.split("\n")) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const cut = line.search(/\s/);
+    if (cut < 0) throw new Error(`"${line}" names a tool but gives no rule for it`);
+    const name = line.slice(0, cut);
+    const rest = line.slice(cut).trim();
+    let rule: RewriteRule;
+    if (rest === "dates" || rest === "provider") {
+      rule = rest;
+    } else {
+      const arrow = rest.indexOf("->");
+      if (arrow < 0) {
+        throw new Error(`"${line}" is not dates, provider, or a find -> replace pair`);
+      }
+      const find = rest.slice(0, arrow).trim();
+      if (!find) throw new Error(`"${line}" has nothing to find`);
+      // An empty replacement is allowed: deleting a sentence is a rewrite.
+      rule = { replaced: { find, replace: rest.slice(arrow + 2).trim() } };
+    }
+    if (!rules[name]) rules[name] = [];
+    rules[name].push(rule);
+  }
+  return rules;
+}
+
+/** The inverse of `splitRules`, for filling the editor. */
+function formatRules(rules: Record<string, RewriteRule[]>): string {
+  const lines: string[] = [];
+  for (const [name, list] of Object.entries(rules)) {
+    for (const rule of list) {
+      lines.push(
+        rule === "dates" || rule === "provider"
+          ? `${name} ${rule}`
+          : `${name} ${rule.replaced.find} -> ${rule.replaced.replace}`,
+      );
+    }
+  }
+  return lines.join("\n");
 }
 
 /** A zeroed usage record, for an account that has not called anything yet. */
@@ -559,6 +612,7 @@ const AdminApp = Vue.defineComponent({
         // Pretty-printed, not compact: someone may open this to read a
         // definition, and a tool schema is not one line long.
         add: u.tools.add.length ? JSON.stringify(u.tools.add, null, 2) : "",
+        rewrite: formatRules(u.tools.rewrite),
       };
     },
     saveTools() {
@@ -580,12 +634,20 @@ const AdminApp = Vue.defineComponent({
           return Promise.resolve();
         }
       }
+      let rewrite: Record<string, RewriteRule[]>;
+      try {
+        rewrite = splitRules(t.rewrite);
+      } catch (e) {
+        this.error = e instanceof Error ? e.message : String(e);
+        return Promise.resolve();
+      }
       return this.act(async () => {
         await this.api("POST", `/api/users/${t.id}/tools`, {
           mode: t.mode,
           disable: splitNames(t.disable),
           allow: splitNames(t.allow),
           add: added,
+          rewrite,
         });
         this.tools = null;
       });
@@ -650,6 +712,9 @@ const AdminApp = Vue.defineComponent({
       if (u.tools.mode !== "all") parts.push(u.tools.mode);
       if (u.tools.disable.length) parts.push(`−${u.tools.disable.length}`);
       if (u.tools.add.length) parts.push(`+${u.tools.add.length}`);
+      // A rewrite changes no counts, so without this a policy that only
+      // rewrites is indistinguishable from one with no policy at all.
+      if (Object.keys(u.tools.rewrite ?? {}).length) parts.push("~");
       return parts.join(" ") || "default";
     },
     // The account's compaction level, as words rather than wire spelling.

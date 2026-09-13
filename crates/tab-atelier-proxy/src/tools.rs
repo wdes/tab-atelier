@@ -19,6 +19,8 @@
 //! load-bearing, not a convenience: an unconfigured account must produce a
 //! byte-identical body.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -93,6 +95,17 @@ pub struct Policy {
     /// Definitions to add. Appended after the client's, and never allowed to
     /// shadow one — see [`Refusal::Shadow`].
     pub add: Vec<Value>,
+    /// Description edits, keyed by tool name.
+    ///
+    /// A tool the client sent keeps its name, its schema and its position, so
+    /// this moves nothing a cache mark points at and cannot orphan a
+    /// `tool_use`. That is the whole reason it exists: it takes volatility out
+    /// of `tools[]` without paying the re-warm that `disable` costs.
+    ///
+    /// Only the description is editable. A name is what `messages[]` refers
+    /// to, and the schema is what the model calls the tool with; either one
+    /// rewritten on the way through is the proxy inventing a contract.
+    pub rewrite: BTreeMap<String, Vec<Normalise>>,
 }
 
 /// Why a requested change did not happen. Surfaced rather than swallowed:
@@ -119,6 +132,239 @@ impl Refusal {
     }
 }
 
+/// A named edit to a tool description.
+///
+/// Named rather than an operator-supplied expression on purpose. This runs on
+/// every request and its output is a prefix the provider caches against, so a
+/// rule that is subtly wrong is both a correctness bug and a silent cache
+/// invalidator. A closed set can be tested against the text it will actually
+/// meet; a regex cannot, and the crate carries none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Normalise {
+    /// Drop sentences asserting the current date.
+    ///
+    /// A description that announces "the current month" is dated the day it
+    /// ships and hostile to caching thereafter: the same tool arrives with a
+    /// different prefix each month, and the first request after the boundary
+    /// pays a full re-warm. The instruction it decorates is the point; the
+    /// date is not.
+    Dates,
+    /// Drop sentences asserting the provider's locality.
+    ///
+    /// "US-only" describes Anthropic's search backend. It travels unchanged to
+    /// a hop that is not Anthropic, where it is false — the proxy putting one
+    /// provider's fact into a request for another. See the worked case in
+    /// `docs/proxy-tools.md`.
+    Provider,
+    /// Swap one fixed string for another, everywhere it appears.
+    ///
+    /// The bluntest rule in the set and the only one carrying operator input,
+    /// which is exactly why it is a pair of literals in this closed enum and
+    /// not an expression: a phrase goes in, a phrase comes out, nothing else.
+    /// An empty `replace` deletes the phrase.
+    Replaced { find: String, replace: String },
+}
+
+impl Normalise {
+    /// Apply to a description, or `None` if it already reads that way.
+    ///
+    /// Returning `None` rather than a copy keeps the caller honest: an edit
+    /// that changes nothing must not be counted, or a description would be
+    /// rewritten to itself on every request and reported as churn.
+    #[must_use]
+    pub fn run(&self, description: &str) -> Option<String> {
+        let pruned = match self {
+            Self::Dates => prune_sentences(description, claims_date),
+            Self::Provider => prune_sentences(description, claims_provider),
+            Self::Replaced { find, replace } => {
+                if find.is_empty() || !description.contains(find.as_str()) {
+                    return None;
+                }
+                // A rule that replaces a string with itself is a no-op, and
+                // counting it would report churn that did not happen.
+                let next = description.replace(find.as_str(), replace);
+                return if next == description { None } else { Some(next) };
+            }
+        };
+        if pruned == description { None } else { Some(pruned) }
+    }
+}
+
+/// Drop every sentence `claimed`, then tidy the text the hole left behind.
+///
+/// Sentence-level rather than line-level: the volatile text sits at the end of
+/// a prose paragraph that also carries the instruction, so dropping the line
+/// would drop the instruction with it.
+fn prune_sentences(text: &str, claimed: fn(&str) -> bool) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut dropped = false;
+    for chunk in text.split_inclusive('\n') {
+        let (line, newline) = chunk.strip_suffix('\n').map_or((chunk, ""), |line| (line, "\n"));
+        for sentence in split_sentences(line) {
+            if claimed(sentence) {
+                dropped = true;
+            } else {
+                out.push_str(sentence);
+            }
+        }
+        out.push_str(newline);
+    }
+    if !dropped {
+        return text.to_owned();
+    }
+    // A dropped sentence can leave a line empty (the paragraph was only that
+    // sentence) or trailing whitespace where the sentence's own gap went.
+    collapse(&out)
+}
+
+/// Split a line at sentence ends, keeping each terminator and the gap after
+/// it, so concatenating the pieces reproduces the line byte for byte.
+///
+/// A period inside an abbreviation therefore reads as an end too. That is
+/// acceptable here because it can only cost precision — a fragment left
+/// behind still reads as English, and the alternative is an abbreviation list
+/// this crate has no business carrying.
+fn split_sentences(line: &str) -> Vec<&str> {
+    let bytes = line.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'.' {
+            let mut end = i + 1;
+            while end < bytes.len() && bytes[end] == b' ' {
+                end += 1;
+            }
+            parts.push(&line[start..end]);
+            start = end;
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+    if start < line.len() {
+        parts.push(&line[start..]);
+    }
+    parts
+}
+
+/// Trim each line's tail and squeeze runs of blank lines to one.
+fn collapse(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut blanks = 0;
+    for chunk in text.split_inclusive('\n') {
+        let (line, newline) = chunk.strip_suffix('\n').map_or((chunk, ""), |line| (line, "\n"));
+        let line = line.trim_end();
+        if line.is_empty() {
+            blanks += 1;
+            if blanks > 1 {
+                continue;
+            }
+        } else {
+            blanks = 0;
+        }
+        out.push_str(line);
+        out.push_str(newline);
+    }
+    out
+}
+
+/// Whether a sentence asserts which month or year it is now.
+fn claims_date(sentence: &str) -> bool {
+    let lower = sentence.to_ascii_lowercase();
+    if DATE_PHRASES.iter().any(|phrase| lower.contains(phrase)) {
+        return true;
+    }
+    // A month name alone is not a claim — "you may share this" is not about
+    // May — so the year has to be there too. The reverse is not enough
+    // either: "HTTP 200" and a copyright year carry no dates a model reads.
+    names_month(sentence) && has_year(sentence)
+}
+
+/// Whether a sentence asserts the provider's locality.
+///
+/// Matched without regard to case, and both spellings of each: the text these
+/// come from is machine-written prose, and a rule that misses "US-based"
+/// because it was written "US based" would fail exactly where it is needed.
+fn claims_provider(sentence: &str) -> bool {
+    let lower = sentence.to_ascii_lowercase();
+    PROVIDER_CLAIMS.iter().any(|claim| lower.contains(claim))
+}
+
+const DATE_PHRASES: [&str; 4] = ["current month", "current date", "today's date", "todays date"];
+
+const PROVIDER_CLAIMS: [&str; 4] = ["us-only", "us only", "us-based", "us based"];
+
+const MONTHS: [&str; 12] = [
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
+];
+
+/// Whether the text names a month as a word, so that "May" counts and
+/// "maybe" does not.
+fn names_month(text: &str) -> bool {
+    MONTHS.iter().any(|month| contains_word(text, month))
+}
+
+/// Whether the text carries a four-digit year.
+///
+/// A run of exactly four digits, so a fragment of a longer number or a
+/// decimal does not read as one, and bounded to the range a date could
+/// plausibly use so a 4-digit id does not either.
+fn has_year(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i - start == 4
+            && text[start..i]
+                .parse::<u32>()
+                .is_ok_and(|year| (1900..=2999).contains(&year))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Case-insensitive `contains`, with word boundaries on both sides.
+fn contains_word(haystack: &str, needle: &str) -> bool {
+    let hay = haystack.as_bytes();
+    let len = needle.len();
+    if len == 0 || len > hay.len() {
+        return false;
+    }
+    for i in 0..=hay.len() - len {
+        if !hay[i..i + len].eq_ignore_ascii_case(needle.as_bytes()) {
+            continue;
+        }
+        let before = i == 0 || !hay[i - 1].is_ascii_alphanumeric();
+        let after = i + len == hay.len() || !hay[i + len].is_ascii_alphanumeric();
+        if before && after {
+            return true;
+        }
+    }
+    false
+}
+
 /// What a pass did, for the log line and the panel.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Report {
@@ -133,6 +379,8 @@ pub struct Report {
     pub removed: Vec<String>,
     pub added: usize,
     pub refused: Vec<Refusal>,
+    /// Names whose description a rewrite edited.
+    pub rewritten: Vec<String>,
     /// `cache_control` marks dropped because the provider cannot take them.
     pub cache_stripped: bool,
 }
@@ -140,7 +388,11 @@ pub struct Report {
 impl Report {
     #[must_use]
     pub const fn changed(&self) -> bool {
-        !self.removed.is_empty() || self.added > 0 || !self.refused.is_empty() || self.cache_stripped
+        !self.removed.is_empty()
+            || self.added > 0
+            || !self.refused.is_empty()
+            || !self.rewritten.is_empty()
+            || self.cache_stripped
     }
 }
 
@@ -155,8 +407,8 @@ impl Report {
 /// `All` ignores the list. Such a policy is stored and means something the
 /// moment the mode changes; it just does not act now.
 #[must_use]
-pub const fn is_noop(policy: &Policy) -> bool {
-    !policy.mode.prunes() && policy.disable.is_empty() && policy.add.is_empty()
+pub fn is_noop(policy: &Policy) -> bool {
+    !policy.mode.prunes() && policy.disable.is_empty() && policy.add.is_empty() && policy.rewrite.is_empty()
 }
 
 /// Reject a policy that could never do what it says, before it is stored.
@@ -184,6 +436,31 @@ pub fn validate(policy: &Policy) -> Result<(), String> {
             .is_none_or(|n| n.trim().is_empty())
         {
             return Err("an add entry needs a non-empty `name`".to_owned());
+        }
+    }
+    for (tool, rules) in &policy.rewrite {
+        if tool.trim().is_empty() {
+            return Err("a rewrite entry has no tool name".to_owned());
+        }
+        // Two keys differing only by case would resolve to whichever the map
+        // happens to iterate first, making the other one inert. `rules_for`
+        // matches loosely, so this is the only place the collision can show.
+        if policy
+            .rewrite
+            .keys()
+            .filter(|other| other.eq_ignore_ascii_case(tool))
+            .count()
+            > 1
+        {
+            return Err(format!("two rewrite entries name {tool:?} in different cases"));
+        }
+        // A `Replaced` with nothing to find replaces nothing. It is inert, so
+        // it would sit in the stored policy looking like it does something.
+        if rules.iter().any(|rule| match rule {
+            Normalise::Replaced { find, .. } => find.is_empty(),
+            Normalise::Dates | Normalise::Provider => false,
+        }) {
+            return Err(format!("a rewrite of {tool:?} finds an empty string"));
         }
     }
     Ok(())
@@ -256,6 +533,8 @@ pub fn apply(body: &mut Value, policy: &Policy, takes_cache: bool) -> Report {
         });
     }
 
+    apply_rewrites(&mut sent, policy, &mut report);
+
     report.sent = sent.len();
     // A cache mark on a definition this client sent, when the array has been
     // rebuilt around it, no longer points where the client put it.
@@ -310,6 +589,51 @@ fn append_added(
     reject_and_append(sent, policy.add.iter().cloned(), client_names, strip_marks, report);
 }
 
+/// The rules for a tool, matched the way every other name in this engine is:
+/// case-insensitively.
+///
+/// A `rewrite` keyed exactly would make `{"WebSearch": …}` a silent no-op
+/// against a client's `websearch`, which is the one failure a policy must not
+/// have — the same reason `disable` and `add` compare loosely.
+fn rules_for<'a>(policy: &'a Policy, name: &str) -> Option<&'a [Normalise]> {
+    policy
+        .rewrite
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, rules)| rules.as_slice())
+}
+
+/// Runs each client-sent definition's name through its rules, editing the
+/// description where it already sits.
+///
+/// A tool with no description is left alone. There is no prose to normalise,
+/// and inventing one would be a bigger change than the policy asked for.
+fn apply_rewrites(sent: &mut [Value], policy: &Policy, report: &mut Report) {
+    for tool in sent {
+        let Some(name) = tool_name(tool).map(ToOwned::to_owned) else {
+            continue;
+        };
+        let Some(rules) = rules_for(policy, &name) else {
+            continue;
+        };
+        let Some(description) = tool.get("description").and_then(Value::as_str) else {
+            continue;
+        };
+        let mut text = description.to_owned();
+        let mut edited = false;
+        for rule in rules {
+            if let Some(next) = rule.run(&text) {
+                text = next;
+                edited = true;
+            }
+        }
+        if edited {
+            tool["description"] = Value::String(text);
+            report.rewritten.push(name);
+        }
+    }
+}
+
 /// The shadow rule and the nameless rule, in one place so `add_only` and the
 /// main path cannot drift apart.
 ///
@@ -349,6 +673,13 @@ fn reject_and_append(
 impl Report {
     /// Whether anything was removed or refused before the cache decision.
     /// `added` is not counted: an addition does not move the client's marks.
+    /// Whether a change moved a definition out from under a cache mark.
+    ///
+    /// A rewrite is deliberately not one. It edits a definition where it
+    /// already sits, so the mark still points at the tool it was put on, and
+    /// the whole reason to rewrite is to stop paying a re-warm — counting it
+    /// here would strip the mark and buy back the churn the rule exists to
+    /// remove.
     const fn changed_before_cache(&self) -> bool {
         !self.removed.is_empty()
     }
@@ -818,6 +1149,173 @@ mod tests {
         assert_eq!(report.added, 1);
     }
 
+    fn described(name: &str, description: &str) -> Value {
+        json!({"name": name, "description": description, "input_schema": {"type": "object"}})
+    }
+
+    fn description_of(body: &Value, name: &str) -> String {
+        body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| tool_name(t) == Some(name))
+            .and_then(|t| t.get("description"))
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_owned()
+    }
+
+    fn rewritten(rules: [(&str, Normalise); 1]) -> BTreeMap<String, Vec<Normalise>> {
+        rules
+            .into_iter()
+            .map(|(name, rule)| (name.to_owned(), vec![rule]))
+            .collect()
+    }
+
+    /// The case the verb exists for: a sentence naming the current date is
+    /// stable for at most a day, so leaving it in defeats the prompt cache.
+    #[test]
+    fn dates_strip_the_volatile_sentence_and_keep_the_instruction() {
+        let policy = Policy {
+            rewrite: rewritten([("Search", Normalise::Dates)]),
+            ..Policy::default()
+        };
+        let mut body = json!({"tools": [described(
+            "Search",
+            "Search the web. \
+             The current date is September 10, 2026."
+        )]});
+        let report = apply(&mut body, &policy, true);
+        assert_eq!(description_of(&body, "Search"), "Search the web.");
+        assert_eq!(report.rewritten, ["Search"]);
+    }
+
+    #[test]
+    fn provider_strips_the_locality_claim() {
+        let policy = Policy {
+            rewrite: rewritten([("Web", Normalise::Provider)]),
+            ..Policy::default()
+        };
+        let mut body = json!({"tools": [described(
+            "Web",
+            "Fetch a page. This tool is US based."
+        )]});
+        apply(&mut body, &policy, true);
+        assert_eq!(description_of(&body, "Web"), "Fetch a page.");
+    }
+
+    /// The blunt rule, and the only one an operator can point at a phrase of
+    /// their own choosing.
+    #[test]
+    fn replaced_swaps_a_phrase() {
+        let policy = Policy {
+            rewrite: rewritten([(
+                "Bash",
+                Normalise::Replaced {
+                    find: "the shell".into(),
+                    replace: "a shell".into(),
+                },
+            )]),
+            ..Policy::default()
+        };
+        let mut body = json!({"tools": [described("Bash", "Run a command in the shell.")]});
+        let report = apply(&mut body, &policy, true);
+        assert_eq!(description_of(&body, "Bash"), "Run a command in a shell.");
+        assert_eq!(report.rewritten, ["Bash"]);
+    }
+
+    #[test]
+    fn replaced_can_delete_a_phrase_outright() {
+        let policy = Policy {
+            rewrite: rewritten([(
+                "Bash",
+                Normalise::Replaced {
+                    find: " very".into(),
+                    replace: String::new(),
+                },
+            )]),
+            ..Policy::default()
+        };
+        let mut body = json!({"tools": [described("Bash", "Run a very long command.")]});
+        apply(&mut body, &policy, true);
+        assert_eq!(description_of(&body, "Bash"), "Run a long command.");
+    }
+
+    /// Normalising prose must never move the tool set: a rewrite that pruned a
+    /// tool would break a conversation already mid-flight, which is the whole
+    /// reason this verb was split out from `disable`.
+    #[test]
+    fn rewriting_prose_never_moves_a_tool() {
+        let policy = Policy {
+            rewrite: BTreeMap::from([
+                ("Bash".to_owned(), vec![Normalise::Dates]),
+                ("Gone".to_owned(), vec![Normalise::Provider]),
+            ]),
+            ..Policy::default()
+        };
+        let mut body = request(&["Read", "Bash"]);
+        let report = apply(&mut body, &policy, true);
+        assert_eq!(names(&body), ["Read", "Bash"]);
+        assert!(report.removed.is_empty());
+        assert_eq!(report.sent, 2);
+    }
+
+    #[test]
+    fn a_tool_with_no_description_is_left_alone() {
+        let policy = Policy {
+            rewrite: rewritten([("Bash", Normalise::Dates)]),
+            ..Policy::default()
+        };
+        let mut body = json!({"tools": [{"name": "Bash", "input_schema": {"type": "object"}}]});
+        let before = body.clone();
+        let report = apply(&mut body, &policy, true);
+        assert_eq!(body, before);
+        assert!(report.rewritten.is_empty(), "nothing changed, so nothing is logged");
+    }
+
+    #[test]
+    fn a_rule_for_a_tool_that_was_not_sent_is_inert() {
+        let policy = Policy {
+            rewrite: rewritten([("Absent", Normalise::Dates)]),
+            ..Policy::default()
+        };
+        let mut body = request(&["Read"]);
+        let before = body.clone();
+        apply(&mut body, &policy, true);
+        assert_eq!(body, before);
+    }
+
+    /// `changed_before_cache` decides whether to strip the client's cache
+    /// marks, and the reason to strip is that the array was *rebuilt*: a mark
+    /// on the third definition no longer points at the third definition. A
+    /// rewrite edits a description in place and moves nothing, so the marks
+    /// still point where the client put them and must be left alone. The
+    /// content change still counts for `changed()`, which is what puts the
+    /// pass in the log.
+    #[test]
+    fn a_rewrite_edits_in_place_and_leaves_the_cache_marks_where_they_were() {
+        let policy = Policy {
+            rewrite: rewritten([("Bash", Normalise::Dates)]),
+            ..Policy::default()
+        };
+        let mut body = json!({"tools": [described("Bash", "Run it. The current date is May 1, 2026.")]});
+        let report = apply(&mut body, &policy, true);
+        assert!(report.changed(), "the description moved, so the pass is worth logging");
+        assert!(
+            !report.changed_before_cache(),
+            "nothing was rebuilt, so the client's marks are still on the right tools"
+        );
+    }
+
+    #[test]
+    fn a_policy_that_only_rewrites_is_not_a_noop() {
+        let policy = Policy {
+            rewrite: rewritten([("Bash", Normalise::Dates)]),
+            ..Policy::default()
+        };
+        assert!(!is_noop(&policy));
+    }
+
     #[test]
     fn a_body_with_no_tools_and_nothing_to_add_is_untouched() {
         let policy = Policy {
@@ -934,6 +1432,7 @@ mod tests {
             disable: vec!["Bash".into()],
             allow: vec!["Read".into()],
             add: vec![tool("extra")],
+            rewrite: BTreeMap::from([("WebSearch".to_owned(), vec![Normalise::Provider])]),
         };
         let json = serde_json::to_value(&policy).expect("serialize");
         let back: Policy = serde_json::from_value(json).expect("deserialize");

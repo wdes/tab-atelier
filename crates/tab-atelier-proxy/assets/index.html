@@ -980,6 +980,19 @@
                 the proxy must keep, is refused rather than guessed at.
               </p>
 
+              <label class="form-label small fw-semibold" for="ta-tools-rewrite">Rewrite descriptions</label>
+              <textarea id="ta-tools-rewrite" rows="4" class="form-control form-control-sm font-monospace mb-1"
+                        v-model="tools.rewrite"
+                        placeholder="WebSearch dates&#10;Bash curl -> fetch"></textarea>
+              <p class="small text-body-secondary mb-0">
+                One rule per line: a tool name, then <code>dates</code>, <code>provider</code>,
+                or a <code>find -&gt; replace</code> pair. Rewrites touch the description only —
+                a tool is never added or removed here. <code>dates</code> drops the sentences that
+                pin a current date; <code>provider</code> prunes the ones naming a rival's
+                product. Lines starting with <code>#</code> are ignored, and a line that is not
+                one of the three forms is refused rather than dropped.
+              </p>
+
               <div class="d-flex gap-2 justify-content-end">
                 <button class="btn btn-sm btn-outline-secondary" @click="tools = null" :disabled="busy">
                   Cancel
