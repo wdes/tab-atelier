@@ -116,6 +116,38 @@ function emptyUsage(id) {
         window: { start: "", end: "", hours: 0 },
     };
 }
+/**
+ * A button that turns into a spinner and a gerund while its work runs.
+ *
+ * The page had six of these and they had drifted apart by one `me-1` — the
+ * spinner sitting on the word instead of beside it. Each spelled the same
+ * four parts by hand: the `spinner-border` span, the `role="status"`, the
+ * label swap, and the disable. `label` is the idle word, `busyLabel` its
+ * gerund.
+ *
+ * No `disabled` prop: every caller already disabled the button on the exact
+ * flag it spun on, so deriving it here is what keeps the two from drifting
+ * again. A `class` passed from the call site still lands on the <button>,
+ * which is how each keeps its own margin.
+ *
+ * Declared here rather than read off a namespace like the charts: this is
+ * app chrome, not a chart, and charts.js is wrapped in an IIFE so its names
+ * never reach this scope to collide with.
+ */
+const BusyButton = Vue.defineComponent({
+    name: "BusyButton",
+    props: {
+        busy: Boolean,
+        label: { type: String, required: true },
+        busyLabel: { type: String, required: true },
+    },
+    emits: ["click"],
+    template: `
+    <button class="btn btn-sm btn-outline-secondary" :disabled="busy" @click="$emit('click')">
+      <span v-if="busy" class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>{{ busy ? busyLabel : label }}
+    </button>
+  `,
+});
 // Bound to a const before `createApp` sees it. Passing the literal inline
 // leaves Vue unable to tie `data`, `computed` and `methods` together, and it
 // fails open: `this` becomes `any` in methods and `{}` in computed, so the
@@ -126,6 +158,7 @@ const AdminApp = Vue.defineComponent({
     // CallsChart` here collides with the one in charts.js and the page dies with
     // a redeclaration SyntaxError before Vue ever mounts.
     components: {
+        BusyButton,
         CallsChart: window.TaCharts.CallsChart,
         TokensChart: window.TaCharts.TokensChart,
         PressureChart: window.TaCharts.PressureChart,
