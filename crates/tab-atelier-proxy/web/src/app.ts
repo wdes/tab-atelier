@@ -467,14 +467,11 @@ const AdminApp = Vue.defineComponent({
     async api<T = unknown>(method: string, path: string, body?: unknown): Promise<T> {
       const resp = await fetch(path, {
         method,
+        // The one place a credential is attached, for every call in this app.
+        // Bearer only: a second spelling is a second thing to audit and to
+        // redact, and a secret in a header no tooling knows about.
         headers: {
           Authorization: "Bearer " + this.token,
-          // Sent twice on purpose: Authorization is the header reverse
-          // proxies and auth modules are most likely to consume before it
-          // reaches a backend, and when that happens the server sees no
-          // credential at all — indistinguishable from a wrong token. A
-          // plainly-named custom header survives those arrangements.
-          "X-Admin-Token": this.token,
           ...(body ? { "Content-Type": "application/json" } : {}),
         },
         body: body ? JSON.stringify(body) : undefined,

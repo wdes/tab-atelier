@@ -1,0 +1,6 @@
+# The proxy's UI is an operator's console, not public content: it is served on
+# whatever address the operator bound, and there is nothing here a crawler
+# should index. This is a request, not a control — anything that ignores it
+# still meets the admin token.
+User-agent: *
+Disallow: /
