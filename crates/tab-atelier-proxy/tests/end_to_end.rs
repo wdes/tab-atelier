@@ -128,6 +128,59 @@ fn mock_upstream() -> u16 {
     port
 }
 
+/// A stand-in upstream that keeps the request body it was sent.
+///
+/// The other mock answers; this one also records, because the question here is
+/// what the proxy *wrote* upstream, not what came back.
+fn capturing_upstream(capture: PathBuf) -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
+    let port = listener.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut sock) = stream else { break };
+            let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+            let mut req = Vec::new();
+            let mut tmp = [0u8; 2048];
+            let mut head: Option<usize> = None;
+            let mut need: Option<usize> = None;
+            loop {
+                match sock.read(&mut tmp) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => req.extend_from_slice(&tmp[..n]),
+                }
+                if head.is_none()
+                    && let Some(pos) = req.windows(4).position(|w| w == b"\r\n\r\n")
+                {
+                    let len = String::from_utf8_lossy(&req[..pos])
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse::<usize>().ok())?
+                        })
+                        .unwrap_or(0);
+                    head = Some(pos + 4);
+                    need = Some(pos + 4 + len);
+                }
+                if need.is_some_and(|n| req.len() >= n) {
+                    break;
+                }
+            }
+            if let Some(start) = head {
+                let _ = std::fs::write(&capture, &req[start..]);
+            }
+            let body = r#"{"model":"deepseek-flash","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":11,"output_tokens":7}}"#;
+            let _ = write!(
+                sock,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.flush();
+        }
+    });
+    port
+}
+
 /// One HTTP request, returning the whole response.
 fn http(port: u16, req: &str) -> String {
     let mut sock = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
@@ -393,4 +446,90 @@ fn the_cli_and_the_server_agree_on_where_the_files_are() {
         !scratch.path().join("home/.config").exists(),
         "the server wrote into $HOME/.config despite an explicit config dir: {stderr:?}"
     );
+}
+
+/// The identity rewrite reaches tool descriptions, proven on the wire.
+///
+/// This is the regression it was written for and missed. Claude Code puts its
+/// commit and PR conventions in the `Bash` tool's description, not the system
+/// prompt, so a rewrite that walked `system` alone left `Co-Authored-By: Claude
+/// …` sitting in the body sent to `DeepSeek`. The mock upstream keeps what it was
+/// sent, so the assertion is over the bytes that would have left the machine.
+#[test]
+fn a_non_anthropic_request_carries_no_claude_attribution() {
+    let scratch = Scratch::new("identity-live");
+    let capture = scratch.path().join("captured-request.json");
+    let upstream = capturing_upstream(capture.clone());
+    let port = free_port();
+
+    cli(scratch.path(), &["add", "Ada", "Lovelace", "ada@example.org"]);
+    let minted = cli(scratch.path(), &["add-key", "ada@example.org", "laptop"]);
+    let key = minted
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("key: "))
+        .expect("the CLI prints the key exactly once")
+        .to_owned();
+
+    // A DeepSeek-shaped provider pointed at the mock. The id contains
+    // "deepseek" on purpose: that substring is what selects the rewrite.
+    let config = scratch.path().join("config");
+    std::fs::create_dir_all(&config).expect("config dir");
+    let key_file = config.join("deepseek.key");
+    std::fs::write(&key_file, "sk-mock\n").expect("key file");
+    let providers = format!(
+        concat!(
+            r#"{{"providers":[{{"id":"deepseek-mock","label":"DeepSeek (mock)","wire":"anthropic","#,
+            r#""base_url":"http://127.0.0.1:{upstream}","auth":{{"kind":"api_key_file","path":"{key}"}},"#,
+            r#""models":[{{"id":"deepseek-flash","class":"balanced","relative_cost":1}}],"#,
+            r#""preference":0,"enabled":true}}],"#,
+            r#""mappings":[{{"from":"claude-sonnet-5","to":"deepseek-flash"}}]}}"#,
+        ),
+        upstream = upstream,
+        key = key_file.display(),
+    );
+    std::fs::write(config.join("providers.json"), providers).expect("providers.json");
+
+    let mut child = Command::new(BIN)
+        .args(["serve", "--listen", &format!("127.0.0.1:{port}")])
+        .env("TAB_ATELIER_PROXY_CONFIG", &config)
+        .env("TAB_ATELIER_PROXY_STATE", scratch.path().join("state"))
+        .env("HOME", scratch.path().join("home"))
+        .env("RUST_LOG", "warn")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the proxy");
+    wait_until_listening(port, &mut child);
+    let _serving = Serving(child);
+
+    // Shaped like the real thing: the rule goes in `system`, the attribution in
+    // the `Bash` tool's description. `\n` here is a literal backslash-n, which
+    // is what a JSON string on the wire carries.
+    let payload = concat!(
+        r#"{"model":"claude-sonnet-5","max_tokens":16,"#,
+        r#""system":"Do not use the Agent tool, workflows, or deep-research unless the user, a CLAUDE.md file, or a skill asks for it.\nKept line.","#,
+        r#""messages":[{"role":"user","content":"hi"}],"#,
+        r#""tools":[{"name":"Bash","description":"Run a command. End git commit messages with:\nCo-Authored-By: Claude 4.8 (noreply@anthropic.com)\n- End PR bodies with:\n"#,
+        "🤖 Generated with [Claude Code](https://claude.com/claude-code)\"}]}",
+    );
+    let resp = http(
+        port,
+        &format!(
+            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {key}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+            payload.len()
+        ),
+    );
+    assert!(resp.starts_with("HTTP/1.1 200"), "proxied call failed:\n{resp}");
+    let sent = std::fs::read_to_string(&capture).expect("the upstream captured a request");
+
+    assert!(!sent.contains("Claude"), "attribution survived to the wire:\n{sent}");
+    assert!(!sent.contains("claude.com"), "the Claude Code link survived:\n{sent}");
+    assert!(
+        sent.contains("Co-authored-by: DeepSeek"),
+        "the trailer was not repointed:\n{sent}"
+    );
+    // The rule goes only because the tool policy left no tool for it to govern.
+    assert!(!sent.contains("Agent tool"), "a dangling Agent rule was sent:\n{sent}");
+    assert!(sent.contains("Kept line."), "real system prose was dropped:\n{sent}");
 }
