@@ -75,14 +75,30 @@ fn post_chat(key: &str, body: &Value) -> ureq::Body {
     resp.into_body()
 }
 
-/// Read the whole (non-streaming) body as JSON.
-fn body_json(mut body: ureq::Body) -> Value {
+/// The key behind this suite is on the free tier: 50 requests a day, and a
+/// development session spends those. A spent quota is not a code failure, so
+/// say so and stand down — a suite that goes red when nothing is wrong teaches
+/// people to ignore red.
+fn quota_spent(body: &str) -> bool {
+    body.contains("rate_limit_exceeded")
+}
+
+fn stand_down() {
+    eprintln!("skipping: the test key's daily request quota is spent");
+}
+
+/// Read the whole (non-streaming) body as JSON, or `None` if the quota is gone.
+fn body_json(mut body: ureq::Body) -> Option<Value> {
     let text = body.read_to_string().unwrap_or_default();
+    if quota_spent(&text) {
+        stand_down();
+        return None;
+    }
     let value: Value = serde_json::from_str(&text).unwrap_or_else(|e| panic!("unparsable body: {e}\n{text}"));
     // `http_status_as_error` is off so a rejection arrives as a body. Catch it
     // here rather than letting it translate into an empty completion.
     assert!(value.get("error").is_none(), "openai rejected the request: {value}");
-    value
+    Some(value)
 }
 
 /// The load-bearing test: a full streamed turn, translated, then billed.
@@ -118,16 +134,24 @@ fn a_live_streamed_turn_translates_and_bills() {
     let mut translator = Translator::new();
     let mut sniffer = Sniffer::new(Some("text/event-stream"));
     let mut out = Vec::new();
+    let mut raw = Vec::new();
     let mut buf = vec![0_u8; 4096];
     loop {
         let n = std::io::Read::read(&mut reader, &mut buf).expect("read chunk");
         if n == 0 {
             break;
         }
+        raw.extend_from_slice(&buf[..n]);
         for frame in translator.feed(&buf[..n]) {
             sniffer.feed(&frame);
             out.extend_from_slice(&frame);
         }
+    }
+    // A rejected request has no SSE frames, so the translator emits nothing and
+    // the assertions below would read that as a broken translation.
+    if quota_spent(&String::from_utf8_lossy(&raw)) {
+        stand_down();
+        return;
     }
     for frame in translator.finish() {
         sniffer.feed(&frame);
@@ -183,7 +207,9 @@ fn a_live_unstreamed_turn_translates() {
     chat["model"] = json!(LUNA);
     chat["stream"] = json!(false);
 
-    let reply = body_json(post_chat(&key, &chat));
+    let Some(reply) = body_json(post_chat(&key, &chat)) else {
+        return;
+    };
     let translated = tab_atelier_proxy::openai::from_chat(&reply);
 
     assert_eq!(translated["type"], json!("message"));
@@ -235,7 +261,9 @@ fn a_live_tool_call_comes_back_as_a_tool_use_block() {
     chat["model"] = json!(LUNA);
     chat["stream"] = json!(false);
 
-    let reply = body_json(post_chat(&key, &chat));
+    let Some(reply) = body_json(post_chat(&key, &chat)) else {
+        return;
+    };
     let translated = tab_atelier_proxy::openai::from_chat(&reply);
 
     let call = translated["content"]
@@ -286,16 +314,24 @@ fn a_live_streamed_tool_call_reassembles_the_arguments() {
     let mut translator = Translator::new();
     let mut sniffer = Sniffer::new(Some("text/event-stream"));
     let mut out = Vec::new();
+    let mut raw = Vec::new();
     let mut buf = vec![0_u8; 4096];
     loop {
         let n = std::io::Read::read(&mut reader, &mut buf).expect("read chunk");
         if n == 0 {
             break;
         }
+        raw.extend_from_slice(&buf[..n]);
         for frame in translator.feed(&buf[..n]) {
             sniffer.feed(&frame);
             out.extend_from_slice(&frame);
         }
+    }
+    // A rejected request has no SSE frames, so the translator emits nothing and
+    // the assertions below would read that as a broken translation.
+    if quota_spent(&String::from_utf8_lossy(&raw)) {
+        stand_down();
+        return;
     }
     for frame in translator.finish() {
         sniffer.feed(&frame);
