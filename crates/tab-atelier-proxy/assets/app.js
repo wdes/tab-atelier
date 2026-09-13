@@ -973,6 +973,16 @@ const AdminApp = Vue.defineComponent({
                 return "—";
             return value.length <= 8 ? value : value.slice(0, 8);
         },
+        /**
+         * What to call the server-side tool a capture ran, for a badge.
+         *
+         * The family name is shown verbatim — `web_search`, not `web search`. It is
+         * the identifier an operator greps for, and the proxy has already dropped
+         * the version date so the label survives Anthropic's next revision.
+         */
+        serverToolLabel(c) {
+            return c.server_tool ?? "";
+        },
         // Quiet by default because of the 30 s poll: a failing read must not blank
         // the accounts page it sits on, and a banner raised on every tick would be
         // unreadable. A reload someone pressed is not quiet — silence there is

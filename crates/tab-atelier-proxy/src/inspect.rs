@@ -103,6 +103,17 @@ pub struct Capture {
     /// basis of a billing or access decision. See [`Client`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client: Option<Client>,
+    /// The server-side tool this call is, when it is one.
+    ///
+    /// A web search is not work the operator asked for directly: the model asks
+    /// for it, and Claude Code answers by making another `/v1/messages` call
+    /// whose only tool is `web_search`. In a list of a hundred calls that turn
+    /// is otherwise indistinguishable from a conversation — same key, same
+    /// model, plausible token count — so it is labelled.
+    ///
+    /// The family only, without the version date: see [`server_tool`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_tool: Option<String>,
     /// Whether this is the conversation or the auto-mode permission classifier.
     ///
     /// Defaults to `Work`, which is the right reading for the lines already on
@@ -315,6 +326,31 @@ fn parse_client(body: &serde_json::Value) -> Option<Client> {
     (client != Client::default()).then_some(client)
 }
 
+/// The server-side tool a request asks for, if it asks for one.
+///
+/// Anthropic's own tools are versioned TYPES — `web_search_20250305`,
+/// `web_fetch_20250910` — while a caller's own tool has no `type` at all, only
+/// a name and an input schema. So the version suffix is the discriminator, and
+/// it is one a client cannot fake by naming its tool `web_search`: without the
+/// date there is no type field, and with one it is indistinguishable from the
+/// real thing, which is the budget the label cares about anyway.
+///
+/// The date is stripped so the label survives the next revision. Anthropic
+/// ships a new date when the tool changes; hardcoding today's would leave the
+/// badge silently absent the day `web_search_20260209` arrives, which is the
+/// exact failure a label is supposed to make visible.
+fn server_tool(body: &serde_json::Value) -> Option<String> {
+    body.get("tools")?
+        .as_array()?
+        .iter()
+        .filter_map(|tool| tool.get("type")?.as_str())
+        .find_map(|ty| {
+            let (family, date) = ty.rsplit_once('_')?;
+            let versioned = date.len() == 8 && date.bytes().all(|b| b.is_ascii_digit());
+            (versioned && !family.is_empty()).then(|| family.to_owned())
+        })
+}
+
 /// Where a request came from, as the proxy saw it.
 ///
 /// Both the resolved answer and the raw inputs, deliberately. Showing only the
@@ -360,6 +396,7 @@ pub fn capture(o: &Outgoing<'_>) -> Capture {
         .as_ref()
         .and_then(|v| v.get("model").and_then(serde_json::Value::as_str).map(str::to_owned));
     let client = parsed.as_ref().and_then(parse_client);
+    let server_tool = parsed.as_ref().and_then(server_tool);
     let (request_body, request_truncated) = clamp(&scrubbed);
     Capture {
         ts: ts.clone(),
@@ -370,6 +407,7 @@ pub fn capture(o: &Outgoing<'_>) -> Capture {
         provider: (*provider).to_owned(),
         model,
         client,
+        server_tool,
         kind: *kind,
         request_headers: headers
             .iter()
@@ -765,5 +803,43 @@ mod tests {
         let (out, cut) = clamp(&big);
         assert!(cut);
         assert!(out.contains('é'));
+    }
+
+    /// The date is stripped, so the label outlives the revision that carries
+    /// it: `web_search_20250305` today, whatever Anthropic dates next.
+    #[test]
+    fn a_versioned_type_names_its_family() {
+        let body = json!({"tools": [
+            {"name": "Read", "description": "x"},
+            {"type": "web_search_20250305", "name": "web_search"},
+        ]});
+        assert_eq!(server_tool(&body).as_deref(), Some("web_search"));
+    }
+
+    /// The discriminator is the date, not the name. A caller may ship its own
+    /// tool called `web_search`; with no `type` it is not Anthropic's, and
+    /// labelling it as a server tool would attribute spend to the wrong side.
+    #[test]
+    fn an_untyped_tool_named_like_a_server_tool_is_not_one() {
+        let body = json!({"tools": [{"name": "web_search", "input_schema": {}}]});
+        assert_eq!(server_tool(&body), None);
+    }
+
+    /// Only `_` + eight digits counts as a version. A bare type, or one dated
+    /// some other way, is not a server tool this code should claim to know.
+    #[test]
+    fn an_unversioned_type_is_not_a_server_tool() {
+        for ty in ["computer", "custom", "web_search_2025", "web_search_2025030x"] {
+            let body = json!({"tools": [{"type": ty, "name": "x"}]});
+            assert_eq!(server_tool(&body), None, "{ty}");
+        }
+    }
+
+    /// No tools array, or an empty one, is the overwhelmingly common case and
+    /// must cost nothing and say nothing.
+    #[test]
+    fn no_tools_means_no_server_tool() {
+        assert_eq!(server_tool(&json!({})), None);
+        assert_eq!(server_tool(&json!({"tools": []})), None);
     }
 }
