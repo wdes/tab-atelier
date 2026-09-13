@@ -30,6 +30,18 @@ pub use claude_api::{
     ANTHROPIC_BETA, ANTHROPIC_VERSION, BASE_API_URL as ANTHROPIC_BASE, Identity as ClaudeIdentity, merge_beta,
 };
 
+/// A version and a project URL, which is what an operator on the other side of
+/// a log line or an abuse report needs in order to know who is calling.
+///
+/// Sent to every non-Anthropic upstream. On the Anthropic hop the request has
+/// to keep wearing the client's Claude Code identity, so this one is not used
+/// there.
+pub const USER_AGENT: &str = concat!(
+    "tab-atelier-proxy/",
+    env!("CARGO_PKG_VERSION"),
+    " (+https://github.com/wdes/tab-atelier)"
+);
+
 /// Test/ops override for the credentials file location. Set via
 /// [`set_credentials_path`]; falls back to `~/.claude/.credentials.json`.
 static CREDS_PATH_OVERRIDE: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
