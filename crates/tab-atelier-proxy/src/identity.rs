@@ -9,10 +9,11 @@
 //! vendor's product, Anthropic's telemetry travels to a competitor, and the
 //! commits it writes credit a model that had no part in them.
 //!
-//! So a request bound for anyone but Anthropic is rewritten first: the
-//! `x-anthropic-*` header line goes, the client's name goes, and the trailer
-//! names the vendor that actually answers. Anthropic's own requests are left
-//! alone, because for them the claims are true.
+//! So a request bound for anyone but Anthropic is rewritten first. The
+//! `x-anthropic-*` header line goes; the identity sentence and the PR-body
+//! instruction are dropped whole; what remains of the client's name goes; and
+//! the trailer names the vendor that actually answers. Anthropic's own requests
+//! are left alone, because for them the claims are true.
 //!
 //! The rewrite is confined to `system`. The same strings appear in what the
 //! user typed and pasted, and editing those would corrupt the conversation — a
@@ -96,43 +97,44 @@ pub fn apply(body: &mut Value, vendor: Vendor, model: &str) {
     }
 }
 
-/// Whether a body could contain anything [`apply`] would change.
-///
-/// Every request from Claude Code carries a system prompt naming the client, so
-/// this saves the parse only for the proxy's own calls — the classifier and the
-/// title generator, whose prompts are written here and mention none of it. The
-/// needles must cover every edit `apply` makes, or it would start skipping work
-/// it owes.
-#[must_use]
-pub fn mentions(body: &[u8]) -> bool {
-    const NEEDLES: [&[u8]; 3] = [b"Claude Code", b"x-anthropic-", b"uthored-by:"];
-    NEEDLES
-        .iter()
-        .any(|needle| body.windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle)))
-}
-
 fn rewrite(text: &str, trailer: Option<&str>) -> String {
-    let text = strip_x_anthropic(text);
+    let text = strip_dropped_lines(text);
     let text = text.replace("Claude Code", "");
     trailer.map_or_else(|| text.clone(), |line| rewrite_trailer(&text, line))
 }
 
-/// Drop the whole line of any `x-anthropic-*` header.
+/// Drop the lines the far end has no business receiving.
 ///
-/// Claude Code prepends its billing header — `x-anthropic-billing-header:` and
-/// a version, an entrypoint, a checksum — as the first line of the system
-/// prompt. It is addressed to Anthropic, so it does not travel to anyone else.
-fn strip_x_anthropic(text: &str) -> String {
-    const PREFIX: &[u8] = b"x-anthropic-";
+/// Three kinds, all Anthropic's own:
+///
+/// * the `x-anthropic-*` billing header — a version, an entrypoint, a
+///   checksum, addressed to Anthropic;
+/// * the identity sentence, dropped whole. Removing only `Claude Code` from it
+///   would leave `You are , Anthropic's official CLI for Claude`, and the claim
+///   would survive the edit that exists to remove it;
+/// * the PR-body instruction, label and attribution together. Dropping the
+///   attribution alone would leave an instruction to end PR bodies with
+///   nothing.
+fn strip_dropped_lines(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for line in text.split_inclusive('\n') {
-        let head = line.trim_start().as_bytes();
-        if head.get(..PREFIX.len()).is_some_and(|p| p.eq_ignore_ascii_case(PREFIX)) {
+        if dropped(line) {
             continue;
         }
         out.push_str(line);
     }
     out
+}
+
+fn dropped(line: &str) -> bool {
+    let head = line.trim_start();
+    // Both prompt blocks are list items, so a bullet may sit in front.
+    let head = head.strip_prefix('-').map_or(head, str::trim_start);
+    let lower = head.to_ascii_lowercase();
+    lower.starts_with("x-anthropic-")
+        || lower.contains("you are claude code, anthropic's official cli for claude")
+        || lower.contains("generated with [claude code]")
+        || lower.starts_with("end pr bodies with")
 }
 
 /// Replace each `Co-Authored-By: … <…>` on its line with `replacement`.
@@ -274,11 +276,40 @@ mod tests {
     }
 
     #[test]
-    fn the_needles_cover_every_edit() {
-        // A body the guard skips must be one `apply` would not have changed.
-        assert!(mentions(b"You are Claude Code, Anthropic's official CLI"));
-        assert!(mentions(b"x-anthropic-billing-header: cc_version=1"));
-        assert!(mentions(b"Co-Authored-By: Claude <noreply@anthropic.com>"));
-        assert!(!mentions(b"{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"));
+    fn the_identity_sentence_is_dropped_whole_not_gutted() {
+        let mut body = json!({
+            "system": "You are Claude Code, Anthropic's official CLI for Claude.\n\nYou are an agent.",
+        });
+        apply(&mut body, Vendor::Deepseek, "deepseek-flash");
+        let text = body["system"].as_str().unwrap();
+        // Removing only `Claude Code` would leave the claim standing.
+        assert!(!text.contains("Anthropic's official CLI for Claude"), "{text}");
+        assert!(!text.contains("Claude Code"), "{text}");
+        assert!(text.contains("You are an agent."), "{text}");
+    }
+
+    #[test]
+    fn the_pr_body_block_goes_label_and_attribution_together() {
+        let mut body = json!({
+            "system": "Preface.\n\
+                       - End PR bodies with:\n\
+                       🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\
+                       Epilogue.",
+        });
+        apply(&mut body, Vendor::Openai, "gpt-5.6-luna");
+        let text = body["system"].as_str().unwrap();
+        assert!(!text.contains("End PR bodies"), "{text}");
+        assert!(!text.to_lowercase().contains("generated with"), "{text}");
+        assert!(text.contains("Preface."), "{text}");
+        assert!(text.contains("Epilogue."), "{text}");
+    }
+
+    #[test]
+    fn a_commit_message_body_is_not_mistaken_for_the_instruction() {
+        // The rule drops the *instruction*, matched from the start of the line.
+        // A commit message that merely mentions the phrase mid-sentence is prose.
+        let mut body = json!({ "system": "Write it so you can end PR bodies with a table." });
+        apply(&mut body, Vendor::Deepseek, "deepseek-flash");
+        assert!(body["system"].as_str().unwrap().contains("end PR bodies with a table."));
     }
 }

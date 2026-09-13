@@ -737,10 +737,10 @@ fn shape_body(
     // to emit one tag. Handing it a toolkit changes what it is, not merely what
     // it reads. See `classifier::Kind::shapes_tools`.
     let policy = route.kind.shapes_tools().then_some(policy);
-    // Did the client claim to be Claude Code to a model that is not Claude? The
-    // scan is only worth its pass when there is an edit to make, and there never
-    // is for Anthropic — where the claim is true.
-    let rewrites_identity = vendor != crate::identity::Vendor::Anthropic && crate::identity::mentions(body);
+    // Did the client claim to be Claude Code to a model that is not Claude?
+    // Anthropic's own requests are the one case where the claim is true, and
+    // so the one case left alone.
+    let rewrites_identity = vendor != crate::identity::Vendor::Anthropic;
     // The tool policy joins the early-out rather than being checked after
     // it. An account with no policy must not pay for the parse and the
     // re-encode, and that is most accounts on most requests.
