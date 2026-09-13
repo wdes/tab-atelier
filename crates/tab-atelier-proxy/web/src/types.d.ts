@@ -58,6 +58,11 @@ interface ApiUser {
  * server's (`tools.rs`), not this file's — the UI must not re-derive it, or
  * the two will disagree about what a policy does.
  */
+/** One description rewrite, in the shape `tools.rs` serialises: the two
+ *  catalogued rules are bare strings, the operator's own substitution is an
+ *  object. */
+type RewriteRule = "dates" | "provider" | { replaced: { find: string; replace: string } };
+
 interface ToolsPolicy {
     mode: "all" | "referenced" | "allow" | "none";
     /** Names removed, in every mode. */
@@ -66,6 +71,9 @@ interface ToolsPolicy {
     allow: string[];
     /** Definitions injected when the client did not send them. */
     add: unknown[];
+    /** Description rewrites, keyed by tool name. Prose only — a rewrite
+     *  never adds or removes a tool. */
+    rewrite: Record<string, RewriteRule[]>;
 }
 
 interface TokenTotals {
@@ -481,6 +489,8 @@ interface ToolsDraft {
     /** JSON, as typed. Parsed in `saveTools`, so a syntax error is reported
      *  against the field the typist is looking at. */
     add: string;
+    /** One rule per line, as typed. Parsed in `saveTools`. */
+    rewrite: string;
 }
 
 /**
