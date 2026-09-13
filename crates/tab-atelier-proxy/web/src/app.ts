@@ -871,6 +871,38 @@ const AdminApp = Vue.defineComponent({
       }
     },
     /**
+     * A body as coloured runs, for a template `v-for`.
+     *
+     * Runs rather than an HTML string: the body is written by whoever holds a
+     * key, so it is rendered through Vue's interpolation, which escapes it.
+     * `v-html` would execute a `"<img onerror=…>"` sitting in a system prompt.
+     */
+    jsonTokens(body: string): JsonToken[] {
+      const pretty = this.prettyJson(body);
+      // A run per token is a `<span>` per token, and a body near the capture
+      // cap has millions. Past this size plain text is the only rendering that
+      // will not lock up the tab, and JSON this large is not read by eye.
+      if (pretty.length > 262144) return [{ cls: "", text: pretty }];
+      const re = /"(?:\\.|[^"\\])*"|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|\b(?:true|false|null)\b/g;
+      const out: JsonToken[] = [];
+      let last = 0;
+      for (const m of pretty.matchAll(re)) {
+        const text = m[0];
+        const at = m.index;
+        if (text === undefined || at === undefined) continue;
+        if (at > last) out.push({ cls: "", text: pretty.slice(last, at) });
+        // A string is a key when a colon follows it: its value is what the
+        // reader is looking for and the key is only the label on the drawer.
+        const cls = text.startsWith('"')
+          ? /^[ \t\r\n]*:/.test(pretty.slice(at + text.length)) ? "ta-j-key" : "ta-j-str"
+          : /^(?:true|false|null)$/.test(text) ? "ta-j-lit" : "ta-j-num";
+        out.push({ cls, text });
+        last = at + text.length;
+      }
+      if (last < pretty.length) out.push({ cls: "", text: pretty.slice(last) });
+      return out;
+    },
+    /**
      * The first eight characters of an opaque id, for display.
      *
      * A session id and a device id are both long enough to wrap the line they

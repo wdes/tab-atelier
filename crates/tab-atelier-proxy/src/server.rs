@@ -2708,7 +2708,18 @@ mod tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
         let html = std::fs::read_to_string(root.join("index.html")).expect("the committed UI");
         let out = versioned_index(&root, &html);
+        // Only the assets this machine can read. Bootstrap is not vendored —
+        // it comes from Debian's libjs-bootstrap5, which is a runtime
+        // dependency of the .deb and absent from a bare CI runner. Asserting on
+        // it would be asserting that the developer has the package installed,
+        // and the production behaviour is to leave such a reference unversioned
+        // so the 404 names the file. So: check what resolves.
+        let mut checked = 0;
         for rel in VERSIONED {
+            if asset_bytes(&root, rel).is_none() {
+                continue;
+            }
+            checked += 1;
             let marker = format!("\"{rel}?v=");
             let at = out
                 .find(&marker)
@@ -2719,6 +2730,9 @@ mod tests {
                 "{rel} is versioned but carries no digest: {reference}"
             );
         }
+        // ...but if nothing resolved, the loop proved nothing and the test is
+        // a green light over an empty page.
+        assert!(checked > 0, "no listed asset was readable; the check above was vacuous");
     }
 
     /// The terminator is rarely on loopback, and a whole fleet logged under

@@ -404,6 +404,19 @@ interface InspectState {
 }
 
 /**
+ * One coloured run of a pretty-printed JSON body.
+ *
+ * A run, not a value: the viewer splits the text by token type and paints each
+ * piece, so whitespace and punctuation ride along with an empty class rather
+ * than being reconstructed. The text is always the body verbatim.
+ */
+interface JsonToken {
+    /** CSS class for the token's role; empty for punctuation and whitespace. */
+    cls: string;
+    text: string;
+}
+
+/**
  * Anything the shared hover/label mixins can plot.
  *
  * The mixins genuinely depend on their host providing `points`, so they
