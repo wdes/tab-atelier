@@ -746,6 +746,7 @@
                 <th>Keys · last used</th>
                 <th class="text-end">Tokens (7 d) · calls · avg/call</th>
                 <th>Routed to</th>
+                <th>Model</th>
                 <th>Compaction</th>
                 <th class="text-end">Key</th>
               </tr>
@@ -830,6 +831,30 @@
                     <option value="">any provider</option>
                     <option v-for="p in (providers ? providers.providers : [])" :key="p.id" :value="p.id">
                       {{ p.id }}
+                    </option>
+                  </select>
+                </td>
+                <td class="small">
+                  <!-- The model pin, which is what actually decides the hop:
+                       a model id resolves to the provider serving it, so this
+                       outranks the provider select to its left. Blank means the
+                       caller's own model is honoured.
+
+                       On the OpenAI wire a model cannot take tools and
+                       reasoning at once — a request with function tools must
+                       force reasoning off — so the list carries two entries per
+                       such model. The value is `model#flavour`; choosing the
+                       reasoning flavour also clears the tool policy, which is
+                       what lifts the tools from the request. See modelChoices
+                       and setUserModel. -->
+                  <select class="form-select form-select-sm" autocomplete="off"
+                          style="min-width: 15rem"
+                          :value="userModelValue(u)"
+                          :disabled="busy"
+                          @change="setUserModel(u, $event.target.value)">
+                    <option value="">caller's model</option>
+                    <option v-for="m in modelChoices" :key="m.value" :value="m.value">
+                      {{ m.label }}
                     </option>
                   </select>
                 </td>

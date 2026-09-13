@@ -93,9 +93,10 @@ pub struct Route {
     pub kind: crate::classifier::Kind,
     /// Set when this is not what the caller asked for.
     pub changed_from: Option<String>,
-    /// `rerouted` (same class, different provider) or `degraded` (cheaper
-    /// class). Distinct because they mean different things to whoever reads
-    /// the header: one preserved the answer, the other did not.
+    /// `rerouted` (same class, different provider), `degraded` (cheaper
+    /// class) or `pinned` (the account's model override). Distinct because
+    /// they mean different things to whoever reads the header: the first two
+    /// preserved or traded away the answer, the third says who chose it.
     pub reason: Option<&'static str>,
 }
 
@@ -196,6 +197,38 @@ pub fn choose(
         class = c.cheaper();
     }
     None
+}
+
+/// Resolve an account's model pin to a destination.
+///
+/// Distinct from [`choose`] in the one way that matters: `model_id` is
+/// resolved EXACTLY. `choose` reads a requested name as a class hint and is
+/// free to answer with any model of that class — which is right for a client
+/// naming a model it merely prefers, and wrong for an operator pinning one
+/// person to one model. Someone who pins `gpt-5.6-luna` means Luna, not
+/// "whichever fast model is cheapest right now", so a pin nothing serves
+/// returns `None` and the caller reports 503 rather than substituting.
+///
+/// `changed_from` is left for the caller to fill: only it knows the name the
+/// client actually asked for.
+#[must_use]
+pub fn choose_exact(
+    registry: &Registry,
+    model_id: &str,
+    provider: Option<&str>,
+    kind: crate::classifier::Kind,
+    health: &dyn Fn(&str) -> Health,
+    env: impl Fn(&str) -> Option<String> + Copy,
+    now: u64,
+) -> Option<Route> {
+    pick_exact(registry, model_id, health, env, now, provider).map(|(p, m)| Route {
+        provider_id: p.id.clone(),
+        model_id: m.id.clone(),
+        class: m.class,
+        kind,
+        changed_from: None,
+        reason: Some("pinned"),
+    })
 }
 
 /// A provider that serves this exact model id, healthy first.

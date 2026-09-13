@@ -24,7 +24,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response};
 
 use crate::users::{self, Account, Store, constant_time_eq};
-use crate::{account, classifier, egress, inspect, provider, qos, routing, usage};
+use crate::{account, classifier, egress, inspect, openai, provider, qos, routing, usage};
 
 type Body = http_body_util::combinators::BoxBody<Bytes, Infallible>;
 
@@ -119,6 +119,10 @@ fn account_json(a: &Account) -> serde_json::Value {
         "weight": a.weight,
         // The pin, so a row can say where this person's work goes.
         "provider": a.provider,
+        // The model pin, which outranks the provider pin: choosing a model
+        // chooses the hop that serves it. This is also what makes a model
+        // selectable per person, since routing resolves the id to a provider.
+        "model": a.model,
         // This person's compaction level. Per ACCOUNT, not per provider — see
         // `set_user_compact` for why the two axes meet there.
         "compact": a.compact.as_str(),
@@ -493,6 +497,48 @@ where
 /// compaction removed, or the 429 to send back. Split out of `anthropic`
 /// because it is the whole `QoS` decision and reads better as one unit than
 /// inline in the middle of the forwarder.
+/// Resolve where a metered request goes, honouring both kinds of pin.
+///
+/// Extracted from `shape_and_admit` to keep that function within the lint's
+/// length, and because this is the one place the provider pin and the model
+/// pin meet.
+///
+/// The MODEL pin is resolved exactly, never as a class hint: someone who pins
+/// `gpt-5.6-luna` means that model, and letting the ordinary ladder answer with
+/// whichever fast model is cheapest would quietly serve a different vendor
+/// than the one they chose. So a pin nothing serves returns `None` and the
+/// caller reports 503, rather than substituting — the same contract as the
+/// provider pin, and the reason both are enforced rather than preferred.
+fn pick_route(
+    state: &Arc<State>,
+    account: &Account,
+    requested: &str,
+    kind: classifier::Kind,
+    health: &dyn Fn(&str) -> routing::Health,
+) -> Option<routing::Route> {
+    let pin = account.model.as_deref();
+    let env = |v: &str| std::env::var(v).ok();
+    let now = usage::now_secs();
+    // Scoped: the registry lock is a std Mutex, and holding one across an
+    // await makes this future non-Send — which the compiler reports as a
+    // spawn failure a long way from here. Taken only for the decision.
+    let registry = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    pin.map_or_else(
+        || {
+            routing::choose(
+                &registry,
+                requested,
+                account.provider.as_deref(),
+                kind,
+                health,
+                env,
+                now,
+            )
+        },
+        |pin| routing::choose_exact(&registry, pin, account.provider.as_deref(), kind, health, env, now),
+    )
+}
+
 async fn shape_and_admit(
     state: &Arc<State>,
     account: &Account,
@@ -538,22 +584,23 @@ async fn shape_and_admit(
         classifier::Kind::Work
     };
     let health = provider_health(state);
-    // Scoped: the registry lock is a std Mutex, and holding one across an
-    // await makes this future non-Send — which the compiler reports as a
-    // spawn failure a long way from here. Taken only for the decision.
-    let route = {
-        let registry = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        routing::choose(
-            &registry,
-            &requested,
-            account.provider.as_deref(),
-            kind,
-            &health,
-            |v| std::env::var(v).ok(),
-            usage::now_secs(),
-        )
-    };
-    let Some(route) = route else {
+    // A per-person model pin is resolved in place of the name the caller used,
+    // but the body is left carrying the caller's name on purpose: `shape_body`
+    // renames the request to `route.model_id`, which the pin has just made the
+    // pinned id. Overwriting `requested` itself would make the two equal, the
+    // rename a no-op, and the pin silently do nothing but choose a route.
+    //
+    // The pin decides WHERE, not whether. An id no configured provider serves
+    // fails to route rather than falling back — the same contract as the
+    // provider pin above, and the reason both are enforced rather than
+    // preferred.
+    //
+    // Resolved EXACTLY, not as a class hint: someone who pins `gpt-5.6-luna`
+    // means that model, and letting the ordinary ladder answer with whichever
+    // fast model is cheapest would quietly serve a different vendor than the
+    // one they chose.
+    let pin = account.model.as_deref();
+    let Some(mut route) = pick_route(state, account, &requested, kind, &health) else {
         // Nothing configured can serve this at any class. A guess would be
         // worse than saying so.
         return Err(text(
@@ -561,6 +608,13 @@ async fn shape_and_admit(
             "tab-atelier-proxy: no provider available for this request (all blocked, or none configured)",
         ));
     };
+    // The pin overrides the name the caller used, so record what it overrode —
+    // the client is entitled to know it was answered by a model it did not
+    // name. Left to here rather than done inside routing because only this
+    // function parsed the request and saw the original.
+    if pin.is_some() && route.model_id != requested {
+        route.changed_from = Some(requested.clone());
+    }
     if let Some(reason) = route.reason {
         log::info!(
             "proxy: {} {reason} {requested} → {}/{}",
@@ -1000,7 +1054,7 @@ fn passthrough_headers(headers: &hyper::HeaderMap) -> Vec<(String, String)> {
 /// Separate from [`forward`] so the lock is taken and released in one small
 /// scope rather than living across the send — a blocking upstream call holding
 /// the inspection mutex would stall the admin page behind an LLM stream.
-fn begin_capture(f: &Forward, hdrs: &[(String, String)]) -> Option<inspect::Capture> {
+fn begin_capture(f: &Forward, path: &str, body: &[u8], hdrs: &[(String, String)]) -> Option<inspect::Capture> {
     // Read the flag and release the lock before building anything: the guard
     // must not be alive across the scrub-and-clamp below, let alone the send.
     let armed = {
@@ -1019,11 +1073,11 @@ fn begin_capture(f: &Forward, hdrs: &[(String, String)]) -> Option<inspect::Capt
         account_id: &f.account_id,
         account_email: &f.account_email,
         method: if f.is_post { "POST" } else { "GET" },
-        path: &f.sub_pq,
+        path,
         provider: &f.route.provider_id,
         kind: f.route.kind,
         headers: hdrs,
-        body: &f.body,
+        body,
         origin: Some(f.origin.clone()),
     }))
 }
@@ -1065,6 +1119,125 @@ fn finish_capture(
     ins.push(c);
 }
 
+/// Streams the upstream body to the client, translating when the hop is not
+/// Anthropic.
+///
+/// The sniffer is fed the *translated* bytes rather than the vendor's own: the
+/// split between input, cache-read and cache-write tokens is decided during
+/// translation, so reading the original would count a cached prefix twice. What
+/// is billed therefore stays a faithful record of a translation of what was
+/// said, rather than of what was said.
+fn pump<R: std::io::Read>(
+    reader: &mut R,
+    wire: provider::Wire,
+    is_sse: bool,
+    status: u16,
+    sniffer: &mut usage::Sniffer,
+    body_tx: &tokio::sync::mpsc::Sender<Bytes>,
+) {
+    let mut buf = [0u8; 8192];
+    if wire != provider::Wire::Openai {
+        loop {
+            match std::io::Read::read(reader, &mut buf) {
+                Ok(0) | Err(_) => break, // EOF, or an upstream read error
+                Ok(n) => {
+                    sniffer.feed(&buf[..n]);
+                    if body_tx.blocking_send(Bytes::copy_from_slice(&buf[..n])).is_err() {
+                        break; // client hung up
+                    }
+                }
+            }
+        }
+        return;
+    }
+    if is_sse {
+        let mut translator = openai::Translator::new();
+        loop {
+            match std::io::Read::read(reader, &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let mut gone = false;
+                    for chunk in translator.feed(&buf[..n]) {
+                        sniffer.feed(&chunk);
+                        if body_tx.blocking_send(chunk).is_err() {
+                            gone = true;
+                            break;
+                        }
+                    }
+                    if gone {
+                        break;
+                    }
+                }
+            }
+        }
+        // The tail that closes any block left open and emits the final usage.
+        // Without it a well-formed upstream response ends as a truncated one.
+        for chunk in translator.finish() {
+            sniffer.feed(&chunk);
+            if body_tx.blocking_send(chunk).is_err() {
+                break;
+            }
+        }
+        return;
+    }
+    // One JSON object, which for this vendor is also every error. Buffered
+    // because a single object cannot be translated in pieces.
+    let mut raw = Vec::new();
+    loop {
+        match std::io::Read::read(reader, &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => raw.extend_from_slice(&buf[..n]),
+        }
+    }
+    let out = if (200..300).contains(&status) {
+        let parsed: serde_json::Value = serde_json::from_slice(&raw).unwrap_or(serde_json::Value::Null);
+        openai::from_chat(&parsed)
+    } else {
+        // An error keeps the vendor's status but wears Anthropic's shape, so a
+        // client that only understands one dialect still reads the message.
+        openai::to_anthropic_error(status, &raw)
+    };
+    let bytes = Bytes::from(serde_json::to_vec(&out).unwrap_or_default());
+    sniffer.feed(&bytes);
+    let _ = body_tx.blocking_send(bytes);
+}
+
+/// The headers the request leaves with: the credential, then whatever the
+/// vendor's API expects to see on top of it.
+///
+/// The Anthropic-specific headers are the OAuth fingerprint and the beta flags.
+/// Neither means anything to another vendor's API — `OpenAI` reads
+/// `Authorization`, already present, and would reject or ignore the rest. Their
+/// absence on a non-Anthropic hop is the point, not an omission.
+fn upstream_headers(f: &Forward, auth: (&'static str, String), wire: provider::Wire) -> Vec<(String, String)> {
+    let mut hdrs: Vec<(String, String)> = vec![
+        ("Content-Type".to_owned(), f.content_type.clone()),
+        (auth.0.to_owned(), auth.1),
+    ];
+    if wire != provider::Wire::Anthropic {
+        return hdrs;
+    }
+    // The client's own beta flags are merged in, not replaced: a body field
+    // gated behind a flag the client opted into is rejected upstream as an
+    // unknown input if only our flags survive.
+    hdrs.push((
+        "anthropic-beta".to_owned(),
+        egress::merge_beta(f.client_beta.as_deref(), egress::ANTHROPIC_BETA),
+    ));
+    // The client's Claude Code identity travels with the request — it is the
+    // fingerprint Anthropic's OAuth path expects, and we are not it.
+    hdrs.extend(f.client_headers.iter().cloned());
+    // A client that sent none of them (a curl smoke test, another SDK) still
+    // has to look like Claude Code upstream, so fill in what is missing rather
+    // than either overriding the real client or sending nothing.
+    for (k, v) in claude_api::api_headers(None) {
+        if !hdrs.iter().any(|(n, _)| n.eq_ignore_ascii_case(k)) {
+            hdrs.push((k.to_owned(), v));
+        }
+    }
+    hdrs
+}
+
 /// The blocking half: authenticate to Anthropic, send, and pump the response.
 ///
 /// The upstream status and body are passed through untouched, including error
@@ -1077,49 +1250,45 @@ fn forward(
     meta_tx: tokio::sync::oneshot::Sender<Result<(u16, Option<String>), String>>,
     body_tx: &tokio::sync::mpsc::Sender<Bytes>,
 ) {
-    let (base, auth) = match destination(&f.state, &f.route.provider_id) {
+    let (base, auth, wire) = match destination(&f.state, &f.route.provider_id) {
         Ok(d) => d,
         Err(e) => {
             let _ = meta_tx.send(Err(e));
             return;
         }
     };
-    let url = format!("{base}{}", f.sub_pq);
-    let agent = egress::relay_agent();
-    let mut hdrs: Vec<(String, String)> = vec![
-        ("Content-Type".to_owned(), f.content_type.clone()),
-        (auth.0.to_owned(), auth.1),
-        // The client's own beta flags are merged in, not replaced: a body field
-        // gated behind a flag the client opted into is rejected upstream as an
-        // unknown input if only our flags survive.
-        (
-            "anthropic-beta".to_owned(),
-            egress::merge_beta(f.client_beta.as_deref(), egress::ANTHROPIC_BETA),
-        ),
-    ];
-    // The client's Claude Code identity travels with the request — it is the
-    // fingerprint Anthropic's OAuth path expects, and we are not it.
-    hdrs.extend(f.client_headers.iter().cloned());
-    // A client that sent none of them (a curl smoke test, another SDK) still
-    // has to look like Claude Code upstream, so fill in what is missing rather
-    // than either overriding the real client or sending nothing.
-    for (k, v) in claude_api::api_headers(None) {
-        if !hdrs.iter().any(|(n, _)| n.eq_ignore_ascii_case(k)) {
-            hdrs.push((k.to_owned(), v));
+    // The path and the body both depend on the dialect, and both are needed
+    // before the headers so the capture below records what actually left. An
+    // Anthropic-shaped hop is forwarded verbatim; an OpenAI-shaped one needs
+    // the translated body and the OpenAI path it belongs to.
+    let (path, body) = match wire {
+        provider::Wire::Anthropic => (f.sub_pq.clone(), f.body.clone()),
+        provider::Wire::Openai => {
+            // The body was validated as JSON on the way in, so a parse failure
+            // here would be a bug rather than bad input; `Null` translates to
+            // the minimal valid request instead of panicking in a proxy.
+            let parsed: serde_json::Value = serde_json::from_slice(&f.body).unwrap_or(serde_json::Value::Null);
+            (
+                "/v1/chat/completions".to_owned(),
+                Bytes::from(serde_json::to_vec(&openai::to_chat(&parsed)).unwrap_or_default()),
+            )
         }
-    }
+    };
+    let url = format!("{base}{path}");
+    let agent = egress::relay_agent();
+    let hdrs = upstream_headers(f, auth, wire);
     // The request as it will actually leave: after routing rewrote the model,
     // after the beta flags were merged, with the proxy's credential in place.
     // That is the thing nobody can otherwise see, and it is the whole reason
     // inspection exists. Scrubbing happens inside `inspect::capture`.
-    let mut pending = begin_capture(f, &hdrs);
+    let mut pending = begin_capture(f, &path, &body, &hdrs);
 
     let sent = if f.is_post {
         let mut rb = agent.post(&url);
         for (k, v) in &hdrs {
             rb = rb.header(k.as_str(), v);
         }
-        rb.send(&f.body[..])
+        rb.send(&body[..])
     } else {
         let mut rb = agent.get(&url);
         for (k, v) in &hdrs {
@@ -1135,11 +1304,29 @@ fn forward(
         }
     };
     let status = resp.status().as_u16();
-    let ctype = resp
+    let upstream_ctype = resp
         .headers()
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
+    // How the body is read is the upstream's call, not the client's: a vendor
+    // may answer a `stream: true` request with one buffered object.
+    let is_sse = upstream_ctype.as_deref().is_some_and(|c| c.contains("event-stream"));
+    // What the client is told it is getting. A translated stream is Anthropic
+    // SSE whatever the vendor called it, and passing `application/json` through
+    // would have the client buffer a live stream into one unparsable object.
+    let ctype = if wire == provider::Wire::Openai {
+        Some(
+            if is_sse {
+                "text/event-stream"
+            } else {
+                "application/json"
+            }
+            .to_owned(),
+        )
+    } else {
+        upstream_ctype.clone()
+    };
     // Capacity is measured, not invented: Anthropic reports what is left on
     // every response, so the scheduler tracks the real plan rather than a
     // number somebody typed into a config.
@@ -1153,10 +1340,10 @@ fn forward(
     let reset_in = header_num("anthropic-ratelimit-tokens-reset");
     let retry_after = header_num("retry-after");
     observe_upstream(f, status, remaining, reset_in, retry_after);
-    // Count what Anthropic says it billed, read off the response as it goes
-    // past. Asking the client to report its own usage would be unenforceable,
-    // and re-tokenising the prompt here would be a guess.
-    let mut sniffer = usage::Sniffer::new(ctype.as_deref());
+    // Count what the vendor says it billed, read off the translated response as
+    // it goes past. Asking the client to report its own usage would be
+    // unenforceable, and re-tokenising the prompt here would be a guess.
+    let mut sniffer = usage::Sniffer::new(upstream_ctype.as_deref());
     if meta_tx.send(Ok((status, ctype))).is_err() {
         // The client is gone, but the call was still made and still cost
         // tokens — so it is recorded anyway, just without a body to read.
@@ -1168,18 +1355,7 @@ fn forward(
         return;
     }
     let mut reader = resp.body_mut().as_reader();
-    let mut buf = [0u8; 8192];
-    loop {
-        match std::io::Read::read(&mut reader, &mut buf) {
-            Ok(0) | Err(_) => break, // EOF, or an upstream read error
-            Ok(n) => {
-                sniffer.feed(&buf[..n]);
-                if body_tx.blocking_send(Bytes::copy_from_slice(&buf[..n])).is_err() {
-                    break; // client hung up
-                }
-            }
-        }
-    }
+    pump(&mut reader, wire, is_sse, status, &mut sniffer, body_tx);
     let (model, tokens) = sniffer.finish();
     record(&f.state, &f.account_id, model.as_deref(), tokens, status);
     finish_capture(f, pending.take(), status, &tokens, model.as_deref());
@@ -1200,12 +1376,16 @@ fn forward(
     let _ = f.weight;
 }
 
-/// The base URL and credential header for a chosen provider.
+/// The base URL, credential header, and wire dialect for a chosen provider.
+///
+/// The wire comes back from here rather than being read off the provider again
+/// by the caller, because the credential header above already depends on it —
+/// resolving both from one lookup keeps them from disagreeing.
 ///
 /// # Errors
 /// The provider's credential is missing, which is a configuration problem
 /// rather than something to paper over with an unauthenticated request.
-fn destination(state: &State, provider_id: &str) -> Result<(String, (&'static str, String)), String> {
+fn destination(state: &State, provider_id: &str) -> Result<(String, (&'static str, String), provider::Wire), String> {
     // Cloned out rather than held: the guard must not live across the network
     // work below, and a Provider is a handful of strings.
     let chosen = {
@@ -1233,20 +1413,25 @@ fn destination(state: &State, provider_id: &str) -> Result<(String, (&'static st
 
     // Credentials are fetched per request, never held: a refreshed OAuth token
     // is picked up without a restart, and nothing lands in a log.
+    let wire = chosen.map_or(provider::Wire::Anthropic, |p| p.wire);
     let auth = match chosen.map(|p| &p.auth) {
         None | Some(provider::Auth::ClaudeOauth) => {
             let t = egress::oauth_access_token().map_err(|e| format!("egress oauth: {e}"))?;
             ("Authorization", format!("Bearer {t}"))
         }
-        // An Anthropic-compatible provider takes a key in x-api-key, the
-        // convention its own SDKs use. Env var or file is the provider's
-        // choice; the route only cares that one resolved.
+        // A third-party provider takes its key in the header its own API uses:
+        // Anthropic-compatible services follow the Anthropic SDKs (`x-api-key`),
+        // OpenAI follows the OpenAI SDKs (`Authorization: Bearer`). Env var or
+        // file is the provider's choice; the route only cares that one resolved.
         Some(auth) => {
             let key = auth.secret_with(|v| std::env::var(v).ok())?;
-            ("x-api-key", key)
+            match wire {
+                provider::Wire::Openai => ("Authorization", format!("Bearer {key}")),
+                provider::Wire::Anthropic => ("x-api-key", key),
+            }
         }
     };
-    Ok((base, auth))
+    Ok((base, auth, wire))
 }
 
 /// Fold an upstream answer back into what the proxy knows.
@@ -1611,6 +1796,12 @@ fn providers_json(state: &State) -> Response<Body> {
                 serde_json::json!({
                     "id": p.id,
                     "base_url": p.base_url,
+                    // Which API this hop speaks. The UI reads it to offer the
+                    // two flavours of a reasoning-capable model: on the OpenAI
+                    // wire a request carrying tools must have reasoning forced
+                    // off, so "tools" and "reasoning" are alternatives rather
+                    // than both-at-once.
+                    "wire": p.wire,
                     "preference": p.preference,
                     "enabled": p.enabled,
                     "peak_now": p.peak_now(now),
@@ -1889,6 +2080,35 @@ fn set_user_provider(state: &Arc<State>, store: &mut Store, who: &str, wanted: &
 ///
 /// Either a preset — one field, everything else supplied from code — or a
 /// hand-written one with a base URL, a model list and a key.
+/// Pin an account to a single model, or clear the pin.
+///
+/// Validated against the registry for the same reason a provider pin is: a typo
+/// would become a per-request 400 the operator never sees. An unknown model is
+/// refused here, where there is a message to give. The pin is a statement about
+/// a model, not about a provider — `pick_exact` finds whichever provider serves
+/// it and takes its wire, its key and its base URL from there.
+fn set_user_model(state: &Arc<State>, store: &mut Store, who: &str, wanted: &str) -> Response<Body> {
+    let wanted = wanted.trim();
+    if !wanted.is_empty() {
+        let known = {
+            let reg = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            reg.providers
+                .iter()
+                .any(|p| p.models.iter().any(|m| m.id.eq_ignore_ascii_case(wanted)))
+        };
+        if !known {
+            return json(
+                400,
+                &serde_json::json!({ "error": format!("no model {wanted:?}") }).to_string(),
+            );
+        }
+    }
+    match store.set_model(who, (!wanted.is_empty()).then_some(wanted)) {
+        Ok(a) => json(200, &serde_json::json!({ "user": account_json(&a) }).to_string()),
+        Err(e) => json(404, &serde_json::json!({ "error": e.to_string() }).to_string()),
+    }
+}
+
 fn save_provider(state: &Arc<State>, field: &dyn Fn(&str) -> String, body: &Bytes) -> Response<Body> {
     let dir = registry_dir(state);
     let mut reg = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2018,6 +2238,61 @@ fn flag_from(body: &Bytes, named: &str) -> Option<bool> {
         .and_then(serde_json::Value::as_bool)
 }
 
+/// Which of the three key routes is being taken.
+#[derive(Clone, Copy)]
+enum KeyAction {
+    /// Mint a named key. The secret is in this response and no other, ever.
+    Add,
+    Remove,
+    Disable,
+}
+
+/// Key management, kept together so the show-once rule stays auditable.
+fn key_route(
+    store: &mut Store,
+    action: KeyAction,
+    path: &str,
+    field: &dyn Fn(&str) -> String,
+    parsed: &serde_json::Value,
+) -> Response<Body> {
+    let owner = |suffix: &str| {
+        path.trim_start_matches("/api/users/")
+            .trim_end_matches(suffix)
+            .to_owned()
+    };
+    match action {
+        KeyAction::Add => {
+            let name = field("name");
+            let name = if name.is_empty() { "new" } else { &name };
+            match store.add_key(&owner("/keys"), name) {
+                Ok((k, secret)) => json(
+                    201,
+                    &serde_json::json!({ "key": key_json(&k), "secret": secret }).to_string(),
+                ),
+                Err(e) => json(400, &serde_json::json!({ "error": e.to_string() }).to_string()),
+            }
+        }
+        KeyAction::Remove => {
+            let (owner, key_ref) = split_key_path(path);
+            match store.remove_key(owner, key_ref) {
+                Ok(k) => json(200, &serde_json::json!({ "removed": key_json(&k) }).to_string()),
+                Err(e) => json(404, &serde_json::json!({ "error": e.to_string() }).to_string()),
+            }
+        }
+        KeyAction::Disable => {
+            let (owner, key_ref) = split_key_path(path.trim_end_matches("/disabled"));
+            let disabled = parsed
+                .get("disabled")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true);
+            match store.set_key_disabled(owner, key_ref, disabled) {
+                Ok(k) => json(200, &serde_json::json!({ "key": key_json(&k) }).to_string()),
+                Err(e) => json(404, &serde_json::json!({ "error": e.to_string() }).to_string()),
+            }
+        }
+    }
+}
+
 fn mutate(state: &Arc<State>, method: &Method, path: &str, body: &Bytes) -> Response<Body> {
     let parsed = serde_json::from_slice::<serde_json::Value>(body).unwrap_or(serde_json::Value::Null);
     let field = |k: &str| parsed.get(k).and_then(|x| x.as_str()).unwrap_or("").to_owned();
@@ -2054,6 +2329,13 @@ fn mutate(state: &Arc<State>, method: &Method, path: &str, body: &Bytes) -> Resp
             let who = p.trim_start_matches("/api/users/").trim_end_matches("/provider");
             set_user_provider(state, &mut store, who, &field("provider"))
         }
+        // Pin an account to a single model, or clear the pin. The model pin
+        // outranks the provider pin: choosing a model chooses the hop that
+        // serves it.
+        (&Method::POST, p) if p.starts_with("/api/users/") && p.ends_with("/model") => {
+            let who = p.trim_start_matches("/api/users/").trim_end_matches("/model");
+            set_user_model(state, &mut store, who, &field("model"))
+        }
         // The account's compaction level. Per PERSON, not per provider: the
         // operator reasoning about it is looking at a person, and routing picks
         // the hop per request — a level filed under a provider silently means
@@ -2069,38 +2351,13 @@ fn mutate(state: &Arc<State>, method: &Method, path: &str, body: &Bytes) -> Resp
         // back. See `set_user_tools` for why the write is whole-object.
         (&Method::POST, p) if p.ends_with("/tools") => set_user_tools(&mut store, &who("/tools"), parsed.get("tools")),
         (&Method::POST, "/api/users") => add_user(&mut store, &field),
-        // Add a named key. Replaces the old `/rotate`: adding first and
-        // removing later means a machine can be moved across without a moment
-        // where nothing works.
-        (&Method::POST, p) if p.ends_with("/keys") => {
-            let name = field("name");
-            let name = if name.is_empty() { "new" } else { &name };
-            match store.add_key(&who("/keys"), name) {
-                Ok((k, secret)) => json(
-                    201,
-                    // The secret is in this response and no other, ever.
-                    &serde_json::json!({ "key": key_json(&k), "secret": secret }).to_string(),
-                ),
-                Err(e) => json(400, &serde_json::json!({ "error": e.to_string() }).to_string()),
-            }
-        }
-        (&Method::DELETE, p) if p.contains("/keys/") => {
-            let (owner, key_ref) = split_key_path(p);
-            match store.remove_key(owner, key_ref) {
-                Ok(k) => json(200, &serde_json::json!({ "removed": key_json(&k) }).to_string()),
-                Err(e) => json(404, &serde_json::json!({ "error": e.to_string() }).to_string()),
-            }
-        }
+        // Keys. Three routes share a path fragment, and all three go through
+        // `key_route` — which is what keeps the "the secret is shown once"
+        // rule auditable in a single place.
+        (&Method::POST, p) if p.ends_with("/keys") => key_route(&mut store, KeyAction::Add, p, &field, &parsed),
+        (&Method::DELETE, p) if p.contains("/keys/") => key_route(&mut store, KeyAction::Remove, p, &field, &parsed),
         (&Method::POST, p) if p.contains("/keys/") && p.ends_with("/disabled") => {
-            let (owner, key_ref) = split_key_path(p.trim_end_matches("/disabled"));
-            let disabled = parsed
-                .get("disabled")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(true);
-            match store.set_key_disabled(owner, key_ref, disabled) {
-                Ok(k) => json(200, &serde_json::json!({ "key": key_json(&k) }).to_string()),
-                Err(e) => json(404, &serde_json::json!({ "error": e.to_string() }).to_string()),
-            }
+            key_route(&mut store, KeyAction::Disable, p, &field, &parsed)
         }
         (&Method::POST, p) if p.ends_with("/disabled") => {
             let disabled = parsed
@@ -2450,6 +2707,7 @@ mod tests {
     fn an_account_serialises_without_its_hash() {
         let a = Account {
             provider: None,
+            model: None,
             compact: crate::compact::Compact::None,
             tools: crate::tools::Policy::default(),
             id: "id-1".to_owned(),

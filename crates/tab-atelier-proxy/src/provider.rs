@@ -101,6 +101,14 @@ pub enum Wire {
     /// The Anthropic Messages API — passed through untouched.
     #[default]
     Anthropic,
+    /// `OpenAI`'s Chat Completions API, translated at the egress boundary.
+    ///
+    /// The translation lives in `openai.rs` and runs inside `forward()`, so
+    /// everything upstream — shaping, the tool policy, the usage sniffer — is
+    /// still looking at a Messages request and a Messages stream. This variant
+    /// is the first thing in production to branch on `Wire`; until now it was
+    /// persisted and tagged but read nowhere.
+    Openai,
 }
 
 /// How to authenticate to a provider.
@@ -488,15 +496,17 @@ impl Provider {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Preset {
     Deepseek,
+    Openai,
 }
 
 impl Preset {
-    pub const ALL: [Self; 1] = [Self::Deepseek];
+    pub const ALL: [Self; 2] = [Self::Deepseek, Self::Openai];
 
     #[must_use]
     pub const fn id(self) -> &'static str {
         match self {
             Self::Deepseek => "deepseek",
+            Self::Openai => "openai",
         }
     }
 
@@ -504,6 +514,7 @@ impl Preset {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Deepseek => "DeepSeek",
+            Self::Openai => "OpenAI",
         }
     }
 
@@ -568,6 +579,42 @@ impl Preset {
                         66,
                         "withdrawn 2026-09-14; requests are served by deepseek-flash at Flash prices",
                     ),
+                ],
+            },
+            // GPT-5.6 ships as three models rather than one with a dial. They
+            // are listed separately, by their real ids, so each can be pinned
+            // per user with a plain model override — which is also what makes
+            // a per-person default possible (see `Account::model`).
+            //
+            // # Prices are OpenAI's, as published
+            //
+            // Per 1M tokens, Sol $5 in / $30 out, Terra $2.50 / $15, Luna
+            // $1 / $6. Same convention as `DeepSeek` above: cache-MISS input
+            // as integers against Anthropic Haiku at 100, which is the figure
+            // that actually decides a reroute. So Luna 100, Terra 250, Sol
+            // 500 — and by output price Sol is dearer than Opus 5.
+            //
+            // Note the cache discount does NOT reach the proxy: OpenAI's
+            // `prompt_tokens_details.cached_tokens` is surfaced to the client
+            // in `cache_read_input_tokens`, but `relative_cost` models only
+            // input and output, exactly as it does for every other provider.
+            Self::Openai => Provider {
+                id: self.id().to_owned(),
+                wire: Wire::Openai,
+                base_url: "https://api.openai.com/v1".to_owned(),
+                auth: Auth::ApiKeyFile {
+                    path: provider_key_path(config_dir, self.id()).display().to_string(),
+                },
+                // The same reasoning as DeepSeek: the subscription is already
+                // paid for, so a metered provider is only worth leaving to when
+                // it is out of capacity.
+                preference: 10,
+                enabled: true,
+                peak: None,
+                models: vec![
+                    Model::new("gpt-5.6-sol", Class::Heavy, 500),
+                    Model::new("gpt-5.6-terra", Class::Balanced, 250),
+                    Model::new("gpt-5.6-luna", Class::Fast, 100),
                 ],
             },
         }

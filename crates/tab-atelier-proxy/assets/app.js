@@ -98,6 +98,8 @@ function emptyUsage(id) {
             last_used_at: null,
             has_key: false,
             provider: null,
+            // No pin: the caller's own model is honoured, as before.
+            model: null,
             // Off, matching the server's default and the `#[serde(default)]` that
             // gives every account already on disk the same value.
             compact: "none",
@@ -435,6 +437,37 @@ const AdminApp = Vue.defineComponent({
                 `export ANTHROPIC_API_KEY=${key}`,
             ].join("\n");
         },
+        // Every model this proxy could route a person to, one entry per CHOICE
+        // rather than per model.
+        //
+        // On the Anthropic wire a model takes tools and reasoning at once, so it
+        // gets a single entry. On the OpenAI wire it cannot — a request carrying
+        // tools has to force reasoning off — so the same model is offered twice:
+        // once with tools (which is how an agent works), once with reasoning and
+        // no tools at all. The value encodes both, because the two halves travel
+        // by different routes: the model half pins the account, the flavour half
+        // is the account's tool policy.
+        modelChoices() {
+            const all = this.providers ? this.providers.providers : [];
+            const wire = new Map(all.map((p) => [p.id, p.wire]));
+            const out = [];
+            for (const p of all) {
+                if (!p.enabled)
+                    continue;
+                for (const m of p.models) {
+                    if (m.deprecated)
+                        continue;
+                    if (wire.get(p.id) === "openai") {
+                        out.push({ value: `${m.id}#tools`, label: `${m.id} — tools, no reasoning` });
+                        out.push({ value: `${m.id}#reasoning`, label: `${m.id} — reasoning, no tools` });
+                    }
+                    else {
+                        out.push({ value: m.id, label: m.id });
+                    }
+                }
+            }
+            return out;
+        },
     },
     mounted() {
         // A token already in this session means a reload should land straight back
@@ -622,6 +655,56 @@ const AdminApp = Vue.defineComponent({
             finally {
                 this.busy = false;
             }
+        },
+        // The model pin, which is really a model-and-flavour pin. See
+        // `modelChoices` for why the two halves are encoded in one value; here
+        // they are split apart and sent to the two endpoints that own them.
+        //
+        // The order matters. Turning tools off first, then pinning, leaves no
+        // window in which the account is pinned to an OpenAI model while still
+        // carrying tools — which is the state that would 400 upstream, since
+        // that wire cannot serve tools without forcing reasoning off.
+        async setUserModel(u, value) {
+            this.busy = true;
+            try {
+                const cut = value.lastIndexOf("#");
+                const model = cut === -1 ? value : value.slice(0, cut);
+                const flav = cut === -1 ? "" : value.slice(cut + 1);
+                if (flav === "reasoning") {
+                    await this.api("POST", `/api/users/${u.id}/tools`, {
+                        mode: "none",
+                        disable: u.tools.disable,
+                        allow: u.tools.allow,
+                        add: u.tools.add,
+                        rewrite: u.tools.rewrite,
+                    });
+                }
+                await this.api("POST", `/api/users/${u.id}/model`, { model });
+                this.error = "";
+                await this.refresh();
+            }
+            catch (e) {
+                this.error = e instanceof Error ? e.message : String(e);
+                await this.refresh();
+            }
+            finally {
+                this.busy = false;
+            }
+        },
+        // Does this person's work land on the OpenAI wire? Only then do the two
+        // flavours of a model exist to choose between.
+        wireOf(u) {
+            const p = this.providers?.providers.find((q) => q.id === u.provider);
+            return p ? p.wire : "anthropic";
+        },
+        // What the select should show: the pin, plus which flavour it is in.
+        // Nothing stored reads as "" so the browser picks the placeholder.
+        userModelValue(u) {
+            if (!u.model)
+                return "";
+            if (this.wireOf(u) !== "openai")
+                return u.model;
+            return `${u.model}#${u.tools.mode === "none" ? "reasoning" : "tools"}`;
         },
         // The tool editor. Opened from the row and saved whole, because the
         // refusals are about the COMBINATION — a name in both `disable` and
