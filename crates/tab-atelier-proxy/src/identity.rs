@@ -83,13 +83,13 @@ pub fn apply(body: &mut Value, vendor: Vendor, model: &str) {
         return;
     };
     match system {
-        Value::String(text) => *text = rewrite(text, trailer.as_deref()),
+        Value::String(text) => *text = rewrite(text, trailer.as_deref(), model),
         // A system prompt is a string or a list of text blocks. Both spellings
         // are in use, and a client is free to pick either.
         Value::Array(blocks) => {
             for block in blocks {
                 if let Some(Value::String(text)) = block.get_mut("text") {
-                    *text = rewrite(text, trailer.as_deref());
+                    *text = rewrite(text, trailer.as_deref(), model);
                 }
             }
         }
@@ -97,15 +97,16 @@ pub fn apply(body: &mut Value, vendor: Vendor, model: &str) {
     }
 }
 
-fn rewrite(text: &str, trailer: Option<&str>) -> String {
-    let text = strip_dropped_lines(text);
+fn rewrite(text: &str, trailer: Option<&str>, model: &str) -> String {
+    let text = strip_and_repoint(text, model);
     let text = text.replace("Claude Code", "");
     trailer.map_or_else(|| text.clone(), |line| rewrite_trailer(&text, line))
 }
 
-/// Drop the lines the far end has no business receiving.
+/// Drop the lines the far end has no business receiving, and repoint the one
+/// that can simply be made true.
 ///
-/// Three kinds, all Anthropic's own:
+/// Dropped, all Anthropic's own:
 ///
 /// * the `x-anthropic-*` billing header — a version, an entrypoint, a
 ///   checksum, addressed to Anthropic;
@@ -114,16 +115,39 @@ fn rewrite(text: &str, trailer: Option<&str>) -> String {
 ///   would survive the edit that exists to remove it;
 /// * the PR-body instruction, label and attribution together. Dropping the
 ///   attribution alone would leave an instruction to end PR bodies with
-///   nothing.
-fn strip_dropped_lines(text: &str) -> String {
+///   nothing;
+/// * the model catalogue and the line beside it. `When building AI
+///   applications, default to the latest and most capable Claude models` is an
+///   instruction to a competitor's model to promote Claude in the code it
+///   writes, and the cutoff is a claim about Claude's training rather than this
+///   model's;
+/// * what the client *is* — a CLI on these platforms, a `fast` mode with these
+///   models. True of the app, of no use to the work.
+fn strip_and_repoint(text: &str, model: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for line in text.split_inclusive('\n') {
-        if dropped(line) {
-            continue;
+        match model_line(line, model) {
+            Some(line) => out.push_str(&line),
+            None if dropped(line) => {}
+            None => out.push_str(line),
         }
-        out.push_str(line);
     }
     out
+}
+
+/// The model line, rewritten to name the model that actually answers.
+///
+/// The one self-description worth keeping, because it can be made true rather
+/// than only removed: routing already resolved the model, and the id it
+/// resolved is what the far end will serve. Everything before the phrase is
+/// kept, so the bullet survives.
+fn model_line(line: &str, model: &str) -> Option<String> {
+    const NEEDLE: &[u8] = b"you are powered by the model named";
+    let at = find_ignoring_ascii_case(line, NEEDLE)?;
+    if !line.is_char_boundary(at) {
+        return None;
+    }
+    Some(format!("{}You are powered by the model named {model}.", &line[..at]))
 }
 
 fn dropped(line: &str) -> bool {
@@ -135,6 +159,10 @@ fn dropped(line: &str) -> bool {
         || lower.contains("you are claude code, anthropic's official cli for claude")
         || lower.contains("generated with [claude code]")
         || lower.starts_with("end pr bodies with")
+        || lower.starts_with("assistant knowledge cutoff is")
+        || lower.starts_with("the most recent claude model family is")
+        || lower.starts_with("claude code is available as a")
+        || lower.starts_with("fast mode for claude code")
 }
 
 /// Replace each `Co-Authored-By: … <…>` on its line with `replacement`.
