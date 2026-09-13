@@ -254,6 +254,16 @@ interface Capture {
      * so a capture written before the field existed still reads as work.
      */
     kind: string;
+    /**
+     * The family name of a server-side tool this call exists to run, e.g.
+     * `web_search`. Absent on an ordinary turn.
+     *
+     * Anthropic runs such a tool on its own side, so Claude Code makes a call
+     * of its own to execute it — separate from the conversation and separately
+     * billed. The version date is stripped on purpose, so the label survives
+     * the next `_2026…` revision.
+     */
+    server_tool?: string;
     request_headers: [string, string][];
     request_body: string;
     request_truncated: boolean;
