@@ -31,15 +31,19 @@ default-members = [".", "crates/catbus-agent", "crates/claude-api"]
 [profile.release]
 lto = "thin"
 codegen-units = 1
-# `debug` is deliberately NOT set here — the workflows that need DWARF set
-# CARGO_PROFILE_RELEASE_DEBUG=2 themselves.
+# `debug` is deliberately NOT set here — the two workflows that ship a .ddeb
+# set CARGO_PROFILE_RELEASE_DEBUG themselves, and at different levels:
+# apt-publish builds a per-commit nightly with `line-tables-only` (enough for
+# a `file:line` backtrace, ~131 s cheaper), release.yml builds a tag with the
+# full `2`. A default here could not express that split — it would flatten
+# both channels onto one level.
 #
-# Two reasons. arch-pkg ships no debug symbols at all (`options=('!debug')`
-# in packaging/arch/PKGBUILD) and was paying ~6 minutes of compile time for
-# artifacts it discards; and a local `cargo build --release` should not carry
-# the whole dependency tree's DWARF unless the build is actually for a
-# debugging artifact. A profile setting here taxes every release build in the
-# repo for the benefit of the two that ship a .ddeb.
+# Two further reasons. arch-pkg ships no debug symbols at all
+# (`options=('!debug')` in packaging/arch/PKGBUILD) and was paying ~6 minutes
+# of compile time for artifacts it discards; and a local
+# `cargo build --release` should not carry the whole dependency tree's DWARF
+# unless the build is actually for a debugging artifact. A profile setting
+# here taxes every release build in the repo for the benefit of those two.
 #
 # (cargo-deb force-enables debug info anyway when --dbgsym is passed, so those
 # two would still produce symbols without the variable. Not relying on that:
