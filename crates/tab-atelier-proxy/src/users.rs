@@ -145,6 +145,26 @@ pub struct Account {
     /// the thing the operator was keeping it away from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    /// Pin every request from this account to one model, by id.
+    ///
+    /// PER PERSON like `compact` and `tools`. A model pin is the finer half of
+    /// the `provider` pin above: the provider says where the traffic lands, the
+    /// model says what serves it. Held by id rather than by class because the
+    /// operator choosing it is picking a model, not expressing a preference the
+    /// router should be free to reinterpret.
+    ///
+    /// It does NOT rename the model inside a request body on its own — routing
+    /// resolves the id to the provider that serves it and the usual rename in
+    /// `shape_body` follows from that. An id no configured provider serves
+    /// therefore fails to route, which is the same "enforced, not preferred"
+    /// contract as [`Self::provider`].
+    ///
+    /// Nothing here decides whether tools may ride along. The same pair of
+    /// fields does: pin a model that uses tools with `tools.mode = none` and
+    /// the tools are stripped, leaving the model's own reasoning intact — see
+    /// [`crate::tools`]. That is why this is a plain id and not an enum.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// Normal, on the scale the UI presents.
@@ -460,6 +480,7 @@ impl Store {
             disabled: false,
             weight: default_weight(),
             provider: None,
+            model: None,
             compact: crate::compact::Compact::None,
             tools: crate::tools::Policy::default(),
         };
@@ -595,6 +616,28 @@ impl Store {
             .find(|a| a.id == id)
             .ok_or_else(|| Error::NotFound(who.to_owned()))?;
         account.provider = provider.map(str::to_owned).filter(|p| !p.is_empty());
+        let out = account.clone();
+        self.reindex();
+        self.save()?;
+        Ok(out)
+    }
+
+    /// Pin this person's requests to one model, or clear the pin.
+    ///
+    /// # Errors
+    /// No such account, or the file could not be written.
+    pub fn set_model(&mut self, who: &str, model: Option<&str>) -> Result<Account, Error> {
+        let id = self
+            .find(who)
+            .ok_or_else(|| Error::NotFound(who.to_owned()))?
+            .id
+            .clone();
+        let account = self
+            .accounts
+            .iter_mut()
+            .find(|a| a.id == id)
+            .ok_or_else(|| Error::NotFound(who.to_owned()))?;
+        account.model = model.map(str::to_owned).filter(|m| !m.is_empty());
         let out = account.clone();
         self.reindex();
         self.save()?;

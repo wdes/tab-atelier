@@ -37,6 +37,12 @@ interface ApiUser {
     /** The provider this account's work is pinned to, if any. */
     provider: string | null;
     /**
+     * The model this account is pinned to, if any. Outranks `provider`: a
+     * model id resolves to the hop serving it, so choosing a model chooses
+     * the provider too.
+     */
+    model: string | null;
+    /**
      * This account's compaction level. Per ACCOUNT, not per provider: routing
      * picks the provider per request, so a level filed under one would quietly
      * mean something else the moment traffic stopped going there.
@@ -333,6 +339,15 @@ interface ProviderModel {
 interface ProviderView {
     id: string;
     base_url: string;
+    /**
+     * Which API this hop speaks — `anthropic` or `openai`.
+     *
+     * The UI needs it because the OpenAI wire cannot carry tools and
+     * reasoning at once: a request with function tools must force reasoning
+     * off. So a model on that wire is offered as two distinct choices,
+     * "tools" and "reasoning", rather than one.
+     */
+    wire: string;
     preference: number;
     enabled: boolean;
     peak_now: boolean;
