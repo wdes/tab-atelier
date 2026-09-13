@@ -694,15 +694,30 @@ const AdminApp = Vue.defineComponent({
         // window in which the account is pinned to an OpenAI model while still
         // carrying tools — which is the state that would 400 upstream, since
         // that wire cannot serve tools without forcing reasoning off.
+        //
+        // The flavour is not a field of its own: it is `tools.mode`, because on
+        // this wire whether tools may ride along IS whether reasoning is on. That
+        // makes the mode read as the flavour, so choosing "tools" has to clear the
+        // `none` that meant "reasoning". Without that the select snaps straight
+        // back to the label it was on and the other one is unreachable — a
+        // one-way door out of a perfectly ordinary starting state.
+        //
+        // Back to `all`, not to one of the narrower modes: nothing remembers which
+        // of the three tools-carrying modes was in force before reasoning was
+        // chosen, and they are not interchangeable. The allow/disable lists
+        // survive either way and take effect again as soon as a mode selects them.
         async setUserModel(u, value) {
             this.busy = true;
             try {
                 const cut = value.lastIndexOf("#");
                 const model = cut === -1 ? value : value.slice(0, cut);
                 const flav = cut === -1 ? "" : value.slice(cut + 1);
-                if (flav === "reasoning") {
+                const mode = flav === "reasoning" ? "none"
+                    : flav === "tools" && u.tools.mode === "none" ? "all"
+                        : null;
+                if (mode) {
                     await this.api("POST", `/api/users/${u.id}/tools`, {
-                        mode: "none",
+                        mode,
                         disable: u.tools.disable,
                         allow: u.tools.allow,
                         add: u.tools.add,
