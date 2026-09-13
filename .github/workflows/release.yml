@@ -71,6 +71,13 @@ jobs:
               # The DWARF the .ddeb carries. Set here rather than in
               # Cargo.toml so arch-pkg — which ships no debug symbols at all
               # — is not taxed for them; see the note in the release profile.
+              #
+              # A tag gets the full level, deliberately. apt-publish builds
+              # the same packages per-commit and sets `line-tables-only`
+              # there to save ~131 s a run; a release is built once and is
+              # the artifact someone actually debugs an install with, so it
+              # keeps the variable and type detail that level drops. The two
+              # channels differ on purpose — do not "unify" them.
               env:
                   CARGO_PROFILE_RELEASE_DEBUG: "2"
               run: |

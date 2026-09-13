@@ -66,9 +66,29 @@ jobs:
                       CHANNEL=nightly
                   fi
                   VERSION="$(scripts/deb-version.sh)"
+                  # How much DWARF the .ddeb carries, per channel.
+                  #
+                  # `stable` comes from a tag. It is the build someone
+                  # debugs a real install against, and it is produced once,
+                  # so it gets the full level.
+                  #
+                  # `nightly` is rebuilt on every push to main, and is where
+                  # the CI minutes are spent. Measured cold: `2` costs ~131 s
+                  # more than `line-tables-only` (570 s vs 439 s) and yields a
+                  # 90 MB .ddeb against 32 MB. Both keep `.debug_line`, so a
+                  # panic or crash backtrace still resolves to `file:line`;
+                  # nightly gives up the variable and type detail gdb reads
+                  # out of the rest of the DWARF. Nothing pays that price
+                  # here — a nightly is discarded within days, a tag is kept.
+                  if [[ "$CHANNEL" == stable ]]; then
+                      DEBUG_LEVEL=2
+                  else
+                      DEBUG_LEVEL=line-tables-only
+                  fi
                   echo "channel=$CHANNEL" >> $GITHUB_OUTPUT
                   echo "version=$VERSION" >> $GITHUB_OUTPUT
-                  echo "→ publishing $VERSION to $CHANNEL"
+                  echo "debug_level=$DEBUG_LEVEL" >> $GITHUB_OUTPUT
+                  echo "→ publishing $VERSION to $CHANNEL (debug=$DEBUG_LEVEL)"
 
             - name: Install system dependencies
               run: |
@@ -107,17 +127,20 @@ jobs:
               # The DWARF the .ddeb carries. Set here rather than in
               # Cargo.toml so arch-pkg — which ships no debug symbols at all
               # — is not taxed for them; see the note in the release profile.
+              # The level follows the channel (`stable` = full, `nightly` =
+              # line tables); the reasoning is in the step above.
               env:
-                  CARGO_PROFILE_RELEASE_DEBUG: "2"
+                  CARGO_PROFILE_RELEASE_DEBUG: ${{ steps.ver.outputs.debug_level }}
               run: |
-                  # --dbgsym: nightly is the main channel people debug
-                  # against, so the symbols ship here and not only at tag
-                  # time. This pool can carry them — apt-ftparchive picks
-                  # *.ddeb up and writes a proper stanza (Section: debug,
-                  # Auto-Built-Package: debug-symbols, Recommends on the
-                  # exact version), verified against real artifacts. An
-                  # earlier comment here claimed it scanned only *.deb and
-                  # that a .ddeb would be silently ignored; that was wrong.
+                  # --dbgsym: the symbols ship on both channels, so a crash
+                  # still names its frames without a rebuild. Only the level
+                  # differs between them. This pool can carry them —
+                  # apt-ftparchive picks *.ddeb up and writes a proper stanza
+                  # (Section: debug, Auto-Built-Package: debug-symbols,
+                  # Recommends on the exact version), verified against real
+                  # artifacts. An earlier comment here claimed it scanned only
+                  # *.deb and that a .ddeb would be silently ignored; that was
+                  # wrong.
                   DBGSYM=(--dbgsym --compress-debug-symbols=zlib)
                   cargo deb -p tab-atelier --locked --deb-version "${{ steps.ver.outputs.version }}" "${DBGSYM[@]}"
                   cargo deb -p tab-atelier --variant headless --locked --deb-version "${{ steps.ver.outputs.version }}" "${DBGSYM[@]}"
@@ -159,13 +182,18 @@ jobs:
                   # forever. Sort by mtime, prune the tail.
                   #
                   # The two extensions carry different caps on purpose.
-                  # Measured across all three packages: a version's .debs
-                  # total ~19 MB while its -dbgsym.ddebs total ~151 MB. The
-                  # site is ~500 MB today, so holding symbols as long as
-                  # binaries would add ~1.5 GB to it. Three symbol versions
-                  # is a few days of nightlies, which covers the case this
-                  # exists for — "the nightly I am running crashed"; older
-                  # versions keep their binaries.
+                  # Measured across all three packages on `stable` (full
+                  # DWARF): a version's .debs total ~19 MB while its
+                  # -dbgsym.ddebs total ~151 MB. On `nightly` the ddebs are
+                  # much smaller — the one package measured cold went 90 MB →
+                  # 32 MB when it moved to line tables, and the other two
+                  # should scale with it (not measured). Each cap only ever
+                  # sees one channel's pool, since the pool path is
+                  # per-channel. The site is ~500 MB today, so holding
+                  # symbols as long as binaries would add ~1.5 GB to it.
+                  # Three symbol versions is a few days of nightlies, which
+                  # covers the case this exists for — "the nightly I am
+                  # running crashed"; older versions keep their binaries.
                   for pkg in tab-atelier tab-atelier-headless tab-atelier-proxy; do
                       ls -1t pool/$CHANNEL/main/t/tab-atelier/${pkg}_*.deb 2>/dev/null \
                           | tail -n +11 | xargs -r rm -f
