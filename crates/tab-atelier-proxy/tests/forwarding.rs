@@ -998,3 +998,89 @@ fn a_local_tool_is_resolved_by_the_proxy_and_never_asked_upstream() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A non-Anthropic upstream is told who is calling.
+///
+/// The Anthropic hop has to keep the client's Claude Code identity, so that
+/// one sends the client's User-Agent. Every other wire used to go out with no
+/// User-Agent at all — the header builder returned before reaching it — which
+/// is both a fingerprinting tell and a thing some providers reject. This
+/// proves the header is actually WIRED onto the outgoing request, not merely
+/// constructed.
+#[test]
+fn an_openai_upstream_receives_a_user_agent() {
+    let _serial = EGRESS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (upstream, seen) = mock_status(200, "{\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4}}");
+
+    let dir = scratch("openai-ua");
+    let creds = dir.join("creds.json");
+    std::fs::write(
+        &creds,
+        r#"{"claudeAiOauth":{"accessToken":"oat-fixture","refreshToken":"r","expiresAt":9999999999999,"scopes":[]}}"#,
+    )
+    .expect("write creds");
+    egress::set_credentials_path(Some(creds));
+
+    let stub_key = dir.join("stub.key");
+    std::fs::write(&stub_key, "sk-stub-provider").expect("write stub key");
+    // Same shape as `stub_provider`, but speaking the OpenAI wire.
+    let mut provider = stub_provider("oai", upstream, 0, &stub_key);
+    provider.wire = Wire::Openai;
+    let registry = Registry {
+        mappings: vec![],
+        providers: vec![provider],
+    };
+
+    let mut store = Store::load(dir.join("users.json")).expect("store");
+    let a = store.add("Ada", "Lovelace", "ada@example.org").expect("add");
+    let (_k, key) = store.add_key(&a.email, "laptop").expect("key");
+    let state = Arc::new(State {
+        store: Mutex::new(store),
+        usage: Mutex::new(usage::Store::load(dir.join("usage"))),
+        sched: Mutex::new(qos::Sched::new()),
+        account: Mutex::new(account::Monitor::load(&dir)),
+        inspect: Mutex::new(tab_atelier_proxy::inspect::Store::load(std::env::temp_dir())),
+        wake: tokio::sync::Notify::new(),
+        registry: Mutex::new(registry),
+        registry_path: dir.join("providers.json"),
+        provider_backoff: Mutex::new(std::collections::BTreeMap::new()),
+        admin_token: "tap_admin".to_owned(),
+        web_root: None,
+    });
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let listener = rt
+        .block_on(async { tokio::net::TcpListener::bind("127.0.0.1:0").await })
+        .expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    rt.spawn(async move { serve_on(listener, state).await });
+
+    let payload = r#"{"model":"oai-balanced","max_tokens":1,"messages":[]}"#;
+    let response = request(
+        port,
+        &format!(
+            "POST /relay/anthropic/v1/messages HTTP/1.1\r\nHost: x\r\nx-api-key: {key}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+            payload.len()
+        ),
+    );
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+
+    let sent = seen
+        .recv_timeout(std::time::Duration::from_secs(3))
+        .expect("upstream request");
+    let lower = sent.to_ascii_lowercase();
+    assert!(
+        lower.contains("user-agent: tab-atelier-proxy/"),
+        "no User-Agent sent: {sent}"
+    );
+    // The provider's own key, and never the caller's.
+    assert!(lower.contains("authorization: bearer sk-stub-provider"), "{sent}");
+    assert!(!sent.contains(&key), "the caller's key must not travel: {sent}");
+
+    egress::set_credentials_path(None);
+    let _ = std::fs::remove_dir_all(&dir);
+}

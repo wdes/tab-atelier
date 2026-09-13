@@ -1228,6 +1228,11 @@ fn upstream_headers(f: &Forward, auth: (&'static str, String), wire: provider::W
         (auth.0.to_owned(), auth.1),
     ];
     if wire != provider::Wire::Anthropic {
+        // No vendor on this hop is Anthropic, so there is no Claude Code
+        // identity to preserve and the request would otherwise arrive with no
+        // User-Agent at all — every real client sends one, and some providers
+        // reject or throttle a request without it.
+        hdrs.push(("User-Agent".to_owned(), egress::USER_AGENT.to_owned()));
         return hdrs;
     }
     // The client's own beta flags are merged in, not replaced: a body field

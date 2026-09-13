@@ -36,14 +36,6 @@ pub const CLOUDFLARE_IPS: &str = "cloudflare_ips";
 /// plain text, one CIDR per line.
 const SOURCES: [&str; 2] = ["https://www.cloudflare.com/ips-v4", "https://www.cloudflare.com/ips-v6"];
 
-/// A version and a project URL, which is what an operator on the other side of
-/// a log line or an abuse report needs in order to know who is calling.
-const USER_AGENT: &str = concat!(
-    "tab-atelier-proxy/",
-    env!("CARGO_PKG_VERSION"),
-    " (+https://github.com/wdes/tab-atelier)"
-);
-
 /// Cloudflare's lists change rarely, and an opted-in account carries the tool on
 /// every request, so fetching per request would put two GETs in front of every
 /// model call. The ceiling is this window: a range announced inside it is not
@@ -152,7 +144,7 @@ fn get(agent: &ureq::Agent, url: &str) -> Result<String, String> {
         .config()
         .timeout_global(Some(TIMEOUT))
         .build()
-        .header("User-Agent", USER_AGENT)
+        .header("User-Agent", crate::egress::USER_AGENT)
         .call()
         .map_err(|err| format!("{url}: {err}"))?;
     let status = response.status().as_u16();
