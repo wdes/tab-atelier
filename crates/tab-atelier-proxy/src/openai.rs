@@ -80,32 +80,58 @@ pub fn to_chat(anthropic: &Value) -> Value {
         }
     }
 
-    if let Some(stops) = anthropic.get("stop_sequences").and_then(Value::as_array) {
+    // The reasoning models do not merely ignore `stop`, they refuse the
+    // request: `400 Unsupported parameter: 'stop' is not supported with this
+    // model`, and an empty array is refused just the same. Dropping the
+    // sequences is the only way to get the call through — which costs the tag
+    // a caller may be waiting on (Claude Code's auto-mode classifier stops on
+    // one), so the decision is keyed on the model rather than the wire:
+    // earlier models honour the field, and compatible servers built on them
+    // still get it.
+    let model = anthropic.get("model").and_then(Value::as_str).unwrap_or_default();
+    if !rejects_stop(model)
+        && let Some(stops) = anthropic.get("stop_sequences").and_then(Value::as_array)
+    {
         let capped: Vec<&Value> = stops.iter().take(MAX_STOP_SEQUENCES).collect();
         if !capped.is_empty() {
             out["stop"] = json!(capped);
         }
     }
 
+    let mut carries_tools = false;
     if let Some(tools) = anthropic.get("tools").and_then(Value::as_array) {
         let converted: Vec<Value> = tools.iter().map(convert_tool).collect();
         if !converted.is_empty() {
             out["tools"] = json!(converted);
-            // Chat Completions refuses function tools on a reasoning model
-            // unless reasoning is switched off. The API says so itself:
-            //
-            //     Function tools with reasoning_effort are not supported for
-            //     gpt-5.6-<tier> in /v1/chat/completions. To use function
-            //     tools, use /v1/responses or set reasoning_effort to 'none'.
-            //
-            // A coding agent sends tools on nearly every turn, so without this
-            // the adapter 400s on the requests that matter most. The Responses
-            // API is the other road; it is a different body shape and would
-            // rewrite both translators, so it is out of scope here. Note this
-            // is a real trade: tool-using turns get no hidden reasoning, which
-            // is also the cheaper and more predictable thing to bill for.
-            out["reasoning_effort"] = json!("none");
+            carries_tools = true;
         }
+    }
+
+    // Reasoning off is what this wire needs in two unrelated cases, and each
+    // arrives on a different field.
+    //
+    // A tool-carrying request. Chat Completions refuses function tools on a
+    // reasoning model unless reasoning is switched off; the API says so itself:
+    //
+    //     Function tools with reasoning_effort are not supported for
+    //     gpt-5.6-<tier> in /v1/chat/completions. To use function tools, use
+    //     /v1/responses or set reasoning_effort to 'none'.
+    //
+    // A coding agent sends tools on nearly every turn, so without this the
+    // adapter 400s on the requests that matter most. The Responses API is the
+    // other road; it is a different body shape and would rewrite both
+    // translators, so it is out of scope here. Note this is a real trade:
+    // tool-using turns get no hidden reasoning, which is also the cheaper and
+    // more predictable thing to bill for.
+    //
+    // A request that disabled thinking. `thinking` has no place on this wire
+    // and is dropped, so the intent has to ride the field this wire does have
+    // — otherwise the reasoning model is left on its default and spends the
+    // caller's entire token budget thinking before it answers. That is fatal
+    // to the auto-mode classifier, which asks for 64 tokens and a verdict and
+    // gets an empty string if every one of them goes to reasoning.
+    if carries_tools || thinking_is_disabled(anthropic) {
+        out["reasoning_effort"] = json!("none");
     }
 
     if let Some(choice) = anthropic.get("tool_choice").and_then(convert_tool_choice) {
@@ -121,6 +147,38 @@ pub fn to_chat(anthropic: &Value) -> Value {
     }
 
     out
+}
+
+/// Whether the model refuses `stop` on the chat-completions wire.
+///
+/// The reasoning series does — `gpt-5` and the `o`-prefixed models answer
+/// `400 Unsupported parameter: 'stop' is not supported with this model`, and an
+/// empty array is refused no differently. Earlier models (`gpt-4o`, `gpt-4.1`,
+/// `gpt-3.5`) still honour the field, as do compatible servers built on them,
+/// so the decision is the model's and not the wire's.
+fn rejects_stop(model: &str) -> bool {
+    // Providers prefix their ids (`openai/gpt-5.6-luna`), so compare the last
+    // segment only. The `o`-series needs the boundary check, or `o200k` — a
+    // tokenizer, not a model — would match.
+    let name = model.rsplit('/').next().unwrap_or(model).to_ascii_lowercase();
+    name.starts_with("gpt-5")
+        || ["o1", "o2", "o3", "o4"].iter().any(|prefix| {
+            name.strip_prefix(prefix)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('-'))
+        })
+}
+
+/// Whether the caller asked for no hidden reasoning.
+///
+/// Claude Code spells it `thinking: {"type": "disabled"}`. The key is dropped on
+/// the way out — it has no place on this wire — so the intent has to ride the
+/// field this wire does have.
+fn thinking_is_disabled(anthropic: &Value) -> bool {
+    anthropic
+        .get("thinking")
+        .and_then(|thinking| thinking.get("type"))
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind == "disabled")
 }
 
 /// Flattens an Anthropic `system` field into the single message `OpenAI` expects.
@@ -983,6 +1041,63 @@ mod tests {
             "stop_sequences": ["a", "b", "c", "d", "e"],
         }));
         assert_eq!(chat["stop"].as_array().expect("array").len(), 4);
+    }
+
+    #[test]
+    fn a_reasoning_model_is_never_sent_stop_because_it_would_refuse_the_call() {
+        // Not "ignores the field" — refuses the request, `400 Unsupported
+        // parameter: 'stop' is not supported with this model`, empty array
+        // included. The auto-mode classifier always carries `stop_sequences`,
+        // so this is what made every classifier call 400 on a gpt-5 alias.
+        let chat = to_chat(&json!({
+            "model": "gpt-5.6-luna",
+            "messages": [],
+            "stop_sequences": ["</block>"],
+        }));
+        assert!(chat.get("stop").is_none());
+    }
+
+    #[test]
+    fn an_earlier_model_still_gets_its_stop_sequences() {
+        // The refusal is a property of the reasoning models, not of the wire:
+        // dropping the field for everything would silently break streaming
+        // servers that honour it.
+        let chat = to_chat(&json!({
+            "model": "gpt-4o",
+            "messages": [],
+            "stop_sequences": ["</block>"],
+        }));
+        assert_eq!(chat["stop"][0], "</block>");
+    }
+
+    #[test]
+    fn the_stop_refusal_survives_a_provider_prefix() {
+        assert!(rejects_stop("openai/gpt-5.6-luna"));
+        assert!(rejects_stop("o3-mini"));
+        // A tokenizer name, not a model: the `o` rule needs its boundary.
+        assert!(!rejects_stop("o200k"));
+        assert!(!rejects_stop("gpt-4.1"));
+    }
+
+    #[test]
+    fn a_disabled_thinking_turns_reasoning_off_even_with_no_tools() {
+        // `thinking` has no home on this wire and is dropped, so the intent
+        // has to move to `reasoning_effort`. Without it the classifier's 64
+        // tokens are all spent reasoning and the answer comes back empty.
+        let chat = to_chat(&json!({
+            "model": "gpt-5.6-luna",
+            "messages": [],
+            "thinking": {"type": "disabled"},
+        }));
+        assert_eq!(chat["reasoning_effort"], "none");
+    }
+
+    #[test]
+    fn an_untouched_thinking_block_does_not_force_reasoning_off() {
+        assert!(!thinking_is_disabled(
+            &json!({"type": "enabled", "budget_tokens": 4000})
+        ));
+        assert!(!thinking_is_disabled(&json!({})));
     }
 
     #[test]
