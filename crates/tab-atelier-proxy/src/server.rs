@@ -628,6 +628,17 @@ async fn shape_and_admit(
             route.model_id
         );
     }
+    // What the far end is. It decides whether the client's claim to be Claude
+    // Code is true — and so whether anything about it should be rewritten — and
+    // whether admission applies at all, since only a destination that spends the
+    // subscription is gated on it.
+    let (on_subscription, vendor) = {
+        let registry = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        registry.get(&route.provider_id).map_or_else(
+            || (true, crate::identity::Vendor::Anthropic),
+            |p| (p.uses_the_subscription(), crate::identity::Vendor::of(p)),
+        )
+    };
     let (body, compaction, local) = shape_body(
         &body,
         &route,
@@ -643,6 +654,7 @@ async fn shape_and_admit(
         // nothing and cost the cache. The flag is here for a provider that
         // turns out to need it.
         true,
+        vendor,
     );
 
     // Admission gates on the SUBSCRIPTION's budget, so it applies only to a
@@ -656,12 +668,6 @@ async fn shape_and_admit(
     // the workaround is to disable the subscription entirely, which is exactly
     // the wrong answer: the far end that could have served it sits idle while
     // the plan it does not use is blamed.
-    let on_subscription = state
-        .registry
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&route.provider_id)
-        .is_none_or(provider::Provider::uses_the_subscription);
     let est = qos::estimate_cost(&body);
     if on_subscription && let Err(retry_after) = admit(state, &account.id, account.weight, est).await {
         log::warn!(
@@ -706,6 +712,7 @@ fn shape_body(
     compact: crate::compact::Compact,
     policy: &crate::tools::Policy,
     takes_cache: bool,
+    vendor: crate::identity::Vendor,
 ) -> (Bytes, Option<inspect::Compaction>, Vec<String>) {
     let rename = (route.model_id != requested).then_some(route.model_id.as_str());
     // The level is the account's, resolved by the caller from wherever the
@@ -730,10 +737,14 @@ fn shape_body(
     // to emit one tag. Handing it a toolkit changes what it is, not merely what
     // it reads. See `classifier::Kind::shapes_tools`.
     let policy = route.kind.shapes_tools().then_some(policy);
+    // Did the client claim to be Claude Code to a model that is not Claude? The
+    // scan is only worth its pass when there is an edit to make, and there never
+    // is for Anthropic — where the claim is true.
+    let rewrites_identity = vendor != crate::identity::Vendor::Anthropic && crate::identity::mentions(body);
     // The tool policy joins the early-out rather than being checked after
     // it. An account with no policy must not pay for the parse and the
     // re-encode, and that is most accounts on most requests.
-    if rename.is_none() && level.is_none() && policy.is_none_or(crate::tools::is_noop) {
+    if rename.is_none() && level.is_none() && policy.is_none_or(crate::tools::is_noop) && !rewrites_identity {
         return (body.clone(), None, Vec::new());
     }
 
@@ -745,6 +756,9 @@ fn shape_body(
     };
     if let Some(model) = rename {
         v["model"] = serde_json::Value::String(model.to_owned());
+    }
+    if rewrites_identity {
+        crate::identity::apply(&mut v, vendor, &route.model_id);
     }
     let before = body.len();
     let elided = crate::compact::apply(&mut v, level);
@@ -2893,6 +2907,7 @@ mod tests {
             crate::compact::Compact::Tools,
             &crate::tools::Policy::default(),
             true,
+            crate::identity::Vendor::Anthropic,
         );
         let record = record.expect("a level was in force, so a record must come back");
         assert_eq!(record.level, "tools");
@@ -2912,6 +2927,7 @@ mod tests {
             crate::compact::Compact::All,
             &crate::tools::Policy::default(),
             true,
+            crate::identity::Vendor::Anthropic,
         );
         let quiet = quiet.expect("still a record");
         assert_eq!(quiet.tool_results_elided, 0);
@@ -2926,6 +2942,7 @@ mod tests {
             crate::compact::Compact::None,
             &crate::tools::Policy::default(),
             true,
+            crate::identity::Vendor::Anthropic,
         );
         assert!(off.is_none(), "no level, no record");
         assert_eq!(untouched, plain, "and the bytes are the ones that arrived");
