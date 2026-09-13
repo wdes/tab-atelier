@@ -153,14 +153,6 @@ fn account_json(a: &Account) -> serde_json::Value {
 /// A claude client sends `x-api-key`; our own forwarding hop and the web UI
 /// send `Authorization: Bearer`. Accepting both avoids the class of bug where
 /// the credential is right and the envelope is not.
-///
-/// `x-admin-token` is the third, and it exists for a reason worth writing
-/// down: `Authorization` is the header reverse proxies and auth modules are
-/// most likely to consume or strip before it ever reaches a backend. When that
-/// happens the proxy sees no credential at all and can only report that, which
-/// looks exactly like a wrong token. A plainly-named custom header passes
-/// through arrangements that eat the standard one, so the UI sends both and
-/// whichever survives is used.
 fn presented(req: &Request<Incoming>) -> String {
     let header = |name: &str| {
         req.headers()
@@ -170,7 +162,6 @@ fn presented(req: &Request<Incoming>) -> String {
             .filter(|v| !v.is_empty())
     };
     header("x-api-key")
-        .or_else(|| header("x-admin-token"))
         .or_else(|| {
             req.headers()
                 .get(hyper::header::AUTHORIZATION)
@@ -1671,7 +1662,7 @@ async fn admin(req: Request<Incoming>, state: Arc<State>) -> Response<Body> {
         // on — the same unhelpful 401 the proxy path deliberately avoids. Say
         // what was wrong without printing anyone's secret.
         let why = if offered.is_empty() {
-            "no credential presented — nothing arrived in Authorization, x-admin-token or x-api-key, \
+            "no credential presented — nothing arrived in Authorization: Bearer or x-api-key, \
              which usually means something in front of the proxy stripped it"
         } else if state
             .store
@@ -2293,6 +2284,23 @@ fn key_route(
     }
 }
 
+/// The tools policy out of a request body, in either shape.
+///
+/// This endpoint is `POST /api/users/<id>/tools`, so the policy is the body,
+/// which is what the UI sends. A `{"tools": ...}` envelope is also accepted,
+/// and must be checked first: a policy has no `tools` field, so a wrapped body
+/// read as a bare policy would deserialise to defaults and discard it.
+///
+/// A non-object is `None` rather than a default policy, because the default is
+/// `mode: all` — guessing would turn a malformed request into the most
+/// permissive one.
+fn tools_body(body: &serde_json::Value) -> Option<&serde_json::Value> {
+    if let Some(inner) = body.get("tools") {
+        return Some(inner);
+    }
+    body.is_object().then_some(body)
+}
+
 fn mutate(state: &Arc<State>, method: &Method, path: &str, body: &Bytes) -> Response<Body> {
     let parsed = serde_json::from_slice::<serde_json::Value>(body).unwrap_or(serde_json::Value::Null);
     let field = |k: &str| parsed.get(k).and_then(|x| x.as_str()).unwrap_or("").to_owned();
@@ -2349,7 +2357,7 @@ fn mutate(state: &Arc<State>, method: &Method, path: &str, body: &Bytes) -> Resp
         // the whole request rather than a `field`-mangled string: it is an
         // object, and flattening it to a string would only be to flatten it
         // back. See `set_user_tools` for why the write is whole-object.
-        (&Method::POST, p) if p.ends_with("/tools") => set_user_tools(&mut store, &who("/tools"), parsed.get("tools")),
+        (&Method::POST, p) if p.ends_with("/tools") => set_user_tools(&mut store, &who("/tools"), tools_body(&parsed)),
         (&Method::POST, "/api/users") => add_user(&mut store, &field),
         // Keys. Three routes share a path fragment, and all three go through
         // `key_route` — which is what keeps the "the secret is shown once"
@@ -2422,6 +2430,65 @@ fn distro_asset(rel: &str) -> Option<&'static str> {
     }
 }
 
+/// The assets `index.html` references, and therefore the ones whose URLs must
+/// carry a content hash.
+///
+/// `vendor/bootstrap.min.css` is served from the distribution's package rather
+/// than this repository (see `distro_asset`). Hashing it works the same way,
+/// which is what lets it be cached as hard as the rest.
+const VERSIONED: &[&str] = &[
+    "vendor/bootstrap.min.css",
+    "vendor/vue.global.prod.js",
+    "charts.js",
+    "app.js",
+];
+
+/// Read an asset the way `web` does: our tree first, the distribution's copy
+/// second.
+fn asset_bytes(root: &std::path::Path, rel: &str) -> Option<Vec<u8>> {
+    std::fs::read(root.join(rel))
+        .ok()
+        .or_else(|| distro_asset(rel).and_then(|p| std::fs::read(p).ok()))
+}
+
+/// A short content hash, for a cache-busting URL.
+///
+/// Twelve hex characters — 48 bits. Collisions are not a security property
+/// here; the worst one costs is a single stale asset surviving one more load.
+/// The short form keeps view-source readable.
+fn content_hash(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(12);
+    for byte in digest.iter().take(6) {
+        // Writing into a String cannot fail.
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// Rewrite `index.html` so every asset it names is fetched from a URL carrying
+/// that asset's current content hash.
+///
+/// This is what makes `immutable` safe to hand out: changed bytes mean a
+/// changed URL, so a browser holding yesterday's copy is never wrong and
+/// nothing has to be revalidated. Only the references are touched — no
+/// templating, no placeholder syntax to keep in sync — so the file on disk
+/// stays valid HTML that opens straight from a checkout.
+fn versioned_index(root: &std::path::Path, html: &str) -> String {
+    let mut out = html.to_owned();
+    for rel in VERSIONED {
+        let Some(bytes) = asset_bytes(root, rel) else {
+            // Missing asset: leave the reference alone, so the browser's own
+            // 404 says so rather than a broken URL hiding which one it was.
+            continue;
+        };
+        out = out.replace(&format!("\"{rel}\""), &format!("\"{rel}?v={}\"", content_hash(&bytes)));
+    }
+    out
+}
+
 /// Serve the UI from `web_root`.
 ///
 /// Path traversal is refused by rejecting any `..` component outright rather
@@ -2440,24 +2507,42 @@ fn web(path: &str, state: &State) -> Response<Body> {
         return text(400, "bad path");
     }
     let full = root.join(rel);
-    let bytes = match std::fs::read(&full) {
-        Ok(b) => b,
-        // Not in our tree — try the distribution's copy before giving up.
-        Err(_) => match distro_asset(rel).and_then(|p| std::fs::read(p).ok()) {
-            Some(b) => b,
-            None => return text(404, "not found"),
-        },
+    let Some(bytes) = asset_bytes(root, rel) else {
+        return text(404, "not found");
     };
     let ctype = match full.extension().and_then(|e| e.to_str()) {
         Some("html") => "text/html; charset=utf-8",
         Some("js") => "application/javascript; charset=utf-8",
         Some("css") => "text/css; charset=utf-8",
         Some("map" | "json") => "application/json",
+        Some("txt") => "text/plain; charset=utf-8",
         _ => "application/octet-stream",
+    };
+    // index.html may not be cached: its whole job is to name the current
+    // hashes, so a cached copy is exactly how a browser ends up requesting
+    // assets that no longer exist. robots.txt is not content-addressed
+    // either. Everything else can be kept forever, because the only URLs that
+    // reach those files were minted here, with a hash that changes when the
+    // bytes do.
+    let cache = if matches!(rel, "index.html" | "robots.txt") {
+        "no-cache"
+    } else {
+        "public, max-age=31536000, immutable"
+    };
+    let bytes = if rel == "index.html" {
+        match String::from_utf8(bytes) {
+            Ok(html) => versioned_index(root, &html).into_bytes(),
+            // Not UTF-8, so not ours; serve it as found rather than fail a
+            // page load over a rewrite that could not be performed.
+            Err(e) => e.into_bytes(),
+        }
+    } else {
+        bytes
     };
     Response::builder()
         .status(200)
         .header("content-type", ctype)
+        .header("cache-control", cache)
         // The UI holds an admin token in memory; keep it out of any embedding
         // page and out of a referrer.
         .header("x-content-type-options", "nosniff")
@@ -2516,6 +2601,35 @@ pub async fn serve_on(listener: tokio::net::TcpListener, state: Arc<State>) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `POST /users/<id>/tools` takes the policy as the body, which is what
+    /// the UI sends. The envelope is checked first: read as a bare policy,
+    /// `{"tools": ...}` deserialises to all defaults and discards the policy.
+    #[test]
+    fn a_tools_body_is_read_in_either_shape() {
+        for body in [
+            serde_json::json!({"mode": "none", "disable": ["Read"]}),
+            serde_json::json!({"tools": {"mode": "none", "disable": ["Read"]}}),
+        ] {
+            let picked = tools_body(&body).expect("a policy");
+            let policy: crate::tools::Policy = serde_json::from_value(picked.clone()).expect("parse");
+            assert_eq!(policy.mode, crate::tools::Mode::None);
+            assert_eq!(policy.disable, vec!["Read".to_string()]);
+        }
+    }
+
+    /// A default `Policy` is `mode: all`, so a body that cannot be read is
+    /// refused rather than defaulted into the most permissive policy.
+    #[test]
+    fn a_tools_body_that_is_not_an_object_is_refused() {
+        for body in [
+            serde_json::json!("nope"),
+            serde_json::json!([1, 2]),
+            serde_json::Value::Null,
+        ] {
+            assert!(tools_body(&body).is_none(), "{body}");
+        }
+    }
 
     /// The terminator is rarely on loopback, and a whole fleet logged under
     /// one address is the symptom.

@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: MPL-2.0
 # Service account for the proxy. It owns the account file and the host's Claude
 # login, so it is a system user with no shell and no login.
 set -e
@@ -12,6 +13,18 @@ case "$1" in
                     tab-atelier-proxy >/dev/null
         fi
         install -d -o tab-atelier-proxy -g tab-atelier-proxy -m 0700 /var/lib/tab-atelier-proxy
+        # An upgrade has to take effect. The new binary is on disk by the time
+        # this runs, but the old one is still the process serving requests —
+        # and the UI is read from disk per request, so an un-restarted service
+        # serves the NEW html backed by the OLD binary. That combination is
+        # worse than either alone: the markup asks for fields the running
+        # server does not know about, and they render as nothing at all.
+        # "$2" is empty on a first install, where the service is deliberately
+        # left stopped for the operator to configure (see systemd-units in
+        # Cargo.toml).
+        if [ -n "$2" ] && [ -d /run/systemd/system ]; then
+            deb-systemd-invoke restart 'tab-atelier-proxy.service' >/dev/null || true
+        fi
         ;;
 esac
 #DEBHELPER#

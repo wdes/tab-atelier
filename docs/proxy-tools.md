@@ -287,7 +287,10 @@ had nothing to do would turn a cache optimisation into an outage.
 The write is whole-object (`POST /api/users/<id>/tools`), not field-at-a-time:
 `allow` means nothing apart from the mode that reads it, and `mode: allow` with
 no list is `none` under another name. Partial writes are the only way to leave a
-half-applied policy behind, so there are none.
+half-applied policy behind, so there are none. The body is the policy object
+itself — the same shape as the `tools` value stored in `users.json`, without the
+enclosing key. A `{"tools": …}` envelope is accepted too, so a client that
+mirrors the stored shape still works.
 
 ### The two guards the field names invite you to get wrong
 

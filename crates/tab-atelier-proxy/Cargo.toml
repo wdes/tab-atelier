@@ -72,12 +72,17 @@ priority = "optional"
 # it would put a second unreviewed copy of a large CSS file in this repo.
 # postinst symlinks it into the web root. Vue is NOT in Debian, so that one is
 # vendored — see assets/vendor/README.md.
-depends = "$auto, libjs-bootstrap5, adduser"
+#
+# init-system-helpers is not implied by "$auto": it is what provides
+# deb-systemd-invoke, which postinst uses so that upgrading the package
+# actually restarts the service rather than leaving the old binary running.
+depends = "$auto, libjs-bootstrap5, adduser, init-system-helpers"
 assets = [
     ["target/release/tab-atelier-proxy", "/usr/bin/", "755"],
     ["assets/index.html", "/usr/share/tab-atelier-proxy/web/", "644"],
     ["assets/app.js", "/usr/share/tab-atelier-proxy/web/", "644"],
     ["assets/charts.js", "/usr/share/tab-atelier-proxy/web/", "644"],
+    ["assets/robots.txt", "/usr/share/tab-atelier-proxy/web/", "644"],
     ["assets/vendor/vue.global.prod.js", "/usr/share/tab-atelier-proxy/web/vendor/", "644"],
     ["systemd/tab-atelier-proxy.service", "/usr/lib/systemd/system/", "644"],
     ["README.md", "/usr/share/doc/tab-atelier-proxy/", "644"],
