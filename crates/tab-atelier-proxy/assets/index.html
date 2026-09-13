@@ -145,6 +145,16 @@
         padding: 4vh 1rem; overflow-y: auto;
       }
       .ta-modal { width: 100%; max-width: 46rem; }
+
+      /* JSON body colouring. The selectors are the token classes the viewer
+         hands back, so if the palette changes these must change with it.
+         Wrapped in `:root:not([data-bs-theme=dark])` so a dark theme, when one
+         arrives, inherits whatever plain `pre` colour it sets rather than dark
+         ink on a dark panel. */
+      :root:not([data-bs-theme=dark]) .ta-j-key { color: #0a58ca; }
+      :root:not([data-bs-theme=dark]) .ta-j-str { color: #146c43; }
+      :root:not([data-bs-theme=dark]) .ta-j-num { color: #a61e4d; }
+      :root:not([data-bs-theme=dark]) .ta-j-lit { color: #b02a37; }
     </style>
   </head>
   <body class="bg-body-tertiary">
@@ -705,9 +715,34 @@
                 capture this large means the request really is that big.
               </div>
               <div class="small text-body-secondary mb-1">Headers</div>
-              <pre class="small bg-body-tertiary p-2 rounded mb-2" style="max-height: 10rem; overflow:auto">{{ inspectOpen.request_headers.map(h => h[0] + ': ' + h[1]).join('\n') }}</pre>
-              <div class="small text-body-secondary mb-1">Body</div>
-              <pre class="small bg-body-tertiary p-2 rounded mb-0" style="max-height: 30rem; overflow:auto">{{ prettyJson(inspectOpen.request_body) }}</pre>
+              <!-- Two columns rather than one joined blob: these are name and
+                   value pairs, and aligned columns are what let an operator
+                   scan for the single header they came to check. Values wrap
+                   instead of scrolling, so a long token cannot push the table
+                   sideways and hide the names. -->
+              <table class="table table-sm small mb-2">
+                <tbody>
+                  <tr v-for="h in inspectOpen.request_headers" :key="h[0]">
+                    <th class="text-body-secondary fw-normal text-nowrap align-top" style="width: 1%">{{ h[0] }}</th>
+                    <td class="font-monospace text-break align-top">{{ h[1] }}</td>
+                  </tr>
+                </tbody>
+              </table>
+              <div class="d-flex justify-content-between align-items-center mb-1">
+                <div class="small text-body-secondary">Body</div>
+                <!-- Copies the pretty form — the same string the viewer cuts
+                     into coloured runs below, so what lands on the clipboard is
+                     what is on screen. -->
+                <button class="btn btn-sm btn-outline-secondary" @click="copy(prettyJson(inspectOpen.request_body))">
+                  {{ copied ? 'Copied' : 'Copy JSON' }}
+                </button>
+              </div>
+              <!-- Runs, interpolated, never `v-html`. The body is written by
+                   whoever holds an API key, and this viewer is where a
+                   prompt-injection payload would be on display; interpolation
+                   escapes it, `v-html` would execute a `<img onerror=…>`
+                   sitting in a system prompt. -->
+              <pre class="small bg-body-tertiary p-2 rounded mb-0" style="max-height: 30rem; overflow:auto"><span v-for="t in jsonTokens(inspectOpen.request_body)" :class="t.cls">{{ t.text }}</span></pre>
             </div>
           </div>
         </div>
