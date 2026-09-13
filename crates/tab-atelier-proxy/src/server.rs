@@ -1110,11 +1110,18 @@ fn finish_capture(
     pending: Option<inspect::Capture>,
     status: u16,
     tokens: &usage::Tokens,
+    excerpt: &[u8],
+    dropped: usize,
     model: Option<&str>,
 ) {
     let Some(mut c) = pending else { return };
     c.status = Some(status);
     c.tokens = Some(*tokens);
+    // The reply as it went to the client, capped by `tap`. Kept verbatim --
+    // newlines and all -- because the panel is where a reply is read
+    // properly, and reflowing it here would destroy the shape being read.
+    c.response_excerpt = (!excerpt.is_empty()).then(|| String::from_utf8_lossy(excerpt).into_owned());
+    c.response_truncated = dropped > 0;
     // What compaction removed from THIS request, so the panel can show the
     // saving rather than only the compacted result.
     c.compaction.clone_from(&f.compaction);
@@ -1137,6 +1144,53 @@ fn finish_capture(
     ins.push(c);
 }
 
+/// Keeps the head of the reply for the capture, up to [`inspect::MAX_EXCERPT`],
+/// and returns how many bytes would not fit.
+///
+/// Collection never fails the request: a reply too large is truncated rather
+/// than dropped, because the opening of a reply says far more about what the
+/// model did than its absence does. Past the cap this is a no-op, so a long
+/// stream costs one length check per chunk.
+///
+/// The overflow is returned rather than inferred from the length, because a
+/// reply of exactly `MAX_EXCERPT` bytes is complete and a longer one is not,
+/// and the two are indistinguishable once only the head is kept.
+fn tap(excerpt: &mut Vec<u8>, bytes: &[u8]) -> usize {
+    let room = inspect::MAX_EXCERPT.saturating_sub(excerpt.len());
+    let kept = bytes.len().min(room);
+    excerpt.extend_from_slice(&bytes[..kept]);
+    bytes.len() - kept
+}
+
+/// How much of a reply is written to the log.
+///
+/// Smaller than the capture's, because the log is read as it scrolls and the
+/// panel is read deliberately. Enough for a short answer or the verdict JSON of
+/// the classifier, which is the reply most worth seeing whole.
+const MAX_LOGGED_REPLY: usize = 512;
+
+/// A reply as one log line.
+///
+/// Newlines are escaped rather than kept: a multi-line reply would otherwise
+/// become a dozen log records, and the prefix that says which request it
+/// belongs to would land on the first of them only.
+fn one_line(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let mut out = String::new();
+    for c in text.chars() {
+        if out.len() >= MAX_LOGGED_REPLY {
+            out.push('…');
+            break;
+        }
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => {}
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// Streams the upstream body to the client, translating when the hop is not
 /// Anthropic.
 ///
@@ -1145,14 +1199,19 @@ fn finish_capture(
 /// translation, so reading the original would count a cached prefix twice. What
 /// is billed therefore stays a faithful record of a translation of what was
 /// said, rather than of what was said.
+///
+/// Returns how many reply bytes the capture limit dropped, so the panel can say
+/// the reply it shows is a head rather than the whole thing.
 fn pump<R: std::io::Read>(
     reader: &mut R,
     wire: provider::Wire,
     is_sse: bool,
     status: u16,
     sniffer: &mut usage::Sniffer,
+    excerpt: &mut Vec<u8>,
     body_tx: &tokio::sync::mpsc::Sender<Bytes>,
-) {
+) -> usize {
+    let mut dropped = 0usize;
     let mut buf = [0u8; 8192];
     if wire != provider::Wire::Openai {
         loop {
@@ -1160,13 +1219,14 @@ fn pump<R: std::io::Read>(
                 Ok(0) | Err(_) => break, // EOF, or an upstream read error
                 Ok(n) => {
                     sniffer.feed(&buf[..n]);
+                    dropped += tap(excerpt, &buf[..n]);
                     if body_tx.blocking_send(Bytes::copy_from_slice(&buf[..n])).is_err() {
                         break; // client hung up
                     }
                 }
             }
         }
-        return;
+        return dropped;
     }
     if is_sse {
         let mut translator = openai::Translator::new();
@@ -1177,6 +1237,7 @@ fn pump<R: std::io::Read>(
                     let mut gone = false;
                     for chunk in translator.feed(&buf[..n]) {
                         sniffer.feed(&chunk);
+                        dropped += tap(excerpt, &chunk);
                         if body_tx.blocking_send(chunk).is_err() {
                             gone = true;
                             break;
@@ -1192,11 +1253,12 @@ fn pump<R: std::io::Read>(
         // Without it a well-formed upstream response ends as a truncated one.
         for chunk in translator.finish() {
             sniffer.feed(&chunk);
+            dropped += tap(excerpt, &chunk);
             if body_tx.blocking_send(chunk).is_err() {
                 break;
             }
         }
-        return;
+        return dropped;
     }
     // One JSON object, which for this vendor is also every error. Buffered
     // because a single object cannot be translated in pieces.
@@ -1217,7 +1279,9 @@ fn pump<R: std::io::Read>(
     };
     let bytes = Bytes::from(serde_json::to_vec(&out).unwrap_or_default());
     sniffer.feed(&bytes);
+    dropped += tap(excerpt, &bytes);
     let _ = body_tx.blocking_send(bytes);
+    dropped
 }
 
 /// The headers the request leaves with: the credential, then whatever the
@@ -1360,14 +1424,24 @@ fn forward(
         // The capture is still filed: the request WAS made and the client
         // hanging up does not unmake it. No token counts, because the
         // response was never read.
-        finish_capture(f, pending.take(), status, &usage::Tokens::default(), None);
+        finish_capture(f, pending.take(), status, &usage::Tokens::default(), &[], 0, None);
         return;
     }
     let mut reader = resp.body_mut().as_reader();
-    pump(&mut reader, wire, is_sse, status, &mut sniffer, body_tx);
+    let mut excerpt = Vec::new();
+    let dropped = pump(&mut reader, wire, is_sse, status, &mut sniffer, &mut excerpt, body_tx);
     let (model, tokens) = sniffer.finish();
     record(&f.state, &f.account_id, model.as_deref(), tokens, status);
-    finish_capture(f, pending.take(), status, &tokens, model.as_deref());
+    log::info!(
+        "proxy: {status} for {}: {} in / {} out ({} cache read, {} cache write) reply: {}",
+        model.as_deref().unwrap_or(&f.route.model_id),
+        tokens.input,
+        tokens.output,
+        tokens.cache_read,
+        tokens.cache_write,
+        one_line(&excerpt)
+    );
+    finish_capture(f, pending.take(), status, &tokens, &excerpt, dropped, model.as_deref());
     if f.metered {
         // Replace the estimate with what it really cost. An underestimate is
         // owed back out of the next turn; an overestimate is credited, or a

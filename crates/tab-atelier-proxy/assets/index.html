@@ -744,6 +744,27 @@
                    escapes it, `v-html` would execute a `<img onerror=…>`
                    sitting in a system prompt. -->
               <pre class="small bg-body-tertiary p-2 rounded mb-0" style="max-height: 30rem; overflow:auto"><span v-for="t in jsonTokens(inspectOpen.request_body)" :class="t.cls">{{ t.text }}</span></pre>
+
+              <!-- The other half of the call. Captured apart from the request
+                   because they fail to different places: a 400 says the request
+                   was rejected, an empty reply says the model answered with
+                   nothing, and only this side distinguishes them. -->
+              <template v-if="inspectOpen.response_excerpt">
+                <div class="d-flex justify-content-between align-items-center mb-1 mt-3">
+                  <div class="small text-body-secondary">
+                    Reply
+                    <span v-if="inspectOpen.response_truncated" class="badge text-bg-warning ms-1"
+                          title="Only the head of the reply was kept.">truncated</span>
+                  </div>
+                  <button class="btn btn-sm btn-outline-secondary" @click="copy(inspectOpen.response_excerpt)">
+                    {{ copied ? 'Copied' : 'Copy' }}
+                  </button>
+                </div>
+                <!-- Verbatim, not run through the JSON tokenizer: an SSE reply
+                     is not one JSON document, and half a stream would render as
+                     a parse error rather than as the events it is. -->
+                <pre class="small bg-body-tertiary p-2 rounded mb-0" style="max-height: 30rem; overflow:auto">{{ inspectOpen.response_excerpt }}</pre>
+              </template>
             </div>
           </div>
         </div>
