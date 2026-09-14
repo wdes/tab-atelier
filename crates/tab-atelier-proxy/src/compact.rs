@@ -157,6 +157,9 @@ pub struct Stats {
     /// array. A count of calls would read as "one file" on a turn that dropped
     /// two.
     pub writes_elided: usize,
+    /// Write calls left intact because their paired `tool_result` is an error —
+    /// see [`errored_call_ids`].
+    pub writes_kept_for_error: usize,
     pub notices_dropped: usize,
 }
 
@@ -399,6 +402,9 @@ fn drop_thinking(messages: &mut [serde_json::Value], stats: &mut Stats) {
 /// `tool_use` block itself, its id, its name and its position all stay — which
 /// is also what keeps the id-pairing invariant of layer A intact.
 fn elide_writes(messages: &mut [serde_json::Value], stats: &mut Stats) {
+    // Read the pairing before mutating these messages: layer A rewrites them
+    // too, and this pass should not depend on what it chose to leave behind.
+    let errored = errored_call_ids(messages);
     let start = window_start(messages, KEEP_TURNS, has_elidable_call);
     for message in &mut messages[..start] {
         let Some(list) = blocks_mut(message) else { continue };
@@ -406,15 +412,50 @@ fn elide_writes(messages: &mut [serde_json::Value], stats: &mut Stats) {
             let Some(prefix) = elidable_prefix(block) else {
                 continue;
             };
-            // `file_path`, `cell_id` and the rest of the small fields survive;
-            // only the long strings go. There is no error case to exempt here
-            // — a `tool_use` has no `is_error`, and a call that FAILED still
-            // has its reason in the `tool_result`, which layer A treats.
+            // A failed call's payload is the only record of what the model
+            // tried to do: the paired result says why it did not land, but not
+            // what "it" was. Stubbing both halves leaves an agent unable to
+            // tell a write that failed from one that was merely compressed,
+            // which is precisely how one concludes it already wrote the file.
+            if let Some(id) = block.get("id").and_then(serde_json::Value::as_str)
+                && errored.iter().any(|e| e == id)
+            {
+                stats.writes_kept_for_error += 1;
+                continue;
+            }
             let Some(input) = block.get_mut("input") else { continue };
             log_long_paths(input);
             stats.writes_elided += elide_long_strings(input, prefix);
         }
     }
+}
+
+/// Ids of calls whose `tool_result` came back marked `is_error`.
+///
+/// `is_error` lives on the paired result, not on the `tool_use` — so a caller
+/// that only looks at the call cannot see it. Reading the pairing up front is
+/// what lets [`elide_writes`] spare a failed call's payload.
+fn errored_call_ids(messages: &[serde_json::Value]) -> Vec<String> {
+    let mut ids = Vec::new();
+    for message in messages {
+        let Some(list) = blocks(message) else { continue };
+        for block in list {
+            if block_type(block) != Some("tool_result") {
+                continue;
+            }
+            let failed = block
+                .get("is_error")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            if !failed {
+                continue;
+            }
+            if let Some(id) = block.get("tool_use_id").and_then(serde_json::Value::as_str) {
+                ids.push(id.to_owned());
+            }
+        }
+    }
+    ids
 }
 
 /// The stub marker for a call whose payload this layer shrinks, if it does.
@@ -1212,6 +1253,70 @@ mod tests {
                 "the kept writes must be byte-identical: {i}"
             );
         }
+    }
+
+    /// A failed write is the one case the model must be able to audit: the
+    /// error names the reason, and the payload names what "it" was. Stubbing
+    /// the payload leaves `Error: …` attached to a byte count — an error with
+    /// no subject, and a gap the model can fill with "I already wrote it".
+    #[test]
+    fn layer_d_spares_a_write_whose_result_errored() {
+        let mut messages = Vec::new();
+        for i in 0..TURNS {
+            // One old call failed; every other call in the window succeeded.
+            let failed = i == 1;
+            messages.push(json!({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": format!("call_{i:02}"),
+                    "content": if failed { "Error: file is read-only" } else { "ok" },
+                    "is_error": failed,
+                }],
+            }));
+            messages.push(json!({
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": format!("call_{i:02}"),
+                    "name": "Write",
+                    "input": {
+                        "file_path": format!("/tmp/f{i:02}.rs"),
+                        "content": "x".repeat(5000 + i),
+                    },
+                }],
+            }));
+        }
+        let mut body = json!({
+            "model": "claude-opus-5",
+            "max_tokens": 4096,
+            "messages": messages,
+        });
+
+        let stats = apply(&mut body, Compact::Writes);
+
+        let inputs = write_inputs(&body);
+        assert_eq!(inputs.len(), TURNS, "no call may be removed");
+        let failed = inputs[1]["content"].as_str().expect("content must stay a string");
+        assert!(
+            !failed.starts_with(WRITE_ELIDED_PREFIX),
+            "the failed write keeps its payload: {failed}"
+        );
+        assert!(
+            failed.len() > 4000,
+            "and keeps it whole rather than truncated: {} bytes",
+            failed.len()
+        );
+        assert_eq!(stats.writes_kept_for_error, 1);
+
+        // The successful call in the same window is still stubbed: the
+        // exemption follows the outcome, not the tool.
+        assert!(
+            inputs[0]["content"]
+                .as_str()
+                .expect("content must stay a string")
+                .starts_with(WRITE_ELIDED_PREFIX)
+        );
     }
 
     /// Layer D is the mirror of A and must not run before its level: an
