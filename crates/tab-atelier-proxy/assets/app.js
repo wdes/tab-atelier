@@ -641,7 +641,10 @@ const AdminApp = Vue.defineComponent({
             }
         },
         async addPreset(p) {
-            await this.api("POST", "/api/providers", { preset: p.id });
+            // `dup` makes this an ADDED entry, not an edit of one already there:
+            // clicking DeepSeek twice has to leave two rows with two key files, not
+            // one row holding whichever key was pasted last.
+            await this.api("POST", "/api/providers", { preset: p.id, dup: true });
             await this.loadProviders();
         },
         async setKey(p) {

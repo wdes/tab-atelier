@@ -492,12 +492,14 @@
               <div class="small text-body-secondary mb-1">Add</div>
               <div class="d-flex flex-wrap gap-2">
                 <button v-for="pr in providers.presets" :key="pr.id" class="btn btn-sm btn-outline-primary"
-                        :disabled="pr.configured" @click="addPreset(pr)">
-                  {{ pr.label }}
+                        @click="addPreset(pr)">
+                  {{ pr.configured ? 'Add another ' + pr.label : pr.label }}
                   <span class="text-body-secondary fw-normal" style="font-size:.75rem">{{ pr.base_url }}</span>
                 </button>
                 <span class="small text-body-secondary align-self-center">
                   A preset comes with its models and prices; paste the key after adding.
+                  Adding the same preset twice makes two separate entries, each with its own key —
+                  pin one account to each to split traffic.
                 </span>
               </div>
 
