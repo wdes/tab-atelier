@@ -71,18 +71,6 @@ pub trait Validated: Sized {
     /// [`Rejection`] with 400, either because the body is not valid JSON for
     /// this type or because [`Validated::validate`] refused it.
     fn accept(body: &Bytes) -> Result<Self, Rejection>;
-
-    /// The body of an inbound request, parsed and validated.
-    ///
-    /// This is what a route calls; [`Validated::accept`] is the half that knows
-    /// about JSON, so a test can drive a request from bytes without a socket.
-    ///
-    /// # Errors
-    ///
-    /// [`Rejection`], ready to become the reply.
-    fn from_request(req: &crate::transport::InReq) -> Result<Self, Rejection> {
-        Self::accept(&req.body)
-    }
 }
 
 /// The `serde` half of [`Validated::accept`], for the requests whose wire shape
