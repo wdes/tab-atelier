@@ -176,3 +176,18 @@ pub(crate) struct NewKeyResource {
     pub key: KeyResource,
     pub secret: String,
 }
+
+impl NewKeyResource {
+    /// The one response that carries a key's plaintext.
+    ///
+    /// The store keeps only a hash, so this is the only moment the secret is
+    /// readable — a client that loses it has to mint another, and the doc
+    /// comment on the route is where that is said out loud.
+    #[must_use]
+    pub(crate) fn new(key: &users::Key, secret: String) -> Self {
+        Self {
+            key: KeyResource::from(key),
+            secret,
+        }
+    }
+}

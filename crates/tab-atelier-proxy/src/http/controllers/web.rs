@@ -62,6 +62,31 @@ pub(crate) fn web(path: &str, state: &State) -> Reply {
         .with_header("referrer-policy", "no-referrer".to_owned())
 }
 
+/// The CORS headers a browser needs before it will talk to the API.
+///
+/// Answered here rather than by a fairing so that it is one row of the route
+/// table: in the packaged build the UI and the API share an origin and this is
+/// never reached, but under `vite dev` the UI is on another port and without it
+/// the browser refuses every request with a message about CORS that names
+/// neither the server nor the missing header.
+#[must_use]
+pub(crate) fn preflight() -> Reply {
+    let mut reply = Reply::empty(204);
+    for (name, value) in [
+        ("access-control-allow-origin", "*"),
+        ("access-control-allow-methods", "GET,POST,PUT,DELETE,OPTIONS"),
+        (
+            "access-control-allow-headers",
+            "content-type,authorization,x-api-key,anthropic-version,anthropic-beta,\
+             x-tab-atelier-token",
+        ),
+        ("access-control-max-age", "600"),
+    ] {
+        reply = reply.with_header(name, value.to_owned());
+    }
+    reply
+}
+
 pub(crate) fn distro_asset(rel: &str) -> Option<&'static str> {
     match rel {
         "vendor/bootstrap.min.css" => Some("/usr/share/javascript/bootstrap5/css/bootstrap.min.css"),

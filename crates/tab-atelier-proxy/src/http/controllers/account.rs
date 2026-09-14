@@ -16,20 +16,6 @@ use crate::server::State;
 use crate::transport::{Reply, json_of};
 use crate::users::Store;
 
-/// The path fragment that marks a per-account setting, and the account it names.
-///
-/// `/api/users/<who>/<kind>` in, `<who>` out. One function for all six settings
-/// so a new one cannot get the trimming subtly differently.
-pub(crate) fn pin_path(rest: &str, kind: &str) -> bool {
-    rest.starts_with("users/") && rest.ends_with(&format!("/{kind}"))
-}
-
-/// The account named by `/users/<who>/<kind>`.
-#[must_use]
-pub(crate) fn pin_who<'a>(rest: &'a str, kind: &str) -> &'a str {
-    rest.trim_start_matches("users/").trim_end_matches(&format!("/{kind}"))
-}
-
 /// Every account, for the operator's table.
 pub(crate) fn list(state: &Arc<State>) -> Reply {
     let store = state.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);

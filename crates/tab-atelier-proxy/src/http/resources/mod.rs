@@ -19,8 +19,8 @@ pub mod status;
 pub mod usage;
 
 pub(crate) use account::{
-    AccountEnvelope, AccountResource, AccountsResource, KeyEnvelope, KeyResource, NewKeyResource,
-    RemovedAccountEnvelope, RemovedKeyEnvelope,
+    AccountEnvelope, AccountResource, AccountsResource, KeyEnvelope, NewKeyResource, RemovedAccountEnvelope,
+    RemovedKeyEnvelope,
 };
 pub(crate) use inspect::{InspectStateResource, InspectStatusResource};
 pub(crate) use pressure::pressure_json;

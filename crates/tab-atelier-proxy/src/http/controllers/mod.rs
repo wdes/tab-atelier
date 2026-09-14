@@ -8,6 +8,7 @@
 //! [`super::resources`], and the path table in [`super::routes`].
 
 pub mod account;
+pub mod hello;
 pub mod inspect;
 pub mod key;
 pub mod mapping;

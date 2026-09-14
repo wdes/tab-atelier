@@ -31,9 +31,16 @@ ureq = { version = "3", features = ["json"] }
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "net", "sync", "time", "io-util", "macros", "signal"] }
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+# The `Body` trait and its `Frame`, for the adapter that hands a
+# relayed stream to Rocket. `http-body-util` is the toolbox; this is
+# the interface both sides agree on.
+http-body = "1"
 http-body-util = "0.1"
 bytes = "1"
-futures-util = { version = "0.3", default-features = false }
+# `io` is for `StreamReader`: the relay hands Rocket a stream and Rocket wants
+# an `AsyncRead` for its streaming responder, so something has to bridge the
+# two. `std` comes with it.
+futures-util = { version = "0.3", default-features = false, features = ["std", "io"] }
 # The HTTP layer. Routes, request guards and the streaming responder come from
 # Rocket; the OpenAPI document is derived from the same structs by okapi, so the
 # spec cannot drift from the handlers the way a hand-written one does.
