@@ -503,4 +503,73 @@ mod ui_tests {
             }
         }
     }
+
+    /// The chart templates are checked the same way `index.html` is.
+    ///
+    /// `charts.js` holds its markup in Vue template strings, and Vue compiles
+    /// them at runtime — so they fail exactly the way `index.html` does: an
+    /// unclosed comment or an unbalanced tag throws during the compile and the
+    /// chart renders as nothing, with one console line. The guard above covers
+    /// `index.html` and this file was not covered at all, which is the gap this
+    /// closes.
+    ///
+    /// The templates stay strings rather than moving into an HTML `<template>`.
+    /// They carry `v-for`, bound attributes and `{{ }}`, so cloning one would
+    /// copy those as inert text and the charts would draw once and never
+    /// update — and a `<template>` inside `#app` would be compiled by the root
+    /// instance and injected as literal DOM. What was worth having from that
+    /// idea is the checking, which is this.
+    #[test]
+    fn every_chart_template_is_structurally_sound() {
+        let source = include_str!("../../../assets/charts.js");
+        let templates = template_literals(source);
+        assert!(
+            templates.len() >= 3,
+            "expected the three chart templates, found {} — has the markup moved?",
+            templates.len()
+        );
+
+        for (n, template) in templates.iter().enumerate() {
+            let opens = template.matches("<!--").count();
+            let closes = template.matches("-->").count();
+            assert_eq!(
+                opens, closes,
+                "chart template {n}: unbalanced HTML comments ({opens} <!-- vs {closes} -->) — \
+                 an unclosed one swallows the rest of the template and the chart renders nothing"
+            );
+
+            // SVG in a template *string* is compiled by `@vue/compiler-dom`,
+            // which honours self-closing syntax — unlike the browser's HTML
+            // parser, which is why `index.html` forbids it and this does not.
+            // What must balance here is the container elements.
+            for tag in ["div", "svg", "g", "span", "template", "text"] {
+                let open =
+                    template.matches(&format!("<{tag} ")).count() + template.matches(&format!("<{tag}>")).count();
+                let close = template.matches(&format!("</{tag}>")).count();
+                assert_eq!(
+                    open, close,
+                    "chart template {n}: <{tag}> is unbalanced ({open} open vs {close} close)"
+                );
+            }
+        }
+    }
+
+    /// Pull the body of every template literal out of a source file.
+    ///
+    /// Deliberately naive: it splits on the `template:` key and reads to the
+    /// next unescaped backtick. That is enough for this file, where the
+    /// templates are the only literals holding markup, and a real parser would
+    /// be a dependency to keep working for a check that only needs to see the
+    /// text.
+    fn template_literals(source: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        let mut rest = source;
+        while let Some(at) = rest.find("template: `") {
+            rest = &rest[at + "template: `".len()..];
+            let Some(end) = rest.find('`') else { break };
+            found.push(rest[..end].to_owned());
+            rest = &rest[end..];
+        }
+        found
+    }
 }
