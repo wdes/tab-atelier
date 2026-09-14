@@ -180,6 +180,48 @@ mod tests {
         assert!(!off.disabled());
     }
 
+    /// Both shapes the callers send must read as the same policy.
+    ///
+    /// The envelope is checked first for a reason: read as a bare policy,
+    /// `{"tools": …}` deserialises to all defaults and discards what the caller
+    /// asked for — so an operator restricting an account would watch the
+    /// restriction vanish and the account keep the permissive default.
+    #[test]
+    fn a_tools_body_is_read_in_either_shape() {
+        for body in [
+            r#"{"mode":"none","disable":["Read"]}"#,
+            r#"{"tools":{"mode":"none","disable":["Read"]}}"#,
+        ] {
+            let parsed = SetTools::accept(&Bytes::copy_from_slice(body.as_bytes())).expect("valid");
+            assert_eq!(parsed.policy.mode, crate::tools::Mode::None, "{body}");
+            assert_eq!(parsed.policy.disable, vec!["Read".to_string()], "{body}");
+        }
+    }
+
+    /// A body that is not a policy is refused rather than defaulted.
+    ///
+    /// A default `Policy` allows everything, so reading an unreadable body as
+    /// one would turn a malformed request into the most permissive answer
+    /// possible — the opposite of what a request that failed to parse should do.
+    #[test]
+    fn a_tools_body_that_is_not_a_policy_is_refused() {
+        for body in ["\"nope\"", "[1,2]", "null", "7"] {
+            assert!(
+                SetTools::accept(&Bytes::copy_from_slice(body.as_bytes())).is_err(),
+                "{body} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tools_body_that_is_not_json_is_refused() {
+        // The rejection names the field so the operator knows which part of the
+        // body to look at.
+        let refused = SetTools::accept(&Bytes::from_static(b"{not json")).expect_err("refused");
+        assert_eq!(refused.status, 400);
+        assert!(refused.message.contains("tools"), "{}", refused.message);
+    }
+
     #[test]
     fn an_absent_weight_is_one() {
         let d: SetWeight = parse("{}");
