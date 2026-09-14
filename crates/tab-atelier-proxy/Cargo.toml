@@ -34,6 +34,26 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 bytes = "1"
 futures-util = { version = "0.3", default-features = false }
+# The HTTP layer. Routes, request guards and the streaming responder come from
+# Rocket; the OpenAPI document is derived from the same structs by okapi, so the
+# spec cannot drift from the handlers the way a hand-written one does.
+#
+# rocket_okapi pins rocket to exactly 0.5.1, so this is a three-crate lockstep:
+# bumping one means bumping all of them together.
+rocket = { version = "0.5.1", features = ["json"] }
+# Swagger UI and RapiDoc are switched off deliberately: the spec is consumed by
+# a generator, not by a browser, and the `swagger`/`rapidoc` features vendor a
+# large JS bundle into the binary. The document is served as JSON at
+# /openapi.json, which needs no feature at all.
+rocket_okapi = { version = "0.9", default-features = false }
+rocket_ws = "0.1"
+# Adapter from tokio's mpsc receiver to the Stream the relay responder returns.
+tokio-stream = "0.1"
+# The schema derives that populate the OpenAPI document. Rocket_okapi speaks
+# schemars 0.8, and the rest of the tree (via rmcp, in the desktop crate) is on
+# 1.x — the two majors coexist, but a type deriving one cannot derive the other,
+# so the HTTP DTOs below are deliberately their own types.
+schemars = "0.8"
 sha2 = { version = "0.10", default-features = false }
 # Subresource Integrity, which mandates base64 — hex cannot stand in for it.
 # Already in this crate's graph via ureq, so declaring it costs no compile unit.
