@@ -146,6 +146,9 @@ pub struct Stats {
     /// Tool results left alone because they carry an error the model may
     /// still need to reason about — see [`elide_tool_results`].
     pub tool_results_kept_for_error: usize,
+    /// Tool results left alone because a stub would have been longer than the
+    /// result it replaced — see [`MIN_TOOL_RESULT_BYTES`].
+    pub tool_results_kept_small: usize,
     pub thinking_dropped: usize,
     /// Layer D: file bodies replaced inside old `tool_use` inputs.
     ///
@@ -318,7 +321,18 @@ fn elide_tool_results(messages: &mut [serde_json::Value], stats: &mut Stats) {
             if already_elided(content) {
                 continue;
             }
+            // Only replace a result when the stub is STRICTLY shorter. A `Write`
+            // or `Edit` acknowledges in a line like "The file /src/lib.rs has
+            // been updated." — often shorter than the stub itself, which then
+            // both grows the body and deletes the only record that the call
+            // succeeded. Comparing against the real stub keeps that rule exact
+            // without a magic number. Layer D holds the same floor for a short
+            // `old_string` (`MIN_WRITE_BYTES`).
             let replacement = stub(bytes_of(content), id);
+            if replacement.len() as u64 >= bytes_of(content) {
+                stats.tool_results_kept_small += 1;
+                continue;
+            }
             block["content"] = serde_json::Value::String(replacement);
             stats.tool_results_elided += 1;
         }
@@ -405,6 +419,26 @@ fn has_elidable_call(message: &serde_json::Value) -> bool {
 /// any list written here could predict. Depth is bounded by the JSON the caller
 /// already parsed, so this cannot recurse further than the body itself does.
 fn elide_long_strings(value: &mut serde_json::Value, prefix: &str) -> usize {
+    elide_strings_under(value, prefix, None)
+}
+
+/// A field holding a *path*, not a payload. Paths are identifiers the model
+/// needs to name what it is acting on; a `file_path` is legally up to
+/// `NAME_MAX` (255) bytes per component, so it would clear `MIN_WRITE_BYTES`
+/// and be replaced by a stub the model cannot use. Payload fields — `content`,
+/// `old_string`, `command`, and whatever a future tool nests — are still
+/// stubbed wherever they appear.
+fn is_path_key(key: &str) -> bool {
+    matches!(key, "file_path" | "notebook_path" | "path")
+}
+
+/// [`elide_long_strings`], carrying the field name each value sits under so a
+/// path field can be exempted. An array element has no key of its own; the
+/// objects inside it name their own fields when we descend into them.
+fn elide_strings_under(value: &mut serde_json::Value, prefix: &str, key: Option<&str>) -> usize {
+    if key.is_some_and(is_path_key) {
+        return 0;
+    }
     match value {
         serde_json::Value::String(s) => {
             // Idempotence, deliberately ahead of the size gate. The stub is
@@ -424,8 +458,11 @@ fn elide_long_strings(value: &mut serde_json::Value, prefix: &str) -> usize {
             *s = payload_stub(prefix, u64::try_from(serialized).unwrap_or(u64::MAX));
             1
         }
-        serde_json::Value::Array(items) => items.iter_mut().map(|v| elide_long_strings(v, prefix)).sum(),
-        serde_json::Value::Object(fields) => fields.values_mut().map(|v| elide_long_strings(v, prefix)).sum(),
+        serde_json::Value::Array(items) => items.iter_mut().map(|v| elide_strings_under(v, prefix, None)).sum(),
+        serde_json::Value::Object(fields) => fields
+            .iter_mut()
+            .map(|(k, v)| elide_strings_under(v, prefix, Some(k)))
+            .sum(),
         _ => 0,
     }
 }
@@ -700,6 +737,58 @@ mod tests {
             1002,
             "the error's content is intact, not stubbed"
         );
+    }
+
+    /// A result smaller than the stub that would replace it must be left alone.
+    ///
+    /// A `Write` or `Edit` acknowledges with a line like "The file /src/lib.rs
+    /// has been updated." — under 100 bytes. Stubbing that spends MORE bytes
+    /// than it saves, and deletes the only record that the call succeeded: a
+    /// model re-reading its own history finds an opaque stub where "it worked"
+    /// used to be, and cannot tell whether the edit landed. Layer D already
+    /// refuses to charge a stub for a short `old_string` (`MIN_WRITE_BYTES`);
+    /// this is the same floor for layer A.
+    #[test]
+    fn layer_a_leaves_a_result_shorter_than_its_own_stub() {
+        let ack = "The file /src/lib.rs has been updated.";
+        let mut b = body();
+        // The oldest result is the one layer A reaches for first.
+        b["messages"][0]["content"][0]["content"] = json!(ack);
+
+        let stats = apply(&mut b, Compact::Tools);
+
+        assert_eq!(stats.tool_results_elided, TURNS - KEEP_TURNS - 1);
+        assert_eq!(
+            tool_results(&b)[0]["content"],
+            ack,
+            "a 34-byte acknowledgement must survive a ~90-byte stub"
+        );
+    }
+
+    /// Linux allows a 255-byte path component (`NAME_MAX`). A stub stands in
+    /// for a body without naming the file, so the `file_path` beside it must
+    /// come through byte-identical. Multi-byte characters on purpose: a slice
+    /// taken at a byte offset would panic or split a character, where a plain
+    /// ASCII name could truncate without complaint.
+    #[test]
+    fn a_max_length_filename_survives_the_write_stub() {
+        let name = "é".repeat(127);
+        assert_eq!(name.len(), 254, "127 x 'é' fills a 255-byte component");
+        let path = format!("/tmp/{name}");
+
+        let mut b = write_body();
+        // Message 1 is the oldest assistant turn: the first the layer reaches.
+        b["messages"][1]["content"][1]["input"]["file_path"] = json!(path);
+
+        let stats = apply(&mut b, Compact::Writes);
+
+        assert_eq!(stats.writes_elided, TURNS - KEEP_TURNS);
+        let first = write_inputs(&b)[0];
+        assert_eq!(first["file_path"], json!(path), "the path is not sliced");
+        assert_eq!(first["file_path"].as_str().expect("a path").len(), 259);
+        let stub = first["content"].as_str().expect("a stub");
+        assert!(stub.starts_with(WRITE_ELIDED_PREFIX), "{stub}");
+        assert!(stub.contains("5002 bytes"), "{stub}");
     }
 
     /// Layer B, and its window: counted over turns that HAVE thinking, so
@@ -983,8 +1072,8 @@ mod tests {
 
     /// The real-world shape layer D exists for: a `Write` whose `tool_result`
     /// is a four-word confirmation while the file body sits in the call's own
-    /// `input`. Layer A reaches those results — it has no size gate — but what
-    /// it finds there is 25 bytes, while the payload it cannot reach is 5 KB.
+    /// `input`. Layer A now keeps such a short result rather than pay for a
+    /// stub longer than it was, so the 5 KB payload is reachable only here.
     /// That asymmetry is why this layer is not redundant with it.
     fn write_body() -> serde_json::Value {
         let mut messages = Vec::new();
@@ -1050,9 +1139,9 @@ mod tests {
 
         assert_eq!(stats.writes_elided, TURNS - KEEP_TURNS);
         assert_eq!(
-            stats.tool_results_elided,
-            TURNS - KEEP_TURNS,
-            "layer A reaches the confirmations too — it has no size gate"
+            stats.tool_results_elided, 0,
+            "a 26-byte confirmation is shorter than the stub that would replace \
+             it, so layer A keeps it — the gate that stops a stub enlarging the body"
         );
 
         // …but what A finds there is nothing, which is the point. Measured

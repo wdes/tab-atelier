@@ -835,6 +835,7 @@ fn shape_body(
             bytes_after: u64::try_from(encoded.len()).unwrap_or(u64::MAX),
             tool_results_elided: elided.tool_results_elided,
             tool_results_kept_for_error: elided.tool_results_kept_for_error,
+            tool_results_kept_small: elided.tool_results_kept_small,
             thinking_dropped: elided.thinking_dropped,
             writes_elided: elided.writes_elided,
             notices_dropped: elided.notices_dropped,
